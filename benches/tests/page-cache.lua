@@ -142,10 +142,12 @@ end)
 local RAW_PAIR = { "dk-raw.pbf", "dk-later-raw.pbf" }
 
 test("diff-unindexed diffs both inputs cold, measured", function()
-    local r = bench("diff-unindexed", { "--dataset", "denmark", "--new", "later" }, RAW_PAIR, { diffed() })
+    local r = bench("diff-unindexed", { "--dataset", "denmark", "--new", "later" }, RAW_PAIR, { { exit = 1 }, { exit = 1 }, diffed() })
     assert(r.outcome == "completed", r.reason)
-    assert(#r.calls == 1, #r.calls)
-    prepared(r.calls[1], "cold", RAW_PAIR)
+    assert(#r.calls == 3, #r.calls)
+    unmeasured(r.calls[1])
+    unmeasured(r.calls[2])
+    prepared(r.calls[3], "cold", RAW_PAIR)
 end)
 
 for _, f in ipairs(RAW_PAIR) do
@@ -196,5 +198,15 @@ for _, f in ipairs({ "dk.pbf", "dk-4705.osc.gz" }) do
         local params = { "--dataset", "denmark", "--row", "apply-changes", "--osc", "4705", "--tool", "pbfhogg" }
         local r = bench("vs-osmium", params, { "dk.pbf", "dk-4705.osc.gz" }, nil, { [DATA .. f] = "refused " .. f })
         refused_by(r, "refused " .. f)
+    end)
+end
+
+for _, side in ipairs({ 1, 2 }) do
+    test("diff-unindexed refuses indexed input front " .. side, function()
+        local calls = side == 1 and { { exit = 0 } } or { { exit = 1 }, { exit = 0 } }
+        local r = bench("diff-unindexed", { "--dataset", "denmark", "--new", "later" }, RAW_PAIR, calls)
+        assert(r.outcome == "failed", r.outcome)
+        assert(string.find(r.reason, "requires a first data blob without indexdata", 1, true), r.reason)
+        assert(#r.calls == side, #r.calls)
     end)
 end

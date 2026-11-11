@@ -9,14 +9,29 @@
 -- Exit 0 is clean and exit 1 violations. Before 854f9465 exit 1 could also
 -- mean a failure, so only 0 is trusted and a declared violations input is
 -- refused. since() uses commit ancestry, so a backport of the exit split
--- outside that ancestry can differ. An absent key accepts either answer.
+-- outside that ancestry can differ. An absent key accepts either answer
+-- unless --require-expectation yes.
+-- Configuration-wide orphan detection belongs to brokkr, which owns the
+-- dataset schema and digest registration, rather than this per-cell lookup.
 
 local M = {}
+
+-- Apply one lookup policy to integrity and diff declarations alike. Record
+-- selection separately from verdicts so undeclared cells remain identifiable.
+function M.selected(params, key, want)
+    record.expectation_key = key
+    record.expectation_applied = want ~= nil
+    if want ~= nil then record.expectation_answer = want end
+    if want == nil and params["require-expectation"] == "yes" then
+        fail("missing expect." .. key .. " required by --require-expectation yes")
+    end
+    return want
+end
 
 -- The answer the input declares under key, or nil.
 function M.declared(params, key)
     local declared = params.variant.expect
-    if declared then return declared[key] end
+    return M.selected(params, key, declared and declared[key])
 end
 
 -- Preflight refusal of a declared violations answer that the build

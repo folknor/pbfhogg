@@ -2017,9 +2017,9 @@ fn diff_single_job_needs_no_writable_current_directory() {
 
 /// One element kind's layout: every inner vector becomes one data blob.
 struct ShardFixture {
-    nodes: Vec<Vec<TestNode>>,
-    ways: Vec<Vec<TestWay>>,
-    relations: Vec<Vec<TestRelation>>,
+    nodes: Vec<Vec<TestNode<'static>>>,
+    ways: Vec<Vec<TestWay<'static>>>,
+    relations: Vec<Vec<TestRelation<'static>>>,
 }
 
 fn shard_meta(version: i32) -> TestMeta {
@@ -2031,7 +2031,7 @@ fn shard_meta(version: i32) -> TestMeta {
 
 /// Node `id`, version 1 or (when `modified`) a moved version 2. Every 13th
 /// id carries no metadata, so deletes without a version are covered.
-fn shard_node(id: i64, modified: bool) -> TestNode {
+fn shard_node(id: i64, modified: bool) -> TestNode<'static> {
     let base = 1000 * i32::try_from(id % 10_000).unwrap();
     TestNode {
         id,
@@ -2047,7 +2047,7 @@ fn shard_node(id: i64, modified: bool) -> TestNode {
 }
 
 /// Way `id`; every 11th carries no metadata.
-fn shard_way(id: i64, modified: bool) -> TestWay {
+fn shard_way(id: i64, modified: bool) -> TestWay<'static> {
     TestWay {
         id,
         refs: if modified {
@@ -2066,7 +2066,7 @@ fn shard_way(id: i64, modified: bool) -> TestWay {
     }
 }
 
-fn shard_relation(id: i64, modified: bool) -> TestRelation {
+fn shard_relation(id: i64, modified: bool) -> TestRelation<'static> {
     let mut members = vec![
         TestMember {
             id: MemberId::Way(id),

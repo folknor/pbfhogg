@@ -200,8 +200,8 @@ fn append_capped_missing_refs(
 ///
 /// # Architecture
 ///
-/// One header walk sorts the blobs by kind ([`build_classify_schedules_split`])
-/// and each phase dispatches through [`parallel_project_phase`]: workers pread
+/// One header walk sorts the blobs by kind (`build_classify_schedules_split`)
+/// and each phase dispatches through `parallel_project_phase`: workers pread
 /// and decompress each blob and validate it through a projection on the block
 /// validator instead of building a block (`read::project_ids`: the node IDs,
 /// each way's ID and `refs` position, each relation's ID and member-array
@@ -244,7 +244,7 @@ fn append_capped_missing_refs(
 ///
 /// # Planet-scale memory usage
 ///
-/// Uses [`IdSet`] for all three ID sets, each pre-allocated as a bitset over
+/// Uses `IdSet` for all three ID sets, each pre-allocated as a bitset over
 /// the ID range `check::id_alloc_bound` chooses (at least the live-OSM range
 /// for the kind, whatever the file's size) and grown after each phase by the
 /// IDs above it, which the phase's merge collects into a side set as results

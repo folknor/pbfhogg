@@ -1018,34 +1018,60 @@ mod config_tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
     fn rejects_invalid_levels_and_radii() {
-        let mut config = BuildConfig::default();
-        config.street_level = 31;
-        assert!(config.validate().is_err());
-        config.street_level = 17;
-        config.coarse_level = 17;
-        assert!(config.validate().is_err());
-        config.coarse_level = 14;
-        config.fine_search_radius_m = f32::NAN;
-        assert!(config.validate().is_err());
-        config.fine_search_radius_m = -1.0;
-        assert!(config.validate().is_err());
-        config.fine_search_radius_m = 75.0;
-        config.coarse_search_radius_m = f32::INFINITY;
-        assert!(config.validate().is_err());
-        config.coarse_search_radius_m = 1000.0;
-        assert!(config.validate().is_ok(), "the defaults must validate");
-        // A radius is bounded by the cell width at its own level, so the
-        // default fine radius fails at a fine enough street level.
-        config.street_level = 19;
-        config.fine_search_radius_m = 1000.0;
-        let err = config
-            .validate()
-            .expect_err("1 km at level 19 is past the cap");
         assert!(
-            err.to_string().contains("too wide for S2 level 19"),
-            "{err}"
+            BuildConfig::default().validate().is_ok(),
+            "the untouched defaults must validate"
         );
+        let cases = [
+            (
+                BuildConfig {
+                    street_level: 31,
+                    ..BuildConfig::default()
+                },
+                "street S2 level must be in",
+            ),
+            (
+                BuildConfig {
+                    coarse_level: BuildConfig::default().street_level,
+                    ..BuildConfig::default()
+                },
+                "must be less than street S2 level",
+            ),
+            (
+                BuildConfig {
+                    fine_search_radius_m: f32::NAN,
+                    ..BuildConfig::default()
+                },
+                "search radius must be a finite non-negative number",
+            ),
+            (
+                BuildConfig {
+                    fine_search_radius_m: -1.0,
+                    ..BuildConfig::default()
+                },
+                "search radius must be a finite non-negative number",
+            ),
+            (
+                BuildConfig {
+                    coarse_search_radius_m: f32::INFINITY,
+                    ..BuildConfig::default()
+                },
+                "coarse search radius must be a finite non-negative number",
+            ),
+            // An explicit 1 km radius exceeds the reach at street level 19.
+            (
+                BuildConfig {
+                    street_level: 19,
+                    fine_search_radius_m: 1000.0,
+                    ..BuildConfig::default()
+                },
+                "too wide for S2 level 19",
+            ),
+        ];
+        for (config, refusal) in cases {
+            let err = config.validate().expect_err(refusal);
+            assert!(err.to_string().contains(refusal), "{err}");
+        }
     }
 }

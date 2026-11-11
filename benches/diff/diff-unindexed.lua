@@ -36,9 +36,24 @@ function validate(params)
     end
 end
 
+-- Match the diff dispatch probe, rather than the whole-file `indexed`
+-- answer: that answer is false for partially indexed inputs too, including
+-- ones whose first blob would select the indexed diff engine. This proves
+-- the sequential path; proving zero indexed blobs anywhere needs a new
+-- inspect count, since no current public field exposes that count.
+local function require_unindexed_front(input)
+    local r = binary("inspect", input, { indexed = true, quiet = true })
+    if r.exit ~= 1 then
+        fail("diff-unindexed requires a first data blob without indexdata; inspect exit "
+            .. tostring(r.exit) .. ": " .. r.stderr)
+    end
+end
+
 function bench(params)
     local old = params.old_variant.file
     local new = params.new_variant.file
+    require_unindexed_front(old)
+    require_unindexed_front(new)
     local out = output("diff.txt")
     local flags = { ["suppress-common"] = true, output = out, overwrite = true }
     if params.type ~= "all" then flags.type = params.type end

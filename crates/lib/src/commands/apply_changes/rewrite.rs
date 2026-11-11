@@ -219,7 +219,7 @@ fn wire_locations(
 /// any PBF parsing/encoding fails. The base is read in several passes, so
 /// it must be a regular file (`InvalidArgument` otherwise), and is pinned for the run (see
 /// [`InputSource::pin`](crate::read::input::InputSource::pin)): a path is
-/// pinned here, a caller's [`PinnedInput`] is used as it is. Where a later
+/// pinned here, a caller's [`PinnedInput`](crate::read::input::PinnedInput) is used as it is. Where a later
 /// open cannot reach the pinned file, a base replaced mid-run fails with
 /// `InputReplaced`. Under `locations_on_ways` without
 /// `ignore_missing_nodes`, a node that a created or modified way references

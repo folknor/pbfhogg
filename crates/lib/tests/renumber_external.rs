@@ -983,7 +983,7 @@ fn member(id: MemberId, role: &'static str) -> TestMember {
     TestMember { id, role }
 }
 
-fn relation_of(id: i64, members: Vec<TestMember>) -> TestRelation {
+fn relation_of(id: i64, members: Vec<TestMember>) -> TestRelation<'static> {
     TestRelation {
         id,
         members,
@@ -1225,7 +1225,7 @@ fn renumber_within_deadline(
 
 const HUNG: &str = "renumber hung on a mid-stream error instead of failing";
 
-fn plain_node(id: i64) -> TestNode {
+fn plain_node(id: i64) -> TestNode<'static> {
     TestNode {
         id,
         lat: 100_000_000,
@@ -1235,7 +1235,7 @@ fn plain_node(id: i64) -> TestNode {
     }
 }
 
-fn plain_way(id: i64, refs: Vec<i64>) -> TestWay {
+fn plain_way(id: i64, refs: Vec<i64>) -> TestWay<'static> {
     TestWay {
         id,
         refs,
@@ -1244,7 +1244,7 @@ fn plain_way(id: i64, refs: Vec<i64>) -> TestWay {
     }
 }
 
-fn plain_relation(id: i64, way: i64) -> TestRelation {
+fn plain_relation(id: i64, way: i64) -> TestRelation<'static> {
     TestRelation {
         id,
         members: vec![TestMember {

@@ -1032,6 +1032,17 @@ enum Probe {
     Unknown(String),
 }
 
+/// Open an existing lock without creating or changing it. Keep the options
+/// private: callers cannot enable creation or truncation. The source guard
+/// seals this entire constructor, not the presence of individual flags.
+fn open_probe_lock(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
 /// Probe a run directory's lock. Only a lock that could be taken
 /// (`LockAvailable`) or a missing handshake file (`LockMissing`) counts as an
 /// observation; every other outcome is `Unknown`, because a probe that
@@ -1052,12 +1063,7 @@ fn probe_lock(dir: &Path) -> Probe {
     let lock = dir.join(LOCK_NAME);
     // Read-write, never create: on NFS `flock` is carried out as a POSIX
     // lock, and an exclusive one needs a descriptor open for writing.
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&lock)
-    {
+    let file = match open_probe_lock(&lock) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Probe::Observed(Observation::LockMissing);
@@ -1568,8 +1574,23 @@ mod tests {
         let parent = crate::path_guard::tests::scratch();
         let live = RunScratch::create(parent.path(), &host()).expect("live");
         assert!(matches!(probe_lock(live.path()), Probe::Live));
-        // That probe_lock opens read-write and never creates is enforced by
-        // scripts/check_source_invariants.py in the convention phase.
+        // Local flock cannot distinguish read-only from read-write opens.
+        // The source guard seals open_probe_lock's complete option chain.
+    }
+
+    #[test]
+    fn opening_a_probe_lock_preserves_absence_and_contents() {
+        let parent = crate::path_guard::tests::scratch();
+        let lock = parent.child(LOCK_NAME);
+        let error = open_probe_lock(&lock).expect_err("missing lock");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(parent.path_state(&lock).expect("lock state").is_none());
+        fs::write(&lock, b"existing owner record").expect("lock contents");
+        drop(open_probe_lock(&lock).expect("existing lock"));
+        assert_eq!(
+            fs::read(&lock).expect("preserved contents"),
+            b"existing owner record",
+        );
     }
 
     #[test]

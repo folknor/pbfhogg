@@ -27,7 +27,13 @@ use pbfhogg::{BlobDecode, BlobReader, Element};
 /// Build a sorted, multi-blob fixture: 60 nodes, 12 ways, 6 relations,
 /// packed at 20 elements/blob. Yields 3 node blobs + 1 way blob + 1
 /// relation blob = 5 OsmData blobs in the input.
-fn write_degrade_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_degrade_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let mut nodes = generate_nodes(60, 1);
     // Tag elements in several distinct blobs (and across all three kinds) so
     // the fixture carries tagdata in more than one blob. With 20 elements per
@@ -152,7 +158,13 @@ fn write_fixture_elements(
 /// feature, replication metadata, and a `source`. Written via
 /// `PbfWriter::to_path`, which embeds `indexdata`, so the output is both
 /// indexed (extractable) and bbox-bearing.
-fn write_bbox_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_bbox_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let nodes = generate_nodes(60, 1);
     let ways = generate_ways(12, 1, 3, 1);
     let rels = generate_relations(6, 1, 2, 1);
@@ -293,7 +305,13 @@ fn osm_data_frames(path: &Path) -> Vec<Vec<u8>> {
 /// precondition: the passthrough path never calls `require_indexdata`, so the
 /// run must succeed on a non-indexed input without `--force` (the decode path
 /// would error out).
-fn write_non_indexed_bbox_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_non_indexed_bbox_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let nodes = generate_nodes(60, 1);
     let ways = generate_ways(12, 1, 3, 1);
     let rels = generate_relations(6, 1, 2, 1);
@@ -349,7 +367,13 @@ fn write_non_indexed_bbox_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, 
 /// feature. Used to make the standalone `--strip-locations` assertion
 /// non-vacuous: the input genuinely declares LOW, so clearing it is a real
 /// change rather than a no-op on a header that never had it.
-fn write_low_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_low_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let nodes = generate_nodes(60, 1);
     let ways = generate_ways(12, 1, 3, 1);
     let rels = generate_relations(6, 1, 2, 1);
@@ -413,7 +437,13 @@ fn write_low_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelat
 /// output blob (intra-blob inversion) instead of producing the documented
 /// cross-blob overlap. Each kind has well over `cap + 1` elements so the
 /// swap fires for all three kinds.
-fn write_unsort_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_unsort_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let nodes = generate_nodes(60, 1);
     let ways = generate_ways(24, 1, 3, 1);
     let rels = generate_relations(24, 1, 2, 1);
@@ -436,7 +466,11 @@ const UNSORT_CAP: &str = "10";
 /// input blob size. Each kind has well over `cap` elements.
 fn write_large_blob_unsort_fixture(
     path: &Path,
-) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let nodes = generate_nodes(60, 1);
     let ways = generate_ways(60, 1, 3, 1);
     let rels = generate_relations(60, 1, 2, 1);

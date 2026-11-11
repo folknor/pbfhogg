@@ -30,7 +30,13 @@ use crate::invoker::CliInvoker;
 /// A multi-blob fixture carrying tags on several distinct blobs across all
 /// three element kinds, so both the indexdata and the tagdata checks have more
 /// than one blob to disagree about.
-fn write_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let mut nodes = generate_nodes(60, 1);
     nodes[0].tags = vec![("place", "city"), ("name", "Origo")];
     nodes[7].tags = vec![("amenity", "cafe")];

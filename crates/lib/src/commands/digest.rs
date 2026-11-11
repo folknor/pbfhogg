@@ -6,14 +6,14 @@
 //!   independent of encoding: compression, blob boundaries, dense versus
 //!   plain nodes, string-table order, granularity, header fields, metadata
 //!   and indexdata presence all leave it unchanged. What it covers is
-//!   defined in one place, [`crate::content`], which is also what every
+//!   defined in one place, `crate::content`, which is also what every
 //!   `diff` path compares with.
 //! - **[`Form::Full`] (`v3`).** Content plus everything a writer states
 //!   about it: metadata with its presence, `visible`, exact coordinates,
 //!   `LocationsOnWays` way coordinates, the declared prepass fields and the
 //!   header fields (folded into the first line). Two accepted files get the
 //!   same full digest exactly when they have the same header and the same
-//!   elements field for field, as [`crate::content`] "The full form"
+//!   elements field for field, as `crate::content` "The full form"
 //!   defines; still independent of compression, blob boundaries,
 //!   string-table order, granularity and indexdata. It is no `diff`
 //!   relation: it is for checking that two writers of one operation agree.
@@ -76,12 +76,12 @@
 //! ```
 //!
 //! Each kind digest is XXH3-128 over the form's record stream
-//! ([`crate::content::write_record`] or
-//! [`crate::content::write_full_record`]) of that kind's elements, in file
+//! (`crate::content::write_record` or
+//! `crate::content::write_full_record`) of that kind's elements, in file
 //! order. The first line's digest is, for the content form, XXH3-128 over
 //! every element's record in file order; for the full form, XXH3-128 over
 //! [`FULL_DOMAIN`], the header record
-//! ([`crate::content::write_header_record`]), then for node, way and
+//! (`crate::content::write_header_record`), then for node, way and
 //! relation in that order the kind byte, the count as u64 LE and the kind
 //! digest as u128 LE. So in the full form a header difference moves the
 //! first line alone.

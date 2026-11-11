@@ -1,7 +1,7 @@
 //! io_uring writer thread with registered buffers for pipelined PBF output.
 //!
 //! Runs the shared ordered-delivery loop
-//! ([`super::pipeline::deliver_in_order`]) into an io_uring sink instead of
+//! (`super::pipeline::deliver_in_order`) into an io_uring sink instead of
 //! the buffered one. Uses
 //! `O_DIRECT` + `WriteFixed` with pre-registered
 //! aligned buffers for maximum throughput when the pipeline is I/O-bound

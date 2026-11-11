@@ -123,7 +123,7 @@ fn check_ids_zero_max_errors_retains_all_violation_details() {
     assert_eq!(limited.violations.len(), 1);
 }
 
-fn node(id: i64) -> TestNode {
+fn node(id: i64) -> TestNode<'static> {
     TestNode {
         id,
         lat: 0,
@@ -133,7 +133,7 @@ fn node(id: i64) -> TestNode {
     }
 }
 
-fn way(id: i64, refs: &[i64]) -> TestWay {
+fn way(id: i64, refs: &[i64]) -> TestWay<'static> {
     TestWay {
         id,
         refs: refs.to_vec(),
@@ -142,7 +142,7 @@ fn way(id: i64, refs: &[i64]) -> TestWay {
     }
 }
 
-fn relation(id: i64, member: MemberId) -> TestRelation {
+fn relation(id: i64, member: MemberId) -> TestRelation<'static> {
     TestRelation {
         id,
         members: vec![TestMember {
@@ -845,9 +845,9 @@ fn check_ids_stops_on_a_way_blob_claiming_another_kind() {
 /// One blob of a fixture, all of one kind.
 #[derive(Clone, Copy)]
 enum Blob<'a> {
-    Nodes(&'a [TestNode]),
-    Ways(&'a [TestWay]),
-    Relations(&'a [TestRelation]),
+    Nodes(&'a [TestNode<'a>]),
+    Ways(&'a [TestWay<'a>]),
+    Relations(&'a [TestRelation<'a>]),
 }
 
 /// Write `blobs` as unindexed blobs in the given order, under a header that
@@ -967,7 +967,11 @@ fn refs_summary(report: &pbfhogg::check::refs::RefCheckResult) -> RefsSummary {
 /// file holding the same: nodes 1 to 4, way 10 resolving, way 11 missing
 /// n99 twice, relations whose node, way and relation members resolve and
 /// miss (n98, w97, r96) and one forward relation member (r21).
-fn refs_fixture_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn refs_fixture_elements() -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let nodes = vec![node(1), node(2), node(3), node(4)];
     let ways = vec![way(10, &[1, 2]), way(11, &[3, 99, 4, 99])];
     let member = |id| TestMember { id, role: "" };

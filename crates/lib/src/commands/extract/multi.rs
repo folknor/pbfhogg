@@ -1085,7 +1085,7 @@ impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_
 ///
 /// Workers pread blob data, decompress, parse into PrimitiveBlock, then call
 /// the provided closure to classify elements against N regions and produce
-/// N × Vec<OwnedBlock>, then compress and frame those blocks
+/// N × `Vec<OwnedBlock>`, then compress and frame those blocks
 /// (`RegionFraming`). The consumer copies each region's frames to its
 /// writer in sequence order.
 #[allow(clippy::too_many_lines)]

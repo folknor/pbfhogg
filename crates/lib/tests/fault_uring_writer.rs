@@ -70,15 +70,63 @@ fn fault_injection_uring_writer_dispatch_panic_surfaces_via_flush() {
         writer.flush()
     }));
 
-    match write_result {
-        Ok(Ok(())) => panic!("uring_writer dispatch panic must not produce a silent success"),
-        Ok(Err(_)) => {
-            // Expected: flush() returned Err carrying the
-            // joined-thread panic.
-        }
-        Err(_) => {
-            // Also acceptable: panic propagates directly via
-            // write_primitive_block's send path (channel drop).
-        }
+    let dispatches = writer
+        .test_faults()
+        .uring_dispatch_count
+        .load(Ordering::Relaxed);
+    require_dispatch_panic_error(write_result, dispatches).expect("injected writer failure");
+}
+
+/// Both send-side recovery and flush join the writer and preserve its payload.
+/// A channel failure alone, or a caller unwind, does not prove that recovery.
+fn require_dispatch_panic_error(
+    result: std::thread::Result<pbfhogg::Result<()>>,
+    dispatches: u64,
+) -> Result<(), String> {
+    if dispatches != 3 {
+        return Err(format!(
+            "expected dispatch 3 to panic, observed {dispatches} dispatches"
+        ));
     }
+    match result {
+        Ok(Err(error)) => {
+            let message = error.report();
+            if message
+                .contains("writer thread panicked: test-hooks: uring_writer dispatch #3 panicking")
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failure did not preserve the injected panic: {message}"
+                ))
+            }
+        }
+        Ok(Ok(())) => Err("injected writer panic returned success".to_owned()),
+        Err(_) => Err("writer panic unwound into the caller instead of returning Err".to_owned()),
+    }
+}
+
+#[test]
+fn dispatch_panic_assertion_rejects_unrelated_error() {
+    let unrelated = std::io::Error::other("unrelated write failure");
+    assert!(require_dispatch_panic_error(Ok(Err(unrelated.into())), 3).is_err());
+}
+
+#[test]
+fn dispatch_panic_assertion_rejects_caller_unwind() {
+    let payload: Box<dyn std::any::Any + Send> =
+        Box::new("test-hooks: uring_writer dispatch #3 panicking");
+    assert!(require_dispatch_panic_error(Err(payload), 3).is_err());
+}
+
+#[test]
+fn dispatch_panic_assertion_requires_reached_dispatch() {
+    let injected = || {
+        std::io::Error::other(
+            "writer thread panicked: test-hooks: uring_writer dispatch #3 panicking",
+        )
+        .into()
+    };
+    assert!(require_dispatch_panic_error(Ok(Err(injected())), 2).is_err());
+    assert!(require_dispatch_panic_error(Ok(Err(injected())), 3).is_ok());
 }

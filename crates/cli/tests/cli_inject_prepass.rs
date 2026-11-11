@@ -27,7 +27,7 @@ use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 // Fixture helpers
 // ---------------------------------------------------------------------------
 
-fn node(id: i64) -> TestNode {
+fn node(id: i64) -> TestNode<'static> {
     let k = i32::try_from(id).expect("small id");
     TestNode {
         id,
@@ -38,7 +38,7 @@ fn node(id: i64) -> TestNode {
     }
 }
 
-fn way(id: i64, refs: Vec<i64>) -> TestWay {
+fn way(id: i64, refs: Vec<i64>) -> TestWay<'static> {
     TestWay {
         id,
         refs,
@@ -47,7 +47,7 @@ fn way(id: i64, refs: Vec<i64>) -> TestWay {
     }
 }
 
-fn mp_relation(id: i64, way_id: i64) -> TestRelation {
+fn mp_relation(id: i64, way_id: i64) -> TestRelation<'static> {
     TestRelation {
         id,
         members: vec![TestMember {

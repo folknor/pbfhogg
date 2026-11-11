@@ -5,9 +5,9 @@
 //! discovered for the file. This bypasses the kernel page cache entirely,
 //! preventing cache pollution during planet-scale (80 GB+) PBF reads.
 //!
-//! [`DirectPositional`] is its positional twin: an exact read of any byte
+//! `DirectPositional` is its positional twin: an exact read of any byte
 //! range at any offset, served from aligned `pread(2)` calls over the range's
-//! enclosing aligned span ([`read_aligned`]). It is the transport of the
+//! enclosing aligned span (`read_aligned`). It is the transport of the
 //! direct header walk (`HeaderWalker::open_direct`).
 
 use std::alloc::{self, Layout};

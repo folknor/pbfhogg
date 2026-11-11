@@ -70,9 +70,9 @@ fn write_history_header_only(path: &Path) {
 fn policy_elements(
     first_node: i64,
 ) -> (
-    Vec<crate::common::TestNode>,
-    Vec<crate::common::TestWay>,
-    Vec<crate::common::TestRelation>,
+    Vec<crate::common::TestNode<'static>>,
+    Vec<crate::common::TestWay<'static>>,
+    Vec<crate::common::TestRelation<'static>>,
 ) {
     // Real metadata: time-filter refuses an input stripped of it.
     let meta = Some(crate::common::TestMeta {

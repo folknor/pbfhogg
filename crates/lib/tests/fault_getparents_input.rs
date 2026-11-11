@@ -94,7 +94,7 @@ const EXPECTED: &[(char, i64)] = &[
     ('r', 2_001),
 ];
 
-fn relation(id: i64, members: Vec<MemberId>) -> TestRelation {
+fn relation(id: i64, members: Vec<MemberId>) -> TestRelation<'static> {
     TestRelation {
         id,
         members: members

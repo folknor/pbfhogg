@@ -3,7 +3,7 @@
 //! Requires both inputs to declare `Sort.Type_then_ID`. Indexed inputs are
 //! compared by the block-pair merge over work units streamed from both
 //! inputs (`units`), at every `-j`; inputs without indexdata by the
-//! element-level merge over [`StreamingBlocks`] cursors. Memory is bounded
+//! element-level merge over `StreamingBlocks` cursors. Memory is bounded
 //! by the units and decoded blocks in flight either way.
 //!
 //! # Design: content equality, not version ordering

@@ -25,6 +25,10 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 when = "gate"
 targets = ["lib", "bins"]
 
+# Resolve intra-doc links under each check build shape. Any rustdoc diagnostic
+# fails the phase, including warnings; the complete gate cannot skip it.
+[rustdoc]
+
 [bin]
 default = "pbfhogg"
 install = ["pbfhogg-cli"]

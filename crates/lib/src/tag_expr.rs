@@ -272,7 +272,7 @@ pub fn validate_expressions(inputs: &[String]) -> Result<()> {
 /// One deliberate difference: a line that is empty or spaces-only after
 /// steps 2 and 3 is skipped. osmium hands it to `get_tag_matcher` too, which
 /// builds a matcher for the empty key; pbfhogg rejects an empty key outright
-/// (see [`parse_expression`]), and erroring on a blank line would be hostile.
+/// (see `parse_expression`), and erroring on a blank line would be hostile.
 pub fn read_expressions_file(path: &Path) -> Result<Vec<String>> {
     // Names the path, and reports content that is not UTF-8 as invalid data.
     let contents = crate::read::input::read_to_string(path)

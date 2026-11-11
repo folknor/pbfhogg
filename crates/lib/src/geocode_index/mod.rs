@@ -5,7 +5,7 @@
 //!
 //! # Feature gates
 //!
-//! - `geocode-reader`: enables [`Reader`] and its S2 dependency.
+//! - `geocode-reader`: enables `reader::Reader` and its S2 dependency.
 //! - `commands`: enables the builder (implies `geocode-reader`).
 
 pub mod format;

@@ -202,7 +202,7 @@ impl Write for FileWriter {
 
     /// Push buffered bytes onward - and nothing more.
     ///
-    /// Explicitly *not* an `fsync`; see [`FileWriter::sync`] for that. Note
+    /// Explicitly *not* an `fsync`; see `FileWriter::sync` for that. Note
     /// that the `Direct` variant's own `flush` still finalizes its page-
     /// aligned tail and `set_len`s the file, because for an `O_DIRECT` writer
     /// that padding removal is part of pushing the bytes onward, not part of

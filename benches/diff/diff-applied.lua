@@ -13,6 +13,7 @@
 --   brokkr bench --dry-run diff-applied --osc 4705 --format default,osc
 --   brokkr bench --alloc diff-applied --variant raw --type way
 local diff = require("diff")
+local expect = require("expect")
 
 function validate(params)
     diff.validate(params)
@@ -25,6 +26,8 @@ function validate(params)
 end
 
 function bench(params, keys)
+    local want = params.variant.expect and params.variant.expect.diff
+    want = expect.selected(params, "diff." .. keys.osc, want and want[keys.osc])
     local raw = diff.unindexed(params.variant.file)
     record.meta = { merged_cache = "miss" }
     if raw then record.meta.diff_pair = "raw-vs-indexed" end
@@ -32,7 +35,5 @@ function bench(params, keys)
     binary("apply-changes", params.variant.file, params.osc.file, {
         output = merged, overwrite = true, force = raw,
     }):ok()
-    local want = params.variant.expect and params.variant.expect.diff
-    want = want and want[keys.osc]
     return diff.run(params, params.variant.file, merged, want)
 end

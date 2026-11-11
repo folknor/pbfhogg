@@ -179,7 +179,7 @@ params.check = { choices = ["yes", "no"], default = "no", help = "yes: diff the 
 
 [bench.dedupe-pair]
 script_file = "../benches/cat/dedupe-pair.lua"
-description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts, reaching passthrough"
+description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts; inspect counters for passthrough coverage"
 version = 3
 date = 2026-11-11
 changelog = [
@@ -204,6 +204,7 @@ description = "Check ID ordering, optionally detecting duplicate IDs, on a datas
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-ids: streaming/full checks, direct I/O, snapshots and declared verdicts" },
@@ -212,6 +213,7 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
+params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -226,6 +228,7 @@ description = "Check every blob's indexdata and tagdata against its payload on a
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-index: direct I/O, snapshots, declared verdicts and profiling with marker stops" },
@@ -234,6 +237,7 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
+params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -249,6 +253,7 @@ description = "Check inline way-node coordinates against node records, optionall
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-locations: agreement checks, snapshots, declared verdicts and profiling with marker stops" },
@@ -256,6 +261,7 @@ changelog = [
 profile = "release"
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
+params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "altw-keep-untagged", help = "the LocationsOnWays input; set altw explicitly for the typed --agreement default" }
@@ -271,6 +277,7 @@ description = "Check way-node references, optionally relation members, on a data
 version = 2
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "--check-relations yes is judged by expect.check-refs-relations, not expect.check-refs; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Refuse _END and -_END consistently with other stop benches" },
   { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
@@ -280,6 +287,7 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
+params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -342,6 +350,7 @@ description = "Diff a base PBF against its applied OSC, measuring the diff child
 version = 2
 date = 2026-11-10
 changelog = [
+  { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child; probe every blob with inspect --get indexed and delegate jobs validation to pbfhogg" },
   { version = 1, date = 2026-11-09, note = "Ported typed diff two-step workload, raw-vs-indexed pairs, formats, jobs, type, snapshots and profiling" },
 ]
@@ -349,6 +358,7 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
+params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
 params.jobs = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the worker count; omitted uses the binary default" }
@@ -369,12 +379,14 @@ description = "Diff two independent snapshots with text or OSC output"
 version = 2
 date = 2026-11-10
 changelog = [
+  { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child and delegate jobs validation to pbfhogg" },
   { version = 1, date = 2026-11-09, note = "Ported typed diff-snapshots: base or named inputs, shared variant, formats, jobs and profiling" },
 ]
 profile = "release"
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
+params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
 params.jobs = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the worker count; omitted uses the binary default" }
@@ -408,9 +420,10 @@ params.common = { choices = ["yes", "no"], default = "yes", help = "no: pass dif
 [bench.diff-unindexed]
 script_file = "../benches/diff/diff-unindexed.lua"
 description = "Text diff -c of two unindexed snapshots of one dataset, inputs cold, optional --type"
-version = 2
+version = 3
 date = 2026-11-11
 changelog = [
+  { version = 3, date = 2026-11-11, note = "Probe both first data blobs outside the measured diff and refuse indexed fronts, establishing sequential dispatch" },
   { version = 2, date = 2026-11-11, note = "Inputs advised out and checked by brokkr's cold on the measured diff call, replacing dd and fincore; the result is the diff child's wall, without the preparation" },
   { date = 2026-11-09, note = "Use shared cache helpers; workload unchanged" },
   { date = 2026-11-09, note = "--type checked by its choices and the same-file check moved to validate(), before anything is built; runs unchanged" },

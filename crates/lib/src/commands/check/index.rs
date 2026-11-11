@@ -17,9 +17,9 @@
 //! `--corrupt-indexdata-kind` / `--corrupt-tagdata` can manufacture a file whose
 //! hints are well-formed and false - but the pair was one-sided. This is the
 //! other side: it decompresses every blob, re-derives the metadata from the
-//! payload with [`crate::blob_meta::try_scan_block_ids_checked`], or, where
+//! payload with `crate::blob_meta::try_scan_block_ids_checked`, or, where
 //! the blob carries tagdata to compare, with
-//! [`crate::blob_meta::try_scan_block_ids_and_tags`], whose one walk yields
+//! `crate::blob_meta::try_scan_block_ids_and_tags`, whose one walk yields
 //! the same index and the key set `try_scan_block_tags` would, and diffs.
 //! Those are
 //! the writer's *passthrough*-path scanners; the ordinary write path derives

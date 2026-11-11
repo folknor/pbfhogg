@@ -1548,7 +1548,7 @@ impl PbfWriter<FileWriter> {
     /// borrowed: the pipelined path queues this request into the writer
     /// thread and returns immediately, so the input has to stay open until
     /// the splice actually runs. Passing a bare `RawFd` could not express
-    /// that - see [`OutputChunk::CopyRange`](crate::write::pipeline::OutputChunk).
+    /// that - see `OutputChunk::CopyRange` (in `crate::write::pipeline`).
     /// The path names the input when the read or splice fails. An input the
     /// crate opened `O_DIRECT` (pass 2 of `sort` and `cat --dedupe` under
     /// `--direct-io`) is not spliced: every backend reads it in aligned

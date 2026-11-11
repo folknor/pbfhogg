@@ -891,7 +891,7 @@ impl crate::error::Leaf for TimestampError {}
 /// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, the OSM XML
 /// timestamp format) into Unix epoch seconds.
 ///
-/// Inverse of [`format_epoch_secs`]. Strict: exactly 20 bytes, `Z` suffix,
+/// Inverse of `format_epoch_secs`. Strict: exactly 20 bytes, `Z` suffix,
 /// no fractional seconds or offsets (OSM planet/OSC files never carry
 /// either). Used by the OSC parser for element `timestamp` attributes and
 /// by the CLI for `time-filter`'s cutoff argument.

@@ -21,8 +21,10 @@ use pbfhogg::writer::Compression;
 use pbfhogg::{Decision, Effect, FieldOverride, HeaderOverrides};
 use serde_json::{Value, json};
 
-/// The scenario-level assertion every scenario carries: no call diagnostic
-/// arrived after its call document was written.
+/// The scenario-level assertion every scenario carries: every call's
+/// diagnostic senders were released when its collection closed, no call
+/// diagnostic arrived after that, and no collector, setup's included,
+/// dropped an event over its budget.
 pub(crate) const DIAGNOSTICS_CLOSED: &str = "call-diagnostics-closed";
 
 /// One scenario: its declaration, its plan, and its run.

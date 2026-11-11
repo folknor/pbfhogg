@@ -118,6 +118,12 @@ Uuids in run order: `fb596e36` `96fe93aa` `0eb42526` `6a9853f6`;
   peak anon 21 MB -> 24 MB (sampled); `5bfa37ab` later changed the
   pool's retention, so this is the change as landed, not as it is now.
 
+Since bench version 3, `diff-unindexed` probes each input's first data
+blob with `inspect --indexed` outside the measured diff and refuses an
+input whose front carries indexdata, so a stored cell has taken the
+sequential path. The probe does not prove that no later blob is indexed.
+The cells above predate the probe; their inputs were `pbf.raw` throughout.
+
 ## Common lines cut by elements (bygg, 2026-11-09, against `71976fd7`)
 
 `pbfhogg diff OLD NEW` without `-c` on Denmark indexed against its own

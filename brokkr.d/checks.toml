@@ -58,6 +58,20 @@ features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
 # cli_* modules is the class to suspect first if a test flakes.
 parallel = {}
 
+# Same build shape as all, without binary fan-out. The serial profile needs
+# both sequential binaries and test_threads = 1; either alone is insufficient.
+# Keep packages and features aligned with all so clippy can deduplicate them.
+# Curated with its own serial:: filter: a complete profile must reference
+# every uncurated entry, and the gate deliberately does not run this one.
+# The gate runs serial:: tests in the parallel all lane instead; a complete
+# lane may not skip them there, so the gate carries no serial guarantee.
+[[check]]
+name = "all-serial"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
+only = ["serial::"]
+curated = true
+
 [[check]]
 name = "consumer"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
@@ -101,7 +115,13 @@ parallel = {}
 # The glibc-only allocator calls (mallopt, mallinfo2, malloc_trim) are gated
 # on target_env = "gnu"; this sweep builds, lints and runs the suite against
 # musl so an ungated call fails here rather than in a downstream musl build.
-# x86_64 musl binaries run natively on the glibc host.
+# These executable sweeps require an x86_64 Linux host able to execute musl
+# binaries directly. A per-sweep target is a literal triple, not a host
+# capability selector. Brokkr refuses configured runners but does not check
+# direct executability before building; foreign hosts fail when listing tests.
+# Host-capability resolution or an early refusal belongs in brokkr's check
+# planner, not a project script or a silent compile-only replacement. Both
+# musl sweeps below retain executable coverage until that support exists.
 [[check]]
 name = "musl"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
@@ -170,7 +190,7 @@ sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all"]
 skip = ["tier2::", "tier3::", "serial::"]
 include_ignored = false
 
-# Tier 3 - full in-project correctness gate (pre-merge). include_ignored
+# Tier 3 - focused all-feature correctness profile. include_ignored
 # picks up fast ignored tests that #[ignore] keeps out of tier 1.
 # Tests slower than brokkr check's fixed 20 s per-test kill are skipped here BY NAME
 # and must be run individually via `brokkr test <name> --timeout <secs>`
@@ -186,24 +206,22 @@ include_ignored = false
 # geocode tests that way. Before adding a short name here, grep the suite for
 # it; before naming a new test, check it does not contain an entry below.
 [test.profiles.full]
-description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
+description = "Partial all-feature correctness (tier 3); over-watchdog tests run individually via brokkr test"
 sweeps = ["all"]
 skip = [
     "sort_cross_validate_osmium",
 ]
 include_ignored = true
 
-# Tests requiring --test-threads=1. Fault tests are not a serial case
-# (their hooks are per-run, see `pbfhogg::test_hooks`); this profile is
-# reserved for any future serial-only test.
-# Note the entries now carry `parallel` (2026-09-02): if a serial:: test
-# ever materializes, give this profile a parallel-free twin of `all`
-# (same build shape, clippy dedupes) rather than running it through the
-# fan-out - the nautilus config is the worked example of that split.
+# Tests requiring sequential binaries and --test-threads=1. Fault tests are
+# not a serial case (their hooks are per-run, see pbfhogg::test_hooks).
+# Never point this profile at a sweep with parallel: libtest's thread limit
+# does not serialize brokkr's binary fan-out. The sweep's own only filter
+# selects the serial:: modules. The gate runs these tests in the parallel
+# all lane, without this guarantee; see the all-serial entry.
 [test.profiles.serial]
-description = "Serial tests requiring --test-threads=1"
-sweeps = ["all"]
-only = ["serial::"]
+description = "Serial tests requiring sequential binaries and --test-threads=1"
+sweeps = ["all-serial"]
 include_ignored = true
 test_threads = 1
 

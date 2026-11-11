@@ -623,6 +623,14 @@ Every condition is tight, within 4 % across its cells. These are the
 current baselines for those benches; no verdict on the engine moves
 themselves, which had no clean before-cell.
 
+Coverage of what a cell measured differs between the two passthrough-
+and path-sensitive benches. `diff-unindexed` (since bench version 3)
+refuses an input whose first data blob carries indexdata before the
+measured diff runs, so its cells took the sequential path. `dedupe-pair`
+has no such check: that a cell reached passthrough and its coalesced copy
+is established only by reading the cat child's `cat_dedupe` counters by
+hand (`brokkr sidecar UUID --child N --counters --grep cat_dedupe`).
+
 The vs-osmium `extract` row's first japan run failed on every osmium arm
 ("wrong format for coordinate: '=139.5'"); `aba6ff4b` fixed the bbox
 spelling. At `4b08aa07`, japan, dataset bbox, complete-ways on both

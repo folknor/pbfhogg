@@ -26,7 +26,7 @@ fn write_pair(
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let old = dir.join(format!("old-{negatives}.osm.pbf"));
     let new = dir.join(format!("new-{negatives}.osm.pbf"));
-    let nodes = |n: usize| -> Vec<TestNode> {
+    let nodes = |n: usize| -> Vec<TestNode<'static>> {
         if negatives {
             generate_nodes_with_negatives(n / 4, n - n / 4)
         } else {

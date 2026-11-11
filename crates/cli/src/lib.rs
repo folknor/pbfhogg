@@ -11,6 +11,8 @@
 mod command_paths;
 mod exit_code;
 mod host;
+#[cfg(test)]
+mod invocation_finalization_tests;
 mod io_reach;
 #[cfg(test)]
 mod library_text_rule;
@@ -2773,839 +2775,848 @@ pub fn run() -> process::ExitCode {
     host::set_quiet(quiet);
     let advice = advice(&cli.command, &matches);
     let mut outcome = Outcome::Positive;
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        // Every flag rule clap cannot express, before anything else looks at
-        // the filesystem. Only tags-filter's autodetected input kind needs a
-        // read (the four-byte sniff it always did), so its OSC-mode refusals
-        // ride that read.
-        let tags_filter_kind = validate_command(&cli.command, &matches, quiet)?;
-        // The command line's inputs, outputs and scratch location, stated
-        // once; the dispatch below moves the command's fields.
-        let paths = CommandPaths::of(&cli.command);
-        paths.refuse_aliases()?;
-        let mut leftovers = LeftoverScanner::default();
-        paths.scan_leftovers(&mut leftovers, &host);
-        // The command line is accepted: the CLI's command interval opens
-        // here and closes on every return from the dispatch below, before the
-        // end-of-run counters (see `host::CommandInterval`).
-        let _command_interval = host::CommandInterval::open(marker_fifo.as_ref());
-        match cli.command {
-            Command::Cat {
-                files,
-                output,
-                clean,
-                type_filter,
-                dedupe,
-                reindex,
-                repair,
-                compression,
-                io,
-                io_uring,
-                force,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, io_uring),
-                    direct_reads: io.direct_io,
+    let result = finish_invocation(
+        &host.invocation,
+        || -> Result<(), Box<dyn std::error::Error>> {
+            // Every flag rule clap cannot express, before anything else looks at
+            // the filesystem. Only tags-filter's autodetected input kind needs a
+            // read (the four-byte sniff it always did), so its OSC-mode refusals
+            // ride that read.
+            let tags_filter_kind = validate_command(&cli.command, &matches, quiet)?;
+            // The command line's inputs, outputs and scratch location, stated
+            // once; the dispatch below moves the command's fields.
+            let paths = CommandPaths::of(&cli.command);
+            paths.refuse_aliases()?;
+            let mut leftovers = LeftoverScanner::default();
+            paths.scan_leftovers(&mut leftovers, &host);
+            // The command line is accepted: the CLI's command interval opens
+            // here and closes on every return from the dispatch below, before the
+            // end-of-run counters (see `host::CommandInterval`).
+            let _command_interval = host::CommandInterval::open(marker_fifo.as_ref());
+            match cli.command {
+                Command::Cat {
+                    files,
+                    output,
+                    clean,
+                    type_filter,
+                    dedupe,
+                    reindex,
+                    repair,
+                    compression,
+                    io,
+                    io_uring,
                     force,
-                };
-                if reindex {
-                    let [file] = files.as_slice() else {
-                        return Err(usage(
-                            &["cat"],
-                            "--reindex takes exactly one input: it carries that file's header \
-                             through unchanged",
-                        ));
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, io_uring),
+                        direct_reads: io.direct_io,
+                        force,
                     };
-                    let stats =
-                        pbfhogg::cat::reindex::reindex(file, output.open(&host)?, &write, &host)?;
-                    stats.write_summary(&mut host.diagnostics.summary_writer("cat.summary"))?;
-                    Ok(())
-                } else if dedupe {
-                    run_merge_pbf(&files, output.open(&host)?, &write, &overrides, &host)
-                } else {
-                    if repair && type_filter.is_some() && clean.is_empty() {
-                        return Err(usage(
-                            &["cat"],
-                            "--repair with --type needs --clean: the type passthrough copies \
+                    if reindex {
+                        let [file] = files.as_slice() else {
+                            return Err(usage(
+                                &["cat"],
+                                "--reindex takes exactly one input: it carries that file's header \
+                             through unchanged",
+                            ));
+                        };
+                        let stats = pbfhogg::cat::reindex::reindex(
+                            file,
+                            output.open(&host)?,
+                            &write,
+                            &host,
+                        )?;
+                        stats.write_summary(&mut host.diagnostics.summary_writer("cat.summary"))?;
+                        Ok(())
+                    } else if dedupe {
+                        run_merge_pbf(&files, output.open(&host)?, &write, &overrides, &host)
+                    } else {
+                        if repair && type_filter.is_some() && clean.is_empty() {
+                            return Err(usage(
+                                &["cat"],
+                                "--repair with --type needs --clean: the type passthrough copies \
                              selected indexed blobs unread",
-                        ));
+                            ));
+                        }
+                        run_cat(
+                            &files,
+                            output.open(&host)?,
+                            type_filter,
+                            &clean_attrs(&clean),
+                            &write,
+                            &overrides,
+                            repair,
+                            &host,
+                        )
                     }
-                    run_cat(
-                        &files,
-                        output.open(&host)?,
-                        type_filter,
-                        &clean_attrs(&clean),
-                        &write,
-                        &overrides,
-                        repair,
-                        &host,
-                    )
                 }
-            }
-            Command::Sort {
-                file,
-                output,
-                compression,
-                io,
-                uring,
-                force,
-                distrust_metadata,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let opts = pbfhogg::sort::SortOptions {
-                    write: WriteOptions {
+                Command::Sort {
+                    file,
+                    output,
+                    compression,
+                    io,
+                    uring,
+                    force,
+                    distrust_metadata,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let opts = pbfhogg::sort::SortOptions {
+                        write: WriteOptions {
+                            compression: compression.compression,
+                            backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                            direct_reads: io.direct_io,
+                            force: force.force,
+                        },
+                        distrust_metadata,
+                    };
+                    run_sort(&file, output.open(&host)?, &opts, &overrides, &host)
+                }
+                Command::Repack {
+                    file,
+                    output,
+                    elements_per_blob,
+                    compression,
+                    io,
+                    uring,
+                    force,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
                         compression: compression.compression,
                         backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
                         direct_reads: io.direct_io,
                         force: force.force,
-                    },
-                    distrust_metadata,
-                };
-                run_sort(&file, output.open(&host)?, &opts, &overrides, &host)
-            }
-            Command::Repack {
-                file,
-                output,
-                elements_per_blob,
-                compression,
-                io,
-                uring,
-                force,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
-                    direct_reads: io.direct_io,
-                    force: force.force,
-                };
-                run_repack(
-                    &file,
-                    output.open(&host)?,
-                    elements_per_blob,
-                    &write,
-                    &overrides,
-                    &host,
-                )
-            }
-            Command::Degrade {
-                file,
-                output,
-                unsort,
-                unsort_intra,
-                strip_locations,
-                strip_indexdata,
-                strip_tagdata,
-                corrupt_tagdata,
-                corrupt_indexdata,
-                corrupt_indexdata_kind,
-                strip_bbox,
-                drop_ids,
-                elements_per_blob,
-                force,
-                compression,
-                io,
-                uring,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
-                    direct_reads: io.direct_io,
-                    force,
-                };
-                // One of the decode-path flags given is what asks for the
-                // re-encode (`degrade_reencodes`, which the advice shares).
-                // Clap has already refused `--unsort` with `--unsort-intra`.
-                let reencodes =
-                    degrade_reencodes(unsort, unsort_intra, strip_locations, drop_ids.is_some());
-                let unsort = if unsort {
-                    Some(pbfhogg::degrade::Unsort::CrossBlob)
-                } else if unsort_intra {
-                    Some(pbfhogg::degrade::Unsort::IntraBlob)
-                } else {
-                    None
-                };
-                let reencode = reencodes.then_some(pbfhogg::degrade::Reencode {
-                    block_cap: elements_per_blob,
+                    };
+                    run_repack(
+                        &file,
+                        output.open(&host)?,
+                        elements_per_blob,
+                        &write,
+                        &overrides,
+                        &host,
+                    )
+                }
+                Command::Degrade {
+                    file,
+                    output,
                     unsort,
+                    unsort_intra,
                     strip_locations,
-                    drop_ids,
-                });
-                let flags = pbfhogg::degrade::DegradeFlags {
-                    reencode,
                     strip_indexdata,
                     strip_tagdata,
                     corrupt_tagdata,
                     corrupt_indexdata,
                     corrupt_indexdata_kind,
                     strip_bbox,
-                };
-                run_degrade(&file, output.open(&host)?, flags, &write, &overrides, &host)
-            }
-            Command::Renumber {
-                file,
-                output,
-                start_id,
-                compression,
-                io,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, false),
-                    direct_reads: io.direct_io,
-                    force: false,
-                };
-                run_renumber(
-                    &file,
-                    output.open(&host)?,
+                    drop_ids,
+                    elements_per_blob,
+                    force,
+                    compression,
+                    io,
+                    uring,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                        direct_reads: io.direct_io,
+                        force,
+                    };
+                    // One of the decode-path flags given is what asks for the
+                    // re-encode (`degrade_reencodes`, which the advice shares).
+                    // Clap has already refused `--unsort` with `--unsort-intra`.
+                    let reencodes = degrade_reencodes(
+                        unsort,
+                        unsort_intra,
+                        strip_locations,
+                        drop_ids.is_some(),
+                    );
+                    let unsort = if unsort {
+                        Some(pbfhogg::degrade::Unsort::CrossBlob)
+                    } else if unsort_intra {
+                        Some(pbfhogg::degrade::Unsort::IntraBlob)
+                    } else {
+                        None
+                    };
+                    let reencode = reencodes.then_some(pbfhogg::degrade::Reencode {
+                        block_cap: elements_per_blob,
+                        unsort,
+                        strip_locations,
+                        drop_ids,
+                    });
+                    let flags = pbfhogg::degrade::DegradeFlags {
+                        reencode,
+                        strip_indexdata,
+                        strip_tagdata,
+                        corrupt_tagdata,
+                        corrupt_indexdata,
+                        corrupt_indexdata_kind,
+                        strip_bbox,
+                    };
+                    run_degrade(&file, output.open(&host)?, flags, &write, &overrides, &host)
+                }
+                Command::Renumber {
+                    file,
+                    output,
                     start_id,
-                    &write,
-                    &overrides,
-                    &host,
-                )
-            }
-            Command::TagsFilter {
-                file,
-                output,
-                input_kind: _,
-                omit_referenced,
-                invert_match,
-                remove_tags,
-                expressions_file: _,
-                expressions: _,
-                compression,
-                force,
-                distrust,
-                io,
-                jobs,
-                header,
-            } => {
-                // `validate_command` read and checked the expressions before
-                // the input was opened: a malformed expression, or an
-                // expressions file with none in it, is refused first.
-                let (kind, expressions) = tags_filter_kind.unwrap_or((InputKind::Pbf, Vec::new()));
-                match kind {
-                    InputKind::Osc => {
-                        run_tags_filter_osc(&file, output.open(&host)?, &expressions, jobs, &host)
-                    }
-                    InputKind::Pbf => {
-                        let opts = tags_filter_options(
-                            &expressions,
-                            TagsFilterFlags {
-                                omit_referenced,
-                                remove_tags,
-                                invert_match,
-                                distrust_metadata: distrust.distrust_metadata,
-                                direct_io: io.direct_io,
-                                force,
-                            },
-                            compression.compression,
-                            jobs,
-                        );
-                        run_tags_filter(
+                    compression,
+                    io,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
+                        force: false,
+                    };
+                    run_renumber(
+                        &file,
+                        output.open(&host)?,
+                        start_id,
+                        &write,
+                        &overrides,
+                        &host,
+                    )
+                }
+                Command::TagsFilter {
+                    file,
+                    output,
+                    input_kind: _,
+                    omit_referenced,
+                    invert_match,
+                    remove_tags,
+                    expressions_file: _,
+                    expressions: _,
+                    compression,
+                    force,
+                    distrust,
+                    io,
+                    jobs,
+                    header,
+                } => {
+                    // `validate_command` read and checked the expressions before
+                    // the input was opened: a malformed expression, or an
+                    // expressions file with none in it, is refused first.
+                    let (kind, expressions) =
+                        tags_filter_kind.unwrap_or((InputKind::Pbf, Vec::new()));
+                    match kind {
+                        InputKind::Osc => run_tags_filter_osc(
                             &file,
                             output.open(&host)?,
-                            &opts,
-                            &header.overrides(),
+                            &expressions,
+                            jobs,
                             &host,
-                        )
+                        ),
+                        InputKind::Pbf => {
+                            let opts = tags_filter_options(
+                                &expressions,
+                                TagsFilterFlags {
+                                    omit_referenced,
+                                    remove_tags,
+                                    invert_match,
+                                    distrust_metadata: distrust.distrust_metadata,
+                                    direct_io: io.direct_io,
+                                    force,
+                                },
+                                compression.compression,
+                                jobs,
+                            );
+                            run_tags_filter(
+                                &file,
+                                output.open(&host)?,
+                                &opts,
+                                &header.overrides(),
+                                &host,
+                            )
+                        }
                     }
                 }
-            }
-            Command::Export {
-                file,
-                output,
-                overwrite,
-                format,
-                type_filter,
-                expressions_file,
-                expressions,
-                properties,
-                bbox,
-                metadata,
-            } => {
-                // The options (expressions included) are built before the
-                // output is reserved, so a malformed expression is refused
-                // first.
-                let options = export_options(
+                Command::Export {
+                    file,
+                    output,
+                    overwrite,
                     format,
                     type_filter,
-                    expressions_file.as_deref(),
-                    &expressions,
+                    expressions_file,
+                    expressions,
                     properties,
                     bbox,
                     metadata,
-                )?;
-                run_export(
-                    &file,
-                    overwrite.open(output.as_deref(), &host)?,
-                    &options,
-                    &host,
-                )
-            }
-            Command::Diff {
-                old,
-                new,
-                suppress_common,
-                verbose,
-                osmium_summary,
-                output,
-                overwrite,
-                type_filter,
-                jobs,
-                format,
-                increment_version,
-                update_timestamp,
-                // Placed by `paths`.
-                tmp: _,
-                io,
-            } => match format {
-                DiffFormat::Osc => {
-                    // `validate_diff` refused a missing -o.
-                    // The output is checked before the scratch directory is
-                    // made, so a missing output directory reports the output.
-                    let output_handle = overwrite
-                        .open(output.as_deref(), &host)?
-                        .ok_or("--output is required with --format osc")?;
-                    let scratch = paths.create_scratch(&host)?;
-                    accept_outcome(
-                        &mut outcome,
-                        run_derive_changes(
-                            &old,
-                            &new,
-                            output_handle,
-                            io.direct_io,
-                            increment_version,
-                            update_timestamp,
-                            jobs,
-                            &host,
-                            scratch,
-                        ),
+                } => {
+                    // The options (expressions included) are built before the
+                    // output is reserved, so a malformed expression is refused
+                    // first.
+                    let options = export_options(
+                        format,
+                        type_filter,
+                        expressions_file.as_deref(),
+                        &expressions,
+                        properties,
+                        bbox,
+                        metadata,
+                    )?;
+                    run_export(
+                        &file,
+                        overwrite.open(output.as_deref(), &host)?,
+                        &options,
+                        &host,
                     )
                 }
-                DiffFormat::Text => {
-                    let flags = DiffFlags {
-                        suppress_common,
-                        verbose,
-                        osmium_summary,
-                        quiet,
-                    };
-                    // A text diff writes no scratch.
-                    let output = overwrite.open(output.as_deref(), &host)?;
-                    accept_outcome(
-                        &mut outcome,
-                        run_diff(
-                            &old,
-                            &new,
-                            flags,
-                            output,
-                            type_filter,
-                            jobs,
-                            io.direct_io,
-                            &host,
-                        ),
-                    )
+                Command::Diff {
+                    old,
+                    new,
+                    suppress_common,
+                    verbose,
+                    osmium_summary,
+                    output,
+                    overwrite,
+                    type_filter,
+                    jobs,
+                    format,
+                    increment_version,
+                    update_timestamp,
+                    // Placed by `paths`.
+                    tmp: _,
+                    io,
+                } => match format {
+                    DiffFormat::Osc => {
+                        // `validate_diff` refused a missing -o.
+                        // The output is checked before the scratch directory is
+                        // made, so a missing output directory reports the output.
+                        let output_handle = overwrite
+                            .open(output.as_deref(), &host)?
+                            .ok_or("--output is required with --format osc")?;
+                        let scratch = paths.create_scratch(&host)?;
+                        accept_outcome(
+                            &mut outcome,
+                            run_derive_changes(
+                                &old,
+                                &new,
+                                output_handle,
+                                io.direct_io,
+                                increment_version,
+                                update_timestamp,
+                                jobs,
+                                &host,
+                                scratch,
+                            ),
+                        )
+                    }
+                    DiffFormat::Text => {
+                        let flags = DiffFlags {
+                            suppress_common,
+                            verbose,
+                            osmium_summary,
+                            quiet,
+                        };
+                        // A text diff writes no scratch.
+                        let output = overwrite.open(output.as_deref(), &host)?;
+                        accept_outcome(
+                            &mut outcome,
+                            run_diff(
+                                &old,
+                                &new,
+                                flags,
+                                output,
+                                type_filter,
+                                jobs,
+                                io.direct_io,
+                                &host,
+                            ),
+                        )
+                    }
+                },
+                Command::Digest { file, form, io } => {
+                    let digest = pbfhogg::digest::digest(&file, form.into(), io.direct_io, &host)?;
+                    let mut out = output::buffered();
+                    digest.write_report(&mut out)?;
+                    out.flush()?;
+                    Ok(())
                 }
-            },
-            Command::Digest { file, form, io } => {
-                let digest = pbfhogg::digest::digest(&file, form.into(), io.direct_io, &host)?;
-                let mut out = output::buffered();
-                digest.write_report(&mut out)?;
-                out.flush()?;
-                Ok(())
-            }
-            Command::Getid {
-                file,
-                output,
-                invert,
-                add_referenced,
-                remove_tags,
-                verbose_ids,
-                id_file,
-                id_osm_file,
-                default_type,
-                ids,
-                compression,
-                force,
-                io,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, false),
-                    direct_reads: io.direct_io,
-                    force: force.force,
-                };
-                // Positional IDs are parsed before the output is reserved; the
-                // ID files are read after, so an existing output is refused
-                // before a full pass over an -I PBF.
-                let sources = IdSources::parse("getid", &ids, id_file, id_osm_file, default_type)?;
-                let output = output.open(&host)?;
-                // getid opens its input more than once, so it is pinned, and
-                // before any ID file is read: every input of the run is
-                // pinned before any is read (the -I PBF in `resolve`), and a
-                // FIFO or missing input is refused before a full -I pass. The
-                // same path given as the input and as -I is two inputs, each
-                // read from one file throughout.
-                let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
-                if invert {
-                    run_removeid(&input, output, sources, &write, &overrides, &host)
-                } else {
-                    let flags = GetidFlags {
-                        add_referenced,
-                        remove_tags,
-                        verbose_ids,
+                Command::Getid {
+                    file,
+                    output,
+                    invert,
+                    add_referenced,
+                    remove_tags,
+                    verbose_ids,
+                    id_file,
+                    id_osm_file,
+                    default_type,
+                    ids,
+                    compression,
+                    force,
+                    io,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
+                        force: force.force,
                     };
-                    run_getid(&input, output, flags, sources, &write, &overrides, &host)
+                    // Positional IDs are parsed before the output is reserved; the
+                    // ID files are read after, so an existing output is refused
+                    // before a full pass over an -I PBF.
+                    let sources =
+                        IdSources::parse("getid", &ids, id_file, id_osm_file, default_type)?;
+                    let output = output.open(&host)?;
+                    // getid opens its input more than once, so it is pinned, and
+                    // before any ID file is read: every input of the run is
+                    // pinned before any is read (the -I PBF in `resolve`), and a
+                    // FIFO or missing input is refused before a full -I pass. The
+                    // same path given as the input and as -I is two inputs, each
+                    // read from one file throughout.
+                    let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
+                    if invert {
+                        run_removeid(&input, output, sources, &write, &overrides, &host)
+                    } else {
+                        let flags = GetidFlags {
+                            add_referenced,
+                            remove_tags,
+                            verbose_ids,
+                        };
+                        run_getid(&input, output, flags, sources, &write, &overrides, &host)
+                    }
                 }
-            }
-            Command::Getparents {
-                file,
-                output,
-                add_self,
-                full_scan_min_blobs,
-                id_file,
-                id_osm_file,
-                default_type,
-                ids,
-                compression,
-                io,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, false),
-                    direct_reads: io.direct_io,
-                    force: false,
-                };
-                let sources =
-                    IdSources::parse("getparents", &ids, id_file, id_osm_file, default_type)?;
-                let output = output.open(&host)?;
-                // Pinned before any ID file is read, as getid's input: every
-                // input of the run is pinned before any is read (the -I PBF
-                // in `resolve`), and a FIFO or missing input is refused
-                // before a full -I pass. The same path given as the input
-                // and as -I is two inputs, each read from one file
-                // throughout.
-                let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
-                run_getparents(
-                    &input,
+                Command::Getparents {
+                    file,
                     output,
                     add_self,
-                    sources,
-                    &write,
-                    &overrides,
                     full_scan_min_blobs,
-                    &host,
-                )
-            }
-            Command::Extract {
-                file,
-                output,
-                overwrite,
-                staging_dir,
-                bbox,
-                polygon,
-                config,
-                directory,
-                simple,
-                smart,
-                set_bounds,
-                clean,
-                compression,
-                force,
-                io,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, false),
-                    direct_reads: io.direct_io,
-                    force,
-                };
-                let overwrite = pbfhogg::Overwrite::from_flag(overwrite);
-                if let Some(config_path) = config.as_deref() {
-                    run_extract_config(
-                        &file,
-                        config_path,
-                        directory.as_deref(),
-                        overwrite,
-                        staging_dir.as_deref(),
-                        extract_strategy(simple, smart),
-                        set_bounds,
-                        &clean_attrs(&clean),
+                    id_file,
+                    id_osm_file,
+                    default_type,
+                    ids,
+                    compression,
+                    io,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
+                        force: false,
+                    };
+                    let sources =
+                        IdSources::parse("getparents", &ids, id_file, id_osm_file, default_type)?;
+                    let output = output.open(&host)?;
+                    // Pinned before any ID file is read, as getid's input: every
+                    // input of the run is pinned before any is read (the -I PBF
+                    // in `resolve`), and a FIFO or missing input is refused
+                    // before a full -I pass. The same path given as the input
+                    // and as -I is two inputs, each read from one file
+                    // throughout.
+                    let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
+                    run_getparents(
+                        &input,
+                        output,
+                        add_self,
+                        sources,
                         &write,
                         &overrides,
-                        &host,
-                        &mut leftovers,
-                    )
-                } else if let Some(output) = output.as_ref() {
-                    // The region (a polygon file is read here) is parsed
-                    // before the output is reserved.
-                    let region = extract_region(bbox, polygon.as_deref())?;
-                    run_extract(
-                        &file,
-                        pbfhogg::Output::with_staging(
-                            output,
-                            overwrite,
-                            pbfhogg::Staging::dir(staging_dir.as_deref()),
-                            &host.diagnostics,
-                        )?,
-                        &region,
-                        extract_strategy(simple, smart),
-                        set_bounds,
-                        &clean_attrs(&clean),
-                        &write,
-                        &overrides,
+                        full_scan_min_blobs,
                         &host,
                     )
-                } else {
-                    Err("--output is required without --config".into())
                 }
-            }
-            Command::AddLocationsToWays {
-                file,
-                output,
-                keep_untagged_nodes,
-                index_type,
-                inject_prepass,
-                ignore_missing_nodes,
-                compression,
-                force,
-                io,
-                header,
-                // Placed by `paths`.
-                tmp: _,
-            } => {
-                // `validate_command` refused the hidden `dense` value.
-                let index_type = index_type.resolve()?;
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, false),
-                    direct_reads: io.direct_io,
+                Command::Extract {
+                    file,
+                    output,
+                    overwrite,
+                    staging_dir,
+                    bbox,
+                    polygon,
+                    config,
+                    directory,
+                    simple,
+                    smart,
+                    set_bounds,
+                    clean,
+                    compression,
                     force,
-                };
-                let options = pbfhogg::altw::AltwOptions {
+                    io,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
+                        force,
+                    };
+                    let overwrite = pbfhogg::Overwrite::from_flag(overwrite);
+                    if let Some(config_path) = config.as_deref() {
+                        run_extract_config(
+                            &file,
+                            config_path,
+                            directory.as_deref(),
+                            overwrite,
+                            staging_dir.as_deref(),
+                            extract_strategy(simple, smart),
+                            set_bounds,
+                            &clean_attrs(&clean),
+                            &write,
+                            &overrides,
+                            &host,
+                            &mut leftovers,
+                        )
+                    } else if let Some(output) = output.as_ref() {
+                        // The region (a polygon file is read here) is parsed
+                        // before the output is reserved.
+                        let region = extract_region(bbox, polygon.as_deref())?;
+                        run_extract(
+                            &file,
+                            pbfhogg::Output::with_staging(
+                                output,
+                                overwrite,
+                                pbfhogg::Staging::dir(staging_dir.as_deref()),
+                                &host.diagnostics,
+                            )?,
+                            &region,
+                            extract_strategy(simple, smart),
+                            set_bounds,
+                            &clean_attrs(&clean),
+                            &write,
+                            &overrides,
+                            &host,
+                        )
+                    } else {
+                        Err("--output is required without --config".into())
+                    }
+                }
+                Command::AddLocationsToWays {
+                    file,
+                    output,
                     keep_untagged_nodes,
-                    write,
                     index_type,
                     inject_prepass,
                     ignore_missing_nodes,
-                };
-                // The output is checked before the scratch directory is made,
-                // so a missing output directory reports the output.
-                let output = output.open(&host)?;
-                let scratch = paths.create_scratch(&host)?;
-                run_add_locations_to_ways(&file, output, &options, &overrides, &host, scratch)
-            }
-            Command::TimeFilter {
-                file,
-                output,
-                timestamp,
-                compression,
-                io,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, false),
-                    direct_reads: io.direct_io,
-                    force: false,
-                };
-                run_time_filter(
-                    &file,
-                    output.open(&host)?,
+                    compression,
+                    force,
+                    io,
+                    header,
+                    // Placed by `paths`.
+                    tmp: _,
+                } => {
+                    // `validate_command` refused the hidden `dense` value.
+                    let index_type = index_type.resolve()?;
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
+                        force,
+                    };
+                    let options = pbfhogg::altw::AltwOptions {
+                        keep_untagged_nodes,
+                        write,
+                        index_type,
+                        inject_prepass,
+                        ignore_missing_nodes,
+                    };
+                    // The output is checked before the scratch directory is made,
+                    // so a missing output directory reports the output.
+                    let output = output.open(&host)?;
+                    let scratch = paths.create_scratch(&host)?;
+                    run_add_locations_to_ways(&file, output, &options, &overrides, &host, scratch)
+                }
+                Command::TimeFilter {
+                    file,
+                    output,
                     timestamp,
-                    &write,
-                    &overrides,
-                    &host,
-                )
-            }
-            Command::Inspect {
-                subcommand,
-                file,
-                indexed,
-                nodes,
-                jobs,
-                blocks,
-                id_ranges,
-                locations,
-                anomalies,
-                extended,
-                show,
-                get,
-                json,
-                io,
-                distrust,
-                force,
-            } => {
-                if let Some(InspectCommand::Tags {
-                    file: tags_file,
-                    min_count,
-                    max_count,
-                    sort,
-                    expressions_file,
-                    expressions,
-                    type_filter,
-                    jobs: tags_jobs,
-                    io: tags_io,
-                    force: tags_force,
-                }) = subcommand
-                {
-                    run_tags_count(
-                        &tags_file,
-                        min_count,
-                        max_count,
-                        sort.into(),
-                        expressions_file.as_deref(),
-                        &expressions,
-                        type_filter,
-                        tags_jobs,
-                        tags_io.direct_io,
-                        tags_force.force,
+                    compression,
+                    io,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
+                        force: false,
+                    };
+                    run_time_filter(
+                        &file,
+                        output.open(&host)?,
+                        timestamp,
+                        &write,
+                        &overrides,
                         &host,
                     )
-                } else {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "clap requires the file unless a subcommand is given (required = true with subcommand_negates_reqs)"
-                    )]
-                    let file = file.expect("clap requires a file without an inspect subcommand");
-                    if let Some(show_id) = show {
-                        return accept_outcome(
-                            &mut outcome,
-                            run_show_element(&file, show_id, io.direct_io, &host),
-                        );
-                    }
-                    accept_outcome(
-                        &mut outcome,
-                        run_inspect(
-                            &file,
-                            InspectFlags {
-                                indexed,
-                                nodes,
-                                id_ranges,
-                                locations,
-                                anomalies,
-                                extended,
-                                json,
-                                force,
-                                distrust_metadata: distrust.distrust_metadata,
-                                quiet,
-                            },
-                            jobs,
-                            blocks,
-                            get.as_deref(),
-                            io.direct_io,
+                }
+                Command::Inspect {
+                    subcommand,
+                    file,
+                    indexed,
+                    nodes,
+                    jobs,
+                    blocks,
+                    id_ranges,
+                    locations,
+                    anomalies,
+                    extended,
+                    show,
+                    get,
+                    json,
+                    io,
+                    distrust,
+                    force,
+                } => {
+                    if let Some(InspectCommand::Tags {
+                        file: tags_file,
+                        min_count,
+                        max_count,
+                        sort,
+                        expressions_file,
+                        expressions,
+                        type_filter,
+                        jobs: tags_jobs,
+                        io: tags_io,
+                        force: tags_force,
+                    }) = subcommand
+                    {
+                        run_tags_count(
+                            &tags_file,
+                            min_count,
+                            max_count,
+                            sort.into(),
+                            expressions_file.as_deref(),
+                            &expressions,
+                            type_filter,
+                            tags_jobs,
+                            tags_io.direct_io,
+                            tags_force.force,
                             &host,
+                        )
+                    } else {
+                        #[expect(
+                            clippy::expect_used,
+                            reason = "clap requires the file unless a subcommand is given (required = true with subcommand_negates_reqs)"
+                        )]
+                        let file =
+                            file.expect("clap requires a file without an inspect subcommand");
+                        if let Some(show_id) = show {
+                            return accept_outcome(
+                                &mut outcome,
+                                run_show_element(&file, show_id, io.direct_io, &host),
+                            );
+                        }
+                        accept_outcome(
+                            &mut outcome,
+                            run_inspect(
+                                &file,
+                                InspectFlags {
+                                    indexed,
+                                    nodes,
+                                    id_ranges,
+                                    locations,
+                                    anomalies,
+                                    extended,
+                                    json,
+                                    force,
+                                    distrust_metadata: distrust.distrust_metadata,
+                                    quiet,
+                                },
+                                jobs,
+                                blocks,
+                                get.as_deref(),
+                                io.direct_io,
+                                &host,
+                            ),
+                        )
+                    }
+                }
+                Command::ApplyChanges {
+                    base,
+                    changes,
+                    output,
+                    compression,
+                    force,
+                    io,
+                    uring,
+                    locations_on_ways,
+                    ignore_missing_nodes,
+                    allow_version_regression,
+                    jobs,
+                    header,
+                } => {
+                    let overrides = header.overrides();
+                    let write = WriteOptions {
+                        compression: compression.compression,
+                        backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                        direct_reads: io.direct_io,
+                        force,
+                    };
+                    // Clap has refused `--ignore-missing-nodes` without
+                    // `--locations-on-ways`, so `None` drops nothing here.
+                    let opts = pbfhogg::apply_changes::MergeOptions {
+                        write,
+                        locations_on_ways: locations_on_ways.then_some(
+                            pbfhogg::apply_changes::LocationsOnWays {
+                                ignore_missing_nodes,
+                            },
                         ),
+                        parallelism: jobs,
+                        allow_version_regression,
+                    };
+                    opts.validate()?;
+                    run_apply_changes(
+                        &base,
+                        &changes,
+                        output.open(&host)?,
+                        &opts,
+                        &overrides,
+                        &host,
                     )
                 }
-            }
-            Command::ApplyChanges {
-                base,
-                changes,
-                output,
-                compression,
-                force,
-                io,
-                uring,
-                locations_on_ways,
-                ignore_missing_nodes,
-                allow_version_regression,
-                jobs,
-                header,
-            } => {
-                let overrides = header.overrides();
-                let write = WriteOptions {
-                    compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
-                    direct_reads: io.direct_io,
-                    force,
-                };
-                // Clap has refused `--ignore-missing-nodes` without
-                // `--locations-on-ways`, so `None` drops nothing here.
-                let opts = pbfhogg::apply_changes::MergeOptions {
-                    write,
-                    locations_on_ways: locations_on_ways.then_some(
-                        pbfhogg::apply_changes::LocationsOnWays {
-                            ignore_missing_nodes,
-                        },
-                    ),
-                    parallelism: jobs,
+                Command::MergeChanges {
+                    changes,
+                    output,
+                    simplify,
                     allow_version_regression,
-                };
-                opts.validate()?;
-                run_apply_changes(
+                    jobs,
+                    tmp: _,
+                } => {
+                    // The output is checked before the scratch directory is made,
+                    // so a missing output directory reports the output.
+                    let output = output.open(&host)?;
+                    let mode = if simplify {
+                        pbfhogg::merge_changes::MergeMode::Simplify {
+                            allow_version_regression,
+                        }
+                    } else {
+                        // Made only where the run may spill (CommandPaths::of).
+                        pbfhogg::merge_changes::MergeMode::Stream {
+                            scratch: paths.create_scratch_if_any(&host)?,
+                        }
+                    };
+                    run_merge_changes(&changes, output, mode, jobs, &host)
+                }
+                Command::Check {
+                    file,
+                    ids,
+                    refs,
+                    index,
+                    locations,
+                    agreement,
+                    check_relations,
+                    show_ids,
+                    full,
+                    type_filter,
+                    max_errors,
+                    json,
+                    io,
+                } => accept_outcome(
+                    &mut outcome,
+                    run_check(
+                        &file,
+                        CheckFlags {
+                            ids,
+                            refs,
+                            index,
+                            locations,
+                            agreement,
+                            check_relations,
+                            show_ids,
+                            full,
+                            json,
+                            quiet,
+                        },
+                        type_filter,
+                        max_errors,
+                        io.direct_io,
+                        &host,
+                    ),
+                ),
+                Command::BuildGeocodeIndex {
+                    file,
+                    output_dir,
+                    street_level,
+                    coarse_level,
+                    admin_level,
+                    admin_tolerance,
+                    search_radius,
+                    coarse_search_radius,
+                    io,
+                    overwrite,
+                    allow_unindexed,
+                    force,
+                    // Placed by `paths`.
+                    tmp: _,
+                    staging_dir: _,
+                } => {
+                    // The one --force that is not the indexdata rule: it predates
+                    // --overwrite and --allow-unindexed and still grants both, so
+                    // say so every time rather than let it replace an index
+                    // silently.
+                    if force {
+                        host::cli_warning(
+                            "geocode.force_grants_overwrite",
+                            format_args!(
+                                "build-geocode-index --force also grants --overwrite: an existing \
+                             index at --output-dir is replaced. Pass --overwrite and/or \
+                             --allow-unindexed instead to say which you mean."
+                            ),
+                        );
+                    }
+                    run_build_geocode_index(
+                        &file,
+                        &output_dir,
+                        GeocodeLevels {
+                            street_level,
+                            coarse_level,
+                            admin_level,
+                            admin_tolerance,
+                            search_radius,
+                            coarse_search_radius,
+                        },
+                        io.direct_io,
+                        overwrite || force,
+                        allow_unindexed || force,
+                        &paths,
+                        &host,
+                    )
+                }
+                Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
+                Command::BenchGeocodeQuery {
+                    index_dir,
+                    bbox,
+                    queries,
+                    seed,
+                    rounds,
+                } => run_bench_geocode_query(&index_dir, &bbox, queries, seed, rounds),
+                Command::BenchWrite {
+                    file,
+                    compression,
+                    writer,
+                } => run_bench_write(&file, compression, writer, &host),
+                Command::BenchMerge {
+                    base,
+                    changes,
+                    output,
+                    compression,
+                    io_mode,
+                } => run_bench_merge(
                     &base,
                     &changes,
                     output.open(&host)?,
-                    &opts,
-                    &overrides,
-                    &host,
-                )
-            }
-            Command::MergeChanges {
-                changes,
-                output,
-                simplify,
-                allow_version_regression,
-                jobs,
-                tmp: _,
-            } => {
-                // The output is checked before the scratch directory is made,
-                // so a missing output directory reports the output.
-                let output = output.open(&host)?;
-                let mode = if simplify {
-                    pbfhogg::merge_changes::MergeMode::Simplify {
-                        allow_version_regression,
-                    }
-                } else {
-                    // Made only where the run may spill (CommandPaths::of).
-                    pbfhogg::merge_changes::MergeMode::Stream {
-                        scratch: paths.create_scratch_if_any(&host)?,
-                    }
-                };
-                run_merge_changes(&changes, output, mode, jobs, &host)
-            }
-            Command::Check {
-                file,
-                ids,
-                refs,
-                index,
-                locations,
-                agreement,
-                check_relations,
-                show_ids,
-                full,
-                type_filter,
-                max_errors,
-                json,
-                io,
-            } => accept_outcome(
-                &mut outcome,
-                run_check(
-                    &file,
-                    CheckFlags {
-                        ids,
-                        refs,
-                        index,
-                        locations,
-                        agreement,
-                        check_relations,
-                        show_ids,
-                        full,
-                        json,
-                        quiet,
-                    },
-                    type_filter,
-                    max_errors,
-                    io.direct_io,
+                    compression,
+                    io_mode,
                     &host,
                 ),
-            ),
-            Command::BuildGeocodeIndex {
-                file,
-                output_dir,
-                street_level,
-                coarse_level,
-                admin_level,
-                admin_tolerance,
-                search_radius,
-                coarse_search_radius,
-                io,
-                overwrite,
-                allow_unindexed,
-                force,
-                // Placed by `paths`.
-                tmp: _,
-                staging_dir: _,
-            } => {
-                // The one --force that is not the indexdata rule: it predates
-                // --overwrite and --allow-unindexed and still grants both, so
-                // say so every time rather than let it replace an index
-                // silently.
-                if force {
-                    host::cli_warning(
-                        "geocode.force_grants_overwrite",
-                        format_args!(
-                            "build-geocode-index --force also grants --overwrite: an existing \
-                             index at --output-dir is replaced. Pass --overwrite and/or \
-                             --allow-unindexed instead to say which you mean."
-                        ),
-                    );
-                }
-                run_build_geocode_index(
-                    &file,
-                    &output_dir,
-                    GeocodeLevels {
-                        street_level,
-                        coarse_level,
-                        admin_level,
-                        admin_tolerance,
-                        search_radius,
-                        coarse_search_radius,
-                    },
-                    io.direct_io,
-                    overwrite || force,
-                    allow_unindexed || force,
-                    &paths,
-                    &host,
-                )
             }
-            Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
-            Command::BenchGeocodeQuery {
-                index_dir,
-                bbox,
-                queries,
-                seed,
-                rounds,
-            } => run_bench_geocode_query(&index_dir, &bbox, queries, seed, rounds),
-            Command::BenchWrite {
-                file,
-                compression,
-                writer,
-            } => run_bench_write(&file, compression, writer, &host),
-            Command::BenchMerge {
-                base,
-                changes,
-                output,
-                compression,
-                io_mode,
-            } => run_bench_merge(
-                &base,
-                &changes,
-                output.open(&host)?,
-                compression,
-                io_mode,
-                &host,
-            ),
-        }
-    })();
+        },
+    );
 
-    // Emit the `writer_*` sidecar counters exactly once, here rather than
-    // from `PbfWriter::flush`. The counters are the invocation's totals, so
-    // flush-time emission published the same running totals once per writer -
-    // once per region for `multi-extract` - which reads as a per-region
-    // breakdown and is not one. This is the single point every command path
-    // passes through, success or failure, and it runs before the hotpath
-    // guard drops. The process runs one invocation, the host's.
-    pbfhogg::write::emit_writer_counters(&host.invocation);
-    pbfhogg::read::emit_read_counters(&host.invocation);
     pbfhogg::write::report_writer_degradations(&host);
     host.report_io_degradations();
     #[cfg(feature = "test-hooks")]
@@ -3674,6 +3685,17 @@ pub fn run() -> process::ExitCode {
     }
     // `_guard` drops here, flushing the hotpath JSON report before the
     // returned `ExitCode` is converted to the process exit status.
+}
+
+// The closure owns dispatch's early returns. Both counter sets are emitted
+// after it returns, including refusals and cancellation, before reporting the
+// result or dropping the hotpath guard. This adds no probe, allocation or
+// branch to dispatch; it moves the existing two calls into one lifecycle.
+fn finish_invocation<T>(invocation: &pbfhogg::host::Invocation, work: impl FnOnce() -> T) -> T {
+    let result = work();
+    pbfhogg::write::emit_writer_counters(invocation);
+    pbfhogg::read::emit_read_counters(invocation);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -43,7 +43,7 @@ fn forced() -> WriteOptions {
 // Shared fixture: a small sorted PBF suitable for every command under test.
 // ---------------------------------------------------------------------------
 
-fn shared_nodes() -> Vec<TestNode> {
+fn shared_nodes() -> Vec<TestNode<'static>> {
     let mut nodes = generate_nodes(10, 1);
     // Decorate half the nodes with a matchable tag so tags-filter has
     // something to select.
@@ -53,7 +53,7 @@ fn shared_nodes() -> Vec<TestNode> {
     nodes
 }
 
-fn shared_ways() -> Vec<TestWay> {
+fn shared_ways() -> Vec<TestWay<'static>> {
     let mut ways = generate_ways(4, 1_000, 3, 1);
     for (i, w) in ways.iter_mut().enumerate() {
         w.tags = if i % 2 == 0 {
@@ -65,7 +65,7 @@ fn shared_ways() -> Vec<TestWay> {
     ways
 }
 
-fn shared_relations() -> Vec<TestRelation> {
+fn shared_relations() -> Vec<TestRelation<'static>> {
     vec![TestRelation {
         id: 100,
         members: vec![TestMember {
@@ -635,7 +635,11 @@ fn meta(version: i32) -> TestMeta {
     }
 }
 
-fn derive_old_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn derive_old_elements() -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let mut nodes = generate_nodes(20, 1);
     for (i, n) in nodes.iter_mut().enumerate() {
         n.meta = Some(meta(1));
@@ -664,7 +668,11 @@ fn derive_old_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
 
 /// The old elements with every change kind applied to every element kind,
 /// each changed element bumping its version.
-fn derive_new_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn derive_new_elements() -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let (mut nodes, mut ways, mut relations) = derive_old_elements();
     nodes[1].tags = vec![("amenity", "restaurant")];
     nodes[1].meta = Some(meta(2));

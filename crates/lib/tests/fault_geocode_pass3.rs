@@ -14,9 +14,11 @@ mod geocode_pass3 {
     use crate::common::snapshot_dir;
 
     /// A rayon worker panic inside geocode builder's Pass 3 Stage A
-    /// streets loop must surface as an `Err`, and the
-    /// `PathGuard::dir()` wrappers around the `.buckets-levelN`
-    /// scratch trees (see ADR-0003) must sweep them on the unwind.
+    /// streets loop unwinds through Rayon's collection boundary to the
+    /// caller, and the run scratch owner must sweep the bucket trees on that
+    /// unwind. The unwind is the contract: panic disposition belongs to the
+    /// caller (ADR-0016), so the builder frames no panic-to-error boundary,
+    /// like every other command's worker pools.
     #[test]
     fn fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs() {
         let dir = crate::common::test_scratch();
@@ -54,18 +56,21 @@ mod geocode_pass3 {
             )
         }));
 
-        // The failure must be the armed hook, not something earlier.
-        let message = match &result {
-            Ok(Ok(_)) => {
-                panic!("geocode build with an armed Pass 3 streets panic must not return Ok")
-            }
-            Ok(Err(e)) => e.report(),
-            Err(payload) => payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                .unwrap_or_default(),
+        // Require the current unwind behavior and the armed hook's payload.
+        // Accepting both Err and unwind would hide a change in that boundary.
+        let payload = match result {
+            Err(payload) => payload,
+            Ok(Err(error)) => panic!(
+                "expected the worker panic to unwind, got: {}",
+                error.report()
+            ),
+            Ok(Ok(_)) => panic!("the armed streets panic returned success"),
         };
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
         assert!(
             message.contains("geocode pass3 stage A streets way 2 panicking"),
             "the build failed, but not at the armed hook: {message}"

@@ -66,7 +66,7 @@ println!("Number of ways: {ways}");
 
 ## Example: Write a PBF file
 
-Build blocks with [`BlockBuilder`] and write them with [`PbfWriter`]:
+Build blocks with [`BlockBuilder`](crate::block_builder::BlockBuilder) and write them with [`PbfWriter`](crate::writer::PbfWriter):
 
 ```rust,no_run
 use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};
@@ -122,7 +122,7 @@ match ElementReader::from_path("does-not-exist.osm.pbf") {
 
 ## Example: In-memory writing
 
-For tests or small PBFs, use [`PbfWriter::new`] with any [`Write`](std::io::Write) impl:
+For tests or small PBFs, use [`PbfWriter::new`](crate::writer::PbfWriter::new) with any [`Write`](std::io::Write) impl:
 
 ```rust,no_run
 use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};

@@ -37,7 +37,7 @@ const KEYS: &[&str] = &[
     "elements.relations",
 ];
 
-fn ways(node_start: i64) -> Vec<TestWay> {
+fn ways(node_start: i64) -> Vec<TestWay<'static>> {
     vec![
         TestWay {
             id: 10,
@@ -54,7 +54,7 @@ fn ways(node_start: i64) -> Vec<TestWay> {
     ]
 }
 
-fn relations() -> Vec<TestRelation> {
+fn relations() -> Vec<TestRelation<'static>> {
     vec![TestRelation {
         id: 100,
         members: vec![],

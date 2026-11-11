@@ -8,9 +8,9 @@
 //! authoritative. Tokens are per invocation: tripping one stops only the runs
 //! that observe it.
 //!
-//! The mid-run sweeps trip the token from the `test-hooks` checkpoint hook at
-//! the k-th checkpoint the run passes, in process, so "mid-run" needs no
-//! signal and no timing.
+//! The mid-run sweep trips the token from the `test-hooks` checkpoint hook at
+//! sampled checkpoint ordinals in selected fixture scenarios, in process, so
+//! "mid-run" needs no signal and no timing.
 
 #![allow(clippy::unwrap_used, clippy::unwrap_in_result)]
 
@@ -246,6 +246,11 @@ fn digest(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg
     .map(drop)
 }
 
+// Fixture scenarios, not a complete command inventory. This covers two altw
+// modes and one mode each of the other listed commands. It omits getid,
+// getparents, repack, renumber, tags-filter, tag counting (inspect tags),
+// time-filter and other command modes. Ordinals identify callback positions,
+// not source sites; parallel scheduling can change which position is reached.
 fn commands() -> Vec<(&'static str, Command)> {
     let mut all: Vec<(&'static str, Command)> = vec![
         ("sort", sort),
@@ -325,7 +330,7 @@ fn run_once(
 }
 
 #[test]
-fn a_tripped_token_stops_every_command_before_it_starts() {
+fn a_tripped_token_stops_selected_scenarios_before_they_start() {
     let inputs = Inputs::new();
     let mut failures = Vec::new();
     for (name, command) in commands() {
@@ -340,20 +345,69 @@ fn a_tripped_token_stops_every_command_before_it_starts() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The token tripped at checkpoint k, for k across the whole run of every
-/// command: each cancelled run returns `Cancelled` and leaves nothing.
+/// The result of targeting one ordinal of a fixture's counting run.
+/// A missing callback is a coverage failure, not a successful cancellation.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+enum CheckpointRun {
+    Unreached { observed: u64 },
+    Cancelled,
+    CompletedAfterDecision { authorized: u64 },
+}
+
+#[cfg(feature = "test-hooks")]
+fn run_at_checkpoint(
+    name: &str,
+    command: Command,
+    inputs: &Inputs,
+    k: u64,
+) -> Result<CheckpointRun, String> {
+    let token = pbfhogg::host::Invocation::new();
+    let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = std::sync::Arc::clone(&outcome);
+    token.on_check(move |ordinal, token| {
+        if ordinal == k {
+            *seen.lock().unwrap() = Some(token.cancel());
+        }
+    });
+    let cancelled = run_once(name, command, inputs, token.clone())?;
+    let fired = *outcome.lock().unwrap();
+    match (fired, cancelled) {
+        (None, _) => Ok(CheckpointRun::Unreached {
+            observed: token.checks_passed(),
+        }),
+        (Some(_), true) => Ok(CheckpointRun::Cancelled),
+        (Some(pbfhogg::CancelOutcome::AfterDecision { authorized }), false) => {
+            // Success is allowed only with evidence that publication had
+            // already been authorized when this callback tripped the token.
+            Ok(CheckpointRun::CompletedAfterDecision { authorized })
+        }
+        (Some(outcome), false) => Err(format!(
+            "{name}: checkpoint {k} fired but the run completed after {outcome:?}"
+        )),
+    }
+}
+
+/// Sample fixture checkpoint ordinals for the selected command scenarios.
+/// Each reached target must cancel or report an already decided publication.
 #[cfg(feature = "test-hooks")]
 #[test]
-fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
+fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision() {
     let inputs = Inputs::new();
     let mut failures = Vec::new();
     for (name, command) in commands() {
-        // How many checkpoints an uninterrupted run passes.
         let counter = pbfhogg::host::Invocation::new();
         counter.on_check(|_, _| {});
-        if let Err(e) = run_once(name, command, &inputs, counter.clone()) {
-            failures.push(e);
-            continue;
+        match run_once(name, command, &inputs, counter.clone()) {
+            Ok(false) => {}
+            Ok(true) => {
+                failures.push(format!("{name}: counting run unexpectedly cancelled"));
+                continue;
+            }
+            Err(e) => {
+                failures.push(e);
+                continue;
+            }
         }
         let count = counter.checks_passed();
         if count == 0 {
@@ -361,26 +415,28 @@ fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
             continue;
         }
         let mut cancelled = 0_u64;
-        // Every ordinal up to a bound, then a spread: these runs are in
-        // process and take milliseconds.
-        let ks: Vec<u64> = if count <= 64 {
+        // Exhaust small fixture counts; larger counts use a spread and
+        // always include the final ordinal. This is not site coverage.
+        let mut ks: Vec<u64> = if count <= 64 {
             (1..=count).collect()
         } else {
             (1..=count)
                 .step_by(usize::try_from(count / 64).unwrap_or(1))
                 .collect()
         };
+        if ks.last() != Some(&count) {
+            ks.push(count);
+        }
         for k in ks {
-            let cancel = pbfhogg::host::Invocation::new();
-            cancel.on_check(move |ordinal, token| {
-                if ordinal == k {
-                    token.cancel();
+            match run_at_checkpoint(name, command, &inputs, k) {
+                Ok(CheckpointRun::Cancelled) => cancelled += 1,
+                Ok(CheckpointRun::CompletedAfterDecision { authorized }) => {
+                    assert!(authorized > 0, "publication ordinals start at one");
                 }
-            });
-            match run_once(name, command, &inputs, cancel) {
-                Ok(true) => cancelled += 1,
-                Ok(false) => {}
-                Err(e) => failures.push(format!("{e} (tripped at checkpoint {k} of {count})")),
+                Ok(CheckpointRun::Unreached { observed }) => failures.push(format!(
+                    "{name}: target checkpoint {k} of {count} was not reached; observed {observed}"
+                )),
+                Err(e) => failures.push(format!("{e} (target checkpoint {k} of {count})")),
             }
         }
         if cancelled == 0 {
@@ -390,11 +446,12 @@ fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A command's own outputs, writers and readers are never issued to the
-/// caller: at every checkpoint of every command the census is empty.
+/// At observed checkpoints of selected fixture scenarios, the census of
+/// issued outputs, writers, readers and buffers is empty. This cannot rule
+/// out a value issued and retired entirely between two observations.
 #[cfg(feature = "test-hooks")]
 #[test]
-fn no_command_issues_its_own_values() {
+fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let inputs = Inputs::new();
     let mut failures = Vec::new();
@@ -402,12 +459,20 @@ fn no_command_issues_its_own_values() {
         let token = pbfhogg::host::Invocation::new();
         let issued = std::sync::Arc::new(AtomicU64::new(0));
         let seen = std::sync::Arc::clone(&issued);
+        let observations = std::sync::Arc::new(AtomicU64::new(0));
+        let observed = std::sync::Arc::clone(&observations);
         token.on_check(move |_, token| {
+            observed.fetch_add(1, Relaxed);
             let c = token.capabilities();
             seen.fetch_max(c.session + c.writer + c.output + c.buffer, Relaxed);
         });
-        if let Err(e) = run_once(name, command, &inputs, token) {
-            failures.push(e);
+        match run_once(name, command, &inputs, token) {
+            Ok(false) => {}
+            Ok(true) => failures.push(format!("{name}: census run unexpectedly cancelled")),
+            Err(e) => failures.push(e),
+        }
+        if observations.load(Relaxed) == 0 {
+            failures.push(format!("{name}: census callback observed no checkpoints"));
         }
         if issued.load(Relaxed) != 0 {
             failures.push(format!("{name}: issued a value of its own to the census"));

@@ -26,7 +26,7 @@ mod grid_parity {
 
     use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_indexed_pbf};
 
-    fn build_nodes() -> Vec<TestNode> {
+    fn build_nodes() -> Vec<TestNode<'static>> {
         // 500 nodes on a 1-degree grid over lon 0..19, lat 40..64.
         let mut v = Vec::new();
         let mut id = 1_i64;
@@ -45,7 +45,7 @@ mod grid_parity {
         v
     }
 
-    fn build_ways() -> Vec<TestWay> {
+    fn build_ways() -> Vec<TestWay<'static>> {
         (0..10_i64)
             .map(|k| TestWay {
                 id: 1_000 + k,
@@ -56,7 +56,7 @@ mod grid_parity {
             .collect()
     }
 
-    fn build_relations() -> Vec<TestRelation> {
+    fn build_relations() -> Vec<TestRelation<'static>> {
         (0..3_i64)
             .map(|k| TestRelation {
                 id: 2_000 + k,

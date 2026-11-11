@@ -77,7 +77,13 @@ fn elements_per_blob(path: &Path) -> Vec<(usize, usize, usize)> {
 /// `ceil(elements / cap)`. Ways (12) and relations (3) each occupy a
 /// single input blob, so even their non-dividing tails cannot cross an
 /// input-blob boundary and the ceil count still holds for them here.
-fn write_repack_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn write_repack_fixture(
+    path: &Path,
+) -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let mut nodes = generate_nodes(60, 1);
     nodes[0].tags = vec![("place", "city"), ("name", "Origo")];
     nodes[7].tags = vec![("amenity", "cafe")];

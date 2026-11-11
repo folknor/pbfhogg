@@ -3129,11 +3129,11 @@ impl BoundOutput {
         self
     }
 
-    /// Open the output's single writing session as a pipelined [`PbfWriter`]
+    /// Open the output's single writing session as a pipelined [`PbfWriter`](crate::writer::PbfWriter)
     /// on `backend`, with `header_block_bytes` (a serialized `HeaderBlock`,
     /// as [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build)
     /// makes) already written. The session finishes when the writer's
-    /// [`flush`](PbfWriter::flush) succeeds; any error the writer reports
+    /// [`flush`](crate::writer::PbfWriter::flush) succeeds; any error the writer reports
     /// fails it for good. The writer does not `fsync` at its end of stream:
     /// [`publish`](Self::publish) does.
     ///

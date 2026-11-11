@@ -85,18 +85,6 @@ Fix: keep the host in the fixture and borrow an entered view, or scope both in a
 closure helper. Enforcement: a lint against `Box::leak` in test infrastructure
 outside documented lifetime tests.
 
-## VER-005 - Fixture strings are static and force leaks in the shared process
-
-Reported by lib-integration.
-
-`TestNode`, `TestWay` and `TestRelation` in `crates/lib/tests/common/mod.rs` require
-static tag strings. Three overflow generators in `crates/lib/tests/geocode_index.rs`
-use `Box::leak`, leaking 196,608 names when all three run in one binary. The
-explanation that the process exits soon no longer describes the shared binary.
-
-Fix: borrowed lifetimes or owned or Cow strings. Enforcement: the type change, plus
-a test-source lint on `Box::leak`.
-
 ## VER-006 - Test files can silently escape compilation
 
 Reported by lib-integration, library-harness, cli-tests, check-machinery.
@@ -153,36 +141,14 @@ assertions for protected files, an architectural rule restricting fault-state
 construction to the invocation, and enclosing-module and macro cases in the checker
 tests.
 
-## VER-010 - The probe_lock guard checks tokens, not the open operation
+## VER-010 - The probe-lock and counter-emission guards are fixed-shape, not AST
 
-Reported by lib-core-unit, check-machinery.
-
-`scripts/check_source_invariants.py` extracts `probe_lock` by string splits, requires
-`.write(true)` and bans `.create(`. It accepts `.create_new(true)`, a later
-`.write(false)`, a string or an unrelated builder, delegation to a helper escapes it,
-and extraction depends on brace layout. `probe_lock` in `crates/lib/src/scratch.rs`
-is correct today; the unit test `the_probe_opens_the_lock_for_writing` delegates the
-claim to this guard, and the guard does not establish the ADR-0018 claim that
-scanning never creates a lock file.
-
-Fix: put probe-open options in one constructor whose interface exposes no creation
-option, test that a missing `LOCK` stays missing and contents are preserved.
-Enforcement: an AST check restricting open flags, with negative fixtures per
-forbidden option.
-
-## VER-011 - The counter-hook check accepts strings and unreachable code
-
-Reported by check-machinery, reproduced in memory by that hunter.
-
-`scripts/check_source_invariants.py` strips only `//` suffixes and whitespace and
-searches CLI source for two strings. A string literal holding the
-`emit_writer_counters` call gave a false pass; a block comment, unused function or
-unreachable branch can too. This contradicts the script's claim that comments and
-literals cannot decide the outcome.
-
-Fix: move final counter emission into an invocation-finalization operation that owns
-the lifecycle, tested on successful, refused and cancelled exits. An AST check can
-enforce placement; substring presence cannot.
+The probe open now goes through `open_probe_lock` in `crates/lib/src/scratch.rs`,
+tested for missing-file preservation, and counter emission lives in
+`finish_invocation` in `crates/cli/src/lib.rs`, tested on success, refusal and
+cancellation. The guards in `scripts/check_source_invariants.py` and
+`scripts/rust_source_shapes.py` check a fixed lexical shape of each; they do not
+prove arbitrary Rust control flow. Residue: a general AST check, if it pays.
 
 ## VER-012 - Source-policy checks are repeated and spread across separate parsers
 
@@ -409,62 +375,12 @@ so a fixture and caller can both configure a hook and only the first applies.
 Fix: return a must-use error or panic on duplicates, or install while constructing the
 scenario. Enforcement: types and signatures.
 
-## VER-030 - The io_uring panic test can pass on an unrelated failure
+## VER-033 - Cancellation coverage is a sample of commands and checkpoints
 
-Reported by fault-injection.
-
-`crates/lib/tests/fault_uring_writer.rs` accepts any error and any unwind. Neither proves
-dispatch 3 reached the injected panic, and an unwind is accepted despite the described
-error through `flush`.
-
-Fix: observe the dispatch count, require the injected payload, and reject unwinds if an
-error is the contract. Enforcement: a shared fault-result assertion helper and a
-regression test supplying an unrelated error.
-
-## VER-031 - The geocode pass 3 fault test accepts what its contract rejects
-
-Reported by fault-injection.
-
-`crates/lib/tests/fault_geocode_pass3.rs` says a worker panic must surface as `Err`, but
-accepts an unwind carrying the injected message, so removing panic-to-error handling can
-stay green.
-
-Fix: require `Ok(Err(e))`, verify provenance, then check leftovers, or change the claim if
-unwinding is intended. Enforcement: the result shape in the test.
-
-## VER-032 - The cancellation sweep accepts runs that never cancel
-
-Reported by fault-injection.
-
-`crates/lib/tests/cancel.rs` picks checkpoint ordinals from a counting run and then ignores
-successful runs at them, requiring only one cancellation per command. Scheduling or
-checkpoint changes can remove coverage silently.
-
-Fix: record whether each callback fired, distinguish unreachable ordinals from cancellation
-too late to affect a decided publication. Enforcement: a structured scenario result.
-
-## VER-033 - "Every checkpoint" and "every command" overstate cancellation coverage
-
-Reported by fault-injection.
-
-The sweep in `cancel.rs` samples when the count exceeds 64 despite its comment, and its
-registry has ten `commands` entries, omitting getid, getparents, repack, renumber,
-tags-filter, tags-count and time-filter.
-
-Fix: rename the claims now. For complete coverage, a command-scenario registry with
-explicit modes and exclusions. Enforcement: mechanical comparison against the command
-inventory.
-
-## VER-034 - The census test can pass without observing anything
-
-Reported by fault-injection.
-
-The test in `cancel.rs` starts its maximum at zero, checks it stays zero, and does not
-assert the callback ran.
-
-Fix: require a positive observation count and narrow the claim to observed checkpoints.
-Enforcing the stronger invariant belongs at issuance, through an explicit
-internal-versus-issued construction path or an observer.
+The claims in `crates/lib/tests/cancel.rs` are renamed to what the sweep does, with
+its registry exclusions documented. Complete coverage, a command-scenario registry
+with explicit modes and exclusions compared mechanically against the command
+inventory, remains undone.
 
 ## VER-035 - The publication observer docs are false about locking
 
@@ -487,18 +403,6 @@ in the hooks sweep. Element-cut tests use hundreds of thousands of nodes.
 
 Fix: small injected thresholds, one tiered production-default test, and an injected
 planner policy. Enforcement: typed policy construction.
-
-## VER-038 - assert_sorted_file cannot see type interleaving and misorders negative IDs
-
-Reported by lib-integration.
-
-`assert_sorted_file` in `crates/lib/tests/common/mod.rs` reads through a helper that splits
-kinds into vectors, so way 1 before node 1 passes. Raw `i64 >=` rejects canonical order
-such as `-1, -2`, which `crates/lib/tests/check.rs` recognizes. This weakens apply-changes
-and renumber assertions today.
-
-Fix: check `(kind, canonical ID key)` while traversing. Enforcement: interleaved, inverted
-and mixed-sign control fixtures.
 
 ## VER-039 - The shared equivalence oracle discards meaningful metadata
 
@@ -524,16 +428,6 @@ coordinate reader swallows role errors.
 
 Fix: preserve multiplicity and numeric unknown types, and fail on unexpected decode errors.
 Enforcement: negative tests of the helpers and a scoped lint on error-to-empty conversions.
-
-## VER-041 - An empty output satisfies the normalized-content assertions
-
-Reported by lib-integration.
-
-`read_normalized` in `common/mod.rs` ignores headers and returns empty sections for empty
-input, so `empty_pbf_survives_sort` in `edge_cases.rs` accepts a zero-byte output.
-
-Fix: successful-output readers require a valid header and complete framing. Enforcement:
-empty, missing-header and malformed-tail controls.
 
 ## VER-042 - One metadata assertion is absent behind an obsolete explanation
 
@@ -771,28 +665,6 @@ Fix: a small semantic reference model and independent rendered-output checks, wi
 only where byte identity is the contract. Confinement to a test module is enforceable; independence
 needs review.
 
-## VER-067 - The geocode defaults test overwrites the defaults it validates
-
-Reported by lib-commands-unit.
-
-`rejects_invalid_levels_and_radii` in `geocode_index/builder/mod.rs` overwrites four fields before
-asserting the defaults validate, and a later comment about the default radius describes a changed
-value.
-
-Fix: assert on an untouched default and build each invalid case independently with its intended
-refusal.
-
-## VER-068 - The geocode reader absence test never calls the reader methods
-
-Reported by lib-commands-unit.
-
-`defensive_fixed_record_readers_expose_absence_in_their_types` in `geocode_index/reader.rs` assigns
-four methods to function pointers and tests `Table::get` on empty tables. Replacing a method body
-with a panic stays green.
-
-Fix: invoke each method on a minimal reader with absent and present records and move table behaviour
-beside `Table`.
-
 ## VER-069 - Sparse allocation failure coverage stops before the syscall
 
 Reported by lib-commands-unit.
@@ -929,36 +801,11 @@ short-flag table back, and the documentation checker reconstructs inventories fr
 Fix: generate the command, option, vocabulary and I/O sections, keeping authored prose. Enforcement:
 a check mode, with writers comparing bytes before replacing a file.
 
-## VER-086 - The bad-request executable test can pass when validation breaks
+## VER-086 - Bad-request validation has no mutation coverage
 
-Reported by library-harness.
-
-`bad_requests_are_refused_quietly` in `crates/harness/tests/exe.rs` gives each request a nonexistent
-marker FIFO, so failing at `MarkerFifo::open` yields every expected result.
-
-Fix: otherwise working launches with a live FIFO, a checked refusal reason and a valid control.
-Enforcement: mutation tests disabling each validation branch.
-
-## VER-087 - scenario_passes_on accepts missing coverage
-
-Reported by library-harness.
-
-The helper in `exe.rs` checks only that collected results say `pass`, and empty arrays satisfy
-`.all(...)`. Brokkr's consumer validates this, outside repository checks.
-
-Fix: compare exact call and assertion inventories through a shared protocol validator. Enforcement:
-missing, duplicate, misplaced and undeclared negative fixtures.
-Brokkr side (reusable validator) filed as bz brokkr#159; it also serves the next entry's runtime inventory check.
-
-## VER-088 - The harness runner can succeed without completing its declaration
-
-Reported by library-harness.
-
-`run_launch` and `finish_call` in `crates/harness/src/runner.rs` never establish that every declared
-call and assertion ran exactly once. Brokkr catches this later, but the exit status misleads.
-
-Fix: execution consumes declared handles and finalization refuses unused or repeated ones, or a
-runtime inventory check. Enforcement: tests that omit and duplicate.
+`bad_requests_are_refused_quietly` in `crates/harness/tests/exe.rs` now uses live FIFOs,
+a valid control launch and branch-specific refusal reasons. Not done: mutation tests
+disabling each validation branch.
 
 ## VER-089 - Plans, execution and CLI counterparts describe the workload independently
 
@@ -971,16 +818,14 @@ implementation can keep its plan identity.
 Fix: typed workload specifications generating the plan, the call and counterpart arguments. Types
 enforce the representation; arbitrary handwritten behaviour cannot be proven equivalent.
 
-## VER-090 - The requirement-table check reads a formatting convention
+## VER-090 - The requirement-table check is convention-bound
 
-Reported by library-harness.
-
-`required` in `crates/harness/src/describe.rs` scans root `brokkr.toml` for a table header and lines
-beginning with a double quote, and does not parse TOML or compose includes, so partial omission
-passes.
-
-Fix: parse the effective configuration or use one structured file. Enforcement: equivalent-format
-and included-file fixtures.
+`required` in `crates/harness/src/describe.rs` now refuses anything outside its convention
+(exactly one root table, exact line shape, no duplicate ids, and any pbfhogg or library key
+or nested include in an included file), and the authoritative composed check is
+`brokkr library --all`. It still does not parse composed TOML; residue only if a
+composed-configuration parse is ever wanted, which needs a brokkr configuration export
+brokkr does not offer.
 
 ## VER-091 - Descriptor scenarios depend on the inherited process
 
@@ -1016,37 +861,6 @@ Fix: compare lengths then bounded chunks, and a bounded seed-state helper also u
 `check_bindings`. Enforcement: the helpers, a source rule against whole-file reads in scale-facing
 assertions, and edge-case tests.
 
-## VER-095 - Harness fixtures build unused inputs and substitute paths into JSON
-
-Reported by library-harness.
-
-`scenario_passes_on` always writes indexed and raw fixtures, and `RunDir::new` substitutes paths into
-JSON text without escaping.
-
-Fix: build only requested inputs and serialize with `serde_json`. Enforcement: JSON-sensitive paths
-and constructors requiring an input recipe.
-
-## VER-096 - The diagnostic-closure assertion samples and does not prove quiescence
-
-Reported by library-harness.
-
-`late_report` in `runner.rs` checks counters once before `scenario.json`, while the assertion's wording
-says no call diagnostic arrived after its document.
-
-Fix: keep delivery inside a joined execution scope and describe the residual limit. Enforcement:
-owned-task completion and a delayed-emission test. Complete future silence cannot be proven by a
-finite sample.
-
-## VER-097 - Harness diagnostic collection is unbounded
-
-Reported by library-harness.
-
-`Collector::event` in `crates/harness/src/diag.rs` formats whole messages before truncating and keeps
-every event, and brokkr refuses artefacts over 16 MiB only after the cost is paid.
-
-Fix: bounded formatting and a collection budget with an overflow verdict. Enforcement: oversized
-message and many-event tests.
-
 ## VER-098 - Release semantics and profiling configurations are not exercised
 
 Reported by library-harness, check-machinery.
@@ -1072,59 +886,18 @@ Fix: resolve build needs from scenario metadata and build matching configuration
 build-planning tests.
 Brokkr side filed as bz brokkr#158.
 
-## VER-100 - The pre-merge runbook does not run the complete gate
+## VER-100 - Nothing enforces the complete gate at merge time
 
-Reported by check-machinery.
+`reference/testing.md` now names `brokkr check --gate` as the before-merge command and
+calls `full` partial. Nothing enforces it: the only workflow, `.github/workflows/docs.yml`,
+deploys documentation. Residue: a required merge check, if the project wants one.
 
-`reference/testing.md` calls `--profile full` the before-merge tier, but `full` selects only the `all`
-sweep, without other feature shapes, doctests, execution accounting or gate-only member checks, and
-legacy profiles exit with `check passed`.
+## VER-104 - The document checker is not verified against renderer output
 
-Fix and enforcement: make the merge command `brokkr check --gate`, enforced in CI or a merge
-prerequisite, and keep focused profiles as explicitly partial.
-
-## VER-101 - The serial profile does not guarantee serial execution
-
-Reported by check-machinery.
-
-`brokkr.d/checks.toml` sets `test_threads = 1` but references `all`, which has `parallel = {}`, so
-binaries run concurrently.
-
-Fix: remove the placeholder or give it the correct shape. Enforcement: a serial-claiming profile may
-reference no parallel sweep.
-The pbfhogg config fix is ours; the brokkr-side refusal is filed as bz brokkr#166.
-
-## VER-102 - Rustdoc link validation is not enabled
-
-Reported by check-machinery.
-
-The composed configuration has no `[rustdoc]` table, so that phase is inert, and
-`scripts/check_doc_links.py` does not resolve intra-doc links. Whether links are broken today was not
-run.
-
-Fix and enforcement: enable the phase and require it in the gate.
-
-## VER-103 - The Markdown checker has a fence-parsing defect
-
-Reported by check-machinery, reproduced in memory by that hunter.
-
-Anchor and paragraph extraction in `scripts/check_doc_links.py` toggle a Boolean on any fence line. A
-four-backtick fence holding a three-backtick line caused both a false examination and a missed real
-link.
-
-Fix: tokens from a parser with compatible fence semantics. Enforcement: regression cases for delimiter
-lengths, types and embedded examples.
-
-## VER-104 - The document checker reimplements renderer behaviour unverified
-
-Reported by check-machinery.
-
-It implements GitHub and VitePress slugging, inline rendering, link recognition and part of TypeScript
-sidebar parsing with no self-test corpus, and recognizes ATX headings only, so valid Setext links can
-be rejected.
-
-Fix: test against committed examples and actual renderer output and use renderer identifiers where
-possible, with an explicit tested GitHub compatibility contract.
+`scripts/check_doc_links.py` now recognizes Setext headings and its self-test,
+`scripts/test_check_doc_links.py`, runs in the gate. Its GitHub and VitePress slugging, inline rendering and
+sidebar parsing are still unverified against real renderer output: expected-output fixtures
+from the pinned VitePress version and an independent GitHub reference are not done.
 
 ## VER-105 - The migration inventory discards identity
 
@@ -1147,15 +920,15 @@ is planned. This is not evidence 1.99 fails.
 Fix: a library and installable-CLI build under the declared version with the toolchain derived from the
 manifest, or remove the claim.
 
-## VER-107 - The musl sweep assumes an x86_64 host
+## VER-107 - The musl sweeps assume an x86_64 host
 
 Reported by check-machinery.
 
-`brokkr.d/checks.toml` always targets `x86_64-unknown-linux-musl`. On aarch64 it is a cross-build with
-foreign executables.
-
-Fix: separate compile-only from executable coverage and resolve a runnable target from an explicit host
-capability, or check the requirement before building. Enforcement: in the check plan.
+Both executable musl sweeps in `brokkr.d/checks.toml` hard-code `x86_64-unknown-linux-musl`,
+now with comments and a host restriction stated in `reference/testing.md`. On aarch64 they
+would be cross-builds with foreign executables. Residue is brokkr-side check planning:
+resolve a runnable target from host capability, or refuse an unexecutable target before
+building.
 
 ## VER-108 - A test-only dispatch instrument ships in production
 
@@ -1189,37 +962,22 @@ resolves.
 Fix: narrow it to what remains unavailable. Enforcement: generated capability inventories or a
 machine-readable describe interface; the handcrafted-fixture rationale still needs review.
 
-## VER-111 - Requested stop markers can silently do nothing
+## VER-112 - Orphaned expectation keys are not rejected
 
-Reported by bench-verify.
+The six integrity and diff benches take `--require-expectation yes|no` through the shared
+`selected` helper in `benches/lib/expect.lua`. Still open: configuration validation rejecting
+orphaned digest-pair and OSC expectation keys (bz brokkr#161 is closed without a
+close message; whether it landed orphan-key validation is unverified), and an
+independent oracle for the correct answer.
 
-`benches/lib/stop.lua` validates spelling and `profiling.lua` forwards it, and scripts accept a normal
-completion when `r.stopped_at` is absent. A renamed marker turns a phase run into a full planet run.
+## VER-113 - dedupe-pair does not prove its copy path
 
-Fix: a shared result helper failing when `stop` was not reached. Enforcement: helper tests for reached,
-missing and renamed markers and a rule for stop-capable scripts.
-The helper is pbfhogg's; the optional brokkr-side strict `stop_at` is filed as bz brokkr#160.
-
-## VER-112 - Expected answers disappear when lookup keys stop matching
-
-Reported by bench-verify.
-
-`diff-pair.lua` and `diff-applied.lua` get `want = nil` on missing or changed keys and either answer
-passes; the integrity benches accept either when absent.
-
-Fix: an assertion mode requiring an expectation and recording whether one applied. Enforcement: reject
-orphaned expectation keys in a configuration check. The correct answer still needs an independent oracle.
-Brokkr side (orphaned-key check, require-expectation lookup) filed as bz brokkr#161.
-
-## VER-113 - Workload names describe paths scripts never establish
-
-Reported by bench-verify.
-
-`diff-unindexed.lua` never checks that inputs lack indexdata. `dedupe-pair.lua` does not require
-passthrough or coalesced copying, and its `--check yes` assumes a subset relation.
-
-Fix: eligibility and coverage predicates checked outside the measured child and from counters afterward.
-Enforcement: script contract tests and typed workload declarations.
+`diff-unindexed.lua` now probes both fronts before measuring and fails on indexed input.
+`dedupe-pair.lua` still cannot require passthrough or coalesced copying: that needs brokkr's
+Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
+`cat_dedupe_copy_range_coalesced`). Proving complete indexdata absence needs an
+indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
+indexed inputs.
 
 ## VER-114 - The geocode result parser accepts missing evidence
 

@@ -137,23 +137,23 @@ fn to_block_meta(m: &TestMeta) -> block_builder::Metadata<'_> {
 
 /// A test node with id, coordinates (in decimicrodegrees), tags, and
 /// optional metadata.
-pub struct TestNode {
+pub struct TestNode<'a> {
     pub id: i64,
     /// Latitude in decimicrodegrees (10^-7 degrees).
     pub lat: i32,
     /// Longitude in decimicrodegrees (10^-7 degrees).
     pub lon: i32,
-    pub tags: Vec<(&'static str, &'static str)>,
+    pub tags: Vec<(&'a str, &'a str)>,
     /// Optional per-element metadata (version/timestamp/changeset/uid/user/visible).
     /// `None` writes a node with no OSM metadata - the default for most tests.
     pub meta: Option<TestMeta>,
 }
 
 /// A test way with id, node references, tags, and optional metadata.
-pub struct TestWay {
+pub struct TestWay<'a> {
     pub id: i64,
     pub refs: Vec<i64>,
-    pub tags: Vec<(&'static str, &'static str)>,
+    pub tags: Vec<(&'a str, &'a str)>,
     pub meta: Option<TestMeta>,
 }
 
@@ -161,10 +161,10 @@ pub struct TestWay {
 ///
 /// Members use the [`TestMember`] struct which pairs a [`MemberId`] with a role
 /// string.
-pub struct TestRelation {
+pub struct TestRelation<'a> {
     pub id: i64,
     pub members: Vec<TestMember>,
-    pub tags: Vec<(&'static str, &'static str)>,
+    pub tags: Vec<(&'a str, &'a str)>,
     pub meta: Option<TestMeta>,
 }
 
@@ -404,7 +404,11 @@ pub fn write_bad_indexdata_pbf(path: &Path) {
     std::fs::write(path, bad).expect("write bad-indexdata fixture");
 }
 
-fn base_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+fn base_elements() -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
     let mut nodes = generate_nodes(300, 1);
     let mut ways = generate_ways(40, 1, 5, 1);
     let mut relations = generate_relations(5, 1, 2, 1);
@@ -674,7 +678,7 @@ pub fn write_test_pbf_non_indexed(
 /// 10 000 ids to stay inside the WGS84 range for arbitrarily large
 /// inputs. No tags, no metadata - map over the result when a test
 /// needs specific tags.
-pub fn generate_nodes(count: usize, start_id: i64) -> Vec<TestNode> {
+pub fn generate_nodes(count: usize, start_id: i64) -> Vec<TestNode<'static>> {
     (0..count)
         .map(|i| {
             let id_offset = i64::try_from(i).expect("node count fits in i64");
@@ -703,7 +707,7 @@ pub fn generate_ways(
     start_id: i64,
     refs_per_way: usize,
     node_start_id: i64,
-) -> Vec<TestWay> {
+) -> Vec<TestWay<'static>> {
     (0..count)
         .map(|i| {
             let id_offset = i64::try_from(i).expect("way count fits in i64");
@@ -731,7 +735,7 @@ pub fn generate_relations(
     start_id: i64,
     members_per_rel: usize,
     way_start_id: i64,
-) -> Vec<TestRelation> {
+) -> Vec<TestRelation<'static>> {
     (0..count)
         .map(|i| {
             let id_offset = i64::try_from(i).expect("relation count fits in i64");
@@ -764,7 +768,7 @@ pub fn generate_relations(
 /// `osm_id_cmp` in `crates/lib/src/osm_id.rs`. Used by the negative-ID sweep
 /// (`cli_negative_id_invariants.rs`) to drive every command through
 /// a mixed-sign fixture in the order canonical-sorted readers expect.
-pub fn generate_nodes_with_negatives(n_neg: usize, n_pos: usize) -> Vec<TestNode> {
+pub fn generate_nodes_with_negatives(n_neg: usize, n_pos: usize) -> Vec<TestNode<'static>> {
     let mut out = Vec::with_capacity(n_neg + n_pos);
     for i in 1..=n_neg {
         let id = -i64::try_from(i).expect("n_neg fits in i64");
@@ -804,7 +808,7 @@ pub fn generate_ways_with_negatives(
     n_neg: usize,
     n_pos: usize,
     refs_per_way: usize,
-) -> Vec<TestWay> {
+) -> Vec<TestWay<'static>> {
     let mut out = Vec::with_capacity(n_neg + n_pos);
     let make_refs = |seed: i64| -> Vec<i64> {
         (0..refs_per_way)
@@ -843,7 +847,7 @@ pub fn generate_relations_with_negatives(
     n_neg: usize,
     n_pos: usize,
     members_per_rel: usize,
-) -> Vec<TestRelation> {
+) -> Vec<TestRelation<'static>> {
     let mut out = Vec::with_capacity(n_neg + n_pos);
     let make_members = || -> Vec<TestMember> {
         (0..members_per_rel)
@@ -1400,12 +1404,33 @@ fn normalize_relation(r: &pbfhogg::Relation<'_>) -> NormalizedRelation {
     }
 }
 
+/// Reject incomplete framing, including the short trailing prefixes that the
+/// production reader deliberately tolerates as EOF. Successful-output oracles
+/// need the last complete frame to cover the entire file.
+fn assert_complete_pbf_framing(path: &Path) {
+    let mut reader = BlobReader::seekable_from_path(path).expect("open framed PBF");
+    let mut end = 0;
+    while let Some(header) = reader.next_header_skip_blob() {
+        header.expect("read complete PBF frame");
+        end = reader
+            .seek_raw(std::io::SeekFrom::Current(0))
+            .expect("frame end");
+    }
+    assert_eq!(
+        end,
+        std::fs::metadata(path).expect("PBF length").len(),
+        "incomplete trailing PBF frame: {}",
+        path.display()
+    );
+}
+
 /// Read a PBF file into its normalized, element-equivalence form.
 ///
 /// Both `DenseNode` and `Node` element variants are coalesced into the same
 /// `NormalizedNode` shape so the serialization choice doesn't affect
 /// comparison. Each section is sorted by id on return.
 pub fn read_normalized(path: &Path) -> NormalizedPbf {
+    assert_complete_pbf_framing(path);
     let reader = BlobReader::from_path(path).expect("open pbf");
     let mut contents = NormalizedPbf {
         nodes: Vec::new(),
@@ -1413,20 +1438,29 @@ pub fn read_normalized(path: &Path) -> NormalizedPbf {
         relations: Vec::new(),
     };
 
+    // Content equality is meaningful only for a complete, header-bearing PBF.
+    // Walking to EOF also makes a malformed tail fail rather than compare equal.
+    let mut saw_header = false;
     for blob in reader {
         let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => contents.nodes.push(normalize_dense_node(&dn)),
-                    Element::Node(n) => contents.nodes.push(normalize_node(&n)),
-                    Element::Way(w) => contents.ways.push(normalize_way(&w)),
-                    Element::Relation(r) => contents.relations.push(normalize_relation(&r)),
-                    _ => {}
+        match blob.decode().expect("decode blob") {
+            BlobDecode::OsmHeader(_) => saw_header = true,
+            BlobDecode::OsmData(block) => {
+                assert!(saw_header, "PBF data precedes header: {}", path.display());
+                for element in block.elements() {
+                    match element {
+                        Element::DenseNode(dn) => contents.nodes.push(normalize_dense_node(&dn)),
+                        Element::Node(n) => contents.nodes.push(normalize_node(&n)),
+                        Element::Way(w) => contents.ways.push(normalize_way(&w)),
+                        Element::Relation(r) => contents.relations.push(normalize_relation(&r)),
+                        _ => {}
+                    }
                 }
             }
+            _ => {}
         }
     }
+    assert!(saw_header, "PBF header missing: {}", path.display());
 
     contents.nodes.sort_by_key(|n| n.id);
     contents.ways.sort_by_key(|w| w.id);
@@ -1439,62 +1473,42 @@ pub fn read_normalized(path: &Path) -> NormalizedPbf {
 /// - The header block declares `is_sorted() == true`.
 /// - Elements appear in file order as nodes → ways → relations (no
 ///   out-of-order type transitions).
-/// - Within each type, ids are monotonically non-decreasing.
+/// - Within each type, ids follow canonical OSM order: zero, negative ids
+///   by increasing magnitude, then positive ids.
 ///
-/// `read_normalized` sorts sections internally, so bugs that emit
-/// elements in the wrong file order can't be caught by element-
-/// equivalence alone. This helper reads the file in raw order via
-/// `read_all_elements_with_coords` (which preserves blob order) and
-/// asserts the sortedness contract.
+/// Check the stream directly: splitting kinds into separate vectors loses
+/// interleaving evidence, while normalizing also sorts away ID inversions.
 pub fn assert_sorted_file(path: &Path) {
-    // Header flag check.
-    let header = read_header(path);
+    assert_complete_pbf_framing(path);
+    let reader = ElementReader::from_path(path).expect("open sorted PBF");
     assert!(
-        header.is_sorted(),
-        "PBF header is not declared sorted (Sort.Type_then_ID missing) for {}",
+        reader.header().is_sorted(),
+        "PBF header is not declared sorted: {}",
         path.display()
     );
-
-    // File-order contents via the non-normalized reader.
-    let contents = read_all_elements_with_coords(path);
-
-    // Within each section, ids must be monotonically non-decreasing.
-    // (The reader already walks per-type sections in file order, so
-    // this also implicitly asserts no out-of-type interleavings within
-    // a section.)
-    let mut last = i64::MIN;
-    for (id, _, _, _) in &contents.nodes {
-        assert!(
-            *id >= last,
-            "node ids not sorted in {}: {} followed by {}",
-            path.display(),
-            last,
-            id
-        );
-        last = *id;
-    }
-    let mut last = i64::MIN;
-    for (id, _, _) in &contents.ways {
-        assert!(
-            *id >= last,
-            "way ids not sorted in {}: {} followed by {}",
-            path.display(),
-            last,
-            id
-        );
-        last = *id;
-    }
-    let mut last = i64::MIN;
-    for (id, _, _) in &contents.relations {
-        assert!(
-            *id >= last,
-            "relation ids not sorted in {}: {} followed by {}",
-            path.display(),
-            last,
-            id
-        );
-        last = *id;
-    }
+    let mut previous = None;
+    reader
+        .for_each(|element| {
+            let (kind, id) = match element {
+                Element::DenseNode(n) => (0u8, n.id()),
+                Element::Node(n) => (0u8, n.id()),
+                Element::Way(w) => (1u8, w.id()),
+                Element::Relation(r) => (2u8, r.id()),
+                _ => return,
+            };
+            // Keep the oracle independent of the production sorting key. Magnitude
+            // is unsigned so i64::MIN remains representable.
+            let key = (kind, id > 0, id.unsigned_abs());
+            if let Some(last) = previous {
+                assert!(
+                    last <= key,
+                    "elements not sorted in {}: {last:?} followed by {key:?}",
+                    path.display()
+                );
+            }
+            previous = Some(key);
+        })
+        .expect("read complete sorted PBF");
 }
 
 /// Assert that two PBF files are element-equivalent.

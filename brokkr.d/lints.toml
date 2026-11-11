@@ -4,8 +4,19 @@
 # only, so data/ and research/ never count. pre-clippy: text only, no build.
 [[script_check]]
 name = "doc-links"
-command = "python3 scripts/check_doc_links.py"
+command = "python3 -B scripts/check_doc_links.py"
 expect = "document conventions ok"
+match = "last-line"
+stage = "pre-clippy"
+
+# In-memory fixtures for the document checker's supported Markdown subset.
+# Each checker's in-memory self-test is a pre-clippy script check like this
+# one, run with -B and printing one "... ok" last line; a self-test with no
+# script check never runs.
+[[script_check]]
+name = "doc-links-fixtures"
+command = "python3 -B scripts/test_check_doc_links.py"
+expect = "document checker fixtures ok"
 match = "last-line"
 stage = "pre-clippy"
 
@@ -607,14 +618,22 @@ must_scan = [
 ]
 message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
 
-# Presence of the CLI exit-path hook calls, the function-scoped probe_lock
-# open flags, no `as i64` cast inside a `.counter(` call's arguments (which
+# Sealed probe-open and invocation-finalization bodies and the dispatch
+# ownership shape, no `as i64` cast inside a `.counter(` call's arguments (which
 # rustfmt wraps across lines), and no static under a test-hooks gate anywhere
 # in crates/lib/src/ (the gate is on the line above): none fits a one-line forbid rule.
 [[script_check]]
 name = "source-invariants"
-command = "python3 scripts/check_source_invariants.py"
+command = "python3 -B scripts/check_source_invariants.py"
 expect = "source invariants ok"
+match = "last-line"
+stage = "pre-clippy"
+
+# In-memory negative fixtures for the sealed lifecycle source shapes.
+[[script_check]]
+name = "source-lifecycle-fixtures"
+command = "python3 -B scripts/test_source_lifecycle.py"
+expect = "source lifecycle fixtures ok"
 match = "last-line"
 stage = "pre-clippy"
 

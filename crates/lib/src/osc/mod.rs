@@ -4,7 +4,7 @@
 //!
 //! - [`parse`]: input parser. `.osc.gz` files into [`CompactDiffOverlay`].
 //! - [`write`]: XML output writers (owned element types are private impl detail).
-//! - [`merge_join`]: streaming merge-join over sorted PBFs, used by `diff`
+//! - `merge_join`: streaming merge-join over sorted PBFs, used by `diff`
 //!   and `derive_changes` to produce OSC output.
 //!
 //! The public API is re-exported at this module level so consumers continue to

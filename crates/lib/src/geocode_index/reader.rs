@@ -2368,16 +2368,93 @@ mod tests {
         }
     }
 
+    /// Only the four fixed-record methods use this fixture. Map the unrelated
+    /// tables from one empty file; no builder or geometry validation is needed.
+    fn fixed_record_reader(scratch: &pbfhogg_test_scratch::TestScratch) -> Reader {
+        let empty = scratch.child("empty");
+        std::fs::write(&empty, b"").expect("empty record file");
+        Reader {
+            #[cfg(feature = "test-hooks")]
+            admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
+            header: Header {
+                format_version: format::FORMAT_VERSION,
+                street_cell_level: crate::tunables::GEOCODE_DEFAULT_STREET_LEVEL,
+                coarse_cell_level: crate::tunables::GEOCODE_DEFAULT_COARSE_LEVEL,
+                admin_cell_level: crate::tunables::GEOCODE_DEFAULT_ADMIN_LEVEL,
+                admin_tolerance_m: crate::tunables::GEOCODE_DEFAULT_ADMIN_TOLERANCE_M,
+                fine_search_radius_m: crate::tunables::GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M,
+                coarse_search_radius_m: crate::tunables::GEOCODE_DEFAULT_COARSE_SEARCH_RADIUS_M,
+                replication_sequence: 0,
+                replication_timestamp: 0,
+                addr_point_count: 0,
+                street_way_count: 0,
+                interp_way_count: 0,
+                admin_polygon_count: 0,
+                geo_cell_count: 0,
+                coarse_cell_count: 0,
+                admin_cell_count: 0,
+            },
+            fine_max_dist_sq: 0.0,
+            coarse_max_dist_sq: 0.0,
+            presence_level: 0,
+            coarse_interp_cells: Vec::new(),
+            geo_cells: Records::map(&empty).expect("empty geo_cells"),
+            street_entries: Lists::map(&empty).expect("empty street_entries"),
+            addr_entries: Lists::map(&empty).expect("empty addr_entries"),
+            interp_entries: Lists::map(&empty).expect("empty interp_entries"),
+            coarse_geo_cells: Records::map(&empty).expect("empty coarse_geo_cells"),
+            coarse_street_entries: Lists::map(&empty).expect("empty coarse_street_entries"),
+            coarse_addr_entries: Lists::map(&empty).expect("empty coarse_addr_entries"),
+            coarse_interp_entries: Lists::map(&empty).expect("empty coarse_interp_entries"),
+            street_ways: Records::map(&empty).expect("empty street_ways"),
+            street_nodes: Records::map(&empty).expect("empty street_nodes"),
+            addr_points: Records::map(&empty).expect("empty addr_points"),
+            interp_ways: Records::map(&empty).expect("empty interp_ways"),
+            interp_nodes: Records::map(&empty).expect("empty interp_nodes"),
+            admin_cells: Records::map(&empty).expect("empty admin_cells"),
+            admin_entries: Lists::map(&empty).expect("empty admin_entries"),
+            admin_polygons: Records::map(&empty).expect("empty admin_polygons"),
+            admin_vertices: Records::map(&empty).expect("empty admin_vertices"),
+            strings: format::mmap_or_empty(&empty).expect("empty strings"),
+        }
+    }
+
     #[test]
     fn defensive_fixed_record_readers_expose_absence_in_their_types() {
-        let _: fn(&Reader, u32) -> Option<AddrPoint> = Reader::read_addr_point;
-        let _: fn(&Reader, u32) -> Option<StreetWay> = Reader::read_street_way;
-        let _: fn(&Reader, u32) -> Option<InterpWay> = Reader::read_interp_way;
-        let _: fn(&Reader, u32) -> Option<AdminPolygon> = Reader::read_admin_polygon;
-        assert!(Table::<AddrPoint>::new(&[]).get(0).is_none());
-        assert!(Table::<StreetWay>::new(&[]).get(0).is_none());
-        assert!(Table::<InterpWay>::new(&[]).get(0).is_none());
-        assert!(Table::<AdminPolygon>::new(&[]).get(0).is_none());
+        let scratch = pbfhogg_test_scratch::scratch();
+        let mut reader = fixed_record_reader(&scratch);
+        assert!(reader.read_addr_point(0).is_none());
+        assert!(reader.read_street_way(0).is_none());
+        assert!(reader.read_interp_way(0).is_none());
+        assert!(reader.read_admin_polygon(0).is_none());
+
+        // Distinct records catch a method that always returns record zero or
+        // ignores its table. Compare every serialized field, not just presence.
+        macro_rules! check_records {
+            ($field:ident, $record:ident, $read:ident) => {{
+                let records = [
+                    $record::from_bytes(&[1; $record::SIZE]),
+                    $record::from_bytes(&[2; $record::SIZE]),
+                ];
+                let path = scratch.child(stringify!($field));
+                let bytes: Vec<u8> = records
+                    .iter()
+                    .flat_map(|record| record.to_bytes())
+                    .collect();
+                std::fs::write(&path, bytes).expect("write fixed records");
+                reader.$field = Records::map(&path).expect("map fixed records");
+                for (index, expected) in (0_u32..).zip(records.iter()) {
+                    let actual = reader.$read(index).expect("present record");
+                    assert_eq!(actual.to_bytes(), expected.to_bytes());
+                }
+                assert!(reader.$read(2).is_none());
+                assert!(reader.$read(u32::MAX).is_none());
+            }};
+        }
+        check_records!(addr_points, AddrPoint, read_addr_point);
+        check_records!(street_ways, StreetWay, read_street_way);
+        check_records!(interp_ways, InterpWay, read_interp_way);
+        check_records!(admin_polygons, AdminPolygon, read_admin_polygon);
     }
 
     #[test]

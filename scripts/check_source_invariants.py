@@ -4,11 +4,11 @@
 Textlint rules can only forbid a token on one physical line, so these four
 cannot be textlint rules:
 
-- The CLI's exit path must call both counter-emission hooks. The library's
-  textlint rules forbid emitting from anywhere else, which a program that
-  emits nothing at all would satisfy, so the call itself is required here.
-- `probe_lock` in crates/lib/src/scratch.rs must open the lock read-write and must never
-  create it. The property is scoped to one function body.
+- The CLI dispatch is owned by finish_invocation, whose complete body runs
+  the dispatch and then both counter hooks. Library textlint rules restrict
+  other callers. This checks the fixed lifecycle shape, not Rust control flow.
+- The complete open_probe_lock constructor is sealed to a noncreating,
+  nontruncating read-write option chain, and probe_lock uses that constructor.
 - No `as i64` cast inside the arguments of a `.counter(...)` call.
   `Invocation::counter` takes unsigned integers directly and saturates them
   at `i64::MAX`, where a cast wraps; rustfmt puts long arguments on their own
@@ -32,81 +32,10 @@ from pathlib import Path
 import re
 import sys
 
+from rust_source_shapes import blank_comments_and_literals, lifecycle_errors
+
 root = Path(__file__).resolve().parent.parent
 errors = []
-
-
-def blank_comments_and_literals(src):
-    """Rust source with comments turned to spaces and the contents of string
-    and char literals turned to `x`, offsets and newlines preserved.
-
-    Comments vanish (whitespace); literals stay opaque tokens with their
-    delimiters, so neither can supply or hide code, and blanking a literal
-    cannot join the tokens around it into something that looks like code.
-    Handles nested block comments, byte and C strings, raw strings with any
-    number of hashes, char and byte literals, and tells lifetimes from chars.
-    """
-    out = list(src)
-    n = len(src)
-    i = 0
-
-    def fill(start, end, ch):
-        for k in range(start, end):
-            if out[k] != "\n":
-                out[k] = ch
-
-    while i < n:
-        c = src[i]
-        if src.startswith("//", i):
-            end = src.find("\n", i)
-            end = n if end == -1 else end
-            fill(i, end, " ")
-            i = end
-        elif src.startswith("/*", i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if src.startswith("/*", j):
-                    depth, j = depth + 1, j + 2
-                elif src.startswith("*/", j):
-                    depth, j = depth - 1, j + 2
-                else:
-                    j += 1
-            fill(i, j, " ")
-            i = j
-        elif (m := re.compile(r'(?:b|c)?r(#*)"').match(src, i)) and (
-            i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")
-        ):
-            close = '"' + m.group(1)
-            end = src.find(close, m.end())
-            end = n if end == -1 else end + len(close)
-            fill(m.end(), end - len(close), "x")
-            i = end
-        elif c == '"' or (
-            c in "bc"
-            and src.startswith('"', i + 1)
-            and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
-        ):
-            start = i + 1 if c == '"' else i + 2
-            j = start
-            while j < n and src[j] != '"':
-                j += 2 if src[j] == "\\" else 1
-            fill(start, j, "x")
-            i = j + 1
-        elif c == "'" or (
-            c == "b"
-            and src.startswith("'", i + 1)
-            and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
-        ):
-            q = i if c == "'" else i + 1
-            m = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'").match(src, q)
-            if m:
-                fill(q + 1, m.end() - 1, "x")
-                i = m.end()
-            else:
-                i = q + 1  # a lifetime or label
-        else:
-            i += 1
-    return "".join(out)
 
 
 EMIT_CALL = re.compile(r"\.\s*counter\s*\(")
@@ -233,30 +162,10 @@ for path in matching("crates/lib/src/**/*.rs"):
             "the run's Invocation token"
         )
 
-
-def code_only(source):
-    return "\n".join(line.split("//")[0] for line in source.splitlines())
-
-
-cli = re.sub(r"\s+", "", code_only((root / "crates/cli/src/lib.rs").read_text()))
-for hook in ("write::emit_writer_counters", "read::emit_read_counters"):
-    call = f"pbfhogg::{hook}(&host.invocation)"
-    if call not in cli:
-        errors.append(
-            f"crates/cli/src/lib.rs: the CLI must call {call} on its exit path, "
-            "or no run emits those counters"
-        )
-
-scratch = code_only((root / "crates/lib/src/scratch.rs").read_text())
-parts = scratch.split("fn probe_lock(")
-if len(parts) < 2:
-    errors.append("crates/lib/src/scratch.rs: fn probe_lock not found")
-else:
-    probe = parts[1].split("\n}\n")[0]
-    if ".write(true)" not in probe:
-        errors.append("crates/lib/src/scratch.rs: probe_lock must open the lock read-write")
-    if ".create(" in probe:
-        errors.append("crates/lib/src/scratch.rs: probe_lock must never create LOCK")
+cli = (root / "crates/cli/src/lib.rs").read_text()
+scratch = (root / "crates/lib/src/scratch.rs").read_text()
+for message in lifecycle_errors(cli, scratch):
+    errors.append(f"source lifecycle: {message}")
 
 if errors:
     print("\n".join(errors), file=sys.stderr)

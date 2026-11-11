@@ -47,7 +47,7 @@ pub struct CatStats {
     /// "Decoded N blobs"), not output blobs written.
     pub blobs_decoded: u64,
     pub elements_written: u64,
-    /// Input blobs [`repair`] rewrote (each counted once, however many
+    /// Input blobs [`repair()`] rewrote (each counted once, however many
     /// output blobs it became); always 0 from [`cat`].
     pub blobs_repaired: u64,
 }

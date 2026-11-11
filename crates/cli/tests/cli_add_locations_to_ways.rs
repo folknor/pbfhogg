@@ -33,7 +33,7 @@ use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn test_nodes() -> Vec<TestNode> {
+fn test_nodes() -> Vec<TestNode<'static>> {
     vec![
         TestNode {
             id: 1,
@@ -59,7 +59,7 @@ fn test_nodes() -> Vec<TestNode> {
     ]
 }
 
-fn test_ways() -> Vec<TestWay> {
+fn test_ways() -> Vec<TestWay<'static>> {
     vec![TestWay {
         id: 10,
         refs: vec![1, 2, 3],
@@ -1412,7 +1412,7 @@ fn missing_node_refs_get_zero_coordinates_external() {
 /// used to come out as "missing locations" for nodes that are in the file
 /// (zeroed under `--ignore-missing-nodes`). Every fixture here declares
 /// Sort.Type_then_ID and carries exact indexdata, three elements per blob.
-fn node_at(id: i64) -> TestNode {
+fn node_at(id: i64) -> TestNode<'static> {
     TestNode {
         id,
         lat: 550_000_000 + i32::try_from(id).unwrap() * 1_000,
@@ -1422,7 +1422,7 @@ fn node_at(id: i64) -> TestNode {
     }
 }
 
-fn way_over(id: i64, refs: &[i64]) -> TestWay {
+fn way_over(id: i64, refs: &[i64]) -> TestWay<'static> {
     TestWay {
         id,
         refs: refs.to_vec(),

@@ -365,7 +365,7 @@ pub fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
 
 /// Point-in-ring that handles rings crossing the antimeridian (±180° longitude).
 ///
-/// The ring is tested in the frame [`pip_ring_frame`] returns: as given when
+/// The ring is tested in the frame `pip_ring_frame` returns: as given when
 /// no edge spans more than 180 degrees of longitude, otherwise with its
 /// longitudes unwrapped, and then at `px`, `px + 360` and `px - 360`. The
 /// planar edges of that frame (with [`point_in_ring`]'s implicit closing edge
@@ -673,7 +673,7 @@ fn project_on_segment(
 ///   path inside that interval, true spherical length is at most this, so a
 ///   bound in the affine metric is a bound in metres on the sphere.
 /// - Spans are measured in the frame the reader tests the ring in
-///   ([`pip_ring_frame`]). Both endpoints of every raw edge spanning more than
+///   (`pip_ring_frame`). Both endpoints of every raw edge spanning more than
 ///   180 degrees of longitude (a seam crossing) are always kept, so those
 ///   edges survive verbatim and the reader picks the same frame; and no kept
 ///   edge spans more than `ADMIN_SIMPLIFY_MAX_CHORD_LON_DEG` of longitude in

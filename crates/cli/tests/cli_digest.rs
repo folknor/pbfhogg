@@ -125,7 +125,7 @@ fn diff_code(old: &Path, new: &Path, jobs: Option<usize>) -> Option<i32> {
     cli.run().status.code()
 }
 
-fn node(id: i64, lat: i32, lon: i32, tags: Vec<(&'static str, &'static str)>) -> TestNode {
+fn node(id: i64, lat: i32, lon: i32, tags: Vec<(&'static str, &'static str)>) -> TestNode<'static> {
     TestNode {
         id,
         lat,
@@ -135,7 +135,7 @@ fn node(id: i64, lat: i32, lon: i32, tags: Vec<(&'static str, &'static str)>) ->
     }
 }
 
-fn way(id: i64, refs: Vec<i64>, tags: Vec<(&'static str, &'static str)>) -> TestWay {
+fn way(id: i64, refs: Vec<i64>, tags: Vec<(&'static str, &'static str)>) -> TestWay<'static> {
     TestWay {
         id,
         refs,
@@ -152,7 +152,7 @@ fn relation(
     id: i64,
     members: Vec<TestMember>,
     tags: Vec<(&'static str, &'static str)>,
-) -> TestRelation {
+) -> TestRelation<'static> {
     TestRelation {
         id,
         members,
@@ -162,9 +162,9 @@ fn relation(
 }
 
 struct Fixture {
-    nodes: Vec<TestNode>,
-    ways: Vec<TestWay>,
-    relations: Vec<TestRelation>,
+    nodes: Vec<TestNode<'static>>,
+    ways: Vec<TestWay<'static>>,
+    relations: Vec<TestRelation<'static>>,
 }
 
 fn base_fixture() -> Fixture {

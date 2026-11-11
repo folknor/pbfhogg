@@ -132,15 +132,13 @@ struct RunDir {
 
 impl RunDir {
     #[allow(clippy::disallowed_methods)] // fixtures in test scratch
-    fn new(input: &Path, request: &str) -> Self {
+    fn new(request: impl FnOnce(&Path) -> Vec<u8>) -> Self {
         let scratch = crate::common::test_scratch();
         let root = scratch.path().canonicalize().expect("canonical scratch");
         for dir in ["cwd", "artefacts", "roles", "private", "capture"] {
             std::fs::create_dir(root.join(dir)).expect("layout");
         }
-        let request = request
-            .replace("@INPUT@", &input.display().to_string())
-            .replace("@ROLES@", &root.join("roles").display().to_string());
+        let request = request(&root.join("roles"));
         std::fs::write(root.join("request.json"), request).expect("request");
         Self {
             _scratch: scratch,
@@ -182,8 +180,23 @@ impl RunDir {
     }
 }
 
-const REPEAT_CAT: &str = r#"{"protocol": 1, "scenario": "repeat-cat", "iteration": ITER,
-  "bindings": {"input": "@INPUT@", "out-a": "@ROLES@/out-a", "out-b": "@ROLES@/out-b"}}"#;
+fn request(scenario: &str, iteration: u32, bindings: &serde_json::Map<String, Value>) -> Value {
+    serde_json::json!({
+        "protocol": 1, "scenario": scenario, "iteration": iteration, "bindings": bindings
+    })
+}
+
+fn repeat_request(input: &Path, roles: &Path, iteration: u32) -> Value {
+    request(
+        "repeat-cat",
+        iteration,
+        &serde_json::Map::from_iter([
+            ("input".into(), serde_json::json!(input)),
+            ("out-a".into(), serde_json::json!(roles.join("out-a"))),
+            ("out-b".into(), serde_json::json!(roles.join("out-b"))),
+        ]),
+    )
+}
 
 /// A sorted, indexed input in its own scratch.
 fn input() -> (pbfhogg_test_scratch::TestScratch, PathBuf) {
@@ -200,7 +213,9 @@ fn input() -> (pbfhogg_test_scratch::TestScratch, PathBuf) {
 /// One passing `repeat-cat` launch; returns its run directory and FIFO
 /// lines.
 fn repeat_cat(input: &Path, iteration: u32, rayon: &str) -> (RunDir, String) {
-    let run_dir = RunDir::new(input, &REPEAT_CAT.replace("ITER", &iteration.to_string()));
+    let run_dir = RunDir::new(|roles| {
+        serde_json::to_vec(&repeat_request(input, roles, iteration)).expect("request JSON")
+    });
     let fifo = Fifo::new(&run_dir.root.join("capture"));
     let ran = run_dir.launch(&fifo.path.clone(), &[("RAYON_NUM_THREADS", rayon)]);
     let lines = fifo.finish();
@@ -316,28 +331,23 @@ fn scenario_passes_on(
     roles: &[&str],
     seeded: &[&str],
 ) -> (RunDir, String) {
-    let (keep, input) = input();
-    let raw = keep
-        .path()
-        .canonicalize()
-        .expect("canonical")
-        .join("raw.osm.pbf");
-    crate::common::write_base_pbf_non_indexed(&raw);
-    let mut bindings: Vec<String> = datasets
-        .iter()
-        .map(|role| match *role {
-            "raw" => format!("\"raw\": \"{}\"", raw.display()),
-            _ => format!("\"{role}\": \"@INPUT@\""),
-        })
-        .collect();
-    for role in roles.iter().chain(seeded) {
-        bindings.push(format!("\"{role}\": \"@ROLES@/{role}\""));
+    let keep = crate::common::test_scratch();
+    let mut bindings = serde_json::Map::new();
+    for role in datasets {
+        let path = keep.path().join(format!("{role}.osm.pbf"));
+        if *role == "raw" {
+            crate::common::write_base_pbf_non_indexed(&path);
+        } else {
+            crate::common::write_base_pbf(&path);
+        }
+        bindings.insert((*role).into(), serde_json::json!(path));
     }
-    let request = format!(
-        "{{\"protocol\": 1, \"scenario\": \"{scenario}\", \"iteration\": 0, \"bindings\": {{{}}}}}",
-        bindings.join(", ")
-    );
-    let run_dir = RunDir::new(&input, &request);
+    let run_dir = RunDir::new(|dir| {
+        for role in roles.iter().chain(seeded) {
+            bindings.insert((*role).into(), serde_json::json!(dir.join(role)));
+        }
+        serde_json::to_vec(&request(scenario, 0, &bindings)).expect("request JSON")
+    });
     for role in seeded {
         std::fs::write(
             run_dir.root.join("roles").join(role),
@@ -354,24 +364,17 @@ fn scenario_passes_on(
         String::from_utf8_lossy(&ran.stdout),
         String::from_utf8_lossy(&ran.stderr)
     );
-    let mut results = run_dir.doc("scenario.json")["assertions"]
-        .as_array()
-        .expect("results")
-        .clone();
-    for call in run_dir.entries("artefacts/calls") {
-        let doc = run_dir.doc(&format!("calls/{call}"));
-        results.extend(
-            doc["assertions"]
-                .as_array()
-                .expect("results")
-                .iter()
-                .cloned(),
-        );
-    }
-    assert!(
-        results.iter().all(|r| r["status"] == "pass"),
-        "{scenario}: {results:?}"
-    );
+    let declaration = describe_scenario(scenario);
+    let calls: Vec<_> = run_dir
+        .entries("artefacts/calls")
+        .into_iter()
+        .map(|file| {
+            let doc = run_dir.doc(&format!("calls/{file}"));
+            (file, doc)
+        })
+        .collect();
+    validate_inventory(&declaration, &run_dir.doc("scenario.json"), &calls)
+        .unwrap_or_else(|error| panic!("{scenario}: {error}"));
     assert_eq!(ran.status.code(), Some(0), "{}", ran.status);
     (run_dir, lines)
 }
@@ -502,27 +505,188 @@ fn isolation_cat_runs_one_call() {
 #[test]
 fn bad_requests_are_refused_quietly() {
     let (_keep, input) = input();
-    for request in [
-        REPEAT_CAT
-            .replace("repeat-cat", "no-such")
-            .replace("ITER", "0"),
-        REPEAT_CAT
-            .replace(", \"out-b\": \"@ROLES@/out-b\"", "")
-            .replace("ITER", "0"),
-        REPEAT_CAT.replace("\"iteration\": ITER", "\"iteration\": 0, \"iteration\": 0"),
-        REPEAT_CAT.replace("ITER", "-0"),
-        REPEAT_CAT.replace("ITER", "0.5"),
-        format!("{} x", REPEAT_CAT.replace("ITER", "0")),
+    // The same input and live FIFO must support a valid launch first.
+    let _control = repeat_cat(&input, 0, "2");
+    for (case, expected) in [
+        (0, "no scenario"),
+        (1, "bindings name"),
+        (2, "duplicate key"),
+        (3, "not a plain integer"),
+        (4, "a number with a fraction or exponent"),
+        (5, "trailing bytes"),
     ] {
-        let run_dir = RunDir::new(&input, &request);
-        let missing = run_dir.root.join("no-fifo");
-        let ran = run_dir.launch(&missing, &[]);
-        assert_eq!(ran.status.code(), Some(2), "{request}");
-        assert!(ran.stdout.is_empty() && ran.stderr.is_empty(), "{request}");
-        assert_eq!(run_dir.entries("artefacts"), ["refusal.json"], "{request}");
+        let run_dir = RunDir::new(|roles| {
+            let mut value = repeat_request(&input, roles, 0);
+            if case == 0 {
+                value["scenario"] = serde_json::json!("no-such");
+            }
+            if case == 1 {
+                value["bindings"]
+                    .as_object_mut()
+                    .expect("bindings")
+                    .remove("out-b");
+            }
+            let text = serde_json::to_string(&value).expect("request JSON");
+            // These four cases deliberately violate JSON or its integer grammar.
+            match case {
+                2 => text.replacen("\"iteration\":0", "\"iteration\":0,\"iteration\":0", 1),
+                3 => text.replacen("\"iteration\":0", "\"iteration\":-0", 1),
+                4 => text.replacen("\"iteration\":0", "\"iteration\":0.5", 1),
+                5 => format!("{text} x"),
+                _ => text,
+            }
+            .into_bytes()
+        });
+        let fifo = Fifo::new(&run_dir.root.join("capture"));
+        let ran = run_dir.launch(&fifo.path.clone(), &[]);
+        let lines = fifo.finish();
+        assert_eq!(ran.status.code(), Some(2), "case {case}");
+        assert!(
+            ran.stdout.is_empty() && ran.stderr.is_empty(),
+            "case {case}"
+        );
+        assert!(lines.is_empty(), "refused request emitted markers: {lines}");
+        assert_eq!(run_dir.entries("artefacts"), ["refusal.json"]);
         let reason = run_dir.doc("refusal.json");
         assert_eq!(reason["protocol"], 1);
-        assert!(!reason["reason"].as_str().expect("reason").is_empty());
+        assert!(
+            reason["reason"]
+                .as_str()
+                .expect("reason")
+                .contains(expected),
+            "{reason}"
+        );
         assert!(run_dir.entries("roles").is_empty());
     }
+}
+
+/// Read the executable's declaration, without coupling tests to scenario internals.
+fn describe_scenario(id: &str) -> Value {
+    let scratch = crate::common::test_scratch();
+    let mut cmd = Command::new(EXE);
+    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let ran = run(cmd, &[], scratch.path(), &scratch);
+    assert!(ran.status.success());
+    assert!(ran.stderr.is_empty());
+    let doc: Value = serde_json::from_slice(&ran.stdout).expect("describe JSON");
+    doc["scenarios"]
+        .as_array()
+        .expect("scenarios")
+        .iter()
+        .find(|s| s["id"] == id)
+        .expect("declared scenario")
+        .clone()
+}
+
+/// Local executable-test coverage check. The reusable consumer validator
+/// belongs in brokkr; compare declarations here until it is available there.
+fn validate_inventory(
+    decl: &Value,
+    scenario: &Value,
+    calls: &[(String, Value)],
+) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let strings = |values: &Value| -> Result<Vec<String>, String> {
+        values
+            .as_array()
+            .ok_or_else(|| "missing inventory".to_owned())?
+            .iter()
+            .map(|v| {
+                v["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "missing id".to_owned())
+            })
+            .collect()
+    };
+    let declared_calls = strings(&decl["calls"])?;
+    let mut expected_files: Vec<_> = declared_calls
+        .iter()
+        .map(|id| format!("{id}.json"))
+        .collect();
+    expected_files.sort();
+    let mut files: Vec<_> = calls.iter().map(|(file, _)| file.clone()).collect();
+    files.sort();
+    if files != expected_files {
+        return Err("call inventory differs".into());
+    }
+    let declarations = decl["assertions"]
+        .as_array()
+        .ok_or("missing assertion declarations")?;
+    for (call, doc) in std::iter::once((None, scenario))
+        .chain(calls.iter().map(|(_, doc)| (doc["call"].as_str(), doc)))
+    {
+        if doc["protocol"] != 1 || (std::ptr::eq(doc, scenario) && doc["scenario"] != decl["id"]) {
+            return Err("document identity differs".into());
+        }
+        if let Some(id) = call {
+            if !declared_calls.iter().any(|c| c == id)
+                || !calls
+                    .iter()
+                    .any(|(file, value)| file == &format!("{id}.json") && std::ptr::eq(value, doc))
+            {
+                return Err("call identity differs".into());
+            }
+        } else if !std::ptr::eq(doc, scenario) {
+            return Err("missing call identity".into());
+        }
+        let expected: BTreeSet<_> = declarations
+            .iter()
+            .filter(|a| a["call"].as_str() == call)
+            .map(|a| a["id"].as_str().ok_or("missing declared assertion id"))
+            .collect::<Result<_, _>>()?;
+        let actual = strings(&doc["assertions"])?;
+        let unique: BTreeSet<_> = actual.iter().map(String::as_str).collect();
+        if unique.len() != actual.len() || unique != expected {
+            return Err(format!("assertion inventory differs for {call:?}"));
+        }
+        if !doc["assertions"]
+            .as_array()
+            .ok_or("missing assertions")?
+            .iter()
+            .all(|a| a["status"] == "pass")
+        {
+            return Err("assertion did not pass".into());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn inventory_rejects_missing_duplicate_misplaced_and_undeclared_results() {
+    let decl = serde_json::json!({"id":"s", "calls":[{"id":"a"}],
+        "assertions":[{"id":"outer","call":null},{"id":"inner","call":"a"}]});
+    let scenario = serde_json::json!({"protocol":1,"scenario":"s",
+        "assertions":[{"id":"outer","status":"pass"}]});
+    let call = serde_json::json!({"protocol":1,"scenario":"s","call":"a",
+        "assertions":[{"id":"inner","status":"pass"}]});
+    let calls = vec![("a.json".into(), call.clone())];
+    assert!(validate_inventory(&decl, &scenario, &calls).is_ok());
+    assert!(validate_inventory(&decl, &scenario, &[]).is_err());
+    for assertions in [
+        serde_json::json!([]),
+        serde_json::json!([{"id":"inner","status":"pass"},{"id":"inner","status":"pass"}]),
+        serde_json::json!([{"id":"outer","status":"pass"}]),
+        serde_json::json!([{"id":"other","status":"pass"}]),
+    ] {
+        let mut bad = call.clone();
+        bad["assertions"] = assertions;
+        assert!(validate_inventory(&decl, &scenario, &[("a.json".into(), bad)]).is_err());
+    }
+    let mut missing = scenario.clone();
+    missing["assertions"] = serde_json::json!([]);
+    assert!(validate_inventory(&decl, &missing, &calls).is_err());
+    let duplicates = vec![("a.json".into(), call.clone()), ("a.json".into(), call)];
+    assert!(validate_inventory(&decl, &scenario, &duplicates).is_err());
+}
+
+#[test]
+fn request_paths_round_trip_json_sensitive_characters() {
+    let scratch = crate::common::test_scratch();
+    let input = scratch.path().join("input-\"-\\-\n.osm.pbf");
+    crate::common::write_base_pbf(&input);
+    let (run, _) = repeat_cat(&input, 0, "2");
+    let bytes = std::fs::read(run.root.join("request.json")).expect("request");
+    let doc: Value = serde_json::from_slice(&bytes).expect("escaped request");
+    assert_eq!(doc["bindings"]["input"], serde_json::json!(input));
 }

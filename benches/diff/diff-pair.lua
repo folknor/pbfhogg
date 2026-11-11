@@ -11,6 +11,7 @@
 --   brokkr bench --dry-run diff-pair --from base --to twin --format default,osc
 --   brokkr bench --hotpath diff-pair --from base --to 20260411
 local diff = require("diff")
+local expect = require("expect")
 
 function validate(params, keys)
     diff.validate(params)
@@ -23,12 +24,15 @@ function bench(params)
     record.meta = { to_snapshot_file = new.file.path:match("[^/]+$"),
         to_snapshot_file_mb = filesize(new.file) / 1000000 }
     local want
+    local key = "diff-snapshots"
     if old.xxhash and new.xxhash then
         local a, b = old.xxhash, new.xxhash
         if a > b then a, b = b, a end
         local declared = params.dataset.expect
         want = declared and declared["diff-snapshots"]
         want = want and want[a .. "+" .. b]
+        key = key .. "." .. a .. "+" .. b
     end
+    want = expect.selected(params, key, want)
     return diff.run(params, old.file, new.file, want)
 end

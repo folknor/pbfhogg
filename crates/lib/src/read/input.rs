@@ -24,7 +24,7 @@
 //! file, not which blobs it reads: a reader of contiguous runs needs plain
 //! readahead, a per-blob dispatched pool is indifferent, and a pool handed
 //! the walker's description reads under `RANDOM`
-//! ([`InputSource::open_random_access`] has the measurements). Opening the path each time, though, resolves it each time, so
+//! (`InputSource::open_random_access` has the measurements). Opening the path each time, though, resolves it each time, so
 //! a file renamed over the input mid-run (an atomic replace by a downloader)
 //! would be read partly from each file, with no error. A [`PinnedInput`]
 //! closes that gap without merging any descriptions: it is taken once, at
@@ -620,7 +620,7 @@ pub(crate) fn pin_sources(
 /// can name the file. Cloning shares both.
 ///
 /// Inside the crate an input can also be opened `O_DIRECT`
-/// ([`InputFile::direct`]); it then carries the file's direct I/O alignment,
+/// (`InputFile::direct`); it then carries the file's direct I/O alignment,
 /// and every reader that takes an `InputFile` by this type (pass 2's frame
 /// reads, the range copies in `crate::write::copy_range`) reads it in
 /// aligned spans. The constructor's one caller hands it only to those.

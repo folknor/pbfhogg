@@ -60,8 +60,8 @@ impl InterpolationStep {
 /// the lower anchor with no parity (as Nominatim reads it).
 ///
 /// This type owns the numbering rule: which anchor pairs a section may run
-/// between ([`Self::answers`]) and which number a point along it gets
-/// ([`Self::number_at`]). The builder and the reader both use it, so the
+/// between (`Self::answers`) and which number a point along it gets
+/// (`Self::number_at`). The builder and the reader both use it, so the
 /// sections the builder writes are exactly the ones the reader answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpolationType {

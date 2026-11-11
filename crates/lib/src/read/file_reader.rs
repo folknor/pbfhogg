@@ -1,7 +1,7 @@
 //! Unified file reader that selects between buffered and O_DIRECT I/O.
 //!
 //! [`FileReader`] wraps either a standard `BufReader<File>` or (when the
-//! `linux-direct-io` feature is enabled) a [`DirectReader`] that bypasses the
+//! `linux-direct-io` feature is enabled) a `DirectReader` that bypasses the
 //! kernel page cache. All read-path code uses `FileReader` as the concrete
 //! reader type, so the O_DIRECT path is zero-cost when the feature is off
 //! (single-variant enum optimizes away).

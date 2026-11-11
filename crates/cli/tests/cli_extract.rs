@@ -68,7 +68,7 @@ enum RegionArg<'a> {
     Polygon(&'a Path),
 }
 
-fn test_nodes() -> Vec<TestNode> {
+fn test_nodes() -> Vec<TestNode<'static>> {
     vec![
         TestNode {
             id: 1,
@@ -101,7 +101,7 @@ fn test_nodes() -> Vec<TestNode> {
     ]
 }
 
-fn test_ways() -> Vec<TestWay> {
+fn test_ways() -> Vec<TestWay<'static>> {
     vec![
         TestWay {
             id: 10,
@@ -124,7 +124,7 @@ fn test_ways() -> Vec<TestWay> {
     ]
 }
 
-fn test_relations() -> Vec<TestRelation> {
+fn test_relations() -> Vec<TestRelation<'static>> {
     vec![
         TestRelation {
             id: 100,
@@ -694,7 +694,7 @@ fn member_relation(id: i64) -> TestMember {
 /// a parent, a grandparent, a parent stored before its child, a cycle
 /// through a self-member, a multipolygon parent that also lists way 11, a
 /// parent of the unmatched route 101, and a parent of an absent relation.
-fn parent_relations() -> Vec<TestRelation> {
+fn parent_relations() -> Vec<TestRelation<'static>> {
     let rel = |id: i64, members: Vec<TestMember>, kind: &'static str| TestRelation {
         id,
         members,
@@ -1853,7 +1853,7 @@ fn simple_multi_blob_bbox_partitioning() {
 // ---------------------------------------------------------------------------
 
 /// `nodes` inside `BBOX_STR`, ids starting at `start`.
-fn inside_nodes(count: i32, start: i64) -> Vec<TestNode> {
+fn inside_nodes(count: i32, start: i64) -> Vec<TestNode<'static>> {
     (0..count)
         .map(|i| TestNode {
             id: start + i64::from(i),

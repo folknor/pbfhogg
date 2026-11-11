@@ -620,7 +620,7 @@ fn write_synthetic_postal_boundary_input(path: &Path) {
 }
 
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn generate_nonzero_nodes(count: usize, start_id: i64) -> Vec<TestNode> {
+fn generate_nonzero_nodes(count: usize, start_id: i64) -> Vec<TestNode<'static>> {
     (0..count)
         .map(|i| TestNode {
             id: start_id + i as i64,
@@ -695,15 +695,14 @@ fn write_street_cell_overflow_input(path: &Path) {
             meta: None,
         },
     ];
+    let names: Vec<String> = (0..65_536u32).map(|i| format!("Street{i}")).collect();
     let ways: Vec<TestWay> = (0..65_536u32)
-        .map(|i| {
-            let name: &'static str = Box::leak(format!("Street{i}").into_boxed_str());
-            TestWay {
-                id: 1_000 + i64::from(i),
-                refs: vec![1, 2],
-                tags: vec![("highway", "residential"), ("name", name)],
-                meta: None,
-            }
+        .zip(&names)
+        .map(|(i, name)| TestWay {
+            id: 1_000 + i64::from(i),
+            refs: vec![1, 2],
+            tags: vec![("highway", "residential"), ("name", name.as_str())],
+            meta: None,
         })
         .collect();
     write_test_pbf_sorted(path, &nodes, &ways, &[]);
@@ -736,15 +735,17 @@ fn write_interp_cell_overflow_input(path: &Path) {
             meta: None,
         },
     ];
+    let names: Vec<String> = (0..65_536u32).map(|i| format!("Interp{i}")).collect();
     let ways: Vec<TestWay> = (0..65_536u32)
-        .map(|i| {
-            let street: &'static str = Box::leak(format!("Interp{i}").into_boxed_str());
-            TestWay {
-                id: 1_000 + i64::from(i),
-                refs: vec![1, 2],
-                tags: vec![("addr:interpolation", "all"), ("addr:street", street)],
-                meta: None,
-            }
+        .zip(&names)
+        .map(|(i, street)| TestWay {
+            id: 1_000 + i64::from(i),
+            refs: vec![1, 2],
+            tags: vec![
+                ("addr:interpolation", "all"),
+                ("addr:street", street.as_str()),
+            ],
+            meta: None,
         })
         .collect();
     write_test_pbf_sorted(path, &nodes, &ways, &[]);
@@ -796,27 +797,24 @@ fn write_admin_cell_overflow_input(path: &Path) {
         meta: None,
     }];
     // 65 536 admin relations, all referencing the same outer way.
-    // Each gets a unique name (via leaked Box<str>) so the builder
-    // treats them as distinct admin polygons. The names are leaked
-    // because TestRelation::tags wants `&'static str`; the test
-    // process exits soon after, so the leak is bounded.
+    // Names are owned for this write and borrowed by the fixtures, so every
+    // distinct polygon name is reclaimed when fixture construction returns.
+    let names: Vec<String> = (0..65_536u32).map(|i| format!("Polygon{i}")).collect();
     let relations: Vec<TestRelation> = (0..65_536u32)
-        .map(|i| {
-            let name: &'static str = Box::leak(format!("Polygon{i}").into_boxed_str());
-            TestRelation {
-                id: 1_000 + i64::from(i),
-                members: vec![TestMember {
-                    id: MemberId::Way(100),
-                    role: "outer",
-                }],
-                tags: vec![
-                    ("boundary", "administrative"),
-                    ("admin_level", "8"),
-                    ("name", name),
-                    ("type", "boundary"),
-                ],
-                meta: None,
-            }
+        .zip(&names)
+        .map(|(i, name)| TestRelation {
+            id: 1_000 + i64::from(i),
+            members: vec![TestMember {
+                id: MemberId::Way(100),
+                role: "outer",
+            }],
+            tags: vec![
+                ("boundary", "administrative"),
+                ("admin_level", "8"),
+                ("name", name.as_str()),
+                ("type", "boundary"),
+            ],
+            meta: None,
         })
         .collect();
 
@@ -1047,7 +1045,7 @@ fn null_island_street_vertex_is_not_treated_as_absent() {
 /// `set_atomic` panic when its pre-allocation bound understated it.
 const HIGH_NODE_ID: i64 = 50_000_000;
 
-fn street_nodes(ids: &[i64]) -> Vec<TestNode> {
+fn street_nodes(ids: &[i64]) -> Vec<TestNode<'static>> {
     ids.iter()
         .zip(0i32..)
         .map(|(&id, i)| TestNode {
@@ -1060,7 +1058,7 @@ fn street_nodes(ids: &[i64]) -> Vec<TestNode> {
         .collect()
 }
 
-fn street_way(refs: Vec<i64>) -> TestWay {
+fn street_way(refs: Vec<i64>) -> TestWay<'static> {
     TestWay {
         id: 10,
         refs,
@@ -1508,7 +1506,7 @@ fn write_all_record_kinds_input(path: &Path) {
     );
 }
 
-fn all_record_kinds_nodes() -> Vec<TestNode> {
+fn all_record_kinds_nodes() -> Vec<TestNode<'static>> {
     vec![
         TestNode {
             id: 1,
@@ -3735,7 +3733,11 @@ fn outside_block_geometry(
 }
 
 /// Nodes and a named residential way between `ends`, IDs from `id`.
-fn named_way(id: i64, ends: [(i32, i32); 2], name: &'static str) -> (Vec<TestNode>, TestWay) {
+fn named_way(
+    id: i64,
+    ends: [(i32, i32); 2],
+    name: &'static str,
+) -> (Vec<TestNode<'static>>, TestWay<'static>) {
     let nodes = ends
         .iter()
         .zip(id..)

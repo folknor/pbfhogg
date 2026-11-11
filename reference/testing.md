@@ -188,12 +188,43 @@ mechanism, not the tiering model.
 |---|---|---|---|
 | 1. Fast contracts | seconds | Every edit | `brokkr check` (default) |
 | 2. Command slice | tens of seconds | While working on that command | `brokkr check --profile <cmd>` |
-| 3. Full in-project | minutes | Before merge | `brokkr check --profile full` |
+| 3. Full in-project | minutes | Before merge | `brokkr check --gate` |
 | 4. Scale/perf | hours | Performance work, release evidence | `brokkr bench`, `brokkr suite` |
 | 5. External cross-validation | depends | Release gate | `brokkr verify` |
 
-Tiers 1-3 are `brokkr check` profiles. Tiers 4-5 are separate
-brokkr commands.
+Tiers 1-3 use `brokkr check`. Tiers 4-5 are separate brokkr commands.
+The merge prerequisite is `brokkr check --gate`: it runs the unfiltered
+feature and target sweeps, doctests, execution accounting and gate-only
+member checks. The `full` profile is partial: it selects only `all` and
+has substring skips. Focused profiles, including `full`, do not replace
+the gate, even when they report success.
+
+The root `brokkr.toml` enables the rustdoc phase with `[rustdoc]`.
+It resolves intra-doc links per distinct build shape after clippy, before
+pre-test checks, and fails on warnings as well as errors. Markdown link
+checking does not replace this compiler pass. The complete gate requires
+this phase; a partial profile may skip it.
+
+The `serial` profile selects `all-serial`, the non-parallel twin of `all`
+curated to the `serial::` modules, and sets `test_threads = 1`. Both binary
+execution and tests within each binary are sequential. Keep the twin's
+packages and features aligned with `all`; a thread limit on a parallel
+sweep cannot provide this guarantee. The gate does not provide it either:
+a complete lane may not skip tests, so the gate runs the `serial::`
+modules inside the parallel `all` lane, concurrently with other binaries.
+A test that is wrong, not merely slower, under concurrency does not
+belong in `serial::`; that module is for tests whose cost (memory, for
+instance) makes concurrent runs undesirable, and `brokkr check --profile
+serial` is how they get their sequential run.
+
+The executable `musl` and `musl-all` sweeps currently require an x86_64
+Linux host able to execute `x86_64-unknown-linux-musl` binaries directly.
+Their literal targets do not adapt to aarch64 hosts. The `riscv64` lint
+sweep is compile-only coverage of the guard fallback, not executable
+musl coverage. Brokkr refuses configured target runners, but needs a
+planner capability check to refuse an unexecutable target before building
+or resolve a native musl target. Until then this is a host restriction
+of the configured gate, not a portable execution guarantee.
 
 `brokkr check` enforces a fixed 20 s per-test watchdog with no
 override, on every profile including `--profile full`. Tests slower
@@ -249,8 +280,8 @@ osmium checks).
 - **During refactor:** edit code + inline tests + any fault test
   whose hook moved. Run `brokkr check`. Green ⇒ refactor
   structurally landing. Tiers 2-5 stay silent during iteration.
-- **Before merge:** run tiers 2-3 to confirm CLI behaviour through
-  the stable surface.
+- **Before merge:** require a successful `brokkr check --gate`. Use
+  command profiles for focused feedback; they do not certify the merge.
 - **Before release:** run tier 4 for performance regression and
   tier 5 for external parity.
 
@@ -425,10 +456,12 @@ exception, not a tier - should not survive across many PRs.
 - **Capability accounting.** `Invocation::capabilities` (`test-hooks`,
   doc-hidden) reads the invocation's transition word (live call guards and
   permits, and whether a count saturated) and its census (issued block
-  iterators, writers, bound outputs and blocks). `crates/lib/tests/cancel.rs` asserts it
-  is back to all zero after every command at every tripped checkpoint, that
-  no command issues its own values, and that a nested public entry mints its
-  own guard; `crates/lib/tests/capabilities.rs` parks a block iterator's pipeline in the
+  iterators, writers, bound outputs and blocks). `crates/lib/tests/cancel.rs`
+  asserts that it is back to all zero after every run of its selected
+  fixture scenarios, sampled cancellation runs included; that each
+  scenario's census callback observes at least one checkpoint and sees no
+  value the command issued itself at any observed checkpoint; and that a
+  nested public entry mints its own guard; `crates/lib/tests/capabilities.rs` parks a block iterator's pipeline in the
   caller's `Read` (a stream whose reads off the building thread wait on a
   channel) and checks the values a caller holds at rest are accounted for.
   The word's saturation arithmetic is a unit test in `crates/lib/src/host.rs`, on the

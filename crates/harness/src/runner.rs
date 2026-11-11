@@ -20,8 +20,9 @@
 //! 5. The call's tap, if it has one, released (dropping the invocation it
 //!    may hold), then every value of the call dropped. The library's work does not outlive
 //!    the call that started it (its pools are joined, its writers wait for
-//!    their framing), so once the host is gone nothing of the call can
-//!    still report.
+//!    their framing). Exclusive collector ownership checks that no call
+//!    diagnostic sender survives this cleanup; an escaped sender fails the
+//!    scenario even if it has not emitted yet.
 //! 6. The call's collection closed, its publications and its call sink's
 //!    account (`Invocation::stream_account`) read.
 //! 7. The call document written.
@@ -42,12 +43,12 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The harness's exit status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Exit {
-    /// Ran, and every result it reported passed.
+    /// Ran every declared call and assertion exactly once, and all passed.
     Passed,
     /// Ran, and some result it reported did not pass.
     Failed,
@@ -146,6 +147,7 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
         settings: Settings::establish(scenario.starts_global_pool()),
         all_passed: true,
         late: Vec::new(),
+        inventory: Mutex::new(Inventory::default()),
     };
     // Setup: every generated role, before any call.
     scenario.setup(&ctx)?;
@@ -155,11 +157,13 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
         crate::scenarios::DIAGNOSTICS_CLOSED,
         late.is_empty(),
         if late.is_empty() {
-            "no call diagnostic arrived after its call document".to_owned()
+            "every call diagnostic sender was released at collection close; no late or over-budget event observed"
+                .to_owned()
         } else {
             late
         },
     ));
+    ctx.inventory().complete(&decl, &results)?;
     let passed = ctx.all_passed && results.iter().all(|r| r.status == Status::Pass);
     let diagnostics: Vec<Value> = ctx
         .setup
@@ -380,6 +384,7 @@ pub(crate) struct CallRecord {
     context: Value,
     diagnostics: Vec<Value>,
     collector: Arc<Collector>,
+    diagnostics_released: bool,
 }
 
 impl CallRecord {
@@ -412,10 +417,17 @@ pub(crate) struct Ctx<'a> {
     settings: Settings,
     all_passed: bool,
     /// Each call's collector, kept to detect a late event.
-    late: Vec<(&'static str, Arc<Collector>)>,
+    late: Vec<(&'static str, Arc<Collector>, bool)>,
+    inventory: Mutex<Inventory>,
 }
 
 impl Ctx<'_> {
+    fn inventory(&self) -> std::sync::MutexGuard<'_, Inventory> {
+        self.inventory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The path bound to `role`.
     pub(crate) fn binding(&self, role: &str) -> &Path {
         self.bindings
@@ -431,6 +443,7 @@ impl Ctx<'_> {
         body: impl FnOnce(&Host, &CallEnv<'_>) -> pbfhogg::Result<()>,
     ) -> Result<CallRecord, String> {
         let id = spec.id;
+        self.inventory().start(self.decl, id)?;
         let context = self.context(&spec)?;
         let sink = self
             .fifo
@@ -439,7 +452,7 @@ impl Ctx<'_> {
         let tap = spec.tap.clone().map(|tap| tap as Arc<dyn InstrumentSink>);
         let invocation = Invocation::with_call_sink(sink, tap);
         let released = Released(spec.tap);
-        let collector = Arc::new(Collector::new(self.fifo.clone()));
+        let mut collector = Arc::new(Collector::new(self.fifo.clone()));
         let host = Host {
             diagnostics: Diagnostics::new(
                 Arc::clone(&collector) as Arc<dyn pbfhogg::host::DiagnosticSink>
@@ -475,11 +488,10 @@ impl Ctx<'_> {
         let seal_us = self.fifo.now_us();
         drop(released);
         drop(host);
-        let diagnostics = collector
-            .close()
-            .iter()
-            .map(crate::diag::Captured::to_json)
-            .collect();
+        // The body must join its work before returning. Exclusive ownership
+        // proves that no diagnostic sender (including a weak reference) escaped
+        // that scope. A counter sample alone cannot prove future silence.
+        let (diagnostics, diagnostics_released) = close_call_diagnostics(&mut collector);
         let publications = self.publications(id, &invocation)?;
         let stream = invocation
             .stream_account()
@@ -497,6 +509,7 @@ impl Ctx<'_> {
             context,
             diagnostics,
             collector,
+            diagnostics_released,
         })
     }
 
@@ -570,8 +583,13 @@ impl Ctx<'_> {
         record: &CallRecord,
         results: &[Outcome],
     ) -> Result<(), String> {
+        self.inventory().finish(self.decl, record.id, results)?;
         self.all_passed &= results.iter().all(|r| r.status == Status::Pass);
-        self.late.push((record.id, Arc::clone(&record.collector)));
+        self.late.push((
+            record.id,
+            Arc::clone(&record.collector),
+            record.diagnostics_released,
+        ));
         let publications: Vec<Value> = record
             .publications
             .iter()
@@ -604,15 +622,131 @@ impl Ctx<'_> {
         write_json(&self.calls_dir.join(format!("{}.json", record.id)), &doc)
     }
 
-    /// Calls whose collector received an event after it closed, if any.
+    /// Ownership at close is the proof; the late count is supplemental.
+    /// This covers delivery through the supplied sink, not arbitrary work or
+    /// diagnostics a body sends to an unrelated sink. Events a collector
+    /// refused for its budget fail the scenario too, for the setup collector
+    /// as well as every call's: truncated evidence never certifies.
     fn late_report(&self) -> String {
-        self.late
+        let calls = self
+            .late
             .iter()
-            .filter(|(_, c)| c.late() > 0)
-            .map(|(id, c)| format!("call {id}: {} late diagnostic events", c.late()))
+            .filter(|(_, c, released)| !released || c.late() > 0 || c.dropped() > 0)
+            .map(|(id, c, released)| {
+                format!(
+                    "call {id}: diagnostic senders released at close: {released}; {} late diagnostic events; {} events dropped over budget",
+                    c.late(),
+                    c.dropped(),
+                )
+            });
+        let setup = Some(self.setup.dropped())
+            .filter(|&dropped| dropped > 0)
+            .map(|dropped| format!("setup: {dropped} events dropped over budget"));
+        setup
+            .into_iter()
+            .chain(calls)
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+/// Close after the call has joined its work and released its host and tap.
+/// Failure of exclusive ownership is sticky even if a sender disappears before
+/// the scenario's final sample. No waiting or guessed grace period is involved.
+fn close_call_diagnostics(collector: &mut Arc<Collector>) -> (Vec<Value>, bool) {
+    let released = Arc::get_mut(collector).is_some();
+    let diagnostics = collector
+        .close()
+        .iter()
+        .map(crate::diag::Captured::to_json)
+        .collect();
+    (diagnostics, released)
+}
+
+/// Record attempts before validating them: a scenario cannot swallow a refusal
+/// and turn an undeclared or repeated call or assertion into a passing launch.
+#[derive(Default)]
+struct Inventory {
+    started: Vec<&'static str>,
+    finished: Vec<&'static str>,
+    assertions: Vec<(Option<&'static str>, &'static str)>,
+}
+
+impl Inventory {
+    fn start(&mut self, decl: &ScenarioDecl, id: &'static str) -> Result<(), String> {
+        self.started.push(id);
+        if !decl.calls.iter().any(|call| call.id == id) {
+            return Err(format!("undeclared call {id}"));
+        }
+        if self.started.iter().filter(|&&name| name == id).count() != 1 {
+            return Err(format!("repeated call {id}"));
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        decl: &ScenarioDecl,
+        id: &'static str,
+        results: &[Outcome],
+    ) -> Result<(), String> {
+        self.finished.push(id);
+        self.assertions
+            .extend(results.iter().map(|r| (Some(id), r.id)));
+        if !self.started.contains(&id)
+            || self.finished.iter().filter(|&&name| name == id).count() != 1
+        {
+            return Err(format!("call {id} was not started or was already finished"));
+        }
+        exact_inventory(
+            "call assertions",
+            decl.assertions
+                .iter()
+                .filter(|a| a.call == Some(id))
+                .map(|a| a.id),
+            results.iter().map(|r| r.id),
+        )
+    }
+
+    fn complete(&self, decl: &ScenarioDecl, results: &[Outcome]) -> Result<(), String> {
+        exact_inventory(
+            "started calls",
+            decl.calls.iter().map(|c| c.id),
+            self.started.iter().copied(),
+        )?;
+        exact_inventory(
+            "finished calls",
+            decl.calls.iter().map(|c| c.id),
+            self.finished.iter().copied(),
+        )?;
+        exact_inventory(
+            "assertions with their scopes",
+            decl.assertions.iter().map(|a| (a.call, a.id)),
+            self.assertions
+                .iter()
+                .copied()
+                .chain(results.iter().map(|r| (None, r.id))),
+        )
+    }
+}
+
+/// Compare multisets, retaining duplicates rather than hiding them in a set.
+/// Duplicate declarations are also refused, even if execution mirrors them.
+fn exact_inventory<T: Ord + std::fmt::Debug>(
+    label: &str,
+    expected: impl Iterator<Item = T>,
+    actual: impl Iterator<Item = T>,
+) -> Result<(), String> {
+    let mut expected: Vec<_> = expected.collect();
+    let mut actual: Vec<_> = actual.collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if expected.windows(2).any(|pair| pair[0] == pair[1]) || expected != actual {
+        return Err(format!(
+            "{label}: declared {expected:?}, observed {actual:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn decision_name(decision: Decision) -> &'static str {
@@ -701,4 +835,125 @@ fn write_json(path: &Path, doc: &Value) -> Result<(), String> {
     let text =
         serde_json::to_string(doc).map_err(|e| format!("serializing {}: {e}", path.display()))?;
     std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Inventory, close_call_diagnostics, exact_inventory};
+    use crate::diag::Collector;
+    use crate::protocol::{AssertionDecl, Outcome, ScenarioDecl};
+    use pbfhogg::host::{DiagnosticSink as _, Event, EventKind};
+    use std::sync::Arc;
+
+    fn declaration() -> ScenarioDecl {
+        let scenarios = crate::scenarios::all();
+        let mut decl = scenarios[0].decl();
+        decl.calls.truncate(1);
+        decl.assertions = vec![AssertionDecl {
+            id: "checked",
+            call: Some(decl.calls[0].id),
+            covers: &[],
+        }];
+        decl
+    }
+
+    #[test]
+    fn inventory_requires_execution_and_completion() {
+        let decl = declaration();
+        let id = decl.calls[0].id;
+        let mut inventory = Inventory::default();
+        assert!(inventory.complete(&decl, &[]).is_err());
+        inventory.start(&decl, id).expect("start");
+        assert!(inventory.complete(&decl, &[]).is_err());
+        inventory
+            .finish(&decl, id, &[Outcome::judge("checked", true, "ok")])
+            .expect("finish");
+        inventory.complete(&decl, &[]).expect("complete");
+        assert!(inventory.start(&decl, id).is_err());
+        assert!(inventory.complete(&decl, &[]).is_err());
+    }
+
+    #[test]
+    fn inventory_remembers_repeated_and_undeclared_attempts() {
+        let decl = declaration();
+        let id = decl.calls[0].id;
+        let mut inventory = Inventory::default();
+        inventory.start(&decl, id).expect("start");
+        let results = [Outcome::judge("checked", true, "ok")];
+        inventory.finish(&decl, id, &results).expect("finish");
+        assert!(inventory.finish(&decl, id, &results).is_err());
+        assert!(inventory.complete(&decl, &[]).is_err());
+        let mut inventory = Inventory::default();
+        assert!(inventory.start(&decl, "undeclared").is_err());
+        assert!(inventory.complete(&decl, &[]).is_err());
+    }
+
+    #[test]
+    fn assertion_inventory_rejects_missing_duplicate_misplaced_and_undeclared() {
+        let expected = [(Some("call"), "checked"), (None, "scenario")];
+        for actual in [
+            vec![(None, "scenario")],
+            vec![
+                (Some("call"), "checked"),
+                (Some("call"), "checked"),
+                (None, "scenario"),
+            ],
+            vec![(None, "checked"), (Some("call"), "scenario")],
+            vec![
+                (Some("call"), "checked"),
+                (None, "scenario"),
+                (None, "extra"),
+            ],
+        ] {
+            assert!(
+                exact_inventory("assertions", expected.into_iter(), actual.into_iter()).is_err()
+            );
+        }
+        assert!(
+            exact_inventory(
+                "declarations",
+                ["same", "same"].into_iter(),
+                ["same", "same"].into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_close_refuses_a_sender_before_its_delayed_emission() {
+        let (_dir, fifo, _reader) = crate::test_scratch::marker_fifo();
+        let mut collector = Arc::new(Collector::new(fifo));
+        let sender = Arc::clone(&collector);
+        let (release, ready) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            ready.recv().expect("release signal");
+            sender.event(&Event {
+                kind: EventKind::Note,
+                key: "delayed",
+                args: format_args!("after close"),
+            });
+        });
+        let (diagnostics, released) = close_call_diagnostics(&mut collector);
+        assert!(diagnostics.is_empty());
+        assert!(!released);
+        assert_eq!(collector.late(), 0);
+        release.send(()).expect("send release");
+        task.join().expect("join sender");
+        assert_eq!(collector.late(), 1);
+        assert!(!released);
+    }
+
+    #[test]
+    fn diagnostic_close_accepts_joined_senders_and_refuses_weak_senders() {
+        let (_dir, fifo, _reader) = crate::test_scratch::marker_fifo();
+        let mut collector = Arc::new(Collector::new(fifo));
+        let sender = Arc::clone(&collector);
+        std::thread::spawn(move || drop(sender))
+            .join()
+            .expect("join");
+        assert!(close_call_diagnostics(&mut collector).1);
+        let weak = Arc::downgrade(&collector);
+        assert!(!close_call_diagnostics(&mut collector).1);
+        drop(weak);
+    }
 }

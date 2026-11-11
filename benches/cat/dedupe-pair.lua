@@ -18,7 +18,10 @@
 --     wall mixes passthrough with the overlap sweep and its transitions.
 --
 -- The cat child's counters say what the plan did; read them before
--- trusting a cell to measure passthrough:
+-- trusting a cell to measure passthrough. This remains manual: brokkr's
+-- Lua child result exposes no sidecar counters. A coverage predicate must
+-- live in brokkr's call contract, or consume counters it exposes, rather
+-- than parse diagnostic stderr or launch a results-query subprocess:
 --
 --   brokkr sidecar UUID --child N --counters --grep cat_dedupe
 --
@@ -62,6 +65,10 @@ function bench(params)
     -- shapes above) the merge must have the base's element content; diff
     -- exit 0 says that much, not that metadata or encoding match. A
     -- correctness run, not a timing cell.
+    -- This is explicitly an output-equals-base assertion, not evidence that
+    -- every arbitrary snapshot pair should have that answer. Non-subset
+    -- pairs are valid timing inputs with --check no. A changed overlapping
+    -- element can also fail this assertion even when IDs form a subset.
     if params.check == "yes" then
         local d = binary("diff", base, out)
         record.diff_exit = d.exit

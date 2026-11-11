@@ -2,7 +2,7 @@
 //! the CLI and the sidecar instrumentation use. The metric readers return
 //! `Option`: a failed or unavailable sample is reported as absent, never as
 //! zero, and each caller decides what absence means for its output. The one
-//! precondition probe here, [`is_mount_point`], returns an I/O error instead,
+//! precondition probe here, `is_mount_point`, returns an I/O error instead,
 //! because its caller refuses work on the answer and must not mistake an
 //! unreadable mount table for "not a mount point".
 

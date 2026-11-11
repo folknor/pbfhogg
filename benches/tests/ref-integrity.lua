@@ -105,3 +105,26 @@ test("an undeclared exit 1 before the exit split fails", function()
     assert(r.outcome == "failed", r.outcome)
     assert(string.find(r.reason, "ended with exit 1", 1, true), r.reason)
 end)
+
+test("required relations expectations refuse a missing key before children", function()
+    local params = relations("yes")
+    table.insert(params, "--require-expectation")
+    table.insert(params, "yes")
+    local r = check { params = params, host = host({ ["check-refs"] = "clean" }) }
+    assert(r.outcome == "refused", r.outcome)
+    assert(string.find(r.reason, "missing expect.check-refs-relations", 1, true), r.reason)
+    assert(#r.calls == 0, #r.calls)
+end)
+
+test("declaration records distinguish asserted from unasserted answers", function()
+    for _, declared in ipairs({ true, false }) do
+        local r = check {
+            params = relations("yes"),
+            host = host(declared and { ["check-refs-relations"] = "clean" } or {}),
+            calls = { { exit = 0 } },
+        }
+        assert(r.outcome == "completed", r.reason)
+        assert(r.record.expectation_key == "check-refs-relations", tostring(r.record.expectation_key))
+        assert(r.record.expectation_applied == declared, tostring(r.record.expectation_applied))
+    end
+end)

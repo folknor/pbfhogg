@@ -553,3 +553,136 @@ fn altw_refusal_leaves_a_preexisting_destination_intact() {
         .collect();
     assert!(leftovers.is_empty(), "scratch file leaked: {leftovers:?}");
 }
+
+// These are controls for the output assertions themselves: a plausible empty
+// normalized value must not hide an absent header or an incomplete frame.
+#[test]
+fn normalized_output_requires_header_and_complete_framing() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("output.pbf");
+    std::fs::write(&path, b"").expect("empty output");
+    assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
+
+    let mut block = block_builder::BlockBuilder::new();
+    block.add_node(1, 0, 0, [], None);
+    {
+        let file = std::fs::File::create(&path).expect("create headerless output");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        writer
+            .write_primitive_block(block.take().expect("take").expect("block"))
+            .expect("write headerless data");
+        writer.flush().expect("flush");
+    }
+    assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
+
+    write_empty_pbf(&path);
+    let valid = std::fs::read(&path).expect("header bytes");
+    read_normalized(&path);
+    for tail in [&[0u8][..], &[0, 0][..], &[0, 0, 0][..], &[0, 0, 0, 1][..]] {
+        let mut bytes = valid.clone();
+        bytes.extend_from_slice(tail);
+        std::fs::write(&path, bytes).expect("malformed tail");
+        assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
+    }
+    std::fs::write(&path, &valid[..valid.len() - 1]).expect("truncated payload");
+    assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
+}
+
+/// Write one element per blob so the controls cover both kind transitions and
+/// cross-blob ID ordering without a fixture writer rearranging the sequence.
+fn write_order_control(path: &std::path::Path, elements: &[(u8, i64)]) {
+    let file = std::fs::File::create(path).expect("create ordering control");
+    let mut writer = PbfWriter::new(file, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    for &(kind, id) in elements {
+        let mut block = block_builder::BlockBuilder::new();
+        // A tag keeps an id-0 element from encoding as an empty message,
+        // which a reader may not surface as an element at all.
+        let tags = [("k", "v")];
+        match kind {
+            0 => {
+                block.add_node(id, 0, 0, tags, None);
+            }
+            1 => {
+                block.add_way(id, tags, &[], None);
+            }
+            2 => {
+                block.add_relation(id, tags, &[], None);
+            }
+            _ => panic!("unknown control kind"),
+        }
+        writer
+            .write_primitive_block(block.take().expect("take").expect("block"))
+            .expect("write control block");
+    }
+    writer.flush().expect("flush");
+}
+
+#[test]
+fn sorted_output_assertion_checks_stream_and_canonical_ids() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("order.pbf");
+    let mut canonical = Vec::new();
+    for kind in 0..3 {
+        canonical.extend([0, -1, -2, i64::MIN, 1, 2, i64::MAX].map(|id| (kind, id)));
+    }
+    write_order_control(&path, &canonical);
+    crate::common::assert_sorted_file(&path);
+    for invalid in [
+        vec![(1, 1), (0, 1)],
+        vec![(0, 1), (1, 1), (0, 2)],
+        vec![(2, 1), (1, 1)],
+        vec![(0, 2), (0, 1)],
+        vec![(0, -2), (0, -1)],
+        vec![(1, 1), (1, -1)],
+        vec![(2, -1), (2, 0)],
+    ] {
+        write_order_control(&path, &invalid);
+        assert!(
+            std::panic::catch_unwind(|| crate::common::assert_sorted_file(&path)).is_err(),
+            "accepted out-of-order control: {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn fixture_tags_borrow_local_strings_for_every_kind() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("borrowed-tags.pbf");
+    let key = String::from("local-key");
+    let value = String::from("local-value");
+    write_test_pbf_sorted(
+        &path,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![(key.as_str(), value.as_str())],
+            meta: None,
+        }],
+        &[TestWay {
+            id: 1,
+            refs: vec![1],
+            tags: vec![(key.as_str(), value.as_str())],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 1,
+            members: vec![],
+            tags: vec![(key.as_str(), value.as_str())],
+            meta: None,
+        }],
+    );
+    let contents = read_normalized(&path);
+    for tags in [
+        &contents.nodes[0].tags,
+        &contents.ways[0].tags,
+        &contents.relations[0].tags,
+    ] {
+        assert_eq!(tags.get(&key), Some(&value));
+    }
+}

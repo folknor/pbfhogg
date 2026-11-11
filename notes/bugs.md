@@ -18,18 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-001 - ref-integrity with relation checking reads the plain expectation
-
-`benches/check-refs/ref-integrity.lua` always selects `expect.check-refs`, also
-under `--check-relations yes`. Brokkr's dataset documentation defines a separate
-`check-refs-relations` expectation because way references can be clean while
-relation references are broken. The result can be false acceptance or false
-rejection.
-
-Fix: select the expectation from the actual check configuration, as
-`location-integrity` does for agreement mode. Enforcement: a small script
-contract test with different plain and relation expectations.
-
 ## BUG-002 - geocode-query can report a speedup while queries fail
 
 `run_bench_geocode_query` in `crates/cli/src/lib.rs` ignores query errors during
@@ -54,6 +42,7 @@ Fix: correct or quarantine the entry and represent replication provenance as
 data. Enforcement: validate the configured sequence against the PBF header and
 require contiguous changes for workloads claiming a replication update. Where
 provenance is unavailable, the workload must state that continuity is unverified.
+Brokkr side (header check, OSC continuity) filed as bz brokkr#167; correcting the plantasjen entry stays here.
 
 ## BUG-004 - The promise guard's unsupported-architecture fallback does not compile
 

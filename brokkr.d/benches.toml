@@ -190,6 +190,7 @@ description = "Check ID ordering, optionally detecting duplicate IDs, on a datas
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-ids: streaming/full checks, direct I/O, snapshots and declared verdicts" },
 ]
@@ -211,6 +212,7 @@ description = "Check every blob's indexdata and tagdata against its payload on a
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-index: direct I/O, snapshots, declared verdicts and profiling with marker stops" },
 ]
@@ -233,6 +235,7 @@ description = "Check inline way-node coordinates against node records, optionall
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-locations: agreement checks, snapshots, declared verdicts and profiling with marker stops" },
 ]
@@ -254,6 +257,7 @@ description = "Check way-node references, optionally relation members, on a data
 version = 2
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-11, note = "--check-relations yes is judged by expect.check-refs-relations, not expect.check-refs; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Refuse _END and -_END consistently with other stop benches" },
   { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
   { version = 1, date = 2026-11-09, note = "Ported typed check-refs: relation checks, direct I/O, snapshots, marker stops and declared verdicts" },

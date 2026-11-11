@@ -18,7 +18,8 @@
 Findings are as reported by the hunters and have not been verified. Hunters read
 source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
-verdict on the code. Entries are in no order of importance.
+verdict on the code. Entries are in no order of importance. VER-127 is the proposed
+test filesystem design that several of the entries depend on.
 
 ## VER-001 - test_host and Host::for_tests fix reported resources but not the executor
 
@@ -227,6 +228,7 @@ duplicates brokkr's selector semantics.
 
 Fix and enforcement: require nonempty selectors in brokkr, including stale exclusions
 and sentinel membership. A pinned list of admitted files is unnecessary.
+Brokkr side filed as bz brokkr#157.
 
 ## VER-015 - The scratch lint bans spellings and does not enforce ownership
 
@@ -258,6 +260,7 @@ Fix: one test-support allocator with an explicit runner-owned root under
 `data/test-scratch/` and a documented standalone fallback, each fixture owning a random
 child, and paths passed as `Path` or `OsStr`. Enforcement: forbid other root discovery,
 allocation and panicking path conversion in invocation helpers.
+The runner-owned root is the brokkr side, filed as bz brokkr#152.
 
 ## VER-017 - Bare early returns report success without exercising the subject
 
@@ -1094,6 +1097,7 @@ The helper in `exe.rs` checks only that collected results say `pass`, and empty 
 
 Fix: compare exact call and assertion inventories through a shared protocol validator. Enforcement:
 missing, duplicate, misplaced and undeclared negative fixtures.
+Brokkr side (reusable validator) filed as bz brokkr#159; it also serves the next entry's runtime inventory check.
 
 ## VER-088 - The harness runner can succeed without completing its declaration
 
@@ -1225,6 +1229,7 @@ reference. Cost not measured.
 
 Fix: resolve build needs from scenario metadata and build matching configurations together. Enforcement:
 build-planning tests.
+Brokkr side filed as bz brokkr#158.
 
 ## VER-100 - The pre-merge runbook does not run the complete gate
 
@@ -1246,6 +1251,7 @@ binaries run concurrently.
 
 Fix: remove the placeholder or give it the correct shape. Enforcement: a serial-claiming profile may
 reference no parallel sweep.
+The pbfhogg config fix is ours; the brokkr-side refusal is filed as bz brokkr#166.
 
 ## VER-102 - Rustdoc link validation is not enabled
 
@@ -1351,6 +1357,7 @@ completion when `r.stopped_at` is absent. A renamed marker turns a phase run int
 
 Fix: a shared result helper failing when `stop` was not reached. Enforcement: helper tests for reached,
 missing and renamed markers and a rule for stop-capable scripts.
+The helper is pbfhogg's; the optional brokkr-side strict `stop_at` is filed as bz brokkr#160.
 
 ## VER-112 - Expected answers disappear when lookup keys stop matching
 
@@ -1361,6 +1368,7 @@ passes; the integrity benches accept either when absent.
 
 Fix: an assertion mode requiring an expectation and recording whether one applied. Enforcement: reject
 orphaned expectation keys in a configuration check. The correct answer still needs an independent oracle.
+Brokkr side (orphaned-key check, require-expectation lookup) filed as bz brokkr#161.
 
 ## VER-113 - Workload names describe paths scripts never establish
 
@@ -1409,6 +1417,7 @@ Reported by bench-verify.
 
 Fix: separate arms and interleaved matched single iterations. Enforcement: brokkr enforcing one backend per
 measured iteration and recording order. Equal drive state cannot be proven.
+Brokkr side is the existing bz brokkr#129 (interleaved rounds), commented with this case.
 
 ## VER-118 - The osmium comparison relies on aligned defaults
 
@@ -1439,6 +1448,7 @@ Brokkr adds host features to bench features, so an invocation can change workloa
 
 Fix: a host-independent experiment manifest with machine resources separate. Enforcement: required coverage
 checked before running, and missing coverage reported as incomplete certification.
+Brokkr side filed as bz brokkr#162.
 
 ## VER-121 - Cache preparation reaches ambient utilities and shared state
 
@@ -1449,6 +1459,7 @@ residency check is one observation before launch.
 
 Fix: a brokkr operation taking input handles, declaring access, detecting support and recording the
 observation. Stable cache state through a run cannot be enforced and should stay a stated limitation.
+Brokkr side filed as bz brokkr#163.
 
 ## VER-122 - Verify's equality oracle is narrower than "identical" and shares the subject's code
 
@@ -1460,6 +1471,7 @@ defect can affect both sides.
 
 Fix: an equality policy per check and an independent decoder for promised fields. Full digest strengthens
 same-project checks but is no independent oracle. Enforcement: negative controls altering each field class.
+Brokkr side filed as bz brokkr#156.
 
 ## VER-123 - Verify uses the build output directory as its workspace
 
@@ -1470,6 +1482,7 @@ directory. Cargo owns `target`, so these PBFs and reports vanish with cleanup an
 
 Fix: a brokkr-owned per-run directory under configured scratch and a separate retained-evidence area.
 Enforcement: directory capability types.
+Brokkr side filed as bz brokkr#154.
 
 ## VER-124 - Optional context tools add cost without a verdict
 
@@ -1479,6 +1492,7 @@ Reported by bench-verify.
 whose failures do not change the verdict.
 
 Fix: an explicit diagnostic option. Enforcement: a declarative step graph rejecting unused outputs.
+Brokkr side filed as bz brokkr#155.
 
 ## VER-125 - The Lua checks do not exercise behavioural contracts
 
@@ -1490,6 +1504,7 @@ and nothing requires a new one to be.
 
 Fix: a script contract harness with controlled `binary`, handles, results, configuration and recording,
 plus enforced registry discovery.
+Brokkr side filed as bz brokkr#164.
 
 ## VER-126 - Repeated bench parameter validation is diverging
 
@@ -1501,3 +1516,123 @@ fail after building.
 
 Fix: parameter types in brokkr's schema or shared constructors. Enforcement: contract tests and a source rule
 against local replacements.
+Brokkr side (typed param domains) filed as bz brokkr#165. brokkr runs validate() before any build, so "fail after building" holds only for values a script's own check lets through.
+
+## VER-127 - Test filesystem design: what tests write, read and delete, where and how
+
+Proposed design, informed by reading broadarrow's `clippy.toml`, `crates/test-scratch` and `crates/test-support`,
+and not copied from it. The only pbfhogg fact checked for it is that `test_scratch()` in
+`crates/lib/tests/common/scratch.rs` returns a random `TempDir` under `data/test-scratch` that cleans up on `Drop`.
+The other pbfhogg facts below are the unverified claims in this document.
+
+### Direction
+
+Keep random names with `Drop` cleanup, behind one owned type. brokkr owns the run root and crash cleanup, and the
+call sites that bypass the type are sealed.
+
+Broadarrow reuses deterministic trees in place, so it needs slots, a claim registry and a sweeper to prove ownership
+before deleting. Random children cannot collide and need none of that. brokkr's machine-wide lock means no test run
+is live between brokkr commands.
+
+### Rules
+
+- **Write.** Tests write only inside a `TestScratch` they own, with paths derived from it. They never write to the
+  source tree, `target/`, tool caches or `/tmp`. Proptest file persistence is disabled, and a failing input is
+  promoted by hand to a named tracked case, which gives up automatic replay.
+- **Read.** Tests read their own scratch, the binary through `CARGO_BIN_EXE_*`, and source or docs only in designated
+  source-contract checks through one `repository_root()` accessor. `crates/lib/tests/test.osm.pbf` stays doc-example
+  only, and `data/` datasets stay forbidden.
+- **Delete.** Test code deletes only inside its own `TestScratch`. Between runs only brokkr deletes. A test binary
+  never sweeps anything it did not create.
+- **How.** Children launch only through the invoker or one bounded oracle runner. Filesystem state checks keep their
+  errors, and only `NotFound` means absent.
+
+### Shape
+
+1. **`crates/test-scratch`:** a dev-only leaf crate with no features, depending only on `tempfile`, not on `pbfhogg`,
+   and referenced as a path-only dev-dependency with no version so `cargo publish` strips it. It replaces the three
+   copies and is the one site a clippy `#[expect]` names.
+2. **Root resolution:** one function, once per process. `PBFHOGG_TEST_SCRATCH_ROOT` if set, read as `OsStr` and
+   required to be absolute, otherwise `data/test-scratch` at a path fixed relative to the crate's manifest, so no
+   ancestor search is needed. The base is canonicalized once, and a failure panics naming the variable.
+3. **`TestScratch`:** wraps `TempDir` privately.
+   - `path()` keeps the existing call shape.
+   - `child(name)` rejects anything but one normal path component.
+   - `cell()` gives numbered subdirectories from an instance counter.
+   - `deny_write(path)` returns a guard borrowing the scratch, so restoration precedes removal. It probes that the
+     denial really happens and returns an unavailable reason otherwise, replacing root checks.
+   - `path_state(path)` returns `io::Result` and uses `symlink_metadata`.
+   - The tree is kept when the thread is panicking, and removed on a clean drop, so a failed test stays inspectable
+     until the next run clears it.
+   - Every filesystem operation is deliberately not wrapped: pbfhogg's APIs take paths, so a capability wrapper
+     would end at `.path()` anyway.
+4. **Children:** `RunningCli<'a>` holds `&'a TestScratch` and its `Drop` kills and reaps, so a child cannot outlive
+   its directory. Defaults are the scratch as working directory, null stdin, and an environment cleared to a small
+   allowlist with typed hook methods. Hang probes that cannot be joined go in a killable child.
+5. **brokkr:** sets `PBFHOGG_TEST_SCRATCH_ROOT` and clears `data/test-scratch` children at the start of a run under
+   its lock, so a watchdog-killed run stays available for diagnosis and residue is limited to one run. A tree that
+   cannot be removed is named and handled by brokkr, and does not take the suite down. Verify's workspace follows
+   the same split: per-run scratch plus a separate retained-evidence area.
+   Filed as bz brokkr#152 (run root export, start-of-run clearing) and bz brokkr#154 (verify workspace). The
+   export asks for a generic BROKKR_TEST_* variable, since brokkr#13 (closed) declined PBFHOGG_TEST_* exports.
+6. **Post-run check, later:** the gate confirms the source tree is unchanged after the tests. It is the only item that
+   catches a write inside the repository by absolute path.
+   Filed as bz brokkr#153.
+
+### Enforcement
+
+- **Clippy `disallowed-methods`:** `std::env::temp_dir`, every `tempfile` constructor including `_in` forms and
+  `Builder`, and `Command::new`. Exempt sites use `#[expect]` with a reason.
+- **Textlint with `must_scan`:** `CARGO_MANIFEST_DIR` in test code outside the accessor and named source-contract
+  checks, `test.osm.pbf`, and `data/` literals. These are spelling-bound and used only where clippy cannot reach.
+- **Types and borrows:** guard before removal, child before scratch.
+- **Post-run tree check:** detective only, and it needs brokkr work.
+
+Nothing here stops `std::fs::write("/somewhere")` in a test, and writes outside the repository stay unseen.
+`reference/testing.md` should state that limit.
+
+### From broadarrow
+
+- **Take:** one base resolver outside `target/` with an absolute-path override, single-component name checks,
+  symlink-safe inspection and the `NotFound` pattern, resolved `temp_dir` and `Command::new` seals with `#[expect]`
+  reasons, and capability assertions only at the fixture that needs them.
+- **Change:** root discovery becomes the crate's fixed location, the UTF-8-only override becomes `OsStr`,
+  `command_in_scratch` becomes a full invoker policy, and crash cleanup moves from a test-side sweep to the runner.
+- **Leave out:** slots and flock, the claim registry, flat roots and the socket budget, the 24-hour sweeper, `0700`
+  privacy and durability proofs. The sweeper is the riskiest part: one process walks all namespaces, a leftover
+  non-writable tree panics inside base initialization and fails the suite, no test of it appears in the files read,
+  and in pbfhogg it would run next to real datasets in `data/`.
+
+### Bearing on this document
+
+- **Resolved by this design:** VER-015 (with the absolute-path limit above), VER-016, VER-037, VER-048, VER-057,
+  VER-058, VER-072 (fresh output per cell), VER-080.
+- **Resolved jointly with their own fixes:** VER-017 (the skip helper is still needed), VER-045 and VER-046 (spawn
+  restriction plus the oracle runner or a move to `brokkr verify`), VER-055 and VER-094 (plus fatal entry errors at
+  the sites), VER-076, VER-077, VER-023 (detached in-process threads still need joining), VER-123 (needs brokkr
+  work).
+- **Affected indirectly:** VER-018 (a root override onto tmpfs could silently turn O_DIRECT and io_uring tests into
+  skips, so capability accounting has to report the filesystem it probed), VER-014 (new textlints need `must_scan`),
+  VER-012 (seals add no new parser), VER-036, VER-049 and VER-050 (fixture size remains a time problem), VER-069 and
+  VER-070 (`path_state` and a listing helper make complete comparison cheap).
+- **Not addressed:** VER-008, VER-060, VER-001 to VER-005, VER-020 to VER-028 other than VER-023, and the assertion,
+  harness-protocol and bench findings.
+
+### Order of work
+
+1. Crate, `TestScratch`, root resolution, and migration of the three copies.
+2. Clippy seals and textlints, after the resolution test below.
+3. Invoker ownership and environment policy, with the oracle runner.
+4. brokkr: run root, start-of-run clearing, then the tree check.
+
+Steps 1 to 3 work with today's brokkr through the fallback root.
+
+### Open before building
+
+- Broadarrow's `clippy.toml` contradicts itself on whether a path that stops resolving disables its seal silently or
+  is a hard error. Test this against the `minimal` sweep, and keep the existing textlint until it is answered.
+- How many production sites use `Command::new` or `tempfile`, since the seals are workspace-wide.
+- Whether `Path::exists`, `is_file` and `is_dir` seals are worth it, gated on a site count. VER-055 and VER-094 are
+  fixed through `path_state` first.
+- Where production scratch goes when a CLI child has no `--tmp-dir`. The invoker policy should pin it inside the
+  fixture.

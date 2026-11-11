@@ -6,9 +6,8 @@
 -- Child wall matches that workload; iteration wall includes Lua bookkeeping.
 --
 -- Exit 0 is clean, exit 1 violations, narrowed by expect.check-index when
--- declared. Before 854f9465, only 0 is trusted. Like ref-integrity, since()
--- uses ancestry rather than the typed runner's binary capability probe;
--- a backport of the exit split outside that ancestry can differ.
+-- declared. Before 854f9465, only 0 is trusted; the shared expect module
+-- holds that policy.
 -- A marker stop records a partial run without claiming a full verdict.
 -- The marked child supports --hotpath and --alloc, including marker stops.
 -- io_uring and compression are absent because typed check-index refuses
@@ -18,11 +17,7 @@
 --   brokkr bench --dry-run index-integrity --direct-io yes,no
 --   brokkr bench --alloc index-integrity --stop CHECK_INDEX
 
-local function expected(params)
-    local declared = params.variant.expect
-    if declared then return declared["check-index"] end
-end
-
+local expect = require("expect")
 local stops = require("stop")
 local profiling = require("profiling")
 
@@ -31,9 +26,7 @@ function validate(params)
 end
 
 function preflight(params)
-    if not params.stop and expected(params) == "violations" and not since("854f9465") then
-        fail("declared violations cannot be trusted before the exit-code split (854f9465)")
-    end
+    if not params.stop then expect.refuse_untrusted(params, "check-index") end
 end
 
 function bench(params)
@@ -50,16 +43,7 @@ function bench(params)
         record.stopped_at = r.stopped_at
         return "stopped"
     end
-    if r.exit ~= 0 and (r.exit ~= 1 or not since("854f9465")) then
-        fail("check --index ended with exit " .. tostring(r.exit)
-            .. ", signal " .. tostring(r.signal) .. ": " .. r.stderr)
-    end
-    local verdict = "clean"
-    if r.exit == 1 then verdict = "violations" end
-    local want = expected(params)
-    if want and verdict ~= want then
-        fail("check --index answered " .. verdict .. ", input expect.check-index declares " .. want)
-    end
+    local verdict = expect.verdict(params, "check-index", "check --index", r)
     record.check_exit = r.exit
     return verdict
 end

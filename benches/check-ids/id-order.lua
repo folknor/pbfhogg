@@ -21,33 +21,19 @@
 --   brokkr bench --iterations 1 id-order --dataset denmark --full yes
 --   brokkr bench --dry-run id-order --full yes,no --direct-io yes,no
 
-local function expected(params)
-    local declared = params.variant.expect
-    if declared then return declared["check-ids"] end
-end
+-- check-ids covers both --full settings, as brokkr documents.
+local expect = require("expect")
 
 function preflight(params)
-    if expected(params) == "violations" and not since("854f9465") then
-        fail("declared violations cannot be trusted before the exit-code split (854f9465)")
-    end
+    expect.refuse_untrusted(params, "check-ids")
 end
 
 function bench(params)
-    local split = since("854f9465")
     local r = binary_with({ hotpath = "check-ids" }, "check", "--ids", params.variant.file, {
         full = params.full == "yes",
         ["direct-io"] = params["direct-io"] == "yes",
     })
-    if r.exit ~= 0 and (r.exit ~= 1 or not split) then
-        fail("check --ids ended with exit " .. tostring(r.exit)
-            .. ", signal " .. tostring(r.signal) .. ": " .. r.stderr)
-    end
-    local verdict = "clean"
-    if r.exit == 1 then verdict = "violations" end
-    local want = expected(params)
-    if want and verdict ~= want then
-        fail("check --ids answered " .. verdict .. ", input expect.check-ids declares " .. want)
-    end
+    local verdict = expect.verdict(params, "check-ids", "check --ids", r)
     record.check_exit = r.exit
     record.summary = r.stderr
     return verdict

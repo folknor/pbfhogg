@@ -568,10 +568,10 @@ fn direct_decode_reads_follow_the_pinned_input() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_input(&input, route);
-    // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
-    let Reference::Bytes(expected) =
-        decode_reference(route, &input, dir.path(), |e| crate::common::is_einval(e))
-    else {
+    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
+    let Reference::Bytes(expected) = decode_reference(route, &input, dir.path(), |e| {
+        crate::common::direct_io_unavailable(e)
+    }) else {
         return;
     };
     check_decode_replacements(route, dir.path(), &input, &expected);
@@ -588,9 +588,9 @@ fn check_passthrough_route(route: Route) {
     let replacement = dir.path().join("replacement.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_input(&input, route);
-    // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
+    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
     let Reference::Bytes(expected) = plain_reference(route, &input, dir.path(), |e| {
-        route.direct && crate::common::is_einval(e)
+        route.direct && crate::common::direct_io_unavailable(e)
     }) else {
         return;
     };

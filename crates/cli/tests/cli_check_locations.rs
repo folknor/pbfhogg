@@ -247,6 +247,7 @@ fn direct_io_is_refused_where_only_the_location_check_runs() {
 
     let out = check(&path, &["--index", "--direct-io"]);
     if out.is_o_direct_unsupported() {
+        crate::common::skip("O_DIRECT not supported on this filesystem");
         return;
     }
     assert!(out.status.success(), "{}", out.stderr_str());

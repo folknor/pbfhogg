@@ -524,8 +524,10 @@ fn direct_reads_follow_the_pinned_inputs() {
             direct: true,
             ..Route::of(mode)
         };
-        // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
-        check_route_with(route, [opens, opens], |e| crate::common::is_einval(e));
+        // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
+        check_route_with(route, [opens, opens], |e| {
+            crate::common::direct_io_unavailable(e)
+        });
     }
 }
 

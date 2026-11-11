@@ -80,9 +80,9 @@ fn digest_opens_its_input_once() {
         );
         let digest = match run(&pin, direct, &host) {
             Ok(digest) => digest,
-            // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
+            // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
             #[cfg(feature = "linux-direct-io")]
-            Err(e) if direct && crate::common::is_einval(&e) => {
+            Err(e) if direct && crate::common::direct_io_unavailable(&e) => {
                 crate::common::skip(format!("direct {direct}: {e}"));
                 continue;
             }

@@ -4,8 +4,9 @@
 //! A unit test that cannot run on this host announces it through the same
 //! `skip` the integration tests use (`crates/lib/tests/common/skip.rs`, mounted by
 //! `#[path]` as `path_guard` mounts the shared scratch allocator), and skips
-//! only on the typed refusal of the feature it needs: a `PlatformUnsupported`
-//! labelled for another feature, or any other error, fails the test.
+//! only on the typed refusal of the feature it needs, decided by [`refused`]:
+//! a `PlatformUnsupported` labelled for another feature, or any other error,
+//! fails the test, and so does any refusal of a backend the run requires.
 //!
 //! It also holds [`Parked`], the observation a unit test uses to know that a
 //! thread is blocked inside a primitive's condition-variable wait.
@@ -65,19 +66,33 @@ pub(crate) fn wait_parked<'a, S>(
 #[path = "../tests/common/skip.rs"]
 mod shared_skip;
 
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+pub(crate) use shared_skip::Backend;
 pub(crate) use shared_skip::skip;
 
+/// Whether `err` authorizes dropping a cell that needs `cell`: a typed
+/// `PlatformUnsupported` refusal labelled with one of `accepted` (the labels
+/// that legitimately stop this cell, which the site chooses). A match fails
+/// the test where the run requires `cell`; the caller announces the skip.
+/// Every unit-test skip on a platform refusal decides through here, so none
+/// can bypass the gate's requirement.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+pub(crate) fn refused(cell: Backend, err: &crate::Error, accepted: &[&str]) -> bool {
+    let refused = matches!(
+        err.kind(),
+        crate::ErrorKind::PlatformUnsupported { feature, .. } if accepted.contains(feature)
+    );
+    if refused {
+        shared_skip::fail_if_required(cell, err);
+    }
+    refused
+}
+
 /// Whether `err` is the typed O_DIRECT setup refusal, the one error an
-/// O_DIRECT test may skip on.
+/// O_DIRECT test may skip on (see [`refused`]).
 #[cfg(feature = "linux-direct-io")]
 pub(crate) fn is_direct_io_refusal(err: &crate::Error) -> bool {
-    matches!(
-        err.kind(),
-        crate::ErrorKind::PlatformUnsupported {
-            feature: "direct-io",
-            ..
-        }
-    )
+    refused(Backend::DirectIo, err, &["direct-io"])
 }
 
 /// Whether files in `dir` open `O_DIRECT`. A typed direct-io refusal is the

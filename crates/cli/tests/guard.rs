@@ -50,8 +50,11 @@
 //!
 //! Hosts: Linux on little-endian x86_64 or aarch64, with
 //! `SECCOMP_RET_KILL_PROCESS` (Linux 4.14). This process asks the kernel
-//! once, without side effects, whether that action is available; where it is
-//! not, children run unguarded and the control test skips. Where it is, a
+//! once, without side effects, whether that action is available, keeping the
+//! errno; where it is not, children run unguarded and the control test skips
+//! with that reason, unless the run requires `promise-guard` (the complete
+//! gate does, through `PBFHOGG_TEST_REQUIRE`), in which case [`apply`] and the
+//! control test fail instead. Where it is, a
 //! filter the kernel rejects fails the spawn, so a broken program can never
 //! quietly turn the guard off. The control test proves each rule fires, and
 //! that the guard leaves alone what it must.
@@ -60,7 +63,7 @@
 //! value and syscall numbers exist only for the two above (libc need not
 //! define every number it names elsewhere), so a runtime check alone cannot
 //! provide the fallback. There `filter` and the probe cases drop out,
-//! [`supported`] is false, [`apply`] does nothing, and the tests keep their
+//! [`availability`] refuses, [`apply`] installs nothing, and the tests keep their
 //! names and skip. The architecture predicate is spelled out on each half of
 //! `filter` and on each use of `tests::cases`; keep every spelling identical.
 
@@ -69,8 +72,15 @@ use std::process::Command;
 /// The variable naming the lease descriptor in the child.
 pub const LEASE_FD_ENV: &str = "PBFHOGG_TEST_LEASE_FD";
 
-/// Whether children can be guarded on this host.
-pub fn supported() -> bool {
+// The shared skip report and backend requirement (std only, so the
+// guard-portability mount, which has no `common`, still compiles).
+#[path = "../../lib/tests/common/skip.rs"]
+#[allow(clippy::duplicate_mod)]
+mod skip;
+
+/// Whether children can be guarded on this host, and if not, why: the errno
+/// of the kernel's answer, or the unsupported architecture.
+pub fn availability() -> Result<(), &'static str> {
     filter::available()
 }
 
@@ -79,8 +89,8 @@ pub fn supported() -> bool {
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 mod filter {
-    pub fn available() -> bool {
-        false
+    pub fn available() -> Result<(), &'static str> {
+        Err("the filter is compiled only for little-endian x86_64 and aarch64")
     }
 
     pub fn install(_cmd: &mut std::process::Command) {}
@@ -151,22 +161,34 @@ mod filter {
         sys as u32
     }
 
-    /// Whether the kernel offers `SECCOMP_RET_KILL_PROCESS`.
-    pub fn available() -> bool {
-        static SUPPORTED: OnceLock<bool> = OnceLock::new();
-        *SUPPORTED.get_or_init(|| {
-            let action: u32 = KILL;
-            // SAFETY: SECCOMP_GET_ACTION_AVAIL reads one u32 and changes nothing.
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_seccomp,
-                    libc::SECCOMP_GET_ACTION_AVAIL,
-                    0,
-                    &raw const action,
-                )
-            };
-            rc == 0
-        })
+    /// Whether the kernel offers `SECCOMP_RET_KILL_PROCESS`; the refusal
+    /// carries the errno it answered with, asked once per process.
+    pub fn available() -> Result<(), &'static str> {
+        static SUPPORTED: OnceLock<Result<(), String>> = OnceLock::new();
+        SUPPORTED
+            .get_or_init(|| {
+                let action: u32 = KILL;
+                // SAFETY: SECCOMP_GET_ACTION_AVAIL reads one u32 and changes nothing.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_GET_ACTION_AVAIL,
+                        0,
+                        &raw const action,
+                    )
+                };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "seccomp SECCOMP_GET_ACTION_AVAIL for SECCOMP_RET_KILL_PROCESS: {}",
+                        std::io::Error::last_os_error()
+                    ))
+                }
+            })
+            .as_ref()
+            .copied()
+            .map_err(String::as_str)
     }
 
     /// One syscall's block: when the syscall number is `sys`, run `body` (which
@@ -350,10 +372,14 @@ fn allows_io_uring(cmd: &Command) -> bool {
 
 /// Put `cmd` under the guard, when the host supports it. Register this after
 /// every other `pre_exec` hook: hooks run in order, and nothing may run in
-/// the child after the filter but the exec.
+/// the child after the filter but the exec. Where the run requires
+/// `promise-guard` (`PBFHOGG_TEST_REQUIRE`), an unguardable host fails the
+/// test here, in the parent, so enforcement does not hang on the control
+/// test being selected.
 pub fn apply(cmd: &mut Command) {
-    if supported() {
-        filter::install(cmd);
+    match availability() {
+        Ok(()) => filter::install(cmd),
+        Err(reason) => skip::fail_if_required(skip::Backend::PromiseGuard, &reason),
     }
 }
 
@@ -398,8 +424,8 @@ mod tests {
     /// which exercises each rule's neighbours, runs to the end.
     #[test]
     fn the_promise_guard_kills_every_violation_and_nothing_else() {
-        if !super::supported() {
-            eprintln!("skipped: this host cannot run the promise guard");
+        if let Err(reason) = super::availability() {
+            super::skip::backend_unavailable(super::skip::Backend::PromiseGuard, reason);
         } else {
             #[cfg(all(
                 target_endian = "little",

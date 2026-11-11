@@ -287,14 +287,14 @@ fn the_full_decode_fallback_reads_only_the_pinned_input() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn the_direct_fallback_reads_only_the_pinned_input() {
-    // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
+    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
     check_route(
         Route {
             indexed: false,
             decode_only: false,
             direct: true,
         },
-        |e| crate::common::is_einval(e),
+        |e| crate::common::direct_io_unavailable(e),
     );
 }
 
@@ -608,7 +608,7 @@ fn node_stats_reads_only_the_pinned_input() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn node_stats_direct_reads_follow_the_pinned_input() {
-    check_node_stats(true, |e| crate::common::is_einval(e));
+    check_node_stats(true, |e| crate::common::direct_io_unavailable(e));
 }
 
 /// A caller's pin is used as it is: replaced before the call, the stats are

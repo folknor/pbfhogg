@@ -412,7 +412,18 @@ fn run_with_markers(dir: &Path, label: &str, args: &[&std::ffi::OsStr]) -> Optio
         .marker_fifo(&markers)
         .args(args)
         .run();
-    if out.is_o_direct_unsupported() || out.is_uring_unsupported() {
+    // The cell's backend is what `args` asked for, never the refusal's label:
+    // an io_uring cell judges a direct-io refusal as io_uring's, and a
+    // buffered cell may skip on neither.
+    let asked = |flag: &str| args.iter().any(|arg| *arg == flag);
+    let refused = if asked("--io-uring") {
+        out.is_uring_unsupported()
+    } else if asked("--direct-io") {
+        out.is_o_direct_unsupported()
+    } else {
+        false
+    };
+    if refused {
         crate::common::skip(format!("{label}: the host lacks the requested I/O backend"));
         return None;
     }

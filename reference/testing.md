@@ -17,16 +17,40 @@ Tests go where they couple least.
   reliability, never the feature. They carry the feature's `cfg` (on
   the test or on a grouping module such as `mod backends`) and, where
   the host lacks the feature (no O_DIRECT on the filesystem, io_uring
-  refused), skip on the typed refusal and pass; nothing makes a
-  feature mandatory. A green run therefore does not prove a backend
-  executed: a regression that misclassifies a real failure as
-  `PlatformUnsupported` turns the test into a passing skip. Evidence
-  that a backend ran is a `brokkr test <name> --sweep all` run (which
-  passes `--nocapture`) showing no `Skipping:` line for it, on a host
-  that has the feature; `brokkr check` hides a passing test's output,
-  skip line included. There is no platform module or profile;
-  a platform test with a known bug is `#[ignore]`d and skipped by name
-  in the `full` profile.
+  refused), skip on the typed refusal and pass in ordinary runs.
+  Libtest has no skipped outcome and brokkr counts a returning test as
+  passed, so a regression that misclassified a real failure as
+  `PlatformUnsupported` would turn the test into a passing skip. The
+  complete gate closes that for the backends it lists:
+  `brokkr.d/checks.toml` sets `PBFHOGG_TEST_REQUIRE` on the
+  `gate-tests` profile (comma-separated `direct-io`, `io-uring`,
+  `promise-guard`; an unknown or malformed token fails every test that
+  consults it), and every refusal predicate that lets a cell skip
+  (`common::direct_io_unavailable`, `common::is_uring_unavailable`,
+  `CliOutput::is_o_direct_unsupported` and `is_uring_unsupported`,
+  `test_support::refused` and its wrappers, `guard::apply` and the
+  guard's control test) calls `skip::fail_if_required`, which fails
+  the test where the run requires that backend. By convention these
+  predicates are the only route to a backend skip; nothing enforces
+  that structurally. Tests that assert a refusal itself inspect the
+  error directly and are not affected. What the gate guarantees is
+  that a required backend's refusal cannot pass as a skip, so it goes
+  green only on a host, and a test scratch filesystem, that does not
+  refuse a listed backend; it does not prove that every cell exercised
+  its backend, and sweeps that compile a backend out carry no claim
+  for it. The requirement is parsed only when a refusal consults it. Each predicate also names the labels that may
+  stop its cell (the io_uring writer also needs O_DIRECT; the
+  non-regular-target test accepts only `io-uring`), so the requirement
+  is the cell's backend, not the refusal's label. The gate lists
+  `direct-io` and `promise-guard` only: the io_uring writer registers
+  16 MiB of buffers, the gate's hosts have an 8 MiB hard
+  `RLIMIT_MEMLOCK`, and so the gate does not certify the io_uring
+  writer; its cells skip there. Evidence for a backend outside the
+  list is still a `brokkr test <name> --sweep all` run (which passes
+  `--nocapture`) showing no `Skipping:` line for it. Environmental
+  skips (osmium, namespaces, descriptor limits, `deny_write`) never
+  fail. There is no platform module or profile; a platform test with a
+  known bug is `#[ignore]`d and skipped by name in the `full` profile.
 - **Stable-API integration tests** in `crates/lib/tests/<topic>.rs` (e.g.
   `crates/lib/tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
   only the stable allowlist below.
@@ -199,7 +223,11 @@ The library harness inherits brokkr's lease the same way and keeps the
 same promise; every child `crates/harness/tests/exe.rs` starts runs under the
 same guard, mounted from `crates/cli/tests/guard.rs`.
 On any other architecture the filter is compiled out: children run
-unguarded and the control test prints `skipped:`. That fallback is
+unguarded and the control test skips through `skip::backend_unavailable`
+with the reason (as it does on a supported architecture whose kernel
+refuses `SECCOMP_GET_ACTION_AVAIL`, errno included); where the run
+requires `promise-guard`, `guard::apply` and the control test fail
+instead. That fallback is
 type-checked by the `riscv64` lint sweep in `brokkr.d/checks.toml`, through
 the libc-only fixture crate `crates/guard-portability`, which mounts the
 guard and nothing else; no sweep compiles the rest of the workspace for an
@@ -398,14 +426,16 @@ files.
 
 - The O_DIRECT and io_uring tests exist only in the `all` and `musl-all`
   sweeps (the builds with `linux-direct-io` and `linux-io-uring`) and skip and
-  pass on a typed platform refusal: O_DIRECT where the scratch
+  pass on a typed platform refusal, except where the complete gate
+  requires the backend (see "Platform-dependent tests"): O_DIRECT where the scratch
   filesystem rejects it, io_uring when setup fails for an
   environmental reason, most often an `RLIMIT_MEMLOCK` soft limit too
   low for the writer's registered buffers. To run the io_uring ones on
   a development host, raise the limit system-wide in
   `/etc/security/limits.conf` (`@<your-group> - memlock unlimited`)
   and log in again; `brokkr check` then runs them (confirm with a
-  named `brokkr test`, since check hides skip lines).
+  named `brokkr test`, since check hides skip lines), and `io-uring` can
+  join `PBFHOGG_TEST_REQUIRE` in the gate profile.
 - Fault-injection tests are neither `#[ignore]`d nor serial: their
   faults ride on the invocation's cancellation token, so they are
   ordinary modules of the `all` binaries and run with
@@ -839,17 +869,20 @@ CLI exits 3 for this variant (see the exit-code table in
 `docs/cli/commands.md`) and keeps its feature label in stderr; CLI skip
 predicates require both that code and label. Runtime I/O failures are never
 setup refusals, and raw `EINVAL` is never a sufficient reason to skip.
-Library tests use `common::is_einval` (historical name; it requires the typed
+Library tests use `common::direct_io_unavailable` (it requires the typed
 direct-I/O variant) and `common::is_uring_unavailable`, never their own errno
-or message matching. The one exception is a test whose subject is the
-classification itself: it matches the typed variant on the exact feature
-label it may skip on, never errno or message text. `is_uring_unavailable`
+or message matching; both enforce the gate's requirement on a match. The one
+exception is a test whose subject is the classification itself: it matches
+the typed variant on the exact feature label it may skip on, never errno or
+message text, and skips through `common::backend_unavailable` so the
+requirement still applies. `is_uring_unavailable`
 accepts `direct-io` as well (the io_uring writer opens its output
 `O_DIRECT`), so `roundtrip::uring_writer_refuses_non_regular_targets`
 skips only on `io-uring`: a `direct-io` label on a non-regular target is
 the misclassification it pins. The library's unit tests under `crates/lib/src/` cannot
 reach `crates/lib/tests/common`; they use `test_support` (`crates/lib/src/test_support.rs`),
-whose `is_direct_io_refusal` requires the `direct-io` label and whose
+whose `refused(cell, err, accepted)` takes the cell's backend and the labels
+that may stop it (`is_direct_io_refusal` is its direct-io form) and whose
 `skip` is `crates/lib/tests/common/skip.rs` mounted by `#[path]`, so their skips
 announce `Skipping:` like any other.
 

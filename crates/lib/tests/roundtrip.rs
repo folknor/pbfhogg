@@ -607,7 +607,7 @@ fn roundtrip_direct_io() {
     );
     let mut writer = match write_result {
         Ok(w) => w,
-        Err(e) if crate::common::is_einval(&e) => {
+        Err(e) if crate::common::direct_io_unavailable(&e) => {
             crate::common::skip(format!("O_DIRECT not supported on this filesystem: {e}"));
             return;
         }
@@ -701,7 +701,7 @@ fn roundtrip_pipelined_direct_io() {
     );
     let mut writer = match write_result {
         Ok(w) => w,
-        Err(e) if crate::common::is_einval(&e) => {
+        Err(e) if crate::common::direct_io_unavailable(&e) => {
             crate::common::skip(format!("O_DIRECT not supported on this filesystem: {e}"));
             return;
         }
@@ -906,7 +906,7 @@ fn uring_writer_refuses_non_regular_targets() {
                     }
                 ) =>
             {
-                crate::common::skip(format!("io_uring not available: {e}"));
+                crate::common::backend_unavailable(crate::common::Backend::IoUring, &e);
                 return;
             }
             Err(e) => panic!("{}: {e}", target.display()),

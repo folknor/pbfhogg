@@ -187,6 +187,7 @@ fn cli_check_default_pair_takes_direct_io_without_a_note() {
         .arg("--direct-io")
         .run();
     if result.is_o_direct_unsupported() {
+        crate::common::skip("O_DIRECT not supported on this filesystem");
         return;
     }
     let stderr = String::from_utf8_lossy(&result.stderr);

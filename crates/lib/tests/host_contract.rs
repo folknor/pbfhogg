@@ -1497,7 +1497,7 @@ mod direct_read {
 
         let reader = match pbfhogg::BlobReader::open(&path, true) {
             Ok(reader) => reader,
-            Err(error) if common::is_einval(&error) => {
+            Err(error) if common::direct_io_unavailable(&error) => {
                 common::skip(format!("O_DIRECT not supported: {error}"));
                 return;
             }
@@ -1526,7 +1526,7 @@ mod direct_read {
         let error =
             match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
                 Ok(_) => panic!("truncated header blob must fail while skipping"),
-                Err(error) if common::is_einval(&error) => {
+                Err(error) if common::direct_io_unavailable(&error) => {
                     common::skip(format!("O_DIRECT not supported: {error}"));
                     return;
                 }
@@ -1571,7 +1571,7 @@ mod direct_read {
         let error =
             match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
                 Ok(_) => panic!("aligned skip beyond EOF must fail"),
-                Err(error) if common::is_einval(&error) => {
+                Err(error) if common::direct_io_unavailable(&error) => {
                     common::skip(format!("O_DIRECT not supported: {error}"));
                     return;
                 }

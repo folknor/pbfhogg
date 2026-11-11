@@ -88,9 +88,12 @@ pub fn make_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
     fifo
 }
 
+// The promise guard (crates/cli/tests/guard.rs) mounts skip.rs on its own,
+// because the guard-portability crate has no `common`.
+#[allow(clippy::duplicate_mod)]
 mod skip;
 #[allow(unused_imports)]
-pub use skip::skip;
+pub use skip::{Backend, backend_unavailable, fail_if_required, skip};
 
 // ---------------------------------------------------------------------------
 // Test element structs - lightweight descriptions of OSM elements for building
@@ -1449,21 +1452,41 @@ pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
 // Error helpers for platform-specific I/O tests
 // ---------------------------------------------------------------------------
 
-/// Historical name retained for callers; only typed direct-I/O setup refusals
-/// are skippable. A runtime EINVAL can indicate an alignment bug, so raw errno
-/// alone must never make an I/O correctness test pass without exercising it.
+/// Whether `err` authorizes dropping an O_DIRECT cell: only the typed
+/// direct-io setup refusal does. A runtime EINVAL can indicate an alignment
+/// bug, so raw errno alone must never make an I/O correctness test pass
+/// without exercising it. A match fails the test where the run requires
+/// direct-io (see `skip::fail_if_required`); the caller announces the skip.
 #[cfg(feature = "linux-direct-io")]
-pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
+pub fn direct_io_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
+    let refused = refusal_in(err, &["direct-io"]);
+    if refused {
+        fail_if_required(Backend::DirectIo, &error_chain(err));
+    }
+    refused
+}
+
+/// Whether `err` authorizes dropping an io_uring cell: the typed io-uring
+/// refusal, or a direct-io one, since the ring writer also needs an O_DIRECT
+/// output. A match fails the test where the run requires io-uring.
+#[cfg(feature = "linux-io-uring")]
+pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
+    let refused = refusal_in(err, &["io-uring", "direct-io"]);
+    if refused {
+        fail_if_required(Backend::IoUring, &error_chain(err));
+    }
+    refused
+}
+
+/// Whether `err`, through its source chain and `io::Error` carriers, holds a
+/// typed `PlatformUnsupported` refusal labelled with one of `features`.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+fn refusal_in(err: &(dyn std::error::Error + 'static), features: &[&str]) -> bool {
     let mut current = Some(err);
     while let Some(error) = current {
         if let Some(error) = error.downcast_ref::<pbfhogg::Error>()
-            && matches!(
-                error.kind(),
-                pbfhogg::ErrorKind::PlatformUnsupported {
-                    feature: "direct-io",
-                    ..
-                }
-            )
+            && let pbfhogg::ErrorKind::PlatformUnsupported { feature, .. } = error.kind()
+            && features.contains(feature)
         {
             return true;
         }
@@ -1478,31 +1501,21 @@ pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Check only typed io_uring setup errors, including their io::Error carrier.
-#[cfg(feature = "linux-io-uring")]
-pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(err);
+/// `err` and every source under it, joined with `: `, so a required
+/// backend's failure names the step and errno that refused it.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut current = err.source();
     while let Some(error) = current {
-        if let Some(error) = error.downcast_ref::<pbfhogg::Error>()
-            && matches!(
-                error.kind(),
-                pbfhogg::ErrorKind::PlatformUnsupported {
-                    feature: "io-uring" | "direct-io",
-                    ..
-                }
-            )
-        {
-            return true;
+        let part = error.to_string();
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
         }
-        if let Some(error) = error.downcast_ref::<std::io::Error>() {
-            current = error
-                .get_ref()
-                .map(|inner| inner as &(dyn std::error::Error + 'static));
-        } else {
-            current = error.source();
-        }
+        current = error.source();
     }
-    false
+    text
 }
 
 // ---------------------------------------------------------------------------

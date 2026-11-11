@@ -839,12 +839,10 @@ mod tests {
         let (probe, align) = match crate::direct_io::create_for_write(&path, None) {
             Ok(opened) => opened,
             Err(e)
-                if matches!(
-                    e.kind(),
-                    crate::ErrorKind::PlatformUnsupported {
-                        feature: "direct-io",
-                        ..
-                    }
+                if crate::test_support::refused(
+                    crate::test_support::Backend::IoUring,
+                    &e,
+                    &["direct-io"],
                 ) =>
             {
                 crate::test_support::skip(format!("io_uring output: {e}"));
@@ -893,12 +891,10 @@ mod tests {
             match result {
                 Ok(()) => {}
                 Err(e)
-                    if matches!(
-                        e.kind(),
-                        crate::ErrorKind::PlatformUnsupported {
-                            feature: "io-uring" | "direct-io",
-                            ..
-                        }
+                    if crate::test_support::refused(
+                        crate::test_support::Backend::IoUring,
+                        &e,
+                        &["io-uring", "direct-io"],
                     ) =>
                 {
                     crate::test_support::skip(format!("io_uring output: {e}"));

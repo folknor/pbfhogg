@@ -544,22 +544,31 @@ impl CliOutput {
         self
     }
 
-    /// A structured platform setup refusal (CLI exit code 3).
+    /// A structured direct-io setup refusal (CLI exit code 3), the one result
+    /// that lets an O_DIRECT cell skip. A match fails the test where the run
+    /// requires direct-io (`common::fail_if_required`).
     pub fn is_o_direct_unsupported(&self) -> bool {
-        self.platform_unsupported("direct-io")
+        self.refused(crate::common::Backend::DirectIo, &["direct-io"])
     }
 
-    /// A structured io_uring setup refusal (CLI exit code 3).
+    /// A structured io_uring setup refusal (CLI exit code 3), the one result
+    /// that lets an io_uring cell skip. The ring writer also requires an
+    /// O_DIRECT output file, so a direct-io refusal counts. A match fails the
+    /// test where the run requires io-uring.
     pub fn is_uring_unsupported(&self) -> bool {
-        // This writer also requires an O_DIRECT output file.
-        self.platform_unsupported("io-uring") || self.platform_unsupported("direct-io")
+        self.refused(crate::common::Backend::IoUring, &["io-uring", "direct-io"])
     }
 
-    fn platform_unsupported(&self, feature: &str) -> bool {
-        self.status.code() == Some(3)
-            && self
-                .stderr_str()
-                .contains(&format!("platform feature {feature} unavailable:"))
+    fn refused(&self, cell: crate::common::Backend, accepted: &[&str]) -> bool {
+        let stderr = self.stderr_str();
+        let refused = self.status.code() == Some(3)
+            && accepted.iter().any(|feature| {
+                stderr.contains(&format!("platform feature {feature} unavailable:"))
+            });
+        if refused {
+            crate::common::fail_if_required(cell, &stderr.trim_end());
+        }
+        refused
     }
 }
 

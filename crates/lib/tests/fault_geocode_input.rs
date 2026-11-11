@@ -410,13 +410,13 @@ fn unindexed_build_reads_only_the_pinned_input() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_build_reads_only_the_pinned_input() {
-    // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
+    // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
     check_route(
         Route {
             indexdata: true,
             direct: true,
         },
-        |e| crate::common::is_einval(e),
+        |e| crate::common::direct_io_unavailable(e),
     );
 }
 

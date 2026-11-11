@@ -454,10 +454,10 @@ fn direct_reads_follow_the_pinned_input() {
         let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         write_input(&input, route);
-        // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
-        let Reference::Outputs(expected) =
-            reference(route, &input, dir.path(), |e| crate::common::is_einval(e))
-        else {
+        // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
+        let Reference::Outputs(expected) = reference(route, &input, dir.path(), |e| {
+            crate::common::direct_io_unavailable(e)
+        }) else {
             return;
         };
         check_replacements(route, dir.path(), &input, &expected);

@@ -597,12 +597,10 @@ mod tests {
                 Ok(copied) => assert_eq!(copied, expected, "{backend:?}"),
                 // Only a typed io_uring setup refusal skips.
                 Err(e)
-                    if matches!(
-                        e.kind(),
-                        crate::ErrorKind::PlatformUnsupported {
-                            feature: "io-uring",
-                            ..
-                        }
+                    if crate::test_support::refused(
+                        crate::test_support::Backend::IoUring,
+                        &e,
+                        &["io-uring"],
                     ) =>
                 {
                     crate::test_support::skip(format!("the io_uring pass 2: {e}"));

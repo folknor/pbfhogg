@@ -397,13 +397,13 @@ fn a_history_input_reads_only_the_pinned_input() {
 #[test]
 fn direct_reads_follow_the_pinned_input() {
     for history in [false, true] {
-        // Only a typed O_DIRECT setup refusal skips; see `is_einval`.
+        // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
         check_route(
             Route {
                 history,
                 direct: true,
             },
-            |e| crate::common::is_einval(e),
+            |e| crate::common::direct_io_unavailable(e),
         );
     }
 }

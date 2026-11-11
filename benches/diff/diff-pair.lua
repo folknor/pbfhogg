@@ -1,3 +1,12 @@
+-- This snapshot workload does not exercise verbose sequence budgeting.
+-- A separate timing cell needs synthetic modified-way PBF pairs with 30,000
+-- refs: disjoint ranges and every 60th ref changed. Preparation must precede
+-- the measured diff --verbose child, whose exit must be 1 and whose output
+-- must distinguish replacement from itemized edits. No existing command or
+-- bench preparation helper builds those pairs; registering a snapshot cell
+-- here would not establish that contract. Supply an untimed fixture producer
+-- before adding that timing workload.
+--
 -- diff-pair: typed diff-snapshots, two independently resolved inputs, with
 -- no merge or cache preparation. Text suppresses common lines; OSC uses
 -- iteration scratch. Same-file pairs are allowed and answer same.

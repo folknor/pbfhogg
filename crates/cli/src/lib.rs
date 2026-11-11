@@ -3095,6 +3095,7 @@ pub fn run() -> process::ExitCode {
                                 io.direct_io,
                                 increment_version,
                                 update_timestamp,
+                                std::time::SystemTime::now,
                                 jobs,
                                 &host,
                                 scratch,
@@ -4573,6 +4574,99 @@ fn derive_timestamp(
 
 #[cfg(test)]
 mod derive_clock_tests {
+    // Exercise the CLI operation through publication and gzip/XML encoding,
+    // with the same injected clock boundary used by the real command.
+    #[test]
+    #[allow(clippy::expect_used)]
+    #[allow(clippy::disallowed_methods)] // test fixture files in scratch, not operator inputs or outputs
+    fn fixed_instant_reaches_published_osc() {
+        use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
+        use pbfhogg::host::{
+            Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions, PageCachePolicy,
+        };
+        use pbfhogg::writer::{Compression, PbfWriter};
+        use std::io::Read;
+
+        let dir = pbfhogg_test_scratch::scratch();
+        let old = dir.path().join("old.pbf");
+        let new = dir.path().join("new.pbf");
+        for (path, populated) in [(&old, true), (&new, false)] {
+            let mut writer = PbfWriter::new(
+                std::fs::File::create(path).expect("input"),
+                Compression::default(),
+            );
+            writer
+                .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+                .expect("write header");
+            if populated {
+                let mut block = BlockBuilder::new();
+                let meta = Metadata {
+                    version: 2,
+                    timestamp: 17,
+                    changeset: 0,
+                    uid: 0,
+                    user: "",
+                    visible: true,
+                };
+                for id in [1, 2] {
+                    block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), Some(&meta));
+                }
+                writer
+                    .write_primitive_block(block.take().expect("block").expect("nonempty"))
+                    .expect("write block");
+            }
+            writer.flush().expect("flush");
+        }
+        for jobs in [1, 4] {
+            let host = Host {
+                diagnostics: Diagnostics::discard(),
+                process: std::sync::Arc::new(NoProcessActions),
+                resources: std::sync::Arc::new(Fixed {
+                    parallelism: std::num::NonZeroUsize::new(4),
+                    memory_available: Some(8 << 30),
+                }),
+                page_cache: PageCachePolicy::Keep,
+                executor: Executor::Ambient,
+                invocation: Invocation::new(),
+            };
+            let osc = dir.path().join(format!("changes-{jobs}.osc.gz"));
+            let output =
+                pbfhogg::Output::new(&osc, pbfhogg::output::Overwrite::Refuse, &host.diagnostics)
+                    .expect("output");
+            let scratch = pbfhogg::scratch::RunScratch::create(dir.path(), &host).expect("scratch");
+            let mut clock_calls = 0;
+            let outcome = super::run_derive_changes(
+                &old,
+                &new,
+                output,
+                false,
+                true,
+                true,
+                || {
+                    clock_calls += 1;
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123)
+                },
+                pbfhogg::Parallelism::from_jobs(jobs),
+                &host,
+                scratch,
+            )
+            .expect("derive and publish");
+            assert!(matches!(outcome, super::Outcome::Negative));
+            assert_eq!(clock_calls, 1);
+            let mut xml = String::new();
+            flate2::read::MultiGzDecoder::new(std::fs::File::open(&osc).expect("published OSC"))
+                .read_to_string(&mut xml)
+                .expect("gzip XML");
+            assert_eq!(
+                xml.matches("timestamp=\"2023-11-14T22:15:23Z\"").count(),
+                2,
+                "{xml}"
+            );
+            assert_eq!(xml.matches("version=\"3\"").count(), 2, "{xml}");
+            assert!(xml.contains("<delete"), "{xml}");
+        }
+    }
+
     #[test]
     #[allow(clippy::expect_used)]
     fn resolves_one_exact_instant_only_when_requested() {
@@ -4602,11 +4696,12 @@ fn run_derive_changes(
     direct_io: bool,
     increment_version: bool,
     update_timestamp: bool,
+    now: impl FnOnce() -> std::time::SystemTime,
     parallelism: pbfhogg::Parallelism,
     host: &pbfhogg::host::Host,
     scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let timestamp = derive_timestamp(update_timestamp, std::time::SystemTime::now)?;
+    let timestamp = derive_timestamp(update_timestamp, now)?;
     let stats = pbfhogg::diff::derive::derive_changes(
         old,
         new,
@@ -5239,7 +5334,7 @@ fn run_merge_changes(
 /// revisions query the same points. One untimed warm-up round faults the
 /// index into the page cache; each timed round then queries every point
 /// once. Reports the timed rounds' total as `elapsed_ms`, each round's
-/// per-query mean, and answer tallies plus a digest of the admin answers, so
+/// per-query mean, and answer tallies plus a digest of the complete answers, so
 /// two runs can be checked for answering alike.
 fn run_bench_geocode_query(
     dir: &std::path::Path,
@@ -5375,9 +5470,8 @@ fn geocode_query_points(bbox: &pbfhogg::extract::Bbox, queries: u32, seed: u64) 
 }
 
 /// What one pass of bench-geocode-query answered: counts per class, and an
-/// FNV-1a digest of every query's admin answers (level and name, in
-/// answer order), so two runs over the same points can be checked for
-/// answering alike.
+/// FNV-1a digest of every ReverseResult field, in query and answer order.
+/// reverse-result-v1 uses length-prefixed UTF-8, option tags and float bits.
 #[derive(Default)]
 struct GeocodeQueryTally {
     admin_answered: u64,
@@ -5397,17 +5491,95 @@ impl GeocodeQueryTally {
     }
 
     fn add(&mut self, r: &pbfhogg::geocode_index::reader::ReverseResult<'_>) {
-        self.admin_answered += u64::from(!r.admin.is_empty());
-        self.admin_matches += r.admin.len() as u64;
-        self.addresses += u64::from(r.address.is_some());
-        self.streets += u64::from(r.street.is_some());
-        self.interpolations += u64::from(r.interpolation.is_some());
-        for a in &r.admin {
-            self.hash(&[a.admin_level]);
-            self.hash(a.name.as_bytes());
-            self.hash(&[0]);
-        }
+        use pbfhogg::geocode_index::reader::{
+            AddressMatch, AdminMatch, InterpolationMatch, ReverseResult, StreetMatch,
+        };
+        // Exhaustive patterns force additions to the answer schema to be
+        // considered here rather than silently omitted from its evidence.
+        let ReverseResult {
+            address,
+            street,
+            interpolation,
+            admin,
+        } = r;
+        self.admin_answered += u64::from(!admin.is_empty());
+        self.admin_matches += admin.len() as u64;
+        self.addresses += u64::from(address.is_some());
+        self.streets += u64::from(street.is_some());
+        self.interpolations += u64::from(interpolation.is_some());
+        // Schema order, option tags, lengths and little-endian float bits make
+        // every field and query boundary unambiguous. Only warm-up calls add().
         self.hash(&[0xFF]);
+        self.hash(&[u8::from(address.is_some())]);
+        if let Some(AddressMatch {
+            lat_e7,
+            lon_e7,
+            house_number,
+            street,
+            place,
+            postcode,
+            distance_m,
+        }) = address
+        {
+            self.hash(&lat_e7.to_le_bytes());
+            self.hash(&lon_e7.to_le_bytes());
+            self.text(house_number);
+            self.optional_text(*street);
+            self.optional_text(*place);
+            self.optional_text(*postcode);
+            self.hash(&distance_m.to_bits().to_le_bytes());
+        }
+        self.hash(&[u8::from(street.is_some())]);
+        if let Some(StreetMatch {
+            name,
+            snap_lat_e7,
+            snap_lon_e7,
+            distance_m,
+        }) = street
+        {
+            self.text(name);
+            self.hash(&snap_lat_e7.to_le_bytes());
+            self.hash(&snap_lon_e7.to_le_bytes());
+            self.hash(&distance_m.to_bits().to_le_bytes());
+        }
+        self.hash(&[u8::from(interpolation.is_some())]);
+        if let Some(InterpolationMatch {
+            street,
+            place,
+            house_number,
+            distance_m,
+        }) = interpolation
+        {
+            self.optional_text(*street);
+            self.optional_text(*place);
+            self.hash(&house_number.to_le_bytes());
+            self.hash(&distance_m.to_bits().to_le_bytes());
+        }
+        self.hash(&(admin.len() as u64).to_le_bytes());
+        for AdminMatch {
+            admin_level,
+            name,
+            country_code,
+            area,
+        } in admin
+        {
+            self.hash(&[*admin_level]);
+            self.text(name);
+            self.optional_text(*country_code);
+            self.hash(&area.to_bits().to_le_bytes());
+        }
+    }
+
+    fn text(&mut self, value: &str) {
+        self.hash(&(value.len() as u64).to_le_bytes());
+        self.hash(value.as_bytes());
+    }
+
+    fn optional_text(&mut self, value: Option<&str>) {
+        self.hash(&[u8::from(value.is_some())]);
+        if let Some(value) = value {
+            self.text(value);
+        }
     }
 
     fn hash(&mut self, bytes: &[u8]) {
@@ -5423,7 +5595,8 @@ impl GeocodeQueryTally {
         output::cli_eprintln!("addresses={}", self.addresses);
         output::cli_eprintln!("streets={}", self.streets);
         output::cli_eprintln!("interpolations={}", self.interpolations);
-        output::cli_eprintln!("admin_digest={:016x}", self.digest);
+        output::cli_eprintln!("result_format=reverse-result-v1");
+        output::cli_eprintln!("answer_digest={:016x}", self.digest);
     }
 }
 
@@ -6081,6 +6254,137 @@ mod geocode_query_bench_tests {
             street: None,
             interpolation: None,
             admin: Vec::new(),
+        }
+    }
+
+    fn complete() -> ReverseResult<'static> {
+        use pbfhogg::geocode_index::reader::{
+            AddressMatch, AdminMatch, InterpolationMatch, StreetMatch,
+        };
+        ReverseResult {
+            address: Some(AddressMatch {
+                lat_e7: 1,
+                lon_e7: 2,
+                house_number: "3",
+                street: Some("road"),
+                place: Some("place"),
+                postcode: Some("zip"),
+                distance_m: 4.0,
+            }),
+            street: Some(StreetMatch {
+                name: "road",
+                snap_lat_e7: 5,
+                snap_lon_e7: 6,
+                distance_m: 7.0,
+            }),
+            interpolation: Some(InterpolationMatch {
+                street: Some("road"),
+                place: None,
+                house_number: 8,
+                distance_m: 9.0,
+            }),
+            admin: vec![AdminMatch {
+                admin_level: 2,
+                name: "country",
+                country_code: Some("AB"),
+                area: 10.0,
+            }],
+        }
+    }
+
+    fn digest(results: &[ReverseResult<'_>]) -> u64 {
+        let mut tally = super::GeocodeQueryTally::new();
+        for result in results {
+            tally.add(result);
+        }
+        tally.digest
+    }
+
+    #[test]
+    fn full_answer_digest_covers_equal_count_field_changes() {
+        let baseline = digest(&[complete()]);
+        macro_rules! changed {
+            ($field:ident, $member:ident, $value:expr) => {{
+                let mut result = complete();
+                result.$field.as_mut().expect("present").$member = $value;
+                assert_ne!(
+                    digest(&[result]),
+                    baseline,
+                    "{}",
+                    stringify!($field.$member)
+                );
+            }};
+        }
+        changed!(address, lat_e7, 11);
+        changed!(address, lon_e7, 12);
+        changed!(address, house_number, "33");
+        changed!(address, street, Some("other"));
+        changed!(address, place, Some("other"));
+        changed!(address, postcode, Some("other"));
+        changed!(address, distance_m, -0.0);
+        changed!(street, name, "other");
+        changed!(street, snap_lat_e7, 15);
+        changed!(street, snap_lon_e7, 16);
+        changed!(street, distance_m, -0.0);
+        changed!(interpolation, street, Some("other"));
+        changed!(interpolation, place, Some("other"));
+        changed!(interpolation, house_number, 18);
+        changed!(interpolation, distance_m, -0.0);
+        for field in 0..4 {
+            let mut result = complete();
+            match field {
+                0 => result.admin[0].admin_level = 3,
+                1 => result.admin[0].name = "other",
+                2 => result.admin[0].country_code = Some("CD"),
+                _ => result.admin[0].area = -0.0,
+            }
+            assert_ne!(digest(&[result]), baseline);
+        }
+        changed!(address, postcode, None);
+        changed!(address, postcode, Some(""));
+        // Float bit identity, rather than numeric equality.
+        let mut positive = complete();
+        positive.street.as_mut().expect("street").distance_m = 0.0;
+        let mut negative = complete();
+        negative.street.as_mut().expect("street").distance_m = -0.0;
+        assert_ne!(digest(&[positive]), digest(&[negative]));
+    }
+
+    #[test]
+    fn full_answer_digest_preserves_options_lengths_and_boundaries() {
+        let mut absent = complete();
+        absent.address.as_mut().expect("address").postcode = None;
+        let mut empty_text = complete();
+        empty_text.address.as_mut().expect("address").postcode = Some("");
+        assert_ne!(digest(&[absent]), digest(&[empty_text]));
+        let mut left = complete();
+        left.address.as_mut().expect("address").street = Some("a\0b");
+        left.address.as_mut().expect("address").place = Some("c");
+        let mut right = complete();
+        right.address.as_mut().expect("address").street = Some("a");
+        right.address.as_mut().expect("address").place = Some("b\0c");
+        assert_ne!(digest(&[left]), digest(&[right]));
+        assert_ne!(
+            digest(&[empty(), complete()]),
+            digest(&[complete(), empty()])
+        );
+        assert_ne!(digest(&[empty()]), digest(&[empty(), empty()]));
+        let mut combined = complete();
+        combined.admin.push(complete().admin.remove(0));
+        let mut no_admin = complete();
+        no_admin.admin.clear();
+        assert_ne!(
+            digest(&[combined, no_admin]),
+            digest(&[complete(), complete()])
+        );
+        for field in 0..3 {
+            let mut result = complete();
+            match field {
+                0 => result.address = None,
+                1 => result.street = None,
+                _ => result.interpolation = None,
+            }
+            assert_ne!(digest(&[result]), digest(&[complete()]));
         }
     }
 

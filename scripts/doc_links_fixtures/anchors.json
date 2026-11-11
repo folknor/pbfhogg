@@ -1,0 +1,25 @@
+{
+  "vitepress_version": "2.0.0-alpha.17",
+  "vitepress": [
+    {"markdown": "# Hello World", "ids": ["hello-world"]},
+    {"markdown": "Title\n=====", "ids": ["title"]},
+    {"markdown": "# A / B", "ids": ["a-b"]},
+    {"markdown": "# 123 name", "ids": ["_123-name"]},
+    {"markdown": "# caf\u00e9", "ids": ["cafe"]},
+    {"markdown": "# under_score", "ids": ["under-score"]},
+    {"markdown": "# **Bold** [link](page.md) `x_y` <b>HTML</b>", "ids": ["bold-link-x-y-html"]},
+    {"markdown": "# `<tag>` and `*literal*`", "ids": ["tag-and-literal"]},
+    {"markdown": "# ![Map](map.svg) title", "ids": ["map-title"]},
+    {"markdown": "# Repeat\n\n# Repeat-1\n\n# Repeat\n\n# Repeat", "ids": ["repeat", "repeat-1", "repeat-2", "repeat-3"]},
+    {"markdown": "# Other {#repeat}\n\n# Repeat", "ids": ["repeat", "repeat-1"]},
+    {"markdown": "````\n# Hidden\n```\n# Also hidden\n````\n# Visible", "ids": ["visible"]}
+  ],
+  "github": [
+    {"markdown": "# Sample Section", "ids": ["sample-section"]},
+    {"markdown": "# Hello, *world*!", "ids": ["hello-world"]},
+    {"markdown": "# A / B", "ids": ["a--b"]},
+    {"markdown": "# Same\n\n# Same\n\n# Same", "ids": ["same", "same-1", "same-2"]},
+    {"markdown": "<a name='same'></a>\n\n# Same\n\n# Same", "ids": ["same", "same-1"]},
+    {"markdown": "# Custom {#chosen}", "ids": ["custom-chosen"]}
+  ]
+}

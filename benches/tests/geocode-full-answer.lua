@@ -1,4 +1,4 @@
--- Mutate the legacy instrument evidence, not the measured workload.
+-- Mutate the versioned instrument evidence, not the measured workload.
 local host = { datasets = { fixture = {
     bbox = "0,0,1,1", pbf = { indexed = { file = "fixture.pbf" } },
 } } }
@@ -6,7 +6,7 @@ local evidence = {
     elapsed_ms = "1", open_ms = "0", queries = "2", rounds = "2",
     us_per_query_best = "0.50", us_per_query_rounds = "0.60,0.50",
     admin_answered = "1", admin_matches = "2", addresses = "1",
-    streets = "0", interpolations = "0", admin_digest = "0123456789abcdef",
+    streets = "0", interpolations = "0", result_format = "reverse-result-v1", answer_digest = "0123456789abcdef",
 }
 local function invoke(omit, replacement, extra)
     local lines = {}
@@ -22,18 +22,18 @@ local function invoke(omit, replacement, extra)
     }
 end
 
-test("geocode accepts complete consistent legacy evidence", function()
+test("full-answer geocode accepts complete consistent full-answer evidence", function()
     local r = invoke()
     assert(r.outcome == "completed", r.reason)
 end)
 
 for key in pairs(evidence) do
-    test("geocode rejects missing " .. key, function()
+    test("full-answer geocode rejects missing " .. key, function()
         local r = invoke(key)
         assert(r.outcome == "failed", r.outcome)
         assert(r.reason:find("missing geocode field", 1, true), r.reason)
     end)
-    test("geocode rejects duplicate " .. key, function()
+    test("full-answer geocode rejects duplicate " .. key, function()
         local r = invoke(nil, nil, key .. "=" .. evidence[key])
         assert(r.outcome == "failed", r.outcome)
         assert(r.reason:find("duplicate geocode field", 1, true), r.reason)
@@ -41,12 +41,12 @@ for key in pairs(evidence) do
 end
 
 for key, value in pairs({
-    elapsed_ms = "nan", open_ms = "-1", queries = "3", rounds = "3",
+    result_format = "legacy-admin-v1", elapsed_ms = "nan", open_ms = "-1", queries = "3", rounds = "3",
     admin_answered = "3", admin_matches = "0", addresses = "3",
-    streets = "3", interpolations = "3", admin_digest = "123",
+    streets = "3", interpolations = "3", answer_digest = "123",
     us_per_query_best = "0.40", us_per_query_rounds = "0.50,",
 }) do
-    test("geocode rejects invalid or inconsistent " .. key, function()
+    test("full-answer geocode rejects invalid or inconsistent " .. key, function()
         local r = invoke(nil, { [key] = value })
         assert(r.outcome == "failed", r.outcome)
     end)

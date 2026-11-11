@@ -859,6 +859,11 @@ fn bounded_tail(name: &OsStr) -> &OsStr {
 /// An entry named `.pbfhogg-<kind>-<pid>-<n>.<name tail>` for `dest`: in
 /// `dir` when given (a caller-chosen staging directory), else beside `dest`.
 /// The marker is a prefix, so the entry keeps the destination's suffix.
+///
+/// The process ID here is read directly, not through the scratch identity
+/// adapter: publication sibling names take the PID independently of scratch
+/// identity acquisition, so PID acquisition is deliberately not confined to
+/// that adapter (only entropy acquisition is).
 fn sibling(dest: &Path, dir: Option<&Path>, kind: &str) -> Result<PathBuf> {
     let name = dest.file_name().ok_or_else(|| {
         new_output_error(OutputError::InvalidPath {

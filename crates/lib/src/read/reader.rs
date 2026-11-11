@@ -1483,6 +1483,12 @@ mod tests {
     /// carry an armed `evict_prefix` callback afterwards, so the callback
     /// cannot tell them apart;
     /// the fadvise call count can, and it is what the kernel actually saw.
+    ///
+    /// These public constructors stay usable from tests on purpose: they
+    /// exercise page-cache behaviour through sequential reads, which is what
+    /// this test pins. Parallel fixtures must inject fixed resources instead
+    /// of reaching the host through them, but that is a rule about the
+    /// parallel fixtures, so no ban on these constructors is applied.
     #[test]
     #[cfg(target_os = "linux")]
     fn public_readers_keep_the_page_cache_unless_asked() {

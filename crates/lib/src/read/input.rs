@@ -295,12 +295,15 @@ fn identity_of(meta: &std::fs::Metadata) -> Identity {
 
 /// How a pinned input's later opens reach the pinned file.
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Reopen {
     /// Through `/proc/self/fd/<pin>`: the pinned file itself.
     Procfs,
     /// Through the path, verified.
     Path,
+    /// A test-owned name of the pinned inode, independent of procfs.
+    #[cfg(feature = "test-hooks")]
+    Injected(PathBuf),
 }
 
 /// A read-only, non-blocking open of `path` with `extra` flags; the caller
@@ -345,6 +348,32 @@ fn clear_nonblock(file: &File, path: &Path) -> Result<()> {
 }
 
 impl PinnedInput {
+    /// Pin an input with a test-owned reopen name instead of probing procfs.
+    /// `None` selects verified path reopening; `Some` must name the pinned
+    /// inode (for example through a hard link kept alive by the test).
+    /// Opens still create independent descriptions and verify identity,
+    /// including direct opens. This does not simulate procfs availability.
+    ///
+    /// # Errors
+    /// Pinning or opening the supplied name failed, or it names another file.
+    #[cfg(all(unix, feature = "test-hooks"))]
+    pub fn pin_with_reopen_path(
+        path: &Path,
+        reopen_path: Option<&Path>,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        let host = host.enter()?;
+        let mut pin = Self::pin_with(path, &host, true)?;
+        if let Some(reopen_path) = reopen_path {
+            let probe = open_nonblocking(reopen_path, 0).map_err(|e| named("open", path, e))?;
+            pin.verify(&probe)?;
+            let inner = Arc::get_mut(&mut pin.0)
+                .ok_or_else(|| Error::internal("new input pin is unexpectedly shared"))?;
+            inner.reopen = Reopen::Injected(reopen_path.to_path_buf());
+        }
+        Ok(pin)
+    }
+
     /// Pin `path` for a run under `host`.
     ///
     /// # Errors
@@ -477,9 +506,11 @@ impl PinnedInput {
     /// What a later open opens: the pin's `/proc/self/fd` entry, or the path.
     #[cfg(unix)]
     fn open_path(&self) -> std::borrow::Cow<'_, Path> {
-        match self.0.reopen {
+        match &self.0.reopen {
             Reopen::Procfs => std::borrow::Cow::Owned(procfs_entry(&self.0.anchor)),
             Reopen::Path => std::borrow::Cow::Borrowed(&self.0.path),
+            #[cfg(feature = "test-hooks")]
+            Reopen::Injected(path) => std::borrow::Cow::Borrowed(path),
         }
     }
 

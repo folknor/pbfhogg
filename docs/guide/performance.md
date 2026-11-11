@@ -51,8 +51,15 @@ explicitly on every row that writes a PBF (`--compression zlib:6` for
 pbfhogg, `pbf_compression=zlib,pbf_compression_level=6` for osmium), so
 a change of either tool's default cannot move the comparison. The
 timings do not establish that the two tools' outputs are equivalent: a
-successful exit proves the command ran, and output equivalence is
-unresolved here, left to separate validation such as `brokkr verify`.
+successful exit proves the command ran. Equivalence is checked by a
+separate, untimed invocation, `brokkr bench vs-osmium --row ROW
+--validate-only yes`, which runs both tools on the row, decodes both
+output PBFs with osmium to OPL including way locations, and compares the
+two spools byte for byte. The policy is ordered entity equality: the
+entities, their order, metadata, tags (in order), references and
+locations must match; file headers and block encoding are excluded. The
+three text-report rows (`inspect`, `inspect-tags`, `inspect-tags-way`)
+print tool-specific report formats and refuse validation.
 To rerun the table, `scripts/vs-osmium.sh PAIRS DATASET OSC` runs every
 row as `PAIRS` alternating single-iteration pairs (the inspect row,
 pbfhogg only), with `OSC` an explicit key in the dataset's OSC table for

@@ -450,7 +450,7 @@ pub(crate) mod test_hooks {
         // A trace or ready file that cannot be written ends the run: a test
         // reading a short trace would silently skip kill points, and one
         // waiting for a ready file would report an unreachable step.
-        fn fail(what: &str, path: &std::path::Path, e: &std::io::Error) -> ! {
+        fn fail_write(what: &str, path: &std::path::Path, e: &std::io::Error) -> ! {
             crate::host::cli_note(
                 "cli.test_hooks",
                 format_args!("cannot write the {what} {}: {e}", path.display()),
@@ -461,7 +461,10 @@ pub(crate) mod test_hooks {
         use std::io::Write;
         let faults = cancel.faults();
         if let Some(spec) = std::env::var_os("PBFHOGG_TEST_PUBLISH_FAULTS") {
-            for name in spec.to_string_lossy().split(',').filter(|n| !n.is_empty()) {
+            let spec = spec
+                .to_str()
+                .unwrap_or_else(|| fail("publication faults must be UTF-8"));
+            for name in spec.split(',') {
                 match name.parse::<PublishFault>() {
                     Ok(fault) => faults.arm_publish_fault(fault),
                     Err(e) => {
@@ -473,7 +476,11 @@ pub(crate) mod test_hooks {
         }
         let steps = std::env::var_os("PBFHOGG_TEST_PUBLISH_STEPS").map(std::path::PathBuf::from);
         let pause = match std::env::var_os("PBFHOGG_TEST_PUBLISH_PAUSE") {
-            Some(spec) => match spec.to_string_lossy().parse::<PublishStep>() {
+            Some(spec) => match spec
+                .to_str()
+                .unwrap_or_else(|| fail("publication pause must be UTF-8"))
+                .parse::<PublishStep>()
+            {
                 Ok(step) => Some(step),
                 Err(e) => {
                     crate::host::cli_note("cli.test_hooks", format_args!("{e}"));
@@ -483,6 +490,11 @@ pub(crate) mod test_hooks {
             None => None,
         };
         let ready = std::env::var_os("PBFHOGG_TEST_PUBLISH_READY").map(std::path::PathBuf::from);
+        if pause.is_some() != ready.is_some()
+            || ready.as_ref().is_some_and(|p| p.as_os_str().is_empty())
+        {
+            fail("publication pause needs a step and nonempty ready path together");
+        }
         if steps.is_none() && pause.is_none() {
             return;
         }
@@ -494,14 +506,14 @@ pub(crate) mod test_hooks {
                     .open(path)
                     .and_then(|mut file| writeln!(file, "{step}"));
                 if let Err(e) = appended {
-                    fail("publication step trace", path, &e);
+                    fail_write("publication step trace", path, &e);
                 }
             }
             if pause == Some(step) {
                 if let Some(ready) = &ready
                     && let Err(e) = std::fs::write(ready, step.to_string())
                 {
-                    fail("publication pause ready file", ready, &e);
+                    fail_write("publication pause ready file", ready, &e);
                 }
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));

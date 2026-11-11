@@ -157,13 +157,13 @@ outcomes separately. Enforcement: structured capability accounting and a capabil
 gate requiring evidence for each promised backend and guard, while portable runs may
 still skip.
 
-## VER-019 - The input replacement matrix has no injected opener
+## VER-019 - The reopen cells do not use the injected opener yet
 
-The 38 reopen-strategy cells in the `fault_*_input.rs` tests now announce an unavailable
-strategy, skip the duplicate fallback cell and check outcomes exhaustively, through
-`crates/lib/tests/common/reopen_cell.rs`. Not done: an injected opener separating reopen
-strategy from the host, and a typed scenario runner; the procfs arm still needs usable
-procfs.
+A test-hooks-only `PinnedInput::pin_with_reopen_path` and a typed `Scenario::run` in
+`crates/lib/tests/common/reopen_cell.rs` inject the reopen path through a scratch hard
+link. The 38 cells across the 18 `fault_*_input.rs` files still use the older
+`available` helper; migrating them to `Scenario::run`, passing its pin into the commands
+and matching its outcome variants, is not done.
 
 ## VER-020 - Negative concurrency assertions pay sleeps and prove nothing about the wait
 
@@ -210,12 +210,6 @@ Fix: controlled completion gates or a controllable completion source at the
 result-collection boundary, with a smaller real-executor test. Enforcement: a source
 rule requiring an explicit exemption for test sleeps, and handshake tests. An injected
 clock does not control OS scheduling.
-
-## VER-022 - Nothing bans sleeps in counter unit tests
-
-Counter and metrics tests in `counters.rs` and `write/metrics.rs` now use fixed values,
-exact totals and observed slow-path entry, with no sleeps. The proposed source rule
-banning sleeps in counter unit tests is not added.
 
 ## VER-023 - Timeout helpers and hang tests detach the work they time out
 
@@ -304,12 +298,6 @@ coordinate reader swallows role errors.
 Fix: preserve multiplicity and numeric unknown types, and fail on unexpected decode errors.
 Enforcement: negative tests of the helpers and a scoped lint on error-to-empty conversions.
 
-## VER-047 - process_nofile has no injected counting results
-
-`crates/lib/tests/process_nofile.rs` now compares controlled descriptor deltas, gates each
-scenario separately and announces skips for unavailable counting or insufficient slots.
-Not done: tests with injected counting results, so a sandbox without procfs is covered.
-
 ## VER-050 - Large apply-changes fixtures pay production thresholds to test scheduling
 
 Reported by lib-integration.
@@ -322,13 +310,6 @@ Fix: extract batch scheduling and ordered-error selection behind explicit limits
 small, keeping format-limit coverage separate. Enforcement: observed batch events and a
 selected tier for large scenarios.
 
-## VER-053 - No check of expected test presence per build shape
-
-`tags_count.rs` is no longer gated on `commands`, and reader tests on independently encoded
-fixtures run under `geocode-reader` in `crates/lib/tests/geocode_reader.rs`. The all-record
-offset validation test still uses builder setup under `commands`, and nothing checks which
-tests each build shape is expected to run.
-
 ## VER-054 - The canonical fixture writer is three implementations
 
 Reported by lib-integration.
@@ -339,18 +320,6 @@ indexdata.
 
 Fix: generate logical blocks once and parameterize framing. Enforcement: verify paired fixtures
 have identical payloads and only the intended envelope differences.
-
-## VER-056 - Nothing refuses an unconfigured parallel test reader
-
-`ElementReader::resources` injects resources and `ElementReader::for_tests` builds fixed
-test readers; inline reader and pipeline tests use them. The proposed lint on
-unconfigured parallel test readers is not added.
-
-## VER-060 - Nothing confines PID and entropy acquisition to the scratch adapter
-
-`scratch.rs` now takes identity and entropy through seams, tested for collisions,
-interruption, short reads and entropy failure. The proposed lint restricting production PID
-acquisition to the scratch identity adapter and `getrandom` to `random_u128` is not added.
 
 ## VER-065 - Merge correctness fixtures scale with production batch tuning
 
@@ -369,7 +338,8 @@ The ignored timing probe in `commands/diff/seq.rs` is removed; its work-limit as
 stay. Timing belongs in a registered bench: synthetic modified-way pairs with 30,000
 refs (disjoint ranges, and every 60th ref changed), measuring `diff --verbose`, requiring
 exit 1 and checking replacement versus itemized output, with fixture preparation outside
-measurement. Not written.
+measurement. Not written: no existing command or bench helper produces those
+pairs untimed, so the bench needs a fixture producer first.
 
 
 
@@ -384,26 +354,6 @@ concurrent children size pools against the whole machine.
 Fix: separate process setup from execution and hand command execution a resolved host and policy,
 keeping subprocess tests for process integration. Enforcement: signatures and explicit child
 configuration.
-
-## VER-079 - Two invoker hook setters still take strings
-
-Hook configuration in `crates/cli/src/signals.rs` is validated and fails explicitly, and
-`crates/cli/tests/invoker.rs` has typed `cancel_pause`, `replace_input` and `&Path` file
-setters. `publish_faults` and `publish_pause` still take untyped strings, and the
-malformed-configuration failures have no subprocess tests.
-
-## VER-081 - derive-changes has no fixed-instant end-to-end test
-
-Clock resolution in `crates/cli/src/lib.rs` is separated from conversion, with
-fixed-instant conversion tests, and `cli_derive_changes.rs` checks that deletion timestamps
-agree and fall within the invocation's clock bounds. A fixed instant through the complete
-OSC output path is not tested.
-
-## VER-086 - Bad-request validation has no mutation coverage
-
-`bad_requests_are_refused_quietly` in `crates/harness/tests/exe.rs` now uses live FIFOs,
-a valid control launch and branch-specific refusal reasons. Not done: mutation tests
-disabling each validation branch.
 
 ## VER-089 - Plans, execution and CLI counterparts describe the workload independently
 
@@ -424,19 +374,6 @@ or nested include in an included file), and the authoritative composed check is
 `brokkr library --all`. It still does not parse composed TOML; residue only if a
 composed-configuration parse is ever wanted, which needs a brokkr configuration export
 brokkr does not offer.
-
-## VER-091 - Real descriptor limits have no child contract test
-
-The descriptor scenarios in `scenarios/nofile.rs` now take exact `FdPool` grants (1024, 6,
-896) with fixed parallelism of eight and private pools, and the filler-open loop is gone.
-Not done: a child contract test for real descriptor counting and restricted launches,
-announcing unsupported hard limits.
-
-## VER-093 - Nothing bans whole-file reads in scale-facing assertions
-
-Harness output comparisons and seed checks go through bounded helpers in
-`scenarios/file_assertions.rs`. The proposed source rule refusing whole-file reads in
-scale-facing assertions is not added.
 
 ## VER-098 - Release semantics and profiling configurations are not exercised
 
@@ -459,10 +396,9 @@ deploys documentation. Residue: a required merge check, if the project wants one
 
 ## VER-104 - The document checker is not verified against renderer output
 
-`scripts/check_doc_links.py` now recognizes Setext headings and its self-test,
-`scripts/test_check_doc_links.py`, runs in the gate. Its GitHub and VitePress slugging, inline rendering and
-sidebar parsing are still unverified against real renderer output: expected-output fixtures
-from the pinned VitePress version and an independent GitHub reference are not done.
+`scripts/check_doc_links.py` is tested against 18 fixtures in `scripts/doc_links_fixtures/`,
+twelve derived from the installed VitePress source and six GitHub contract cases. Full
+renderer parity and sidebar route and base behaviour remain unverified.
 
 
 ## VER-107 - The musl sweeps assume an x86_64 host
@@ -514,22 +450,12 @@ Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
 indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
 indexed inputs.
 
-## VER-114 - The geocode-query digest does not cover the complete answer
+## VER-118 - Three osmium comparison rows have no equivalence check
 
-`geocode-query.lua` now requires and validates all twelve result fields under a
-`legacy-admin-v1` label, with contract cases in `benches/tests/geocode-evidence.lua`. The
-digest still covers only admin level and name. Needed: a versioned result from the CLI
-instrument in `crates/cli/src/lib.rs` carrying a digest of every `ReverseResult` field
-(option presence, query and collection boundaries, length-prefixed strings, float bits),
-adopted by the Lua parser, with equal-count fixtures varying address, street,
-interpolation and admin values.
-
-## VER-118 - The osmium comparison checks only success
-
-`vs-osmium.lua` pins zlib level 6 on both tools, with flag contracts in
-`benches/tests/comparison-flags.lua`. Outputs are still not compared for equivalence in a
-separate run, and complete-ways and node-retention behaviour rely on defaults because
-pbfhogg has no affirmative flag for them.
+`vs-osmium.lua --validate-only yes` decodes both tools' PBF outputs independently through
+osmium OPL with way locations and compares them, for nine rows; the three text-report rows
+are refused. Complete-ways and node-retention behaviour are checked only at their
+defaults, because pbfhogg has no affirmative flag for them.
 
 ## VER-122 - Verify's equality oracle is narrower than "identical" and shares the subject's code
 
@@ -565,15 +491,6 @@ whose failures do not change the verdict.
 Fix: an explicit diagnostic option. Enforcement: a declarative step graph rejecting unused outputs.
 Brokkr side filed as bz brokkr#155.
 
-## VER-125 - Most bench scripts have no contract test
-
-Reported by bench-verify.
-
-Contract tests now cover 20 of 32 scripts. Still without one: canonical-digest,
-geocode-build, id-order, id-remap, id-select, location-integrity, parent-select,
-perturb-pbf, reencode-pbf, region-extract, sort-pbf and time-snapshot.
-
-Fix: a contract test per script for the argv it builds, its stop handling and its verdict.
 
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
 

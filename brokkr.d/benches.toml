@@ -120,9 +120,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.geocode-query]
 script_file = "../benches/build-geocode-index/geocode-query.lua"
 description = "Reverse geocoding query latency over fixed pseudo-random points, against an index the bench builds"
-version = 1
-date = 2026-11-10
+version = 2
+date = 2026-11-11
 changelog = [
+  { version = 2, date = 2026-11-11, note = "Require reverse-result-v1 full-answer evidence: answer_digest hashes every query's complete answer, computed in the untimed warm-up; legacy admin-only evidence is refused; the timed query loop is unchanged" },
   { date = 2026-11-11, note = "Fail closed on missing, duplicate, malformed or inconsistent legacy query evidence; label the admin-only result format explicitly" },
   { date = 2026-11-11, note = "--bbox, --queries, --rounds and --seed checked by typed domains at bind; a leading + or zero is refused, and the bbox needs WGS84 range and strict order; workload unchanged" },
   { date = 2026-11-11, note = "A query error in warm-up or a timed round now fails the run instead of being dropped; errors= no longer reported; points clamped to the bbox; workload unchanged" },
@@ -306,9 +307,10 @@ params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO
 [bench.vs-osmium]
 script_file = "../benches/compare/vs-osmium.lua"
 description = "One row of the guide's CLI command table, pbfhogg or osmium, inputs cold"
-version = 6
+version = 7
 date = 2026-11-11
 changelog = [
+  { version = 7, date = 2026-11-11, note = "Add --validate-only yes: a separate run of both PBF-producing arms, both outputs decoded by osmium to OPL with way locations and compared byte for byte; text-report rows refuse it; timing arms unchanged" },
   { version = 6, date = 2026-11-11, note = "Pin zlib level 6 for both writers; driver reads the Lua row registry and requires explicit positive pairs, dataset and dataset-scoped OSC key" },
   { version = 5, date = 2026-11-11, note = "Inputs advised out and checked by brokkr's cold on the measured tool call, replacing dd and fincore; the result is the tool child's wall, without the preparation" },
   { version = 4, date = 2026-11-10, note = "Fix osmium extract bbox spelling to --bbox= so the equals sign is not parsed as part of the coordinate" },
@@ -322,6 +324,7 @@ params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = 
 params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the apply-changes row only" }
 params.row = { validated = true, required = true, help = "inspect, sort, extract, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
+params.validate-only = { choices = ["yes", "no"], default = "no", help = "yes: run no timing; run both tools on a PBF-producing row and compare their outputs as osmium OPL with way locations" }
 
 # -- degrade
 

@@ -10,8 +10,8 @@
 -- The ranked wall is the query child's, so it includes process start, the
 -- index open and the warm-up round; the per-query figure to compare is
 -- record.child.us_per_query_best (fastest timed round's mean), with every
--- round's mean beside it. record.child.admin_digest hashes every query's
--- admin answers: two revisions whose digests differ answered differently.
+-- round's mean beside it. record.child.answer_digest hashes every query's
+-- complete answer: two revisions whose digests differ answered differently.
 -- A query error in the warm-up or any timed round fails the instrument, so
 -- r:ok() fails the run: a revision whose queries fail never reads as faster.
 --
@@ -62,16 +62,14 @@ function bench(params)
     r:ok()
     if params.verbose == "yes" then print(r.stderr) end
 
-    -- This is the legacy instrument schema, not a full-answer digest.
-    -- Keep parsing fail-closed until the instrument supplies a versioned
-    -- full-answer result; never interpret its admin digest as that result.
+    -- Reject legacy or unknown schemas rather than comparing partial answers.
     local fields = {
         elapsed_ms = true, open_ms = true, queries = true, rounds = true,
         us_per_query_best = true, us_per_query_rounds = true,
         admin_answered = true, admin_matches = true, addresses = true,
-        streets = true, interpolations = true, admin_digest = true,
+        streets = true, interpolations = true, answer_digest = true, result_format = true,
     }
-    local child = { bbox = bbox, result_format = "legacy-admin-v1" }
+    local child = { bbox = bbox }
     for line in string.gmatch(r.stderr, "[^\r\n]+") do
         local key, value = string.match(line, "^([%w_]+)=(.*)$")
         if key and fields[key] then
@@ -83,7 +81,7 @@ function bench(params)
         if child[key] == nil then fail("missing geocode field: " .. key) end
     end
     for key in pairs(fields) do
-        if key ~= "admin_digest" and key ~= "us_per_query_rounds" then
+        if key ~= "answer_digest" and key ~= "us_per_query_rounds" and key ~= "result_format" then
             local value = child[key]
             local pattern = key == "us_per_query_best" and "^%d+%.%d%d$" or "^%d+$"
             local n = tonumber(value)
@@ -93,8 +91,9 @@ function bench(params)
             child[key] = n
         end
     end
-    if #child.admin_digest ~= 16 or not child.admin_digest:match("^%x+$") then
-        fail("invalid geocode admin_digest")
+    if child.result_format ~= "reverse-result-v1" then fail("unsupported geocode result_format") end
+    if #child.answer_digest ~= 16 or not child.answer_digest:match("^%x+$") then
+        fail("invalid geocode answer_digest")
     end
     local count, best = 0, math.huge
     local values = child.us_per_query_rounds

@@ -8,6 +8,8 @@
 //! name): the harness inherits brokkr's lease descriptor as the CLI does,
 //! and makes the same promise about it. Process policy (the descriptor
 //! limit the harness raises) changes only in the children.
+//! The descriptor contract also reinvokes this test binary under restricted
+//! limits to test real probes without changing a sibling test's process state.
 //!
 //! `common` is the library package's `crates/lib/tests/common`, mounted by path, for
 //! the fixture writers and the shared scratch.
@@ -25,3 +27,6 @@ mod guard;
 
 #[cfg(target_os = "linux")]
 mod exe;
+
+#[cfg(target_os = "linux")]
+mod nofile;

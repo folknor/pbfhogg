@@ -468,56 +468,220 @@ fn bad_requests_are_refused_quietly() {
     let (_keep, input) = input();
     // The same input and live FIFO must support a valid launch first.
     let _control = repeat_cat(&input, 0, "2");
+    // Each case changes one property of the passing request. In particular,
+    // range checks have separate lower and upper probes, and each required
+    // field and field type is exercised without another invalid field.
     for (case, expected) in [
-        (0, "no scenario"),
-        (1, "bindings name"),
-        (2, "duplicate key"),
-        (3, "not a plain integer"),
-        (4, "a number with a fraction or exponent"),
-        (5, "trailing bytes"),
+        ("unknown scenario", "no scenario"),
+        ("missing binding", "bindings name"),
+        ("extra binding", "bindings name"),
+        ("duplicate key", "duplicate key"),
+        ("duplicate binding", "duplicate key"),
+        ("negative zero", "not a plain integer"),
+        ("leading zero", "not a plain integer"),
+        ("fraction", "a number with a fraction or exponent"),
+        ("exponent", "a number with a fraction or exponent"),
+        ("trailing bytes", "trailing bytes"),
+        ("protocol version", "request.protocol:"),
+        ("negative iteration", "request.iteration: out of range"),
+        ("large iteration", "request.iteration: out of range"),
+        ("missing protocol", "lacks a required key"),
+        ("missing scenario", "lacks a required key"),
+        ("missing iteration", "lacks a required key"),
+        ("missing bindings", "lacks a required key"),
+        (
+            "protocol type",
+            "request.protocol: unknown key or wrong type",
+        ),
+        (
+            "scenario type",
+            "request.scenario: unknown key or wrong type",
+        ),
+        (
+            "iteration type",
+            "request.iteration: unknown key or wrong type",
+        ),
+        (
+            "bindings type",
+            "request.bindings: unknown key or wrong type",
+        ),
+        ("unknown field", "request.extra: unknown key or wrong type"),
+        ("binding type", "request.bindings.out-b: not a string"),
+        ("relative binding", "request.bindings.out-b: not absolute"),
+        ("non-object", "the request is not an object"),
     ] {
         let run_dir = RunDir::new(|roles| {
             let mut value = repeat_request(&input, roles, 0);
-            if case == 0 {
-                value["scenario"] = serde_json::json!("no-such");
-            }
-            if case == 1 {
-                value["bindings"]
-                    .as_object_mut()
-                    .expect("bindings")
-                    .remove("out-b");
+            match case {
+                "unknown scenario" => value["scenario"] = serde_json::json!("no-such"),
+                "missing binding" => {
+                    value["bindings"]
+                        .as_object_mut()
+                        .expect("bindings")
+                        .remove("out-b");
+                }
+                "extra binding" => {
+                    value["bindings"]["extra"] = serde_json::json!(roles.join("extra"));
+                }
+                "protocol version" => value["protocol"] = serde_json::json!(2),
+                "negative iteration" => value["iteration"] = serde_json::json!(-1),
+                "large iteration" => value["iteration"] = serde_json::json!(u64::MAX),
+                "missing protocol" | "missing scenario" | "missing iteration"
+                | "missing bindings" => {
+                    let key = case.strip_prefix("missing ").expect("missing field case");
+                    value.as_object_mut().expect("request").remove(key);
+                }
+                "protocol type" | "scenario type" | "iteration type" | "bindings type" => {
+                    let key = case.strip_suffix(" type").expect("field type case");
+                    value[key] = serde_json::Value::Null;
+                }
+                "unknown field" => value["extra"] = serde_json::json!(0),
+                "binding type" => value["bindings"]["out-b"] = serde_json::json!(0),
+                "relative binding" => value["bindings"]["out-b"] = serde_json::json!("out-b"),
+                "non-object" => value = serde_json::json!([]),
+                _ => {}
             }
             let text = serde_json::to_string(&value).expect("request JSON");
-            // These four cases deliberately violate JSON or its integer grammar.
-            match case {
-                2 => text.replacen("\"iteration\":0", "\"iteration\":0,\"iteration\":0", 1),
-                3 => text.replacen("\"iteration\":0", "\"iteration\":-0", 1),
-                4 => text.replacen("\"iteration\":0", "\"iteration\":0.5", 1),
-                5 => format!("{text} x"),
+            // Text edits preserve spellings that serde_json would normalize.
+            let text = match case {
+                "duplicate key" => {
+                    text.replacen("\"iteration\":0", "\"iteration\":0,\"iteration\":0", 1)
+                }
+                "duplicate binding" => {
+                    let binding =
+                        serde_json::to_string(&value["bindings"]["out-b"]).expect("path JSON");
+                    text.replacen(
+                        "\"bindings\":{",
+                        &format!("\"bindings\":{{\"out-b\":{binding},"),
+                        1,
+                    )
+                }
+                "negative zero" => text.replacen("\"iteration\":0", "\"iteration\":-0", 1),
+                "leading zero" => text.replacen("\"iteration\":0", "\"iteration\":00", 1),
+                "fraction" => text.replacen("\"iteration\":0", "\"iteration\":0.5", 1),
+                "exponent" => text.replacen("\"iteration\":0", "\"iteration\":0e0", 1),
+                "trailing bytes" => format!("{text} x"),
                 _ => text,
-            }
-            .into_bytes()
+            };
+            text.into_bytes()
         });
-        let fifo = Fifo::new(&run_dir.root.join("capture"));
-        let ran = run_dir.launch(&fifo.path.clone(), &[]);
-        let lines = fifo.finish();
-        assert_eq!(ran.status.code(), Some(2), "case {case}");
-        assert!(
-            ran.stdout.is_empty() && ran.stderr.is_empty(),
-            "case {case}"
-        );
-        assert!(lines.is_empty(), "refused request emitted markers: {lines}");
-        assert_eq!(run_dir.entries("artefacts"), ["refusal.json"]);
-        let reason = run_dir.doc("refusal.json");
-        assert_eq!(reason["protocol"], 1);
-        assert!(
-            reason["reason"]
-                .as_str()
-                .expect("reason")
-                .contains(expected),
-            "{reason}"
-        );
+        assert_request_refused(&run_dir, case, expected);
         assert!(run_dir.entries("roles").is_empty());
+    }
+}
+
+/// Assert refusal before setup or any call starts, with the specific reason
+/// so a later validation failure cannot mask a removed earlier check.
+fn assert_request_refused(run_dir: &RunDir, case: &str, expected: &str) {
+    let fifo = Fifo::new(&run_dir.root.join("capture"));
+    let ran = run_dir.launch(&fifo.path.clone(), &[]);
+    let lines = fifo.finish();
+    assert_eq!(ran.status.code(), Some(2), "case {case}");
+    assert!(
+        ran.stdout.is_empty() && ran.stderr.is_empty(),
+        "case {case}"
+    );
+    assert!(lines.is_empty(), "case {case} emitted markers: {lines}");
+    assert_eq!(
+        run_dir.entries("artefacts"),
+        ["refusal.json"],
+        "case {case}"
+    );
+    let reason = run_dir.doc("refusal.json");
+    assert_eq!(reason["protocol"], 1);
+    assert!(
+        reason["reason"]
+            .as_str()
+            .expect("reason")
+            .contains(expected),
+        "case {case}: {reason}"
+    );
+    assert!(run_dir.entries("cwd").is_empty(), "case {case}");
+    assert!(run_dir.entries("private").is_empty(), "case {case}");
+}
+
+#[test]
+fn bad_binding_states_are_refused_before_setup() {
+    let (_keep, input) = input();
+    for (case, expected) in [
+        ("missing input", "input input:"),
+        ("directory input", "input input is not a regular file"),
+        ("existing output", "role out-a is not in its initial state"),
+        ("missing parent", "role out-a:"),
+        ("same outputs", "name one path"),
+        ("aliased parents", "name one path"),
+        (
+            "missing seed",
+            "role out-replace is not in its initial state",
+        ),
+        ("wrong seed", "role out-replace is not in its initial state"),
+        (
+            "symlink seed",
+            "role out-replace is not in its initial state",
+        ),
+        ("input output alias", "name one path"),
+    ] {
+        let run_dir = RunDir::new(|roles| {
+            let mut value = repeat_request(&input, roles, 0);
+            match case {
+                "missing input" => {
+                    value["bindings"]["input"] = serde_json::json!(roles.join("missing"));
+                }
+                "directory input" => value["bindings"]["input"] = serde_json::json!(roles),
+                "existing output" => {
+                    std::fs::write(roles.join("out-a"), b"untouched").expect("existing output");
+                }
+                "missing parent" => {
+                    value["bindings"]["out-a"] = serde_json::json!(roles.join("missing/out"));
+                }
+                "same outputs" => value["bindings"]["out-b"] = value["bindings"]["out-a"].clone(),
+                "aliased parents" => {
+                    std::fs::create_dir(roles.join("sub")).expect("subdirectory");
+                    value["bindings"]["out-b"] = serde_json::json!(roles.join("sub/../out-a"));
+                }
+                "missing seed" | "wrong seed" | "symlink seed" | "input output alias" => {
+                    value["scenario"] = serde_json::json!("seeded-replace");
+                    value["bindings"]
+                        .as_object_mut()
+                        .expect("bindings")
+                        .remove("out-a");
+                    value["bindings"]
+                        .as_object_mut()
+                        .expect("bindings")
+                        .remove("out-b");
+                    for role in ["out-replace", "out-refuse"] {
+                        value["bindings"][role] = serde_json::json!(roles.join(role));
+                        if role == "out-refuse" || case != "missing seed" {
+                            let seed = if role == "out-refuse" || case != "wrong seed" {
+                                format!("brokkr-library-seed-v1 {role}\n")
+                            } else {
+                                "wrong seed\n".to_owned()
+                            };
+                            if role == "out-replace" && case == "symlink seed" {
+                                let target = roles.join("seed-target");
+                                std::fs::write(&target, seed).expect("seed target");
+                                std::os::unix::fs::symlink(target, roles.join(role))
+                                    .expect("seed link");
+                            } else {
+                                std::fs::write(roles.join(role), seed).expect("seed");
+                            }
+                        }
+                    }
+                    if case == "input output alias" {
+                        value["bindings"]["input"] = value["bindings"]["out-replace"].clone();
+                    }
+                }
+                _ => unreachable!("listed binding case"),
+            }
+            serde_json::to_vec(&value).expect("request JSON")
+        });
+        assert_request_refused(&run_dir, case, expected);
+        if case == "existing output" {
+            assert_eq!(
+                std::fs::read(run_dir.root.join("roles/out-a")).expect("output"),
+                b"untouched"
+            );
+        }
     }
 }
 

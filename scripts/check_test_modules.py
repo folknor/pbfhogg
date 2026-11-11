@@ -3,7 +3,8 @@
 External modules must be at file scope. Inline modules may contain tests, but
 not external module declarations. Unknown cfg forms fail closed; extend the
 small evaluator deliberately when the test graph needs a new form. This checks
-source reachability, not macro expansion or whether a test executes.
+source reachability and module presence in at least one executable sweep,
+not macro expansion or whether a test executes.
 """
 from pathlib import Path
 import re
@@ -39,12 +40,17 @@ def cfg_value(expression, features):
             return all(values) if name == 'all' else any(values)
         if name in ('test', 'unix'):
             return True
-        assert name in ('feature', 'target_os', 'target_env'), f'unsupported cfg: {name}'
+        assert name in ('feature', 'target_os', 'target_env', 'target_endian', 'target_arch'), \
+            f'unsupported cfg: {name}'
         assert tokens[position] == '='
         value = tokens[position + 1].strip('"')
         position += 2
         if name == 'feature':
             return value in features
+        if name == 'target_endian':
+            return value == 'little'
+        if name == 'target_arch':
+            return value == 'x86_64'
         # These are the executable Linux sweeps configured by this project.
         return value in features if name == 'target_env' else value == 'linux'
 
@@ -106,6 +112,48 @@ def reachable(roots, features):
     return visited
 
 
+def module_presence(source, features):
+    """Declaration identities, including inline modules and enclosing cfg gates.
+
+    File-level gates are handled by reachable(). This lexical check shares its
+    closed cfg evaluator and intentionally makes no claim about macro expansion.
+    """
+    code = blank_comments_and_literals(source)
+    pattern = r'((?:#\s*\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([;{])'
+    scopes = []
+    declared, enabled = set(), set()
+    for match in re.finditer(pattern, code):
+        attrs = source[match.start(1):match.end(1)]
+        assert 'cfg_attr' not in attrs, 'cfg_attr modules need explicit audit support'
+        gates = [cfg_value(gate, features) for gate in
+                 re.findall(r'#\s*\[cfg\((.*?)\)\]', attrs, re.S)]
+        active = all(gates) and all(value for end, value in scopes if end > match.start())
+        identity = (code.count('\n', 0, match.start()) + 1, match[2])
+        declared.add(identity)
+        if active:
+            enabled.add(identity)
+        if match[3] == '{':
+            depth = 1
+            for end in range(match.end(), len(code)):
+                depth += (code[end] == '{') - (code[end] == '}')
+                if depth == 0:
+                    scopes.append((end, active))
+                    break
+            else:
+                raise AssertionError('unclosed inline module')
+    return declared, enabled
+
+
+def require_module_coverage(declared, enabled):
+    # A disabled declaration is a platform alternative when an enabled module
+    # of the same name exists in the file; only never-enabled names are flagged.
+    enabled_names = {(identity[0], identity[-1]) for identity in enabled}
+    missing = {identity for identity in declared - enabled
+               if (identity[0], identity[-1]) not in enabled_names}
+    assert not missing, 'Test module declarations outside executable sweep shapes:\n' + '\n'.join(
+        f'{path}:{line}: mod {name}' for path, line, name in sorted(missing))
+
+
 def require_coverage(found, covered):
     missing = found - covered
     assert not missing, 'Rust test files outside executable sweep module graphs:\n' + '\n'.join(map(str, sorted(missing)))
@@ -116,6 +164,7 @@ def audit(root):
     members = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']['members']
     found = set()
     covered = set()
+    enabled_modules = set()
     for member in members:
         directory = root / member
         manifest = tomllib.loads((directory / 'Cargo.toml').read_text())
@@ -139,8 +188,17 @@ def audit(root):
                 if not set(target.get('required-features', [])).issubset(features):
                     continue
                 path = (directory / target.get('path', 'tests/' + target['name'] + '.rs')).resolve()
-                covered.update(reachable([path], features))
+                graph = reachable([path], features)
+                covered.update(graph)
+                for file in graph:
+                    _, enabled = module_presence(file.read_text(), features)
+                    enabled_modules.update((file, line, name) for line, name in enabled)
     require_coverage(found, covered)
+    declared_modules = set()
+    for file in found:
+        declared, _ = module_presence(file.read_text(), set())
+        declared_modules.update((file, line, name) for line, name in declared)
+    require_module_coverage(declared_modules, enabled_modules)
     return len(found)
 
 

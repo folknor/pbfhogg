@@ -35,6 +35,33 @@ local function contains(argv, key, value)
 end
 
 local cases = {
+    { name = "geocode-build", command = "build-geocode-index",
+        args = { "--direct-io", "yes" },
+        flags = { { "--force" }, { "--direct-io" }, { "--output-dir" }, { "--tmp-dir" } } },
+    { name = "id-remap", command = "renumber",
+        args = { "--direct-io", "yes", "--compression", "zstd:1" },
+        flags = { { "--direct-io" }, { "--compression", "zstd:1" }, { "--output" } } },
+    { name = "id-select", command = "getid",
+        args = { "--add-referenced", "yes", "--direct-io", "yes" },
+        flags = { { "--add-referenced" }, { "--direct-io" }, { "--output" } } },
+    { name = "parent-select", command = "getparents",
+        args = { "--compression", "zstd:1" },
+        flags = { { "--compression", "zstd:1" }, { "--output" } } },
+    { name = "perturb-pbf", command = "degrade", out = "degrade.pbf",
+        args = { "--strip-indexdata", "yes", "--strip-locations", "yes", "--unsort", "yes", "--io-uring", "yes" },
+        flags = { { "--strip-indexdata" }, { "--strip-locations" }, { "--unsort" }, { "--io-uring" }, { "--overwrite" } } },
+    { name = "reencode-pbf", command = "repack", out = "repack.pbf",
+        args = { "--elements-per-blob", "17", "--force-repack", "yes", "--io-uring", "yes" },
+        flags = { { "--elements-per-blob", "17" }, { "--force" }, { "--io-uring" }, { "--overwrite" } } },
+    { name = "region-extract", command = "extract", out = "smart.osm.pbf",
+        args = { "--bbox", "0,0,1,1", "--strategy", "smart", "--io-uring", "yes" },
+        flags = { { "-b=0,0,1,1" }, { "--smart" }, { "--io-uring" }, { "--overwrite" } } },
+    { name = "sort-pbf", command = "sort", out = "sorted.pbf",
+        args = { "--force-sort", "yes", "--direct-io", "yes", "--io-uring", "yes", "--compression", "zstd:1" },
+        flags = { { "--force" }, { "--direct-io" }, { "--io-uring" }, { "--compression", "zstd:1" } } },
+    { name = "time-snapshot", command = "time-filter",
+        args = { "--direct-io", "yes", "--compression", "zstd:1" },
+        flags = { { "2024-01-01T00:00:00Z" }, { "--direct-io" }, { "--compression", "zstd:1" } } },
     { name = "copy-pbf", command = "cat", out = "cat.pbf",
         args = { "--type", "way", "--clean", "yes", "--direct-io", "yes", "--compression", "zstd:1" },
         flags = { { "--type", "way" }, { "--clean", "version" }, { "--direct-io" }, { "--compression", "zstd:1" } } },
@@ -65,8 +92,18 @@ for _, case in ipairs(cases) do
         local argv = r.calls[1].argv
         assert(argv[1] == case.command)
         for _, flag in ipairs(case.flags) do contains(argv, table.unpack(flag)) end
-        assert(r.record.summary == "summary")
-        if case.out then assert(r.record.output_bytes == 3) end
+        if case.name == "region-extract" then
+            assert(#r.record.strategies == 1)
+            assert(r.record.strategies[1].summary == "summary")
+            assert(r.record.strategies[1].output_bytes[1] == 3)
+        else
+            assert(r.record.summary == "summary")
+            if case.out then assert(r.record.output_bytes == 3) end
+        end
+        if case.name == "id-select" or case.name == "parent-select" then
+            assert(argv[3] == "n115722" and argv[4] == "n115723")
+            assert(r.record.ids[1] == "n115722")
+        end
         if case.name == "merge-diffs" then
             assert(argv[2] == DATA .. "10.osc.gz" and argv[3] == DATA .. "9.osc.gz")
         elseif case.name == "apply-diff" then
@@ -83,7 +120,13 @@ for _, case in ipairs(cases) do
         args[#args + 1] = "--stop"; args[#args + 1] = "=CONTRACT_POINT"
         local r = invoke(case.name, args, { { stopped_at = "CONTRACT_POINT" } })
         assert(r.outcome == "completed", r.reason)
-        assert(r.verdict == "stopped" and r.record.stopped_at == "CONTRACT_POINT")
+        assert(r.verdict == "stopped")
+        if case.name == "region-extract" then
+            assert(r.record.strategies[1].stopped_at == "CONTRACT_POINT")
+            assert(r.record.strategies[1].output_bytes == nil)
+        else
+            assert(r.record.stopped_at == "CONTRACT_POINT")
+        end
         assert(r.record.output_bytes == nil)
         assert(r.calls[1].stop_at == "CONTRACT_POINT")
     end)
@@ -101,6 +144,10 @@ for _, case in ipairs(cases) do
 end
 
 for _, case in ipairs({
+    { "geocode-build", { "--io-uring", "yes" }, "no io_uring writer" },
+    { "geocode-build", { "--compression", "none" }, "writes no PBF" },
+    { "perturb-pbf", {}, "at least one" },
+    { "id-select", { "--add-referenced", "yes", "--invert", "yes" }, "mutually exclusive" },
     { "copy-pbf", { "--dedupe", "yes", "--clean", "yes" }, "takes neither" },
     { "copy-pbf", { "--io-uring", "yes" }, "requires --dedupe" },
     { "tag-select", { "--omit-referenced", "yes", "--jobs", "2" }, "--omit-referenced refuses" },

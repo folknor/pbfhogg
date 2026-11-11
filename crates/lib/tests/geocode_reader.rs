@@ -16,12 +16,12 @@ fn write_index(dir: &Path) {
         replication_sequence: 0,
         replication_timestamp: 0,
         addr_point_count: 1,
-        street_way_count: 0,
-        interp_way_count: 0,
-        admin_polygon_count: 0,
+        street_way_count: 1,
+        interp_way_count: 1,
+        admin_polygon_count: 1,
         geo_cell_count: 2,
         coarse_cell_count: 0,
-        admin_cell_count: 0,
+        admin_cell_count: 1,
     };
     std::fs::write(dir.join(format::FILE_HEADER), header.to_bytes()).expect("header");
     for file in [
@@ -37,6 +37,59 @@ fn write_index(dir: &Path) {
     ] {
         std::fs::write(dir.join(file), []).expect("empty record file");
     }
+    write_offset_records(dir);
+    write_lists_and_address(dir);
+}
+
+/// Populate every offset-bearing record without depending on the builder.
+/// Geometry is intentionally unreferenced by the query entry lists.
+fn write_offset_records(dir: &Path) {
+    let street = format::StreetWay {
+        node_offset: 0,
+        name_offset: 4,
+        node_count: 1,
+    };
+    let interpolation = format::InterpWay {
+        node_offset: 0,
+        parent_offset: 4,
+        start_number: 10,
+        end_number: 20,
+        node_count: 1,
+        interpolation_type: 0,
+        parent_kind: 0,
+    };
+    let polygon = format::AdminPolygon {
+        area: 1.0,
+        vertex_offset: 0,
+        vertex_count: 1,
+        name_offset: 4,
+        country_code_offset: 0,
+        admin_level: 6,
+    };
+    let admin = format::AdminCell {
+        cell_id: 1,
+        entries_offset: 0,
+    };
+    for (file, bytes) in [
+        (format::FILE_STREET_WAYS, street.to_bytes().to_vec()),
+        (format::FILE_INTERP_WAYS, interpolation.to_bytes().to_vec()),
+        (format::FILE_ADMIN_POLYGONS, polygon.to_bytes().to_vec()),
+        (format::FILE_ADMIN_CELLS, admin.to_bytes().to_vec()),
+    ] {
+        std::fs::write(dir.join(file), bytes).expect("offset-bearing record");
+    }
+    for file in [
+        format::FILE_STREET_NODES,
+        format::FILE_INTERP_NODES,
+        format::FILE_ADMIN_VERTICES,
+    ] {
+        std::fs::write(dir.join(file), [0u8; 8]).expect("one coordinate");
+    }
+    std::fs::write(dir.join(format::FILE_ADMIN_ENTRIES), 0u16.to_le_bytes())
+        .expect("empty admin list");
+}
+
+fn write_lists_and_address(dir: &Path) {
     // Every empty list has a u16 count, at offset zero.
     for file in [
         format::FILE_STREET_ENTRIES,
@@ -170,4 +223,49 @@ fn reader_open_failure_names_the_missing_file() {
         report.contains(&strings.display().to_string()),
         "the error must name the missing data file: {report}"
     );
+}
+
+/// Reader open-time validation must cover every offset-into-a-file
+/// relationship in the format, not just the geo entry lists. Validating some
+/// of the kinds and not the others is how a truncated file opens successfully
+/// and then silently answers with incomplete results: every read path is
+/// individually bounds-safe and returns "nothing here" rather than an error,
+/// so the caller cannot tell a truncated list from an empty one.
+#[test]
+fn reader_rejects_every_out_of_bounds_offset_kind() {
+    let dir = crate::common::test_scratch();
+    let good = dir.path().join("good");
+    write_index(&good);
+    pbfhogg::geocode_index::reader::Reader::open(&good)
+        .expect("the pristine index must open, or every case below is vacuous");
+
+    // (file to corrupt, byte range holding the offset, substring of the
+    // expected error). One case per offset kind in the format.
+    let cases: &[(&str, std::ops::Range<usize>, &str)] = &[
+        ("admin_cells.bin", 8..16, "admin entry"),
+        ("street_ways.bin", 0..8, "street way node"),
+        ("interp_ways.bin", 0..8, "interpolation way node"),
+        ("admin_polygons.bin", 4..12, "admin polygon vertex"),
+    ];
+    for (file, range, expected) in cases {
+        let index_dir = dir.path().join(format!("case-{file}"));
+        write_index(&index_dir);
+        let path = index_dir.join(file);
+        let mut bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        assert!(
+            bytes.len() >= range.end,
+            "{file} is empty in the fixture, so this case proves nothing"
+        );
+        let poison = vec![0xFEu8; range.len()];
+        bytes[range.clone()].copy_from_slice(&poison);
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {file}: {e}"));
+
+        let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+            .err()
+            .unwrap_or_else(|| panic!("{file}: out-of-bounds offset must fail open, not open"));
+        assert!(
+            err.to_string().contains(expected),
+            "{file}: expected an error mentioning {expected}, got: {err}"
+        );
+    }
 }

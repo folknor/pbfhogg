@@ -1262,72 +1262,8 @@ fn builder_refuses_a_truly_empty_index() {
     );
 }
 
-/// Reader open-time validation must cover every offset-into-a-file
-/// relationship in the format, not just the geo entry lists. Validating some
-/// of the kinds and not the others is how a truncated file opens successfully
-/// and then silently answers with incomplete results: every read path is
-/// individually bounds-safe and returns "nothing here" rather than an error,
-/// so the caller cannot tell a truncated list from an empty one.
-#[test]
-fn reader_rejects_every_out_of_bounds_offset_kind() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let good = dir.path().join("good");
-    write_all_record_kinds_input(&input);
-    let stats = build_index(
-        &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
-            ..Default::default()
-        },
-        &good,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("build index");
-    assert!(
-        stats.addr_points > 0
-            && stats.street_ways > 0
-            && stats.interp_ways > 0
-            && stats.admin_polygons > 0,
-        "fixture must populate every record kind, got {stats:?}"
-    );
-    pbfhogg::geocode_index::reader::Reader::open(&good)
-        .expect("the pristine index must open, or every case below is vacuous");
-
-    // (file to corrupt, byte range holding the offset, substring of the
-    // expected error). One case per offset kind in the format.
-    let cases: &[(&str, std::ops::Range<usize>, &str)] = &[
-        ("admin_cells.bin", 8..16, "admin entry"),
-        ("street_ways.bin", 0..8, "street way node"),
-        ("interp_ways.bin", 0..8, "interpolation way node"),
-        ("admin_polygons.bin", 4..12, "admin polygon vertex"),
-    ];
-    for (file, range, expected) in cases {
-        let index_dir = dir.path().join(format!("case-{file}"));
-        copy_dir(&good, &index_dir);
-        let path = index_dir.join(file);
-        let mut bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
-        assert!(
-            bytes.len() >= range.end,
-            "{file} is empty in the fixture, so this case proves nothing"
-        );
-        let poison = vec![0xFEu8; range.len()];
-        bytes[range.clone()].copy_from_slice(&poison);
-        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {file}: {e}"));
-
-        let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-            .err()
-            .unwrap_or_else(|| panic!("{file}: out-of-bounds offset must fail open, not open"));
-        assert!(
-            err.to_string().contains(expected),
-            "{file}: expected an error mentioning {expected}, got: {err}"
-        );
-    }
-}
-
 /// One input that populates every record kind at once: address points,
-/// street ways, interpolation ways and admin polygons. The offset-validation
-/// test needs all four non-empty, or its cases are vacuous.
+/// street ways, interpolation ways and admin polygons for builder contracts.
 fn write_all_record_kinds_input(path: &Path) {
     write_test_pbf_sorted(
         path,
@@ -1443,16 +1379,6 @@ fn all_record_kinds_nodes() -> Vec<TestNode<'static>> {
             meta: None,
         },
     ]
-}
-
-fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-    std::fs::create_dir_all(to).expect("create dir");
-    for entry in std::fs::read_dir(from).expect("read_dir") {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
-        }
-    }
 }
 
 #[test]

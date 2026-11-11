@@ -72,7 +72,8 @@ NAME` list each harness in turn to find one test.
   sweep; the CLI binary has no such gates, since `pbfhogg-cli` always
   links the library with `commands`. **`crates/harness/tests/all.rs`** (the
   `pbfhogg-harness` package) is the third: the tests that drive the
-  library harness executable (`exe.rs`), with `crates/lib/tests/common/` and the
+  library harness executable (`exe.rs`) and the real-limit descriptor
+  contracts (`nofile.rs`, see below), with `crates/lib/tests/common/` and the
   promise guard (`crates/cli/tests/guard.rs`, mounted at the crate root so its
   control test keeps the name `guard::tests::probe`) mounted by path.
   The harness's own unit tests live in its bin target.
@@ -94,14 +95,22 @@ NAME` list each harness in turn to find one test.
   and `reopen_cell.rs` (the reopen-strategy admission the `fault_*_input`
   replacement cells share) are each declared once, by `#[path]`, in
   `crates/lib/tests/all.rs`, and the harness mounts `fifo_capture.rs` the
-  same way.
+  same way. `reopen_cell.rs` also holds the replacement seam
+  `Scenario::run` (`Pinned` or `Path`): it pins the input with an injected
+  reopen name (a scratch hard link for `Pinned`, none for `Path`) and hands
+  that pin to the closure, so a replacement cell needs no procfs; the
+  closure must pass that pin to the command rather than re-pinning the path.
 - **A new test file not declared in the `all.rs` under its package's test directory (or as
   its own `[[test]]`) is never compiled.** Add the `mod` line with the file.
   The pre-clippy `test-modules` script check (`scripts/check_test_modules.py`)
   reports such a file: every `.rs` under a member's `tests/` must be
   reachable from a `[[test]]` target that some sweep in `brokkr.d/checks.toml`
   builds, following `mod` declarations, `#[path]` attributes and `cfg` gates
-  evaluated against that sweep's features. It is lexical: it reads source
+  evaluated against that sweep's features. Module presence is checked too:
+  every `mod` declaration in a test file, inline modules included, must be
+  enabled (its own and its enclosing modules' `cfg` gates true) in at least
+  one sweep that builds the file, so a test module gated out of every sweep
+  is reported. It is lexical: it reads source
   reachability, not macro expansion or whether a test executes; an external
   `mod` inside an inline module, a `cfg_attr` on a module, or a `cfg` form its
   small evaluator does not know fails closed until the audit is extended.
@@ -684,7 +693,20 @@ It checks descriptor counting by a controlled delta (eight files opened
 between two counts) rather than assuming inherited descriptor numbers leave
 no holes, and each scenario skips through the announced-skip helper when the
 host's counting, free slots or hard limit cannot support it, restoring the
-original soft limit at the end.
+original soft limit at the end. It also refuses an external join under six
+injected descriptor counts (counted with slots left, counted past the limit,
+uncounted, a failed count, `EMFILE` and `ENFILE` exhaustion) through a
+`ProcessActions` provider on the host, so those refusal messages are tested
+without procfs, a real shortage or a limit change.
+The harness package tests real probes the same way without a target of its
+own: `crates/harness/tests/nofile.rs` reinvokes the `all` test binary as a
+bounded `OwnedChild` with a fixed soft and hard `RLIMIT_NOFILE` set before
+exec, and that child checks descriptor counting against an independent
+`fcntl` oracle, raising to the hard cap, the harness's `RaiseToHard` policy,
+a descriptor held above the soft limit and exhaustion. The parent never
+changes its own limits. It skips where the host's hard limit is below the
+fixture's. It is the one harness test that constructs a child outside
+`exe.rs`, because the limit must be set in the child before exec.
 The split is deliberate: a deterministic descriptor grant (an exact
 `host::FdPool` budget, as the library harness's descriptor scenarios use)
 tests command admission and sizing independently of inherited limits and
@@ -700,6 +722,35 @@ promise, and a larger expression such as a scan budget is evaluated whole.
 The test-module and I/O-size audits, like the other Python checkers, mask Rust comments and
 literals through `scripts/rust_source_shapes.py` and carry in-memory
 self-tests run as their own pre-clippy script checks.
+
+Scratch entropy has one owner, checked before clippy by
+`scripts/check_entropy_owner.py` (`entropy-owner`, self-tested by
+`entropy-owner-fixtures`): the literal `getrandom` identifier may appear only
+inside `random_u128` in `crates/lib/src/scratch.rs`, once, in production and
+test code alike. It is lexical: aliases imported elsewhere, other entropy APIs
+and macro-generated identifiers need review. Process-ID acquisition is not
+confined there, because output publication names its sibling entries with
+the PID independently of scratch identity.
+
+Two textlint rules in `brokkr.d/lints.toml` keep test shapes that broke
+before from returning. `counter-modules-do-not-sleep` bans the `sleep`
+identifier in `crates/lib/src/counters.rs` and
+`crates/lib/src/write/metrics.rs`: counter tests assert exact inputs or
+synchronise on an observed slow path. `scale-scenarios-do-not-read-whole-files`
+bans `fs::read`, `fs::read_to_string`, `read_to_end` and `read_to_string` in
+`crates/harness/src/scenarios/`: dataset-sized scenario observations stream
+through the bounded helpers in `file_assertions.rs`. Both are spelling-bound
+tripwires, not semantic proofs.
+
+The documentation link checker (`scripts/check_doc_links.py`, `doc-links`)
+computes heading anchors for GitHub and for the pinned VitePress renderer
+over a bounded Markdown subset. Its self-test (`doc-links-fixtures`) reads
+the committed corpus `scripts/doc_links_fixtures/anchors.json`, whose
+expected IDs were hand-derived from the installed VitePress source and from
+GitHub's published section-link rules, never produced by the checker;
+`scripts/doc_links_fixtures/README.md` records that provenance, the
+sidebar-coverage boundary and the syntax outside the corpus. On a VitePress
+upgrade the corpus is re-derived from the new source, not from checker output.
 
 Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`.
 `PbfWriter` and the file reader and writer constructors return

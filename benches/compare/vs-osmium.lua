@@ -26,9 +26,14 @@
 -- run that passes proves every ID exists. The inspect row has no osmium
 -- counterpart: bare inspect answers from indexdata, and `osmium fileinfo -e`
 -- computes a census (timestamps, bbox, metadata coverage) pbfhogg does not.
--- Output equivalence is not certified by these timing runs. A successful
--- exit proves execution only; an independent, field-complete comparison
--- belongs in a separate validation run, never in the measured child.
+-- Timing runs certify execution only. --validate-only yes separately runs
+-- both PBF-producing arms, decodes both with osmium to OPL (including way
+-- locations), and compares the complete spools with cmp. This checks ordered
+-- entities, metadata, tags, references and locations, but excludes headers
+-- and encoding. Tag order is significant under this deliberately strict policy.
+-- Text-report rows have different report formats and refuse validation.
+-- The CLI exposes no affirmative complete-ways or keep-member-nodes switch:
+-- their defaults are part of the compared behavior, checked by validation.
 -- extract uses the dataset bbox and the complete-ways strategy on both
 -- sides (pbfhogg's default, osmium's explicit complete_ways).
 
@@ -46,9 +51,9 @@ end
 
 -- Each row: the pbfhogg argv and the osmium argv. A row whose osmium side
 -- is nil has no osmium counterpart.
-local function rows(params, keys)
+local function rows(params, keys, output_name)
     local pbf = params.variant.file
-    local out = function() return output("out.osm.pbf") end
+    local out = function() return output(output_name or "out.osm.pbf") end
     local pbf_flags = function(flags)
         flags = flags or {}
         flags.compression = "zlib:6"
@@ -126,6 +131,7 @@ local function inputs(params)
 end
 
 function preflight(params)
+    if params["validate-only"] == "yes" then return end
     for _, f in ipairs(inputs(params)) do
         local why = page_cache(f, "cold")
         if why then fail(why) end
@@ -143,12 +149,35 @@ function validate(params, keys)
     end
     if params.row == "apply-changes" and not params.osc then fail("the apply-changes row needs --osc") end
     if params.row ~= "apply-changes" and params.osc then fail("--osc is for the apply-changes row only") end
+    if params["validate-only"] == "yes" and
+        (params.row == "inspect" or params.row == "inspect-tags" or params.row == "inspect-tags-way") then
+        fail("output validation requires a PBF-producing row")
+    end
     if params.tool == "osmium" and not row.osmium then
         fail("the " .. params.row .. " row has no osmium counterpart")
     end
 end
 
+local function validate_outputs(params, keys)
+    local left_args = rows(params, keys, "pbfhogg.osm.pbf")[params.row].pbfhogg()
+    local right_args = rows(params, keys, "osmium.osm.pbf")[params.row].osmium()
+    binary(table.unpack(left_args)):ok()
+    binary_with({ program = "osmium" }, table.unpack(right_args)):ok()
+    local function decode(args)
+        local pbf = args[#args].output
+        return binary_with({ program = "osmium", reads = { pbf } },
+            "cat", pbf, { ["output-format"] = "opl,locations_on_ways=true" }):ok().stdout_file
+    end
+    local left, right = decode(left_args), decode(right_args)
+    binary_with({ program = "cmp", reads = { left, right } }, left, right):ok()
+    record.validation = "osmium-opl-ordered-v1"
+end
+
 function bench(params, keys)
+    if params["validate-only"] == "yes" then
+        validate_outputs(params, keys)
+        return
+    end
     local row = rows(params, keys)[params.row]
     local options = { cold = inputs(params), measured = true }
     if params.tool == "pbfhogg" then

@@ -2162,7 +2162,7 @@ mod in_publication {
         pub(super) row: &'static str,
         pub(super) seeded: Seeded,
         /// `PBFHOGG_TEST_PUBLISH_FAULTS`.
-        pub(super) faults: &'static str,
+        pub(super) faults: &'static [pbfhogg::test_hooks::PublishFault],
         /// The faults make the run fail.
         pub(super) fails: bool,
     }
@@ -2392,8 +2392,7 @@ mod in_publication {
         let mut child = CliInvoker::new(&invocation_scratch)
             .args(&setup.args)
             .publish_faults(scenario.faults)
-            .publish_pause(step)
-            .publish_ready(&ready)
+            .publish_pause(step.parse().expect("recorded publication step"), &ready)
             .spawn();
         let start = Instant::now();
         while !ready.exists() {
@@ -2564,7 +2563,7 @@ mod in_publication {
     pub(super) fn killed_at_every_step(scenario: &Scenario) {
         let invocation_scratch = pbfhogg_test_scratch::scratch();
         let fx = Fx::new();
-        let label = format!("[{} {}]", scenario.row, scenario.faults);
+        let label = format!("[{} {:?}]", scenario.row, scenario.faults);
         let steps = steps_of(&fx, scenario).unwrap_or_else(|why| panic!("{label} {why}"));
         // What a whole new output holds (see `contents`), from a run nobody
         // interferes with.
@@ -2613,28 +2612,29 @@ macro_rules! killed_in_publication {
 #[cfg(feature = "test-hooks")]
 mod killed_in_publication {
     use super::in_publication;
+    use pbfhogg::test_hooks::PublishFault::*;
 
     killed_in_publication! {
-        a_file_published_exclusively: "cat", None, "", false;
-        a_file_published_by_link: "cat", None, "force-link-fallback", false;
-        a_file_rolled_back_while_linked: "cat", None, "force-link-fallback,after-link", true;
-        a_replaced_file: "cat", All, "", false;
-        a_replaced_file_kept_after_a_late_failure: "cat", All, "after-installed:0", true;
-        a_group_published_exclusively: "extract --config", None, "", false;
-        a_replaced_group: "extract --config", All, "", false;
-        a_group_replacing_one_member: "extract --config", Last, "", false;
-        a_replaced_group_rolled_back: "extract --config", All, "after-installed:1", true;
-        a_replaced_group_whose_rollback_fails: "extract --config", All, "after-installed:1,restore", true;
-        a_directory_published_exclusively: "build-geocode-index", None, "", false;
-        a_directory_rolled_back_out_of_place: "build-geocode-index", None, "after-installed:0", true;
-        a_replaced_directory: "build-geocode-index", All, "", false;
-        a_replaced_directory_that_cannot_be_moved_aside: "build-geocode-index", All, "move-aside", true;
-        a_replaced_directory_failing_after_its_backup: "build-geocode-index", All, "after-backup", true;
-        a_replaced_directory_whose_install_is_refused: "build-geocode-index", All, "cross-mount:0", true;
-        a_replaced_directory_rolled_back: "build-geocode-index", All, "after-installed:0", true;
-        a_replaced_directory_taken_out_but_not_restored: "build-geocode-index", All, "after-installed:0,restore-rename", true;
-        a_replaced_directory_left_unsynced: "build-geocode-index", All, "dir-sync", true;
-        a_replaced_directory_whose_backup_is_not_removed: "build-geocode-index", All, "backup-removal", false;
+        a_file_published_exclusively: "cat", None, &[], false;
+        a_file_published_by_link: "cat", None, &[ForceLinkFallback], false;
+        a_file_rolled_back_while_linked: "cat", None, &[ForceLinkFallback, AfterLink], true;
+        a_replaced_file: "cat", All, &[], false;
+        a_replaced_file_kept_after_a_late_failure: "cat", All, &[AfterInstalled(0)], true;
+        a_group_published_exclusively: "extract --config", None, &[], false;
+        a_replaced_group: "extract --config", All, &[], false;
+        a_group_replacing_one_member: "extract --config", Last, &[], false;
+        a_replaced_group_rolled_back: "extract --config", All, &[AfterInstalled(1)], true;
+        a_replaced_group_whose_rollback_fails: "extract --config", All, &[AfterInstalled(1), Restore], true;
+        a_directory_published_exclusively: "build-geocode-index", None, &[], false;
+        a_directory_rolled_back_out_of_place: "build-geocode-index", None, &[AfterInstalled(0)], true;
+        a_replaced_directory: "build-geocode-index", All, &[], false;
+        a_replaced_directory_that_cannot_be_moved_aside: "build-geocode-index", All, &[MoveAside], true;
+        a_replaced_directory_failing_after_its_backup: "build-geocode-index", All, &[AfterBackup], true;
+        a_replaced_directory_whose_install_is_refused: "build-geocode-index", All, &[CrossMount(0)], true;
+        a_replaced_directory_rolled_back: "build-geocode-index", All, &[AfterInstalled(0)], true;
+        a_replaced_directory_taken_out_but_not_restored: "build-geocode-index", All, &[AfterInstalled(0), RestoreRename], true;
+        a_replaced_directory_left_unsynced: "build-geocode-index", All, &[DirSync], true;
+        a_replaced_directory_whose_backup_is_not_removed: "build-geocode-index", All, &[BackupRemoval], false;
     }
 }
 

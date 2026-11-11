@@ -85,6 +85,20 @@ mod tests {
     }
 
     #[test]
+    fn iteration_accepts_both_protocol_boundaries() {
+        for iteration in [0, i64::MAX] {
+            let text = format!(
+                r#"{{"protocol":1,"scenario":"repeat-cat","iteration":{iteration},"bindings":{{}}}}"#
+            );
+            let request = parse(&text).expect("valid iteration boundary");
+            assert_eq!(
+                request.iteration,
+                u64::try_from(iteration).expect("nonnegative")
+            );
+        }
+    }
+
+    #[test]
     fn refuses_a_malformed_request() {
         for bad in [
             r#"{"protocol": 2, "scenario": "s", "iteration": 0, "bindings": {}}"#,

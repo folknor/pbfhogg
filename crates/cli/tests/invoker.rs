@@ -134,9 +134,35 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
+    /// Arm only faults represented by the library's publication protocol.
+    #[cfg(feature = "test-hooks")]
     #[allow(dead_code)]
-    pub fn publish_faults(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_PUBLISH_FAULTS", value);
+    pub fn publish_faults(mut self, faults: &[pbfhogg::test_hooks::PublishFault]) -> Self {
+        use pbfhogg::test_hooks::PublishFault;
+        let names: Vec<String> = faults
+            .iter()
+            .map(|fault| match fault {
+                PublishFault::BeforeInstall => "before-install".to_owned(),
+                PublishFault::MoveAside => "move-aside".to_owned(),
+                PublishFault::AfterBackup => "after-backup".to_owned(),
+                PublishFault::ForceLinkFallback => "force-link-fallback".to_owned(),
+                PublishFault::AfterLink => "after-link".to_owned(),
+                PublishFault::AfterInstalled(k) => format!("after-installed:{k}"),
+                PublishFault::CrossMount(k) => format!("cross-mount:{k}"),
+                PublishFault::Restore => "restore".to_owned(),
+                PublishFault::RestoreRename => "restore-rename".to_owned(),
+                PublishFault::DirSync => "dir-sync".to_owned(),
+                PublishFault::BackupSync => "backup-sync".to_owned(),
+                PublishFault::BackupLinkSync => "backup-link-sync".to_owned(),
+                PublishFault::MoveAsideCrossMount => "move-aside-cross-mount".to_owned(),
+                PublishFault::BackupRemoval => "backup-removal".to_owned(),
+            })
+            .collect();
+        if names.is_empty() {
+            self.cmd.env_remove("PBFHOGG_TEST_PUBLISH_FAULTS");
+        } else {
+            self.cmd.env("PBFHOGG_TEST_PUBLISH_FAULTS", names.join(","));
+        }
         self
     }
 
@@ -146,15 +172,13 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
+    /// Pause at a typed publication step and announce it at `ready`.
+    #[cfg(feature = "test-hooks")]
     #[allow(dead_code)]
-    pub fn publish_pause(mut self, value: impl AsRef<OsStr>) -> Self {
-        self.cmd.env("PBFHOGG_TEST_PUBLISH_PAUSE", value);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn publish_ready(mut self, path: &Path) -> Self {
-        self.cmd.env("PBFHOGG_TEST_PUBLISH_READY", path);
+    pub fn publish_pause(mut self, step: pbfhogg::test_hooks::PublishStep, ready: &Path) -> Self {
+        self.cmd
+            .env("PBFHOGG_TEST_PUBLISH_PAUSE", step.to_string())
+            .env("PBFHOGG_TEST_PUBLISH_READY", ready);
         self
     }
 
@@ -580,6 +604,190 @@ fn listed(cmd: &clap::Command) -> impl Iterator<Item = &clap::Command> {
 
 mod tests {
     use super::{CliInvoker, CliOutput};
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn typed_publication_faults_round_trip_through_the_child_protocol() {
+        use pbfhogg::test_hooks::PublishFault::{self, *};
+        let scratch = pbfhogg_test_scratch::scratch();
+        let faults = [
+            BeforeInstall,
+            MoveAside,
+            AfterBackup,
+            ForceLinkFallback,
+            AfterLink,
+            AfterInstalled(2),
+            CrossMount(3),
+            Restore,
+            RestoreRename,
+            DirSync,
+            BackupSync,
+            BackupLinkSync,
+            MoveAsideCrossMount,
+            BackupRemoval,
+        ];
+        let invoker = CliInvoker::new(&scratch).publish_faults(&faults);
+        let (_, value) = invoker
+            .cmd
+            .get_envs()
+            .find(|(key, _)| *key == "PBFHOGG_TEST_PUBLISH_FAULTS")
+            .expect("fault environment");
+        let decoded: Vec<PublishFault> = value
+            .expect("armed faults")
+            .to_str()
+            .expect("UTF-8 fault names")
+            .split(',')
+            .map(|name| name.parse().expect("publication fault spelling"))
+            .collect();
+        assert_eq!(decoded, faults);
+        let cleared = invoker.publish_faults(&[]);
+        // A cleared environment drops the entry; an inheriting one records a
+        // removal. Either way no value may remain armed.
+        assert!(
+            !cleared
+                .cmd
+                .get_envs()
+                .any(|(key, value)| { key == "PBFHOGG_TEST_PUBLISH_FAULTS" && value.is_some() })
+        );
+    }
+
+    /// Malformed protocol values must fail before even a version-only run.
+    /// Raw environment access stays private to this refusal test; callers
+    /// configure valid publication hooks through the typed setters.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn malformed_publication_hooks_fail_explicitly() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        for (key, value, message) in [
+            (
+                "PBFHOGG_TEST_PUBLISH_FAULTS",
+                "unknown",
+                "not a publication fault",
+            ),
+            ("PBFHOGG_TEST_PUBLISH_FAULTS", "", "not a publication fault"),
+            (
+                "PBFHOGG_TEST_PUBLISH_FAULTS",
+                "after-link,",
+                "not a publication fault",
+            ),
+            (
+                "PBFHOGG_TEST_PUBLISH_FAULTS",
+                "after-installed:no",
+                "not a member index",
+            ),
+            (
+                "PBFHOGG_TEST_PUBLISH_PAUSE",
+                "unknown",
+                "not a publication step",
+            ),
+            (
+                "PBFHOGG_TEST_PUBLISH_PAUSE",
+                "installed:no",
+                "not a member index",
+            ),
+            (
+                "PBFHOGG_TEST_PUBLISH_PAUSE",
+                "installed:0",
+                "publication pause needs",
+            ),
+            (
+                "PBFHOGG_TEST_PUBLISH_READY",
+                "ready",
+                "publication pause needs",
+            ),
+        ] {
+            let mut invoker = CliInvoker::new(&scratch).arg("--version");
+            invoker.cmd.env(key, value);
+            let out = invoker.run();
+            assert_eq!(
+                out.status.code(),
+                Some(101),
+                "{key}={value:?}: {}",
+                out.stderr_str()
+            );
+            assert!(
+                out.stderr_str().contains(message),
+                "{key}={value:?}: {}",
+                out.stderr_str()
+            );
+            assert!(out.stdout.is_empty());
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn malformed_checkpoint_and_replacement_hooks_fail_explicitly() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        for (key, value, message) in [
+            (
+                "PBFHOGG_TEST_CANCEL_PAUSE",
+                "0:ready",
+                "positive checkpoint",
+            ),
+            ("PBFHOGG_TEST_CANCEL_PAUSE", "1:", "ready path"),
+            (
+                "PBFHOGG_TEST_CANCEL_PAUSE",
+                "1:ready:other",
+                "suffix must be stuck",
+            ),
+            ("PBFHOGG_TEST_CANCEL_COUNT", "", "cancel count needs a path"),
+            (
+                "PBFHOGG_TEST_REPLACE_INPUT",
+                "input",
+                "replacement needs input",
+            ),
+            (
+                "PBFHOGG_TEST_REPLACE_REPORT",
+                "report",
+                "report requires an armed replacement",
+            ),
+            (
+                "PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN",
+                "yes",
+                "must be 0 or 1",
+            ),
+            (
+                "PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST",
+                "no",
+                "is not a count",
+            ),
+        ] {
+            let mut invoker = CliInvoker::new(&scratch).arg("--version");
+            invoker.cmd.env(key, value);
+            let out = invoker.run();
+            assert_eq!(
+                out.status.code(),
+                Some(101),
+                "{key}={value:?}: {}",
+                out.stderr_str()
+            );
+            assert!(
+                out.stderr_str().contains(message),
+                "{key}={value:?}: {}",
+                out.stderr_str()
+            );
+            assert!(out.stdout.is_empty());
+        }
+    }
+
+    #[cfg(all(feature = "test-hooks", unix))]
+    #[test]
+    fn publication_hook_names_require_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = pbfhogg_test_scratch::scratch();
+        for key in ["PBFHOGG_TEST_PUBLISH_FAULTS", "PBFHOGG_TEST_PUBLISH_PAUSE"] {
+            let mut invoker = CliInvoker::new(&scratch).arg("--version");
+            invoker.cmd.env(key, std::ffi::OsStr::from_bytes(b"\xff"));
+            let out = invoker.run();
+            assert_eq!(out.status.code(), Some(101), "{}", out.stderr_str());
+            assert!(
+                out.stderr_str().contains("must be UTF-8"),
+                "{}",
+                out.stderr_str()
+            );
+            assert!(out.stdout.is_empty());
+        }
+    }
 
     /// The binary cargo handed this build runs, and stdout capture and the
     /// assertion helpers work on a trivial invocation.

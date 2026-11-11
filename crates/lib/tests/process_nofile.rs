@@ -11,6 +11,89 @@
 
 mod common;
 
+#[test]
+fn injected_descriptor_counts_refuse_external_join_without_procfs() {
+    use pbfhogg::host::{Host, ProcessActions};
+    use pbfhogg::process::{FdAllowance, FdCount, FdProbe, FdReservation};
+    use std::sync::Arc;
+
+    struct InjectedCount(FdProbe);
+    impl ProcessActions for InjectedCount {
+        fn fd_allowance(&self, _wanted: u64) -> FdReservation {
+            FdReservation::unreserved(FdAllowance::from_probe(self.0))
+        }
+    }
+
+    let dir = common::test_scratch();
+    let input = dir.path().join("base.osm.pbf");
+    common::write_base_pbf(&input);
+    // Inject at the existing provider boundary: neither procfs nor an actual
+    // descriptor shortage is needed, and no process limit is changed.
+    for (index, (soft_limit, open, available, message)) in [
+        (
+            600,
+            FdCount::Counted(400),
+            200,
+            "400 already open, 200 available",
+        ),
+        (
+            600,
+            FdCount::Counted(601),
+            0,
+            "601 already open, 0 available",
+        ),
+        (
+            128,
+            FdCount::Uncounted,
+            128,
+            "file descriptor limit too low",
+        ),
+        (
+            600,
+            FdCount::Failed(libc::EIO),
+            0,
+            "counting the process's open file descriptors failed",
+        ),
+        (
+            600,
+            FdCount::Exhausted(libc::EMFILE),
+            0,
+            "the process already holds every descriptor",
+        ),
+        (
+            600,
+            FdCount::Exhausted(libc::ENFILE),
+            0,
+            "the system-wide file table is full",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let probe = FdProbe {
+            soft_limit,
+            adjustment: None,
+            open,
+            hard_limit: Some(soft_limit),
+        };
+        let allowance = FdAllowance::from_probe(probe);
+        assert_eq!(allowance.descriptors, available, "{open:?}");
+        assert_eq!(allowance.probe, Some(probe));
+        let host = Host {
+            diagnostics: pbfhogg::host::Diagnostics::discard(),
+            process: Arc::new(InjectedCount(probe)),
+            resources: Arc::new(common::fixed_resources()),
+            page_cache: pbfhogg::host::PageCachePolicy::Keep,
+            executor: pbfhogg::host::Executor::Ambient,
+            invocation: pbfhogg::host::Invocation::new(),
+        };
+        let output = dir.path().join(format!("refused-{index}.pbf"));
+        let error = external_join(&host, &input, &output)
+            .expect_err("injected allowance cannot hold a shard worker");
+        assert!(error.contains(message), "{open:?}: {error}");
+    }
+}
+
 fn external_join(
     host: &pbfhogg::host::Host,
     input: &std::path::Path,

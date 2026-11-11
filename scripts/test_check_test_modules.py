@@ -4,7 +4,10 @@ No filesystem fixtures or host toolchain are needed.
 """
 from pathlib import Path
 from unittest.mock import patch
-from check_test_modules import cfg_value, module_edges, reachable, require_coverage
+from check_test_modules import (
+    cfg_value, module_edges, reachable, require_coverage, module_presence,
+    require_module_coverage,
+)
 
 
 def main():
@@ -29,6 +32,27 @@ def main():
         pass
     else:
         raise AssertionError('unknown cfg accepted')
+    source = (
+        '#[cfg(feature = "outer")]\nmod outer {\n'
+        '#[cfg(feature = "inner")]\nmod inner {}\n'
+        'mod inherited {}\n}\nmod always {}'
+    )
+    declared, disabled = module_presence(source, set())
+    assert len(declared) == 4
+    assert {name for _, name in disabled} == {'always'}
+    _, outer = module_presence(source, {'outer'})
+    assert {name for _, name in outer} == {'outer', 'inherited', 'always'}
+    _, both = module_presence(source, {'outer', 'inner'})
+    assert both == declared
+    qualify = lambda entries: {(base / 'all.rs', line, name) for line, name in entries}
+    require_module_coverage(qualify(declared), qualify(both))
+    try:
+        require_module_coverage(qualify(declared), qualify(outer))
+    except AssertionError as error:
+        assert 'mod inner' in str(error)
+    else:
+        raise AssertionError('never-enabled inline module accepted')
+    assert module_presence('// mod fake {}\nconst S: &str = "mod fake {}";', set()) == (set(), set())
     root = base / 'all.rs'
     child = base / 'child.rs'
     sources = {root: 'mod child;', child: ''}

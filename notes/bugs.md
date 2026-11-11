@@ -18,18 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-002 - geocode-query can report a speedup while queries fail
-
-`run_bench_geocode_query` in `crates/cli/src/lib.rs` ignores query errors during
-timed rounds. Warm-up counts errors but still returns success, and
-`benches/build-geocode-index/geocode-query.lua` never rejects a nonzero error
-count. A revision that starts returning errors can complete less work and appear
-faster.
-
-Fix: fail unexpected query errors, including during timed rounds, and declare
-expected outcomes separately if error workloads are wanted. Enforcement: an
-instrument test using a reader abstraction that returns a deliberate query error.
-
 ## BUG-003 - plantasjen north-america entry carries a known false replication sequence
 
 `brokkr.d/hosts/plantasjen.toml` records that the north-america base is actually

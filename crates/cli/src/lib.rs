@@ -5190,25 +5190,11 @@ fn run_bench_geocode_query(
     let reader = pbfhogg::geocode_index::reader::Reader::open(dir)?;
     let open_ms = open_start.elapsed().as_millis();
 
-    // The warm-up round is also the answer tally: answers do not change
-    // between rounds, so the timed rounds keep only a sink against the
-    // optimizer.
-    let tally = GeocodeQueryTally::warm_up(&reader, &points);
-
-    let mut sink = 0usize;
-    let mut round_ns: Vec<u128> = Vec::with_capacity(rounds as usize);
-    let timed_start = Instant::now();
-    for _ in 0..rounds {
-        let start = Instant::now();
-        for &(lat, lon) in &points {
-            if let Ok(r) = reader.query(lat, lon) {
-                sink = sink.wrapping_add(r.admin.len());
-            }
-        }
-        round_ns.push(start.elapsed().as_nanos());
-    }
-    let elapsed_ms = timed_start.elapsed().as_millis();
-    std::hint::black_box(sink);
+    let GeocodeQueryPasses {
+        tally,
+        round_ns,
+        elapsed_ms,
+    } = geocode_query_passes(|lat, lon| reader.query(lat, lon), &points, rounds)?;
 
     let per_query = |ns: u128| ns as f64 / f64::from(queries) / 1000.0;
     let rounds_us: Vec<String> = round_ns
@@ -5226,8 +5212,76 @@ fn run_bench_geocode_query(
     Ok(())
 }
 
+/// What the warm-up and timed passes of bench-geocode-query measured.
+struct GeocodeQueryPasses {
+    tally: GeocodeQueryTally,
+    round_ns: Vec<u128>,
+    elapsed_ms: u128,
+}
+
+/// The warm-up pass, which is also the answer tally, then `rounds` timed
+/// passes over `points`. Any query error, in either phase, fails the whole
+/// run: a failed query does less work than an answered one, so a revision
+/// whose queries fail must never read as faster. The validated bbox and the
+/// clamp in `geocode_query_points` keep every point in range, so with
+/// today's reader an error means the reader changed, not the workload.
+/// `query` is a closure so a test can inject a deliberate error.
+fn geocode_query_passes<'a, F>(
+    mut query: F,
+    points: &[(f64, f64)],
+    rounds: u32,
+) -> Result<GeocodeQueryPasses, Box<dyn std::error::Error>>
+where
+    F: FnMut(
+        f64,
+        f64,
+    ) -> Result<
+        pbfhogg::geocode_index::reader::ReverseResult<'a>,
+        pbfhogg::geocode_index::reader::QueryError,
+    >,
+{
+    use std::time::Instant;
+
+    let failed = |phase: &str, i: usize, e: pbfhogg::geocode_index::reader::QueryError| {
+        let (lat, lon) = points[i];
+        format!("bench-geocode-query: {phase}, point {i} (lat {lat}, lon {lon}) failed: {e}")
+    };
+
+    // Answers do not change between rounds, so the timed rounds keep only a
+    // sink against the optimizer.
+    let mut tally = GeocodeQueryTally::new();
+    for (i, &(lat, lon)) in points.iter().enumerate() {
+        let r = query(lat, lon).map_err(|e| failed("warm-up", i, e))?;
+        tally.add(&r);
+    }
+
+    let mut sink = 0usize;
+    let mut round_ns: Vec<u128> = Vec::with_capacity(rounds as usize);
+    let timed_start = Instant::now();
+    for round in 0..rounds {
+        let start = Instant::now();
+        for (i, &(lat, lon)) in points.iter().enumerate() {
+            match query(lat, lon) {
+                Ok(r) => sink = sink.wrapping_add(r.admin.len()),
+                Err(e) => return Err(failed(&format!("timed round {}", round + 1), i, e).into()),
+            }
+        }
+        round_ns.push(start.elapsed().as_nanos());
+    }
+    let elapsed_ms = timed_start.elapsed().as_millis();
+    std::hint::black_box(sink);
+    Ok(GeocodeQueryPasses {
+        tally,
+        round_ns,
+        elapsed_ms,
+    })
+}
+
 /// `queries` (lat, lon) points uniform in `bbox`, a pure function of bbox
-/// and seed (splitmix64), so every revision queries the same points.
+/// and seed (splitmix64). Each coordinate is clamped to its bbox interval,
+/// since the scaling can round an ulp past the upper bound, and at a world
+/// bound that point would be out of range; the clamp moves only such edge
+/// points, so revisions query the same points.
 fn geocode_query_points(bbox: &pbfhogg::extract::Bbox, queries: u32, seed: u64) -> Vec<(f64, f64)> {
     let mut state = seed;
     let mut unit = || {
@@ -5243,7 +5297,10 @@ fn geocode_query_points(bbox: &pbfhogg::extract::Bbox, queries: u32, seed: u64) 
         .map(|_| {
             let lat = bbox.min_lat + unit() * (bbox.max_lat - bbox.min_lat);
             let lon = bbox.min_lon + unit() * (bbox.max_lon - bbox.min_lon);
-            (lat, lon)
+            (
+                lat.clamp(bbox.min_lat, bbox.max_lat),
+                lon.clamp(bbox.min_lon, bbox.max_lon),
+            )
         })
         .collect()
 }
@@ -5259,34 +5316,29 @@ struct GeocodeQueryTally {
     addresses: u64,
     streets: u64,
     interpolations: u64,
-    errors: u64,
     digest: u64,
 }
 
 impl GeocodeQueryTally {
-    fn warm_up(reader: &pbfhogg::geocode_index::reader::Reader, points: &[(f64, f64)]) -> Self {
-        let mut t = Self {
+    fn new() -> Self {
+        Self {
             digest: 0xCBF2_9CE4_8422_2325,
             ..Self::default()
-        };
-        for &(lat, lon) in points {
-            let Ok(r) = reader.query(lat, lon) else {
-                t.errors += 1;
-                continue;
-            };
-            t.admin_answered += u64::from(!r.admin.is_empty());
-            t.admin_matches += r.admin.len() as u64;
-            t.addresses += u64::from(r.address.is_some());
-            t.streets += u64::from(r.street.is_some());
-            t.interpolations += u64::from(r.interpolation.is_some());
-            for a in &r.admin {
-                t.hash(&[a.admin_level]);
-                t.hash(a.name.as_bytes());
-                t.hash(&[0]);
-            }
-            t.hash(&[0xFF]);
         }
-        t
+    }
+
+    fn add(&mut self, r: &pbfhogg::geocode_index::reader::ReverseResult<'_>) {
+        self.admin_answered += u64::from(!r.admin.is_empty());
+        self.admin_matches += r.admin.len() as u64;
+        self.addresses += u64::from(r.address.is_some());
+        self.streets += u64::from(r.street.is_some());
+        self.interpolations += u64::from(r.interpolation.is_some());
+        for a in &r.admin {
+            self.hash(&[a.admin_level]);
+            self.hash(a.name.as_bytes());
+            self.hash(&[0]);
+        }
+        self.hash(&[0xFF]);
     }
 
     fn hash(&mut self, bytes: &[u8]) {
@@ -5302,7 +5354,6 @@ impl GeocodeQueryTally {
         output::cli_eprintln!("addresses={}", self.addresses);
         output::cli_eprintln!("streets={}", self.streets);
         output::cli_eprintln!("interpolations={}", self.interpolations);
-        output::cli_eprintln!("errors={}", self.errors);
         output::cli_eprintln!("admin_digest={:016x}", self.digest);
     }
 }
@@ -5943,6 +5994,87 @@ mod advice_tests {
             };
             let want = advised.then_some("--elements-per-blob");
             assert_eq!(element_cap(&argv), want, "{argv:?}");
+        }
+    }
+}
+
+/// bench-geocode-query refuses a query error in either phase rather than
+/// timing less work, and its points stay inside the bbox.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod geocode_query_bench_tests {
+    use super::{geocode_query_passes, geocode_query_points};
+    use pbfhogg::geocode_index::reader::{QueryError, ReverseResult};
+
+    fn empty() -> ReverseResult<'static> {
+        ReverseResult {
+            address: None,
+            street: None,
+            interpolation: None,
+            admin: Vec::new(),
+        }
+    }
+
+    /// A query that answers its first `ok` calls and fails from then on.
+    fn failing_after(
+        ok: usize,
+    ) -> impl FnMut(f64, f64) -> Result<ReverseResult<'static>, QueryError> {
+        let mut calls = 0;
+        move |lat, _| {
+            calls += 1;
+            if calls > ok {
+                Err(QueryError::LatitudeOutOfRange(lat))
+            } else {
+                Ok(empty())
+            }
+        }
+    }
+
+    const POINTS: [(f64, f64); 3] = [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)];
+
+    #[test]
+    fn every_query_answered_succeeds() {
+        let passes = geocode_query_passes(failing_after(usize::MAX), &POINTS, 2).unwrap();
+        assert_eq!(passes.round_ns.len(), 2);
+    }
+
+    #[test]
+    fn a_warm_up_error_fails_the_run() {
+        let Err(e) = geocode_query_passes(failing_after(1), &POINTS, 2) else {
+            panic!("a warm-up error must fail the run");
+        };
+        assert!(e.to_string().contains("warm-up, point 1"), "{e}");
+    }
+
+    #[test]
+    fn an_error_in_a_later_timed_round_fails_the_run() {
+        // Warm-up and the first timed round answer; round 2 fails at point 2.
+        let Err(e) = geocode_query_passes(failing_after(POINTS.len() * 2 + 2), &POINTS, 3) else {
+            panic!("a timed-round error must fail the run");
+        };
+        assert!(e.to_string().contains("timed round 2, point 2"), "{e}");
+    }
+
+    #[test]
+    fn points_stay_inside_world_and_tight_bboxes() {
+        let boxes = [
+            "-180,-90,180,90",
+            "179.9999999,89.9999999,180,90",
+            "-180,-90,-179.9999999,-89.9999999",
+            "5.9,47.3,15.0,55.0",
+        ];
+        for b in boxes {
+            let bbox = pbfhogg::extract::parse_bbox(b).unwrap();
+            for (lat, lon) in geocode_query_points(&bbox, 10_000, 7) {
+                assert!(
+                    (bbox.min_lat..=bbox.max_lat).contains(&lat),
+                    "{b}: lat {lat}"
+                );
+                assert!(
+                    (bbox.min_lon..=bbox.max_lon).contains(&lon),
+                    "{b}: lon {lon}"
+                );
+            }
         }
     }
 }

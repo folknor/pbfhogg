@@ -108,6 +108,7 @@ description = "Reverse geocoding query latency over fixed pseudo-random points, 
 version = 1
 date = 2026-11-10
 changelog = [
+  { date = 2026-11-11, note = "A query error in warm-up or a timed round now fails the run instead of being dropped; errors= no longer reported; points clamped to the bbox; workload unchanged" },
   { version = 1, date = 2026-11-10, note = "Added: index built untimed, then the bench-geocode-query instrument measured; per-query means and an admin answer digest recorded" },
 ]
 profile = "release"

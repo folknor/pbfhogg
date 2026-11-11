@@ -12,6 +12,8 @@
 -- record.child.us_per_query_best (fastest timed round's mean), with every
 -- round's mean beside it. record.child.admin_digest hashes every query's
 -- admin answers: two revisions whose digests differ answered differently.
+-- A query error in the warm-up or any timed round fails the instrument, so
+-- r:ok() fails the run: a revision whose queries fail never reads as faster.
 --
 -- The instrument must exist in the built revision: a --commit before it was
 -- added fails with that reason. The bbox defaults to the dataset's bbox,

@@ -5,8 +5,11 @@
 //! Every scratch directory is a random child of the workspace's gitignored
 //! `data/test-scratch`. Random names cannot collide between tests, sweeps or
 //! processes, so no slot, claim registry or sweeper is needed, and a test
-//! binary never deletes anything it did not create. Clearing residue between
-//! runs is the runner's job, not a test's.
+//! binary never deletes anything it did not create. Residue is cleared at
+//! the run boundary instead: `scripts/test_tree.py`, run by `brokkr check`
+//! before its test phase, empties the base, and after a green test phase
+//! requires it to be empty again. A binary cannot tell a live sibling's tree
+//! from residue, so it must not sweep.
 //!
 //! The location is fixed relative to this crate: the workspace is two levels
 //! above `crates/test-scratch`. It is not relocatable; a test binary run from
@@ -112,7 +115,10 @@ pub fn scratch() -> TestScratch {
 ///
 /// Residue in `data/test-scratch` therefore grows on unwinding, on
 /// [`keep`](Self::keep), on cleanup failure and on process termination.
-/// Nothing in a test binary clears it.
+/// Nothing in a test binary clears it; `brokkr check` empties the base
+/// before its test phase and fails a green test phase that leaves any tree
+/// behind, so a passing test that keeps a tree (by `keep` or a caught
+/// unwind) removes it itself before it returns.
 #[derive(Debug)]
 pub struct TestScratch {
     /// Taken exactly once, by `keep` or by `drop`, so no second cleanup

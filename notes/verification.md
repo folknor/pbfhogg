@@ -1360,21 +1360,12 @@ Fix: parameter types in brokkr's schema or shared constructors. Enforcement: con
 against local replacements.
 Brokkr side (typed param domains) filed as bz brokkr#165. brokkr runs validate() before any build, so "fail after building" holds only for values a script's own check lets through.
 
-## VER-127 - Test filesystem: pbfhogg-side residue after brokkr declined its share
+## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
 
-The test scratch leaf, retention contract, owned runners and textlint seals are
-implemented and committed; the settled design is `notes/VER-127-design.md`. No
-scratch-root environment override will exist: the root is fixed and brokkr exports
-no variable.
-
-brokkr declined the rest (bz brokkr#152, #153 and #154, all closed as wontfix), so
-each is now pbfhogg's own work and its pbfhogg-side design is still to be done:
-- Clearing leftover trees under `data/test-scratch/`. Nothing clears them today.
-- A post-run check that tests did not write into the source tree.
-- The verify workspace (see VER-123). brokkr verify is to be removed and
-  reimplemented in pbfhogg, so this is a requirement on that implementation:
-  its outputs go to an owned per-run scratch directory, with any retained
-  evidence kept separately, never under `target/`.
-
-The design's earlier ruling that a test binary never sweeps rested on brokkr owning
-the sweep, and is open again.
+The verify workspace (see VER-123; brokkr side brokkr#154, closed wontfix).
+brokkr verify is to be removed and reimplemented in pbfhogg, so this is a
+requirement on that implementation: its outputs go to an owned per-run scratch
+directory, with any retained evidence kept separately, never under `target/`.
+The rest of the test-filesystem work is done; its settled design is stated
+in `reference/testing.md` "Test scratch" and in the leaf crate
+`crates/test-scratch`.

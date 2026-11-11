@@ -617,3 +617,24 @@ command = "python3 scripts/check_source_invariants.py"
 expect = "source invariants ok"
 match = "last-line"
 stage = "pre-clippy"
+
+# Test-run hygiene, owned by pbfhogg because the runner clears and checks
+# nothing: the pre-test entry empties data/test-scratch and records a
+# stat manifest of the checkout; the post-test entry fails if the checkout
+# changed or test scratch is not empty after a green test phase. Keep these
+# the last entries of their stages, so no other pre-test check writes after
+# the snapshot. scripts/test_tree.py states what the manifest excludes and
+# cannot see.
+[[script_check]]
+name = "test-tree-clear-and-snapshot"
+command = "python3 -B scripts/test_tree.py clear-and-snapshot"
+expect = "test tree snapshot ok"
+match = "contains"
+stage = "pre-test"
+
+[[script_check]]
+name = "test-tree-verify"
+command = "python3 -B scripts/test_tree.py verify"
+expect = "test tree unchanged"
+match = "last-line"
+stage = "post-test"

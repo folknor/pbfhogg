@@ -16,7 +16,6 @@
 use crate::reopen_cell;
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 use pbfhogg::digest::{Digest, Form};
 use pbfhogg::read::input::{InputSource, PinnedInput};
@@ -110,46 +109,39 @@ fn a_replacement_after_the_open_does_not_reach_the_run() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
-    for force_path in [true, false] {
+    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
         write_input(&input);
         let expected = expected(&input);
         write_replacement(&replacement);
         let host = crate::common::test_host();
-        host.invocation
-            .faults()
-            .force_pin_path_reopen
-            .store(force_path, Ordering::Relaxed);
-        let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        let procfs = pin.reopens_through_procfs();
-        if !reopen_cell::available(force_path, procfs) {
-            continue;
-        }
-        host.invocation
-            .faults()
-            .arm_input_replacement(&input, &replacement, 1);
-        let result = run(&pin, false, &host);
-        let cell = format!("procfs {procfs}");
-        let report = host
-            .invocation
-            .faults()
-            .input_replacement()
-            .expect("armed replacement");
-        assert!(
-            report.fired,
-            "{cell}: the replacement must fire: {report:?}"
-        );
-        assert_eq!(
-            result.unwrap_or_else(|e| panic!("{cell}: {e}")),
-            expected,
-            "{cell}: the run must read only the file it opened"
-        );
-        assert_eq!(report.attempts, 1, "{cell}: {report:?}");
-        assert_eq!(report.attempts_after_fired, 0, "{cell}: {report:?}");
+        scenario.run(&input, &host, |pin, scenario| {
+            host.invocation
+                .faults()
+                .arm_input_replacement(&input, &replacement, 1);
+            let result = run(pin, false, &host);
+            let cell = format!("scenario {scenario:?}");
+            let report = host
+                .invocation
+                .faults()
+                .input_replacement()
+                .expect("armed replacement");
+            assert!(
+                report.fired,
+                "{cell}: the replacement must fire: {report:?}"
+            );
+            assert_eq!(
+                result.unwrap_or_else(|e| panic!("{cell}: {e}")),
+                expected,
+                "{cell}: the run must read only the file it opened"
+            );
+            assert_eq!(report.attempts, 1, "{cell}: {report:?}");
+            assert_eq!(report.attempts_after_fired, 0, "{cell}: {report:?}");
+        });
     }
 }
 
 /// A caller's pin is the run's: replaced between the caller's pin and the
-/// call, the input is the file the caller pinned (procfs) or the one open is
+/// call, the input is the file the caller pinned (stable reopen name) or the one open is
 /// refused (path reopen). Opening the path afresh would digest the
 /// replacement.
 #[test]
@@ -157,39 +149,33 @@ fn a_caller_pin_is_used_as_it_is() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
-    for force_path in [true, false] {
+    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
         write_input(&input);
         let expected = expected(&input);
         write_replacement(&replacement);
         let host = crate::common::test_host();
-        host.invocation
-            .faults()
-            .force_pin_path_reopen
-            .store(force_path, Ordering::Relaxed);
-        let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        let procfs = pin.reopens_through_procfs();
-        if !reopen_cell::available(force_path, procfs) {
-            continue;
-        }
-        std::fs::rename(&replacement, &input).expect("replace the input");
-        let result = run(&pin, false, &host);
-        let cell = format!("procfs {procfs}");
-        if procfs {
-            assert_eq!(
-                result.unwrap_or_else(|e| panic!("{cell}: {e}")),
-                expected,
-                "{cell}: the digest must be the pinned file's"
-            );
-        } else {
-            // reopen_cell::available admits only Unix cells, where the
-            // identity refusal is guaranteed.
-            let err = result
-                .err()
-                .unwrap_or_else(|| panic!("{cell}: must refuse"));
-            assert!(
-                matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                "{cell}: {err:?}"
-            );
-        }
+        scenario.run(&input, &host, |pin, scenario| {
+            std::fs::rename(&replacement, &input).expect("replace the input");
+            let result = run(pin, false, &host);
+            let cell = format!("scenario {scenario:?}");
+            match scenario {
+                reopen_cell::Scenario::Pinned => {
+                    assert_eq!(
+                        result.unwrap_or_else(|e| panic!("{cell}: {e}")),
+                        expected,
+                        "{cell}: the digest must be the pinned file's"
+                    );
+                }
+                reopen_cell::Scenario::Path => {
+                    let err = result
+                        .err()
+                        .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                    assert!(
+                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                        "{cell}: {err:?}"
+                    );
+                }
+            }
+        });
     }
 }

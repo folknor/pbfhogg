@@ -145,6 +145,9 @@ struct Route {
 }
 
 /// Build the index of `input` into `index_dir`, replacing what is there.
+// The builder accepts only BuildConfig::input_path and pins it internally.
+// A caller-pin seam is needed before this replacement cell can inject its
+// opener without changing the input name the fault plan replaces.
 fn run(
     route: Route,
     input: &Path,

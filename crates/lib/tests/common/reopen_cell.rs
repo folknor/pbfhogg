@@ -1,6 +1,7 @@
 //! Admission for the replacement matrix's two distinct reopen strategies.
 //!
-//! Automatic reopening is a procfs cell, not another path-fallback cell.
+//! Injected pinned reopening uses a stable scratch hard link. Legacy callers
+//! without a caller-pin API still distinguish procfs from path fallback.
 //! Off Unix there is no identity verification to assert after replacement.
 //! Decide before arming a replacement or running a command, so an unavailable
 //! strategy cannot execute a duplicate or leave an outcome unchecked.
@@ -17,10 +18,6 @@ impl Scenario {
     /// Run with an injected reopen name. The closure must pass this pin to
     /// the command, rather than passing the input path and taking a new pin.
     /// The scratch name lives until the closure and all its command work end.
-    #[allow(
-        dead_code,
-        reason = "replacement callers migrate to this runner separately"
-    )]
     pub fn run(
         self,
         input: &std::path::Path,

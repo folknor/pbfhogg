@@ -157,13 +157,15 @@ outcomes separately. Enforcement: structured capability accounting and a capabil
 gate requiring evidence for each promised backend and guard, while portable runs may
 still skip.
 
-## VER-019 - The reopen cells do not use the injected opener yet
+## VER-019 - Two commands cannot take an injected input pin
 
-A test-hooks-only `PinnedInput::pin_with_reopen_path` and a typed `Scenario::run` in
-`crates/lib/tests/common/reopen_cell.rs` inject the reopen path through a scratch hard
-link. The 38 cells across the 18 `fault_*_input.rs` files still use the older
-`available` helper; migrating them to `Scenario::run`, passing its pin into the commands
-and matching its outcome variants, is not done.
+36 of the 38 reopen cells run through the typed `Scenario::run` seam in
+`crates/lib/tests/common/reopen_cell.rs` with injected pins. The public-external route of
+add-locations-to-ways and geocode-build still use the older `available` helper, because
+public `external_join` and `build_geocode_index` pin paths internally and accept no
+caller pin; `crates/lib/tests/fault_apply_changes.rs` still uses it too. Residue: a
+caller-pin entry point on each of the two commands, and migrating the apply-changes
+fault test.
 
 ## VER-020 - Negative concurrency assertions pay sleeps and prove nothing about the wait
 
@@ -255,12 +257,12 @@ Fix: scenario objects owning transitions, notifications, release guards and obse
 with a real deadline only as a backstop, making invalid transition combinations
 unrepresentable.
 
-## VER-033 - Cancellation coverage is a sample of commands and checkpoints
+## VER-033 - Twelve library commands have no cancellation scenario
 
-The claims in `crates/lib/tests/cancel.rs` are renamed to what the sweep does, with
-its registry exclusions documented. Complete coverage, a command-scenario registry
-with explicit modes and exclusions compared mechanically against the command
-inventory, remains undone.
+`crates/lib/tests/cancel.rs` keeps a registry of all 19 public library command modules,
+compared mechanically against the module declarations: seven are exercised, twelve are
+excluded explicitly, and checkpoint replays are capped at 64 per scenario. Scenarios for
+the excluded twelve, and a comparison against the CLI command inventory, are not done.
 
 ## VER-036 - Chunk tests keep large fixtures despite size injection seams
 

@@ -22,10 +22,9 @@
 use crate::reopen_cell;
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 use pbfhogg::inspect::InspectOptions;
-use pbfhogg::read::input::{InputSource, PinnedInput};
+use pbfhogg::read::input::InputSource;
 
 use crate::common::{TestNode, TestRelation, TestWay, generate_nodes};
 
@@ -187,66 +186,59 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Option
     let opens = route.pinned_opens();
     let replacement = dir.join("replacement.osm.pbf");
     for after in 1..=opens {
-        for force_path in [true, false] {
+        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(input, route.indexed);
             write_replacement(&replacement, route.indexed);
             let host = crate::common::test_host();
-            host.invocation
-                .faults()
-                .force_pin_path_reopen
-                .store(force_path, Ordering::Relaxed);
-            let procfs = PinnedInput::pin(input, &host)
-                .expect("probe pin")
-                .reopens_through_procfs();
-            if !reopen_cell::available(force_path, procfs) {
-                continue;
-            }
-            host.invocation
-                .faults()
-                .arm_input_replacement(input, &replacement, after);
-            let result = run_inspect(route, input, &host);
+            scenario.run(input, &host, |pin, scenario| {
+                host.invocation
+                    .faults()
+                    .arm_input_replacement(input, &replacement, after);
+                let result = run_inspect(route, pin, &host);
 
-            let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(
-                report.fired,
-                "{cell}: the replacement must fire: {report:?}"
-            );
-            if procfs || after == opens {
-                let got = result.unwrap_or_else(|e| {
-                    panic!("{cell}: the run is unaffected by the replacement: {e}")
-                });
-                assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                assert_eq!(report.verified, opens, "{cell}: {report:?}");
-                assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                assert_eq!(
-                    report.attempts_after_fired,
-                    opens - after,
-                    "{cell}: {report:?}"
-                );
-                assert_eq!(
-                    got, expected,
-                    "{cell}: the report must be of the pinned input"
-                );
-            } else {
-                // reopen_cell::available admits only Unix cells, where the
-                // identity refusal is guaranteed.
-                let err = result
-                    .err()
-                    .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
+                let report = host
+                    .invocation
+                    .faults()
+                    .input_replacement()
+                    .expect("armed replacement");
                 assert!(
-                    matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                    "{cell}: {err:?}"
+                    report.fired,
+                    "{cell}: the replacement must fire: {report:?}"
                 );
-                assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                assert_eq!(report.verified, after, "{cell}: {report:?}");
-                assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-                assert_eq!(report.attempts_after_fired, 1, "{cell}: {report:?}");
-            }
+                match (scenario, after == opens) {
+                    (reopen_cell::Scenario::Pinned, _) | (reopen_cell::Scenario::Path, true) => {
+                        let got = result.unwrap_or_else(|e| {
+                            panic!("{cell}: the run is unaffected by the replacement: {e}")
+                        });
+                        assert_eq!(report.attempts, opens, "{cell}: {report:?}");
+                        assert_eq!(report.verified, opens, "{cell}: {report:?}");
+                        assert_eq!(report.refused, 0, "{cell}: {report:?}");
+                        assert_eq!(
+                            report.attempts_after_fired,
+                            opens - after,
+                            "{cell}: {report:?}"
+                        );
+                        assert_eq!(
+                            got, expected,
+                            "{cell}: the report must be of the pinned input"
+                        );
+                    }
+                    (reopen_cell::Scenario::Path, false) => {
+                        let err = result
+                            .err()
+                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                        assert!(
+                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                            "{cell}: {err:?}"
+                        );
+                        assert_eq!(report.refused, 1, "{cell}: {report:?}");
+                        assert_eq!(report.verified, after, "{cell}: {report:?}");
+                        assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
+                        assert_eq!(report.attempts_after_fired, 1, "{cell}: {report:?}");
+                    }
+                }
+            });
         }
     }
 }
@@ -276,7 +268,7 @@ fn the_index_only_scan_reads_only_the_pinned_input() {
 
 /// Unindexed input: the walk finds a blob without indexdata and the full
 /// decode reopens from the start. Replaced between the two, the decode
-/// refuses (path reopen) or reads the pinned file (procfs), file size
+/// refuses (path reopen) or reads the pinned file (stable reopen name), file size
 /// included.
 #[test]
 fn the_full_decode_fallback_reads_only_the_pinned_input() {
@@ -325,39 +317,33 @@ fn a_decode_only_run_opens_once_through_a_caller_pin() {
         let Some(expected) = reference(route, &input, dir.path(), |_| false) else {
             unreachable!("no failure is skippable here");
         };
-        for force_path in [true, false] {
+        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(&input, indexed);
             write_replacement(&replacement, indexed);
             let host = crate::common::test_host();
-            host.invocation
-                .faults()
-                .force_pin_path_reopen
-                .store(force_path, Ordering::Relaxed);
-            let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-            if !reopen_cell::available(force_path, pin.reopens_through_procfs()) {
-                continue;
-            }
-            host.invocation
-                .faults()
-                .arm_input_replacement(&input, &replacement, 1);
-            let got = run_inspect(route, &pin, &host)
-                .unwrap_or_else(|e| panic!("{route:?}, force_path {force_path}: {e}"));
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(report.fired, "{route:?}: {report:?}");
-            assert_eq!(report.attempts, 1, "{route:?}: {report:?}");
-            assert_eq!(report.attempts_after_fired, 0, "{route:?}: {report:?}");
-            assert_eq!(got, expected, "{route:?}, force_path {force_path}");
+            scenario.run(&input, &host, |pin, scenario| {
+                host.invocation
+                    .faults()
+                    .arm_input_replacement(&input, &replacement, 1);
+                let got = run_inspect(route, pin, &host)
+                    .unwrap_or_else(|e| panic!("{route:?}, scenario {scenario:?}: {e}"));
+                let report = host
+                    .invocation
+                    .faults()
+                    .input_replacement()
+                    .expect("armed replacement");
+                assert!(report.fired, "{route:?}: {report:?}");
+                assert_eq!(report.attempts, 1, "{route:?}: {report:?}");
+                assert_eq!(report.attempts_after_fired, 0, "{route:?}: {report:?}");
+                assert_eq!(got, expected, "{route:?}, scenario {scenario:?}");
+            });
         }
     }
 }
 
 /// A caller's pin is the run's pin on the pinning route: replaced between
 /// the caller's pin and the call, the report is of the file the caller
-/// pinned (procfs) or the first open is refused (path reopen). An entry
+/// pinned (stable reopen name) or the first open is refused (path reopen). An entry
 /// that pinned the path afresh would report the replacement.
 #[test]
 fn a_caller_pin_is_used_as_it_is() {
@@ -370,38 +356,34 @@ fn a_caller_pin_is_used_as_it_is() {
             decode_only: false,
             direct: false,
         };
-        for force_path in [true, false] {
+        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(&input, indexed);
             let expected = expected(route, &input);
             write_replacement(&replacement, indexed);
             let host = crate::common::test_host();
-            host.invocation
-                .faults()
-                .force_pin_path_reopen
-                .store(force_path, Ordering::Relaxed);
-            let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-            let procfs = pin.reopens_through_procfs();
-            if !reopen_cell::available(force_path, procfs) {
-                continue;
-            }
-            std::fs::rename(&replacement, &input).expect("replace the input");
-            let result = run_inspect(route, &pin, &host);
-            let cell = format!("{route:?}, procfs {procfs}");
-            if procfs {
-                let got = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                assert_eq!(
-                    got, expected,
-                    "{cell}: the report must be of the pinned file"
-                );
-            } else {
-                let err = result
-                    .err()
-                    .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                assert!(
-                    matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                    "{cell}: {err:?}"
-                );
-            }
+            scenario.run(&input, &host, |pin, scenario| {
+                std::fs::rename(&replacement, &input).expect("replace the input");
+                let result = run_inspect(route, pin, &host);
+                let cell = format!("{route:?}, scenario {scenario:?}");
+                match scenario {
+                    reopen_cell::Scenario::Pinned => {
+                        let got = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+                        assert_eq!(
+                            got, expected,
+                            "{cell}: the report must be of the pinned file"
+                        );
+                    }
+                    reopen_cell::Scenario::Path => {
+                        let err = result
+                            .err()
+                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                        assert!(
+                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                            "{cell}: {err:?}"
+                        );
+                    }
+                }
+            });
         }
     }
 }
@@ -566,61 +548,57 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
     assert_eq!(expected.node_count, 30, "the unreplaced node count");
 
     for after in 1..=NODE_STATS_OPENS {
-        for force_path in [true, false] {
+        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(&input, true);
             write_replacement(&replacement, true);
             let host = crate::common::test_host();
-            host.invocation
-                .faults()
-                .force_pin_path_reopen
-                .store(force_path, Ordering::Relaxed);
-            let procfs = PinnedInput::pin(&input, &host)
-                .expect("probe pin")
-                .reopens_through_procfs();
-            if !reopen_cell::available(force_path, procfs) {
-                continue;
-            }
-            host.invocation
-                .faults()
-                .arm_input_replacement(&input, &replacement, after);
-            let result = run_node_stats(&input, direct, &host);
-            let cell = format!("direct {direct}, replaced after open {after}, procfs {procfs}");
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(report.fired, "{cell}: {report:?}");
-            if procfs || after == NODE_STATS_OPENS {
-                let got = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
-                assert_eq!(report.attempts, NODE_STATS_OPENS, "{cell}: {report:?}");
-                assert_eq!(report.refused, 0, "{cell}: {report:?}");
-                assert_eq!(
-                    report.attempts_after_fired,
-                    NODE_STATS_OPENS - after,
-                    "{cell}: {report:?}"
-                );
-                assert_eq!(
-                    got, expected,
-                    "{cell}: the stats must be of the pinned input"
-                );
-            } else {
-                let err = result
-                    .err()
-                    .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                assert!(
-                    matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                    "{cell}: {err:?}"
-                );
-                assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
-            }
+            scenario.run(&input, &host, |pin, scenario| {
+                host.invocation
+                    .faults()
+                    .arm_input_replacement(&input, &replacement, after);
+                let result = run_node_stats(pin, direct, &host);
+                let cell =
+                    format!("direct {direct}, replaced after open {after}, scenario {scenario:?}");
+                let report = host
+                    .invocation
+                    .faults()
+                    .input_replacement()
+                    .expect("armed replacement");
+                assert!(report.fired, "{cell}: {report:?}");
+                match (scenario, after == NODE_STATS_OPENS) {
+                    (reopen_cell::Scenario::Pinned, _) | (reopen_cell::Scenario::Path, true) => {
+                        let got = result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+                        assert_eq!(report.attempts, NODE_STATS_OPENS, "{cell}: {report:?}");
+                        assert_eq!(report.refused, 0, "{cell}: {report:?}");
+                        assert_eq!(
+                            report.attempts_after_fired,
+                            NODE_STATS_OPENS - after,
+                            "{cell}: {report:?}"
+                        );
+                        assert_eq!(
+                            got, expected,
+                            "{cell}: the stats must be of the pinned input"
+                        );
+                    }
+                    (reopen_cell::Scenario::Path, false) => {
+                        let err = result
+                            .err()
+                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                        assert!(
+                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                            "{cell}: {err:?}"
+                        );
+                        assert_eq!(report.refused, 1, "{cell}: {report:?}");
+                        assert_eq!(report.attempts, after + 1, "{cell}: {report:?}");
+                    }
+                }
+            });
         }
     }
 }
 
 /// Replaced between the probe and the walk, the walk refuses (path reopen)
-/// or reads the pinned file (procfs).
+/// or reads the pinned file (stable reopen name).
 #[test]
 fn node_stats_reads_only_the_pinned_input() {
     check_node_stats(false, |_| false);
@@ -634,38 +612,34 @@ fn node_stats_direct_reads_follow_the_pinned_input() {
 }
 
 /// A caller's pin is used as it is: replaced before the call, the stats are
-/// of the pinned file (procfs) or the probe is refused (path reopen).
+/// of the pinned file (stable reopen name) or the probe is refused (path reopen).
 #[test]
 fn node_stats_uses_a_caller_pin_as_it_is() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
-    for force_path in [true, false] {
+    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
         write_input(&input, true);
         let expected =
             run_node_stats(&input, false, &crate::common::test_host()).expect("unreplaced run");
         write_replacement(&replacement, true);
         let host = crate::common::test_host();
-        host.invocation
-            .faults()
-            .force_pin_path_reopen
-            .store(force_path, Ordering::Relaxed);
-        let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        let procfs = pin.reopens_through_procfs();
-        if !reopen_cell::available(force_path, procfs) {
-            continue;
-        }
-        std::fs::rename(&replacement, &input).expect("replace the input");
-        let result = run_node_stats(&pin, false, &host);
-        if procfs {
-            assert_eq!(result.expect("procfs run"), expected);
-        } else {
-            let err = result.expect_err("must refuse");
-            assert!(
-                matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                "{err:?}"
-            );
-        }
+        scenario.run(&input, &host, |pin, scenario| {
+            std::fs::rename(&replacement, &input).expect("replace the input");
+            let result = run_node_stats(pin, false, &host);
+            match scenario {
+                reopen_cell::Scenario::Pinned => {
+                    assert_eq!(result.expect("pinned run"), expected);
+                }
+                reopen_cell::Scenario::Path => {
+                    let err = result.expect_err("must refuse");
+                    assert!(
+                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                        "{err:?}"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -697,7 +671,7 @@ fn inspect_header_takes_the_size_from_its_one_open() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
-    for force_path in [true, false] {
+    for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
         write_input(&input, true);
         write_replacement(&replacement, true);
         let size = std::fs::metadata(&input).expect("stat input").len();
@@ -709,28 +683,22 @@ fn inspect_header_takes_the_size_from_its_one_open() {
             "the sizes must differ for the check to mean anything"
         );
         let host = crate::common::test_host();
-        host.invocation
-            .faults()
-            .force_pin_path_reopen
-            .store(force_path, Ordering::Relaxed);
-        let pin = PinnedInput::pin(&input, &host).expect("caller pin");
-        if !reopen_cell::available(force_path, pin.reopens_through_procfs()) {
-            continue;
-        }
-        host.invocation
-            .faults()
-            .arm_input_replacement(&input, &replacement, 1);
-        let read = pbfhogg::inspect::inspect_header(&pin, false, &host)
-            .unwrap_or_else(|e| panic!("force_path {force_path}: {e}"));
-        let report = host
-            .invocation
-            .faults()
-            .input_replacement()
-            .expect("armed replacement");
-        assert!(report.fired, "{report:?}");
-        assert_eq!(report.attempts, 1, "{report:?}");
-        assert_eq!(read.file_size, size, "force_path {force_path}");
-        assert!(read.header.is_sorted());
+        scenario.run(&input, &host, |pin, scenario| {
+            host.invocation
+                .faults()
+                .arm_input_replacement(&input, &replacement, 1);
+            let read = pbfhogg::inspect::inspect_header(pin, false, &host)
+                .unwrap_or_else(|e| panic!("scenario {scenario:?}: {e}"));
+            let report = host
+                .invocation
+                .faults()
+                .input_replacement()
+                .expect("armed replacement");
+            assert!(report.fired, "{report:?}");
+            assert_eq!(report.attempts, 1, "{report:?}");
+            assert_eq!(read.file_size, size, "scenario {scenario:?}");
+            assert!(read.header.is_sorted());
+        });
     }
 }
 

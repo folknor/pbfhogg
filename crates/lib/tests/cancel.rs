@@ -246,25 +246,233 @@ fn digest(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg
     .map(drop)
 }
 
-// Fixture scenarios, not a complete command inventory. This covers two altw
-// modes and one mode each of the other listed commands. It omits getid,
-// getparents, repack, renumber, tags-filter, tag counting (inspect tags),
-// time-filter and other command modes. Ordinals identify callback positions,
-// not source sites; parallel scheduling can change which position is reached.
-fn commands() -> Vec<(&'static str, Command)> {
-    let mut all: Vec<(&'static str, Command)> = vec![
-        ("sort", sort),
-        ("cat --type", cat),
-        ("add-locations-to-ways sparse", altw_sparse),
-        ("add-locations-to-ways external", altw_external),
-        ("apply-changes", apply_changes),
-        ("merge-changes", merge_changes),
-        ("diff -j 2", diff_parallel),
-        ("derive-changes -j 2", derive_changes),
-        ("digest", digest),
-    ];
+/// Inventory ownership is by public library command module, not CLI spelling.
+/// Library tests cannot depend on pbfhogg-cli (which depends on this library).
+/// Modes are declared here rather than inferred from scenario display names.
+struct CommandCoverage {
+    module: &'static str,
+    scenarios: Vec<Scenario>,
+    excluded_modes: &'static str,
+}
+
+struct Scenario {
+    mode: &'static str,
+    run: Command,
+}
+
+fn tested(
+    module: &'static str,
+    scenarios: Vec<Scenario>,
+    excluded_modes: &'static str,
+) -> CommandCoverage {
+    CommandCoverage {
+        module,
+        scenarios,
+        excluded_modes,
+    }
+}
+
+fn excluded(module: &'static str, reason: &'static str) -> CommandCoverage {
+    tested(module, Vec::new(), reason)
+}
+
+fn command_registry() -> Vec<CommandCoverage> {
+    let mut registry = registry_head();
+    registry.extend(registry_tail());
+    registry
+}
+
+fn registry_head() -> Vec<CommandCoverage> {
+    vec![
+        tested(
+            "altw",
+            vec![
+                Scenario {
+                    mode: "sparse, keep untagged, no prepass",
+                    run: altw_sparse,
+                },
+                Scenario {
+                    mode: "external, keep untagged, no prepass",
+                    run: altw_external,
+                },
+            ],
+            "Auto routing, inject prepass, missing-node tolerance and dropping untagged nodes are not exercised.",
+        ),
+        tested(
+            "apply_changes",
+            vec![Scenario {
+                mode: "default PBF base plus XML OSC",
+                run: apply_changes,
+            }],
+            "LocationsOnWays and nondefault merge/write options are not exercised.",
+        ),
+        tested(
+            "cat",
+            vec![Scenario {
+                mode: "single input, explicit all-type filter, default write",
+                run: cat,
+            }],
+            "Multiple inputs, dedupe, cleaning and individual type filters are not exercised.",
+        ),
+        excluded(
+            "check",
+            "All modes excluded: validation needs dedicated fixtures and reports; no cancellation claim here.",
+        ),
+        excluded(
+            "degrade",
+            "All modes excluded: indexdata, locations and ordering transformations need dedicated fixtures.",
+        ),
+        tested(
+            "diff",
+            vec![
+                Scenario {
+                    mode: "text diff, two jobs, include common, no type filter",
+                    run: diff_parallel,
+                },
+                Scenario {
+                    mode: "derive XML gzip changes, two jobs, default flags",
+                    run: derive_changes,
+                },
+            ],
+            "Serial execution, suppressed common, verbose, type filtering and other derive options are not exercised.",
+        ),
+        tested(
+            "digest",
+            vec![Scenario {
+                mode: "full form, default flags",
+                run: digest,
+            }],
+            "Other forms and nondefault flags are not exercised.",
+        ),
+    ]
+}
+
+fn registry_tail() -> Vec<CommandCoverage> {
+    vec![
+        excluded(
+            "export",
+            "All modes excluded: format-specific streaming outputs need separate assertions.",
+        ),
+        excluded(
+            "extract",
+            "All modes excluded: region strategies and multi-extract need dedicated geometry fixtures.",
+        ),
+        excluded(
+            "getid",
+            "All modes excluded: ID and reference-completion paths need dedicated request fixtures.",
+        ),
+        excluded(
+            "getparents",
+            "All modes excluded: parent traversal paths need dedicated request fixtures.",
+        ),
+        excluded(
+            "inspect",
+            "All modes excluded: descriptive reports are not exercised by this output-publication sweep.",
+        ),
+        tested(
+            "merge_changes",
+            vec![Scenario {
+                mode: "stream, two jobs, two XML inputs, forced spill with test-hooks",
+                run: merge_changes,
+            }],
+            "In-memory merge, other job counts and compression/input variants are not exercised.",
+        ),
+        excluded(
+            "renumber",
+            "All modes excluded: mapping strategies and external scratch paths need dedicated fixtures.",
+        ),
+        excluded(
+            "repack",
+            "All modes excluded: reencoding policies need dedicated fixtures.",
+        ),
+        tested(
+            "sort",
+            vec![Scenario {
+                mode: "default options on sorted fixture",
+                run: sort,
+            }],
+            "Forced sorting, external runs and nondefault sort/write options are not exercised.",
+        ),
+        excluded(
+            "tags_count",
+            "All modes excluded: tag aggregation and report modes need separate scenarios.",
+        ),
+        excluded(
+            "tags_filter",
+            "All modes excluded: expressions and reference completion need dedicated fixtures.",
+        ),
+        excluded(
+            "time_filter",
+            "All modes excluded: timestamp/history selection needs dedicated fixtures.",
+        ),
+    ]
+}
+
+/// An added public command module must acquire either scenarios or an explicit
+/// exclusion. Read all declarations, including feature-gated ones, so consumer
+/// builds enforce the same inventory as commands-enabled builds. Private helper
+/// modules are deliberately outside this command inventory.
+#[test]
+fn cancellation_registry_accounts_for_public_library_command_modules() {
+    use std::collections::BTreeSet;
+
+    let inventory: BTreeSet<_> = include_str!("../src/commands/mod.rs")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub mod "))
+        .map(|declaration| {
+            declaration
+                .strip_suffix(';')
+                .expect("public module declaration shape")
+        })
+        .collect();
+    assert!(!inventory.is_empty(), "command inventory must not be empty");
+    let registry = command_registry();
+    let registered: BTreeSet<_> = registry.iter().map(|entry| entry.module).collect();
+    assert_eq!(registered.len(), registry.len(), "duplicate command module");
+    assert_eq!(
+        inventory, registered,
+        "unaccounted or removed command module"
+    );
+    for entry in registry {
+        assert!(
+            !entry.excluded_modes.trim().is_empty(),
+            "{}: declare exclusions",
+            entry.module
+        );
+        let modes: BTreeSet<_> = entry
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.mode)
+            .collect();
+        assert_eq!(
+            modes.len(),
+            entry.scenarios.len(),
+            "{}: duplicate mode",
+            entry.module
+        );
+        assert!(modes.iter().all(|mode| !mode.trim().is_empty()));
+    }
+}
+
+// All three sweeps consume this registry. Geocode's builder lives outside
+// commands/, so it is an additional scenario, not a command-module inventory
+// member. Its single indexed-fixture build permits unindexed input and excludes
+// unindexed fixtures and nondefault build policies. No geocode scenario runs without `commands`.
+fn commands() -> Vec<(String, Command)> {
+    let mut all: Vec<_> = command_registry()
+        .into_iter()
+        .flat_map(|entry| {
+            entry
+                .scenarios
+                .into_iter()
+                .map(move |scenario| (format!("{}: {}", entry.module, scenario.mode), scenario.run))
+        })
+        .collect();
     #[cfg(feature = "commands")]
-    all.push(("build-geocode-index", geocode));
+    all.push((
+        "geocode builder: indexed fixture, allow unindexed, default policies".to_owned(),
+        geocode as Command,
+    ));
     all
 }
 
@@ -336,7 +544,7 @@ fn a_tripped_token_stops_selected_scenarios_before_they_start() {
     for (name, command) in commands() {
         let cancel = pbfhogg::host::Invocation::new();
         cancel.cancel();
-        match run_once(name, command, &inputs, cancel) {
+        match run_once(&name, command, &inputs, cancel) {
             Ok(true) => {}
             Ok(false) => failures.push(format!("{name}: completed under a tripped token")),
             Err(e) => failures.push(e),
@@ -388,6 +596,35 @@ fn run_at_checkpoint(
     }
 }
 
+/// A strict per-scenario replay budget, independent of checkpoint count.
+#[cfg(feature = "test-hooks")]
+fn checkpoint_sample(count: u64) -> Vec<u64> {
+    if count <= 64 {
+        (1..=count).collect()
+    } else {
+        (0..64_u64)
+            .map(|n| 1 + (count - 1) / 63 * n + (count - 1) % 63 * n / 63)
+            .collect()
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn checkpoint_sampling_has_a_strict_budget_and_includes_endpoints() {
+    for count in [0, 1, 63, 64, 65, 127, 128, 1000, u64::MAX] {
+        let sample = checkpoint_sample(count);
+        assert_eq!(
+            sample.len(),
+            usize::try_from(count.min(64)).expect("bounded length")
+        );
+        assert!(sample.windows(2).all(|pair| pair[0] < pair[1]));
+        if count > 0 {
+            assert_eq!(sample.first(), Some(&1));
+            assert_eq!(sample.last(), Some(&count));
+        }
+    }
+}
+
 /// Sample fixture checkpoint ordinals for the selected command scenarios.
 /// Each reached target must cancel or report an already decided publication.
 #[cfg(feature = "test-hooks")]
@@ -398,7 +635,7 @@ fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision
     for (name, command) in commands() {
         let counter = pbfhogg::host::Invocation::new();
         counter.on_check(|_, _| {});
-        match run_once(name, command, &inputs, counter.clone()) {
+        match run_once(&name, command, &inputs, counter.clone()) {
             Ok(false) => {}
             Ok(true) => {
                 failures.push(format!("{name}: counting run unexpectedly cancelled"));
@@ -415,20 +652,12 @@ fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision
             continue;
         }
         let mut cancelled = 0_u64;
-        // Exhaust small fixture counts; larger counts use a spread and
-        // always include the final ordinal. This is not site coverage.
-        let mut ks: Vec<u64> = if count <= 64 {
-            (1..=count).collect()
-        } else {
-            (1..=count)
-                .step_by(usize::try_from(count / 64).unwrap_or(1))
-                .collect()
-        };
-        if ks.last() != Some(&count) {
-            ks.push(count);
-        }
+        // Exhaust at most 64 ordinals; otherwise sample exactly 64 evenly
+        // spaced targets including first and last. Callback ordinals are not
+        // source-site coverage and parallel scheduling can change reachability.
+        let ks = checkpoint_sample(count);
         for k in ks {
-            match run_at_checkpoint(name, command, &inputs, k) {
+            match run_at_checkpoint(&name, command, &inputs, k) {
                 Ok(CheckpointRun::Cancelled) => cancelled += 1,
                 Ok(CheckpointRun::CompletedAfterDecision { authorized }) => {
                     assert!(authorized > 0, "publication ordinals start at one");
@@ -466,7 +695,7 @@ fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
             let c = token.capabilities();
             seen.fetch_max(c.session + c.writer + c.output + c.buffer, Relaxed);
         });
-        match run_once(name, command, &inputs, token) {
+        match run_once(&name, command, &inputs, token) {
             Ok(false) => {}
             Ok(true) => failures.push(format!("{name}: census run unexpectedly cancelled")),
             Err(e) => failures.push(e),

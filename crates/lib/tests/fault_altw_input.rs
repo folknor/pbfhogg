@@ -2,9 +2,9 @@
 //! fault plan on the run's token (`arm_input_replacement`, see
 //! `pbfhogg::test_hooks`).
 //!
-//! Every open of the input after the run's pin is derived from it, so on a
-//! host that reopens through `/proc/self/fd` a replaced input does not
-//! affect the run, and where opens go through the path the run fails with
+//! Every open of the input after the run's pin is derived from it. With a
+//! stable scratch reopen name a replaced input does not affect the run,
+//! and where opens go through the path the run fails with
 //! `InputReplaced` and publishes nothing. Each route is checked with the
 //! replacement armed after each of its opens but the last in turn, so every
 //! later open is shown to follow the pin and the refusal path of every open
@@ -73,17 +73,21 @@ fn host(memory_available: Option<u64>) -> pbfhogg::host::Host {
     host
 }
 
-fn run(
+// The public external join accepts only a path and pins it internally.
+// Keep its replacement coverage here until it can accept a caller pin;
+// passing a stable link as the input would change the fault target.
+fn run<'a>(
     route: Route,
-    input: &Path,
+    input: impl Into<pbfhogg::read::input::InputSource<'a>>,
     output: &Path,
     host: &pbfhogg::host::Host,
     scratch_dir: &Path,
 ) -> pbfhogg::Result<()> {
+    let input = input.into();
     let scratch = pbfhogg::scratch::RunScratch::create(scratch_dir, host)?;
     if let Route::PublicExternal = route {
         return pbfhogg::altw::external::external_join(
-            input,
+            input.path(),
             crate::common::out(output),
             false,
             &WriteOptions::default(),
@@ -143,78 +147,87 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
     let expected = std::fs::read(&reference).expect("read reference output");
 
     for after in 1..opens {
-        for force_path in [true, false] {
+        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(&input, indexed);
             write_replacement(&replacement);
             let host = host(memory_available);
-            host.invocation
-                .faults()
-                .force_pin_path_reopen
-                .store(force_path, Ordering::Relaxed);
-            let procfs = pbfhogg::read::input::PinnedInput::pin(&input, &host)
-                .expect("probe pin")
-                .reopens_through_procfs();
-            if !reopen_cell::available(force_path, procfs) {
-                continue;
-            }
-            host.invocation
-                .faults()
-                .arm_input_replacement(&input, &replacement, after);
-            let output = dir.path().join("out.osm.pbf");
-            let before = snapshot_dir(dir.path());
-            let result = run(route, &input, &output, &host, dir.path());
+            let run_cell = |pin: &pbfhogg::read::input::PinnedInput, scenario| {
+                host.invocation
+                    .faults()
+                    .arm_input_replacement(&input, &replacement, after);
+                let output = dir.path().join("out.osm.pbf");
+                let before = snapshot_dir(dir.path());
+                let result = run(route, pin, &output, &host, dir.path());
 
-            let cell = format!("{route:?}, replaced after open {after}, procfs {procfs}");
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(
-                report.fired,
-                "{cell}: the replacement must fire: {report:?}"
-            );
+                let cell = format!("{route:?}, replaced after open {after}, scenario {scenario:?}");
+                let report = host
+                    .invocation
+                    .faults()
+                    .input_replacement()
+                    .expect("armed replacement");
+                assert!(
+                    report.fired,
+                    "{cell}: the replacement must fire: {report:?}"
+                );
 
-            if procfs {
-                result.unwrap_or_else(|e| {
-                    panic!("{cell}: a procfs-pinned run is unaffected by the replacement: {e}")
-                });
-                assert_eq!(report.attempts, opens, "{cell}: {report:?}");
-                assert_eq!(report.verified, opens, "{cell}: {report:?}");
-                assert_eq!(
-                    report.attempts_after_fired,
-                    opens - after,
-                    "{cell}: {report:?}"
-                );
-                assert_eq!(
-                    std::fs::read(&output).expect("read output"),
-                    expected,
-                    "{cell}: the run must read only the input it pinned"
-                );
-                std::fs::remove_file(&output).expect("remove output");
+                match scenario {
+                    reopen_cell::Scenario::Pinned => {
+                        result.unwrap_or_else(|e| {
+                            panic!("{cell}: a pinned run is unaffected by the replacement: {e}")
+                        });
+                        assert_eq!(report.attempts, opens, "{cell}: {report:?}");
+                        assert_eq!(report.verified, opens, "{cell}: {report:?}");
+                        assert_eq!(
+                            report.attempts_after_fired,
+                            opens - after,
+                            "{cell}: {report:?}"
+                        );
+                        assert_eq!(
+                            std::fs::read(&output).expect("read output"),
+                            expected,
+                            "{cell}: the run must read only the input it pinned"
+                        );
+                        std::fs::remove_file(&output).expect("remove output");
+                    }
+                    reopen_cell::Scenario::Path => {
+                        let err = result
+                            .err()
+                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                        assert!(
+                            matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                            "{cell}: {err:?}"
+                        );
+                        // The run stops at the first open after the replacement,
+                        // except where two opens race past it together.
+                        let refused = if racing == Some(after) { 2 } else { 1 };
+                        assert_eq!(report.refused, refused, "{cell}: {report:?}");
+                        assert_eq!(report.attempts, after + refused, "{cell}: {report:?}");
+                        assert_eq!(report.attempts_after_fired, refused, "{cell}: {report:?}");
+                        assert!(
+                            !output.exists(),
+                            "{cell}: a refused run must publish nothing"
+                        );
+                        // The replacement was renamed over the input, so it is the
+                        // one path the run itself did not account for.
+                        let mut after_run = snapshot_dir(dir.path());
+                        after_run.insert(PathBuf::from("replacement.osm.pbf"));
+                        crate::common::assert_scratch_unchanged(&before, &after_run);
+                    }
+                }
+            };
+            if matches!(route, Route::PublicExternal) {
+                let force_path = matches!(scenario, reopen_cell::Scenario::Path);
+                host.invocation
+                    .faults()
+                    .force_pin_path_reopen
+                    .store(force_path, Ordering::Relaxed);
+                let pin = pbfhogg::read::input::PinnedInput::pin(&input, &host)
+                    .expect("probe public external pin");
+                if reopen_cell::available(force_path, pin.reopens_through_procfs()) {
+                    run_cell(&pin, scenario);
+                }
             } else {
-                let err = result
-                    .err()
-                    .unwrap_or_else(|| panic!("{cell}: must refuse"));
-                assert!(
-                    matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                    "{cell}: {err:?}"
-                );
-                // The run stops at the first open after the replacement,
-                // except where two opens race past it together.
-                let refused = if racing == Some(after) { 2 } else { 1 };
-                assert_eq!(report.refused, refused, "{cell}: {report:?}");
-                assert_eq!(report.attempts, after + refused, "{cell}: {report:?}");
-                assert_eq!(report.attempts_after_fired, refused, "{cell}: {report:?}");
-                assert!(
-                    !output.exists(),
-                    "{cell}: a refused run must publish nothing"
-                );
-                // The replacement was renamed over the input, so it is the
-                // one path the run itself did not account for.
-                let mut after_run = snapshot_dir(dir.path());
-                after_run.insert(PathBuf::from("replacement.osm.pbf"));
-                crate::common::assert_scratch_unchanged(&before, &after_run);
+                scenario.run(&input, &host, run_cell);
             }
         }
     }

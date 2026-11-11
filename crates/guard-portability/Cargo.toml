@@ -1,0 +1,30 @@
+[package]
+name = "pbfhogg-guard-portability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compile fixture: the promise guard's fallback on architectures it does not support"
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# Exists only for the `riscv64` lint sweep in brokkr.d/checks.toml. It mounts
+# crates/cli/tests/guard.rs alone, with libc as its only dependency, so the
+# guard's unsupported-architecture half can be type-checked for a foreign
+# triple without the rest of the workspace (whose zstd-sys build needs a C
+# toolchain and sysroot for that triple).
+[lib]
+path = "src/lib.rs"
+
+# Scoped like the mount in src/lib.rs, so the host build has no unused
+# dependency.
+[target.'cfg(all(target_os = "linux", not(all(target_endian = "little", any(target_arch = "x86_64", target_arch = "aarch64")))))'.dev-dependencies]
+libc = "0.2.191"
+
+[lints]
+workspace = true

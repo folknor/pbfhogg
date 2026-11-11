@@ -171,6 +171,12 @@ test that starts the binary some other way escapes the guard: do not.
 The library harness inherits brokkr's lease the same way and keeps the
 same promise; every child `crates/harness/tests/exe.rs` starts runs under the
 same guard, mounted from `crates/cli/tests/guard.rs`.
+On any other architecture the filter is compiled out: children run
+unguarded and the control test prints `skipped:`. That fallback is
+type-checked by the `riscv64` lint sweep in `brokkr.d/checks.toml`, through
+the libc-only fixture crate `crates/guard-portability`, which mounts the
+guard and nothing else; no sweep compiles the rest of the workspace for an
+unsupported architecture.
 
 ## Validation tiers
 

@@ -18,17 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-004 - The promise guard's unsupported-architecture fallback does not compile
-
-`crates/cli/tests/guard.rs` defines `AUDIT_ARCH` only for x86_64 and aarch64, and
-`program` references it unconditionally. On another Linux architecture the
-runtime `supported()` check cannot provide the documented unguarded fallback
-because compilation fails first.
-
-Fix: compile the supported implementation behind an architecture gate and provide
-a separate unsupported implementation. Enforcement: cross-target compile checks,
-which do not need execution on every architecture.
-
 ## BUG-005 - The signal reporter holds a mutex across a potentially blocking stderr write
 
 `crates/cli/src/signals.rs` holds `FINISHED` while printing the stopping notice,

@@ -108,6 +108,20 @@ packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 
+# Lint-only, on an architecture the promise guard (crates/cli/tests/guard.rs)
+# does not support: its seccomp filter compiles only on little-endian x86_64
+# and aarch64. This type-checks the guard's unguarded fallback, and only that,
+# through the libc-only fixture crate that mounts it; it says nothing about
+# the rest of the workspace on riscv64, whose zstd-sys build would need a C
+# toolchain and sysroot for the triple. The triple must stay outside the
+# guard's supported set, or the fixture is empty and this checks nothing.
+# Nothing is linked or run; it needs only
+# `rustup target add riscv64gc-unknown-linux-gnu`.
+[[lint_sweep]]
+name = "riscv64"
+packages = ["pbfhogg-guard-portability"]
+target = "riscv64gc-unknown-linux-gnu"
+
 # Doctests live in cargo's `--doc` pseudo-target, which a `parallel` sweep
 # cannot carry, and `[test] doctests` is off by default - so until this entry
 # existed no doctest in the library ever ran, and a broken example in a doc

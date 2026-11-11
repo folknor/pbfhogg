@@ -1440,7 +1440,7 @@ mod tests {
             tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)))
                 .ok();
         });
-        match rx.recv_timeout(Duration::from_secs(10)) {
+        match rx.recv_timeout(crate::tunables::TEST_HANG_BOUND) {
             Ok(Ok(value)) => value,
             Ok(Err(payload)) => std::panic::resume_unwind(payload),
             Err(_) => panic!("the pool hung: no return within the deadline"),
@@ -1535,31 +1535,38 @@ mod tests {
         assert_eq!(err.to_string(), "bad blob 700");
     }
 
-    /// Several failures: the reported one is the lowest task, every time,
-    /// even when a later one finishes first.
+    /// Several failures: the reported one is the lowest task, even when a
+    /// later one has failed first. Task 300 fails only once task 301 has
+    /// (recorded, not assumed).
     #[test]
     fn the_lowest_failing_task_is_the_one_reported() {
-        for _ in 0..20 {
-            let err = within_deadline(|| {
-                run(
-                    5_000,
-                    6,
-                    |i| {
-                        if i == 300 {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        if i == 300 || i == 301 || i == 2_000 {
-                            Err(Error::internal(format!("bad blob {i}")))
-                        } else {
-                            Ok(i)
-                        }
-                    },
-                    |_| Ok(()),
-                )
-                .unwrap_err()
-            });
-            assert_eq!(err.to_string(), "bad blob 300");
-        }
+        let (err, ordered) = within_deadline(|| {
+            let later_failed = AtomicBool::new(false);
+            let ordered = AtomicBool::new(false);
+            let err = run(
+                5_000,
+                6,
+                |i| match i {
+                    300 => {
+                        ordered.store(
+                            eventually(|| later_failed.load(Ordering::SeqCst)),
+                            Ordering::SeqCst,
+                        );
+                        Err(Error::internal(format!("bad blob {i}")))
+                    }
+                    301 => {
+                        later_failed.store(true, Ordering::SeqCst);
+                        Err(Error::internal(format!("bad blob {i}")))
+                    }
+                    _ => Ok(i),
+                },
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            (err, ordered.load(Ordering::SeqCst))
+        });
+        assert!(ordered, "task 301 never failed ahead of task 300");
+        assert_eq!(err.to_string(), "bad blob 300");
     }
 
     /// The consumer's own failure ends the run just as promptly.
@@ -1713,18 +1720,28 @@ mod tests {
 
     /// One slow task while the others race ahead: the window bounds how far
     /// they get. Credit returns only after `consume`, so nothing is ever
-    /// further ahead of the consumed count than the window.
+    /// further ahead of the consumed count than the window. Task 0 is held
+    /// until a worker has parked at the admission gate, so the others have
+    /// run as far as the window lets them before it finishes.
     #[test]
     fn a_slow_task_does_not_let_the_others_run_unbounded() {
-        let peak = within_deadline(|| {
+        let window = default_window(4).get();
+        let (peak, parked) = within_deadline(move || {
+            let metrics = OrderedPoolMetrics::new();
             let peak = AtomicUsize::new(0);
             let consumed = AtomicUsize::new(0);
-            run(
+            let parked = AtomicBool::new(false);
+            run_in(
                 3_000,
                 4,
+                window,
+                &metrics,
                 |i| {
                     if i == 0 {
-                        std::thread::sleep(Duration::from_millis(200));
+                        parked.store(
+                            eventually(|| metrics.window_parks.load(Ordering::Relaxed) > 0),
+                            Ordering::SeqCst,
+                        );
                     }
                     let ahead = i.saturating_sub(consumed.load(Ordering::SeqCst));
                     peak.fetch_max(ahead, Ordering::SeqCst);
@@ -1736,9 +1753,9 @@ mod tests {
                 },
             )
             .unwrap();
-            peak.load(Ordering::SeqCst)
+            (peak.load(Ordering::SeqCst), parked.load(Ordering::SeqCst))
         });
-        let window = default_window(4).get();
+        assert!(parked, "no worker parked at the gate behind the slow head");
         assert!(
             peak < window,
             "a worker ran {peak} tasks ahead of the consumer; the window ({window}) must bound it"
@@ -2188,11 +2205,14 @@ mod tests {
     }
 
     /// A later task failing first does not win: the reported error is the
-    /// lowest failing task's, after every item of the tasks before it.
+    /// lowest failing task's, after every item of the tasks before it. Task
+    /// 20 fails only once task 23 has.
     #[test]
     fn a_streamed_failure_surfaces_in_task_order() {
-        let (err, consumer) = within_deadline(|| {
+        let (err, consumer, ordered) = within_deadline(|| {
             let mut consumer = Recorder::default();
+            let later_failed = AtomicBool::new(false);
+            let ordered = AtomicBool::new(false);
             let err = streams_in(
                 200,
                 4,
@@ -2201,10 +2221,14 @@ mod tests {
                 &OrderedPoolMetrics::new(),
                 |task, emitter| {
                     if task == 20 {
-                        std::thread::sleep(Duration::from_millis(20));
+                        ordered.store(
+                            eventually(|| later_failed.load(Ordering::SeqCst)),
+                            Ordering::SeqCst,
+                        );
                         return Err(Error::internal("task 20 failed"));
                     }
                     if task == 23 {
+                        later_failed.store(true, Ordering::SeqCst);
                         return Err(Error::internal("task 23 failed"));
                     }
                     emit_some(task, emitter)
@@ -2212,8 +2236,9 @@ mod tests {
                 &mut consumer,
             )
             .unwrap_err();
-            (err, consumer)
+            (err, consumer, ordered.load(Ordering::SeqCst))
         });
+        assert!(ordered, "task 23 never failed ahead of task 20");
         assert_eq!(err.to_string(), "task 20 failed");
         assert_eq!(consumer.ends.len(), 20, "every task below 20 finished");
         assert_eq!(consumer.before.last(), Some(&20));

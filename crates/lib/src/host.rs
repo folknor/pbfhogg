@@ -1021,10 +1021,14 @@ impl Recorder {
     /// under the same invocation is refused as re-entry, never waited on. A
     /// poisoned lock is recovered: it guards no state, only exclusion.
     pub(crate) fn publication_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.0
-            .0
-            .publishing
-            .lock()
+        let lock = &self.0.0.publishing;
+        #[cfg(feature = "test-hooks")]
+        match lock.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => self.faults().on_publication_lock_wait(),
+        }
+        lock.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

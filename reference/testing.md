@@ -261,6 +261,16 @@ construction. Those tests are `#[ignore]`d out of `check`'s reach and
 must be exercised individually via `brokkr test <name> --timeout
 <secs>` (`brokkr test -p pbfhogg-cli <name> ...` for a CLI test), which raises the per-test timeout up to 280 s.
 
+A test's own failure bounds (the hook wait, the hang bound of the timeout
+helpers, the observation bound of unit tests, the harness rendezvous, the
+child timeout) are the "Test time bounds" in `crates/lib/src/tunables.rs`,
+const-asserted below a mirror of that watchdog so a broken run fails with a
+named message before the watchdog kills it unnamed. A test never infers that
+another thread blocked from elapsed time: it waits (bounded) for an
+observation made at the wait itself - a `test_support::Parked` count under a
+primitive's mutex, a fault-plan hook at a join or a lock, a slow-path tally -
+and only then releases it.
+
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication
 diffs) is `brokkr verify` and `brokkr bench`, which resolve datasets

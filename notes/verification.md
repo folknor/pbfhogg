@@ -125,95 +125,56 @@ caller pin; `crates/lib/tests/fault_apply_changes.rs` still uses it too. Residue
 caller-pin entry point on each of the two commands, and migrating the apply-changes
 fault test.
 
-## VER-020 - Negative concurrency assertions pay sleeps and prove nothing about the wait
+## VER-023 - Hang helpers still detach the work they time out
 
-Reported by fault-injection, lib-core-unit, lib-integration, lib-commands-unit.
+`ordered_pool.rs` `within_deadline`, `assert_completes` in `read/pipeline.rs` and
+`read/reader.rs`, the early-drop tests in `crates/lib/tests/read_paths.rs` and
+`renumber_within_deadline` in `renumber_external.rs` all bound the operation by
+`TEST_HANG_BOUND` (below the runner watchdog), but on expiry they panic and leave the
+timed-out thread running under later tests, with the fixture directory removed under it.
+Ending the process on expiry (write the reason to fd 2, abort) was argued and rejected:
+abort skips `OwnedChild`'s kill-on-drop, and nothing gives test children a parent-death
+signal, so a sibling test's child (`common/oracle.rs`, `CliInvoker`) would outlive the
+binary on its scratch. Even a joined helper cannot bound a thread's thread-local
+teardown in-process (`JoinHandle::is_finished` covers the main function only). Residue:
+run irrecoverable hang probes in a killable child (or give every test child a
+parent-death signal first, then fail-stop), and a ban on discarded test thread handles
+outside such targets.
 
-Sites wait real time and infer that another thread blocked. A descheduled thread passes
-the assertion, or a valid ordering can fail it.
+## VER-026 - The watchdog the test bounds sit under is a copy
 
-- `crates/lib/tests/fault_library_pools.rs`: 200 ms, three tests, at least 600 ms.
-- `joined_pool.rs` and `read/pipeline.rs`: 200 ms each.
-- `read/reader.rs` (three tests) and `read/pipeline.rs` queue close: at least 200 ms per
-  build shape together. Sending "ready" before `acquire` does not establish `acquire`
-  ran; the queue-close child can start after closure and pass without testing a wakeup;
-  the admission-gate test can fail valid code.
-- `crates/lib/tests/publication.rs` ordinal test 50 ms, and `PublishOrder` in
-  `host_contract.rs` 500 ms plus two 20 ms: about 590 ms per sweep, about 2.95 s over
-  five sweeps.
-- `every_router_notification_waits_for_the_final_check_gate` in
-  `altw/external/coord_payloads.rs`: 50 ms times four, at least 200 ms; the
-  condition-variable wait also accepts a spurious wake as evidence.
-
-Fix: add a per-instance observation at the actual wait or join transition and release
-only after it, with timeouts only as failure bounds. Enforcement: a shared handshake or
-contention fixture, a model test for the router protocol, and a lint against
-timing-based negative assertions. A paused clock cannot establish thread ordering.
-
-## VER-021 - Sleep-based scheduling does not establish the ordering tests claim
-
-Reported by lib-core-unit, lib-commands-unit.
-
-- `ordered_pool.rs`: twenty repetitions at 5 ms with no assertion the later failure
-  finished first, a 200 ms slow head task, and a 20 ms reversal delay.
-- `scan/classify.rs`: 24 blobs at 2 ms, positive stall assertions depending on
-  scheduling.
-- `write/parallel_gzip.rs`: a sink sleeping 40 ms per write.
-- `threads.rs`: three tests with 50 ms sleeps.
-- `encode_failing` in `apply_changes/stream_output.rs`: the earlier block waits on a
-  flag, sleeps 20 ms, then fails. The comment admits this is a bias, but test
-  descriptions say the later failure happens first. Four tests build a 16-thread pool so
-  dependent blocks become separate jobs, so a Rayon splitter change can turn correct
-  behaviour into a ten-second failure.
-
-Fix: controlled completion gates or a controllable completion source at the
-result-collection boundary, with a smaller real-executor test. Enforcement: a source
-rule requiring an explicit exemption for test sleeps, and handshake tests. An injected
-clock does not control OS scheduling.
-
-## VER-023 - Timeout helpers and hang tests detach the work they time out
-
-Reported by lib-core-unit, lib-integration.
-
-`ordered_pool.rs` discards its spawned handle; helpers in `read/pipeline.rs` and
-`read/reader.rs`, the tests in `crates/lib/tests/read_paths.rs` and
-`renumber_within_deadline` in `renumber_external.rs` likewise detach. On timeout, workers
-keep files, pipeline threads and executor work alive while later tests run, and the
-fixture directory may be removed underneath them. A deadlocked Rust thread cannot be
-safely reclaimed in-process.
-
-Fix: run irrecoverable hang probes in a killable child process, and keep recoverable
-rendezvous tests in-process with release-and-join guards or guaranteed cancellation.
-Enforcement: one hang-test harness and a ban on discarded test thread handles outside
-isolated targets.
-
-## VER-026 - Timeout policy is duplicated and internal watchdogs lose to brokkr's
-
-Reported by lib-core-unit, library-harness.
-
-Helpers in `read/pipeline.rs` and `read/reader.rs` wait 30 s and promise a descriptive
-deadlock failure, while `brokkr check` kills a test at 20 s. In the harness the concurrent
-scenario gate in `scenarios/concurrent_cat.rs` waits up to 60 s, the executable runner
-polls every 5 ms with a 15 s deadline, and FIFO readers poll every millisecond. A broken
-rendezvous is killed before it can report.
-
-Fix: a shared timeout policy below the outer watchdog or one process-owning authority,
-event-driven readiness for FIFO and child completion, and one launch deadline budget.
-Enforcement: configuration validation of deadline relationships and a failure-path test
-with a short injected budget. Process and kernel deadlines still need real monotonic
-time.
+Every test time bound now lives in `crates/lib/src/tunables.rs` ("Test time bounds")
+and is const-asserted below `TEST_RUNNER_WATCHDOG`, a mirror of brokkr's fixed 20 s
+per-test watchdog: brokkr does not expose that value to the test process, so a change
+there is not seen (bz brokkr ticket filed with this change). Bounds are checked one by
+one: a test that waits on several in sequence, or starts one late, can still reach the
+watchdog unnamed; no test carries one deadline through its waits.
 
 ## VER-028 - Hook synchronization is spread across atomics and polling loops
 
-Reported by fault-injection.
+`FaultPlan::wait_until` in `crates/lib/src/test_hooks.rs` polls every millisecond (its
+bound is now `TEST_HOOK_WAIT` in tunables), and fault tests duplicate the polling on the
+plan's public atomics. Sparred shape for the fix: a plan doorbell (`notify_all`, store
+then ring, predicate rechecked under the bell) for conditions that read only plan state,
+with every such field private behind a notifying setter - including the stores in
+`apply_changes/scanner.rs`, `drain.rs` and `rewrite.rs` and the test-side release flags;
+a separate form with a bounded tick for predicates over state the plan does not own
+(merge-changes `Ledger::halted`, which `Ledger::stop` sets without cancelling, the
+token, the altw router's abort), evaluated outside the bell lock with an absolute next
+tick; and `on_framing_job` returning why its wait ended instead of setting
+`framing_wait_reached` inside the predicate.
 
-`crates/lib/src/test_hooks.rs` polls every millisecond with a fixed ten-second bound and
-tests duplicate polling. Several scenarios rely on production seams and test code updating
-related flags correctly. The fixed timeout is outside the tunables convention.
+## VER-132 - Nothing stops a test inferring a block from elapsed time
 
-Fix: scenario objects owning transitions, notifications, release guards and observations,
-with a real deadline only as a backstop, making invalid transition combinations
-unrepresentable.
+The sites the hunters named now observe the wait itself (a `test_support::Parked`
+count under the primitive's mutex, the pool join and publication-lock hooks, cfg(test)
+slow-path tallies in classify, the router's notification count), but no rule enforces
+the shape: a new sleep-then-assert or `recv_timeout`-expects-`Timeout` passes review
+unnoticed. Known remaining site: `crates/lib/tests/fault_pipelined_writer.rs` sleeps
+200 ms before asserting the admitted count, once per backend. The router test cannot
+observe that the notifier is blocked on `notify_mu` in-process and says so at the test.
+Residue: a source rule requiring an explicit exemption for `thread::sleep` and
+negative `recv_timeout` in test code, and that site.
 
 ## VER-033 - Twelve library commands have no cancellation scenario
 

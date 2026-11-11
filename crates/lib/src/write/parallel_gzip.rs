@@ -117,6 +117,10 @@ pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     #[cfg(test)]
     /// Whether `finish` has joined the workers and writer thread.
     finished: bool,
+    #[cfg(test)]
+    /// Set by `flush` once its barrier is queued, just before it blocks on
+    /// the barrier's acknowledgement.
+    flush_waiting: std::sync::Arc<std::sync::atomic::AtomicBool>,
     raw_tx: Option<SyncSender<(usize, Job)>>,
     reorder_permit_rx: Receiver<()>,
     /// Joins to the inner writer and the count of sequence numbers it
@@ -294,6 +298,8 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             next_seq: 0,
             #[cfg(test)]
             finished: false,
+            #[cfg(test)]
+            flush_waiting: std::sync::Arc::default(),
             raw_tx: Some(raw_tx),
             reorder_permit_rx,
             writer_handle,
@@ -520,6 +526,9 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
         self.dispatch(Job::Barrier(ack_tx))?;
         #[cfg(feature = "test-hooks")]
         self.cancel.faults().on_gzip_barrier_queued();
+        #[cfg(test)]
+        self.flush_waiting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         match ack_rx.recv() {
             Ok(reply) => reply,
             Err(_) => {
@@ -1060,27 +1069,27 @@ mod tests {
         assert!(out[256..320].iter().all(|&b| b == 11));
     }
 
-    /// Inner writer that records what actually reached it, how long each
-    /// write took to land, and how many times it was flushed.
+    /// Inner writer that records what actually reached it and how many times
+    /// it was flushed.
     ///
-    /// The `delay` is the whole point: it makes "dispatched to the pool" and
-    /// "written to the inner writer" separable in wall-clock terms, so a
-    /// `flush` that only dispatches fails the assertions below rather than
-    /// racing past them.
+    /// With a `hold` set, every write first waits until the writer's `flush`
+    /// is blocked on its barrier: "dispatched to the pool" and "written to
+    /// the inner writer" are then ordered by construction, so a `flush` that
+    /// only dispatches returns while nothing has been written.
     #[derive(Clone)]
     struct ProbeSink {
         data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
         flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        delay: std::time::Duration,
+        hold: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
         fail: bool,
     }
 
     impl ProbeSink {
-        fn new(delay_ms: u64, fail: bool) -> Self {
+        fn new(fail: bool) -> Self {
             Self {
                 data: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 flushes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                delay: std::time::Duration::from_millis(delay_ms),
+                hold: std::sync::Arc::default(),
                 fail,
             }
         }
@@ -1088,7 +1097,18 @@ mod tests {
 
     impl Write for ProbeSink {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            std::thread::sleep(self.delay);
+            if let Some(waiting) = self.hold.get() {
+                let start = std::time::Instant::now();
+                while !waiting.load(std::sync::atomic::Ordering::SeqCst) {
+                    if start.elapsed() > crate::test_support::OBSERVE_BOUND {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "probe sink: flush never waited",
+                        ));
+                    }
+                    std::thread::yield_now();
+                }
+            }
             if self.fail {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
@@ -1112,18 +1132,23 @@ mod tests {
     ///
     /// The previous fix made `flush` dispatch the buffered chunk to the
     /// compressor pool and return, which passes any test that only checks
-    /// "did flush return Ok". The sink here sleeps 40 ms per write, so at the
-    /// moment a dispatch-only `flush` returns, nothing has been written yet
-    /// and the recorded byte count is zero. Only a flush that waits for the
-    /// writer thread sees a complete gzip stream.
+    /// "did flush return Ok". The sink here holds every write until `flush`
+    /// is blocked on its barrier, so a dispatch-only `flush` returns with
+    /// nothing written and the recorded byte count zero. Only a flush that
+    /// waits for the writer thread sees a complete gzip stream. The payload
+    /// is under one chunk, so only `flush` dispatches anything and nothing
+    /// before it can stall behind the held sink.
     #[test]
     fn flush_waits_for_bytes_to_reach_the_inner_writer() {
-        let sink = ProbeSink::new(40, false);
+        let sink = ProbeSink::new(false);
         let seen = std::sync::Arc::clone(&sink.data);
         let flushes = std::sync::Arc::clone(&sink.flushes);
+        let hold = std::sync::Arc::clone(&sink.hold);
         let mut gz = ParallelGzipWriter::new(sink, 1024, 4, &crate::host::Call::detached());
+        hold.set(std::sync::Arc::clone(&gz.flush_waiting))
+            .expect("hold set once");
 
-        let payload = [42u8; 4096];
+        let payload = [42u8; 512];
         gz.write_all(&payload).unwrap();
         gz.flush().unwrap();
 
@@ -1158,7 +1183,7 @@ mod tests {
     /// not exist yet, so `Ok(())` is the only answer it can give.
     #[test]
     fn flush_propagates_a_downstream_write_error() {
-        let sink = ProbeSink::new(0, true);
+        let sink = ProbeSink::new(true);
         let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Call::detached());
         gz.write_all(&[7u8; 4096]).unwrap();
         let err = gz.flush().expect_err("flush must report the sink's ENOSPC");
@@ -1178,7 +1203,7 @@ mod tests {
     /// quietly reintroduce the no-op for exactly the caller who flushes twice.
     #[test]
     fn flush_with_nothing_buffered_still_reaches_the_inner_writer() {
-        let sink = ProbeSink::new(0, false);
+        let sink = ProbeSink::new(false);
         let flushes = std::sync::Arc::clone(&sink.flushes);
         let mut gz = ParallelGzipWriter::new(sink, 1024, 2, &crate::host::Call::detached());
         gz.flush().unwrap();

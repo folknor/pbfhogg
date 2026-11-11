@@ -62,7 +62,11 @@ impl JoinedPool {
         // Exists before the first spawn, so a build that fails or unwinds
         // part way still joins what it started (rayon has told those threads
         // to stop by then).
-        let mut workers = Workers(Vec::with_capacity(threads));
+        let mut workers = Workers {
+            handles: Vec::with_capacity(threads),
+            #[cfg(feature = "test-hooks")]
+            hooks: invocation.clone(),
+        };
         #[allow(
             clippy::disallowed_methods,
             reason = "the one sanctioned rayon pool construction: its workers are joined"
@@ -83,7 +87,7 @@ impl JoinedPool {
                     #[cfg(feature = "test-hooks")]
                     hooks.faults().on_built_pool_thread_exit();
                 })?;
-                workers.0.push(handle);
+                workers.handles.push(handle);
                 Ok(())
             })
             .build();
@@ -100,11 +104,17 @@ impl JoinedPool {
 }
 
 /// The join guard: joins every handle it holds when it drops.
-struct Workers(Vec<JoinHandle<()>>);
+struct Workers {
+    handles: Vec<JoinHandle<()>>,
+    #[cfg(feature = "test-hooks")]
+    hooks: crate::host::Invocation,
+}
 
 impl Drop for Workers {
     fn drop(&mut self) {
-        for handle in self.0.drain(..) {
+        #[cfg(feature = "test-hooks")]
+        self.hooks.faults().on_built_pool_join();
+        for handle in self.handles.drain(..) {
             // A worker that panicked does not stop the join of the rest. Its
             // payload is forgotten, not dropped: the destructor could panic
             // again, here or during an unwind (`Invocation::deliver` does the
@@ -163,21 +173,19 @@ mod tests {
         let _release = Release(invocation.clone(), Some(handle));
         let faults = invocation.faults();
 
+        // Both workers are held in their exit hook and the unwinding owner
+        // has reached its join: whatever ends the unwind now has to wait
+        // for the release below.
         let start = Instant::now();
-        while faults.built_pool_threads_held.load(SeqCst) < 2 {
+        while faults.built_pool_threads_held.load(SeqCst) < 2
+            || faults.built_pool_joins_started.load(SeqCst) < 1
+        {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
-                "the pool threads did not reach their exit hook"
+                "the pool threads did not reach their exit hook, or the owner its join"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(
-            matches!(
-                done_rx.recv_timeout(Duration::from_millis(200)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ),
-            "the owner finished unwinding while its workers were still running"
-        );
         faults.release_built_pool_threads.store(true, SeqCst);
         let (unwound, done) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(unwound);

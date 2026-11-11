@@ -371,8 +371,6 @@ mod tests {
     }
 
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
 
     use crate::host::{Executor, Invocation};
 
@@ -389,58 +387,27 @@ mod tests {
         crate::error::Error::internal(format!("block {block} failed"))
     }
 
-    /// A pool large enough that rayon's splitter cuts every batch these
-    /// tests make into one-block jobs: its indexed bridge starts with as many
-    /// splits as the pool has threads and halves them per split, so 16
-    /// threads split a batch of up to 16 blocks down to single blocks. A
-    /// block that waits on another (`encode_failing`) then never shares a job
-    /// with the block it waits for, and an idle thread steals that one. That
-    /// is rayon's implementation, not its contract; the wait's deadline
-    /// panics, so a change there fails these tests instead of passing them.
+    /// The fixed-width test executor. Which order the batch's blocks finish
+    /// in does not matter to these tests: `write_run` collects a parallel
+    /// batch's results indexed, one per block in block order, before it
+    /// walks them, so completion order cannot reach which failure is
+    /// returned, and no block here waits for another.
     fn pool() -> Executor {
-        Executor::Pool(std::sync::Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(16)
-                .build()
-                .expect("test pool"),
-        ))
+        Executor::for_tests()
     }
 
-    /// An encoder failing blocks `earlier` and `later` (`earlier < later`),
-    /// with `earlier` held until `later` has failed, so the later failure
-    /// completes first. Every other block frames as its own index. Records
-    /// each encoded block's range.
-    ///
-    /// The flag is set just before `later` returns, not when its error is
-    /// received, which nothing inside the encoder can observe; the sleep
-    /// after the wait covers that gap. So reversed completion is a strong
-    /// bias, not a proof: what is deterministic is that the earlier error
-    /// is the one returned and the prefix before it is what was written.
+    /// An encoder failing blocks `earlier` and `later`. Every other block
+    /// frames as its own index. Records each encoded block's range.
     fn encode_failing(
         earlier: usize,
         later: usize,
         seen: &Mutex<Vec<Range<usize>>>,
-        later_failed: &AtomicBool,
     ) -> impl Fn(&mut BlockBuilder, Range<usize>) -> Result<FramedBlock> + Sync {
         move |bb, chunk| {
             assert!(bb.is_empty(), "every block starts on an empty builder");
             seen.lock().expect("lock").push(chunk.clone());
             let block = block_of(&chunk);
-            if block == later {
-                later_failed.store(true, Ordering::SeqCst);
-                return Err(block_failure(block));
-            }
-            if block == earlier {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !later_failed.load(Ordering::SeqCst) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "block {later} never ran while block {earlier} waited for it: \
-                         the pool did not split the batch into one-block jobs"
-                    );
-                    std::thread::yield_now();
-                }
-                std::thread::sleep(Duration::from_millis(20));
+            if block == later || block == earlier {
                 return Err(block_failure(block));
             }
             Ok((Some(block.to_le_bytes().to_vec()), chunk.len() as u64))
@@ -477,7 +444,6 @@ mod tests {
     ) -> (crate::error::Error, Vec<usize>, Vec<Range<usize>>) {
         let cap = DEFAULT_ELEMENT_CAP.get();
         let seen = Mutex::new(Vec::new());
-        let later_failed = AtomicBool::new(false);
         let mut frames = Vec::new();
         let run = START..START + (blocks - 1) * cap + last_len;
         let result = write_run(
@@ -485,7 +451,7 @@ mod tests {
             run,
             &mut BlockBuilder::new(),
             &Invocation::new(),
-            encode_failing(earlier, later, &seen, &later_failed),
+            encode_failing(earlier, later, &seen),
             |frame| {
                 frames.push(frame);
                 Ok(())
@@ -499,8 +465,8 @@ mod tests {
         (err, written_blocks(&frames), seen)
     }
 
-    /// Two failing blocks in the first parallel batch, the later failing
-    /// first: the earlier one's error is returned, the block before it is
+    /// Two failing blocks in the first parallel batch, finishing in whatever
+    /// order: the earlier one's error is returned, the block before it is
     /// written, nothing after it is, and every block of the batch was
     /// encoded at its cut.
     #[test]
@@ -535,7 +501,6 @@ mod tests {
     #[test]
     fn a_sequential_run_stops_at_its_first_failure() {
         let seen = Mutex::new(Vec::new());
-        let later_failed = AtomicBool::new(true);
         let mut frames = Vec::new();
         let cap = DEFAULT_ELEMENT_CAP.get();
         let result = write_run(
@@ -543,7 +508,7 @@ mod tests {
             START..START + 4 * cap + 17,
             &mut BlockBuilder::new(),
             &Invocation::new(),
-            encode_failing(1, 3, &seen, &later_failed),
+            encode_failing(1, 3, &seen),
             |frame| {
                 frames.push(frame);
                 Ok(())

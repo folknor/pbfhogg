@@ -941,7 +941,20 @@ crate::counters::counter_set! {
         /// until workers finish their whole share, so its wait is the scan
         /// itself rather than a stall.
         result_recv_wait_ns => "classify_unordered_result_recv_wait_ns",
+        /// Test builds only, never emitted: how often the dispatcher, and the
+        /// per-blob pool's consumer, entered the blocking slow path, so a
+        /// test can hold its work until a block has provably begun.
+        dispatch_send_blocks,
+        result_recv_blocks,
     }
+}
+
+/// Counts one entry into a blocking slow path, in test builds only: other
+/// builds pass an empty observer, so the pools' instructions do not change.
+#[inline]
+fn tally_block(_blocks: &std::sync::atomic::AtomicU64) {
+    #[cfg(test)]
+    _blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A worker's next schedule position from the shared descriptor receiver, or
@@ -977,9 +990,15 @@ fn recv_checked_recording_wait<T>(
     rx: &std::sync::mpsc::Receiver<T>,
     cancel: &crate::host::Recorder,
     wait_ns: &std::sync::atomic::AtomicU64,
+    blocks: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<T>> {
     cancel.check()?;
-    let received = crate::counters::recv_recording_wait(rx, wait_ns);
+    let received = crate::counters::recv_recording_wait_observing(
+        rx,
+        wait_ns,
+        || tally_block(blocks),
+        |watch| watch.elapsed_ns(),
+    );
     cancel.check()?;
     Ok(received.ok())
 }
@@ -1127,10 +1146,12 @@ fn run_unordered_per_blob<L, R: Send>(
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
-                if crate::counters::send_recording_wait(
+                if crate::counters::send_recording_wait_observing(
                     &desc_tx,
                     position,
                     &metrics.dispatch_send_wait_ns,
+                    || tally_block(&metrics.dispatch_send_blocks),
+                    |watch| watch.elapsed_ns(),
                 )
                 .is_err()
                 {
@@ -1181,9 +1202,12 @@ fn run_unordered_per_blob<L, R: Send>(
         // joins the workers (a borrow would keep it alive past the join and
         // leave a worker parked in `send`).
         let result_rx = result_rx;
-        while let Some((seq, result)) =
-            recv_checked_recording_wait(&result_rx, &host.invocation, &metrics.result_recv_wait_ns)?
-        {
+        while let Some((seq, result)) = recv_checked_recording_wait(
+            &result_rx,
+            &host.invocation,
+            &metrics.result_recv_wait_ns,
+            &metrics.result_recv_blocks,
+        )? {
             if merge(seq, result?).is_break() {
                 // Dropping the receiver - it falls out of scope when this
                 // closure returns, before the scope joins - fails the workers'
@@ -1735,10 +1759,12 @@ fn run_accumulate_decoded<S: Send>(
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
-                if crate::counters::send_recording_wait(
+                if crate::counters::send_recording_wait_observing(
                     &desc_tx,
                     position,
                     &metrics.dispatch_send_wait_ns,
+                    || tally_block(&metrics.dispatch_send_blocks),
+                    |watch| watch.elapsed_ns(),
                 )
                 .is_err()
                 {
@@ -2254,12 +2280,14 @@ mod tests {
     /// The per-blob pool records its stalls into the set it is given, under
     /// the names `--stalls` reads.
     ///
-    /// One worker, slower per blob than its dispatcher and its consumer, and
-    /// more blobs than the descriptor channel holds: the dispatcher must find
-    /// that channel full, and the consumer must find the result channel empty,
-    /// so both record a wait. No duration is asserted, only that a wait was
-    /// recorded where the pool blocked, and that a lone worker, which no peer
-    /// can hold the descriptor lock against, records no lock wait at all.
+    /// One worker and more blobs than the descriptor channel holds. The
+    /// worker holds its first blob until the dispatcher has found that
+    /// channel full and the consumer the result channel empty (each counted
+    /// as it enters its blocking path), so both waits are recorded by
+    /// construction rather than by a probable schedule. No duration is
+    /// asserted, only that a wait was recorded where the pool blocked, and
+    /// that a lone worker, which no peer can hold the descriptor lock
+    /// against, records no lock wait at all.
     #[test]
     fn the_unordered_pool_records_where_it_blocks() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2280,8 +2308,19 @@ mod tests {
             &schedule,
             Some(1),
             || (),
-            |_: &mut (), _: usize, _: &[u8]| -> crate::Result<()> {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            |_: &mut (), position: usize, _: &[u8]| -> crate::Result<()> {
+                if position == 0 {
+                    let start = std::time::Instant::now();
+                    while metrics.dispatch_send_blocks.load(Relaxed) == 0
+                        || metrics.result_recv_blocks.load(Relaxed) == 0
+                    {
+                        assert!(
+                            start.elapsed() < crate::test_support::OBSERVE_BOUND,
+                            "the dispatcher or the consumer never blocked"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
                 Ok(())
             },
             |_, ()| {

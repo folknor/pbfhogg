@@ -1374,7 +1374,43 @@ pub(crate) const GEOCODE_WALK_INLINE_CELLS: usize = 128;
 /// above a real distance.
 pub(crate) const GEOCODE_CELL_BOUND_SLACK_RAD: f64 = 1e-12;
 
-/// Test children leave time for cleanup before the runner's 20 second watchdog.
+// --- Test time bounds ---
+//
+// Every bound below is a failure bound: a correct run never reaches it, and a
+// broken one fails at it with a named message. Each must therefore expire
+// before the test runner's own per-test watchdog kills the test unnamed, so
+// they are asserted below a mirror of that watchdog. The mirror is a copy:
+// brokkr does not expose its watchdog to the test process, so a change there
+// is not seen here. Being below the watchdog individually does not make a
+// test that waits on several of them in sequence, or starts one late, finish
+// before it; such a test carries one deadline through its waits.
+
+/// brokkr's fixed per-test watchdog (`brokkr man test`), mirrored.
+pub const TEST_RUNNER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
+/// A unit test's wait for a transition a correct implementation makes at
+/// once (a thread reaching a wait it was set up to reach).
+pub(crate) const TEST_OBSERVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+/// A test's bound on a whole operation whose defect would be a hang.
+pub const TEST_HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// Every bounded fault-hook wait (`test_hooks`): longer than any legitimate
+/// park in a fault test.
+pub(crate) const TEST_HOOK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Two parties of a harness scenario meeting each other. It runs inside a
+/// child the harness tests bound by [`TEST_CHILD_TIMEOUT`], so it must expire
+/// first for the scenario to report the broken rendezvous itself.
+pub const TEST_RENDEZVOUS_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+const _: () = {
+    let watchdog = TEST_RUNNER_WATCHDOG.as_millis();
+    assert!(TEST_OBSERVE_BOUND.as_millis() < watchdog);
+    assert!(TEST_HANG_BOUND.as_millis() < watchdog);
+    assert!(TEST_HOOK_WAIT.as_millis() < watchdog);
+    assert!(TEST_CHILD_TIMEOUT.as_millis() < watchdog);
+    assert!(TEST_RENDEZVOUS_BOUND.as_millis() < TEST_CHILD_TIMEOUT.as_millis());
+    assert!(TEST_CHILD_CLEANUP.as_millis() < TEST_CHILD_TIMEOUT.as_millis());
+};
+
+/// Test children leave time for cleanup before the runner's watchdog.
 pub const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Bounded cleanup and pipe completion, including a descendant holding a pipe open.
 pub const TEST_CHILD_CLEANUP: std::time::Duration = std::time::Duration::from_secs(1);

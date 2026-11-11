@@ -1,7 +1,6 @@
 //! End-to-end tests for renumber.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crate::common::adversarial::{
     mutate_blob_header_indexdata, mutate_blob_payload, set_relation_memids_terminator_continuation,
@@ -1220,7 +1219,7 @@ fn renumber_within_deadline(
         // The receiver is gone only if the deadline already failed.
         tx.send(run_renumber(&input, &output, &default_opts())).ok();
     });
-    rx.recv_timeout(Duration::from_secs(10))
+    rx.recv_timeout(pbfhogg::TEST_HANG_BOUND)
 }
 
 const HUNG: &str = "renumber hung on a mid-stream error instead of failing";

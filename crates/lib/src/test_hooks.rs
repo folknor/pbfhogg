@@ -54,9 +54,9 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Upper bound on every bounded hook wait, so a broken pipeline fails the
-/// test that armed it with a named message instead of hanging it. Under the
-/// 20 s check watchdog, longer than any legitimate park in a fault test.
-const HOOK_WAIT: Duration = Duration::from_secs(10);
+/// test that armed it with a named message instead of hanging it; see the
+/// test time bounds in `tunables`.
+const HOOK_WAIT: Duration = crate::tunables::TEST_HOOK_WAIT;
 
 /// Every token-scoped fault and observation. See the module docs.
 ///
@@ -88,6 +88,18 @@ pub struct FaultPlan {
     pub built_pool_exit_hooks_done: AtomicU64,
     /// A bounded pool-thread park expired.
     pub built_pool_hook_timed_out: AtomicBool,
+    /// Owners that reached their pool's join: counted as the join guard
+    /// drops, before it joins the first thread (on success, on a build
+    /// that failed part way, and during an unwind). With the threads held,
+    /// it says the owner is at its join while they are still running; it
+    /// does not by itself say the join waits.
+    pub built_pool_joins_started: AtomicU64,
+
+    // --- publication execution lock (`host::Recorder::publication_lock`) ---
+    /// Publications that found the invocation's execution lock held and
+    /// went on to wait for it: counted before the blocking acquire, so a
+    /// test that sees it knows the publication is waiting undecided.
+    pub publication_lock_waits: AtomicU64,
 
     // --- multi-extract (`commands::extract::multi`) ---
     /// Decline the region grid, so classification runs the linear scan even
@@ -505,6 +517,8 @@ impl FaultPlan {
             release_built_pool_threads: AtomicBool::new(false),
             built_pool_exit_hooks_done: AtomicU64::new(0),
             built_pool_hook_timed_out: AtomicBool::new(false),
+            built_pool_joins_started: AtomicU64::new(0),
+            publication_lock_waits: AtomicU64::new(0),
             force_linear_region_grid: AtomicBool::new(false),
             region_grids_declined: AtomicU64::new(0),
             pool_worker_panic: AtomicU64::new(u64::MAX),
@@ -868,6 +882,17 @@ impl FaultPlan {
             ));
         }
         Ok(())
+    }
+
+    /// Called by a publication that found the execution lock held, before
+    /// it blocks on it.
+    pub(crate) fn on_publication_lock_wait(&self) {
+        self.publication_lock_waits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Called by a pool's join guard as it drops, before its first join.
+    pub(crate) fn on_built_pool_join(&self) {
+        self.built_pool_joins_started.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Called by a pool thread after its rayon main loop returns, as the last

@@ -14,7 +14,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -474,7 +473,7 @@ fn block_iterator_early_drop_under_pressure() {
     });
 
     done_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(pbfhogg::TEST_HANG_BOUND)
         .expect("pipeline did not stop after iterator drop");
 }
 
@@ -496,7 +495,7 @@ fn block_fn_error_stops_pipeline() {
 
     assert!(
         done_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(pbfhogg::TEST_HANG_BOUND)
             .expect("pipeline did not stop after block closure error")
     );
 }
@@ -608,7 +607,7 @@ fn early_exit_does_not_read_whole_file() {
     });
 
     done_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(pbfhogg::TEST_HANG_BOUND)
         .expect("early-drop pipeline did not stop after iterator drop");
 
     let read = bytes_read.load(Relaxed);

@@ -6,6 +6,61 @@
 //! `#[path]` as `path_guard` mounts the shared scratch allocator), and skips
 //! only on the typed refusal of the feature it needs: a `PlatformUnsupported`
 //! labelled for another feature, or any other error, fails the test.
+//!
+//! It also holds [`Parked`], the observation a unit test uses to know that a
+//! thread is blocked inside a primitive's condition-variable wait.
+
+/// A count of threads parked in one primitive's condition-variable wait,
+/// kept inside the state that primitive's mutex guards (test builds only).
+///
+/// The waiter calls [`enter`](Self::enter) under its mutex immediately
+/// before `Condvar::wait` and [`leave`](Self::leave) after it returns. A test
+/// that then sees the count under the same mutex knows the waiter found its
+/// condition false and has released the mutex inside `wait` (it cannot have
+/// done anything else while the test holds the lock), so whatever the test
+/// does next under that mutex wakes it: nothing is inferred from elapsed
+/// time.
+#[derive(Default)]
+pub(crate) struct Parked {
+    waiting: usize,
+}
+
+impl Parked {
+    pub(crate) fn enter(&mut self, observer: &std::sync::Condvar) {
+        self.waiting += 1;
+        observer.notify_all();
+    }
+
+    pub(crate) fn leave(&mut self) {
+        self.waiting -= 1;
+    }
+}
+
+/// Bound on a unit test's wait for a transition that a correct
+/// implementation makes promptly; only a broken one reaches it.
+pub(crate) const OBSERVE_BOUND: std::time::Duration = crate::tunables::TEST_OBSERVE_BOUND;
+
+/// Wait, under `mutex`, until `parked(state)` reports at least `n` waiters,
+/// failing the test once [`OBSERVE_BOUND`] passes. Returns the guard, so the
+/// caller's next step runs while the waiters are provably parked.
+pub(crate) fn wait_parked<'a, S>(
+    mutex: &'a std::sync::Mutex<S>,
+    observer: &std::sync::Condvar,
+    parked: impl Fn(&S) -> &Parked,
+    n: usize,
+) -> std::sync::MutexGuard<'a, S> {
+    let guard = mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (guard, timeout) = observer
+        .wait_timeout_while(guard, OBSERVE_BOUND, |s| parked(s).waiting < n)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        !timeout.timed_out(),
+        "fewer than {n} threads parked within {OBSERVE_BOUND:?}"
+    );
+    guard
+}
 
 #[path = "../tests/common/skip.rs"]
 mod shared_skip;

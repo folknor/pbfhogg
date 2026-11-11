@@ -5,13 +5,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use pbfhogg::host::Invocation;
 use pbfhogg::{BoundOutput, CancelOutcome, Decision, Effect, Publication};
 
-/// Bound on every park, under the 20 s check watchdog.
-const PARK: Duration = Duration::from_secs(10);
+/// Bound on every park; see the test time bounds in the library's tunables.
+#[cfg(feature = "test-hooks")]
+const PARK: std::time::Duration = pbfhogg::TEST_HANG_BOUND;
 
 fn rows(invocation: &Invocation) -> Vec<Publication> {
     let mut rows = Vec::new();
@@ -75,7 +75,10 @@ fn reversed_creation_and_publication_order() {
 }
 
 /// A publication parked in its `before_publish` hook holds the invocation's
-/// execution lock: a second publication waits undecided, and is row 2.
+/// execution lock: a second publication waits undecided, and is row 2. The
+/// second is seen waiting on the lock (the plan's count of contended
+/// acquires), not assumed to after a pause.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn ordinal_order_is_execution_order_with_a_hook_parked() {
     let dir = crate::common::test_scratch();
@@ -96,7 +99,12 @@ fn ordinal_order_is_execution_order_with_a_hook_parked() {
         let first = scope.spawn(move || a.publish());
         parked_rx.recv_timeout(PARK).expect("a parked in its hook");
         let second = scope.spawn(move || b.publish());
-        std::thread::sleep(Duration::from_millis(50));
+        let waits = &invocation.faults().publication_lock_waits;
+        let start = std::time::Instant::now();
+        while waits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < PARK, "b never waited on the lock");
+            std::thread::yield_now();
+        }
         let seen = rows(&invocation);
         assert_eq!(seen.len(), 1, "b waits undecided: {seen:?}");
         assert!(!seen[0].finished());

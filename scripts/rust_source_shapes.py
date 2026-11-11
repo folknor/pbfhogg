@@ -166,9 +166,7 @@ STATIC_INVENTORY = {
     "crates/lib/src/fadvise.rs": {"static ATTEMPTS: RefCell<Vec<(Advice, Range)>> =": 1},
     "crates/lib/src/write/framing.rs": {"static PIPELINE_SCRATCH: RefCell<FrameScratch> =": 1},
     "crates/lib/src/threads.rs": {
-        "static FINISHED: AtomicUsize =": 1,
-        "static HELD: Cell<Option<SlowTeardown>> =": 1,
-        "static LATE: AtomicBool =": 2},
+        "static HELD: Cell<Option<SlowTeardown>> =": 1},
     "crates/lib/src/error.rs": {"static FOREIGN_ROOT: ForeignRoot =": 1},
     "crates/lib/src/output.rs": {
         "static SEQ: AtomicU64 =": 1},

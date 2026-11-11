@@ -104,39 +104,60 @@ fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
 /// type could enforce is the better trade: a future second acquirer is a
 /// correctness question about *this* comment, not a silent deadlock under load.
 struct AdmissionGate {
-    count: Mutex<usize>,
+    state: Mutex<GateState>,
     cond: Condvar,
     cap: NonZeroUsize,
+    #[cfg(test)]
+    observer: Condvar,
+}
+
+struct GateState {
+    count: usize,
+    #[cfg(test)]
+    parked: crate::test_support::Parked,
 }
 
 impl AdmissionGate {
     fn new(cap: NonZeroUsize) -> Self {
         Self {
-            count: Mutex::new(0),
+            state: Mutex::new(GateState {
+                count: 0,
+                #[cfg(test)]
+                parked: crate::test_support::Parked::default(),
+            }),
             cond: Condvar::new(),
             cap,
+            #[cfg(test)]
+            observer: Condvar::new(),
         }
     }
 
     fn acquire(&self) -> bool {
-        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut blocked = false;
-        while *count >= self.cap.get() {
+        while state.count >= self.cap.get() {
             blocked = true;
-            count = self
+            #[cfg(test)]
+            state.parked.enter(&self.observer);
+            state = self
                 .cond
-                .wait(count)
+                .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            state.parked.leave();
         }
-        *count += 1;
+        state.count += 1;
         blocked
     }
 
     fn release(&self) {
-        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
-        assert!(*count > 0, "decode admission permit released below zero");
-        *count -= 1;
-        drop(count);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            state.count > 0,
+            "decode admission permit released below zero"
+        );
+        state.count -= 1;
+        drop(state);
         self.cond.notify_all();
     }
 }
@@ -929,7 +950,7 @@ mod tests {
             tx.send(()).expect("watchdog receiver open");
             result
         });
-        rx.recv_timeout(Duration::from_secs(30))
+        rx.recv_timeout(crate::tunables::TEST_HANG_BOUND)
             .unwrap_or_else(|_| panic!("{label}: did not complete within timeout"));
         handle.join().expect("watchdog thread joins")
     }
@@ -1165,8 +1186,10 @@ mod tests {
 
     /// What a decode worker's thread-local holds, torn down when its thread
     /// exits: it parks (bounded) until the test releases it.
+    #[cfg(feature = "test-hooks")]
     struct Teardown(Arc<TeardownState>);
 
+    #[cfg(feature = "test-hooks")]
     #[derive(Default)]
     struct TeardownState {
         installed: AtomicUsize,
@@ -1175,6 +1198,7 @@ mod tests {
         release: AtomicBool,
     }
 
+    #[cfg(feature = "test-hooks")]
     impl Drop for Teardown {
         fn drop(&mut self) {
             self.0.started.fetch_add(1, Ordering::SeqCst);
@@ -1188,8 +1212,10 @@ mod tests {
 
     /// Releases every parked teardown and joins the reading thread on every
     /// exit path, a failed assertion included.
+    #[cfg(feature = "test-hooks")]
     struct ReleaseTeardowns(Arc<TeardownState>, Option<std::thread::JoinHandle<()>>);
 
+    #[cfg(feature = "test-hooks")]
     impl Drop for ReleaseTeardowns {
         fn drop(&mut self) {
             self.0.release.store(true, Ordering::SeqCst);
@@ -1202,7 +1228,10 @@ mod tests {
     /// The decode pool is joined before the read returns, thread teardown
     /// included: a worker parked in a thread-local destructor keeps the call
     /// from returning until it is released, so nothing a worker's
-    /// thread-locals hold outlives the read.
+    /// thread-locals hold outlives the read. The release waits until the
+    /// read has reached its decode pool's join (the pool's test hook), so
+    /// the read is provably at its join while a teardown is still parked.
+    #[cfg(feature = "test-hooks")]
     #[test]
     fn a_decode_worker_tearing_down_holds_the_read() {
         thread_local! {
@@ -1210,10 +1239,13 @@ mod tests {
         }
         let state = Arc::new(TeardownState::default());
         let worker_state = Arc::clone(&state);
+        let invocation = crate::host::Invocation::new();
+        let reader_invocation = invocation.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
             let result = ElementReader::for_tests(Cursor::new(fused_pbf(8)))
                 .unwrap()
+                .invocation(reader_invocation)
                 .decode_threads(2)
                 .for_each_fused_block(
                     |_| {
@@ -1233,20 +1265,19 @@ mod tests {
         let _release = ReleaseTeardowns(Arc::clone(&state), Some(handle));
 
         let start = std::time::Instant::now();
-        while state.started.load(Ordering::SeqCst) == 0 {
+        while state.started.load(Ordering::SeqCst) == 0
+            || invocation
+                .faults()
+                .built_pool_joins_started
+                .load(Ordering::SeqCst)
+                == 0
+        {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
-                "no decode worker began tearing down"
+                "no decode worker began tearing down, or the read never reached its join"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(
-            matches!(
-                done_rx.recv_timeout(Duration::from_millis(200)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ),
-            "the read returned while a decode worker was still tearing down"
-        );
         state.release.store(true, Ordering::SeqCst);
         let (result, finished_at_return) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         result.unwrap();
@@ -1394,20 +1425,23 @@ mod tests {
         assert!(!gate.acquire());
         assert!(!gate.acquire());
 
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let child_gate = Arc::clone(&gate);
         let handle = std::thread::spawn(move || {
-            ready_tx.send(()).expect("ready channel open");
             let blocked = child_gate.acquire();
             done_tx.send(blocked).expect("done channel open");
         });
 
-        ready_rx.recv().expect("child reached acquire");
-        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
-
+        // The child found the gate full and parked, so the release below is
+        // what admits it, and `acquire` reports that it blocked.
+        drop(crate::test_support::wait_parked(
+            &gate.state,
+            &gate.observer,
+            |s| &s.parked,
+            1,
+        ));
         gate.release();
-        match done_rx.recv_timeout(Duration::from_secs(5)) {
+        match done_rx.recv_timeout(crate::test_support::OBSERVE_BOUND) {
             Ok(blocked) => assert!(blocked),
             Err(e) => panic!("child did not acquire after release: {e}"),
         }

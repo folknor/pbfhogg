@@ -983,11 +983,15 @@ where
 struct BatchQueue<'b> {
     inner: Mutex<BatchQueueState<'b>>,
     cond: Condvar,
+    #[cfg(test)]
+    observer: Condvar,
 }
 
 struct BatchQueueState<'b> {
     batches: VecDeque<Batch<'b>>,
     closed: bool,
+    #[cfg(test)]
+    parked: crate::test_support::Parked,
 }
 
 impl<'b> BatchQueue<'b> {
@@ -996,8 +1000,12 @@ impl<'b> BatchQueue<'b> {
             inner: Mutex::new(BatchQueueState {
                 batches: VecDeque::new(),
                 closed: false,
+                #[cfg(test)]
+                parked: crate::test_support::Parked::default(),
             }),
             cond: Condvar::new(),
+            #[cfg(test)]
+            observer: Condvar::new(),
         }
     }
 
@@ -1029,10 +1037,14 @@ impl<'b> BatchQueue<'b> {
             if state.closed {
                 return None;
             }
+            #[cfg(test)]
+            state.parked.enter(&self.observer);
             state = self
                 .cond
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            state.parked.leave();
         }
     }
 }
@@ -1052,11 +1064,15 @@ struct ByteBudget {
     state: Mutex<ByteBudgetState>,
     cond: Condvar,
     cap: u64,
+    #[cfg(test)]
+    observer: Condvar,
 }
 
 struct ByteBudgetState {
     used: u64,
     shutdown: bool,
+    #[cfg(test)]
+    parked: crate::test_support::Parked,
 }
 
 impl ByteBudget {
@@ -1065,9 +1081,13 @@ impl ByteBudget {
             state: Mutex::new(ByteBudgetState {
                 used: 0,
                 shutdown: false,
+                #[cfg(test)]
+                parked: crate::test_support::Parked::default(),
             }),
             cond: Condvar::new(),
             cap: cap.max(1),
+            #[cfg(test)]
+            observer: Condvar::new(),
         }
     }
 
@@ -1120,10 +1140,14 @@ impl ByteBudget {
                     bytes: n,
                 });
             }
+            #[cfg(test)]
+            state.parked.enter(&self.observer);
             state = self
                 .cond
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            state.parked.leave();
         }
     }
 
@@ -1429,7 +1453,6 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::sync::Arc;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     #[test]
     fn injected_resources_are_lazy_and_explicit_workers_take_precedence() {
@@ -1594,30 +1617,36 @@ mod tests {
     // reading further; these pin that bounded-admission contract deterministically
     // (no I/O, no threads-of-decode) so the reader working set stays bounded.
 
+    /// Waits until `n` acquirers are parked in `budget`'s wait.
+    fn budget_parked(budget: &ByteBudget, n: usize) {
+        drop(crate::test_support::wait_parked(
+            &budget.state,
+            &budget.observer,
+            |s| &s.parked,
+            n,
+        ));
+    }
+
     #[test]
     fn byte_budget_blocks_at_cap_until_release() {
         let budget = Arc::new(ByteBudget::new(10));
         let held = budget.acquire(6).unwrap();
 
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let child = Arc::clone(&budget);
         let handle = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
             // 6 + 5 > 10 and the budget is non-empty, so this blocks.
             let admitted = child.acquire(5).is_some();
             done_tx.send(admitted).unwrap();
         });
 
-        ready_rx.recv().unwrap();
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "acquire must block while the budget is over cap"
-        );
-
+        // The acquirer found no room and parked: it blocked.
+        budget_parked(&budget, 1);
         drop(held);
         assert!(
-            done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            done_rx
+                .recv_timeout(crate::test_support::OBSERVE_BOUND)
+                .unwrap(),
             "acquire must succeed once capacity frees up"
         );
         handle.join().unwrap();
@@ -1688,21 +1717,19 @@ mod tests {
         let budget = Arc::new(ByteBudget::new(10));
         let _held = budget.acquire(10).unwrap();
 
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let child = Arc::clone(&budget);
         let handle = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
             let admitted = child.acquire(5).is_some();
             done_tx.send(admitted).unwrap();
         });
 
-        ready_rx.recv().unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
-
+        budget_parked(&budget, 1);
         budget.shutdown();
         assert!(
-            !done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            !done_rx
+                .recv_timeout(crate::test_support::OBSERVE_BOUND)
+                .unwrap(),
             "shutdown must wake a blocked acquirer and return false"
         );
         handle.join().unwrap();
@@ -1729,11 +1756,19 @@ mod tests {
             done_tx.send(got.is_none()).unwrap();
         });
 
-        // Consumer is blocked on an empty, open queue.
-        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        // The consumer is parked on the empty, open queue, so the close
+        // below is a wakeup, not a closed queue found on entry.
+        drop(crate::test_support::wait_parked(
+            &queue.inner,
+            &queue.observer,
+            |s| &s.parked,
+            1,
+        ));
         queue.close();
         assert!(
-            done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            done_rx
+                .recv_timeout(crate::test_support::OBSERVE_BOUND)
+                .unwrap(),
             "close must wake a blocked consumer with None"
         );
         handle.join().unwrap();
@@ -1810,7 +1845,7 @@ mod tests {
             }
             out
         });
-        match rx.recv_timeout(Duration::from_secs(30)) {
+        match rx.recv_timeout(crate::tunables::TEST_HANG_BOUND) {
             Ok(()) => handle
                 .join()
                 .expect("watchdog thread itself failed to join"),

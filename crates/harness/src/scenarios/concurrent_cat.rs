@@ -55,8 +55,10 @@ const CAT_COUNTERS: [&str; 3] = [
     "cat_elements_written",
 ];
 
-/// How long a request waits for the other call's.
-const GATE_WAIT: Duration = Duration::from_secs(60);
+/// How long a request waits for the other call's: a failure bound, set
+/// below the harness tests' child timeout so a broken rendezvous reports
+/// itself rather than being killed.
+const GATE_WAIT: Duration = pbfhogg::TEST_RENDEZVOUS_BOUND;
 
 /// Each call: its id, input role, input blocks, output role.
 const CALLS: [(&str, &str, u64, &str); 2] = [

@@ -207,41 +207,91 @@ mod tests {
     use super::*;
     use std::cell::RefCell as Cell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-    use std::time::Duration;
 
-    /// Parks in its destructor (bounded) and records that it finished.
-    struct SlowTeardown(&'static AtomicUsize);
+    /// Set when the scope body has returned or unwound: a thread that waits
+    /// for it is provably still running when the scope reaches its join.
+    #[derive(Default)]
+    struct BodyEnded(AtomicBool);
+
+    impl BodyEnded {
+        /// Wait (bounded) until the body has ended.
+        fn wait(&self) {
+            let start = std::time::Instant::now();
+            while !self.0.load(SeqCst) {
+                assert!(
+                    start.elapsed() < crate::test_support::OBSERVE_BOUND,
+                    "the scope body never ended"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Marks the body ended when dropped, on a return or an unwind alike.
+    struct EndBody<'a>(&'a BodyEnded);
+
+    impl Drop for EndBody<'_> {
+        fn drop(&mut self) {
+            self.0.0.store(true, SeqCst);
+        }
+    }
+
+    /// Parks in its destructor until the scope body has ended (when given
+    /// one to wait for), then records that it finished.
+    struct SlowTeardown {
+        finished: Arc<AtomicUsize>,
+        body: Option<Arc<BodyEnded>>,
+    }
 
     impl Drop for SlowTeardown {
         fn drop(&mut self) {
-            std::thread::sleep(Duration::from_millis(50));
-            self.0.fetch_add(1, SeqCst);
+            if let Some(body) = &self.body {
+                body.wait();
+            }
+            self.finished.fetch_add(1, SeqCst);
         }
     }
 
     /// The scope does not return until every thread's thread-local
-    /// destructors have run, joined or not, borrowed results included.
+    /// destructors have run, joined or not, borrowed results included. The
+    /// unjoined threads' destructors wait for the body to end, so they are
+    /// still running when the scope reaches its join; the joined one needs
+    /// no wait, since the body itself joins it.
     #[test]
     fn scope_waits_for_thread_local_destructors() {
-        static FINISHED: AtomicUsize = AtomicUsize::new(0);
         thread_local! {
             static HELD: Cell<Option<SlowTeardown>> = const { Cell::new(None) };
         }
+        let finished = Arc::new(AtomicUsize::new(0));
+        let body = Arc::new(BodyEnded::default());
         let borrowed = [1, 2, 3];
         let total = scope(|s| {
-            let joined = s.spawn(|| {
-                HELD.with(|h| *h.borrow_mut() = Some(SlowTeardown(&FINISHED)));
+            let _end = EndBody(&body);
+            let mine = Arc::clone(&finished);
+            let joined = s.spawn(move || {
+                HELD.with(|h| {
+                    *h.borrow_mut() = Some(SlowTeardown {
+                        finished: mine,
+                        body: None,
+                    });
+                });
                 borrowed.iter().sum::<i32>()
             });
             for _ in 0..3 {
-                drop(s.spawn(|| {
-                    HELD.with(|h| *h.borrow_mut() = Some(SlowTeardown(&FINISHED)));
+                let (mine, body) = (Arc::clone(&finished), Arc::clone(&body));
+                drop(s.spawn(move || {
+                    HELD.with(|h| {
+                        *h.borrow_mut() = Some(SlowTeardown {
+                            finished: mine,
+                            body: Some(body),
+                        });
+                    });
                 }));
             }
             joined.join().unwrap()
         });
         assert_eq!(total, 6);
-        assert_eq!(FINISHED.load(SeqCst), 4);
+        assert_eq!(finished.load(SeqCst), 4);
     }
 
     /// A joined panic is the joiner's; an unjoined one is re-raised after
@@ -251,19 +301,21 @@ mod tests {
         let caught = scope(|s| s.spawn(|| panic!("joined")).join().is_err());
         assert!(caught);
 
-        static LATE: AtomicBool = AtomicBool::new(false);
-        let unwound = std::panic::catch_unwind(|| {
+        let late = AtomicBool::new(false);
+        let body = BodyEnded::default();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             scope(|s| {
+                let _end = EndBody(&body);
                 drop(s.spawn(|| panic!("unjoined")));
                 drop(s.spawn(|| {
-                    std::thread::sleep(Duration::from_millis(50));
-                    LATE.store(true, SeqCst);
+                    body.wait();
+                    late.store(true, SeqCst);
                 }));
             });
-        });
+        }));
         assert!(unwound.is_err());
         assert!(
-            LATE.load(SeqCst),
+            late.load(SeqCst),
             "re-raised only after every thread exited"
         );
     }
@@ -271,19 +323,21 @@ mod tests {
     /// A panicking body keeps its own payload and still joins every thread.
     #[test]
     fn a_panicking_body_joins_and_keeps_its_panic() {
-        static LATE: AtomicBool = AtomicBool::new(false);
-        let payload = std::panic::catch_unwind(|| {
+        let late = AtomicBool::new(false);
+        let body = BodyEnded::default();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             scope(|s| {
+                let _end = EndBody(&body);
                 drop(s.spawn(|| panic!("child")));
                 drop(s.spawn(|| {
-                    std::thread::sleep(Duration::from_millis(50));
-                    LATE.store(true, SeqCst);
+                    body.wait();
+                    late.store(true, SeqCst);
                 }));
                 panic!("body");
             })
-        })
+        }))
         .unwrap_err();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"body"));
-        assert!(LATE.load(SeqCst));
+        assert!(late.load(SeqCst));
     }
 }

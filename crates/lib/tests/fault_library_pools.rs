@@ -3,9 +3,9 @@
 //! the call ends: on success, after a build that failed part way, and during
 //! an unwind. Each test parks every pool thread after its rayon main loop
 //! returns (`FaultPlan::hold_built_pool_threads`), waits until exactly the
-//! expected threads have parked, checks the call has not ended while they
-//! are parked, then releases them and checks the call ended only after every
-//! one finished its exit hook.
+//! expected threads have parked and the call has reached the pool's join,
+//! then releases them and checks the call ended only after every one
+//! finished its exit hook.
 
 #![allow(clippy::unwrap_used)]
 
@@ -43,8 +43,7 @@ impl Drop for Release {
 
 /// Runs `call` on its own thread under `invocation`, whose pool threads are
 /// held, and returns its result once `expected` pool threads have parked,
-/// the call has been seen not to end while they are parked, and they have
-/// been released.
+/// the call has reached its pool's join, and they have been released.
 fn run_held<T: Send + 'static>(
     invocation: &Invocation,
     expected: u64,
@@ -63,24 +62,21 @@ fn run_held<T: Send + 'static>(
         })),
     };
 
+    // Every thread is parked and cannot exit, and the call has reached its
+    // pool's join: from here the call ends only after the release below.
     let start = Instant::now();
-    while faults.built_pool_threads_held.load(SeqCst) < expected {
+    while faults.built_pool_threads_held.load(SeqCst) < expected
+        || faults.built_pool_joins_started.load(SeqCst) < 1
+    {
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "only {} of {expected} pool threads reached their exit hook",
-            faults.built_pool_threads_held.load(SeqCst)
+            "only {} of {expected} pool threads reached their exit hook, \
+             and {} joins started",
+            faults.built_pool_threads_held.load(SeqCst),
+            faults.built_pool_joins_started.load(SeqCst)
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    // Positive sync above: every thread is parked and cannot exit. A call
-    // that does not join them returns within this window.
-    assert!(
-        matches!(
-            done_rx.recv_timeout(Duration::from_millis(200)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "the call ended while its pool threads were still running"
-    );
     faults.release_built_pool_threads.store(true, SeqCst);
     let (result, hooks_done) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(

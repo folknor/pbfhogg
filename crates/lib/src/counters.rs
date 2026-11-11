@@ -363,7 +363,7 @@ pub(crate) fn send_recording_wait<T>(
 }
 
 #[inline]
-fn send_recording_wait_observing<T>(
+pub(crate) fn send_recording_wait_observing<T>(
     tx: &SyncSender<T>,
     item: T,
     wait_ns: &AtomicU64,
@@ -396,7 +396,7 @@ pub(crate) fn recv_recording_wait<T>(
 }
 
 #[inline]
-fn recv_recording_wait_observing<T>(
+pub(crate) fn recv_recording_wait_observing<T>(
     rx: &Receiver<T>,
     wait_ns: &AtomicU64,
     on_slow_path: impl FnOnce(),

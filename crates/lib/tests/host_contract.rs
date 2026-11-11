@@ -648,14 +648,20 @@ fn a_panicking_sink_does_not_fail_the_run() {
 /// Records the publication events of its invocation, and holds every
 /// `PUBLISH_START` until a second one arrives or `PUBLISH_OVERLAP_WAIT`
 /// passes, so two publications that could overlap do.
+#[cfg(feature = "test-hooks")]
 struct PublishOrder {
     events: std::sync::Mutex<Vec<(String, Option<i64>)>>,
-    starts: std::sync::Mutex<usize>,
-    started: std::sync::Condvar,
+    starts: std::sync::atomic::AtomicUsize,
+    /// The invocation the sink reports for, set once it exists and taken
+    /// back at the end, so the sink and the invocation do not keep each
+    /// other alive.
+    invocation: std::sync::Mutex<Option<pbfhogg::host::Invocation>>,
 }
-/// Long enough for the second publication, already past its hooks, to reach
-/// `PUBLISH_START` if nothing holds it back.
-const PUBLISH_OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Bound on the first span's wait for the second publication: a correct
+/// lock has it waiting on the lock at once.
+#[cfg(feature = "test-hooks")]
+const PUBLISH_OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "test-hooks")]
 impl pbfhogg::debug::InstrumentSink for PublishOrder {
     fn marker(&self, name: &str) {
         if !name.starts_with("PUBLISH_") {
@@ -666,14 +672,27 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
             .expect("events")
             .push((name.to_owned(), None));
         if name == "PUBLISH_START" {
-            let mut starts = self.starts.lock().expect("starts");
-            *starts += 1;
-            self.started.notify_all();
-            drop(
-                self.started
-                    .wait_timeout_while(starts, PUBLISH_OVERLAP_WAIT, |n| *n < 2)
-                    .expect("starts"),
-            );
+            use std::sync::atomic::Ordering::SeqCst;
+            // The first span stays open until the other publication is seen
+            // waiting on the execution lock, or (without the lock) has
+            // started its own span. The second span passes straight on.
+            if self.starts.fetch_add(1, SeqCst) == 0 {
+                let invocation = self
+                    .invocation
+                    .lock()
+                    .expect("invocation")
+                    .clone()
+                    .expect("invocation set");
+                let waits = &invocation.faults().publication_lock_waits;
+                let start = std::time::Instant::now();
+                while waits.load(SeqCst) == 0 && self.starts.load(SeqCst) < 2 {
+                    assert!(
+                        start.elapsed() < PUBLISH_OVERLAP_WAIT,
+                        "the second publication neither waited on the lock nor started"
+                    );
+                    std::thread::yield_now();
+                }
+            }
         }
     }
     fn counter(&self, name: &str, value: i64) {
@@ -690,21 +709,23 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
 /// followed by its own `publish_sync_calls`, `publish_sync_ns` and
 /// `PUBLISH_END` before the other publication's span begins, so a stream
 /// reader can pair every sample with its span. Both runs start together, and
-/// the sink holds the first span open, so without the invocation's
-/// publication execution lock the two spans interleave on the stream. The
-/// lock is taken before the decision, so the `before_publish` hooks (which
-/// run after it) never overlap either.
+/// the sink holds the first span open until the second is waiting on the
+/// invocation's publication execution lock, so without that lock the two
+/// spans interleave on the stream. The lock is taken before the decision, so
+/// the `before_publish` hooks (which run after it) never overlap either.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn concurrent_publications_of_one_invocation_do_not_interleave() {
     let sink = Arc::new(PublishOrder {
         events: std::sync::Mutex::new(Vec::new()),
-        starts: std::sync::Mutex::new(0),
-        started: std::sync::Condvar::new(),
+        starts: std::sync::atomic::AtomicUsize::new(0),
+        invocation: std::sync::Mutex::new(None),
     });
     let mut host = crate::common::test_host();
     host.invocation = pbfhogg::host::Invocation::with_sink(
         Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
     );
+    *sink.invocation.lock().expect("invocation") = Some(host.invocation.clone());
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let at_start = Arc::new(std::sync::Barrier::new(2));
@@ -721,7 +742,6 @@ fn concurrent_publications_of_one_invocation_do_not_interleave() {
                     if in_hook.swap(true, SeqCst) {
                         overlapped.store(true, SeqCst);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
                     in_hook.store(false, SeqCst);
                 });
                 at_start.wait();
@@ -738,6 +758,7 @@ fn concurrent_publications_of_one_invocation_do_not_interleave() {
             });
         }
     });
+    sink.invocation.lock().expect("invocation").take();
     assert!(
         !overlapped.load(std::sync::atomic::Ordering::SeqCst),
         "two before_publish hooks of one invocation ran at once"

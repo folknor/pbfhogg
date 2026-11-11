@@ -139,6 +139,11 @@ pub(super) struct ConcurrentBlobLocationRouter {
     // times every successful way-blob call, fast path included, and skips
     // error-ending waits; neither bounds the other.
     readiness_wait_ns: std::sync::atomic::AtomicU64,
+    /// Notifications made, counted inside the gate scope that makes them
+    /// (test builds only), so a test can tell a delivered notification
+    /// from a spurious wake.
+    #[cfg(test)]
+    notifications: std::sync::atomic::AtomicU64,
     // Counters emitted by mod.rs after the scope joins.
     pub(super) stats: std::sync::Mutex<ConcurrentRouterStats>,
 }
@@ -196,6 +201,8 @@ impl ConcurrentBlobLocationRouter {
                 invocation,
             ),
             readiness_wait_ns: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            notifications: std::sync::atomic::AtomicU64::new(0),
             stats: std::sync::Mutex::new(stats),
         })
     }
@@ -342,6 +349,9 @@ impl ConcurrentBlobLocationRouter {
             .notify_mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        self.notifications
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.notify.notify_all();
     }
 
@@ -1172,19 +1182,24 @@ mod tests {
                     );
                     std::thread::yield_now();
                 }
-                // The predicate is visible, but its notification must still
-                // be blocked by the gate. No later publication rescues us.
-                assert!(matches!(
-                    received.recv_timeout(Duration::from_millis(50)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ));
-                let (gate, result) = router
-                    .notify
-                    .wait_timeout(gate, Duration::from_secs(5))
-                    .expect("wait");
+                // The predicate is visible and the gate is still ours, so no
+                // gated notification can have been made yet. That the
+                // publisher is blocked on the gate (rather than descheduled
+                // before it) is not observable in-process; what is checked
+                // is that its notification arrives through the gated
+                // protocol: counted under the gate, and only after this
+                // thread has atomically released it inside the wait. A wake
+                // with no notification counted is spurious and waits again.
+                assert_eq!(router.notifications.load(SeqCst), 0);
+                let mut gate = gate;
+                while router.notifications.load(SeqCst) == 0 {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "event {event} lost its notification");
+                    gate = router.notify.wait_timeout(gate, remaining).expect("wait").0;
+                }
                 drop(gate);
+                received.recv().expect("publication completed");
                 publisher.join().expect("publisher");
-                assert!(!result.timed_out(), "event {event} lost its notification");
             });
         }
     }

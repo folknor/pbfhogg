@@ -285,6 +285,18 @@ fn scenario_passes_on(
     roles: &[&str],
     seeded: &[&str],
 ) -> (RunDir, String) {
+    scenario_passes_with(scenario, datasets, roles, seeded, &[])
+}
+
+/// [`scenario_passes_on`] with `env` added to the launch.
+#[allow(clippy::disallowed_methods)] // seeds in test scratch
+fn scenario_passes_with(
+    scenario: &str,
+    datasets: &[&str],
+    roles: &[&str],
+    seeded: &[&str],
+    env: &[(&str, &str)],
+) -> (RunDir, String) {
     let keep = crate::common::test_scratch();
     let mut bindings = serde_json::Map::new();
     for role in datasets {
@@ -310,7 +322,7 @@ fn scenario_passes_on(
         .expect("seed");
     }
     let fifo = Fifo::new(&run_dir.root.join("capture"));
-    let ran = run_dir.launch(&fifo.path.clone(), &[]);
+    let ran = run_dir.launch(&fifo.path.clone(), env);
     let lines = fifo.finish();
     assert!(
         ran.stdout.is_empty() && ran.stderr.is_empty(),
@@ -459,6 +471,92 @@ fn seeded_replace_replaces_one_seed_and_keeps_the_other() {
 fn isolation_cat_runs_one_call() {
     let (run, _) = scenario_passes("isolation-cat", true, &["out"], &[]);
     assert_eq!(run.entries("artefacts/calls"), ["a.json"]);
+}
+
+/// The profiler variables brokkr sets on a profiled launch, writing the
+/// report to `report`.
+fn profiling_env(report: &Path) -> [(&'static str, String); 3] {
+    [
+        ("HOTPATH_OUTPUT_PATH", report.display().to_string()),
+        ("HOTPATH_OUTPUT_FORMAT", "json".to_owned()),
+        ("HOTPATH_METRICS_SERVER_OFF", "true".to_owned()),
+    ]
+}
+
+/// Describe mode never profiles, even when asked: one document, nothing on
+/// stderr, no report. Every build runs it; the instrumented sweeps make it
+/// mean something.
+#[test]
+fn describe_ignores_a_profiling_request() {
+    let scratch = crate::common::test_scratch();
+    let report = scratch.path().join("report.json");
+    let vars = profiling_env(&report);
+    let env: Vec<(&str, &std::ffi::OsStr)> = vars
+        .iter()
+        .map(|(key, value)| (*key, std::ffi::OsStr::new(value)))
+        .collect();
+    let mut cmd = Command::new(EXE);
+    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let ran = run(cmd, &env, scratch.path(), &scratch);
+    assert!(ran.status.success(), "{}", ran.status);
+    assert!(
+        ran.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let _: Value = serde_json::from_slice(&ran.stdout).expect("one JSON document");
+    assert!(!report.exists(), "describe mode wrote a profile");
+}
+
+/// A profiled launch of an instrumented build: the run passes quietly and
+/// the report names library functions the scenario reached, with calls
+/// counted and, under `hotpath-alloc`, bytes counted - so the counting
+/// allocator is installed, not just the guard. Unprofiled quiet runs of the
+/// same build are every other scenario test in this file.
+#[cfg(feature = "hotpath")]
+#[test]
+fn a_profiled_launch_reports_library_functions() {
+    let keep = crate::common::test_scratch();
+    let report = keep.path().join("report.json");
+    let vars = profiling_env(&report);
+    let env: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (_run, _) = scenario_passes_with("isolation-cat", &["input"], &["out"], &[], &env);
+    let text = std::fs::read(&report).expect("the profile report");
+    let doc: Value = serde_json::from_slice(&text).expect("a JSON report");
+    let section = if cfg!(feature = "hotpath-alloc") {
+        "functions_alloc"
+    } else {
+        "functions_timing"
+    };
+    let data = doc[section]["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no {section}.data in {doc}"));
+    let library: Vec<&Value> = data
+        .iter()
+        .filter(|entry| {
+            entry["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("pbfhogg::"))
+        })
+        .collect();
+    assert!(!library.is_empty(), "no library function in {doc}");
+    assert!(
+        library
+            .iter()
+            .any(|entry| entry["calls"].as_u64().is_some_and(|calls| calls > 0)),
+        "no library call counted in {doc}"
+    );
+    if cfg!(feature = "hotpath-alloc") {
+        // The report formats byte totals for humans ("831.4 KB"); a
+        // missing counting allocator shows as "0 B" on every function.
+        assert_eq!(doc[section]["profiling_mode"], "alloc-bytes", "{doc}");
+        assert!(
+            library.iter().any(|entry| entry["total"]
+                .as_str()
+                .is_some_and(|total| !total.starts_with("0 "))),
+            "no library allocation counted in {doc}"
+        );
+    }
 }
 
 /// A request the harness cannot honour exits 2 without a byte of output,

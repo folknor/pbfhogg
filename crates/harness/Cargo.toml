@@ -36,9 +36,10 @@ default = []
 commands = []
 # brokkr's --hotpath and --alloc build the harness with these (its library
 # protocol, Profiling a scenario); both forward to the library's features of
-# the same names.
+# the same names. `hotpath-alloc` implies the package's own `hotpath`, as the
+# library's does, so the profiling test in tests/exe.rs runs in both shapes.
 hotpath = ["pbfhogg/hotpath"]
-hotpath-alloc = ["pbfhogg/hotpath-alloc"]
+hotpath-alloc = ["hotpath", "pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
 

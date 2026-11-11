@@ -985,6 +985,7 @@ impl FaultPlan {
     // ---- io_uring writer -------------------------------------------------
 
     /// Called by the uring writer thread per handoff operation.
+    #[cfg(feature = "linux-io-uring")]
     pub(crate) fn on_uring_dispatch(&self) {
         let n = self.uring_dispatch_count.fetch_add(1, Ordering::Relaxed) + 1;
         if n == self.uring_panic_at_dispatch.load(Ordering::Relaxed) {

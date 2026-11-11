@@ -146,8 +146,10 @@ parallel = {}
 # I/O alignment query returning None off glibc (crates/lib/src/direct_io.rs),
 # went unbuilt and unrun. Both musl sweeps are kept: `musl` still covers the
 # feature-off branches and the CLI's feature_missing tests on musl. Mixed
-# shapes (one platform feature without the other) are covered by neither
-# target. The profiling features stay out for the reason given for `all`.
+# shapes (one platform feature without the other) and the profiling features
+# are compiled by the gate-only lint sweeps below, never tested: the
+# profiling features stay out of CLI test sweeps for the reason given for
+# `all`.
 [[check]]
 name = "musl-all"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
@@ -155,6 +157,104 @@ features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
+
+# The shipped build profile: opt-level 3, fat LTO, one codegen unit, so
+# debug_assertions and overflow checks off. Every other tested sweep builds
+# dev, where an overflow panics; here the whole library and CLI suite runs
+# with release semantics, so a #[should_panic] invariant test whose panic
+# came from a debug-only check, or a path whose arithmetic wraps in release,
+# fails. ADR-0021 requires invariants to hold in release; this is where the
+# suite says so. Default features without the hook cfg: the product shape,
+# not the optional backends, whose release behaviour this does not claim.
+# CLI children here size on the real machine, as in consumer and musl.
+# Gate only: the LTO link of every test binary is too slow for tier1.
+[[check]]
+name = "release"
+packages = ["pbfhogg", "pbfhogg-cli"]
+profile = "release"
+parallel = {}
+
+# The profiling lane. The harness is the one instrumented executable whose
+# output contract holds under test (the CLI's guard is unconditional and
+# writes its report to stdout, see the `all` header), so these two sweeps
+# run the harness suite built with each profiling feature: describe mode and
+# every unprofiled scenario stay quiet in an instrumented build, describe
+# ignores a profiling request, and a profiled launch writes a report naming
+# library functions (crates/harness/tests/exe.rs). Gate only.
+[[check]]
+name = "harness-hotpath"
+packages = ["pbfhogg-harness"]
+features = ["hotpath", "linux-direct-io", "linux-io-uring"]
+parallel = {}
+
+[[check]]
+name = "harness-hotpath-alloc"
+packages = ["pbfhogg-harness"]
+features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
+parallel = {}
+
+# Compile and lint-only shapes the tested sweeps cannot carry, run by the
+# gate. The profiling features over every package, so the CLI's instrumented
+# build, its counting allocator and the code behind cfg(feature = "hotpath")
+# compile and pass clippy; `hotpath-alloc` implies `hotpath` in every
+# package, but the hotpath crate expands differently under each, so both.
+[[lint_sweep]]
+name = "hotpath"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["hotpath", "linux-direct-io", "linux-io-uring"]
+when = "gate"
+
+[[lint_sweep]]
+name = "hotpath-alloc"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
+when = "gate"
+
+# The profiling shape on musl. The musl sweeps never build the profiling
+# features, and the glibc-allocator textlint trusts debug.rs and process.rs
+# for their own gates, so a glibc-only call reached only under a profiling
+# feature would otherwise escape both; it fails to compile here.
+[[lint_sweep]]
+name = "musl-hotpath-alloc"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
+target = "x86_64-unknown-linux-musl"
+when = "gate"
+
+# Mixed platform shapes, one backend without the other, on both targets.
+# Every tested sweep enables both or neither, so code selected only by a
+# mixed shape would otherwise never compile. With the hook cfg, as the
+# sweeps that build the backends are.
+[[lint_sweep]]
+name = "direct-io-only"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["linux-direct-io"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
+when = "gate"
+
+[[lint_sweep]]
+name = "io-uring-only"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["linux-io-uring"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
+when = "gate"
+
+[[lint_sweep]]
+name = "musl-direct-io-only"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["linux-direct-io"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
+target = "x86_64-unknown-linux-musl"
+when = "gate"
+
+[[lint_sweep]]
+name = "musl-io-uring-only"
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+features = ["linux-io-uring"]
+rustflags = ["--cfg", "pbfhogg_test_hooks"]
+target = "x86_64-unknown-linux-musl"
+when = "gate"
 
 # Lint-only, on an architecture the promise guard (crates/cli/tests/guard.rs)
 # does not support: its seccomp filter compiles only on little-endian x86_64
@@ -283,8 +383,13 @@ skip = ["serial::"]
 # writer can register its pool.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all"]
-env = { PBFHOGG_TEST_REQUIRE = "direct-io,promise-guard" }
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc"]
+env = {PBFHOGG_TEST_REQUIRE = "direct-io,promise-guard" }
+
+# The profiling lane alone, for work on the harness or the instrumentation.
+[test.profiles.profiling]
+description = "The harness suite built with each profiling feature"
+sweeps = ["harness-hotpath", "harness-hotpath-alloc"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

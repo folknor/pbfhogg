@@ -10,10 +10,11 @@
 //!   `reframe_ways_with_new_ids`, `rewrite_relations_with_new_ids`).
 //!   Returns an error naming the offending id; never panics, never
 //!   silently passes through.
-//! - `diff` / `derive-changes` parallel shard planners - `debug_assert!`
-//!   only. Release builds rely on the upstream chain never producing
-//!   mixed-sign input. **Not exercisable from CLI tests** because
-//!   `brokkr check` runs in release mode.
+//! - `diff` / `derive-changes` are no longer an enforcement site: their
+//!   work-unit planner cuts in canonical `id_order` keys, so negative IDs
+//!   window like any other (ADR-0002, amended 2026-10-31). No build-mode
+//!   check stands in for it; the gate's `release` sweep runs this file in
+//!   the shipped profile as well as dev.
 //!
 //! Other commands (`cat`, `sort`, `inspect`, `tags-filter`, `getid`)
 //! are NOT named as enforcement sites in DEVIATIONS. The contract this

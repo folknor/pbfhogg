@@ -212,9 +212,10 @@ promise in `docs/cli/commands.md` "Names pbfhogg leaves behind". The guard is
 stricter than the promise (no duplicate of the lease, no `sendmsg`,
 `sendmmsg` or `pidfd_getfd` at all) and blind to io_uring submissions
 and to a `clone3` caller that ignores its `ENOSYS`; the module doc says
-why. It also runs only the test builds, whose features never include
-hotpath's; the `no-hotpath-cpu` script check in `brokkr.toml`
-(`scripts/check_hotpath_cpu.py`) covers the profiler builds by failing
+why. Over the CLI it runs only builds without hotpath's features; the
+instrumented harness runs under it in the profiling lane (below). The
+`no-hotpath-cpu` script check in `brokkr.d/lints.toml`
+(`scripts/check_hotpath_cpu.py`) covers every profiler build by failing
 when the resolved dependency graph, with every workspace feature on,
 enables hotpath's process-starting CPU profiler. `guard::tests` re-runs the test binary under the guard once per
 rule to prove each one fires and that the allowed neighbours do not. A
@@ -280,6 +281,27 @@ musl coverage. Brokkr refuses configured target runners, but needs a
 planner capability check to refuse an unexecutable target before building
 or resolve a native musl target. Until then this is a host restriction
 of the configured gate, not a portable execution guarantee.
+
+Three further tested sweeps run in the gate only. `release` runs the
+library and CLI suites in the shipped release profile (fat LTO, debug
+assertions and overflow checks off), default features, no hook cfg, so a
+`#[should_panic]` invariant test whose panic came from a debug-only check,
+or a path whose arithmetic wraps only in release, fails there; every other
+tested sweep builds dev. It makes no release claim for the optional
+backends. `harness-hotpath` and `harness-hotpath-alloc` are the profiling
+lane (`brokkr check --profile profiling` runs it alone): the harness suite
+built with each profiling feature, so describe mode and every unprofiled
+scenario are checked quiet in an instrumented build, describe ignores a
+profiling request, and a profiled launch must write a report naming library
+functions with calls and, under `hotpath-alloc`, allocated bytes counted.
+The CLI is not tested instrumented: its guard is unconditional and reports
+to stdout.
+
+Gate-only lint sweeps compile and lint what no tested sweep carries: the
+`hotpath` and `hotpath-alloc` shapes over every package, `musl-hotpath-alloc`
+(the profiling code on musl, where a glibc-only allocator call would fail),
+and the mixed backend shapes (one of `linux-direct-io`, `linux-io-uring`
+without the other) on both targets.
 
 `brokkr check` enforces a fixed 20 s per-test watchdog with no
 override, on every profile including `--profile full`. Tests slower

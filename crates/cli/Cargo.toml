@@ -53,7 +53,10 @@ default = []
 # pbfhogg-cli rejecting the unknown feature.
 commands = []
 hotpath = ["pbfhogg/hotpath"]
-hotpath-alloc = ["pbfhogg/hotpath-alloc"]
+# Implies the package's own `hotpath`, as the library's does: dependency
+# features never propagate back, so without it a `cfg(feature = "hotpath")`
+# item here would vanish from an allocation build.
+hotpath-alloc = ["hotpath", "pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
 # The CLI's environment hooks (src/signals.rs, src/host.rs) and pbfhogg's

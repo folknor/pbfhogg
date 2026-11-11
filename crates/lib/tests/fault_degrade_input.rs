@@ -590,7 +590,7 @@ fn check_passthrough_route(route: Route) {
     write_input(&input, route);
     // Only a typed O_DIRECT setup refusal skips; see `direct_io_unavailable`.
     let Reference::Bytes(expected) = plain_reference(route, &input, dir.path(), |e| {
-        route.direct && crate::common::direct_io_unavailable(e)
+        route.direct && direct_io_refused(e)
     }) else {
         return;
     };
@@ -624,6 +624,20 @@ fn check_passthrough_route(route: Route) {
             );
             std::fs::remove_file(&output).expect("remove output");
         });
+    }
+}
+
+/// A typed O_DIRECT setup refusal. Without the backend no route asks for
+/// O_DIRECT, so nothing is one.
+fn direct_io_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+    #[cfg(feature = "linux-direct-io")]
+    {
+        crate::common::direct_io_unavailable(err)
+    }
+    #[cfg(not(feature = "linux-direct-io"))]
+    {
+        let _ = err;
+        false
     }
 }
 

@@ -28,10 +28,11 @@ stage = "pre-clippy"
 # crates/lib/src/process.rs, behind
 # `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
 # A call gated on `target_os = "linux"` alone also compiles for musl, where
-# these symbols do not exist. The `musl` and `musl-all` sweeps in checks.toml
-# catch that, but only in what they compile: default features and the `all`
-# feature shape, so code behind the profiling features, and branches only a
-# mixed platform-feature shape selects, never build for musl.
+# these symbols do not exist. The musl sweeps in checks.toml catch that in
+# what they compile: the tested `musl` and `musl-all` shapes, and in the gate
+# the lint-only `musl-hotpath-alloc`, `musl-direct-io-only` and
+# `musl-io-uring-only` shapes, which reach the profiling code and the mixed
+# backend branches. Other feature combinations still never build for musl.
 # This rule scans source whatever its features and keeps the calls in the
 # reviewed wrappers even when a stray one is correctly gated. It checks
 # placement only: the excluded wrapper files are trusted for their own gates,

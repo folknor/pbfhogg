@@ -614,7 +614,8 @@ impl PbfWriter<FileWriter> {
     /// when the pipeline is I/O-bound (e.g. `Compression::None` on fast storage).
     ///
     /// Requires the `linux-io-uring` feature and Linux 5.1+. `path` must be a
-    /// regular file or absent, as for [`to_path_direct`](Self::to_path_direct).
+    /// regular file or absent, as for `to_path_direct` (not linked: that
+    /// method exists only with `linux-direct-io`).
     ///
     /// # Latent blocking scenario
     ///

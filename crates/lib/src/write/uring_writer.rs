@@ -8,7 +8,8 @@
 //! (e.g. `Compression::None` on erofs).
 //!
 //! Data is accumulated into 256 KB registered buffers (same strategy as
-//! [`super::direct_writer::DirectWriter`]). When a buffer fills, a `WriteFixed`
+//! `super::direct_writer::DirectWriter`, which only `linux-direct-io`
+//! builds). When a buffer fills, a `WriteFixed`
 //! SQE is submitted. CQEs are reaped to recycle buffer indices via a free-list.
 
 use super::IO_BUF_BYTES;

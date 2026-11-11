@@ -9,11 +9,19 @@ expect = "document conventions ok"
 match = "last-line"
 stage = "pre-clippy"
 
-# glibc-only allocator calls live in crates/lib/src/debug.rs and crates/lib/src/process.rs, behind
+# glibc-only allocator calls live in crates/lib/src/debug.rs and
+# crates/lib/src/process.rs, behind
 # `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.
 # A call gated on `target_os = "linux"` alone also compiles for musl, where
-# these symbols do not exist, and nothing here builds against musl - so the
-# one way to keep musl building is to keep calls in gated debug/process wrappers.
+# these symbols do not exist. The `musl` sweep in checks.toml catches that,
+# but only in what it compiles: default features, so code behind
+# linux-direct-io, linux-io-uring, test-hooks or the profiling features, and
+# any `not(feature = ...)` branch those flip, never builds for musl there.
+# This rule scans source whatever its features and keeps the calls in the
+# reviewed wrappers even when a stray one is correctly gated. It checks
+# placement only: the excluded wrapper files are trusted for their own gates,
+# and a call spelled other than `libc::name` (an alias, a `use`, a local
+# extern) slips past it.
 # Matches the `libc::` path, so callers of the wrappers (`crate::debug`'s
 # `emit_mallinfo2`; `crate::process`'s `cap_malloc_arenas`, `malloc_trim` and
 # `set_mmap_threshold`) stay legal, and `region = "code"` lets comments
@@ -21,7 +29,7 @@ stage = "pre-clippy"
 [[textlint]]
 name = "glibc-allocator-calls-live-in-debug"
 pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
-paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs"]
+paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
 exclude = ["crates/lib/src/debug.rs", "crates/lib/src/process.rs"]
 region = "code"
 message = "glibc-only allocator calls belong in target_env gnu gated debug/process wrappers"

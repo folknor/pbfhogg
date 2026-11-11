@@ -28,12 +28,18 @@ attribution only, not correctness.
 Fix: end the Pass 3 span before the header write and give the smoke test its own
 START/END pair.
 
-## BUG-008 - A lint comment says nothing builds against musl
+## BUG-010 - Feature-gated code never builds for musl
 
-Lateral finding from the BUG-004 scout, not yet judged. The comment on the
-`glibc-allocator-calls-live-in-debug` rule in `brokkr.d/lints.toml` says nothing
-here builds against musl, while `brokkr.d/checks.toml` defines a `musl` sweep. The
-rule's rationale may rest on the false statement.
+Lateral finding from the BUG-008 work, not yet judged. The `musl` sweep in
+`brokkr.d/checks.toml` builds default features only, so code behind
+`linux-direct-io`, `linux-io-uring`, `test-hooks` and the profiling features
+never compiles for musl. The allocator textlint exempts `crates/lib/src/debug.rs`
+and `crates/lib/src/process.rs` wholesale, so an ungated glibc call added inside
+either file behind one of those features escapes both guards. Source reading
+suggests the Linux features build on musl (`direct_io.rs` already has a
+non-gnu `statx` fallback), but no build has confirmed it. The profiling features
+are kept off broad sweeps on purpose because their instrumentation disturbs the
+CLI tests.
 
-Fix: establish whether the rule still holds under the musl sweep and reword the
-comment to what is true.
+Fix: add musl coverage for the platform and test-hooks features, compile-only
+if running them is not wanted.

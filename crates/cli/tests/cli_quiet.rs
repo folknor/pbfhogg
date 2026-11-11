@@ -21,23 +21,24 @@ use std::path::PathBuf;
 
 use crate::common::{TestWay, generate_nodes, write_test_pbf_sorted};
 use crate::invoker::{CliInvoker, CliOutput};
-use tempfile::TempDir;
+use pbfhogg_test_scratch::TestScratch;
 
 /// The note a forced run on unindexed input prints.
 const FORCED_NOTE: &str = "Input contains blobs without indexdata";
 
 struct Fx {
-    dir: TempDir,
+    dir: TestScratch,
 }
 
 impl Fx {
     fn new() -> Self {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let p = dir.path();
         crate::common::write_base_pbf(&p.join("base.osm.pbf"));
         crate::common::write_changed_pbf(&p.join("changed.osm.pbf"));
         crate::common::write_synthetic_indexed_input(&p.join("geo.osm.pbf"));
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(p.join("base.osm.pbf"))
             .arg("-o")
@@ -79,8 +80,12 @@ impl Fx {
 /// Run `args` with the current directory in a scratch directory of its own:
 /// a text diff without `-o` puts its scratch there.
 fn run(args: &[OsString]) -> CliOutput {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let cwd = crate::common::test_scratch();
-    CliInvoker::new().current_dir(cwd.path()).args(args).run()
+    CliInvoker::new(&invocation_scratch)
+        .current_dir(cwd.path())
+        .args(args)
+        .run()
 }
 
 /// `args` with `-q` before the subcommand (`leading`) or after everything.

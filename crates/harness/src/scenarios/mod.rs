@@ -215,8 +215,12 @@ pub(crate) fn installed_ok(id: &'static str, record: &CallRecord, role: &str) ->
 }
 
 /// Whether `path` is absent.
-pub(crate) fn absent(path: &std::path::Path) -> bool {
-    path.symlink_metadata().is_err()
+pub(crate) fn absent(path: &std::path::Path) -> std::io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// The output bound to `role`, staged in the private directory, built
@@ -246,4 +250,23 @@ pub(crate) fn cat_into(
 ) -> pbfhogg::Result<pbfhogg::cat::CatStats> {
     let out = output(env, role, pbfhogg::Overwrite::Refuse, host)?;
     pbfhogg::cat::cat(inputs, out, type_filter, clean, &WRITE, &overrides(), host)
+}
+
+#[cfg(test)]
+mod absence_tests {
+    #[test]
+    fn only_not_found_means_absent() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let file = scratch.child("file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(!super::absent(&file).expect("present"));
+        assert!(super::absent(&scratch.child("missing")).expect("absent"));
+        assert!(super::absent(&file.join("child")).is_err());
+        #[cfg(unix)]
+        {
+            let link = scratch.child("link");
+            std::os::unix::fs::symlink(scratch.child("missing"), &link).expect("link");
+            assert!(!super::absent(&link).expect("dangling symlink is present"));
+        }
+    }
 }

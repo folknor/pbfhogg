@@ -15,11 +15,16 @@ const END: &str = "CLI_COMMAND_END";
 
 /// Run `args` with the marker file attached; the exit status and the lines
 /// written, each split into its timestamp and body.
-fn run_with_markers(dir: &Path, label: &str, args: &[&str]) -> (i32, Vec<(u64, String)>) {
+fn run_with_markers(
+    dir: &Path,
+    label: &str,
+    args: &[impl AsRef<std::ffi::OsStr>],
+) -> (i32, Vec<(u64, String)>) {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let markers = dir.join(format!("{label}.markers"));
     std::fs::write(&markers, []).unwrap();
-    let out = CliInvoker::new()
-        .env("BROKKR_MARKER_FIFO", &markers)
+    let out = CliInvoker::new(&invocation_scratch)
+        .marker_fifo(&markers)
         .args(args)
         .run();
     let code = out.status.code().unwrap();
@@ -68,10 +73,10 @@ fn a_dispatched_command_marks_one_interval_around_its_work() {
     crate::common::write_base_pbf(&input);
     let output = dir.path().join("out.osm.pbf");
     let args = [
-        "cat",
-        input.to_str().unwrap(),
-        "-o",
-        output.to_str().unwrap(),
+        std::ffi::OsStr::new("cat"),
+        input.as_os_str(),
+        std::ffi::OsStr::new("-o"),
+        output.as_os_str(),
     ];
     let (code, lines) = run_with_markers(dir.path(), "cat", &args);
     assert_eq!(code, 0, "{lines:?}");
@@ -101,10 +106,10 @@ fn a_refusal_inside_the_dispatch_closes_its_interval() {
     let output = dir.path().join("out.osm.pbf");
     std::fs::write(&output, b"kept").unwrap();
     let args = [
-        "cat",
-        input.to_str().unwrap(),
-        "-o",
-        output.to_str().unwrap(),
+        std::ffi::OsStr::new("cat"),
+        input.as_os_str(),
+        std::ffi::OsStr::new("-o"),
+        output.as_os_str(),
     ];
     let (code, lines) = run_with_markers(dir.path(), "refused", &args);
     assert_eq!(code, 2, "{lines:?}");

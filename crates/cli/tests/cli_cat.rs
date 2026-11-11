@@ -36,7 +36,8 @@ fn run_cat(
     clean_attrs: &[&str],
     direct_io: bool,
 ) -> crate::invoker::CliOutput {
-    let mut cli = CliInvoker::new().arg("cat");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch).arg("cat");
     for input in inputs {
         cli = cli.arg(*input);
     }
@@ -905,13 +906,14 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
 /// `--clean` still asks for indexdata, since it skips unselected blobs on it.
 #[test]
 fn clean_needs_no_indexdata_but_a_type_filter_does() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let indexed = dir.path().join("indexed.osm.pbf");
     let unindexed = dir.path().join("unindexed.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_clean_fixture(&indexed);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&indexed)
         .arg("-o")
@@ -922,7 +924,7 @@ fn clean_needs_no_indexdata_but_a_type_filter_does() {
     let from_unindexed = dir.path().join("from-unindexed.osm.pbf");
     let from_indexed = dir.path().join("from-indexed.osm.pbf");
     for (input, dest) in [(&unindexed, &from_unindexed), (&indexed, &from_indexed)] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("cat")
             .arg(input)
             .arg("-o")
@@ -936,7 +938,7 @@ fn clean_needs_no_indexdata_but_a_type_filter_does() {
         ordered_elements(&from_indexed)
     );
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&unindexed)
         .arg("-o")
@@ -955,6 +957,7 @@ fn clean_needs_no_indexdata_but_a_type_filter_does() {
 /// unindexed one is decoded and filtered.
 #[test]
 fn clean_keeps_input_order() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("unsorted.osm.pbf");
     write_raw_block_pbf(&input, false, &[], &unsorted_clean_blocks());
@@ -970,7 +973,7 @@ fn clean_keeps_input_order() {
 
     let run = |source: &Path, name: &str, extra: &[&str], summary: &str| {
         let output = dir.path().join(name);
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("cat")
             .arg(source)
             .arg("-o")
@@ -1007,7 +1010,7 @@ fn clean_keeps_input_order() {
         [("way", 31, 31, 1), ("way", 30, 30, 1)]
     );
     // The poisoned blob is what a node selection reads, so it fails there.
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&poisoned)
         .arg("-o")
@@ -1026,10 +1029,11 @@ fn clean_phase_markers(
     inputs: &[&Path],
     flags: &[&str],
 ) -> (crate::invoker::CliOutput, Vec<String>) {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let markers = dir.join(format!("{label}.markers"));
     std::fs::write(&markers, []).unwrap();
-    let mut cli = CliInvoker::new()
-        .env("BROKKR_MARKER_FIFO", &markers)
+    let mut cli = CliInvoker::new(&invocation_scratch)
+        .marker_fifo(&markers)
         .arg("cat");
     for input in inputs {
         cli = cli.arg(*input);
@@ -1198,6 +1202,7 @@ fn partial_index_blocks() -> Vec<Vec<u8>> {
 /// asks for indexdata at all.
 #[test]
 fn every_mode_gives_the_indexed_output_on_a_partially_indexed_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let blocks = partial_index_blocks();
     let shapes: [(&str, [bool; 4]); 3] = [
@@ -1231,7 +1236,7 @@ fn every_mode_gives_the_indexed_output_on_a_partially_indexed_input() {
         let mut results = Vec::new();
         for (shape, indexed) in &shapes {
             let output = dir.path().join(format!("{mode}-{shape}.out.osm.pbf"));
-            let mut cli = CliInvoker::new()
+            let mut cli = CliInvoker::new(&invocation_scratch)
                 .arg("cat")
                 .arg(dir.path().join(format!("{shape}.osm.pbf")))
                 .arg("-o")
@@ -1294,7 +1299,8 @@ fn write_sorted_pbf_with(
 }
 
 fn run_dedupe(inputs: &[&Path], output: &Path) -> crate::invoker::CliOutput {
-    let mut cli = CliInvoker::new().arg("cat");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch).arg("cat");
     for input in inputs {
         cli = cli.arg(*input);
     }
@@ -1445,12 +1451,13 @@ fn cat_dedupe_refuses_an_input_without_exactly_one_leading_header() {
 /// headline used to report the inflated figure as fact.
 #[test]
 fn cat_dedupe_keeps_indexdata_claims_out_of_the_observed_count() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let lying = dir.path().join("lying.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_sorted_pbf_with(&honest, 1, |hb| hb);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -1735,6 +1742,7 @@ mod backends {
 
 #[test]
 fn passthrough_rejects_malformed_unindexed_payload() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("malformed.pbf");
     let output = dir.path().join("output.pbf");
@@ -1750,7 +1758,7 @@ fn passthrough_rejects_malformed_unindexed_payload() {
     writer.flush().expect("flush fixture");
     drop(writer);
 
-    let out = crate::invoker::CliInvoker::new()
+    let out = crate::invoker::CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -1779,6 +1787,7 @@ fn passthrough_rejects_malformed_unindexed_payload() {
 
 #[test]
 fn every_cat_path_refuses_non_leading_header_frames() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_sorted_pbf_with(&input, 1, |hb| hb);
@@ -1795,7 +1804,7 @@ fn every_cat_path_refuses_non_leading_header_frames() {
             ("clean", vec!["--clean", "version"]),
             ("dedupe", vec!["--dedupe"]),
         ] {
-            let mut cli = CliInvoker::new().arg("cat").arg(&bad);
+            let mut cli = CliInvoker::new(&invocation_scratch).arg("cat").arg(&bad);
             // Plain cat and --clean without --type never refuse unindexed
             // input, so they refuse --force.
             let force = mode == "filtered" || mode == "dedupe";
@@ -2190,6 +2199,7 @@ fn data_blob_header_field(path: &Path, wanted: u64) -> Vec<bool> {
 /// element-less block.
 #[test]
 fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
     use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -2264,7 +2274,7 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
     );
 
     // A command that needs indexdata on every blob refuses the input.
-    let refused = CliInvoker::new()
+    let refused = CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&input)
         .arg("-o")
@@ -2273,7 +2283,7 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
     assert!(!refused.status.success(), "{}", refused.stderr_str());
     refused.assert_stderr_contains("indexdata");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -2307,7 +2317,7 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
     assert_eq!(ordered_elements(&output), ordered_elements(&input));
 
     // The recipe's output passes the gate that refused its input.
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&output)
         .arg("-o")
@@ -2320,6 +2330,7 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
 /// run comes out in the same sequence, one block per run.
 #[test]
 fn passthrough_reencode_keeps_unsorted_element_order() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("unsorted.osm.pbf");
     let output = dir.path().join("indexed.osm.pbf");
@@ -2342,7 +2353,7 @@ fn passthrough_reencode_keeps_unsorted_element_order() {
         )],
     );
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -2370,6 +2381,7 @@ fn passthrough_reencode_keeps_unsorted_element_order() {
 /// to fail on the empty and the mixed blocks with "failed to scan block IDs".
 #[test]
 fn merge_engine_places_blocks_no_single_index_describes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2421,7 +2433,7 @@ fn merge_engine_places_blocks_no_single_index_describes() {
     let dedupe_out = dir.path().join("dedupe.osm.pbf");
     let sort_out = dir.path().join("sort.osm.pbf");
     let dedupe = run_dedupe(&[&input], &dedupe_out);
-    let sort = CliInvoker::new()
+    let sort = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -2459,7 +2471,7 @@ fn merge_engine_places_blocks_no_single_index_describes() {
             "the reframed passthrough carries its scanned tag keys"
         );
         // The pass that refuses an unindexed blob accepts the output.
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("check")
             .arg("--index")
             .arg(output)
@@ -2492,6 +2504,7 @@ fn merge_engine_reports_a_malformed_payload_as_itself() {
 /// from its payload, and the output passes `check --index`.
 #[test]
 fn sort_replaces_indexdata_it_found_false() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2506,14 +2519,14 @@ fn sort_replaces_indexdata_it_found_false() {
 
     // `--corrupt-indexdata` inflates every blob's count and max_id.
     let lying = dir.path().join("lying.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
         .arg(&lying)
         .arg("--corrupt-indexdata")
         .assert_success();
-    let refused = CliInvoker::new()
+    let refused = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&lying)
@@ -2521,7 +2534,7 @@ fn sort_replaces_indexdata_it_found_false() {
     assert_eq!(refused.status.code(), Some(1), "{}", refused.stderr_str());
 
     let output = dir.path().join("sorted.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&lying)
         .arg("-o")
@@ -2530,7 +2543,7 @@ fn sort_replaces_indexdata_it_found_false() {
     assert!(out.status.success(), "{}", out.stderr_str());
     out.assert_stderr_contains("2 blobs carried indexdata their payload contradicts");
     out.assert_stderr_contains("(2 blobs: 2 passthrough, 0 rewritten)");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&output)
@@ -2544,6 +2557,7 @@ fn sort_replaces_indexdata_it_found_false() {
 /// false claims `sort` replaces, and its output passes `check --index`.
 #[test]
 fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2578,7 +2592,7 @@ fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
     ] {
         let lying = dir.path().join(format!("{name}.osm.pbf"));
         std::fs::write(&lying, lying_bytes).expect("write lying fixture");
-        let refused = CliInvoker::new()
+        let refused = CliInvoker::new(&invocation_scratch)
             .arg("check")
             .arg("--index")
             .arg(&lying)
@@ -2592,7 +2606,7 @@ fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
         refused.assert_stdout_contains(detail);
 
         let output = dir.path().join(format!("{name}-sorted.osm.pbf"));
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("sort")
             .arg(&lying)
             .arg("-o")
@@ -2600,7 +2614,7 @@ fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
             .run();
         assert!(out.status.success(), "{name}: {}", out.stderr_str());
         out.assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("check")
             .arg("--index")
             .arg(&output)
@@ -2610,7 +2624,7 @@ fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
     // Counterpart: the honest file under the same unclaimed header keeps its
     // indexdata, so the rule is not "always reframe".
     let output = dir.path().join("honest-sorted.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&honest)
         .arg("-o")
@@ -2646,6 +2660,7 @@ fn with_header_field(pbf: &[u8], frame: usize, field: u8, bytes: &[u8]) -> Vec<u
 /// alone, dropping field 5 and with it the declaration.
 #[test]
 fn sort_keeps_way_members_when_it_reframes_a_false_way_index() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2678,7 +2693,7 @@ fn sort_keeps_way_members_when_it_reframes_a_false_way_index() {
     assert_eq!(data_blob_header_field(&lying, 5), vec![false, true]);
 
     let output = dir.path().join("sorted.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&lying)
         .arg("-o")
@@ -2695,7 +2710,7 @@ fn sort_keeps_way_members_when_it_reframes_a_false_way_index() {
         vec![false, true],
         "field 5 survives the reframe"
     );
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&output)
@@ -2708,6 +2723,7 @@ fn sort_keeps_way_members_when_it_reframes_a_false_way_index() {
 /// rather than written without the enrichment the header promised.
 #[test]
 fn passthrough_reencode_refuses_to_drop_a_declared_way_enrichment() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let meta = pb::info(1, 8);
     let mut pinned = pb::way(10, &[1, 2], None, &meta);
@@ -2747,7 +2763,7 @@ fn passthrough_reencode_refuses_to_drop_a_declared_way_enrichment() {
         (&pins, "pbfhogg.SharedNodePins-v1"),
     ] {
         let output = dir.path().join("out.osm.pbf");
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("cat")
             .arg(input)
             .arg("-o")
@@ -2805,7 +2821,8 @@ fn with_unknown_header_field(bytes: &[u8], frame: usize) -> Vec<u8> {
 }
 
 fn run_reindex(input: &Path, output: &Path) -> crate::invoker::CliOutput {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .args(["cat", "--reindex"])
         .arg(input)
         .arg("-o")
@@ -2819,6 +2836,7 @@ fn run_reindex(input: &Path, output: &Path) -> crate::invoker::CliOutput {
 /// field through, and the result passes `check` and `check --index`.
 #[test]
 fn reindex_repairs_false_kind_claims_losslessly() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2832,7 +2850,7 @@ fn reindex_repairs_false_kind_claims_losslessly() {
     write_raw_block_pbf(&honest, true, &[], &[(true, nodes), (true, ways)]);
 
     let rotated = dir.path().join("rotated.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -2843,18 +2861,24 @@ fn reindex_repairs_false_kind_claims_losslessly() {
     let lying = dir.path().join("lying.osm.pbf");
     let bytes = std::fs::read(&rotated).expect("read rotated");
     std::fs::write(&lying, with_unknown_header_field(&bytes, 2)).expect("write lying");
-    let bare = CliInvoker::new().arg("check").arg(&lying).run();
+    let bare = CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(&lying)
+        .run();
     assert_eq!(bare.status.code(), Some(1), "{}", bare.stderr_str());
 
     let output = dir.path().join("reindexed.osm.pbf");
     let out = run_reindex(&lying, &output);
     assert!(out.status.success(), "{}", out.stderr_str());
     out.assert_stderr_contains("Reindexed 2 blobs; indexdata changed in 2, tagdata changed in 0");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .args(["check", "--index"])
         .arg(&output)
         .assert_success();
-    CliInvoker::new().arg("check").arg(&output).assert_success();
+    CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(&output)
+        .assert_success();
     assert_eq!(data_payloads(&output), data_payloads(&lying));
     assert_eq!(ordered_elements(&output), ordered_elements(&honest));
     let out_bytes = std::fs::read(&output).expect("read output");
@@ -2880,6 +2904,7 @@ fn reindex_repairs_false_kind_claims_losslessly() {
 /// passes `check --index`.
 #[test]
 fn reindex_counts_false_tagdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use pbfhogg::block_builder::BlockBuilder;
 
     let dir = crate::common::test_scratch();
@@ -2893,14 +2918,14 @@ fn reindex_counts_false_tagdata() {
     write_raw_block_pbf(&honest, true, &[], &[(true, nodes), (true, ways)]);
 
     let corrupt = dir.path().join("tags.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
         .arg(&corrupt)
         .arg("--corrupt-tagdata")
         .assert_success();
-    let bad = CliInvoker::new()
+    let bad = CliInvoker::new(&invocation_scratch)
         .args(["check", "--index"])
         .arg(&corrupt)
         .run();
@@ -2910,7 +2935,7 @@ fn reindex_counts_false_tagdata() {
     let out = run_reindex(&corrupt, &output);
     assert!(out.status.success(), "{}", out.stderr_str());
     out.assert_stderr_contains("Reindexed 2 blobs; indexdata changed in 0, tagdata changed in 2");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .args(["check", "--index"])
         .arg(&output)
         .assert_success();
@@ -2923,6 +2948,7 @@ fn reindex_counts_false_tagdata() {
 /// none of the re-encoding or filtering modes.
 #[test]
 fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("mixed.osm.pbf");
     write_raw_block_pbf(&input, false, &[], &unsorted_clean_blocks());
@@ -2934,7 +2960,7 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
 
     let honest = dir.path().join("honest.osm.pbf");
     crate::common::write_test_pbf_sorted(&honest, &[], &[], &[]);
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .args(["cat", "--reindex"])
         .arg(&honest)
         .arg(&honest)
@@ -2955,7 +2981,7 @@ fn reindex_refuses_an_unindexable_block_and_the_lossy_modes() {
         &["--clean", "uid"],
         &["--generator", "x"],
     ] {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .args(["cat", "--reindex"])
             .args(flags)
             .arg(&honest)
@@ -3061,7 +3087,8 @@ fn header_field_bytes(pbf: &[u8], frame: usize, wanted: u64) -> Vec<u8> {
 }
 
 fn run_cat_args(input: &Path, output: &Path, flags: &[&str]) -> crate::invoker::CliOutput {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(input)
         .arg("-o")
@@ -3078,6 +3105,7 @@ fn run_cat_args(input: &Path, output: &Path, flags: &[&str]) -> crate::invoker::
 /// unchanged and no note.
 #[test]
 fn repair_merges_a_repeated_info_and_dense_info() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let unindexed = |blocks: Vec<Vec<u8>>| -> Vec<(bool, Vec<u8>)> {
         blocks.into_iter().map(|b| (false, b)).collect()
@@ -3113,7 +3141,7 @@ fn repair_merges_a_repeated_info_and_dense_info() {
     out.assert_stderr_contains("Repaired 3 input blobs");
     assert_eq!(ordered_elements(&output), ordered_elements(&reference));
     assert_eq!(data_blob_indexdata(&output), vec![true, true, true]);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&output)
@@ -3156,6 +3184,7 @@ fn repair_merges_a_repeated_info_and_dense_info() {
 /// replacing only indexdata, tagdata and datasize.
 #[test]
 fn repair_reads_indexed_blobs_and_keeps_their_header_fields() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let reference = dir.path().join("reference.osm.pbf");
     let indexed = |blocks: Vec<Vec<u8>>| -> Vec<(bool, Vec<u8>)> {
@@ -3192,7 +3221,7 @@ fn repair_reads_indexed_blobs_and_keeps_their_header_fields() {
     out.assert_stderr_contains("across 3 input blobs");
     assert_eq!(ordered_elements(&output), ordered_elements(&reference));
     assert_eq!(data_blob_header_field(&output, 9), vec![false, false, true]);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&output)

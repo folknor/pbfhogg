@@ -88,6 +88,7 @@ fn assert_names(out: &CliOutput, path: &Path, what: &str) {
 
 #[test]
 fn a_missing_input_of_every_kind_is_named() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     write_base(&base, 10);
@@ -95,7 +96,7 @@ fn a_missing_input_of_every_kind_is_named() {
     let missing = |name: &str| dir.path().join(format!("missing-{name}"));
 
     let pbf = missing("input.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .args([
             "cat".as_ref(),
             pbf.as_os_str(),
@@ -106,7 +107,7 @@ fn a_missing_input_of_every_kind_is_named() {
     assert_names(&out, &pbf, "PBF");
 
     let osc = missing("changes.osc.gz");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)
@@ -116,7 +117,7 @@ fn a_missing_input_of_every_kind_is_named() {
     assert_names(&out, &osc, "OSC");
 
     let ids = missing("ids.txt");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("getid")
         .arg(&base)
         .arg("--id-file")
@@ -127,7 +128,7 @@ fn a_missing_input_of_every_kind_is_named() {
     assert_names(&out, &ids, "ID file");
 
     let polygon = missing("region.geojson");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&base)
         .arg("--polygon")
@@ -138,7 +139,7 @@ fn a_missing_input_of_every_kind_is_named() {
     assert_names(&out, &polygon, "GeoJSON");
 
     let config = missing("extracts.json");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&base)
         .arg("--config")
@@ -147,7 +148,7 @@ fn a_missing_input_of_every_kind_is_named() {
     assert_names(&out, &config, "extract config");
 
     let expressions = missing("expressions.txt");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&base)
         .arg("-e")
@@ -165,6 +166,7 @@ fn a_missing_input_of_every_kind_is_named() {
 /// (merge-changes).
 #[test]
 fn a_malformed_osc_is_named() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     write_base(&base, 10);
@@ -175,7 +177,7 @@ fn a_malformed_osc_is_named() {
          <node id=\"1\" version=\"1\" lat=\"1.0\" lon=\"1.0\"/>\n</create>\n",
     );
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)
@@ -184,7 +186,7 @@ fn a_malformed_osc_is_named() {
         .run();
     assert_names(&out, &osc, "apply-changes");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("merge-changes")
         .arg(&osc)
         .arg("-o")
@@ -219,11 +221,12 @@ fn assert_write_failure_named(out: &CliOutput, output: &Path, what: &str) {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_pbf_write_names_the_output() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     write_base(&base, 20_000);
     let output = dir.path().join("repacked.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("repack")
         .arg(&base)
         .arg("-o")
@@ -241,6 +244,7 @@ fn a_failed_pbf_write_names_the_output() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_splice_names_the_output_and_the_input_range() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     write_base(&base, 20_000);
@@ -250,7 +254,7 @@ fn a_failed_splice_names_the_output_and_the_input_range() {
         "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"></osmChange>\n",
     );
     let output = dir.path().join("applied.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)
@@ -271,6 +275,7 @@ fn a_failed_splice_names_the_output_and_the_input_range() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_parallel_write_names_the_output() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     write_base(&base, 20_000);
@@ -284,7 +289,7 @@ fn a_failed_parallel_write_names_the_output() {
          </modify>\n</osmChange>\n",
     );
     let output = dir.path().join("rewritten.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)
@@ -301,11 +306,12 @@ fn a_failed_parallel_write_names_the_output() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_osc_write_names_the_output_and_not_the_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let osc = dir.path().join("changes.osc.gz");
     write_osc_gz(&osc, &creates(20_000));
     let output = dir.path().join("merged.osc.gz");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("merge-changes")
         .arg(&osc)
         .arg("-o")

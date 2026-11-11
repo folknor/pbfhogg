@@ -33,3 +33,29 @@ belongs with VER-098's compile-only profiling shapes in
 
 Fix: a compile-only musl shape with the profiling features, landed with
 VER-098's.
+
+## BUG-011 - pbfhogg has not opted into brokkr's bench-script contract tests and cache operation
+
+brokkr now ships what pbfhogg's bench findings asked for, and none of it is used
+yet:
+
+- A project-facing contract-test harness for Lua bench scripts: a
+  `bench_tests = "DIR"` key, `run(spec)` driving one arm of a real bench through
+  binding, `validate()`, `preflight()` and `bench()` against fake calls, run by
+  `brokkr check` and by `brokkr bench --test`. Opting in needs
+  `bench_scripts = "../benches"` and a `bench_tests` directory. The first test owed
+  is the one the ref-integrity fix deferred: `benches/check-refs/ref-integrity.lua`
+  must read `check-refs-relations` under `--check-relations yes` and
+  `check-refs` otherwise, through `benches/lib/expect.lua`, with different
+  declared answers for the two keys.
+- An unregistered-script check, so a script under `benches/` missing from
+  `brokkr.d/benches.toml` is refused.
+- A brokkr-owned page-cache operation for cold and warm benches, replacing
+  pbfhogg's ambient `dd` and `fincore` helper. It refuses read-only datasets, so
+  the datasets those benches use must be writable by brokkr's user on each host.
+- Typed param domains checked at bind time, which may replace locally copied
+  unsigned and bbox validators in the bench scripts.
+
+Fix: opt in, write the deferred ref-integrity contract test, move cache benches
+onto brokkr's operation and delete the helper, and replace local validators where
+brokkr's types now cover them.

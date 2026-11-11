@@ -540,9 +540,15 @@ fn altw_refusal_leaves_a_preexisting_destination_intact() {
         b"user data",
         "a refused run must leave the pre-existing destination untouched"
     );
+    assert!(
+        dir.path_state(&output)
+            .expect("inspect destination")
+            .expect("destination")
+            .is_file()
+    );
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .expect("read dir")
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .map(|e| e.expect("read scratch directory entry").file_name())
         .filter(|n| n != "precious.osm.pbf" && n != "in.osm.pbf")
         .collect();
     assert!(leftovers.is_empty(), "scratch file leaked: {leftovers:?}");

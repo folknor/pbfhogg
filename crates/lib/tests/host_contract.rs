@@ -1413,10 +1413,6 @@ fn diff_writes_no_scratch_at_any_worker_count() {
 /// the input or output (as before) would not.
 #[test]
 fn scratch_backends_write_inside_the_run_directory() {
-    // Root ignores directory permissions.
-    if unsafe { libc::geteuid() } == 0 {
-        return;
-    }
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
@@ -1426,19 +1422,17 @@ fn scratch_backends_write_inside_the_run_directory() {
         std::fs::create_dir(&parent).expect("parent");
         let scratch = crate::common::scratch_in(&parent);
         let run_dir = scratch.path().to_path_buf();
-        std::fs::set_permissions(
-            &run_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o500),
-        )
-        .expect("lock the run directory");
+        let denial = match dir.deny_write(&run_dir) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                crate::common::skip(reason);
+                return;
+            }
+        };
         let output = dir.path().join(format!("locked-{command}-{jobs}.osc"));
         let host = crate::common::test_host();
         let result = run_scratch_backend(command, jobs, &base, &changed, &output, &host, scratch);
-        std::fs::set_permissions(
-            &run_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .expect("unlock");
+        drop(denial);
         let err = result.expect_err("a run directory that cannot be written must fail the run");
         assert!(
             err.contains(&run_dir.display().to_string()),

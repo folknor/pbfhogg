@@ -141,16 +141,12 @@ pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
 }
 
 #[cfg(test)]
-#[path = "../tests/common/scratch.rs"]
-mod shared_scratch;
-
-#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    // Include only the shared allocator, keeping the integration harness
-    // and its public-library imports out of the library under test.
-    pub(crate) use super::shared_scratch::test_scratch as scratch;
+    // The library's unit tests take scratch from the dev-only
+    // `pbfhogg-test-scratch` crate, the same owner every harness uses.
+    pub(crate) use pbfhogg_test_scratch::scratch;
 
     #[test]
     fn file_drop_removes() {

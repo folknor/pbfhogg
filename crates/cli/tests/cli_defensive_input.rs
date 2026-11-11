@@ -67,12 +67,13 @@ fn write_lying_sorted_pbf(path: &Path) {
 /// resolution agree only when IDs increase in file order.
 #[test]
 fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_lying_sorted_pbf(&input);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&input)
         .arg("-o")
@@ -102,12 +103,13 @@ fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
 
 #[test]
 fn renumber_unsorted_header_error_explains_renumber_requirement() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &[], &[], &[]);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&input)
         .arg("-o")
@@ -138,6 +140,7 @@ fn renumber_unsorted_header_error_explains_renumber_requirement() {
 /// drop upsert creates.
 #[test]
 fn apply_changes_rejects_unsorted_header() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let diff = dir.path().join("diff.osc.gz");
@@ -163,7 +166,7 @@ fn apply_changes_rejects_unsorted_header() {
         .expect("write xml");
     enc.finish().expect("finish gz");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&diff)
@@ -286,6 +289,7 @@ fn write_three_kind_fixture(path: &Path) {
 /// indexdata, before stage 1's own reversed-range check is reached.
 #[test]
 fn altw_external_rejects_reversed_indexdata_range() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -310,7 +314,7 @@ fn altw_external_rejects_reversed_indexdata_range() {
     });
     std::fs::write(&input, &mutated).expect("rewrite fixture");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(&input)
         .arg("-o")
@@ -354,6 +358,7 @@ fn altw_external_rejects_reversed_indexdata_range() {
 /// only the strict walk can detect.
 #[test]
 fn renumber_rejects_truncated_relation_blob_payload() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -366,7 +371,7 @@ fn renumber_rejects_truncated_relation_blob_payload() {
     let mutated = set_relation_memids_terminator_continuation(&pbf, blob_idx, 0);
     std::fs::write(&input, &mutated).expect("rewrite fixture");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&input)
         .arg("-o")
@@ -411,6 +416,7 @@ fn renumber_rejects_truncated_relation_blob_payload() {
 /// without requiring a bespoke granularity-overflow fixture.
 #[test]
 fn cat_rejects_truncated_node_blob_payload() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -423,7 +429,7 @@ fn cat_rejects_truncated_node_blob_payload() {
     });
     std::fs::write(&input, &mutated).expect("rewrite fixture");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -461,11 +467,12 @@ fn cat_rejects_truncated_node_blob_payload() {
 /// fail with a different message.
 #[test]
 fn getparents_rejects_zero_full_scan_min_blobs() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let output = dir.path().join("out.osm.pbf");
     // Every other argument is well-formed, so the range check is the only
     // thing left that can reject this invocation.
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .args(["getparents", "/nonexistent/never-opened.osm.pbf"])
         .arg("-o")
         .arg(&output)
@@ -484,10 +491,11 @@ fn getparents_rejects_zero_full_scan_min_blobs() {
 /// commands that construct their readers through the host.
 #[test]
 fn bench_commands_report_unrecognised_indexdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let path = dir.path().join("bad-indexdata.osm.pbf");
     crate::common::write_bad_indexdata_pbf(&path);
-    let input = path.to_str().expect("utf-8 scratch path");
+    let input = path.as_os_str();
     // Parallel map/reduce and the unfiltered pipeline have always skipped
     // indexdata parsing. Keep that fast path, including its lack of a warning.
     for (mode, warnings) in [
@@ -496,8 +504,13 @@ fn bench_commands_report_unrecognised_indexdata() {
         ("pipelined", 0),
         ("blobreader", 1),
     ] {
-        let out = CliInvoker::new()
-            .args(["bench-read", input, "--mode", mode])
+        let out = CliInvoker::new(&invocation_scratch)
+            .args([
+                std::ffi::OsStr::new("bench-read"),
+                input,
+                std::ffi::OsStr::new("--mode"),
+                std::ffi::OsStr::new(mode),
+            ])
             .assert_success();
         let stderr = out.stderr_str();
         assert_eq!(
@@ -517,8 +530,13 @@ fn bench_commands_report_unrecognised_indexdata() {
         }
     }
     for mode in ["sync", "pipelined"] {
-        let out = CliInvoker::new()
-            .args(["bench-write", input, "--writer", mode])
+        let out = CliInvoker::new(&invocation_scratch)
+            .args([
+                std::ffi::OsStr::new("bench-write"),
+                input,
+                std::ffi::OsStr::new("--writer"),
+                std::ffi::OsStr::new(mode),
+            ])
             .assert_success();
         let stderr = out.stderr_str();
         assert_eq!(
@@ -639,6 +657,7 @@ fn assert_refused(out: &crate::invoker::CliOutput, needle: &str, context: &str) 
 /// (time-filter history) and even when the user is being cleaned away.
 #[test]
 fn bad_user_and_role_string_indices_are_refused_on_reencode() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let user_needle = "node 1: user name string index 9";
     let role_needle = "relation 1 member 0: role string index 9";
@@ -649,7 +668,7 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
         for historical in [false, true] {
             let input = dir.path().join("bad-string.osm.pbf");
             write_bad_string_pbf(&input, bad, historical);
-            let out = CliInvoker::new()
+            let out = CliInvoker::new(&invocation_scratch)
                 .arg("time-filter")
                 .arg(&input)
                 .arg("-o")
@@ -665,7 +684,7 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
         let input = dir.path().join("bad-string.osm.pbf");
         write_bad_string_pbf(&input, bad, false);
         // Re-encoding that keeps the user refuses it.
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("cat")
             .arg(&input)
             .arg("-o")
@@ -677,7 +696,7 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
     // Roles have no --clean and stay refused under `--clean user`.
     let input = dir.path().join("bad-string.osm.pbf");
     write_bad_string_pbf(&input, BadString::Role, false);
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -692,11 +711,12 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
 /// work and must never complete as a faster run.
 #[test]
 fn bench_write_refuses_a_bad_role_string_index() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("bad-role.osm.pbf");
     write_bad_string_pbf(&input, BadString::Role, false);
     for mode in ["sync", "pipelined"] {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("bench-write")
             .arg(&input)
             .args(["--writer", mode])
@@ -713,11 +733,12 @@ fn bench_write_refuses_a_bad_role_string_index() {
 /// out-of-range user string index is rescued by it.
 #[test]
 fn cat_clean_user_rescues_a_bad_user_string_index() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("bad-user.osm.pbf");
     write_bad_string_pbf(&input, BadString::User, false);
     let output = dir.path().join("rescued.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -1010,9 +1031,10 @@ fn write_raw_rewrite_osc(path: &Path) {
 }
 
 fn run_raw_rewrite(dir: &Path, base: &Path) -> crate::invoker::CliOutput {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let osc = dir.join("diff.osc.gz");
     write_raw_rewrite_osc(&osc);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(base)
         .arg(&osc)

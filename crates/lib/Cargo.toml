@@ -80,6 +80,8 @@ libc = "0.2.191"
 
 
 [dev-dependencies]
+# Path-only with no version: `cargo publish` strips it.
+pbfhogg-test-scratch = { path = "../test-scratch" }
 tempfile = "3.27.0"
 proptest = "1"
 

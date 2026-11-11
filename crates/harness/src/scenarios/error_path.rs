@@ -78,7 +78,8 @@ impl Scenario for ErrorPath {
             let input = env.binding("bad-input");
             cat_into(env, &[input], "out", None, &CLEAN_NONE, host).map(drop)
         })?;
-        let out_absent = super::absent(ctx.binding("out"));
+        let out_absent =
+            super::absent(ctx.binding("out")).map_err(|e| format!("inspect output: {e}"))?;
         // The output was bound before the input was read, so its owner's
         // drop decided it refused; nothing reached the destination.
         let ok = record

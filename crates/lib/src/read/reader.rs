@@ -1421,7 +1421,10 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn public_readers_keep_the_page_cache_unless_asked() {
-        let path = "tests/test.osm.pbf";
+        let dir = crate::path_guard::tests::scratch();
+        let fixture = dir.child("input.osm.pbf");
+        crate::test_support::multi_blob_pbf(&fixture);
+        let path = fixture.as_path();
 
         // The default keeps: the header blob is read and nothing is advised.
         let default_keep = ElementReader::from_path(path).unwrap();
@@ -1938,7 +1941,10 @@ mod tests {
         // channel. This one pins the wiring: the real pipeline thread must
         // actually set the flag, or every pipelined read in the crate would end
         // with the spurious error asserted above.
-        let real = ElementReader::from_path("tests/test.osm.pbf")
+        let dir = crate::path_guard::tests::scratch();
+        let fixture = dir.child("input.osm.pbf");
+        crate::test_support::multi_blob_pbf(&fixture);
+        let real = ElementReader::from_path(&fixture)
             .unwrap()
             .into_blocks_pipelined()
             .unwrap();
@@ -1956,7 +1962,7 @@ mod tests {
         // Early termination must stay clean too: dropping the iterator part-way
         // is a supported use (zipping, `take`), and must not turn into an error
         // on the next call.
-        let mut partial = ElementReader::from_path("tests/test.osm.pbf")
+        let mut partial = ElementReader::from_path(&fixture)
             .unwrap()
             .into_blocks_pipelined()
             .unwrap();

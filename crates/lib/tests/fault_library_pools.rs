@@ -96,7 +96,7 @@ fn run_held<T: Send + 'static>(
     result
 }
 
-fn many_block_input() -> (tempfile::TempDir, std::path::PathBuf) {
+fn many_block_input() -> (pbfhogg_test_scratch::TestScratch, std::path::PathBuf) {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 8);

@@ -107,7 +107,7 @@ impl Scenario for NofileCatRefused {
             // Raw spellings: `dir/./name`, `dir/././name`, ... Each is its
             // own pin (cat compares spellings byte for byte).
             let dir = env.private_dir();
-            missing_exists = !super::absent(&dir.join(MISSING));
+            missing_exists = !super::absent(&dir.join(MISSING))?;
             let spellings: Vec<PathBuf> = (0..SPELLINGS)
                 .map(|k| {
                     let mut path = OsString::from(dir.as_os_str());
@@ -122,7 +122,8 @@ impl Scenario for NofileCatRefused {
             let inputs: Vec<&std::path::Path> = spellings.iter().map(PathBuf::as_path).collect();
             super::cat_into(env, &inputs, "out", None, &CLEAN_NONE, host).map(drop)
         })?;
-        let out_absent = super::absent(ctx.binding("out"));
+        let out_absent =
+            super::absent(ctx.binding("out")).map_err(|e| format!("inspect output: {e}"))?;
         let scanned = markers.saw("CAT_SCAN_START");
         let ok = record.outcome.error().is_some_and(|(kind, message)| {
             kind == "invalid_argument" && message.contains("descriptors")
@@ -247,7 +248,7 @@ impl Scenario for NofileMultiExtractRefused {
         let record = ctx.call(spec, |host, env| {
             let dir = env.private_dir();
             let missing = dir.join(MISSING);
-            missing_exists = !super::absent(&missing);
+            missing_exists = !super::absent(&missing)?;
             // Held to the end of the call: every descriptor but MULTI_FREE
             // under the soft limit.
             let fillers = fill_descriptors(dir, MULTI_FREE)?;
@@ -277,9 +278,11 @@ impl Scenario for NofileMultiExtractRefused {
             drop(fillers);
             result.map(drop)
         })?;
-        let outs_absent = MULTI_OUTPUTS
-            .iter()
-            .all(|role| super::absent(ctx.binding(role)));
+        let mut outs_absent = true;
+        for role in MULTI_OUTPUTS {
+            outs_absent &= super::absent(ctx.binding(role))
+                .map_err(|e| format!("inspect output {role}: {e}"))?;
+        }
         let scanned = markers.saw("MULTI_EXTRACT_START");
         let refused_row = matches!(
             record.publications.as_slice(),

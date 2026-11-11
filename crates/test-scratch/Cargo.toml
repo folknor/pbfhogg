@@ -1,0 +1,28 @@
+[package]
+name = "pbfhogg-test-scratch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only: the one test scratch owner for every pbfhogg test harness"
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# A leaf on purpose: no features and no dependency on pbfhogg, so the library's
+# `minimal` sweep and the CLI's feature unification cannot reach it. The
+# packages that use it name it as a path-only dev-dependency with no version,
+# which `cargo publish` strips from the published manifests.
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

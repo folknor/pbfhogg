@@ -1201,11 +1201,22 @@ fn force_without_indexdata_bounds_node_ids_from_the_blobs() {
 #[ignore = "external"]
 fn legal_non_dense_nodes_build_a_queryable_index() {
     let dir = crate::common::test_scratch();
+    match crate::common::oracle::Oracle::new(&dir)
+        .arg("--version")
+        .output()
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::common::skip("osmium not found in PATH");
+            return;
+        }
+        Err(error) => panic!("osmium version probe: {error}"),
+    }
     let dense = dir.path().join("dense.osm.pbf");
     let input = dir.path().join("non-dense.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&dense);
-    let status = std::process::Command::new("osmium")
+    let status = crate::common::oracle::Oracle::new(&dir)
         .args(["cat", "-f", "pbf,pbf_dense_nodes=false", "-o"])
         .arg(&input)
         .arg(&dense)
@@ -2625,7 +2636,7 @@ fn build_small_index(
     nodes: &[TestNode],
     ways: &[TestWay],
 ) -> (
-    tempfile::TempDir,
+    pbfhogg_test_scratch::TestScratch,
     pbfhogg::geocode_index::builder::BuildStats,
     pbfhogg::geocode_index::reader::Reader,
 ) {

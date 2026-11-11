@@ -42,7 +42,7 @@
 
 [[check]]
 name = "all"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
 features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
 # binaries executed directly, budget = tests in flight, defaulting to the L3
@@ -104,7 +104,7 @@ parallel = {}
 # x86_64 musl binaries run natively on the glibc host.
 [[check]]
 name = "musl"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 

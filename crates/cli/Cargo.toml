@@ -70,6 +70,8 @@ hotpath = "0.31.0"
 libc = "0.2.191"
 
 [dev-dependencies]
+# Path-only with no version: `cargo publish` strips it.
+pbfhogg-test-scratch = { path = "../test-scratch" }
 tempfile = "3.27.0"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 zstd = "0.14.0"

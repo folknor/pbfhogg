@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const EXE: &str = env!("CARGO_BIN_EXE_pbfhogg-harness");
 
@@ -21,16 +21,16 @@ struct Ran {
 /// Run `cmd` under the promise guard with nothing inherited of the
 /// protocol's or the profiler's variables but what `env` sets.
 #[allow(clippy::disallowed_methods)] // capture files in test scratch
-fn run(mut cmd: Command, env: &[(&str, &str)], scratch: &Path) -> Ran {
-    for var in [
-        "BROKKR_MARKER_FIFO",
-        "BROKKR_HARNESS_ARTEFACT_DIR",
-        "HOTPATH_OUTPUT_PATH",
-        "HOTPATH_OUTPUT_FORMAT",
-        "HOTPATH_METRICS_SERVER_OFF",
-        "RAYON_NUM_THREADS",
-    ] {
-        cmd.env_remove(var);
+fn run(
+    mut cmd: Command,
+    env: &[(&str, &std::ffi::OsStr)],
+    scratch: &Path,
+    owner: &pbfhogg_test_scratch::TestScratch,
+) -> Ran {
+    let cwd = cmd.get_current_dir().map(Path::to_path_buf);
+    crate::common::process::isolate(&mut cmd, owner);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
     }
     cmd.envs(env.iter().copied());
     let out = scratch.join("stdout");
@@ -39,19 +39,12 @@ fn run(mut cmd: Command, env: &[(&str, &str)], scratch: &Path) -> Ran {
         .stdout(std::fs::File::create(&out).expect("stdout file"))
         .stderr(std::fs::File::create(&err).expect("stderr file"));
     crate::guard::apply(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn the harness");
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait for the harness") {
-            break status;
-        }
-        if start.elapsed() > Duration::from_secs(15) {
-            child.kill().ok();
-            child.wait().ok();
-            panic!("the harness did not finish");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let mut child =
+        crate::common::process::OwnedChild::spawn(&mut cmd, owner).expect("spawn the harness");
+    let status = child
+        .wait(pbfhogg::TEST_CHILD_TIMEOUT)
+        .expect("wait for the harness")
+        .status;
     assert!(
         !crate::guard::killed_by_guard(status),
         "the harness broke the promise guard"
@@ -68,7 +61,7 @@ fn describe_prints_one_valid_document_and_nothing_else() {
     let scratch = crate::common::test_scratch();
     let mut cmd = Command::new(EXE);
     cmd.arg("--describe-harness").current_dir(scratch.path());
-    let ran = run(cmd, &[], scratch.path());
+    let ran = run(cmd, &[], scratch.path(), &scratch);
     assert!(ran.status.success(), "{}", ran.status);
     assert!(
         ran.stderr.is_empty(),
@@ -133,7 +126,7 @@ impl Fifo {
 
 /// A run directory laid out as brokkr lays it out.
 struct RunDir {
-    _scratch: tempfile::TempDir,
+    _scratch: pbfhogg_test_scratch::TestScratch,
     root: PathBuf,
 }
 
@@ -164,14 +157,14 @@ impl RunDir {
             .current_dir(self.root.join("cwd"));
         let artefacts = self.root.join("artefacts");
         let mut vars = vec![
-            (
-                "BROKKR_HARNESS_ARTEFACT_DIR",
-                artefacts.to_str().expect("UTF-8"),
-            ),
-            ("BROKKR_MARKER_FIFO", fifo.to_str().expect("UTF-8")),
+            ("BROKKR_HARNESS_ARTEFACT_DIR", artefacts.as_os_str()),
+            ("BROKKR_MARKER_FIFO", fifo.as_os_str()),
         ];
-        vars.extend_from_slice(env);
-        run(cmd, &vars, &self.root.join("capture"))
+        vars.extend(
+            env.iter()
+                .map(|(key, value)| (*key, std::ffi::OsStr::new(value))),
+        );
+        run(cmd, &vars, &self.root.join("capture"), &self._scratch)
     }
 
     fn doc(&self, relative: &str) -> Value {
@@ -193,7 +186,7 @@ const REPEAT_CAT: &str = r#"{"protocol": 1, "scenario": "repeat-cat", "iteration
   "bindings": {"input": "@INPUT@", "out-a": "@ROLES@/out-a", "out-b": "@ROLES@/out-b"}}"#;
 
 /// A sorted, indexed input in its own scratch.
-fn input() -> (tempfile::TempDir, PathBuf) {
+fn input() -> (pbfhogg_test_scratch::TestScratch, PathBuf) {
     let scratch = crate::common::test_scratch();
     let path = scratch
         .path()

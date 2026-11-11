@@ -23,7 +23,8 @@ use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Invoke `pbfhogg sort --force -o <output> <input>`.
 fn run_sort(input: &Path, output: &Path) {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(input)
         .arg("-o")
@@ -547,21 +548,23 @@ fn sort_already_sorted() {
 #[test]
 #[ignore = "external"]
 fn sort_cross_validate_osmium() {
-    let osmium_check = std::process::Command::new("osmium")
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let osmium_check = crate::common::oracle::Oracle::new(&dir)
         .arg("--version")
         .output();
-    if osmium_check.is_err() {
+    if matches!(&osmium_check, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         crate::common::skip("osmium not found in PATH");
         return;
     }
 
-    let dir = crate::common::test_scratch();
+    osmium_check.expect("osmium version probe");
     let input = dir.path().join("overlapping.osm.pbf");
     let pbfhogg_out = dir.path().join("pbfhogg_sorted.osm.pbf");
     let osmium_out = dir.path().join("osmium_sorted.osm.pbf");
 
     write_unsorted_overlapping_pbf(&input);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .timeout(std::time::Duration::from_secs(110))
         .arg("sort")
         .arg(&input)
@@ -570,8 +573,10 @@ fn sort_cross_validate_osmium() {
         .arg("--force")
         .assert_success();
 
-    let status = std::process::Command::new("osmium")
-        .args(["sort", input.to_str().expect("path"), "-o"])
+    let status = crate::common::oracle::Oracle::new(&dir)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
         .arg(&osmium_out)
         .arg("--overwrite")
         .status()
@@ -831,6 +836,7 @@ fn sort_preserves_historical_information_feature() {
 /// out-of-order blob into the decode + re-encode path.
 #[test]
 fn sort_repairs_intra_blob_disorder_in_non_indexed_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("intra_unsorted.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
@@ -840,7 +846,7 @@ fn sort_repairs_intra_blob_disorder_in_non_indexed_input() {
     // no indexdata, forcing the payload-decoding pass-1 fallback.
     assert_non_indexed(&input);
 
-    let run = CliInvoker::new()
+    let run = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -881,6 +887,7 @@ fn sort_repairs_intra_blob_disorder_in_non_indexed_input() {
 /// decode + re-encode.
 #[test]
 fn sort_repairs_intra_blob_disorder_in_catted_indexed_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let raw = dir.path().join("intra_unsorted_raw.osm.pbf");
     let catted = dir.path().join("intra_unsorted_catted.osm.pbf");
@@ -890,7 +897,7 @@ fn sort_repairs_intra_blob_disorder_in_catted_indexed_input() {
     assert_non_indexed(&raw);
 
     // cat indexes the blobs but never reorders elements.
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&raw)
         .arg("-o")
@@ -905,7 +912,7 @@ fn sort_repairs_intra_blob_disorder_in_catted_indexed_input() {
 
     // Indexed input: no --force needed. Pre-fix this run passed the
     // disordered blob through and stamped a false sorted claim.
-    let run = CliInvoker::new()
+    let run = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&catted)
         .arg("-o")
@@ -932,6 +939,7 @@ fn sort_repairs_intra_blob_disorder_in_catted_indexed_input() {
 /// path the header-claim-keyed trust ruling deliberately preserves.
 #[test]
 fn sort_declared_sorted_indexed_input_skips_payload_verification() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("declared_sorted.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
@@ -965,7 +973,7 @@ fn sort_declared_sorted_indexed_input_skips_payload_verification() {
     assert_indexed(&input);
     assert!(read_header(&input).is_sorted(), "fixture must claim sorted");
 
-    let run = CliInvoker::new()
+    let run = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -993,6 +1001,7 @@ fn sort_declared_sorted_indexed_input_skips_payload_verification() {
 /// not flag well-formed blobs (no false positives, no rewrite regression).
 #[test]
 fn sort_sorted_non_indexed_input_stays_on_passthrough() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("sorted_non_indexed.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
@@ -1033,7 +1042,7 @@ fn sort_sorted_non_indexed_input_stays_on_passthrough() {
     );
     assert_non_indexed(&input);
 
-    let run = CliInvoker::new()
+    let run = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -1079,13 +1088,14 @@ mod backends {
     #[cfg(feature = "linux-direct-io")]
     #[test]
     fn sort_overlapping_blobs_direct_io() {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("overlapping.osm.pbf");
         let output = dir.path().join("sorted.osm.pbf");
 
         write_unsorted_overlapping_pbf(&input);
 
-        let run = CliInvoker::new()
+        let run = CliInvoker::new(&invocation_scratch)
             .arg("sort")
             .arg(&input)
             .arg("-o")
@@ -1127,13 +1137,14 @@ mod backends {
     #[cfg(feature = "linux-io-uring")]
     #[test]
     fn sort_overlapping_blobs_uring() {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("overlapping.osm.pbf");
         let output = dir.path().join("sorted.osm.pbf");
 
         write_unsorted_overlapping_pbf(&input);
 
-        let run = CliInvoker::new()
+        let run = CliInvoker::new(&invocation_scratch)
             .arg("sort")
             .arg(&input)
             .arg("-o")
@@ -1189,13 +1200,14 @@ mod backends {
 #[cfg(not(feature = "linux-direct-io"))]
 #[test]
 fn sort_direct_io_feature_missing_error() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_unsorted_overlapping_pbf(&input);
 
-    let run = CliInvoker::new()
+    let run = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -1218,13 +1230,14 @@ fn sort_direct_io_feature_missing_error() {
 #[cfg(not(feature = "linux-io-uring"))]
 #[test]
 fn sort_io_uring_feature_missing_error() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_unsorted_overlapping_pbf(&input);
 
-    let run = CliInvoker::new()
+    let run = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -1246,6 +1259,7 @@ fn sort_io_uring_feature_missing_error() {
 
 #[test]
 fn sort_refuses_non_leading_header_frames() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_unsorted_overlapping_pbf(&input);
@@ -1256,7 +1270,7 @@ fn sort_refuses_non_leading_header_frames() {
         let bad = dir.path().join(format!("header-at-{insertion}.osm.pbf"));
         let doubled = [&bytes[..insertion], header, &bytes[insertion..]].concat();
         std::fs::write(&bad, doubled).expect("write repeated header");
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("sort")
             .arg(&bad)
             .arg("-o")
@@ -1316,12 +1330,13 @@ fn write_way_blob_claiming_nodes(path: &Path, sorted: bool) {
 /// nothing.
 #[test]
 fn sort_refuses_a_believed_claim_its_decoded_overlap_blob_contradicts() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("lying.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_way_blob_claiming_nodes(&input, true);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -1386,6 +1401,7 @@ pub(crate) const FORGED_SWEEP_RANGES: [(&[&[i64]], usize, i64, i64); 2] = [
 /// nothing published.
 #[test]
 fn sort_refuses_a_decoded_overlap_blob_its_claimed_range_misdescribes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     for (blobs, frame, min_id, max_id) in FORGED_SWEEP_RANGES {
         let dir = crate::common::test_scratch();
         let honest = dir.path().join("honest.osm.pbf");
@@ -1397,7 +1413,7 @@ fn sort_refuses_a_decoded_overlap_blob_its_claimed_range_misdescribes() {
             crate::common::adversarial::forge_indexdata_range(&bytes, frame, min_id, max_id, None);
         std::fs::write(&input, lying).expect("write forged file");
 
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("sort")
             .arg(&input)
             .arg("-o")
@@ -1472,6 +1488,7 @@ fn node_ids(path: &Path) -> Vec<i64> {
 /// blob, rewrites the one out of order, and the output passes `check --ids`.
 #[test]
 fn sort_distrust_metadata_repairs_disorder_under_a_sorted_claim() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("intra.osm.pbf");
     write_intra_unsorted_under_sorted_claim(&input);
@@ -1485,7 +1502,7 @@ fn sort_distrust_metadata_repairs_disorder_under_a_sorted_claim() {
     );
 
     let repaired = dir.path().join("repaired.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg("--distrust-metadata")
         .arg(&input)
@@ -1495,7 +1512,7 @@ fn sort_distrust_metadata_repairs_disorder_under_a_sorted_claim() {
     out.assert_stderr_contains("internally unsorted");
     assert_eq!(node_ids(&repaired), vec![1, 2, 3]);
     assert_sorted_file(&repaired);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--ids")
         .arg("--index")
@@ -1509,6 +1526,7 @@ fn sort_distrust_metadata_repairs_disorder_under_a_sorted_claim() {
 /// one is replaced. An honest blob keeps its header byte for byte.
 #[test]
 fn sort_distrust_metadata_replaces_false_tagdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     crate::common::write_test_pbf_sorted(
@@ -1524,7 +1542,7 @@ fn sort_distrust_metadata_replaces_false_tagdata() {
         &[],
     );
     let lying = dir.path().join("lying.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -1534,14 +1552,14 @@ fn sort_distrust_metadata_replaces_false_tagdata() {
 
     let plain = dir.path().join("plain.osm.pbf");
     run_sort(&lying, &plain);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&plain)
         .assert_failure();
 
     let repaired = dir.path().join("repaired.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg("--distrust-metadata")
         .arg(&lying)
@@ -1549,14 +1567,14 @@ fn sort_distrust_metadata_replaces_false_tagdata() {
         .arg(&repaired)
         .assert_success();
     out.assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&repaired)
         .assert_success();
 
     let kept = dir.path().join("kept.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg("--distrust-metadata")
         .arg(&honest)
@@ -1589,6 +1607,7 @@ fn sort_distrust_metadata_replaces_false_tagdata() {
 /// copying it through because the keys match as a set.
 #[test]
 fn sort_distrust_metadata_replaces_out_of_order_tagdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     crate::common::write_test_pbf_sorted(
@@ -1630,7 +1649,7 @@ fn sort_distrust_metadata_replaces_out_of_order_tagdata() {
     .expect("write fixture");
 
     let repaired = dir.path().join("repaired.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg("--distrust-metadata")
         .arg(&unsorted)
@@ -1644,7 +1663,7 @@ fn sort_distrust_metadata_replaces_out_of_order_tagdata() {
         Some(canonical.as_slice()),
         "the regenerated tagdata is present and canonical"
     );
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(&repaired)
@@ -1655,6 +1674,7 @@ fn sort_distrust_metadata_replaces_out_of_order_tagdata() {
 /// `--force`.
 #[test]
 fn sort_distrust_metadata_needs_no_indexdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("unindexed.osm.pbf");
     let node = |id: i64| TestNode {
@@ -1666,7 +1686,7 @@ fn sort_distrust_metadata_needs_no_indexdata() {
     };
     write_test_pbf_non_indexed(&input, &[node(2), node(1)], &[], &[]);
     let output = dir.path().join("out.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg("--distrust-metadata")
         .arg(&input)

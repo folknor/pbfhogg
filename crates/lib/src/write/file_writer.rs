@@ -331,7 +331,8 @@ mod tests {
         #[test]
         fn einval_on_a_regular_file_stays_an_error() {
             // Only the file type is consulted; any regular file will do.
-            let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+            let dir = pbfhogg_test_scratch::scratch();
+            let file = File::create(dir.child("regular-file")).unwrap();
             assert!(!sync_unsupported(Some(libc::EINVAL), || file_type_of(
                 &file
             )));

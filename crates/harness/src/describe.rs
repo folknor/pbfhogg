@@ -55,7 +55,7 @@ mod tests {
     /// The ids of brokkr.toml's `[pbfhogg.library.require]` table: one
     /// quoted key per line, up to the next table header.
     fn required() -> std::collections::BTreeSet<String> {
-        let path = crate::test_scratch::workspace_root().join("brokkr.toml");
+        let path = pbfhogg_test_scratch::repository_root().join("brokkr.toml");
         let text = std::fs::read_to_string(path).expect("brokkr.toml");
         text.lines()
             .skip_while(|l| l.trim() != "[pbfhogg.library.require]")

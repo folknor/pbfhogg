@@ -771,7 +771,7 @@ mod tests {
     /// length (buffered: the fake ignores it), so the length and regular-file
     /// limits are the ones `from_opened` takes from the metadata.
     struct Harness {
-        _dir: tempfile::TempDir,
+        _dir: pbfhogg_test_scratch::TestScratch,
         reader: DirectReader,
         fake: FakeFile,
     }

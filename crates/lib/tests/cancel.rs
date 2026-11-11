@@ -16,14 +16,14 @@
 
 use std::path::{Path, PathBuf};
 
-use tempfile::TempDir;
+use pbfhogg_test_scratch::TestScratch;
 
 /// One library command, run against fixtures in `inputs`, writing to `out`
 /// and putting any scratch in `scratch`.
 type Command = fn(&Inputs, &Path, &Path, &pbfhogg::host::Host) -> pbfhogg::Result<()>;
 
 struct Inputs {
-    dir: TempDir,
+    dir: TestScratch,
 }
 
 impl Inputs {

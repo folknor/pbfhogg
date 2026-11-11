@@ -212,7 +212,8 @@ fn check_bindings(decl: &ScenarioDecl, bindings: &BTreeMap<String, PathBuf>) -> 
                     path.symlink_metadata().is_ok_and(|m| m.is_file())
                         && std::fs::read(path).is_ok_and(|b| b == crate::protocol::seed(role.id))
                 } else {
-                    path.symlink_metadata().is_err()
+                    crate::scenarios::absent(path)
+                        .map_err(|e| format!("inspect role {}: {e}", role.id))?
                 };
                 if !initial_ok {
                     return Err(format!("role {} is not in its initial state", role.id));

@@ -131,7 +131,8 @@ struct ApplyOpts {
 }
 
 fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(base)
         .arg(osc)
@@ -2220,7 +2221,8 @@ fn passed_through(path: &Path, frame: &[u8]) -> bool {
 /// `pbfhogg check --locations` on an output: every inline coordinate
 /// agrees with its node record.
 fn assert_locations_check_passes(path: &Path) {
-    let out = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--locations")
         .arg(path)
@@ -2999,6 +3001,7 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
 /// merely inert also passes "the flag parsed".
 #[test]
 fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -3040,7 +3043,7 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
     );
 
     // The escape hatch restores the old positional rule.
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)
@@ -3077,6 +3080,7 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
 /// with different content. Each used to fail the whole apply.
 #[test]
 fn merge_admits_equal_versions_from_overlapping_diffs() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let first = dir.path().join("4705.osc.gz");
@@ -3136,7 +3140,7 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
   </delete>
 </osmChange>"#,
     );
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("merge-changes")
         .arg(&first)
         .arg(&second)
@@ -3171,7 +3175,7 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
 </osmChange>"#,
     );
     let combined_stale = dir.path().join("combined-stale.osc.gz");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("merge-changes")
         .arg(&first)
         .arg(&second)
@@ -3186,7 +3190,7 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
         "error must name the regression; stderr:\n{}",
         out.stderr_str()
     );
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&combined_stale)
@@ -3210,8 +3214,9 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
 /// `-l`), so the combination is a usage error, before any input is opened.
 #[test]
 fn merge_refuses_force_with_locations_on_ways_before_any_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(dir.path().join("no-such-base.osm.pbf"))
         .arg(dir.path().join("no-such-diff.osc.gz"))

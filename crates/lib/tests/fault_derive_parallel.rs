@@ -56,15 +56,21 @@ fn write_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 
 /// One plain-XML derive at `jobs` and `unit_bytes` (0 keeps the default),
 /// written to a fresh output each call.
-fn derive_xml(dir: &Path, old: &Path, new: &Path, jobs: usize, unit_bytes: usize) -> String {
-    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn derive_xml(
+    owner: &pbfhogg_test_scratch::TestScratch,
+    old: &Path,
+    new: &Path,
+    jobs: usize,
+    unit_bytes: usize,
+) -> String {
+    let cell = owner.cell();
+    let dir = cell.as_path();
     let host = crate::common::test_host();
     host.invocation
         .faults()
         .diff_unit_target_bytes
         .store(unit_bytes, Ordering::Relaxed);
-    let run = RUN.fetch_add(1, Ordering::Relaxed);
-    let osc = dir.join(format!("out-{jobs}-{unit_bytes}-{run}.osc"));
+    let osc = dir.join("out.osc");
     derive_changes(
         old,
         new,
@@ -86,12 +92,12 @@ fn derive_xml(dir: &Path, old: &Path, new: &Path, jobs: usize, unit_bytes: usize
 fn the_osc_does_not_depend_on_the_cuts() {
     let dir = crate::common::test_scratch();
     let (old, new) = write_pair(dir.path());
-    let reference = derive_xml(dir.path(), &old, &new, 1, 0);
+    let reference = derive_xml(&dir, &old, &new, 1, 0);
     assert!(reference.contains("<delete>") && reference.contains("<create>"));
     for jobs in [1, 3] {
         for unit_bytes in [1, 200, 0] {
             assert_eq!(
-                derive_xml(dir.path(), &old, &new, jobs, unit_bytes),
+                derive_xml(&dir, &old, &new, jobs, unit_bytes),
                 reference,
                 "jobs {jobs}, unit {unit_bytes}"
             );
@@ -103,7 +109,7 @@ fn the_osc_does_not_depend_on_the_cuts() {
 /// blob), `chunk` bytes per member and units spilling after `spill_after`
 /// queued members, decompressed. Asserts the run left no scratch behind.
 fn derive_gz(
-    dir: &Path,
+    owner: &pbfhogg_test_scratch::TestScratch,
     old: &Path,
     new: &Path,
     jobs: usize,
@@ -111,7 +117,8 @@ fn derive_gz(
     spill_after: usize,
 ) -> String {
     use std::io::Read;
-    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cell = owner.cell();
+    let dir = cell.as_path();
     let host = crate::common::test_host();
     let faults = host.invocation.faults();
     faults.diff_unit_target_bytes.store(1, Ordering::Relaxed);
@@ -119,10 +126,9 @@ fn derive_gz(
     faults
         .derive_spill_after
         .store(spill_after, Ordering::Relaxed);
-    let run = RUN.fetch_add(1, Ordering::Relaxed);
-    let scratch = dir.join(format!("scratch-gz-{run}"));
+    let scratch = dir.join("scratch");
     std::fs::create_dir(&scratch).unwrap();
-    let osc = dir.join(format!("out-gz-{run}.osc.gz"));
+    let osc = dir.join("out.osc.gz");
     derive_changes(
         old,
         new,
@@ -157,12 +163,12 @@ fn derive_gz(
 fn the_gzip_osc_does_not_depend_on_members_or_spills() {
     let dir = crate::common::test_scratch();
     let (old, new) = write_pair(dir.path());
-    let reference = derive_xml(dir.path(), &old, &new, 1, 0);
+    let reference = derive_xml(&dir, &old, &new, 1, 0);
     for jobs in [1, 3] {
         for chunk in [64, 0] {
             for spill_after in [usize::MAX, 0, 2] {
                 assert_eq!(
-                    derive_gz(dir.path(), &old, &new, jobs, chunk, spill_after),
+                    derive_gz(&dir, &old, &new, jobs, chunk, spill_after),
                     reference,
                     "jobs {jobs}, chunk {chunk}, spill after {spill_after}"
                 );

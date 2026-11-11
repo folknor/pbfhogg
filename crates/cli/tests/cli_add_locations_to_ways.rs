@@ -100,7 +100,8 @@ fn run_altw(
     backend: IndexBackend,
     direct_io: bool,
 ) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(input)
         .arg("-o")
@@ -117,7 +118,7 @@ fn run_altw(
 
 /// `--index-type T`, plus `--force` on the backends that take it: external
 /// requires indexed input whatever `--force` says, so it refuses the flag.
-fn backend_args(mut cli: CliInvoker, backend: IndexBackend) -> CliInvoker {
+fn backend_args<'a>(mut cli: CliInvoker<'a>, backend: IndexBackend) -> CliInvoker<'a> {
     if let Some(name) = backend.flag() {
         cli = cli.arg("--index-type").arg(name);
     }
@@ -137,7 +138,8 @@ fn run_altw_ignoring_missing(
     keep_untagged_nodes: bool,
     backend: IndexBackend,
 ) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(input)
         .arg("-o")
@@ -949,8 +951,9 @@ fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
 /// before any input is opened.
 #[test]
 fn altw_external_refuses_force_before_any_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(dir.path().join("no-such-input.osm.pbf"))
         .arg("-o")
@@ -1076,13 +1079,14 @@ fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
 /// and what to switch to.
 #[test]
 fn altw_dense_index_type_rejected_with_migration_hint() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(&input)
         .arg("-o")

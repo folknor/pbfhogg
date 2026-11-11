@@ -51,7 +51,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::invoker::{CliInvoker, CliOutput, subcommands};
-use tempfile::TempDir;
+use pbfhogg_test_scratch::TestScratch;
 
 const USER_DATA: &[u8] = b"user data";
 /// Appears in the name of every input that does not exist.
@@ -92,7 +92,7 @@ fn corrupt_last_blob(source: &Path, dest: &Path) {
 /// The fixtures every row draws from, built once per test into a directory
 /// kept apart from every output directory.
 struct Fx {
-    dir: TempDir,
+    dir: TestScratch,
     counter: Cell<usize>,
 }
 
@@ -699,7 +699,11 @@ fn build_geocode_index(c: &Ctx, i: Input) -> Invocation {
 // ---------------------------------------------------------------------------
 
 fn run(inv: &Invocation, extra: &[OsString]) -> CliOutput {
-    CliInvoker::new().args(&inv.args).args(extra).run()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
+        .args(&inv.args)
+        .args(extra)
+        .run()
 }
 
 fn names(dir: &Path) -> Vec<String> {
@@ -763,11 +767,6 @@ fn tmp_args(tmp: Option<&Path>) -> Vec<OsString> {
     tmp.map_or_else(Vec::new, |dir| {
         vec!["--tmp-dir".into(), dir.as_os_str().to_owned()]
     })
-}
-
-fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions.
-    unsafe { libc::geteuid() == 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -902,12 +901,12 @@ fn symlink_refused(fx: &Fx, row: &Row) -> Result<(), String> {
 
 fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
     // Fresh destination: nothing at all may be left, under any name.
-    let mut scratch_homes: Vec<Option<TempDir>> = vec![None];
+    let mut scratch_homes: Vec<Option<TestScratch>> = vec![None];
     if row.tmp_dir {
         scratch_homes.push(Some(crate::common::test_scratch()));
     }
     for tmp in &scratch_homes {
-        let tmp_path = tmp.as_ref().map(TempDir::path);
+        let tmp_path = tmp.as_ref().map(TestScratch::path);
         let dir = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
@@ -1097,12 +1096,15 @@ fn bad_tmp_dir_is_refused_first(fx: &Fx, row: &Row) -> Result<(), String> {
     std::fs::write(&a_file, b"x").unwrap();
     let locked = base.path().join("locked");
     std::fs::create_dir(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let denial = base.deny_write(&locked);
+    if let Err(reason) = &denial {
+        crate::common::skip(reason);
+    }
     let mut bad = vec![
         ("missing", base.path().join("no-such-dir"), "--tmp-dir"),
         ("a file", a_file, "not a directory"),
     ];
-    if !is_root() {
+    if denial.is_ok() {
         bad.push(("unwritable", locked.clone(), "--tmp-dir"));
     }
     let mut result = Ok(());
@@ -1142,7 +1144,7 @@ fn bad_tmp_dir_is_refused_first(fx: &Fx, row: &Row) -> Result<(), String> {
         }
     }
     let locked_left = names(&locked);
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    drop(denial);
     result?;
     ensure!(
         locked_left.is_empty(),
@@ -1265,6 +1267,7 @@ fn is_bench_key_value(line: &str) -> bool {
 /// it is global. A text diff is not a row here: a quiet text diff takes no
 /// `-o` (`cli_quiet` covers it).
 fn quiet_run_prints_only_warnings(fx: &Fx, row: &Row) -> Result<(), String> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let plain_dir = crate::common::test_scratch();
     let plain = (row.build)(
         &Ctx {
@@ -1294,7 +1297,10 @@ fn quiet_run_prints_only_warnings(fx: &Fx, row: &Row) -> Result<(), String> {
             Input::Good,
         );
         let out = if leading {
-            CliInvoker::new().arg("-q").args(&inv.args).run()
+            CliInvoker::new(&invocation_scratch)
+                .arg("-q")
+                .args(&inv.args)
+                .run()
         } else {
             run(&inv, &["-q".into()])
         };
@@ -1394,6 +1400,7 @@ fn run_property_on<'a>(prop: Prop, check: Check, rows: impl Iterator<Item = &'a 
 
 #[test]
 fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let commands = subcommands();
     assert!(
         commands.len() >= 20,
@@ -1424,7 +1431,7 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
     }
     // The table and the command's own surface must agree.
     for row in ROWS {
-        let help = CliInvoker::new()
+        let help = CliInvoker::new(&invocation_scratch)
             .args([row.command, "--help"])
             .assert_success()
             .stdout_str();
@@ -1447,7 +1454,7 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
         }
     }
     for (name, reason) in NO_OUTPUT {
-        let help = CliInvoker::new()
+        let help = CliInvoker::new(&invocation_scratch)
             .args([name, "--help"])
             .assert_success()
             .stdout_str();
@@ -1604,11 +1611,11 @@ mod interrupted {
     /// same phases every time, and a pause between the spill and its
     /// copy-back sees the payload. Every run of a row that is counted and
     /// then paused goes through here, so both see the same schedule.
-    pub(super) fn with_visible_scratch(row: &Row, invoker: CliInvoker) -> CliInvoker {
+    pub(super) fn with_visible_scratch<'a>(row: &Row, invoker: CliInvoker<'a>) -> CliInvoker<'a> {
         if row.command == "add-locations-to-ways" && row.label != SPARSE_ALTW_LABEL {
             invoker.args(["--index-type", "external"])
         } else if row.label == MERGE_CHANGES_SPILL_LABEL {
-            invoker.env("PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST", "1")
+            invoker.merge_changes_spill_first(1)
         } else {
             invoker
         }
@@ -1618,8 +1625,8 @@ mod interrupted {
     /// for rows that take it (so scratch and staging are told apart).
     struct Run<'r> {
         row: &'r Row,
-        out: TempDir,
-        tmp: Option<TempDir>,
+        out: TestScratch,
+        tmp: Option<TestScratch>,
         inv: Invocation,
     }
 
@@ -1637,10 +1644,10 @@ mod interrupted {
             Self { row, out, tmp, inv }
         }
 
-        fn invoker(&self, extra: &[OsString]) -> CliInvoker {
-            with_visible_scratch(self.row, CliInvoker::new().args(&self.inv.args))
+        fn invoker(&self, extra: &[OsString]) -> CliInvoker<'_> {
+            with_visible_scratch(self.row, CliInvoker::new(&self.out).args(&self.inv.args))
                 .args(extra)
-                .args(tmp_args(self.tmp.as_ref().map(TempDir::path)))
+                .args(tmp_args(self.tmp.as_ref().map(TestScratch::path)))
         }
     }
 
@@ -1650,10 +1657,7 @@ mod interrupted {
         let run = Run::new(fx, row);
         let control = crate::common::test_scratch();
         let count_file = control.path().join("count");
-        let out = run
-            .invoker(&[])
-            .env("PBFHOGG_TEST_CANCEL_COUNT", &count_file)
-            .run();
+        let out = run.invoker(&[]).cancel_count(&count_file).run();
         ensure!(
             exited_ok(row, &out),
             "the counting run failed: exit {:?}; stderr:\n{}",
@@ -1702,10 +1706,7 @@ mod interrupted {
         } else {
             Vec::new()
         };
-        let mut child = run
-            .invoker(&extra)
-            .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
-            .spawn();
+        let mut child = run.invoker(&extra).cancel_pause(&pause).spawn();
 
         let start = Instant::now();
         let mut seen = Seen::default();
@@ -1932,6 +1933,7 @@ fn killed_run_sharing_one_directory_leaves_everything_there(
 #[cfg(feature = "test-hooks")]
 #[allow(clippy::too_many_lines)]
 fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::time::{Duration, Instant};
     let count = interrupted::checkpoint_count(fx, row)?;
     let (out_dir, staging, separate_tmp, control) = (
@@ -1958,10 +1960,13 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
     pause.push(ready.as_os_str());
     pause.push(":stuck");
-    let mut child = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
-        .args(&extra)
-        .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
-        .spawn();
+    let mut child = interrupted::with_visible_scratch(
+        row,
+        CliInvoker::new(&invocation_scratch).args(&inv.args),
+    )
+    .args(&extra)
+    .cancel_pause(&pause)
+    .spawn();
     let start = Instant::now();
     while !ready.exists() {
         ensure!(!child.has_exited(), "the run ended before its pause");
@@ -2008,9 +2013,12 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     }
 
     let before = tree_snapshot(staging.path());
-    let next = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
-        .args(&extra)
-        .run();
+    let next = interrupted::with_visible_scratch(
+        row,
+        CliInvoker::new(&invocation_scratch).args(&inv.args),
+    )
+    .args(&extra)
+    .run();
     let stderr = next.stderr_str();
     ensure!(exited_ok(row, &next), "the next run failed: {stderr}");
     for entry in staged.iter().take(1).chain(&run_dirs) {
@@ -2062,10 +2070,13 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     // A fresh private directory for the next run, which replaces the
     // outputs and leaves the directory empty.
     std::fs::create_dir(staging.path()).unwrap();
-    let again = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
-        .args(&extra)
-        .arg("--overwrite")
-        .run();
+    let again = interrupted::with_visible_scratch(
+        row,
+        CliInvoker::new(&invocation_scratch).args(&inv.args),
+    )
+    .args(&extra)
+    .arg("--overwrite")
+    .run();
     ensure!(
         exited_ok(row, &again),
         "a replacing run through a fresh shared directory failed: {}",
@@ -2255,9 +2266,9 @@ mod in_publication {
 
     /// One scenario's directories, planted outputs and command line.
     struct Setup {
-        out: TempDir,
-        staging: TempDir,
-        tmp: TempDir,
+        out: TestScratch,
+        staging: TestScratch,
+        tmp: TestScratch,
         inv: Invocation,
         seeded: Vec<bool>,
         args: Vec<OsString>,
@@ -2309,14 +2320,15 @@ mod in_publication {
 
     /// The steps one run of the scenario announces.
     fn steps_of(fx: &Fx, scenario: &Scenario) -> Result<Vec<String>, String> {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let row = row(scenario.row);
         let setup = Setup::new(fx, row, scenario.seeded);
         let control = crate::common::test_scratch();
         let trace = control.path().join("steps");
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .args(&setup.args)
-            .env("PBFHOGG_TEST_PUBLISH_FAULTS", scenario.faults)
-            .env("PBFHOGG_TEST_PUBLISH_STEPS", &trace)
+            .publish_faults(scenario.faults)
+            .publish_steps(&trace)
             .run();
         // 101 is the hooks' own failure (a bad spelling, a trace that could
         // not be written) or a panic, never the injected failure a failing
@@ -2363,16 +2375,17 @@ mod in_publication {
         at: usize,
         reference: &[Vec<(PathBuf, Vec<u8>)>],
     ) -> Result<(), String> {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let row = row(scenario.row);
         let setup = Setup::new(fx, row, scenario.seeded);
         let step = &steps[at];
         let control = crate::common::test_scratch();
         let ready = control.path().join("ready");
-        let mut child = CliInvoker::new()
+        let mut child = CliInvoker::new(&invocation_scratch)
             .args(&setup.args)
-            .env("PBFHOGG_TEST_PUBLISH_FAULTS", scenario.faults)
-            .env("PBFHOGG_TEST_PUBLISH_PAUSE", step)
-            .env("PBFHOGG_TEST_PUBLISH_READY", &ready)
+            .publish_faults(scenario.faults)
+            .publish_pause(step)
+            .publish_ready(&ready)
             .spawn();
         let start = Instant::now();
         while !ready.exists() {
@@ -2504,7 +2517,7 @@ mod in_publication {
         again.extend(["--staging-dir".into(), setup.staging.path().into()]);
         again.extend(tmp_args(row.tmp_dir.then_some(setup.tmp.path())));
         again.push("--overwrite".into());
-        let next = CliInvoker::new().args(&again).run();
+        let next = CliInvoker::new(&invocation_scratch).args(&again).run();
         ensure!(
             exited_ok(row, &next),
             "{step}: the next run failed: {}",
@@ -2541,6 +2554,7 @@ mod in_publication {
 
     /// Every step of one scenario, each killed in a run of its own.
     pub(super) fn killed_at_every_step(scenario: &Scenario) {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let fx = Fx::new();
         let label = format!("[{} {}]", scenario.row, scenario.faults);
         let steps = steps_of(&fx, scenario).unwrap_or_else(|why| panic!("{label} {why}"));
@@ -2548,7 +2562,7 @@ mod in_publication {
         // interferes with.
         let row = row(scenario.row);
         let clean = Setup::new(&fx, row, Seeded::None);
-        let out = CliInvoker::new().args(&clean.args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(&clean.args).run();
         assert!(
             exited_ok(row, &out),
             "{label} the reference run failed: {}",
@@ -2621,12 +2635,15 @@ mod killed_in_publication {
 /// (exit 2), one with no output to stage a usage error (exit 64).
 #[test]
 fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let output = dir.path().join("out.osm.pbf");
-    let refused = CliInvoker::new()
-        .args(["sort", input.to_str().unwrap(), "-o"])
+    let refused = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
         .arg(&output)
         .arg("--staging-dir")
         .arg(dir.path())
@@ -2639,8 +2656,10 @@ fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
     assert!(hidden(dir.path()).is_empty(), "{:?}", hidden(dir.path()));
 
     // A text diff to stdout has no output to stage.
-    let usage = CliInvoker::new()
-        .args(["diff", input.to_str().unwrap(), input.to_str().unwrap()])
+    let usage = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg(input.as_os_str())
+        .arg(input.as_os_str())
         .arg("--staging-dir")
         .arg(dir.path())
         .run();
@@ -2668,6 +2687,7 @@ fn a_staging_dir_holding_the_output_or_without_an_output_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_work() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use crate::invoker::{NAMESPACE_BROKEN, NAMESPACE_DENIED};
     use std::os::unix::fs::MetadataExt;
     let root = crate::common::test_scratch();
@@ -2685,7 +2705,7 @@ fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_wo
     let missing = root.path().join(format!("{MISSING_MARK}.osm.pbf"));
     let output = out_dir.join("out.osm.pbf");
     let sort = |input: &Path, staging: &Path| {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("sort")
             .arg(input)
             .arg("-o")
@@ -2728,7 +2748,7 @@ fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_wo
     let published = sort(&input, &source);
     assert!(published.status.success(), "{}", published.stderr_str());
     let plain = root.path().join("plain.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -2900,6 +2920,7 @@ mod tier3 {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::time::{Duration, Instant};
     let fx = Fx::new();
     let row = ROWS
@@ -2927,10 +2948,13 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
         let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
         pause.push(ready.as_os_str());
         pause.push(":stuck");
-        let mut child = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
-            .args(tmp_args(Some(tmp.path())))
-            .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
-            .spawn();
+        let mut child = interrupted::with_visible_scratch(
+            row,
+            CliInvoker::new(&invocation_scratch).args(&inv.args),
+        )
+        .args(tmp_args(Some(tmp.path())))
+        .cancel_pause(&pause)
+        .spawn();
         let wait_for = |path: &Path, child: &mut crate::invoker::RunningCli| {
             let start = Instant::now();
             while !path.exists() {
@@ -2974,9 +2998,12 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
             left.iter().any(|n| n.starts_with(".pbfhogg-tmp-")),
             "expected the abandoned staging entry, found {left:?}"
         );
-        let next = interrupted::with_visible_scratch(row, CliInvoker::new().args(&inv.args))
-            .args(tmp_args(Some(tmp.path())))
-            .run();
+        let next = interrupted::with_visible_scratch(
+            row,
+            CliInvoker::new(&invocation_scratch).args(&inv.args),
+        )
+        .args(tmp_args(Some(tmp.path())))
+        .run();
         assert!(
             exited_ok(row, &next),
             "the next run failed: {}",
@@ -2995,6 +3022,7 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_command_without_an_output_is_interrupted_too() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::time::{Duration, Instant};
     let fx = Fx::new();
     let good = fx.pbf(Input::Good);
@@ -3016,11 +3044,11 @@ fn a_command_without_an_output_is_interrupted_too() {
         let ready = control.path().join("ready");
         let mut pause = OsString::from("2:");
         pause.push(ready.as_os_str());
-        let mut child = CliInvoker::new()
+        let mut child = CliInvoker::new(&invocation_scratch)
             .args(*words)
             .arg(&good)
             .current_dir(cwd.path())
-            .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
+            .cancel_pause(&pause)
             .spawn();
         let start = Instant::now();
         while !ready.exists() {
@@ -3142,6 +3170,7 @@ const REFUSED_OSC_NAMES: &[&str] = &["x", "x.gz", "x.xml", "x.osc.gzip", "x.OSC"
 
 #[test]
 fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let osc = write_osc_fixtures(dir.path());
     for producer in OSC_PRODUCERS {
@@ -3149,7 +3178,7 @@ fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
             let out_dir = crate::common::test_scratch();
             let dest = out_dir.path().join(name);
             let args = (producer.build)(&osc, dir.path(), &dest);
-            let result = CliInvoker::new().args(&args).run();
+            let result = CliInvoker::new(&invocation_scratch).args(&args).run();
             let label = format!("{} -> {name}", producer.label);
             assert_eq!(
                 result.status.code(),
@@ -3173,6 +3202,7 @@ fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
 
 #[test]
 fn osc_gzip_framing_follows_the_output_name_for_every_producer() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let osc = write_osc_fixtures(dir.path());
 
@@ -3182,7 +3212,7 @@ fn osc_gzip_framing_follows_the_output_name_for_every_producer() {
             let out_dir = crate::common::test_scratch();
             let dest = out_dir.path().join(name);
             let args = (producer.build)(&osc, dir.path(), &dest);
-            let result = CliInvoker::new().args(&args).run();
+            let result = CliInvoker::new(&invocation_scratch).args(&args).run();
             // A diff that found changes is a completed run that exits 1.
             let completed = result.status.success()
                 || (producer.label.starts_with("diff") && result.status.code() == Some(1));

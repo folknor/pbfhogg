@@ -149,7 +149,7 @@ fn test_relations() -> Vec<TestRelation> {
 
 /// The strategy flag, plus `--force` for the strategies that refuse an
 /// unindexed input (`--simple` never refuses, so it refuses `--force`).
-fn strategy_args(cli: CliInvoker, strategy: Strategy) -> CliInvoker {
+fn strategy_args<'a>(cli: CliInvoker<'a>, strategy: Strategy) -> CliInvoker<'a> {
     match strategy {
         Strategy::Simple => cli.arg("--simple"),
         Strategy::CompleteWays => cli.arg("--force"),
@@ -165,7 +165,8 @@ fn run_extract(
     region: &RegionArg<'_>,
     strategy: Strategy,
 ) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(input)
         .arg("-o")
@@ -182,7 +183,8 @@ fn run_extract(
 /// Invoke `pbfhogg extract <input> --config <config>
 /// [--simple|--smart] --set-bounds [--force]` and assert success.
 fn run_extract_multi(input: &Path, config: &Path, strategy: Strategy) -> CliOutput {
-    let cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let cli = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(input)
         .arg("--config")
@@ -512,6 +514,7 @@ fn polygon_vertex_and_edge_nodes_follow_osmium() {
 
 #[test]
 fn polygon_rejects_degenerate_exterior_without_publishing_output() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -523,7 +526,7 @@ fn polygon_rejects_degenerate_exterior_without_publishing_output() {
         r#"{"type":"Polygon","coordinates":[[[12.0,55.0],[13.0,56.0]]] }"#,
     );
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("-o")
@@ -1130,6 +1133,7 @@ fn simple_sorted_polygon_filters_nodes() {
 /// pairwise check does.
 #[test]
 fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
@@ -1149,7 +1153,7 @@ fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
     );
     std::fs::write(&config, config_json).expect("write config");
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -1170,6 +1174,7 @@ fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
 #[cfg(unix)]
 #[test]
 fn multi_extract_rejects_symlinked_output_paths() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
@@ -1192,7 +1197,7 @@ fn multi_extract_rejects_symlinked_output_paths() {
     );
     std::fs::write(&config, config_json).expect("write config");
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -1220,6 +1225,7 @@ fn multi_extract_rejects_symlinked_output_paths() {
 /// by then.
 #[test]
 fn multi_extract_refuses_when_a_destination_cannot_be_published() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
@@ -1242,7 +1248,7 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
     );
     std::fs::write(&config, config_json).expect("write config");
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -1277,6 +1283,7 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
 #[cfg(target_os = "linux")]
 #[test]
 fn multi_extract_refuses_more_regions_than_the_descriptor_limit_holds() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     const REGIONS: usize = 40;
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
@@ -1293,7 +1300,7 @@ fn multi_extract_refuses_more_regions_than_the_descriptor_limit_holds() {
     );
     std::fs::write(&config, config_json).expect("write config");
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -1374,7 +1381,7 @@ fn multi_extract_diagnostics_use_final_output_paths() {
     let simple = run_extract_multi(&input, &config, Strategy::Simple);
     let simple_stderr = simple.stderr_str();
     assert!(
-        simple_stderr.contains(simple_output.to_str().expect("UTF-8 output path")),
+        simple_stderr.contains(simple_output.to_string_lossy().as_ref()),
         "the summary should report the final simple output path; stderr:\n{simple_stderr}"
     );
     assert_eq!(
@@ -1410,6 +1417,7 @@ fn multi_extract_diagnostics_use_final_output_paths() {
 
 #[test]
 fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let config_dir = dir.path().join("config");
     let configured_dir = config_dir.join("configured");
@@ -1440,7 +1448,7 @@ fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
     )
     .expect("write config");
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -1458,7 +1466,7 @@ fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
     assert!(
         result
             .stderr_str()
-            .contains(relative_output.to_str().expect("UTF-8 output path")),
+            .contains(relative_output.to_string_lossy().as_ref()),
         "summary should report the rebased relative output; stderr:\n{}",
         result.stderr_str()
     );
@@ -1886,12 +1894,13 @@ fn single_region_config(dir: &Path) -> std::path::PathBuf {
 /// verbatim - and the summary must still say 20.
 #[test]
 fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -2021,6 +2030,7 @@ fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
 /// decoder's error and publish nothing.
 #[test]
 fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
@@ -2035,7 +2045,7 @@ fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
     let refusal = "invalid UTF-8 at string table index 0";
 
     let output = dir.path().join("single.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("-o")
@@ -2046,7 +2056,7 @@ fn a_candidate_the_decoder_refuses_is_not_copied_raw() {
     assert!(!output.exists(), "nothing is published");
 
     let config = multi_config(dir.path(), "multi-refused");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -2092,6 +2102,7 @@ fn write_plain_node_pbf(input: &Path) {
 /// matched is silently missing.
 #[test]
 fn complete_and_smart_classify_plain_nodes_on_sorted_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("plain.osm.pbf");
     write_plain_node_pbf(&input);
@@ -2104,7 +2115,7 @@ fn complete_and_smart_classify_plain_nodes_on_sorted_input() {
             ("partial", "--bbox=0,0,0.0000025,0.0000025", vec![1]),
         ] {
             let out = dir.path().join(format!("{name}-{case}.osm.pbf"));
-            let cli = CliInvoker::new()
+            let cli = CliInvoker::new(&invocation_scratch)
                 .arg("extract")
                 .arg(&input)
                 .arg("-o")
@@ -2122,11 +2133,12 @@ fn complete_and_smart_classify_plain_nodes_on_sorted_input() {
 
 #[test]
 fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("plain.osm.pbf");
     write_plain_node_pbf(&input);
     let single = dir.path().join("single.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .args(["extract", "--simple", "--bbox=-1,-1,1,1"])
         .arg(&input)
         .arg("-o")
@@ -2258,6 +2270,7 @@ fn multi_config(dir: &Path, name: &str) -> std::path::PathBuf {
 /// and publishes nothing.
 #[test]
 fn extract_refuses_a_blob_whose_claimed_kind_is_false() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     for sorted in [true, false] {
         for forged in &FORGED_CLAIMS {
@@ -2271,7 +2284,7 @@ fn extract_refuses_a_blob_whose_claimed_kind_is_false() {
                     "out-{name}-{sorted}-{}-{}.osm.pbf",
                     forged.frame, forged.claim
                 ));
-                let cli = CliInvoker::new()
+                let cli = CliInvoker::new(&invocation_scratch)
                     .arg("extract")
                     .arg(&input)
                     .arg("-o")
@@ -2299,6 +2312,7 @@ fn extract_refuses_a_blob_whose_claimed_kind_is_false() {
 /// refuse it.
 #[test]
 fn extract_refuses_a_passthrough_candidate_holding_ways() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
@@ -2317,7 +2331,7 @@ fn extract_refuses_a_passthrough_candidate_holding_ways() {
     std::fs::write(&input, lying).expect("write lying fixture");
 
     let output = dir.path().join("single.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("-o")
@@ -2328,7 +2342,7 @@ fn extract_refuses_a_passthrough_candidate_holding_ways() {
     assert!(!output.exists(), "nothing is published");
 
     let config = multi_config(dir.path(), "multi-candidate");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("extract")
         .arg(&input)
         .arg("--config")
@@ -2346,12 +2360,13 @@ fn extract_refuses_a_passthrough_candidate_holding_ways() {
 /// forged claim is refused before any region output is published.
 #[test]
 fn multi_extract_refuses_a_blob_whose_claimed_kind_is_false() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     for forged in &FORGED_CLAIMS {
         let input = forge_kind_claim(dir.path(), true, forged);
         let name = format!("multi-{}-{}", forged.frame, forged.claim);
         let config = multi_config(dir.path(), &name);
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("extract")
             .arg(&input)
             .arg("--config")

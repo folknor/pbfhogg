@@ -54,7 +54,8 @@ fn read_osc_plain(path: &Path) -> String {
 /// `MergeChangesStats::write_summary` line) so the caller can pin
 /// counter values.
 fn run_merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> String {
-    let mut cli = CliInvoker::new().arg("merge-changes");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch).arg("merge-changes");
     for input in inputs {
         cli = cli.arg(*input);
     }
@@ -387,7 +388,8 @@ fn simplify_create_then_delete_yields_only_delete() {
 
 /// Run `merge-changes` expecting failure; returns stderr.
 fn merge_changes_failure(inputs: &[&Path], output: &Path, extra: &[&str]) -> String {
-    let mut cli = CliInvoker::new().arg("merge-changes");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch).arg("merge-changes");
     for input in inputs {
         cli = cli.arg(*input);
     }
@@ -547,6 +549,7 @@ fn merge_changes_refuses_a_truncated_input() {
 /// success. That is data corruption, and it is now refused.
 #[test]
 fn simplify_refuses_a_version_regression() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let newer = dir.path().join("002.osc.gz");
     let older = dir.path().join("001.osc.gz");
@@ -586,7 +589,7 @@ fn simplify_refuses_a_version_regression() {
 
     // And the escape hatch really is an escape hatch.
     let out2 = dir.path().join("out2.osc.gz");
-    let mut cli = CliInvoker::new().arg("merge-changes");
+    let mut cli = CliInvoker::new(&invocation_scratch).arg("merge-changes");
     for input in [&newer, &older] {
         cli = cli.arg(input);
     }
@@ -613,6 +616,7 @@ fn simplify_refuses_a_version_regression() {
 /// it.
 #[test]
 fn simplify_admits_equal_versions_from_overlapping_diffs() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let first = dir.path().join("4705.osc.gz");
     let second = dir.path().join("4706.osc.gz");
@@ -679,7 +683,7 @@ fn simplify_admits_equal_versions_from_overlapping_diffs() {
         stderr.contains("is lower than version 12"),
         "a lower claim after equal ones must be refused; stderr:\n{stderr}"
     );
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("merge-changes")
         .arg(&first)
         .arg(&second)
@@ -702,9 +706,10 @@ fn simplify_admits_equal_versions_from_overlapping_diffs() {
 /// a usage error instead, refused before any input is read.
 #[test]
 fn allow_version_regression_requires_simplify() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let out = dir.path().join("out.osc.gz");
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("merge-changes")
         .arg(dir.path().join("missing.osc.gz"))
         .arg("-o")

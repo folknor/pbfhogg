@@ -213,6 +213,8 @@ The third member, **`pbfhogg-harness`** (`crates/harness/`, bin only, `publish =
 
 The fourth, **`pbfhogg-guard-portability`** (`crates/guard-portability/`, `publish = false`, libc only), is a compile fixture: it mounts the guard alone so the `riscv64` lint sweep can type-check the guard's unsupported-architecture fallback. It is empty on x86_64 and aarch64.
 
+The fifth, **`pbfhogg-test-scratch`** (`crates/test-scratch/`, `publish = false`, depends only on `tempfile`), is the one owner of test scratch for every harness, taken as a path-only dev-dependency; see `reference/testing.md` "Test scratch".
+
 `cargo clippy --all-targets` at the workspace root selects every member: the virtual manifest has no `default-members` restriction. Verify changes with `brokkr check` for the configured feature and target sweeps (the sweeps that run CLI tests select both `pbfhogg` and `pbfhogg-cli`).
 
 ## Architecture

@@ -109,7 +109,8 @@ fn honest_ways() -> Vec<Vec<Way>> {
 }
 
 fn check(path: &Path, extra: &[&str]) -> CliOutput {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--locations")
         .args(extra)
@@ -191,10 +192,11 @@ fn a_file_without_the_claim_exits_two() {
 
 #[test]
 fn agreement_requires_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let path = dir.path().join("honest.osm.pbf");
     write_low(&path, true, &NODES, &honest_ways());
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--agreement")
         .arg(&path)
@@ -290,13 +292,14 @@ fn agreement_fails_disagreeing_copies_of_an_absent_node() {
 /// and points at `check --index` and the repair.
 #[test]
 fn a_relabelled_blob_fails_the_check_not_passes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let mut ways = honest_ways();
     ways[1][0].2[1] = (500_000_001, 600_000_000);
     write_low(&input, true, &NODES, &ways);
     let corrupt = dir.path().join("kind.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -360,6 +363,7 @@ fn an_empty_dense_message_in_a_way_blob_is_no_node() {
 /// mismatch on way 20.
 #[test]
 fn apply_changes_output_passes_after_a_node_move() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("move.osc.gz");
@@ -375,7 +379,7 @@ fn apply_changes_output_passes_after_a_node_move() {
   </modify>
 </osmChange>"#,
     );
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)

@@ -49,6 +49,7 @@ impl DiffStats {
 }
 
 fn run_diff(old: &Path, new: &Path, opts: DiffOpts) -> (String, DiffStats) {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     // The pbfhogg binary's `main` installs a `HotpathGuardBuilder`,
     // and the guard emits its timing banner to stdout at drop time.
     // That banner pollutes the diff text we want to read. Side-step
@@ -71,7 +72,7 @@ fn run_diff(old: &Path, new: &Path, opts: DiffOpts) -> (String, DiffStats) {
     );
     let out_path = dir_for_output.join(suffix);
 
-    let mut cli = CliInvoker::new()
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(old)
         .arg(new)
@@ -108,7 +109,8 @@ fn run_diff(old: &Path, new: &Path, opts: DiffOpts) -> (String, DiffStats) {
 }
 
 fn run_diff_failing(old: &Path, new: &Path) -> crate::invoker::CliOutput {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(old)
         .arg(new)
@@ -1961,6 +1963,7 @@ fn diff_verbose_sharded_matches_one_shard() {
 /// directory the process cannot write, and leave no run directory anywhere.
 #[test]
 fn diff_single_job_needs_no_writable_current_directory() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::os::unix::fs::PermissionsExt;
 
     let dir = crate::common::test_scratch();
@@ -1972,7 +1975,7 @@ fn diff_single_job_needs_no_writable_current_directory() {
     std::fs::create_dir(&cwd).unwrap();
     std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(&old)
         .arg(&new)
@@ -2401,6 +2404,7 @@ fn diff_sequential_and_sharded_output_byte_identical() {
 
 #[test]
 fn derive_sequential_and_sharded_output_byte_identical() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::io::Read as _;
 
     let dir = crate::common::test_scratch();
@@ -2410,7 +2414,7 @@ fn derive_sequential_and_sharded_output_byte_identical() {
         let osc = dir
             .path()
             .join(format!("j{jobs}-i{}.osc.gz", u8::from(increment_version)));
-        let mut cli = CliInvoker::new()
+        let mut cli = CliInvoker::new(&invocation_scratch)
             .arg("diff")
             .arg("--format")
             .arg("osc")

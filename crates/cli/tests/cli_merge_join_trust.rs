@@ -123,7 +123,8 @@ fn run_diff_jobs(old: &Path, new: &Path, jobs: &str) -> (Option<i32>, String) {
 
 /// [`run_diff_jobs`] with extra arguments (a type filter).
 fn run_diff_args(old: &Path, new: &Path, jobs: &str, args: &[&str]) -> (Option<i32>, String) {
-    let mut invoker = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut invoker = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(old)
         .arg(new)
@@ -418,6 +419,7 @@ fn valid_mixed_sign_blob_layouts_are_accepted() {
 /// to write this valid base back out, even with an empty change file.
 #[test]
 fn apply_changes_writes_a_valid_mixed_sign_layout() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("empty.osc.gz");
@@ -429,7 +431,7 @@ fn apply_changes_writes_a_valid_mixed_sign_layout() {
 <osmChange version="0.6"></osmChange>"#,
     );
 
-    let applied = CliInvoker::new()
+    let applied = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)

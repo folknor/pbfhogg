@@ -195,7 +195,7 @@ fn replacement_fixture(route: Route, index: usize) -> Fixture {
 }
 
 struct Inputs {
-    dir: tempfile::TempDir,
+    dir: pbfhogg_test_scratch::TestScratch,
     paths: [PathBuf; 2],
 }
 

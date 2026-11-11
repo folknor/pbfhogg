@@ -42,7 +42,8 @@ fn run_derive(
     update_timestamp: bool,
     jobs: Option<usize>,
 ) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg("--format")
         .arg("osc")
@@ -81,7 +82,8 @@ fn assert_derive_answered(out: &CliOutput, label: &str) {
 }
 
 fn run_apply(base: &Path, osc: &Path, output: &Path) -> CliOutput {
-    let out = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(base)
         .arg(osc)

@@ -16,8 +16,8 @@
 //! against come from the clap tree production parses
 //! ([`pbfhogg_cli::cli_command`]), never from `--help` text.
 //!
-//! No external crate dependency - kept deliberately small to match
-//! the project's minimal dev-dep posture.
+//! Scratch ownership comes from the dev-only test-scratch leaf; child and
+//! capture ownership is shared with the bounded reference-tool runner.
 //!
 //! ## Timeout
 //!
@@ -45,54 +45,12 @@
 //! before asserting success - tmpfs / overlayfs and hosts with low
 //! `RLIMIT_MEMLOCK` are common.
 
+use crate::common::process::OwnedChild;
+use pbfhogg_test_scratch::TestScratch;
 use std::ffi::OsStr;
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
-
-/// Default wall-clock timeout applied to every [`CliInvoker`] that
-/// doesn't override via [`CliInvoker::timeout`]. Sized for Tier 1 /
-/// Tier 2 fixtures; tests that exercise real datasets should bump
-/// it explicitly.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Polling cadence for [`std::process::Child::try_wait`] inside the
-/// timeout loop. 20 ms is fast enough that test wall-time isn't
-/// noticeably padded; slow enough that the loop doesn't burn CPU on
-/// a long-running command.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-/// Retain the first and last MiB while continuing to drain the pipe.
-fn capture(mut reader: impl Read) -> Vec<u8> {
-    const EDGE: usize = 1024 * 1024;
-    let mut first = Vec::with_capacity(EDGE);
-    let mut last = std::collections::VecDeque::with_capacity(EDGE);
-    let mut total = 0_usize;
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let count = match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        };
-        total = total.saturating_add(count);
-        let prefix = count.min(EDGE - first.len());
-        first.extend_from_slice(&chunk[..prefix]);
-        for byte in &chunk[prefix..count] {
-            if last.len() == EDGE {
-                last.pop_front();
-            }
-            last.push_back(*byte);
-        }
-    }
-    if total > EDGE * 2 {
-        first.extend_from_slice(b"\n[output truncated; first and last MiB retained]\n");
-    }
-    first.extend(last);
-    first
-}
+use std::time::Duration;
 
 /// The exit status base of a [`CliInvoker::bind_mounted`] child whose
 /// namespace setup the host refused; the failed step is added.
@@ -113,19 +71,23 @@ pub const EXIT_USAGE: i32 = 64;
 
 /// Invokes the `pbfhogg` binary with a set of arguments, captures
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.
-pub struct CliInvoker {
+pub struct CliInvoker<'a> {
+    scratch: &'a TestScratch,
     cmd: Command,
     timeout: Duration,
     stderr_closed: bool,
 }
 
-impl CliInvoker {
+impl<'a> CliInvoker<'a> {
     /// Start a new invocation. Default timeout is
-    /// [`DEFAULT_TIMEOUT`]; override via [`Self::timeout`].
-    pub fn new() -> Self {
+    /// [`pbfhogg::TEST_CHILD_TIMEOUT`]; override via [`Self::timeout`].
+    pub fn new(scratch: &'a TestScratch) -> Self {
+        let mut cmd = Command::new(pbfhogg_bin());
+        crate::common::process::isolate(&mut cmd, scratch);
         Self {
-            cmd: Command::new(pbfhogg_bin()),
-            timeout: DEFAULT_TIMEOUT,
+            scratch,
+            cmd,
+            timeout: pbfhogg::TEST_CHILD_TIMEOUT,
             stderr_closed: false,
         }
     }
@@ -146,9 +108,86 @@ impl CliInvoker {
         self
     }
 
-    /// Set one environment variable for this child process only.
-    pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(mut self, key: K, val: V) -> Self {
-        self.cmd.env(key, val);
+    #[allow(dead_code)]
+    pub fn cancel_pause(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_CANCEL_PAUSE", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn cancel_count(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_CANCEL_COUNT", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn publish_faults(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_FAULTS", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn publish_steps(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_STEPS", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn publish_pause(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_PAUSE", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn publish_ready(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_READY", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn replace_input(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_REPLACE_INPUT", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn replace_with(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_REPLACE_WITH", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn replace_after(mut self, value: u64) -> Self {
+        self.cmd
+            .env("PBFHOGG_TEST_REPLACE_AFTER", value.to_string());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn force_pin_path_reopen(mut self, value: bool) -> Self {
+        self.cmd.env(
+            "PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN",
+            if value { "1" } else { "0" },
+        );
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn merge_changes_spill_first(mut self, value: u64) -> Self {
+        self.cmd
+            .env("PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST", value.to_string());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn replace_report(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("PBFHOGG_TEST_REPLACE_REPORT", value);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn marker_fifo(mut self, value: impl AsRef<OsStr>) -> Self {
+        self.cmd.env("BROKKR_MARKER_FIFO", value);
         self
     }
 
@@ -344,85 +383,19 @@ impl CliInvoker {
     /// Run the binary, capture output, return a [`CliOutput`].
     /// Does NOT assert on exit status - the caller does that.
     /// Panics on timeout (see [`Self::timeout`]).
-    pub fn run(mut self) -> CliOutput {
+    pub fn run(self) -> CliOutput {
+        self.spawn().wait()
+    }
+
+    /// Start a child owned by the borrowed scratch scope.
+    pub fn spawn(mut self) -> RunningCli<'a> {
         self.cmd.stdout(Stdio::piped());
         if !self.stderr_closed {
             self.cmd.stderr(Stdio::piped());
         }
-
         guard(&mut self.cmd);
-        let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
-
-        // Drain stdout/stderr in background threads so a chatty
-        // child can't block on a full pipe buffer while we poll
-        // `try_wait`. `Child::wait_with_output` does this for us
-        // but consumes the child by value, which we can't afford -
-        // we need to keep `child` available so the timeout path can
-        // call `kill()`.
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take();
-
-        let stdout_thread = std::thread::spawn(move || capture(stdout));
-        let stderr_thread = stderr.map(|stderr| std::thread::spawn(move || capture(stderr)));
-
-        let start = Instant::now();
-        let status: ExitStatus = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break s,
-                Ok(None) => {
-                    if start.elapsed() > self.timeout {
-                        child.kill().ok();
-                        child.wait().ok();
-                        let stderr_buf = stderr_thread
-                            .map(|thread| thread.join().unwrap_or_default())
-                            .unwrap_or_default();
-                        panic!(
-                            "pbfhogg timed out after {:?}; stderr:\n{}",
-                            self.timeout,
-                            String::from_utf8_lossy(&stderr_buf),
-                        );
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(e) => panic!("error waiting for pbfhogg child: {e}"),
-            }
-        };
-        assert_not_guard_killed(status);
-
-        let stdout_buf = stdout_thread.join().unwrap_or_default();
-        let stderr_buf = stderr_thread
-            .map(|thread| thread.join().unwrap_or_default())
-            .unwrap_or_default();
-
-        CliOutput {
-            status,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
-        }
-    }
-
-    #[cfg_attr(
-        not(feature = "test-hooks"),
-        allow(
-            dead_code,
-            reason = "only the test-hooks interruption tests start a child without waiting"
-        )
-    )]
-    /// Start the binary without waiting for it, for a test that signals it
-    /// mid-run. Stdout and stderr are captured as for [`Self::run`]. The
-    /// child is killed and reaped if the handle drops while it still runs, so
-    /// a failing assertion never leaves one behind.
-    pub fn spawn(mut self) -> RunningCli {
-        self.cmd.stdout(Stdio::piped());
-        self.cmd.stderr(Stdio::piped());
-        guard(&mut self.cmd);
-        let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
         RunningCli {
-            child: Some(child),
-            stdout_thread: Some(std::thread::spawn(move || capture(stdout))),
-            stderr_thread: Some(std::thread::spawn(move || capture(stderr))),
+            owner: OwnedChild::spawn(&mut self.cmd, self.scratch).expect("spawn pbfhogg"),
             timeout: self.timeout,
         }
     }
@@ -454,101 +427,29 @@ impl CliInvoker {
     }
 }
 
-impl Default for CliInvoker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg_attr(
-    not(feature = "test-hooks"),
-    allow(
-        dead_code,
-        reason = "only the test-hooks interruption tests start a child without waiting"
-    )
-)]
-/// A `pbfhogg` child started by [`CliInvoker::spawn`].
-pub struct RunningCli {
-    child: Option<std::process::Child>,
-    stdout_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
-    stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+/// A child whose lifetime cannot exceed its scratch guard.
+pub struct RunningCli<'a> {
+    owner: OwnedChild<'a>,
     timeout: Duration,
 }
 
-#[cfg_attr(
-    not(feature = "test-hooks"),
-    allow(
-        dead_code,
-        reason = "only the test-hooks interruption tests start a child without waiting"
-    )
-)]
-impl RunningCli {
-    /// Send `signal` (a `libc::SIG*` number) to the child.
+#[allow(dead_code)]
+impl RunningCli<'_> {
     pub fn signal(&self, signal: libc::c_int) {
-        let child = self.child.as_ref().expect("child is running");
-        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
-        // SAFETY: plain syscall on a child this handle owns and has not
-        // reaped, so the pid cannot have been reused.
-        let rc = unsafe { libc::kill(pid, signal) };
-        assert_eq!(rc, 0, "kill({pid}, {signal}) failed");
+        self.owner.signal(signal);
     }
 
-    /// Whether the child has exited (it is reaped if so).
     pub fn has_exited(&mut self) -> bool {
-        let child = self.child.as_mut().expect("child is running");
-        matches!(child.try_wait(), Ok(Some(_)))
+        self.owner.has_exited().expect("inspect child")
     }
 
-    /// Wait for the child to exit within the invoker's timeout and return
-    /// its output. On timeout the child is killed and the test panics.
     pub fn wait(mut self) -> CliOutput {
-        let mut child = self.child.take().expect("child is running");
-        let start = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if start.elapsed() > self.timeout => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    let stderr = self
-                        .stderr_thread
-                        .take()
-                        .map(|t| t.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    panic!(
-                        "pbfhogg did not exit within {:?} of being waited for; stderr:\n{}",
-                        self.timeout,
-                        String::from_utf8_lossy(&stderr)
-                    );
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-                Err(e) => panic!("error waiting for pbfhogg child: {e}"),
-            }
-        };
-        assert_not_guard_killed(status);
-        let stdout = self
-            .stdout_thread
-            .take()
-            .map(|t| t.join().unwrap_or_default())
-            .unwrap_or_default();
-        let stderr = self
-            .stderr_thread
-            .take()
-            .map(|t| t.join().unwrap_or_default())
-            .unwrap_or_default();
+        let out = self.owner.wait(self.timeout).expect("wait for pbfhogg");
+        assert_not_guard_killed(out.status);
         CliOutput {
-            status,
-            stdout,
-            stderr,
-        }
-    }
-}
-
-impl Drop for RunningCli {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.kill().ok();
-            child.wait().ok();
+            status: out.status,
+            stdout: out.stdout,
+            stderr: out.stderr,
         }
     }
 }
@@ -678,8 +579,76 @@ mod tests {
     /// assertion helpers work on a trivial invocation.
     #[test]
     fn cli_invoker_runs_version_command() {
-        let out = CliInvoker::new().arg("--version").assert_success();
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("--version")
+            .assert_success();
         out.assert_stdout_contains("pbfhogg");
+    }
+
+    #[test]
+    fn cli_invoker_reaps_on_wait_error_and_assertion_unwind() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let mut running = CliInvoker::new(&scratch).arg("--version").spawn();
+        let pid = libc::pid_t::try_from(running.owner.id()).expect("pid");
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            running
+                .owner
+                .wait_with_poll(pbfhogg::TEST_CHILD_TIMEOUT, |_| {
+                    Err(std::io::Error::other("injected wait error"))
+                })
+                .expect("injected failure");
+        }));
+        assert!(failure.is_err());
+        let mut status = 0;
+        // SAFETY: WNOHANG never blocks; the owner should already have reaped.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn cli_invoker_has_an_explicit_execution_policy() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let invoker = CliInvoker::new(&scratch);
+        assert_eq!(invoker.cmd.get_current_dir(), Some(scratch.path()));
+        let env: std::collections::BTreeMap<_, _> = invoker.cmd.get_envs().collect();
+        for key in env.keys() {
+            assert!(matches!(
+                key.to_str(),
+                Some(
+                    "PATH"
+                        | "HOME"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "LC_CTYPE"
+                        | "LC_MESSAGES"
+                        | "TZ"
+                        | "TMPDIR"
+                )
+            ));
+        }
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(scratch.path().as_os_str()))
+        );
+    }
+
+    #[test]
+    fn cli_invoker_passes_non_utf8_paths_without_conversion() {
+        use std::os::unix::ffi::OsStringExt;
+        let scratch = pbfhogg_test_scratch::scratch();
+        let input = scratch.child(std::ffi::OsString::from_vec(b"input-\xff.pbf".to_vec()));
+        crate::common::write_base_pbf(&input);
+        CliInvoker::new(&scratch)
+            .arg("check")
+            .arg(&input)
+            .assert_success();
     }
 
     #[cfg(unix)]

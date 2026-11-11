@@ -68,8 +68,9 @@ fn scratch_leftovers(dir: &Path) -> Vec<std::ffi::OsString> {
 /// site wrapped in the guard but never committed leaves the destination
 /// missing, and a guard that forgets to remove or rename its scratch
 /// leaves a stray `.pbfhogg-tmp-*` behind. Both fail here loudly.
-fn assert_output_published(dir: &Path, dest: &Path, args: &[&str]) {
-    let out = CliInvoker::new().args(args).run();
+fn assert_output_published(dir: &Path, dest: &Path, args: &[&std::ffi::OsStr]) {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch).args(args).run();
     assert!(
         out.status.success(),
         "command failed; stderr:\n{}",
@@ -92,16 +93,15 @@ fn assert_output_published(dir: &Path, dest: &Path, args: &[&str]) {
 /// the check itself - before the command ran, and without naming the file.
 #[test]
 fn missing_input_is_reported_as_a_missing_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let missing = dir.path().join("nowhere.osm.pbf");
     let dest = dir.path().join("out.osm.pbf");
-    let out = CliInvoker::new()
-        .args([
-            "sort",
-            missing.to_str().unwrap(),
-            "-o",
-            dest.to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(missing.as_os_str())
+        .arg("-o")
+        .arg(dest.as_os_str())
         .run();
     assert!(!out.status.success());
     let stderr = out.stderr_str();
@@ -115,17 +115,16 @@ fn missing_input_is_reported_as_a_missing_input() {
 /// not have turned it off for inputs that do exist.
 #[test]
 fn input_output_alias_is_still_rejected() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
-    let out = CliInvoker::new()
-        .args([
-            "sort",
-            input.to_str().unwrap(),
-            "--force",
-            "-o",
-            input.to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("--force")
+        .arg("-o")
+        .arg(input.as_os_str())
         .run();
     assert!(!out.status.success());
     assert!(
@@ -141,6 +140,7 @@ fn input_output_alias_is_still_rejected() {
 /// refused before any work, even though the directory is a replaceable index.
 #[test]
 fn a_geocode_index_directory_holding_an_input_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let idx = dir.path().join("idx");
     std::fs::create_dir(&idx).unwrap();
@@ -153,7 +153,7 @@ fn a_geocode_index_directory_holding_an_input_is_refused() {
     let link = idx.join("link.osm.pbf");
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     for input in [&inside, &link] {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("build-geocode-index")
             .arg(input)
             .arg("--allow-unindexed")
@@ -189,22 +189,21 @@ fn a_geocode_index_directory_holding_an_input_is_refused() {
 /// indexes.
 #[test]
 fn framing_error_names_the_input_file() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let good = dir.path().join("in.osm.pbf");
     let bad = dir.path().join("corrupt.osm.pbf");
     write_fixture(&good);
     write_truncated(&bad, &good);
     let dest = dir.path().join("out.osm.pbf");
-    let out = CliInvoker::new()
-        .args([
-            "cat",
-            good.to_str().unwrap(),
-            bad.to_str().unwrap(),
-            "--clean",
-            "version",
-            "-o",
-            dest.to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("cat")
+        .arg(good.as_os_str())
+        .arg(bad.as_os_str())
+        .arg("--clean")
+        .arg("version")
+        .arg("-o")
+        .arg(dest.as_os_str())
         .run();
     assert!(!out.status.success());
     let stderr = out.stderr_str();
@@ -229,6 +228,7 @@ fn framing_error_names_the_input_file() {
 /// would leave the seeded file gone.
 #[test]
 fn cat_failure_leaves_preexisting_destination_intact() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let good = dir.path().join("in.osm.pbf");
     let bad = dir.path().join("corrupt.osm.pbf");
@@ -236,17 +236,15 @@ fn cat_failure_leaves_preexisting_destination_intact() {
     write_truncated(&bad, &good);
     let dest = dir.path().join("precious.osm.pbf");
     std::fs::write(&dest, b"user data").unwrap();
-    let out = CliInvoker::new()
-        .args([
-            "cat",
-            good.to_str().unwrap(),
-            bad.to_str().unwrap(),
-            "--clean",
-            "version",
-            "-o",
-            dest.to_str().unwrap(),
-            "--overwrite",
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("cat")
+        .arg(good.as_os_str())
+        .arg(bad.as_os_str())
+        .arg("--clean")
+        .arg("version")
+        .arg("-o")
+        .arg(dest.as_os_str())
+        .arg("--overwrite")
         .run();
     assert!(!out.status.success(), "corrupt input should fail the run");
     assert_eq!(
@@ -291,21 +289,20 @@ fn write_dangling_ref_fixture(path: &Path) {
 /// PBF full of fabricated `(0, 0)` vertices.
 #[test]
 fn altw_missing_nodes_leave_preexisting_destination_intact() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_dangling_ref_fixture(&input);
     let dest = dir.path().join("precious.osm.pbf");
     std::fs::write(&dest, b"user data").unwrap();
 
-    let out = CliInvoker::new()
-        .args([
-            "add-locations-to-ways",
-            input.to_str().unwrap(),
-            "--force",
-            "-o",
-            dest.to_str().unwrap(),
-            "--overwrite",
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("add-locations-to-ways")
+        .arg(input.as_os_str())
+        .arg("--force")
+        .arg("-o")
+        .arg(dest.as_os_str())
+        .arg("--overwrite")
         .run();
     assert!(
         !out.status.success(),
@@ -334,12 +331,12 @@ fn altw_publishes_through_the_guard() {
         dir.path(),
         &dest,
         &[
-            "add-locations-to-ways",
-            input.to_str().unwrap(),
-            "--ignore-missing-nodes",
-            "--force",
-            "-o",
-            dest.to_str().unwrap(),
+            std::ffi::OsStr::new("add-locations-to-ways"),
+            input.as_os_str(),
+            std::ffi::OsStr::new("--ignore-missing-nodes"),
+            std::ffi::OsStr::new("--force"),
+            std::ffi::OsStr::new("-o"),
+            dest.as_os_str(),
         ],
     );
 }
@@ -350,7 +347,10 @@ fn altw_publishes_through_the_guard() {
 /// guard on the way out, and leaves the text clap prints untouched.
 #[test]
 fn usage_error_keeps_claps_message_and_exits_64() {
-    let out = CliInvoker::new().args(["sort", "--no-such-flag"]).run();
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
+        .args(["sort", "--no-such-flag"])
+        .run();
     assert_eq!(
         out.status.code(),
         Some(crate::invoker::EXIT_USAGE),
@@ -369,7 +369,8 @@ fn usage_error_keeps_claps_message_and_exits_64() {
 /// failure, which no other test here would notice.
 #[test]
 fn help_exits_zero_on_stdout() {
-    let out = CliInvoker::new().args(["--help"]).run();
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch).args(["--help"]).run();
     assert_eq!(out.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("OpenStreetMap PBF toolkit"),
@@ -403,11 +404,12 @@ fn counter(events: &str, name: &str) -> Option<i64> {
 
 /// Run the CLI with the marker stream armed; `None` when the run reports
 /// that the host lacks what `args` asked for (O_DIRECT, io_uring).
-fn run_with_markers(dir: &Path, label: &str, args: &[&str]) -> Option<String> {
+fn run_with_markers(dir: &Path, label: &str, args: &[&std::ffi::OsStr]) -> Option<String> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let markers = dir.join(format!("{label}.markers"));
     std::fs::write(&markers, []).unwrap();
-    let out = CliInvoker::new()
-        .env("BROKKR_MARKER_FIFO", &markers)
+    let out = CliInvoker::new(&invocation_scratch)
+        .marker_fifo(&markers)
         .args(args)
         .run();
     if out.is_o_direct_unsupported() || out.is_uring_unsupported() {
@@ -453,21 +455,29 @@ fn pbf_writers_leave_every_sync_to_publication() {
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let osc = empty_osc(dir.path());
-    let (input, osc) = (input.to_str().unwrap(), osc.to_str().unwrap());
+    let (input, osc) = (input.as_os_str(), osc.as_os_str());
     let cat_out = dir.path().join("cat.osm.pbf");
     let apply_out = dir.path().join("apply.osm.pbf");
     // The buffered backend (`cat`) and the parallel one (apply-changes'
     // default): one staged file and its parent each.
     for (label, args) in [
-        ("cat", vec!["cat", input, "-o", cat_out.to_str().unwrap()]),
+        (
+            "cat",
+            vec![
+                std::ffi::OsStr::new("cat"),
+                input,
+                std::ffi::OsStr::new("-o"),
+                cat_out.as_os_str(),
+            ],
+        ),
         (
             "apply-changes",
             vec![
-                "apply-changes",
+                std::ffi::OsStr::new("apply-changes"),
                 input,
                 osc,
-                "-o",
-                apply_out.to_str().unwrap(),
+                std::ffi::OsStr::new("-o"),
+                apply_out.as_os_str(),
             ],
         ),
     ] {
@@ -500,18 +510,18 @@ fn a_group_publication_does_every_sync_once() {
     )
     .unwrap();
     let args = [
-        "extract",
-        input.to_str().unwrap(),
-        "--config",
-        config.to_str().unwrap(),
-        "--simple",
+        std::ffi::OsStr::new("extract"),
+        input.as_os_str(),
+        std::ffi::OsStr::new("--config"),
+        config.as_os_str(),
+        std::ffi::OsStr::new("--simple"),
     ];
     let events = run_with_markers(dir.path(), "fresh", &args).unwrap();
     assert_publication_did_every_sync(&events, "fresh", 3 + 1);
 
     // Replace all three: each backup adds its container and the parent.
     let mut replace = args.to_vec();
-    replace.push("--overwrite");
+    replace.push(std::ffi::OsStr::new("--overwrite"));
     let events = run_with_markers(dir.path(), "replace", &replace).unwrap();
     assert_publication_did_every_sync(&events, "replace", 3 + 1 + 2 * 3);
     // Staging and the three backups are all gone once the parent synced.
@@ -538,7 +548,7 @@ mod backends {
         let input = dir.path().join("in.osm.pbf");
         crate::common::write_base_pbf(&input);
         let osc = empty_osc(dir.path());
-        let (input, osc) = (input.to_str().unwrap(), osc.to_str().unwrap());
+        let (input, osc) = (input.as_os_str(), osc.as_os_str());
         let mut flags: Vec<&str> = Vec::new();
         #[cfg(feature = "linux-direct-io")]
         flags.push("--direct-io");
@@ -547,12 +557,12 @@ mod backends {
         for flag in flags {
             let out = dir.path().join(format!("apply{flag}.osm.pbf"));
             let args = [
-                "apply-changes",
+                std::ffi::OsStr::new("apply-changes"),
                 input,
                 osc,
-                "-o",
-                out.to_str().unwrap(),
-                flag,
+                std::ffi::OsStr::new("-o"),
+                out.as_os_str(),
+                std::ffi::OsStr::new(flag),
             ];
             let Some(events) = run_with_markers(dir.path(), flag, &args) else {
                 continue;

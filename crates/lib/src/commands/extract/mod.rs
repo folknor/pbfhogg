@@ -940,8 +940,8 @@ pub(crate) fn extract_to(
 mod tests {
     use super::*;
     use crate::coord_fmt::from_decimicro;
+    use pbfhogg_test_scratch::TestScratch;
     use std::io::Write as _;
-    use tempfile::TempDir;
 
     #[test]
     fn parse_valid_bbox() {
@@ -1274,7 +1274,7 @@ mod tests {
     // parse_geojson tests
     // -----------------------------------------------------------------------
 
-    fn write_temp_geojson(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
+    fn write_temp_geojson(dir: &TestScratch, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -1472,7 +1472,7 @@ mod tests {
     // Config file parsing tests
     // -----------------------------------------------------------------------
 
-    fn write_temp_json(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
+    fn write_temp_json(dir: &TestScratch, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -1511,7 +1511,7 @@ mod tests {
             r#"{{
                 "directory": "{}",
                 "extracts": [
-                    {{ "output": "test.osm.pbf", "bbox": [0.0, 0.0, 1.0, 1.0] }}
+                    {{ "output": "generated.osm.pbf", "bbox": [0.0, 0.0, 1.0, 1.0] }}
                 ]
             }}"#,
             outdir.display()
@@ -1519,7 +1519,7 @@ mod tests {
         let path = write_temp_json(&dir, "config.json", &json);
         let (directory, slots) = parse_extract_config(&path).unwrap();
         assert!(directory.is_some());
-        assert_eq!(slots[0].output, outdir.join("test.osm.pbf"));
+        assert_eq!(slots[0].output, outdir.join("generated.osm.pbf"));
     }
 
     #[test]

@@ -1236,48 +1236,15 @@ mod tests {
     use crate::error::{BlobError, ErrorKind};
     use crate::read::blob_wire::BlobData;
 
-    /// Truncate `crates/lib/tests/test.osm.pbf` inside the payload of its last blob and
-    /// return the file, its path kept alive by the returned tempdir.
-    ///
-    /// The cut point is derived from the real frame layout rather than guessed,
-    /// so the fixture is provably shape 4 ("EOF inside the Blob payload") and
-    /// not shape 1-3, which would make the test below pass for the wrong
-    /// reason.
-    fn pbf_truncated_inside_the_last_payload() -> (tempfile::TempDir, std::path::PathBuf) {
-        let full = std::fs::read("tests/test.osm.pbf").unwrap();
-
-        let mut walker = BlobReader::new_seekable(std::io::Cursor::new(full.as_slice())).unwrap();
-        let mut last_payload_start = 0u64;
-        let mut last_payload_end = 0u64;
-        while let Some(item) = walker.next_header_skip_blob() {
-            let (header, frame_start) = item.unwrap();
-            let frame_start = frame_start.unwrap().0;
-            // 4-byte length prefix + BlobHeader + payload. The payload start is
-            // the position the reader reached after consuming the header, which
-            // is `frame_start + 4 + header_len`; recovering `header_len` from
-            // the file is simpler than threading it out of the reader.
-            let header_len = u32::from_be_bytes(
-                full[frame_start as usize..frame_start as usize + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as u64;
-            last_payload_start = frame_start + 4 + header_len;
-            last_payload_end = last_payload_start + u64::try_from(header.get_blob_size()).unwrap();
-        }
-        assert_eq!(
-            last_payload_end,
-            full.len() as u64,
-            "the fixture's last frame should end exactly at EOF"
-        );
-
-        // Cut three bytes into the last payload: past its first byte, so the
-        // header is fully committed and only the payload is short.
-        let cut = last_payload_start + 3;
-        assert!(cut < last_payload_end, "cut must land inside the payload");
-
+    /// Cut inside the final payload of a generated multi-blob file.
+    fn pbf_truncated_inside_the_last_payload()
+    -> (pbfhogg_test_scratch::TestScratch, std::path::PathBuf) {
         let dir = crate::path_guard::tests::scratch();
-        let path = dir.path().join("shape4.osm.pbf");
-        std::fs::write(&path, &full[..cut as usize]).unwrap();
+        let intact = dir.child("intact.osm.pbf");
+        let cut = crate::test_support::multi_blob_pbf(&intact);
+        let full = std::fs::read(&intact).unwrap();
+        let path = dir.child("shape4.osm.pbf");
+        std::fs::write(&path, &full[..cut]).unwrap();
         (dir, path)
     }
 
@@ -1296,8 +1263,9 @@ mod tests {
     /// cannot make this pass.
     #[test]
     fn all_three_shape_four_detectors_reject_the_same_file() {
-        let intact = std::path::Path::new("tests/test.osm.pbf");
-        let (_dir, truncated) = pbf_truncated_inside_the_last_payload();
+        let (dir, truncated) = pbf_truncated_inside_the_last_payload();
+        let intact_path = dir.child("intact.osm.pbf");
+        let intact = intact_path.as_path();
 
         // Arm 1: full-payload read, counting bytes delivered.
         let read_arm = |path: &std::path::Path| -> Result<usize> {
@@ -1372,7 +1340,10 @@ mod tests {
                 })
                 .sum()
         }
-        let path = std::path::Path::new("tests/test.osm.pbf");
+        let dir = crate::path_guard::tests::scratch();
+        let fixture = dir.child("input.osm.pbf");
+        crate::test_support::multi_blob_pbf(&fixture);
+        let path = fixture.as_path();
 
         let mut kept = BlobReader::from_path(path).unwrap();
         let kept_elements = element_count(&mut kept);

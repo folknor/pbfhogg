@@ -50,7 +50,8 @@ fn run_apply_changes(
     jobs: Option<usize>,
     locations_on_ways: bool,
 ) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(base)
         .arg(osc)
@@ -76,7 +77,8 @@ fn run_apply_simple(base: &Path, osc: &Path, output: &Path) -> CliOutput {
 /// Bootstrap a LocationsOnWays-enriched base PBF via the
 /// `add-locations-to-ways` CLI.
 fn bootstrap_low_base(input: &Path, output: &Path) {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(input)
         .arg("-o")
@@ -310,6 +312,7 @@ fn interior_create_in_final_false_positive_blob_stays_sorted() {
 /// downstream consumer a file that lies about its ordering.
 #[test]
 fn unsorted_base_under_a_sorted_stamp_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -340,7 +343,7 @@ fn unsorted_base_under_a_sorted_stamp_is_refused() {
 </osmChange>"#,
     );
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
         .arg(&base)
         .arg(&osc)
@@ -527,6 +530,7 @@ fn write_blocks(path: &Path, blocks: &[Vec<u8>], sorted: bool, indexed: bool) {
 /// `--force` lets it reach the sort refusal.
 #[test]
 fn base_without_the_sort_claim_is_refused_after_the_indexdata_check() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -544,7 +548,7 @@ fn base_without_the_sort_claim_is_refused_after_the_indexdata_check() {
         block(&[group(&[way(100, &[1, 2])])]),
     ];
     let run = |base: &Path, force: bool| {
-        let mut cli = CliInvoker::new()
+        let mut cli = CliInvoker::new(&invocation_scratch)
             .arg("apply-changes")
             .arg(base)
             .arg(&osc)
@@ -595,6 +599,7 @@ fn base_without_the_sort_claim_is_refused_after_the_indexdata_check() {
 /// would call nodes).
 #[test]
 fn forced_run_over_an_unindexed_base_writes_a_wholly_indexed_file() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -632,7 +637,7 @@ fn forced_run_over_an_unindexed_base_writes_a_wholly_indexed_file() {
     run_apply_simple(&base, &osc, &output);
 
     crate::common::assert_every_data_blob_indexed(&output);
-    let check = CliInvoker::new()
+    let check = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg(&output)
         .arg("--index")
@@ -662,6 +667,7 @@ fn forced_run_over_an_unindexed_base_writes_a_wholly_indexed_file() {
 /// even after earlier blobs have been written, and publishes nothing.
 #[test]
 fn forced_run_refuses_a_blob_that_mixes_kinds_and_publishes_nothing() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -686,7 +692,7 @@ fn forced_run_refuses_a_blob_that_mixes_kinds_and_publishes_nothing() {
     );
 
     let refused = |extra: &[&str]| {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("apply-changes")
             .arg(&base)
             .arg(&osc)

@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn scratch_goes_to_tmp_dir_else_the_output_directory_else_dot() {
-        let dir = crate::test_scratch::scratch();
+        let dir = pbfhogg_test_scratch::scratch();
         let tmp = dir.path().join("tmp");
         let out_dir = dir.path().join("out");
         std::fs::create_dir(&tmp).unwrap();
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn an_explicit_tmp_dir_error_names_the_flag_and_the_directory() {
-        let dir = crate::test_scratch::scratch();
+        let dir = pbfhogg_test_scratch::scratch();
         let missing = dir.path().join("missing");
         let host = host::cli_host(pbfhogg::host::Invocation::new());
         let tmp = TmpDirArg {
@@ -643,7 +643,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_holds_an_input_inside_it_or_the_entry_naming_it() {
-        let root = crate::test_scratch::scratch();
+        let root = pbfhogg_test_scratch::scratch();
         let idx = root.path().join("idx");
         let outside = root.path().join("outside");
         std::fs::create_dir(&idx).unwrap();

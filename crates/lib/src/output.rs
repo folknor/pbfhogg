@@ -3682,7 +3682,7 @@ impl OutputSet {
 mod tests {
     use super::*;
 
-    fn scratch() -> tempfile::TempDir {
+    fn scratch() -> pbfhogg_test_scratch::TestScratch {
         crate::path_guard::tests::scratch()
     }
 
@@ -3998,12 +3998,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_read_only_directory_output_is_refused_before_work() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Root can move the directory despite these mode bits.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let dir = scratch();
         let dest = dir.path().join("index");
         let staging = dir.path().join("staging");
@@ -4015,10 +4009,16 @@ mod tests {
             Staging::Dir(&staging),
             Staging::DirWithBackups(&staging),
         ] {
-            fs::set_permissions(&dest, fs::Permissions::from_mode(0o555)).unwrap();
+            let denial = match dir.deny_write(&dest) {
+                Ok(guard) => guard,
+                Err(reason) => {
+                    crate::test_support::skip(reason);
+                    return;
+                }
+            };
             let refused =
                 OutputDir::with_staging(&dest, Overwrite::Replace, None, placement, &discard());
-            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+            drop(denial);
             let err = refused.unwrap_err();
             assert!(err.report().contains("output directory"), "{err}");
             assert!(err.report().contains("is not writable"), "{err}");
@@ -4030,9 +4030,15 @@ mod tests {
                 OutputDir::with_staging(&dest, Overwrite::Replace, None, placement, &discard())
                     .unwrap();
             stage_dir(&out, "new.bin", b"new");
-            fs::set_permissions(&dest, fs::Permissions::from_mode(0o555)).unwrap();
+            let denial = match dir.deny_write(&dest) {
+                Ok(guard) => guard,
+                Err(reason) => {
+                    crate::test_support::skip(reason);
+                    return;
+                }
+            };
             let result = out.publish(run_token());
-            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+            drop(denial);
             let err = result.unwrap_err();
             assert!(err.report().contains("is not writable"), "{err}");
             assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
@@ -4340,19 +4346,21 @@ mod tests {
     /// A staging entry that cannot be removed is reported, not lost.
     #[test]
     fn a_staging_file_that_cannot_be_removed_is_reported() {
-        // Root ignores directory permissions, so the removal cannot fail there.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let dir = scratch();
         let sub = dir.path().join("sub");
         fs::create_dir(&sub).unwrap();
         let (sink, diagnostics) = recording();
         let out = Output::new(sub.join("out"), Overwrite::Refuse, &diagnostics).unwrap();
         let staging = out.path().to_path_buf();
-        fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+        let denial = match dir.deny_write(&sub) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                crate::test_support::skip(reason);
+                return;
+            }
+        };
         drop(out);
-        fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        drop(denial);
         let events = sink.0.lock().unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(
@@ -4784,18 +4792,13 @@ mod tests {
         fs::create_dir_all(stage_dir_path.join("inner")).unwrap();
         let fine = dir.path().join("a.pbf");
         let held = stage_dir_path.join("inner").join("b.pbf");
-        let read_only = |mode| {
-            fs::set_permissions(
-                &stage_dir_path,
-                std::os::unix::fs::PermissionsExt::from_mode(mode),
-            )
-            .unwrap();
+        let denial = match dir.deny_write(&stage_dir_path) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                crate::test_support::skip(reason);
+                return;
+            }
         };
-        // Root creates entries in a read-only directory, so the order cannot
-        // be observed this way there; the refusal itself still can.
-        // SAFETY: geteuid has no preconditions.
-        let ordered = unsafe { libc::geteuid() } != 0;
-        read_only(0o500);
         let err = OutputSet::files_with_staging(
             [&fine, &held],
             Overwrite::Refuse,
@@ -4803,7 +4806,7 @@ mod tests {
             &discard(),
         )
         .unwrap_err();
-        read_only(0o700);
+        drop(denial);
         let refused_by_check = matches!(
             output_error(&err),
             OutputError::StagingDir {
@@ -4811,7 +4814,7 @@ mod tests {
                 ..
             }
         );
-        assert!(refused_by_check || !ordered, "{err}");
+        assert!(refused_by_check, "{err}");
         assert_eq!(others(&stage_dir_path, &[]), ["inner"]);
         assert!(others(dir.path(), &["stage"]).is_empty());
 
@@ -4863,8 +4866,10 @@ mod tests {
         let proc = Path::new("/proc");
         match (device_of(proc), device_of(dir.path())) {
             (Ok(p), Ok(d)) if p != d => {}
-            // `/proc` is missing or not a separate mount: nothing to probe.
-            _ => return,
+            _ => {
+                crate::test_support::skip("/proc is unavailable or not on a different device");
+                return;
+            }
         }
         assert!(rename_refused_between(proc, dir.path()));
         assert!(rename_refused_between(dir.path(), proc));
@@ -5469,7 +5474,7 @@ mod tests {
             /// previous ones, or nothing.
             destinations: Vec<Option<Vec<u8>>>,
             /// Kept alive for the paths above.
-            _dir: tempfile::TempDir,
+            _dir: pbfhogg_test_scratch::TestScratch,
         }
 
         /// Replace either a directory output, or a two-member group whose

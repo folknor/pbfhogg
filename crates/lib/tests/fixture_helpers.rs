@@ -220,20 +220,34 @@ fn base_and_changed_fixtures_differ_by_the_documented_edits() {
 // Scratch and adversarial helpers
 // ---------------------------------------------------------------------------
 
-#[test]
-#[should_panic(expected = "read scratch directory")]
-fn missing_snapshot_root_is_an_error() {
-    let dir = crate::common::test_scratch();
-    crate::common::snapshot_dir(&dir.path().join("missing"));
+/// Runs `snapshot_dir` on `root` and returns its panic message. The scratch
+/// guard stays outside the caught closure: a guard dropped while unwinding
+/// keeps its tree, so a `should_panic` test holding one would leave residue
+/// on every passing run.
+fn snapshot_panic_message(root: &std::path::Path) -> String {
+    let payload = std::panic::catch_unwind(|| crate::common::snapshot_dir(root))
+        .expect_err("snapshot_dir must panic");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .expect("a string panic payload")
 }
 
 #[test]
-#[should_panic(expected = "read scratch directory")]
+fn missing_snapshot_root_is_an_error() {
+    let dir = crate::common::test_scratch();
+    let message = snapshot_panic_message(&dir.path().join("missing"));
+    assert!(message.contains("read scratch directory"), "{message}");
+}
+
+#[test]
 fn file_snapshot_root_is_an_error() {
     let dir = crate::common::test_scratch();
     let file = dir.path().join("file");
     std::fs::write(&file, b"").expect("create file");
-    crate::common::snapshot_dir(&file);
+    let message = snapshot_panic_message(&file);
+    assert!(message.contains("read scratch directory"), "{message}");
 }
 
 #[test]
@@ -255,4 +269,21 @@ fn truncate_to_caps_to_len() {
     assert_eq!(truncate_to(&bytes, 3), vec![1, 2, 3]);
     assert_eq!(truncate_to(&bytes, 99), bytes);
     assert_eq!(truncate_to(&bytes, 0), Vec::<u8>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_snapshot_does_not_follow_symlink_cycles_or_escapes() {
+    let dir = crate::common::test_scratch();
+    let outside = crate::common::test_scratch();
+    std::fs::write(outside.child("hidden"), b"x").expect("write");
+    std::os::unix::fs::symlink(outside.path(), dir.child("escape")).expect("escape");
+    std::os::unix::fs::symlink(dir.path(), dir.child("cycle")).expect("cycle");
+    assert_eq!(
+        crate::common::snapshot_dir(dir.path()),
+        ["cycle", "escape"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect()
+    );
 }

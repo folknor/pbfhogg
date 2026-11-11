@@ -348,7 +348,7 @@ fn collect_sequential(path: &Path) -> Vec<(char, i64)> {
 #[test]
 fn pipelined_matches_sequential() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let sequential = collect_sequential(&path);
@@ -387,7 +387,7 @@ fn for_each_matches_pipelined_across_compressions() {
         Compression::Zstd(3),
     ] {
         let dir = crate::common::test_scratch();
-        let path = dir.path().join("test.osm.pbf");
+        let path = dir.path().join("generated.osm.pbf");
         write_materialization_pbf(&path, compression);
 
         let sequential = collect_sequential_full(&path);
@@ -423,7 +423,7 @@ fn for_each_matches_pipelined_across_compressions() {
 #[test]
 fn block_iterator_matches_pipelined() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let sequential = collect_sequential(&path);
@@ -444,7 +444,7 @@ fn block_iterator_matches_pipelined() {
 #[test]
 fn block_iterator_early_drop() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let reader = ElementReader::from_path(&path).unwrap();
@@ -624,7 +624,7 @@ fn block_type_classification() {
     use pbfhogg::BlockType;
 
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let reader = ElementReader::from_path(&path).unwrap();
@@ -657,7 +657,7 @@ fn block_type_classification() {
 #[test]
 fn par_map_reduce_count() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let sequential = collect_sequential(&path);
@@ -688,7 +688,7 @@ fn par_map_reduce_count() {
 #[test]
 fn par_map_reduce_collect_ids() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let mut expected = collect_sequential(&path);
@@ -718,7 +718,7 @@ fn par_map_reduce_collect_ids() {
 #[test]
 fn blobreader_seek_to_start() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let mut reader = BlobReader::seekable_from_path(&path).unwrap();
@@ -737,7 +737,7 @@ fn blobreader_seek_to_start() {
 #[test]
 fn blobreader_blob_from_offset() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     // First pass: collect all blob types (as strings) and offsets
@@ -760,7 +760,7 @@ fn blobreader_blob_from_offset() {
 #[test]
 fn blobreader_seek_raw() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let mut reader = BlobReader::seekable_from_path(&path).unwrap();
@@ -815,7 +815,7 @@ fn blobreader_seek_raw_clears_error_state() {
 #[test]
 fn blobreader_next_header_skip_blob() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     // Normal iteration: collect types (as strings) and offsets
@@ -890,7 +890,7 @@ fn write_sorted_pbf(path: &Path) {
 #[test]
 fn header_accessor() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_test_pbf(&path);
 
     let reader = ElementReader::from_path(&path).unwrap();
@@ -934,7 +934,7 @@ fn header_is_sorted_false() {
 #[test]
 fn header_consumed_elements_still_work() {
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("test.osm.pbf");
+    let path = dir.path().join("generated.osm.pbf");
     write_sorted_pbf(&path);
 
     let reader = ElementReader::from_path(&path).unwrap();

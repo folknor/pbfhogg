@@ -846,7 +846,7 @@ mod tests {
         line.push(format_args!("{} {name}\n", 42_u64));
 
         let scratch = crate::path_guard::tests::scratch();
-        let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
+        let sink = scratch.anonymous_file();
         assert_eq!(
             line.emit(&sink),
             super::Sent::Dropped,
@@ -867,7 +867,7 @@ mod tests {
         let mut line = Line::new();
         line.push(format_args!("{} PASS1_END\n", 42_u128));
         let scratch = crate::path_guard::tests::scratch();
-        let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
+        let sink = scratch.anonymous_file();
         assert_eq!(
             line.emit(&sink),
             super::Sent::Whole,
@@ -916,7 +916,11 @@ mod tests {
     /// A FIFO with a reader that never reads, which keeps it open for
     /// writers.
     #[cfg(target_os = "linux")]
-    fn fifo_with_idle_reader() -> (tempfile::TempDir, std::fs::File, super::MarkerFifo) {
+    fn fifo_with_idle_reader() -> (
+        pbfhogg_test_scratch::TestScratch,
+        std::fs::File,
+        super::MarkerFifo,
+    ) {
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let scratch = crate::path_guard::tests::scratch();

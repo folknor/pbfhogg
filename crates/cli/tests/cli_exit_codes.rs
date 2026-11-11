@@ -63,6 +63,7 @@ fn code(out: &crate::invoker::CliOutput) -> i32 {
 /// on three different codes.
 #[test]
 fn diff_separates_identical_differing_and_failure() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
@@ -71,13 +72,19 @@ fn diff_separates_identical_differing_and_failure() {
     write_two_nodes(&b, 110_000_000);
     write_two_nodes(&c, 999_000_000);
 
-    let same = CliInvoker::new()
-        .args(["diff", "-q", a.to_str().unwrap(), b.to_str().unwrap()])
+    let same = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("-q")
+        .arg(a.as_os_str())
+        .arg(b.as_os_str())
         .run();
     assert_eq!(code(&same), EXIT_SUCCESS, "identical files must exit 0");
 
-    let differ = CliInvoker::new()
-        .args(["diff", "-q", a.to_str().unwrap(), c.to_str().unwrap()])
+    let differ = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("-q")
+        .arg(a.as_os_str())
+        .arg(c.as_os_str())
         .run();
     assert_eq!(
         code(&differ),
@@ -87,8 +94,11 @@ fn diff_separates_identical_differing_and_failure() {
     );
 
     let missing = dir.path().join("does-not-exist.osm.pbf");
-    let failed = CliInvoker::new()
-        .args(["diff", "-q", a.to_str().unwrap(), missing.to_str().unwrap()])
+    let failed = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("-q")
+        .arg(a.as_os_str())
+        .arg(missing.as_os_str())
         .run();
     assert_eq!(
         code(&failed),
@@ -104,20 +114,19 @@ fn diff_separates_identical_differing_and_failure() {
 /// before and while it writes its output, so it is the case that used to die.
 #[test]
 fn a_closed_stderr_does_not_kill_the_run() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
     let nodes = crate::common::generate_nodes(50, 1);
     crate::common::write_indexed_pbf(&input, &nodes, &[], &[]);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .stderr_closed()
-        .args([
-            "sort",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-        ])
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
         .run();
     assert_eq!(
         code(&out),
@@ -136,15 +145,18 @@ fn a_closed_stderr_does_not_kill_the_run() {
 /// summary goes to the closed stderr after the diff itself went to stdout.
 #[test]
 fn a_closed_stderr_keeps_the_differences_status() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let c = dir.path().join("c.osm.pbf");
     write_two_nodes(&a, 110_000_000);
     write_two_nodes(&c, 999_000_000);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .stderr_closed()
-        .args(["diff", a.to_str().unwrap(), c.to_str().unwrap()])
+        .arg("diff")
+        .arg(a.as_os_str())
+        .arg(c.as_os_str())
         .run();
     assert_eq!(code(&out), EXIT_ANSWER_NEGATIVE);
 }
@@ -152,18 +164,17 @@ fn a_closed_stderr_keeps_the_differences_status() {
 /// A failure is still a failure when nobody can read its message.
 #[test]
 fn a_closed_stderr_keeps_the_failure_status() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let missing = dir.path().join("does-not-exist.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .stderr_closed()
-        .args([
-            "sort",
-            missing.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-        ])
+        .arg("sort")
+        .arg(missing.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
         .run();
     assert_eq!(code(&out), EXIT_FAILED);
 }
@@ -172,18 +183,23 @@ fn a_closed_stderr_keeps_the_failure_status() {
 /// invocation is 2.
 #[test]
 fn inspect_indexed_answer_and_failure_differ() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 
-    let indexed = CliInvoker::new()
-        .args(["inspect", "--indexed", input.to_str().unwrap()])
+    let indexed = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg("--indexed")
+        .arg(input.as_os_str())
         .run();
     assert_eq!(code(&indexed), EXIT_SUCCESS);
 
     let missing = dir.path().join("nope.osm.pbf");
-    let failed = CliInvoker::new()
-        .args(["inspect", "--indexed", missing.to_str().unwrap()])
+    let failed = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg("--indexed")
+        .arg(missing.as_os_str())
         .run();
     assert_eq!(
         code(&failed),
@@ -197,17 +213,24 @@ fn inspect_indexed_answer_and_failure_differ() {
 /// negative answer, not a failure.
 #[test]
 fn inspect_show_missing_element_is_the_negative_answer() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 
-    let found = CliInvoker::new()
-        .args(["inspect", input.to_str().unwrap(), "--show", "n1"])
+    let found = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(input.as_os_str())
+        .arg("--show")
+        .arg("n1")
         .run();
     assert_eq!(code(&found), EXIT_SUCCESS);
 
-    let absent = CliInvoker::new()
-        .args(["inspect", input.to_str().unwrap(), "--show", "n404"])
+    let absent = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(input.as_os_str())
+        .arg("--show")
+        .arg("n404")
         .run();
     assert_eq!(
         code(&absent),
@@ -221,8 +244,11 @@ fn inspect_show_missing_element_is_the_negative_answer() {
         absent.stderr_str(),
     );
 
-    let malformed = CliInvoker::new()
-        .args(["inspect", input.to_str().unwrap(), "--show", "zzz"])
+    let malformed = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(input.as_os_str())
+        .arg("--show")
+        .arg("zzz")
         .run();
     assert_eq!(
         code(&malformed),
@@ -238,52 +264,98 @@ fn inspect_show_missing_element_is_the_negative_answer() {
 /// flag-support probes from `SUB --FLAG --help`, so those shapes are pinned
 /// too.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn usage_errors_exit_64() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
-    let input = input.to_str().unwrap();
+    let input = input.as_os_str();
     let fresh = dir.path().join("fresh.osm.pbf");
-    let fresh = fresh.to_str().unwrap();
+    let fresh = fresh.as_os_str();
 
     // (argv, why) - refused as usage errors.
-    let usage: &[(&[&str], &str)] = &[
+    let usage: &[(&[&std::ffi::OsStr], &str)] = &[
         (&[], "no subcommand: clap prints help on stderr"),
-        (&["sort", "--no-such-flag"], "unknown flag"),
-        (&["sort", "--hel", "--help"], "brokkr's control probe"),
         (
-            &["inspect", "--overwrite", "--help"],
+            &[
+                std::ffi::OsStr::new("sort"),
+                std::ffi::OsStr::new("--no-such-flag"),
+            ],
+            "unknown flag",
+        ),
+        (
+            &[
+                std::ffi::OsStr::new("sort"),
+                std::ffi::OsStr::new("--hel"),
+                std::ffi::OsStr::new("--help"),
+            ],
+            "brokkr's control probe",
+        ),
+        (
+            &[
+                std::ffi::OsStr::new("inspect"),
+                std::ffi::OsStr::new("--overwrite"),
+                std::ffi::OsStr::new("--help"),
+            ],
             "a flag the subcommand lacks",
         ),
-        (&["sort", input], "a missing required argument"),
-        (&["inspect", input, "--show", "zzz"], "a malformed value"),
         (
-            &["export", input, "-O"],
+            &[std::ffi::OsStr::new("sort"), input],
+            "a missing required argument",
+        ),
+        (
+            &[
+                std::ffi::OsStr::new("inspect"),
+                input,
+                std::ffi::OsStr::new("--show"),
+                std::ffi::OsStr::new("zzz"),
+            ],
+            "a malformed value",
+        ),
+        (
+            &[
+                std::ffi::OsStr::new("export"),
+                input,
+                std::ffi::OsStr::new("-O"),
+            ],
             "a flag rule clap expresses (-O needs -o)",
         ),
         (
             &[
-                "degrade",
+                std::ffi::OsStr::new("degrade"),
                 input,
-                "-o",
+                std::ffi::OsStr::new("-o"),
                 fresh,
-                "--unsort-intra",
-                "--elements-per-blob",
-                "1",
+                std::ffi::OsStr::new("--unsort-intra"),
+                std::ffi::OsStr::new("--elements-per-blob"),
+                std::ffi::OsStr::new("1"),
             ],
             "a flag rule the CLI checks before dispatch",
         ),
         (
-            &["cat", input, input, "-o", fresh, "--reindex"],
+            &[
+                std::ffi::OsStr::new("cat"),
+                input,
+                input,
+                std::ffi::OsStr::new("-o"),
+                fresh,
+                std::ffi::OsStr::new("--reindex"),
+            ],
             "a rule a dispatch arm checks",
         ),
         (
-            &["inspect", "tags", input, "=primary"],
+            &[
+                std::ffi::OsStr::new("inspect"),
+                std::ffi::OsStr::new("tags"),
+                input,
+                std::ffi::OsStr::new("=primary"),
+            ],
             "an invalid expression, checked in the arm",
         ),
     ];
     for (args, why) in usage {
-        let out = CliInvoker::new().args(*args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(*args).run();
         let stderr = out.stderr_str();
         assert_eq!(
             code(&out),
@@ -312,7 +384,7 @@ fn usage_errors_exit_64() {
         &["sort", "--overwrite", "--help"],
         &["sort", "--staging-dir=.", "--help"],
     ] {
-        let out = CliInvoker::new().args(args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(args).run();
         assert_eq!(code(&out), EXIT_SUCCESS, "{args:?}: {}", out.stderr_str());
     }
 }
@@ -322,33 +394,63 @@ fn usage_errors_exit_64() {
 /// itself refuses included.
 #[test]
 fn runtime_failures_stay_2() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
-    let input = input.to_str().unwrap();
+    let input = input.as_os_str();
     let existing = dir.path().join("existing.osm.pbf");
     std::fs::write(&existing, b"occupied").unwrap();
-    let existing = existing.to_str().unwrap();
+    let existing = existing.as_os_str();
     let missing = dir.path().join("missing.osm.pbf");
-    let missing = missing.to_str().unwrap();
+    let missing = missing.as_os_str();
     let fresh = dir.path().join("fresh.osm.pbf");
-    let fresh = fresh.to_str().unwrap();
+    let fresh = fresh.as_os_str();
 
     // (argv, why) - refused or failed by the command: the runtime status.
-    let runtime: &[(&[&str], &str)] = &[
-        (&["sort", missing, "-o", fresh], "a missing input"),
-        (&["sort", input, "-o", existing], "an existing output"),
+    let runtime: &[(&[&std::ffi::OsStr], &str)] = &[
         (
-            &["sort", input, "-o", input, "-O"],
+            &[
+                std::ffi::OsStr::new("sort"),
+                missing,
+                std::ffi::OsStr::new("-o"),
+                fresh,
+            ],
+            "a missing input",
+        ),
+        (
+            &[
+                std::ffi::OsStr::new("sort"),
+                input,
+                std::ffi::OsStr::new("-o"),
+                existing,
+            ],
+            "an existing output",
+        ),
+        (
+            &[
+                std::ffi::OsStr::new("sort"),
+                input,
+                std::ffi::OsStr::new("-o"),
+                input,
+                std::ffi::OsStr::new("-O"),
+            ],
             "an output aliasing its input",
         ),
         (
-            &["renumber", input, "-o", fresh, "--start-id", "0"],
+            &[
+                std::ffi::OsStr::new("renumber"),
+                input,
+                std::ffi::OsStr::new("-o"),
+                fresh,
+                std::ffi::OsStr::new("--start-id"),
+                std::ffi::OsStr::new("0"),
+            ],
             "a value the library refuses",
         ),
     ];
     for (args, why) in runtime {
-        let out = CliInvoker::new().args(*args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(*args).run();
         let stderr = out.stderr_str();
         assert_eq!(
             code(&out),
@@ -373,6 +475,7 @@ fn runtime_failures_stay_2() {
 /// can act on it.
 #[test]
 fn inspect_show_rejects_every_other_mode_flag() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
@@ -390,8 +493,11 @@ fn inspect_show_rejects_every_other_mode_flag() {
         vec!["-j", "2"],
         vec!["--force"],
     ] {
-        let out = CliInvoker::new()
-            .args(["inspect", input.to_str().unwrap(), "--show", "n1"])
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("inspect")
+            .arg(input.as_os_str())
+            .arg("--show")
+            .arg("n1")
             .args(&extra)
             .run();
         assert!(
@@ -414,13 +520,16 @@ fn inspect_show_rejects_every_other_mode_flag() {
 /// Passing them to any other inspect mode did nothing and said nothing.
 #[test]
 fn inspect_force_and_jobs_require_nodes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 
     for extra in [vec!["--force"], vec!["-j", "2"]] {
-        let out = CliInvoker::new()
-            .args(["inspect", input.to_str().unwrap(), "--blocks"])
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("inspect")
+            .arg(input.as_os_str())
+            .arg("--blocks")
             .args(&extra)
             .run();
         assert!(
@@ -433,14 +542,12 @@ fn inspect_force_and_jobs_require_nodes() {
     }
 
     // ... and both stay valid where they actually do something.
-    CliInvoker::new()
-        .args([
-            "inspect",
-            input.to_str().unwrap(),
-            "--nodes",
-            "--force",
-            "-j",
-            "2",
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(input.as_os_str())
+        .arg("--nodes")
+        .arg("--force")
+        .arg("-j")
+        .arg("2")
         .assert_success();
 }

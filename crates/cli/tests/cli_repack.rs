@@ -20,7 +20,8 @@ use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Invoke `pbfhogg repack --elements-per-blob N -o <output> <input>`.
 fn run_repack(input: &Path, output: &Path, elements_per_blob: usize) -> crate::invoker::CliOutput {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("repack")
         .arg(input)
         .arg("-o")
@@ -197,12 +198,13 @@ fn repack_propagates_sorted_flag() {
 /// `--elements-per-blob 0` is rejected up front.
 #[test]
 fn repack_rejects_zero_cap() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_repack_fixture(&input);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("repack")
         .arg(&input)
         .arg("-o")
@@ -938,11 +940,12 @@ fn relabelled_way_blob(dir: &Path, kind: u8) -> std::path::PathBuf {
 /// ways missing and exit 0. The run is now refused and publishes nothing.
 #[test]
 fn repack_refuses_a_blob_whose_claimed_kind_is_false() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     for (kind, claimed) in [(0, "node"), (2, "relation")] {
         let input = relabelled_way_blob(dir.path(), kind);
         let output = dir.path().join(format!("out-{kind}.osm.pbf"));
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("repack")
             .arg(&input)
             .arg("-o")
@@ -962,6 +965,7 @@ fn repack_refuses_a_blob_whose_claimed_kind_is_false() {
 /// phase with no claim) is not refused and keeps every element.
 #[test]
 fn repack_accepts_honest_claims_and_unindexed_force_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let (nodes, ways, rels) = write_repack_fixture(&honest);
@@ -971,7 +975,7 @@ fn repack_accepts_honest_claims_and_unindexed_force_input() {
     assert_eq!(read_normalized(&output).ways.len(), ways.len());
 
     let unindexed = dir.path().join("unindexed.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -979,7 +983,7 @@ fn repack_accepts_honest_claims_and_unindexed_force_input() {
         .arg("--strip-indexdata")
         .assert_success();
     let forced = dir.path().join("forced.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("repack")
         .arg(&unindexed)
         .arg("-o")

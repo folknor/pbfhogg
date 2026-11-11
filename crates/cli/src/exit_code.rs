@@ -265,7 +265,7 @@ pub fn output_hint(err: &(dyn std::error::Error + 'static), advice: &Advice) -> 
 #[allow(clippy::disallowed_methods)] // fixture files in test scratch, not operator input
 mod tests {
     use super::{Hinted, error_report, is_platform_unsupported};
-    use crate::test_scratch::scratch;
+    use pbfhogg_test_scratch::scratch;
     use std::io;
 
     fn platform() -> pbfhogg::Error {

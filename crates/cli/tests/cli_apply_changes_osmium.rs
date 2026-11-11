@@ -874,7 +874,8 @@ fn expected_summary(case: &Case, base_state: &State, want: &State) -> String {
 }
 
 fn assert_locations_check_passes(path: &Path) {
-    let out = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--locations")
         .arg(path)
@@ -908,8 +909,10 @@ fn assert_state(tool: &str, got: &State, want: &State) {
 #[test]
 #[ignore = "external"]
 fn apply_changes_locations_on_ways_agrees_with_osmium() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
     // Only a missing osmium skips; any other spawn failure is a failure.
-    let version = match std::process::Command::new("osmium")
+    let version = match crate::common::oracle::Oracle::new(&dir)
         .arg("--version")
         .output()
     {
@@ -927,7 +930,6 @@ fn apply_changes_locations_on_ways_agrees_with_osmium() {
         }
         Err(e) => panic!("spawning osmium --version: {e}"),
     };
-    let dir = crate::common::test_scratch();
     let base = base();
     let base_path = dir.path().join("base.osm.pbf");
     write_base(&base_path, &base);
@@ -950,7 +952,7 @@ fn apply_changes_locations_on_ways_agrees_with_osmium() {
         write_osc(&osc_path, &osc_xml(&case.osc));
 
         let hogg_out = dir.path().join(format!("{name}-pbfhogg.osm.pbf"));
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("apply-changes")
             .arg(&base_path)
             .arg(&osc_path)
@@ -966,7 +968,7 @@ fn apply_changes_locations_on_ways_agrees_with_osmium() {
         out.assert_stderr_contains(&summary);
 
         let osmium_out = dir.path().join(format!("{name}-osmium.osm.pbf"));
-        let status = std::process::Command::new("osmium")
+        let status = crate::common::oracle::Oracle::new(&dir)
             .arg("apply-changes")
             .arg(&base_path)
             .arg(&osc_path)

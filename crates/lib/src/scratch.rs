@@ -1205,16 +1205,14 @@ mod tests {
     /// A parent that cannot be written is refused by `create` itself.
     #[test]
     fn a_read_only_parent_is_refused_at_creation() {
-        // Root passes the access check on anything.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let parent = crate::path_guard::tests::scratch();
-        fs::set_permissions(
-            parent.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o500),
-        )
-        .expect("chmod");
+        let denial = match parent.deny_write(parent.path()) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                crate::test_support::skip(reason);
+                return;
+            }
+        };
         let err = RunScratch::create(parent.path(), &host()).expect_err("read-only");
         assert!(
             err.to_string()
@@ -1222,11 +1220,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(fs::read_dir(parent.path()).expect("dir").count(), 0);
-        fs::set_permissions(
-            parent.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .expect("chmod back");
+        drop(denial);
     }
 
     #[test]
@@ -1530,10 +1524,6 @@ mod tests {
     /// directory is an issue that says so, never a stale entry.
     #[test]
     fn a_lock_that_cannot_be_probed_leaves_liveness_unknown() {
-        // Root opens anything, so the probe cannot fail there.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let parent = crate::path_guard::tests::scratch();
         let run = parent.path().join(".pbfhogg-run-999999-00");
         fs::create_dir(&run).expect("dir");
@@ -1545,6 +1535,20 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o400),
         )
         .expect("chmod");
+        // Opening an existing lock is a different operation from creating a
+        // directory entry, so probe it directly rather than using deny_write.
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(run.join(LOCK_NAME))
+        {
+            Ok(_) => {
+                crate::test_support::skip("opening the read-only lock for writing still succeeds");
+                return;
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => panic!("probe lock write denial: {e}"),
+        }
         let scan = find_stale(parent.path());
         assert!(scan.stale.is_empty(), "{scan:?}");
         assert_eq!(scan.issues.len(), 1, "{scan:?}");
@@ -1590,10 +1594,6 @@ mod tests {
 
     #[test]
     fn a_failed_cleanup_is_reported_with_the_leftover_path() {
-        // Root ignores directory permissions, so this check cannot fail there.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let parent = crate::path_guard::tests::scratch();
         let sink = std::sync::Arc::new(Recording::default());
         let mut h = host();
@@ -1602,11 +1602,13 @@ mod tests {
         let path = run.path().to_path_buf();
         let sub = run.create_subdir("stuck").expect("subdir");
         create(&sub.file("f").expect("name")).expect("file");
-        fs::set_permissions(
-            &sub.dir.path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o500),
-        )
-        .expect("chmod");
+        let denial = match parent.deny_write(&sub.dir.path) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                crate::test_support::skip(reason);
+                return;
+            }
+        };
         drop(run);
         let events = sink.0.lock().expect("sink").clone();
         assert_eq!(events.len(), 1, "{events:?}");
@@ -1619,11 +1621,7 @@ mod tests {
         assert!(path.join(LOCK_NAME).exists());
         let scan = find_stale(parent.path());
         assert_eq!(scan.stale[0].observation, Observation::LockAvailable);
-        fs::set_permissions(
-            &sub.dir.path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .expect("chmod back");
+        drop(denial);
     }
 
     #[test]

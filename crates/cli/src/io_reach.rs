@@ -175,7 +175,7 @@ mod tests {
     #[allow(clippy::disallowed_methods)] // reads a repository document, not an operator input
     fn direct_io_matrix_matches_reach() {
         let docs = std::fs::read_to_string(
-            crate::test_scratch::workspace_root().join("docs/cli/commands.md"),
+            pbfhogg_test_scratch::repository_root().join("docs/cli/commands.md"),
         )
         .unwrap();
         let actual = docs

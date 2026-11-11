@@ -306,7 +306,13 @@ mod tests {
 
     /// A buffered reader over `len` patterned bytes with a 16-byte buffer, so
     /// every append transition is reachable with small sizes.
-    fn small_buffered(len: usize) -> (super::FileReader, Vec<u8>, tempfile::TempDir) {
+    fn small_buffered(
+        len: usize,
+    ) -> (
+        super::FileReader,
+        Vec<u8>,
+        pbfhogg_test_scratch::TestScratch,
+    ) {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("in.bin");
         #[allow(clippy::cast_possible_truncation)]

@@ -22,7 +22,7 @@ use pbfhogg::test_hooks::SealStep;
 /// A FIFO in the test's scratch, drained on a thread until every write end
 /// has dropped; the drain returns everything it read.
 struct Capture {
-    _dir: tempfile::TempDir,
+    _dir: pbfhogg_test_scratch::TestScratch,
     fifo: MarkerFifo,
     drain: std::thread::JoinHandle<String>,
 }

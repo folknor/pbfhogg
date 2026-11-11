@@ -31,7 +31,8 @@ use pbfhogg::MemberId;
 
 /// The report lines in `form` (`None`: the default), or the failed run.
 fn digest_in(path: &Path, form: Option<&str>) -> Result<Vec<String>, CliOutput> {
-    let mut cli = CliInvoker::new().arg("digest");
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch).arg("digest");
     if let Some(form) = form {
         cli = cli.arg("--form").arg(form);
     }
@@ -88,7 +89,8 @@ fn assert_refused(path: &Path, why: &str) {
 }
 
 fn assert_refused_in(path: &Path, form: &str, why: &str) {
-    let out = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("digest")
         .arg("--form")
         .arg(form)
@@ -111,7 +113,8 @@ fn assert_refused_in(path: &Path, form: &str, why: &str) {
 /// is the same with or without `--suppress-common`, which `--quiet` refuses
 /// as an output-only flag.)
 fn diff_code(old: &Path, new: &Path, jobs: Option<usize>) -> Option<i32> {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(old)
         .arg(new)
@@ -981,6 +984,7 @@ fn full_digest_is_independent_of_encoding() {
 /// the content form, which does not.
 #[test]
 fn full_digest_covers_declared_prepass_fields() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let nodes: Vec<TestNode> = (1..=12)
@@ -1019,7 +1023,7 @@ fn full_digest_covers_declared_prepass_fields() {
         let out = dir
             .path()
             .join(format!("{name}-{backend}-{inject}.osm.pbf"));
-        let mut cli = CliInvoker::new()
+        let mut cli = CliInvoker::new(&invocation_scratch)
             .arg("add-locations-to-ways")
             .arg(input)
             .arg("-o")
@@ -1116,15 +1120,18 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 #[ignore = "external"]
 fn osmium_reencodings_digest_equal() {
-    if std::process::Command::new("osmium")
+    let dir = crate::common::test_scratch();
+    match crate::common::oracle::Oracle::new(&dir)
         .arg("--version")
         .output()
-        .is_err()
     {
-        crate::common::skip("osmium not found in PATH");
-        return;
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::common::skip("osmium not found in PATH");
+            return;
+        }
+        Err(e) => panic!("osmium version probe: {e}"),
     }
-    let dir = crate::common::test_scratch();
     let source = dir.path().join("source.osm.pbf");
     let mut f = base_fixture();
     f.nodes[0].meta = Some(TestMeta::default());
@@ -1140,7 +1147,7 @@ fn osmium_reencodings_digest_equal() {
     .enumerate()
     {
         let out = dir.path().join(format!("osmium-{i}.osm.pbf"));
-        let status = std::process::Command::new("osmium")
+        let status = crate::common::oracle::Oracle::new(&dir)
             .arg("cat")
             .arg(&source)
             .arg("-f")

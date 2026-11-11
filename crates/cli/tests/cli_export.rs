@@ -120,18 +120,17 @@ fn features(output: &[u8]) -> Vec<serde_json::Value> {
 
 #[test]
 fn default_sequence_is_exact_and_escaped() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
 
-    let output = CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--type",
-            "node",
-            "amenity",
-        ])
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("amenity")
         .assert_success();
     assert!(!output.stdout.contains(&0x1e));
     assert_eq!(
@@ -144,11 +143,15 @@ fn default_sequence_is_exact_and_escaped() {
 
 #[test]
 fn way_geometry_and_area_heuristic() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
-    let output = CliInvoker::new()
-        .args(["export", input.to_str().unwrap(), "--type", "way"])
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--type")
+        .arg("way")
         .assert_success();
     let values = features(&output.stdout);
     assert_eq!(values.len(), 5);
@@ -167,6 +170,7 @@ fn way_geometry_and_area_heuristic() {
 
 #[test]
 fn filters_properties_bbox_and_collection_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
@@ -174,22 +178,20 @@ fn filters_properties_bbox_and_collection_compose() {
     let expression_file = temp.path().join("expressions.txt");
     std::fs::write(&expression_file, "# exported roads\nhighway\n").unwrap();
 
-    let output = CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--type",
-            "way",
-            "--format",
-            "geojson",
-            "--properties",
-            "highway",
-            "--bbox",
-            "12.4,55.6,12.7,55.9",
-            "--expressions",
-            expression_file.to_str().unwrap(),
-            "missing_tag",
-        ])
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--type")
+        .arg("way")
+        .arg("--format")
+        .arg("geojson")
+        .arg("--properties")
+        .arg("highway")
+        .arg("--bbox")
+        .arg("12.4,55.6,12.7,55.9")
+        .arg("--expressions")
+        .arg(expression_file.as_os_str())
+        .arg("missing_tag")
         .assert_success();
     let collection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(collection["type"], "FeatureCollection");
@@ -205,31 +207,27 @@ fn filters_properties_bbox_and_collection_compose() {
             .is_none()
     );
 
-    let empty = CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--type",
-            "node",
-            "--format",
-            "geojson",
-            "missing_tag",
-        ])
+    let empty = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--format")
+        .arg("geojson")
+        .arg("missing_tag")
         .assert_success();
     assert_eq!(
         empty.stdout,
         b"{\"type\":\"FeatureCollection\",\"features\":[]}\n"
     );
 
-    let nodes = CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--type",
-            "node",
-            "--bbox",
-            "12.4,55.6,12.7,55.9",
-        ])
+    let nodes = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--bbox")
+        .arg("12.4,55.6,12.7,55.9")
         .assert_success();
     let nodes = features(&nodes.stdout);
     assert_eq!(nodes.len(), 1);
@@ -238,17 +236,16 @@ fn filters_properties_bbox_and_collection_compose() {
 
 #[test]
 fn metadata_types_and_locations_gate() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();
     let enriched = temp.path().join("enriched.pbf");
     write_fixture(&enriched, true);
-    let output = CliInvoker::new()
-        .args([
-            "export",
-            enriched.to_str().unwrap(),
-            "--type",
-            "node",
-            "--metadata",
-        ])
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(enriched.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--metadata")
         .assert_success();
     let value = &features(&output.stdout)[0]["properties"];
     assert_eq!(value["@version"], 3);
@@ -260,14 +257,12 @@ fn metadata_types_and_locations_gate() {
 
     let no_metadata = temp.path().join("no-metadata.pbf");
     write_node_without_metadata(&no_metadata);
-    let output = CliInvoker::new()
-        .args([
-            "export",
-            no_metadata.to_str().unwrap(),
-            "--type",
-            "node",
-            "--metadata",
-        ])
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(no_metadata.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--metadata")
         .assert_success();
     let properties = &features(&output.stdout)[0]["properties"];
     for key in [
@@ -286,12 +281,16 @@ fn metadata_types_and_locations_gate() {
 
     let raw = temp.path().join("raw.pbf");
     write_fixture(&raw, false);
-    CliInvoker::new()
-        .args(["export", raw.to_str().unwrap(), "--type", "way"])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(raw.as_os_str())
+        .arg("--type")
+        .arg("way")
         .assert_failure()
         .assert_stderr_contains("input PBF is missing required feature: LocationsOnWays");
-    CliInvoker::new()
-        .args(["export", raw.to_str().unwrap()])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(raw.as_os_str())
         .assert_failure()
         // The library half of the message must stay flag-free; the
         // `--type node` half is added by the CLI, not by `ErrorKind`.
@@ -299,56 +298,57 @@ fn metadata_types_and_locations_gate() {
             "way geometry needs an input carrying inline way-node coordinates; \
              use --type node to export nodes only",
         );
-    CliInvoker::new()
-        .args(["export", raw.to_str().unwrap(), "--type", "node"])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(raw.as_os_str())
+        .arg("--type")
+        .arg("node")
         .assert_success();
-    CliInvoker::new()
-        .args(["export", raw.to_str().unwrap(), "--type", "relation"])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(raw.as_os_str())
+        .arg("--type")
+        .arg("relation")
         .assert_failure()
         .assert_stderr_contains("export cannot export relations");
 }
 
 #[test]
 fn file_output_is_guarded_against_input_aliases() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
     let before = std::fs::read(&input).unwrap();
-    CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--output",
-            input.to_str().unwrap(),
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--output")
+        .arg(input.as_os_str())
         .assert_failure()
         .assert_stderr_contains("aliases input");
     assert_eq!(std::fs::read(&input).unwrap(), before);
 
     let hardlink = temp.path().join("hardlink.pbf");
     std::fs::hard_link(&input, &hardlink).unwrap();
-    CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--output",
-            hardlink.to_str().unwrap(),
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--output")
+        .arg(hardlink.as_os_str())
         .assert_failure()
         .assert_stderr_contains("aliases input");
     assert_eq!(std::fs::read(&input).unwrap(), before);
 
     std::fs::remove_file(&hardlink).unwrap();
     let output = temp.path().join("features.geojson");
-    CliInvoker::new()
-        .args([
-            "export",
-            input.to_str().unwrap(),
-            "--type",
-            "node",
-            "--output",
-            output.to_str().unwrap(),
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--output")
+        .arg(output.as_os_str())
         .assert_success();
     assert!(
         std::fs::read_to_string(output)
@@ -361,15 +361,13 @@ fn file_output_is_guarded_against_input_aliases() {
     bytes.truncate(bytes.len() - 5);
     std::fs::write(&corrupt, bytes).unwrap();
     let partial = temp.path().join("partial.geojson");
-    CliInvoker::new()
-        .args([
-            "export",
-            corrupt.to_str().unwrap(),
-            "--format",
-            "geojson",
-            "--output",
-            partial.to_str().unwrap(),
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(corrupt.as_os_str())
+        .arg("--format")
+        .arg("geojson")
+        .arg("--output")
+        .arg(partial.as_os_str())
         .assert_failure();
     assert!(!partial.exists(), "partial output survived decode failure");
 
@@ -377,15 +375,13 @@ fn file_output_is_guarded_against_input_aliases() {
     // shares the output name - not delete it, not truncate it.
     let precious = temp.path().join("important.geojson");
     std::fs::write(&precious, b"user data").unwrap();
-    CliInvoker::new()
-        .args([
-            "export",
-            corrupt.to_str().unwrap(),
-            "--format",
-            "geojson",
-            "--output",
-            precious.to_str().unwrap(),
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(corrupt.as_os_str())
+        .arg("--format")
+        .arg("geojson")
+        .arg("--output")
+        .arg(precious.as_os_str())
         .assert_failure();
     assert_eq!(
         std::fs::read(&precious).unwrap(),

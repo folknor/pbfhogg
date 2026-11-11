@@ -28,7 +28,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::invoker::{CliInvoker, CliOutput, subcommands};
-use tempfile::TempDir;
+use pbfhogg_test_scratch::TestScratch;
 
 /// The one spelling of the missing-header error.
 const MISSING_HEADER: &str = "does not start with an OsmHeader blob";
@@ -147,7 +147,7 @@ fn write_policy_fixtures(dir: &Path) {
 
 /// The inputs every row draws from.
 struct Fx {
-    dir: TempDir,
+    dir: TestScratch,
 }
 
 impl Fx {
@@ -769,7 +769,8 @@ fn bench_write(_: &Ctx, input: &Path) -> Invocation {
 // ---------------------------------------------------------------------------
 
 fn run(inv: &Invocation) -> CliOutput {
-    CliInvoker::new().args(&inv.args).run()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch).args(&inv.args).run()
 }
 
 fn exited_ok(row: &Row, out: &CliOutput) -> bool {
@@ -2047,10 +2048,11 @@ fn a_payload_running_past_eof_is_refused_with_its_location_by_every_command() {
 /// tests cover.
 #[test]
 fn getid_forced_unindexed_route_refuses_a_second_header() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new();
     let dir = crate::common::test_scratch();
     let output = dir.path().join("out.osm.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("getid")
         .arg(fx.path("two-headers-unindexed.osm.pbf"))
         .arg("--force")
@@ -2072,6 +2074,7 @@ fn getid_forced_unindexed_route_refuses_a_second_header() {
 #[cfg(unix)]
 #[test]
 fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new();
     let dir = crate::common::test_scratch();
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
@@ -2084,7 +2087,7 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
         ("getparents", &["--full-scan-min-blobs", "1"]),
     ];
     for (command, extra) in modes {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg(command)
             .arg(&fifo)
             .arg("-o")
@@ -2105,7 +2108,7 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
         assert!(!output.exists(), "{command} {extra:?}: published an output");
     }
     for command in ["getid", "getparents"] {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg(command)
             .arg(fx.path("good.osm.pbf"))
             .arg("-o")
@@ -2132,6 +2135,7 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
 #[cfg(unix)]
 #[test]
 fn inspect_pins_its_input_wherever_it_reads_it_twice() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let modes: [&[&str]; 5] = [
@@ -2142,7 +2146,7 @@ fn inspect_pins_its_input_wherever_it_reads_it_twice() {
         &["--blocks", "--indexed"],
     ];
     for extra in modes {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .arg("inspect")
             .arg(&fifo)
             .args(extra)
@@ -2174,6 +2178,7 @@ const CHECK_COMPOSITIONS: [(&[&str], u64); 5] = [
 #[cfg(unix)]
 #[test]
 fn check_pins_its_input_when_it_composes_checks() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let ids_alone: &[&str] = &["--ids"];
@@ -2182,7 +2187,11 @@ fn check_pins_its_input_when_it_composes_checks() {
         .map(|&(extra, _)| extra)
         .chain([ids_alone])
     {
-        let out = CliInvoker::new().arg("check").arg(&fifo).args(extra).run();
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("check")
+            .arg(&fifo)
+            .args(extra)
+            .run();
         let stderr = out.stderr_str();
         assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
         assert!(
@@ -2258,6 +2267,7 @@ mod check_composition {
     }
 
     fn reads_every_check_from_the_pinned_input(composition: usize) {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let replacement = dir.path().join("replacement.osm.pbf");
@@ -2265,19 +2275,16 @@ mod check_composition {
         let run = |extra: &[&str], after: u64, force_path: bool| {
             let report_file = control.path().join("report");
             drop(std::fs::remove_file(&report_file));
-            let out = CliInvoker::new()
+            let out = CliInvoker::new(&invocation_scratch)
                 .arg("check")
                 .arg(&input)
                 .args(extra)
                 .arg("--json")
-                .env("PBFHOGG_TEST_REPLACE_INPUT", &input)
-                .env("PBFHOGG_TEST_REPLACE_WITH", &replacement)
-                .env("PBFHOGG_TEST_REPLACE_AFTER", after.to_string())
-                .env(
-                    "PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN",
-                    if force_path { "1" } else { "0" },
-                )
-                .env("PBFHOGG_TEST_REPLACE_REPORT", &report_file)
+                .replace_input(&input)
+                .replace_with(&replacement)
+                .replace_after(after)
+                .force_pin_path_reopen(force_path)
+                .replace_report(&report_file)
                 .run();
             (out, report(&report_file))
         };
@@ -2349,15 +2356,16 @@ mod check_composition {
 
 #[test]
 fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new();
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .args(["inspect", "--indexed"])
         .arg(fx.path("header-only.osm.pbf"))
         .run();
     assert_eq!(out.status.code(), Some(0), "stderr:\n{}", out.stderr_str());
     assert!(out.stdout_str().contains("Indexed: yes"));
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .args(["inspect", "--indexed"])
         .arg(fx.path("zero.osm.pbf"))
         .run();
@@ -2368,13 +2376,14 @@ fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
 
 #[test]
 fn an_output_that_is_any_input_the_command_reads_is_refused_before_any_work() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new();
     let mut failures = Vec::new();
     for alias in ALIASES {
         let dir = crate::common::test_scratch();
         let (args, protected) = (alias.build)(&fx, dir.path());
         let before = std::fs::read(&protected).unwrap();
-        let out = CliInvoker::new().args(&args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(&args).run();
         let stderr = out.stderr_str();
         let label = format!("{} {}", alias.command, alias.flag);
         if out.status.code() != Some(2) {
@@ -2404,6 +2413,7 @@ fn an_output_that_is_any_input_the_command_reads_is_refused_before_any_work() {
 
 #[test]
 fn every_secondary_input_flag_has_an_alias_case() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     // The flags that name an input file besides the positional PBF, read from
     // each command's own `--help`; one without a case in ALIASES fails here.
     let expected: &[(&str, &[&str])] = &[
@@ -2417,7 +2427,7 @@ fn every_secondary_input_flag_has_an_alias_case() {
     // their own cases above.
     let mut problems = Vec::new();
     for (command, flags) in expected {
-        let help = CliInvoker::new()
+        let help = CliInvoker::new(&invocation_scratch)
             .args([command, "--help"])
             .assert_success()
             .stdout_str();

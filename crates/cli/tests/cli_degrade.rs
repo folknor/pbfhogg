@@ -763,6 +763,7 @@ fn a_written_index_spells_an_absent_bbox_as_an_inverted_box() {
 /// for an unrelated reason.
 #[test]
 fn degrade_corrupt_indexdata_writes_a_valid_but_overstated_index() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -772,7 +773,7 @@ fn degrade_corrupt_indexdata_writes_a_valid_but_overstated_index() {
     let before = declared_indexdata(&input);
     assert!(before.len() > 1, "fixture must have several blobs");
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -803,6 +804,7 @@ fn degrade_corrupt_indexdata_writes_a_valid_but_overstated_index() {
 /// that makes a consumer skip a blob rather than merely misreport it.
 #[test]
 fn degrade_corrupt_indexdata_kind_rotates_only_the_declared_kind() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -818,7 +820,7 @@ fn degrade_corrupt_indexdata_kind_rotates_only_the_declared_kind() {
          proves nothing"
     );
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -859,6 +861,7 @@ fn degrade_corrupt_indexdata_kind_rotates_only_the_declared_kind() {
 /// what makes the corruption a *lie* rather than damage.
 #[test]
 fn degrade_corrupt_tagdata_keeps_indexdata_and_elements_intact() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -872,7 +875,7 @@ fn degrade_corrupt_tagdata_keeps_indexdata_and_elements_intact() {
         "fixture must carry tagdata in several blobs"
     );
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -907,13 +910,14 @@ fn degrade_corrupt_tagdata_keeps_indexdata_and_elements_intact() {
 /// question. All four are rejected, not resolved.
 #[test]
 fn degrade_rejects_contradictory_corruption_combinations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_degrade_fixture(&input);
 
     let reject = |flags: &[&str], expect: &str| {
         let output = dir.path().join(format!("out-{}.osm.pbf", flags.join("-")));
-        let mut inv = CliInvoker::new();
+        let mut inv = CliInvoker::new(&invocation_scratch);
         inv = inv.arg("degrade").arg(&input).arg("-o").arg(&output);
         for f in flags {
             inv = inv.arg(*f);
@@ -940,7 +944,7 @@ fn degrade_rejects_contradictory_corruption_combinations() {
         "--corrupt-indexdata-kind",
     ] {
         let output = dir.path().join(format!("ok{flag}.osm.pbf"));
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -960,6 +964,7 @@ fn degrade_rejects_contradictory_corruption_combinations() {
 /// not touched.
 #[test]
 fn degrade_strip_indexdata_drops_indexdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -967,7 +972,7 @@ fn degrade_strip_indexdata_drops_indexdata() {
     write_degrade_fixture(&input);
     assert_indexed(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1004,6 +1009,7 @@ fn degrade_strip_indexdata_drops_indexdata() {
 /// members) round-trips through the BlockBuilder re-encode.
 #[test]
 fn degrade_strip_locations_clears_low_and_preserves_elements() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1016,7 +1022,7 @@ fn degrade_strip_locations_clears_low_and_preserves_elements() {
         "fixture must declare LocationsOnWays for the strip to be meaningful"
     );
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1048,6 +1054,7 @@ fn degrade_strip_locations_clears_low_and_preserves_elements() {
 /// intact - a tagdata-stripped file is still indexed.
 #[test]
 fn degrade_strip_tagdata_drops_tagdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1066,7 +1073,7 @@ fn degrade_strip_tagdata_drops_tagdata() {
     );
     assert_indexed(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1105,6 +1112,7 @@ fn degrade_strip_tagdata_drops_tagdata() {
 /// sortedness, and the element multiset all survive.
 #[test]
 fn degrade_strip_bbox_clears_header_bbox() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1120,7 +1128,7 @@ fn degrade_strip_bbox_clears_header_bbox() {
     assert_rich_header_fields_present(&input);
     assert_indexed(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1166,6 +1174,7 @@ fn degrade_strip_bbox_clears_header_bbox() {
 /// the OsmData frames are copied verbatim.
 #[test]
 fn degrade_strip_bbox_no_indexdata_uses_passthrough() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1176,7 +1185,7 @@ fn degrade_strip_bbox_no_indexdata_uses_passthrough() {
     assert_rich_header_fields_present(&input);
 
     // No --force: a decode-path dispatch would fail the indexdata precondition.
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1206,6 +1215,7 @@ fn degrade_strip_bbox_no_indexdata_uses_passthrough() {
 /// OsmData blob, while sortedness and the element multiset survive.
 #[test]
 fn degrade_strip_bbox_and_strip_indexdata_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1214,7 +1224,7 @@ fn degrade_strip_bbox_and_strip_indexdata_compose() {
     assert!(read_header(&input).bbox().is_some());
     assert_indexed(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1241,6 +1251,7 @@ fn degrade_strip_bbox_and_strip_indexdata_compose() {
 /// passthrough path's.
 #[test]
 fn degrade_strip_bbox_and_strip_locations_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1248,7 +1259,7 @@ fn degrade_strip_bbox_and_strip_locations_compose() {
     write_bbox_fixture(&input);
     assert!(read_header(&input).bbox().is_some());
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1281,6 +1292,7 @@ fn degrade_strip_bbox_and_strip_locations_compose() {
 /// invariant end-to-end: the degraded file stays a valid extract input.
 #[test]
 fn degrade_strip_bbox_extract_bbox_matches_original() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let stripped = dir.path().join("stripped.osm.pbf");
@@ -1289,7 +1301,7 @@ fn degrade_strip_bbox_extract_bbox_matches_original() {
 
     write_bbox_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1302,7 +1314,7 @@ fn degrade_strip_bbox_extract_bbox_matches_original() {
     // non-empty but not the whole file. osmium order: minlon,minlat,maxlon,maxlat.
     let region = "0.0,0.0,0.00055,0.00055";
     for (src, out) in [(&input, &extract_orig), (&stripped, &extract_stripped)] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("extract")
             .arg(src)
             .arg("-o")
@@ -1343,6 +1355,7 @@ fn degrade_strip_bbox_extract_bbox_matches_original() {
 /// survives an override is pinned by `crates/cli/tests/cli_output_header.rs`.
 #[test]
 fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1360,7 +1373,7 @@ fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
 
     const OVERRIDE_GENERATOR: &str = "degrade-rebuild-override/9.0";
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1407,13 +1420,14 @@ fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
 /// the inter-blob seam, not inside a blob.
 #[test]
 fn degrade_unsort_creates_adjacent_overlap_per_kind() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1497,13 +1511,14 @@ fn assert_unsort_cross_blob_shape(output: &Path, input: &Path) {
 /// non-overlapping ranges.
 #[test]
 fn degrade_unsort_intra_creates_intra_blob_inversion() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1525,13 +1540,14 @@ fn degrade_unsort_intra_creates_intra_blob_inversion() {
 /// elements so it lands at the start of the first output block.
 #[test]
 fn degrade_unsort_intra_large_input_blobs_stay_intra_blob() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_large_blob_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1595,13 +1611,14 @@ fn assert_unsort_intra_shape(output: &Path, input: &Path) {
 /// `--unsort` and `--unsort-intra` are mutually exclusive.
 #[test]
 fn degrade_unsort_and_unsort_intra_are_mutually_exclusive() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1618,6 +1635,7 @@ fn degrade_unsort_and_unsort_intra_are_mutually_exclusive() {
 /// reach `sort`'s overlap-rewrite path.
 #[test]
 fn degrade_unsort_then_sort_round_trips() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let unsorted = dir.path().join("unsorted.osm.pbf");
@@ -1625,7 +1643,7 @@ fn degrade_unsort_then_sort_round_trips() {
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1635,7 +1653,7 @@ fn degrade_unsort_then_sort_round_trips() {
         .arg(UNSORT_CAP)
         .assert_success();
 
-    let sort_out = CliInvoker::new()
+    let sort_out = CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&unsorted)
         .arg("-o")
@@ -1673,13 +1691,14 @@ fn degrade_unsort_then_sort_round_trips() {
 /// unindexed.
 #[test]
 fn degrade_unsort_and_strip_indexdata_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_degrade_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1705,13 +1724,14 @@ fn degrade_unsort_and_strip_indexdata_compose() {
 /// still fires when the ways go through the coordinate-dropping re-encode.
 #[test]
 fn degrade_unsort_and_strip_locations_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1733,13 +1753,14 @@ fn degrade_unsort_and_strip_locations_compose() {
 /// shape is preserved *and* `LocationsOnWays` is cleared.
 #[test]
 fn degrade_unsort_intra_and_strip_locations_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1761,13 +1782,14 @@ fn degrade_unsort_intra_and_strip_locations_compose() {
 /// unsorted *and* unindexed.
 #[test]
 fn degrade_unsort_intra_and_strip_indexdata_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1787,6 +1809,7 @@ fn degrade_unsort_intra_and_strip_indexdata_compose() {
 /// pass through untouched.
 #[test]
 fn degrade_strip_tagdata_and_strip_indexdata_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1795,7 +1818,7 @@ fn degrade_strip_tagdata_and_strip_indexdata_compose() {
     assert_has_tagdata(&input);
     assert_indexed(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1822,6 +1845,7 @@ fn degrade_strip_tagdata_and_strip_indexdata_compose() {
 /// writer with tagdata cleared, under either unsort mode.
 #[test]
 fn degrade_unsort_and_strip_tagdata_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1829,7 +1853,7 @@ fn degrade_unsort_and_strip_tagdata_compose() {
     write_degrade_fixture(&input);
     assert_has_tagdata(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1858,6 +1882,7 @@ fn degrade_unsort_and_strip_tagdata_compose() {
 /// blob carries tagdata.
 #[test]
 fn degrade_strip_locations_and_strip_tagdata_compose() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1865,7 +1890,7 @@ fn degrade_strip_locations_and_strip_tagdata_compose() {
     write_degrade_fixture(&input);
     assert_has_tagdata(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1917,13 +1942,14 @@ fn assert_transformation_flags(text: &str) {
 /// Running `degrade` with no transformation flags is rejected.
 #[test]
 fn degrade_requires_at_least_one_flag() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_degrade_fixture(&input);
 
-    let cli_output = CliInvoker::new()
+    let cli_output = CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -1936,7 +1962,8 @@ fn degrade_requires_at_least_one_flag() {
 
 #[test]
 fn degrade_help_lists_every_transformation_flag() {
-    let cli_output = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let cli_output = CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg("--help")
         .assert_success();
@@ -2028,9 +2055,10 @@ fn expected_dangles(out: &crate::common::NormalizedPbf) -> (u64, u64, u64, u64) 
 /// so this uses `run()` (not `assert_success`) and reads stdout. Returns the
 /// four-field sum so callers can guard against a vacuous (zero-dangle) run.
 fn assert_check_refs_matches_output(path: &Path) -> u64 {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let out = read_normalized(path);
     let (mnr, mwr, mnm, mrm) = expected_dangles(&out);
-    let check = CliInvoker::new()
+    let check = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg(path)
         .arg("--refs")
@@ -2069,12 +2097,13 @@ fn assert_check_refs_matches_output(path: &Path) -> u64 {
 /// and way 2 (a member of every relation), so the four-field sum is > 0.
 #[test]
 fn degrade_drop_ids_dangling_refs_match_check_refs() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_degrade_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -2093,12 +2122,13 @@ fn degrade_drop_ids_dangling_refs_match_check_refs() {
 
 #[test]
 fn degrade_drop_ids_removes_exactly_n() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_degrade_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -2114,6 +2144,7 @@ fn degrade_drop_ids_removes_exactly_n() {
 
 #[test]
 fn degrade_drop_ids_is_reproducible_and_seed_changes_selection() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let first = dir.path().join("first.osm.pbf");
@@ -2121,7 +2152,7 @@ fn degrade_drop_ids_is_reproducible_and_seed_changes_selection() {
     let third = dir.path().join("third.osm.pbf");
     write_degrade_fixture(&input);
     for (output, spec) in [(&first, "10:7"), (&second, "10:7"), (&third, "10:8")] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -2142,6 +2173,7 @@ fn degrade_drop_ids_is_reproducible_and_seed_changes_selection() {
 
 #[test]
 fn degrade_drop_ids_validates_arguments_and_total() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -2151,7 +2183,7 @@ fn degrade_drop_ids_validates_arguments_and_total() {
         ("10", "N:SEED"),
         ("1000000:1", "input has only"),
     ] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -2166,13 +2198,14 @@ fn degrade_drop_ids_validates_arguments_and_total() {
 /// `--elements-per-blob 0` is rejected up front.
 #[test]
 fn degrade_rejects_zero_block_cap() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_degrade_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -2187,6 +2220,7 @@ fn degrade_rejects_zero_block_cap() {
 /// A cap larger than the input must not drive builder preallocation.
 #[test]
 fn degrade_bounds_preallocation_by_input_size() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -2194,7 +2228,7 @@ fn degrade_bounds_preallocation_by_input_size() {
     write_degrade_fixture(&input);
 
     for flag in ["--strip-locations", "--unsort"] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -2211,6 +2245,7 @@ fn degrade_bounds_preallocation_by_input_size() {
 
 #[test]
 fn degrade_unsort_counts_a_trailing_held_element_once() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -2219,7 +2254,7 @@ fn degrade_unsort_counts_a_trailing_held_element_once() {
 
     // The node count exactly fills the cap, leaving its final node held
     // until the phase ends because no following node can complete the swap.
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -2239,13 +2274,14 @@ fn degrade_unsort_counts_a_trailing_held_element_once() {
 /// clear Sort.Type_then_ID.
 #[test]
 fn degrade_unsort_intra_rejects_block_cap_one() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -2263,13 +2299,14 @@ fn degrade_unsort_intra_rejects_block_cap_one() {
 /// the same overlap shape sort's detect_overlaps fires on.
 #[test]
 fn degrade_unsort_accepts_block_cap_one() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
     write_unsort_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&input)
         .arg("-o")
@@ -2287,12 +2324,13 @@ mod tier2 {
 
     #[test]
     fn degrade_drop_ids_and_strip_locations_compose() {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
         write_degrade_fixture(&input);
         let input_count = normalized_count(&input);
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -2306,12 +2344,13 @@ mod tier2 {
 
     #[test]
     fn degrade_drop_ids_and_strip_indexdata_compose() {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
         write_degrade_fixture(&input);
         let input_count = normalized_count(&input);
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -2324,12 +2363,13 @@ mod tier2 {
 
     #[test]
     fn degrade_drop_ids_and_unsort_compose() {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
         write_unsort_fixture(&input);
         let input_count = normalized_count(&input);
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -2399,6 +2439,7 @@ fn relabelled_way_blob(dir: &Path, kind: u8) -> std::path::PathBuf {
 /// nothing.
 #[test]
 fn degrade_refuses_a_blob_whose_claimed_kind_is_false() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     for (kind, claimed) in [(0, "node"), (2, "relation")] {
         let input = relabelled_way_blob(dir.path(), kind);
@@ -2407,7 +2448,7 @@ fn degrade_refuses_a_blob_whose_claimed_kind_is_false() {
             ("drop", ["--drop-ids", "5:1", "--strip-locations"]),
         ] {
             let output = dir.path().join(format!("out-{kind}-{name}.osm.pbf"));
-            let out = CliInvoker::new()
+            let out = CliInvoker::new(&invocation_scratch)
                 .arg("degrade")
                 .arg(&input)
                 .arg("-o")
@@ -2430,13 +2471,14 @@ fn degrade_refuses_a_blob_whose_claimed_kind_is_false() {
 /// decode), and a wholly unindexed input under `--force` is not refused.
 #[test]
 fn degrade_accepts_honest_claims_and_unindexed_force_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     write_degrade_fixture(&honest);
     let count = normalized_count(&honest);
 
     let output = dir.path().join("out.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -2451,7 +2493,7 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
         ("strip", "--strip-indexdata"),
         ("corrupt", "--corrupt-indexdata-kind"),
     ] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&lying)
             .arg("-o")
@@ -2461,7 +2503,7 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
     }
 
     let unindexed = dir.path().join("unindexed.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -2469,7 +2511,7 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
         .arg("--strip-indexdata")
         .assert_success();
     let forced = dir.path().join("forced.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&unindexed)
         .arg("-o")
@@ -2485,12 +2527,13 @@ fn degrade_accepts_honest_claims_and_unindexed_force_input() {
 /// applied.
 #[test]
 fn degrade_corrupt_indexdata_refuses_a_blob_with_no_indexdata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     write_degrade_fixture(&honest);
 
     let unindexed = dir.path().join("unindexed.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&honest)
         .arg("-o")
@@ -2499,7 +2542,7 @@ fn degrade_corrupt_indexdata_refuses_a_blob_with_no_indexdata() {
         .assert_success();
 
     for flag in ["--corrupt-indexdata", "--corrupt-indexdata-kind"] {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&unindexed)
             .arg("-o")

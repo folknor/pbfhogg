@@ -47,7 +47,8 @@ fn write_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>
 const EXIT_ANSWER_NEGATIVE: i32 = 1;
 
 fn check_index(path: &Path) -> crate::invoker::CliOutput {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg(path)
@@ -56,8 +57,9 @@ fn check_index(path: &Path) -> crate::invoker::CliOutput {
 
 /// Run `degrade` with one corruption flag and return the corrupted file's path.
 fn degrade_with(dir: &Path, input: &Path, flag: &str, name: &str) -> std::path::PathBuf {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let out = dir.join(name);
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(input)
         .arg("-o")
@@ -110,6 +112,7 @@ fn an_honest_file_passes_and_exits_zero() {
 /// fallback payload scan, so this verifies the producer path in question.
 #[test]
 fn repacked_empty_tag_key_passes_index_check() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let repacked = dir.path().join("repacked.osm.pbf");
@@ -122,7 +125,7 @@ fn repacked_empty_tag_key_passes_index_check() {
     }];
     write_indexed_pbf(&input, &nodes, &[], &[]);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("repack")
         .arg(&input)
         .arg("-o")
@@ -144,12 +147,13 @@ fn repacked_empty_tag_key_passes_index_check() {
 /// useless on exactly the inputs most worth checking.
 #[test]
 fn a_file_that_makes_no_claims_passes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let stripped = dir.path().join("stripped.osm.pbf");
     write_fixture(&input);
     let stripped = {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("degrade")
             .arg(&input)
             .arg("-o")
@@ -182,6 +186,7 @@ fn a_file_that_makes_no_claims_passes() {
 /// wholly unindexed counterpart for each shape.
 #[test]
 fn unindexable_blobs_without_indexdata_violate_partial_coverage() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("coverage.osm.pbf");
     let mut nodes = generate_nodes(6, 1);
@@ -207,7 +212,7 @@ fn unindexable_blobs_without_indexdata_violate_partial_coverage() {
             );
             let offset = crate::common::adversarial::locate_blobs(&partial)[blob].frame_start;
             std::fs::write(&input, &partial).expect("write partial fixture");
-            let out = CliInvoker::new()
+            let out = CliInvoker::new(&invocation_scratch)
                 .args(["check", "--index", "--json"])
                 .arg(&input)
                 .run();
@@ -246,6 +251,7 @@ fn unindexable_blobs_without_indexdata_violate_partial_coverage() {
 /// even when per-blob findings have already filled the report cap.
 #[test]
 fn partial_index_remains_visible_under_a_cap_and_counts_unreadable_claims() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
@@ -256,7 +262,7 @@ fn partial_index_remains_visible_under_a_cap_and_counts_unreadable_claims() {
     let partial =
         crate::common::adversarial::mutate_blob_header_indexdata(&malformed, 2, Vec::clear);
     std::fs::write(&input, partial).expect("write fixture");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .args(["check", "--index", "--json", "--max-errors", "1"])
         .arg(&input)
         .run();
@@ -622,6 +628,7 @@ fn mixed_kind_block() -> Vec<u8> {
 /// the entire file.
 #[test]
 fn index_is_opt_in_and_a_bare_check_does_not_run_it() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
@@ -630,7 +637,10 @@ fn index_is_opt_in_and_a_bare_check_does_not_run_it() {
     // A bare `check` on the corrupted file must not report the metadata lie -
     // it does not look. (It also must not fail for some other reason: the
     // payload is byte-identical to the honest fixture.)
-    let bare = CliInvoker::new().arg("check").arg(&corrupt).run();
+    let bare = CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(&corrupt)
+        .run();
     assert!(
         bare.status.success(),
         "a bare check runs --ids and --refs only, and the payload is honest; \
@@ -655,6 +665,7 @@ fn index_is_opt_in_and_a_bare_check_does_not_run_it() {
 /// `--index` selects, so it suppresses the default `--ids` + `--refs` pair.
 #[test]
 fn index_alone_runs_only_the_index_check() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
@@ -675,7 +686,7 @@ fn index_alone_runs_only_the_index_check() {
 
     // Counterpart: asking for both runs both, so the suppression above is the
     // selector working rather than the index check having replaced them.
-    let both = CliInvoker::new()
+    let both = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg("--refs")
@@ -689,12 +700,13 @@ fn index_alone_runs_only_the_index_check() {
 /// The JSON surface carries the same verdict as the human one.
 #[test]
 fn json_output_reports_the_verdict_and_the_violations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let corrupt = degrade_with(dir.path(), &input, "--corrupt-indexdata", "count.osm.pbf");
 
-    let honest = CliInvoker::new()
+    let honest = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg("--json")
@@ -705,7 +717,7 @@ fn json_output_reports_the_verdict_and_the_violations() {
     assert_eq!(honest["index"]["passed"], serde_json::Value::Bool(true));
     assert_eq!(honest["index"]["total_violations"], 0);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg("--index")
         .arg("--json")
@@ -923,6 +935,7 @@ mod serial {
 
     #[test]
     fn sparse_global_ids_above_allocation_floors_are_checked_exactly() {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("high-ids.osm.pbf");
         let mut nodes = generate_nodes(2, 20_000_000_000);
@@ -955,11 +968,11 @@ mod serial {
             },
         ];
         write_multi_block_test_pbf(&input, &nodes, &ways, &relations, 1);
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .args(["check", "--refs", "--check-relations"])
             .arg(&input)
             .assert_success();
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .args(["check", "--ids", "--full"])
             .arg(&input)
             .assert_success();
@@ -968,7 +981,7 @@ mod serial {
         // overflow merge, even with detail retention capped.
         nodes.push(generate_nodes(1, nodes[1].id).remove(0));
         write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .args(["check", "--ids", "--full", "--json", "--max-errors", "2"])
             .arg(&input)
             .assert_failure();
@@ -988,6 +1001,7 @@ mod serial {
 /// same lie is still printed: a stopped check does not end the run.
 #[test]
 fn a_bare_check_fails_a_file_whose_kind_claims_are_false() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
@@ -998,7 +1012,10 @@ fn a_bare_check_fails_a_file_whose_kind_claims_are_false() {
         "rotated.osm.pbf",
     );
 
-    let bare = CliInvoker::new().arg("check").arg(&rotated).run();
+    let bare = CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(&rotated)
+        .run();
     assert_eq!(
         bare.status.code(),
         Some(EXIT_ANSWER_NEGATIVE),
@@ -1019,7 +1036,7 @@ fn a_bare_check_fails_a_file_whose_kind_claims_are_false() {
         bare.stderr_str()
     );
 
-    let both = CliInvoker::new()
+    let both = CliInvoker::new(&invocation_scratch)
         .args(["check", "--ids", "--index"])
         .arg(&rotated)
         .run();
@@ -1029,5 +1046,8 @@ fn a_bare_check_fails_a_file_whose_kind_claims_are_false() {
     assert!(stdout.contains("Blob metadata"), "{stdout}");
 
     // The honest file the lie was forged from passes the same bare check.
-    CliInvoker::new().arg("check").arg(&input).assert_success();
+    CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(&input)
+        .assert_success();
 }

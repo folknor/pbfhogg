@@ -165,7 +165,8 @@ impl Scenario for CancelCat {
             cat_into(env, &[input], "out", None, &CLEAN_NONE, host).map(drop)
         })?;
         record.cancel = *tap.result.lock().unwrap_or_else(PoisonError::into_inner);
-        let out_absent = super::absent(ctx.binding("out"));
+        let out_absent =
+            super::absent(ctx.binding("out")).map_err(|e| format!("inspect output: {e}"))?;
         let ok = if self.post {
             record.outcome.is_ok()
                 && matches!(

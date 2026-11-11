@@ -3,8 +3,8 @@
 //!
 //! Same class of bugs as cargo-fuzz (parse crashes, boundary
 //! violations, roundtrip asymmetries) but runs inside `cargo test`
-//! in seconds with deterministic shrinking on failure. No corpus
-//! directory committed (`proptest-regressions/` is gitignored).
+//! in seconds with deterministic shrinking on failure. Failure persistence is
+//! disabled; promote a failing case by hand to a named regression test.
 //!
 //! Properties pinned:
 //!
@@ -34,6 +34,7 @@ use proptest::prelude::*;
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,
+        failure_persistence: None,
         ..ProptestConfig::default()
     })]
 

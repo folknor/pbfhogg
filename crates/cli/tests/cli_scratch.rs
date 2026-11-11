@@ -22,11 +22,6 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions.
-    unsafe { libc::geteuid() == 0 }
-}
-
 /// The layout of a run directory whose owner is gone: nobody holds its lock.
 fn plant_dead_run_dir(parent: &Path) -> PathBuf {
     let dir = parent.join(".pbfhogg-run-999999-0123456789abcdef0123456789abcdef");
@@ -39,6 +34,7 @@ fn plant_dead_run_dir(parent: &Path) -> PathBuf {
 
 #[test]
 fn a_bad_tmp_dir_fails_before_any_input_is_read() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let missing_input = dir.path().join("no-such-input.osm.pbf");
     let missing_other = dir.path().join("no-such-other.osm.pbf");
@@ -48,46 +44,51 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
     // is refused before the --tmp-dir check this test is about.
     let osc_output = dir.path().join("out.osc");
     let (input, other, tmp_arg, output_arg, osc_arg) = (
-        missing_input.to_str().unwrap(),
-        missing_other.to_str().unwrap(),
-        tmp.to_str().unwrap(),
-        output.to_str().unwrap(),
-        osc_output.to_str().unwrap(),
+        missing_input.as_os_str(),
+        missing_other.as_os_str(),
+        tmp.as_os_str(),
+        output.as_os_str(),
+        osc_output.as_os_str(),
     );
-    let runs: Vec<Vec<&str>> = vec![
+    let runs: Vec<Vec<&std::ffi::OsStr>> = vec![
         vec![
-            "add-locations-to-ways",
+            std::ffi::OsStr::new("add-locations-to-ways"),
             input,
-            "-o",
+            std::ffi::OsStr::new("-o"),
             output_arg,
-            "--tmp-dir",
+            std::ffi::OsStr::new("--tmp-dir"),
             tmp_arg,
         ],
         vec![
-            "diff",
+            std::ffi::OsStr::new("diff"),
             input,
             other,
-            "--format",
-            "osc",
-            "-o",
+            std::ffi::OsStr::new("--format"),
+            std::ffi::OsStr::new("osc"),
+            std::ffi::OsStr::new("-o"),
             osc_arg,
-            "--tmp-dir",
+            std::ffi::OsStr::new("--tmp-dir"),
             tmp_arg,
         ],
         vec![
-            "build-geocode-index",
+            std::ffi::OsStr::new("build-geocode-index"),
             input,
-            "--output-dir",
+            std::ffi::OsStr::new("--output-dir"),
             output_arg,
-            "--tmp-dir",
+            std::ffi::OsStr::new("--tmp-dir"),
             tmp_arg,
         ],
     ];
     for args in runs {
-        let out = CliInvoker::new().args(&args).assert_failure();
+        let out = CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_failure();
         let stderr = out.stderr_str();
         assert!(stderr.contains("--tmp-dir"), "{args:?}: {stderr}");
-        assert!(stderr.contains(tmp_arg), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(tmp_arg.to_string_lossy().as_ref()),
+            "{args:?}: {stderr}"
+        );
         assert!(
             !stderr.contains("no-such-input"),
             "{args:?}: the input must not have been looked at: {stderr}"
@@ -98,8 +99,14 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
 
     // A text diff writes no scratch at any -j, so it refuses --tmp-dir
     // outright, also before any input is read.
-    let out = CliInvoker::new()
-        .args(["diff", input, other, "--tmp-dir", tmp_arg])
+    let out = CliInvoker::new(&invocation_scratch)
+        .args([
+            std::ffi::OsStr::new("diff"),
+            input,
+            other,
+            std::ffi::OsStr::new("--tmp-dir"),
+            tmp_arg,
+        ])
         .assert_failure();
     let stderr = out.stderr_str();
     assert!(
@@ -111,46 +118,44 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
 
 #[test]
 fn a_tmp_dir_that_is_a_file_or_unwritable_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("missing.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     let file = dir.path().join("a-file");
     std::fs::write(&file, b"x").unwrap();
-    let out = CliInvoker::new()
-        .args([
-            "add-locations-to-ways",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--tmp-dir",
-            file.to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("add-locations-to-ways")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .arg("--tmp-dir")
+        .arg(file.as_os_str())
         .assert_failure();
     assert!(
         out.stderr_str().contains("not a directory"),
         "{}",
         out.stderr_str()
     );
-
-    // Root ignores directory permissions, so this half cannot fail there.
-    if is_root() {
-        return;
-    }
     let locked = dir.path().join("locked");
     std::fs::create_dir(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
-    let out = CliInvoker::new()
-        .args([
-            "add-locations-to-ways",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--tmp-dir",
-            locked.to_str().unwrap(),
-        ])
+    let denial = match dir.deny_write(&locked) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            crate::common::skip(reason);
+            return;
+        }
+    };
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("add-locations-to-ways")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .arg("--tmp-dir")
+        .arg(locked.as_os_str())
         .assert_failure();
     let stderr = out.stderr_str();
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    drop(denial);
     assert!(stderr.contains("--tmp-dir"), "{stderr}");
     assert!(!stderr.contains("missing.osm.pbf"), "{stderr}");
     assert!(names(&locked).is_empty());
@@ -158,6 +163,7 @@ fn a_tmp_dir_that_is_a_file_or_unwritable_is_refused() {
 
 #[test]
 fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let work = dir.path().join("work");
     let tmp = dir.path().join("tmp");
@@ -171,16 +177,21 @@ fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
     std::fs::write(&truncated, bytes).unwrap();
     let output = work.join("out.osm.pbf");
 
-    for tmp_args in [vec![], vec!["--tmp-dir", tmp.to_str().unwrap()]] {
+    for tmp_args in [
+        vec![],
+        vec![std::ffi::OsStr::new("--tmp-dir"), tmp.as_os_str()],
+    ] {
         let mut args = vec![
-            "add-locations-to-ways",
-            truncated.to_str().unwrap(),
-            "--force",
-            "-o",
-            output.to_str().unwrap(),
+            std::ffi::OsStr::new("add-locations-to-ways"),
+            truncated.as_os_str(),
+            std::ffi::OsStr::new("--force"),
+            std::ffi::OsStr::new("-o"),
+            output.as_os_str(),
         ];
         args.extend(tmp_args);
-        CliInvoker::new().args(&args).assert_failure();
+        CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_failure();
         assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
         let beside: Vec<_> = names(&work);
         assert_eq!(
@@ -197,6 +208,7 @@ fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
 /// the run with scratch files already on disk.
 #[test]
 fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let work = dir.path().join("work");
     let tmp = dir.path().join("tmp");
@@ -214,20 +226,23 @@ fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
     std::fs::write(&new, corrupt).unwrap();
     let output = work.join("out.osc");
 
-    for tmp_args in [vec![], vec!["--tmp-dir", tmp.to_str().unwrap()]] {
+    for tmp_args in [
+        vec![],
+        vec![std::ffi::OsStr::new("--tmp-dir"), tmp.as_os_str()],
+    ] {
         let mut args = vec![
-            "diff",
-            "--format",
-            "osc",
-            "-j",
-            "2",
-            old.to_str().unwrap(),
-            new.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
+            std::ffi::OsStr::new("diff"),
+            std::ffi::OsStr::new("--format"),
+            std::ffi::OsStr::new("osc"),
+            std::ffi::OsStr::new("-j"),
+            std::ffi::OsStr::new("2"),
+            old.as_os_str(),
+            new.as_os_str(),
+            std::ffi::OsStr::new("-o"),
+            output.as_os_str(),
         ];
         args.extend(tmp_args);
-        let out = CliInvoker::new().args(&args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(&args).run();
         assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
         assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
         assert_eq!(
@@ -243,11 +258,7 @@ fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
 /// any `-j`).
 #[test]
 fn a_scratch_free_diff_needs_no_writable_directory() {
-    use std::os::unix::fs::PermissionsExt;
-    // Root writes anywhere, so the read-only directory proves nothing there.
-    if unsafe { libc::geteuid() } == 0 {
-        return;
-    }
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
@@ -255,7 +266,13 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
     crate::common::write_changed_pbf(&new);
     let cwd = dir.path().join("cwd");
     std::fs::create_dir(&cwd).unwrap();
-    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let denial = match dir.deny_write(&cwd) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            crate::common::skip(reason);
+            return;
+        }
+    };
     for args in [
         vec!["-j", "1"],
         vec!["-j", "1", "-q"],
@@ -265,13 +282,14 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
         vec!["-j", "2"],
         vec!["-v"],
     ] {
-        let out = CliInvoker::new()
+        let out = CliInvoker::new(&invocation_scratch)
             .current_dir(&cwd)
             .args(
                 ["diff"]
                     .into_iter()
                     .chain(args)
-                    .chain([old.to_str().unwrap(), new.to_str().unwrap()]),
+                    .map(std::ffi::OsStr::new)
+                    .chain([old.as_os_str(), new.as_os_str()]),
             )
             .run();
         assert!(
@@ -280,11 +298,12 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
             out.stderr_str()
         );
     }
-    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(denial);
 }
 
 #[test]
 fn successful_runs_clean_up_after_themselves() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let tmp = dir.path().join("tmp");
     std::fs::create_dir(&tmp).unwrap();
@@ -292,39 +311,35 @@ fn successful_runs_clean_up_after_themselves() {
     let new = dir.path().join("new.osm.pbf");
     crate::common::write_base_pbf(&old);
     crate::common::write_changed_pbf(&new);
-    let tmp_arg = tmp.to_str().unwrap();
+    let tmp_arg = tmp.as_os_str();
 
     let osc = dir.path().join("delta.osc.gz");
     // The inputs differ, so the OSC diff completes with exit 1.
-    let out = CliInvoker::new()
-        .args([
-            "diff",
-            "--format",
-            "osc",
-            "-j",
-            "2",
-            old.to_str().unwrap(),
-            new.to_str().unwrap(),
-            "-o",
-            osc.to_str().unwrap(),
-            "--tmp-dir",
-            tmp_arg,
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("--format")
+        .arg("osc")
+        .arg("-j")
+        .arg("2")
+        .arg(old.as_os_str())
+        .arg(new.as_os_str())
+        .arg("-o")
+        .arg(osc.as_os_str())
+        .arg("--tmp-dir")
+        .arg(tmp_arg)
         .run();
     assert_eq!(out.status.code(), Some(1), "{}", out.stderr_str());
     assert!(osc.exists());
     assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
 
     let located = dir.path().join("located.osm.pbf");
-    CliInvoker::new()
-        .args([
-            "add-locations-to-ways",
-            old.to_str().unwrap(),
-            "-o",
-            located.to_str().unwrap(),
-            "--tmp-dir",
-            tmp_arg,
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("add-locations-to-ways")
+        .arg(old.as_os_str())
+        .arg("-o")
+        .arg(located.as_os_str())
+        .arg("--tmp-dir")
+        .arg(tmp_arg)
         .assert_success();
     assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
     assert!(
@@ -336,34 +351,31 @@ fn successful_runs_clean_up_after_themselves() {
 
 #[test]
 fn a_tmp_dir_inside_a_replaced_index_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let index = dir.path().join("index");
-    CliInvoker::new()
-        .args([
-            "build-geocode-index",
-            input.to_str().unwrap(),
-            "--output-dir",
-            index.to_str().unwrap(),
-            "--allow-unindexed",
-        ])
+    CliInvoker::new(&invocation_scratch)
+        .arg("build-geocode-index")
+        .arg(input.as_os_str())
+        .arg("--output-dir")
+        .arg(index.as_os_str())
+        .arg("--allow-unindexed")
         .run();
     if !index.exists() {
         // The fixture has no addresses; whatever the builder made of it, an
         // existing directory is what this test needs.
         std::fs::create_dir(&index).unwrap();
     }
-    let out = CliInvoker::new()
-        .args([
-            "build-geocode-index",
-            input.to_str().unwrap(),
-            "--output-dir",
-            index.to_str().unwrap(),
-            "--overwrite",
-            "--tmp-dir",
-            index.to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("build-geocode-index")
+        .arg(input.as_os_str())
+        .arg("--output-dir")
+        .arg(index.as_os_str())
+        .arg("--overwrite")
+        .arg("--tmp-dir")
+        .arg(index.as_os_str())
         .assert_failure();
     assert!(
         out.stderr_str().contains("inside the index output")
@@ -380,6 +392,7 @@ fn a_tmp_dir_inside_a_replaced_index_is_refused() {
 
 #[test]
 fn leftovers_of_crashed_runs_are_reported_and_never_removed() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let work = dir.path().join("work");
     let tmp = dir.path().join("tmp");
@@ -400,15 +413,13 @@ fn leftovers_of_crashed_runs_are_reported_and_never_removed() {
     std::fs::write(&unrelated, b"mine").unwrap();
 
     let output = work.join("located.osm.pbf");
-    let out = CliInvoker::new()
-        .args([
-            "add-locations-to-ways",
-            input.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--tmp-dir",
-            tmp.to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("add-locations-to-ways")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .arg("--tmp-dir")
+        .arg(tmp.as_os_str())
         .assert_success();
     let stderr = out.stderr_str();
     for found in [&dead_run, &legacy, &staging, &backup] {
@@ -439,6 +450,7 @@ fn leftovers_of_crashed_runs_are_reported_and_never_removed() {
 
 #[test]
 fn a_live_run_directory_is_not_reported() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     // A second process's run directory holds its lock; here the lock is held
     // by this test's own descriptor, which is what a live run looks like.
     let dir = crate::common::test_scratch();
@@ -456,13 +468,11 @@ fn a_live_run_directory_is_not_reported() {
     );
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
-    let out = CliInvoker::new()
-        .args([
-            "sort",
-            input.to_str().unwrap(),
-            "-o",
-            dir.path().join("sorted.osm.pbf").to_str().unwrap(),
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(dir.path().join("sorted.osm.pbf").as_os_str())
         .assert_success();
     assert!(
         !out.stderr_str().contains(".pbfhogg-run-"),
@@ -478,6 +488,7 @@ fn occurrences(haystack: &str, needle: &Path) -> usize {
 
 #[test]
 fn extract_config_scans_every_destination_directory_once() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let (first, second) = (dir.path().join("first"), dir.path().join("second"));
     std::fs::create_dir(&first).unwrap();
@@ -501,14 +512,12 @@ fn extract_config_scans_every_destination_directory_once() {
     std::fs::write(&in_first, vec![3_u8; 64]).unwrap();
     std::fs::write(&in_second, vec![4_u8; 64]).unwrap();
 
-    let out = CliInvoker::new()
-        .args([
-            "extract",
-            input.to_str().unwrap(),
-            "--config",
-            config.to_str().unwrap(),
-            "--simple",
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("extract")
+        .arg(input.as_os_str())
+        .arg("--config")
+        .arg(config.as_os_str())
+        .arg("--simple")
         .run();
     let stderr = out.stderr_str();
     assert!(out.status.success(), "{stderr}");
@@ -531,6 +540,7 @@ fn extract_config_scans_every_destination_directory_once() {
 /// output (`--format osc`).
 #[test]
 fn diff_reports_what_older_versions_left_where_they_left_it() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let (inputs, out_dir, tmp) = (
         dir.path().join("inputs"),
@@ -552,20 +562,27 @@ fn diff_reports_what_older_versions_left_where_they_left_it() {
     std::fs::write(&unrelated, b"mine").unwrap();
 
     for osc in [false, true] {
-        let mut args = vec!["diff", old.to_str().unwrap(), new.to_str().unwrap()];
+        let mut args = vec![
+            std::ffi::OsStr::new("diff"),
+            old.as_os_str(),
+            new.as_os_str(),
+        ];
         let output = out_dir.join(format!("delta-{osc}.osc.gz"));
         if osc {
             // Only the osc form writes scratch, so only it takes --tmp-dir.
             args.extend([
-                "--format",
-                "osc",
-                "-o",
-                output.to_str().unwrap(),
-                "--tmp-dir",
-                tmp.to_str().unwrap(),
+                std::ffi::OsStr::new("--format"),
+                std::ffi::OsStr::new("osc"),
+                std::ffi::OsStr::new("-o"),
+                output.as_os_str(),
+                std::ffi::OsStr::new("--tmp-dir"),
+                tmp.as_os_str(),
             ]);
         }
-        let stderr = CliInvoker::new().args(&args).run().stderr_str();
+        let stderr = CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .run()
+            .stderr_str();
         assert_eq!(occurrences(&stderr, &shard), 1, "osc={osc}: {stderr}");
         // Only the osc form writes beside an output.
         assert_eq!(
@@ -582,6 +599,7 @@ fn diff_reports_what_older_versions_left_where_they_left_it() {
 
 #[test]
 fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
@@ -600,14 +618,12 @@ fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
     std::fs::create_dir_all(staging.join("new").join(".buckets-level17")).unwrap();
 
     // Without --overwrite the build is refused; the scan comes first.
-    let stderr = CliInvoker::new()
-        .args([
-            "build-geocode-index",
-            input.to_str().unwrap(),
-            "--output-dir",
-            index.to_str().unwrap(),
-            "--allow-unindexed",
-        ])
+    let stderr = CliInvoker::new(&invocation_scratch)
+        .arg("build-geocode-index")
+        .arg(input.as_os_str())
+        .arg("--output-dir")
+        .arg(index.as_os_str())
+        .arg("--allow-unindexed")
         .assert_failure()
         .stderr_str();
     assert_eq!(occurrences(&stderr, &buckets), 1, "{stderr}");
@@ -634,6 +650,7 @@ fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
 /// may be live - is refused before any work, and nothing in it is touched.
 #[test]
 fn an_index_holding_leftovers_is_not_replaced() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_synthetic_indexed_input(&input);
@@ -645,15 +662,13 @@ fn an_index_holding_leftovers_is_not_replaced() {
     std::fs::write(backup.join("other.osm.pbf"), b"only copy").unwrap();
     let run = plant_dead_run_dir(&index);
 
-    let stderr = CliInvoker::new()
-        .args([
-            "build-geocode-index",
-            input.to_str().unwrap(),
-            "--output-dir",
-            index.to_str().unwrap(),
-            "--allow-unindexed",
-            "--overwrite",
-        ])
+    let stderr = CliInvoker::new(&invocation_scratch)
+        .arg("build-geocode-index")
+        .arg(input.as_os_str())
+        .arg("--output-dir")
+        .arg(index.as_os_str())
+        .arg("--allow-unindexed")
+        .arg("--overwrite")
         .assert_failure()
         .stderr_str();
     assert!(stderr.contains("cannot be replaced"), "{stderr}");
@@ -677,10 +692,7 @@ fn an_index_holding_leftovers_is_not_replaced() {
 
 #[test]
 fn a_backup_that_cannot_be_removed_is_reported_by_the_cli() {
-    // Root ignores directory permissions, so the removal cannot fail there.
-    if is_root() {
-        return;
-    }
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     // The builder refuses an input with nothing to index.
@@ -690,32 +702,27 @@ fn a_backup_that_cannot_be_removed_is_reported_by_the_cli() {
     std::fs::create_dir_all(&locked).unwrap();
     std::fs::write(index.join("geocode_header.bin"), b"index").unwrap();
     std::fs::write(locked.join("f"), b"x").unwrap();
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let _denial = match dir.deny_write(&locked) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            crate::common::skip(reason);
+            return;
+        }
+    };
 
-    let out = CliInvoker::new()
-        .args([
-            "build-geocode-index",
-            input.to_str().unwrap(),
-            "--output-dir",
-            index.to_str().unwrap(),
-            "--allow-unindexed",
-            "--overwrite",
-        ])
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("build-geocode-index")
+        .arg(input.as_os_str())
+        .arg("--output-dir")
+        .arg(index.as_os_str())
+        .arg("--allow-unindexed")
+        .arg("--overwrite")
         .run();
     let stderr = out.stderr_str();
-    // Put the permissions back before anything can fail the test.
     let backups: Vec<_> = names(dir.path())
         .into_iter()
         .filter(|n| n.starts_with(".pbfhogg-backup-"))
         .collect();
-    for backup in &backups {
-        let leftover = dir.path().join(backup).join("index").join("locked");
-        std::fs::set_permissions(
-            &leftover,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .ok();
-    }
     assert!(
         out.status.success(),
         "the replacement itself succeeded: {stderr}"

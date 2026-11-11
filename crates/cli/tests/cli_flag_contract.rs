@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::invoker::{CliInvoker, CliOutput, EXIT_USAGE, subcommand_paths};
-use tempfile::TempDir;
+use pbfhogg_test_scratch::TestScratch;
 
 /// In the name of every input that does not exist.
 const MISSING: &str = "no-such-input";
@@ -36,7 +36,8 @@ macro_rules! ensure {
 }
 
 fn run(args: &[OsString]) -> CliOutput {
-    CliInvoker::new().args(args).run()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch).args(args).run()
 }
 
 /// The words of an invocation, with `IN`, `IN2`, `OSC`, `OSC2` and `OUT` replaced by
@@ -768,7 +769,7 @@ fn every_command_with_jobs_is_in_the_table_and_shares_one_help_text() {
 // ---------------------------------------------------------------------------
 
 struct Fx {
-    dir: TempDir,
+    dir: TestScratch,
 }
 
 impl Fx {
@@ -795,7 +796,8 @@ impl Fx {
 }
 
 fn strip_indexdata(from: &Path, to: &Path) {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(from)
         .arg("-o")
@@ -1158,6 +1160,7 @@ fn printed_recipe(stderr: &str) -> Option<Vec<String>> {
 /// bare `cat --clean`, is the usage error it was always going to be.
 #[test]
 fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new();
     let mut failures = Vec::new();
     for (n, row) in FORCE.iter().enumerate() {
@@ -1169,7 +1172,7 @@ fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
             continue;
         };
         let cwd = crate::common::test_scratch();
-        let ran = CliInvoker::new()
+        let ran = CliInvoker::new(&invocation_scratch)
             .current_dir(cwd.path())
             .args(&recipe)
             .run();
@@ -1203,7 +1206,7 @@ fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(fx.path("indexed.osm.pbf"))
         .arg("--clean")
@@ -1216,16 +1219,17 @@ fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
 /// The sort recipe an unsorted-input refusal prints works as written.
 #[test]
 fn the_printed_sort_recipe_makes_the_refused_diff_succeed() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new();
     let unsorted = fx.path("unsorted.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(fx.path("indexed.osm.pbf"))
         .arg("--unsort")
         .arg("-o")
         .arg(&unsorted)
         .assert_success();
-    let refused = CliInvoker::new()
+    let refused = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(&unsorted)
         .arg(fx.path("indexed.osm.pbf"))
@@ -1234,11 +1238,11 @@ fn the_printed_sort_recipe_makes_the_refused_diff_succeed() {
     assert_eq!(refused.status.code(), Some(2), "{stderr}");
     let recipe = printed_recipe(&stderr).unwrap_or_else(|| panic!("no recipe printed:\n{stderr}"));
     let cwd = crate::common::test_scratch();
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .current_dir(cwd.path())
         .args(&recipe)
         .assert_success();
-    let accepted = CliInvoker::new()
+    let accepted = CliInvoker::new(&invocation_scratch)
         .arg("diff")
         .arg(cwd.path().join("sorted.osm.pbf"))
         .arg(fx.path("indexed.osm.pbf"))
@@ -1276,7 +1280,8 @@ fn the_force_table_is_every_command_offering_force() {
 // ---------------------------------------------------------------------------
 
 fn help(path: &[String]) -> String {
-    CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    CliInvoker::new(&invocation_scratch)
         .args(path)
         .arg("--help")
         .assert_success()

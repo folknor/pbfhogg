@@ -53,7 +53,8 @@ fn write_minimal_pbf_impl(path: &Path, sorted: bool) {
 
 #[test]
 fn cli_version() {
-    let output = CliInvoker::new().arg("--version").run();
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let output = CliInvoker::new(&invocation_scratch).arg("--version").run();
     assert!(output.status.success(), "exit code: {}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("pbfhogg"), "version output: {stdout}");
@@ -61,7 +62,8 @@ fn cli_version() {
 
 #[test]
 fn cli_help() {
-    let output = CliInvoker::new().arg("--help").run();
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let output = CliInvoker::new(&invocation_scratch).arg("--help").run();
     assert!(output.status.success(), "exit code: {}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cat"), "help should list cat command");
@@ -70,19 +72,18 @@ fn cli_help() {
 
 #[test]
 fn cli_cat_passthrough() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args([
-            "cat",
-            input.to_str().expect("path"),
-            "-o",
-            output.to_str().expect("path"),
-        ])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("cat")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
         .run();
 
     assert!(
@@ -99,19 +100,18 @@ fn cli_cat_passthrough() {
 
 #[test]
 fn cli_sort() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args([
-            "sort",
-            input.to_str().expect("path"),
-            "-o",
-            output.to_str().expect("path"),
-        ])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
         .run();
 
     assert!(
@@ -124,13 +124,15 @@ fn cli_sort() {
 
 #[test]
 fn cli_inspect() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args(["inspect", input.to_str().expect("path")])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(input.as_os_str())
         .run();
 
     assert!(
@@ -147,13 +149,15 @@ fn cli_inspect() {
 
 #[test]
 fn cli_check() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args(["check", input.to_str().expect("path")])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(input.as_os_str())
         .run();
 
     assert!(
@@ -172,11 +176,12 @@ fn cli_check() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn cli_check_default_pair_takes_direct_io_without_a_note() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
+    let result = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg(&input)
         .arg("--direct-io")
@@ -195,19 +200,18 @@ fn cli_check_default_pair_takes_direct_io_without_a_note() {
 
 #[test]
 fn cli_renumber() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_minimal_sorted_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args([
-            "renumber",
-            input.to_str().expect("path"),
-            "-o",
-            output.to_str().expect("path"),
-        ])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("renumber")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
         .run();
 
     assert!(
@@ -225,21 +229,20 @@ fn cli_renumber() {
 
 #[test]
 fn cli_renumber_custom_start_id() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_minimal_sorted_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args([
-            "renumber",
-            "--start-id",
-            "1000,5000,9000",
-            input.to_str().expect("path"),
-            "-o",
-            output.to_str().expect("path"),
-        ])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("renumber")
+        .arg("--start-id")
+        .arg("1000,5000,9000")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
         .run();
 
     assert!(
@@ -290,20 +293,19 @@ fn cli_renumber_custom_start_id() {
 #[cfg(not(feature = "linux-direct-io"))]
 #[test]
 fn cli_direct_io_rejected_without_feature() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args([
-            "sort",
-            input.to_str().expect("path"),
-            "-o",
-            output.to_str().expect("path"),
-            "--direct-io",
-        ])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .arg("--direct-io")
         .run();
 
     assert!(
@@ -321,20 +323,19 @@ fn cli_direct_io_rejected_without_feature() {
 #[cfg(not(feature = "linux-io-uring"))]
 #[test]
 fn cli_io_uring_rejected_without_feature() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
     write_minimal_pbf(&input);
 
-    let result = CliInvoker::new()
-        .args([
-            "sort",
-            input.to_str().expect("path"),
-            "-o",
-            output.to_str().expect("path"),
-            "--io-uring",
-        ])
+    let result = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .arg("--io-uring")
         .run();
 
     assert!(
@@ -350,12 +351,13 @@ fn cli_io_uring_rejected_without_feature() {
 
 #[test]
 fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     for args in [
         vec!["inspect", "first.pbf", "tags", "second.pbf"],
         vec!["inspect"],
         vec!["extract", "input.pbf", "-o", "output.pbf"],
     ] {
-        let output = CliInvoker::new().args(&args).run();
+        let output = CliInvoker::new(&invocation_scratch).args(&args).run();
         assert_eq!(
             output.status.code(),
             Some(crate::invoker::EXIT_USAGE),
@@ -366,6 +368,7 @@ fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
 
 #[test]
 fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     for (name, bytes) in [
         ("unknown.pbf", b"not a PBF".as_slice()),
@@ -374,7 +377,7 @@ fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
     ] {
         let input = dir.path().join(name);
         std::fs::write(&input, bytes).expect("write input");
-        let output = CliInvoker::new()
+        let output = CliInvoker::new(&invocation_scratch)
             .arg("tags-filter")
             .arg(&input)
             .arg("name")
@@ -388,6 +391,7 @@ fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
 
 #[test]
 fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("changes.unknown");
     std::fs::write(
@@ -395,7 +399,7 @@ fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
         b"\xef\xbb\xbf  \n<osmChange version=\"0.6\"></osmChange>",
     )
     .expect("write XML");
-    let output = CliInvoker::new()
+    let output = CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&input)
         .arg("name")
@@ -408,7 +412,8 @@ fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
 
 #[test]
 fn cli_diff_quiet_osc_without_output_retains_error() {
-    let output = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let output = CliInvoker::new(&invocation_scratch)
         .args(["diff", "old.pbf", "new.pbf", "--format", "osc", "-q"])
         .run();
     assert!(!output.status.success());
@@ -420,12 +425,13 @@ fn cli_diff_quiet_osc_without_output_retains_error() {
 #[cfg(unix)]
 #[test]
 fn cli_check_json_preserves_non_utf8_filename_lossily() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::os::unix::ffi::OsStringExt;
     let dir = crate::common::test_scratch();
     let name = std::ffi::OsString::from_vec(b"actual-\xff.pbf".to_vec());
     let input = dir.path().join(&name);
     write_minimal_pbf(&input);
-    let output = CliInvoker::new()
+    let output = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg(&input)
         .args(["--ids", "--json"])
@@ -445,6 +451,7 @@ fn cli_check_json_preserves_non_utf8_filename_lossily() {
 /// named), and the same groups in order pass (exit 0).
 #[test]
 fn cli_check_ids_fails_an_unindexed_file_out_of_type_order() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use crate::common::groups::{Field, block, write_unindexed_blocks};
 
     let dir = crate::common::test_scratch();
@@ -456,7 +463,7 @@ fn cli_check_ids_fails_an_unindexed_file_out_of_type_order() {
     ] {
         let input = dir.path().join(format!("{name}.osm.pbf"));
         write_unindexed_blocks(&input, &[block(&groups)]);
-        let output = CliInvoker::new()
+        let output = CliInvoker::new(&invocation_scratch)
             .arg("check")
             .arg(&input)
             .arg("--ids")
@@ -474,12 +481,15 @@ fn cli_check_ids_fails_an_unindexed_file_out_of_type_order() {
 
 #[test]
 fn cli_osc_outputs_are_plain_under_osc_and_keep_metadata() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
     for command in ["tags-filter", "merge-changes"] {
         let output = dir.path().join(format!("{command}.osc"));
-        let mut cli = CliInvoker::new().arg(command).arg(&input);
+        let mut cli = CliInvoker::new(&invocation_scratch)
+            .arg(command)
+            .arg(&input);
         if command == "tags-filter" {
             cli = cli.args(["--input-kind", "osc", "name"]);
         }
@@ -506,6 +516,7 @@ fn cli_osc_outputs_are_plain_under_osc_and_keep_metadata() {
 #[cfg(unix)]
 #[test]
 fn cli_merge_changes_non_utf8_osc_gz_path_is_gzipped() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     use std::os::unix::ffi::OsStrExt;
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
@@ -515,7 +526,7 @@ fn cli_merge_changes_non_utf8_osc_gz_path_is_gzipped() {
             .path()
             .join(std::ffi::OsStr::from_bytes(b"invalid-\xff.osc.gz"));
         // Both passes write the same name; the second replaces the first.
-        let mut cli = CliInvoker::new()
+        let mut cli = CliInvoker::new(&invocation_scratch)
             .arg("merge-changes")
             .arg(&input)
             .arg("-o")
@@ -538,6 +549,7 @@ fn cli_merge_changes_non_utf8_osc_gz_path_is_gzipped() {
 #[cfg(unix)]
 #[test]
 fn cli_osc_counters_keep_historical_name_and_per_file_values() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
     let base = dir.path().join("base.pbf");
@@ -546,8 +558,8 @@ fn cli_osc_counters_keep_historical_name_and_per_file_values() {
     for command in ["merge-changes", "tags-filter", "apply-changes"] {
         let markers = dir.path().join(format!("{command}.markers"));
         std::fs::write(&markers, []).expect("markers");
-        let cli = CliInvoker::new()
-            .env("BROKKR_MARKER_FIFO", &markers)
+        let cli = CliInvoker::new(&invocation_scratch)
+            .marker_fifo(&markers)
             .arg(command);
         let cli = match command {
             "apply-changes" => cli.arg(&base).arg(&input),

@@ -69,12 +69,13 @@ fn build_unsorted_fixture(path: &Path) {
 /// amount. Mixed-sign ids must survive end-to-end.
 #[test]
 fn cat_preserves_mixed_sign_ids() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("cat")
         .arg(&input)
         .arg("-o")
@@ -114,11 +115,15 @@ fn cat_preserves_mixed_sign_ids() {
 /// downstream assertion; pinning panic-freedom is enough.
 #[test]
 fn inspect_handles_mixed_sign_ids() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     build_fixture(&input);
 
-    let out = CliInvoker::new().arg("inspect").arg(&input).run();
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(&input)
+        .run();
     let stderr = out.stderr_str();
     assert!(
         !stderr.contains("panicked at"),
@@ -131,12 +136,13 @@ fn inspect_handles_mixed_sign_ids() {
 /// which sorts internally - so we only verify count+presence.
 #[test]
 fn sort_preserves_mixed_sign_ids() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_unsorted_fixture(&input);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("sort")
         .arg(&input)
         .arg("-o")
@@ -181,6 +187,7 @@ fn sort_preserves_mixed_sign_ids() {
 /// list.
 #[test]
 fn tags_filter_handles_mixed_sign_ids() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -194,7 +201,7 @@ fn tags_filter_handles_mixed_sign_ids() {
     let relations: Vec<TestRelation> = generate_relations_with_negatives(N_NEG, N_POS, 2);
     write_test_pbf_sorted(&input, &nodes, &ways, &relations);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&input)
         .arg("-o")
@@ -242,12 +249,13 @@ fn tags_filter_handles_mixed_sign_ids() {
 /// (`non-negative`) and the specific id (`-1`).
 #[test]
 fn renumber_rejects_mixed_sign_ids_with_named_id() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_fixture(&input);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("renumber")
         .arg(&input)
         .arg("-o")
@@ -286,12 +294,13 @@ fn renumber_rejects_mixed_sign_ids_with_named_id() {
 /// substring "non-negative", same shape as renumber's reject.
 #[test]
 fn getid_rejects_negative_ids_with_named_id_and_kind() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_fixture(&input);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("getid")
         .arg(&input)
         .arg("-o")
@@ -349,6 +358,7 @@ fn getid_rejects_negative_ids_with_named_id_and_kind() {
 /// that fix even if the clamp ever changes.)
 #[test]
 fn getid_id_osm_file_passes_through_negative_source_ids() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let source = dir.path().join("source.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
@@ -365,7 +375,7 @@ fn getid_id_osm_file_passes_through_negative_source_ids() {
     let pos_relations = generate_relations_with_negatives(0, N_POS, 2);
     write_test_pbf_sorted(&input, &pos_nodes, &pos_ways, &pos_relations);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("getid")
         .arg(&input)
         .arg("-o")

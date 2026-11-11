@@ -45,7 +45,8 @@ fn run_filter_full(
     remove_tags: bool,
     jobs: Option<usize>,
 ) -> String {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(input)
         .arg("-o")
@@ -88,6 +89,7 @@ fn run_filter(input: &Path, output: &Path, expressions: &[&str], omit_referenced
 /// the highway node would keep that blob eligible whatever its tag index said.
 #[test]
 fn repacked_empty_key_is_not_skipped_by_tag_filter() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let repacked = dir.path().join("repacked.osm.pbf");
@@ -110,7 +112,7 @@ fn repacked_empty_key_is_not_skipped_by_tag_filter() {
     ];
     crate::common::write_indexed_pbf(&input, &nodes, &[], &[]);
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("repack")
         .arg(&input)
         .arg("-o")
@@ -138,6 +140,7 @@ fn repacked_empty_key_is_not_skipped_by_tag_filter() {
 /// escape hatch that gets the right answer back out of it.
 #[test]
 fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let pristine = dir.path().join("pristine.osm.pbf");
     let corrupt = dir.path().join("corrupt.osm.pbf");
@@ -174,7 +177,7 @@ fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
         "the fixture itself must match, or the assertions below prove nothing"
     );
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&pristine)
         .arg("-o")
@@ -198,7 +201,7 @@ fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
 
     // With --distrust-metadata the answer depends only on element data.
     let distrusted = dir.path().join("distrusted.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&corrupt)
         .arg("-o")
@@ -279,6 +282,7 @@ fn an_out_of_order_stored_tag_index_is_not_believed() {
 /// narrowed schedule comes back empty.
 #[test]
 fn distrust_metadata_holds_through_reference_expansion() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let pristine = dir.path().join("pristine.osm.pbf");
     let corrupt = dir.path().join("corrupt.osm.pbf");
@@ -334,7 +338,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
         "n1/n2 are untagged; they can only arrive through way-dependency collection"
     );
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&pristine)
         .arg("-o")
@@ -349,7 +353,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
     // `--corrupt-indexdata-kind` were a no-op - the fixture would simply be
     // honest and the distrust assertion would succeed for the wrong reason.
     let believed = dir.path().join("believed.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&corrupt)
         .arg("-o")
@@ -362,7 +366,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
     // With --distrust-metadata every scan reads every blob and decides on
     // decoded elements, so the mislabelling changes nothing about the answer.
     let distrusted = dir.path().join("distrusted.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&corrupt)
         .arg("-o")
@@ -388,6 +392,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
 /// says so instead of accepting a flag that would do nothing.
 #[test]
 fn distrust_metadata_is_rejected_on_osc_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let osc = dir.path().join("changes.osc.gz");
     {
@@ -400,7 +405,7 @@ fn distrust_metadata_is_rejected_on_osc_input() {
     }
     let out = dir.path().join("out.osc.gz");
 
-    let failure = CliInvoker::new()
+    let failure = CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&osc)
         .arg("-o")
@@ -411,7 +416,7 @@ fn distrust_metadata_is_rejected_on_osc_input() {
     failure.assert_stderr_contains("carries no blob metadata");
 
     // Passing counterpart: the same OSC run without the flag is accepted.
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&osc)
         .arg("-o")
@@ -466,6 +471,7 @@ fn key_only_filter() {
 /// plain key instead.
 #[test]
 fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -505,7 +511,7 @@ fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
     )
     .expect("write expressions");
 
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&input)
         .arg("-o")
@@ -526,6 +532,7 @@ fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
 /// silent zero-match literal key `w/highway`.
 #[test]
 fn expressions_file_rejects_an_indented_type_prefix() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -533,7 +540,7 @@ fn expressions_file_rejects_an_indented_type_prefix() {
     write_test_pbf(&input, &generate_nodes(3, 1), &[], &[]);
     std::fs::write(&exprs, "  w/highway\n").expect("write expressions");
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&input)
         .arg("-o")
@@ -1540,6 +1547,7 @@ fn way_blob_claiming_nodes(dir: &Path) -> std::path::PathBuf {
 /// scheduled it for a node sweep that ignored its ways.
 #[test]
 fn a_blob_holding_another_kind_than_it_claims_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = way_blob_claiming_nodes(dir.path());
 
@@ -1549,7 +1557,7 @@ fn a_blob_holding_another_kind_than_it_claims_is_refused() {
         ("invert", &["--invert-match"][..]),
     ] {
         let output = dir.path().join(format!("{name}.osm.pbf"));
-        let mut cli = CliInvoker::new()
+        let mut cli = CliInvoker::new(&invocation_scratch)
             .arg("tags-filter")
             .arg(&input)
             .arg("-o")
@@ -1567,11 +1575,12 @@ fn a_blob_holding_another_kind_than_it_claims_is_refused() {
 /// believe the forged claim, so it is not refused and finds the way.
 #[test]
 fn distrust_metadata_is_not_refused_for_a_lying_kind_claim() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let forged = way_blob_claiming_nodes(dir.path());
 
     let output = dir.path().join("distrusted.osm.pbf");
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("tags-filter")
         .arg(&forged)
         .arg("-o")
@@ -1590,7 +1599,7 @@ fn distrust_metadata_is_not_refused_for_a_lying_kind_claim() {
         ("invert", &["--invert-match"][..]),
     ] {
         let output = dir.path().join(format!("honest-{name}.osm.pbf"));
-        let mut cli = CliInvoker::new()
+        let mut cli = CliInvoker::new(&invocation_scratch)
             .arg("tags-filter")
             .arg(&honest)
             .arg("-o")

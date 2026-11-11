@@ -215,8 +215,8 @@ pub(crate) mod threads;
 // Shared with the CLI's `inspect tags` printer; not a library API.
 #[doc(hidden)]
 pub mod text_quote;
-// Unit-test skip support; every skip it serves is an O_DIRECT one.
-#[cfg(all(test, feature = "linux-direct-io"))]
+// Shared unit-test skip reporting and platform probes.
+#[cfg(test)]
 pub(crate) mod test_support;
 // Every performance and behaviour tunable lives here; public ones are
 // re-exported from the paths they were public at.
@@ -291,3 +291,9 @@ pub mod process;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub mod test_hooks;
+
+#[doc(hidden)]
+pub use tunables::{
+    TEST_CHILD_CAPTURE_CHUNK, TEST_CHILD_CAPTURE_EDGE, TEST_CHILD_CLEANUP, TEST_CHILD_POLL,
+    TEST_CHILD_TIMEOUT,
+};

@@ -30,7 +30,6 @@ fn truncation_sweep_no_panic() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let truncated = dir.path().join("truncated.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
 
     // Small multi-blob fixture: ~6 OSMData blobs (4 node + 1 way + 1 rel).
     let nodes = generate_nodes(40, 1);
@@ -65,14 +64,27 @@ fn truncation_sweep_no_panic() {
     offsets.sort_unstable();
     offsets.dedup();
 
+    // Each configuration must read valid input successfully before corruption
+    // can count as a detected framing failure.
+    for (subcmd, extra) in [
+        ("cat", &[][..]),
+        ("inspect", &[][..]),
+        ("sort", &[][..]),
+        ("getid", &["--", "n1"][..]),
+        ("add-locations-to-ways", &[][..]),
+        ("renumber", &[][..]),
+    ] {
+        run_and_assert(&dir, subcmd, &input, 0, Classification::Valid, extra);
+    }
+
     for &len in &offsets {
         let bytes = truncate_to(&pbf, len);
         std::fs::write(&truncated, &bytes).expect("write truncated");
 
         let class = classify_offset(&blobs, len);
-        run_and_assert("cat", &truncated, &output, len, class, &[]);
-        run_and_assert("inspect", &truncated, &output, len, class, &[]);
-        run_and_assert("sort", &truncated, &output, len, class, &[]);
+        run_and_assert(&dir, "cat", &truncated, len, class, &[]);
+        run_and_assert(&dir, "inspect", &truncated, len, class, &[]);
+        run_and_assert(&dir, "sort", &truncated, len, class, &[]);
         // Broaden coverage to exercise read-path sites the cat/inspect/
         // sort triple doesn't hit:
         //   - getid: HeaderWalker fast path with pread for matching
@@ -82,16 +94,9 @@ fn truncation_sweep_no_panic() {
         //     `FileReader::skip` path - one of the contract sites that
         //     the original audit missed and 12699db landed.
         //   - renumber: full-read + pass-2 reframe walker.
-        run_and_assert("getid", &truncated, &output, len, class, &["--", "n1"]);
-        run_and_assert(
-            "add-locations-to-ways",
-            &truncated,
-            &output,
-            len,
-            class,
-            &[],
-        );
-        run_and_assert("renumber", &truncated, &output, len, class, &[]);
+        run_and_assert(&dir, "getid", &truncated, len, class, &["--", "n1"]);
+        run_and_assert(&dir, "add-locations-to-ways", &truncated, len, class, &[]);
+        run_and_assert(&dir, "renumber", &truncated, len, class, &[]);
     }
 }
 
@@ -109,6 +114,7 @@ fn truncation_sweep_no_panic() {
 /// (see `crates/lib/tests/read_paths.rs::trailing_partial_length_prefix_*`).
 #[derive(Debug, Clone, Copy)]
 enum Classification {
+    Valid,
     /// Shape 1: file ends with 0-3 leftover bytes of an incomplete
     /// next-frame length prefix.
     Tolerated,
@@ -131,19 +137,22 @@ fn classify_offset(blobs: &[BlobLocation], offset: usize) -> Classification {
 }
 
 fn run_and_assert(
+    dir: &pbfhogg_test_scratch::TestScratch,
     subcmd: &str,
     input: &std::path::Path,
-    output: &std::path::Path,
     len: usize,
     class: Classification,
     extra_args: &[&str],
 ) {
-    let mut inv = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let cell = dir.cell();
+    let output = cell.join("output.osm.pbf");
+    let mut inv = CliInvoker::new(&invocation_scratch)
         .arg(subcmd)
         .arg(input)
         .timeout(PER_INVOCATION_TIMEOUT);
     if subcmd != "inspect" {
-        inv = inv.arg("-o").arg(output);
+        inv = inv.arg("-o").arg(&output);
     }
     for arg in extra_args {
         inv = inv.arg(arg);
@@ -159,7 +168,16 @@ fn run_and_assert(
         "{subcmd} produced suspiciously large stderr ({}) at truncation len={len}",
         stderr.len(),
     );
+    assert!(
+        matches!(out.status.code(), Some(0 | 2)),
+        "{subcmd} had a usage error or abnormal exit at len={len}: {:?}; {stderr}",
+        out.status,
+    );
     match class {
+        Classification::Valid => assert!(
+            out.status.success(),
+            "{subcmd} valid-input control failed: {stderr}"
+        ),
         Classification::Tolerated => {
             // Shape 1: reader-level tolerance is pinned by unit tests
             // (`crates/lib/tests/read_paths.rs::trailing_partial_length_prefix_*`).
@@ -171,7 +189,9 @@ fn run_and_assert(
         }
         Classification::HardError => {
             assert!(
-                !out.status.success(),
+                out.status.code() == Some(2)
+                    && stderr.contains("frame truncated:")
+                    && stderr.contains(&input.display().to_string()),
                 "{subcmd} must hard-error on a shape-2/3/4 truncation \
                  (len={len}); per `reference/truncation-handling.md` \
                  only shape 1 (0-3 bytes past a frame boundary) is \

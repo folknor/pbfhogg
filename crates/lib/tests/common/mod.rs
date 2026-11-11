@@ -27,12 +27,14 @@
 //! - [`PbfContentsIdOnly`] / [`read_all_elements_id_only`]: used by extract,
 //!   getid, and tags_filter tests that only need element IDs and tags.
 //!
-//! Fixtures only: nothing here spawns the `pbfhogg` binary. Tests that drive
+//! Nothing here spawns pbfhogg; the oracle runner spawns external reference tools. Tests that drive
 //! it live in the CLI package, whose `crates/cli/tests/invoker.rs` holds the
 //! `CliInvoker`.
 
 pub mod adversarial;
 pub mod groups;
+pub mod oracle;
+pub mod process;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,9 +43,10 @@ use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 
-mod scratch;
+// Scratch comes from the dev-only `pbfhogg-test-scratch` crate, the one
+// owner for every harness; this name is only the integration tests' handle.
 #[allow(unused_imports)]
-pub use scratch::test_scratch;
+pub use pbfhogg_test_scratch::{TestScratch, scratch as test_scratch};
 
 /// A fresh output at `path` for a library command: refused if anything is
 /// already there, so a test that writes one path twice says so with
@@ -1605,9 +1608,9 @@ pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
 // with the `test-hooks` fault-injection harness in the pipeline modules.
 // ---------------------------------------------------------------------------
 
-/// Recursive listing of all regular-file paths under `root`, relative
-/// to `root`. Directories are included as keys in the set so a removed
-/// empty subdir also shows up in the diff.
+/// Recursive listing of entries under `root`, relative to `root`.
+/// Directories are included so a removed empty subdir shows up in the diff.
+/// Symlinks are listed but never followed; inspection and entry errors fail.
 pub fn snapshot_dir(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
     let mut out = std::collections::BTreeSet::new();
     snapshot_dir_inner(root, root, &mut out);
@@ -1629,7 +1632,10 @@ fn snapshot_dir_inner(
         let path = entry.path();
         let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
         out.insert(rel);
-        if path.is_dir() {
+        if pbfhogg_test_scratch::path_state(&path)
+            .expect("inspect scratch entry")
+            .is_some_and(|kind| kind.is_dir())
+        {
             snapshot_dir_inner(base, &path, out);
         }
     }

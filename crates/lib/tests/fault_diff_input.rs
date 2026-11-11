@@ -112,7 +112,7 @@ fn write_input(path: &Path, route: Route, side: Side, replacement: bool) {
 }
 
 struct Inputs {
-    dir: tempfile::TempDir,
+    dir: pbfhogg_test_scratch::TestScratch,
     old: PathBuf,
     new: PathBuf,
 }

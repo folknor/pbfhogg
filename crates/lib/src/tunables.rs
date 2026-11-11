@@ -1372,3 +1372,14 @@ pub(crate) const GEOCODE_WALK_INLINE_CELLS: usize = 128;
 /// gap and in the distance it is compared with can never lift the bound
 /// above a real distance.
 pub(crate) const GEOCODE_CELL_BOUND_SLACK_RAD: f64 = 1e-12;
+
+/// Test children leave time for cleanup before the runner's 20 second watchdog.
+pub const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bounded cleanup and pipe completion, including a descendant holding a pipe open.
+pub const TEST_CHILD_CLEANUP: std::time::Duration = std::time::Duration::from_secs(1);
+/// Test child polling avoids a busy wait while keeping cleanup responsive.
+pub const TEST_CHILD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+/// Keep the first and last MiB of child output, draining everything else.
+pub const TEST_CHILD_CAPTURE_EDGE: usize = 1024 * 1024;
+/// Bounded stack buffer for test child pipe reads.
+pub const TEST_CHILD_CAPTURE_CHUNK: usize = 8192;

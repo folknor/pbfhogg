@@ -217,7 +217,7 @@ fn write_indexed_simple_pbf(path: &std::path::Path) {
 #[test]
 fn inspect_json_base() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     let report = pbfhogg::inspect::inspect(
@@ -243,7 +243,7 @@ fn inspect_json_base() {
         json["file"]
             .as_str()
             .expect("value")
-            .contains("test.osm.pbf")
+            .contains("generated.osm.pbf")
     );
     assert!(json["file_size"].as_u64().expect("value") > 0);
 
@@ -268,7 +268,7 @@ fn inspect_json_base() {
     assert!(json["blocks"]["total"].as_u64().expect("value") > 0);
 
     // Ordering
-    // test.osm.pbf is canonical: one segment per kind, each listed whole.
+    // generated.osm.pbf is canonical: one segment per kind, each listed whole.
     assert_eq!(json["ordering"]["standard"], true);
     assert_eq!(json["ordering"]["segment_count"], 3);
     let head = json["ordering"]["segments_head"]
@@ -291,7 +291,7 @@ fn inspect_json_base() {
 #[test]
 fn inspect_json_with_id_ranges() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     let report = pbfhogg::inspect::inspect(
@@ -332,7 +332,7 @@ fn inspect_json_with_id_ranges() {
 #[test]
 fn inspect_json_with_blocks() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     let report = pbfhogg::inspect::inspect(
@@ -366,7 +366,7 @@ fn inspect_json_with_blocks() {
 #[test]
 fn inspect_json_blocks_limit_honored() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     let report = pbfhogg::inspect::inspect(
@@ -400,7 +400,7 @@ fn inspect_json_blocks_limit_honored() {
 #[test]
 fn inspect_json_combined_flags() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     let report = pbfhogg::inspect::inspect(
@@ -479,7 +479,7 @@ fn inspect_json_blocks_anomalies_only() {
 #[test]
 fn inspect_extended() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     // extended=true forces full decode and collects timestamps, bbox, metadata
@@ -571,7 +571,7 @@ fn inspect_extended_metadata_counts_values() {
 #[test]
 fn inspect_get_value() {
     let dir = crate::common::test_scratch();
-    let input = dir.path().join("test.osm.pbf");
+    let input = dir.path().join("generated.osm.pbf");
     write_simple_pbf(&input);
 
     let report = pbfhogg::inspect::inspect(

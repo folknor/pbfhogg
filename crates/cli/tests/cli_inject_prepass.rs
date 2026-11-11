@@ -60,7 +60,8 @@ fn mp_relation(id: i64, way_id: i64) -> TestRelation {
 }
 
 fn run_inject(input: &Path, output: &Path, backend: &str) {
-    let out = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(input)
         .arg("-o")

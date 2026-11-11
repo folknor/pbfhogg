@@ -762,7 +762,9 @@ mod pin_tests {
         let (input, replacement) = fixture(dir.path());
         let pin = PinnedInput::pin_with(&input, &Host::entered_for_tests(), false).unwrap();
         if !pin.reopens_through_procfs() {
-            // No usable procfs here: the path mode is covered by its own test.
+            crate::test_support::skip(
+                "procfs cannot reopen the pinned file; path mode has its own test.",
+            );
             return;
         }
         assert_eq!(read_all(pin.open().unwrap()), b"original");

@@ -30,6 +30,7 @@ fn default_opts() -> TagCountOptions<'static> {
 /// key-for-key and count-for-count.
 #[test]
 fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let indexed = dir.path().join("indexed.osm.pbf");
     let no_tagdata = dir.path().join("no-tagdata.osm.pbf");
@@ -50,7 +51,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
 
     // Reference file: identical elements, no tag index, so no blob can be
     // skipped and every count comes from a full decode.
-    CliInvoker::new()
+    CliInvoker::new(&invocation_scratch)
         .arg("degrade")
         .arg(&indexed)
         .arg("-o")
@@ -95,7 +96,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     // decodes agree just as well as a skipping run and a full one. The skip
     // has to be observed. It is reported on stderr rather than returned, so
     // this half goes through the CLI.
-    let skipped = CliInvoker::new()
+    let skipped = CliInvoker::new(&invocation_scratch)
         .arg("inspect")
         .arg("tags")
         .arg(&indexed)
@@ -116,7 +117,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     // Counterpart: the same run against the file with no tag index cannot
     // skip anything, so the line must be absent. Without this, a command that
     // printed the line unconditionally would pass the assertion above.
-    let unskipped = CliInvoker::new()
+    let unskipped = CliInvoker::new(&invocation_scratch)
         .arg("inspect")
         .arg("tags")
         .arg(&no_tagdata)
@@ -134,6 +135,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
 /// are the rows on stdout. A bare run counts keys; a key row is two fields.
 #[test]
 fn summary_counts_distinct_rows_and_the_rows_that_passed() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("summary.osm.pbf");
     let mut nodes = generate_nodes(5, 1);
@@ -147,7 +149,7 @@ fn summary_counts_distinct_rows_and_the_rows_that_passed() {
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
     let run = |extra: &[&str]| {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("inspect")
             .arg("tags")
             .arg(&input)
@@ -178,6 +180,7 @@ fn summary_counts_distinct_rows_and_the_rows_that_passed() {
 /// three tab-separated fields, a key row two.
 #[test]
 fn rows_quote_and_escape_key_and_value() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("text.osm.pbf");
     let mut nodes = generate_nodes(2, 1);
@@ -186,7 +189,7 @@ fn rows_quote_and_escape_key_and_value() {
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
     let stdout = |extra: &[&str]| {
-        CliInvoker::new()
+        CliInvoker::new(&invocation_scratch)
             .arg("inspect")
             .arg("tags")
             .arg(&input)

@@ -221,8 +221,8 @@ alignment and boundaries.
 Reported by check-machinery.
 
 Brokkr lets a `paths` glob matching nothing pass. Some rules use `must_scan`, many do
-not, including those for environment access, host probes, process mutation, stdout and
-scratch allocation. `scripts/textlint_coverage.py` detects dead selectors but no check
+not, including those for environment access, host probes, process mutation and
+stdout. `scripts/textlint_coverage.py` detects dead selectors but no check
 or gate invokes it, its manifest under `notes/` is a migration artifact, and it
 duplicates brokkr's selector semantics.
 
@@ -230,54 +230,13 @@ Fix and enforcement: require nonempty selectors in brokkr, including stale exclu
 and sentinel membership. A pinned list of admitted files is unnecessary.
 Brokkr side filed as bz brokkr#157.
 
-## VER-015 - The scratch lint bans spellings and does not enforce ownership
+## VER-016 - Runner-owned scratch root remains
 
-Reported by lib-integration, cli-tests.
-
-The rule in `brokkr.d/lints.toml` bans ambient-temp constructors but permits `_in`
-constructors anywhere, so `TempDir::new_in` can target a build directory or tool cache,
-and fixed paths through filesystem calls are unseen. No current write into another
-tool's state was found.
-
-Fix: restrict allocation entry points to the shared scratch implementation and derive
-child paths from an owned scratch object. Enforcement: a wrapper type and constructor
-restrictions.
-
-## VER-016 - Scratch root discovery is duplicated and keyed on an incidental lockfile
-
-Reported by lib-integration, lib-commands-unit, cli-tests, check-machinery.
-
-`crates/lib/tests/common/scratch.rs`, `crates/cli/src/test_scratch.rs` and
-`crates/harness/src/test_scratch.rs` independently search ancestors of compile-time
-`CARGO_MANIFEST_DIR` for `Cargo.lock` and write `data/test-scratch`. A relocated binary
-or read-only checkout fails or writes back into the original tree, a missing lockfile
-panics, and an intervening lockfile changes the root. The comment that CLI unit tests
-cannot mount the integration file is not a Rust restriction. Many tests also require
-UTF-8 paths. The location itself is appropriately owned; hunters found no need to move
-it.
-
-Fix: one test-support allocator with an explicit runner-owned root under
-`data/test-scratch/` and a documented standalone fallback, each fixture owning a random
-child, and paths passed as `Path` or `OsStr`. Enforcement: forbid other root discovery,
-allocation and panicking path conversion in invocation helpers.
-The runner-owned root is the brokkr side, filed as bz brokkr#152.
-
-## VER-017 - Bare early returns report success without exercising the subject
-
-Reported by lib-core-unit, lib-integration, cli-tests.
-
-Bare returns for root in `crates/lib/src/scratch.rs` (three sites),
-`crates/lib/src/output.rs` (two), `crates/lib/tests/host_contract.rs` permission
-confinement, `crates/cli/tests/cli_scratch.rs` (three) and
-`crates/cli/tests/cli_output_contract.rs`. Bare returns when procfs reopening is
-unavailable in `read/input.rs` and when `/proc` gives no different-device mount in
-`output.rs`. These violate the announced-skip convention, and root is only a proxy for
-permission behaviour given capabilities and filesystem policy.
-
-Fix: probe that the fixture denies the operation, use injected filesystem or
-publication faults for portable error paths, and keep a small platform test with an
-explicit prerequisite result. Enforcement: one skip helper and a shared refusal-fixture
-helper.
+The shared leaf fixes the repository location at compile time. Invocation helpers
+pass native paths without UTF-8 conversion, and spelling-bound manifest-directory
+discovery enforcement is installed with explicit roots and scan sentinels.
+Residue: no runner-owned root until bz brokkr#152 names and ships its variable
+(S6). Relocated binaries deliberately still name the checkout they were compiled in.
 
 ## VER-018 - Passing skips are invisible and can satisfy the complete gate
 
@@ -539,16 +498,6 @@ in the hooks sweep. Element-cut tests use hundreds of thousands of nodes.
 Fix: small injected thresholds, one tiered production-default test, and an injected
 planner policy. Enforcement: typed policy construction.
 
-## VER-037 - Derive helpers use process-wide counters for fixture names
-
-Reported by fault-injection.
-
-`crates/lib/tests/fault_derive_parallel.rs` and its gzip helper keep static run counters,
-so names depend on unrelated order and outputs persist until the scratch guard drops.
-
-Fix: a child directory per invocation with fixed names. Enforcement: a text rule against
-static fixture-name counters once the helper exists.
-
 ## VER-038 - assert_sorted_file cannot see type interleaving and misorders negative IDs
 
 Reported by lib-integration.
@@ -629,29 +578,15 @@ despite claiming exactly the documented edits.
 Fix: assert exact bytes and compare complete contents against explicit edits. Executable
 examples can enforce counts; prose cannot be guaranteed.
 
-## VER-045 - Plain-node geocode coverage depends on an installed osmium
+## VER-045 - Plain-node geocode coverage still requires installed osmium
 
-Reported by lib-integration.
-
-`legal_non_dense_nodes_build_a_queryable_index` in `crates/lib/tests/geocode_index.rs`
-invokes `osmium` from `PATH`, is ignored by ordinary runs, and passes by skipping. The
-subject is this repository's plain-node handling.
-
-Fix: extend `common/groups.rs` and make it an ordinary synthetic test, keeping parity work
-in `brokkr verify`. Enforcement: a lint limiting process launches in library integration
-tests.
-
-## VER-046 - External oracle tests bypass the bounded subprocess machinery
-
-Reported by cli-tests.
-
-`cli_sort.rs`, `cli_digest.rs` and `cli_apply_changes_osmium.rs` invoke PATH osmium directly.
-Sort and digest treat any spawn error as not found. A stalled oracle relies on the outer
-watchdog, which can kill the test without cleaning up its child.
-
-Fix: move the comparisons into brokkr's verification as the documented migration intends, or
-share a bounded external-tool runner with version reporting and kill and reap ownership.
-Enforcement: direct oracle spawning only in that runner.
+`legal_non_dense_nodes_build_a_queryable_index` remains an ignored external test
+and skips when osmium is absent. Its launches now use the shared bounded oracle
+runner, deliberately resolved executable, private cwd/TMPDIR and version report.
+The remaining coverage gap is independent of child ownership: an ordinary
+synthetic plain-node fixture should exercise this repository's handling without
+an external tool. Extend `common/groups.rs` for that coverage; parity work can
+stay external. This coverage change is outside the filesystem chain.
 
 ## VER-047 - process_nofile assumes more about Linux than its subject needs
 
@@ -665,18 +600,18 @@ unavailable count.
 Fix: separate counting from limit and budget scenarios, compare controlled deltas, and handle
 unavailable procfs. Enforcement: isolated scenarios and injected counting results.
 
-## VER-048 - Proptest config inherits the environment and documents the wrong regression path
+## VER-048 - Proptest configuration inherits the environment
 
-Reported by lib-integration.
+Reported by lib-integration. Narrowed by the test-filesystem fixture slice:
+failure persistence is now explicitly disabled and failing cases are promoted by
+hand to named tests, so no regression-path or checkout-write residue remains.
 
-`crates/lib/tests/proptests.rs` uses `ProptestConfig::default()`, and the macros reapply
-`PROPTEST_*` after `cases: 64`, so `PROPTEST_CASES=0` removes coverage while passing.
-Persistence falls back to `crates/lib/tests/proptests.proptest-regressions`, not the
-documented ignored directory, and the ignore pattern misses it.
+`crates/lib/tests/proptests.rs` still uses `ProptestConfig::default()`, and the
+macros reapply `PROPTEST_*` after `cases: 64`, so `PROPTEST_CASES=0` removes
+coverage while passing. Seed policy is still inherited too.
 
-Fix: explicit configuration with a deliberate seed and reproducer policy, using tracked
-fixtures or a runner-owned directory under `data/`. Enforcement: one configuration helper
-with tests of resolved settings and paths.
+Fix: deliberate environment and seed policy, with tests of resolved settings.
+This is outside the test-filesystem chain's persistence-only change.
 
 ## VER-049 - Property tests spend heavily on a narrower input space than described
 
@@ -748,16 +683,6 @@ indexdata.
 Fix: generate logical blocks once and parameterize framing. Enforcement: verify paired fixtures
 have identical payloads and only the intended envelope differences.
 
-## VER-055 - Two filesystem checks conceal errors or leave their directory
-
-Reported by lib-integration.
-
-The overwrite-refusal test in `edge_cases.rs` uses `filter_map(|e| e.ok())`. `snapshot_dir_inner`
-in `common/mod.rs` follows directory symlinks through `path.is_dir()`.
-
-Fix: fatal entry errors and `symlink_metadata`. Enforcement: injection and symlink escape and
-cycle fixtures, plus a scoped lint against swallowed filesystem errors.
-
 ## VER-056 - Reader constructors bring machine probes into tests
 
 Reported by lib-core-unit.
@@ -768,27 +693,6 @@ decoder count.
 
 Fix: a resource-injection builder for public readers, keeping convenient defaults. Enforcement: a
 structural fixture API and a lint on unconfigured parallel test readers.
-
-## VER-057 - Inline tests consume the doc-example PBF
-
-Reported by lib-core-unit.
-
-Tests in `read/blob.rs` (three) and `read/reader.rs` (two) read `tests/test.osm.pbf`, extending
-the documented doc-example exception and depending on Cargo's working directory. The truncation
-test finds the layout through a production `BlobReader`.
-
-Fix: generate small scratch fixtures and keep independent byte-level framing helpers. Enforcement:
-ban the path in executable unit-test code.
-
-## VER-058 - A file-classification test reads the source checkout
-
-Reported by lib-core-unit.
-
-A test in `write/file_writer.rs` opens the package `Cargo.toml` by compile-time path just to get
-a regular file.
-
-Fix: a file in owned scratch or an explicit classification input. Enforcement: a rule against
-manifest-relative opens except designated source-contract checks.
 
 ## VER-059 - The cgroup parent-limit test never exercises parent discovery
 
@@ -929,19 +833,6 @@ a configuration unlike the annotation. It has correctness assertions.
 Fix: split work-limit assertions from timing and move timing to a registered bench. Enforcement: a
 source check against timing probes in correctness targets.
 
-## VER-072 - The truncation sweep can pass without reading the truncated input
-
-Reported by cli-tests.
-
-`crates/cli/tests/cli_truncation_sweep.rs` uses one output path for the whole sweep and neither
-removes it nor requests overwrite. After a tolerated truncation publishes, later cells can refuse
-the existing destination, and hard truncations accept any unsuccessful exit, including usage errors
-and most abnormal terminations.
-
-Fix: a fresh output per cell, the runtime-failure exit code and a framing error naming the input,
-and a valid-input control per configuration. Enforcement: a shared corruption-test helper requiring
-an expected error category.
-
 ## VER-073 - The truncation sweep's "every command" claim is false
 
 Reported by cli-tests.
@@ -971,28 +862,7 @@ over hundreds of quick children is seconds per test.
 Fix: blocking completion with an independent timeout. Enforcement: an invoker test with a controlled
 child, without a host-speed assertion.
 
-## VER-076 - The two invocation paths have different cleanup guarantees
 
-Reported by cli-tests.
-
-`run` and `spawn` with `RunningCli::wait` are separate implementations. A `try_wait` error panics
-without reliably reaping in either, `RunningCli::drop` does not join capture threads, and capture
-errors become short or empty output.
-
-Fix: one owner of child and capture threads on all paths, `run` built on it, and explicit capture
-failures. Enforcement: fault-injected invoker tests.
-
-## VER-077 - The invoker inherits ambient environment, stdin and working directory
-
-Reported by cli-tests.
-
-`CliInvoker::new` preserves the parent's state, so `PBFHOGG_TEST_*` can arm children,
-`BROKKR_MARKER_FIFO` can make them write to external instrumentation, and Rayon settings can change
-policy.
-
-Fix: an explicit policy removing instrumentation and hook variables, setting execution, defaulting
-stdin to null and making working directory explicit. Enforcement: tests of the builder and a ban on
-raw CLI construction outside the invoker.
 
 ## VER-078 - CLI children use the real machine
 
@@ -1016,15 +886,6 @@ writer discards errors. Publication and merge-spill hooks fail explicitly.
 
 Fix: parse hook configuration into validated types before dispatch and give the invoker typed hook
 methods. Enforcement: negative configuration tests.
-
-## VER-080 - Permission restoration is not unwind-safe
-
-Reported by cli-tests.
-
-`cli_scratch.rs` makes a directory non-writable before a loop of assertions, restoring afterward. A
-failure can prevent `TempDir` cleanup. Backup-removal testing has the same shape.
-
-Fix: a permission-restoration guard inside the scratch owner. Enforcement: a helper test that unwinds.
 
 ## VER-081 - The timestamp test does not prove the current time
 
@@ -1164,16 +1025,6 @@ planet scale and inflates process measurements. `SeededReplace::run` reads each 
 Fix: compare lengths then bounded chunks, and a bounded seed-state helper also used in
 `check_bindings`. Enforcement: the helpers, a source rule against whole-file reads in scale-facing
 assertions, and edge-case tests.
-
-## VER-094 - Harness absence checks treat every error as absence
-
-Reported by library-harness.
-
-`absent` in `scenarios/mod.rs` and `check_bindings` in `runner.rs` treat any `symlink_metadata` error
-as absent, including permission failures.
-
-Fix: return `Result<bool>` and recognize only `NotFound`. Enforcement: one filesystem-state helper
-and injected-error tests.
 
 ## VER-095 - Harness fixtures build unused inputs and substitute paths into JSON
 
@@ -1520,119 +1371,41 @@ Brokkr side (typed param domains) filed as bz brokkr#165. brokkr runs validate()
 
 ## VER-127 - Test filesystem design: what tests write, read and delete, where and how
 
-Proposed design, informed by reading broadarrow's `clippy.toml`, `crates/test-scratch` and `crates/test-support`,
-and not copied from it. The only pbfhogg fact checked for it is that `test_scratch()` in
-`crates/lib/tests/common/scratch.rs` returns a random `TempDir` under `data/test-scratch` that cleans up on `Drop`.
-The other pbfhogg facts below are the unverified claims in this document.
+The settled design and chain plan are in `notes/VER-127-design.md`; its rulings
+supersede the original proposal. S1 through S5 are implemented, uncommitted.
 
-### Direction
+Done: one dev-only scratch leaf, fixed repository accessor, retention and loud
+cleanup contract; checked child names, fresh cells, symlink-safe state inspection,
+anonymous files, probed write-denial guards with descriptor-based restoration;
+permission-test migrations and fallible harness absence checks. S2 closes
+VER-017, VER-055, VER-080 and VER-094.
+S3 generates executable read fixtures and the regular-file fixture in scratch,
+disables property persistence, and gives derive/truncation invocations fresh cells.
+Truncation configurations have successful valid-input controls and require located
+framing failures for hard cuts. S3 closes VER-037, VER-057, VER-058 and VER-072;
+VER-048 retains only its environment and seed-policy residue.
 
-Keep random names with `Drop` cleanup, behind one owned type. brokkr owns the run root and crash cleanup, and the
-call sites that bypass the type are sealed.
+S4 unifies run/spawn ownership with scratch borrows, bounded kill/reap and
+cancellable capture cleanup, isolates child cwd/stdin/environment, adds explicit
+hook setters, shares a deliberately resolved bounded oracle runner, and removes
+UTF-8 invocation conversions. Harness launches use the shared owner and keep
+explicit protocol variables. S4 closes VER-046, VER-076 and VER-077; VER-016
+retains S6 residue and VER-045 retains its independent coverage gap.
+Harness CLI counterparts were not extended (scheduled for removal in pbfhogg#54).
 
-Broadarrow reuses deterministic trees in place, so it needs slots, a claim registry and a sweeper to prove ownership
-before deleting. Random children cannot collide and need none of that. brokkr's machine-wide lock means no test run
-is live between brokkr commands.
+S5 adds six spelling-bound textlint seals with explicit source roots and
+`must_scan`, including the shared process owner, constructor spellings and
+static fixture-name counters. Generated scratch fixtures use a distinct basename.
+The documented limit remains: renamed imports and absolute writes outside the
+repository stay unseen. S5 closes VER-015 and narrows VER-016 to S6.
 
-### Rules
+Remaining:
+- S6: runner-root override only after bz brokkr#152 names and ships its variable.
+  No environment override is implemented today.
+- Brokkr-only: start-of-run clearing (bz brokkr#152), post-run tree check
+  (bz brokkr#153), and verify workspace ownership (bz brokkr#154).
 
-- **Write.** Tests write only inside a `TestScratch` they own, with paths derived from it. They never write to the
-  source tree, `target/`, tool caches or `/tmp`. Proptest file persistence is disabled, and a failing input is
-  promoted by hand to a named tracked case, which gives up automatic replay.
-- **Read.** Tests read their own scratch, the binary through `CARGO_BIN_EXE_*`, and source or docs only in designated
-  source-contract checks through one `repository_root()` accessor. `crates/lib/tests/test.osm.pbf` stays doc-example
-  only, and `data/` datasets stay forbidden.
-- **Delete.** Test code deletes only inside its own `TestScratch`. Between runs only brokkr deletes. A test binary
-  never sweeps anything it did not create.
-- **How.** Children launch only through the invoker or one bounded oracle runner. Filesystem state checks keep their
-  errors, and only `NotFound` means absent.
-
-### Shape
-
-1. **`crates/test-scratch`:** a dev-only leaf crate with no features, depending only on `tempfile`, not on `pbfhogg`,
-   and referenced as a path-only dev-dependency with no version so `cargo publish` strips it. It replaces the three
-   copies and is the one site a clippy `#[expect]` names.
-2. **Root resolution:** one function, once per process. `PBFHOGG_TEST_SCRATCH_ROOT` if set, read as `OsStr` and
-   required to be absolute, otherwise `data/test-scratch` at a path fixed relative to the crate's manifest, so no
-   ancestor search is needed. The base is canonicalized once, and a failure panics naming the variable.
-3. **`TestScratch`:** wraps `TempDir` privately.
-   - `path()` keeps the existing call shape.
-   - `child(name)` rejects anything but one normal path component.
-   - `cell()` gives numbered subdirectories from an instance counter.
-   - `deny_write(path)` returns a guard borrowing the scratch, so restoration precedes removal. It probes that the
-     denial really happens and returns an unavailable reason otherwise, replacing root checks.
-   - `path_state(path)` returns `io::Result` and uses `symlink_metadata`.
-   - The tree is kept when the thread is panicking, and removed on a clean drop, so a failed test stays inspectable
-     until the next run clears it.
-   - Every filesystem operation is deliberately not wrapped: pbfhogg's APIs take paths, so a capability wrapper
-     would end at `.path()` anyway.
-4. **Children:** `RunningCli<'a>` holds `&'a TestScratch` and its `Drop` kills and reaps, so a child cannot outlive
-   its directory. Defaults are the scratch as working directory, null stdin, and an environment cleared to a small
-   allowlist with typed hook methods. Hang probes that cannot be joined go in a killable child.
-5. **brokkr:** sets `PBFHOGG_TEST_SCRATCH_ROOT` and clears `data/test-scratch` children at the start of a run under
-   its lock, so a watchdog-killed run stays available for diagnosis and residue is limited to one run. A tree that
-   cannot be removed is named and handled by brokkr, and does not take the suite down. Verify's workspace follows
-   the same split: per-run scratch plus a separate retained-evidence area.
-   Filed as bz brokkr#152 (run root export, start-of-run clearing) and bz brokkr#154 (verify workspace). The
-   export asks for a generic BROKKR_TEST_* variable, since brokkr#13 (closed) declined PBFHOGG_TEST_* exports.
-6. **Post-run check, later:** the gate confirms the source tree is unchanged after the tests. It is the only item that
-   catches a write inside the repository by absolute path.
-   Filed as bz brokkr#153.
-
-### Enforcement
-
-- **Clippy `disallowed-methods`:** `std::env::temp_dir`, every `tempfile` constructor including `_in` forms and
-  `Builder`, and `Command::new`. Exempt sites use `#[expect]` with a reason.
-- **Textlint with `must_scan`:** `CARGO_MANIFEST_DIR` in test code outside the accessor and named source-contract
-  checks, `test.osm.pbf`, and `data/` literals. These are spelling-bound and used only where clippy cannot reach.
-- **Types and borrows:** guard before removal, child before scratch.
-- **Post-run tree check:** detective only, and it needs brokkr work.
-
-Nothing here stops `std::fs::write("/somewhere")` in a test, and writes outside the repository stay unseen.
-`reference/testing.md` should state that limit.
-
-### From broadarrow
-
-- **Take:** one base resolver outside `target/` with an absolute-path override, single-component name checks,
-  symlink-safe inspection and the `NotFound` pattern, resolved `temp_dir` and `Command::new` seals with `#[expect]`
-  reasons, and capability assertions only at the fixture that needs them.
-- **Change:** root discovery becomes the crate's fixed location, the UTF-8-only override becomes `OsStr`,
-  `command_in_scratch` becomes a full invoker policy, and crash cleanup moves from a test-side sweep to the runner.
-- **Leave out:** slots and flock, the claim registry, flat roots and the socket budget, the 24-hour sweeper, `0700`
-  privacy and durability proofs. The sweeper is the riskiest part: one process walks all namespaces, a leftover
-  non-writable tree panics inside base initialization and fails the suite, no test of it appears in the files read,
-  and in pbfhogg it would run next to real datasets in `data/`.
-
-### Bearing on this document
-
-- **Resolved by this design:** VER-015 (with the absolute-path limit above), VER-016, VER-037, VER-048, VER-057,
-  VER-058, VER-072 (fresh output per cell), VER-080.
-- **Resolved jointly with their own fixes:** VER-017 (the skip helper is still needed), VER-045 and VER-046 (spawn
-  restriction plus the oracle runner or a move to `brokkr verify`), VER-055 and VER-094 (plus fatal entry errors at
-  the sites), VER-076, VER-077, VER-023 (detached in-process threads still need joining), VER-123 (needs brokkr
-  work).
-- **Affected indirectly:** VER-018 (a root override onto tmpfs could silently turn O_DIRECT and io_uring tests into
-  skips, so capability accounting has to report the filesystem it probed), VER-014 (new textlints need `must_scan`),
-  VER-012 (seals add no new parser), VER-036, VER-049 and VER-050 (fixture size remains a time problem), VER-069 and
-  VER-070 (`path_state` and a listing helper make complete comparison cheap).
-- **Not addressed:** VER-008, VER-060, VER-001 to VER-005, VER-020 to VER-028 other than VER-023, and the assertion,
-  harness-protocol and bench findings.
-
-### Order of work
-
-1. Crate, `TestScratch`, root resolution, and migration of the three copies.
-2. Clippy seals and textlints, after the resolution test below.
-3. Invoker ownership and environment policy, with the oracle runner.
-4. brokkr: run root, start-of-run clearing, then the tree check.
-
-Steps 1 to 3 work with today's brokkr through the fallback root.
-
-### Open before building
-
-- Broadarrow's `clippy.toml` contradicts itself on whether a path that stops resolving disables its seal silently or
-  is a hard error. Test this against the `minimal` sweep, and keep the existing textlint until it is answered.
-- How many production sites use `Command::new` or `tempfile`, since the seals are workspace-wide.
-- Whether `Path::exists`, `is_file` and `is_dir` seals are worth it, gated on a site count. VER-055 and VER-094 are
-  fixed through `path_state` first.
-- Where production scratch goes when a CLI child has no `--tmp-dir`. The invoker policy should pin it inside the
-  fixture.
+A guard dropped during unwinding keeps its tree; this is not a test-verdict
+contract. No test binary sweeps residue. Clippy seals for test code were refused
+in the settled design; enforcement uses textlint. The remaining neighbouring
+findings are assigned in the design's slice plan.

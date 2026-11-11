@@ -388,7 +388,7 @@ fn padded_header(datasize: usize, total: usize) -> Vec<u8> {
 }
 
 struct Fixture {
-    dir: tempfile::TempDir,
+    dir: pbfhogg_test_scratch::TestScratch,
     intact: Vec<u8>,
     /// The last frame (blob index 2): its start, BlobHeader length, payload
     /// start and declared datasize. Every case damages this frame.

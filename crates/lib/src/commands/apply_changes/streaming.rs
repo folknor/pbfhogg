@@ -1302,9 +1302,9 @@ mod tests {
     use crate::tunables::{DECOMPRESS_POOL_MAX_RETAINED_CAPACITY, MAX_RETAINED_SCRATCH_CAPACITY};
     use std::os::unix::fs::FileExt as _;
 
-    fn input(len: usize) -> (tempfile::TempDir, std::fs::File) {
+    fn input(len: usize) -> (pbfhogg_test_scratch::TestScratch, std::fs::File) {
         let dir = crate::path_guard::tests::scratch();
-        let file = tempfile::tempfile_in(dir.path()).expect("scratch file");
+        let file = dir.anonymous_file();
         let bytes: Vec<u8> = (0..len).map(byte).collect();
         file.write_all_at(&bytes, 0).expect("write input");
         (dir, file)

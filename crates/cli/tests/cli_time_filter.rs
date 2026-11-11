@@ -45,7 +45,8 @@ struct RelationSnapshot {
 /// assert success. Returns the captured stderr (which carries the
 /// stats summary line) so the caller can pin counter values.
 fn run_time_filter(input: &Path, output: &Path, cutoff: i64) -> String {
-    let out = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("time-filter")
         .arg(input)
         .arg("-o")
@@ -320,12 +321,13 @@ fn write_metadata_stripped_input(path: &Path) {
 /// it apart from a cutoff that genuinely kept everything.
 #[test]
 fn time_filter_refuses_metadata_stripped_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("stripped.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_metadata_stripped_input(&input);
 
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("time-filter")
         .arg(&input)
         .arg("-o")
@@ -633,8 +635,9 @@ fn write_node_blocks(path: &Path, history: bool, indexed: bool, blocks: &[&[(i64
 }
 
 fn assert_time_filter_refuses(input: &Path, needle: &str) -> String {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let output = input.with_extension("out.pbf");
-    let out = CliInvoker::new()
+    let out = CliInvoker::new(&invocation_scratch)
         .arg("time-filter")
         .arg(input)
         .arg("-o")

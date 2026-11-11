@@ -38,7 +38,7 @@ use crate::invoker::{CliInvoker, CliOutput, subcommands};
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, HeaderBlock, MemberId};
-use tempfile::TempDir;
+use pbfhogg_test_scratch::TestScratch;
 
 macro_rules! ensure {
     ($cond:expr, $($arg:tt)*) => {
@@ -98,7 +98,7 @@ impl Fixture {
 }
 
 struct Fx {
-    dir: TempDir,
+    dir: TestScratch,
     counter: std::cell::Cell<usize>,
 }
 
@@ -241,7 +241,8 @@ fn write_fixture(path: &Path, sorted: bool) {
 }
 
 fn enrich(input: &Path, output: &Path, prepass: bool) {
-    let mut cli = CliInvoker::new()
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("add-locations-to-ways")
         .arg(input)
         .arg("-o")
@@ -1100,8 +1101,9 @@ fn run_row(
     fixture: Fixture,
     pins: &HashMap<i64, Option<Vec<u8>>>,
 ) -> Result<(), String> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let (args, outputs) = (row.build)(fx, fixture);
-    let out: CliOutput = CliInvoker::new().args(&args).run();
+    let out: CliOutput = CliInvoker::new(&invocation_scratch).args(&args).run();
     match (row.expect)(fixture) {
         Outcome::Refused => {
             ensure!(
@@ -1210,6 +1212,7 @@ fn every_command_declares_what_an_injected_prepass_input_yields() {
 /// of a config alike.
 #[test]
 fn an_extract_of_unsorted_input_does_not_declare_sorted() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Unsorted]);
     let region = region_arg();
     let mut runs: Vec<Invocation> = [
@@ -1222,7 +1225,9 @@ fn an_extract_of_unsorted_input_does_not_declare_sorted() {
     .collect();
     runs.push(extract_config(&fx, Fixture::Unsorted));
     for (args, outputs) in runs {
-        CliInvoker::new().args(&args).assert_success();
+        CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_success();
         for output in outputs {
             assert!(
                 !read_header(&output).is_sorted(),
@@ -1243,6 +1248,7 @@ fn an_extract_of_unsorted_input_does_not_declare_sorted() {
 /// `--generator`. Each now keeps every declaration its blobs back.
 #[test]
 fn raw_copying_commands_keep_the_enrichment_their_blobs_carry() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Prepass]);
     let input = fx.path(Fixture::Prepass);
     let pins = read_contents(&input).pins;
@@ -1264,7 +1270,9 @@ fn raw_copying_commands_keep_the_enrichment_their_blobs_carry() {
         ),
     ];
     for (args, outputs) in runs {
-        CliInvoker::new().args(&args).assert_success();
+        CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_success();
         let h = read_header(&outputs[0]);
         assert!(
             h.has_locations_on_ways() && h.has_way_members_v1() && h.has_shared_node_pins_v1(),
@@ -1294,6 +1302,7 @@ fn raw_copying_commands_keep_the_enrichment_their_blobs_carry() {
 /// instead of writing a header that lies.
 #[test]
 fn an_unindexed_way_blob_cannot_break_a_declared_enrichment() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Prepass]);
     let input = fx.path(Fixture::Prepass);
     let bytes = std::fs::read(&input).unwrap();
@@ -1314,7 +1323,7 @@ fn an_unindexed_way_blob_cannot_break_a_declared_enrichment() {
     .unwrap();
     for extra in [&[][..], &["-t", "way"][..]] {
         let (args, outputs) = simple(&fx, "cat", std::slice::from_ref(&mixed), extra);
-        let out = CliInvoker::new().args(&args).run();
+        let out = CliInvoker::new(&invocation_scratch).args(&args).run();
         assert!(
             !out.status.success(),
             "cat {extra:?} wrote a way blob without the enrichment its header declared"
@@ -1332,9 +1341,12 @@ fn an_unindexed_way_blob_cannot_break_a_declared_enrichment() {
 /// drops the sequence number, which named a later state than the data.
 #[test]
 fn time_filter_before_the_input_state_drops_the_sequence_number() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Plain]);
     let (args, outputs) = simple(&fx, "time-filter", &[fx.path(Fixture::Plain)], &["500"]);
-    CliInvoker::new().args(&args).assert_success();
+    CliInvoker::new(&invocation_scratch)
+        .args(&args)
+        .assert_success();
     let h = read_header(&outputs[0]);
     assert_eq!(h.osmosis_replication_timestamp(), Some(500));
     assert_eq!(h.osmosis_replication_sequence_number(), None);
@@ -1345,6 +1357,7 @@ fn time_filter_before_the_input_state_drops_the_sequence_number() {
 /// spellings as time-filter's cutoff.
 #[test]
 fn the_replication_timestamp_override_accepts_rfc3339() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Plain]);
     let (args, outputs) = simple(
         &fx,
@@ -1355,7 +1368,9 @@ fn the_replication_timestamp_override_accepts_rfc3339() {
             "osmosis_replication_timestamp=1970-01-01T00:33:20Z",
         ],
     );
-    CliInvoker::new().args(&args).assert_success();
+    CliInvoker::new(&invocation_scratch)
+        .args(&args)
+        .assert_success();
     assert_eq!(
         read_header(&outputs[0]).osmosis_replication_timestamp(),
         Some(2000),
@@ -1367,6 +1382,7 @@ fn the_replication_timestamp_override_accepts_rfc3339() {
 /// knows the new one stamps it.
 #[test]
 fn apply_changes_takes_the_new_replication_position_from_the_caller() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Plain]);
     let (args, outputs) = simple(
         &fx,
@@ -1379,7 +1395,9 @@ fn apply_changes_takes_the_new_replication_position_from_the_caller() {
             "osmosis_replication_timestamp=2000",
         ],
     );
-    CliInvoker::new().args(&args).assert_success();
+    CliInvoker::new(&invocation_scratch)
+        .args(&args)
+        .assert_success();
     let h = read_header(&outputs[0]);
     assert_eq!(h.osmosis_replication_timestamp(), Some(2000));
     assert_eq!(h.osmosis_replication_sequence_number(), Some(8));
@@ -1390,6 +1408,7 @@ fn apply_changes_takes_the_new_replication_position_from_the_caller() {
 /// on degrade's verbatim passthrough alike, and leaves the others alone.
 #[test]
 fn an_empty_output_header_value_omits_the_field() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Plain]);
     let clear = [
         "--output-header",
@@ -1407,7 +1426,9 @@ fn an_empty_output_header_value_omits_the_field() {
         ),
     ];
     for (args, outputs) in runs {
-        CliInvoker::new().args(&args).assert_success();
+        CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_success();
         let h = read_header(&outputs[0]);
         assert_eq!(h.osmosis_replication_base_url(), None, "{args:?}");
         assert_eq!(h.osmosis_replication_sequence_number(), None, "{args:?}");
@@ -1423,13 +1444,14 @@ fn an_empty_output_header_value_omits_the_field() {
 /// silently ignored.
 #[test]
 fn tags_filter_osc_mode_refuses_header_overrides() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
     let fx = Fx::new(&[Fixture::Plain]);
     let out = fx.dir.path().join("out.osc");
     for flags in [
         &["--generator", "gen"][..],
         &["--output-header", "osmosis_replication_sequence_number=1"][..],
     ] {
-        let run = CliInvoker::new()
+        let run = CliInvoker::new(&invocation_scratch)
             .arg("tags-filter")
             .arg(fx.osc())
             .args(["--input-kind", "osc", "amenity", "-o"])

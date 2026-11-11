@@ -2,16 +2,16 @@
 
 Settled under spar (codex, 2026-11-11). The rulings below are closed: later
 links implement them and do not reopen them. Source item: VER-127 in
-`notes/verification.md`, which stays there until the last link closes the
-chain.
+`notes/verification.md`, which stays there until the work listed under
+"Remaining after the chain's commit" is done.
 
 ## Facts the design rests on (checked at 9392f187)
 
 - `data/test-scratch/` held 16 leftover `.tmp*` trees (one from 2026-11-09
   holding a CLI child's `.pbfhogg-run-*` directory) and a stray
   `old_blob_meta.rs`. Residue is real, not hypothetical.
-- brokkr#152 (export a scratch root, clear it at start of run) is open and
-  unshipped; its variable name is undecided. brokkr#13 declined
+- brokkr#152 (export a scratch root, clear it at start of run) was later
+  closed as wontfix, as were #153 and #154. brokkr#13 declined
   `PBFHOGG_TEST_*` exports and 94453ae6 removed env-overridable roots.
 - `disallowed_methods` is `allow` workspace-wide and denied only in the
   library's non-test code and the CLI's `src`. Integration test crates call
@@ -42,14 +42,16 @@ chain.
 3. **`repository_root()` and the scratch base are separate.** Reading the
    checkout never creates `data/test-scratch`; the base is created once, on
    first `scratch()`.
-4. **No env override until brokkr#152 names its variable.** A variable no
+4. **No env override.** (Originally deferred until brokkr#152 named a
+   variable; brokkr will export none, so this is final.) A variable no
    runner sets is dead code, and the prior ruling removed one.
 5. **Retention contract, stated literally:** a guard destroyed during
    unwinding keeps its tree; everything else is removed. Unwinding is not a
    test verdict (a guard created inside a caught closure is kept even when
    the test passes; a `prop_assert!` failure loses its case's tree).
    Residue grows on unwinding, explicit `keep()`, cleanup failure and
-   process termination. A test binary never sweeps.
+   process termination. A test binary never sweeps. (Reopened: this rested
+   on brokkr owning the sweep, which brokkr declined.)
 6. **Cleanup failure is loud.** A non-unwinding drop calls `TempDir::close`
    and panics naming the path on failure, noting the tree may be partial.
    The `TempDir` sits in an `Option` taken exactly once. The panic fails the
@@ -333,17 +335,28 @@ S5 validation:
   drop path) and the full `brokkr check --gate` passes (12750 tests passed,
   29 ignored; 12610 expected executions all passed).
 
-### S6 env override (small; blocked on brokkr#152)
+### S6 env override (dropped)
 
-When brokkr ships its variable: read it once as `OsStr` in the leaf's
-scratch-base init, require absolute, canonicalize, panic naming the
-variable; fallback stays the fixed location. Not before.
+Dropped, not blocked: brokkr will not export a scratch-root variable, so the
+root stays fixed and the leaf's source comment says why.
 
 ## Remaining after the chain's commit
 
-Only S6 (env override, blocked on brokkr#152) remains in this repository.
-Brokkr-side items: brokkr#152 (export and clear a scratch root), brokkr#153
-(post-run tree check), brokkr#154 (verify workspace).
+brokkr declined all three of its tickets (brokkr#152, #153 and #154 are
+closed as wontfix), so what they asked is now pbfhogg's own work. The
+pbfhogg-side design of each is still to be done:
+
+- Clearing leftover trees under `data/test-scratch/` (formerly the
+  start-of-run clearing in brokkr#152). Nothing clears them today.
+- A post-run check that tests did not write into the source tree (formerly
+  brokkr#153).
+- The verify workspace (formerly brokkr#154). brokkr verify is to be removed
+  and reimplemented in pbfhogg, so this is a requirement on that
+  implementation: its outputs go to an owned per-run scratch directory, with
+  any retained evidence kept separately, never under `target/`.
+
+Ruling 5 above, "a test binary never sweeps", rested on brokkr owning the
+sweep. That premise is gone and the question is open again.
 
 ## Tickets each slice touches (commented after the chain's commit landed)
 

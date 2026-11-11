@@ -538,7 +538,8 @@ exception, not a tier - should not survive across many PRs.
   `common::test_scratch()` and library unit tests as
   `path_guard::tests::scratch()`, both re-exports. The location is fixed
   two levels above the crate's manifest and checked once per process to be
-  a workspace manifest; it is not relocatable. `repository_root()` in the
+  a workspace manifest; it is not relocatable and has no environment
+  override, because the test runner exports no scratch-root variable. `repository_root()` in the
   same crate is the accessor for tests that read the checkout (the CLI
   reference, `brokkr.toml`), and it creates nothing.
   `child(name)` accepts exactly one normal path component and creates
@@ -565,7 +566,9 @@ exception, not a tier - should not survive across many PRs.
   as scoped owners (never `static` or thread-local) and outside any closure
   whose panic the test expects. `keep()` retains a tree deliberately.
   Residue in `data/test-scratch/` grows on unwinding, `keep()`, cleanup
-  failure and process termination, and no test binary clears it.
+  failure and process termination, and nothing clears it automatically:
+  neither a test binary nor the test runner does, so delete leftover trees
+  by hand.
   Scratch constructor spellings are sealed outside the leaf by
   `test-scratch-via-test-scratch-crate` in `brokkr.d/lints.toml`.
   Companion rules seal child construction to the four owned runners,

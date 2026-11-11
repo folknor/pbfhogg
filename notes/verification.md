@@ -18,9 +18,7 @@
 Findings are as reported by the hunters and have not been verified. Hunters read
 source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
-verdict on the code. Entries are in no order of importance. VER-127 is the proposed
-test filesystem design that several of the entries depend on.
-
+verdict on the code. Entries are in no order of importance.
 ## VER-001 - test_host and Host::for_tests fix reported resources but not the executor
 
 Reported by lib-integration, fault-injection, lib-core-unit, lib-commands-unit,
@@ -229,14 +227,6 @@ duplicates brokkr's selector semantics.
 Fix and enforcement: require nonempty selectors in brokkr, including stale exclusions
 and sentinel membership. A pinned list of admitted files is unnecessary.
 Brokkr side filed as bz brokkr#157.
-
-## VER-016 - Runner-owned scratch root remains
-
-The shared leaf fixes the repository location at compile time. Invocation helpers
-pass native paths without UTF-8 conversion, and spelling-bound manifest-directory
-discovery enforcement is installed with explicit roots and scan sentinels.
-Residue: no runner-owned root until bz brokkr#152 names and ships its variable
-(S6). Relocated binaries deliberately still name the checkout they were compiled in.
 
 ## VER-018 - Passing skips are invisible and can satisfy the complete gate
 
@@ -1333,7 +1323,8 @@ directory. Cargo owns `target`, so these PBFs and reports vanish with cleanup an
 
 Fix: a brokkr-owned per-run directory under configured scratch and a separate retained-evidence area.
 Enforcement: directory capability types.
-Brokkr side filed as bz brokkr#154.
+brokkr declined this (bz brokkr#154, wontfix); brokkr verify is to be removed and
+reimplemented in pbfhogg, which must meet the requirement tracked under VER-127.
 
 ## VER-124 - Optional context tools add cost without a verdict
 
@@ -1369,43 +1360,21 @@ Fix: parameter types in brokkr's schema or shared constructors. Enforcement: con
 against local replacements.
 Brokkr side (typed param domains) filed as bz brokkr#165. brokkr runs validate() before any build, so "fail after building" holds only for values a script's own check lets through.
 
-## VER-127 - Test filesystem design: what tests write, read and delete, where and how
+## VER-127 - Test filesystem: pbfhogg-side residue after brokkr declined its share
 
-The settled design and chain plan are in `notes/VER-127-design.md`; its rulings
-supersede the original proposal. S1 through S5 are implemented, uncommitted.
+The test scratch leaf, retention contract, owned runners and textlint seals are
+implemented and committed; the settled design is `notes/VER-127-design.md`. No
+scratch-root environment override will exist: the root is fixed and brokkr exports
+no variable.
 
-Done: one dev-only scratch leaf, fixed repository accessor, retention and loud
-cleanup contract; checked child names, fresh cells, symlink-safe state inspection,
-anonymous files, probed write-denial guards with descriptor-based restoration;
-permission-test migrations and fallible harness absence checks. S2 closes
-VER-017, VER-055, VER-080 and VER-094.
-S3 generates executable read fixtures and the regular-file fixture in scratch,
-disables property persistence, and gives derive/truncation invocations fresh cells.
-Truncation configurations have successful valid-input controls and require located
-framing failures for hard cuts. S3 closes VER-037, VER-057, VER-058 and VER-072;
-VER-048 retains only its environment and seed-policy residue.
+brokkr declined the rest (bz brokkr#152, #153 and #154, all closed as wontfix), so
+each is now pbfhogg's own work and its pbfhogg-side design is still to be done:
+- Clearing leftover trees under `data/test-scratch/`. Nothing clears them today.
+- A post-run check that tests did not write into the source tree.
+- The verify workspace (see VER-123). brokkr verify is to be removed and
+  reimplemented in pbfhogg, so this is a requirement on that implementation:
+  its outputs go to an owned per-run scratch directory, with any retained
+  evidence kept separately, never under `target/`.
 
-S4 unifies run/spawn ownership with scratch borrows, bounded kill/reap and
-cancellable capture cleanup, isolates child cwd/stdin/environment, adds explicit
-hook setters, shares a deliberately resolved bounded oracle runner, and removes
-UTF-8 invocation conversions. Harness launches use the shared owner and keep
-explicit protocol variables. S4 closes VER-046, VER-076 and VER-077; VER-016
-retains S6 residue and VER-045 retains its independent coverage gap.
-Harness CLI counterparts were not extended (scheduled for removal in pbfhogg#54).
-
-S5 adds six spelling-bound textlint seals with explicit source roots and
-`must_scan`, including the shared process owner, constructor spellings and
-static fixture-name counters. Generated scratch fixtures use a distinct basename.
-The documented limit remains: renamed imports and absolute writes outside the
-repository stay unseen. S5 closes VER-015 and narrows VER-016 to S6.
-
-Remaining:
-- S6: runner-root override only after bz brokkr#152 names and ships its variable.
-  No environment override is implemented today.
-- Brokkr-only: start-of-run clearing (bz brokkr#152), post-run tree check
-  (bz brokkr#153), and verify workspace ownership (bz brokkr#154).
-
-A guard dropped during unwinding keeps its tree; this is not a test-verdict
-contract. No test binary sweeps residue. Clippy seals for test code were refused
-in the settled design; enforcement uses textlint. The remaining neighbouring
-findings are assigned in the design's slice plan.
+The design's earlier ruling that a test binary never sweeps rested on brokkr owning
+the sweep, and is open again.

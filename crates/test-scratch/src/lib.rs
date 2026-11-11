@@ -50,6 +50,11 @@ pub fn repository_root() -> &'static Path {
 
 /// The scratch base, `<repository root>/data/test-scratch`, created once per
 /// process.
+///
+/// The root is deliberately fixed and has no environment override: the test
+/// runner exports no scratch-root variable, so a variable read here would
+/// be one nothing sets, and a second location would split residue between
+/// two trees. Do not add one.
 fn scratch_base() -> &'static Path {
     static BASE: OnceLock<PathBuf> = OnceLock::new();
     BASE.get_or_init(|| {

@@ -1,8 +1,8 @@
--- sort-cold: `sort` of a dataset's file into scratch, the input evicted from
--- the page cache as the timed block starts. Registered in
--- brokkr.d/benches.toml. Use `--force yes` for an unindexed input
--- (`pbf.raw`), equivalent to typed `brokkr sort --force-sort`.
--- sort-pbf covers the typed workload without cache preparation.
+-- sort-cold: `sort` of a dataset's file into scratch, the input out of the
+-- page cache as the sort starts. Registered in brokkr.d/benches.toml. Use
+-- `--force yes` for an unindexed input (`pbf.raw`), equivalent to typed
+-- `brokkr sort --force-sort`. sort-pbf covers the typed workload without
+-- cache preparation.
 --
 -- An unindexed input sends every blob through pass 1's payload scan (pread,
 -- decompress, ID and tag-key scan, on pass 1's worker pool), so pass 1 is judged by its SORT_INDEX_BUILD span
@@ -11,24 +11,24 @@
 --
 --   brokkr bench --iterations 1 --commit REF sort-cold --dataset europe --variant raw --force yes
 --
--- Eviction happens in the timed block, after brokkr hashes the inputs, and
--- fincore checks it before the sort; the iteration wall therefore includes
--- that preparation, so compare commits on the sort child's own wall
--- (`brokkr results UUID`). --force is checked by its choices in
--- brokkr.d/benches.toml.
+-- The sort call is `cold` over its input (`brokkr man bench page-cache`):
+-- brokkr advises the file out after admitting the call and fails the
+-- iteration unless none of it is resident before launch, storing the
+-- account with the child. The call is `measured`, so the result is the
+-- sort child's wall, without that preparation. The preflight checks only
+-- what page_cache() can see beforehand. --force is checked by its choices
+-- in brokkr.d/benches.toml.
 
-local cache = require("cache")
+function preflight(params)
+    local why = page_cache(params.variant.file, "cold")
+    if why then fail(why) end
+end
 
 function bench(params)
     local pbf = params.variant.file
-    binary_with({ program = "dd" }, "if=" .. pbf.path, "iflag=nocache", "count=0", "status=none"):ok()
-    local res = cache.resident(pbf.path)
-    record.input_resident_bytes = res
     record.input_bytes = filesize(pbf)
-    if res > 0 then
-        fail(res .. " bytes of the input are cached after eviction")
-    end
     local out = output("out.osm.pbf")
-    binary("sort", pbf, { force = params.force == "yes", output = out, overwrite = true }):ok()
+    binary_with({ cold = { pbf }, measured = true },
+        "sort", pbf, { force = params.force == "yes", output = out, overwrite = true }):ok()
     record.output_bytes = filesize(out)
 end

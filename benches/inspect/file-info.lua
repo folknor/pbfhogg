@@ -17,17 +17,9 @@ function validate(params)
     if params.mode ~= "tags" and (params.type or params.expr) then
         fail("--type and expressions require --mode tags")
     end
-    if params.jobs then
-        if params.mode ~= "nodes" and params.mode ~= "tags" then
-            fail("--jobs requires --mode nodes or tags")
-        end
-        local digits = params.jobs:gsub("^%+", "")
-        local canonical = digits:gsub("^0+", "")
-        if canonical == "" then canonical = "0" end
-        if not digits:match("^%d+$") or #canonical > 20
-            or (#canonical == 20 and canonical > "18446744073709551615") then
-            fail("--jobs must be an unsigned 64-bit integer")
-        end
+    -- --jobs is a u64 by its typed domain in the registry.
+    if params.jobs and params.mode ~= "nodes" and params.mode ~= "tags" then
+        fail("--jobs requires --mode nodes or tags")
     end
     for _, expr in ipairs(params.expr or {}) do
         if type(expr) ~= "string" or expr:sub(1, 1) == "-" or expr:find("%z") then

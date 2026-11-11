@@ -29,12 +29,17 @@
 --
 --   brokkr bench --iterations 1 --commit REF dedupe-pair --with one-relation --cache cold
 --
--- Cache handling is dedupe-self's: the timed block reads both inputs whole
--- (warm) or evicts both (cold), and fincore checks both before the merge.
--- Compare commits on the cat child's own wall. --cache and --check are
--- checked by their choices in brokkr.d/benches.toml.
+-- Cache handling is dedupe-self's: the cat call is `cold` or `warm` over
+-- both inputs, so brokkr prepares and checks both before launch, and the
+-- call is `measured`, so the result is the cat child's wall. --cache and
+-- --check are checked by their choices in brokkr.d/benches.toml.
 
-local cache = require("cache")
+function preflight(params)
+    for _, f in ipairs({ params.base_variant.file, params.with_variant.file }) do
+        local why = page_cache(f, params.cache)
+        if why then fail(why) end
+    end
+end
 
 function validate(params)
     -- validate() sees each file as its path string; bench sees a handle.
@@ -46,27 +51,11 @@ end
 function bench(params)
     local base = params.base_variant.file
     local with = params.with_variant.file
-    for _, f in ipairs({ base, with }) do
-        if params.cache == "cold" then
-            binary_with({ program = "dd" }, "if=" .. f.path, "iflag=nocache", "count=0", "status=none"):ok()
-        else
-            binary_with({ program = "dd" }, "if=" .. f.path, "of=/dev/null", "bs=4M", "status=none"):ok()
-        end
-    end
-    for name, f in pairs({ base = base, with = with }) do
-        local res = cache.resident(f.path)
-        local size = filesize(f)
-        record[name .. "_resident_bytes"] = res
-        record[name .. "_bytes"] = size
-        if params.cache == "cold" and res > 0 then
-            fail(res .. " bytes of " .. f.path .. " are cached in a cold run")
-        end
-        if params.cache == "warm" and res < size then
-            fail("only " .. res .. " of " .. size .. " bytes of " .. f.path .. " are cached in a warm run")
-        end
-    end
+    record.base_bytes = filesize(base)
+    record.with_bytes = filesize(with)
     local out = output("out.osm.pbf")
-    binary("cat", base, with, { dedupe = true, output = out, overwrite = true }):ok()
+    binary_with({ [params.cache] = { base, with }, measured = true },
+        "cat", base, with, { dedupe = true, output = out, overwrite = true }):ok()
     record.output_bytes = filesize(out)
     -- --check yes diffs the output against the base with the same build.
     -- For a second input whose elements are a subset of the base's (both

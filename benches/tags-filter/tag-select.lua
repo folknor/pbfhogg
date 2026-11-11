@@ -38,15 +38,7 @@ function validate(params)
     if params["omit-referenced"] == "yes" and (params["remove-tags"] == "yes" or params.jobs) then
         fail("--omit-referenced refuses --remove-tags and --jobs")
     end
-    if params.jobs then
-        local digits = params.jobs:gsub("^%+", "")
-        local canonical = digits:gsub("^0+", "")
-        if canonical == "" then canonical = "0" end
-        if not digits:match("^%d+$") or #canonical > 20
-            or (#canonical == 20 and canonical > "18446744073709551615") then
-            fail("--jobs must be an unsigned 64-bit integer")
-        end
-    end
+    -- --jobs is a u64 by its typed domain in the registry.
     compression.parse(params.compression)
     stops.resolve(params.stop)
 end

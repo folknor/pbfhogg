@@ -8,12 +8,13 @@
 -- Shapes it has run: denmark base against the 320k-per-blob repack (every
 -- element a common line; the one-sided oversized frames are clipped at the
 -- other side's cuts, so units stay within their channel), and germany base
--- against 20260420 with -c -v (real verbose details). Both inputs are read whole into
--- the page cache in the timed block, before the diff, and checked resident
--- with fincore there, so the diff times formatting and scheduling, not the
--- drive; the iteration wall includes that read. Take one iteration per
--- invocation, alternate the builds under comparison, and compare the diff
--- child's own wall (`brokkr results UUID`):
+-- against 20260420 with -c -v (real verbose details). The diff call is
+-- `warm` over both inputs (`brokkr man bench page-cache`): brokkr reads
+-- both through after admitting the call and fails the iteration unless all
+-- of both is resident before launch, so the diff times formatting and
+-- scheduling, not the drive. The call is `measured`, so the result is the
+-- diff child's wall, without that read. Take one iteration per invocation
+-- and alternate the builds under comparison:
 --
 --   brokkr bench --iterations 1 diff-text --new 320k
 --   brokkr bench --iterations 1 diff-text --dataset germany --new 20260420 --verbose yes --common no
@@ -25,7 +26,12 @@
 -- The output size and summary are recorded so arms can be checked for
 -- parity.
 
-local cache = require("cache")
+function preflight(params)
+    for _, f in ipairs({ params.old_variant.file, params.new_variant.file }) do
+        local why = page_cache(f, "warm")
+        if why then fail(why) end
+    end
+end
 
 -- --verbose and --common are checked by their choices in
 -- brokkr.d/benches.toml.
@@ -38,20 +44,11 @@ end
 function bench(params)
     local old = params.old_variant.file
     local new = params.new_variant.file
-    for _, f in ipairs({ old, new }) do
-        binary_with({ program = "dd" }, "if=" .. f.path, "of=/dev/null", "bs=4M", "status=none"):ok()
-    end
-    for _, f in ipairs({ old, new }) do
-        local res = cache.resident(f.path)
-        if res < filesize(f) then
-            fail("only " .. res .. " bytes of " .. f.path .. " are cached in a warm run")
-        end
-    end
     local out = output("diff.txt")
     local flags = { output = out, overwrite = true }
     if params.verbose == "yes" then flags.verbose = true end
     if params.common == "no" then flags["suppress-common"] = true end
-    local d = binary("diff", old, new, flags)
+    local d = binary_with({ warm = { old, new }, measured = true }, "diff", old, new, flags)
     record.diff_exit = d.exit
     if d.exit ~= 0 and d.exit ~= 1 then
         fail("diff exited " .. tostring(d.exit) .. ": " .. d.stderr)

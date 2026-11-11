@@ -16,15 +16,9 @@ local compression = require("compression")
 local stops = require("stop")
 local profiling = require("profiling")
 
+-- --elements-per-blob is a positive u32 by its typed domain in the
+-- registry: the bench's own cap, narrower than the CLI's NonZeroUsize.
 function validate(params)
-    if params["elements-per-blob"] then
-        local digits = params["elements-per-blob"]:gsub("^%+", "")
-        local canonical = digits:gsub("^0+", "")
-        if not digits:match("^%d+$") or canonical == "" or #canonical > 10
-            or (#canonical == 10 and canonical > "4294967295") then
-            fail("--elements-per-blob must be a positive 32-bit integer")
-        end
-    end
     compression.parse(params.compression)
     stops.resolve(params.stop)
 end

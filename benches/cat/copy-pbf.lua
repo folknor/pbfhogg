@@ -3,7 +3,7 @@
 -- --clean yes passes --clean version, also combined with --type. Compression
 -- is forwarded as typed cat does, including on raw passthrough paths.
 -- --dedupe yes repeats the same input, exactly the typed self-merge, without
--- the cache preparation and fincore requirements of dedupe-self/dedupe-pair.
+-- the page-cache preparation and checks of dedupe-self/dedupe-pair.
 -- Those benches remain the controlled-cache comparison workloads.
 -- Outputs live under the host scratch's bench-iterations, one per iteration.
 -- Profiling and marker stops combine; stopped output is not a complete PBF.

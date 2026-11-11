@@ -1240,16 +1240,6 @@ Reported by bench-verify.
 Fix: split production from measurement and reuse an immutable index keyed by input digest, producer and
 options, owned by brokkr. Enforcement: invalidation tests varying each key component.
 
-## VER-116 - The ranked metric includes work scripts tell readers to exclude
-
-Reported by bench-verify.
-
-`diff-text.lua`, `dedupe-self.lua` and `sort-cold.lua` tell readers to compare the command wall but do not
-mark that child `measured = true`, so iterations rank on the whole block.
-
-Fix: mark the child and show setup separately. Enforcement: a shared single-command helper and a contract
-test of which call supplies the result.
-
 ## VER-117 - The buffered and io_uring merge comparison has a fixed predecessor bias
 
 Reported by bench-verify.
@@ -1291,17 +1281,6 @@ Fix: a host-independent experiment manifest with machine resources separate. Enf
 checked before running, and missing coverage reported as incomplete certification.
 Brokkr side filed as bz brokkr#162.
 
-## VER-121 - Cache preparation reaches ambient utilities and shared state
-
-Reported by bench-verify.
-
-Cache benches invoke GNU `dd` and `fincore` from `PATH`, eviction changes shared page cache, and the
-residency check is one observation before launch.
-
-Fix: a brokkr operation taking input handles, declaring access, detecting support and recording the
-observation. Stable cache state through a run cannot be enforced and should stay a stated limitation.
-Brokkr side filed as bz brokkr#163.
-
 ## VER-122 - Verify's equality oracle is narrower than "identical" and shares the subject's code
 
 Reported by bench-verify.
@@ -1336,29 +1315,25 @@ whose failures do not change the verdict.
 Fix: an explicit diagnostic option. Enforcement: a declarative step graph rejecting unused outputs.
 Brokkr side filed as bz brokkr#155.
 
-## VER-125 - The Lua checks do not exercise behavioural contracts
+## VER-125 - Most bench scripts have no contract test
 
 Reported by bench-verify.
 
-Brokkr's bench check compiles scripts and resolves globals, and its manual says wrong keys, types and nils
-surface only at runtime. Dry-run executes validation only. All 32 executable scripts are registered today,
-and nothing requires a new one to be.
+`bench_tests` and `bench_scripts` are set in `brokkr.d/benches.toml`, so unregistered scripts are refused
+and `benches/tests/` runs on every `brokkr check`. Only ref-integrity and the six page-cache benches have
+tests there; every other script's argv, record and verdict paths run only on a real bench.
 
-Fix: a script contract harness with controlled `binary`, handles, results, configuration and recording,
-plus enforced registry discovery.
-Brokkr side filed as bz brokkr#164.
+Fix: a contract test per script for the argv it builds, its stop handling and its verdict.
 
-## VER-126 - Repeated bench parameter validation is diverging
+## VER-126 - Nothing stops a local copy of a typed param validator
 
 Reported by bench-verify.
 
-Unsigned parsing is copied across jobs and region params. Geocode's bbox splitter skips empty fields and does
-not check finite values or bounds, and integer validators do not enforce Rust widths, so invalid values can
-fail after building.
+The integer and bbox params now use brokkr's typed domains, with `benches/lib/bbox.lua` adding only the
+strict order pbfhogg's `Bbox::try_new` needs. Nothing refuses a new script that hand-parses an integer or a
+bbox again instead of declaring the domain.
 
-Fix: parameter types in brokkr's schema or shared constructors. Enforcement: contract tests and a source rule
-against local replacements.
-Brokkr side (typed param domains) filed as bz brokkr#165. brokkr runs validate() before any build, so "fail after building" holds only for values a script's own check lets through.
+Fix: a source rule against local replacements, if one can be stated without false positives.
 
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
 

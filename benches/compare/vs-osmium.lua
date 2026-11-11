@@ -4,7 +4,7 @@
 -- Each row's two command lines are written side by side below, so a reader
 -- can check they ask for the same thing. `--tool` takes pbfhogg, osmium or
 -- both. Every iteration starts with its inputs out of the page cache (see
--- evict below), so the iterations of one invocation are alike. The published figures come from alternating
+-- inputs below), so the iterations of one invocation are alike. The published figures come from alternating
 -- single-iteration runs, the starting tool reversed from pair to pair
 -- (scripts/vs-osmium.sh), medians compared:
 --
@@ -101,15 +101,21 @@ end
 -- Both arms start cold: libosmium drops its input from the page cache as
 -- it reads (posix_fadvise DONTNEED, unless OSMIUM_CLEAN_PAGE_CACHE_AFTER_READ
 -- is no), so a run after an osmium run starts cold and one after a pbfhogg
--- run starts warm. The timed block drops every input of the arm the same
--- way just before the measured child (GNU dd's nocache with count=0 advises
--- the whole file away) and fails unless fincore then finds none of it
--- resident; the iteration wall includes that.
-local function evict(path)
-    binary_with({ program = "dd" }, "if=" .. path, "iflag=nocache", "count=0", "status=none"):ok()
-    local r = binary_with({ program = "fincore" }, "--bytes", "--noheadings", "--output", "RES", path):ok()
-    local res = tonumber(r.stdout:match("%d+"))
-    if res == nil or res > 0 then fail("after eviction " .. tostring(res) .. " bytes of " .. path .. " are still cached") end
+-- run starts warm. So the tool's call is `cold` over every input of the arm
+-- (`brokkr man bench page-cache`): brokkr advises each out after admitting
+-- the call and fails the iteration unless none of any is resident before
+-- launch. The call is `measured`, so the result is the tool child's wall,
+-- without that preparation.
+local function inputs(params)
+    if params.osc then return { params.variant.file, params.osc.file } end
+    return { params.variant.file }
+end
+
+function preflight(params)
+    for _, f in ipairs(inputs(params)) do
+        local why = page_cache(f, "cold")
+        if why then fail(why) end
+    end
 end
 
 -- --row against the one row table bench() runs from, and the rules between
@@ -130,11 +136,11 @@ end
 
 function bench(params, keys)
     local row = rows(params, keys)[params.row]
-    evict(params.variant.file.path)
-    if params.osc then evict(params.osc.file.path) end
+    local options = { cold = inputs(params), measured = true }
     if params.tool == "pbfhogg" then
-        binary(table.unpack(row.pbfhogg())):ok()
+        binary_with(options, table.unpack(row.pbfhogg())):ok()
     else
-        binary_with({ program = "osmium" }, table.unpack(row.osmium())):ok()
+        options.program = "osmium"
+        binary_with(options, table.unpack(row.osmium())):ok()
     end
 end

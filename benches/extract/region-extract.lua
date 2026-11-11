@@ -18,19 +18,14 @@ local compression = require("compression")
 local stops = require("stop")
 local profiling = require("profiling")
 
+local bboxes = require("bbox")
+
+-- The effective bbox: --bbox (typed bbox = true in the registry) or the
+-- dataset's, as numbers and as the text argv carries.
 local function bbox(params)
     local value = params.bbox or params.dataset.bbox
     if type(value) ~= "string" then fail("supply --bbox or configure the dataset bbox") end
-    local coords = {}
-    for part in (value .. ","):gmatch("(.-),") do
-        local n = tonumber(part:match("^%s*(.-)%s*$"))
-        if not n or n ~= n or n == math.huge or n == -math.huge then
-            fail("bbox must contain four finite comma-separated coordinates")
-        end
-        table.insert(coords, n)
-    end
-    if #coords ~= 4 then fail("bbox must contain four finite comma-separated coordinates") end
-    return coords, value
+    return bboxes.parse(value), value
 end
 
 function validate(params)
@@ -41,19 +36,8 @@ function validate(params)
         if #polygons > 0 and params.bbox then fail("choose --bbox or --polygon in single mode") end
     end
     if params.mode == "multi" or #polygons == 0 then
-        local coords = bbox(params)
-        if params.mode == "multi" then
-            local digits = (params.regions or "5"):gsub("^%+", "")
-            local canonical = digits:gsub("^0+", "")
-            if not digits:match("^%d+$") or canonical == "" or #canonical > 20
-                or (#canonical == 20 and canonical > "18446744073709551615") then
-                fail("--regions must be a positive unsigned 64-bit integer")
-            end
-            local width = (coords[3] - coords[1]) / tonumber(digits)
-            if width ~= width or width == math.huge or width == -math.huge then
-                fail("bbox geometry produced a non-finite coordinate")
-            end
-        end
+        -- --regions is a positive u64 by its typed domain in the registry.
+        bbox(params)
     end
     compression.parse(params.compression)
     stops.resolve(params.stop)

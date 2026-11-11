@@ -6,14 +6,15 @@
 -- base, so only the old side remains unindexed. Both typed diff and the
 -- general diff-applied bench support --type; typed diff-snapshots does not.
 --
--- Both inputs are evicted from the page cache in the timed block and
--- fincore checks that none of either is resident before the diff starts.
--- Warm is not offered: a germany pair (two 4.7 GB files) does not stay
--- cached under the bench's memory limit, so a warm state cannot be held.
--- The path runs on one thread well below the drive's read rate, so cold
--- costs little. Take one iteration per invocation, alternate the commits
--- under comparison, and compare the diff child's own wall
--- (`brokkr results UUID`), not the iteration wall:
+-- The diff call is `cold` over both inputs (`brokkr man bench page-cache`):
+-- brokkr advises both out after admitting the call and fails the iteration
+-- unless none of either is resident before launch. Warm is not offered: a
+-- germany pair (two 4.7 GB files) does not stay cached under the bench's
+-- memory limit, so a warm state cannot be held. The path runs on one
+-- thread well below the drive's read rate, so cold costs little. The call
+-- is `measured`, so the result is the diff child's wall, without the
+-- preparation. Take one iteration per invocation and alternate the commits
+-- under comparison:
 --
 --   brokkr bench --iterations 1 --commit REF diff-unindexed --dataset germany --new 20260420
 --
@@ -21,7 +22,12 @@
 -- output size and the summary are recorded so arms can be checked for
 -- parity.
 
-local cache = require("cache")
+function preflight(params)
+    for _, f in ipairs({ params.old_variant.file, params.new_variant.file }) do
+        local why = page_cache(f, "cold")
+        if why then fail(why) end
+    end
+end
 
 -- --type is checked by its choices in brokkr.d/benches.toml.
 function validate(params)
@@ -33,19 +39,10 @@ end
 function bench(params)
     local old = params.old_variant.file
     local new = params.new_variant.file
-    for _, f in ipairs({ old, new }) do
-        binary_with({ program = "dd" }, "if=" .. f.path, "iflag=nocache", "count=0", "status=none"):ok()
-    end
-    for _, f in ipairs({ old, new }) do
-        local res = cache.resident(f.path)
-        if res > 0 then
-            fail(res .. " bytes of " .. f.path .. " are cached after eviction")
-        end
-    end
     local out = output("diff.txt")
     local flags = { ["suppress-common"] = true, output = out, overwrite = true }
     if params.type ~= "all" then flags.type = params.type end
-    local d = binary("diff", old, new, flags)
+    local d = binary_with({ cold = { old, new }, measured = true }, "diff", old, new, flags)
     record.diff_exit = d.exit
     if d.exit ~= 1 then
         fail("diff exited " .. tostring(d.exit) .. ", expected 1 for a differing pair: " .. d.stderr)

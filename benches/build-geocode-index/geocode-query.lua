@@ -22,28 +22,19 @@
 --   brokkr bench --dry-run geocode-query --dataset germany
 --   brokkr bench --iterations 1 geocode-query --dataset germany --bbox 5.9,47.3,15.0,55.0
 
-local function bbox_ok(s)
-    local parts = {}
-    for v in string.gmatch(s, "[^,]+") do parts[#parts + 1] = tonumber(v) end
-    if #parts ~= 4 then return false end
-    for i = 1, 4 do if parts[i] == nil then return false end end
-    return parts[1] < parts[3] and parts[2] < parts[4]
-end
+local bboxes = require("bbox")
 
-local function positive_int(s)
-    return s ~= nil and string.match(s, "^[1-9]%d*$") ~= nil
-end
-
+-- --bbox, --queries, --rounds and --seed have typed domains in the
+-- registry (bbox, positive u32, positive u32, u64), matching the
+-- instrument's own argument types. What is left here is the effective
+-- bbox's strict order, which the instrument would refuse only after the
+-- index build.
 function validate(params)
-    if params.bbox and not bbox_ok(params.bbox) then
-        fail("--bbox must be min_lon,min_lat,max_lon,max_lat with min below max")
-    end
-    if params.bbox == nil and params.dataset.bbox == nil then
+    local bbox = params.bbox or params.dataset.bbox
+    if bbox == nil then
         fail("the dataset has no bbox in this host's config: pass --bbox")
     end
-    if not positive_int(params.queries) then fail("--queries must be a positive integer") end
-    if not positive_int(params.rounds) then fail("--rounds must be a positive integer") end
-    if not string.match(params.seed, "^%d+$") then fail("--seed must be an unsigned integer") end
+    bboxes.parse(bbox)
 end
 
 function bench(params)

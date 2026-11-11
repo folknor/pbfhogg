@@ -16,16 +16,8 @@ local compression = require("compression")
 local stops = require("stop")
 local profiling = require("profiling")
 
+-- --jobs is a u64 by its typed domain in the registry.
 function validate(params)
-    if params.jobs then
-        local digits = params.jobs:gsub("^%+", "")
-        local canonical = digits:gsub("^0+", "")
-        if canonical == "" then canonical = "0" end
-        if not digits:match("^%d+$") or #canonical > 20
-            or (#canonical == 20 and canonical > "18446744073709551615") then
-            fail("--jobs must be an unsigned 64-bit integer")
-        end
-    end
     compression.parse(params.compression)
     stops.resolve(params.stop)
 end

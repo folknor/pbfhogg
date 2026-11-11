@@ -70,27 +70,29 @@ file = "japan-20260225-seq4706.osm.pbf"
 xxhash = "f80ccecbe3e1a4fbc468cbf3a12494d0"
 seq = 4706
 
-[plantasjen.datasets.japan.osc.4706]
-file = "japan-20260225-seq4706.osc.gz"
-xxhash = "2688aefbe9710c1fe6b748140b550481"
+# No OSC registered. japan-20260225-seq4706.osc.gz (xxhash
+# 2688aefbe9710c1fe6b748140b550481) was once registered as osc.4706, but
+# Geofabrik's osc N is the N-1 to N diff, so it is already contained in this
+# seq 4706 base (header seq 4706, timestamp 2026-02-25T21:21:21Z, no OSC
+# timestamp after it) and applying it is a replay, not an update. The
+# chaining osc 4707 is no longer served upstream; a real chain needs a
+# fresh base. The same holds for norway, switzerland, malta and
+# greater-london below.
 
 [plantasjen.datasets.north-america]
 origin = "Geofabrik"
 
-# Mislabelled: despite the name and seq below, this file is Geofabrik's
+# Misleading filename: despite "seq4710", this file is Geofabrik's
 # north-america at replication seq 4700 (header seq 4700, newest element
-# 2026-02-15T21:20:39Z, matching the header timestamp), so osc.4710 does
-# not chain from it; diffs 4701-4709 are missing. Left as is: nothing
-# current applies that OSC to this base. Fix the pairing before trusting
-# an apply-changes or diff result on north-america as a real daily update.
+# 2026-02-15T21:20:39Z, matching the header timestamp). No OSC registered:
+# north-america-seq4710.osc.gz (xxhash 8fc177ca4c07c600099f8f0810f4e712)
+# was once registered as osc.4710, but it is the 4709 to 4710 diff, so
+# diffs 4701-4709 are missing between it and this base, and they are no
+# longer served upstream. A real chain needs a fresh base.
 [plantasjen.datasets.north-america.pbf.indexed]
 file = "north-america-seq4710-with-indexdata.osm.pbf"
 xxhash = "851e6804bcdd713df0bec7510396bf7a"
-seq = 4710
-
-[plantasjen.datasets.north-america.osc.4710]
-file = "north-america-seq4710.osc.gz"
-xxhash = "8fc177ca4c07c600099f8f0810f4e712"
+seq = 4700
 
 [plantasjen.datasets.norway]
 origin = "Geofabrik"
@@ -106,9 +108,9 @@ file = "norway-20260225-seq4709.osm.pbf"
 xxhash = "8f1e29b1f89fc0d323afeac0da1e7794"
 seq = 4709
 
-[plantasjen.datasets.norway.osc.4709]
-file = "norway-20260225-seq4709.osc.gz"
-xxhash = "bc081b3f8b3766dcb0e100aaa6f95b84"
+# No OSC registered: norway-20260225-seq4709.osc.gz (xxhash
+# bc081b3f8b3766dcb0e100aaa6f95b84) is contained in this seq 4709 base;
+# see the comment on japan.
 
 [plantasjen.datasets.switzerland]
 origin = "Geofabrik"
@@ -124,9 +126,9 @@ file = "switzerland-20260225-seq4707.osm.pbf"
 xxhash = "c096571ba6c33f6efda5f79fe288e937"
 seq = 4707
 
-[plantasjen.datasets.switzerland.osc.4707]
-file = "switzerland-20260225-seq4707.osc.gz"
-xxhash = "079448509b57c41ec31baa32656059db"
+# No OSC registered: switzerland-20260225-seq4707.osc.gz (xxhash
+# 079448509b57c41ec31baa32656059db) is contained in this seq 4707 base;
+# see the comment on japan.
 
 [plantasjen.datasets.malta]
 origin = "Geofabrik"
@@ -142,9 +144,10 @@ file = "malta-20260225-seq4706.osm.pbf"
 xxhash = "019ab75cdca1578155bfad579f80de87"
 seq = 4706
 
-[plantasjen.datasets.malta.osc.4706]
-file = "malta-20260225-seq4706.osc.gz"
-xxhash = "560c8161214e2d83e2433b94f712a5bb"
+# No OSC registered: malta-20260225-seq4706.osc.gz (xxhash
+# 560c8161214e2d83e2433b94f712a5bb) is contained in this seq 4706 base;
+# see the comment on japan. On bygg, 2026-11-11, diff-applied over the
+# pair answered "same".
 
 [plantasjen.datasets.greater-london]
 origin = "Geofabrik"
@@ -160,9 +163,9 @@ file = "greater-london-20260225-seq4704.osm.pbf"
 xxhash = "ed9f545b1b42b0d0ccb07f3ba4bc3102"
 seq = 4704
 
-[plantasjen.datasets.greater-london.osc.4704]
-file = "greater-london-20260225-seq4704.osc.gz"
-xxhash = "1f1c5da73006766adf72428155ed9978"
+# No OSC registered: greater-london-20260225-seq4704.osc.gz (xxhash
+# 1f1c5da73006766adf72428155ed9978) is contained in this seq 4704 base;
+# see the comment on japan.
 
 [plantasjen.datasets.europe]
 origin = "Geofabrik"

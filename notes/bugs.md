@@ -18,20 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-003 - plantasjen north-america entry carries a known false replication sequence
-
-`brokkr.d/hosts/plantasjen.toml` records that the north-america base is actually
-sequence 4700, while its entry says 4710 and offers OSC 4710 with intervening
-changes missing. The warning protects a reader, but `apply-diff` and
-`diff-applied` can bind those entries and run successfully, which transforms an
-incomplete update chain rather than the claimed daily update.
-
-Fix: correct or quarantine the entry and represent replication provenance as
-data. Enforcement: validate the configured sequence against the PBF header and
-require contiguous changes for workloads claiming a replication update. Where
-provenance is unavailable, the workload must state that continuity is unverified.
-Brokkr side (header check, OSC continuity) filed as bz brokkr#167; correcting the plantasjen entry stays here.
-
 ## BUG-004 - The promise guard's unsupported-architecture fallback does not compile
 
 `crates/cli/tests/guard.rs` defines `AUDIT_ARCH` only for x86_64 and aarch64, and
@@ -73,3 +59,15 @@ address retrievability, verify an exact-coordinate candidate through an API that
 exposes candidates and handles colocated addresses. Enforcement: a test that
 removes address-cell entries while retaining street entries. Whether failure
 should block publication is a product policy decision.
+
+## BUG-007 - bench-read relation mode turns a role decode error into an empty role
+
+Lateral finding from the BUG-002 scout, not yet judged. The `bench-read` relation
+mode in `crates/cli/src/lib.rs` reads member roles with
+`m.role().ok().unwrap_or_default()`, so a role that fails to decode counts as an
+empty string and the run succeeds. A revision that breaks role decoding can then
+complete less work and look faster, the same shape as the geocode-query error
+swallowing.
+
+Fix: fail the run on a decode error. Enforcement: an instrument test with a
+deliberately failing role lookup.

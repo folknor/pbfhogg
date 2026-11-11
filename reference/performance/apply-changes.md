@@ -23,6 +23,17 @@ Planet (87 GB, daily diff): 86% rewrite. Peak memory is traced through
 the dated sections below, most recent last ("apply-changes' memory step at
 the node-to-way transition").
 
+The Malta, Greater London, Switzerland, Norway, Japan and North America rows
+are not forward updates. Their bases were paired with an OSC that does not
+chain from them: each of the five smaller bases is at the same replication
+sequence N as the `osc.N` it was given, so the OSC is already contained in
+the base (bygg, 2026-11-11: no OSC timestamp after the base header
+timestamp, and `diff-applied --dataset malta` answered "same"), and the
+North America base is at sequence 4700 while its OSC is the 4709-to-4710
+diff. The rows still time apply-changes over a real OSC of that size, but
+not a daily update of that base. Those OSC registrations have since been
+removed from the host configs; a real chain needs a fresh base.
+
 io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).

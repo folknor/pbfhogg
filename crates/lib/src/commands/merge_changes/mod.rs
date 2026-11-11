@@ -199,7 +199,14 @@ pub fn merge_changes(
     let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
-    let result = merge_changes_to(inputs, &output, &mode, parallelism, host)?;
+    let result = merge_changes_to(
+        inputs,
+        &output,
+        &mode,
+        parallelism,
+        stream::Batching::PRODUCTION,
+        host,
+    )?;
     // The run scratch goes before publication, as on every scratch path.
     drop(mode);
     output.publish()?;
@@ -213,6 +220,7 @@ pub(crate) fn merge_changes_to(
     output: &crate::output::BoundOutput,
     mode: &MergeMode,
     parallelism: crate::host::Parallelism,
+    batching: stream::Batching,
     host: &crate::host::Entered<'_>,
 ) -> Result<MergeChangesStats> {
     // Gzip or plain XML is decided by the name the caller chose (never the
@@ -269,6 +277,7 @@ pub(crate) fn merge_changes_to(
     let cancel = &host.invocation;
     let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
         let plan = stream::Plan {
+            batching,
             inputs,
             is_gz,
             readers: worker_count,
@@ -900,6 +909,46 @@ mod tests {
         crate::scratch::RunScratch::create(dir, &crate::host::Host::for_tests().entered()).unwrap()
     }
 
+    /// Readers cut a batch every kilobyte, so a few hundred changes make
+    /// dozens of batches; `inflight_bytes` sets how many may be admitted.
+    fn small(inflight_bytes: usize) -> stream::Batching {
+        stream::Batching {
+            batch_bytes: 1 << 10,
+            inflight_bytes,
+        }
+    }
+
+    /// The small configurations: an in-flight budget below one batch (each
+    /// batch admitted alone, credit recycled one at a time) and one of
+    /// several batches (results finish out of order and wait in the
+    /// coordinator).
+    fn small_batchings() -> [stream::Batching; 2] {
+        [small(256), small(8 << 10)]
+    }
+
+    /// [`merge_changes`] at `batching`, published to `dest`.
+    fn merge_at(
+        inputs: &[&Path],
+        dest: &Path,
+        mode: MergeMode,
+        parallelism: crate::host::Parallelism,
+        batching: stream::Batching,
+        host: &crate::host::Entered<'_>,
+    ) -> crate::Result<MergeChangesStats> {
+        let output = crate::output::bind_unissued(
+            crate::output::Output::new(
+                dest,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            &host.invocation,
+        )?;
+        let stats = merge_changes_to(inputs, &output, &mode, parallelism, batching, host)?;
+        drop(mode);
+        output.publish()?;
+        Ok(stats)
+    }
+
     /// Every `id="N"` in document order.
     fn ids_in(xml: &str) -> Vec<i64> {
         xml.split(" id=\"")
@@ -908,18 +957,18 @@ mod tests {
             .collect()
     }
 
-    // Inputs large enough to cut into several batches each, so later inputs
-    // may spill and be copied back (whether they do is scheduling;
+    // Inputs cut into many small batches each, so later inputs may spill
+    // and be copied back (whether they do is scheduling;
     // `a_forced_spill_is_copied_back_and_removed` forces it), plus an empty
-    // input and action transitions
-    // inside one input. The output must hold every change in input order,
-    // and its bytes must not depend on the worker count: batch boundaries
+    // input and action transitions inside one input. The output must hold
+    // every change in input order, and at one batching its bytes must not
+    // depend on the worker count or the in-flight budget: batch boundaries
     // come from the batch byte target alone. The one-thread pool exercises
     // the coordinator's cooperative wait.
     #[test]
     fn batched_merge_keeps_input_order_and_is_jobs_independent() -> crate::Result<()> {
         let scratch = crate::path_guard::tests::scratch();
-        let per_input = crate::tunables::MERGE_CHANGES_BATCH_BYTES / 40;
+        let per_input = 300_i64;
         let mut paths = Vec::new();
         let mut expected_ids = Vec::new();
         for i in 0..5_i64 {
@@ -927,9 +976,7 @@ mod tests {
             let mut body = String::new();
             if i != 2 {
                 body.push_str("<create>");
-                for k in 0..i64::try_from(per_input)
-                    .map_err(|e| crate::Error::internal(e.to_string()))?
-                {
+                for k in 0..per_input {
                     let id = i * 10_000_000 + k;
                     body.push_str(&format!(
                         "<node id=\"{id}\" lat=\"1\" lon=\"2\"><tag k=\"n\" v=\"{k}\"/></node>"
@@ -950,7 +997,10 @@ mod tests {
         let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
         for is_gz in [false, true] {
             let mut first: Option<Vec<u8>> = None;
-            for jobs in [1, 2, 8] {
+            for (batching, jobs) in small_batchings()
+                .into_iter()
+                .flat_map(|b| [1, 2, 8].map(|jobs| (b, jobs)))
+            {
                 let name = if is_gz { "out.osc.gz" } else { "out.osc" };
                 let output = scratch.path().join(name);
                 let parallelism = crate::host::Parallelism::from_jobs(jobs);
@@ -959,15 +1009,12 @@ mod tests {
                 let run_dir = stream_writes_scratch(inputs.len(), parallelism)
                     .then(|| run_scratch(scratch.path()));
                 assert_eq!(run_dir.is_none(), jobs == 1);
-                let stats = merge_changes(
+                let stats = merge_at(
                     &inputs,
-                    crate::output::Output::new(
-                        &output,
-                        crate::output::Overwrite::Replace,
-                        &crate::host::Diagnostics::discard(),
-                    )?,
+                    &output,
                     MergeMode::Stream { scratch: run_dir },
                     parallelism,
+                    batching,
                     &crate::host::Host::for_tests().entered(),
                 )?;
                 assert_eq!(stats.changes_out, expected_ids.len() as u64);
@@ -981,23 +1028,82 @@ mod tests {
                     String::from_utf8(bytes.clone())
                         .map_err(|e| crate::Error::internal(e.to_string()))?
                 };
-                assert!(xml.ends_with("</osmChange>"), "jobs={jobs}, gzip={is_gz}");
-                assert_eq!(ids_in(&xml), expected_ids, "jobs={jobs}, gzip={is_gz}");
+                let case = format!("{batching:?}, jobs={jobs}, gzip={is_gz}");
+                assert!(xml.ends_with("</osmChange>"), "{case}");
+                assert_eq!(ids_in(&xml), expected_ids, "{case}");
+                // Both small batchings cut at the same batch bytes.
                 match &first {
                     None => first = Some(bytes),
-                    Some(f) => assert_eq!(&bytes, f, "jobs={jobs}, gzip={is_gz}"),
+                    Some(f) => assert_eq!(&bytes, f, "{case}"),
                 }
             }
         }
         Ok(())
     }
 
+    /// The production batching through the public entry point, at a size
+    /// it acts on: one input sized from the batch target cuts into more
+    /// than one batch, and comes out whole and in order.
+    #[test]
+    fn the_production_batching_cuts_an_input_into_several_batches() -> crate::Result<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let input = scratch.path().join("input.osc");
+        // Each element records a few tens of bytes of start tags: several
+        // batches at the production target.
+        let count = i64::try_from(crate::tunables::MERGE_CHANGES_BATCH_BYTES / 20)
+            .map_err(|e| crate::Error::internal(e.to_string()))?;
+        let mut body = String::from("<osmChange version=\"0.6\"><create>");
+        for k in 0..count {
+            body.push_str(&format!(
+                "<node id=\"{k}\" lat=\"1\" lon=\"2\"><tag k=\"n\" v=\"{k}\"/></node>"
+            ));
+        }
+        body.push_str("</create></osmChange>");
+        std::fs::write(&input, body)?;
+        let sink = std::sync::Arc::new(Counters::default());
+        let host = crate::host::Host {
+            invocation: crate::host::Invocation::with_sink(std::sync::Arc::clone(&sink) as _),
+            ..crate::host::Host::for_tests()
+        };
+        let output = scratch.path().join("out.osc.gz");
+        let stats = merge_changes(
+            &[&input],
+            crate::output::Output::new(
+                &output,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )?,
+            MergeMode::Stream { scratch: None },
+            crate::host::Parallelism::from_jobs(2),
+            &host.entered(),
+        )?;
+        assert_eq!(stats.changes_out, u64::try_from(count).unwrap_or(u64::MAX));
+        let batches: Vec<i64> = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(name, _)| name == "merge_changes_batches")
+            .map(|(_, value)| *value)
+            .collect();
+        assert!(
+            batches.len() == 1 && batches[0] > 1,
+            "one input at the production batch target: {batches:?}"
+        );
+        let mut xml = String::new();
+        {
+            use std::io::Read;
+            flate2::read::MultiGzDecoder::new(std::fs::read(&output)?.as_slice())
+                .read_to_string(&mut xml)?;
+        }
+        assert_eq!(ids_in(&xml), (0..count).collect::<Vec<_>>());
+        Ok(())
+    }
+
     /// Counter samples a run emits, by name.
-    #[cfg(feature = "test-hooks")]
     #[derive(Default)]
     struct Counters(std::sync::Mutex<Vec<(String, i64)>>);
 
-    #[cfg(feature = "test-hooks")]
     impl crate::debug::InstrumentSink for Counters {
         fn marker(&self, _: &str) {}
         fn counter(&self, name: &str, value: i64) {
@@ -1020,8 +1126,9 @@ mod tests {
     fn a_forced_spill_is_copied_back_and_removed() -> crate::Result<()> {
         use std::sync::atomic::Ordering::SeqCst;
         let scratch = crate::path_guard::tests::scratch();
-        // Several batches per input.
-        let per_input = crate::tunables::MERGE_CHANGES_BATCH_BYTES / 20;
+        // Dozens of batches per input at the small batching.
+        let per_input = 600;
+        let batching = small(8 << 10);
         let mut paths = Vec::new();
         for i in 0..2_usize {
             let path = scratch.path().join(format!("input-{i}.osc"));
@@ -1038,15 +1145,12 @@ mod tests {
         }
         let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
         let reference = scratch.path().join("reference.osc");
-        merge_changes(
+        merge_at(
             &inputs,
-            crate::output::Output::new(
-                &reference,
-                crate::output::Overwrite::Replace,
-                &crate::host::Diagnostics::discard(),
-            )?,
+            &reference,
             MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
+            batching,
             &crate::host::Host::for_tests().entered(),
         )?;
         let reference = std::fs::read(reference)?;
@@ -1078,6 +1182,7 @@ mod tests {
                 &output,
                 &mode,
                 crate::host::Parallelism::from_jobs(2),
+                batching,
                 &host,
             )?;
             let case = format!("spill first {first}");
@@ -1262,17 +1367,14 @@ mod tests {
         jobs: usize,
         allow_version_regression: bool,
     ) -> crate::Result<Vec<u8>> {
-        merge_changes(
+        merge_at(
             inputs,
-            crate::output::Output::new(
-                output,
-                crate::output::Overwrite::Replace,
-                &crate::host::Diagnostics::discard(),
-            )?,
+            output,
             MergeMode::Simplify {
                 allow_version_regression,
             },
             crate::host::Parallelism::from_jobs(jobs),
+            small(8 << 10),
             &crate::host::Host::for_tests().entered(),
         )?;
         Ok(std::fs::read(output)?)
@@ -1280,15 +1382,15 @@ mod tests {
 
     /// Inputs that overlap on IDs across and within files, mix actions and
     /// kinds inside a section, carry metadata, escapes and unversioned
-    /// changes, and are large enough to cut into several batches each.
+    /// changes, and cut into dozens of batches each at the small batching.
     fn simplify_inputs(dir: &Path, regress: bool) -> Vec<std::path::PathBuf> {
-        let per_input = i64::try_from(crate::tunables::MERGE_CHANGES_BATCH_BYTES / 60).unwrap();
+        let per_input = 600_i64;
         (0..4_i64)
             .map(|i| {
                 let mut body = String::new();
                 for k in 0..per_input {
                     let id = (k * 7 + i * 3) % (per_input / 2);
-                    let version = if regress && i == 3 && k % 1000 == 17 {
+                    let version = if regress && i == 3 && k % 100 == 17 {
                         1
                     } else {
                         i32::try_from(i + 2).unwrap()

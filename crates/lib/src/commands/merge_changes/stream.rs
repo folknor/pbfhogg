@@ -76,8 +76,32 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use crate::osc::xml_parse::{LexBatch, LexSink, parse_osc_path};
 use crate::scratch::{RunScratch, ScratchPath};
 
+/// How readers cut batches and how many batch bytes may be in flight. The
+/// one exception to the rule that engines read tunables directly: this
+/// policy belongs to the streaming mechanism, production callers always
+/// pass [`Batching::PRODUCTION`], and only the mechanism's own tests pass
+/// boundary configurations. Batch bytes reach the output (each batch is its
+/// own member with its own action sections, so they move member and
+/// section framing, never the changes or their order); the in-flight
+/// budget never does.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Batching {
+    /// Raw element bytes at which a reader seals a batch.
+    pub(crate) batch_bytes: usize,
+    /// Admitted, not yet written batch bytes over every input ([`Ledger`]).
+    pub(crate) inflight_bytes: usize,
+}
+
+impl Batching {
+    pub(crate) const PRODUCTION: Self = Self {
+        batch_bytes: crate::tunables::MERGE_CHANGES_BATCH_BYTES,
+        inflight_bytes: crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES,
+    };
+}
+
 /// What one streaming merge needs.
 pub(crate) struct Plan<'a> {
+    pub(crate) batching: Batching,
     pub(crate) inputs: &'a [&'a Path],
     pub(crate) is_gz: bool,
     /// Upper bound on concurrently alive reader threads.
@@ -360,7 +384,7 @@ pub(crate) fn run(
 ) -> crate::Result<u64> {
     let is_gz = plan.is_gz;
     let encode = move |batch: &LexBatch, path: &Path| super::encode_batch(batch, path, is_gz);
-    let ledger = Ledger::new(crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES);
+    let ledger = Ledger::new(plan.batching.inflight_bytes);
     let (tx, rx) = std::sync::mpsc::channel::<Msg<(Vec<u8>, u64)>>();
     let ledger_ref = &ledger;
     let encoder = Encoder::new(plan, ledger_ref, &encode);
@@ -400,7 +424,7 @@ where
     T: Send,
     E: Fn(&LexBatch, &Path) -> crate::Result<T> + Sync,
 {
-    let ledger = Ledger::new(crate::tunables::MERGE_CHANGES_INFLIGHT_BYTES);
+    let ledger = Ledger::new(plan.batching.inflight_bytes);
     let (tx, rx) = std::sync::mpsc::channel::<Msg<T>>();
     let ledger_ref = &ledger;
     let encoder = Encoder::new(plan, ledger_ref, encode);
@@ -564,9 +588,7 @@ fn read_input<'s, T, E>(
             );
             Ok(())
         };
-        let mut sink = LexSink::new(crate::tunables::MERGE_CHANGES_BATCH_BYTES, seal, || {
-            ledger.halted()
-        });
+        let mut sink = LexSink::new(plan.batching.batch_bytes, seal, || ledger.halted());
         // Deliberately use the shared historical per-file decompression counter.
         // Command-specific names or accumulation would break brokkr comparisons.
         parse_osc_path(path, &mut sink, cancel)?;
@@ -920,6 +942,7 @@ mod tests {
             let rendezvous = std::sync::Barrier::new(lanes);
             let inputs = [Path::new("synthetic.osc")];
             let plan = Plan {
+                batching: Batching::PRODUCTION,
                 inputs: &inputs,
                 is_gz: false,
                 readers: 1,

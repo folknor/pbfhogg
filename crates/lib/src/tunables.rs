@@ -40,8 +40,15 @@
 //! owns it. A test instrument public only because its callers live in another
 //! crate (`getparents_with_min_blobs`, behind the CLI's hidden
 //! `--full-scan-min-blobs`) is a documented exception, hidden, unsupported and
-//! compiled only with the `test-hooks` feature, so no production build has it.
-//! Known and accepted: altw external's small fixtures still open all
+//! compiled only with the `test-hooks` feature, so no production build has it;
+//! the fault plan's nonzero threshold overrides (diff units, text chunks,
+//! apply-changes create batches) are the same kind of instrument for the
+//! library's integration tests. One narrow exception to "no per-scope tuning
+//! struct": merge-changes' `stream::Batching` carries the batch size and
+//! in-flight budget below as the streaming mechanism's own parameter;
+//! production callers pass `Batching::PRODUCTION` and only that mechanism's
+//! tests pass anything else. It is not a precedent for caller-supplied
+//! tuning. Known and accepted: altw external's small fixtures still open all
 //! `NUM_BUCKETS` id-shard files per worker, which costs fixture time, not
 //! coverage. No tunable reads the environment (ADR-0016).
 
@@ -623,11 +630,14 @@ pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
 /// so the drain is not busy for the whole run while the workers keep
 /// producing behind it. The batch bounds what one call holds (its frames,
 /// and a builder per running task), whatever the run's length; 64 keeps a
-/// 32-thread executor busy through a batch. The integration test that
-/// crosses a batch boundary sizes its run at 65 full blocks and one
-/// element; a unit test in `stream_output.rs` fails if this value grows
-/// past what that run crosses, so raising it means growing the run.
-pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: usize = 64;
+/// 32-thread executor busy through a batch. Scheduling only: blocks are
+/// cut at the element cap whatever the batch. Tests reach small batches
+/// through `write_run`'s parameter and the test-hooks fault plan; the one
+/// tier-3 integration test that runs this value sizes its run at 65 full
+/// blocks and one element, and a unit test in `stream_output.rs` fails if
+/// this value grows past what that run crosses.
+pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::MIN.saturating_add(63);
 
 /// Filter bits per OSC node in the `--locations-on-ways` refresh probe
 /// (`apply_changes/refresh.rs`), before rounding up to a power of two. The

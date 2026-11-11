@@ -196,7 +196,7 @@ pub(super) fn run<C: UnitConsumer>(
     let old_path = Arc::clone(old_cursor.path());
     let new_path = Arc::clone(new_cursor.path());
     let kinds: Vec<ElementKind> = phases.iter().map(|p| p.kind).collect();
-    let target = unit_target(&host.invocation);
+    let cut = UnitCut::new(&host.invocation, prints_every_element);
     let workers = jobs.max(1);
     let invocation = &host.invocation;
 
@@ -204,10 +204,6 @@ pub(super) fn run<C: UnitConsumer>(
         let (tx, rx) = std::sync::mpsc::sync_channel::<PlanMsg>(DIFF_UNIT_QUEUE_DEPTH);
         let planner = scope.spawn(move || {
             let mut cursors = [old_cursor, new_cursor];
-            let cut = UnitCut {
-                target,
-                prints_every_element,
-            };
             let msg = match plan(&mut cursors, &kinds, cut, &tx, invocation) {
                 Ok(()) => PlanMsg::Done,
                 Err(e) => PlanMsg::Failed(e),
@@ -236,23 +232,6 @@ pub(super) fn run<C: UnitConsumer>(
             )),
         }
     })
-}
-
-/// The unit target, or the fault plan's override in a test-hooks build.
-fn unit_target(invocation: &crate::host::Recorder) -> usize {
-    #[cfg(feature = "test-hooks")]
-    {
-        let forced = invocation
-            .faults()
-            .diff_unit_target_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if forced > 0 {
-            return forced;
-        }
-    }
-    #[cfg(not(feature = "test-hooks"))]
-    let _ = invocation;
-    DIFF_UNIT_TARGET_BYTES
 }
 
 /// The calling thread's side: pull units from the planner into the pool and
@@ -501,12 +480,44 @@ impl<C: UnitConsumer>
 // The planner
 // ---------------------------------------------------------------------------
 
-/// When the planner closes a unit: the frame-byte target, and whether every
-/// taken frame's claimed elements count toward the element cut.
+/// When the planner closes a unit: the frame-byte target, the element cut,
+/// and whether every taken frame's claimed elements count toward it. Both
+/// thresholds steer scheduling only; neither reaches the output, the
+/// unsplittable-unit cap or any decode limit.
 #[derive(Clone, Copy)]
 struct UnitCut {
     target: usize,
+    lone_elements: u64,
     prints_every_element: bool,
+}
+
+impl UnitCut {
+    /// The production thresholds, or the fault plan's nonzero overrides in
+    /// a test-hooks build (so a small fixture runs every cut).
+    fn new(invocation: &crate::host::Recorder, prints_every_element: bool) -> Self {
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
+        let mut cut = Self {
+            target: DIFF_UNIT_TARGET_BYTES,
+            lone_elements: DIFF_UNIT_LONE_ELEMENTS,
+            prints_every_element,
+        };
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let faults = invocation.faults();
+            let target = faults.diff_unit_target_bytes.load(Relaxed);
+            if target > 0 {
+                cut.target = target;
+            }
+            let lone = faults.diff_unit_lone_elements.load(Relaxed);
+            if lone > 0 {
+                cut.lone_elements = lone;
+            }
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = invocation;
+        cut
+    }
 }
 
 /// Cut every phase's kind into units and send them, then walk the rest of
@@ -574,7 +585,7 @@ fn plan_kind(
                 // The kind is over on both inputs.
                 break None;
             };
-            let due = bytes >= target || lone >= DIFF_UNIT_LONE_ELEMENTS;
+            let due = bytes >= target || lone >= cut.lone_elements;
             if due && max_first.is_some_and(|m| next_first > m) {
                 break Some(next_first);
             }

@@ -183,29 +183,6 @@ compared mechanically against the module declarations: seven are exercised, twel
 excluded explicitly, and checkpoint replays are capped at 64 per scenario. Scenarios for
 the excluded twelve, and a comparison against the CLI command inventory, are not done.
 
-## VER-036 - Chunk tests keep large fixtures despite size injection seams
-
-Reported by fault-injection.
-
-`crates/lib/tests/fault_diff_parallel.rs` uses 120,000 nodes to exceed the default chunk
-and runs 60,000 nodes through 27 combinations including seven-byte chunks, at root tier
-in the hooks sweep. Element-cut tests use hundreds of thousands of nodes.
-
-Fix: small injected thresholds, one tiered production-default test, and an injected
-planner policy. Enforcement: typed policy construction.
-
-## VER-050 - Large apply-changes fixtures pay production thresholds to test scheduling
-
-Reported by lib-integration.
-
-`crates/lib/tests/apply_changes_create_runs.rs` generates 520,001 creates in one test and
-528,001 plus 73 MiB of oversized tags in another, at root tier in five sweeps: over five
-million creates and 365 MiB of oversized tag text per default check.
-
-Fix: extract batch scheduling and ordered-error selection behind explicit limits and test
-small, keeping format-limit coverage separate. Enforcement: observed batch events and a
-selected tier for large scenarios.
-
 ## VER-133 - Test-local metadata readers and PBF writers bypass the shared oracle
 
 Found while closing the shared-oracle work.
@@ -229,16 +206,21 @@ loops across some 45 test files (cli_digest's `write_full`, cli_time_filter's
 Fix: route each through `read_normalized` or the model, or state why a projection
 is deliberately narrower; widen the text rule to the test trees once they are clean.
 
-## VER-065 - Merge correctness fixtures scale with production batch tuning
+## VER-134 - Other library fixtures still pay production thresholds
 
-Reported by lib-commands-unit.
+Found while shrinking the diff, apply-changes and merge-changes fixtures.
 
-Fixtures in `merge_changes/mod.rs` derive sizes from `MERGE_CHANGES_BATCH_BYTES`.
-`rendered_simplify_writes_the_owned_bytes` does 24 simplify operations over 34,952 generated changes
-at today's constant.
+`crates/lib/tests/merge_pbf.rs` sizes fixtures against crate-private sweep
+constants (`PLANET_BLOB_ELEMENTS = 228_000` in
+`a_planet_density_self_merge_streams_its_run_in_bounded_chunks` and
+`sorted_views_are_charged_to_the_run`, `VERSIONS = 100_000` in
+`a_many_version_group_ships_block_by_block`), and
+`crates/lib/tests/geocode_index.rs` builds 65,536-node inputs at three sites,
+all at tier 1. Not measured per test.
 
-Fix: a batching configuration passed by production and tests, small boundary tests, and one focused
-production-configuration test. Enforcement: the configuration type.
+Fix: the same rule as the diff planner, create-run and merge-changes batching
+work: a narrow parameter or test-hooks override at the owning mechanism,
+small tier-1 fixtures, one tier-3 test of the production value.
 
 ## VER-071 - The verbose sequence budget has no registered timing bench
 

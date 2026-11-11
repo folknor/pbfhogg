@@ -228,6 +228,16 @@ pub struct FaultPlan {
     /// the overflow and its fallback to blocking sends run on a small
     /// fixture.
     pub diff_text_overflow_bytes: AtomicUsize,
+    /// Overrides the planner's element cut (the claimed elements of
+    /// output-bound frames at which a unit closes) when nonzero, so a small
+    /// fixture is cut by elements while the byte target stays far away.
+    pub diff_unit_lone_elements: AtomicU64,
+
+    // --- apply-changes create runs ---
+    /// Overrides the blocks of one create run encoded per executor call
+    /// when nonzero, so a run of a few blocks crosses several batches. The
+    /// block cut stays at the element cap: this moves scheduling only.
+    pub apply_changes_create_batch_blocks: AtomicUsize,
 
     // --- merge-changes ordered merge (`commands::merge_changes::stream`) ---
     /// Members of input 1 the ordered merge (not `--simplify`) spills before
@@ -555,6 +565,8 @@ impl FaultPlan {
             derive_spill_after: AtomicUsize::new(usize::MAX),
             diff_text_chunk_bytes: AtomicUsize::new(0),
             diff_text_overflow_bytes: AtomicUsize::new(0),
+            diff_unit_lone_elements: AtomicU64::new(0),
+            apply_changes_create_batch_blocks: AtomicUsize::new(0),
             merge_changes_spill_first: AtomicUsize::new(usize::MAX),
             merge_changes_members_spilled: AtomicU64::new(0),
             merge_changes_spilled_input_complete: AtomicBool::new(false),

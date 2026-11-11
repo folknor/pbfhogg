@@ -182,7 +182,14 @@ pub fn tags_filter_osc(
     let host = &host.enter()?;
     let output = crate::output::bind_unissued(output, &host.invocation)?;
     host.invocation.check()?;
-    let result = tags_filter_osc_to(input, &output, expression_strs, parallelism, host)?;
+    let result = tags_filter_osc_to(
+        input,
+        &output,
+        expression_strs,
+        parallelism,
+        stream::Batching::PRODUCTION,
+        host,
+    )?;
     output.publish()?;
     Ok(result)
 }
@@ -211,6 +218,7 @@ pub(crate) fn tags_filter_osc_to(
     output: &crate::output::BoundOutput,
     expression_strs: &[String],
     parallelism: crate::host::Parallelism,
+    batching: stream::Batching,
     host: &crate::host::Entered<'_>,
 ) -> Result<TagsFilterOscStats> {
     let is_gz = crate::osc::output_is_gzip(output.destination())?;
@@ -224,6 +232,7 @@ pub(crate) fn tags_filter_osc_to(
     }
     let inputs = [input];
     let plan = stream::Plan {
+        batching,
         inputs: &inputs,
         is_gz: false,
         readers: 1,
@@ -853,17 +862,24 @@ mod tests {
                 crate::host::Parallelism::Auto
             }
         };
-        tags_filter_osc(
-            input,
+        // `tags_filter_osc` at small batches, so a few hundred elements
+        // make dozens of batches with several in flight.
+        let host = host.enter()?;
+        let output = crate::output::bind_unissued(
             crate::output::Output::new(
                 output,
                 crate::output::Overwrite::Replace,
                 &crate::host::Diagnostics::discard(),
             )?,
-            exprs,
-            parallelism,
-            &host,
-        )
+            &host.invocation,
+        )?;
+        let batching = stream::Batching {
+            batch_bytes: 1 << 10,
+            inflight_bytes: 8 << 10,
+        };
+        let stats = tags_filter_osc_to(input, &output, exprs, parallelism, batching, &host)?;
+        output.publish()?;
+        Ok(stats)
     }
 
     fn rendered(
@@ -896,7 +912,7 @@ mod tests {
     #[test]
     fn byte_path_writes_the_owned_document() {
         let dir = crate::path_guard::tests::scratch();
-        let count = i64::try_from(crate::tunables::MERGE_CHANGES_BATCH_BYTES / 40).unwrap();
+        let count = 400_i64;
         let mut body = String::new();
         for k in 0..count {
             let action = match k % 4 {
@@ -954,7 +970,7 @@ mod tests {
 
     /// Many batches of well-formed elements, then `tail`.
     fn many_batches_then(dir: &Path, name: &str, tail: &str, close: bool) -> std::path::PathBuf {
-        let count = crate::tunables::MERGE_CHANGES_BATCH_BYTES / 10;
+        let count = 400;
         let mut body = String::from("<osmChange version=\"0.6\"><create>");
         for k in 0..count {
             body.push_str(&format!(

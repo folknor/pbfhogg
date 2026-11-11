@@ -301,9 +301,16 @@ uses the host's resources and `-j` for worker counts, the engine's own
 parameters (the ordered pool's `PoolConfig`, the parallel reader's
 private budget and batch sizes) or a crate-private dispatch function; a
 constant that blocks a named test gets a narrow private parameter at the
-mechanism that owns it. A cross-crate test instrument (getparents'
-full-scan threshold) is hidden and unsupported. The module doc of
-`crates/lib/src/tunables.rs` gives the reasons.
+mechanism that owns it (merge-changes' streaming `Batching`, apply-changes'
+`write_run` batch). A cross-crate test instrument is hidden, unsupported
+and test-hooks only: getparents' full-scan threshold, and the fault plan's
+nonzero scheduling overrides (`diff_unit_target_bytes`,
+`diff_unit_lone_elements`, `diff_text_chunk_bytes`,
+`diff_text_overflow_bytes`, `derive_chunk_bytes`,
+`apply_changes_create_batch_blocks`), which a library integration test sets
+on its own invocation. A test that shrinks a threshold this way keeps one
+test of the production value at a size it acts on, in `tier3`. The module
+doc of `crates/lib/src/tunables.rs` gives the reasons.
 
 **No checked-in input data.** Fixture PBFs are built at test time into
 scratch by the `crates/lib/tests/common` writers (`write_test_pbf*`,

@@ -26,6 +26,7 @@
 //! the rest of the run (reference/performance/apply-changes.md, "apply-changes' memory
 //! step at the node-to-way transition").
 
+use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use rayon::prelude::*;
@@ -94,6 +95,7 @@ impl<'a> CreateEncoder<'a> {
         let compression = self.compression;
         let added = write_run(
             self.executor,
+            create_batch_blocks(&invocation),
             run,
             &mut self.bb,
             &invocation,
@@ -109,12 +111,30 @@ impl<'a> CreateEncoder<'a> {
     }
 }
 
+/// Blocks per executor call: `APPLY_CHANGES_CREATE_BATCH_BLOCKS`, or the
+/// fault plan's nonzero override in a test-hooks build. Scheduling only:
+/// the blocks are cut at the element cap whatever the batch.
+fn create_batch_blocks(invocation: &crate::host::Invocation) -> NonZeroUsize {
+    #[cfg(feature = "test-hooks")]
+    if let Some(forced) = NonZeroUsize::new(
+        invocation
+            .faults()
+            .apply_changes_create_batch_blocks
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        return forced;
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = invocation;
+    APPLY_CHANGES_CREATE_BATCH_BLOCKS
+}
+
 /// Cut `run` into blocks of `DEFAULT_ELEMENT_CAP`, `encode` each and `write`
 /// every frame in block order; returns the elements encoded. `encode` gets an
 /// empty builder and the block's index range, and returns the block's frame
 /// (`None` for nothing to write) and its element count. A run longer than
 /// one block, with an executor, is encoded on it in batches of
-/// `APPLY_CHANGES_CREATE_BATCH_BLOCKS` blocks; otherwise every block is
+/// `batch_blocks` blocks; otherwise every block is
 /// encoded on the calling thread into `bb`. `invocation` is checked before
 /// each batch or block.
 ///
@@ -126,6 +146,7 @@ impl<'a> CreateEncoder<'a> {
 /// choice. Every block of the batch is still encoded.
 fn write_run<E, W>(
     executor: Option<&crate::host::Executor>,
+    batch_blocks: NonZeroUsize,
     run: Range<usize>,
     bb: &mut BlockBuilder,
     invocation: &crate::host::Invocation,
@@ -140,7 +161,9 @@ where
     let mut added = 0u64;
     match executor {
         Some(executor) if run.len() > cap => {
-            for batch in chunks(run, cap * APPLY_CHANGES_CREATE_BATCH_BLOCKS) {
+            // Saturating: a batch past `usize::MAX` elements is the whole
+            // run, never a zero step or a wrapped boundary.
+            for batch in chunks(run, cap.saturating_mul(batch_blocks.get())) {
                 invocation.check()?;
                 let blocks: Vec<Range<usize>> = chunks(batch, cap).collect();
                 let framed: Vec<Result<FramedBlock>> = executor.install(|| {
@@ -192,7 +215,7 @@ fn chunks(range: Range<usize>, size: usize) -> impl Iterator<Item = Range<usize>
     let end = range.end;
     range
         .step_by(size)
-        .map(move |start| start..end.min(start + size))
+        .map(move |start| start..end.min(start.saturating_add(size)))
 }
 
 /// Encode the creates `run` (an index range into the kind's sorted upserts,
@@ -344,8 +367,9 @@ mod create_run_fixture;
 mod tests {
     use super::*;
 
-    // Share the integration fixture's shape rather than guarding a second
-    // handwritten count that can drift independently of the actual run.
+    // Share the tier-3 integration fixture's shape rather than guarding a
+    // second handwritten count that can drift independently of the actual
+    // run: that test is the one that runs the production batch.
     use super::create_run_fixture::BOUNDARY_RUN_FULL_BLOCKS;
 
     #[test]
@@ -353,20 +377,10 @@ mod tests {
         let cap = DEFAULT_ELEMENT_CAP.get();
         let run = 0..BOUNDARY_RUN_FULL_BLOCKS * cap + 1;
         assert!(
-            chunks(run, cap * APPLY_CHANGES_CREATE_BATCH_BLOCKS).count() > 1,
+            chunks(run, cap * APPLY_CHANGES_CREATE_BATCH_BLOCKS.get()).count() > 1,
             "APPLY_CHANGES_CREATE_BATCH_BLOCKS holds the batch-boundary fixture's \
              whole run in one batch: grow the run in tests/apply_changes_create_runs.rs \
              by changing its shared fixture definition"
-        );
-        // The failure fixture there fails the two blocks after the clean
-        // full ones (`BOUNDARY_RUN_FULL_BLOCKS` and the one after it); they
-        // must share a batch, and not the first.
-        let batch_of = |block: usize| block / APPLY_CHANGES_CREATE_BATCH_BLOCKS;
-        let first_failing = BOUNDARY_RUN_FULL_BLOCKS;
-        assert!(
-            batch_of(first_failing) > 0 && batch_of(first_failing) == batch_of(first_failing + 1),
-            "the create-run failure fixture in tests/apply_changes_create_runs.rs no \
-             longer fails two blocks of one later batch"
         );
     }
 
@@ -437,6 +451,7 @@ mod tests {
     /// blocks and the ranges encoded, sorted.
     fn run_failing(
         executor: Option<&Executor>,
+        batch_blocks: NonZeroUsize,
         blocks: usize,
         last_len: usize,
         earlier: usize,
@@ -448,6 +463,7 @@ mod tests {
         let run = START..START + (blocks - 1) * cap + last_len;
         let result = write_run(
             executor,
+            batch_blocks,
             run,
             &mut BlockBuilder::new(),
             &Invocation::new(),
@@ -472,7 +488,14 @@ mod tests {
     #[test]
     fn the_first_failure_in_a_parallel_batch_is_returned_after_its_prefix() {
         let executor = pool();
-        let (err, written, seen) = run_failing(Some(&executor), 5, 17, 1, 3);
+        let (err, written, seen) = run_failing(
+            Some(&executor),
+            APPLY_CHANGES_CREATE_BATCH_BLOCKS,
+            5,
+            17,
+            1,
+            3,
+        );
         assert!(err.to_string().contains("block 1 failed"), "got {err}");
         assert_eq!(written, vec![0]);
         assert_eq!(seen, expected_ranges(5, 17));
@@ -484,9 +507,16 @@ mod tests {
     #[test]
     fn the_first_failure_in_a_later_parallel_batch_is_returned_after_its_prefix() {
         let executor = pool();
-        let batch = APPLY_CHANGES_CREATE_BATCH_BLOCKS;
+        let batch = APPLY_CHANGES_CREATE_BATCH_BLOCKS.get();
         let blocks = batch + 3;
-        let (err, written, seen) = run_failing(Some(&executor), blocks, 1, batch + 1, batch + 2);
+        let (err, written, seen) = run_failing(
+            Some(&executor),
+            APPLY_CHANGES_CREATE_BATCH_BLOCKS,
+            blocks,
+            1,
+            batch + 1,
+            batch + 2,
+        );
         assert!(
             err.to_string()
                 .contains(&format!("block {} failed", batch + 1)),
@@ -494,6 +524,46 @@ mod tests {
         );
         assert_eq!(written, (0..=batch).collect::<Vec<_>>());
         assert_eq!(seen, expected_ranges(blocks, 1));
+    }
+
+    /// The same rules at small batches: two failures in the third batch of
+    /// two, and a run walked one block per batch or in one saturated batch,
+    /// all cut at the element cap and written whole and in order.
+    #[test]
+    fn small_and_saturated_batches_keep_the_cuts_and_the_order() {
+        let executor = pool();
+        let two = NonZeroUsize::MIN.saturating_add(1);
+        let (err, written, seen) = run_failing(Some(&executor), two, 7, 17, 4, 5);
+        assert!(err.to_string().contains("block 4 failed"), "got {err}");
+        assert_eq!(written, vec![0, 1, 2, 3]);
+        // Batches of two: the third batch (blocks 4 and 5) failed, so the
+        // fourth (block 6) was never encoded.
+        assert_eq!(seen, expected_ranges(7, 17)[..6].to_vec());
+
+        let cap = DEFAULT_ELEMENT_CAP.get();
+        let len = 5 * cap + 17;
+        for batch_blocks in [NonZeroUsize::MIN, NonZeroUsize::MAX] {
+            let seen = Mutex::new(Vec::new());
+            let mut frames = Vec::new();
+            let added = write_run(
+                Some(&executor),
+                batch_blocks,
+                START..START + len,
+                &mut BlockBuilder::new(),
+                &Invocation::new(),
+                encode_failing(usize::MAX, usize::MAX, &seen),
+                |frame| {
+                    frames.push(frame);
+                    Ok(())
+                },
+            )
+            .expect("run");
+            assert_eq!(added, len as u64, "batch {batch_blocks}");
+            assert_eq!(written_blocks(&frames), vec![0, 1, 2, 3, 4, 5]);
+            let mut seen = seen.into_inner().expect("lock");
+            seen.sort_by_key(|r| r.start);
+            assert_eq!(seen, expected_ranges(6, 17), "batch {batch_blocks}");
+        }
     }
 
     /// Without an executor (`-j 1`) blocks are encoded one at a time, so
@@ -505,6 +575,7 @@ mod tests {
         let cap = DEFAULT_ELEMENT_CAP.get();
         let result = write_run(
             None,
+            APPLY_CHANGES_CREATE_BATCH_BLOCKS,
             START..START + 4 * cap + 17,
             &mut BlockBuilder::new(),
             &Invocation::new(),
@@ -534,6 +605,7 @@ mod tests {
         let mut offered = Vec::new();
         let result = write_run(
             Some(&executor),
+            APPLY_CHANGES_CREATE_BATCH_BLOCKS,
             START..START + 4 * cap + 17,
             &mut BlockBuilder::new(),
             &Invocation::new(),
@@ -571,6 +643,7 @@ mod tests {
             let mut frames = Vec::new();
             let added = write_run(
                 executor,
+                APPLY_CHANGES_CREATE_BATCH_BLOCKS,
                 START..START + len,
                 &mut BlockBuilder::new(),
                 &Invocation::new(),
@@ -592,6 +665,7 @@ mod tests {
         let caller = std::thread::current().id();
         let added = write_run(
             Some(&executor),
+            APPLY_CHANGES_CREATE_BATCH_BLOCKS,
             START..START + cap,
             &mut BlockBuilder::new(),
             &Invocation::new(),

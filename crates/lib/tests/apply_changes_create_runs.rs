@@ -174,38 +174,47 @@ fn create_runs_are_cut_at_the_element_cap_and_written_in_order() {
     }
 }
 
-// The unit batch guard reads this same fixture definition.
-#[path = "create_run_fixture.rs"]
-mod create_run_fixture;
-use create_run_fixture::BOUNDARY_RUN_FULL_BLOCKS;
-
-#[test]
-fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
-    let dir = crate::common::test_scratch();
-    // Plain XML and uncompressed output: the batching is independent of
-    // both, and gzip and zlib in a debug build would be most of the run.
-    let osc = dir.path().join("diff.osc");
-    let cap = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP.get();
-    let first = 1000_i64;
-    let count = BOUNDARY_RUN_FULL_BLOCKS * cap + 1;
-    let creates = first..first + i64::try_from(count).unwrap();
+/// A plain-XML OSC of node creates `first..first + count`; the node at
+/// `oversize.0`, if any, carries a tag value of `oversize.1` bytes.
+fn write_node_creates(path: &Path, first: i64, count: usize, oversize: Option<(i64, usize)>) {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n<create>\n",
     );
-    for id in creates.clone() {
-        writeln!(
-            xml,
-            "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>"
-        )
-        .unwrap();
+    for id in first..first + i64::try_from(count).unwrap() {
+        match oversize {
+            Some((at, bytes)) if at == id => {
+                write!(
+                    xml,
+                    "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"><tag k=\"note\" v=\""
+                )
+                .unwrap();
+                xml.extend(std::iter::repeat_n('x', bytes));
+                xml.push_str("\"/></node>\n");
+            }
+            _ => writeln!(
+                xml,
+                "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>"
+            )
+            .unwrap(),
+        }
     }
     xml.push_str("</create>\n</osmChange>\n");
-    std::fs::write(&osc, xml).unwrap();
+    std::fs::write(path, xml).unwrap();
+}
 
-    // Every create lies past the one base node blob, so the whole run is
-    // written at the node-to-way transition, as planet's is.
-    let base = dir.path().join("base.osm.pbf");
-    let output = dir.path().join("out.osm.pbf");
+/// Merge `osc` into a base of one node blob (ids 1..=50) and one way blob,
+/// uncompressed, at the automatic parallelism (more than one worker, so a
+/// run past one block is encoded on the executor). `batch_blocks` is the
+/// fault plan's create-batch override (0 keeps the production batch).
+/// Every create lies past the one base node blob, so the whole run is
+/// written at the node-to-way transition, as planet's is.
+fn merge_creates(
+    dir: &Path,
+    osc: &Path,
+    output: &Path,
+    batch_blocks: usize,
+) -> pbfhogg::Result<pbfhogg::apply_changes::MergeStats> {
+    let base = dir.join("base.osm.pbf");
     write_multi_block_test_pbf(
         &base,
         &generate_nodes(50, 1),
@@ -214,34 +223,56 @@ fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
         50,
     );
     let opts = pbfhogg::apply_changes::MergeOptions {
+        // Plain XML and uncompressed output: the batching is independent
+        // of both, and gzip and zlib in a debug build would be most of the
+        // run.
         write: pbfhogg::write::WriteOptions {
             compression: pbfhogg::writer::Compression::None,
             ..pbfhogg::write::WriteOptions::default()
         },
         locations_on_ways: None,
-        // The automatic sizing gives more than one worker, so the run is
-        // encoded on the executor, in batches.
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
     };
-    let stats = pbfhogg::apply_changes::merge(
+    let host = crate::common::test_host();
+    #[cfg(feature = "test-hooks")]
+    host.invocation
+        .faults()
+        .apply_changes_create_batch_blocks
+        .store(batch_blocks, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "test-hooks"))]
+    assert_eq!(batch_blocks, 0, "a batch override needs test-hooks");
+    pbfhogg::apply_changes::merge(
         &base,
-        &osc,
-        crate::common::out(&output),
+        osc,
+        crate::common::out(output),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
+        &host,
     )
-    .unwrap();
+}
+
+/// A run of `full_blocks` full blocks and one element, merged at
+/// `batch_blocks`, comes out whole, cut at the cap and in order, its final
+/// partial batch included.
+fn assert_run_written_whole(full_blocks: usize, batch_blocks: usize) {
+    let dir = crate::common::test_scratch();
+    let osc = dir.path().join("diff.osc");
+    let output = dir.path().join("out.osm.pbf");
+    let cap = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP.get();
+    let first = 1000_i64;
+    let count = full_blocks * cap + 1;
+    write_node_creates(&osc, first, count, None);
+    let stats = merge_creates(dir.path(), &osc, &output, batch_blocks).unwrap();
 
     let mut expected_blobs = vec![(50, 0, 0)];
-    expected_blobs.extend(std::iter::repeat_n((cap, 0, 0), BOUNDARY_RUN_FULL_BLOCKS));
+    expected_blobs.extend(std::iter::repeat_n((cap, 0, 0), full_blocks));
     expected_blobs.push((1, 0, 0));
     expected_blobs.push((0, 10, 0));
     assert_eq!(elements_per_blob(&output), expected_blobs);
     let c = read_all_elements_id_only(&output);
     let mut expected_nodes: Vec<i64> = (1..=50).collect();
-    expected_nodes.extend(creates);
+    expected_nodes.extend(first..first + i64::try_from(count).unwrap());
     assert_eq!(node_ids_id_only(&c), expected_nodes);
     assert_eq!(way_ids_id_only(&c), (1..=10).collect::<Vec<i64>>());
     assert_eq!(stats.diff_nodes, count as u64);
@@ -249,99 +280,59 @@ fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
     crate::common::assert_sorted_file(&output);
 }
 
-/// Bytes of the tag value that fails each of the two failing blocks: the
-/// earlier failing block's larger, so its encoding tends to finish last
-/// and the reported size says which block's error came back. Both exceed
-/// the 32 MiB a raw blob payload may hold, which no element cap bounds.
-const EARLIER_OVERSIZE: usize = 40 << 20;
-const LATER_OVERSIZE: usize = 33 << 20;
-
-/// A create run whose blocks fail on real input, in a batch past the first:
-/// after `BOUNDARY_RUN_FULL_BLOCKS` clean full blocks, block
-/// `BOUNDARY_RUN_FULL_BLOCKS` carries a node with a tag value over the blob
-/// payload limit and the one-element block after it another, smaller one.
-/// The earlier block's refusal is the one returned and nothing is
-/// published. Which blocks reached the writer first is not visible from
-/// here (a failed merge publishes nothing); the unit tests on `write_run` in
-/// `crates/lib/src/commands/apply_changes/stream_output.rs` pin that, and the order the
-/// failures complete in. A unit test there also checks that these two
-/// blocks share a batch that is not the first.
+/// Batches of two blocks over three full blocks and one element: two full
+/// batches' worth crossed, the last batch partial.
+#[cfg(feature = "test-hooks")]
 #[test]
-fn a_create_run_failing_in_a_later_batch_returns_the_earliest_failure() {
+fn a_create_run_past_one_executor_batch_is_written_whole_and_in_order() {
+    assert_run_written_whole(3, 2);
+}
+
+/// The blob payload limit is the block failure real input can reach in a
+/// create run: one tag value over the 32 MiB a raw blob payload may hold,
+/// which no element cap bounds. In batches of one block it fails block 1,
+/// a batch past the first, after block 0 was written; the run fails with
+/// that refusal and nothing is published. Which of two failures wins, and
+/// what reached the writer first, is `write_run`'s, pinned by its unit
+/// tests in `crates/lib/src/commands/apply_changes/stream_output.rs`.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_create_block_over_the_blob_limit_fails_the_merge_from_a_later_batch() {
+    const OVERSIZE: usize = 33 << 20;
     let dir = crate::common::test_scratch();
     let osc = dir.path().join("diff.osc");
+    let output = dir.path().join("out.osm.pbf");
     let cap = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP.get();
     let first = 1000_i64;
-    let clean = BOUNDARY_RUN_FULL_BLOCKS * cap;
-    let count = clean + cap + 1;
-    let creates = first..first + i64::try_from(count).unwrap();
-    let earlier = first + i64::try_from(clean).unwrap();
-    let later = creates.end - 1;
-    let mut xml = String::with_capacity(EARLIER_OVERSIZE + LATER_OVERSIZE + count * 64);
-    xml.push_str(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n<create>\n",
-    );
-    for id in creates {
-        let oversize = if id == earlier {
-            EARLIER_OVERSIZE
-        } else if id == later {
-            LATER_OVERSIZE
-        } else {
-            0
-        };
-        if oversize == 0 {
-            writeln!(
-                xml,
-                "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>"
-            )
-            .unwrap();
-        } else {
-            write!(
-                xml,
-                "<node id=\"{id}\" lat=\"1.0\" lon=\"2.0\" version=\"1\"><tag k=\"note\" v=\""
-            )
-            .unwrap();
-            xml.extend(std::iter::repeat_n('x', oversize));
-            xml.push_str("\"/></node>\n");
-        }
-    }
-    xml.push_str("</create>\n</osmChange>\n");
-    std::fs::write(&osc, xml).unwrap();
-
-    let base = dir.path().join("base.osm.pbf");
-    let output = dir.path().join("out.osm.pbf");
-    write_multi_block_test_pbf(
-        &base,
-        &generate_nodes(50, 1),
-        &generate_ways(10, 1, 2, 1),
-        &[],
-        50,
-    );
-    let opts = pbfhogg::apply_changes::MergeOptions {
-        write: pbfhogg::write::WriteOptions {
-            compression: pbfhogg::writer::Compression::None,
-            ..pbfhogg::write::WriteOptions::default()
-        },
-        locations_on_ways: None,
-        parallelism: pbfhogg::Parallelism::Auto,
-        allow_version_regression: false,
-    };
-    let Err(err) = pbfhogg::apply_changes::merge(
-        &base,
-        &osc,
-        crate::common::out(&output),
-        &opts,
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
-    ) else {
+    let failing = first + i64::try_from(cap).unwrap();
+    write_node_creates(&osc, first, 2 * cap + 1, Some((failing, OVERSIZE)));
+    let Err(err) = merge_creates(dir.path(), &osc, &output, 1) else {
         panic!("a create block over the blob payload limit must fail the merge")
     };
     match err.kind() {
-        pbfhogg::ErrorKind::BlobTooLarge { size, .. } => assert!(
-            *size >= EARLIER_OVERSIZE as u64,
-            "the later failing block's refusal ({size} bytes) came back, not the earlier one's"
-        ),
+        pbfhogg::ErrorKind::BlobTooLarge { size, .. } => {
+            assert!(*size >= OVERSIZE as u64, "{size} bytes");
+        }
         _ => panic!("expected the oversize block's refusal, got {err}"),
     }
     assert!(!output.exists(), "a failed merge published its output");
+}
+
+// The unit batch guard in `stream_output.rs` reads this same fixture
+// definition, so the tier-3 run keeps crossing the production batch.
+#[path = "create_run_fixture.rs"]
+mod create_run_fixture;
+
+/// The production batch, at a size it acts on: tier 3, run by the full
+/// profile and the gate.
+mod tier3 {
+    use super::create_run_fixture::BOUNDARY_RUN_FULL_BLOCKS;
+
+    /// `BOUNDARY_RUN_FULL_BLOCKS` full blocks and one element cross the
+    /// production batch: a take-one mutation of the batch loop once dropped
+    /// every create past the first batch with every smaller test green.
+    #[test]
+    fn a_create_run_past_the_production_batch_is_written_whole_and_in_order() {
+        super::assert_run_written_whole(BOUNDARY_RUN_FULL_BLOCKS, 0);
+    }
 }

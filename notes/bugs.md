@@ -18,20 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-005 - The signal reporter holds a mutex across a potentially blocking stderr write
-
-`crates/cli/src/signals.rs` holds `FINISHED` while printing the stopping notice,
-and `finish` takes the same lock before returning the command outcome. A full,
-still-open stderr pipe can therefore block completion behind the notice thread.
-The dedicated signal waiter still permits a second signal to terminate the
-process, but ordinary completion is coupled to the reporter's blocking write. The
-invoker drains stderr and cannot expose this state through its normal API.
-
-Fix: make reporter lifecycle and completion ownership explicit, with a bounded or
-nonblocking diagnostic handoff. Enforcement: a subprocess test that holds a full
-stderr pipe and controls when it drains, and keeping blocking output outside
-completion-state locks.
-
 ## BUG-006 - The geocode builder's smoke check can pass after address lookup breaks
 
 The smoke query in `crates/lib/src/geocode_index/builder/mod.rs` queries the first
@@ -60,3 +46,13 @@ swallowing.
 
 Fix: fail the run on a decode error. Enforcement: an instrument test with a
 deliberately failing role lookup.
+
+## BUG-008 - A lint comment says nothing builds against musl
+
+Lateral finding from the BUG-004 scout, not yet judged. The comment on the
+`glibc-allocator-calls-live-in-debug` rule in `brokkr.d/lints.toml` says nothing
+here builds against musl, while `brokkr.d/checks.toml` defines a `musl` sweep. The
+rule's rationale may rest on the false statement.
+
+Fix: establish whether the rule still holds under the musl sweep and reword the
+comment to what is true.

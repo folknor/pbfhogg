@@ -2760,7 +2760,12 @@ pub fn run() -> process::ExitCode {
     });
     let (cli, matches) = match parsed {
         Ok(parsed) => parsed,
-        Err(err) => return clap_exit(&err),
+        Err(err) => {
+            // clap's text is this run's final output: a signal notice not
+            // printed yet is stale.
+            signals::finish();
+            return clap_exit(&err);
+        }
     };
 
     // From here on `--quiet` filters every diagnostic. The warnings printed

@@ -137,6 +137,15 @@ pub(crate) fn stderr_fragment(args: std::fmt::Arguments<'_>) {
     write_stderr(args, false);
 }
 
+/// Run `f` holding std's stderr lock, which every stderr write in the binary
+/// takes. The lock is reentrant, so `f` may itself write stderr; every other
+/// thread's stderr write waits until `f` returns. The signal reporter relies
+/// on this to order its notice before the run's final line.
+pub(crate) fn hold_stderr(f: &mut dyn FnMut()) {
+    let _held = io::stderr().lock();
+    f();
+}
+
 fn write_stderr(args: std::fmt::Arguments<'_>, newline: bool) {
     let mut handle = io::stderr().lock();
     if STDERR_READER_GONE.load(Ordering::Relaxed) {

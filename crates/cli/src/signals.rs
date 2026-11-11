@@ -25,8 +25,7 @@
 //! pbfhogg starts no child processes, so the blocked mask (which `exec`
 //! would hand down) reaches no other program.
 
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use pbfhogg::host::Invocation;
 
@@ -35,14 +34,75 @@ use pbfhogg::host::Invocation;
 /// observation of the token.
 static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-/// Set by `run` before it reports the outcome, so a reporter thread
-/// scheduled late does not print a "stopping" notice after the run's final
-/// line. A lock, not a flag: the reporter holds it across its check and its
-/// print, so `finish` either sees the notice already printed or stops it from
-/// printing at all. Only `run` and the reporter take it, never the waiter,
-/// so a reporter stuck on a full stderr cannot keep the second signal from
-/// being taken.
-static FINISHED: Mutex<bool> = Mutex::new(false);
+/// Decides between the "stopping" notice and `run`'s final report, so a
+/// reporter thread scheduled late never prints after the run's final stderr
+/// line. (Help and version text goes to stdout, which this cannot order: a
+/// notice already printing may land after it.)
+static NOTICE: NoticeGate = NoticeGate::new();
+
+/// Who owns the stopping notice: nobody yet, the reporter (printing it), or
+/// `run` (finished, so the notice is stale and must not print).
+///
+/// `finish` is a compare-and-swap and never waits. The ordering it does not
+/// enforce itself rides on std's stderr lock, which every stderr write in the
+/// binary takes (`output::write_stderr`, clap's `Error::print`): the reporter
+/// acquires that lock *before* it claims the notice and keeps it through the
+/// print. So if the reporter wins, every later stderr write - the run's final
+/// line included - queues behind the notice; if `finish` wins, the reporter
+/// prints nothing. `finish` therefore never blocks on the reporter; a final
+/// stderr write may wait for the notice, as it would wait on a full pipe
+/// anyway; a run that ends
+/// with no stderr write at all (stdout's reader gone) exits even while the
+/// notice is stuck on a full stderr pipe. An earlier design held a mutex
+/// across the print that `finish` also took, which coupled completion to the
+/// reporter's write; do not reintroduce a wait in `finish`. Only `run` and the
+/// reporter touch the gate, never the waiter.
+struct NoticeGate(AtomicU8);
+
+const NOTICE_PENDING: u8 = 0;
+const NOTICE_PRINTING: u8 = 1;
+const NOTICE_FINISHED: u8 = 2;
+
+impl NoticeGate {
+    const fn new() -> Self {
+        Self(AtomicU8::new(NOTICE_PENDING))
+    }
+
+    /// The reporter's claim; true means print. Call only while holding the
+    /// output lock the final report also takes.
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                NOTICE_PENDING,
+                NOTICE_PRINTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// `run`'s claim. Never waits.
+    fn finish(&self) {
+        // Losing means the reporter is printing; nothing to do.
+        _ = self.0.compare_exchange(
+            NOTICE_PENDING,
+            NOTICE_FINISHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// The reporter's protocol, apart from the real stderr so it can be tested:
+/// take the output lock through `hold_output`, then claim, then print under
+/// the same lock. The claim must not move before the lock.
+fn deliver(gate: &NoticeGate, hold_output: impl FnOnce(&mut dyn FnMut()), mut print: impl FnMut()) {
+    hold_output(&mut || {
+        if gate.claim() {
+            print();
+        }
+    });
+}
 
 /// Block SIGINT and SIGTERM in the calling thread and start the waiter that
 /// trips `cancel`. Call first thing in `run`, before any other thread is
@@ -119,19 +179,17 @@ fn report_stopping(signo: libc::c_int) {
         std::thread::Builder::new()
             .name("pbfhogg-signal-notice".to_owned())
             .spawn(move || {
-                let finished = FINISHED.lock().unwrap_or_else(PoisonError::into_inner);
-                if *finished {
-                    return;
-                }
-                crate::host::cli_note(
-                    "cli.signal_stopping",
-                    format_args!(
-                        "{} received; stopping and removing this run's staging and scratch \
-                         files. Send it again to exit at once and leave them for the next run \
-                         to report.",
-                        name(signo)
-                    ),
-                );
+                deliver(&NOTICE, crate::output::hold_stderr, || {
+                    crate::host::cli_note(
+                        "cli.signal_stopping",
+                        format_args!(
+                            "{} received; stopping and removing this run's staging and scratch \
+                             files. Send it again to exit at once and leave them for the next \
+                             run to report.",
+                            name(signo)
+                        ),
+                    );
+                });
             }),
     );
 }
@@ -148,8 +206,9 @@ pub(crate) fn first_signal(cancel: &Invocation) -> Option<libc::c_int> {
 }
 
 /// `run` is about to report the outcome; a notice still queued is stale.
+/// Never waits, even for a notice stuck on a full stderr (see [`NoticeGate`]).
 pub(crate) fn finish() {
-    *FINISHED.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    NOTICE.finish();
 }
 
 /// The exit status for a run cancelled by `signo`: `128 + signo`. A token
@@ -163,6 +222,96 @@ pub(crate) fn name(signo: libc::c_int) -> &'static str {
         libc::SIGINT => "SIGINT",
         libc::SIGTERM => "SIGTERM",
         _ => "a signal",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "std::thread::scope joins its two threads before each test returns"
+)]
+mod tests {
+    use super::{NoticeGate, deliver};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// The reporter's output lock in these tests: a log every writer appends to.
+    fn hold<'a>(log: &'a Mutex<Vec<&'static str>>) -> impl FnOnce(&mut dyn FnMut()) + 'a {
+        move |f: &mut dyn FnMut()| {
+            let _held = log.lock().unwrap();
+            f();
+        }
+    }
+
+    /// The reporter is parked inside `hold_output`, just before it takes the
+    /// lock, while the run finishes. Claiming only under the lock, it then
+    /// sees the run finished and prints nothing; a claim moved ahead of the
+    /// lock would already have won and would print.
+    #[test]
+    fn a_finished_run_suppresses_a_reporter_that_had_not_yet_taken_the_lock() {
+        let gate = &NoticeGate::new();
+        let log = &Mutex::new(Vec::new());
+        let printed = &AtomicBool::new(false);
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let reporter = s.spawn(move || {
+                let hold_output = move |f: &mut dyn FnMut()| {
+                    arrived_tx.send(()).unwrap();
+                    go_rx.recv_timeout(BOUND).unwrap();
+                    hold(log)(f);
+                };
+                deliver(gate, hold_output, || printed.store(true, Ordering::SeqCst));
+            });
+            arrived_rx.recv_timeout(BOUND).unwrap();
+            gate.finish();
+            go_tx.send(()).unwrap();
+            reporter.join().unwrap();
+        });
+        assert!(
+            !printed.load(Ordering::SeqCst),
+            "the notice printed after the run finished"
+        );
+    }
+
+    #[test]
+    fn finish_does_not_wait_for_a_printing_notice_and_the_final_line_follows_it() {
+        let gate = &NoticeGate::new();
+        let log = &Mutex::new(Vec::new());
+        let notice_printed = &AtomicBool::new(false);
+        let (claimed_tx, claimed_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let reporter = s.spawn(move || {
+                deliver(gate, hold(log), || {
+                    claimed_tx.send(()).unwrap();
+                    release_rx.recv_timeout(BOUND).unwrap();
+                    // The print, made while `hold` keeps the output lock.
+                    notice_printed.store(true, Ordering::SeqCst);
+                });
+            });
+            claimed_rx.recv_timeout(BOUND).unwrap();
+            // The reporter holds the output lock and is mid-print: finish
+            // must return now, not after the print.
+            gate.finish();
+            let writer = s.spawn(move || {
+                let mut out = log.lock().unwrap();
+                out.push(if notice_printed.load(Ordering::SeqCst) {
+                    "final after notice"
+                } else {
+                    "final before notice"
+                });
+            });
+            release_tx.send(()).unwrap();
+            reporter.join().unwrap();
+            writer.join().unwrap();
+        });
+        assert_eq!(*log.lock().unwrap(), ["final after notice"]);
     }
 }
 

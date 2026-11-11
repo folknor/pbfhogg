@@ -547,6 +547,18 @@ mod tests {
     use super::{ScratchSite, TmpDirArg, dir_holds, merge_changes_writes_scratch};
     use crate::host;
 
+    /// The CLI's host over fixed resources: these tests make scratch and
+    /// never size or route anything, but they do not probe the runner.
+    fn test_cli_host() -> pbfhogg::host::Host {
+        host::cli_host(
+            pbfhogg::host::Invocation::new(),
+            std::sync::Arc::new(pbfhogg::host::Fixed {
+                parallelism: std::num::NonZeroUsize::new(4),
+                memory_available: Some(8 << 30),
+            }),
+        )
+    }
+
     /// merge-changes makes a run directory only where it may spill: several
     /// inputs, without `--simplify`, not at `-j 1`. `-j 0` may resolve to one
     /// worker on a small host, which is not the command line's guarantee.
@@ -580,7 +592,7 @@ mod tests {
         std::fs::create_dir(&tmp).unwrap();
         std::fs::create_dir(&out_dir).unwrap();
         let output = out_dir.join("result.pbf");
-        let host = host::cli_host(pbfhogg::host::Invocation::new());
+        let host = test_cli_host();
 
         let explicit = TmpDirArg {
             tmp_dir: Some(tmp.clone()),
@@ -610,7 +622,7 @@ mod tests {
     /// place scratch in the current directory.
     #[test]
     fn a_bare_output_name_or_none_places_scratch_in_the_current_directory() {
-        let host = host::cli_host(pbfhogg::host::Invocation::new());
+        let host = test_cli_host();
         let default = TmpDirArg { tmp_dir: None };
         for output in [Some(std::path::Path::new("out.pbf")), None] {
             let scratch = ScratchSite::new(&default, output).create(&host).unwrap();
@@ -623,7 +635,7 @@ mod tests {
     fn an_explicit_tmp_dir_error_names_the_flag_and_the_directory() {
         let dir = pbfhogg_test_scratch::scratch();
         let missing = dir.path().join("missing");
-        let host = host::cli_host(pbfhogg::host::Invocation::new());
+        let host = test_cli_host();
         let tmp = TmpDirArg {
             tmp_dir: Some(missing.clone()),
         };

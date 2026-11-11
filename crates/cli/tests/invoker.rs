@@ -70,6 +70,11 @@ pub const EXIT_FAILED: i32 = 2;
 /// by clap or by the CLI's own option validation.
 pub const EXIT_USAGE: i32 = 64;
 
+/// The cores a child sizes from by default, matching the library's test hosts.
+pub const CHILD_CORES: NonZeroU64 = NonZeroU64::MIN.saturating_add(3);
+/// The memory a child routes on by default, matching the library's test hosts.
+pub const CHILD_MEMORY: u64 = 8 << 30;
+
 /// Invokes the `pbfhogg` binary with a set of arguments, captures
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.
 pub struct CliInvoker<'a> {
@@ -91,6 +96,23 @@ impl<'a> CliInvoker<'a> {
             timeout: pbfhogg::TEST_CHILD_TIMEOUT,
             stderr_closed: false,
         }
+        .resources(CHILD_CORES, Some(CHILD_MEMORY))
+    }
+
+    /// The sizing inputs the child resolves instead of probing the runner:
+    /// `cores` for every resource-sized pool and the width of rayon's global
+    /// pool (`RAYON_NUM_THREADS`, honoured by any build), `memory` (`None`
+    /// for unknown) for memory-routed choices such as altw's auto backend.
+    /// The resource override is a `test-hooks` hook
+    /// (`PBFHOGG_TEST_RESOURCES`); a build without the feature ignores it and
+    /// sizes and routes from the machine. Fixed sizing inputs, not a thread
+    /// cap: `-j` and concurrent stage threads can exceed `cores`.
+    pub fn resources(mut self, cores: NonZeroU64, memory: Option<u64>) -> Self {
+        let memory = memory.map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());
+        self.cmd
+            .env("PBFHOGG_TEST_RESOURCES", format!("{cores}:{memory}"))
+            .env("RAYON_NUM_THREADS", cores.to_string());
+        self
     }
 
     /// Append a single argument.
@@ -716,6 +738,30 @@ mod tests {
 
     #[cfg(feature = "test-hooks")]
     #[test]
+    fn malformed_resources_hook_fails_explicitly() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        for value in ["", "4", "0:none", "x:none", "4:", "4:lots", "4:none:1"] {
+            let mut invoker = CliInvoker::new(&scratch).arg("--version");
+            invoker.cmd.env("PBFHOGG_TEST_RESOURCES", value);
+            let out = invoker.run();
+            assert_eq!(
+                out.status.code(),
+                Some(101),
+                "{value:?}: {}",
+                out.stderr_str()
+            );
+            assert!(
+                out.stderr_str()
+                    .contains("is not <cores>:<memory bytes or none>"),
+                "{value:?}: {}",
+                out.stderr_str()
+            );
+            assert!(out.stdout.is_empty());
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
     fn malformed_checkpoint_and_replacement_hooks_fail_explicitly() {
         let scratch = pbfhogg_test_scratch::scratch();
         for (key, value, message) in [
@@ -889,9 +935,20 @@ mod tests {
                         | "LC_MESSAGES"
                         | "TZ"
                         | "TMPDIR"
+                        | "PBFHOGG_TEST_RESOURCES"
+                        | "RAYON_NUM_THREADS"
                 )
             ));
         }
+        // The child sizes and routes from fixed inputs, not the runner.
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("PBFHOGG_TEST_RESOURCES")),
+            Some(&Some(std::ffi::OsStr::new("4:8589934592")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("RAYON_NUM_THREADS")),
+            Some(&Some(std::ffi::OsStr::new("4")))
+        );
         assert_eq!(
             env.get(std::ffi::OsStr::new("TMPDIR")),
             Some(&Some(scratch.path().as_os_str()))

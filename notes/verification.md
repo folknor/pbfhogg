@@ -237,13 +237,12 @@ pairs untimed, so the bench needs a fixture producer first.
 
 Reported by cli-tests.
 
-`crates/cli/src/host.rs` builds `MachineProbe` resources and an ambient executor, while fixed
-resources apply only to in-process fixture preparation. Tests can select different paths per host and
-concurrent children size pools against the whole machine.
-
-Fix: separate process setup from execution and hand command execution a resolved host and policy,
-keeping subprocess tests for process integration. Enforcement: signatures and explicit child
-configuration.
+`cli_host` now takes resolved resources and `CliInvoker` gives every child fixed sizing inputs
+(`PBFHOGG_TEST_RESOURCES`, a `test-hooks` hook, plus `RAYON_NUM_THREADS`). Residue: children built
+without `test-hooks` (the `consumer` and `musl` sweeps) ignore the resource variable and still size
+resource-derived pools and route altw auto and check locations on the runner's real cores and
+memory. Release builds cannot take a private override, so closing this needs either a different
+execution boundary for those sweeps or acceptance that they are process-integration coverage only.
 
 ## VER-089 - Plans, execution and CLI counterparts describe the workload independently
 

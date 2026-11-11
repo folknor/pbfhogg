@@ -285,7 +285,9 @@ of its own of the same four-thread width, and a descriptor provider
 granting every request `min(wanted, 1024)` without probing the process,
 so what the library is told and where its rayon work runs are the same
 everywhere and independent of sibling tests; a test that needs a
-different machine sets its own `host::Fixed`. `Executor::Ambient`
+different machine sets its own `host::Fixed`. CLI children are told the
+same machine through `CliInvoker` (see its entry below), in `test-hooks`
+builds. `Executor::Ambient`
 appears in a test only where it is the subject, marked
 `// ambient-deliberate:` on its line. Each test owns its hosts and
 invocations: none is held in a static or leaked (`Host::entered` borrows
@@ -598,8 +600,18 @@ exception, not a tier - should not survive across many PRs.
   when another writer holds a pipe open. Output keeps the first and last MiB.
   The default cwd and `TMPDIR` are the borrowed scratch and stdin is null.
   The environment is cleared, retaining only PATH, HOME, LANG, LC_ALL,
-  LC_CTYPE, LC_MESSAGES and TZ when present. Hook, profiler, Rayon and
-  brokkr variables enter only through explicit setters. Hook setters are
+  LC_CTYPE, LC_MESSAGES and TZ when present. Hook, profiler and
+  brokkr variables enter only through explicit setters. One setter is
+  applied by default: `resources(cores, memory)`, at 4 cores and 8 GiB like
+  the library's test hosts, sets `PBFHOGG_TEST_RESOURCES=<cores>:<bytes or
+  none>`, which a `test-hooks` child resolves to a `host::Fixed` in place of
+  `MachineProbe`, and `RAYON_NUM_THREADS=<cores>`, which bounds the CLI's
+  ambient executor in any build. These are fixed sizing and routing inputs,
+  not a thread cap (`-j` and concurrent stage threads can exceed them). A
+  child built without `test-hooks` (the `consumer` and `musl` sweeps)
+  ignores the resource variable and still sizes its pools and routes altw's
+  auto backend on the runner's machine: those runs are process-integration
+  coverage, and no assertion may depend on the machine. Hook setters are
   named for the hook (`cancel_pause`, `cancel_count`, `publish_faults`,
   `publish_steps`, `publish_pause`, `publish_ready`, `replace_input`,
   `replace_with`, `replace_after`, `force_pin_path_reopen`,

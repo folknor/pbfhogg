@@ -1,5 +1,5 @@
 use pbfhogg::host::{
-    Event, EventKind, Executor, Host, MachineProbe, PageCachePolicy, ProcessActions,
+    Event, EventKind, Executor, Host, MachineProbe, PageCachePolicy, ProcessActions, Resources,
 };
 use pbfhogg::process::FdReservation;
 use std::sync::Arc;
@@ -15,16 +15,57 @@ impl ProcessActions for LegacyProcessActions {
     }
 }
 /// The CLI's host. `cancel` is the token the signal waiter trips (see
-/// `signals`).
-pub(crate) fn cli_host(cancel: pbfhogg::host::Invocation) -> Host {
+/// `signals`); `resources` is what [`cli_resources`] resolved, so assembling
+/// the host chooses nothing about the machine.
+pub(crate) fn cli_host(cancel: pbfhogg::host::Invocation, resources: Arc<dyn Resources>) -> Host {
     Host {
         diagnostics: pbfhogg::host::Diagnostics::new(Arc::new(StderrSink)),
         process: Arc::new(LegacyProcessActions),
-        resources: Arc::new(MachineProbe),
+        resources,
         page_cache: PageCachePolicy::Evict,
         executor: Executor::Ambient,
         invocation: cancel,
     }
+}
+
+/// The resources this process sizes and routes against: the machine
+/// (`MachineProbe`). A `test-hooks` build reads
+/// `PBFHOGG_TEST_RESOURCES=<cores>:<memory bytes or none>` first and, when it
+/// is set, uses those fixed sizing inputs instead, so a test child sizes its
+/// pools and routes its auto choices the same on every runner. It fixes
+/// sizing inputs, not a thread cap: `-j` and concurrent stage threads can
+/// still exceed the core count. A malformed value ends the process with
+/// status 101, like the other test hooks.
+pub(crate) fn cli_resources() -> Arc<dyn Resources> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(spec) = std::env::var_os("PBFHOGG_TEST_RESOURCES") {
+        let Some(fixed) = spec.to_str().and_then(parse_test_resources) else {
+            cli_warning(
+                "cli.test_hooks",
+                format_args!(
+                    "PBFHOGG_TEST_RESOURCES={spec:?} is not <cores>:<memory bytes or none>"
+                ),
+            );
+            std::process::exit(101);
+        };
+        return Arc::new(fixed);
+    }
+    Arc::new(MachineProbe)
+}
+
+/// `<cores>:<memory bytes or none>`, cores nonzero.
+#[cfg(feature = "test-hooks")]
+fn parse_test_resources(spec: &str) -> Option<pbfhogg::host::Fixed> {
+    let (cores, memory) = spec.split_once(':')?;
+    let parallelism = Some(cores.parse::<std::num::NonZeroUsize>().ok()?);
+    let memory_available = match memory {
+        "none" => None,
+        bytes => Some(bytes.parse::<u64>().ok()?),
+    };
+    Some(pbfhogg::host::Fixed {
+        parallelism,
+        memory_available,
+    })
 }
 
 /// The run's invocation: instrumented with the sidecar marker FIFO when

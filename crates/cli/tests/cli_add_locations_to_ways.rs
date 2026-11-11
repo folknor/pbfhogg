@@ -865,8 +865,9 @@ fn zero_ref_ways_survive_sparse_and_external_assembly() {
 }
 
 /// Auto on a sorted + indexed input runs and names the backend it chose.
-/// Which backend depends on the runner's memory, so that choice is pinned
-/// by `host_contract::fixed_memory_routes_auto`, which supplies the memory.
+/// Without `test-hooks` the child routes on the runner's memory, so the
+/// choice is pinned by `auto_routes_on_the_childs_supplied_memory` and
+/// in-process by `host_contract::fixed_memory_routes_auto`.
 #[test]
 fn auto_on_sorted_indexed_input_reports_its_choice() {
     let dir = crate::common::test_scratch();
@@ -891,6 +892,43 @@ fn auto_on_sorted_indexed_input_reports_its_choice() {
         "an auto-resolved backend must not be second-guessed by the \
          explicit-sparse hint; stderr:\n{stderr}",
     );
+}
+
+/// The child routes auto on the memory its invoker supplies, not on the
+/// runner's: the same sorted indexed input goes sparse at the default 8 GiB,
+/// external one byte above the fixed anonymous allowance, and sparse again
+/// with no budget left or memory unknown (the boundaries
+/// `host_contract::fixed_memory_routes_auto` pins in-process).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn auto_routes_on_the_childs_supplied_memory() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_indexed_pbf(&input, &test_nodes(), &test_ways(), &[]);
+    let allowance: u64 = 3 << 30;
+    for (memory, backend) in [
+        (Some(crate::invoker::CHILD_MEMORY), "sparse"),
+        (Some(allowance + 1), "external"),
+        (Some(allowance), "sparse"),
+        (None, "sparse"),
+    ] {
+        let output = dir.path().join(format!("auto-{memory:?}.osm.pbf"));
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        let out = CliInvoker::new(&invocation_scratch)
+            .resources(crate::invoker::CHILD_CORES, memory)
+            .arg("add-locations-to-ways")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .args(["--index-type", "auto"])
+            .run();
+        let stderr = out.stderr_str();
+        assert!(out.status.success(), "{memory:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!("auto-selected index type {backend} (")),
+            "{memory:?} must route {backend}; stderr:\n{stderr}",
+        );
+    }
 }
 
 /// Omitting `--index-type` runs auto: the default reports an auto choice

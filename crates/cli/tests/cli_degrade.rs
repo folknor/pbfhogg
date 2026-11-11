@@ -174,7 +174,7 @@ fn write_bbox_fixture(
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
     write_fixture_elements(&mut writer, &nodes, &ways, &rels);
@@ -387,7 +387,7 @@ fn write_low_fixture(
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
 

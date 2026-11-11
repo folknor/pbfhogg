@@ -3666,28 +3666,13 @@ mod tests {
         Diagnostics::discard()
     }
 
-    /// The one token these tests write and publish under: publication
-    /// refuses an output written under another invocation. Never tripped; a
-    /// test that cancels uses a token of its own.
-    fn run_host() -> crate::host::Entered<'static> {
-        crate::host::Host {
-            invocation: run_token().clone(),
-            ..crate::host::Host::for_tests()
-        }
-        .entered_leaked()
-    }
-
-    fn run_token() -> &'static crate::host::Invocation {
-        static TOKEN: std::sync::OnceLock<crate::host::Invocation> = std::sync::OnceLock::new();
-        TOKEN.get_or_init(crate::host::Invocation::new)
-    }
-
     /// An output bound to one invocation is refused by a command running
     /// another, and by a PBF writer opened with another's host; the refused
     /// one is decided `refused_error` in its own invocation's log and its
     /// staging entry removed.
     #[test]
     fn an_output_bound_to_another_invocation_is_refused() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let mine = crate::host::Invocation::new();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard())
@@ -3698,7 +3683,7 @@ mod tests {
             crate::write::compression::Compression::default(),
             &[],
             crate::write::OutputBackend::Buffered,
-            &run_host(),
+            &run.entered(),
         ) else {
             panic!("a host running another invocation is refused");
         };
@@ -3706,7 +3691,7 @@ mod tests {
             matches!(err.kind(), crate::ErrorKind::InvalidArgument { .. }),
             "{err}"
         );
-        let err = out.bind_to(run_token()).unwrap_err();
+        let err = out.bind_to(&run.invocation).unwrap_err();
         assert!(
             matches!(err.kind(), crate::ErrorKind::InvalidArgument { .. }),
             "{err}"
@@ -3737,10 +3722,11 @@ mod tests {
 
     #[test]
     fn a_fresh_output_publishes_and_leaves_nothing_else() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         assert!(!dest.exists(), "nothing at the destination before publish");
         stage(&out, b"new").unwrap();
         out.publish().unwrap();
@@ -3763,11 +3749,12 @@ mod tests {
 
     #[test]
     fn replace_overwrites_an_existing_output() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
         fs::write(&dest, b"old").unwrap();
         let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage(&out, b"new").unwrap();
         out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
@@ -3778,12 +3765,13 @@ mod tests {
     /// leaves a pre-existing destination byte-identical and no staging file.
     #[test]
     fn a_dropped_output_publishes_nothing() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("important.json");
         fs::write(&dest, b"user data").unwrap();
         {
             let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
-            let out = out.bind(run_token()).expect("bind output fixture");
+            let out = out.bind(&run.invocation).expect("bind output fixture");
             stage(&out, b"complete-looking output").unwrap();
         }
         assert_eq!(fs::read(&dest).unwrap(), b"user data");
@@ -3792,7 +3780,7 @@ mod tests {
         let fresh = dir.path().join("fresh.json");
         {
             let out = Output::new(&fresh, Overwrite::Refuse, &discard()).unwrap();
-            let out = out.bind(run_token()).expect("bind output fixture");
+            let out = out.bind(&run.invocation).expect("bind output fixture");
             stage(&out, b"complete-looking output").unwrap();
         }
         assert!(!fresh.exists());
@@ -3803,10 +3791,11 @@ mod tests {
     /// not replaced at publication.
     #[test]
     fn refuse_is_exclusive_at_publication() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage(&out, b"ours").unwrap();
         fs::write(&dest, b"theirs").unwrap();
         let err = out.publish().unwrap_err();
@@ -3931,12 +3920,13 @@ mod tests {
 
     #[test]
     fn a_directory_output_swaps_in_whole() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("index");
         fs::create_dir(&dest).unwrap();
         fs::write(dest.join("old.bin"), b"old").unwrap();
         let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage_dir(&out, "new.bin", b"new");
         out.publish().unwrap();
         assert!(!dest.join("old.bin").exists());
@@ -3952,6 +3942,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_read_only_directory_output_is_refused_before_work() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("index");
         let staging = dir.path().join("staging");
@@ -3983,7 +3974,7 @@ mod tests {
             let out =
                 OutputDir::with_staging(&dest, Overwrite::Replace, None, placement, &discard())
                     .unwrap();
-            let out = out.bind(run_token()).expect("bind output fixture");
+            let out = out.bind(&run.invocation).expect("bind output fixture");
             stage_dir(&out, "new.bin", b"new");
             let denial = match dir.deny_write(&dest) {
                 Ok(guard) => guard,
@@ -4012,6 +4003,7 @@ mod tests {
                 Ok(())
             }
         }
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("index");
         fs::create_dir(&dest).unwrap();
@@ -4022,7 +4014,7 @@ mod tests {
         fs::remove_file(dest.join("marker")).unwrap();
         let out =
             OutputDir::new(&dest, Overwrite::Replace, Some(refuse_marked), &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage_dir(&out, "new.bin", b"new");
         fs::write(dest.join("marker"), b"").unwrap();
         let err = out.publish().unwrap_err();
@@ -4076,10 +4068,11 @@ mod tests {
 
     #[test]
     fn a_finished_writer_publishes_and_an_unfinished_one_does_not() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out.osc");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let mut writer = out.writer().unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         // Bytes are still in the buffer: the output is not publishable.
@@ -4090,7 +4083,7 @@ mod tests {
         assert!(others(dir.path(), &[]).is_empty(), "staging is removed");
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let mut writer = out.writer().unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         writer.finish().unwrap();
@@ -4100,9 +4093,10 @@ mod tests {
 
     #[test]
     fn an_output_has_one_writing_session() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let out = Output::new(dir.path().join("o"), Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let first = out.writer().unwrap();
         assert!(
             out.writer().is_err(),
@@ -4117,10 +4111,11 @@ mod tests {
     /// finished with nothing written.
     #[test]
     fn an_output_nobody_wrote_is_refused() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("empty");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         fs::write(out.path(), b"behind the session's back").unwrap();
         let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
@@ -4128,14 +4123,14 @@ mod tests {
         assert!(others(dir.path(), &[]).is_empty());
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage(&out, b"").unwrap();
         out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"");
 
         let index = dir.path().join("index");
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let writer = out.writer().unwrap();
         fs::write(writer.path().join("f"), b"x").unwrap();
         drop(writer);
@@ -4143,7 +4138,7 @@ mod tests {
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!index.exists());
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(others(dir.path(), &["empty"]).is_empty());
@@ -4153,8 +4148,9 @@ mod tests {
     /// on past a lost write and certify the output with a later finish.
     #[test]
     fn a_failed_write_fails_the_session() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
-        let host = run_host();
+        let host = run.entered();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let out = Output::new(
             dir.path().join("out.osm.pbf"),
@@ -4162,7 +4158,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let mut writer = out
             .pbf_writer(
                 crate::write::compression::Compression::None,
@@ -4185,12 +4181,12 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let completion = out.output.begin_write().unwrap();
         let mut writer = crate::write::writer::PbfWriter::to_staged_file(
             out.path(),
             Default::default(),
-            run_token(),
+            &run.invocation,
         )
         .unwrap()
         .with_completion(completion);
@@ -4246,6 +4242,7 @@ mod tests {
     /// before the swap, while it holds anything pbfhogg never deletes.
     #[test]
     fn a_directory_holding_leftovers_is_not_replaced() {
+        let run = crate::host::Host::for_tests();
         use std::os::unix::ffi::OsStrExt;
         let dir = scratch();
         let index = dir.path().join("index");
@@ -4270,7 +4267,7 @@ mod tests {
 
         // Planted after construction: refused at publication, untouched.
         let out = OutputDir::new(&index, Overwrite::Replace, None, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage_dir(&out, "header", b"new");
         let run = index.join(".pbfhogg-run-1-cd");
         fs::create_dir(&run).unwrap();
@@ -4288,6 +4285,7 @@ mod tests {
     /// deletes that ended up in its staging: it keeps the staging and warns.
     #[test]
     fn dropped_directory_staging_keeps_protected_entries() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let (sink, diagnostics) = recording();
         let out = OutputDir::new(
@@ -4297,7 +4295,7 @@ mod tests {
             &diagnostics,
         )
         .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let writer = out.writer().unwrap();
         let inner = writer.path().join(".pbfhogg-backup-1-0.x");
         fs::create_dir(&inner).unwrap();
@@ -4340,16 +4338,17 @@ mod tests {
     /// that was written to and never flushed cannot be published past.
     #[test]
     fn a_pbf_writer_that_was_not_flushed_blocks_publication() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
-        let host = run_host();
+        let host = run.entered();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
 
         // A writer was started and has not reached a successful flush (a
         // `PbfWriter` dropped unflushed would trip its own test assertion, so
         // the bare lease stands in for it).
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let lease = out.output.begin_write().unwrap();
         let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
@@ -4358,7 +4357,7 @@ mod tests {
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard())
             .unwrap()
-            .bind(run_token())
+            .bind(&run.invocation)
             .unwrap();
         let mut writer = crate::commands::writer_from_header_bytes(
             &out,
@@ -4379,7 +4378,7 @@ mod tests {
             &discard(),
         )
         .unwrap()
-        .bind(run_token())
+        .bind(&run.invocation)
         .unwrap();
         let mut writer = crate::commands::writer_from_header_bytes(
             &out,
@@ -4397,10 +4396,11 @@ mod tests {
 
     #[test]
     fn a_replaced_staging_file_is_refused() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage(&out, b"ours").unwrap();
         let staging = out.path().to_path_buf();
         fs::remove_file(&staging).unwrap();
@@ -4417,12 +4417,13 @@ mod tests {
     /// not followed, synced and installed as a link.
     #[test]
     fn a_replaced_staging_directory_is_refused() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("index");
         let elsewhere = dir.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         let out = OutputDir::new(&dest, Overwrite::Refuse, None, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let writer = out.writer().unwrap();
         fs::remove_dir(writer.path()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, writer.path()).unwrap();
@@ -4440,12 +4441,13 @@ mod tests {
     /// stops the publication, though the session was finished when it began.
     #[test]
     fn a_session_failed_by_a_hook_is_not_published() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
-        let host = run_host();
+        let host = run.entered();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let mut writer = out
             .pbf_writer(
                 crate::write::compression::Compression::None,
@@ -4468,11 +4470,12 @@ mod tests {
     /// the staged bytes are all there. It is the point a timer stops at.
     #[test]
     fn before_publish_hooks_run_before_anything_is_installed() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let dest = dir.path().join("out");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let mut writer = out.writer().unwrap();
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
@@ -4493,9 +4496,10 @@ mod tests {
     /// publication that never starts.
     #[test]
     fn a_refused_publication_runs_no_hooks() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         let _writer = out.writer().unwrap();
         let ran = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&ran);
@@ -4536,6 +4540,7 @@ mod tests {
     /// keeps the backup whole, and the warning says why.
     #[test]
     fn a_backup_holding_protected_entries_is_kept() {
+        let host = crate::host::Host::for_tests();
         let dir = scratch();
         let (sink, diagnostics) = recording();
         let mut target = Target::prepare(
@@ -4553,7 +4558,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         fs::write(entry.join("old-file"), b"old").unwrap();
         let backup = Backup { container, entry };
-        target.remove_backup(0, &backup, &Faults::of(&run_token().call().unwrap()));
+        target.remove_backup(0, &backup, &Faults::of(&host.invocation.call().unwrap()));
         drop(target);
         assert!(run.exists());
         assert_eq!(fs::read(backup.entry.join("old-file")).unwrap(), b"old");
@@ -4578,6 +4583,7 @@ mod tests {
     /// run, and nowhere beside the destination; publication empties it.
     #[test]
     fn a_staging_directory_holds_the_staging_file_and_nothing_beside_the_output() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let (stage_dir_path, out_dir) = (dir.path().join("stage"), dir.path().join("out"));
         fs::create_dir(&stage_dir_path).unwrap();
@@ -4590,7 +4596,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         assert_eq!(out.path().parent(), Some(stage_dir_path.as_path()));
         assert!(
             out.path()
@@ -4614,6 +4620,7 @@ mod tests {
     /// file from the staging directory, as it would beside the output.
     #[test]
     fn a_dropped_output_removes_its_entry_from_the_staging_directory() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let stage_dir_path = dir.path().join("stage");
         fs::create_dir(&stage_dir_path).unwrap();
@@ -4626,7 +4633,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage(&out, b"partial").unwrap();
         assert_eq!(leftovers(&stage_dir_path).len(), 1);
         drop(out);
@@ -4640,6 +4647,7 @@ mod tests {
     /// successful replacement.
     #[test]
     fn a_directory_output_stages_in_the_staging_directory_and_backs_up_beside_itself() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let stage_dir_path = dir.path().join("stage");
         fs::create_dir(&stage_dir_path).unwrap();
@@ -4654,7 +4662,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         assert_eq!(leftovers(&stage_dir_path).len(), 1);
         assert!(leftovers(dir.path()).is_empty());
         stage_dir(&out, "new", b"new");
@@ -4744,13 +4752,14 @@ mod tests {
     /// it deletes neither the output nor a backup beside it.
     #[test]
     fn a_staging_directory_below_the_output_directory_is_accepted() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let below = dir.path().join(".stage");
         fs::create_dir(&below).unwrap();
         let dest = dir.path().join("o.pbf");
         let out = Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(&below), &discard())
             .unwrap();
-        let out = out.bind(run_token()).expect("bind output fixture");
+        let out = out.bind(&run.invocation).expect("bind output fixture");
         stage(&out, b"x").unwrap();
         out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"x");
@@ -4765,6 +4774,7 @@ mod tests {
     /// the staging refusal: the error kind proves the order.
     #[test]
     fn a_set_checks_the_staging_directory_against_every_member_first() {
+        let run = crate::host::Host::for_tests();
         let dir = scratch();
         let stage_dir_path = dir.path().join("stage");
         fs::create_dir_all(stage_dir_path.join("inner")).unwrap();
@@ -4804,7 +4814,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let set = set.bind(run_token()).expect("bind output fixture");
+        let set = set.bind(&run.invocation).expect("bind output fixture");
         assert_eq!(leftovers(&stage_dir_path).len(), 2);
         for member in set.iter() {
             stage(member, b"m").unwrap();

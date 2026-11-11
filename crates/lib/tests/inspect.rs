@@ -59,7 +59,7 @@ fn write_nodes_blocks(path: &std::path::Path, blocks: &[usize]) {
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
     let mut bb = BlockBuilder::new();
@@ -1070,7 +1070,7 @@ fn write_node_id_blocks(path: &std::path::Path, blocks: &[&[i64]]) {
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
     let mut bb = BlockBuilder::new();
@@ -1128,7 +1128,7 @@ fn inspect_empty_payload_is_visible_but_neutral_to_ordering() {
         &path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("writer");
     // A string table with its required empty entry, and no primitive groups.

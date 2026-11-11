@@ -1192,9 +1192,11 @@ mod tests {
     #[test]
     fn mapped_sidecar_matches_owned_records_and_handles_empty_input() {
         let dir = crate::path_guard::tests::scratch();
-        let scratch =
-            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
-                .expect("run scratch");
+        let scratch = crate::scratch::RunScratch::create(
+            dir.path(),
+            &crate::host::Host::for_tests().entered(),
+        )
+        .expect("run scratch");
         let path = scratch.file("per-way-refcounts").expect("name");
         let bytes = make_sidecar_bytes(&[&[0, 3, 128], &[], &[1]]);
         std::fs::write(path.as_path(), &bytes).expect("write sidecar");

@@ -1412,9 +1412,11 @@ mod ref_count_sidecar_tests {
     #[test]
     fn streamed_prefixes_check_alignment_trailer_and_overflow() {
         let dir = crate::path_guard::tests::scratch();
-        let scratch =
-            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
-                .expect("run scratch");
+        let scratch = crate::scratch::RunScratch::create(
+            dir.path(),
+            &crate::host::Host::for_tests().entered(),
+        )
+        .expect("run scratch");
         let path = scratch.file("way-ref-counts").expect("name");
         let write = |counts: &[u64]| {
             let bytes: Vec<u8> = counts.iter().flat_map(|n| n.to_le_bytes()).collect();

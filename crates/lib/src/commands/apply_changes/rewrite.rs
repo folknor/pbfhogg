@@ -767,7 +767,7 @@ mod tests {
             .unwrap(),
             &MergeOptions::default(),
             &HeaderOverrides::default(),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .err()
         .expect("the base input must not also be the output");

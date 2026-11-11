@@ -73,6 +73,8 @@ libc = "0.2.191"
 # Path-only with no version: `cargo publish` strips it.
 pbfhogg-test-scratch = { path = "../test-scratch" }
 tempfile = "3.27.0"
+# Each in-process test host's executor pool (`common::test_executor`).
+rayon = "1.12.0"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 zstd = "0.14.0"
 

@@ -525,7 +525,8 @@ mod tests {
     }
 
     fn built(inputs: &[HeaderBlock], facts: &OutputFacts) -> HeaderBlock {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let out = build(inputs, facts, &HeaderOverrides::default(), &host).unwrap();
         HeaderBlock::parse_from_bytes(&out.bytes).unwrap()
     }
@@ -688,7 +689,8 @@ mod tests {
         let dropped = built(std::slice::from_ref(&input), &with(Replication::Drop));
         assert_eq!(state(dropped), (None, None, None));
 
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let stamped = HeaderOverrides {
             replication_sequence_number: FieldOverride::Set(8),
             ..Default::default()
@@ -714,7 +716,8 @@ mod tests {
                 .replication_sequence_number(0)
                 .replication_base_url(""),
         );
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let cleared = HeaderOverrides::parse(
             None,
             &[
@@ -802,7 +805,8 @@ mod tests {
     /// An empty input slice is an error, not a panic and not a NaN bbox.
     #[test]
     fn an_empty_input_slice_is_refused() {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         assert!(
             build(
                 &[],

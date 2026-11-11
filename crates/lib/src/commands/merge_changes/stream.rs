@@ -906,7 +906,8 @@ mod tests {
     /// coordinator, not the encoder's completion channel.
     #[test]
     fn encode_jobs_stay_on_the_executor_within_their_lanes() {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         for (threads, lanes) in [(6, 2), (1, 1), (3, 1)] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)

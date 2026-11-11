@@ -119,9 +119,16 @@ NAME` list each harness in turn to find one test.
   entries are the list. Arming a fault is not such a reason: fault
   state is per run (see "Conventions").
 - **What the shared binary shares.** Every module of `all` runs
-  concurrently in one process with: the global rayon pool; and
-  `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
-  Child processes inherit that limit. The sidecar metric sets (the
+  concurrently in one process with: `RLIMIT_NOFILE`, which the library
+  `all` raises to the hard limit once before `main`
+  (`crates/lib/tests/process_setup.rs`; the CLI and harness `all`
+  binaries leave the inherited limit alone), and which child processes
+  inherit; the real descriptors every test holds, which nothing bounds
+  (test hosts' grants are fixed, not reserved, so a host with a low hard
+  limit can still run out under heavy concurrency); and rayon's global
+  pool, which only a test choosing `Executor::Ambient` reaches, since
+  every test host carries an executor pool of its own. No fixture or host
+  constructor changes process state. The sidecar metric sets (the
   writers', the read pipeline's and the worker pools' stall counters)
   are not shared: each belongs to the `Invocation` a run is given, so a
   test that needs one run's exact count reads it from its own token
@@ -263,9 +270,17 @@ with an empty `data/`.
 **No test depends on the host.** No goldens blessed on one machine, no
 core-count, memory or rlimit preconditions. `common::test_host()` and,
 for unit tests under `crates/lib/src/`, `Host::for_tests()` hand the library a
-`host::Fixed` (a fixed core count and memory budget), so library
-tests see the same machine everywhere; a test that needs a
-different machine sets its own `host::Fixed`. Tests may still skip where
+`host::Fixed` (a fixed core count and memory budget), an executor pool
+of its own of the same four-thread width, and a descriptor provider
+granting every request `min(wanted, 1024)` without probing the process,
+so what the library is told and where its rayon work runs are the same
+everywhere and independent of sibling tests; a test that needs a
+different machine sets its own `host::Fixed`. `Executor::Ambient`
+appears in a test only where it is the subject, marked
+`// ambient-deliberate:` on its line. Each test owns its hosts and
+invocations: none is held in a static or leaked (`Host::entered` borrows
+an entered view from the test's own host). The real descriptor limit
+is shared, as "What the shared binary shares" says. Tests may still skip where
 the host lacks a feature (O_DIRECT, io_uring, osmium in PATH,
 unprivileged user namespaces).
 
@@ -687,7 +702,8 @@ exception, not a tier - should not survive across many PRs.
   a CI gate.
 
 `pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
-use `NoProcessActions`; the CLI raises its descriptor limit in a child. The
+get fixed descriptor grants from their test hosts; the CLI raises its
+descriptor limit in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
 It checks descriptor counting by a controlled delta (eight files opened
 between two counts) rather than assuming inherited descriptor numbers leave

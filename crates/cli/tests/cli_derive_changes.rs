@@ -1049,7 +1049,7 @@ fn derive_refuses_a_way_blob_claiming_another_kind() {
             path,
             Compression::default(),
             &header,
-            pbfhogg::host::Executor::Ambient,
+            crate::common::test_executor(),
         )
         .expect("create writer");
         let mut bb = BlockBuilder::new();

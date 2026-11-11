@@ -527,7 +527,8 @@ mod tests {
         }
 
         fn run(self) -> (Resolution, StringPool) {
-            let host = crate::host::Host::entered_for_tests();
+            let host_owner = crate::host::Host::for_tests();
+            let host = host_owner.entered();
             let resolution = resolve_interpolation_ways_mmap(
                 self.ways,
                 Table::new(&self.addr_bytes),

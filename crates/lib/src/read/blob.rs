@@ -1291,7 +1291,7 @@ mod tests {
         let walk_arm = |path: &std::path::Path| -> Result<usize> {
             let mut walker = super::super::header_walker::HeaderWalker::open(
                 path,
-                &crate::host::Host::entered_for_tests(),
+                &crate::host::Host::for_tests().entered(),
             )?;
             let mut count = 0;
             while walker.next_header()?.is_some() {

@@ -411,6 +411,57 @@ test_code = "only"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/common/process.rs"]
 message = "Use TestScratch::cell() for fixture names instead of a static name counter"
 
+# Test hosts are owned by the test that made them and drop with it: no
+# test holds a host, an entered host or an invocation in a static (inside a
+# function or a OnceLock included), so no two tests share a publication log,
+# counters, cancellation or lifecycle, and none leaks one with Box::leak.
+# Spelling-bound tripwires: a type alias escapes them.
+[[textlint]]
+name = "no-static-test-hosts"
+pattern = '\bstatic\s+\w+\s*:[^=]*\b(?:Host|Entered|Invocation)\b'
+paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
+region = "code"
+test_code = "only"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/common/process.rs"]
+message = "A test owns its Host, Entered and Invocation values; hand them through a per-test fixture, never a static"
+
+[[textlint]]
+name = "no-leak-in-tests"
+pattern = '\bBox::leak\b'
+paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
+except = ['//\s*leak-deliberate:\s*\S']
+region = "code"
+test_code = "only"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/common/process.rs"]
+message = "Test values drop with the test; keep the owner in the test and borrow from it (a deliberate leak carries `// leak-deliberate: why` on its line)"
+
+# Test hosts run their rayon work on a pool of their own
+# (`common::test_executor`, `Executor::for_tests`), so no test's width depends
+# on the runner or competes for the global pool. Ambient is chosen only where
+# it is the subject, marked on its line.
+[[textlint]]
+name = "no-ambient-executor-in-tests"
+pattern = '\bExecutor::Ambient\b'
+paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
+except = ['//\s*ambient-deliberate:\s*\S']
+region = "code"
+test_code = "only"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/common/process.rs"]
+message = "Tests use the test host's own executor pool; choose Executor::Ambient only where it is the subject, with `// ambient-deliberate: why` on its line"
+
+# The integration binary raises its descriptor limit once, before main
+# (crates/lib/tests/process_setup.rs); fixtures and host constructors
+# change no process state. The real-limit scenarios own their processes.
+[[textlint]]
+name = "no-limit-changes-in-test-fixtures"
+pattern = '\braise_nofile_to_hard_cap\b|\blibc::setrlimit\b'
+paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
+exclude = ["crates/lib/src/process.rs", "crates/lib/tests/process_setup.rs", "crates/lib/tests/process_nofile.rs", "crates/harness/tests/nofile.rs", "crates/cli/tests/invoker.rs"]
+region = "code"
+test_code = "only"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/common/mod.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs"]
+message = "Fixtures change no process state; the descriptor limit is raised once at start-up in crates/lib/tests/process_setup.rs, and real-limit scenarios own their processes"
+
 # FIFOs in the integration-test trees have two owners: creation is
 # crates/lib/tests/common/mod.rs make_fifo, draining is
 # crates/lib/tests/common/fifo_capture.rs, whose reader blocks in poll and is

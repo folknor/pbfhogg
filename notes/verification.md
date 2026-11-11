@@ -19,71 +19,29 @@ Findings are as reported by the hunters and have not been verified. Hunters read
 source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
-## VER-001 - test_host and Host::for_tests fix reported resources but not the executor
+## VER-130 - Concurrent tests in one binary share an unbounded descriptor limit
 
-Reported by lib-integration, fault-injection, lib-core-unit, lib-commands-unit,
-check-machinery.
+Test hosts hand the library fixed descriptor grants (`min(wanted, 1024)`,
+`common::FixedFdGrant` and `host::FixedFdGrant`), and the library `all` raises its
+soft `RLIMIT_NOFILE` once before `main` (`crates/lib/tests/process_setup.rs`). Nothing
+bounds the real descriptors concurrent tests hold: grants are not reservations, and
+later altw external stages, outputs, scratch and fixture preparation are outside any
+request. On a host whose hard limit is near 1024, two concurrent external joins can
+exhaust it. A request-level waiting budget was argued and rejected: waiting runs keep
+what they already opened, admitted runs keep opening, and tests that replace the
+provider (`fd_pool.rs`, the `host_contract.rs` concurrent joins) bypass it. Residue:
+gate whole descriptor-heavy scenarios before they acquire anything, or isolate them in
+their own process.
 
-`common::test_host` in `crates/lib/tests/common/mod.rs` and `Host::for_tests` in
-`crates/lib/src/host.rs` report fixed resources but select `Executor::Ambient`,
-and writer unit tests and the io_uring fault test choose it explicitly. Off a
-Rayon worker that reaches the process-global pool, whose width depends on the real
-host and Rayon configuration, and which concurrent tests contend for. Fixed
-reported resources do not guarantee the concurrency a parked-worker scenario
-needs. The `reference/testing.md` statement that tests see the same machine
-everywhere is too broad today.
+## VER-131 - Test executor pools are released, not joined
 
-Fix: hand ordinary tests an owned executor with explicit width and reserve ambient
-execution for tests of ambient behaviour. Enforcement: a fixture-host type and a
-source rule allowing `Executor::Ambient` only in named tests.
-
-## VER-002 - test_host mutates the process descriptor limit during fixture creation
-
-Reported by lib-integration, fault-injection, cli-tests, check-machinery.
-
-`common::test_host` raises `RLIMIT_NOFILE` once, discards the result, and returns a
-host whose process policy is `NoProcessActions`. Whichever test calls first
-decides when every sibling and later child changes. The `NoProcessActions` provider
-still probes the real descriptor count, so allowances vary with sibling tests and
-simultaneous descriptor-heavy tests can receive overlapping estimates, as the
-contract in `crates/lib/src/host.rs` warns. A high hard limit masks the coupling;
-a constrained host can refuse work or exhaust descriptors.
-
-Fix: separate host-value construction from process initialization, make limit setup
-an explicit harness step that reports its outcome, and coordinate descriptor-heavy
-tests through a reserving budget or isolated execution. Enforcement: a rule that
-host constructors and fixture factories make no process mutation, with real limit
-scenarios in their own target.
-
-## VER-003 - Unit test modules share one live invocation through statics
-
-Reported by lib-core-unit, lib-commands-unit.
-
-`crates/lib/src/output.rs` stores a publication token in a process-wide `OnceLock`,
-and the `run_host` helpers in `commands/getparents/mod.rs` and
-`commands/tags_filter/mod.rs` store an `Entered` host in one. Tests share the
-publication log, execution lock, counters, diagnostic suppression, cancellation and
-lifecycle. Independent scenarios serialize publication and keep each other's
-records, and safety rests on a promise that the host is never cancelled, armed or
-sealed. The comments justify sharing within a test, not across tests. Existing
-fault-state rules do not catch these statics.
-
-Fix: pass an owned per-test fixture holding the invocation and host. Enforcement:
-ban static `Host`, `Entered` and `Invocation` values in test code, including inside
-functions and `OnceLock`.
-
-## VER-004 - entered_for_tests and entered_leaked leak every host
-
-Reported by lib-core-unit, lib-commands-unit.
-
-These helpers in `crates/lib/src/host.rs` use `Box::leak`, retaining each host,
-invocation, instrumentation sink and fault-plan state until the binary exits. It
-need not leak threads today, but it makes adding an owned executor dangerous and
-prevents tests observing host destruction.
-
-Fix: keep the host in the fixture and borrow an entered view, or scope both in a
-closure helper. Enforcement: a lint against `Box::leak` in test infrastructure
-outside documented lifetime tests.
+Every test host owns a four-thread rayon pool (`common::test_executor`,
+`Executor::for_tests`) that drops with its test. Dropping the last owner of a rayon
+pool does not join its workers, so their exit and thread-local destructors run after
+the test returns, and no test can assert that a host's threads are gone when it drops.
+Residue: a fixture type owning the pool's join handles, joined once every executor
+owner is released (never on one of the pool's own workers), which every `test_host()`
+caller would then hold.
 
 ## VER-008 - "Product builds never enable test-hooks" is a convention
 

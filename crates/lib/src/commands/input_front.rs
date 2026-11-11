@@ -183,7 +183,8 @@ mod tests {
         let mut bytes = frame("OSMHeader", &[0xFF, 0xFF, 0xFF]);
         bytes.extend_from_slice(&frame("OSMData", &[0x00]));
         std::fs::write(&path, bytes).unwrap();
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
 
         let mut front = InputFront::open(&path, false, &host).unwrap();
         let refused = front
@@ -208,7 +209,8 @@ mod tests {
     #[test]
     fn header_only_is_indexed_and_headerless_is_missing_header() {
         let dir = crate::path_guard::tests::scratch();
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let header_only = dir.path().join("header-only.osm.pbf");
         std::fs::write(&header_only, frame("OSMHeader", &[])).unwrap();
         let mut front = InputFront::open(&header_only, false, &host).unwrap();

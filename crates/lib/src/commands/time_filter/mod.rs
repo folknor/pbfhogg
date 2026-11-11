@@ -1008,7 +1008,8 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let s = time_filter(
             input,
             staged,

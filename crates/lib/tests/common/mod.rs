@@ -56,8 +56,6 @@ pub fn out(path: impl AsRef<Path>) -> pbfhogg::Output {
     pbfhogg::Output::new(
         path.as_ref(),
         pbfhogg::Overwrite::Refuse,
-        // Not `test_host()`: that raises the process's descriptor limit,
-        // which the rlimit tests must observe unchanged.
         &pbfhogg::host::Diagnostics::discard(),
     )
     .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
@@ -69,8 +67,6 @@ pub fn out_replace(path: impl AsRef<Path>) -> pbfhogg::Output {
     pbfhogg::Output::new(
         path.as_ref(),
         pbfhogg::Overwrite::Replace,
-        // Not `test_host()`: that raises the process's descriptor limit,
-        // which the rlimit tests must observe unchanged.
         &pbfhogg::host::Diagnostics::discard(),
     )
     .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
@@ -503,7 +499,7 @@ pub fn write_indexed_pbf(
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
 
@@ -1736,17 +1732,48 @@ pub(crate) fn scratch_in(dir: impl AsRef<Path>) -> pbfhogg::scratch::RunScratch 
         .unwrap_or_else(|e| panic!("scratch in {}: {e}", dir.as_ref().display()))
 }
 
+/// The descriptor grant every request gets from a test host's provider.
+pub(crate) const TEST_FD_GRANT: u64 = 1024;
+
+/// A test host's descriptor provider: each request is granted
+/// `min(wanted, TEST_FD_GRANT)` as a host grant, a function of the request
+/// alone - never of sibling tests, outstanding reservations, the open count
+/// or the process limit. It reserves nothing and bounds no real descriptor
+/// use; tests of reserving behaviour build a `host::FdPool`.
+pub(crate) struct FixedFdGrant;
+
+impl pbfhogg::host::ProcessActions for FixedFdGrant {
+    fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
+        pbfhogg::process::FdReservation::unreserved(pbfhogg::process::FdAllowance::host_grant(
+            wanted.min(TEST_FD_GRANT),
+        ))
+    }
+}
+
+/// An executor pool of the test's own: four workers, matching
+/// [`fixed_resources`], so no test's rayon width depends on the runner or
+/// competes with a sibling test for the global pool. Dropping the last
+/// owner lets the workers exit; it does not join them.
+pub(crate) fn test_executor() -> pbfhogg::host::Executor {
+    pbfhogg::host::Executor::Pool(std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build a test executor pool"),
+    ))
+}
+
+/// A host for an in-process library test: fixed resources, an executor
+/// pool of its own, fixed descriptor grants and a fresh invocation. Builds
+/// no process state; the integration binary's descriptor limit is raised
+/// once at its start (`crates/lib/tests/all.rs`), never here.
 pub(crate) fn test_host() -> pbfhogg::host::Host {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        pbfhogg::process::raise_nofile_to_hard_cap();
-    });
     pbfhogg::host::Host {
         diagnostics: pbfhogg::host::Diagnostics::discard(),
-        process: std::sync::Arc::new(pbfhogg::host::NoProcessActions),
+        process: std::sync::Arc::new(FixedFdGrant),
         resources: std::sync::Arc::new(fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
-        executor: pbfhogg::host::Executor::Ambient,
+        executor: test_executor(),
         // A fresh token per call: a test that trips one cancels only itself,
         // and one that arms its fault plan (`pbfhogg::test_hooks`) faults
         // only its own run.

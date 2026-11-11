@@ -603,7 +603,7 @@ fn roundtrip_direct_io() {
         &path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     );
     let mut writer = match write_result {
         Ok(w) => w,
@@ -697,7 +697,7 @@ fn roundtrip_pipelined_direct_io() {
         &path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     );
     let mut writer = match write_result {
         Ok(w) => w,
@@ -776,7 +776,7 @@ fn roundtrip_uring_tiny_output() {
         &path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     ) {
         Ok(w) => w,
         Err(e) if crate::common::is_uring_unavailable(&e) => {
@@ -862,7 +862,7 @@ fn direct_writer_refuses_non_regular_targets() {
             &target,
             Compression::default(),
             &header,
-            pbfhogg::host::Executor::Ambient,
+            crate::common::test_executor(),
         );
         match result {
             Ok(_) => panic!("{}: accepted as a direct output", target.display()),
@@ -892,7 +892,7 @@ fn uring_writer_refuses_non_regular_targets() {
             &target,
             Compression::default(),
             &header,
-            pbfhogg::host::Executor::Ambient,
+            crate::common::test_executor(),
         );
         match result {
             Ok(_) => panic!("{}: accepted as an io_uring output", target.display()),

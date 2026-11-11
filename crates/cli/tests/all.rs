@@ -14,9 +14,12 @@
 //! the file>` (`cli_sort::backends::...`), so brokkr's tier filters keep
 //! matching.
 //!
-//! Every module here shares one process with every other, concurrently: the
-//! global rayon pool and `RLIMIT_NOFILE`, raised once by
-//! `common::test_host()` and inherited by every spawned binary.
+//! Every module here shares one process with every other, concurrently,
+//! and the inherited `RLIMIT_NOFILE`, which nothing here changes: the
+//! spawned `pbfhogg` binaries raise their own. `common::test_host()` gives
+//! each in-process host an executor pool of its own and fixed descriptor
+//! grants, so only a test choosing `Executor::Ambient` reaches the global
+//! rayon pool.
 //!
 //! `common` is the library package's `crates/lib/tests/common`, mounted by path, so its
 //! `cfg(feature = ...)` gates read this package's features (the same names).

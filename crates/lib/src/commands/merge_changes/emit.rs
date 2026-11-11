@@ -366,7 +366,7 @@ mod tests {
             parse_osc_path(
                 &path,
                 &mut sink,
-                &crate::host::Host::entered_for_tests().invocation,
+                &crate::host::Host::for_tests().entered().invocation,
             )?;
             sink.finish()?;
         }

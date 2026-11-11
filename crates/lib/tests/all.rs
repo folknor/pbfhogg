@@ -18,8 +18,11 @@
 //! the module prefix only prepends.
 //!
 //! Every module here shares one process with every other, concurrently. The
-//! process-wide state they share: the global rayon pool; and
-//! `RLIMIT_NOFILE`, raised once by `common::test_host()`. A test that needs
+//! process-wide state they share: `RLIMIT_NOFILE`, raised to the hard
+//! limit once before `main` by `process_setup`, and the real descriptors
+//! every test holds, which nothing bounds; and the global rayon pool, which
+//! a test reaches only by choosing `Executor::Ambient` (`common::test_host()`
+//! gives each host a pool of its own). A test that needs
 //! any of this state to itself gets its own `[[test]]` target in
 //! `Cargo.toml` with the reason beside it.
 //!
@@ -139,6 +142,8 @@ mod getparents;
 mod merge_pbf;
 mod non_indexed_parity;
 mod osc_parser_parity;
+#[cfg(target_os = "linux")]
+mod process_setup;
 mod proptests;
 mod publication;
 mod read_paths;

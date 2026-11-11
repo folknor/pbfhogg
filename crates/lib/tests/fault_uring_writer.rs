@@ -29,7 +29,7 @@ fn fault_injection_uring_writer_dispatch_panic_surfaces_via_flush() {
         &path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     ) {
         Ok(w) => w,
         Err(e) if crate::common::is_uring_unavailable(&e) => {

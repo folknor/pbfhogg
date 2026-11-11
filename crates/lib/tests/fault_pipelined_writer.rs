@@ -259,7 +259,7 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
         let dir = crate::common::test_scratch();
         // `open`'s writer type borrows the path, and the writer moves to
         // another thread below.
-        let path: &'static Path = Box::leak(dir.path().join("window.osm.pbf").into_boxed_path());
+        let path: &'static Path = Box::leak(dir.path().join("window.osm.pbf").into_boxed_path()); // leak-deliberate: a path, not a host
         let exited = Arc::new(AtomicUsize::new(0));
         let on_exit = Arc::clone(&exited);
         let pool = Arc::new(

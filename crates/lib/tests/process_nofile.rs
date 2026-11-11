@@ -84,7 +84,7 @@ fn injected_descriptor_counts_refuse_external_join_without_procfs() {
             process: Arc::new(InjectedCount(probe)),
             resources: Arc::new(common::fixed_resources()),
             page_cache: pbfhogg::host::PageCachePolicy::Keep,
-            executor: pbfhogg::host::Executor::Ambient,
+            executor: crate::common::test_executor(),
             invocation: pbfhogg::host::Invocation::new(),
         };
         let output = dir.path().join(format!("refused-{index}.pbf"));
@@ -107,8 +107,7 @@ fn external_join(
         &Default::default(),
         false,
         host,
-        // Made from the test's own host: `common::test_host` raises the soft
-        // limit this test is measuring.
+        // Made from the test's own host, whose provider is the one under test.
         pbfhogg::scratch::RunScratch::create(
             output.parent().unwrap_or(std::path::Path::new(".")),
             host,
@@ -126,14 +125,14 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
     let dir = common::test_scratch();
     let input = dir.path().join("base.osm.pbf");
     common::write_base_pbf(&input);
-    // Not common::test_host(): that raises the descriptor limit this test
-    // must see unraised.
+    // Not common::test_host(): its fixed grants never probe the limit this
+    // test measures.
     let host = Host {
         diagnostics: pbfhogg::host::Diagnostics::discard(),
         process: Arc::new(NoProcessActions),
         resources: Arc::new(common::fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
-        executor: pbfhogg::host::Executor::Ambient,
+        executor: crate::common::test_executor(),
         invocation: pbfhogg::host::Invocation::new(),
     };
     let set_soft = |soft: u64| {

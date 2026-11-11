@@ -605,15 +605,9 @@ fn process_block(
 
 #[cfg(test)]
 mod tests {
-
-    /// One host for this module's tests, so a run and the publication of
-    /// its output share an invocation (publication refuses another). Never
-    /// cancelled and never armed.
-    fn run_host() -> &'static crate::host::Entered<'static> {
-        static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =
-            std::sync::OnceLock::new();
-        HOST.get_or_init(crate::host::Host::entered_for_tests)
-    }
+    // Each scope owns its host. A run and the publication of its output
+    // share that host's invocation (publication refuses another), so a run
+    // and its bind take the same local host.
     use super::{
         FULL_SCAN_ARM_MIN_BLOBS, GetparentsOptions, ScanArm, getparents_dispatched,
         getparents_with_arm,
@@ -701,7 +695,9 @@ mod tests {
 
     /// `path` pinned, for driving an arm directly.
     fn pinned(path: &std::path::Path) -> crate::read::input::PinnedInput {
-        crate::read::input::PinnedInput::pin(path, run_host()).expect("pin input")
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        crate::read::input::PinnedInput::pin(path, &host).expect("pin input")
     }
 
     /// Write a node block, then optionally a way block, which can be written
@@ -747,7 +743,9 @@ mod tests {
 
     fn ids(path: &std::path::Path) -> Vec<i64> {
         let mut ids = Vec::new();
-        ElementReader::open_in(path, false, run_host())
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        ElementReader::open_in(path, false, &host)
             .expect("read output")
             .for_each(|element| match element {
                 Element::DenseNode(node) => ids.push(node.id()),
@@ -774,7 +772,9 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .expect("stage output");
-        let staged = staged.bind(&run_host().invocation).expect("open");
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let staged = staged.bind(&host.invocation).expect("open");
         getparents_with_arm(
             &pinned(&input),
             &staged,
@@ -783,7 +783,7 @@ mod tests {
             &WriteOptions::default(),
             &HeaderOverrides::default(),
             ScanArm::FullScan,
-            run_host(),
+            &host,
         )
         .expect("getparents");
         staged.publish().expect("publish");
@@ -806,7 +806,9 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .expect("stage output");
-            let staged = staged.bind(&run_host().invocation).expect("open");
+            let host_owner = crate::host::Host::for_tests();
+            let host = host_owner.entered();
+            let staged = staged.bind(&host.invocation).expect("open");
             getparents_with_arm(
                 &pinned(input),
                 &staged,
@@ -815,7 +817,7 @@ mod tests {
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 arm,
-                run_host(),
+                &host,
             )
             .expect("getparents");
             staged.publish().expect("publish");
@@ -938,7 +940,9 @@ mod tests {
     /// The output's elements as (kind, id), in file order.
     fn ordered(path: &std::path::Path) -> Vec<(char, i64)> {
         let mut out = Vec::new();
-        ElementReader::open_in(path, false, run_host())
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        ElementReader::open_in(path, false, &host)
             .expect("read output")
             .for_each(|element| match element {
                 Element::DenseNode(node) => out.push(('n', node.id())),
@@ -985,7 +989,9 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .expect("stage output");
-        let staged = staged.bind(&run_host().invocation).expect("open");
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let staged = staged.bind(&host.invocation).expect("open");
         let stats = getparents_with_arm(
             &pinned(input),
             &staged,
@@ -994,7 +1000,7 @@ mod tests {
             &WriteOptions::default(),
             &HeaderOverrides::default(),
             arm,
-            run_host(),
+            &host,
         )?;
         staged.publish().expect("publish");
         Ok(ArmRun {
@@ -1128,7 +1134,9 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .expect("stage output");
-            let staged = staged.bind(&run_host().invocation).expect("open");
+            let host_owner = crate::host::Host::for_tests();
+            let host = host_owner.entered();
+            let staged = staged.bind(&host.invocation).expect("open");
             let (arm, _) = getparents_dispatched(
                 &input,
                 &staged,
@@ -1137,7 +1145,7 @@ mod tests {
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 min_blobs,
-                run_host(),
+                &host,
             )
             .expect("getparents");
             staged.publish().expect("publish");

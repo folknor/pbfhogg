@@ -1939,36 +1939,62 @@ impl std::fmt::Debug for ResourcesHandle {
         f.write_str("ResourcesHandle")
     }
 }
+/// The unit tests' descriptor provider: every request is granted
+/// `min(wanted, 1024)` as a host grant, a function of the request alone -
+/// never of sibling tests, outstanding reservations, the open count or the
+/// process limit. It reserves nothing and bounds no real descriptor use;
+/// tests of reserving behaviour build an [`FdPool`].
+#[cfg(test)]
+pub(crate) struct FixedFdGrant;
+#[cfg(test)]
+impl ProcessActions for FixedFdGrant {
+    fn fd_allowance(&self, wanted: u64) -> FdReservation {
+        FdReservation::unreserved(crate::process::FdAllowance::host_grant(wanted.min(1024)))
+    }
+}
+
+#[cfg(test)]
+impl Executor {
+    /// A pool of the unit tests' own: four workers, matching the fixed
+    /// four-core [`Host::for_tests`] machine, so no test's rayon width
+    /// depends on the runner or competes with a sibling test for the global
+    /// pool. Dropping the last owner lets the workers exit; it does not
+    /// join them.
+    pub(crate) fn for_tests() -> Self {
+        Self::Pool(Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("build a test executor pool"),
+        ))
+    }
+}
+
 #[cfg(test)]
 impl Host {
-    /// Fixed resources: the same machine on every host, so no unit-test
-    /// outcome depends on the runner's core count or free memory.
+    /// The same machine on every runner: fixed resources (4 cores, 8 GiB),
+    /// an executor pool of its own of the same width, fixed descriptor
+    /// grants and a fresh invocation, so no unit-test outcome depends on
+    /// the runner or on a sibling test. Builds no process state.
     pub(crate) fn for_tests() -> Self {
         Self {
             diagnostics: Diagnostics::discard(),
-            process: Arc::new(NoProcessActions),
+            process: Arc::new(FixedFdGrant),
             resources: Arc::new(Fixed {
                 parallelism: NonZeroUsize::new(4),
                 memory_available: Some(8 << 30),
             }),
             page_cache: PageCachePolicy::Keep,
-            executor: Executor::Ambient,
+            executor: Executor::for_tests(),
             invocation: Invocation::new(),
         }
     }
 
-    /// [`for_tests`](Self::for_tests), entered: what a unit test hands the
-    /// crate's internal helpers, which take an entered host. The host is
-    /// leaked, so the entry can outlive the expression that made it.
-    pub(crate) fn entered_for_tests() -> Entered<'static> {
-        Self::for_tests().entered_leaked()
-    }
-
-    /// This host, leaked and entered, for a unit test that built its own.
-    pub(crate) fn entered_leaked(self) -> Entered<'static> {
-        Box::leak(Box::new(self))
-            .enter()
-            .expect("a fresh host's invocation is open")
+    /// This host entered, borrowed from the test that owns it: what a unit
+    /// test hands the crate's internal helpers. The host outlives the entry
+    /// and drops with the test.
+    pub(crate) fn entered(&self) -> Entered<'_> {
+        self.enter().expect("a test host's invocation is open")
     }
 }
 
@@ -2047,7 +2073,7 @@ mod tests {
     }
     #[test]
     fn executor_installs_and_knows_its_workers() {
-        assert_eq!(Executor::Ambient.install(|| 7), 7);
+        assert_eq!(Executor::Ambient.install(|| 7), 7); // ambient-deliberate: Ambient's own contract
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)

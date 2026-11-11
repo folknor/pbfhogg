@@ -4626,7 +4626,12 @@ mod derive_clock_tests {
                     memory_available: Some(8 << 30),
                 }),
                 page_cache: PageCachePolicy::Keep,
-                executor: Executor::Ambient,
+                executor: Executor::Pool(std::sync::Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(4)
+                        .build()
+                        .expect("test executor pool"),
+                )),
                 invocation: Invocation::new(),
             };
             let osc = dir.path().join(format!("changes-{jobs}.osc.gz"));

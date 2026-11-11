@@ -55,7 +55,7 @@ fn write_blobs(path: &Path, blobs: &[Blob]) {
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
     fill_blobs(blobs, |bytes| {

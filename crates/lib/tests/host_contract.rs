@@ -14,9 +14,9 @@ struct Actions {
     fd: AtomicUsize,
 }
 impl ProcessActions for Actions {
-    fn fd_allowance(&self, _wanted: u64) -> FdReservation {
+    fn fd_allowance(&self, wanted: u64) -> FdReservation {
         self.fd.fetch_add(1, Relaxed);
-        FdReservation::unreserved(pbfhogg::process::current_nofile())
+        crate::common::FixedFdGrant.fd_allowance(wanted)
     }
 }
 fn input(dir: &std::path::Path) -> std::path::PathBuf {
@@ -945,7 +945,7 @@ fn ambient_writer_inside_a_foreign_pool_flushes() {
                 &path,
                 Default::default(),
                 &empty_header(),
-                pbfhogg::host::Executor::Ambient,
+                pbfhogg::host::Executor::Ambient, // ambient-deliberate: Ambient inside a foreign pool is the subject
             )?;
             for _ in 0..POOL_BLOCKS {
                 writer.write_primitive_block(&EMPTY_BLOCK)?;
@@ -1180,9 +1180,12 @@ fn concurrent_external_joins_use_distinct_scratch() {
     let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
     struct Overlap(std::sync::Barrier);
     impl ProcessActions for Overlap {
-        fn fd_allowance(&self, _wanted: u64) -> FdReservation {
+        // Both requests meet at the barrier before either is granted, so
+        // the runs overlap; each grant is the fixed test grant, never a
+        // live probe that the other run's descriptors would move.
+        fn fd_allowance(&self, wanted: u64) -> FdReservation {
             self.0.wait();
-            FdReservation::unreserved(pbfhogg::process::current_nofile())
+            crate::common::FixedFdGrant.fd_allowance(wanted)
         }
     }
     let mut host = host;

@@ -407,7 +407,8 @@ mod tests {
     }
 
     fn run(input: &Path, output: &Path, direct_reads: bool) -> Vec<u8> {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let out = crate::output::Output::new(
             output,
             crate::output::Overwrite::Refuse,

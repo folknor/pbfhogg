@@ -1890,7 +1890,8 @@ mod tests {
     fn the_decoding_pools_refuse_a_contradicted_kind_claim() {
         let dir = crate::path_guard::tests::scratch();
         let path = write_way_blob_claiming_nodes(dir.path());
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let expected = Some(crate::KindContradiction {
             claimed: crate::ElementKind::Node,
             found: crate::ElementKind::Way,
@@ -2024,7 +2025,8 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
 
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let (schedules, input, _) =
             super::build_classify_schedules_split(&path, super::KindClaims::Refuse, &host).unwrap();
         let super::KindSchedules::Unindexed(blobs) = &schedules else {
@@ -2067,7 +2069,7 @@ mod tests {
             &path,
             None,
             UNCHECKED,
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(
@@ -2092,7 +2094,7 @@ mod tests {
                 merged += 1;
                 std::ops::ControlFlow::Break(())
             },
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
 
@@ -2121,7 +2123,7 @@ mod tests {
             |_position, ()| {
                 all.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");
@@ -2146,7 +2148,7 @@ mod tests {
             &path,
             None,
             UNCHECKED,
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(schedule.len(), BLOBS);
@@ -2198,7 +2200,7 @@ mod tests {
                         Ok(())
                     },
                     |_| {},
-                    &crate::host::Host::entered_for_tests(),
+                    &crate::host::Host::for_tests().entered(),
                 )
             }));
             (outcome, classified.into_inner())
@@ -2243,7 +2245,7 @@ mod tests {
             |seen| {
                 all.fetch_add(seen, Ordering::Relaxed);
             },
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a clean run classifies every blob");
@@ -2265,7 +2267,8 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let blobs = super::POOL_DESCRIPTOR_CHANNEL_DEPTH + 8;
         let path = write_many_blob_pbf(dir.path(), blobs);
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let (schedule, input) =
             super::build_classify_schedule(&path, None, UNCHECKED, &host).unwrap();
         assert_eq!(schedule.len(), blobs);
@@ -2325,7 +2328,7 @@ mod tests {
             &path,
             None,
             UNCHECKED,
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(schedule.len(), BLOBS);
@@ -2354,7 +2357,7 @@ mod tests {
                 merged.push(seq);
                 Ok(())
             },
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(merged, (0..BLOBS).collect::<Vec<_>>());
@@ -2370,7 +2373,8 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         const BLOBS: usize = 6;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let (schedule, input) =
             super::build_classify_schedule(&path, None, UNCHECKED, &host).unwrap();
         assert_eq!(schedule.len(), BLOBS);
@@ -2487,7 +2491,8 @@ mod tests {
         assert_eq!(err.byte_offset().map(|o| o.0), Some((1 << 40) - 4), "{err}");
 
         // A cancellation is not a fault of the input.
-        let cancelled = crate::host::Host::entered_for_tests();
+        let cancelled_owner = crate::host::Host::for_tests();
+        let cancelled = cancelled_owner.entered();
         let err = super::parallel_classify_phase(
             &input,
             &schedule,

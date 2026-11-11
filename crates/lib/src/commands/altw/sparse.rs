@@ -492,9 +492,11 @@ mod tests {
     #[test]
     fn failed_preallocation_leaves_no_file_in_scratch() {
         let dir = crate::path_guard::tests::scratch();
-        let scratch =
-            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
-                .unwrap();
+        let scratch = crate::scratch::RunScratch::create(
+            dir.path(),
+            &crate::host::Host::for_tests().entered(),
+        )
+        .unwrap();
         let mut called = false;
         let err = super::open_anonymous_sparse_file_with(&scratch, 4096, |file, path, bytes| {
             super::preallocate_sparse_file_with(file, path, bytes, bytes, |_, length| {
@@ -525,9 +527,11 @@ mod tests {
     #[test]
     fn successful_allocation_unlinks_the_store() {
         let dir = crate::path_guard::tests::scratch();
-        let scratch =
-            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
-                .unwrap();
+        let scratch = crate::scratch::RunScratch::create(
+            dir.path(),
+            &crate::host::Host::for_tests().entered(),
+        )
+        .unwrap();
         use std::io::{Read as _, Seek as _, Write as _};
 
         let names = || {

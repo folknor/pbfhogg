@@ -430,7 +430,8 @@ mod tests {
     /// threshold admits zero.
     #[test]
     fn drain_tells_key_rows_from_pairs_and_skips_storage_slots() {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let table = CountTable::new();
         let pair = |k: &str, v: &str, n| {
             let hash = pair_hash(k.as_bytes(), v.as_bytes());

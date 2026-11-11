@@ -1122,7 +1122,7 @@ mod scratch_tests {
     #[test]
     fn dropping_the_run_scratch_removes_all_sink_fragments() {
         let dir = crate::path_guard::tests::scratch();
-        let scratch = RunScratch::create(dir.path(), &crate::host::Host::entered_for_tests())
+        let scratch = RunScratch::create(dir.path(), &crate::host::Host::for_tests().entered())
             .expect("scratch");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _sink =

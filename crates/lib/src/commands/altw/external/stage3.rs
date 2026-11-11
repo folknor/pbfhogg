@@ -544,7 +544,7 @@ mod tests {
         let temp = crate::path_guard::tests::scratch();
         let scratch = crate::scratch::RunScratch::create(
             temp.path(),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .expect("run scratch");
         let worker_path = scratch.file("payloads-W0").expect("name");

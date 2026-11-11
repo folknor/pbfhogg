@@ -165,18 +165,13 @@ def lifecycle_errors(cli, scratch):
 STATIC_INVENTORY = {
     "crates/lib/src/fadvise.rs": {"static ATTEMPTS: RefCell<Vec<(Advice, Range)>> =": 1},
     "crates/lib/src/write/framing.rs": {"static PIPELINE_SCRATCH: RefCell<FrameScratch> =": 1},
-    "crates/lib/src/commands/getparents/mod.rs": {
-        "static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =": 1},
-    "crates/lib/src/commands/tags_filter/mod.rs": {
-        "static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =": 1},
     "crates/lib/src/threads.rs": {
         "static FINISHED: AtomicUsize =": 1,
         "static HELD: Cell<Option<SlowTeardown>> =": 1,
         "static LATE: AtomicBool =": 2},
     "crates/lib/src/error.rs": {"static FOREIGN_ROOT: ForeignRoot =": 1},
     "crates/lib/src/output.rs": {
-        "static SEQ: AtomicU64 =": 1,
-        "static TOKEN: std::sync::OnceLock<crate::host::Invocation> =": 1},
+        "static SEQ: AtomicU64 =": 1},
     "crates/lib/src/read/pipeline.rs": {
         "static ST_SCRATCH: RefCell<Vec<(u32, u32)>> =": 1,
         "static GR_SCRATCH: RefCell<Vec<(u32, u32)>> =": 1,

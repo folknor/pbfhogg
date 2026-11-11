@@ -897,7 +897,7 @@ mod tests {
     }
 
     fn run_scratch(dir: &Path) -> crate::scratch::RunScratch {
-        crate::scratch::RunScratch::create(dir, &crate::host::Host::entered_for_tests()).unwrap()
+        crate::scratch::RunScratch::create(dir, &crate::host::Host::for_tests().entered()).unwrap()
     }
 
     /// Every `id="N"` in document order.
@@ -968,7 +968,7 @@ mod tests {
                     )?,
                     MergeMode::Stream { scratch: run_dir },
                     parallelism,
-                    &crate::host::Host::entered_for_tests(),
+                    &crate::host::Host::for_tests().entered(),
                 )?;
                 assert_eq!(stats.changes_out, expected_ids.len() as u64);
                 let bytes = std::fs::read(output)?;
@@ -1047,18 +1047,18 @@ mod tests {
             )?,
             MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )?;
         let reference = std::fs::read(reference)?;
 
         // (members spilled first, promoted with the file open)
         for (first, open) in [(1, true), (1_000, false)] {
             let sink = std::sync::Arc::new(Counters::default());
-            let host = crate::host::Host {
+            let host_owner = crate::host::Host {
                 invocation: crate::host::Invocation::with_sink(std::sync::Arc::clone(&sink) as _),
                 ..crate::host::Host::for_tests()
-            }
-            .entered_leaked();
+            };
+            let host = host_owner.entered();
             let faults = host.invocation.faults();
             faults.merge_changes_spill_first.store(first, SeqCst);
             let dest = scratch.path().join(format!("out-{first}.osc"));
@@ -1140,7 +1140,7 @@ mod tests {
                 .unwrap(),
                 mode,
                 parallelism,
-                &crate::host::Host::entered_for_tests(),
+                &crate::host::Host::for_tests().entered(),
             )
             .unwrap_err()
             .to_string()
@@ -1209,7 +1209,7 @@ mod tests {
                 .unwrap(),
                 mode,
                 crate::host::Parallelism::from_jobs(1),
-                &crate::host::Host::entered_for_tests(),
+                &crate::host::Host::for_tests().entered(),
             )
             .unwrap();
             assert_eq!(stats.files, 2);
@@ -1232,7 +1232,8 @@ mod tests {
         jobs: usize,
         allow_version_regression: bool,
     ) -> crate::Result<Vec<u8>> {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let out = crate::output::bind_unissued(
             crate::output::Output::new(
                 output,
@@ -1272,7 +1273,7 @@ mod tests {
                 allow_version_regression,
             },
             crate::host::Parallelism::from_jobs(jobs),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )?;
         Ok(std::fs::read(output)?)
     }
@@ -1400,7 +1401,7 @@ mod tests {
             .unwrap(),
             MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .expect_err("a truncated input must be refused");
         assert!(
@@ -1439,7 +1440,7 @@ mod tests {
             .unwrap(),
             MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .expect_err("a truncated input must be refused");
         assert!(
@@ -1480,7 +1481,7 @@ mod tests {
             .unwrap(),
             MergeMode::Stream { scratch: None },
             crate::host::Parallelism::from_jobs(1),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .unwrap();
         assert_eq!(stats.changes_out, 1);

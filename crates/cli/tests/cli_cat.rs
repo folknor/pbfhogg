@@ -395,7 +395,7 @@ fn write_pbf_with_header(
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
     let mut bb = BlockBuilder::new();
@@ -1287,7 +1287,7 @@ fn write_sorted_pbf_with(
         path,
         Compression::default(),
         &header,
-        pbfhogg::host::Executor::Ambient,
+        crate::common::test_executor(),
     )
     .expect("create writer");
     let mut bb = BlockBuilder::new();

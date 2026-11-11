@@ -406,7 +406,7 @@ mod tests {
         plan_merge(
             &[a.into(), b.into()],
             &WriteOptions::default(),
-            &crate::host::Host::entered_for_tests(),
+            &crate::host::Host::for_tests().entered(),
         )
         .expect("pass 1")
     }
@@ -417,7 +417,8 @@ mod tests {
             crate::output::Overwrite::Refuse,
             &crate::host::Diagnostics::discard(),
         )?;
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let output = output.bind(&host.invocation)?;
         write_merge(
             plan,
@@ -458,7 +459,8 @@ mod tests {
         let (a, b) = fixtures(dir.path());
         let c = dir.path().join("c.osm.pbf");
         write_fixture_indexed(&c, &[Blob::Nodes(&[3, 4, 5]), Blob::Way(11)], false);
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let opts = |direct_reads| WriteOptions {
             direct_reads,
             force: true,
@@ -520,7 +522,7 @@ mod tests {
     #[cfg(feature = "linux-direct-io")]
     fn merged_output(
         dir: &std::path::Path,
-        host: &crate::host::Entered<'static>,
+        host: &crate::host::Entered<'_>,
         merge: MergePlan,
         opts: &WriteOptions,
         name: &str,
@@ -554,7 +556,8 @@ mod tests {
             return;
         }
         let (a, b) = fixtures(dir.path());
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let sources: [InputSource<'_>; 2] = [(&a).into(), (&b).into()];
         let buffered = plan_merge(&sources, &WriteOptions::default(), &host).expect("pass 1");
         assert!(

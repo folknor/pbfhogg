@@ -791,7 +791,7 @@ mod pin_tests {
     fn procfs_reopen_reads_the_pinned_file_after_a_replace_and_an_unlink() {
         let dir = crate::path_guard::tests::scratch();
         let (input, replacement) = fixture(dir.path());
-        let pin = PinnedInput::pin_with(&input, &Host::entered_for_tests(), false).unwrap();
+        let pin = PinnedInput::pin_with(&input, &Host::for_tests().entered(), false).unwrap();
         if !pin.reopens_through_procfs() {
             crate::test_support::skip(
                 "procfs cannot reopen the pinned file; path mode has its own test.",
@@ -827,7 +827,7 @@ mod pin_tests {
     fn path_reopen_refuses_a_replaced_input() {
         let dir = crate::path_guard::tests::scratch();
         let (input, replacement) = fixture(dir.path());
-        let pin = PinnedInput::pin_with(&input, &Host::entered_for_tests(), true).unwrap();
+        let pin = PinnedInput::pin_with(&input, &Host::for_tests().entered(), true).unwrap();
         assert!(!pin.reopens_through_procfs());
         assert_eq!(read_all(pin.open().unwrap()), b"original");
 
@@ -851,7 +851,7 @@ mod pin_tests {
         let (input, _) = fixture(dir.path());
         for force_path in [false, true] {
             let pin =
-                PinnedInput::pin_with(&input, &Host::entered_for_tests(), force_path).unwrap();
+                PinnedInput::pin_with(&input, &Host::for_tests().entered(), force_path).unwrap();
             let mut first = pin.open().unwrap();
             let mut second = pin.open().unwrap();
             let mut byte = [0u8; 1];
@@ -880,7 +880,7 @@ mod pin_tests {
         assert_eq!(input, dotted, "Path equality folds the `.`");
         let paths: [&Path; 5] = [&input, &other, &input, &dotted, &other];
         let sources = paths.map(InputSource::Path);
-        let pins = super::pin_sources(&sources, &Host::entered_for_tests()).unwrap();
+        let pins = super::pin_sources(&sources, &Host::for_tests().entered()).unwrap();
         let same = |i: usize, j: usize| std::sync::Arc::ptr_eq(&pins[i].0, &pins[j].0);
         assert!(same(0, 2) && same(1, 4));
         assert!(!same(0, 1) && !same(0, 3) && !same(1, 3));
@@ -897,7 +897,8 @@ mod pin_tests {
     fn pin_sources_keeps_caller_pins_apart_from_paths() {
         let dir = crate::path_guard::tests::scratch();
         let (input, _) = fixture(dir.path());
-        let host = Host::entered_for_tests();
+        let host_owner = Host::for_tests();
+        let host = host_owner.entered();
         let first = PinnedInput::pin(&input, &host).unwrap();
         let second = PinnedInput::pin(&input, &host).unwrap();
         let sources = [
@@ -925,7 +926,7 @@ mod pin_tests {
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let err = PinnedInput::pin(&fifo, &Host::entered_for_tests()).unwrap_err();
+        let err = PinnedInput::pin(&fifo, &Host::for_tests().entered()).unwrap_err();
         assert!(
             matches!(err.kind(), ErrorKind::InvalidArgument { .. }),
             "{err:?}"
@@ -941,7 +942,8 @@ mod pin_tests {
         let dir = crate::path_guard::tests::scratch();
         for force_path in [true, false] {
             let (input, replacement) = fixture(dir.path());
-            let host = Host::entered_for_tests();
+            let host_owner = Host::for_tests();
+            let host = host_owner.entered();
             host.invocation
                 .faults()
                 .force_pin_path_reopen

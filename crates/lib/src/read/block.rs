@@ -2605,7 +2605,8 @@ mod strict_validation_tests {
         use super::{BlockBuffer, NoProjection};
         use crate::read::wire_fixtures::{mutations, projection_fixtures};
 
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let pool = crate::blob::DecompressPool::new(&host.invocation);
         let (mut st, mut gr) = (Vec::new(), Vec::new());
         let returned = |what: &str| {

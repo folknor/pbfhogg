@@ -782,7 +782,8 @@ mod tests {
     use super::*;
 
     fn bound(path: &Path) -> crate::output::BoundOutput {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         crate::output::bind_unissued(
             crate::output::Output::new(
                 path,
@@ -796,7 +797,8 @@ mod tests {
     }
 
     fn owned(input: &Path, output: &Path, exprs: &[String]) -> (Vec<u8>, String) {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let out = bound(output);
         let expressions = parse_expressions(exprs).unwrap();
         let (filtered, stats) =
@@ -837,7 +839,11 @@ mod tests {
         let mut host = crate::host::Host::for_tests();
         let parallelism = match schedule {
             Schedule::Fixed(n) => crate::host::Parallelism::from_jobs(n),
-            Schedule::AutoAmbient => crate::host::Parallelism::Auto,
+            Schedule::AutoAmbient => {
+                // Auto on the CLI's executor, rayon's ambient pool.
+                host.executor = crate::host::Executor::Ambient; // ambient-deliberate: the CLI's executor
+                crate::host::Parallelism::Auto
+            }
             Schedule::AutoCallerPool => {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(1)

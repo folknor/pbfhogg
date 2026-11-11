@@ -1405,15 +1405,6 @@ fn collect_way_node_dependencies(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-
-    /// One host for this module's tests, so a run and the publication of
-    /// its output share an invocation (publication refuses another). Never
-    /// cancelled and never armed.
-    fn run_host() -> &'static crate::host::Entered<'static> {
-        static HOST: std::sync::OnceLock<crate::host::Entered<'static>> =
-            std::sync::OnceLock::new();
-        HOST.get_or_init(crate::host::Host::entered_for_tests)
-    }
     use super::*;
     use crate::ElementKind;
     use crate::owned::TypeFilter;
@@ -1516,21 +1507,23 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let staged = staged.bind(&run_host().invocation).unwrap();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let staged = staged.bind(&host.invocation).unwrap();
         tags_filter_single_pass(
-            &PinnedInput::pin(&input, run_host()).unwrap(),
+            &PinnedInput::pin(&input, &host).unwrap(),
             &staged,
             &expressions,
             false,
             false,
             &WriteOptions::default(),
             &HeaderOverrides::default(),
-            run_host(),
+            &host,
         )
         .unwrap();
         staged.publish().unwrap();
         let mut ids = Vec::new();
-        ElementReader::open_in(&output, false, run_host())
+        ElementReader::open_in(&output, false, &host)
             .unwrap()
             .for_each(|element| match element {
                 Element::DenseNode(node) => ids.push(node.id()),
@@ -1648,7 +1641,8 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let s = tags_filter(input, staged, &opts, &HeaderOverrides::default(), &host)?;
         let mut elements = Vec::new();
         ElementReader::open_in(&output, false, &host)

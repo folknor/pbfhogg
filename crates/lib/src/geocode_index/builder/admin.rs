@@ -450,7 +450,7 @@ mod tests {
             &relations,
             &way_geom,
             &BuildConfig::default(),
-            &crate::host::Executor::Ambient,
+            &crate::host::Executor::for_tests(),
         );
         assert_eq!(polygons.len(), 1, "the closed ring should assemble");
         assert_eq!(polygons[0].name_offset, 3);
@@ -515,7 +515,7 @@ mod tests {
             &relations,
             &way_geom,
             &BuildConfig::default(),
-            &crate::host::Executor::Ambient,
+            &crate::host::Executor::for_tests(),
         );
         assert_eq!(polygons.len(), 1);
         assert_eq!(polygons[0].name_offset, 2);
@@ -669,7 +669,7 @@ mod tests {
                 &relations,
                 &way_geom,
                 &config,
-                &crate::host::Executor::Ambient,
+                &crate::host::Executor::for_tests(),
             );
             assert_eq!(polygons.len(), 1);
             assert!(
@@ -718,7 +718,7 @@ mod tests {
             &relations,
             &way_geom,
             &BuildConfig::default(),
-            &crate::host::Executor::Ambient,
+            &crate::host::Executor::for_tests(),
         );
         let middle = (12.2 + w_lon / 2.0, lat0 + w_lat / 2.0);
         let answers: Vec<u32> = polygons
@@ -777,7 +777,7 @@ mod tests {
             &relations,
             &way_geom,
             &config,
-            &crate::host::Executor::Ambient,
+            &crate::host::Executor::for_tests(),
         );
         assert_eq!(polygons.len(), 1);
         let stored = &polygons[0].vertices;

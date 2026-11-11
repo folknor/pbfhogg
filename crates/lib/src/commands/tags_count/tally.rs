@@ -537,7 +537,8 @@ mod tests {
             (only(ElementKind::Way), Some(&overlapping)),
             (TypeFilter::all(), Some(&pairs)),
         ];
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let mut fixtures = projection_fixtures();
         fixtures.extend(tag_fixtures());
         for (what, bytes) in fixtures {
@@ -591,7 +592,8 @@ mod tests {
     /// written out, so a walk and a tally that drift together still fail.
     #[test]
     fn tag_rules_on_a_known_block() {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let (_, bytes) = tag_fixtures().swap_remove(0);
         let count = |texts: &[&str]| {
             let parsed =
@@ -646,7 +648,8 @@ mod tests {
     /// and 600 keys.
     #[test]
     fn counts_add_across_blobs_and_shards() {
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let words: Vec<String> = (0..600).map(|i| format!("w{i}")).collect();
         let mut strings: Vec<&str> = vec![""];
         strings.extend(words.iter().map(String::as_str));

@@ -2062,7 +2062,8 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap();
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let staged = staged.bind(&host.invocation).unwrap();
         getid_with_refs(
             &PinnedInput::pin(&input, &host).unwrap(),
@@ -2077,7 +2078,7 @@ mod tests {
         .unwrap();
         staged.publish().unwrap();
         assert_eq!(
-            read_ids(&output, &crate::host::Host::entered_for_tests()),
+            read_ids(&output, &crate::host::Host::for_tests().entered()),
             vec![1, 2, 10]
         );
     }
@@ -2096,7 +2097,8 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("partial.pbf");
         write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), false);
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         let pin = PinnedInput::pin(&input, &host).unwrap();
         let refused = |label: &str, result: Result<()>| {
             let err = result.expect_err(label);
@@ -2185,7 +2187,7 @@ mod tests {
             ids_from_both_arms(
                 &input,
                 &["n1", "w10"],
-                &crate::host::Host::entered_for_tests()
+                &crate::host::Host::for_tests().entered()
             ),
             vec![1, 10]
         );
@@ -2196,7 +2198,8 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
-        let host = crate::host::Host::entered_for_tests();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
         // Reject the node blob by kind, then by ID range while still asking
         // for nodes. In both cases the following way payload must be read.
         for query in [&["w10"][..], &["n999", "w10"][..]] {
@@ -2212,7 +2215,7 @@ mod tests {
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
         assert!(
-            ids_from_both_arms(&input, &["n999"], &crate::host::Host::entered_for_tests())
+            ids_from_both_arms(&input, &["n999"], &crate::host::Host::for_tests().entered())
                 .is_empty()
         );
     }
@@ -2223,7 +2226,7 @@ mod tests {
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], None, true);
         assert_eq!(
-            ids_from_both_arms(&input, &["n2"], &crate::host::Host::entered_for_tests()),
+            ids_from_both_arms(&input, &["n2"], &crate::host::Host::for_tests().entered()),
             vec![2]
         );
     }
@@ -2284,7 +2287,8 @@ mod tests {
         for direct in directs {
             write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
             let reference = dir.path().join("reference.pbf");
-            let host = crate::host::Host::entered_for_tests();
+            let host_owner = crate::host::Host::for_tests();
+            let host = host_owner.entered();
             host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, OPENS + 1);
@@ -2314,7 +2318,8 @@ mod tests {
                     // Other IDs entirely: a run that read any of it would
                     // write different bytes.
                     write_blocks(&replacement, &[1_001, 1_002], Some((1_010, &[1_001])), true);
-                    let host = crate::host::Host::entered_for_tests();
+                    let host_owner = crate::host::Host::for_tests();
+                    let host = host_owner.entered();
                     host.invocation
                         .faults()
                         .force_pin_path_reopen
@@ -2377,7 +2382,8 @@ mod tests {
                 &crate::host::Diagnostics::discard(),
             )
             .unwrap();
-            let host = crate::host::Host::entered_for_tests();
+            let host_owner = crate::host::Host::for_tests();
+            let host = host_owner.entered();
             let staged = staged.bind(&host.invocation).unwrap();
             let (arm, _) = getid_dispatched(
                 &input,
@@ -2393,7 +2399,7 @@ mod tests {
             staged.publish().unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
-                read_ids(&output, &crate::host::Host::entered_for_tests()),
+                read_ids(&output, &crate::host::Host::for_tests().entered()),
                 vec![1, 10]
             );
         }

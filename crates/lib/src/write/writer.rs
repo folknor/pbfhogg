@@ -1636,7 +1636,7 @@ mod tests {
         let path = dir.path().join("malformed.pbf");
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let mut writer =
-            PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
+            PbfWriter::to_path(&path, Compression::None, &header, Executor::for_tests()).unwrap();
         // The worker reports on the ordered channel; enqueue may succeed.
         let queued = writer.write_primitive_block(&[0x80]);
         let flushed = writer.flush();
@@ -1666,7 +1666,7 @@ mod tests {
                 window_rx,
                 handle,
                 SeqTotal::new(),
-                Executor::Ambient,
+                Executor::for_tests(),
                 invocation.clone(),
             ),
             invocation,
@@ -1738,7 +1738,7 @@ mod tests {
         let path = dir.path().join("post-flush.osm.pbf");
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let mut w =
-            PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
+            PbfWriter::to_path(&path, Compression::None, &header, Executor::for_tests()).unwrap();
         w.flush().unwrap();
         let err = w
             .write_raw(b"anything")
@@ -1853,7 +1853,8 @@ mod tests {
 
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let mut w =
-            PbfWriter::to_path(&out_path, Compression::None, &header, Executor::Ambient).unwrap();
+            PbfWriter::to_path(&out_path, Compression::None, &header, Executor::for_tests())
+                .unwrap();
 
         let input = crate::read::input::InputFile::from_parts(
             Arc::new(std::fs::File::open(&input_path).unwrap()),
@@ -1901,7 +1902,7 @@ mod tests {
 
         let path = dir.path().join("durable.osm.pbf");
         let mut w =
-            PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
+            PbfWriter::to_path(&path, Compression::None, &header, Executor::for_tests()).unwrap();
         w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
         w.flush().unwrap();
         assert_eq!(
@@ -2116,9 +2117,13 @@ mod tests {
                     counted(&w)
                 }
                 "buffered" => {
-                    let mut w =
-                        PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient)
-                            .unwrap();
+                    let mut w = PbfWriter::to_path(
+                        &path,
+                        Compression::None,
+                        &header,
+                        Executor::for_tests(),
+                    )
+                    .unwrap();
                     fill(&mut w, &block, &raw);
                     counted(&w)
                 }
@@ -2127,7 +2132,7 @@ mod tests {
                         &path,
                         Compression::None,
                         &header,
-                        Executor::Ambient,
+                        Executor::for_tests(),
                     )
                     .unwrap();
                     fill(&mut w, &block, &raw);

@@ -90,6 +90,8 @@ mod fault_extract_input;
 mod fault_geocode_input;
 #[cfg(all(feature = "test-hooks", feature = "commands"))]
 mod fault_geocode_pass3;
+#[cfg(all(feature = "test-hooks", feature = "commands"))]
+mod fault_geocode_smoke;
 #[cfg(feature = "test-hooks")]
 mod fault_getid_input;
 #[cfg(feature = "test-hooks")]

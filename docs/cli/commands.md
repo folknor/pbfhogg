@@ -2147,7 +2147,10 @@ a coarser level.
 
 Every build writes a complete generation in a staging directory (beside the
 output directory, or in `--staging-dir`) and
-publishes it only after the build and smoke test succeed; `--overwrite` (or
+publishes it only after the build and smoke test succeed. The smoke test opens
+the written index with the reader's validation and checks that the first
+address point is listed in its own fine and coarse cell; a failure fails the
+build. `--overwrite` (or
 legacy `--force`) lets that publication replace an existing index. Failed
 builds leave the existing index intact. Publication moves the old directory aside, moves
 the new one into place, then removes the old files. Already-open readers keep

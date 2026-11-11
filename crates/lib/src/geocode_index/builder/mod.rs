@@ -146,18 +146,18 @@ impl BuildConfig {
     }
 }
 
-/// Result of the builder's query smoke test.
+/// Result of the builder's post-write smoke test. A failed check is not an
+/// outcome: the build returns an error and publishes nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SmokeOutcome {
-    /// No address point was written, so there was no query coordinate.
+    /// No address point was written, so there was no record to check.
     #[default]
     SkippedNoAddressPoints,
-    /// The query at the first address point found an address or a street.
+    /// The written index opened, and the first address point is listed in
+    /// its own fine cell and its own coarse cell. This is placement in the
+    /// written lists, not a claim about what a query ranks first.
     Passed,
-    /// The query at the first address point found neither an address nor a
-    /// street. The coordinates are in decimicrodegrees (10^-7 degrees).
-    NoMatch { latitude_e7: i32, longitude_e7: i32 },
 }
 
 /// Build statistics.
@@ -830,9 +830,21 @@ fn build_generation(
 
     // `Reader::open` runs the same record and string validation described on
     // its public API, so this smoke test intentionally repeats that structural
-    // pass on the files just written before querying the result. Its work is
-    // part of the build wall time; skipping it would leave written output
-    // unchecked by the reader path.
+    // pass on the files just written. Its work is part of the build wall
+    // time; skipping it would leave written output unchecked by the reader
+    // path.
+    //
+    // The semantic part checks one stated claim: address record 0 is listed
+    // in its own fine and its own coarse cell, the cells Pass 3 filed it
+    // under, each level judged on its own. It used to be a query at that
+    // point that passed on any address or street and only warned on a miss,
+    // so a broken address list could hide behind a nearby street and still
+    // publish. A membership check needs no radius (a zero radius is valid
+    // and would make a distance-based probe miss its own point) and no
+    // ranking (a colocated address cannot shadow record 0). Every address
+    // record gets one entry per level unconditionally, so no input can make
+    // it miss: a miss is a builder bug and refuses publication. Public query
+    // behaviour is the tests' to prove, not this check's.
     let first_addr_point = if addr_point_count > 0 {
         Some(addr_points.table().get(0).ok_or_else(|| {
             Error::internal(
@@ -851,38 +863,27 @@ fn build_generation(
         );
         let test_reader = super::reader::Reader::open(output_dir)?;
         if let Some(first_addr_point) = first_addr_point {
-            let result = test_reader
-                .query(
+            let (fine_cell, coarse_cell) =
+                pass3::addr_point_cells(first_addr_point.lat_e7, first_addr_point.lon_e7, sl, cl);
+            let (fine, coarse) = test_reader.address_listed_in(0, fine_cell, coarse_cell);
+            if !(fine && coarse) {
+                let missing = match (fine, coarse) {
+                    (false, false) => "fine and coarse cells",
+                    (false, true) => "fine cell",
+                    _ => "coarse cell",
+                };
+                return Err(Error::internal(format!(
+                    "geocode smoke test: address point 0 at ({:.7}, {:.7}) is not listed in its \
+                     own {missing}; refusing to publish",
                     e7_to_deg(f64::from(first_addr_point.lat_e7)),
                     e7_to_deg(f64::from(first_addr_point.lon_e7)),
-                )
-                .map_err(|e| Error::internal_with("geocode smoke test query failed", e))?;
-            if result.address.is_none() && result.street.is_none() {
-                crate::host::diag!(
-                    host.diagnostics,
-                    Warning,
-                    "geocode.smoke_test.no_match",
-                    "smoke test query at ({:.7}, {:.7}) in index {} returned no address \
-                     or street match",
-                    e7_to_deg(f64::from(first_addr_point.lat_e7)),
-                    e7_to_deg(f64::from(first_addr_point.lon_e7)),
-                    output_dir.display()
-                );
-                SmokeOutcome::NoMatch {
-                    latitude_e7: first_addr_point.lat_e7,
-                    longitude_e7: first_addr_point.lon_e7,
-                }
-            } else {
-                SmokeOutcome::Passed
+                )));
             }
+            SmokeOutcome::Passed
         } else {
             SmokeOutcome::SkippedNoAddressPoints
         }
     };
-    host.invocation.counter(
-        "geocode_smoke_test_no_match",
-        matches!(smoke_test, SmokeOutcome::NoMatch { .. }),
-    );
 
     #[cfg(feature = "hotpath")]
     let pass4_ms = pass4_start.elapsed_ms();

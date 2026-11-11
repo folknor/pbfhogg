@@ -169,6 +169,54 @@ fn cover_way_segments(
 
 // Bucket files hold `format::BucketRecord`s.
 
+/// The fine and coarse cells an address point is filed under: its own cell
+/// at each level, the coarse one taken as the fine one's parent. The
+/// builder's post-write membership check derives its keys from this same
+/// function, so the two cannot drift apart.
+pub(super) fn addr_point_cells(
+    lat_e7: i32,
+    lon_e7: i32,
+    fine_level: u8,
+    coarse_level: u8,
+) -> (u64, u64) {
+    let ll = LatLng::from_degrees(e7_to_deg(f64::from(lat_e7)), e7_to_deg(f64::from(lon_e7)));
+    let fine_cid = CellID::from(ll).parent(u64::from(fine_level)).0;
+    let coarse_cid = CellID(fine_cid).parent(u64::from(coarse_level)).0;
+    (fine_cid, coarse_cid)
+}
+
+/// Test-only: the fault plan's `geocode_misfile_address`, which files one
+/// address point at one level under its antipode's cell instead of its own,
+/// leaving every other entry (streets included) where it belongs.
+#[cfg(feature = "test-hooks")]
+fn misfile_address(
+    faults: &crate::test_hooks::FaultPlan,
+    idx: usize,
+    pt: AddrPoint,
+    fine_cid: u64,
+    coarse_cid: u64,
+    fine_level: u8,
+    coarse_level: u8,
+) -> (u64, u64) {
+    let Some((target, level)) = faults.geocode_misfile_address() else {
+        return (fine_cid, coarse_cid);
+    };
+    if target != idx {
+        return (fine_cid, coarse_cid);
+    }
+    let antipode_lon = if pt.lon_e7 > 0 {
+        pt.lon_e7 - 1_800_000_000
+    } else {
+        pt.lon_e7 + 1_800_000_000
+    };
+    let (far_fine, far_coarse) =
+        addr_point_cells(-pt.lat_e7, antipode_lon, fine_level, coarse_level);
+    match level {
+        crate::test_hooks::GeocodeCellLevel::Fine => (far_fine, coarse_cid),
+        crate::test_hooks::GeocodeCellLevel::Coarse => (fine_cid, far_coarse),
+    }
+}
+
 fn bucket_for_cell(cell_id: u64) -> usize {
     (cell_id >> 56) as usize
 }
@@ -546,12 +594,18 @@ pub(super) fn bucketed_cell_assignment_fused(
                         first_missing_addr.fetch_min(idx, AtomicOrdering::Relaxed);
                         return None;
                     };
-                    let ll = LatLng::from_degrees(
-                        e7_to_deg(pt.lat_e7 as f64),
-                        e7_to_deg(pt.lon_e7 as f64),
+                    let (fine_cid, coarse_cid) =
+                        addr_point_cells(pt.lat_e7, pt.lon_e7, fine_level, coarse_level);
+                    #[cfg(feature = "test-hooks")]
+                    let (fine_cid, coarse_cid) = misfile_address(
+                        cancel.faults(),
+                        idx,
+                        pt,
+                        fine_cid,
+                        coarse_cid,
+                        fine_level,
+                        coarse_level,
                     );
-                    let fine_cid = CellID::from(ll).parent(fine_level as u64).0;
-                    let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
                     Some((
                         fine_cid,
                         coarse_cid,

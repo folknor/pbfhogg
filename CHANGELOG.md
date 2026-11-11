@@ -16,6 +16,14 @@
 
 ### Changed
 
+- **`build-geocode-index` refuses to publish an index whose smoke test
+  fails.** The smoke test used to query the first address point and pass on
+  any address or street, only warning on a miss and publishing anyway; it now
+  checks that the first address point is listed in its own fine and coarse
+  cell, and a miss fails the build with an internal error, leaving any
+  existing index in place. `SmokeOutcome::NoMatch`, the
+  `geocode.smoke_test.no_match` warning and the
+  `geocode_smoke_test_no_match` sidecar counter are gone.
 - **Gzip checksums use the CPU's carry-less multiply where it has one.**
   They always ran a table-driven fallback before. Planet `merge-changes`
   over seven daily diffs drops from 3.6 to 2.8 s, and with `--simplify` from

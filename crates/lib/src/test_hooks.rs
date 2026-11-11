@@ -389,6 +389,10 @@ pub struct FaultPlan {
     // --- geocode builder pass 3 ---
     /// Street way index at which the Stage A streets worker panics.
     pub geocode_streets_panic_at_way: AtomicU32,
+    /// Address point index Pass 3 files under the wrong cell at one level;
+    /// see [`arm_geocode_misfile_address`](Self::arm_geocode_misfile_address).
+    geocode_misfile_address_at: AtomicUsize,
+    geocode_misfile_address_coarse: AtomicBool,
 
     // --- pinned inputs (`read::input::PinnedInput`) ---
     /// Pin every input taken under this token as on a host whose
@@ -428,6 +432,13 @@ pub enum SealStep {
     /// before the terminal record: a panic here ends the stream `failed`,
     /// and the invocation is sealed regardless.
     Stream,
+}
+
+/// A geocode cell level, for [`FaultPlan::arm_geocode_misfile_address`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeocodeCellLevel {
+    Fine,
+    Coarse,
 }
 
 /// An armed input replacement and what it observed; see
@@ -579,6 +590,8 @@ impl FaultPlan {
             altw_stage4_way0_entered: AtomicBool::new(false),
             altw_hook_timed_out: AtomicBool::new(false),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
+            geocode_misfile_address_at: AtomicUsize::new(usize::MAX),
+            geocode_misfile_address_coarse: AtomicBool::new(false),
             force_pin_path_reopen: AtomicBool::new(false),
             input_replacement: Mutex::new(None),
             publish_faults: Mutex::new(Vec::new()),
@@ -644,6 +657,31 @@ impl FaultPlan {
         self.input_replacement
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Make the geocode builder's Pass 3 file address point `index` at
+    /// `level` under its antipode's cell instead of its own, as a broken cell
+    /// assignment would, leaving its entry at the other level and every
+    /// street entry in place.
+    pub fn arm_geocode_misfile_address(&self, index: usize, level: GeocodeCellLevel) {
+        self.geocode_misfile_address_coarse
+            .store(level == GeocodeCellLevel::Coarse, Ordering::Relaxed);
+        self.geocode_misfile_address_at
+            .store(index, Ordering::Relaxed);
+    }
+
+    /// The armed address misfiling, if any.
+    pub(crate) fn geocode_misfile_address(&self) -> Option<(usize, GeocodeCellLevel)> {
+        let index = self.geocode_misfile_address_at.load(Ordering::Relaxed);
+        if index == usize::MAX {
+            return None;
+        }
+        let level = if self.geocode_misfile_address_coarse.load(Ordering::Relaxed) {
+            GeocodeCellLevel::Coarse
+        } else {
+            GeocodeCellLevel::Fine
+        };
+        Some((index, level))
     }
 
     /// Rename `replacement` over `target` right after the `after`-th open of

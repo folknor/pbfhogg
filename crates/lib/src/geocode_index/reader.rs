@@ -1400,6 +1400,40 @@ impl ClassBounds {
 // ---------------------------------------------------------------------------
 
 impl Reader {
+    /// Whether address record `index` appears in the address list of the
+    /// fine cell `fine_cell` and of the coarse cell `coarse_cell`, judged per
+    /// level. This is the builder's post-write membership check: the cell
+    /// keys come from the same formula Pass 3 filed the record under, so no
+    /// radius, distance or ranking takes part, and a zero search radius or a
+    /// colocated address cannot change the answer. It proves placement in the
+    /// written lists, not public query behaviour, which tests own.
+    pub(crate) fn address_listed_in(
+        &self,
+        index: u32,
+        fine_cell: u64,
+        coarse_cell: u64,
+    ) -> (bool, bool) {
+        let listed = |cells: &Records<GeoCell>, entries: &Lists<AddrEntry>, cell_id: u64| {
+            cells
+                .table()
+                .find_by_key(cell_id, |cell| cell.cell_id)
+                .is_some_and(|gc| {
+                    entries
+                        .entries(gc.addr_offset)
+                        .iter()
+                        .any(|entry| entry.addr_index == index)
+                })
+        };
+        (
+            listed(&self.geo_cells, &self.addr_entries, fine_cell),
+            listed(
+                &self.coarse_geo_cells,
+                &self.coarse_addr_entries,
+                coarse_cell,
+            ),
+        )
+    }
+
     /// Classes the index holds records of: a class with none is never
     /// searched, at either level.
     fn present_kinds(&self) -> SearchKinds {

@@ -18,23 +18,6 @@
 Findings are as reported by the hunters and have not been verified. Costs and
 behaviour are derived from source reading unless an entry says otherwise.
 
-## BUG-006 - The geocode builder's smoke check can pass after address lookup breaks
-
-The smoke query in `crates/lib/src/geocode_index/builder/mod.rs` queries the first
-stored address point but reports `Passed` when it finds either an address or a
-street. A broken address index can be masked by a nearby street, and any address
-result passes without its identity or distance being checked. The enum accurately
-documents this weak condition, so the hunter calls it a weak check rather than a
-contradiction. It pays for opening and validating the whole newly written index
-while its query component establishes little about address retrieval. A complete
-miss is only a warning and still permits publication.
-
-Fix: separate structural validation from a stated semantic check. If the claim is
-address retrievability, verify an exact-coordinate candidate through an API that
-exposes candidates and handles colocated addresses. Enforcement: a test that
-removes address-cell entries while retaining street entries. Whether failure
-should block publication is a product policy decision.
-
 ## BUG-007 - bench-read relation mode turns a role decode error into an empty role
 
 Lateral finding from the BUG-002 scout, not yet judged. The `bench-read` relation

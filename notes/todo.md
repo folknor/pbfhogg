@@ -31,15 +31,15 @@ Picked for 0.6.0 on 2026-07-30, right after the 0.5.0 release; deferred
 when 0.6.0 was cut down to the library gate, multi-extract descriptor
 admission and the regressions.
 
-- [ ] **`Executor` lane limit: planet confirmation** (landed 2026-11-10,
-  unmeasured): merge-changes and the OSC tags-filter now run on the host
-  executor at every `Parallelism`, `Fixed(n)` as a lane limit
-  (`merge_changes::stream::Encoder`, `simplify::sort_in_lanes`). Matched
-  planet A/B against the parent commit: `merge-diffs` default and
-  `--simplify yes` (Auto: only the lane queue plumbing changed, expect
-  noise), and `tag-select --input-kind osc` at default and `--jobs 4`
-  (the `-j` arm changes threading: a shared global pool with 4 lanes
-  instead of a dedicated 4-thread pool). Record in reference/performance.
+- [ ] **`Executor` lane limit: the `-j` arm on planet** (landed 2026-11-10):
+  merge-changes and the OSC tags-filter now run on the host executor at
+  every `Parallelism`, `Fixed(n)` as a lane limit
+  (`merge_changes::stream::Encoder`, `simplify::sort_in_lanes`). The Auto
+  cells are done; the simplify slowdown they showed was a page-splitting
+  CRC load, not the lanes (reference/performance/merge-changes.md). Left:
+  a matched planet A/B of `tag-select --input-kind osc --jobs 4` against
+  the parent commit (a shared global pool with 4 lanes instead of a
+  dedicated 4-thread pool). Record in reference/performance.
 
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).

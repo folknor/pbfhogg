@@ -8,6 +8,52 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Hardware gzip CRC (bygg, 2026-11-11, `9b76817b` + change)
+
+flate2 builds zlib-rs without its `std` feature, and without `std` zlib-rs
+never detects carry-less multiply at runtime, so every gzip CRC ran the
+table-driven braid code. A direct `zlib-rs` dependency with `std` turns the
+detection on through feature unification. Both arms `--commit`,
+`--iterations 1`:
+
+| Cell | `9b76817b` | `9b76817b` + `std` |
+|---|---|---|
+| planet merge-diffs 4914..4920 `--simplify yes` | 6.2 s (`5c5f081e`) | 4.2, 4.2 s (`45991a26`, `282dad7a`) |
+| planet merge-diffs 4914..4920 | 3.6 s (`eeb1edf8`) | 2.8 s (`7a125123`) |
+
+`brokkr verify merge-changes --dataset denmark` passes on the change.
+
+### Simplify slowdown traced to a page-splitting CRC load (bygg, 2026-11-11)
+
+`5de56b61` (Executor lanes and joined scopes) took planet
+`merge-diffs 4914..4920 --simplify yes` from 5.4 s to 6.2 s with no real
+cost of its own. The loss was all in the parse phase (3.17 to 3.94 s), with
+`merge_changes_decompress_ns` on the readers at 2.54 s against 1.63 s on
+identical input. `9b76817b` did not recover it. Reverting either half of
+`5de56b61` did, and so did changes that only move the reader stack:
+
+| Build, against main at `9b76817b` | Wall | UUIDs |
+|---|---|---|
+| main, control | 6.2, 6.1 s | `9fa3203d`, `ae863eed` |
+| `fa5b4d5e`, the parent of `5de56b61`, control | 5.4 s | `28ad7c87` |
+| main, readers on a raw `std` scope | 5.3, 5.3 s | `f4a4b1b9`, `a03ac853` |
+| main, merge-changes as of `fa5b4d5e`, joined scope kept | 5.4, 5.4 s | `5883bfac`, `de820680` |
+| main + 16, 32, 48 bytes of unused code | 6.2, 6.2, 6.1 s | `e25c61e1`, `44d1ecc5`, `28ecea2e` |
+| main + one leaked 64-byte heap block | 6.1 s | `0c5278ea` |
+| main, reader stack shifted 1040 bytes | 5.4, 5.4 s | `12046bb2`, `5abeb633` |
+| main, reader stack shifted 4096 bytes | 6.2 s | `461f6d13` |
+
+The code padding moved `inflate` through all four 16-byte offsets within a
+cache line, the fast variant's placement included, without moving the wall,
+so function alignment is not the cause. `perf stat` around `brokkr bench` on
+the two stack-shift builds (`17d73bd6` at 4096, `8b50acbd` at 1040) counted
+13.6 G against 0.15 G `ls_misal_loads.ma4k`; `ls_bad_status2.stli_other` was
+6.65 G against 6.23 G, so this is not 4K aliasing. Sampling that event put
+the page-crossing loads in `zlib_rs::crc32::braid::braid_core`, a 32-byte
+vector load from its on-stack `[usize; 5]`, which straddles a page at some
+stack positions. `braid_core` was 12 % of all user cycles on the slow build.
+The hardware CRC above takes bulk checksums off that code.
+
 ### Delete bodies kept (bygg, 2026-11-10, `f5e01579` against `17644689`)
 
 merge-changes and the OSC tags-filter write a delete's tags, refs,

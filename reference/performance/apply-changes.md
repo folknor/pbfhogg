@@ -27,6 +27,14 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### Hardware gzip CRC is neutral (bygg, 2026-11-11, `9b76817b` + change)
+
+zlib-rs with `std`, so gzip checksums use carry-less multiply (see
+merge-changes.md, "Hardware gzip CRC"). After a trim, `--iterations 1`, both
+arms `--commit`, A B B A, planet apply-diff of OSC 4913: `9b76817b` 191.6,
+195.2 s (`da7362cb`, `054477fc`); with `std` 194.2, 194.2 s (`a573fdd4`,
+`8bd4c062`). The 0.4 % between the means is noise.
+
 ### Descriptor-first streaming pipeline
 
 Three-stage pipeline replacing the per-batch rayon barrier:

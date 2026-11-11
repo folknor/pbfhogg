@@ -16,6 +16,10 @@
 
 ### Changed
 
+- **Gzip checksums use the CPU's carry-less multiply where it has one.**
+  They always ran a table-driven fallback before. Planet `merge-changes`
+  over seven daily diffs drops from 3.6 to 2.8 s, and with `--simplify` from
+  6.2 to 4.2 s. `apply-changes` on planet is unchanged.
 - **`merge-changes` and the OSC `tags-filter` with `-j N` /
   `Parallelism::Fixed(n)` run on the host's executor** instead of building a
   pool of their own: `n` now caps how many of their jobs run at once there

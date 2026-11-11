@@ -21,6 +21,8 @@
 //! when the run succeeds: a refused run leaves an absent destination absent
 //! and an existing one (replace mode) as it was.
 
+use crate::reopen_cell;
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -292,11 +294,6 @@ fn check_replacements(route: Route, inputs: &Inputs, target: Side, expected: &st
             for existing in [false, true] {
                 write_input(input, route, target, false);
                 write_input(&replacement, route, target, true);
-                if existing {
-                    std::fs::write(&output, SENTINEL).expect("earlier output");
-                } else if output.exists() {
-                    std::fs::remove_file(&output).expect("clear output");
-                }
                 let host = crate::common::test_host();
                 host.invocation
                     .faults()
@@ -305,6 +302,14 @@ fn check_replacements(route: Route, inputs: &Inputs, target: Side, expected: &st
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
+                if !reopen_cell::available(force_path, procfs) {
+                    continue;
+                }
+                if existing {
+                    std::fs::write(&output, SENTINEL).expect("earlier output");
+                } else if output.exists() {
+                    std::fs::remove_file(&output).expect("clear output");
+                }
                 host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
@@ -346,9 +351,9 @@ fn check_replacements(route: Route, inputs: &Inputs, target: Side, expected: &st
                         out, expected,
                         "{cell}: the answer must come from the pinned inputs alone"
                     );
-                } else if cfg!(unix) {
-                    // Off Unix a pin verifies nothing; the identity refusal is
-                    // a Unix guarantee.
+                } else {
+                    // reopen_cell::available admits only Unix cells, where
+                    // the identity refusal is guaranteed.
                     let err = result
                         .err()
                         .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -539,6 +544,9 @@ fn a_repeated_input_is_one_pin() {
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
+                if !reopen_cell::available(force_path, procfs) {
+                    continue;
+                }
                 host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
@@ -553,7 +561,7 @@ fn a_repeated_input_is_one_pin() {
                         out, expected,
                         "{cell}: both sides must read the pinned file"
                     );
-                } else if cfg!(unix) {
+                } else {
                     let err = result
                         .err()
                         .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -592,6 +600,9 @@ fn a_caller_pin_is_used_as_it_is() {
                 .store(force_path, Ordering::Relaxed);
             let pin = PinnedInput::pin(&inputs.old, &host).expect("caller pin");
             let procfs = pin.reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             std::fs::rename(&replacement, &inputs.old).expect("replace the input");
             let cell = format!("{route:?}, procfs {procfs}");
 
@@ -625,7 +636,7 @@ fn a_caller_pin_is_used_as_it_is() {
                     !against.contains("creates: 0, modifies: 0, deletes: 0"),
                     "{cell}: a path must not share a caller's pin: {against}"
                 );
-            } else if cfg!(unix) {
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));

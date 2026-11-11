@@ -1,5 +1,7 @@
 //! In-process host isolation has no CLI expression, so these tests call the
 //! hidden command entries as well as the public host API.
+use crate::fifo_capture;
+
 use pbfhogg::host::{ProcessActions, Resources};
 use pbfhogg::process::FdReservation;
 use std::sync::{
@@ -453,40 +455,9 @@ fn instrumentation_reaches_only_the_invocations_own_sink() {
 #[test]
 fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
     use pbfhogg::debug::{CallId, InstrumentSink, MarkerFifo};
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let dir = crate::common::test_scratch();
-    let path = dir.path().join("sidecar.fifo");
-    let c_path = std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("c path");
-    // SAFETY: a valid NUL-terminated path in the test's own scratch.
-    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
-    // The read end first: a non-blocking write open needs a reader.
-    let mut reader = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&path)
-        .expect("read end");
-    enlarge_pipe(&reader);
-
-    let fifo = MarkerFifo::open(&path).expect("write end");
-    // Drain while the calls write, so a small pipe capacity cannot drop
-    // lines; EOF arrives once every write handle has dropped.
-    let drain = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(e) => panic!("drain FIFO: {e}"),
-            }
-        }
-        String::from_utf8(bytes).expect("utf-8 stream")
-    });
+    let drain = fifo_capture::FifoCapture::new(dir.path());
+    let fifo = MarkerFifo::open(&drain.path).expect("write end");
     let start = fifo.now_us();
     fifo.marker("PROCESS_START");
     let sizes: Vec<(String, u64, (usize, u64))> = std::thread::scope(|scope| {
@@ -520,7 +491,7 @@ fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
     assert!(fifo.now_us() >= start, "the clock is monotonic");
     drop(fifo);
 
-    let text = drain.join().expect("drain");
+    let text = drain.finish();
     let lines: Vec<&str> = text.lines().collect();
     assert!(text.ends_with('\n'), "no fragment");
     for line in &lines {
@@ -572,21 +543,6 @@ fn write_edge_lines(fifo: &pbfhogg::debug::MarkerFifo) -> bool {
     // Each attempt drops its 513-byte line; any further drop was a full
     // FIFO, which can take the 512-byte line too.
     edge.account().drops == attempts
-}
-
-/// Room for every line a test writes into the pipe `end` belongs to, where
-/// the host allows it, so a drain that falls behind does not drop lines. A
-/// refusal leaves the default size.
-#[cfg(unix)]
-fn enlarge_pipe(end: &std::fs::File) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: an fcntl on a descriptor the caller owns.
-        let _size = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = end;
 }
 
 /// Call `id`'s stream holds its own markers and `writer_bytes_written`, and

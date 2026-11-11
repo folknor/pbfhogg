@@ -85,17 +85,6 @@ Fix: keep the host in the fixture and borrow an entered view, or scope both in a
 closure helper. Enforcement: a lint against `Box::leak` in test infrastructure
 outside documented lifetime tests.
 
-## VER-007 - New harness scenarios need no executable test
-
-Reported by library-harness.
-
-All twelve registered scenarios have executable tests today, but adding one to
-`scenarios::all()` does not require one, and the gate inventories compiled tests so
-it cannot find the missing obligation.
-
-Fix: drive basic scenario execution from structured case data. Enforcement: an exact
-registry-to-executable-coverage check.
-
 ## VER-008 - "Product builds never enable test-hooks" is a convention
 
 Reported by fault-injection, cli-tests.
@@ -145,19 +134,12 @@ Fix: one source-analysis entry point over one parsed corpus, run once per check,
 one maintained Rust parser, with the command schema exported once. Enforcement: wiring
 into brokkr and no additional whole-tree scripts.
 
-## VER-014 - Most textlint rules can lose their whole corpus silently
+## VER-014 - Empty textlint globs and stale exclusions are only audit-enforced
 
-Reported by check-machinery.
-
-Brokkr lets a `paths` glob matching nothing pass. Some rules use `must_scan`, many do
-not, including those for environment access, host probes, process mutation and
-stdout. `scripts/textlint_coverage.py` detects dead selectors but no check
-or gate invokes it, its manifest under `notes/` is a migration artifact, and it
-duplicates brokkr's selector semantics.
-
-Fix and enforcement: require nonempty selectors in brokkr, including stale exclusions
-and sentinel membership. A pinned list of admitted files is unnecessary.
-Brokkr side filed as bz brokkr#157.
+Every rule in `brokkr.d/lints.toml` now has a `must_scan` sentinel, and the old coverage
+script and its migration manifest are retired. brokkr still lets an empty `paths` glob or
+a stale exclusion pass an ordinary check; only its audit flags them. Brokkr side: bz
+brokkr#157.
 
 ## VER-018 - Passing skips are invisible and can satisfy the complete gate
 
@@ -175,19 +157,13 @@ outcomes separately. Enforcement: structured capability accounting and a capabil
 gate requiring evidence for each promised backend and guard, while portable runs may
 still skip.
 
-## VER-019 - The input replacement matrix silently loses its procfs arm
+## VER-019 - The input replacement matrix has no injected opener
 
-Reported by fault-injection.
-
-Tests such as those in `crates/lib/tests/fault_time_filter_input.rs` request forced
-path reopening and automatic reopening, then adapt to `reopens_through_procfs()`.
-Without procfs reopening both cells exercise path reopening, unannounced. On non-Unix
-systems, `else if cfg!(unix)` branches leave intermediate-replacement outcomes
-unchecked.
-
-Fix: announce the skip, do not rerun the identical cell, and separate reopen strategy
-behind an injected opener. Enforcement: a scenario runner requiring every cell to
-return a checked outcome.
+The 38 reopen-strategy cells in the `fault_*_input.rs` tests now announce an unavailable
+strategy, skip the duplicate fallback cell and check outcomes exhaustively, through
+`crates/lib/tests/common/reopen_cell.rs`. Not done: an injected opener separating reopen
+strategy from the host, and a typed scenario runner; the procfs arm still needs usable
+procfs.
 
 ## VER-020 - Negative concurrency assertions pay sleeps and prove nothing about the wait
 
@@ -257,18 +233,6 @@ rendezvous tests in-process with release-and-join guards or guaranteed cancellat
 Enforcement: one hang-test harness and a ban on discarded test thread handles outside
 isolated targets.
 
-## VER-025 - The parked-reader fixture can deadlock while unwinding
-
-Reported by lib-integration.
-
-`ParkingRead` in `crates/lib/tests/capabilities.rs` blocks on an unbounded receive, and
-the block iterator is created after the release sender. A failed assertion drops the
-iterator first, its pipeline join waits for the reader, and the sender stays alive
-further up, so a useful failure becomes a watchdog kill.
-
-Fix: bundle iterator and release in a guard that releases before joining. Enforcement: a
-test that unwinds while parked.
-
 ## VER-026 - Timeout policy is duplicated and internal watchdogs lose to brokkr's
 
 Reported by lib-core-unit, library-harness.
@@ -284,20 +248,6 @@ event-driven readiness for FIFO and child completion, and one launch deadline bu
 Enforcement: configuration validation of deadline relationships and a failure-path test
 with a short injected budget. Process and kernel deadlines still need real monotonic
 time.
-
-## VER-027 - FIFO capture polls, is duplicated, and leaks on unwind
-
-Reported by lib-integration, library-harness.
-
-`Capture` in `crates/lib/tests/seal.rs` and the capture in `host_contract.rs` poll with
-1 ms sleeps and duplicate setup. `Capture` joins only through `finish`. `Fifo` in
-`crates/harness/tests/exe.rs` has no `Drop`, so a panic detaches a reader that polls
-forever with its descriptor open in the merged binary, and reader errors are swallowed.
-Both library sites need UTF-8 paths while `make_fifo` accepts native bytes.
-
-Fix: one owning fixture with event-driven reads, explicit shutdown and joined cleanup, and
-equivalent ownership of child processes. Enforcement: deliberate-unwind and non-UTF-8
-tests, and a ban on local FIFO-drain implementations.
 
 ## VER-028 - Hook synchronization is spread across atomics and polling loops
 
@@ -354,53 +304,11 @@ coordinate reader swallows role errors.
 Fix: preserve multiplicity and numeric unknown types, and fail on unexpected decode errors.
 Enforcement: negative tests of the helpers and a scoped lint on error-to-empty conversions.
 
-## VER-045 - Plain-node geocode coverage still requires installed osmium
+## VER-047 - process_nofile has no injected counting results
 
-`legal_non_dense_nodes_build_a_queryable_index` remains an ignored external test
-and skips when osmium is absent. Its launches now use the shared bounded oracle
-runner, deliberately resolved executable, private cwd/TMPDIR and version report.
-The remaining coverage gap is independent of child ownership: an ordinary
-synthetic plain-node fixture should exercise this repository's handling without
-an external tool. Extend `common/groups.rs` for that coverage; parity work can
-stay external. This coverage change is outside the filesystem chain.
-
-## VER-047 - process_nofile assumes more about Linux than its subject needs
-
-Reported by lib-integration.
-
-`crates/lib/tests/process_nofile.rs` skips everything below a hard limit of 1024, requires
-procfs counting, and assumes every descriptor below its highest held one is occupied, so an
-inherited hole invalidates it. A sandbox without procfs fails where production represents an
-unavailable count.
-
-Fix: separate counting from limit and budget scenarios, compare controlled deltas, and handle
-unavailable procfs. Enforcement: isolated scenarios and injected counting results.
-
-## VER-048 - Proptest configuration inherits the environment
-
-Reported by lib-integration. Narrowed by the test-filesystem fixture slice:
-failure persistence is now explicitly disabled and failing cases are promoted by
-hand to named tests, so no regression-path or checkout-write residue remains.
-
-`crates/lib/tests/proptests.rs` still uses `ProptestConfig::default()`, and the
-macros reapply `PROPTEST_*` after `cases: 64`, so `PROPTEST_CASES=0` removes
-coverage while passing. Seed policy is still inherited too.
-
-Fix: deliberate environment and seed policy, with tests of resolved settings.
-This is outside the test-filesystem chain's persistence-only change.
-
-## VER-049 - Property tests spend heavily on a narrower input space than described
-
-Reported by lib-integration.
-
-Seven properties are 448 cases per sweep, not the documented `64 * 4`. Five create disk
-fixtures: 320 directories per sweep, 1,600 over five sweeps. Tags are empty, relation members
-are all ways with one role, metadata is absent. The truncation property does not assert
-refusal, and the arbitrary-reader one does not prove termination.
-
-Fix: memory-backed codec fixtures, independent semantic generators, and separate no-panic,
-termination and truncation assertions. Enforcement: strategy control cases and shared runner
-tests.
+`crates/lib/tests/process_nofile.rs` now compares controlled descriptor deltas, gates each
+scenario separately and announces skips for unavailable counting or insufficient slots.
+Not done: tests with injected counting results, so a sandbox without procfs is covered.
 
 ## VER-050 - Large apply-changes fixtures pay production thresholds to test scheduling
 
@@ -414,28 +322,12 @@ Fix: extract batch scheduling and ordered-error selection behind explicit limits
 small, keeping format-limit coverage separate. Enforcement: observed batch events and a
 selected tier for large scenarios.
 
-## VER-052 - The io_uring size sweep emits unintended blobs and misses its boundaries
+## VER-053 - No check of expected test presence per build shape
 
-Reported by lib-integration.
-
-`roundtrip_uring_small_size_sweep` in `roundtrip.rs` calls `bb.take()` after every node,
-giving 26,611 one-node blobs over seven cases although a comment says the 16,000-node case
-makes two. Node counts with compression do not establish the stated 4 KiB and 256 KiB
-positions.
-
-Fix: drive exact byte lengths through the writer layer, assert logical length and submission
-behaviour, keep a small roundtrip, and derive cases from the alignment contract.
-
-## VER-053 - Whole-file feature gates remove unrelated coverage
-
-Reported by lib-integration.
-
-`crates/lib/tests/all.rs` gates all of `geocode_index.rs` on `commands`, so the
-`geocode-reader` sweep cannot run reader tests, and gates `tags_count.rs` though `tags_count`
-is in the always-compiled surface per ADR-0011.
-
-Fix: separate builder setup from reader tests with independently encoded fixtures, and remove
-unneeded gates. Enforcement: expected test presence per build shape.
+`tags_count.rs` is no longer gated on `commands`, and reader tests on independently encoded
+fixtures run under `geocode-reader` in `crates/lib/tests/geocode_reader.rs`. The all-record
+offset validation test still uses builder setup under `commands`, and nothing checks which
+tests each build shape is expected to run.
 
 ## VER-054 - The canonical fixture writer is three implementations
 
@@ -454,37 +346,11 @@ have identical payloads and only the intended envelope differences.
 test readers; inline reader and pipeline tests use them. The proposed lint on
 unconfigured parallel test readers is not added.
 
-## VER-059 - The cgroup parent-limit test never exercises parent discovery
+## VER-060 - Nothing confines PID and entropy acquisition to the scratch adapter
 
-Reported by lib-core-unit.
-
-`cgroup_memory_budget_caps_host_and_parent_headroom` in `host.rs` calls `cgroup_memory_available`
-twice for its parent case, and `machine_memory_available` reads kernel files directly, so ancestor
-walk, mount mapping, mountinfo decoding and membership selection have no seam.
-
-Fix: a narrow kernel-file reader and complete synthetic hierarchies, including unlimited leaves
-with limited parents and delegated mounts.
-
-## VER-060 - Scratch identity generation has no deterministic seam
-
-Reported by lib-core-unit.
-
-`scratch.rs` directly acquires randomness and the PID and `random_u128` calls `getrandom`, so
-interruption, entropy failure and repeated-name collision cannot be exercised.
-
-Fix: an internal constructor accepting identity generation with scripted generators. Enforcement:
-restrict direct entropy and PID acquisition to the adapter with a lint.
-
-## VER-061 - Output unit tests bypass the production binding protocol
-
-Reported by lib-core-unit.
-
-Shorthands in `output.rs` open writing sessions on unbound outputs and bind only at publication,
-and `OutputDir::writer` ignores its invocation argument. They are `cfg(test)` and not
-production-reachable, but they preserve an alternate protocol.
-
-Fix: rewrite around owned bound-output fixtures and remove the methods, so the compiler enforces
-sequencing.
+`scratch.rs` now takes identity and entropy through seams, tested for collisions,
+interruption, short reads and entropy failure. The proposed lint restricting production PID
+acquisition to the scratch identity adapter and `getrandom` to `random_u128` is not added.
 
 ## VER-065 - Merge correctness fixtures scale with production batch tuning
 
@@ -496,18 +362,6 @@ at today's constant.
 
 Fix: a batching configuration passed by production and tests, small boundary tests, and one focused
 production-configuration test. Enforcement: the configuration type.
-
-## VER-066 - A complete retired merge implementation is compiled as a test oracle
-
-Reported by lib-commands-unit.
-
-`merge_changes/mod.rs` keeps a test-only owned representation, parser sink, stream construction and
-writer, run through `owned_simplify`. The hunter calls this meaningful differential coverage, not a
-tautology, but shared parser and version-floor components limit its independence.
-
-Fix: a small semantic reference model and independent rendered-output checks, with byte comparisons
-only where byte identity is the contract. Confinement to a test module is enforceable; independence
-needs review.
 
 ## VER-071 - The verbose sequence budget has no registered timing bench
 
@@ -544,16 +398,6 @@ Clock resolution in `crates/cli/src/lib.rs` is separated from conversion, with
 fixed-instant conversion tests, and `cli_derive_changes.rs` checks that deletion timestamps
 agree and fall within the invocation's clock bounds. A fixed instant through the complete
 OSC output path is not tested.
-
-## VER-085 - Generated reference data is maintained by hand
-
-Reported by cli-tests.
-
-`crates/cli/src/io_reach.rs` compares a Markdown matrix with `matrix()`, `lib.rs` parses the
-short-flag table back, and the documentation checker reconstructs inventories from Markdown.
-
-Fix: generate the command, option, vocabulary and I/O sections, keeping authored prose. Enforcement:
-a check mode, with writers comparing bytes before replacing a file.
 
 ## VER-086 - Bad-request validation has no mutation coverage
 
@@ -607,18 +451,6 @@ Fix: release contract tests for build-mode behaviour, compile and lint-only `hot
 `hotpath-alloc` shapes, and a small profiling lane with expectations for describe, inactive and active
 modes. Enforcement: required shapes in the gate.
 
-## VER-099 - Brokkr builds a release CLI even with no CLI counterpart
-
-Reported by library-harness.
-
-`LibraryHarness::build` in brokkr builds a release CLI on every real run, so `page-cache-keep` and the
-refusal scenarios build what they never use, documented and deliberate in brokkr's library-internals
-reference. Cost not measured.
-
-Fix: resolve build needs from scenario metadata and build matching configurations together. Enforcement:
-build-planning tests.
-Brokkr side filed as bz brokkr#158.
-
 ## VER-100 - Nothing enforces the complete gate at merge time
 
 `reference/testing.md` now names `brokkr check --gate` as the before-merge command and
@@ -632,16 +464,6 @@ deploys documentation. Residue: a required merge check, if the project wants one
 sidebar parsing are still unverified against real renderer output: expected-output fixtures
 from the pinned VitePress version and an independent GitHub reference are not done.
 
-## VER-105 - The migration inventory discards identity
-
-Reported by check-machinery, cli-tests.
-
-`scripts/test_inventory.py` writes package, target kind and name, then ignores them in comparison,
-ignores build shape, and skips non-dictionary inventories. `Counter` detects reduced multiplicity, but a
-move to another package or target preserves the count.
-
-Fix: compare complete identities with explicit, stale-checked mappings and refuse a claim when an
-inventory is missing.
 
 ## VER-107 - The musl sweeps assume an x86_64 host
 
@@ -702,42 +524,12 @@ instrument in `crates/cli/src/lib.rs` carrying a digest of every `ReverseResult`
 adopted by the Lua parser, with equal-count fixtures varying address, street,
 interpolation and admin values.
 
-## VER-115 - Every geocode-query iteration rebuilds the whole index
-
-Reported by bench-verify.
-
-`geocode-query.lua` builds per iteration, three full builds by default, all discarded.
-
-Fix: split production from measurement and reuse an immutable index keyed by input digest, producer and
-options, owned by brokkr. Enforcement: invalidation tests varying each key component.
-
-## VER-117 - The buffered and io_uring merge comparison has a fixed predecessor bias
-
-Reported by bench-verify.
-
-`merge-workload.lua` always runs buffered first, and only buffered ranks the run.
-
-Fix: separate arms and interleaved matched single iterations. Enforcement: brokkr enforcing one backend per
-measured iteration and recording order. Equal drive state cannot be proven.
-Brokkr side is the existing bz brokkr#129 (interleaved rounds), commented with this case.
-
 ## VER-118 - The osmium comparison checks only success
 
 `vs-osmium.lua` pins zlib level 6 on both tools, with flag contracts in
 `benches/tests/comparison-flags.lua`. Outputs are still not compared for equivalence in a
 separate run, and complete-ways and node-retention behaviour rely on defaults because
 pbfhogg has no affirmative flag for them.
-
-## VER-120 - Host identity changes coverage and build features
-
-Reported by bench-verify.
-
-Host files differ in datasets, bboxes, OSCs, expectations and features, for example `dm6.toml` versus bygg.
-Brokkr adds host features to bench features, so an invocation can change workload and build.
-
-Fix: a host-independent experiment manifest with machine resources separate. Enforcement: required coverage
-checked before running, and missing coverage reported as incomplete certification.
-Brokkr side filed as bz brokkr#162.
 
 ## VER-122 - Verify's equality oracle is narrower than "identical" and shares the subject's code
 
@@ -777,30 +569,11 @@ Brokkr side filed as bz brokkr#155.
 
 Reported by bench-verify.
 
-`bench_tests` and `bench_scripts` are set in `brokkr.d/benches.toml`, so unregistered scripts are refused
-and `benches/tests/` runs on every `brokkr check`. Only ref-integrity and the six page-cache benches have
-tests there; every other script's argv, record and verdict paths run only on a real bench.
+Contract tests now cover 20 of 32 scripts. Still without one: canonical-digest,
+geocode-build, id-order, id-remap, id-select, location-integrity, parent-select,
+perturb-pbf, reencode-pbf, region-extract, sort-pbf and time-snapshot.
 
 Fix: a contract test per script for the argv it builds, its stop handling and its verdict.
-
-## VER-126 - Nothing stops a local copy of a typed param validator
-
-Reported by bench-verify.
-
-The integer and bbox params now use brokkr's typed domains, with `benches/lib/bbox.lua` adding only the
-strict order pbfhogg's `Bbox::try_new` needs. Nothing refuses a new script that hand-parses an integer or a
-bbox again instead of declaring the domain.
-
-Fix: a source rule against local replacements, if one can be stated without false positives.
-
-## VER-129 - OwnedChild::wait can hang if the watchdog kill fails
-
-Found while reconciling the bounded child owner. In `crates/lib/tests/common/process.rs`,
-if the timeout thread's `kill` fails, the waiting thread stays blocked in `observe_exit`
-and never reaches the join, so a test hangs to the outer watchdog. Unlikely, because the
-child is kept as an unreaped zombie until observed.
-
-Fix: make the wait path observe the kill result and stop waiting on failure.
 
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
 

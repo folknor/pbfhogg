@@ -16,6 +16,8 @@
 //! without; the overlap layouts check that the workers' reads follow the pin
 //! too.
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -179,6 +181,9 @@ fn check_route(route: Route) {
             let procfs = pbfhogg::read::input::PinnedInput::pin(&input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, after);
@@ -214,9 +219,7 @@ fn check_route(route: Route) {
                     "{cell}: the run must read only the input it pinned"
                 );
                 std::fs::remove_file(&output).expect("remove output");
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is
-                // a Unix guarantee.
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));

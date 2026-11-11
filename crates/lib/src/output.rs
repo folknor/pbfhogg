@@ -3630,53 +3630,6 @@ impl BoundOutputSet {
     }
 }
 
-/// Unit-test shorthands for the filesystem mechanics of publication, which
-/// predate binding: a session opened on the unbound value, and a
-/// publication that binds at the last moment. Tests of the publication log
-/// itself use the bound API.
-#[cfg(test)]
-impl Output {
-    pub(crate) fn writer(&self, invocation: &crate::host::Invocation) -> Result<OutputWriter> {
-        self.writer_under(invocation)
-    }
-
-    pub(crate) fn pbf_writer(
-        &self,
-        compression: crate::write::compression::Compression,
-        header_block_bytes: &[u8],
-        backend: crate::write::OutputBackend,
-        host: &crate::host::Entered<'_>,
-    ) -> Result<crate::write::writer::PbfWriter<crate::write::file_writer::FileWriter>> {
-        self.pbf_writer_under(compression, header_block_bytes, backend, host)
-    }
-
-    pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
-        self.bind(invocation)?.publish()
-    }
-}
-
-#[cfg(test)]
-impl OutputDir {
-    pub(crate) fn writer(&self, _invocation: &crate::host::Invocation) -> Result<DirWriter> {
-        self.target.session.begin(&self.target.dest)?;
-        Ok(DirWriter {
-            path: self.target.write.clone(),
-            completion: self.target.session.clone(),
-        })
-    }
-
-    pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
-        self.bind(invocation)?.publish()
-    }
-}
-
-#[cfg(test)]
-impl OutputSet {
-    pub(crate) fn publish(self, invocation: &crate::host::Invocation) -> Result<()> {
-        self.bind(invocation)?.publish()
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -3764,25 +3717,15 @@ mod tests {
     }
 
     /// Write `bytes` through the output's writing session and finish it.
-    fn stage(out: &Output, bytes: &[u8]) -> Result<()> {
-        stage_under(out, run_token(), bytes)
-    }
-
-    /// [`stage`] under a token of the test's own (one it arms faults on).
-    fn stage_under(out: &Output, token: &crate::host::Invocation, bytes: &[u8]) -> Result<()> {
-        let mut writer = out.writer(token)?;
+    fn stage(out: &BoundOutput, bytes: &[u8]) -> Result<()> {
+        let mut writer = out.writer()?;
         writer.write_all(bytes)?;
         writer.finish()
     }
 
     /// Write one file into a directory output's session and finish it.
-    fn stage_dir(out: &OutputDir, name: &str, bytes: &[u8]) {
-        stage_dir_under(out, run_token(), name, bytes);
-    }
-
-    /// [`stage_dir`] under a token of the test's own.
-    fn stage_dir_under(out: &OutputDir, token: &crate::host::Invocation, name: &str, bytes: &[u8]) {
-        let writer = out.writer(token).unwrap();
+    fn stage_dir(out: &BoundOutputDir, name: &str, bytes: &[u8]) {
+        let writer = out.writer().unwrap();
         fs::write(writer.path().join(name), bytes).unwrap();
         writer.finish();
     }
@@ -3792,9 +3735,10 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         assert!(!dest.exists(), "nothing at the destination before publish");
         stage(&out, b"new").unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
     }
@@ -3818,8 +3762,9 @@ mod tests {
         let dest = dir.path().join("out.osm.pbf");
         fs::write(&dest, b"old").unwrap();
         let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage(&out, b"new").unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
     }
@@ -3833,6 +3778,7 @@ mod tests {
         fs::write(&dest, b"user data").unwrap();
         {
             let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
+            let out = out.bind(run_token()).expect("bind output fixture");
             stage(&out, b"complete-looking output").unwrap();
         }
         assert_eq!(fs::read(&dest).unwrap(), b"user data");
@@ -3841,6 +3787,7 @@ mod tests {
         let fresh = dir.path().join("fresh.json");
         {
             let out = Output::new(&fresh, Overwrite::Refuse, &discard()).unwrap();
+            let out = out.bind(run_token()).expect("bind output fixture");
             stage(&out, b"complete-looking output").unwrap();
         }
         assert!(!fresh.exists());
@@ -3854,9 +3801,10 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("out.osm.pbf");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage(&out, b"ours").unwrap();
         fs::write(&dest, b"theirs").unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Exists { .. }));
         assert_eq!(fs::read(&dest).unwrap(), b"theirs");
         assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
@@ -3983,8 +3931,9 @@ mod tests {
         fs::create_dir(&dest).unwrap();
         fs::write(dest.join("old.bin"), b"old").unwrap();
         let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage_dir(&out, "new.bin", b"new");
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert!(!dest.join("old.bin").exists());
         assert_eq!(fs::read(dest.join("new.bin")).unwrap(), b"new");
         assert!(others(dir.path(), &["index"]).is_empty());
@@ -4029,6 +3978,7 @@ mod tests {
             let out =
                 OutputDir::with_staging(&dest, Overwrite::Replace, None, placement, &discard())
                     .unwrap();
+            let out = out.bind(run_token()).expect("bind output fixture");
             stage_dir(&out, "new.bin", b"new");
             let denial = match dir.deny_write(&dest) {
                 Ok(guard) => guard,
@@ -4037,7 +3987,7 @@ mod tests {
                     return;
                 }
             };
-            let result = out.publish(run_token());
+            let result = out.publish();
             drop(denial);
             let err = result.unwrap_err();
             assert!(err.report().contains("is not writable"), "{err}");
@@ -4067,9 +4017,10 @@ mod tests {
         fs::remove_file(dest.join("marker")).unwrap();
         let out =
             OutputDir::new(&dest, Overwrite::Replace, Some(refuse_marked), &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage_dir(&out, "new.bin", b"new");
         fs::write(dest.join("marker"), b"").unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(
             err.to_string().contains("marked"),
             "the validator is rerun before the swap: {err}"
@@ -4123,20 +4074,22 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("out.osc");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let mut writer = out.writer().unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         // Bytes are still in the buffer: the output is not publishable.
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
         drop(writer);
         assert!(others(dir.path(), &[]).is_empty(), "staging is removed");
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let mut writer = out.writer().unwrap();
         writer.write_all(b"<osmChange/>").unwrap();
         writer.finish().unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"<osmChange/>");
     }
 
@@ -4144,12 +4097,13 @@ mod tests {
     fn an_output_has_one_writing_session() {
         let dir = scratch();
         let out = Output::new(dir.path().join("o"), Overwrite::Refuse, &discard()).unwrap();
-        let first = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let first = out.writer().unwrap();
         assert!(
-            out.writer(run_token()).is_err(),
+            out.writer().is_err(),
             "a second writer would truncate the first"
         );
-        assert!(out.begin_write().is_err());
+        assert!(out.output.begin_write().is_err());
         drop(first);
     }
 
@@ -4161,27 +4115,31 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("empty");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         fs::write(out.path(), b"behind the session's back").unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
         assert!(others(dir.path(), &[]).is_empty());
 
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage(&out, b"").unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"");
 
         let index = dir.path().join("index");
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let writer = out.writer().unwrap();
         fs::write(writer.path().join("f"), b"x").unwrap();
         drop(writer);
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!index.exists());
         let out = OutputDir::new(&index, Overwrite::Refuse, None, &discard()).unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(others(dir.path(), &["empty"]).is_empty());
     }
@@ -4199,6 +4157,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         let mut writer = out
             .pbf_writer(
                 crate::write::compression::Compression::None,
@@ -4211,7 +4170,7 @@ mod tests {
         // write after the end of stream is the error every backend reports.
         writer.flush().unwrap();
         assert!(writer.write_raw(b"late").is_err());
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
 
         // The synchronous path: a framing error before anything was written.
@@ -4221,7 +4180,8 @@ mod tests {
             &discard(),
         )
         .unwrap();
-        let completion = out.begin_write().unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let completion = out.output.begin_write().unwrap();
         let mut writer = crate::write::writer::PbfWriter::to_staged_file(
             out.path(),
             Default::default(),
@@ -4231,7 +4191,7 @@ mod tests {
         .with_completion(completion);
         assert!(writer.write_primitive_block(b"\xff\xff\xff").is_err());
         writer.flush().unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
     }
 
@@ -4305,10 +4265,11 @@ mod tests {
 
         // Planted after construction: refused at publication, untouched.
         let out = OutputDir::new(&index, Overwrite::Replace, None, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage_dir(&out, "header", b"new");
         let run = index.join(".pbfhogg-run-1-cd");
         fs::create_dir(&run).unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::HoldsLeftovers { .. }
@@ -4331,7 +4292,8 @@ mod tests {
             &diagnostics,
         )
         .unwrap();
-        let writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let writer = out.writer().unwrap();
         let inner = writer.path().join(".pbfhogg-backup-1-0.x");
         fs::create_dir(&inner).unwrap();
         drop(writer);
@@ -4382,8 +4344,9 @@ mod tests {
         // `PbfWriter` dropped unflushed would trip its own test assertion, so
         // the bare lease stands in for it).
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let lease = out.begin_write().unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let lease = out.output.begin_write().unwrap();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         drop(lease);
         assert!(!dest.exists());
@@ -4432,11 +4395,12 @@ mod tests {
         let dir = scratch();
         let dest = dir.path().join("out");
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage(&out, b"ours").unwrap();
         let staging = out.path().to_path_buf();
         fs::remove_file(&staging).unwrap();
         fs::write(&staging, b"someone else").unwrap();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::StagingReplaced { .. }
@@ -4453,11 +4417,12 @@ mod tests {
         let elsewhere = dir.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         let out = OutputDir::new(&dest, Overwrite::Refuse, None, &discard()).unwrap();
-        let writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let writer = out.writer().unwrap();
         fs::remove_dir(writer.path()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, writer.path()).unwrap();
         writer.finish();
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(
             output_error(&err),
             OutputError::StagingReplaced { .. }
@@ -4475,6 +4440,7 @@ mod tests {
         let host = run_host();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         let mut writer = out
             .pbf_writer(
                 crate::write::compression::Compression::None,
@@ -4488,7 +4454,7 @@ mod tests {
         let out = out.before_publish(move || {
             assert!(writer.lock().unwrap().write_raw(b"late").is_err());
         });
-        let err = out.publish(run_token()).unwrap_err();
+        let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
         assert!(!dest.exists());
     }
@@ -4501,7 +4467,8 @@ mod tests {
         let dest = dir.path().join("out");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let mut writer = out.writer().unwrap();
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
         let (probe_dest, probe_staging, log) =
@@ -4512,7 +4479,7 @@ mod tests {
                 fs::read(&probe_staging).unwrap_or_default(),
             ));
         });
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(*seen.lock().unwrap(), vec![(false, b"data".to_vec())]);
         assert_eq!(fs::read(&dest).unwrap(), b"data");
     }
@@ -4523,11 +4490,12 @@ mod tests {
     fn a_refused_publication_runs_no_hooks() {
         let dir = scratch();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
-        let _writer = out.writer(run_token()).unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
+        let _writer = out.writer().unwrap();
         let ran = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&ran);
         let out = out.before_publish(move || *flag.lock().unwrap() = true);
-        assert!(out.publish(run_token()).is_err());
+        assert!(out.publish().is_err());
         assert!(!*ran.lock().unwrap());
     }
 
@@ -4541,10 +4509,11 @@ mod tests {
         let dir = scratch();
         let token = crate::host::Invocation::new();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&token).unwrap();
+        let out = out.bind(&token).expect("bind output fixture");
+        let mut writer = out.writer().unwrap();
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
-        out.publish(&token).unwrap();
+        out.publish().unwrap();
         assert_eq!(
             token
                 .call()
@@ -4616,6 +4585,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         assert_eq!(out.path().parent(), Some(stage_dir_path.as_path()));
         assert!(
             out.path()
@@ -4629,7 +4599,7 @@ mod tests {
             "nothing beside the output"
         );
         stage(&out, b"new").unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(others(&out_dir, &["out.osm.pbf"]).is_empty());
         assert!(others(&stage_dir_path, &[]).is_empty());
@@ -4651,6 +4621,7 @@ mod tests {
             &discard(),
         )
         .unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage(&out, b"partial").unwrap();
         assert_eq!(leftovers(&stage_dir_path).len(), 1);
         drop(out);
@@ -4678,10 +4649,11 @@ mod tests {
             &discard(),
         )
         .unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         assert_eq!(leftovers(&stage_dir_path).len(), 1);
         assert!(leftovers(dir.path()).is_empty());
         stage_dir(&out, "new", b"new");
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(dest.join("new")).unwrap(), b"new");
         assert!(!dest.join("old").exists());
         assert!(others(&stage_dir_path, &[]).is_empty());
@@ -4773,8 +4745,9 @@ mod tests {
         let dest = dir.path().join("o.pbf");
         let out = Output::with_staging(&dest, Overwrite::Refuse, Staging::Dir(&below), &discard())
             .unwrap();
+        let out = out.bind(run_token()).expect("bind output fixture");
         stage(&out, b"x").unwrap();
-        out.publish(run_token()).unwrap();
+        out.publish().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"x");
         assert!(others(&below, &[]).is_empty());
     }
@@ -4826,11 +4799,12 @@ mod tests {
             &discard(),
         )
         .unwrap();
+        let set = set.bind(run_token()).expect("bind output fixture");
         assert_eq!(leftovers(&stage_dir_path).len(), 2);
         for member in set.iter() {
             stage(member, b"m").unwrap();
         }
-        set.publish(run_token()).unwrap();
+        set.publish().unwrap();
         assert_eq!(others(&stage_dir_path, &[]), ["inner"]);
         assert_eq!(fs::read(&fine).unwrap(), b"m");
         assert_eq!(fs::read(&other).unwrap(), b"m");
@@ -4909,10 +4883,11 @@ mod tests {
             )
             .unwrap();
             let token = armed(&[PublishFault::AfterInstalled(0)]);
+            let set = set.bind(&token).expect("bind output fixture");
             for member in set.iter() {
-                stage_under(member, &token, b"m").unwrap();
+                stage(member, b"m").unwrap();
             }
-            assert!(set.publish(&token).is_err());
+            assert!(set.publish().is_err());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &["stage"]).is_empty());
             assert!(others(&stage_dir_path, &[]).is_empty());
@@ -4969,8 +4944,9 @@ mod tests {
                 } else {
                     armed(&[PublishFault::CrossMount(0)])
                 };
-                stage_under(&out, &token, b"new").unwrap();
-                let err = out.publish(&token).unwrap_err();
+                let out = out.bind(&token).expect("bind output fixture");
+                stage(&out, b"new").unwrap();
+                let err = out.publish().unwrap_err();
                 assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
                 assert!(!dest.exists());
                 assert!(others(dir.path(), &["stage"]).is_empty());
@@ -4987,15 +4963,17 @@ mod tests {
             let dest = dir.path().join("out.osm.pbf");
             let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             let token = armed(&[PublishFault::CrossMount(0)]);
-            stage_under(&out, &token, b"new").unwrap();
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            let err = out.publish().unwrap_err();
             assert!(!matches!(err.kind(), crate::ErrorKind::Output(_)), "{err}");
             assert!(err.report().contains("cannot publish"), "{err}");
 
             let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             let token = armed(&[PublishFault::ForceLinkFallback, PublishFault::CrossMount(0)]);
-            stage_under(&out, &token, b"new").unwrap();
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            let err = out.publish().unwrap_err();
             assert!(matches!(
                 output_error(&err),
                 OutputError::ExclusivePublishUnsupported { .. }
@@ -5024,8 +5002,9 @@ mod tests {
             )
             .unwrap();
             let token = armed(&[PublishFault::CrossMount(0)]);
-            stage_dir_under(&out, &token, "new", b"new");
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new", b"new");
+            let err = out.publish().unwrap_err();
             assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
             assert_eq!(fs::read(dest.join("old")).unwrap(), b"old");
             assert!(!dest.join("new").exists());
@@ -5059,10 +5038,11 @@ mod tests {
                 } else {
                     armed(&[PublishFault::CrossMount(1)])
                 };
+                let set = set.bind(&token).expect("bind output fixture");
                 for member in set.iter() {
-                    stage_under(member, &token, b"new").unwrap();
+                    stage(member, b"new").unwrap();
                 }
-                let err = set.publish(&token).unwrap_err();
+                let err = set.publish().unwrap_err();
                 if restore_fails {
                     let OutputError::RollbackIncomplete { unresolved, source } = output_error(&err)
                     else {
@@ -5107,8 +5087,9 @@ mod tests {
             let (sink, diagnostics) = recording();
             let out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
             let token = armed(&[PublishFault::BackupRemoval]);
-            stage_dir_under(&out, &token, "new-file", b"new");
-            out.publish(&token).unwrap();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new-file", b"new");
+            out.publish().unwrap();
             assert_eq!(fs::read(dest.join("new-file")).unwrap(), b"new");
             let events = sink.0.lock().unwrap();
             assert_eq!(events.len(), 1, "{events:?}");
@@ -5137,8 +5118,9 @@ mod tests {
             let (sink, diagnostics) = recording();
             let out = OutputDir::new(&dest, Overwrite::Replace, None, &diagnostics).unwrap();
             let token = armed(&[PublishFault::DirSync]);
-            stage_dir_under(&out, &token, "new-file", b"new");
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new-file", b"new");
+            let err = out.publish().unwrap_err();
             let OutputError::Unsynced {
                 kept, kept_synced, ..
             } = output_error(&err)
@@ -5170,8 +5152,9 @@ mod tests {
             fs::write(dest.join("old-file"), b"old").unwrap();
             let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             let token = armed(&[PublishFault::BackupSync]);
-            stage_dir_under(&out, &token, "new-file", b"new");
-            assert!(out.publish(&token).is_err());
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new-file", b"new");
+            assert!(out.publish().is_err());
             assert_eq!(fs::read(dest.join("old-file")).unwrap(), b"old");
             assert!(!dest.join("new-file").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -5181,12 +5164,13 @@ mod tests {
             dir: &Path,
             overwrite: Overwrite,
             token: &crate::host::Invocation,
-        ) -> (OutputSet, PathBuf, PathBuf) {
+        ) -> (BoundOutputSet, PathBuf, PathBuf) {
             let a = dir.join("a.osm.pbf");
             let b = dir.join("b.osm.pbf");
             let set = OutputSet::files([&a, &b], overwrite, &discard()).unwrap();
+            let set = set.bind(token).expect("bind output fixture");
             for member in set.iter() {
-                stage_under(member, token, b"new").unwrap();
+                stage(member, b"new").unwrap();
             }
             (set, a, b)
         }
@@ -5200,8 +5184,9 @@ mod tests {
             fs::write(&dest, b"user data").unwrap();
             let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
             let token = armed(&[PublishFault::BeforeInstall]);
-            stage_under(&out, &token, b"new").unwrap();
-            assert!(out.publish(&token).is_err());
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            assert!(out.publish().is_err());
             assert_eq!(fs::read(&dest).unwrap(), b"user data");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -5212,8 +5197,9 @@ mod tests {
             let dest = dir.path().join("out.osm.pbf");
             let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             let token = armed(&[PublishFault::ForceLinkFallback]);
-            stage_under(&out, &token, b"new").unwrap();
-            out.publish(&token).unwrap();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            out.publish().unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
 
@@ -5221,9 +5207,10 @@ mod tests {
             let other = dir.path().join("other.osm.pbf");
             let out = Output::new(&other, Overwrite::Refuse, &discard()).unwrap();
             let token = armed(&[PublishFault::ForceLinkFallback]);
-            stage_under(&out, &token, b"ours").unwrap();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"ours").unwrap();
             fs::write(&other, b"theirs").unwrap();
-            let err = out.publish(&token).unwrap_err();
+            let err = out.publish().unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Exists { .. }));
             assert_eq!(fs::read(&other).unwrap(), b"theirs");
         }
@@ -5236,8 +5223,9 @@ mod tests {
             let dest = dir.path().join("out.osm.pbf");
             let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             let token = armed(&[PublishFault::ForceLinkFallback, PublishFault::AfterLink]);
-            stage_under(&out, &token, b"new").unwrap();
-            assert!(out.publish(&token).is_err());
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            assert!(out.publish().is_err());
             assert!(!dest.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -5254,8 +5242,9 @@ mod tests {
             fs::write(&dest, b"old").unwrap();
             let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
             let token = armed(&[PublishFault::AfterInstalled(0)]);
-            stage_under(&out, &token, b"new").unwrap();
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            let err = out.publish().unwrap_err();
             let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
                 panic!("expected an incomplete rollback, got {err}");
             };
@@ -5275,8 +5264,9 @@ mod tests {
             fs::write(&dest, b"old").unwrap();
             let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
             let token = armed(&[PublishFault::AfterInstalled(0), PublishFault::Restore]);
-            stage_under(&out, &token, b"new").unwrap();
-            assert!(out.publish(&token).is_err());
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            assert!(out.publish().is_err());
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -5290,8 +5280,9 @@ mod tests {
             let dest = dir.path().join("out.osm.pbf");
             let out = Output::new(&dest, Overwrite::Replace, &discard()).unwrap();
             let token = armed(&[PublishFault::AfterInstalled(0)]);
-            stage_under(&out, &token, b"new").unwrap();
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            let err = out.publish().unwrap_err();
             assert!(
                 !matches!(
                     err.kind(),
@@ -5310,7 +5301,7 @@ mod tests {
             fs::write(dir.path().join("b.osm.pbf"), b"old b").unwrap();
             let token = armed(&[PublishFault::AfterInstalled(1)]);
             let (set, a, b) = staged_set(dir.path(), Overwrite::Replace, &token);
-            assert!(set.publish(&token).is_err());
+            assert!(set.publish().is_err());
             assert_eq!(fs::read(&a).unwrap(), b"old a");
             assert_eq!(fs::read(&b).unwrap(), b"old b");
             assert!(others(dir.path(), &["a.osm.pbf", "b.osm.pbf"]).is_empty());
@@ -5319,7 +5310,7 @@ mod tests {
             let dir = scratch();
             let token = armed(&[PublishFault::AfterInstalled(0)]);
             let (set, a, b) = staged_set(dir.path(), Overwrite::Refuse, &token);
-            assert!(set.publish(&token).is_err());
+            assert!(set.publish().is_err());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -5334,8 +5325,9 @@ mod tests {
             fs::write(dest.join("old.bin"), b"old").unwrap();
             let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             let token = armed(&[PublishFault::AfterBackup]);
-            stage_dir_under(&out, &token, "new.bin", b"new");
-            assert!(out.publish(&token).is_err());
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new.bin", b"new");
+            assert!(out.publish().is_err());
             assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
             assert!(!dest.join("new.bin").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -5352,7 +5344,7 @@ mod tests {
             fs::write(&b, b"old b").unwrap();
             let token = armed(&[PublishFault::AfterInstalled(1), PublishFault::Restore]);
             let (set, _, _) = staged_set(dir.path(), Overwrite::Replace, &token);
-            let err = set.publish(&token).unwrap_err();
+            let err = set.publish().unwrap_err();
             let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
                 panic!("expected an incomplete rollback, got {err}");
             };
@@ -5382,8 +5374,9 @@ mod tests {
             fs::write(dest.join("old.bin"), b"old").unwrap();
             let out = OutputDir::new(&dest, Overwrite::Replace, None, &discard()).unwrap();
             let token = armed(&[PublishFault::AfterBackup, PublishFault::Restore]);
-            stage_dir_under(&out, &token, "new.bin", b"new");
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new.bin", b"new");
+            let err = out.publish().unwrap_err();
             assert!(matches!(
                 output_error(&err),
                 OutputError::RollbackIncomplete { .. }
@@ -5402,8 +5395,9 @@ mod tests {
             let dest = dir.path().join("out.osm.pbf");
             let out = Output::new(&dest, Overwrite::Refuse, &discard()).unwrap();
             let token = armed(&[PublishFault::DirSync]);
-            stage_under(&out, &token, b"new").unwrap();
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage(&out, b"new").unwrap();
+            let err = out.publish().unwrap_err();
             assert!(matches!(output_error(&err), OutputError::Unsynced { .. }));
             assert!(err.to_string().contains("was published"), "{err}");
             assert_eq!(fs::read(&dest).unwrap(), b"new");
@@ -5431,8 +5425,9 @@ mod tests {
             )
             .unwrap();
             let token = armed(&[PublishFault::AfterInstalled(0), PublishFault::RestoreRename]);
-            stage_dir_under(&out, &token, "new.bin", b"new");
-            let err = out.publish(&token).unwrap_err();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new.bin", b"new");
+            let err = out.publish().unwrap_err();
             let OutputError::RollbackIncomplete { unresolved, .. } = output_error(&err) else {
                 panic!("expected an incomplete rollback, got {err}");
             };
@@ -5496,8 +5491,8 @@ mod tests {
             backups_staged: bool,
         ) -> WithBackups {
             let dir = scratch();
-            let stage_dir = dir.path().join("stage");
-            fs::create_dir(&stage_dir).unwrap();
+            let stage_root = dir.path().join("stage");
+            fs::create_dir(&stage_root).unwrap();
             let name = if group { "out.osm.pbf" } else { "index" };
             let parents: Vec<PathBuf> = if group {
                 vec![dir.path().join("p0"), dir.path().join("p1")]
@@ -5520,7 +5515,7 @@ mod tests {
             let steps = Arc::new(Mutex::new(Vec::new()));
             let stepped = Arc::clone(&steps);
             let watched = parents.clone();
-            let watched_stage = stage_dir.clone();
+            let watched_stage = stage_root.clone();
             token.faults().on_publish_step(move |step| {
                 for parent in &watched {
                     for entry in others(parent, &[name]) {
@@ -5542,9 +5537,9 @@ mod tests {
             });
             let (sink, diagnostics) = recording();
             let staging = if backups_staged {
-                Staging::DirWithBackups(&stage_dir)
+                Staging::DirWithBackups(&stage_root)
             } else {
-                Staging::Dir(&stage_dir)
+                Staging::Dir(&stage_root)
             };
             let result = if group {
                 let set = OutputSet::files_with_staging(
@@ -5554,10 +5549,11 @@ mod tests {
                     &diagnostics,
                 )
                 .unwrap();
+                let set = set.bind(&token).expect("bind output fixture");
                 for member in set.iter() {
-                    stage_under(member, &token, b"new").unwrap();
+                    stage(member, b"new").unwrap();
                 }
-                set.publish(&token)
+                set.publish()
             } else {
                 let out = OutputDir::with_staging(
                     parents[0].join(name),
@@ -5567,8 +5563,9 @@ mod tests {
                     &diagnostics,
                 )
                 .unwrap();
-                stage_dir_under(&out, &token, "new.bin", b"new");
-                out.publish(&token)
+                let out = out.bind(&token).expect("bind output fixture");
+                stage_dir(&out, "new.bin", b"new");
+                out.publish()
             };
             let mut beside = beside.lock().unwrap().clone();
             for parent in &parents {
@@ -5576,7 +5573,7 @@ mod tests {
                     beside.push(format!("after: {entry}"));
                 }
             }
-            let staged = others(&stage_dir, &[]);
+            let staged = others(&stage_root, &[]);
             let warnings = sink
                 .0
                 .lock()
@@ -5614,7 +5611,7 @@ mod tests {
                 result,
                 staged,
                 warnings,
-                stage_dir,
+                stage_dir: stage_root,
                 steps,
                 syncs,
                 destinations,
@@ -5807,8 +5804,9 @@ mod tests {
             )
             .unwrap();
             let token = armed(&[PublishFault::BackupLinkSync]);
-            stage_dir_under(&out, &token, "new", b"new");
-            out.publish(&token).unwrap();
+            let out = out.bind(&token).expect("bind output fixture");
+            stage_dir(&out, "new", b"new");
+            out.publish().unwrap();
             assert_eq!(fs::read(dest.join("new")).unwrap(), b"new");
             assert!(others(dir.path(), &["index", "stage"]).is_empty());
             assert!(others(&stage_dir_path, &[]).is_empty());
@@ -5837,8 +5835,9 @@ mod tests {
                     OutputDir::with_staging(&dest, Overwrite::Replace, None, staging, &discard())
                         .unwrap();
                 let token = armed(&[PublishFault::MoveAsideCrossMount]);
-                stage_dir_under(&out, &token, "new", b"new");
-                let err = out.publish(&token).unwrap_err();
+                let out = out.bind(&token).expect("bind output fixture");
+                stage_dir(&out, "new", b"new");
+                let err = out.publish().unwrap_err();
                 if with_backups {
                     assert_cross_mount_refusal(&err, &stage_dir_path, &dest);
                 } else {
@@ -5887,14 +5886,16 @@ mod tests {
                     }
                     if count == 1 {
                         let out = Output::new(&paths[0], overwrite, &discard()).unwrap();
-                        stage_under(&out, &token, b"new").unwrap();
-                        out.publish(&token)
+                        let out = out.bind(&token).expect("bind output fixture");
+                        stage(&out, b"new").unwrap();
+                        out.publish()
                     } else {
                         let set = OutputSet::files(&paths, overwrite, &discard()).unwrap();
+                        let set = set.bind(&token).expect("bind output fixture");
                         for member in set.iter() {
-                            stage_under(member, &token, b"new").unwrap();
+                            stage(member, b"new").unwrap();
                         }
-                        set.publish(&token)
+                        set.publish()
                     }
                 }
                 Form::Dir => {
@@ -5904,8 +5905,9 @@ mod tests {
                         fs::write(dest.join("old.bin"), b"old").unwrap();
                     }
                     let out = OutputDir::new(&dest, overwrite, None, &discard()).unwrap();
-                    stage_dir_under(&out, &token, "new.bin", b"new");
-                    out.publish(&token)
+                    let out = out.bind(&token).expect("bind output fixture");
+                    stage_dir(&out, "new.bin", b"new");
+                    out.publish()
                 }
             };
             let steps = steps.lock().unwrap().clone();

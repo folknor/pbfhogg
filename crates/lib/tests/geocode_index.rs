@@ -1,8 +1,9 @@
 //! Reverse-geocode coverage on synthetic inputs.
 //!
 //! The index builder lives behind the `commands` feature (and the
-//! reader behind `geocode-reader`, which `commands` enables), so
-//! `crates/lib/tests/all.rs` mounts this module only with `commands` on.
+//! reader behind `geocode-reader`, which `commands` enables). Builder/query
+//! integration lives here; independently encoded reader fixtures live in
+//! `geocode_reader.rs`.
 
 use std::path::Path;
 
@@ -1193,41 +1194,15 @@ fn force_without_indexdata_bounds_node_ids_from_the_blobs() {
     );
 }
 
-// BlockBuilder emits dense nodes only. Exercise plain nodes with osmium:
-// brokkr test legal_non_dense_nodes_build_a_queryable_index --sweep all
 #[test]
-#[ignore = "external"]
 fn legal_non_dense_nodes_build_a_queryable_index() {
     let dir = crate::common::test_scratch();
-    match crate::common::oracle::Oracle::new(&dir)
-        .arg("--version")
-        .output()
-    {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::common::skip("osmium not found in PATH");
-            return;
-        }
-        Err(error) => panic!("osmium version probe: {error}"),
-    }
-    let dense = dir.path().join("dense.osm.pbf");
     let input = dir.path().join("non-dense.osm.pbf");
     let index_dir = dir.path().join("index");
-    write_synthetic_indexed_input(&dense);
-    let status = crate::common::oracle::Oracle::new(&dir)
-        .args(["cat", "-f", "pbf,pbf_dense_nodes=false", "-o"])
-        .arg(&input)
-        .arg(&dense)
-        .status();
-    let status = match status {
-        Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::common::skip("osmium not found in PATH");
-            return;
-        }
-        Err(error) => panic!("run osmium to produce a legal non-dense fixture: {error}"),
-    };
-    assert!(status.success(), "osmium fixture conversion failed");
+    crate::common::groups::write_unindexed_blocks(
+        &input,
+        &[crate::common::groups::plain_geocode_block()],
+    );
     let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
@@ -1283,73 +1258,6 @@ fn builder_refuses_a_truly_empty_index() {
     assert!(
         err.to_string()
             .contains("refusing to publish an empty index"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let index_dir = dir.path().join("index");
-    write_synthetic_indexed_input(&input);
-    build_index(
-        &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
-            ..Default::default()
-        },
-        &index_dir,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("build index");
-    let cells_path = index_dir.join("geo_cells.bin");
-    let mut cells = std::fs::read(&cells_path).expect("read cells");
-    cells[16..24].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
-    std::fs::write(&cells_path, cells).expect("corrupt offset");
-    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .err()
-        .expect("hostile offset must be a typed open error");
-    assert!(
-        err.to_string().contains("address entry offset"),
-        "unexpected error: {err}"
-    );
-}
-
-/// Queries binary-search the cell files and test ID ranges against them, so
-/// cells out of order would read as missing ones: open refuses them.
-#[test]
-fn reader_rejects_cells_out_of_order() {
-    use pbfhogg::geocode_index::format::GeoCell;
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let index_dir = dir.path().join("index");
-    write_synthetic_indexed_input(&input);
-    build_index(
-        &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
-            ..Default::default()
-        },
-        &index_dir,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("build index");
-    let cells_path = index_dir.join("geo_cells.bin");
-    let mut cells = std::fs::read(&cells_path).expect("read cells");
-    assert!(
-        cells.len() >= 2 * GeoCell::SIZE,
-        "the fixture needs two fine cells"
-    );
-    let (first, rest) = cells.split_at_mut(GeoCell::SIZE);
-    first.swap_with_slice(&mut rest[..GeoCell::SIZE]);
-    std::fs::write(&cells_path, cells).expect("reorder cells");
-    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .err()
-        .expect("out-of-order cells must be a typed open error");
-    assert!(
-        err.to_string()
-            .contains("cell IDs are not strictly ascending"),
         "unexpected error: {err}"
     );
 }
@@ -1415,47 +1323,6 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
             "{file}: expected an error mentioning {expected}, got: {err}"
         );
     }
-}
-
-/// A missing index, and an index missing one data file, fail open naming
-/// the file that is not there: a bare "No such file or directory" does not
-/// say which of the index's files it was.
-#[test]
-fn reader_open_failure_names_the_missing_file() {
-    let dir = crate::common::test_scratch();
-    let missing = dir.path().join("no-such-index");
-    let err = pbfhogg::geocode_index::reader::Reader::open(&missing)
-        .err()
-        .expect("a missing index must fail open");
-    let report = err.report();
-    assert!(
-        report.contains(&missing.display().to_string()),
-        "the error must name the missing index's header: {report}"
-    );
-
-    let input = dir.path().join("input.osm.pbf");
-    let index_dir = dir.path().join("index");
-    write_all_record_kinds_input(&input);
-    build_index(
-        &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
-            ..Default::default()
-        },
-        &index_dir,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("build index");
-    let strings = index_dir.join("strings.bin");
-    std::fs::remove_file(&strings).expect("remove a data file");
-    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
-        .err()
-        .expect("an index missing a data file must fail open");
-    let report = err.report();
-    assert!(
-        report.contains(&strings.display().to_string()),
-        "the error must name the missing data file: {report}"
-    );
 }
 
 /// One input that populates every record kind at once: address points,

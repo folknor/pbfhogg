@@ -1,7 +1,7 @@
 """The repository-root path prefixes the crates/ move relocates.
 
-Shared by scripts/textlint_coverage.py and scripts/rewrite_citations.py so
-both map paths the same way. The move puts the library (with its src/,
+Shared by scripts/rewrite_citations.py and scripts/move_config_paths.py so
+both map moved paths the same way. The move puts the library (with its src/,
 tests/ and examples/) in crates/lib and the CLI and harness members in
 crates/cli and crates/harness. Paths outside these prefixes (docs/, reference/, brokkr.d/, the root convention
 files) stay where they are.

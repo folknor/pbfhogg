@@ -89,7 +89,12 @@ NAME` list each harness in turn to find one test.
   line in `crates/lib/tests/all.rs` instead. A helper crate would see only its
   own features, and its dependency on the library would have to keep
   `commands` off for the `minimal` sweep. `crates/lib/tests/common/` holds fixtures
-  only; nothing in it spawns the binary.
+  only; nothing in it spawns the binary. Two files there are not modules of
+  `common/mod.rs`, so pbfhogg-cli never compiles them: `fifo_capture.rs`
+  and `reopen_cell.rs` (the reopen-strategy admission the `fault_*_input`
+  replacement cells share) are each declared once, by `#[path]`, in
+  `crates/lib/tests/all.rs`, and the harness mounts `fifo_capture.rs` the
+  same way.
 - **A new test file not declared in the `all.rs` under its package's test directory (or as
   its own `[[test]]`) is never compiled.** Add the `mod` line with the file.
   The pre-clippy `test-modules` script check (`scripts/check_test_modules.py`)
@@ -104,11 +109,6 @@ NAME` list each harness in turn to find one test.
   in its package's `Cargo.toml` with the reason written beside it; the `[[test]]`
   entries are the list. Arming a fault is not such a reason: fault
   state is per run (see "Conventions").
-- **Moving tests between the packages: `scripts/test_inventory.py`.**
-  It compares the tests a plan lists against the tests the tree now
-  has (see its docstring for the exact brokkr command that produces the
-  plan). It matches by test name only, so a lost test can be masked by a
-  same-named test in the other package.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
@@ -152,7 +152,10 @@ platform features, one without the platform features (pbfhogg-cli's default
 build), and the same two shapes again for musl. No sweep pre-builds the binary
 (`build_packages`): cargo builds it for each test build. The `minimal`
 and `geocode-reader` sweeps stay library-only: the CLI's lib dep would turn
-`commands` back on. `brokkr test NAME` searches one package,
+`commands` back on. The `geocode-reader` sweep runs
+`crates/lib/tests/geocode_reader.rs`, declared under that feature in
+`crates/lib/tests/all.rs`: reader contracts on index records it encodes
+itself, with no command builder, so they keep running without `commands`. `brokkr test NAME` searches one package,
 `[test] default_package = "pbfhogg"`; a CLI test needs
 `brokkr test -p pbfhogg-cli NAME`.
 
@@ -476,7 +479,7 @@ exception, not a tier - should not survive across many PRs.
   classification and a threaded race of the seal's exchange against
   retirements and nested mints.
 - **Sealing.** `crates/lib/tests/seal.rs` (`test-hooks`, Unix) seals invocations that
-  own a call sink on a real FIFO drained on a thread, and reads the stream
+  own a call sink on a real FIFO drained by `FifoCapture`, and reads the stream
   back. `FaultPlan::on_seal_step` parks or unwinds the finalizing thread at
   a `SealStep` (`Snapshot`, before the commit point; `Stream`, after the
   sealing emissions and before the terminal record), which is how
@@ -650,9 +653,25 @@ exception, not a tier - should not survive across many PRs.
   and `assert_scratch_unchanged` for before/after comparisons
   around error paths, plus `with_tracked_scratch_dir(scratch_root,
   expected_new_paths, f)` wrapper.
-- **Property tests.** `crates/lib/tests/proptests.rs`, 64 cases per property.
-  Failure persistence is disabled, so property runs never write regression
-  files into the checkout. Promote a failing case by hand to a named test.
+- **Property tests.** `crates/lib/tests/proptests.rs`, entirely in memory:
+  three properties of 64 cases each, run through explicit `TestRunner`s on
+  one spelled-out `Config` with a fixed ChaCha seed. Neither
+  `Config::default` nor the `proptest!` macro is used, because both consult
+  `PROPTEST_*` environment variables; no environment setting changes case
+  count, shrinking or replay, and a test pins the resolved settings and the
+  seed's reproducibility. Failure persistence is disabled, so property runs
+  never write regression files into the checkout. Promote a failing case by
+  hand to a named test.
+- **FIFOs.** Integration tests create a FIFO only with
+  `common::make_fifo` and drain one only with `FifoCapture`
+  (`crates/lib/tests/common/fifo_capture.rs`, declared once in
+  `crates/lib/tests/all.rs` and mounted by path in `crates/harness/tests/exe.rs`).
+  Its reader holds both ends (so no EOF spin before a producer opens), blocks
+  in `poll` on the FIFO and a `UnixStream` shutdown channel, and is woken and
+  joined by `finish` or on drop, unwinding included. Producers must be done
+  before `finish`. Two textlint rules in `brokkr.d/lints.toml` refuse a local
+  `mkfifo` or FIFO drain in the test trees; unit tests under `src/` keep
+  their own FIFOs.
 - **Policy proposal (not-yet-adopted).** Every new parallel pipeline
   should ship with three tests: a worker-panic test, a `-j N` vs
   `-j 2` parity test, and a scratch-leak test. Worth considering as
@@ -661,6 +680,11 @@ exception, not a tier - should not survive across many PRs.
 `pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
 use `NoProcessActions`; the CLI raises its descriptor limit in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
+It checks descriptor counting by a controlled delta (eight files opened
+between two counts) rather than assuming inherited descriptor numbers leave
+no holes, and each scenario skips through the announced-skip helper when the
+host's counting, free slots or hard limit cannot support it, restoring the
+original soft limit at the end.
 The split is deliberate: a deterministic descriptor grant (an exact
 `host::FdPool` budget, as the library harness's descriptor scenarios use)
 tests command admission and sizing independently of inherited limits and

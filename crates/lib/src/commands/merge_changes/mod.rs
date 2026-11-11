@@ -1224,6 +1224,8 @@ mod tests {
 
     /// The owned simplify path (the oracle): parse to owned changes, dedupe
     /// in a map, write the survivors.
+    /// Kept deliberately for meaningful differential coverage, though shared
+    /// parser and version-floor components limit its independence.
     fn owned_simplify(
         inputs: &[&Path],
         output: &Path,

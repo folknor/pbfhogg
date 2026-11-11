@@ -21,6 +21,8 @@
 //! water there, so it is positive after a full-scan run that decoded
 //! anything and zero after a walker run or a run refused before the scan.
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -290,6 +292,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
@@ -329,9 +334,7 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
                     "{cell}: the output must hold only what the pinned input yields"
                 );
                 std::fs::remove_file(&output).expect("remove output");
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is
-                // a Unix guarantee.
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -447,6 +450,9 @@ fn a_caller_pin_is_used_as_it_is() {
                 .store(force_path, Ordering::Relaxed);
             let pin = PinnedInput::pin(&input, &host).expect("caller pin");
             let procfs = pin.reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             std::fs::rename(&replacement, &input).expect("replace the input");
             let output = dir.path().join("out.osm.pbf");
             let result = if public_default {
@@ -471,7 +477,7 @@ fn a_caller_pin_is_used_as_it_is() {
                     "{cell}: the output must come from the pinned file"
                 );
                 std::fs::remove_file(&output).expect("remove output");
-            } else if cfg!(unix) {
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));

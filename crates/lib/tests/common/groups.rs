@@ -130,3 +130,50 @@ pub fn write_unindexed_blocks(path: &Path, blocks: &[Vec<u8>]) {
     }
     writer.flush().expect("flush");
 }
+
+/// Plain nodes with coordinates and tags, followed by one named street.
+/// This bypasses BlockBuilder's dense-only node encoding.
+pub fn plain_geocode_block() -> Vec<u8> {
+    let strings = [
+        "",
+        "addr:housenumber",
+        "10",
+        "addr:street",
+        "Main Street",
+        "name",
+        "highway",
+        "residential",
+    ];
+    let mut table = Vec::new();
+    for value in strings {
+        bytes_field(&mut table, 1, value.as_bytes());
+    }
+    let mut group = Vec::new();
+    for (id, lat, lon) in [
+        (1, 557_000_000, 125_000_000),
+        (2, 557_000_000, 125_010_000),
+        (3, 557_000_500, 125_005_000),
+    ] {
+        let mut node = Vec::new();
+        varint_field(&mut node, 1, zigzag(id));
+        if id == 3 {
+            bytes_field(&mut node, 2, &[1, 3]);
+            bytes_field(&mut node, 3, &[2, 4]);
+        }
+        varint_field(&mut node, 8, zigzag(lat));
+        varint_field(&mut node, 9, zigzag(lon));
+        bytes_field(&mut group, 1, &node);
+    }
+    let mut way = Vec::new();
+    varint_field(&mut way, 1, 10);
+    bytes_field(&mut way, 2, &[5, 6]);
+    bytes_field(&mut way, 3, &[4, 7]);
+    packed_sint(&mut way, 8, &[1, 2], true);
+    let mut ways = Vec::new();
+    bytes_field(&mut ways, 3, &way);
+    let mut out = Vec::new();
+    bytes_field(&mut out, 1, &table);
+    bytes_field(&mut out, 2, &group);
+    bytes_field(&mut out, 2, &ways);
+    out
+}

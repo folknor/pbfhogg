@@ -150,44 +150,21 @@ impl<'a> OwnedChild<'a> {
     }
 
     pub fn wait(&mut self, timeout: Duration) -> io::Result<Output> {
+        // A cached status (has_exited() may already have reaped) must be read
+        // before opening a pidfd: a reaped PID could name another process.
         let status = if let Some(status) = self.child.try_wait()? {
-            // has_exited() may already have cached and reaped this child.
             status
         } else {
-            let pid = libc::pid_t::try_from(self.child.id())
-                .map_err(|_| io::Error::other("pid does not fit pid_t"))?;
-            // Observe exit without reaping. The watchdog is joined before wait()
-            // releases the PID, so its kill can never target a reused PID.
-            let (observed, expired) = std::thread::scope(|scope| {
-                let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
-                let watchdog = scope.spawn(move || {
-                    match cancelled.recv_timeout(timeout) {
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // SAFETY: this child remains unreaped until we join.
-                            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                            Ok(true)
-                        }
-                        _ => Ok(false),
-                    }
-                });
-                let observed = observe_exit(pid);
-                let _cancelled = cancel.send(());
-                let expired = watchdog
-                    .join()
-                    .map_err(|_| io::Error::other("child watchdog panicked"))?;
-                Ok::<_, io::Error>((observed, expired?))
-            })?;
-            observed?;
-            let status = self.child.wait()?;
-            if expired {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "test child timed out",
-                ));
-            }
-            status
+            let exit = ExitFd::open(&self.child)?;
+            wait_for_exit(
+                &mut self.child,
+                timeout,
+                |child, remaining| {
+                    exit.block(remaining)?;
+                    child.try_wait()
+                },
+                Child::kill,
+            )?
         };
         Ok(Output {
             status,
@@ -207,26 +184,80 @@ impl<'a> OwnedChild<'a> {
     }
 }
 
-/// Block for exit while retaining the zombie and thus ownership of its PID.
-fn observe_exit(pid: libc::pid_t) -> io::Result<()> {
-    let id = libc::id_t::try_from(pid).map_err(|_| io::Error::other("non-positive child PID"))?;
-    loop {
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
-        // SAFETY: info is writable; WNOWAIT leaves reaping to the Child owner.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                id,
-                info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
+/// Exit readiness for an unreaped child. A pidfd becomes readable the moment
+/// the child exits, so completion costs no polling delay; where the kernel
+/// lacks pidfd_open (before Linux 5.3) it degrades to sleeping one
+/// `TEST_CHILD_POLL` interval per check.
+struct ExitFd(Option<std::os::fd::OwnedFd>);
+
+impl ExitFd {
+    fn open(child: &Child) -> io::Result<Self> {
+        let pid = libc::pid_t::try_from(child.id())
+            .map_err(|_| io::Error::other("pid does not fit pid_t"))?;
+        // SAFETY: the child is unreaped (the caller checked try_wait), so the
+        // PID still names it; pidfd_open takes no pointers.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOSYS) {
+                return Ok(Self(None));
+            }
             return Err(error);
+        }
+        let fd = std::os::fd::RawFd::try_from(fd)
+            .map_err(|_| io::Error::other("pidfd does not fit RawFd"))?;
+        // SAFETY: pidfd_open returned a fresh descriptor that nothing else owns.
+        Ok(Self(Some(unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        })))
+    }
+
+    /// Return when the child has exited or `limit` has elapsed.
+    fn block(&self, limit: Duration) -> io::Result<()> {
+        let Some(fd) = &self.0 else {
+            std::thread::sleep(TEST_CHILD_POLL.min(limit));
+            return Ok(());
+        };
+        let millis = limit.as_nanos().div_ceil(1_000_000);
+        let millis = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll borrows the live pidfd for this call only.
+        if unsafe { libc::poll(&mut poll, 1, millis) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Wait and terminate on the owning thread: `block` returns as soon as the
+/// child exits (no polling delay), and the kill runs here rather than on a
+/// watchdog, so a failed kill is returned immediately instead of leaving a
+/// waiter blocked forever, and no other thread can race reaping and PID reuse.
+fn wait_for_exit<S, T>(
+    state: &mut S,
+    timeout: Duration,
+    mut block: impl FnMut(&mut S, Duration) -> io::Result<Option<T>>,
+    kill: impl FnOnce(&mut S) -> io::Result<()>,
+) -> io::Result<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = block(state, timeout.saturating_sub(start.elapsed()))? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            kill(state)?;
+            // OwnedChild::drop performs bounded reaping and pipe cleanup.
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "test child timed out",
+            ));
         }
     }
 }
@@ -288,6 +319,28 @@ impl Drop for OwnedChild<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_timeout_kill_returns_without_waiting_for_exit() {
+        let mut polls = 0;
+        let error = wait_for_exit(
+            &mut polls,
+            Duration::ZERO,
+            |polls, _remaining| {
+                *polls += 1;
+                Ok(None::<()>)
+            },
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "kill refused",
+                ))
+            },
+        )
+        .expect_err("kill failure must reach the owner");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(polls, 1, "no exit observation after a failed kill");
+    }
 
     #[test]
     fn capture_cancels_when_another_writer_keeps_the_pipe_open() {

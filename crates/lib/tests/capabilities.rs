@@ -60,6 +60,27 @@ impl Read for ParkingRead {
     }
 }
 
+/// Release the caller's reader before dropping an iterator that joins it.
+/// Declaration order cannot provide this during an assertion's unwind.
+struct ReleasedBeforeJoin<T> {
+    release: Option<mpsc::Sender<()>>,
+    joined: T,
+}
+
+impl<T> ReleasedBeforeJoin<T> {
+    fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _sent = release.send(());
+        }
+    }
+}
+
+impl<T> Drop for ReleasedBeforeJoin<T> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// A block iterator held by the caller while its pipeline is blocked in the
 /// caller's stream holds the pipeline's permit and its session ticket, and
 /// no call guard. Exhausted, it holds the ticket and no permit; its blocks,
@@ -77,19 +98,24 @@ fn a_block_iterator_blocked_on_the_callers_stream() {
         release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
         released: false,
     };
-    let mut blocks = pbfhogg::ElementReader::new(stream)
+    let blocks = pbfhogg::ElementReader::new(stream)
         .unwrap()
         .invocation(invocation.clone())
         .into_blocks_pipelined()
         .unwrap();
+    let mut guarded = ReleasedBeforeJoin {
+        release: Some(release_tx),
+        joined: blocks,
+    };
     parked_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
+        .recv_timeout(pbfhogg::TEST_CHILD_TIMEOUT)
         .expect("the pipeline reached the caller's stream");
     let held = assert_quiescent(&invocation);
     assert!(held.permits >= 1, "{held:?}");
     assert_eq!((held.session, held.buffer), (1, 0), "{held:?}");
 
-    release_tx.send(()).unwrap();
+    guarded.release();
+    let blocks = &mut guarded.joined;
     let kept: Vec<_> = blocks.by_ref().map(Result::unwrap).collect();
     assert!(!kept.is_empty());
     assert!(blocks.next().is_none());
@@ -105,7 +131,38 @@ fn a_block_iterator_blocked_on_the_callers_stream() {
         (0, 1, 0),
         "an exhausted iterator records nothing more: {exhausted:?}"
     );
-    drop(blocks);
+    drop(guarded);
+    assert_eq!(invocation.capabilities(), Capabilities::default());
+}
+
+#[test]
+fn a_parked_reader_is_released_during_unwind() {
+    let invocation = Invocation::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (parked_tx, parked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let stream = ParkingRead {
+            bytes: std::io::Cursor::new(base_bytes()),
+            owner: std::thread::current().id(),
+            parked: parked_tx,
+            release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
+            released: false,
+        };
+        let blocks = pbfhogg::ElementReader::new(stream)
+            .expect("reader")
+            .invocation(invocation.clone())
+            .into_blocks_pipelined()
+            .expect("pipeline");
+        let _guarded = ReleasedBeforeJoin {
+            release: Some(release_tx),
+            joined: blocks,
+        };
+        parked_rx
+            .recv_timeout(pbfhogg::TEST_CHILD_TIMEOUT)
+            .expect("the pipeline reached the caller's stream");
+        panic!("unwind while the caller's reader is parked");
+    }));
+    assert!(result.is_err(), "the deliberate panic was caught");
     assert_eq!(invocation.capabilities(), Capabilities::default());
 }
 

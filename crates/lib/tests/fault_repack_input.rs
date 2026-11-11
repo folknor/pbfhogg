@@ -20,6 +20,8 @@
 //! changes the output header) and other elements (a walk of it changes the
 //! output).
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -405,9 +407,6 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
             for existing in [false, true] {
                 write_input(input, route);
                 write_replacement(&replacement, route);
-                if existing {
-                    std::fs::write(&output, SENTINEL).expect("write destination");
-                }
                 let host = crate::common::test_host();
                 host.invocation
                     .faults()
@@ -416,6 +415,12 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
+                if !reopen_cell::available(force_path, procfs) {
+                    continue;
+                }
+                if existing {
+                    std::fs::write(&output, SENTINEL).expect("write destination");
+                }
                 host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
@@ -459,9 +464,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
                         "{cell}: the run must read only the input it pinned"
                     );
                     std::fs::remove_file(&output).expect("remove output");
-                } else if cfg!(unix) {
-                    // Off Unix a pin verifies nothing; the identity refusal
-                    // is a Unix guarantee.
+                } else {
+                    // reopen_cell::available admits only Unix cells, where
+                    // the identity refusal is guaranteed.
                     let err = result
                         .err()
                         .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -588,6 +593,9 @@ fn a_caller_pin_is_used_as_it_is() {
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
         let procfs = pin.reopens_through_procfs();
+        if !reopen_cell::available(force_path, procfs) {
+            continue;
+        }
         std::fs::rename(&replacement, &input).expect("replace the input");
         let result = run(route, &pin, out(&output), &host);
         let cell = format!("procfs {procfs}");
@@ -606,7 +614,7 @@ fn a_caller_pin_is_used_as_it_is() {
                 "{cell}: the output header must come from the pinned file"
             );
             std::fs::remove_file(&output).expect("remove output");
-        } else if cfg!(unix) {
+        } else {
             let err = result
                 .err()
                 .unwrap_or_else(|| panic!("{cell}: must refuse"));

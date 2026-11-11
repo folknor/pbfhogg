@@ -25,6 +25,24 @@ The README's three tables come from the campaign at `53360af4`
   O_DIRECT tips) carry host and commit labels but were not re-measured on
   bygg.
 
+## Possible features from the 2026-11 verification hunt
+
+Triaged as new capability rather than defect, so not worked as findings:
+
+- [ ] **Generate the reference tables instead of hand-maintaining them.**
+  `crates/cli/src/io_reach.rs` compares a Markdown matrix with `matrix()`,
+  `lib.rs` parses the short-flag table back, and the documentation checker
+  reconstructs inventories from Markdown. A generator for the command,
+  option, vocabulary and I/O sections (authored prose kept), with a check
+  mode and byte comparison before replacing a file, would retire those
+  round-trips.
+- [ ] **Host-independent experiment manifest.** Host files differ in
+  datasets, bboxes, OSCs, expectations and features, and brokkr adds host
+  features to bench features, so one invocation can change workload and
+  build by host. A manifest separating the experiment from machine
+  resources, with required coverage checked before running and missing
+  coverage reported as incomplete. brokkr side filed as bz brokkr#162.
+
 ## 0.7.0 items (moved from the 0.6.0 list on 2026-10-30)
 
 Picked for 0.6.0 on 2026-07-30, right after the 0.5.0 release; deferred

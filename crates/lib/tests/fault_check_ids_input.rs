@@ -18,6 +18,8 @@
 //! covered in `crates/cli/tests/cli_input_contract.rs`; the caller-pin tests here
 //! cover the library side of it for all three checks.
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -172,6 +174,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &serde_j
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
@@ -207,9 +212,7 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &serde_j
                     &got, expected,
                     "{cell}: the report must come only from the pinned input"
                 );
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is
-                // a Unix guarantee.
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -329,6 +332,9 @@ fn every_check_uses_a_caller_pin_as_it_is() {
                 .store(force_path, Ordering::Relaxed);
             let pin = PinnedInput::pin(&input, &host).expect("caller pin");
             let procfs = pin.reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             std::fs::rename(&replacement, &input).expect("replace the input");
             // `(node count, data blob count)` where the check reports it.
             let result: pbfhogg::Result<(u64, Option<u64>)> = match check {
@@ -348,7 +354,7 @@ fn every_check_uses_a_caller_pin_as_it_is() {
                     "index" => assert_eq!(blobs, Some(5), "{cell}"),
                     _ => assert_eq!(nodes, 100, "{cell}: must read the pinned file"),
                 }
-            } else if cfg!(unix) {
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));

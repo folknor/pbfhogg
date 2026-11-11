@@ -5,9 +5,6 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 const EXE: &str = env!("CARGO_BIN_EXE_pbfhogg-harness");
 
@@ -77,52 +74,9 @@ fn describe_prints_one_valid_document_and_nothing_else() {
     assert_eq!(entries, 2);
 }
 
-/// A marker FIFO whose lines a thread collects until [`Fifo::finish`].
-struct Fifo {
-    path: PathBuf,
-    stop: Arc<AtomicBool>,
-    reader: std::thread::JoinHandle<Vec<u8>>,
-}
-
-impl Fifo {
-    #[allow(clippy::disallowed_methods)] // a FIFO in test scratch
-    fn new(dir: &Path) -> Self {
-        use std::io::Read as _;
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let path = dir.join("fifo");
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL");
-        // SAFETY: a valid NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        // Opened here, non-blocking, so a child that never opens the FIFO
-        // cannot leave the reader waiting.
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .expect("open the read end");
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = Arc::clone(&stop);
-        let reader = std::thread::spawn(move || {
-            let mut lines = Vec::new();
-            let mut buf = [0_u8; 65536];
-            loop {
-                let done = stopping.load(Ordering::Acquire);
-                match file.read(&mut buf) {
-                    Ok(n) if n > 0 => lines.extend_from_slice(&buf[..n]),
-                    _ if done => return lines,
-                    _ => std::thread::sleep(Duration::from_millis(1)),
-                }
-            }
-        });
-        Self { path, stop, reader }
-    }
-
-    fn finish(self) -> String {
-        self.stop.store(true, Ordering::Release);
-        String::from_utf8(self.reader.join().expect("the reader")).expect("UTF-8 lines")
-    }
-}
+#[path = "../../lib/tests/common/fifo_capture.rs"]
+mod fifo_capture;
+use fifo_capture::FifoCapture as Fifo;
 
 /// A run directory laid out as brokkr lays it out.
 struct RunDir {
@@ -583,6 +537,45 @@ fn describe_scenario(id: &str) -> Value {
         .find(|s| s["id"] == id)
         .expect("declared scenario")
         .clone()
+}
+
+/// Every registered scenario is an executable obligation. Role declarations
+/// supply its basic case; specialized tests below add stronger observations.
+#[test]
+fn every_declared_scenario_executes() {
+    let scratch = crate::common::test_scratch();
+    let mut cmd = Command::new(EXE);
+    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let ran = run(cmd, &[], scratch.path(), &scratch);
+    assert!(ran.status.success());
+    assert!(ran.stderr.is_empty());
+    let doc: Value = serde_json::from_slice(&ran.stdout).expect("describe JSON");
+    let mut executed = std::collections::BTreeSet::new();
+    for declaration in doc["scenarios"].as_array().expect("scenarios") {
+        let id = declaration["id"].as_str().expect("scenario id");
+        assert!(executed.insert(id), "duplicate scenario {id}");
+        let mut datasets = Vec::new();
+        let mut roles = Vec::new();
+        let mut seeded = Vec::new();
+        for role in declaration["roles"].as_array().expect("roles") {
+            let name = role["id"].as_str().expect("role id");
+            match role["source"].as_str().expect("role source") {
+                "dataset" => {
+                    let variant = role["variant"].as_str().expect("dataset variant");
+                    assert!(
+                        matches!((name, variant), ("raw", "raw") | (_, "indexed")),
+                        "add a fixture for dataset {name} variant {variant}"
+                    );
+                    datasets.push(name);
+                }
+                "output" if role["seeded"] == true => seeded.push(name),
+                "output" | "generated" => roles.push(name),
+                source => panic!("unsupported role source {source}"),
+            }
+        }
+        scenario_passes_on(id, &datasets, &roles, &seeded);
+    }
+    assert!(!executed.is_empty(), "empty scenario registry");
 }
 
 /// Local executable-test coverage check. The reusable consumer validator

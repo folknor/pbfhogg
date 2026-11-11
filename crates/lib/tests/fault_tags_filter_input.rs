@@ -22,6 +22,8 @@
 //!   that leave some kind out, as every route's here do: no `n/`) and the
 //!   pipelined reader.
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -249,6 +251,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
             let procfs = pbfhogg::read::input::PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
@@ -286,9 +291,7 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[u8]) {
                     "{cell}: the output must hold only what the pinned input yields"
                 );
                 std::fs::remove_file(&output).expect("remove output");
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is
-                // a Unix guarantee.
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -437,10 +440,7 @@ fn direct_reads_follow_the_pinned_input() {
 #[test]
 fn a_fifo_input_is_refused_in_every_mode() {
     let dir = crate::common::test_scratch();
-    let fifo = dir.path().join("in.fifo");
-    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
-    // SAFETY: a valid NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     for route in [
         Route::TWO_PASS,
         Route::SINGLE_PASS,

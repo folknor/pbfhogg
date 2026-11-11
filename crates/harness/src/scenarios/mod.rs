@@ -52,7 +52,8 @@ pub(crate) trait Scenario {
     fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String>;
 }
 
-/// Every scenario, in describe order.
+/// Every scenario, in describe order. The executable registry test runs each
+/// declaration using its dataset, generated and seeded role descriptions.
 pub(crate) fn all() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(repeat_cat::RepeatCat),

@@ -39,6 +39,9 @@ end
 
 function bench(params)
     local bbox = params.bbox or params.dataset.bbox
+    -- Rebuild per iteration: brokkr#147 declined a persistent producer cache.
+    -- Iteration outputs are reclaimed; local reuse would bypass ownership and
+    -- invalidation by input digest, producer revision and build options.
     local index = output("geocode-index")
     binary("build-geocode-index", params.variant.file, {
         ["output-dir"] = index,

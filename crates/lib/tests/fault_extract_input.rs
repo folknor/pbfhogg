@@ -30,6 +30,8 @@
 //!   (a declined probe, or a route that skips it) one extract per region,
 //!   every one of them on the run's one pin.
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -322,6 +324,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Vec<u8
             let procfs = pbfhogg::read::input::PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
@@ -361,9 +366,7 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Vec<u8
                     );
                     std::fs::remove_file(output).expect("remove output");
                 }
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is
-                // a Unix guarantee.
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));

@@ -654,7 +654,11 @@ mod tests {
             } else {
                 let error = child.wait(std::time::Duration::ZERO).expect_err("timeout");
                 assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-                assert!(child.has_exited().expect("timeout reaped child"));
+                // The timeout only signals the kill; reaping is a later wait.
+                let killed = child
+                    .wait(pbfhogg::TEST_CHILD_TIMEOUT)
+                    .expect("killed child exits");
+                assert!(!killed.status.success());
             }
         }
     }

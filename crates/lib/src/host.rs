@@ -1768,12 +1768,22 @@ impl Resources for MachineProbe {
 // an unlimited leaf can still be constrained by its parent. Hidden ancestors
 // outside the mount namespace cannot be observed by this best-effort probe.
 #[cfg(target_os = "linux")]
-fn machine_memory_available(mut available: u64) -> Option<u64> {
-    let membership = crate::process::read_kernel_file("/proc/self/cgroup").ok()?;
+fn machine_memory_available(available: u64) -> Option<u64> {
+    machine_memory_available_with(available, &|path| crate::process::read_kernel_file(path))
+}
+
+// Generic dispatch keeps the kernel adapter out of synthetic hierarchy tests
+// without adding an indirect call to the production probe.
+#[cfg(target_os = "linux")]
+fn machine_memory_available_with(
+    mut available: u64,
+    read: &impl Fn(&std::path::Path) -> std::io::Result<String>,
+) -> Option<u64> {
+    let membership = read(std::path::Path::new("/proc/self/cgroup")).ok()?;
     let Some(group) = membership.lines().find_map(|line| line.strip_prefix("0::")) else {
         return Some(available); // cgroup v1 has no unified memory controller
     };
-    let mounts = crate::process::read_kernel_file("/proc/self/mountinfo").ok()?;
+    let mounts = read(std::path::Path::new("/proc/self/mountinfo")).ok()?;
     let mut found = false;
     for line in mounts.lines() {
         let Some((fields, fs)) = line.split_once(" - ") else {
@@ -1805,7 +1815,7 @@ fn machine_memory_available(mut available: u64) -> Option<u64> {
             return None;
         }
         found = true;
-        available = cap_by_cgroup_ancestors(&mount, mount.join(relative), available)?;
+        available = cap_by_cgroup_ancestors(&mount, mount.join(relative), available, read)?;
     }
     // No visible unified mount means its limits cannot be established.
     found.then_some(available)
@@ -1818,12 +1828,13 @@ fn cap_by_cgroup_ancestors(
     mount: &std::path::Path,
     mut path: std::path::PathBuf,
     mut available: u64,
+    read: &impl Fn(&std::path::Path) -> std::io::Result<String>,
 ) -> Option<u64> {
     loop {
-        match crate::process::read_kernel_file(path.join("memory.max")) {
+        match read(&path.join("memory.max")) {
             Ok(maximum) if maximum.trim() == "max" => {}
             Ok(maximum) => {
-                let current = crate::process::read_kernel_file(path.join("memory.current")).ok()?;
+                let current = read(&path.join("memory.current")).ok()?;
                 available = cgroup_memory_available(available, &maximum, &current)?;
             }
             // The hierarchy root or a disabled memory controller has no
@@ -1983,8 +1994,40 @@ mod tests {
         assert_eq!(cgroup_memory_available(256, "max", "unused"), Some(256));
         assert_eq!(cgroup_memory_available(256, "bad", "3"), None);
         assert_eq!(cgroup_memory_available(256, "8", "bad"), None);
-        let leaf = cgroup_memory_available(256, "max", "0").expect("leaf");
-        assert_eq!(cgroup_memory_available(leaf, "8", "3"), Some(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_discovery_walks_visible_ancestors() {
+        for (root, group) in [("/", "/team/leaf"), ("/delegated", "/delegated/team/leaf")] {
+            let files = std::collections::BTreeMap::from([
+                (
+                    "/proc/self/cgroup".to_owned(),
+                    format!("5:memory:/wrong\n0::{group}\n"),
+                ),
+                (
+                    "/proc/self/mountinfo".to_owned(),
+                    format!(
+                        "1 0 0:1 /unrelated /wrong rw - cgroup2 cgroup rw\n2 0 0:2 {root} /cg\\040space rw - cgroup2 cgroup rw\n"
+                    ),
+                ),
+                (
+                    "/cg space/team/leaf/memory.max".to_owned(),
+                    "max".to_owned(),
+                ),
+                ("/cg space/team/memory.max".to_owned(), "8".to_owned()),
+                ("/cg space/team/memory.current".to_owned(), "3".to_owned()),
+                ("/cg space/memory.max".to_owned(), "max".to_owned()),
+            ]);
+            let read = |path: &std::path::Path| {
+                files
+                    .get(path.to_str().expect("fixture path"))
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+            };
+            assert_eq!(machine_memory_available_with(256, &read), Some(5));
+            assert_eq!(machine_memory_available_with(4, &read), Some(4));
+        }
     }
 
     #[test]

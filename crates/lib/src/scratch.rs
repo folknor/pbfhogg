@@ -178,6 +178,16 @@ impl RunScratch {
     /// `parent` is missing, not a directory, or not writable, or the
     /// directory could not be initialised.
     pub fn create(parent: &Path, host: &Host) -> crate::Result<Self> {
+        Self::create_with_identity(parent, host, || Ok((std::process::id(), random_u128()?)))
+    }
+
+    // Monomorphized identity source: no dynamic dispatch or extra acquisition
+    // on the production path, and no process-global test override.
+    fn create_with_identity(
+        parent: &Path,
+        host: &Host,
+        mut identity: impl FnMut() -> crate::Result<(u32, u128)>,
+    ) -> crate::Result<Self> {
         let host = &host.enter()?;
         let parent = if parent.as_os_str().is_empty() {
             Path::new(".")
@@ -197,8 +207,8 @@ impl RunScratch {
             )));
         }
         loop {
-            let owner = random_u128()?;
-            let path = parent.join(format!("{RUN_PREFIX}{}-{owner:032x}", std::process::id()));
+            let (pid, owner) = identity()?;
+            let path = parent.join(format!("{RUN_PREFIX}{pid}-{owner:032x}"));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
                     // The guard exists from here on, so a failure while
@@ -429,21 +439,30 @@ fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
 }
 
 fn random_u128() -> crate::Result<u128> {
+    random_u128_with(|bytes| {
+        // SAFETY: the pointer and length describe the borrowed output slice.
+        let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(usize::try_from(n).unwrap_or(0))
+        }
+    })
+}
+
+fn random_u128_with(mut read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> crate::Result<u128> {
     let mut bytes = [0_u8; 16];
     let mut filled = 0;
     while filled < bytes.len() {
-        // SAFETY: the pointer and length describe the unfilled tail of `bytes`.
-        let n = unsafe {
-            libc::getrandom(bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, 0)
-        };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
+        match read(&mut bytes[filled..]) {
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(
+                    crate::Error::from(e).context("no randomness for a scratch directory name")
+                );
             }
-            return Err(crate::Error::from(e).context("no randomness for a scratch directory name"));
         }
-        filled += usize::try_from(n).unwrap_or(0);
     }
     Ok(u128::from_le_bytes(bytes))
 }
@@ -1149,6 +1168,57 @@ pub fn is_within(inner: &Path, outer: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_collision_retries_without_claiming_the_existing_directory() {
+        let parent = crate::path_guard::tests::scratch();
+        let occupied = parent.child(format!("{RUN_PREFIX}17-{:032x}", 1));
+        fs::create_dir(&occupied).expect("occupied name");
+        fs::write(occupied.join("keep"), b"existing").expect("sentinel");
+        let mut identities = [(17, 1), (17, 1), (17, 2)].into_iter();
+        let run = RunScratch::create_with_identity(parent.path(), &host(), || {
+            Ok(identities.next().expect("bounded retries"))
+        })
+        .expect("third identity is unused");
+        assert_eq!(run.owner, 2);
+        assert_eq!(
+            run.path(),
+            parent.child(format!("{RUN_PREFIX}17-{:032x}", 2))
+        );
+        drop(run);
+        assert!(identities.next().is_none());
+        assert_eq!(
+            fs::read(occupied.join("keep")).expect("preserved"),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn entropy_retries_interruption_and_short_reads_and_reports_failure() {
+        let mut calls = 0;
+        let value = random_u128_with(|bytes| {
+            calls += 1;
+            if calls == 1 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = bytes.len().min(3);
+            bytes[..count].fill(7);
+            Ok(count)
+        })
+        .expect("interrupted and short reads");
+        assert_eq!(value, u128::from_le_bytes([7; 16]));
+        assert_eq!(calls, 7);
+        let parent = crate::path_guard::tests::scratch();
+        let error = RunScratch::create_with_identity(parent.path(), &host(), || {
+            Ok((
+                17,
+                random_u128_with(|_| Err(io::ErrorKind::PermissionDenied.into()))?,
+            ))
+        })
+        .expect_err("entropy failure");
+        assert!(error.to_string().contains("no randomness"), "{error}");
+        assert_eq!(fs::read_dir(parent.path()).expect("parent").count(), 0);
+    }
 
     fn host() -> Host {
         Host::for_tests()

@@ -19,6 +19,8 @@
 //! are exact. The replacement differs from the input in its element counts,
 //! node coordinates and size, so a read of it shows in any report.
 
+use crate::reopen_cell;
+
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -196,6 +198,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Option
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
@@ -227,9 +232,9 @@ fn check_replacements(route: Route, dir: &Path, input: &Path, expected: &[Option
                     got, expected,
                     "{cell}: the report must be of the pinned input"
                 );
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is a
-                // Unix guarantee.
+            } else {
+                // reopen_cell::available admits only Unix cells, where the
+                // identity refusal is guaranteed.
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -329,6 +334,9 @@ fn a_decode_only_run_opens_once_through_a_caller_pin() {
                 .force_pin_path_reopen
                 .store(force_path, Ordering::Relaxed);
             let pin = PinnedInput::pin(&input, &host).expect("caller pin");
+            if !reopen_cell::available(force_path, pin.reopens_through_procfs()) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, 1);
@@ -373,6 +381,9 @@ fn a_caller_pin_is_used_as_it_is() {
                 .store(force_path, Ordering::Relaxed);
             let pin = PinnedInput::pin(&input, &host).expect("caller pin");
             let procfs = pin.reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             std::fs::rename(&replacement, &input).expect("replace the input");
             let result = run_inspect(route, &pin, &host);
             let cell = format!("{route:?}, procfs {procfs}");
@@ -382,7 +393,7 @@ fn a_caller_pin_is_used_as_it_is() {
                     got, expected,
                     "{cell}: the report must be of the pinned file"
                 );
-            } else if cfg!(unix) {
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -566,6 +577,9 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
             let procfs = PinnedInput::pin(&input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(&input, &replacement, after);
@@ -590,7 +604,7 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
                     got, expected,
                     "{cell}: the stats must be of the pinned input"
                 );
-            } else if cfg!(unix) {
+            } else {
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -638,11 +652,14 @@ fn node_stats_uses_a_caller_pin_as_it_is() {
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
         let procfs = pin.reopens_through_procfs();
+        if !reopen_cell::available(force_path, procfs) {
+            continue;
+        }
         std::fs::rename(&replacement, &input).expect("replace the input");
         let result = run_node_stats(&pin, false, &host);
         if procfs {
             assert_eq!(result.expect("procfs run"), expected);
-        } else if cfg!(unix) {
+        } else {
             let err = result.expect_err("must refuse");
             assert!(
                 matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
@@ -697,6 +714,9 @@ fn inspect_header_takes_the_size_from_its_one_open() {
             .force_pin_path_reopen
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
+        if !reopen_cell::available(force_path, pin.reopens_through_procfs()) {
+            continue;
+        }
         host.invocation
             .faults()
             .arm_input_replacement(&input, &replacement, 1);

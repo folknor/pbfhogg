@@ -22,6 +22,8 @@
 //! Also here: a path given twice shares one pin, the descriptors a run asks
 //! its host for, and a FIFO refused before any input is read.
 
+use crate::reopen_cell;
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -325,6 +327,9 @@ fn check_replacements(route: Route, inputs: &Inputs, target: usize, expected: &[
             let procfs = PinnedInput::pin(input, &host)
                 .expect("probe pin")
                 .reopens_through_procfs();
+            if !reopen_cell::available(force_path, procfs) {
+                continue;
+            }
             host.invocation
                 .faults()
                 .arm_input_replacement(input, &replacement, after);
@@ -366,9 +371,9 @@ fn check_replacements(route: Route, inputs: &Inputs, target: usize, expected: &[
                     "{cell}: the output must hold only what the pinned inputs yield"
                 );
                 std::fs::remove_file(&output).expect("remove output");
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is a
-                // Unix guarantee.
+            } else {
+                // reopen_cell::available admits only Unix cells, where the
+                // identity refusal is guaranteed.
                 let err = result
                     .err()
                     .unwrap_or_else(|| panic!("{cell}: must refuse"));
@@ -558,6 +563,9 @@ fn a_repeated_input_is_one_pin() {
                 let procfs = PinnedInput::pin(input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();
+                if !reopen_cell::available(force_path, procfs) {
+                    continue;
+                }
                 host.invocation
                     .faults()
                     .arm_input_replacement(input, &replacement, after);
@@ -574,7 +582,7 @@ fn a_repeated_input_is_one_pin() {
                         "{cell}: both arguments must read the pinned file"
                     );
                     std::fs::remove_file(&output).expect("remove output");
-                } else if cfg!(unix) {
+                } else {
                     let err = result
                         .err()
                         .unwrap_or_else(|| panic!("{cell}: must refuse"));

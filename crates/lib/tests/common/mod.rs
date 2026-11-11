@@ -76,7 +76,8 @@ pub fn out_replace(path: impl AsRef<Path>) -> pbfhogg::Output {
     .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
 }
 
-/// A FIFO named `name` in `dir`, for the input-pinning refusals.
+/// A FIFO named `name` in `dir`: the one place integration tests create
+/// FIFOs (input-pinning refusals, and `fifo_capture::FifoCapture`).
 #[cfg(unix)]
 pub fn make_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
     let fifo = dir.join(name);

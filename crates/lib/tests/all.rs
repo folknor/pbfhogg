@@ -37,6 +37,15 @@
 )]
 
 mod common;
+// Shared helpers kept out of `common/mod.rs`, which pbfhogg-cli also mounts
+// and which must not grow its users' dependencies. Each is declared once
+// here, so its code and unit tests exist once in this binary; the harness
+// package mounts `fifo_capture` by path on its own.
+#[path = "common/fifo_capture.rs"]
+mod fifo_capture;
+#[cfg(feature = "test-hooks")]
+#[path = "common/reopen_cell.rs"]
+mod reopen_cell;
 
 // Gated on `commands` because they reach modules that feature gates
 // (`check`, `export`, `extract`, `inspect`'s JSON output, the geocode
@@ -50,6 +59,8 @@ mod check;
 mod check_locations;
 #[cfg(feature = "commands")]
 mod geocode_index;
+#[cfg(feature = "geocode-reader")]
+mod geocode_reader;
 #[cfg(feature = "commands")]
 mod inspect;
 
@@ -136,7 +147,6 @@ mod roundtrip;
 mod roundtrip_invariants;
 #[cfg(all(feature = "test-hooks", unix))]
 mod seal;
-#[cfg(feature = "commands")]
 mod tags_count;
 mod tags_filter_osc;
 

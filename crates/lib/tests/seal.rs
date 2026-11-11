@@ -10,8 +10,6 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -19,52 +17,20 @@ use pbfhogg::debug::{CallId, InstrumentSink, MarkerFifo, StreamAccount, StreamSt
 use pbfhogg::host::{Invocation, SealOutcome, SealRefusal};
 use pbfhogg::test_hooks::SealStep;
 
-/// A FIFO in the test's scratch, drained on a thread until every write end
-/// has dropped; the drain returns everything it read.
+use crate::fifo_capture;
+
+/// A call-stream producer and its owned, wakeable FIFO capture.
 struct Capture {
-    _dir: pbfhogg_test_scratch::TestScratch,
     fifo: MarkerFifo,
-    drain: std::thread::JoinHandle<String>,
+    drain: fifo_capture::FifoCapture,
+    _dir: pbfhogg_test_scratch::TestScratch,
 }
 
 impl Capture {
     fn new() -> Self {
         let dir = crate::common::test_scratch();
-        let path = dir.path().join("sidecar.fifo");
-        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        // SAFETY: a valid NUL-terminated path in the test's own scratch.
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
-        let mut reader = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .unwrap();
-        // Room for everything a test writes, where the host allows it, so
-        // the drain rarely matters. A test still never assumes nothing was
-        // dropped: see `assert_ended`.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: an fcntl on a descriptor this function owns. A refusal
-            // (a host capping pipe sizes) leaves the default, which is fine.
-            let _size = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
-        }
-        let fifo = MarkerFifo::open(&path).unwrap();
-        let drain = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Err(e) => panic!("drain FIFO: {e}"),
-                }
-            }
-            String::from_utf8(bytes).unwrap()
-        });
+        let drain = fifo_capture::FifoCapture::new(dir.path());
+        let fifo = MarkerFifo::open(&drain.path).expect("write end");
         Self {
             _dir: dir,
             fifo,
@@ -82,7 +48,7 @@ impl Capture {
     /// so every call sink) must be dropped first.
     fn finish(self, id: &str) -> Vec<String> {
         drop(self.fifo);
-        let text = self.drain.join().unwrap();
+        let text = self.drain.finish();
         let tag = format!(" %{id} ");
         text.lines()
             .filter_map(|l| l.split_once(&tag).map(|(_, body)| body.to_owned()))
@@ -324,7 +290,7 @@ struct SealingOnDrop {
     seen: Arc<Mutex<Vec<String>>>,
 }
 
-impl Read for SealingOnDrop {
+impl std::io::Read for SealingOnDrop {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.bytes.read(buf)
     }

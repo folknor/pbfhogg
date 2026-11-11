@@ -25,6 +25,10 @@ function validate(params)
 end
 
 function bench(params)
+    -- Buffered-first and buffered-only ranking are descriptive, not a matched
+    -- backend comparison: the second child inherits the first child's drive
+    -- state. Proper interleaved single-arm rounds await brokkr#129; changing
+    -- local order cannot balance predecessor workloads across iterations.
     local modes = params.uring == "yes" and { "buffered", "uring" } or { "buffered" }
     record.cells = {}
     local stopped = false

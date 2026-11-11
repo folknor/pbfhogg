@@ -1,3 +1,7 @@
+# Every textlint rule pins representative files with must_scan, so a dead
+# corpus fails an ordinary check. Sentinels pin representative scope;
+# they do not prove every glob or exclusion is live. Brokkr owns selector
+# validation; its check --audit reports stale selectors and exclusions.
 # AGENTS.md's document-folder rule, enforced rather than trusted: nothing
 # durable (reference/, docs/, code comments) may cite notes/, and durable
 # docs must not point at files that no longer exist. Reads tracked files
@@ -43,6 +47,7 @@ pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
 exclude = ["crates/lib/src/debug.rs", "crates/lib/src/process.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/src/describe.rs", "crates/harness/tests/exe.rs"]
 message = "glibc-only allocator calls belong in target_env gnu gated debug/process wrappers"
 
 # Stdout discipline. `print!`/`println!` panic when stdout's reader goes away,
@@ -63,6 +68,7 @@ name = "no-library-feature-gates-in-tests-common"
 pattern = 'feature\s*=\s*"(?:commands|geocode-reader)"'
 paths = ["crates/lib/tests/common/**/*.rs"]
 except = ['^\s*//']
+must_scan = ["crates/lib/tests/common/process.rs"]
 message = "crates/lib/tests/common is shared with pbfhogg-cli, where `commands` means something else; gate the mod line in crates/lib/tests/all.rs instead, never a shared helper"
 
 # Fault injection is per-run: every hook's state lives in the fault plan the
@@ -75,6 +81,7 @@ name = "no-static-fault-hook-state"
 pattern = '^\s*(?:pub(?:\([^)]*\))?\s+)?static\s'
 paths = ["crates/lib/src/test_hooks.rs"]
 region = "code"
+must_scan = ["crates/lib/src/test_hooks.rs"]
 message = "fault-hook state lives in FaultPlan, carried by the run's Invocation token; a static would fire in every concurrent test of the process"
 
 [[textlint]]
@@ -83,6 +90,7 @@ pattern = '\bmod\s+\w*test_hooks\b'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/lib.rs"]
 region = "code"
+must_scan = ["crates/lib/src/test_hooks.rs"]
 message = "fault hooks go in pbfhogg::test_hooks (crates/lib/src/test_hooks.rs) as FaultPlan fields, not in a module of their own"
 
 [[textlint]]
@@ -90,6 +98,7 @@ name = "no-print-macro"
 pattern = '\b(?:print|println)!\s*[\(\[\{]'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs"]
 message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | head); in the CLI write through output::buffered, in the library into a caller-supplied io::Write"
 
 [[textlint]]
@@ -98,6 +107,7 @@ pattern = '\bstdout\b'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
 exclude = ["crates/cli/src/output.rs", "crates/harness/src/describe_out.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs"]
 message = "only crates/cli/src/output.rs (and the harness's describe writer, crates/harness/src/describe_out.rs) acquires stdout; use output::buffered, or have the library take an io::Write"
 
 # Header feature spellings live in `read/block.rs` feature constants. Test
@@ -114,6 +124,7 @@ except = [
     '(?:unpacked_field_error|repeated_field_error)\("DenseNodes",',
 ]
 region = "string"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs"]
 message = "Use the Feature constants from read/block.rs for PBF header feature names"
 
 # Read-side data the crate has already validated (a constructed block, the
@@ -156,6 +167,7 @@ pattern = '\.unwrap_or\(""\)'
 paths = ["crates/lib/src/read/**/*.rs", "crates/lib/src/blob_meta/**/*.rs", "crates/lib/src/osc/**/*.rs", "crates/lib/src/owned.rs"]
 except = ['^\s*//', '//\s*ok-deliberate:\s*\S']
 test_code = "skip"
+must_scan = ["crates/lib/src/read/block.rs", "crates/lib/src/blob_meta/mod.rs", "crates/lib/src/osc/interner.rs", "crates/lib/src/owned.rs"]
 message = "An empty-string fallback on read-side data writes a silent wrong tag, role or user; panic on the broken invariant or return the error"
 
 [[textlint]]
@@ -164,6 +176,7 @@ pattern = '\blibc::(?:mallopt|setrlimit|prlimit|prlimit64)\b'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/process.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Process mutations belong to the caller's explicit process toolbox"
 
 # docs/cli/commands.md "Names pbfhogg leaves behind" promises that the
@@ -181,6 +194,7 @@ pattern = '\bprocess::(?:Command|Child|Stdio|CommandExt)\b|\buse\s+std::process:
 # does, so it is held to the same promise.
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs"]
 message = "The CLI promises it starts no other process and leaves inherited descriptors alone (docs/cli/commands.md, Names pbfhogg leaves behind); the library harness keeps the same promise"
 
 # The same promise covers file-status flags. The one F_SETFL clears O_NONBLOCK
@@ -191,6 +205,7 @@ pattern = '\bF_SETFL\b'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
 exclude = ["crates/lib/src/read/input.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs"]
 message = "Only crates/lib/src/read/input.rs changes file-status flags, on descriptors it opened; inherited descriptors keep theirs"
 
 # hotpath's hotpath-cpu feature spawns a detached profiler process, which would
@@ -214,6 +229,7 @@ pattern = 'available_parallelism|/proc/meminfo'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/host.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Host probes must use Resources at the original program point"
 
 # Direct I/O must keep the alignment the file's device and filesystem
@@ -227,6 +243,7 @@ pattern = '\bO_DIRECT\b'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs"]
 exclude = ["crates/lib/src/direct_io.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs"]
 message = "O_DIRECT files open through crate::direct_io (create_for_write, open_for_read), which also returns the alignment their I/O must keep"
 
 [[textlint]]
@@ -234,6 +251,7 @@ name = "no-env-read"
 pattern = '\benv::(?:var|var_os|vars|vars_os)\b'
 paths = ["crates/lib/src/**/*.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Environment access belongs to the caller"
 
 # The CLI's command interval markers are reserved for it: brokkr reads exactly
@@ -246,6 +264,7 @@ pattern = 'CLI_COMMAND_(?:START|END)'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
 exclude = ["crates/cli/src/host.rs"]
 region = "string"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs"]
 message = "CLI_COMMAND_START and CLI_COMMAND_END are the CLI's reserved command-interval markers; only host::CommandInterval emits them"
 
 [[textlint]]
@@ -253,6 +272,7 @@ name = "no-public-reader-in-commands"
 pattern = '\b(?:BlobReader|ElementReader)::(?:open|from_path|from_path_direct|from_path_with_eviction)\b'
 paths = ["crates/lib/src/commands/**/*.rs", "crates/lib/src/geocode_index/builder/**/*.rs", "crates/lib/src/scan/**/*.rs", "crates/lib/src/osc/**/*.rs"]
 region = "code"
+must_scan = ["crates/lib/src/commands/mod.rs", "crates/lib/src/geocode_index/builder/mod.rs", "crates/lib/src/scan/classify.rs", "crates/lib/src/osc/interner.rs"]
 message = "Command readers must inherit the caller's host"
 
 # Input page-cache eviction is the caller's policy (ADR-0016), and the
@@ -313,6 +333,7 @@ pattern = '\brayon::(?:spawn|join|scope|in_place_scope|broadcast)\b|build_global
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/host.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Library rayon tasks must go through the caller's host::Executor, not an ambient pool"
 
 [[textlint]]
@@ -321,6 +342,7 @@ pattern = '\beprint(?:ln)?!'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
 exclude = ["crates/cli/src/output.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs"]
 message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr; the library harness writes nothing to stderr at all"
 
 # Test scratch has one owner, the dev-only crates/test-scratch crate
@@ -389,6 +411,32 @@ test_code = "only"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/common/process.rs"]
 message = "Use TestScratch::cell() for fixture names instead of a static name counter"
 
+# FIFOs in the integration-test trees have two owners: creation is
+# crates/lib/tests/common/mod.rs make_fifo, draining is
+# crates/lib/tests/common/fifo_capture.rs, whose reader blocks in poll and is
+# woken and joined on finish or drop (the local drains it replaced spun on
+# sleep and could leave a reader running). Both rules are spelling-bound
+# tripwires: F_SETPIPE_SZ marks a drain because every local drain sized its
+# pipe; a drain without it stays unseen. Library and harness unit tests under
+# src/ cannot reach the test-tree helpers and stay out of scope.
+[[textlint]]
+name = "test-fifos-created-only-by-make-fifo"
+pattern = '\bmkfifo\s*\('
+paths = ["crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
+exclude = ["crates/lib/tests/common/mod.rs"]
+region = "code"
+must_scan = ["crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/common/process.rs"]
+message = "Create test FIFOs with crate::common::make_fifo"
+
+[[textlint]]
+name = "test-fifo-drains-only-in-fifo-capture"
+pattern = '\bF_SETPIPE_SZ\b'
+paths = ["crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
+exclude = ["crates/lib/tests/common/fifo_capture.rs"]
+region = "code"
+must_scan = ["crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs", "crates/lib/tests/host_contract.rs", "crates/lib/tests/seal.rs"]
+message = "Drain a test FIFO with crate::fifo_capture::FifoCapture, the one wakeable, joined capture"
+
 # Error propagation (reference/pipeline.md, "Error propagation and
 # provenance"). A typed error keeps its kind and
 # its cause as it travels; text is only ever produced for the final rendering
@@ -401,6 +449,7 @@ pattern = '\bio::Error::other\b'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "io::Error::other flattens a typed error into an opaque Other; use a pbfhogg::Error constructor (Error::internal and friends) or keep the original io::Error"
 
 [[textlint]]
@@ -409,6 +458,7 @@ pattern = '\bErrorKind::Other\b'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "io::ErrorKind::Other discards what failed; pick the real io kind, or a pbfhogg::Error constructor"
 
 [[textlint]]
@@ -417,6 +467,7 @@ pattern = '\bio::Error::new\(\s*\w+\.kind\(\)\s*,\s*(?:\w+\.to_string\(\)|format
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Rebuilding an io::Error from its own kind and text loses its OS error and its source; add context with Error::context instead"
 
 [[textlint]]
@@ -425,6 +476,7 @@ pattern = '\.map_err\(\|\w+\|\s*\w+\.to_string\(\)\)'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "map_err to a String flattens the error's kind and cause; propagate the typed error and add context with Error::context"
 
 [[textlint]]
@@ -433,6 +485,7 @@ pattern = '\bResult<(?:[^;{<>,]|<(?:[^<>]|<[^<>]*>)*>)*,\s*String>'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "A String error carries no kind and no cause; return pbfhogg::Result"
 
 [[textlint]]
@@ -441,6 +494,7 @@ pattern = 'Box<dyn (?:std::error::)?Error'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Box<dyn Error> erases the error's kind; return pbfhogg::Result"
 
 # Only error.rs builds an ErrorKind; everything else uses the constructors
@@ -452,6 +506,7 @@ pattern = '\bnew_error\(\s*(?:crate::error::)?ErrorKind::'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
 region = "code"
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Build errors with the constructors in error.rs, not new_error(ErrorKind::..)"
 
 # A rough check: an error constructor whose text interpolates another error
@@ -465,6 +520,7 @@ name = "no-error-interpolated-into-message"
 pattern = '\b(?:invalid_argument|invalid_data|internal)\(\s*format!\(.*\{(?:e|err|error|source)(?::[^}]*)?\}'
 paths = ["crates/lib/src/**/*.rs"]
 exclude = ["crates/lib/src/error.rs"]
+must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Do not interpolate an error into a new error's message; keep it as the typed source or add context to it"
 
 # Writer counter funnel. `sync_all_ns` / `sync_all_calls` are a pair and

@@ -830,6 +830,104 @@ impl OutputSink for UringSink<'_> {
 mod tests {
     use super::*;
 
+    /// Exercise the byte accumulator directly: compressed entity counts do
+    /// not place writes at either the filesystem alignment or pool boundary.
+    #[test]
+    fn exact_size_padding_and_submission_boundaries() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("uring-boundaries.bin");
+        let (probe, align) = match crate::direct_io::create_for_write(&path, None) {
+            Ok(opened) => opened,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    crate::ErrorKind::PlatformUnsupported {
+                        feature: "direct-io",
+                        ..
+                    }
+                ) =>
+            {
+                crate::test_support::skip(format!("io_uring output: {e}"));
+                return;
+            }
+            Err(e) => panic!("unexpected output setup error: {e}"),
+        };
+        drop(probe);
+        let lengths = [
+            0,
+            1,
+            align - 1,
+            align,
+            align + 1,
+            IO_BUF_BYTES - 1,
+            IO_BUF_BYTES,
+            IO_BUF_BYTES + 1,
+            2 * IO_BUF_BYTES - 1,
+            2 * IO_BUF_BYTES,
+            2 * IO_BUF_BYTES + 1,
+        ];
+        for len in lengths {
+            // A nonzero pattern makes stale padding or an interior gap visible.
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i % 251 + 1).expect("pattern fits u8"))
+                .collect();
+            let invocation = crate::host::Invocation::new();
+            let call = invocation.call().expect("fresh invocation");
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            drop(tx);
+            let inbox = Inbox::detached(rx);
+            let expected = SeqTotal::new();
+            expected.announce(0);
+            let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
+            // The initial byte handoff uses the same accumulator as every
+            // framed blob; no PBF framing or compression changes its length.
+            let result = uring_init_and_run(
+                &inbox,
+                &path,
+                &bytes,
+                &init_tx,
+                &expected,
+                super::super::Finish::Deferred,
+                &call,
+            );
+            match result {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        crate::ErrorKind::PlatformUnsupported {
+                            feature: "io-uring" | "direct-io",
+                            ..
+                        }
+                    ) =>
+                {
+                    crate::test_support::skip(format!("io_uring output: {e}"));
+                    return;
+                }
+                Err(e) => panic!("len={len}: unexpected writer error: {e}"),
+            }
+            init_rx
+                .recv()
+                .expect("init announcement")
+                .expect("init success");
+            assert_eq!(
+                call.metrics().writer.uring_submit_calls.load(Relaxed),
+                u64::try_from(len.div_ceil(IO_BUF_BYTES)).expect("count fits u64"),
+                "len={len}: one submission per full buffer plus final partial"
+            );
+            assert_eq!(
+                std::fs::metadata(&path).expect("output metadata").len(),
+                u64::try_from(len).expect("length fits u64"),
+                "len={len}: alignment padding must be truncated"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read output"),
+                bytes,
+                "len={len}"
+            );
+        }
+    }
+
     #[test]
     fn aligned_buffer_pool_basics() {
         // Above the floor, so the test shows the pool honours the alignment

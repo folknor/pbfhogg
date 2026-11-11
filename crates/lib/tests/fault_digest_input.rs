@@ -13,6 +13,8 @@
 //!
 //! The replacement carries other IDs, so a digest of it differs.
 
+use crate::reopen_cell;
+
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -119,6 +121,9 @@ fn a_replacement_after_the_open_does_not_reach_the_run() {
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
         let procfs = pin.reopens_through_procfs();
+        if !reopen_cell::available(force_path, procfs) {
+            continue;
+        }
         host.invocation
             .faults()
             .arm_input_replacement(&input, &replacement, 1);
@@ -163,6 +168,9 @@ fn a_caller_pin_is_used_as_it_is() {
             .store(force_path, Ordering::Relaxed);
         let pin = PinnedInput::pin(&input, &host).expect("caller pin");
         let procfs = pin.reopens_through_procfs();
+        if !reopen_cell::available(force_path, procfs) {
+            continue;
+        }
         std::fs::rename(&replacement, &input).expect("replace the input");
         let result = run(&pin, false, &host);
         let cell = format!("procfs {procfs}");
@@ -172,9 +180,9 @@ fn a_caller_pin_is_used_as_it_is() {
                 expected,
                 "{cell}: the digest must be the pinned file's"
             );
-        } else if cfg!(unix) {
-            // Off Unix a pin verifies nothing; the identity refusal is a
-            // Unix guarantee.
+        } else {
+            // reopen_cell::available admits only Unix cells, where the
+            // identity refusal is guaranteed.
             let err = result
                 .err()
                 .unwrap_or_else(|| panic!("{cell}: must refuse"));

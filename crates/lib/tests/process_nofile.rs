@@ -78,50 +78,44 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
         );
         (after.rlim_cur, after.rlim_max)
     };
-    // The scenarios set soft limits up to 1024.
-    if get().1 < 1024 {
-        eprintln!("Skipping: hard RLIMIT_NOFILE below 1024");
-        return;
-    }
-
-    // Scenario 0: only descriptors numbered below the cutoff are counted.
-    // Descriptors are allocated lowest-free-first and nothing else in this
-    // process opens files concurrently, so every number below the highest
-    // held one is occupied once these are open (inherited descriptors may
-    // sit between held ones) and the count's own directory handle lands
-    // above them.
+    // Counting is independent of the descriptor budget scenarios. Compare a
+    // controlled delta rather than assuming inherited descriptor numbers have
+    // no holes. The counter's own directory handle is present in both counts.
     #[cfg(target_os = "linux")]
-    {
+    let countable = {
         use pbfhogg::process::{FdCount, count_open_descriptors};
-        use std::os::fd::AsRawFd as _;
-        let held: Vec<std::fs::File> = (0..8)
-            .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
-            .collect();
-        let fds: Vec<u64> = held
-            .iter()
-            .map(|f| u64::try_from(f.as_raw_fd()).expect("non-negative fd"))
-            .collect();
-        let lo = *fds.iter().min().expect("held");
-        let hi = *fds.iter().max().expect("held") + 1;
-        let count = |limit| match count_open_descriptors(limit) {
-            FdCount::Counted(n) => n,
-            other => panic!("procfs must be countable on Linux, got {other:?}"),
-        };
-        assert_eq!(count(0), 0);
-        assert_eq!(count(hi) - count(lo), hi - lo, "held fds {fds:?}");
-        assert!(count(hi) - count(lo) >= 8, "held fds {fds:?}");
-        assert_eq!(count(hi), hi, "every number below {hi} is occupied");
-        assert!(
-            count(u64::MAX) > count(hi),
-            "the count's own handle is above"
-        );
-        drop(held);
-    }
+        match count_open_descriptors(u64::MAX) {
+            FdCount::Counted(before) if get().0.saturating_sub(before) >= 8 => {
+                let held: Vec<_> = (0..8)
+                    .map(|_| std::fs::File::open(&input).expect("open fixture"))
+                    .collect();
+                assert!(matches!(count_open_descriptors(0), FdCount::Counted(0)));
+                match count_open_descriptors(u64::MAX) {
+                    FdCount::Counted(after) => assert_eq!(after, before + 8),
+                    other => panic!("count became unavailable with eight held files: {other:?}"),
+                }
+                drop(held);
+                true
+            }
+            other => {
+                common::skip(format!(
+                    "descriptor counting unavailable or fewer than eight free slots: {other:?}"
+                ));
+                false
+            }
+        }
+    };
 
     // Scenario 1: the run probes the limit and leaves it as it found it.
-    let hard = set_soft(1024);
-    external_join(&host, &input, &dir.path().join("external.pbf")).expect("external");
-    assert_eq!(get(), (1024, hard));
+    let original = get();
+    let hard = original.1;
+    if hard >= 1024 {
+        set_soft(1024);
+        external_join(&host, &input, &dir.path().join("external.pbf")).expect("external");
+        assert_eq!(get(), (1024, hard));
+    } else {
+        common::skip("unchanged-limit scenario needs hard RLIMIT_NOFILE >= 1024");
+    }
 
     // Scenario 2: descriptors the process already holds come out of the
     // allowance. 600 would fit one 256-shard worker plus headroom if the
@@ -129,11 +123,20 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
     // partway through stage 1; counted, it fails up front instead. Linux
     // only: elsewhere the open descriptors are not counted.
     #[cfg(target_os = "linux")]
-    {
+    if countable && hard >= 600 {
         set_soft(600);
-        let held: Vec<std::fs::File> = (0..400)
-            .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
-            .collect();
+        let held = (0..400)
+            .map(|_| std::fs::File::open(&input))
+            .collect::<std::io::Result<Vec<_>>>();
+        let held = match held {
+            Ok(held) => held,
+            Err(error) if error.raw_os_error() == Some(libc::EMFILE) => {
+                common::skip("inherited descriptors leave fewer than 400 free slots");
+                set_soft(original.0);
+                return;
+            }
+            Err(error) => panic!("open held fixture: {error}"),
+        };
         let err = external_join(&host, &input, &dir.path().join("held.pbf"))
             .expect_err("400 held descriptors leave no room for a shard worker");
         assert!(
@@ -142,6 +145,8 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
         );
         drop(held);
         assert_eq!(get(), (600, hard));
-        set_soft(1024);
+    } else {
+        common::skip("held-descriptor scenario needs counting and hard RLIMIT_NOFILE >= 600");
     }
+    set_soft(original.0);
 }

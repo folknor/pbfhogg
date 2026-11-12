@@ -272,18 +272,26 @@ struct Row {
     gaps: &'static [(Prop, &'static str)],
 }
 
-/// Subcommands that write no output, with the reason.
-const NO_OUTPUT: &[(&str, &str)] = &[
-    ("digest", "prints the digest on stdout"),
-    ("inspect", "prints its report on stdout"),
+/// Subcommands that write no output, with the reason and the arguments
+/// (before the input PBF) `a_command_without_an_output_is_interrupted_too`
+/// interrupts it with, so every entry is interrupted.
+const NO_OUTPUT: &[(&str, &str, &[&str])] = &[
+    ("digest", "prints the digest on stdout", &["digest"]),
+    ("inspect", "prints its report on stdout", &["inspect"]),
     (
         "check",
         "prints its findings on stdout, exit code only with --quiet",
+        &["check", "--refs"],
     ),
-    ("bench-read", "reads and reports counters on stderr"),
+    (
+        "bench-read",
+        "reads and reports counters on stderr",
+        &["bench-read", "--mode", "pipelined"],
+    ),
     (
         "bench-write",
         "encodes into /dev/null, a byte sink the benchmark discards, not an output",
+        &["bench-write"],
     ),
 ];
 
@@ -1410,7 +1418,7 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
     let mut problems = Vec::new();
     for command in &commands {
         let in_table = ROWS.iter().any(|row| row.command == command);
-        let no_output = NO_OUTPUT.iter().any(|(name, _)| name == command);
+        let no_output = NO_OUTPUT.iter().any(|(name, _, _)| name == command);
         match (in_table, no_output) {
             (false, false) => problems.push(format!(
                 "`{command}` is in neither ROWS nor NO_OUTPUT: add a row for it, or say why it writes no output"
@@ -1422,7 +1430,7 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
     for name in ROWS
         .iter()
         .map(|row| row.command)
-        .chain(NO_OUTPUT.iter().map(|(name, _)| *name))
+        .chain(NO_OUTPUT.iter().map(|(name, _, _)| *name))
     {
         if !commands.iter().any(|c| c == name) {
             problems.push(format!(
@@ -1458,7 +1466,12 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
             ));
         }
     }
-    for (name, reason) in NO_OUTPUT {
+    for (name, reason, interrupt) in NO_OUTPUT {
+        if interrupt.first() != Some(name) {
+            problems.push(format!(
+                "`{name}` is interrupted with {interrupt:?}, which does not run it"
+            ));
+        }
         let command = tree
             .find_subcommand(name)
             .expect("no-output command exists");
@@ -3033,14 +3046,7 @@ fn a_command_without_an_output_is_interrupted_too() {
     use std::time::{Duration, Instant};
     let fx = Fx::new();
     let good = fx.pbf(Input::Good);
-    let commands: [&[&str]; 5] = [
-        &["inspect"],
-        &["digest"],
-        &["check", "--refs"],
-        &["bench-read", "--mode", "pipelined"],
-        &["bench-write"],
-    ];
-    for (i, words) in commands.iter().enumerate() {
+    for (i, (_, _, words)) in NO_OUTPUT.iter().enumerate() {
         let signal = if i % 2 == 0 {
             libc::SIGINT
         } else {

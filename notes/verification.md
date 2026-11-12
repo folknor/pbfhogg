@@ -91,13 +91,6 @@ success path - a named handle dropped on an assertion failure, which the
 detached-threads source rule (statement and `let _` discards only) cannot see.
 `capabilities.rs` bounds a thread rendezvous with `TEST_CHILD_TIMEOUT`.
 
-## VER-033 - Twelve library commands have no cancellation scenario
-
-`crates/lib/tests/cancel.rs` keeps a registry of all 19 public library command modules,
-compared mechanically against the module declarations: seven are exercised, twelve are
-excluded explicitly, and checkpoint replays are capped at 64 per scenario. Scenarios for
-the excluded twelve, and a comparison against the CLI command inventory, are not done.
-
 ## VER-133 - Test-local metadata readers and PBF writers bypass the shared oracle
 
 Found while closing the shared-oracle work.

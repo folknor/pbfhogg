@@ -640,7 +640,12 @@ exception, not a tier - should not survive across many PRs.
 - **Cancellation hooks.** `Invocation::on_check` (per-instance, hook cfg)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Invocation::checks_passed` counts them. Library tests trip the token from
-  the callback (`crates/lib/tests/cancel.rs`). The CLI, built with the hook cfg, reads
+  the callback (`crates/lib/tests/cancel.rs`): its registry gives every
+  public library command module at least one fixture scenario and names
+  the modes it leaves out, is checked against the module declarations,
+  and each module gets its own sweep tests (tripped before the start,
+  sampled ordinals capped at 64 per scenario, census), so no test's time
+  is the whole registry's. The CLI, built with the hook cfg, reads
   two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
   checkpoint count there at exit, and
   `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
@@ -650,7 +655,11 @@ exception, not a tier - should not survive across many PRs.
   `crates/cli/tests/cli_output_contract.rs` count a command's checkpoints, park it at
   sampled ordinals (tier 1) or at every ordinal of the counting run (its
   `tier3` shards, run by `--profile full` and the gate), signal it, and
-  assert the exit code and an empty directory, with no sleeps. Ordinals are
+  assert the exit code and an empty directory, with no sleeps; a command
+  that writes no output is interrupted with the arguments its `NO_OUTPUT`
+  entry carries, so each surface is compared against its own inventory
+  (library modules, clap subcommands) rather than against the other's.
+  Ordinals are
   positions, not sites, and the fixture's counts are not real data's, so
   neither sweep proves every checkpoint site of a planet run unwinds.
   A row whose checkpoint layout would depend on scheduling is pinned to
@@ -678,8 +687,8 @@ exception, not a tier - should not survive across many PRs.
   doc-hidden) reads the invocation's transition word (live call guards and
   permits, and whether a count saturated) and its census (issued block
   iterators, writers, bound outputs and blocks). `crates/lib/tests/cancel.rs`
-  asserts that it is back to all zero after every run of its selected
-  fixture scenarios, sampled cancellation runs included; that each
+  asserts that it is back to all zero after every run of its fixture
+  scenarios, sampled cancellation runs included; that each
   scenario's census callback observes at least one checkpoint and sees no
   value the command issued itself at any observed checkpoint; and that a
   nested public entry mints its own guard; `crates/lib/tests/capabilities.rs` parks a block iterator's pipeline in the

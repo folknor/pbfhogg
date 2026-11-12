@@ -8,9 +8,13 @@
 //! authoritative. Tokens are per invocation: tripping one stops only the runs
 //! that observe it.
 //!
-//! The mid-run sweep trips the token from the `test-hooks` checkpoint hook at
-//! sampled checkpoint ordinals in selected fixture scenarios, in process, so
-//! "mid-run" needs no signal and no timing.
+//! A registry gives every public library command module fixture scenarios
+//! (and states the modes it leaves out), checked against the module
+//! declarations; each module gets its own sweep tests. The mid-run sweep
+//! trips the token from the checkpoint hook at sampled checkpoint ordinals
+//! of each scenario, in process, so "mid-run" needs no signal and no timing.
+//! Module completeness is not entry or mode completeness: the registry
+//! names what each module's scenarios leave out.
 
 #![allow(clippy::unwrap_used, clippy::unwrap_in_result)]
 
@@ -24,29 +28,61 @@ type Command = fn(&Inputs, &Path, &Path, &pbfhogg::host::Host) -> pbfhogg::Resul
 
 struct Inputs {
     dir: TestScratch,
-    /// The heavy ticket the registry tests hold, since their scenarios
-    /// include an external join (one run at a time); `None` builds light
-    /// hosts.
+    /// The heavy ticket a scenario that needs one (an external join) runs
+    /// under, one run at a time; `None` builds light hosts.
     ticket: Option<std::sync::Arc<crate::common::FdTicket>>,
 }
 
 impl Inputs {
-    /// Inputs for a test running only light scenarios.
-    #[cfg(pbfhogg_test_hooks)]
+    /// Inputs for light scenarios.
     fn new() -> Self {
         Self::build(None)
     }
 
-    /// Inputs for a test running every registered scenario in turn, or
-    /// `None` when its heavy ticket was not admitted (reported as a skip).
-    fn for_registry(test: &str) -> Option<Self> {
+    /// Inputs for a heavy scenario, or `None` when its ticket was not
+    /// admitted (reported as a skip).
+    fn heavy(test: &str) -> Option<Self> {
         crate::common::heavy_ticket(1, test).map(|ticket| Self::build(Some(ticket)))
     }
 
     fn build(ticket: Option<std::sync::Arc<crate::common::FdTicket>>) -> Self {
         let dir = crate::common::test_scratch();
         crate::common::write_base_pbf(&dir.path().join("base.osm.pbf"));
+        // The base with LocationsOnWays, for the commands that need way
+        // geometry (export's ways, check's locations).
+        let host = crate::common::test_host();
+        pbfhogg::altw::add_locations_to_ways(
+            &dir.path().join("base.osm.pbf"),
+            crate::common::out(dir.path().join("altw.osm.pbf")),
+            &pbfhogg::altw::AltwOptions {
+                keep_untagged_nodes: true,
+                write: Default::default(),
+                index_type: pbfhogg::altw::IndexType::Sparse,
+                inject_prepass: false,
+                ignore_missing_nodes: false,
+            },
+            &Default::default(),
+            &host,
+            pbfhogg::scratch::RunScratch::create(dir.path(), &host).unwrap(),
+        )
+        .unwrap();
         crate::common::write_changed_pbf(&dir.path().join("changed.osm.pbf"));
+        // Elements with metadata, which time-filter refuses to go without.
+        let mut nodes = crate::common::generate_nodes(300, 1);
+        let mut ways = crate::common::generate_ways(40, 1, 5, 1);
+        for n in &mut nodes {
+            n.meta = Some(Default::default());
+        }
+        for w in &mut ways {
+            w.meta = Some(Default::default());
+        }
+        crate::common::write_multi_block_test_pbf(
+            &dir.path().join("meta.osm.pbf"),
+            &nodes,
+            &ways,
+            &[],
+            100,
+        );
         #[cfg(feature = "commands")]
         crate::common::write_synthetic_indexed_input(&dir.path().join("geo.osm.pbf"));
         std::fs::write(
@@ -266,6 +302,382 @@ fn digest(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg
     .map(drop)
 }
 
+#[cfg(feature = "commands")]
+fn check_refs(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::check::refs::check_refs(
+        &i.path("base.osm.pbf"),
+        &pbfhogg::check::refs::CheckRefsOptions {
+            direct_io: false,
+            check_relations: true,
+            show_ids: None,
+        },
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn check_index(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::check::index::check_index(
+        &i.path("base.osm.pbf"),
+        &pbfhogg::check::index::CheckIndexOptions {
+            max_errors: 0,
+            direct_io: false,
+        },
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn check_ids(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::check::verify_ids::verify_ids(
+        &i.path("base.osm.pbf"),
+        &pbfhogg::check::verify_ids::VerifyIdsOptions {
+            max_errors: 0,
+            direct_io: false,
+            full: true,
+            type_filter: None,
+        },
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn check_locations(
+    i: &Inputs,
+    _: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    pbfhogg::check::locations::check_locations(
+        &i.path("altw.osm.pbf"),
+        &pbfhogg::check::locations::CheckLocationsOptions {
+            max_errors: 0,
+            direct_io: false,
+            agreement: false,
+            store_budget_bytes: None,
+        },
+        host,
+    )
+    .map(drop)
+}
+
+fn degrade(i: &Inputs, out: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::degrade::degrade(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        pbfhogg::degrade::DegradeFlags {
+            strip_indexdata: true,
+            ..Default::default()
+        },
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn export(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::export::export(
+        &i.path("altw.osm.pbf"),
+        Vec::new(),
+        &pbfhogg::export::ExportOptions::new(
+            Default::default(),
+            Default::default(),
+            &[],
+            None,
+            None,
+            false,
+        )?,
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn extract(
+    i: &Inputs,
+    out: &Path,
+    host: &pbfhogg::host::Host,
+    strategy: pbfhogg::extract::ExtractStrategy,
+) -> pbfhogg::Result<()> {
+    pbfhogg::extract::extract(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        &pbfhogg::extract::Region::Bbox(pbfhogg::extract::parse_bbox("-180,-90,180,90").unwrap()),
+        strategy,
+        true,
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+#[cfg(feature = "commands")]
+fn extract_simple(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract(i, out, host, pbfhogg::extract::ExtractStrategy::Simple)
+}
+
+#[cfg(feature = "commands")]
+fn extract_smart(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    extract(i, out, host, pbfhogg::extract::ExtractStrategy::Smart)
+}
+
+fn ids(specs: &[&str]) -> pbfhogg::getid::ElementIds {
+    let specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    pbfhogg::getid::parse_ids(&specs).unwrap()
+}
+
+fn getid(i: &Inputs, out: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::getid::getid(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        &ids(&["n1", "w1", "r1"]),
+        &pbfhogg::getid::GetidOptions {
+            add_referenced: None,
+            report_found: false,
+        },
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+fn removeid(i: &Inputs, out: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::getid::removeid(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        &ids(&["n1", "w1", "r1"]),
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+fn getparents(i: &Inputs, out: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::getparents::getparents(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        &ids(&["n1", "w1"]),
+        &pbfhogg::getparents::GetparentsOptions { add_self: true },
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+fn inspect_with(i: &Inputs, host: &pbfhogg::host::Host, extended: bool) -> pbfhogg::Result<()> {
+    pbfhogg::inspect::inspect(
+        &i.path("base.osm.pbf"),
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: true,
+            show_id_ranges: true,
+            show_locations: false,
+            extended,
+            distrust_metadata: false,
+            direct_io: false,
+        },
+        host,
+    )
+    .map(drop)
+}
+
+fn inspect_indexed(
+    i: &Inputs,
+    _: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    inspect_with(i, host, false)
+}
+
+fn inspect_extended(
+    i: &Inputs,
+    _: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    inspect_with(i, host, true)
+}
+
+fn inspect_header(
+    i: &Inputs,
+    _: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    pbfhogg::inspect::inspect_header(&i.path("base.osm.pbf"), false, host).map(drop)
+}
+
+fn node_stats(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::inspect::node_stats::node_stats(
+        &i.path("base.osm.pbf"),
+        false,
+        false,
+        pbfhogg::Parallelism::from_jobs(2),
+        host,
+    )
+    .map(drop)
+}
+
+fn show_element(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::inspect::show_element_to(
+        &i.path("base.osm.pbf"),
+        pbfhogg::ElementKind::Way,
+        20,
+        false,
+        &mut Vec::new(),
+        host,
+    )
+    .map(drop)
+}
+
+fn renumber(i: &Inputs, out: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::renumber::renumber_external(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        &pbfhogg::renumber::RenumberOptions {
+            start_node_id: 1,
+            start_way_id: 1,
+            start_relation_id: 1,
+        },
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+fn repack(i: &Inputs, out: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::repack::repack(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        std::num::NonZeroUsize::new(50).unwrap(),
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+fn tags_count(i: &Inputs, _: &Path, _: &Path, host: &pbfhogg::host::Host) -> pbfhogg::Result<()> {
+    pbfhogg::tags_count::tags_count(
+        &i.path("base.osm.pbf"),
+        &pbfhogg::tags_count::TagCountOptions {
+            min_count: 1,
+            max_count: None,
+            sort: Default::default(),
+            expressions: &[],
+            type_filter: None,
+            direct_io: false,
+            force: false,
+            parallelism: pbfhogg::Parallelism::from_jobs(2),
+        },
+        host,
+    )
+    .map(drop)
+}
+
+fn tags_filter(
+    i: &Inputs,
+    out: &Path,
+    host: &pbfhogg::host::Host,
+    add_referenced: Option<pbfhogg::tags_filter::AddReferenced>,
+) -> pbfhogg::Result<()> {
+    let expressions = ["w/highway".to_owned(), "n/amenity".to_owned()];
+    pbfhogg::tags_filter::tags_filter(
+        &i.path("base.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        &pbfhogg::tags_filter::TagsFilterOptions {
+            expression_strs: &expressions,
+            add_referenced,
+            invert: false,
+            write: Default::default(),
+            distrust_metadata: false,
+        },
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
+fn tags_filter_direct(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    tags_filter(i, out, host, None)
+}
+
+fn tags_filter_referenced(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    tags_filter(
+        i,
+        out,
+        host,
+        Some(pbfhogg::tags_filter::AddReferenced {
+            remove_tags: false,
+            parallelism: pbfhogg::Parallelism::from_jobs(2),
+        }),
+    )
+}
+
+fn tags_filter_osc(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    pbfhogg::tags_filter::osc::tags_filter_osc(
+        &i.path("change.osc"),
+        crate::common::out(out.join("out.osc")),
+        &["n/amenity".to_owned()],
+        pbfhogg::Parallelism::from_jobs(2),
+        host,
+    )
+    .map(drop)
+}
+
+fn time_filter(
+    i: &Inputs,
+    out: &Path,
+    _: &Path,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<()> {
+    pbfhogg::time_filter::time_filter(
+        &i.path("meta.osm.pbf"),
+        crate::common::out(out.join("out.osm.pbf")),
+        i64::MAX,
+        &Default::default(),
+        &Default::default(),
+        host,
+    )
+    .map(drop)
+}
+
 /// Inventory ownership is by public library command module, not CLI spelling.
 /// Library tests cannot depend on pbfhogg-cli (which depends on this library).
 /// Modes are declared here rather than inferred from scenario display names.
@@ -278,6 +690,16 @@ struct CommandCoverage {
 struct Scenario {
     mode: &'static str,
     run: Command,
+    /// Runs under a heavy descriptor ticket of its own (an external join).
+    heavy: bool,
+}
+
+fn light(mode: &'static str, run: Command) -> Scenario {
+    Scenario {
+        mode,
+        run,
+        heavy: false,
+    }
 }
 
 fn tested(
@@ -292,8 +714,48 @@ fn tested(
     }
 }
 
-fn excluded(module: &'static str, reason: &'static str) -> CommandCoverage {
-    tested(module, Vec::new(), reason)
+// check, export and extract compile only with `commands`; without it their
+// modules still count in the inventory and simply have nothing to run.
+
+#[cfg(feature = "commands")]
+fn check_scenarios() -> Vec<Scenario> {
+    vec![
+        light("refs, relation members", check_refs),
+        light("index against payloads", check_index),
+        light("IDs, full duplicate sets", check_ids),
+        light("locations, LocationsOnWays input", check_locations),
+    ]
+}
+
+#[cfg(feature = "commands")]
+fn export_scenarios() -> Vec<Scenario> {
+    vec![light(
+        "GeoJSON sequence, all types, LocationsOnWays input",
+        export,
+    )]
+}
+
+#[cfg(feature = "commands")]
+fn extract_scenarios() -> Vec<Scenario> {
+    vec![
+        light("single bbox, simple strategy", extract_simple),
+        light("single bbox, smart strategy", extract_smart),
+    ]
+}
+
+#[cfg(not(feature = "commands"))]
+fn check_scenarios() -> Vec<Scenario> {
+    Vec::new()
+}
+
+#[cfg(not(feature = "commands"))]
+fn export_scenarios() -> Vec<Scenario> {
+    Vec::new()
+}
+
+#[cfg(not(feature = "commands"))]
+fn extract_scenarios() -> Vec<Scenario> {
+    Vec::new()
 }
 
 fn command_registry() -> Vec<CommandCoverage> {
@@ -307,61 +769,55 @@ fn registry_head() -> Vec<CommandCoverage> {
         tested(
             "altw",
             vec![
-                Scenario {
-                    mode: "sparse, keep untagged, no prepass",
-                    run: altw_sparse,
-                },
+                light("sparse, keep untagged, no prepass", altw_sparse),
                 Scenario {
                     mode: "external, keep untagged, no prepass",
                     run: altw_external,
+                    heavy: true,
                 },
             ],
             "Auto routing, inject prepass, missing-node tolerance and dropping untagged nodes are not exercised.",
         ),
         tested(
             "apply_changes",
-            vec![Scenario {
-                mode: "default PBF base plus XML OSC",
-                run: apply_changes,
-            }],
+            vec![light("default PBF base plus XML OSC", apply_changes)],
             "LocationsOnWays and nondefault merge/write options are not exercised.",
         ),
         tested(
             "cat",
-            vec![Scenario {
-                mode: "single input, explicit all-type filter, default write",
-                run: cat,
-            }],
+            vec![light(
+                "single input, explicit all-type filter, default write",
+                cat,
+            )],
             "Multiple inputs, dedupe, cleaning and individual type filters are not exercised.",
         ),
-        excluded(
+        tested(
             "check",
-            "All modes excluded: validation needs dedicated fixtures and reports; no cancellation claim here.",
+            check_scenarios(),
+            "Shown missing-reference IDs, violation caps, location agreement and store budgets are not exercised.",
         ),
-        excluded(
+        tested(
             "degrade",
-            "All modes excluded: indexdata, locations and ordering transformations need dedicated fixtures.",
+            vec![light("strip indexdata, header-only passthrough", degrade)],
+            "Reencoding (unsort, strip locations, drop IDs) and the tagdata edits are not exercised.",
         ),
         tested(
             "diff",
             vec![
-                Scenario {
-                    mode: "text diff, two jobs, include common, no type filter",
-                    run: diff_parallel,
-                },
-                Scenario {
-                    mode: "derive XML gzip changes, two jobs, default flags",
-                    run: derive_changes,
-                },
+                light(
+                    "text diff, two jobs, include common, no type filter",
+                    diff_parallel,
+                ),
+                light(
+                    "derive XML gzip changes, two jobs, default flags",
+                    derive_changes,
+                ),
             ],
             "Serial execution, suppressed common, verbose, type filtering and other derive options are not exercised.",
         ),
         tested(
             "digest",
-            vec![Scenario {
-                mode: "full form, default flags",
-                run: digest,
-            }],
+            vec![light("full form, default flags", digest)],
             "Other forms and nondefault flags are not exercised.",
         ),
     ]
@@ -369,61 +825,81 @@ fn registry_head() -> Vec<CommandCoverage> {
 
 fn registry_tail() -> Vec<CommandCoverage> {
     vec![
-        excluded(
+        tested(
             "export",
-            "All modes excluded: format-specific streaming outputs need separate assertions.",
+            export_scenarios(),
+            "Plain GeoJSON, type, expression, property and bbox selections and metadata are not exercised.",
         ),
-        excluded(
+        tested(
             "extract",
-            "All modes excluded: region strategies and multi-extract need dedicated geometry fixtures.",
+            extract_scenarios(),
+            "Polygons, complete-ways, multi-extract and cleaning are not exercised.",
         ),
-        excluded(
+        tested(
             "getid",
-            "All modes excluded: ID and reference-completion paths need dedicated request fixtures.",
+            vec![
+                light("getid, exact IDs, no reference completion", getid),
+                light("removeid, exact IDs", removeid),
+            ],
+            "Reference completion, found-ID reporting and ID lists read from a PBF are not exercised.",
         ),
-        excluded(
+        tested(
             "getparents",
-            "All modes excluded: parent traversal paths need dedicated request fixtures.",
+            vec![light("node and way IDs, add self", getparents)],
+            "Parents without the queried objects and the minimum-blob variant are not exercised.",
         ),
-        excluded(
+        tested(
             "inspect",
-            "All modes excluded: descriptive reports are not exercised by this output-publication sweep.",
+            vec![
+                light("indexdata scan, blocks and ID ranges", inspect_indexed),
+                light("extended full decode", inspect_extended),
+                light("header only", inspect_header),
+                light("node statistics, two jobs", node_stats),
+                light("show one way", show_element),
+            ],
+            "Location diagnostics, distrusted metadata, direct reads and the get-key lookups are not exercised.",
         ),
         tested(
             "merge_changes",
-            vec![Scenario {
-                mode: "stream, two jobs, two XML inputs, forced spill with test-hooks",
-                run: merge_changes,
-            }],
+            vec![light(
+                "stream, two jobs, two XML inputs, forced spill with test-hooks",
+                merge_changes,
+            )],
             "In-memory merge, other job counts and compression/input variants are not exercised.",
         ),
-        excluded(
+        tested(
             "renumber",
-            "All modes excluded: mapping strategies and external scratch paths need dedicated fixtures.",
+            vec![light("external, IDs from one", renumber)],
+            "Other start IDs and nondefault write options are not exercised.",
         ),
-        excluded(
+        tested(
             "repack",
-            "All modes excluded: reencoding policies need dedicated fixtures.",
+            vec![light("50 elements per blob", repack)],
+            "Nondefault write options are not exercised.",
         ),
         tested(
             "sort",
-            vec![Scenario {
-                mode: "default options on sorted fixture",
-                run: sort,
-            }],
+            vec![light("default options on sorted fixture", sort)],
             "Forced sorting, external runs and nondefault sort/write options are not exercised.",
         ),
-        excluded(
+        tested(
             "tags_count",
-            "All modes excluded: tag aggregation and report modes need separate scenarios.",
+            vec![light("every key, two jobs", tags_count)],
+            "Expressions, type filters, count bounds, sort orders and forced decode are not exercised.",
         ),
-        excluded(
+        tested(
             "tags_filter",
-            "All modes excluded: expressions and reference completion need dedicated fixtures.",
+            vec![
+                light("PBF, direct matches only", tags_filter_direct),
+                light("PBF, add referenced, two jobs", tags_filter_referenced),
+                light("XML OSC input, two jobs", tags_filter_osc),
+            ],
+            "Inversion, tag removal and distrusted metadata are not exercised.",
         ),
-        excluded(
+        tested(
             "time_filter",
-            "All modes excluded: timestamp/history selection needs dedicated fixtures.",
+            vec![light("cutoff after every timestamp", time_filter)],
+            "Cutoffs that drop versions and nondefault write options are not exercised.",
         ),
     ]
 }
@@ -453,7 +929,24 @@ fn cancellation_registry_accounts_for_public_library_command_modules() {
         inventory, registered,
         "unaccounted or removed command module"
     );
+    let swept: BTreeSet<_> = SWEPT
+        .iter()
+        .copied()
+        .filter(|module| *module != "geocode_builder")
+        .collect();
+    assert_eq!(swept.len() + 1, SWEPT.len(), "duplicate swept module");
+    assert_eq!(
+        swept, registered,
+        "a registered module without its sweep tests"
+    );
     for entry in registry {
+        // Every module has a scenario; only check, export and extract go
+        // without one, in builds without `commands`, where they do not exist.
+        assert!(
+            !entry.scenarios.is_empty() || cfg!(not(feature = "commands")),
+            "{}: no scenario",
+            entry.module
+        );
         assert!(
             !entry.excluded_modes.trim().is_empty(),
             "{}: declare exclusions",
@@ -474,26 +967,104 @@ fn cancellation_registry_accounts_for_public_library_command_modules() {
     }
 }
 
-// All three sweeps consume this registry. Geocode's builder lives outside
-// commands/, so it is an additional scenario, not a command-module inventory
-// member. Its single indexed-fixture build permits unindexed input and excludes
-// unindexed fixtures and nondefault build policies. No geocode scenario runs without `commands`.
-fn commands() -> Vec<(String, Command)> {
-    let mut all: Vec<_> = command_registry()
+/// The scenarios of one swept module. Geocode's builder lives outside
+/// commands/, so it is swept as `geocode_builder`, not a command-module
+/// inventory member. Its single indexed-fixture build permits unindexed
+/// input and excludes unindexed fixtures and nondefault build policies. No
+/// geocode scenario runs without `commands`.
+fn scenarios(module: &str) -> Vec<Scenario> {
+    if module == "geocode_builder" {
+        #[cfg(feature = "commands")]
+        return vec![light(
+            "indexed fixture, allow unindexed, default policies",
+            geocode,
+        )];
+        #[cfg(not(feature = "commands"))]
+        return Vec::new();
+    }
+    command_registry()
         .into_iter()
-        .flat_map(|entry| {
-            entry
-                .scenarios
-                .into_iter()
-                .map(move |scenario| (format!("{}: {}", entry.module, scenario.mode), scenario.run))
-        })
-        .collect();
-    #[cfg(feature = "commands")]
-    all.push((
-        "geocode builder: indexed fixture, allow unindexed, default policies".to_owned(),
-        geocode as Command,
-    ));
-    all
+        .find(|entry| entry.module == module)
+        .map(|entry| entry.scenarios)
+        .unwrap_or_else(|| panic!("{module} is not in the command registry"))
+}
+
+/// Each swept module gets its own three sweep tests, so a test's time is
+/// one module's scenarios, not the whole registry's, under the fixed
+/// per-test watchdog. `SWEPT` is checked against the registry.
+macro_rules! sweeps {
+    ($($module:ident),* $(,)?) => {
+        const SWEPT: &[&str] = &[$(stringify!($module)),*];
+        $(
+            mod $module {
+                #[test]
+                fn a_tripped_token_stops_it_before_it_starts() {
+                    super::sweep_before_start(module_path!(), stringify!($module));
+                }
+
+                #[cfg(pbfhogg_test_hooks)]
+                #[test]
+                fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_decision() {
+                    super::sweep_sampled_ordinals(module_path!(), stringify!($module));
+                }
+
+                #[cfg(pbfhogg_test_hooks)]
+                #[test]
+                fn the_census_is_empty_at_observed_checkpoints() {
+                    super::sweep_census(module_path!(), stringify!($module));
+                }
+            }
+        )*
+    };
+}
+
+sweeps!(
+    altw,
+    apply_changes,
+    cat,
+    check,
+    degrade,
+    diff,
+    digest,
+    export,
+    extract,
+    getid,
+    getparents,
+    inspect,
+    merge_changes,
+    renumber,
+    repack,
+    sort,
+    tags_count,
+    tags_filter,
+    time_filter,
+    geocode_builder,
+);
+
+/// Run `each` over the scenarios of `module`, named `module: mode`. Light
+/// scenarios share one set of inputs; a heavy one takes a ticket of its
+/// own and is skipped (environmentally) when not admitted. Collects every
+/// failure and fails the test once with all of them.
+fn sweep(test: &str, module: &str, mut each: impl FnMut(&str, Command, &Inputs) -> Vec<String>) {
+    let light = Inputs::new();
+    let mut failures = Vec::new();
+    for scenario in scenarios(module) {
+        let name = format!("{module}: {}", scenario.mode);
+        let heavy;
+        let inputs = if scenario.heavy {
+            match Inputs::heavy(test) {
+                Some(inputs) => {
+                    heavy = inputs;
+                    &heavy
+                }
+                None => continue,
+            }
+        } else {
+            &light
+        };
+        failures.extend(each(&name, scenario.run, inputs));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 fn entries(dir: &Path) -> Vec<String> {
@@ -557,24 +1128,17 @@ fn run_once(
     }
 }
 
-#[test]
-fn a_tripped_token_stops_selected_scenarios_before_they_start() {
-    let Some(inputs) =
-        Inputs::for_registry("a_tripped_token_stops_selected_scenarios_before_they_start")
-    else {
-        return;
-    };
-    let mut failures = Vec::new();
-    for (name, command) in commands() {
+/// A token tripped before the call stops every scenario of `module`.
+fn sweep_before_start(test: &str, module: &str) {
+    sweep(test, module, |name, command, inputs| {
         let cancel = pbfhogg::host::Invocation::new();
         cancel.cancel();
-        match run_once(&name, command, &inputs, cancel) {
-            Ok(true) => {}
-            Ok(false) => failures.push(format!("{name}: completed under a tripped token")),
-            Err(e) => failures.push(e),
+        match run_once(name, command, inputs, cancel) {
+            Ok(true) => Vec::new(),
+            Ok(false) => vec![format!("{name}: completed under a tripped token")],
+            Err(e) => vec![e],
         }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    });
 }
 
 /// The result of targeting one ordinal of a fixture's counting run.
@@ -649,43 +1213,29 @@ fn checkpoint_sampling_has_a_strict_budget_and_includes_endpoints() {
     }
 }
 
-/// Sample fixture checkpoint ordinals for the selected command scenarios.
-/// Each reached target must cancel or report an already decided publication.
+/// Sample fixture checkpoint ordinals for every scenario of `module`. Each
+/// reached target must cancel or report an already decided publication.
 #[cfg(pbfhogg_test_hooks)]
-#[test]
-fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision() {
-    let Some(inputs) = Inputs::for_registry(
-        "a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision",
-    ) else {
-        return;
-    };
-    let mut failures = Vec::new();
-    for (name, command) in commands() {
+fn sweep_sampled_ordinals(test: &str, module: &str) {
+    sweep(test, module, |name, command, inputs| {
+        let mut failures = Vec::new();
         let counter = pbfhogg::host::Invocation::new();
         counter.on_check(|_, _| {});
-        match run_once(&name, command, &inputs, counter.clone()) {
+        match run_once(name, command, inputs, counter.clone()) {
             Ok(false) => {}
-            Ok(true) => {
-                failures.push(format!("{name}: counting run unexpectedly cancelled"));
-                continue;
-            }
-            Err(e) => {
-                failures.push(e);
-                continue;
-            }
+            Ok(true) => return vec![format!("{name}: counting run unexpectedly cancelled")],
+            Err(e) => return vec![e],
         }
         let count = counter.checks_passed();
         if count == 0 {
-            failures.push(format!("{name}: passed no checkpoint"));
-            continue;
+            return vec![format!("{name}: passed no checkpoint")];
         }
         let mut cancelled = 0_u64;
         // Exhaust at most 64 ordinals; otherwise sample exactly 64 evenly
         // spaced targets including first and last. Callback ordinals are not
         // source-site coverage and parallel scheduling can change reachability.
-        let ks = checkpoint_sample(count);
-        for k in ks {
-            match run_at_checkpoint(&name, command, &inputs, k) {
+        for k in checkpoint_sample(count) {
+            match run_at_checkpoint(name, command, inputs, k) {
                 Ok(CheckpointRun::Cancelled) => cancelled += 1,
                 Ok(CheckpointRun::CompletedAfterDecision { authorized }) => {
                     assert!(authorized > 0, "publication ordinals start at one");
@@ -699,24 +1249,18 @@ fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision
         if cancelled == 0 {
             failures.push(format!("{name}: no tripped checkpoint cancelled the run"));
         }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+        failures
+    });
 }
 
-/// At observed checkpoints of selected fixture scenarios, the census of
+/// At observed checkpoints of every scenario of `module`, the census of
 /// issued outputs, writers, readers and buffers is empty. This cannot rule
 /// out a value issued and retired entirely between two observations.
 #[cfg(pbfhogg_test_hooks)]
-#[test]
-fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
+fn sweep_census(test: &str, module: &str) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    let Some(inputs) =
-        Inputs::for_registry("selected_scenarios_have_an_empty_census_at_observed_checkpoints")
-    else {
-        return;
-    };
-    let mut failures = Vec::new();
-    for (name, command) in commands() {
+    sweep(test, module, |name, command, inputs| {
+        let mut failures = Vec::new();
         let token = pbfhogg::host::Invocation::new();
         let issued = std::sync::Arc::new(AtomicU64::new(0));
         let seen = std::sync::Arc::clone(&issued);
@@ -727,7 +1271,7 @@ fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
             let c = token.capabilities();
             seen.fetch_max(c.session + c.writer + c.output + c.buffer, Relaxed);
         });
-        match run_once(&name, command, &inputs, token) {
+        match run_once(name, command, inputs, token) {
             Ok(false) => {}
             Ok(true) => failures.push(format!("{name}: census run unexpectedly cancelled")),
             Err(e) => failures.push(e),
@@ -738,8 +1282,8 @@ fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
         if issued.load(Relaxed) != 0 {
             failures.push(format!("{name}: issued a value of its own to the census"));
         }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+        failures
+    });
 }
 
 /// A public command reached from inside another (`sort` runs `sort_with`)

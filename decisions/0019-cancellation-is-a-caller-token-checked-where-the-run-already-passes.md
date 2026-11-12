@@ -40,6 +40,14 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   into its output directory - is not interrupted inside; the next
   boundary observes the token. That is the trade: an untripped token must
   cost nothing measurable, so the worst-case latency is one such phase.
+- **A blocked wait learns of a trip by a waker, not a timer.** Where a run
+  can park with no peer left to wake it (the apply-changes drain, the
+  merge-changes credit wait), the wait registers a crate-private waker on
+  the token (`Invocation::on_cancel`) for its duration; `cancel` runs it
+  after the trip, outside its locks. A waker only wakes its own wait (a
+  message on the waiter's channel, a notify under the waiter's lock); it
+  never closes a channel or stops a worker, so the wait still leaves
+  through a checkpoint that reports `Cancelled`. Checkpoints are unchanged.
 - **A checkpoint exits only through a path that reports its cause, wakes or
   closes every participant, and keeps sequence accounting.** In an ordered
   pool the consumer checks (a worker that skipped a sequence number would

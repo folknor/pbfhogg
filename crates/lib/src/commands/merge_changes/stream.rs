@@ -70,8 +70,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::osc::xml_parse::{LexBatch, LexSink, parse_osc_path};
 use crate::scratch::{RunScratch, ScratchPath};
@@ -125,12 +125,19 @@ enum Msg<T> {
         batches: usize,
     },
     ReaderFailed(crate::Error),
+    /// Sent after every encode-job spawn, so a coordinator parked in
+    /// [`recv`] after its pool reported idle runs the job it could not
+    /// see: a spawn from a reader thread is injected into the pool, and one
+    /// from a lane handoff lands on another worker's deque, and rayon wakes
+    /// neither a thread blocked on this channel. Never leaves `recv`.
+    Wake,
 }
 
 /// The byte budget of admitted, not yet written batches.
 struct Ledger {
-    state: Mutex<LedgerState>,
-    room: Condvar,
+    /// The credit state and its condvar, shared with the invocation's
+    /// cancellation waker ([`Ledger::wake_on_cancel`]).
+    sync: Arc<LedgerSync>,
     budget: usize,
     wait_ns: AtomicU64,
     /// Set with `stopped`, readable without the lock: readers ask it at
@@ -143,14 +150,27 @@ struct LedgerState {
     stopped: bool,
 }
 
+struct LedgerSync {
+    state: Mutex<LedgerState>,
+    room: Condvar,
+}
+
+impl LedgerSync {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl Ledger {
     fn new(budget: usize) -> Self {
         Self {
-            state: Mutex::new(LedgerState {
-                used: 0,
-                stopped: false,
+            sync: Arc::new(LedgerSync {
+                state: Mutex::new(LedgerState {
+                    used: 0,
+                    stopped: false,
+                }),
+                room: Condvar::new(),
             }),
-            room: Condvar::new(),
             budget,
             wait_ns: AtomicU64::new(0),
             halted: AtomicBool::new(false),
@@ -164,16 +184,27 @@ impl Ledger {
     /// Take `n` bytes of credit, waiting for room. Refuses once stopped or
     /// cancelled. A request larger than the budget is granted when nothing
     /// else holds credit.
+    ///
+    /// Every way out of the wait is a notification: `release` and `stop`
+    /// notify `room`, and a cancellation does through the waker
+    /// [`wake_on_cancel`](Self::wake_on_cancel) registers. The token is read
+    /// under the state lock beside `stopped`, and the waker takes that lock
+    /// before it notifies, so a trip cannot fall between the check and the
+    /// wait. The test-only checkpoint hook runs outside the lock: a hook that
+    /// cancels runs the waker, which takes this lock.
     fn acquire(&self, n: usize, cancel: &crate::host::Recorder) -> crate::Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut waited: Option<crate::counters::Stopwatch> = None;
         loop {
+            cancel.checkpoint_hook();
+            let mut state = self.sync.lock();
             if state.stopped {
                 return Err(crate::Error::internal(
                     "merge-changes stopped after an earlier failure",
                 ));
             }
-            cancel.check()?;
+            if cancel.is_cancelled() {
+                return Err(crate::error::new_cancelled());
+            }
             if state.used == 0 || state.used + n <= self.budget {
                 state.used += n;
                 if let Some(watch) = waited {
@@ -183,28 +214,40 @@ impl Ledger {
                 return Ok(());
             }
             waited.get_or_insert_with(crate::counters::Stopwatch::start);
-            state = self
-                .room
-                // wait-deliberate: idle park of a cooperative wait; expiry rechecks
-                .wait_timeout(state, crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            // Woken, the guard drops here so the next hook runs unlocked.
+            drop(
+                self.sync
+                    .room
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
         }
     }
 
+    /// Register the invocation waker that ends a credit wait on a trip:
+    /// it takes the state lock and notifies `room`. Held for the run.
+    fn wake_on_cancel(&self, cancel: &crate::host::Recorder) -> crate::host::CancelWake {
+        let sync = Arc::clone(&self.sync);
+        cancel.on_cancel(move || {
+            let state = sync.lock();
+            drop(state);
+            sync.room.notify_all();
+        })
+    }
+
     fn release(&self, n: usize) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.sync.lock();
         state.used = state.used.saturating_sub(n);
         drop(state);
-        self.room.notify_all();
+        self.sync.room.notify_all();
     }
 
     fn stop(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.sync.lock();
         state.stopped = true;
         self.halted.store(true, Ordering::Relaxed);
         drop(state);
-        self.room.notify_all();
+        self.sync.room.notify_all();
     }
 }
 
@@ -292,7 +335,9 @@ where
     /// within the lane limit.
     fn submit(&'s self, scope: &rayon::Scope<'s>, job: Pending<T>) {
         if self.limit == usize::MAX {
+            let wake = job.tx.clone();
             scope.spawn(move |_| self.run(job));
+            drop(wake.send(Msg::Wake));
         } else {
             self.submit_in_lane(scope, job);
         }
@@ -313,6 +358,7 @@ where
     }
 
     fn start(&'s self, scope: &rayon::Scope<'s>, job: Pending<T>) {
+        let wake = job.tx.clone();
         scope.spawn(move |scope| {
             let _handoff = Handoff {
                 encoder: self,
@@ -320,6 +366,7 @@ where
             };
             self.run(job);
         });
+        drop(wake.send(Msg::Wake));
     }
 
     /// Encode one batch and answer its position, a panic included.
@@ -404,6 +451,7 @@ pub(crate) fn run(
     let encode = move |batch: &LexBatch, path: &Path| super::encode_batch(batch, path, is_gz);
     let ledger = Ledger::new(plan.batching.inflight_bytes);
     let (tx, rx) = std::sync::mpsc::channel::<Msg<(Vec<u8>, u64)>>();
+    let _wake = ledger.wake_on_cancel(plan.cancel);
     let ledger_ref = &ledger;
     let encoder = Encoder::new(plan, ledger_ref, &encode);
     let encoder_ref = &encoder;
@@ -444,6 +492,7 @@ where
 {
     let ledger = Ledger::new(plan.batching.inflight_bytes);
     let (tx, rx) = std::sync::mpsc::channel::<Msg<T>>();
+    let _wake = ledger.wake_on_cancel(plan.cancel);
     let ledger_ref = &ledger;
     let encoder = Encoder::new(plan, ledger_ref, encode);
     let encoder_ref = &encoder;
@@ -540,6 +589,11 @@ fn collect_results<T>(
                 }
             }
             Msg::ReaderFailed(error) => return Err(error),
+            Msg::Wake => {
+                return Err(crate::Error::internal(
+                    "merge-changes: recv returned a wake",
+                ));
+            }
         }
         plan.cancel.check()?;
     }
@@ -754,6 +808,11 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                     }
                 }
                 Msg::ReaderFailed(error) => return Err(error),
+                Msg::Wake => {
+                    return Err(crate::Error::internal(
+                        "merge-changes: recv returned a wake",
+                    ));
+                }
             }
             self.plan.cancel.check()?;
         }
@@ -914,25 +973,29 @@ fn spill_err(path: &ScratchPath, e: io::Error) -> crate::Error {
 }
 
 /// Receive one message, running queued pool jobs while waiting when the
-/// caller is a pool worker (the writer's `recv_permit` shape).
+/// caller is a pool worker (the writer's `recv_permit` shape). [`Msg::Wake`]
+/// is consumed here and never returned.
+///
+/// Once the pool reports idle the wait blocks with no timeout. Every job
+/// this wait could need to run is an encode job, and every encode-job spawn
+/// is followed by a `Wake` on this channel: a job spawned before the idle
+/// report was already visible to `yield_now` (it searches the local deque,
+/// every other worker's and the injector), and one spawned after it sends a
+/// `Wake` that ends the block, after which `yield_now` finds it. Results,
+/// reader messages and disconnect arrive on the channel themselves.
 fn recv<T>(rx: &Receiver<Msg<T>>, executor: crate::host::ExecutorRef<'_>) -> crate::Result<Msg<T>> {
     let lost = || crate::Error::internal("merge-changes workers exited without a result");
     loop {
-        match rx.try_recv() {
-            Ok(item) => return Ok(item),
+        let message = match rx.try_recv() {
+            Ok(message) => message,
             Err(TryRecvError::Disconnected) => return Err(lost()),
             Err(TryRecvError::Empty) => match executor.yield_now() {
-                Some(rayon::Yield::Executed) => {}
-                Some(rayon::Yield::Idle) => {
-                    // wait-deliberate: idle park of a cooperative wait; expiry rechecks
-                    match rx.recv_timeout(crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT) {
-                        Ok(item) => return Ok(item),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return Err(lost()),
-                    }
-                }
-                None => return rx.recv().map_err(|_| lost()),
+                Some(rayon::Yield::Executed) => continue,
+                Some(rayon::Yield::Idle) | None => rx.recv().map_err(|_| lost())?,
             },
+        };
+        if !matches!(message, Msg::Wake) {
+            return Ok(message);
         }
     }
 }
@@ -1003,6 +1066,9 @@ mod tests {
             drop(tx);
             let mut answered = Vec::new();
             for message in rx {
+                if matches!(message, Msg::Wake) {
+                    continue;
+                }
                 let Msg::Member {
                     input, seq, result, ..
                 } = message

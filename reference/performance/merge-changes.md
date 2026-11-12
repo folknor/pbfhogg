@@ -8,6 +8,15 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Encode-job wakes, no idle poll (bygg, 2026-11-12, `ab647536` + change)
+
+The coordinator's 1 ms idle `recv_timeout` and the credit wait's 1 ms
+`wait_timeout` became blocking waits: every encode-job spawn sends a wake
+on the result channel, and a cancellation notifies the credit condvar.
+`--iterations 1`, A B B A, planet 7-OSC default merge (`--osc
+4914..4920`): `ab647536` 2864, 3030 ms (`ac99611e`, `71dee67c`); variant
+2891, 2799 ms (`fddf6eee`, `5618ab70`). Noise.
+
 ### Hardware gzip CRC (bygg, 2026-11-11, `9b76817b` + change)
 
 flate2 builds zlib-rs without its `std` feature, and without `std` zlib-rs

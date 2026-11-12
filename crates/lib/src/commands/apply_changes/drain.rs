@@ -263,15 +263,12 @@ pub(super) fn run_drain(
     // received: the exclusive end of the node seqs.
     let mut node_end_seq: Option<u64> = None;
 
-    // Recv timeout for the main loop. The node boundary arrives on this
-    // channel, so the barrier needs no polling; the timeout is what lets
-    // the drain notice a published producer failure or a cancellation when
-    // nothing else would wake it (a failed worker never delivers its seq,
-    // while the scanner can sit in its barrier wait and the surviving
-    // workers idle on the candidate channel).
-    //
-    // The 25 ms tradeoff is recorded on `crate::tunables::DRAIN_RECV_TIMEOUT`.
-    let poll = crate::tunables::DRAIN_RECV_TIMEOUT;
+    // Every wait of the main loop ends on a message. The node boundary
+    // arrives on this channel, and so does a `DrainMessage::Wake` from a
+    // published producer failure or a cancellation (`DrainWake`), the two
+    // events nothing else would deliver: a failed worker never sends its
+    // seq, while the scanner can sit in its barrier wait and the surviving
+    // workers idle on the candidate channel.
 
     // The reorder map is bounded upstream, by the sequence window
     // (`window.rs`): the scanner takes a token per seq before dispatch and
@@ -283,13 +280,13 @@ pub(super) fn run_drain(
     // can fill it ahead of the head, and the drain deadlocks. Worker-only
     // byte permits would starve the head behind later work the same way.
     //
-    // Main loop: pull items (or timeout), reorder, advance, fire
+    // Main loop: pull items (or a wake), reorder, advance, fire
     // barrier when ready. Exits when `drain_rx` disconnects AND the
     // reorder buffer is empty.
     let mut drain_disconnected = false;
-    // The invocation's token, checked beside the producer-failure poll
-    // below, once per receive: after a cancellation the drain stops within
-    // one `DRAIN_RECV_TIMEOUT` plus the contiguous run of buffered items it
+    // The invocation's token, checked beside the producer-failure slot
+    // below, once per receive: a cancellation wakes the receive, so the
+    // drain stops after at most the contiguous run of buffered items it
     // is already writing (the advance loop below does not check between
     // items). Returning it leaves through the drain's existing error
     // exit (receiver and barrier sender dropped, producers unblocked, both
@@ -300,8 +297,7 @@ pub(super) fn run_drain(
         let item_opt = if drain_disconnected {
             None
         } else {
-            // wait-deliberate: expiry polls producer failure and cancellation
-            match drain_rx.recv_timeout(poll) {
+            match drain_rx.recv() {
                 Ok(DrainMessage::Item(item)) => Some(item),
                 Ok(DrainMessage::NodeBoundary { node_end_seq: end }) => {
                     #[cfg(pbfhogg_test_hooks)]
@@ -315,8 +311,8 @@ pub(super) fn run_drain(
                     }
                     None
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Ok(DrainMessage::Wake) => None,
+                Err(mpsc::RecvError) => {
                     drain_disconnected = true;
                     None
                 }

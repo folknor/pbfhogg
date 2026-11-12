@@ -36,7 +36,7 @@
 
 use std::io::{self, Write};
 use std::panic::AssertUnwindSafe;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -45,7 +45,7 @@ use flate2::write::GzEncoder;
 use crate::error::Error;
 use crate::reorder_buffer::ReorderBuffer;
 pub use crate::tunables::DEFAULT_CHUNK_SIZE;
-use crate::tunables::{GZIP_REORDER_PERMIT_POLL, QUEUE_SLOTS_PER_WORKER};
+use crate::tunables::QUEUE_SLOTS_PER_WORKER;
 use crate::write::metrics::WriterMetrics;
 use crate::write::pool_failure::FirstFailure;
 
@@ -77,6 +77,14 @@ enum Job {
 /// One unit of output handed to the writer thread, reordered by seq.
 enum Out {
     Bytes(Vec<u8>),
+    /// Not an answer to any seq: a worker thread ended with the pool's
+    /// failure already recorded (a panic past `compress_job`, a poisoned
+    /// queue lock) and may have lost the seq it held, which strands later
+    /// outputs in the reorder buffer while the writer thread waits in
+    /// `recv`. This wakes it: the writer thread discards what it holds and
+    /// returns a permit, so a producer blocked for one wakes and sees the
+    /// failure. Its seq is ignored, never inserted or counted.
+    Stopped,
     Barrier(SyncSender<io::Result<()>>),
     /// This seq produced no bytes: compressing it failed or panicked, or the
     /// pool had already stopped and the worker skipped it. The failure is in
@@ -250,6 +258,10 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                 if let Err(payload) = caught {
                     worker_failure.record_panic("parallel gzip worker", payload.as_ref());
                 }
+                // Recorded first, so the writer thread sees the failure.
+                if worker_failure.stopped() {
+                    drop(compressed_tx.send((usize::MAX, Out::Stopped)));
+                }
                 drop(compressed_tx);
             });
             match spawned {
@@ -327,16 +339,20 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             .unwrap_or_else(|| Error::internal(format!("ParallelGzipWriter: {fallback}")).into())
     }
 
-    /// Wait for room in the sequence window. A timeout only polls the shared
-    /// failure state; it does not reduce the window or add a delay when a
-    /// permit is already available. This also lets an unexpected worker exit
-    /// release the producer instead of leaving it parked behind a lost seq.
+    /// Wait for room in the sequence window, failing once the pool has
+    /// stopped. The block needs no timed recheck: once a failure is on
+    /// record the writer thread returns a permit for every output it then
+    /// receives or holds, and a worker thread that ends with the failure
+    /// recorded sends [`Out::Stopped`], which makes it return one more even
+    /// when the worker lost its seq; a writer thread that ends disconnects.
     fn wait_for_reorder_permit(&self) -> io::Result<()> {
+        let stopped = || Err(self.pool_error("pool stopped while waiting for reorder capacity"));
+        let disconnected =
+            || Err(self.pool_error("writer stopped before releasing reorder capacity"));
         match self.reorder_permit_rx.try_recv() {
+            Ok(()) if self.failure.stopped() => return stopped(),
             Ok(()) => return Ok(()),
-            Err(TryRecvError::Disconnected) => {
-                return Err(self.pool_error("writer stopped before releasing reorder capacity"));
-            }
+            Err(TryRecvError::Disconnected) => return disconnected(),
             Err(TryRecvError::Empty) => {}
         }
 
@@ -345,20 +361,13 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         metrics
             .parallel_gzip_reorder_blocked
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let result = loop {
-            if self.failure.stopped() {
-                break Err(self.pool_error("pool stopped while waiting for reorder capacity"));
-            }
-            match self
-                .reorder_permit_rx
-                // wait-deliberate: expiry rechecks whether the pool stopped
-                .recv_timeout(GZIP_REORDER_PERMIT_POLL)
-            {
-                Ok(()) => break Ok(()),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    break Err(self.pool_error("writer stopped before releasing reorder capacity"));
-                }
+        let result = if self.failure.stopped() {
+            stopped()
+        } else {
+            match self.reorder_permit_rx.recv() {
+                Ok(()) if self.failure.stopped() => stopped(),
+                Ok(()) => Ok(()),
+                Err(_) => disconnected(),
             }
         };
         start.record_ns(&metrics.parallel_gzip_reorder_wait_ns);
@@ -742,7 +751,7 @@ fn writer_loop<W: Write>(
         // Once stopped, nothing is inserted again: unordered discards return
         // permits without advancing the buffer's head, so the window proof no
         // longer holds and ordered delivery is over anyway.
-        if failure.stopped() {
+        if matches!(out, Out::Stopped) || failure.stopped() {
             discard_pending(&mut pending, failure, reorder_permit_tx);
             discard_failed_out(out, failure, reorder_permit_tx);
             continue;
@@ -763,7 +772,7 @@ fn writer_loop<W: Write>(
         while let Some(item) = pending.pop_ready() {
             match item {
                 // Its failure was recorded before it was sent.
-                Out::Dropped => {}
+                Out::Dropped | Out::Stopped => {}
                 Out::Bytes(b) => {
                     if !failure.stopped() {
                         guarded(failure, WHO, || inner.write_all(&b));
@@ -828,7 +837,8 @@ fn discard_pending(
 /// its own, so a blocking return could find the channel full and park this
 /// thread for good - `finish` hanging on the join, barriers further down
 /// never answered. A full channel needs no replenishment once failure is on
-/// record: the producer's permit wait polls the failure state.
+/// record: a producer blocked for a permit finds the channel non-empty, and
+/// rechecks the failure state once it takes one.
 fn discard_failed_out(out: Out, failure: &FirstFailure, reorder_permit_tx: &SyncSender<()>) {
     if let Out::Barrier(ack) = out {
         let reply = match failure.restate() {

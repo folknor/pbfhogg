@@ -136,6 +136,39 @@ struct InvocationState {
     /// The census: how many issued values of each [`Kind`] are alive.
     /// Bookkeeping only; nothing is ever called under it.
     census: std::sync::Mutex<[u64; Kind::COUNT]>,
+    /// The cancellation wakers ([`Invocation::on_cancel`]): how a run's
+    /// blocked wait learns of a trip without polling the token. Touched once
+    /// per registration and once by `cancel`, never at a checkpoint.
+    wakers: std::sync::Mutex<CancelWakers>,
+}
+
+/// A cancellation waker: run by [`Invocation::cancel`] after the trip.
+type CancelWaker = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct CancelWakers {
+    next: u64,
+    live: Vec<(u64, CancelWaker)>,
+}
+
+/// Registration of one cancellation waker; dropping it deregisters. See
+/// [`Invocation::on_cancel`].
+#[must_use = "dropping the registration deregisters the waker"]
+pub(crate) struct CancelWake {
+    invocation: Invocation,
+    id: u64,
+}
+
+impl Drop for CancelWake {
+    fn drop(&mut self) {
+        let mut wakers = self
+            .invocation
+            .0
+            .wakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wakers.live.retain(|(id, _)| *id != self.id);
+    }
 }
 
 /// Where an invocation's markers and counter samples go.
@@ -516,9 +549,58 @@ impl Invocation {
         // A fault-plan wait on the token wakes at the trip; rung after the
         // log's lock is released, so the bell never nests inside it.
         drop(log);
+        // Wake every registered blocked wait, outside both locks: the trip
+        // is stored before the registry is read, so a waker registered
+        // after this snapshot sees the trip at registration instead.
+        let wakers: Vec<CancelWaker> = self
+            .0
+            .wakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live
+            .iter()
+            .map(|(_, wake)| Arc::clone(wake))
+            .collect();
+        for wake in wakers {
+            wake();
+        }
         #[cfg(pbfhogg_test_hooks)]
         self.0.faults.0.ring();
         outcome
+    }
+
+    /// Register `wake` to run when this token is tripped, so a wait that
+    /// blocks on something of its own (a channel, a condvar) ends on the
+    /// trip instead of re-reading the token on a timer. Checkpoints are
+    /// unchanged: still one relaxed load.
+    ///
+    /// Exactly one of two things happens, decided under the registry lock:
+    /// the waker is in the set a later [`cancel`](Self::cancel) runs, or the
+    /// token is already tripped and `wake` runs here, before this returns.
+    /// `wake` runs on the cancelling thread (the CLI's signal thread among
+    /// them), so it never blocks beyond a brief lock and never cancels; it
+    /// may run once after the registration is dropped and may run more than
+    /// once, so it must be harmless then. Must not be called with a lock
+    /// held that `wake` takes.
+    pub(crate) fn on_cancel(&self, wake: impl Fn() + Send + Sync + 'static) -> CancelWake {
+        let wake: CancelWaker = Arc::new(wake);
+        let mut wakers = self
+            .0
+            .wakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = wakers.next;
+        wakers.next += 1;
+        wakers.live.push((id, Arc::clone(&wake)));
+        let tripped = self.0.tripped.load(std::sync::atomic::Ordering::Acquire);
+        drop(wakers);
+        if tripped {
+            wake();
+        }
+        CancelWake {
+            invocation: self.clone(),
+            id,
+        }
     }
 
     /// The publication log, poison recovered: no mutation of it can unwind

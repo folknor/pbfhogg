@@ -166,7 +166,7 @@ pub(super) struct StreamingChannels {
     /// merge into the same reorder buffer keyed by global seq). Bounded
     /// by `DRAIN_CHANNEL_CAPACITY`: a worker blocks sending while the
     /// drain is behind the writer.
-    pub drain_tx: mpsc::SyncSender<DrainMessage>,
+    pub drain_tx: super::descriptor::DrainTx,
 }
 
 crate::counters::counter_set! {
@@ -338,7 +338,7 @@ pub(super) fn run_workers(
 
     crate::threads::scope(|scope| {
         for worker_id in 0..worker_count {
-            let drain_tx = drain_tx.clone();
+            let drain_tx = Arc::clone(&drain_tx);
             let loc = locations.as_ref().map(|l| WorkerLoc {
                 slot: &l.coord_slots[worker_id],
                 loc_map: &l.loc_map,

@@ -9,9 +9,9 @@
 //! "producer dropped a seq" error was returned in place of the real cause.
 //!
 //! Protocol: every producer error or caught panic is published here BEFORE the
-//! publishing thread releases its drain sender. The drain polls the slot
-//! on every loop iteration and once more after it observes the drain
-//! channel disconnect; because publication precedes sender release, a
+//! publishing thread releases its drain sender, and publication wakes the
+//! drain ([`DrainWake`]). The drain checks the slot after every receive,
+//! the disconnect included; because publication precedes sender release, a
 //! disconnected channel with an empty slot proves no producer failed.
 //! Returning the error from the drain drops the drain receiver and the
 //! barrier sender, which unblocks the scanner and every worker.
@@ -19,6 +19,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::descriptor::DrainWake;
 use crate::error::{Error, panic_error};
 
 pub(super) struct FailureSlot {
@@ -26,13 +27,15 @@ pub(super) struct FailureSlot {
     /// failed" stays observable after the error itself has been taken.
     failed: AtomicBool,
     error: Mutex<Option<Error>>,
+    wake: DrainWake,
 }
 
 impl FailureSlot {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(wake: DrainWake) -> Self {
         Self {
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
+            wake,
         }
     }
 
@@ -46,6 +49,8 @@ impl FailureSlot {
         if !self.failed.swap(true, Ordering::AcqRel) {
             *slot = Some(error);
         }
+        drop(slot);
+        self.wake.wake();
     }
 
     /// Preserve a thread's panic message as an ordinary pipeline failure.

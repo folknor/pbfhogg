@@ -166,7 +166,7 @@ struct LocationsSetup {
 fn wire_locations(
     setup: LocationsSetup,
     worker_count: usize,
-    drain_tx: &mpsc::SyncSender<DrainMessage>,
+    drain_tx: &super::descriptor::DrainTx,
 ) -> (ScannerLocations, WorkerLocations, DrainLocations) {
     let LocationsSetup { mode, index, probe } = setup;
     let (barrier_tx, barrier_rx) = mpsc::sync_channel::<()>(1);
@@ -177,7 +177,7 @@ fn wire_locations(
     let scanner = ScannerLocations {
         refresh_ways: probe.has_upserts(),
         barrier_rx,
-        boundary_tx: drain_tx.clone(),
+        boundary_tx: Arc::clone(drain_tx),
     };
     let drain = DrainLocations {
         coord_slots: coord_slots.iter().map(Arc::clone).collect(),
@@ -496,6 +496,9 @@ pub(crate) fn merge_to<'a>(
 
     // Channels.
     let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainMessage>(DRAIN_CHANNEL_CAPACITY);
+    // Owned behind one `Arc`, so the drain's wake can hold it weakly.
+    let drain_tx: super::descriptor::DrainTx = Arc::new(drain_tx);
+    let wake = super::descriptor::DrainWake::new(&drain_tx);
     let (candidate_tx, candidate_rx) =
         mpsc::sync_channel::<super::descriptor::ScannedBlob>(CANDIDATE_CHANNEL_CAPACITY);
     // Sequence admission: bounds seqs reserved and not yet processed, the
@@ -512,7 +515,7 @@ pub(crate) fn merge_to<'a>(
     // returns - which only happens after the drain joins.
     let (scanner_route, worker_route, drain_route) = match splice_source {
         Some(input_file) => (
-            Route::Splice(drain_tx.clone()),
+            Route::Splice(Arc::clone(&drain_tx)),
             Route::Splice(()),
             Route::Splice(input_file),
         ),
@@ -531,7 +534,7 @@ pub(crate) fn merge_to<'a>(
 
     let worker_counters = Arc::new(WorkerCounters::new());
     let drain_counters = Arc::new(DrainCounters::new());
-    let failure = Arc::new(FailureSlot::new());
+    let failure = Arc::new(FailureSlot::new(wake.clone()));
 
     let scanner_cfg = ScannerConfig {
         base: &base,
@@ -584,8 +587,11 @@ pub(crate) fn merge_to<'a>(
     // A drain error drops its receiver and barrier sender before we join,
     // unblocking scanner dispatch, barrier waits and worker sends. Join both
     // threads on every path so an implicit scope join cannot discard a cause.
+    // A cancellation ends the drain's blocked receive (`DrainWake`); held
+    // until the drain has returned.
+    let cancel_wake = host.invocation.on_cancel(move || wake.wake());
     let scanner_failure = Arc::clone(&failure);
-    let scanner_sender_guard = streaming_channels.drain_tx.clone();
+    let scanner_sender_guard = Arc::clone(&streaming_channels.drain_tx);
     let stats = crate::threads::scope(|scope| -> Result<MergeStats> {
         let scanner_handle = scope.spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -617,6 +623,7 @@ pub(crate) fn merge_to<'a>(
         #[cfg(pbfhogg_test_hooks)]
         host.invocation.faults().on_apply_changes_drain_returned();
 
+        drop(cancel_wake);
         let scanner_join = scanner_handle.join();
         let workers_join = workers_handle.join();
         if let Err(payload) = scanner_join {

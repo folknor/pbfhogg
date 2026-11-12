@@ -61,7 +61,7 @@ pub(super) struct ScannerChannels {
     /// Where untouched blobs go. `Splice` carries the fast-path drain
     /// sender; `Owned` has none, and all passthroughs route through
     /// `candidate_tx`.
-    pub route: Route<mpsc::SyncSender<DrainMessage>>,
+    pub route: Route<super::descriptor::DrainTx>,
 }
 
 /// The scanner's share of `--locations-on-ways`: the node→way barrier's two
@@ -84,7 +84,7 @@ pub(super) struct ScannerLocations {
     /// `CoordSlots` and publish `Arc<loc_map>` without needing a way item to
     /// trigger the transition. Owned by the scanner and dropped with it, so
     /// it never keeps the drain channel open past the scanner's exit.
-    pub boundary_tx: mpsc::SyncSender<DrainMessage>,
+    pub boundary_tx: super::descriptor::DrainTx,
 }
 
 /// Scanner configuration + I/O channels.

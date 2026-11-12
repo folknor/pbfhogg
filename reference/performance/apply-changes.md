@@ -38,6 +38,15 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### Drain blocks on its channel, no receive timeout (bygg, 2026-11-12, `ab647536` + change)
+
+The drain's 25 ms `recv_timeout` became a plain `recv`: a published
+producer failure and a cancellation now send a wake on the drain channel.
+`--iterations 1`, A B B A, baseline from a clean tree and the variant
+uncommitted, no trim, planet apply-diff of OSC 4913: `ab647536` 195.6,
+196.3 s (`eed56339`, `0ccd390c`); variant 195.5, 197.1 s (`3758db8e`,
+`ae547c61`). Every phase of the first pair within 1 %. Neutral.
+
 ### Hardware gzip CRC is neutral (bygg, 2026-11-11, `9b76817b` + change)
 
 zlib-rs with `std`, so gzip checksums use carry-less multiply (see

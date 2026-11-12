@@ -217,6 +217,38 @@ pub(super) enum DrainMessage {
     NodeBoundary {
         node_end_seq: u64,
     },
+    /// Carries nothing: a producer failure was published or the invocation
+    /// was cancelled ([`DrainWake`]). The drain checks both after every
+    /// receive, so a wake only has to end the one it is blocked in.
+    Wake,
+}
+
+/// An owning drain sender. Every producer holds the drain channel through
+/// one of these, never through a bare `SyncSender` clone, so a [`DrainWake`]
+/// (a `Weak` to the same sender) reaches the drain exactly while any
+/// producer can still send, and does not hold the channel open itself.
+pub(super) type DrainTx = std::sync::Arc<std::sync::mpsc::SyncSender<DrainMessage>>;
+
+/// Ends a drain receive that nothing else would end: a failed worker never
+/// delivers its seq while the scanner sits in its barrier wait and the
+/// surviving workers idle on the candidate channel, and a cancellation trips
+/// a token nobody is checking. Never blocks: a full channel already holds a
+/// message the drain will receive, after which it checks failure and token.
+#[derive(Clone)]
+pub(super) struct DrainWake(std::sync::Weak<std::sync::mpsc::SyncSender<DrainMessage>>);
+
+impl DrainWake {
+    pub(super) fn new(tx: &DrainTx) -> Self {
+        Self(std::sync::Arc::downgrade(tx))
+    }
+
+    /// No-op once every producer has dropped its sender: the drain then
+    /// wakes on the disconnect.
+    pub(super) fn wake(&self) {
+        if let Some(tx) = self.0.upgrade() {
+            drop(tx.try_send(DrainMessage::Wake));
+        }
+    }
 }
 
 impl BlobDescriptor {

@@ -165,12 +165,6 @@ pub(crate) const ORDERED_POOL_WINDOW_PER_WORKER: usize = 8;
 /// Floor of the ordered pool's default result window.
 pub(crate) const ORDERED_POOL_WINDOW_MIN: usize = 32;
 
-/// How long a cooperative wait on an executor parks in `recv_timeout` once
-/// `yield_now` reports the executor idle, before polling again. Used by the
-/// pipelined writer's permit wait and merge-changes' ordered member drain.
-pub(crate) const EXECUTOR_IDLE_RECV_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(1);
-
 // ---------------------------------------------------------------------------
 // Read path
 // ---------------------------------------------------------------------------
@@ -475,11 +469,6 @@ pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 /// states the bound.
 pub(crate) const QUEUE_SLOTS_PER_WORKER: usize = 2;
 
-/// How long the parallel gzip writer parks on its reorder-permit channel
-/// before re-checking whether the pool has stopped.
-pub(crate) const GZIP_REORDER_PERMIT_POLL: std::time::Duration =
-    std::time::Duration::from_millis(25);
-
 /// Number of io_uring registered buffers, each `IO_BUF_BYTES`: 64 x 256 KiB
 /// = 16 MiB, the one pool shape every io_uring bench measures. The writer
 /// registers exactly this pool or refuses (see step 5 of
@@ -651,20 +640,6 @@ pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: std::num::NonZeroUsize =
 /// bits per key in one word, about 0.35 % of absent IDs pass (8 MB at a
 /// planet daily diff).
 pub(crate) const APPLY_CHANGES_REFRESH_FILTER_BITS_PER_KEY: usize = 16;
-
-/// Drain `recv_timeout`: how long the drain blocks on an empty item channel
-/// before checking the producer failure slot and the cancellation token.
-/// The node boundary arrives on the item channel itself, so no polling is
-/// needed for the barrier. A failed worker never delivers its seq while the scanner can sit in its
-/// barrier wait and the other workers idle on the candidate channel, so no
-/// channel disconnect would wake the drain; the timeout does.
-///
-/// 25 ms is a tradeoff: tighter polling adds CPU at very small
-/// dataset sizes; looser polling adds latency at the moment of
-/// node→way transition. At planet, the transition fires once per
-/// run, so even 100 ms total polling latency is invisible against
-/// ~100 s wall.
-pub(crate) const DRAIN_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Fixed per-descriptor byte cost added when accounting a drain or scanner
 /// item for reorder high-water telemetry (not an admission permit or a memory

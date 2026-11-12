@@ -8,9 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
-use crate::tunables::{
-    EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DELIVERY_WINDOW, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD,
-};
+use crate::tunables::{PIPELINE_DELIVERY_WINDOW, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WriterMetrics;
 use std::io::Write;
@@ -502,16 +500,30 @@ impl Drop for WriterExit {
 /// `recv`, today's path byte for byte. On a worker of the executor's pool a
 /// blocking `recv` could park the only thread able to run the framing work
 /// that returns the permit (a one-thread pool deadlocks outright), so the wait
-/// is cooperative: run the pool's pending jobs while none is free, and nap for
-/// a millisecond at a time when there are none. The cooperative time is added
-/// to `writer_coop_wait_ns`, which is therefore zero unless a `PbfWriter` is
+/// is cooperative: run the pool's pending jobs while none is free, then block
+/// once the pool reports idle. The cooperative time is added to
+/// `writer_coop_wait_ns`, which is therefore zero unless a `PbfWriter` is
 /// driven from a rayon worker.
+///
+/// Blocking after `Yield::Idle` needs no timed recheck, by these properties
+/// of the jobs a permit (or a delivery-window token) waits on. Framing jobs
+/// are spawned only by the producer, which is this thread and cannot spawn
+/// while it waits. `yield_now` searches this worker's deque, every other
+/// worker's (retrying a contended steal) and the injector, and a steal
+/// executes the job it takes rather than moving it to another deque; so
+/// idle means every framing job spawned so far has finished or is running
+/// on some thread. A framing job neither spawns nor yields: it frames,
+/// sends its slot to the writer thread and drops its `PermitGuard`, whose
+/// send is the notification; window tokens come back from the writer thread
+/// over the same kind of channel, and its exit disconnects it. If framing
+/// jobs ever spawn follow-up work or are spawned from another thread, this
+/// argument breaks and the wait needs a notification for them.
 pub(super) fn recv_permit(
     rx: &Receiver<()>,
     executor: &crate::host::Executor,
     metrics: &WriterMetrics,
 ) -> std::result::Result<(), std::sync::mpsc::RecvError> {
-    use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
+    use std::sync::mpsc::{RecvError, TryRecvError};
     if !executor.on_worker() {
         return rx.recv();
     }
@@ -522,13 +534,7 @@ pub(super) fn recv_permit(
             Err(TryRecvError::Disconnected) => break Err(RecvError),
             Err(TryRecvError::Empty) => match executor.yield_now() {
                 Some(rayon::Yield::Executed) => {}
-                // wait-deliberate: idle park of a cooperative wait; expiry rechecks
-                Some(rayon::Yield::Idle) => match rx.recv_timeout(EXECUTOR_IDLE_RECV_TIMEOUT) {
-                    Ok(()) => break Ok(()),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break Err(RecvError),
-                },
-                None => break rx.recv(),
+                Some(rayon::Yield::Idle) | None => break rx.recv(),
             },
         }
     };

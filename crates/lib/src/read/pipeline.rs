@@ -561,8 +561,13 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         // and is never reported as a location.
         let item = item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
         let t_send = crate::counters::Stopwatch::start();
-        if tx.send((seq, item, Some(permit))).is_err() {
+        // A failed send hands the permit back; it is released only after
+        // `shutdown` is stored, so the dispatcher its release wakes sees the
+        // flag and admits no further decode task.
+        if let Err(std::sync::mpsc::SendError((_, _, permit))) = tx.send((seq, item, Some(permit)))
+        {
             shutdown.store(true, Relaxed);
+            drop(permit);
         }
         t_send.record_ns(&metrics.decoded_send_wait_ns);
     });

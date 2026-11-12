@@ -48,16 +48,6 @@ fixed token shape of each; it does not prove arbitrary Rust control flow. syn is
 now in that crate, so an AST check would not need a new parser. Residue: a general
 AST check, if it pays.
 
-## VER-136 - The CLI reference coverage tests toggle fences on any fence-shaped line
-
-`doc_coverage_tests::headings` and `table_rows` in `crates/cli/src/lib.rs` flip their
-fenced state on every line starting with three backticks or tildes, without tracking
-the delimiter character or length. A tilde line inside a backtick fence, or a longer
-opening fence, desynchronizes them, so headings or table rows in
-`docs/cli/commands.md` can be skipped or invented. `scripts/check_doc_links.py`
-already tracks both. Fix: track the opening delimiter as CommonMark does, with
-fixtures for mixed and lengthened fences.
-
 ## VER-014 - Empty textlint globs and stale exclusions are only audit-enforced
 
 Every rule in `brokkr.d/lints.toml` now has a `must_scan` sentinel, and the old coverage

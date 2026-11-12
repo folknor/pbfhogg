@@ -6142,13 +6142,11 @@ mod short_flag_tests {
             pbfhogg_test_scratch::repository_root().join("docs/cli/commands.md"),
         )
         .unwrap();
-        let section = doc
-            .split("## Short flags")
-            .nth(1)
-            .expect("docs/cli/commands.md has a `## Short flags` section");
-        let section = section.split("\n## ").next().unwrap_or(section);
+        let visible = crate::markdown::visible_lines(&doc);
+        let (start, end) = crate::markdown::level2_region(&visible, "Short flags")
+            .expect("docs/cli/commands.md has exactly one `## Short flags` section");
         let mut documented: Vec<(char, Vec<String>)> = Vec::new();
-        for line in section.lines() {
+        for line in crate::markdown::table_rows(&visible[start..end]) {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
             // | `-x` | `--long` (, `--long`) | ... |
             let [_, short, longs, ..] = cells[..] else {
@@ -6455,6 +6453,179 @@ mod geocode_query_bench_tests {
     }
 }
 
+/// The slice of Markdown the tests over `docs/cli/commands.md` read: fences,
+/// the document's ATX headings and its leading-pipe table rows. Fences follow
+/// CommonMark, as `scripts/check_doc_links.py` does: an opener of at most
+/// three spaces and a run of at least three backticks or tildes (a backtick
+/// info string holds no backtick); a closer of the same character, at least
+/// the opener's length, at most three spaces of indent and only trailing
+/// whitespace; an unclosed fence hides the rest of the document. Indented
+/// code, list items and other containers are not modelled, so this is the
+/// document's convention, not renderer equivalence.
+#[cfg(test)]
+mod markdown {
+    pub(crate) struct Heading {
+        pub(crate) level: usize,
+        pub(crate) text: String,
+        pub(crate) line: usize,
+    }
+
+    /// The fence run that opens or closes a fence on `line`, and the text
+    /// after it: at most three spaces, then three or more of one character.
+    fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
+        let indent = line.bytes().take_while(|b| *b == b' ').count();
+        if indent > 3 {
+            return None;
+        }
+        let rest = &line[indent..];
+        let ch = *rest.as_bytes().first()?;
+        if ch != b'`' && ch != b'~' {
+            return None;
+        }
+        let len = rest.bytes().take_while(|b| *b == ch).count();
+        (len >= 3).then(|| (ch, len, &rest[len..]))
+    }
+
+    /// One entry per source line, as `str::lines` splits it: the line, or
+    /// `None` for a fence delimiter or a line inside a fence. Indexes match
+    /// the source's, so a heading found here slices the raw lines too.
+    pub(crate) fn visible_lines(doc: &str) -> Vec<Option<&str>> {
+        let mut open: Option<(u8, usize)> = None;
+        doc.lines()
+            .map(|line| {
+                let run = fence_run(line);
+                match (open, run) {
+                    (Some((ch, len)), Some((c, l, tail)))
+                        if c == ch && l >= len && tail.trim().is_empty() =>
+                    {
+                        open = None;
+                        None
+                    }
+                    (Some(_), _) => None,
+                    (None, Some((c, l, tail))) if c == b'~' || !tail.contains('`') => {
+                        open = Some((c, l));
+                        None
+                    }
+                    (None, _) => Some(line),
+                }
+            })
+            .collect()
+    }
+
+    /// The document's ATX headings outside fences: at most three literal
+    /// spaces, one to six `#`, a space, then the text. `line` indexes the
+    /// source.
+    pub(crate) fn headings(visible: &[Option<&str>]) -> Vec<Heading> {
+        let mut out = Vec::new();
+        for (line, raw) in visible.iter().enumerate() {
+            let Some(raw) = raw else { continue };
+            let indent = raw.bytes().take_while(|b| *b == b' ').count();
+            if indent > 3 {
+                continue;
+            }
+            let rest = &raw[indent..];
+            let level = rest.bytes().take_while(|b| *b == b'#').count();
+            if (1..=6).contains(&level) && rest[level..].starts_with(' ') {
+                out.push(Heading {
+                    level,
+                    text: rest[level..].trim().to_owned(),
+                    line,
+                });
+            }
+        }
+        out
+    }
+
+    /// Table rows outside fences: a `|` line in an example block is not part
+    /// of a rendered table. A lexical convention, a line whose first
+    /// non-blank character is `|`; it does not model tables in list items.
+    pub(crate) fn table_rows<'a>(visible: &[Option<&'a str>]) -> Vec<&'a str> {
+        visible
+            .iter()
+            .flatten()
+            .filter(|line| line.trim_start().starts_with('|'))
+            .copied()
+            .collect()
+    }
+
+    /// The source lines of the one level-2 heading titled `title`, up to the
+    /// next heading of level 2 or above; `None` unless exactly one exists.
+    pub(crate) fn level2_region(visible: &[Option<&str>], title: &str) -> Option<(usize, usize)> {
+        let heads = headings(visible);
+        let mut found = heads.iter().filter(|h| h.level == 2 && h.text == title);
+        let start = found.next()?.line;
+        if found.next().is_some() {
+            return None;
+        }
+        let end = heads
+            .iter()
+            .find(|h| h.line > start && h.level <= 2)
+            .map_or(visible.len(), |h| h.line);
+        Some((start, end))
+    }
+
+    mod tests {
+        use super::{headings, level2_region, table_rows, visible_lines};
+
+        fn shown(doc: &str) -> Vec<&str> {
+            visible_lines(doc).into_iter().flatten().collect()
+        }
+
+        #[test]
+        fn a_closer_matches_the_opener_character_and_length() {
+            let cases = [
+                ("````\n```\n# no\n````\nafter", vec!["after"]),
+                ("~~~\n```\n# no\n~~~\nafter", vec!["after"]),
+                ("```\n~~~\n# no\n```\nafter", vec!["after"]),
+                ("```\n``` suffix\n# no\n```\nafter", vec!["after"]),
+                ("   ```rust\n# no\n```\nafter", vec!["after"]),
+                ("~~~~\n~~~\n# no\n~~~~~\nafter", vec!["after"]),
+                ("```\n    ```\n# no\n```\nafter", vec!["after"]),
+            ];
+            for (doc, want) in cases {
+                assert_eq!(shown(doc), want, "{doc:?}");
+            }
+        }
+
+        #[test]
+        fn an_unclosed_fence_hides_the_rest() {
+            assert_eq!(shown("before\n```\n# no\n| no |"), vec!["before"]);
+        }
+
+        #[test]
+        fn a_backtick_info_string_with_a_backtick_is_text() {
+            assert_eq!(shown("``` a`b\n# yes"), vec!["``` a`b", "# yes"]);
+            assert_eq!(shown("~~~ a`b\n# no\n~~~\nafter"), vec!["after"]);
+        }
+
+        #[test]
+        fn four_spaces_open_no_fence() {
+            assert_eq!(shown("    ```\n# yes"), vec!["    ```", "# yes"]);
+        }
+
+        #[test]
+        fn fenced_headings_and_rows_are_hidden_and_indexes_hold() {
+            let doc = "## A\n````\n```\n## Fake\n| `--fake` |\n```\n````\n| `--real` |\n## B";
+            let visible = visible_lines(doc);
+            let heads: Vec<(usize, String)> = headings(&visible)
+                .into_iter()
+                .map(|h| (h.line, h.text))
+                .collect();
+            assert_eq!(heads, vec![(0, "A".to_owned()), (8, "B".to_owned())]);
+            assert_eq!(table_rows(&visible), vec!["| `--real` |"]);
+            assert_eq!(level2_region(&visible, "A"), Some((0, 8)));
+            assert_eq!(level2_region(&visible, "Fake"), None);
+        }
+
+        #[test]
+        fn headings_take_at_most_three_spaces() {
+            let visible = visible_lines("   ## Yes\n    ## No\n\t## No");
+            let found: Vec<String> = headings(&visible).into_iter().map(|h| h.text).collect();
+            assert_eq!(found, vec!["Yes"]);
+        }
+    }
+}
+
 /// `docs/cli/commands.md` is the CLI reference, written by hand. These tests
 /// keep its surface in step with the built command tree: every visible
 /// command has exactly one section under `## Commands`, every visible option
@@ -6472,37 +6643,7 @@ mod geocode_query_bench_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod doc_coverage_tests {
     use super::cli_command;
-
-    struct Heading {
-        level: usize,
-        text: String,
-        line: usize,
-    }
-
-    /// ATX headings outside fenced code.
-    fn headings(lines: &[&str]) -> Vec<Heading> {
-        let mut out = Vec::new();
-        let mut fenced = false;
-        for (line, raw) in lines.iter().enumerate() {
-            let trimmed = raw.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                fenced = !fenced;
-                continue;
-            }
-            if fenced {
-                continue;
-            }
-            let level = trimmed.chars().take_while(|c| *c == '#').count();
-            if (1..=6).contains(&level) && trimmed[level..].starts_with(' ') {
-                out.push(Heading {
-                    level,
-                    text: trimmed[level..].trim().to_owned(),
-                    line,
-                });
-            }
-        }
-        out
-    }
+    use super::markdown::{Heading, headings, table_rows};
 
     /// True when `token` occurs in `hay` with no option-name character
     /// (`[A-Za-z0-9-]`) on either side, so `--output` is not found inside
@@ -6618,23 +6759,6 @@ mod doc_coverage_tests {
         }
     }
 
-    /// Table rows outside fenced code: a `|` line in an example block is not
-    /// part of a rendered table. `lines` must start outside a fence, which a
-    /// region opened by a heading does.
-    fn table_rows<'a>(lines: &[&'a str]) -> Vec<&'a str> {
-        let mut fenced = false;
-        let mut rows = Vec::new();
-        for line in lines {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                fenced = !fenced;
-            } else if !fenced && trimmed.starts_with('|') {
-                rows.push(*line);
-            }
-        }
-        rows
-    }
-
     fn visible_subcommands(cmd: &clap::Command) -> Vec<&clap::Command> {
         cmd.get_subcommands()
             .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")
@@ -6650,7 +6774,8 @@ mod doc_coverage_tests {
         )
         .unwrap();
         let lines: Vec<&str> = doc.lines().collect();
-        let heads = headings(&lines);
+        let visible = super::markdown::visible_lines(&doc);
+        let heads = headings(&visible);
         let mut cmd = cli_command();
         cmd.build();
         let mut problems = Vec::new();
@@ -6679,7 +6804,7 @@ mod doc_coverage_tests {
                 check_args(
                     "pbfhogg",
                     &cmd,
-                    &table_rows(region),
+                    &table_rows(&visible[global.line..end]),
                     &region.join("\n"),
                     true,
                     &mut problems,
@@ -6739,7 +6864,7 @@ mod doc_coverage_tests {
             check_args(
                 &path,
                 command,
-                &table_rows(region),
+                &table_rows(&visible[section.line..end]),
                 &region.join("\n"),
                 false,
                 &mut problems,
@@ -6773,7 +6898,7 @@ mod doc_coverage_tests {
                 check_args(
                     &child_path,
                     child,
-                    &table_rows(region),
+                    &table_rows(&visible[child_section.line..child_end]),
                     &region.join("\n"),
                     false,
                     &mut problems,

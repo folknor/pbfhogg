@@ -626,9 +626,9 @@ and inherits the contract.
   the truncation check disabled because the length-equality check
   fired instead.
 - `crates/lib/src/read/decompress.rs::tests::truncated_zlib_stream_errors_instead_of_hanging` -
-  runs the decompression on a worker thread behind a 5 s watchdog,
-  so the hang regression surfaces as a bounded failure rather than
-  as a hung suite.
+  runs the decompression on the test thread under a hang bound, so
+  the hang regression ends the test binary with a named report rather
+  than hanging the suite until the runner's watchdog.
 - `crates/lib/src/read/decompress.rs::tests::decompression_bomb_is_bounded_during_inflation`
   and `raw_size_capacity_hint_is_clamped_to_the_cap` - pin the
   during-inflation bound and the capacity-hint clamp separately.

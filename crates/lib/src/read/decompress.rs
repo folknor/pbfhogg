@@ -1061,46 +1061,36 @@ mod tests {
     /// path in the crate funnels through it, so on a rayon decode worker the
     /// spin presents as a deadlock.
     ///
-    /// The watchdog is the point of the test: it runs the decompression on a
-    /// worker thread and fails if no answer arrives, so a regression surfaces
-    /// as a bounded failure rather than as a hung test suite. The budget is
-    /// deliberately well inside the 20 s per-test watchdog `brokkr check`
-    /// enforces - a correct implementation answers in microseconds.
+    /// The hang bound is the point of the test: the decompression runs on the
+    /// test thread under a `HangBound`, so a regression ends the test binary
+    /// with a named report instead of spinning until the runner's watchdog
+    /// kills it unnamed. A hung thread cannot be joined, which is why the
+    /// work is not moved onto one - a correct implementation answers in
+    /// microseconds.
     #[test]
     fn truncated_zlib_stream_errors_instead_of_hanging() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "zlib decompression of a truncated stream did not terminate - \
+             the no-progress guard is gone",
+        );
         // Compressible payload, then cut the deflate stream in half: the
         // prefix is byte-valid deflate, it just never reaches a final block.
         let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         let full = zlib_compress(&payload);
         assert!(full.len() > 64, "need a stream long enough to bisect");
-        let truncated = full[..full.len() / 2].to_vec();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let blob = WireBlob {
-                data: Some(BlobData::Zlib(Bytes::from(truncated))),
-                raw_size: Some(200_000),
-            };
-            let mut out = Vec::new();
-            let result = decompress_wire_blob_into(&blob, &mut out);
-            // Send failure means the receiver already gave up on the watchdog.
-            let _sent = tx.send(result.is_err());
-        });
-
-        // wait-deliberate: a hang bound; expiry fails the test
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(is_err) => {
-                handle.join().expect("decompress thread must not panic");
-                assert!(
-                    is_err,
-                    "a truncated deflate stream must be an error, not a short read"
-                );
-            }
-            Err(_) => panic!(
-                "zlib decompression of a truncated stream did not terminate \
-                 within 5s - the no-progress guard is gone"
-            ),
-        }
+        let blob = WireBlob {
+            data: Some(BlobData::Zlib(Bytes::copy_from_slice(
+                &full[..full.len() / 2],
+            ))),
+            raw_size: Some(200_000),
+        };
+        let mut out = Vec::new();
+        assert!(
+            decompress_wire_blob_into(&blob, &mut out).is_err(),
+            "a truncated deflate stream must be an error, not a short read"
+        );
     }
 
     /// The decompressed-size cap is enforced *during* inflation, not after.

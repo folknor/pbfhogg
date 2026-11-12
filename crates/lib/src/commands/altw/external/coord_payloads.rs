@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn every_router_notification_waits_for_the_final_check_gate() {
         use std::sync::atomic::Ordering::SeqCst;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         // Hold the gate exactly where wait_ready holds it after its last
         // predicate check. Every event must wait for the atomic unlock/wait,
@@ -1166,7 +1166,7 @@ mod tests {
                     }
                     sent.send(()).expect("publication completed");
                 });
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::OBSERVE_BOUND;
                 loop {
                     let changed = match event {
                         0 | 1 => router.slots[0].lock().expect("slot").is_some(),

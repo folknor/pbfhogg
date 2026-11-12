@@ -410,49 +410,21 @@ fn a_fifo_is_refused_where_the_scan_may_read_twice() {
     assert!(err.to_string().contains("not a regular file"), "{err}");
 }
 
-/// Feed `bytes` into the FIFO at `path` from a thread. The writer side
-/// opens non-blocking and retries until a reader has the FIFO open, so a
-/// run that never opens it leaves the writer to give up (false) rather than
-/// hang the test.
+/// Feed `bytes` into the FIFO at `path`, under a hang bound the caller
+/// arms first. Whether the run opened it; a reader that stops early closes
+/// its end, so a short write is the reader's business, not the feeder's.
 #[cfg(unix)]
-fn feed_fifo(path: &Path, bytes: Vec<u8>) -> std::thread::JoinHandle<bool> {
-    let path = path.to_path_buf();
-    std::thread::spawn(move || -> bool {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut file = loop {
-            // ENXIO until a reader has the FIFO open.
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(file) => break file,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    // wait-deliberate: pace of a retry for the FIFO's reader; the deadline fails
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => return false,
-            }
-        };
-        let fd = file.as_raw_fd();
-        // SAFETY: `fd` is open for both calls.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        assert!(flags >= 0, "F_GETFL");
-        // SAFETY: as above.
-        assert!(
-            unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } >= 0,
-            "F_SETFL"
-        );
-        // A reader that stops early closes its end: a short write is the
-        // reader's business, not this feeder's.
-        match file.write_all(&bytes) {
-            Ok(()) | Err(_) => {}
-        }
-        true
-    })
+fn feed_fifo(path: &Path, bytes: Vec<u8>) -> crate::common::FifoFeeder {
+    crate::common::FifoFeeder::start(path, bytes)
+}
+
+#[cfg(unix)]
+fn fifo_bound() -> pbfhogg_test_scratch::HangBound {
+    pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the FIFO run or its feeder did not end",
+    )
 }
 
 /// The decode-only route reads its input once, so a FIFO serves it. Its
@@ -460,6 +432,7 @@ fn feed_fifo(path: &Path, bytes: Vec<u8>) -> std::thread::JoinHandle<bool> {
 #[cfg(unix)]
 #[test]
 fn a_decode_only_run_reads_a_fifo() {
+    let _bound = fifo_bound();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_input(&input, true);
@@ -473,7 +446,7 @@ fn a_decode_only_run_reads_a_fifo() {
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let feeder = feed_fifo(&fifo, std::fs::read(&input).expect("read input"));
     let result = run_inspect(route, &fifo, &crate::common::test_host());
-    let fed = feeder.join().expect("feeder thread");
+    let fed = !matches!(feeder.finish(), crate::common::Fed::NeverOpened);
     let got = result.unwrap_or_else(|e| panic!("a FIFO serves the decode-only scan: {e}"));
     assert!(fed, "the run must have opened the FIFO");
     assert_eq!(got, expected);
@@ -708,13 +681,14 @@ fn inspect_header_takes_the_size_from_its_one_open() {
 #[cfg(unix)]
 #[test]
 fn inspect_header_reads_a_fifo() {
+    let _bound = fifo_bound();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_input(&input, true);
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let feeder = feed_fifo(&fifo, std::fs::read(&input).expect("read input"));
     let result = pbfhogg::inspect::inspect_header(&fifo, false, &crate::common::test_host());
-    let fed = feeder.join().expect("feeder thread");
+    let fed = !matches!(feeder.finish(), crate::common::Fed::NeverOpened);
     let read = result.unwrap_or_else(|e| panic!("a FIFO serves the header read: {e}"));
     assert!(fed, "the run must have opened the FIFO");
     assert_eq!(read.file_size, 0);

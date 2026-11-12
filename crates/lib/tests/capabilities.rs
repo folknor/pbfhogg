@@ -60,6 +60,16 @@ impl Read for ParkingRead {
     }
 }
 
+/// The bound over a parked-reader scenario, armed first: the iterator's
+/// join of its pipeline thread after the release is otherwise unbounded.
+fn hang_bound() -> pbfhogg_test_scratch::HangBound {
+    pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the released pipeline did not end",
+    )
+}
+
 /// Release the caller's reader before dropping an iterator that joins it.
 /// Declaration order cannot provide this during an assertion's unwind.
 struct ReleasedBeforeJoin<T> {
@@ -88,6 +98,7 @@ impl<T> Drop for ReleasedBeforeJoin<T> {
 /// ticket each until they are dropped.
 #[test]
 fn a_block_iterator_blocked_on_the_callers_stream() {
+    let _bound = hang_bound();
     let invocation = Invocation::new();
     let (parked_tx, parked_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::channel();
@@ -108,7 +119,7 @@ fn a_block_iterator_blocked_on_the_callers_stream() {
         joined: blocks,
     };
     parked_rx
-        .recv_timeout(pbfhogg::TEST_CHILD_TIMEOUT)
+        .recv_timeout(pbfhogg::TEST_OBSERVE_BOUND)
         .expect("the pipeline reached the caller's stream");
     let held = assert_quiescent(&invocation);
     assert!(held.permits >= 1, "{held:?}");
@@ -137,6 +148,7 @@ fn a_block_iterator_blocked_on_the_callers_stream() {
 
 #[test]
 fn a_parked_reader_is_released_during_unwind() {
+    let _bound = hang_bound();
     let invocation = Invocation::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (parked_tx, parked_rx) = mpsc::sync_channel(1);
@@ -158,7 +170,7 @@ fn a_parked_reader_is_released_during_unwind() {
             joined: blocks,
         };
         parked_rx
-            .recv_timeout(pbfhogg::TEST_CHILD_TIMEOUT)
+            .recv_timeout(pbfhogg::TEST_OBSERVE_BOUND)
             .expect("the pipeline reached the caller's stream");
         panic!("unwind while the caller's reader is parked");
     }));

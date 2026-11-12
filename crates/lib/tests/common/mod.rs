@@ -89,6 +89,90 @@ pub fn make_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
     fifo
 }
 
+/// What a [`FifoFeeder`] did: the run never opened the FIFO within
+/// `TEST_OBSERVE_BOUND`, or it did and this is how the write ended (a reader
+/// that stops early closes its end, which some callers accept).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub enum Fed {
+    NeverOpened,
+    Wrote(std::io::Result<()>),
+}
+
+/// Feeds bytes into a FIFO from a thread of its own, joined on every exit:
+/// by [`finish`](Self::finish), or by `Drop` when the test unwinds first.
+/// The writer opens non-blocking and retries until a reader has the FIFO
+/// open, so a run that never opens it leaves the feeder to give up rather
+/// than hang. A reader that opens and then stops consuming would block the
+/// write, so a test feeding a FIFO arms its `HangBound` first.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub struct FifoFeeder {
+    handle: Option<std::thread::JoinHandle<Fed>>,
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl FifoFeeder {
+    pub fn start(path: &Path, bytes: Vec<u8>) -> Self {
+        let path = path.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let deadline = std::time::Instant::now() + pbfhogg::TEST_OBSERVE_BOUND;
+            let mut file = loop {
+                // ENXIO until a reader has the FIFO open.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(file) => break file,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        // wait-deliberate: pace of a retry for the FIFO's reader; the deadline fails
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return Fed::NeverOpened,
+                }
+            };
+            // Back to blocking writes now that the reader is there.
+            let fd = file.as_raw_fd();
+            // SAFETY: `fd` is open for both calls.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL");
+            // SAFETY: as above.
+            assert!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } >= 0,
+                "F_SETFL"
+            );
+            Fed::Wrote(file.write_all(&bytes))
+        });
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Join the feeder and say what it did.
+    pub fn finish(mut self) -> Fed {
+        self.handle
+            .take()
+            .expect("joined once")
+            .join()
+            .expect("feeder thread")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FifoFeeder {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Unwinding already: the feeder's own outcome adds nothing.
+            let _joined = handle.join();
+        }
+    }
+}
+
 // The promise guard (crates/cli/tests/guard.rs) mounts skip.rs on its own,
 // because the guard-portability crate has no `common`.
 #[allow(clippy::duplicate_mod)]

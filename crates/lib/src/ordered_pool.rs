@@ -1832,7 +1832,7 @@ mod tests {
 
     /// Poll `cond` for up to the deadline; whether it came true.
     fn eventually(cond: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::test_support::OBSERVE_BOUND;
         while !cond() {
             if std::time::Instant::now() >= deadline {
                 return false;

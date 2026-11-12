@@ -64,6 +64,50 @@ pub(crate) fn wait_parked<'a, S>(
     guard
 }
 
+/// Run `parked` on a thread of its own while `observe` watches it from the
+/// test thread, all under one `HangBound` armed first, and return both
+/// results. The thread is joined on every exit: if `observe` unwinds (a
+/// failed assertion), `release` runs first, so a thread parked waiting for
+/// the release the test never reached is woken before the join, not left
+/// detached. On success `observe` releases the thread itself and `release`
+/// does not run. A thread that stays hung after release is the bound's.
+pub(crate) fn with_parked_thread<T: Send, R>(
+    label: &'static str,
+    parked: impl FnOnce() -> T + Send,
+    release: impl FnOnce(),
+    observe: impl FnOnce() -> R,
+) -> (T, R) {
+    struct OnUnwind<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for OnUnwind<F> {
+        fn drop(&mut self) {
+            if std::thread::panicking()
+                && let Some(release) = self.0.take()
+            {
+                release();
+            }
+        }
+    }
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        crate::tunables::TEST_HANG_BOUND,
+        crate::tunables::TEST_HANG_REPORT_GRACE,
+        label,
+    );
+    // The library's scope, not std's: it joins the thread whole, its
+    // thread-local destructors included, on an unwind too, so the thread
+    // has ended before the bound disarms.
+    crate::threads::scope(|scope| {
+        let handle = scope.spawn(parked);
+        let observed = {
+            let _release = OnUnwind(Some(release));
+            observe()
+        };
+        let joined = handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (joined, observed)
+    })
+}
+
 #[path = "../tests/common/skip.rs"]
 mod shared_skip;
 

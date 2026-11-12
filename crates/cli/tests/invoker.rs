@@ -460,9 +460,10 @@ impl<'a> CliInvoker<'a> {
             self.cmd.stderr(Stdio::piped());
         }
         guard(&mut self.cmd);
+        let owner = OwnedChild::spawn(&mut self.cmd, self.scratch).expect("spawn pbfhogg");
         RunningCli {
-            owner: OwnedChild::spawn(&mut self.cmd, self.scratch).expect("spawn pbfhogg"),
-            timeout: self.timeout,
+            owner,
+            deadline: std::time::Instant::now() + self.timeout,
         }
     }
 
@@ -493,10 +494,23 @@ impl<'a> CliInvoker<'a> {
     }
 }
 
-/// A child whose lifetime cannot exceed its scratch guard.
+/// A child whose lifetime cannot exceed its scratch guard. Its timeout is
+/// one deadline from spawn that every wait on it shares, so a test that
+/// waits for a pause point and then for the exit waits one bound, not two.
+/// Cleanup after a kill (reaping, pipe completion) is bounded separately.
 pub struct RunningCli<'a> {
     owner: OwnedChild<'a>,
-    timeout: Duration,
+    deadline: std::time::Instant,
+}
+
+/// How a [`RunningCli::wait_for_file`] ended without the file appearing.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum NoFile {
+    /// The child exited first.
+    Exited,
+    /// The child's deadline passed.
+    Expired,
 }
 
 #[allow(dead_code)]
@@ -509,8 +523,32 @@ impl RunningCli<'_> {
         self.owner.has_exited().expect("inspect child")
     }
 
+    /// Poll for `path`, a file the child writes (a pause point's ready
+    /// file), until it appears, the child exits, or the child's deadline
+    /// passes. `Ok` means the child was still running after the file
+    /// appeared, so it can still be signalled: once its exit is seen (and it
+    /// is reaped) the answer is `Exited`, even if the file appeared just
+    /// before, since a signal to a reaped PID could reach another process.
+    pub fn wait_for_file(&mut self, path: &std::path::Path) -> Result<(), NoFile> {
+        loop {
+            if path.exists() {
+                return Ok(());
+            }
+            if self.has_exited() {
+                return Err(NoFile::Exited);
+            }
+            if std::time::Instant::now() >= self.deadline {
+                return Err(NoFile::Expired);
+            }
+            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; the child's deadline fails
+        }
+    }
+
     pub fn wait(mut self) -> CliOutput {
-        let out = self.owner.wait(self.timeout).expect("wait for pbfhogg");
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let out = self.owner.wait(remaining).expect("wait for pbfhogg");
         assert_not_guard_killed(out.status);
         CliOutput {
             status: out.status,

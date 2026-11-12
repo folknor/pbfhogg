@@ -233,12 +233,25 @@ pub(crate) fn name(signo: libc::c_int) -> &'static str {
 )]
 mod tests {
     use super::{NoticeGate, deliver};
+    use pbfhogg_test_scratch::HangBound;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    const BOUND: Duration = Duration::from_secs(10);
+    /// Each rendezvous below is a thread reaching a point it was set up to
+    /// reach.
+    const BOUND: Duration = pbfhogg::TEST_OBSERVE_BOUND;
+
+    /// The whole scenario, joins included: a `finish` that waited for the
+    /// reporter would block the test thread itself.
+    fn hang_bound(label: &'static str) -> HangBound {
+        HangBound::arm(
+            pbfhogg::TEST_HANG_BOUND,
+            pbfhogg::TEST_HANG_REPORT_GRACE,
+            label,
+        )
+    }
 
     /// The reporter's output lock in these tests: a log every writer appends to.
     fn hold<'a>(log: &'a Mutex<Vec<&'static str>>) -> impl FnOnce(&mut dyn FnMut()) + 'a {
@@ -254,12 +267,15 @@ mod tests {
     /// lock would already have won and would print.
     #[test]
     fn a_finished_run_suppresses_a_reporter_that_had_not_yet_taken_the_lock() {
+        let _bound = hang_bound("the suppressed notice scenario did not end");
         let gate = &NoticeGate::new();
         let log = &Mutex::new(Vec::new());
         let printed = &AtomicBool::new(false);
-        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
-        let (go_tx, go_rx) = mpsc::channel::<()>();
         std::thread::scope(|s| {
+            // Inside the scope: an unwind drops `go_tx` before the join,
+            // which wakes the reporter.
+            let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
             let reporter = s.spawn(move || {
                 let hold_output = move |f: &mut dyn FnMut()| {
                     arrived_tx.send(()).unwrap();
@@ -281,12 +297,15 @@ mod tests {
 
     #[test]
     fn finish_does_not_wait_for_a_printing_notice_and_the_final_line_follows_it() {
+        let _bound = hang_bound("finish waited for a printing notice");
         let gate = &NoticeGate::new();
         let log = &Mutex::new(Vec::new());
         let notice_printed = &AtomicBool::new(false);
-        let (claimed_tx, claimed_rx) = mpsc::channel::<()>();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
         std::thread::scope(|s| {
+            // Inside the scope: an unwind drops `release_tx` before the
+            // joins, which wakes the reporter.
+            let (claimed_tx, claimed_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
             let reporter = s.spawn(move || {
                 deliver(gate, hold(log), || {
                     claimed_tx.send(()).unwrap();

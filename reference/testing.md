@@ -342,10 +342,14 @@ must be exercised individually via `brokkr test <name> --timeout
 <secs>` (`brokkr test -p pbfhogg-cli <name> ...` for a CLI test), which raises the per-test timeout up to 280 s.
 
 A test's own failure bounds (the hook wait, the hang bound of the timeout
-helpers, the observation bound of unit tests, the harness rendezvous, the
-child timeout) are the "Test time bounds" in `crates/lib/src/tunables.rs`,
-const-asserted below a mirror of that watchdog so a broken run fails with a
-named message before the watchdog kills it unnamed. A wait whose defect
+helpers, the observation bound, the harness rendezvous, the child timeout)
+are the "Test time bounds" in `crates/lib/src/tunables.rs`, const-asserted
+below a mirror of that watchdog so a broken run fails with a named message
+before the watchdog kills it unnamed; a test names one of them, never a
+literal duration of its own. The observation bound (`TEST_OBSERVE_BOUND`)
+is for a transition a correct implementation makes at once: a thread
+reaching the point it was set up to reach, a child ending at once after a
+signal. A wait whose defect
 would be a hang is a `pbfhogg_test_scratch::HangBound` armed at
 `TEST_HANG_BOUND`, declared first in the test so it also bounds the release
 guards and joins after it, with the operation on the test thread: a hung
@@ -358,7 +362,13 @@ child carries a parent-death `SIGKILL` (`common::process::isolate`), keyed
 to the thread that spawned it, which is why a test child is always spawned,
 owned and reaped by its test's own thread. No test throws away a
 `thread::spawn` handle (the source-policy detached-threads rule, a lexical
-tripwire). A test never infers that
+tripwire), and a test joins every thread it starts on every exit, a failed
+assertion's unwind included: whatever the thread is parked waiting for is
+released before the join (a release sender owned inside the
+`std::thread::scope` body, a guard, or
+`test_support::with_parked_thread`), and the join sits under the test's
+`HangBound`. The rule cannot see a named handle dropped on an unwind, so
+it rests on review. A test never infers that
 another thread blocked from elapsed time: it waits (bounded) for an
 observation made at the wait itself - a `test_support::Parked` count under a
 primitive's mutex, a fault-plan hook at a join, a lock or an empty delivery
@@ -500,7 +510,9 @@ The boundary follows what a test is for, not one list for every test.
 - **CLI tests** (`crates/cli/tests/`) test the binary. They name the
   library only to build inputs (the block builder and writer), to read
   outputs (the blob and element readers and their view types, the geocode
-  reader) and to spell the binary's test-hook protocol, so a rewrite of a
+  reader), to spell the binary's test-hook protocol and to name the two
+  test time bounds a CLI test waits on (the child timeout and the
+  observation bound), so a rewrite of a
   command's library code cannot break them by type changes alone. Any other
   library path carries a `// library-deliberate: <reason>` comment on its
   line, alone on the line above, or on the first line of its `use`
@@ -782,7 +794,11 @@ exception, not a tier - should not survive across many PRs.
 - **CliInvoker for CLI-driven tests.** `crates/cli/tests/invoker.rs`. Every
   new `crates/cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via
-  `.timeout(Duration)`. Construction borrows `&TestScratch`, and the running
+  `.timeout(Duration)`. The timeout is one deadline from spawn shared by
+  every wait on that child: `wait_for_file` (a pause point's ready file,
+  reporting whether it appeared, the child exited first, or the deadline
+  passed) and the final `wait`, so a paused child is one bound, not two.
+  A test that runs several children still sums their bounds. Construction borrows `&TestScratch`, and the running
   handle carries that borrow through child and capture cleanup. `run` uses
   the same owner as `spawn().wait()`. Pipe reads are nonblocking, capture
   errors fail explicitly, and cleanup and EOF waits are bounded, including

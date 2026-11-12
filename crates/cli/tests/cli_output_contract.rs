@@ -1552,9 +1552,7 @@ fn a_quiet_run_prints_only_warnings_and_writes_the_same_outputs() {
 #[cfg(pbfhogg_test_hooks)]
 mod interrupted {
     use super::*;
-    use std::time::{Duration, Instant};
-
-    const READY_TIMEOUT: Duration = Duration::from_secs(10);
+    use crate::invoker::NoFile;
 
     pub(super) fn signal_name(signal: libc::c_int) -> &'static str {
         if signal == libc::SIGTERM {
@@ -1730,21 +1728,11 @@ mod interrupted {
             .cancel_pause(ordinal, &ready, false)
             .spawn();
 
-        let start = Instant::now();
         let mut seen = Seen::default();
-        loop {
-            if ready.exists() {
-                break;
-            }
-            if child.has_exited() {
-                seen.completed = true;
-                break;
-            }
-            ensure!(
-                start.elapsed() < READY_TIMEOUT,
-                "checkpoint {k} was never reached"
-            );
-            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
+        match child.wait_for_file(&ready) {
+            Ok(()) => {}
+            Err(NoFile::Exited) => seen.completed = true,
+            Err(NoFile::Expired) => return Err(format!("checkpoint {k} was never reached")),
         }
         if seen.completed {
             let out = child.wait();
@@ -1956,7 +1944,7 @@ fn killed_run_sharing_one_directory_leaves_everything_there(
 #[allow(clippy::too_many_lines)]
 fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
-    use std::time::{Duration, Instant};
+    use crate::invoker::NoFile;
     let count = interrupted::checkpoint_count(fx, row)?;
     let (out_dir, staging, separate_tmp, control) = (
         crate::common::test_scratch(),
@@ -1988,14 +1976,10 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     .args(&extra)
     .cancel_pause(ordinal, &ready, true)
     .spawn();
-    let start = Instant::now();
-    while !ready.exists() {
-        ensure!(!child.has_exited(), "the run ended before its pause");
-        ensure!(
-            start.elapsed() < Duration::from_secs(10),
-            "the pause was never reached"
-        );
-        std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
+    match child.wait_for_file(&ready) {
+        Ok(()) => {}
+        Err(NoFile::Exited) => return Err("the run ended before its pause".into()),
+        Err(NoFile::Expired) => return Err("the pause was never reached".into()),
     }
     child.signal(libc::SIGKILL);
     drop(child.wait());
@@ -2157,7 +2141,7 @@ fn one_directory_can_serve_as_both_staging_and_scratch_and_be_removed_whole() {
 #[cfg(pbfhogg_test_hooks)]
 mod in_publication {
     use super::*;
-    use std::time::{Duration, Instant};
+    use crate::invoker::NoFile;
 
     /// Which outputs exist before the run (planted, and replaced with
     /// `--overwrite`).
@@ -2407,14 +2391,10 @@ mod in_publication {
             .publish_faults(scenario.faults)
             .publish_pause(step.parse().expect("recorded publication step"), &ready)
             .spawn();
-        let start = Instant::now();
-        while !ready.exists() {
-            ensure!(!child.has_exited(), "{step}: the run ended before the step");
-            ensure!(
-                start.elapsed() < Duration::from_secs(10),
-                "{step}: the step was never reached"
-            );
-            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
+        match child.wait_for_file(&ready) {
+            Ok(()) => {}
+            Err(NoFile::Exited) => return Err(format!("{step}: the run ended before the step")),
+            Err(NoFile::Expired) => return Err(format!("{step}: the step was never reached")),
         }
         child.signal(libc::SIGKILL);
         drop(child.wait());
@@ -2942,7 +2922,7 @@ mod tier3 {
 #[test]
 fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let fx = Fx::new();
     let row = ROWS
         .iter()
@@ -2976,19 +2956,8 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
         .cancel_pause(ordinal, &ready, true)
         .spawn();
         let wait_for = |path: &Path, child: &mut crate::invoker::RunningCli| {
-            let start = Instant::now();
-            while !path.exists() {
-                assert!(
-                    !child.has_exited(),
-                    "the run ended before {}",
-                    path.display()
-                );
-                assert!(
-                    start.elapsed() < Duration::from_secs(10),
-                    "{} never appeared",
-                    path.display()
-                );
-                std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
+            if let Err(missed) = child.wait_for_file(path) {
+                panic!("{} never appeared: {missed:?}", path.display());
             }
         };
         wait_for(&ready, &mut child);
@@ -3008,7 +2977,7 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
             out.stderr_str()
         );
         assert!(
-            sent.elapsed() < Duration::from_secs(5),
+            sent.elapsed() < pbfhogg::TEST_OBSERVE_BOUND,
             "the second signal did not end the run at once"
         );
         // The stuck run never cleaned up: its staging entry is still there,
@@ -3043,7 +3012,6 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
 #[test]
 fn a_command_without_an_output_is_interrupted_too() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
-    use std::time::{Duration, Instant};
     let fx = Fx::new();
     let good = fx.pbf(Input::Good);
     for (i, (_, _, words)) in NO_OUTPUT.iter().enumerate() {
@@ -3065,14 +3033,8 @@ fn a_command_without_an_output_is_interrupted_too() {
                 false,
             )
             .spawn();
-        let start = Instant::now();
-        while !ready.exists() {
-            assert!(!child.has_exited(), "{words:?} ended before checkpoint 2");
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "{words:?} never paused"
-            );
-            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
+        if let Err(missed) = child.wait_for_file(&ready) {
+            panic!("{words:?} never paused at checkpoint 2: {missed:?}");
         }
         child.signal(signal);
         let out = child.wait();

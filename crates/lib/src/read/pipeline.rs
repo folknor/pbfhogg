@@ -1129,6 +1129,11 @@ mod tests {
 
     #[test]
     fn fused_stalled_transform_preserves_order() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "the released fused read did not return",
+        );
         let stalled = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         let worker_stalled = Arc::clone(&stalled);
@@ -1169,13 +1174,13 @@ mod tests {
         let start = std::time::Instant::now();
         while !stalled.load(Ordering::Relaxed) {
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < crate::test_support::OBSERVE_BOUND,
                 "transform did not stall"
             );
             std::thread::yield_now();
         }
         release.store(true, Ordering::Relaxed);
-        let (result, ids) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (result, ids) = done_rx.recv().unwrap();
         result.unwrap();
         assert_eq!(ids, [0, 1, 2]);
     }
@@ -1198,7 +1203,7 @@ mod tests {
     impl Drop for Teardown {
         fn drop(&mut self) {
             self.0.started.fetch_add(1, Ordering::SeqCst);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + crate::tunables::TEST_HOOK_WAIT;
             while !self.0.release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
                 // wait-deliberate: pace of a poll for the test's release
                 std::thread::sleep(Duration::from_millis(1));
@@ -1234,6 +1239,11 @@ mod tests {
         thread_local! {
             static TEARDOWN: RefCell<Option<Teardown>> = const { RefCell::new(None) };
         }
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "the released read did not return",
+        );
         let state = Arc::new(TeardownState::default());
         let worker_state = Arc::clone(&state);
         let invocation = crate::host::Invocation::new();
@@ -1270,14 +1280,14 @@ mod tests {
                 == 0
         {
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < crate::test_support::OBSERVE_BOUND,
                 "no decode worker began tearing down, or the read never reached its join"
             );
             // wait-deliberate: pace of a poll on observed counters; the deadline fails
             std::thread::sleep(Duration::from_millis(1));
         }
         state.release.store(true, Ordering::SeqCst);
-        let (result, finished_at_return) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (result, finished_at_return) = done_rx.recv().unwrap();
         result.unwrap();
         assert_eq!(
             finished_at_return,
@@ -1423,30 +1433,24 @@ mod tests {
         assert!(!gate.acquire());
         assert!(!gate.acquire());
 
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let child_gate = Arc::clone(&gate);
-        let handle = std::thread::spawn(move || {
-            let blocked = child_gate.acquire();
-            done_tx.send(blocked).expect("done channel open");
-        });
-
-        // The child found the gate full and parked, so the release below is
-        // what admits it, and `acquire` reports that it blocked.
-        drop(crate::test_support::wait_parked(
-            &gate.state,
-            &gate.observer,
-            |s| &s.parked,
-            1,
-        ));
-        gate.release();
-        // wait-deliberate: expiry panics in the error arm
-        match done_rx.recv_timeout(crate::test_support::OBSERVE_BOUND) {
-            Ok(blocked) => assert!(blocked),
-            Err(e) => panic!("child did not acquire after release: {e}"),
-        }
-        if let Err(e) = handle.join() {
-            panic!("child panicked: {e:?}");
-        }
+        let (blocked, ()) = crate::test_support::with_parked_thread(
+            "the child did not acquire after release",
+            || gate.acquire(),
+            || gate.release(),
+            || {
+                // The child found the gate full and parked, so the release
+                // below is what admits it, and `acquire` reports that it
+                // blocked.
+                drop(crate::test_support::wait_parked(
+                    &gate.state,
+                    &gate.observer,
+                    |s| &s.parked,
+                    1,
+                ));
+                gate.release();
+            },
+        );
+        assert!(blocked, "the child acquired without blocking");
     }
 
     #[test]

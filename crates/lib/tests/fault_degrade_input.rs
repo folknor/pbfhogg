@@ -732,12 +732,16 @@ fn a_fifo_input_is_refused_on_the_decode_path() {
 /// The passthrough reads its input in one sequential pass, so a FIFO
 /// serves it: the output equals the run on the file the FIFO carried.
 ///
-/// The writer side opens non-blocking and retries until the run has opened
-/// the read side, so a run that never opens the FIFO leaves the writer to
-/// give up rather than hang the test.
+/// The feeder (`common::FifoFeeder`) gives up if the run never opens the
+/// FIFO; the hang bound covers a run that opens it and stops reading.
 #[cfg(unix)]
 #[test]
 fn the_passthrough_reads_a_fifo() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the FIFO passthrough or its feeder did not end",
+    );
     let route = Route::strip_indexdata();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
@@ -749,47 +753,16 @@ fn the_passthrough_reads_a_fifo() {
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let output = dir.path().join("out.osm.pbf");
 
-    let writer_path = fifo.clone();
-    let feeder = std::thread::spawn(move || -> bool {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut file = loop {
-            // ENXIO until a reader has the FIFO open.
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&writer_path)
-            {
-                Ok(file) => break file,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    // wait-deliberate: pace of a retry for the FIFO's reader; the deadline fails
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => return false,
-            }
-        };
-        // Back to blocking writes now that the reader is there.
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
-            // SAFETY: `fd` is open for both calls.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            assert!(flags >= 0, "F_GETFL");
-            // SAFETY: as above.
-            assert!(
-                unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } >= 0,
-                "F_SETFL"
-            );
-        }
-        file.write_all(&bytes).expect("feed the FIFO");
-        true
-    });
-
+    let feeder = crate::common::FifoFeeder::start(&fifo, bytes);
     let result = run(route, &fifo, out(&output), &crate::common::test_host());
-    let fed = feeder.join().expect("feeder thread");
+    let fed = feeder.finish();
     result.unwrap_or_else(|e| panic!("a FIFO serves the passthrough: {e}"));
-    assert!(fed, "the run must have opened the FIFO");
+    match fed {
+        crate::common::Fed::NeverOpened => panic!("the run must have opened the FIFO"),
+        crate::common::Fed::Wrote(written) => {
+            written.unwrap_or_else(|e| panic!("the passthrough read the whole FIFO: {e}"));
+        }
+    }
     assert!(
         std::fs::read(&output).expect("read output") == expected,
         "the output must equal the run on the file the FIFO carried"

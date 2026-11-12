@@ -1415,9 +1415,10 @@ pub(crate) const GEOCODE_CELL_BOUND_SLACK_RAD: f64 = 1e-12;
 
 /// brokkr's fixed per-test watchdog (`brokkr man test`), mirrored.
 pub const TEST_RUNNER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
-/// A unit test's wait for a transition a correct implementation makes at
-/// once (a thread reaching a wait it was set up to reach).
-pub(crate) const TEST_OBSERVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+/// A test's wait for a transition a correct implementation makes at once (a
+/// thread reaching a wait it was set up to reach, a child ending at once
+/// after a signal it was sent).
+pub const TEST_OBSERVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 /// A test's bound on a whole operation whose defect would be a hang. On
 /// expiry the test binary ends (`pbfhogg_test_scratch::HangBound`): a hung
 /// thread cannot be joined, and one left running would outlive its test.

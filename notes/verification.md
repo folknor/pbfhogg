@@ -56,22 +56,33 @@ Every test time bound lives in `crates/lib/src/tunables.rs` ("Test time bounds")
 is const-asserted below `TEST_RUNNER_WATCHDOG`, brokkr's fixed 20 s per-test
 watchdog, which the maintainer confirms is always 20 s. Library hang waits now carry
 one fail-stop `HangBound` over the whole scenario, but tests outside them still wait
-on bounds in sequence: a CLI test that runs several children, each under `TEST_CHILD_TIMEOUT`
-(10 s), can reach the watchdog unnamed, and CLI tests cannot name `TEST_HANG_BOUND`
+on bounds in sequence. One child is now one bound (`RunningCli` carries a single
+deadline from spawn through `wait_for_file` and `wait`), but a CLI test that runs
+several children, each under `TEST_CHILD_TIMEOUT` (10 s) - a row loop, or a run and
+then a next run as in `a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers`
+- can reach the watchdog unnamed, and CLI tests cannot name `TEST_HANG_BOUND`
 through the test-import audit (`crates/source-policy/src/rules/test_imports.rs`).
 
-## VER-137 - Literal test bounds and a handle joined only on success
+## VER-139 - Test threads not yet checked for release before join
 
-Found while closing the hang-helper work. Failure bounds still written as literals
-outside "Test time bounds": `read/decompress.rs` (5 s; its worker handle is dropped
-unjoined on expiry), the 5 s deadline loops in `ordered_pool.rs` and
-`coord_payloads.rs`, the `read/pipeline.rs` stalled-transform and teardown tests (5 s,
-10 s), `crates/cli/src/signals.rs` `BOUND` (10 s), the `fault_inspect_input.rs` and
-`fault_degrade_input.rs` feeders (10 s), and the `cli_output_contract.rs` loops and
-`READY_TIMEOUT`. `crates/lib/tests/seal.rs` joins its two spawned threads only on the
-success path - a named handle dropped on an assertion failure, which the
-detached-threads source rule (statement and `let _` discards only) cannot see.
-`capabilities.rs` bounds a thread rendezvous with `TEST_CHILD_TIMEOUT`.
+Found while closing the literal-bound and success-only-join work, which converted
+`seal.rs`, `capabilities.rs`, the `read/reader.rs` budget and queue tests, the
+`read/pipeline.rs` gate test and the FIFO feeders. Not yet read against the rule
+(every thread a test starts is released and joined on every exit, under the test's
+`HangBound`): `crates/lib/tests/fault_pipelined_writer.rs` (the `raw` writer thread is
+declared after its `Cleanup` guard, so an assertion failure drops the handle before
+the guard releases framing, detaching the thread), `crates/lib/tests/digest_input.rs`
+FIFO writer, the `write/writer.rs`, `write/pipeline.rs` and `read/reader.rs` (the
+spawn near the `par_map_reduce` tests) unit-test spawns,
+`commands/apply_changes/window.rs` (`a_returned_drain_wakes_a_parked_scanner`, no
+bound on its join) and `crates/cli/tests/guard.rs`. `crates/cli/tests/cli_sort.rs`
+`sort_cross_validate_osmium` sets a literal 110 s child timeout, above the watchdog,
+on an `#[ignore]` test run only through `brokkr test --timeout`.
+`OwnedChild::signal` (`crates/lib/tests/common/process.rs`) still calls `kill` on the
+numeric PID after the child was reaped by `has_exited`; it should refuse instead.
+`seal.rs` and `crates/cli/src/signals.rs` join through `std::thread::scope`, which
+does not wait for thread-local destructors; their threads hold none that matter, but
+only lib unit tests can reach `crate::threads::scope`.
 
 ## VER-138 - Element order inside a mixed-field group is pbfhogg's, not the file's
 

@@ -81,6 +81,16 @@ fn run_cat(invocation: &Invocation) -> pbfhogg::Result<()> {
     result
 }
 
+/// The bound over a scenario with a parked thread, armed first so it also
+/// covers the scope's join after the release.
+fn hang_bound() -> pbfhogg_test_scratch::HangBound {
+    pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the released seal scenario did not end",
+    )
+}
+
 fn account(invocation: &Invocation) -> StreamAccount {
     invocation.stream_account().unwrap()
 }
@@ -139,6 +149,7 @@ fn assert_ended(bodies: &[String], account: StreamAccount, sealed: usize, state:
 /// the first seals, and a later seal returns its snapshot.
 #[test]
 fn concurrent_sealers_are_refused_until_the_account_is_frozen() {
+    let _bound = hang_bound();
     let capture = Capture::new();
     let invocation = capture.invocation("c", None);
     run_cat(&invocation).unwrap();
@@ -151,23 +162,29 @@ fn concurrent_sealers_are_refused_until_the_account_is_frozen() {
             release_rx.lock().unwrap().recv().unwrap();
         }
     });
-    let first = {
-        let invocation = invocation.clone();
-        std::thread::spawn(move || invocation.seal())
-    };
-    reached_rx.recv().unwrap();
-    assert!(matches!(
-        invocation.seal(),
-        SealOutcome::Refused(SealRefusal::Finalizing)
-    ));
-    assert_eq!(invocation.cancel(), pbfhogg::CancelOutcome::Ended);
-    assert_eq!(
-        account(&invocation).state,
-        StreamState::Open,
-        "not frozen yet"
-    );
-    release_tx.send(()).unwrap();
-    let SealOutcome::Sealed(snapshot) = first.join().unwrap() else {
+    let first = std::thread::scope(|scope| {
+        // Owned by the scope's body: an assertion's unwind drops it before
+        // the scope joins, which releases the parked sealer.
+        let release_tx = release_tx;
+        let sealer = invocation.clone();
+        let first = scope.spawn(move || sealer.seal());
+        reached_rx
+            .recv_timeout(pbfhogg::TEST_OBSERVE_BOUND)
+            .expect("the first sealer reached its stream step");
+        assert!(matches!(
+            invocation.seal(),
+            SealOutcome::Refused(SealRefusal::Finalizing)
+        ));
+        assert_eq!(invocation.cancel(), pbfhogg::CancelOutcome::Ended);
+        assert_eq!(
+            account(&invocation).state,
+            StreamState::Open,
+            "not frozen yet"
+        );
+        release_tx.send(()).unwrap();
+        first.join().unwrap()
+    });
+    let SealOutcome::Sealed(snapshot) = first else {
         panic!("the first sealer seals");
     };
     let SealOutcome::Sealed(again) = invocation.seal() else {
@@ -241,6 +258,7 @@ fn a_seal_from_a_callback_is_refused() {
 /// follows its first sealing emission.
 #[test]
 fn an_emission_in_flight_holds_the_seal_off() {
+    let _bound = hang_bound();
     let capture = Capture::new();
     let (parked_tx, parked_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -254,18 +272,23 @@ fn an_emission_in_flight_holds_the_seal_off() {
         }),
     });
     let invocation = capture.invocation("f", Some(tap as Arc<dyn InstrumentSink>));
-    let run = {
-        let invocation = invocation.clone();
-        std::thread::spawn(move || run_cat(&invocation))
-    };
-    parked_rx.recv().unwrap();
-    assert!(matches!(
-        invocation.seal(),
-        SealOutcome::Refused(SealRefusal::InProgress)
-    ));
-    assert_eq!(account(&invocation).state, StreamState::Open);
-    release_tx.send(()).unwrap();
-    run.join().unwrap().unwrap();
+    std::thread::scope(|scope| {
+        // Owned by the scope's body: an assertion's unwind drops it before
+        // the scope joins, which releases the parked emission.
+        let release_tx = release_tx;
+        let runner = invocation.clone();
+        let run = scope.spawn(move || run_cat(&runner));
+        parked_rx
+            .recv_timeout(pbfhogg::TEST_OBSERVE_BOUND)
+            .expect("the run's emission parked");
+        assert!(matches!(
+            invocation.seal(),
+            SealOutcome::Refused(SealRefusal::InProgress)
+        ));
+        assert_eq!(account(&invocation).state, StreamState::Open);
+        release_tx.send(()).unwrap();
+        run.join().unwrap().unwrap();
+    });
     let SealOutcome::Sealed(snapshot) = invocation.seal() else {
         panic!("the run returned");
     };

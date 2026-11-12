@@ -1452,7 +1452,6 @@ mod tests {
     use crate::error::{BlobError, ErrorKind};
     use std::io::{Cursor, Read};
     use std::sync::Arc;
-    use std::sync::mpsc;
 
     #[test]
     fn injected_resources_are_lazy_and_explicit_workers_take_precedence() {
@@ -1631,25 +1630,19 @@ mod tests {
     fn byte_budget_blocks_at_cap_until_release() {
         let budget = Arc::new(ByteBudget::new(10));
         let held = budget.acquire(6).unwrap();
-
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let child = Arc::clone(&budget);
-        let handle = std::thread::spawn(move || {
+        let (admitted, ()) = crate::test_support::with_parked_thread(
+            "the acquirer was not admitted after release",
             // 6 + 5 > 10 and the budget is non-empty, so this blocks.
-            let admitted = child.acquire(5).is_some();
-            done_tx.send(admitted).unwrap();
-        });
-
-        // The acquirer found no room and parked: it blocked.
-        budget_parked(&budget, 1);
-        drop(held);
-        assert!(
-            done_rx
-                .recv_timeout(crate::test_support::OBSERVE_BOUND)
-                .unwrap(),
-            "acquire must succeed once capacity frees up"
+            || budget.acquire(5).is_some(),
+            // An unwind drops `held`, which is the release.
+            || {},
+            || {
+                // The acquirer found no room and parked: it blocked.
+                budget_parked(&budget, 1);
+                drop(held);
+            },
         );
-        handle.join().unwrap();
+        assert!(admitted, "acquire must succeed once capacity frees up");
     }
 
     #[test]
@@ -1716,23 +1709,19 @@ mod tests {
     fn byte_budget_shutdown_unblocks_acquirer() {
         let budget = Arc::new(ByteBudget::new(10));
         let _held = budget.acquire(10).unwrap();
-
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let child = Arc::clone(&budget);
-        let handle = std::thread::spawn(move || {
-            let admitted = child.acquire(5).is_some();
-            done_tx.send(admitted).unwrap();
-        });
-
-        budget_parked(&budget, 1);
-        budget.shutdown();
+        let (admitted, ()) = crate::test_support::with_parked_thread(
+            "shutdown did not wake the acquirer",
+            || budget.acquire(5).is_some(),
+            || budget.shutdown(),
+            || {
+                budget_parked(&budget, 1);
+                budget.shutdown();
+            },
+        );
         assert!(
-            !done_rx
-                .recv_timeout(crate::test_support::OBSERVE_BOUND)
-                .unwrap(),
+            !admitted,
             "shutdown must wake a blocked acquirer and return false"
         );
-        handle.join().unwrap();
     }
 
     #[test]
@@ -1748,30 +1737,24 @@ mod tests {
 
     #[test]
     fn batch_queue_close_wakes_blocked_consumer() {
-        let queue = Arc::new(BatchQueue::new());
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let child = Arc::clone(&queue);
-        let handle = std::thread::spawn(move || {
-            let got = child.pop();
-            done_tx.send(got.is_none()).unwrap();
-        });
-
-        // The consumer is parked on the empty, open queue, so the close
-        // below is a wakeup, not a closed queue found on entry.
-        drop(crate::test_support::wait_parked(
-            &queue.inner,
-            &queue.observer,
-            |s| &s.parked,
-            1,
-        ));
-        queue.close();
-        assert!(
-            done_rx
-                .recv_timeout(crate::test_support::OBSERVE_BOUND)
-                .unwrap(),
-            "close must wake a blocked consumer with None"
+        let queue = BatchQueue::new();
+        let (closed, ()) = crate::test_support::with_parked_thread(
+            "close did not wake the consumer",
+            || queue.pop().is_none(),
+            || queue.close(),
+            || {
+                // The consumer is parked on the empty, open queue, so the
+                // close below is a wakeup, not a closed queue found on entry.
+                drop(crate::test_support::wait_parked(
+                    &queue.inner,
+                    &queue.observer,
+                    |s| &s.parked,
+                    1,
+                ));
+                queue.close();
+            },
         );
-        handle.join().unwrap();
+        assert!(closed, "close must wake a blocked consumer with None");
     }
 
     // ---- par_map_reduce orchestration failure paths --------------------------

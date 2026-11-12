@@ -132,7 +132,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
 
     /// Releases the held pool threads and joins the owner on every exit
     /// path, a failed assertion included.
@@ -140,10 +139,7 @@ mod tests {
 
     impl Drop for Release {
         fn drop(&mut self) {
-            self.0
-                .faults()
-                .release_built_pool_threads
-                .store(true, SeqCst);
+            self.0.faults().release_built_pool_threads();
             if let Some(handle) = self.1.take() {
                 drop(handle.join());
             }
@@ -176,18 +172,15 @@ mod tests {
         // Both workers are held in their exit hook and the unwinding owner
         // has reached its join: whatever ends the unwind now has to wait
         // for the release below.
-        let start = Instant::now();
-        while faults.built_pool_threads_held.load(SeqCst) < 2
-            || faults.built_pool_joins_started.load(SeqCst) < 1
-        {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "the pool threads did not reach their exit hook, or the owner its join"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        faults.release_built_pool_threads.store(true, SeqCst);
-        let (unwound, done) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            faults.wait_for(|| faults.built_pool_threads_held.load(SeqCst) >= 2
+                && faults.built_pool_joins_started.load(SeqCst) >= 1),
+            "the pool threads did not reach their exit hook, or the owner its join"
+        );
+        faults.release_built_pool_threads();
+        let (unwound, done) = done_rx
+            .recv_timeout(crate::tunables::TEST_HANG_BOUND)
+            .unwrap();
         assert!(unwound);
         assert_eq!(done, 2, "both workers finished before the unwind did");
         assert!(!faults.built_pool_hook_timed_out.load(SeqCst));

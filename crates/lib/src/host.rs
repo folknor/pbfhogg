@@ -508,7 +508,13 @@ impl Invocation {
         self.0
             .tripped
             .store(true, std::sync::atomic::Ordering::Release);
-        log.cancel()
+        let outcome = log.cancel();
+        // A fault-plan wait on the token wakes at the trip; rung after the
+        // log's lock is released, so the bell never nests inside it.
+        drop(log);
+        #[cfg(pbfhogg_test_hooks)]
+        self.0.faults.ring();
+        outcome
     }
 
     /// The publication log, poison recovered: no mutation of it can unwind

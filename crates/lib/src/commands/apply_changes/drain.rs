@@ -375,8 +375,7 @@ pub(super) fn run_drain(
         #[cfg(pbfhogg_test_hooks)]
         cancel
             .faults()
-            .apply_changes_drain_next_seq
-            .store(state.next_seq, std::sync::atomic::Ordering::SeqCst);
+            .on_apply_changes_drain_advanced(state.next_seq);
 
         // The one barrier check, after every receive and advance: once the
         // boundary is known and every seq below it is processed, the node
@@ -454,10 +453,7 @@ pub(super) fn run_drain(
     // for any kinds whose blobs we never saw (or saw and finished).
     cancel.marker("MERGE_TRAILING_CREATES_START");
     #[cfg(pbfhogg_test_hooks)]
-    cancel
-        .faults()
-        .apply_changes_drain_past_nodes
-        .store(true, Ordering::SeqCst);
+    cancel.faults().on_apply_changes_drain_past_nodes();
     let types_to_flush = match state.last_type {
         None | Some(ElementKind::Node) => {
             &[ElementKind::Node, ElementKind::Way, ElementKind::Relation][..]
@@ -730,8 +726,7 @@ fn process_item(
         writer
             .cancel_token()
             .faults()
-            .apply_changes_drain_past_nodes
-            .store(true, Ordering::SeqCst);
+            .on_apply_changes_drain_past_nodes();
     }
 
     if let Some(prev) = state.last_type

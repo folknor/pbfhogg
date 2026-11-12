@@ -544,8 +544,8 @@ exception, not a tier - should not survive across many PRs.
   sweep sets the cfg.
 - **Fault plans ride the token.** `pbfhogg::test_hooks` is the one
   answer to "what can a test inject". Its `FaultPlan` holds every
-  token-scoped hook (arming fields and observation counters, public
-  atomics, disarmed as a `MAX` sentinel); one lives in each
+  token-scoped hook (arming fields and observation counters, disarmed as
+  a `MAX` sentinel); one lives in each
   `host::Invocation` and `Invocation::faults()` reaches it. The token is what
   an invocation already hands every worker loop it starts (the read
   pipeline, the output writers, the diff and derive work units, altw's
@@ -565,6 +565,21 @@ exception, not a tier - should not survive across many PRs.
   Publication hooks below). Per-object hooks stay with their owner and
   are listed in the module docs: the geocode reader's counter, and the
   cancellation hooks below.
+- **Hook waits ring a bell, they do not poll.** Arming fields and plain
+  counters are public atomics. A field that some wait reads is a
+  `Watched` atomic instead: anyone loads it, only `test_hooks` writes it,
+  and every write rings the plan's bell, so a parked hook or a waiting
+  test wakes at the transition. A code path that moves such a field calls
+  an `on_*` hook on the plan; a test releases parked work through a
+  `release_*` method; `Invocation::cancel` rings too. A hook wait over
+  state that does not ring (the merge-changes ledger's halt, the altw
+  router's abort) is also re-evaluated every `TEST_HOOK_TICK`. A test
+  waits with `FaultPlan::wait_for`, never its own sleep loop: it is
+  bounded by `TEST_HOOK_WAIT`, returns false for the test's assertion to
+  name, and ticks as well, so its condition may read anything. The bell
+  is a notification, not a snapshot: a handshake that needs several
+  fields read together, or a transient state seen, keeps its state under
+  one lock, as the decode gate does.
 - **Cancellation hooks.** `Invocation::on_check` (per-instance, hook cfg)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Invocation::checks_passed` counts them. Library tests trip the token from

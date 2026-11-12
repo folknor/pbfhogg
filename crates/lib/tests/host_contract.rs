@@ -645,9 +645,10 @@ fn a_panicking_sink_does_not_fail_the_run() {
     );
 }
 
-/// Records the publication events of its invocation, and holds every
-/// `PUBLISH_START` until a second one arrives or `PUBLISH_OVERLAP_WAIT`
-/// passes, so two publications that could overlap do.
+/// Records the publication events of its invocation, and holds the first
+/// `PUBLISH_START` until the second publication waits on the lock or
+/// starts (a bounded fault-plan wait), so two publications that could
+/// overlap do.
 #[cfg(pbfhogg_test_hooks)]
 struct PublishOrder {
     events: std::sync::Mutex<Vec<(String, Option<i64>)>>,
@@ -657,10 +658,6 @@ struct PublishOrder {
     /// other alive.
     invocation: std::sync::Mutex<Option<pbfhogg::host::Invocation>>,
 }
-/// Bound on the first span's wait for the second publication: a correct
-/// lock has it waiting on the lock at once.
-#[cfg(pbfhogg_test_hooks)]
-const PUBLISH_OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(pbfhogg_test_hooks)]
 impl pbfhogg::debug::InstrumentSink for PublishOrder {
     fn marker(&self, name: &str) {
@@ -683,15 +680,13 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
                     .expect("invocation")
                     .clone()
                     .expect("invocation set");
-                let waits = &invocation.faults().publication_lock_waits;
-                let start = std::time::Instant::now();
-                while waits.load(SeqCst) == 0 && self.starts.load(SeqCst) < 2 {
-                    assert!(
-                        start.elapsed() < PUBLISH_OVERLAP_WAIT,
-                        "the second publication neither waited on the lock nor started"
-                    );
-                    std::thread::yield_now();
-                }
+                let faults = invocation.faults();
+                // `starts` is the sink's own: the wait's tick re-reads it.
+                assert!(
+                    faults.wait_for(|| faults.publication_lock_waits.load(SeqCst) > 0
+                        || self.starts.load(SeqCst) >= 2),
+                    "the second publication neither waited on the lock nor started"
+                );
             }
         }
     }

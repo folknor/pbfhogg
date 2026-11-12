@@ -19,7 +19,6 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::Ordering::SeqCst;
-use std::time::{Duration, Instant};
 
 use flate2::write::GzEncoder;
 use pbfhogg::apply_changes::{MergeOptions, merge};
@@ -110,15 +109,12 @@ fn fault_injection_parallel_writer_pool_panic_surfaces_error_and_joins_pool() {
     // Unconditional cleanup before any assertion, so a failing
     // assertion cannot leave parked workers behind: release them and
     // wait (bounded) for every pool thread to exit.
-    faults.release_pool_workers.store(true, SeqCst);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while faults.live_pool_workers.load(SeqCst) > 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    faults.release_pool_workers();
+    faults.wait_for(|| faults.live_pool_workers.load(SeqCst) == 0);
     let live_after_release = faults.live_pool_workers.load(SeqCst);
     assert_eq!(
         live_after_release, 0,
-        "parallel_writer pool workers still running 10 s after release"
+        "parallel_writer pool workers still running a hook wait after release"
     );
     // The handshake is what makes the assertions below meaningful: a
     // sibling was parked when worker 0 panicked, and stayed parked until

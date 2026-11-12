@@ -1150,15 +1150,12 @@ mod apply_changes {
                                 &host,
                             )
                         });
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(10);
-                        while !faults.apply_changes_scanner_in_barrier_wait.load(SeqCst) {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "{label}: the scanner never reached its barrier wait"
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
+                        assert!(
+                            faults.wait_for(|| faults
+                                .apply_changes_scanner_in_barrier_wait
+                                .load(SeqCst)),
+                            "{label}: the scanner never reached its barrier wait"
+                        );
                         host.invocation.cancel();
                         run.join().expect("merge must not unwind")
                     });

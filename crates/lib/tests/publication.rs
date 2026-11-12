@@ -99,12 +99,14 @@ fn ordinal_order_is_execution_order_with_a_hook_parked() {
         let first = scope.spawn(move || a.publish());
         parked_rx.recv_timeout(PARK).expect("a parked in its hook");
         let second = scope.spawn(move || b.publish());
-        let waits = &invocation.faults().publication_lock_waits;
-        let start = std::time::Instant::now();
-        while waits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(start.elapsed() < PARK, "b never waited on the lock");
-            std::thread::yield_now();
-        }
+        let faults = invocation.faults();
+        assert!(
+            faults.wait_for(|| faults
+                .publication_lock_waits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0),
+            "b never waited on the lock"
+        );
         let seen = rows(&invocation);
         assert_eq!(seen.len(), 1, "b waits undecided: {seen:?}");
         assert!(!seen[0].finished());

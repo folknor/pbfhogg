@@ -126,20 +126,6 @@ there is not seen (bz brokkr ticket filed with this change). Bounds are checked 
 one: a test that waits on several in sequence, or starts one late, can still reach the
 watchdog unnamed; no test carries one deadline through its waits.
 
-## VER-028 - Hook synchronization is spread across atomics and polling loops
-
-`FaultPlan::wait_until` in `crates/lib/src/test_hooks.rs` polls every millisecond (its
-bound is now `TEST_HOOK_WAIT` in tunables), and fault tests duplicate the polling on the
-plan's public atomics. Sparred shape for the fix: a plan doorbell (`notify_all`, store
-then ring, predicate rechecked under the bell) for conditions that read only plan state,
-with every such field private behind a notifying setter - including the stores in
-`apply_changes/scanner.rs`, `drain.rs` and `rewrite.rs` and the test-side release flags;
-a separate form with a bounded tick for predicates over state the plan does not own
-(merge-changes `Ledger::halted`, which `Ledger::stop` sets without cancelling, the
-token, the altw router's abort), evaluated outside the bell lock with an absolute next
-tick; and `on_framing_job` returning why its wait ended instead of setting
-`framing_wait_reached` inside the predicate.
-
 ## VER-132 - Nothing stops a test inferring a block from elapsed time
 
 The sites the hunters named now observe the wait itself (a `test_support::Parked`

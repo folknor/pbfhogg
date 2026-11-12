@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use pbfhogg::ElementReader;
 use pbfhogg::host::Invocation;
@@ -29,10 +28,7 @@ struct Release {
 
 impl Drop for Release {
     fn drop(&mut self) {
-        self.invocation
-            .faults()
-            .release_built_pool_threads
-            .store(true, SeqCst);
+        self.invocation.faults().release_built_pool_threads();
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {
@@ -64,21 +60,16 @@ fn run_held<T: Send + 'static>(
 
     // Every thread is parked and cannot exit, and the call has reached its
     // pool's join: from here the call ends only after the release below.
-    let start = Instant::now();
-    while faults.built_pool_threads_held.load(SeqCst) < expected
-        || faults.built_pool_joins_started.load(SeqCst) < 1
-    {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "only {} of {expected} pool threads reached their exit hook, \
-             and {} joins started",
-            faults.built_pool_threads_held.load(SeqCst),
-            faults.built_pool_joins_started.load(SeqCst)
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    faults.release_built_pool_threads.store(true, SeqCst);
-    let (result, hooks_done) = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(
+        faults.wait_for(|| faults.built_pool_threads_held.load(SeqCst) >= expected
+            && faults.built_pool_joins_started.load(SeqCst) >= 1),
+        "only {} of {expected} pool threads reached their exit hook, \
+         and {} joins started",
+        faults.built_pool_threads_held.load(SeqCst),
+        faults.built_pool_joins_started.load(SeqCst)
+    );
+    faults.release_built_pool_threads();
+    let (result, hooks_done) = done_rx.recv_timeout(pbfhogg::TEST_HANG_BOUND).unwrap();
     assert_eq!(
         faults.built_pool_threads_held.load(SeqCst),
         expected,

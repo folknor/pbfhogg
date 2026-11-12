@@ -73,17 +73,6 @@ fn counter(invocation: &Invocation, name: &str) -> u64 {
     found.unwrap_or_else(|| panic!("no counter named {name}"))
 }
 
-fn wait_for(cond: impl Fn() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !cond() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    true
-}
-
 /// What the run looked like the moment the writer's ending operation
 /// returned, before anything else touched it.
 struct AtReturn {
@@ -118,11 +107,15 @@ struct Cleanup {
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        self.invocation.faults().release_framing.store(true, SeqCst);
+        let faults = self.invocation.faults();
+        faults.release_framing();
         drop(self.pool.take());
-        let joined = wait_for(|| self.exited.load(SeqCst) == POOL_THREADS);
+        let joined = faults.wait_for(|| self.exited.load(SeqCst) == POOL_THREADS);
         if !std::thread::panicking() {
-            assert!(joined, "the writer's pool did not exit 10 s after release");
+            assert!(
+                joined,
+                "the writer's pool did not exit a hook wait after release"
+            );
         }
     }
 }
@@ -148,7 +141,7 @@ fn end_writer<W: Write>(
             // Raw sends succeed while the writer thread still holds its
             // receiver; the first one after it exits fails and recovers its
             // error.
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + pbfhogg::TEST_HANG_BOUND;
             let err = loop {
                 match writer.write_raw(b"raw") {
                     Err(e) => break e,
@@ -207,7 +200,7 @@ fn run(backend: Backend, end: End) {
     writer.write_primitive_block(&MALFORMED_BLOCK).unwrap();
     writer.write_primitive_block(&EMPTY_BLOCK).unwrap();
     assert!(
-        wait_for(|| faults.held_framing_jobs.load(SeqCst) == 1),
+        faults.wait_for(|| faults.held_framing_jobs.load(SeqCst) == 1),
         "{backend:?}/{end:?}: block 1's framing job never parked"
     );
 
@@ -281,7 +274,7 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
         let faults = invocation.faults();
         faults.hold_framing_at.store(0, SeqCst);
         writer.write_primitive_block(&EMPTY_BLOCK).unwrap();
-        assert!(wait_for(|| faults.held_framing_jobs.load(SeqCst) == 1));
+        assert!(faults.wait_for(|| faults.held_framing_jobs.load(SeqCst) == 1));
 
         let admitted = Arc::new(AtomicUsize::new(0));
         let progress = Arc::clone(&admitted);
@@ -294,7 +287,7 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
         });
         // Items 1 to WINDOW - 1 fit beside the parked head; the next waits.
         assert!(
-            wait_for(|| admitted.load(SeqCst) == WINDOW - 1),
+            faults.wait_for(|| admitted.load(SeqCst) == WINDOW - 1),
             "{backend:?}: the window admitted {} raw items",
             admitted.load(SeqCst)
         );
@@ -304,7 +297,7 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
             WINDOW - 1,
             "{backend:?}: a write past the window was admitted behind a parked head"
         );
-        faults.release_framing.store(true, SeqCst);
+        faults.release_framing();
         let mut writer = raw.join().unwrap();
         writer.flush().unwrap();
         assert!(

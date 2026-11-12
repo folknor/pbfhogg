@@ -174,10 +174,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
             continue;
         }
         #[cfg(pbfhogg_test_hooks)]
-        host.invocation
-            .faults()
-            .apply_changes_scanner_headers_walked
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        host.invocation.faults().on_apply_changes_header_walked();
 
         // Derive element kind and id_range from indexdata when present.
         // Under --force (no indexdata), route unconditionally to the
@@ -435,9 +432,7 @@ fn dispatch_item(
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Disconnected(scanned)) => scanned,
                 Err(mpsc::TrySendError::Full(scanned)) => {
-                    faults
-                        .apply_changes_dispatch_blocked
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    faults.on_apply_changes_dispatch_blocked();
                     scanned
                 }
             };
@@ -502,10 +497,7 @@ fn wait_for_barrier(
 ) -> Result<()> {
     host.invocation.marker("MERGE_SCANNER_BARRIER_WAIT_START");
     #[cfg(pbfhogg_test_hooks)]
-    host.invocation
-        .faults()
-        .apply_changes_scanner_in_barrier_wait
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    host.invocation.faults().on_apply_changes_barrier_wait();
     if rx.recv().is_err() {
         #[cfg(pbfhogg_test_hooks)]
         if !at_eof {

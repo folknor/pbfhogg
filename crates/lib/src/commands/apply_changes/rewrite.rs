@@ -615,10 +615,7 @@ pub(crate) fn merge_to<'a>(
         // Test-only: the drain has returned, so its config, channels and
         // locations state, the barrier sender included, are dropped by now.
         #[cfg(pbfhogg_test_hooks)]
-        host.invocation
-            .faults()
-            .apply_changes_drain_returned
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        host.invocation.faults().on_apply_changes_drain_returned();
 
         let scanner_join = scanner_handle.join();
         let workers_join = workers_handle.join();

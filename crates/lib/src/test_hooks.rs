@@ -47,6 +47,33 @@
 //!
 //! Disarmed is a sentinel (`MAX` for an index or a count), never zero, since
 //! zero is a real worker, shard or sequence number.
+//!
+//! # Waiting: the plan's bell
+//!
+//! A hook that parks and a test that waits for a hook both wait on the
+//! plan's bell, never on a sleep loop. Every field some wait's condition
+//! reads is a [`Watched`] atomic: anyone may load it, but only this module
+//! writes it, and every write rings the bell after the store, so a waiter
+//! wakes at the transition. A code path outside this module that moves such
+//! a field calls an `on_*` hook here, and a test releases parked work
+//! through a `release_*` method. Tripping the invocation's token rings the
+//! bell too ([`Invocation::cancel`](crate::host::Invocation::cancel)).
+//!
+//! A wait snapshots the bell's ring count, evaluates its condition without
+//! the bell's lock, and sleeps only while the count is unchanged, so a ring
+//! between the evaluation and the sleep is never lost, and a condition may
+//! take any other lock. A condition over state that does not ring (the
+//! merge-changes ledger's halt, the altw router's abort, a test's own
+//! counters) waits polled instead: it is also re-evaluated every
+//! `TEST_HOOK_TICK`. Every wait ends at one absolute deadline,
+//! `TEST_HOOK_WAIT` after it starts. [`FaultPlan::wait_for`], the test-side
+//! wait, is always polled, since a closure cannot prove that what it reads
+//! rings; the hook waits in this module are classified one by one.
+//!
+//! The bell is a notification, not a snapshot: a condition over several
+//! fields reads them one by one, and a transient state that comes and goes
+//! between two evaluations can be missed. A handshake that needs either
+//! belongs in state under one lock, as the read pipeline's decode gate is.
 
 pub use crate::output::{PublishFault, PublishStep};
 
@@ -60,11 +87,141 @@ use std::time::{Duration, Instant};
 /// test time bounds in `tunables`.
 const HOOK_WAIT: Duration = crate::tunables::TEST_HOOK_WAIT;
 
+/// How often a polled wait re-evaluates a condition over unrung state.
+const HOOK_TICK: Duration = crate::tunables::TEST_HOOK_TICK;
+
+/// The plan's doorbell: a ring count under a lock, and the condition
+/// variable every waiter sleeps on. See the module docs.
+struct Bell {
+    rings: Mutex<u64>,
+    rung: Condvar,
+}
+
+impl Bell {
+    const fn new() -> Self {
+        Self {
+            rings: Mutex::new(0),
+            rung: Condvar::new(),
+        }
+    }
+
+    fn rings(&self) -> MutexGuard<'_, u64> {
+        self.rings.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wake every waiter: called after the store it announces.
+    fn ring(&self) {
+        let mut rings = self.rings();
+        *rings = rings.wrapping_add(1);
+        // Every waiter: the bell is shared by unrelated conditions.
+        self.rung.notify_all();
+    }
+
+    /// Sleep while the ring count is still `seen`, at most `timeout`.
+    fn sleep_past(&self, seen: u64, timeout: Duration) {
+        let rings = self.rings();
+        drop(
+            self.rung
+                .wait_timeout_while(rings, timeout, |rings| *rings == seen)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+}
+
+/// What a wait's condition reads, which decides how it waits.
+#[derive(Clone, Copy)]
+enum Wake {
+    /// Only state whose every write rings the bell: [`Watched`] fields and
+    /// the token. Sleeps until a ring or the deadline.
+    Rung,
+    /// Also state that does not ring: re-evaluated every [`HOOK_TICK`] as
+    /// well.
+    Polled,
+}
+
+/// A plan field some wait's condition reads: loadable by anyone, written
+/// only by this module, and every write rings the plan's bell. See the
+/// module docs.
+pub struct Watched<A>(A);
+
+impl Watched<AtomicBool> {
+    const fn new(value: bool) -> Self {
+        Self(AtomicBool::new(value))
+    }
+
+    /// The current value.
+    pub fn load(&self, order: Ordering) -> bool {
+        self.0.load(order)
+    }
+
+    fn store(&self, value: bool, bell: &Bell) {
+        self.0.store(value, Ordering::SeqCst);
+        bell.ring();
+    }
+}
+
+impl Watched<AtomicU64> {
+    const fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+
+    /// The current value.
+    pub fn load(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    fn store(&self, value: u64, bell: &Bell) {
+        self.0.store(value, Ordering::SeqCst);
+        bell.ring();
+    }
+
+    fn fetch_add(&self, n: u64, bell: &Bell) {
+        self.0.fetch_add(n, Ordering::SeqCst);
+        bell.ring();
+    }
+
+    fn fetch_sub(&self, n: u64, bell: &Bell) {
+        self.0.fetch_sub(n, Ordering::SeqCst);
+        bell.ring();
+    }
+}
+
+impl Watched<AtomicUsize> {
+    const fn new(value: usize) -> Self {
+        Self(AtomicUsize::new(value))
+    }
+
+    /// The current value.
+    pub fn load(&self, order: Ordering) -> usize {
+        self.0.load(order)
+    }
+
+    fn store(&self, value: usize, bell: &Bell) {
+        self.0.store(value, Ordering::SeqCst);
+        bell.ring();
+    }
+}
+
+/// Why a parked framing job's wait ended.
+#[derive(Clone, Copy)]
+enum FramingRelease {
+    /// The waiting writer had taken back every permit not held by a parked
+    /// job.
+    Reached,
+    /// The test released it.
+    Released,
+}
+
 /// Every token-scoped fault and observation. See the module docs.
 ///
-/// Fields are public atomics: a test stores to arm and loads to observe.
-/// Each group names the code it reaches.
+/// Arming fields and plain counters are public atomics: a test stores to
+/// arm and loads to observe. A field some wait reads is [`Watched`]
+/// instead: loadable, and moved only through the plan's methods. Each group
+/// names the code it reaches.
 pub struct FaultPlan {
+    /// Rung after every write to a [`Watched`] field.
+    bell: Bell,
+
     // --- read pipeline (`read::pipeline::run_pipeline`) ---
     decode_gate: Mutex<DecodeGate>,
     decode_gate_cv: Condvar,
@@ -81,9 +238,9 @@ pub struct FaultPlan {
     /// its pool therefore returns while a thread is still parked.
     pub hold_built_pool_threads: AtomicBool,
     /// Pool threads that reached the park; only ever grows.
-    pub built_pool_threads_held: AtomicU64,
+    pub built_pool_threads_held: Watched<AtomicU64>,
     /// Test-side release for parked pool threads.
-    pub release_built_pool_threads: AtomicBool,
+    pub release_built_pool_threads: Watched<AtomicBool>,
     /// Pool threads whose exit hook completed: the last thing a thread's
     /// main function does. Its thread-local destructors run after it, so
     /// this counts hook completion, not thread exit.
@@ -95,13 +252,13 @@ pub struct FaultPlan {
     /// that failed part way, and during an unwind). With the threads held,
     /// it says the owner is at its join while they are still running; it
     /// does not by itself say the join waits.
-    pub built_pool_joins_started: AtomicU64,
+    pub built_pool_joins_started: Watched<AtomicU64>,
 
     // --- publication execution lock (`host::Recorder::publication_lock`) ---
     /// Publications that found the invocation's execution lock held and
     /// went on to wait for it: counted before the blocking acquire, so a
     /// test that sees it knows the publication is waiting undecided.
-    pub publication_lock_waits: AtomicU64,
+    pub publication_lock_waits: Watched<AtomicU64>,
 
     // --- multi-extract (`commands::extract::multi`) ---
     /// Decline the region grid, so classification runs the linear scan even
@@ -126,16 +283,16 @@ pub struct FaultPlan {
     /// `live_pool_workers` shows deterministically.
     pub hold_other_pool_workers: AtomicBool,
     /// Workers currently parked by `hold_other_pool_workers`.
-    pub held_pool_workers: AtomicU64,
+    pub held_pool_workers: Watched<AtomicU64>,
     /// Test-side release for parked workers (cleanup after the assertion).
-    pub release_pool_workers: AtomicBool,
+    pub release_pool_workers: Watched<AtomicBool>,
     /// Set when the owner is about to join a worker other than the panicked
     /// one while some worker is still parked: the owner is waiting for its
     /// pool rather than walking away from it. Releases parked workers.
-    pub join_reached_held_worker: AtomicBool,
+    pub join_reached_held_worker: Watched<AtomicBool>,
     /// Pool worker threads running: incremented on worker entry, decremented
     /// as the very last thing the worker does.
-    pub live_pool_workers: AtomicU64,
+    pub live_pool_workers: Watched<AtomicU64>,
     /// Ops popped and executed across the pool. Ops discarded after the pool
     /// stopped are not counted.
     pub pool_op_count: AtomicU64,
@@ -153,7 +310,7 @@ pub struct FaultPlan {
     /// is queued, so the failure provably lands in front of it.
     pub gzip_panic_waits_for_barrier: AtomicBool,
     /// Flush barriers accepted into the raw queue.
-    pub gzip_barriers_queued: AtomicU64,
+    pub gzip_barriers_queued: Watched<AtomicU64>,
     /// A bounded gzip hook wait expired.
     pub gzip_hook_timed_out: AtomicBool,
 
@@ -177,7 +334,7 @@ pub struct FaultPlan {
     /// parked, which `held_framing_jobs` shows deterministically.
     pub hold_framing_at: AtomicUsize,
     /// Framing jobs currently parked by `hold_framing_at`.
-    pub held_framing_jobs: AtomicU64,
+    pub held_framing_jobs: Watched<AtomicU64>,
     /// Framing jobs the producer has dispatched to the executor, counted on
     /// the producer thread before the spawn.
     pub framing_jobs_dispatched: AtomicU64,
@@ -190,13 +347,13 @@ pub struct FaultPlan {
     pub framing_wait_reached: AtomicBool,
     /// Test-side release for a parked framing job (cleanup after the
     /// assertion).
-    pub release_framing: AtomicBool,
+    pub release_framing: Watched<AtomicBool>,
     /// A bounded framing hook wait expired.
     pub framing_hook_timed_out: AtomicBool,
     /// Permits the writer waiting for its framing jobs has taken back so
     /// far (`MAX`: none is waiting), and how many it needs.
-    framing_wait_taken: AtomicU64,
-    framing_wait_needed: AtomicU64,
+    framing_wait_taken: Watched<AtomicU64>,
+    framing_wait_needed: Watched<AtomicU64>,
 
     // --- output construction (`BoundOutput::pbf_writer`) ---
     /// Refuse every output backend as a `PlatformUnsupported` setup error,
@@ -254,15 +411,15 @@ pub struct FaultPlan {
     /// fails the run (`merge_changes_hook_timed_out`).
     pub merge_changes_spill_first: AtomicUsize,
     /// Members of input 1 written to its spill file.
-    pub merge_changes_members_spilled: AtomicU64,
+    pub merge_changes_members_spilled: Watched<AtomicU64>,
     /// Set when input 1 is complete while not the head, after its spill
     /// file (if any) was flushed and closed.
-    pub merge_changes_spilled_input_complete: AtomicBool,
+    pub merge_changes_spilled_input_complete: Watched<AtomicBool>,
     /// Set when input 1's reader holds before sealing batch `N`.
-    pub merge_changes_reader_held: AtomicBool,
+    pub merge_changes_reader_held: Watched<AtomicBool>,
     /// The head input, published once each promotion (its copy-back and
     /// spill file removal included) has finished.
-    pub merge_changes_head: AtomicUsize,
+    pub merge_changes_head: Watched<AtomicUsize>,
     /// Promotions that copied back a spill file still open (the input was
     /// still being read).
     pub merge_changes_copied_open: AtomicU64,
@@ -287,7 +444,7 @@ pub struct FaultPlan {
     /// alongside provably lands while the scanner is blocked dispatching.
     pub apply_changes_hold_workers_until_dispatch_blocked: AtomicBool,
     /// Set by the scanner when a candidate send finds the channel full.
-    pub apply_changes_dispatch_blocked: AtomicBool,
+    pub apply_changes_dispatch_blocked: Watched<AtomicBool>,
 
     // --- apply-changes node-to-way barrier (`apply_changes::{scanner, drain}`) ---
     /// Hold the scanner's node boundary (bounded) until the drain has
@@ -295,13 +452,13 @@ pub struct FaultPlan {
     /// node item: the case the drain once needed an idle re-poll for.
     pub apply_changes_late_boundary: AtomicBool,
     /// The drain's next expected seq, published after each advance.
-    pub apply_changes_drain_next_seq: AtomicU64,
+    pub apply_changes_drain_next_seq: Watched<AtomicU64>,
     /// Boundaries the drain received after it had already processed every
     /// seq below them, so a late-boundary test can prove its case ran.
     pub apply_changes_late_boundaries_seen: AtomicU64,
     /// Set by the scanner as it starts waiting for the barrier signal (at
     /// the first way or relation descriptor, or at end of input).
-    pub apply_changes_scanner_in_barrier_wait: AtomicBool,
+    pub apply_changes_scanner_in_barrier_wait: Watched<AtomicBool>,
     /// Set by the scanner when it finds the barrier channel closed (in its
     /// wait at the first way or relation, or at a poll) and stops walking
     /// before end of input.
@@ -309,7 +466,7 @@ pub struct FaultPlan {
     /// Set by the scanner when its header walk reaches end of input.
     pub apply_changes_scanner_reached_eof: AtomicBool,
     /// OsmData headers the scanner has walked, counted as each is read.
-    pub apply_changes_scanner_headers_walked: AtomicU64,
+    pub apply_changes_scanner_headers_walked: Watched<AtomicU64>,
     /// `apply_changes_scanner_headers_walked` when the scanner's barrier
     /// wait at a way or relation ended (`u64::MAX` if it never did): the
     /// node headers plus the one non-node header that triggered the wait,
@@ -328,7 +485,7 @@ pub struct FaultPlan {
     pub apply_changes_poll_waits_for_drain_exit_after_seq: AtomicU64,
     /// Set by `merge` once the drain has returned (its barrier sender
     /// dropped with it).
-    pub apply_changes_drain_returned: AtomicBool,
+    pub apply_changes_drain_returned: Watched<AtomicBool>,
     /// Hold the drain (bounded) just before it merges the coordinate slots
     /// at the barrier until either the scanner is in its barrier wait with
     /// fewer headers walked than `apply_changes_mark_candidate_seq` + 1 (it
@@ -342,7 +499,7 @@ pub struct FaultPlan {
     pub apply_changes_mark_candidate_seq: AtomicU64,
     /// Set by a worker once it has finished the candidate at
     /// `apply_changes_mark_candidate_seq`.
-    pub apply_changes_candidate_marked: AtomicBool,
+    pub apply_changes_candidate_marked: Watched<AtomicBool>,
     /// Hold the drain (bounded) after it has published the map and before
     /// it sends the signal, until the scanner is in its barrier wait, then
     /// record in `apply_changes_non_node_dispatched_before_signal` whether
@@ -358,7 +515,7 @@ pub struct FaultPlan {
     pub apply_changes_cancel_at_refusal: AtomicBool,
     /// Set by the drain once it has handled anything past the node phase: a
     /// way or relation item, or its trailing creates.
-    pub apply_changes_drain_past_nodes: AtomicBool,
+    pub apply_changes_drain_past_nodes: Watched<AtomicBool>,
     /// Set by the drain once it has sent the barrier signal.
     pub apply_changes_barrier_signalled: AtomicBool,
     /// Run with the owned route (workers pread passthroughs, no splice)
@@ -385,7 +542,7 @@ pub struct FaultPlan {
     /// unpublished, so a stage 4 worker waiting on one stays parked.
     pub altw_stage3_hold_bucket: AtomicUsize,
     /// Set when the held bucket is claimed.
-    pub altw_stage3_bucket_held: AtomicBool,
+    pub altw_stage3_bucket_held: Watched<AtomicBool>,
     /// Set when the held bucket saw the router aborted before the bound.
     pub altw_stage3_saw_abort: AtomicBool,
 
@@ -405,7 +562,7 @@ pub struct FaultPlan {
     pub altw_stage4_panic_work_at: AtomicUsize,
     /// Set by a stage 4 worker just before it waits on the router for way
     /// blob 0.
-    pub altw_stage4_way0_entered: AtomicBool,
+    pub altw_stage4_way0_entered: Watched<AtomicBool>,
     /// A bounded altw hook wait expired: the handshake did not happen, and
     /// a test relying on it proved nothing.
     pub altw_hook_timed_out: AtomicBool,
@@ -517,6 +674,7 @@ impl FaultPlan {
     )]
     pub const fn new() -> Self {
         Self {
+            bell: Bell::new(),
             decode_gate: Mutex::new(DecodeGate {
                 armed_seq: None,
                 ready: false,
@@ -525,39 +683,39 @@ impl FaultPlan {
             decode_gate_cv: Condvar::new(),
             built_pool_spawn_fail_at: AtomicUsize::new(usize::MAX),
             hold_built_pool_threads: AtomicBool::new(false),
-            built_pool_threads_held: AtomicU64::new(0),
-            release_built_pool_threads: AtomicBool::new(false),
+            built_pool_threads_held: Watched::<AtomicU64>::new(0),
+            release_built_pool_threads: Watched::<AtomicBool>::new(false),
             built_pool_exit_hooks_done: AtomicU64::new(0),
             built_pool_hook_timed_out: AtomicBool::new(false),
-            built_pool_joins_started: AtomicU64::new(0),
-            publication_lock_waits: AtomicU64::new(0),
+            built_pool_joins_started: Watched::<AtomicU64>::new(0),
+            publication_lock_waits: Watched::<AtomicU64>::new(0),
             force_linear_region_grid: AtomicBool::new(false),
             region_grids_declined: AtomicU64::new(0),
             pool_worker_panic: AtomicU64::new(u64::MAX),
             hold_other_pool_workers: AtomicBool::new(false),
-            held_pool_workers: AtomicU64::new(0),
-            release_pool_workers: AtomicBool::new(false),
-            join_reached_held_worker: AtomicBool::new(false),
-            live_pool_workers: AtomicU64::new(0),
+            held_pool_workers: Watched::<AtomicU64>::new(0),
+            release_pool_workers: Watched::<AtomicBool>::new(false),
+            join_reached_held_worker: Watched::<AtomicBool>::new(false),
+            live_pool_workers: Watched::<AtomicU64>::new(0),
             pool_op_count: AtomicU64::new(0),
             pool_hook_timed_out: AtomicBool::new(false),
             gzip_panic_at_op: AtomicU64::new(u64::MAX),
             gzip_op_count: AtomicU64::new(0),
             gzip_panic_waits_for_barrier: AtomicBool::new(false),
-            gzip_barriers_queued: AtomicU64::new(0),
+            gzip_barriers_queued: Watched::<AtomicU64>::new(0),
             gzip_hook_timed_out: AtomicBool::new(false),
             uring_panic_at_dispatch: AtomicU64::new(u64::MAX),
             uring_dispatch_count: AtomicU64::new(0),
             framing_panic_at: AtomicUsize::new(usize::MAX),
             hold_framing_at: AtomicUsize::new(usize::MAX),
-            held_framing_jobs: AtomicU64::new(0),
+            held_framing_jobs: Watched::<AtomicU64>::new(0),
             framing_jobs_dispatched: AtomicU64::new(0),
             framing_jobs_done: AtomicU64::new(0),
             framing_wait_reached: AtomicBool::new(false),
-            release_framing: AtomicBool::new(false),
+            release_framing: Watched::<AtomicBool>::new(false),
             framing_hook_timed_out: AtomicBool::new(false),
-            framing_wait_taken: AtomicU64::new(u64::MAX),
-            framing_wait_needed: AtomicU64::new(u64::MAX),
+            framing_wait_taken: Watched::<AtomicU64>::new(u64::MAX),
+            framing_wait_needed: Watched::<AtomicU64>::new(u64::MAX),
             refuse_output_backend: AtomicBool::new(false),
             output_backend_refusals: AtomicU64::new(0),
             diff_unit_panic: AtomicUsize::new(usize::MAX),
@@ -570,10 +728,10 @@ impl FaultPlan {
             diff_unit_lone_elements: AtomicU64::new(0),
             apply_changes_create_batch_blocks: AtomicUsize::new(0),
             merge_changes_spill_first: AtomicUsize::new(usize::MAX),
-            merge_changes_members_spilled: AtomicU64::new(0),
-            merge_changes_spilled_input_complete: AtomicBool::new(false),
-            merge_changes_reader_held: AtomicBool::new(false),
-            merge_changes_head: AtomicUsize::new(0),
+            merge_changes_members_spilled: Watched::<AtomicU64>::new(0),
+            merge_changes_spilled_input_complete: Watched::<AtomicBool>::new(false),
+            merge_changes_reader_held: Watched::<AtomicBool>::new(false),
+            merge_changes_head: Watched::<AtomicUsize>::new(0),
             merge_changes_copied_open: AtomicU64::new(0),
             merge_changes_copied_closed: AtomicU64::new(0),
             merge_changes_hook_timed_out: AtomicBool::new(false),
@@ -581,27 +739,27 @@ impl FaultPlan {
             apply_changes_panic_waits_for_barrier_wait: AtomicBool::new(false),
             apply_changes_park_at_blob_seq: AtomicU64::new(u64::MAX),
             apply_changes_hold_workers_until_dispatch_blocked: AtomicBool::new(false),
-            apply_changes_dispatch_blocked: AtomicBool::new(false),
+            apply_changes_dispatch_blocked: Watched::<AtomicBool>::new(false),
             apply_changes_late_boundary: AtomicBool::new(false),
-            apply_changes_drain_next_seq: AtomicU64::new(0),
+            apply_changes_drain_next_seq: Watched::<AtomicU64>::new(0),
             apply_changes_late_boundaries_seen: AtomicU64::new(0),
-            apply_changes_scanner_in_barrier_wait: AtomicBool::new(false),
+            apply_changes_scanner_in_barrier_wait: Watched::<AtomicBool>::new(false),
             apply_changes_scanner_stopped_before_eof: AtomicBool::new(false),
             apply_changes_scanner_reached_eof: AtomicBool::new(false),
-            apply_changes_scanner_headers_walked: AtomicU64::new(0),
+            apply_changes_scanner_headers_walked: Watched::<AtomicU64>::new(0),
             apply_changes_headers_walked_at_release: AtomicU64::new(u64::MAX),
             apply_changes_non_node_dispatched: AtomicBool::new(false),
             apply_changes_hold_walk_until_drain_past_nodes: AtomicBool::new(false),
             apply_changes_poll_waits_for_drain_exit_after_seq: AtomicU64::new(u64::MAX),
-            apply_changes_drain_returned: AtomicBool::new(false),
+            apply_changes_drain_returned: Watched::<AtomicBool>::new(false),
             apply_changes_merge_waits_for_scanner_or_candidate: AtomicBool::new(false),
             apply_changes_mark_candidate_seq: AtomicU64::new(u64::MAX),
-            apply_changes_candidate_marked: AtomicBool::new(false),
+            apply_changes_candidate_marked: Watched::<AtomicBool>::new(false),
             apply_changes_signal_waits_for_scanner_wait: AtomicBool::new(false),
             apply_changes_non_node_dispatched_before_signal: AtomicBool::new(false),
             apply_changes_fail_at_refusal: AtomicBool::new(false),
             apply_changes_cancel_at_refusal: AtomicBool::new(false),
-            apply_changes_drain_past_nodes: AtomicBool::new(false),
+            apply_changes_drain_past_nodes: Watched::<AtomicBool>::new(false),
             apply_changes_barrier_signalled: AtomicBool::new(false),
             apply_changes_force_owned_route: AtomicBool::new(false),
             apply_changes_hook_timed_out: AtomicBool::new(false),
@@ -609,13 +767,13 @@ impl FaultPlan {
             check_overflow_ids: AtomicU64::new(0),
             altw_stage3_panic_at_bucket: AtomicUsize::new(usize::MAX),
             altw_stage3_hold_bucket: AtomicUsize::new(usize::MAX),
-            altw_stage3_bucket_held: AtomicBool::new(false),
+            altw_stage3_bucket_held: Watched::<AtomicBool>::new(false),
             altw_stage3_saw_abort: AtomicBool::new(false),
             altw_stage4_fail_at_start: AtomicBool::new(false),
             altw_stage4_fail_consume_at: AtomicUsize::new(usize::MAX),
             altw_stage4_panic_consume_at: AtomicUsize::new(usize::MAX),
             altw_stage4_panic_work_at: AtomicUsize::new(usize::MAX),
-            altw_stage4_way0_entered: AtomicBool::new(false),
+            altw_stage4_way0_entered: Watched::<AtomicBool>::new(false),
             altw_hook_timed_out: AtomicBool::new(false),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
             geocode_misfile_address_at: AtomicUsize::new(usize::MAX),
@@ -851,6 +1009,9 @@ impl FaultPlan {
         }
         g.ready = true;
         self.decode_gate_cv.notify_all();
+        // Gate lock, then bell lock: no wait holds the bell's lock while
+        // it evaluates a condition, so this order cannot invert.
+        self.bell.ring();
         let deadline = Instant::now() + HOOK_WAIT;
         while !g.released {
             if Instant::now() >= deadline {
@@ -871,15 +1032,49 @@ impl FaultPlan {
 
     // ---- parallel pwrite writer ----------------------------------------
 
-    fn wait_until(&self, timed_out: &AtomicBool, cond: impl Fn() -> bool) {
+    /// The one wait: evaluates `cond` until it yields, at most
+    /// [`HOOK_WAIT`] from now (`None` past it). See the module docs for why
+    /// a ring is never lost.
+    fn wait<R>(&self, wake: Wake, mut cond: impl FnMut() -> Option<R>) -> Option<R> {
         let deadline = Instant::now() + HOOK_WAIT;
-        while !cond() {
-            if Instant::now() >= deadline {
-                timed_out.store(true, Ordering::SeqCst);
-                return;
+        loop {
+            let seen = *self.bell.rings();
+            if let Some(reason) = cond() {
+                return Some(reason);
             }
-            std::thread::sleep(Duration::from_millis(1));
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            let timeout = match wake {
+                Wake::Rung => remaining,
+                Wake::Polled => remaining.min(HOOK_TICK),
+            };
+            self.bell.sleep_past(seen, timeout);
         }
+    }
+
+    /// A hook's bounded wait for `cond`; past the bound it sets
+    /// `timed_out` and returns, so the test that armed it can fail named.
+    fn wait_until(&self, timed_out: &AtomicBool, wake: Wake, cond: impl Fn() -> bool) {
+        if self.wait(wake, || cond().then_some(())).is_none() {
+            timed_out.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A test's wait for `cond`, at most `TEST_HOOK_WAIT`: false if it
+    /// never held, for the caller's assertion to name. It wakes at once on
+    /// any write to a [`Watched`] field or a tripped token, and re-evaluates
+    /// every `TEST_HOOK_TICK` besides, so `cond` may read anything.
+    pub fn wait_for(&self, cond: impl Fn() -> bool) -> bool {
+        self.wait(Wake::Polled, || cond().then_some(())).is_some()
+    }
+
+    /// Ring the bell for a transition outside the plan that some wait
+    /// reads: the invocation's token tripping.
+    pub(crate) fn ring(&self) {
+        self.bell.ring();
     }
 
     // ---- library-built rayon pools ---------------------------------------
@@ -901,20 +1096,26 @@ impl FaultPlan {
     /// Called by a publication that found the execution lock held, before
     /// it blocks on it.
     pub(crate) fn on_publication_lock_wait(&self) {
-        self.publication_lock_waits.fetch_add(1, Ordering::SeqCst);
+        self.publication_lock_waits.fetch_add(1, &self.bell);
     }
 
     /// Called by a pool's join guard as it drops, before its first join.
     pub(crate) fn on_built_pool_join(&self) {
-        self.built_pool_joins_started.fetch_add(1, Ordering::SeqCst);
+        self.built_pool_joins_started.fetch_add(1, &self.bell);
+    }
+
+    /// Release pool threads parked by `hold_built_pool_threads`. Safe to
+    /// call on every exit path, armed or not.
+    pub fn release_built_pool_threads(&self) {
+        self.release_built_pool_threads.store(true, &self.bell);
     }
 
     /// Called by a pool thread after its rayon main loop returns, as the last
     /// thing its main function does.
     pub(crate) fn on_built_pool_thread_exit(&self) {
         if self.hold_built_pool_threads.load(Ordering::SeqCst) {
-            self.built_pool_threads_held.fetch_add(1, Ordering::SeqCst);
-            self.wait_until(&self.built_pool_hook_timed_out, || {
+            self.built_pool_threads_held.fetch_add(1, &self.bell);
+            self.wait_until(&self.built_pool_hook_timed_out, Wake::Rung, || {
                 self.release_built_pool_threads.load(Ordering::SeqCst)
             });
         }
@@ -929,20 +1130,26 @@ impl FaultPlan {
         let hold = self.hold_other_pool_workers.load(Ordering::SeqCst);
         if worker as u64 == self.pool_worker_panic.load(Ordering::SeqCst) {
             if hold {
-                self.wait_until(&self.pool_hook_timed_out, || {
+                self.wait_until(&self.pool_hook_timed_out, Wake::Rung, || {
                     self.held_pool_workers.load(Ordering::SeqCst) >= 1
                 });
             }
             panic!("test-hooks: parallel_writer pool worker {worker} panicking");
         }
         if hold {
-            self.held_pool_workers.fetch_add(1, Ordering::SeqCst);
-            self.wait_until(&self.pool_hook_timed_out, || {
+            self.held_pool_workers.fetch_add(1, &self.bell);
+            self.wait_until(&self.pool_hook_timed_out, Wake::Rung, || {
                 self.join_reached_held_worker.load(Ordering::SeqCst)
                     || self.release_pool_workers.load(Ordering::SeqCst)
             });
-            self.held_pool_workers.fetch_sub(1, Ordering::SeqCst);
+            self.held_pool_workers.fetch_sub(1, &self.bell);
         }
+    }
+
+    /// Release workers parked by `hold_other_pool_workers`. Safe to call on
+    /// every exit path, armed or not.
+    pub fn release_pool_workers(&self) {
+        self.release_pool_workers.store(true, &self.bell);
     }
 
     /// Called by the parallel writer's owner just before it joins `worker`.
@@ -950,14 +1157,14 @@ impl FaultPlan {
         if worker as u64 != self.pool_worker_panic.load(Ordering::SeqCst)
             && self.held_pool_workers.load(Ordering::SeqCst) > 0
         {
-            self.join_reached_held_worker.store(true, Ordering::SeqCst);
+            self.join_reached_held_worker.store(true, &self.bell);
         }
     }
 
     /// `live_pool_workers` membership for one pool worker thread, released
     /// on drop (the unwind included).
     pub(crate) fn live_pool_worker(&self) -> LivePoolWorker<'_> {
-        self.live_pool_workers.fetch_add(1, Ordering::SeqCst);
+        self.live_pool_workers.fetch_add(1, &self.bell);
         LivePoolWorker(self)
     }
 
@@ -969,7 +1176,7 @@ impl FaultPlan {
         let n = self.gzip_op_count.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.gzip_panic_at_op.load(Ordering::SeqCst) {
             if self.gzip_panic_waits_for_barrier.load(Ordering::SeqCst) {
-                self.wait_until(&self.gzip_hook_timed_out, || {
+                self.wait_until(&self.gzip_hook_timed_out, Wake::Rung, || {
                     self.gzip_barriers_queued.load(Ordering::SeqCst) != 0
                 });
             }
@@ -979,7 +1186,7 @@ impl FaultPlan {
 
     /// Called by the gzip writer's `flush` once its barrier is queued.
     pub(crate) fn on_gzip_barrier_queued(&self) {
-        self.gzip_barriers_queued.fetch_add(1, Ordering::SeqCst);
+        self.gzip_barriers_queued.fetch_add(1, &self.bell);
     }
 
     // ---- io_uring writer -------------------------------------------------
@@ -1012,19 +1219,36 @@ impl FaultPlan {
         if seq != self.hold_framing_at.load(Ordering::SeqCst) {
             return;
         }
-        self.held_framing_jobs.fetch_add(1, Ordering::SeqCst);
-        self.wait_until(&self.framing_hook_timed_out, || {
+        self.held_framing_jobs.fetch_add(1, &self.bell);
+        // A writer that has taken back every other permit wins over a test
+        // release seen in the same evaluation.
+        let ended = self.wait(Wake::Rung, || {
             let taken = self.framing_wait_taken.load(Ordering::SeqCst);
             let held = self.held_framing_jobs.load(Ordering::SeqCst);
             if taken != u64::MAX
                 && taken.saturating_add(held) >= self.framing_wait_needed.load(Ordering::SeqCst)
             {
-                self.framing_wait_reached.store(true, Ordering::SeqCst);
-                return true;
+                return Some(FramingRelease::Reached);
             }
-            self.release_framing.load(Ordering::SeqCst)
+            self.release_framing
+                .load(Ordering::SeqCst)
+                .then_some(FramingRelease::Released)
         });
-        self.held_framing_jobs.fetch_sub(1, Ordering::SeqCst);
+        match ended {
+            // Published before the job counts as no longer parked.
+            Some(FramingRelease::Reached) => {
+                self.framing_wait_reached.store(true, Ordering::SeqCst);
+            }
+            Some(FramingRelease::Released) => {}
+            None => self.framing_hook_timed_out.store(true, Ordering::SeqCst),
+        }
+        self.held_framing_jobs.fetch_sub(1, &self.bell);
+    }
+
+    /// Release a framing job parked by `hold_framing_at`. Safe to call on
+    /// every exit path, armed or not.
+    pub fn release_framing(&self) {
+        self.release_framing.store(true, &self.bell);
     }
 
     /// Called by a framing job whose body ran to its end, just before it
@@ -1036,15 +1260,13 @@ impl FaultPlan {
     /// Called by a writer waiting for its framing jobs: on entry
     /// (`taken` 0) and after each permit it takes back, of `needed`.
     pub(crate) fn on_framing_wait(&self, taken: usize, needed: usize) {
-        self.framing_wait_needed
-            .store(needed as u64, Ordering::SeqCst);
-        self.framing_wait_taken
-            .store(taken as u64, Ordering::SeqCst);
+        self.framing_wait_needed.store(needed as u64, &self.bell);
+        self.framing_wait_taken.store(taken as u64, &self.bell);
     }
 
     /// Called by a writer whose wait for its framing jobs is over.
     pub(crate) fn after_framing_wait(&self) {
-        self.framing_wait_taken.store(u64::MAX, Ordering::SeqCst);
+        self.framing_wait_taken.store(u64::MAX, &self.bell);
     }
 
     /// Whether the multi-extract region grid is declined (counted).
@@ -1079,7 +1301,9 @@ impl FaultPlan {
         cond: impl Fn() -> bool,
     ) -> crate::Result<()> {
         let timed_out = &self.merge_changes_hook_timed_out;
-        self.wait_until(timed_out, || stopped() || cond());
+        // Polled: `stopped` reads the ledger's halt, which `Ledger::stop`
+        // sets without tripping the token or ringing the plan.
+        self.wait_until(timed_out, Wake::Polled, || stopped() || cond());
         if timed_out.load(Ordering::SeqCst) {
             return Err(crate::Error::internal(format!(
                 "test-hooks: the merge-changes spill-first handshake did not happen within \
@@ -1119,7 +1343,7 @@ impl FaultPlan {
         if input != 1 || seq != self.merge_changes_spill_first.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.merge_changes_reader_held.store(true, Ordering::SeqCst);
+        self.merge_changes_reader_held.store(true, &self.bell);
         self.merge_changes_wait(stopped, || {
             self.merge_changes_head.load(Ordering::SeqCst) >= 1
         })
@@ -1129,8 +1353,7 @@ impl FaultPlan {
     /// that input's spill file.
     pub(crate) fn on_merge_changes_spilled(&self, input: usize) {
         if input == 1 {
-            self.merge_changes_members_spilled
-                .fetch_add(1, Ordering::SeqCst);
+            self.merge_changes_members_spilled.fetch_add(1, &self.bell);
         }
     }
 
@@ -1139,7 +1362,7 @@ impl FaultPlan {
     pub(crate) fn on_merge_changes_complete(&self, input: usize) {
         if input == 1 {
             self.merge_changes_spilled_input_complete
-                .store(true, Ordering::SeqCst);
+                .store(true, &self.bell);
         }
     }
 
@@ -1158,7 +1381,7 @@ impl FaultPlan {
             }
             None => {}
         }
-        self.merge_changes_head.store(head, Ordering::SeqCst);
+        self.merge_changes_head.store(head, &self.bell);
     }
 
     // ---- apply-changes ---------------------------------------------------
@@ -1176,19 +1399,20 @@ impl FaultPlan {
             .apply_changes_hold_workers_until_dispatch_blocked
             .load(Ordering::SeqCst)
         {
-            self.wait_until(timed_out, || {
+            self.wait_until(timed_out, Wake::Rung, || {
                 self.apply_changes_dispatch_blocked.load(Ordering::SeqCst)
             });
         }
         if seq == self.apply_changes_park_at_blob_seq.load(Ordering::SeqCst) {
-            self.wait_until(timed_out, &cancelled);
+            // Rung: tripping the token rings the plan.
+            self.wait_until(timed_out, Wake::Rung, &cancelled);
         }
         if seq == self.apply_changes_panic_at_blob_seq.load(Ordering::SeqCst) {
             if self
                 .apply_changes_panic_waits_for_barrier_wait
                 .load(Ordering::SeqCst)
             {
-                self.wait_until(timed_out, || {
+                self.wait_until(timed_out, Wake::Rung, || {
                     self.apply_changes_scanner_in_barrier_wait
                         .load(Ordering::SeqCst)
                 });
@@ -1201,7 +1425,7 @@ impl FaultPlan {
     /// exclusive end `node_end_seq`.
     pub(crate) fn before_apply_changes_boundary(&self, node_end_seq: u64) {
         if self.apply_changes_late_boundary.load(Ordering::SeqCst) {
-            self.wait_until(&self.apply_changes_hook_timed_out, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
                 self.apply_changes_drain_next_seq.load(Ordering::SeqCst) >= node_end_seq
             });
         }
@@ -1216,7 +1440,7 @@ impl FaultPlan {
             .apply_changes_hold_walk_until_drain_past_nodes
             .swap(false, Ordering::SeqCst)
         {
-            self.wait_until(&self.apply_changes_hook_timed_out, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
                 self.apply_changes_drain_past_nodes.load(Ordering::SeqCst)
             });
         }
@@ -1230,10 +1454,43 @@ impl FaultPlan {
                 .apply_changes_poll_waits_for_drain_exit_after_seq
                 .load(Ordering::SeqCst)
         {
-            self.wait_until(&self.apply_changes_hook_timed_out, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
                 self.apply_changes_drain_returned.load(Ordering::SeqCst)
             });
         }
+    }
+
+    /// Called by the scanner as it reads each OsmData header.
+    pub(crate) fn on_apply_changes_header_walked(&self) {
+        self.apply_changes_scanner_headers_walked
+            .fetch_add(1, &self.bell);
+    }
+
+    /// Called by the scanner when a candidate send finds the channel full.
+    pub(crate) fn on_apply_changes_dispatch_blocked(&self) {
+        self.apply_changes_dispatch_blocked.store(true, &self.bell);
+    }
+
+    /// Called by the scanner as it starts waiting for the barrier signal.
+    pub(crate) fn on_apply_changes_barrier_wait(&self) {
+        self.apply_changes_scanner_in_barrier_wait
+            .store(true, &self.bell);
+    }
+
+    /// Called by the drain after each advance, with the seq it expects next.
+    pub(crate) fn on_apply_changes_drain_advanced(&self, next_seq: u64) {
+        self.apply_changes_drain_next_seq
+            .store(next_seq, &self.bell);
+    }
+
+    /// Called by the drain once it handles anything past the node phase.
+    pub(crate) fn on_apply_changes_drain_past_nodes(&self) {
+        self.apply_changes_drain_past_nodes.store(true, &self.bell);
+    }
+
+    /// Called by `merge` once the drain has returned.
+    pub(crate) fn on_apply_changes_drain_returned(&self) {
+        self.apply_changes_drain_returned.store(true, &self.bell);
     }
 
     /// Called by the drain just before it merges the coordinate slots at
@@ -1244,7 +1501,7 @@ impl FaultPlan {
             .load(Ordering::SeqCst)
         {
             let mark = self.apply_changes_mark_candidate_seq.load(Ordering::SeqCst);
-            self.wait_until(&self.apply_changes_hook_timed_out, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
                 // Waiting without having walked the marked descriptor, or
                 // the marked candidate done: whichever the scanner's shape
                 // allows.
@@ -1264,8 +1521,7 @@ impl FaultPlan {
     /// (coordinates flushed and its item sent).
     pub(crate) fn on_apply_changes_candidate_done(&self, seq: u64) {
         if seq == self.apply_changes_mark_candidate_seq.load(Ordering::SeqCst) {
-            self.apply_changes_candidate_marked
-                .store(true, Ordering::SeqCst);
+            self.apply_changes_candidate_marked.store(true, &self.bell);
         }
     }
 
@@ -1279,7 +1535,7 @@ impl FaultPlan {
             .apply_changes_signal_waits_for_scanner_wait
             .load(Ordering::SeqCst)
         {
-            self.wait_until(&self.apply_changes_hook_timed_out, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
                 self.apply_changes_scanner_in_barrier_wait
                     .load(Ordering::SeqCst)
             });
@@ -1330,8 +1586,9 @@ impl FaultPlan {
         if bucket != self.altw_stage3_hold_bucket.load(Ordering::SeqCst) {
             return;
         }
-        self.altw_stage3_bucket_held.store(true, Ordering::SeqCst);
-        self.wait_until(&self.altw_hook_timed_out, &aborted);
+        self.altw_stage3_bucket_held.store(true, &self.bell);
+        // Polled: the router's abort does not ring the plan.
+        self.wait_until(&self.altw_hook_timed_out, Wake::Polled, &aborted);
         self.altw_stage3_saw_abort
             .store(aborted(), Ordering::SeqCst);
     }
@@ -1340,7 +1597,7 @@ impl FaultPlan {
     /// blob `way_blob_idx`.
     pub(crate) fn on_altw_stage4_ready_wait(&self, way_blob_idx: usize) {
         if way_blob_idx == 0 {
-            self.altw_stage4_way0_entered.store(true, Ordering::SeqCst);
+            self.altw_stage4_way0_entered.store(true, &self.bell);
         }
     }
 
@@ -1351,7 +1608,7 @@ impl FaultPlan {
         if ordinal != self.altw_stage4_panic_work_at.load(Ordering::SeqCst) {
             return;
         }
-        self.wait_until(&self.altw_hook_timed_out, || {
+        self.wait_until(&self.altw_hook_timed_out, Wake::Rung, || {
             self.altw_stage3_bucket_held.load(Ordering::SeqCst)
                 && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
         });
@@ -1364,7 +1621,7 @@ impl FaultPlan {
         if !self.altw_stage4_fail_at_start.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.wait_until(&self.altw_hook_timed_out, || {
+        self.wait_until(&self.altw_hook_timed_out, Wake::Rung, || {
             self.altw_stage3_bucket_held.load(Ordering::SeqCst)
         });
         Err(crate::Error::internal(
@@ -1382,7 +1639,7 @@ impl FaultPlan {
         if !fails && !panics {
             return Ok(());
         }
-        self.wait_until(&self.altw_hook_timed_out, || {
+        self.wait_until(&self.altw_hook_timed_out, Wake::Rung, || {
             self.altw_stage3_bucket_held.load(Ordering::SeqCst)
                 && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
         });
@@ -1400,7 +1657,7 @@ pub(crate) struct LivePoolWorker<'a>(&'a FaultPlan);
 
 impl Drop for LivePoolWorker<'_> {
     fn drop(&mut self) {
-        self.0.live_pool_workers.fetch_sub(1, Ordering::SeqCst);
+        self.0.live_pool_workers.fetch_sub(1, &self.0.bell);
     }
 }
 

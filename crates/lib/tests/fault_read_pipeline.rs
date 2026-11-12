@@ -7,7 +7,6 @@
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use pbfhogg::ElementReader;
 use pbfhogg::host::Invocation;
@@ -75,27 +74,19 @@ fn admission_high_water_bounded_under_slow_first_decode() {
         })),
     };
 
-    let start = Instant::now();
-    while !faults.blocked_decode_ready() {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "decode hook was not reached"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    let start = Instant::now();
-    while reorder_high_water(&cancel) < 1 {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "later decode did not reach the reorder buffer"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    assert!(
+        faults.wait_for(|| faults.blocked_decode_ready()),
+        "decode hook was not reached"
+    );
+    // The counter does not ring the plan: the wait's tick re-reads it.
+    assert!(
+        faults.wait_for(|| reorder_high_water(&cancel) >= 1),
+        "later decode did not reach the reorder buffer"
+    );
 
     faults.release_blocked_decode();
     let result = done_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(pbfhogg::TEST_HANG_BOUND)
         .expect("pipeline did not finish after releasing decode hook");
     driver.release_and_join();
     result.unwrap();

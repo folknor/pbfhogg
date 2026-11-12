@@ -134,13 +134,6 @@ Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
 indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
 indexed inputs.
 
-## VER-118 - Three osmium comparison rows have no equivalence check
-
-`vs-osmium.lua --validate-only yes` decodes both tools' PBF outputs independently through
-osmium OPL with way locations and compares them, for nine rows; the three text-report rows
-are refused. Complete-ways and node-retention behaviour are checked only at their
-defaults, because pbfhogg has no affirmative flag for them.
-
 ## VER-122 - Verify's equality oracle is narrower than "identical" and shares the subject's code
 
 Reported by bench-verify.

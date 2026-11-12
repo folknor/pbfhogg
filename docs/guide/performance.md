@@ -58,8 +58,11 @@ output PBFs with osmium to OPL including way locations, and compares the
 two spools byte for byte. The policy is ordered entity equality: the
 entities, their order, metadata, tags (in order), references and
 locations must match; file headers and block encoding are excluded. The
-three text-report rows (`inspect`, `inspect-tags`, `inspect-tags-way`)
-print tool-specific report formats and refuse validation.
+`inspect-tags` and `inspect-tags-way` rows print reports rather than PBFs:
+their validation parses both stdouts into ordered rows of count and key,
+decoding each tool's quoting (osmium doubles quotes, pbfhogg writes JSON
+string literals, see DEVIATIONS.md), and requires the row lists to be
+equal. The `inspect` row has no osmium counterpart and refuses validation.
 To rerun the table, `scripts/vs-osmium.sh PAIRS DATASET OSC` runs every
 row as `PAIRS` alternating single-iteration pairs (the inspect row,
 pbfhogg only), with `OSC` an explicit key in the dataset's OSC table for

@@ -31,9 +31,17 @@
 -- locations), and compares the complete spools with cmp. This checks ordered
 -- entities, metadata, tags, references and locations, but excludes headers
 -- and encoding. Tag order is significant under this deliberately strict policy.
--- Text-report rows have different report formats and refuse validation.
--- The CLI exposes no affirmative complete-ways or keep-member-nodes switch:
--- their defaults are part of the compared behavior, checked by validation.
+-- The inspect tags rows validate their reports instead: both stdouts are
+-- parsed into ordered (count, key) rows, each tool's quoting decoded, and
+-- the row lists must be equal. The inspect row refuses validation, having
+-- no osmium counterpart.
+-- The CLI exposes no affirmative complete-ways or keep-member-nodes switch.
+-- That is not an unchecked behaviour: osmium is given the matching
+-- --strategy complete_ways and --keep-member-nodes, so validation compares
+-- the semantics actually timed, and a drift in pbfhogg's default fails it
+-- wherever the input exposes the difference. The other strategies and
+-- --keep-untagged-nodes are not rows of this table; brokkr verify extract
+-- gates the extract strategies.
 -- extract uses the dataset bbox and the complete-ways strategy on both
 -- sides (pbfhogg's default, osmium's explicit complete_ways).
 
@@ -149,9 +157,8 @@ function validate(params, keys)
     end
     if params.row == "apply-changes" and not params.osc then fail("the apply-changes row needs --osc") end
     if params.row ~= "apply-changes" and params.osc then fail("--osc is for the apply-changes row only") end
-    if params["validate-only"] == "yes" and
-        (params.row == "inspect" or params.row == "inspect-tags" or params.row == "inspect-tags-way") then
-        fail("output validation requires a PBF-producing row")
+    if params["validate-only"] == "yes" and params.row == "inspect" then
+        fail("the inspect row has no osmium report to validate against")
     end
     if params.tool == "osmium" and not row.osmium then
         fail("the " .. params.row .. " row has no osmium counterpart")
@@ -173,9 +180,91 @@ local function validate_outputs(params, keys)
     record.validation = "osmium-opl-ordered-v1"
 end
 
+-- The inspect tags rows print `count TAB key NEWLINE` on both sides, in the
+-- same order, but quote the key differently (DEVIATIONS.md, inspect tags):
+-- osmium wraps it in double quotes and doubles a quote inside, escaping
+-- nothing else; pbfhogg writes a JSON string literal. Each field parser
+-- consumes one quoted field starting at pos and returns the decoded key and
+-- the position after it, or fails. The osmium parser walks quoted text, so
+-- a tab or newline inside a key decodes rather than splitting the row.
+local function osmium_field(text, pos)
+    if text:sub(pos, pos) ~= '"' then fail("osmium row " .. pos .. ": key is not quoted") end
+    local parts, i = {}, pos + 1
+    while true do
+        local j = text:find('"', i, true)
+        if not j then fail("osmium row " .. pos .. ": unterminated key") end
+        parts[#parts + 1] = text:sub(i, j - 1)
+        if text:sub(j + 1, j + 1) == '"' then
+            parts[#parts + 1] = '"'
+            i = j + 2
+        else
+            return table.concat(parts), j + 1
+        end
+    end
+end
+
+local function pbfhogg_field(text, pos)
+    if text:sub(pos, pos) ~= '"' then fail("pbfhogg row " .. pos .. ": key is not quoted") end
+    local i = pos + 1
+    while true do
+        local j = text:find('["\\]', i)
+        if not j then fail("pbfhogg row " .. pos .. ": unterminated key") end
+        if text:sub(j, j) == "\\" then
+            i = j + 2
+        else
+            local decoded = json.decode("[" .. text:sub(pos, j) .. "]")
+            if type(decoded) ~= "table" or type(decoded[1]) ~= "string" or #decoded ~= 1 then
+                fail("pbfhogg row " .. pos .. ": key is not a JSON string")
+            end
+            return decoded[1], j + 1
+        end
+    end
+end
+
+-- Every byte of the report is consumed: rows of decimal count, TAB, one
+-- quoted key, NEWLINE. A third field, a blank line or trailing bytes fail.
+-- Counts stay strings, so no precision is lost.
+local function report_rows(tool, text, field)
+    local rows, pos = {}, 1
+    while pos <= #text do
+        local _, e = text:find("^%d+\t", pos)
+        if not e then fail(tool .. " row at byte " .. pos .. ": expected a count and a tab") end
+        local count = text:sub(pos, e - 1)
+        local key, nxt = field(text, e + 1)
+        if text:sub(nxt, nxt) ~= "\n" then
+            fail(tool .. " row at byte " .. pos .. ": expected the row to end after its key")
+        end
+        rows[#rows + 1] = { count = count, key = key }
+        pos = nxt + 1
+    end
+    return rows
+end
+
+-- Both reports are read whole, so a report past read()'s 16 MiB limit
+-- fails the run rather than validating part of it.
+local function validate_reports(params, keys)
+    local row = rows(params, keys)[params.row]
+    local left = binary(table.unpack(row.pbfhogg())):ok().stdout_file
+    local right = binary_with({ program = "osmium" }, table.unpack(row.osmium())):ok().stdout_file
+    local ours = report_rows("pbfhogg", read(left), pbfhogg_field)
+    local theirs = report_rows("osmium", read(right), osmium_field)
+    for i = 1, math.max(#ours, #theirs) do
+        local a, b = ours[i], theirs[i]
+        if not a or not b or a.count ~= b.count or a.key ~= b.key then
+            local show = function(r) return r and (r.count .. " " .. json.encode({ r.key })) or "no row" end
+            fail("row " .. i .. " differs: pbfhogg " .. show(a) .. ", osmium " .. show(b))
+        end
+    end
+    record.validation = "tags-count-rows-ordered-v1"
+end
+
 function bench(params, keys)
     if params["validate-only"] == "yes" then
-        validate_outputs(params, keys)
+        if params.row == "inspect-tags" or params.row == "inspect-tags-way" then
+            validate_reports(params, keys)
+        else
+            validate_outputs(params, keys)
+        end
         return
     end
     local row = rows(params, keys)[params.row]

@@ -307,9 +307,10 @@ params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO
 [bench.vs-osmium]
 script_file = "../benches/compare/vs-osmium.lua"
 description = "One row of the guide's CLI command table, pbfhogg or osmium, inputs cold"
-version = 7
-date = 2026-11-11
+version = 8
+date = 2026-11-12
 changelog = [
+  { version = 8, date = 2026-11-12, note = "--validate-only yes also covers inspect-tags and inspect-tags-way: both reports parsed into ordered count and key rows with each tool's quoting decoded, then compared; inspect still refuses; timing arms unchanged" },
   { version = 7, date = 2026-11-11, note = "Add --validate-only yes: a separate run of both PBF-producing arms, both outputs decoded by osmium to OPL with way locations and compared byte for byte; text-report rows refuse it; timing arms unchanged" },
   { version = 6, date = 2026-11-11, note = "Pin zlib level 6 for both writers; driver reads the Lua row registry and requires explicit positive pairs, dataset and dataset-scoped OSC key" },
   { version = 5, date = 2026-11-11, note = "Inputs advised out and checked by brokkr's cold on the measured tool call, replacing dd and fincore; the result is the tool child's wall, without the preparation" },
@@ -324,7 +325,7 @@ params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = 
 params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the apply-changes row only" }
 params.row = { validated = true, required = true, help = "inspect, sort, extract, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
-params.validate-only = { choices = ["yes", "no"], default = "no", help = "yes: run no timing; run both tools on a PBF-producing row and compare their outputs as osmium OPL with way locations" }
+params.validate-only = { choices = ["yes", "no"], default = "no", help = "yes: run no timing; run both tools and compare their outputs: PBF rows as osmium OPL with way locations, inspect tags rows as decoded count and key rows; inspect refuses" }
 
 # -- degrade
 

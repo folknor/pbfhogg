@@ -524,9 +524,11 @@ mod tests {
         use super::Stopwatch;
         use std::time::Duration;
 
+        // fixture-time: conversion inputs under test, not waits
         let sample = Duration::from_nanos(2_999_999);
         assert_eq!(Stopwatch::duration_ns(sample), 2_999_999);
         assert_eq!(Stopwatch::duration_ms(sample), 2);
+        // fixture-time: conversion input under test, not a wait
         assert_eq!(Stopwatch::duration_ms(Duration::from_nanos(999_999)), 0);
         assert_eq!(Stopwatch::duration_ns(Duration::ZERO), 0);
         assert_eq!(Stopwatch::duration_ns(Duration::MAX), u64::MAX);

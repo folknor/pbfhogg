@@ -758,7 +758,8 @@ fn the_passthrough_reads_a_fifo() {
     let fed = feeder.finish();
     result.unwrap_or_else(|e| panic!("a FIFO serves the passthrough: {e}"));
     match fed {
-        crate::common::Fed::NeverOpened => panic!("the run must have opened the FIFO"),
+        crate::common::Fed::Unfed => panic!("the run must have opened the FIFO"),
+        crate::common::Fed::OpenFailed(e) => panic!("the feeder could not open the FIFO: {e}"),
         crate::common::Fed::Wrote(written) => {
             written.unwrap_or_else(|e| panic!("the passthrough read the whole FIFO: {e}"));
         }

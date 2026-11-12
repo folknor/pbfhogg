@@ -911,7 +911,6 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
 
     #[derive(Clone)]
     struct CountingRead {
@@ -933,8 +932,10 @@ mod tests {
             let read = self.inner.read(buf)?;
             self.bytes_read.fetch_add(read, Ordering::Relaxed);
             if read > 0 {
+                // Residue in the timed_waits source rule, until a gated
+                // reader replaces this throttle.
                 // wait-deliberate: throttles the reader; nothing is inferred from it
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(crate::tunables::TEST_HOOK_TICK);
             }
             Ok(read)
         }
@@ -1194,20 +1195,43 @@ mod tests {
     #[derive(Default)]
     struct TeardownState {
         installed: AtomicUsize,
-        started: AtomicUsize,
         finished: AtomicUsize,
-        release: AtomicBool,
+        /// Teardowns started, and whether the test has released them: one
+        /// lock, so the test's wait for a start and a teardown's wait for
+        /// the release each wake on the other's write.
+        gate: std::sync::Mutex<(usize, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    #[cfg(pbfhogg_test_hooks)]
+    impl TeardownState {
+        fn gate(&self) -> std::sync::MutexGuard<'_, (usize, bool)> {
+            self.gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn release(&self) {
+            self.gate().1 = true;
+            self.changed.notify_all();
+        }
     }
 
     #[cfg(pbfhogg_test_hooks)]
     impl Drop for Teardown {
         fn drop(&mut self) {
-            self.0.started.fetch_add(1, Ordering::SeqCst);
-            let deadline = std::time::Instant::now() + crate::tunables::TEST_HOOK_WAIT;
-            while !self.0.release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-                // wait-deliberate: pace of a poll for the test's release
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            let mut gate = self.0.gate();
+            gate.0 += 1;
+            self.0.changed.notify_all();
+            // Bounded so a test that never releases fails at its join
+            // assertion instead of hanging the worker forever.
+            drop(
+                self.0
+                    .changed
+                    // wait-deliberate: ends at the test's release; the bound only stops a lost release
+                    .wait_timeout_while(gate, crate::tunables::TEST_HOOK_WAIT, |g| !g.1)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
             self.0.finished.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1220,7 +1244,7 @@ mod tests {
     #[cfg(pbfhogg_test_hooks)]
     impl Drop for ReleaseTeardowns {
         fn drop(&mut self) {
-            self.0.release.store(true, Ordering::SeqCst);
+            self.0.release();
             if let Some(handle) = self.1.take() {
                 drop(handle.join());
             }
@@ -1271,22 +1295,25 @@ mod tests {
         });
         let _release = ReleaseTeardowns(Arc::clone(&state), Some(handle));
 
-        let start = std::time::Instant::now();
-        while state.started.load(Ordering::SeqCst) == 0
-            || invocation
+        let (gate, observed) = state
+            .changed
+            // wait-deliberate: ends when a teardown starts; the bound fails the test
+            .wait_timeout_while(state.gate(), crate::test_support::OBSERVE_BOUND, |g| {
+                g.0 == 0
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Released before the release below takes the same lock.
+        drop(gate);
+        assert!(!observed.timed_out(), "no decode worker began tearing down");
+        assert!(
+            invocation.faults().wait_for(|| invocation
                 .faults()
                 .built_pool_joins_started
                 .load(Ordering::SeqCst)
-                == 0
-        {
-            assert!(
-                start.elapsed() < crate::test_support::OBSERVE_BOUND,
-                "no decode worker began tearing down, or the read never reached its join"
-            );
-            // wait-deliberate: pace of a poll on observed counters; the deadline fails
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        state.release.store(true, Ordering::SeqCst);
+                > 0),
+            "the read never reached its join"
+        );
+        state.release();
         let (result, finished_at_return) = done_rx.recv().unwrap();
         result.unwrap();
         assert_eq!(

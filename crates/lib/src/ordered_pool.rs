@@ -1426,7 +1426,6 @@ fn refill<P, T, E>(
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// Run `f` under a fail-stop hang bound. The defect these tests pin is a
     /// hang, which ends the test binary with the test's name rather than
@@ -1837,7 +1836,8 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll on an observed counter; the deadline fails
+            // Residue in the timed_waits source rule: the counters ring nothing yet.
+            std::thread::sleep(crate::tunables::TEST_HOOK_TICK); // wait-deliberate: pace of a poll on an observed counter; the deadline fails
         }
         true
     }

@@ -4658,6 +4658,7 @@ mod derive_clock_tests {
                 true,
                 || {
                     clock_calls += 1;
+                    // fixture-time: the injected clock's instant, data the output is checked against
                     std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123)
                 },
                 pbfhogg::Parallelism::from_jobs(jobs),
@@ -4684,6 +4685,7 @@ mod derive_clock_tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn resolves_one_exact_instant_only_when_requested() {
+        // fixture-time: the injected clock's instant, data the result is checked against
         let instant = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123);
         assert_eq!(
             super::derive_timestamp(true, || instant).expect("valid instant"),
@@ -4696,6 +4698,7 @@ mod derive_clock_tests {
         );
         assert!(
             super::derive_timestamp(true, || std::time::UNIX_EPOCH
+                // fixture-time: an instant before the epoch, the refused input
                 - std::time::Duration::from_secs(1))
             .is_err()
         );

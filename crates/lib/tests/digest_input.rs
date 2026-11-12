@@ -172,11 +172,11 @@ fn a_stream_is_digested_like_the_file_it_carries() {
         let feeder = crate::common::FifoFeeder::start(&fifo, payload);
         let result = digest(&fifo);
         // A refusal may close the read end before every byte is taken, so
-        // the write's own outcome is not checked; that the digest opened
-        // the stream is.
+        // the write's own outcome is not checked; that a transfer to the
+        // digest began is.
         assert!(
-            !matches!(feeder.finish(), crate::common::Fed::NeverOpened),
-            "{label}: the digest never opened the stream"
+            matches!(feeder.finish(), crate::common::Fed::Wrote(_)),
+            "{label}: no transfer to the digest began"
         );
         if accepted {
             assert_eq!(

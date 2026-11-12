@@ -1080,6 +1080,19 @@ impl FaultPlan {
         self.wait(Wake::Polled, || cond().then_some(())).is_some()
     }
 
+    /// Wait for `token`, the invocation this plan belongs to, to trip, at
+    /// most `TEST_HOOK_WAIT`: false if it never did. Rung, never polled:
+    /// [`Invocation::cancel`](crate::host::Invocation::cancel) rings the
+    /// bell after the trip, so the wait ends at the trip itself.
+    pub fn wait_cancelled(&self, token: &crate::host::Invocation) -> bool {
+        assert!(
+            std::ptr::eq(token.faults(), self),
+            "a plan waits only for its own invocation's token"
+        );
+        self.wait(Wake::Rung, || token.is_cancelled().then_some(()))
+            .is_some()
+    }
+
     /// Ring the bell for a transition outside the plan that some wait
     /// reads: the invocation's token tripping.
     pub(crate) fn ring(&self) {

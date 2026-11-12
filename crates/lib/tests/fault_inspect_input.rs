@@ -446,7 +446,7 @@ fn a_decode_only_run_reads_a_fifo() {
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let feeder = feed_fifo(&fifo, std::fs::read(&input).expect("read input"));
     let result = run_inspect(route, &fifo, &crate::common::test_host());
-    let fed = !matches!(feeder.finish(), crate::common::Fed::NeverOpened);
+    let fed = matches!(feeder.finish(), crate::common::Fed::Wrote(_));
     let got = result.unwrap_or_else(|e| panic!("a FIFO serves the decode-only scan: {e}"));
     assert!(fed, "the run must have opened the FIFO");
     assert_eq!(got, expected);
@@ -688,7 +688,7 @@ fn inspect_header_reads_a_fifo() {
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let feeder = feed_fifo(&fifo, std::fs::read(&input).expect("read input"));
     let result = pbfhogg::inspect::inspect_header(&fifo, false, &crate::common::test_host());
-    let fed = !matches!(feeder.finish(), crate::common::Fed::NeverOpened);
+    let fed = matches!(feeder.finish(), crate::common::Fed::Wrote(_));
     let read = result.unwrap_or_else(|e| panic!("a FIFO serves the header read: {e}"));
     assert!(fed, "the run must have opened the FIFO");
     assert_eq!(read.file_size, 0);

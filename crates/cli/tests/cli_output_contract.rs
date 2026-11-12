@@ -1552,7 +1552,7 @@ fn a_quiet_run_prints_only_warnings_and_writes_the_same_outputs() {
 #[cfg(pbfhogg_test_hooks)]
 mod interrupted {
     use super::*;
-    use crate::invoker::NoFile;
+    use crate::invoker::{Announcement, NoAnnouncement};
 
     pub(super) fn signal_name(signal: libc::c_int) -> &'static str {
         if signal == libc::SIGTERM {
@@ -1715,24 +1715,21 @@ mod interrupted {
                 seed(output, row.kind);
             }
         }
-        let control = crate::common::test_scratch();
-        let ready = control.path().join("ready");
         let ordinal = std::num::NonZeroU64::new(k).ok_or("checkpoint ordinals start at 1")?;
         let extra: Vec<OsString> = if replace {
             vec!["--overwrite".into()]
         } else {
             Vec::new()
         };
-        let mut child = run
-            .invoker(&extra)
-            .cancel_pause(ordinal, &ready, false)
-            .spawn();
+        let mut child = run.invoker(&extra).cancel_pause(ordinal, false).spawn();
 
         let mut seen = Seen::default();
-        match child.wait_for_file(&ready) {
+        match child.wait_announcement(&Announcement::Paused(k)) {
             Ok(()) => {}
-            Err(NoFile::Exited) => seen.completed = true,
-            Err(NoFile::Expired) => return Err(format!("checkpoint {k} was never reached")),
+            Err(NoAnnouncement::Exited) => seen.completed = true,
+            Err(NoAnnouncement::Expired) => {
+                return Err(format!("checkpoint {k} was never reached"));
+            }
         }
         if seen.completed {
             let out = child.wait();
@@ -1944,10 +1941,9 @@ fn killed_run_sharing_one_directory_leaves_everything_there(
 #[allow(clippy::too_many_lines)]
 fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
-    use crate::invoker::NoFile;
+    use crate::invoker::{Announcement, NoAnnouncement};
     let count = interrupted::checkpoint_count(fx, row)?;
-    let (out_dir, staging, separate_tmp, control) = (
-        crate::common::test_scratch(),
+    let (out_dir, staging, separate_tmp) = (
         crate::common::test_scratch(),
         crate::common::test_scratch(),
         crate::common::test_scratch(),
@@ -1966,7 +1962,6 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
     );
     let mut extra: Vec<OsString> = vec!["--staging-dir".into(), staging.path().into()];
     extra.extend(tmp_args(row.tmp_dir.then_some(tmp)));
-    let ready = control.path().join("ready");
     let ordinal =
         std::num::NonZeroU64::new(count.div_ceil(2)).ok_or("the run passes no checkpoint")?;
     let mut child = interrupted::with_visible_scratch(
@@ -1974,12 +1969,12 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
         CliInvoker::new(&invocation_scratch).args(&inv.args),
     )
     .args(&extra)
-    .cancel_pause(ordinal, &ready, true)
+    .cancel_pause(ordinal, true)
     .spawn();
-    match child.wait_for_file(&ready) {
+    match child.wait_announcement(&Announcement::Paused(ordinal.get())) {
         Ok(()) => {}
-        Err(NoFile::Exited) => return Err("the run ended before its pause".into()),
-        Err(NoFile::Expired) => return Err("the pause was never reached".into()),
+        Err(NoAnnouncement::Exited) => return Err("the run ended before its pause".into()),
+        Err(NoAnnouncement::Expired) => return Err("the pause was never reached".into()),
     }
     child.signal(libc::SIGKILL);
     drop(child.wait());
@@ -2141,7 +2136,7 @@ fn one_directory_can_serve_as_both_staging_and_scratch_and_be_removed_whole() {
 #[cfg(pbfhogg_test_hooks)]
 mod in_publication {
     use super::*;
-    use crate::invoker::NoFile;
+    use crate::invoker::{Announcement, NoAnnouncement};
 
     /// Which outputs exist before the run (planted, and replaced with
     /// `--overwrite`).
@@ -2384,17 +2379,19 @@ mod in_publication {
         let row = row(scenario.row);
         let setup = Setup::new(fx, row, scenario.seeded);
         let step = &steps[at];
-        let control = crate::common::test_scratch();
-        let ready = control.path().join("ready");
         let mut child = CliInvoker::new(&invocation_scratch)
             .args(&setup.args)
             .publish_faults(scenario.faults)
-            .publish_pause(step.parse().expect("recorded publication step"), &ready)
+            .publish_pause(step.parse().expect("recorded publication step"))
             .spawn();
-        match child.wait_for_file(&ready) {
+        match child.wait_announcement(&Announcement::Published(step.clone())) {
             Ok(()) => {}
-            Err(NoFile::Exited) => return Err(format!("{step}: the run ended before the step")),
-            Err(NoFile::Expired) => return Err(format!("{step}: the step was never reached")),
+            Err(NoAnnouncement::Exited) => {
+                return Err(format!("{step}: the run ended before the step"));
+            }
+            Err(NoAnnouncement::Expired) => {
+                return Err(format!("{step}: the step was never reached"));
+            }
         }
         child.signal(libc::SIGKILL);
         drop(child.wait());
@@ -2936,7 +2933,6 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
     ] {
         let out_dir = crate::common::test_scratch();
         let tmp = crate::common::test_scratch();
-        let control = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx: &fx,
@@ -2944,8 +2940,6 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
             },
             Input::Good,
         );
-        let ready = control.path().join("ready");
-        let ack = control.path().join("ready.ack");
         let ordinal =
             std::num::NonZeroU64::new(count.div_ceil(2)).expect("the altw row passes a checkpoint");
         let mut child = interrupted::with_visible_scratch(
@@ -2953,18 +2947,19 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
             CliInvoker::new(&invocation_scratch).args(&inv.args),
         )
         .args(tmp_args(Some(tmp.path())))
-        .cancel_pause(ordinal, &ready, true)
+        .cancel_pause(ordinal, true)
         .spawn();
-        let wait_for = |path: &Path, child: &mut crate::invoker::RunningCli| {
-            if let Err(missed) = child.wait_for_file(path) {
-                panic!("{} never appeared: {missed:?}", path.display());
+        use crate::invoker::Announcement;
+        let wait_for = |expected: Announcement, child: &mut crate::invoker::RunningCli| {
+            if let Err(missed) = child.wait_announcement(&expected) {
+                panic!("never announced {expected}: {missed:?}");
             }
         };
-        wait_for(&ready, &mut child);
+        wait_for(Announcement::Paused(ordinal.get()), &mut child);
         child.signal(first);
         // The first signal is taken (the paused thread saw the token trip)
         // before the second is sent: two pending standard signals coalesce.
-        wait_for(&ack, &mut child);
+        wait_for(Announcement::Cancelled(ordinal.get()), &mut child);
         let sent = Instant::now();
         child.signal(second);
         let out = child.wait();
@@ -3021,19 +3016,13 @@ fn a_command_without_an_output_is_interrupted_too() {
             libc::SIGTERM
         };
         let cwd = crate::common::test_scratch();
-        let control = crate::common::test_scratch();
-        let ready = control.path().join("ready");
         let mut child = CliInvoker::new(&invocation_scratch)
             .args(*words)
             .arg(&good)
             .current_dir(cwd.path())
-            .cancel_pause(
-                std::num::NonZeroU64::new(2).expect("nonzero"),
-                &ready,
-                false,
-            )
+            .cancel_pause(std::num::NonZeroU64::new(2).expect("nonzero"), false)
             .spawn();
-        if let Err(missed) = child.wait_for_file(&ready) {
+        if let Err(missed) = child.wait_announcement(&crate::invoker::Announcement::Paused(2)) {
             panic!("{words:?} never paused at checkpoint 2: {missed:?}");
         }
         child.signal(signal);

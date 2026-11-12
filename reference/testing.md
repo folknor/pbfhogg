@@ -372,17 +372,34 @@ it rests on review. A test never infers that
 another thread blocked from elapsed time: it waits (bounded) for an
 observation made at the wait itself - a `test_support::Parked` count under a
 primitive's mutex, a fault-plan hook at a join, a lock or an empty delivery
-window, a slow-path tally - and only then releases it. The source-policy
-timed-waits rule (`crates/source-policy/src/rules/timed_waits.rs`) puts every
-std timed wait in front of review: each `sleep`, `sleep_until`,
-`park_timeout`, `recv_timeout`, `recv_deadline` or condvar `wait_timeout*`
-identifier in a member's `src/` or `tests/`, production included, needs a
-`// wait-deliberate: <reason>` line comment on its line or alone above it,
-except a `recv_timeout`/`recv_deadline` method call followed directly by
-`.unwrap()` or `.expect(`, whose expiry panics at the receive. It is a
-spelling tripwire: wrappers, macro expansion and spins on `Instant`,
-`yield_now` or `try_recv` are outside it, and a marker's reason is reviewed,
-not checked.
+window, a slow-path tally - and only then releases it.
+
+A time value survives only as a deadline bounding a wait that normally ends
+on an event. A wait on something our code controls ends on a notification
+(the producer signals; a test gates the producer instead of sleeping it,
+and a child announces its pause on a pipe instead of the test polling for
+a file); a timed wait survives only where the other side cannot notify, and
+says why. The source-policy timed-waits rule
+(`crates/source-policy/src/rules/timed_waits.rs`) enforces the spellings:
+a `sleep`, `sleep_until` or `sleep_ms` identifier, or libc's `nanosleep`,
+`clock_nanosleep` or `usleep`, anywhere in a member's `src/` or `tests/`,
+production included, is refused with no exemption but the rule's own
+`RESIDUE` list, which names each remaining sleep per file with its reason
+and what removes it, and fails when an entry goes stale, so it only
+shrinks. Every other std timed wait (`park_timeout`, `recv_timeout`,
+`recv_deadline`, condvar `wait_timeout*`) and each libc raw wait the tree
+uses (`libc::poll`, `ppoll`, `epoll_wait`, `select`, `pselect`; an
+inventory, not every timed syscall) needs a `// wait-deliberate: <reason>`
+line comment on its line or alone above it, except a
+`recv_timeout`/`recv_deadline` method call followed directly by `.unwrap()`
+or `.expect(`, whose expiry panics at the receive. The duration-literals
+rule (`crates/source-policy/src/rules/duration_literals.rs`) refuses a
+`Duration` built from a numeric literal outside `tunables.rs` (and the hang
+bound's own tests in the test-scratch crate, which cannot name the
+library's tunables), unless `// fixture-time: <reason>` says the value is
+data, not a wait. Both are spelling tripwires: wrappers, named integers,
+macro expansion and spins on `Instant`, `yield_now` or `try_recv` are
+outside them, and a marker's reason is reviewed, not checked.
 
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication
@@ -689,10 +706,12 @@ exception, not a tier - should not survive across many PRs.
   is the whole registry's. The CLI, built with the hook cfg, reads
   two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
   checkpoint count there at exit, and
-  `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
-  reaching checkpoint `k`, writes the ready file, and waits for the token;
-  `stuck` writes `<ready file>.ack` once tripped and never returns, so only
-  a second signal ends the run. The interruption tests in
+  `PBFHOGG_TEST_CANCEL_PAUSE=<k>[:stuck]` parks the thread reaching
+  checkpoint `k`, announces `paused <k>` on the descriptor named by
+  `PBFHOGG_TEST_ANNOUNCE_FD` (a pipe the test hands down; `CliInvoker` sets
+  both), and blocks on the fault plan's bell until the token trips;
+  `stuck` announces `cancelled <k>` once tripped and parks for good, so
+  only a second signal ends the run. The interruption tests in
   `crates/cli/tests/cli_output_contract.rs` count a command's checkpoints, park it at
   sampled ordinals (tier 1) or at every ordinal of the counting run (its
   `tier3` shards, run by `--profile full` and the gate), signal it, and
@@ -769,11 +788,11 @@ exception, not a tier - should not survive across many PRs.
   channel within a bounded wait. The CLI, built with the hook cfg, reads
   `PBFHOGG_TEST_PUBLISH_FAULTS=<fault>,...` (faults spelled as
   `PublishFault` parses them; a bad spelling exits 101, as does a trace
-  or ready file that cannot be written),
+  or announcement that cannot be written),
   `PBFHOGG_TEST_PUBLISH_STEPS=<file>` (appends each step as it happens)
-  and `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` with
-  `PBFHOGG_TEST_PUBLISH_READY=<file>` (writes the ready file after that
-  step and never returns, so only a kill ends the run). The
+  and `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` (announces `published <step>` on
+  `PBFHOGG_TEST_ANNOUNCE_FD` after that step and parks for good, so only a
+  kill ends the run). The
   `killed_in_publication` tests in `crates/cli/tests/cli_output_contract.rs`
   record each scenario's steps with a counting run under the same faults,
   SIGKILL a run after every one, check the leftovers against the recorded
@@ -795,9 +814,12 @@ exception, not a tier - should not survive across many PRs.
   new `crates/cli/tests/cli_*.rs` goes through it. Every child times out at
   `TEST_CHILD_TIMEOUT`, set below `brokkr check`'s 20 s watchdog, with no
   per-test override. The timeout is one deadline from spawn shared by
-  every wait on that child: `wait_for_file` (a pause point's ready file,
-  reporting whether it appeared, the child exited first, or the deadline
-  passed) and the final `wait`, so a paused child is one bound, not two.
+  every wait on that child: `wait_announcement` (a pause point's typed
+  announcement, read from a pipe the child holds the only writer of and
+  waited on together with the child's pidfd, so it ends the moment the
+  line is written; it reports the announcement, an exit first, or the
+  deadline, never reaps, and fails on any other line) and the final
+  `wait`, so a paused child is one bound, not two.
   Every child a test thread spawns through `common::process::OwnedChild`
   (CLI, harness and osmium children alike) also shares
   `TEST_CHILD_BUDGET`, anchored at the thread's first child: once it is
@@ -813,7 +835,11 @@ exception, not a tier - should not survive across many PRs.
   handle carries that borrow through child and capture cleanup. `run` uses
   the same owner as `spawn().wait()`. Pipe reads are nonblocking, capture
   errors fail explicitly, and cleanup and EOF waits are bounded, including
-  when another writer holds a pipe open. Output keeps the first and last MiB.
+  when another writer holds a pipe open. Exit waits block on the child's
+  pidfd, opened at spawn, and a capture thread blocks on its pipe and its
+  own stop eventfd, which only cleanup fires; nothing polls on a clock,
+  except the exit re-check on a kernel without `pidfd_open`
+  (`TEST_CHILD_POLL`). Output keeps the first and last MiB.
   The default cwd and `TMPDIR` are the borrowed scratch and stdin is null,
   and the child is `SIGKILL`ed if the thread that spawned it ends.
   The environment is cleared, retaining only PATH, HOME, LANG, LC_ALL,
@@ -962,7 +988,12 @@ exception, not a tier - should not survive across many PRs.
   Its reader holds both ends (so no EOF spin before a producer opens), blocks
   in `poll` on the FIFO and a `UnixStream` shutdown channel, and is woken and
   joined by `finish` or on drop, unwinding included. Producers must be done
-  before `finish`. Two textlint rules in `brokkr.d/lints.toml` refuse a local
+  before `finish`. A test feeding a FIFO to a run under test uses
+  `common::FifoFeeder`, whose thread blocks in its write open until the run
+  opens the read end; teardown, after the synchronous run has returned,
+  releases a feeder still blocked there by opening a reader itself, and the
+  feeder then reports `Unfed` without writing. No clock is involved. Two
+  textlint rules in `brokkr.d/lints.toml` refuse a local
   `mkfifo` or FIFO drain in the test trees; unit tests under `src/` keep
   their own FIFOs.
 - **Policy proposal (not-yet-adopted).** Every new parallel pipeline

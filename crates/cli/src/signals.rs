@@ -362,44 +362,81 @@ pub(crate) mod test_hooks {
         }
     }
 
+    /// The descriptor a paused run announces on:
+    /// `PBFHOGG_TEST_ANNOUNCE_FD=<n>`, the write end of a pipe the test
+    /// handed down. Required by every pause hook; read once, at arming, so
+    /// a missing or malformed number ends the run before it starts.
+    fn announce_fd() -> std::os::fd::RawFd {
+        std::env::var("PBFHOGG_TEST_ANNOUNCE_FD")
+            .ok()
+            .and_then(|v| v.parse::<std::os::fd::RawFd>().ok())
+            .filter(|fd| *fd > 2)
+            .unwrap_or_else(|| fail("a pause hook needs PBFHOGG_TEST_ANNOUNCE_FD above stdio"))
+    }
+
+    /// Write one announcement line to the test. A line is far below
+    /// `PIPE_BUF`, so it lands whole; a write that fails ends the run, since
+    /// the test would otherwise wait for nothing.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only hook pipe, outside every output and scratch API"
+    )]
+    fn announce(fd: std::os::fd::RawFd, line: &str) {
+        use std::io::Write;
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        // A fresh open of the same pipe through procfs: the inherited
+        // descriptor itself is never adopted, duplicated or closed, as the
+        // CLI promises; only this new one is closed when it drops.
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{fd}"))
+            .and_then(|mut pipe| pipe.write_all(&bytes));
+        if let Err(error) = written {
+            fail(format_args!("cannot announce {line:?}: {error}"));
+        }
+    }
+
+    /// Park the calling thread until the test kills the process: no time
+    /// value, since nothing but `SIGKILL` is meant to end it. `park` may
+    /// return spuriously, hence the loop.
+    fn park_until_killed() -> ! {
+        loop {
+            std::thread::park();
+        }
+    }
+
     struct CancelPause {
         ordinal: u64,
-        ready: std::path::PathBuf,
         stuck: bool,
     }
 
     impl CancelPause {
         fn parse(spec: &std::ffi::OsStr) -> Result<Self, &'static str> {
             let spec = spec.to_str().ok_or("cancel pause must be UTF-8")?;
-            let mut parts = spec.splitn(3, ':');
+            let mut parts = spec.splitn(2, ':');
             let ordinal = parts
                 .next()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
                 .ok_or("cancel pause needs a positive checkpoint")?;
-            let ready = parts
-                .next()
-                .filter(|v| !v.is_empty())
-                .ok_or("cancel pause needs a ready path")?;
             let stuck = match parts.next() {
                 None => false,
                 Some("stuck") => true,
                 Some(_) => return Err("cancel pause suffix must be stuck"),
             };
-            Ok(Self {
-                ordinal,
-                ready: ready.into(),
-                stuck,
-            })
+            Ok(Self { ordinal, stuck })
         }
     }
 
-    /// `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
-    /// reaching the `k`-th checkpoint: it writes `<ready file>` and polls the
-    /// token. Normally it then returns, and the checkpoint reports the
-    /// cancellation. With `stuck` it writes `<ready file>.ack` once it has
-    /// seen the token tripped and never returns, so the run cannot finish
-    /// its cleanup and only a second signal ends it.
+    /// `PBFHOGG_TEST_CANCEL_PAUSE=<k>[:stuck]` parks the thread reaching the
+    /// `k`-th checkpoint: it announces `paused <k>` and blocks until the
+    /// token trips (the trip rings the fault plan's bell, so the wait ends
+    /// at the trip). Normally it then returns, and the checkpoint reports
+    /// the cancellation. With `stuck` it announces `cancelled <k>` once it
+    /// has seen the token tripped and never returns, so the run cannot
+    /// finish its cleanup and only a second signal ends it.
     ///
     /// `PBFHOGG_TEST_CANCEL_COUNT=<file>` counts checkpoints; [`write_count`]
     /// writes the total when the run ends.
@@ -421,26 +458,22 @@ pub(crate) mod test_hooks {
             return;
         }
         let Some(spec) = pause else { return };
-        let CancelPause {
-            ordinal: k,
-            ready,
-            stuck,
-        } = CancelPause::parse(&spec).unwrap_or_else(|error| fail(error));
+        let CancelPause { ordinal: k, stuck } =
+            CancelPause::parse(&spec).unwrap_or_else(|error| fail(error));
+        let fd = announce_fd();
         cancel.on_check(move |ordinal, token| {
             if ordinal != k {
                 return;
             }
-            write_hook(&ready, ordinal.to_string());
-            while !token.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(1)); // wait-deliberate: test child pacing its poll for cancellation
+            announce(fd, &format!("paused {k}"));
+            if !token.faults().wait_cancelled(token) {
+                fail(format_args!(
+                    "checkpoint {k} paused, but no cancellation came"
+                ));
             }
             if stuck {
-                let mut ack = ready.clone().into_os_string();
-                ack.push(".ack");
-                write_hook(std::path::Path::new(&ack), b"cancelled");
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1)); // wait-deliberate: test child parked until the test kills it
-                }
+                announce(fd, &format!("cancelled {k}"));
+                park_until_killed();
             }
         });
     }
@@ -460,18 +493,18 @@ pub(crate) mod test_hooks {
     ///   killed partway still leaves its trace. A trace or ready file that
     ///   cannot be written ends the run, so a short trace never passes for a
     ///   whole one.
-    /// - `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` with
-    ///   `PBFHOGG_TEST_PUBLISH_READY=<file>` parks the publishing thread
-    ///   after that step: it writes the ready file and never returns, so
-    ///   only a kill ends the run.
+    /// - `PBFHOGG_TEST_PUBLISH_PAUSE=<step>` parks the publishing thread
+    ///   after that step: it announces `published <step>` on
+    ///   `PBFHOGG_TEST_ANNOUNCE_FD` and never returns, so only a kill ends
+    ///   the run.
     #[allow(
         clippy::disallowed_methods,
         reason = "test-only hook files, outside every output and scratch API"
     )]
     pub(crate) fn arm_publication(cancel: &Invocation) {
-        // A trace or ready file that cannot be written ends the run: a test
-        // reading a short trace would silently skip kill points, and one
-        // waiting for a ready file would report an unreachable step.
+        // A trace that cannot be written ends the run: a test reading a
+        // short trace would silently skip kill points. (An announcement
+        // that cannot be written ends it too, in `announce`.)
         fn fail_write(what: &str, path: &std::path::Path, e: &std::io::Error) -> ! {
             crate::host::cli_note(
                 "cli.test_hooks",
@@ -511,15 +544,10 @@ pub(crate) mod test_hooks {
             },
             None => None,
         };
-        let ready = std::env::var_os("PBFHOGG_TEST_PUBLISH_READY").map(std::path::PathBuf::from);
-        if pause.is_some() != ready.is_some()
-            || ready.as_ref().is_some_and(|p| p.as_os_str().is_empty())
-        {
-            fail("publication pause needs a step and nonempty ready path together");
-        }
         if steps.is_none() && pause.is_none() {
             return;
         }
+        let fd = pause.map(|_| announce_fd());
         faults.on_publish_step(move |step| {
             if let Some(path) = &steps {
                 let appended = std::fs::OpenOptions::new()
@@ -531,15 +559,11 @@ pub(crate) mod test_hooks {
                     fail_write("publication step trace", path, &e);
                 }
             }
-            if pause == Some(step) {
-                if let Some(ready) = &ready
-                    && let Err(e) = std::fs::write(ready, step.to_string())
-                {
-                    fail_write("publication pause ready file", ready, &e);
-                }
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1)); // wait-deliberate: test child parked until the test kills it
-                }
+            if pause == Some(step)
+                && let Some(fd) = fd
+            {
+                announce(fd, &format!("published {step}"));
+                park_until_killed();
             }
         });
     }
@@ -666,27 +690,17 @@ pub(crate) mod test_hooks {
 
         #[test]
         fn pause_requires_a_reachable_checkpoint_and_a_complete_protocol() {
-            for spec in [
-                "",
-                "1",
-                "no:ready",
-                "0:ready",
-                "1:",
-                "1:ready:other",
-                "1:ready:stuck:extra",
-            ] {
+            for spec in ["", "no", "0", "1:", "1:other", "1:stuck:extra", "0:stuck"] {
                 assert!(
                     CancelPause::parse(std::ffi::OsStr::new(spec)).is_err(),
                     "{spec}"
                 );
             }
-            let pause =
-                CancelPause::parse(std::ffi::OsStr::new("2:ready:stuck")).expect("valid pause");
+            let pause = CancelPause::parse(std::ffi::OsStr::new("2:stuck")).expect("valid pause");
             assert_eq!(pause.ordinal, 2);
-            assert_eq!(pause.ready, std::path::Path::new("ready"));
             assert!(pause.stuck);
             assert!(
-                !CancelPause::parse(std::ffi::OsStr::new("1:ready"))
+                !CancelPause::parse(std::ffi::OsStr::new("1"))
                     .expect("valid pause")
                     .stuck
             );

@@ -133,23 +133,23 @@ mod tests {
         );
     }
 
+    /// The bound the disarm tests arm: long enough that the drop always
+    /// comes first. Nothing waits it out: `Drop` joins the watchdog, so a
+    /// drop that returns has proved the bound can never fire.
+    const DISARMED_BOUND: Duration = Duration::from_secs(10);
+
     #[test]
     fn a_dropped_bound_never_fires() {
-        let bound = HangBound::arm(Duration::from_millis(50), Duration::ZERO, "quick");
+        let bound = HangBound::arm(DISARMED_BOUND, Duration::ZERO, "quick");
         drop(bound);
-        // Past the deadline: the process is still here.
-        // wait-deliberate: outliving a disarmed bound is the claim under test
-        std::thread::sleep(Duration::from_millis(100));
     }
 
     #[test]
     fn a_bound_disarms_while_its_test_unwinds() {
         let outcome = std::panic::catch_unwind(|| {
-            let _bound = HangBound::arm(Duration::from_millis(50), Duration::ZERO, "unwind");
+            let _bound = HangBound::arm(DISARMED_BOUND, Duration::ZERO, "unwind");
             panic!("the operation failed");
         });
         assert!(outcome.is_err());
-        // wait-deliberate: outliving a disarmed bound is the claim under test
-        std::thread::sleep(Duration::from_millis(100));
     }
 }

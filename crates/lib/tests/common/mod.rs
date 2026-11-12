@@ -89,25 +89,45 @@ pub fn make_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
     fifo
 }
 
-/// What a [`FifoFeeder`] did: the run never opened the FIFO within
-/// `TEST_OBSERVE_BOUND`, or it did and this is how the write ended (a reader
-/// that stops early closes its end, which some callers accept).
+/// What a [`FifoFeeder`] did: no transfer began before the feeder was torn
+/// down (the run under test never met it at the FIFO), its own open failed,
+/// or a transfer began and this is how the write ended (a reader that stops
+/// early closes its end, which some callers accept).
 #[cfg(unix)]
 #[allow(dead_code)]
 pub enum Fed {
-    NeverOpened,
+    Unfed,
+    OpenFailed(std::io::Error),
     Wrote(std::io::Result<()>),
+}
+
+/// Where a [`FifoFeeder`]'s thread is; see [`FifoFeeder`].
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeedState {
+    Opening,
+    Opened,
+    Rescued,
 }
 
 /// Feeds bytes into a FIFO from a thread of its own, joined on every exit:
 /// by [`finish`](Self::finish), or by `Drop` when the test unwinds first.
-/// The writer opens non-blocking and retries until a reader has the FIFO
-/// open, so a run that never opens it leaves the feeder to give up rather
-/// than hang. A reader that opens and then stops consuming would block the
+///
+/// No time is involved. The feeder opens the FIFO for writing and blocks
+/// until a reader opens it, the kernel's own rendezvous. Teardown, which
+/// every caller reaches only after the synchronous run under test has
+/// returned (so it holds no reader), releases a feeder still blocked in its
+/// open by opening a reader itself: it marks the state `Rescued` first,
+/// and the feeder, finding that once its open returns, writes nothing and
+/// reports [`Fed::Unfed`]. A feeder whose open the run met marks `Opened`
+/// before writing, so a run that read even one byte is never reported
+/// unfed. A reader that opens and then stops consuming would block the
 /// write, so a test feeding a FIFO arms its `HangBound` first.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub struct FifoFeeder {
+    path: std::path::PathBuf,
+    state: std::sync::Arc<std::sync::Mutex<FeedState>>,
     handle: Option<std::thread::JoinHandle<Fed>>,
 }
 
@@ -115,61 +135,86 @@ pub struct FifoFeeder {
 #[allow(dead_code)]
 impl FifoFeeder {
     pub fn start(path: &Path, bytes: Vec<u8>) -> Self {
-        let path = path.to_path_buf();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FeedState::Opening));
+        let feeder_state = std::sync::Arc::clone(&state);
+        let feeder_path = path.to_path_buf();
         let handle = std::thread::spawn(move || {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            use std::os::unix::io::AsRawFd;
-            let deadline = std::time::Instant::now() + pbfhogg::TEST_OBSERVE_BOUND;
-            let mut file = loop {
-                // ENXIO until a reader has the FIFO open.
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&path)
-                {
-                    Ok(file) => break file,
-                    Err(_) if std::time::Instant::now() < deadline => {
-                        // wait-deliberate: pace of a retry for the FIFO's reader; the deadline fails
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(_) => return Fed::NeverOpened,
+            let opened = std::fs::OpenOptions::new().write(true).open(&feeder_path);
+            {
+                let mut state = feeder_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *state == FeedState::Rescued {
+                    return Fed::Unfed;
                 }
-            };
-            // Back to blocking writes now that the reader is there.
-            let fd = file.as_raw_fd();
-            // SAFETY: `fd` is open for both calls.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            assert!(flags >= 0, "F_GETFL");
-            // SAFETY: as above.
-            assert!(
-                unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } >= 0,
-                "F_SETFL"
-            );
-            Fed::Wrote(file.write_all(&bytes))
+                *state = FeedState::Opened;
+            }
+            match opened {
+                // The lock is released: never held across the write.
+                Ok(mut file) => Fed::Wrote(file.write_all(&bytes)),
+                Err(e) => Fed::OpenFailed(e),
+            }
         });
         Self {
+            path: path.to_path_buf(),
+            state,
             handle: Some(handle),
         }
     }
 
-    /// Join the feeder and say what it did.
+    /// Join the feeder, releasing it first if it is still waiting for a
+    /// reader, and say what it did.
     pub fn finish(mut self) -> Fed {
-        self.handle
-            .take()
+        self.join()
             .expect("joined once")
-            .join()
+            .expect("open the FIFO to release its feeder")
             .expect("feeder thread")
+    }
+
+    /// The feeder's outcome, or `None` once joined. The middle layer is the
+    /// rescue open's failure, after which the feeder is not joined (it may
+    /// still be blocked, and the test's `HangBound` ends that).
+    fn join(&mut self) -> Option<std::io::Result<std::thread::Result<Fed>>> {
+        let handle = self.handle.take()?;
+        let rescue = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let opening = *state == FeedState::Opening;
+            if opening {
+                *state = FeedState::Rescued;
+            }
+            opening
+        };
+        // Held until the join: the reader that completes the feeder's open.
+        let _reader = if rescue {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path)
+            {
+                Ok(reader) => Some(reader),
+                Err(e) => {
+                    // Still owned: Drop's join waits under the HangBound.
+                    self.handle = Some(handle);
+                    return Some(Err(e));
+                }
+            }
+        } else {
+            None
+        };
+        Some(Ok(handle.join()))
     }
 }
 
 #[cfg(unix)]
 impl Drop for FifoFeeder {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            // Unwinding already: the feeder's own outcome adds nothing.
-            let _joined = handle.join();
-        }
+        // Unwinding already: the feeder's own outcome adds nothing.
+        let _joined = self.join();
     }
 }
 

@@ -48,6 +48,7 @@ impl FifoCapture {
                     },
                 ];
                 // SAFETY: fds is a live array of two descriptors owned above.
+                // wait-deliberate: untimed; ends on the FIFO or the shutdown channel
                 let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
                 if ready < 0 {
                     let error = io::Error::last_os_error();

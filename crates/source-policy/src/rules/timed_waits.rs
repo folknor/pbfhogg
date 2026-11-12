@@ -18,6 +18,19 @@
 //! what the test then asserts, and a caller that catches the panic is
 //! outside it.
 //!
+//! A sleep is never a deadline bounding a wait for an event, so the sleep
+//! family ([`SLEEPS`], and libc's sleeping calls) is refused outright: no
+//! marker exempts it. A wait on something our code controls ends on a
+//! notification; a wait on something that cannot notify states why through
+//! a marked bounded wait. The only sleeps left are the [`RESIDUE`] entries,
+//! each a known site with its reason and what removes it, counted per file
+//! so a new sleep in a residue file is refused too, and a stale entry (fewer
+//! sleeps than it allows) fails until it is shrunk.
+//!
+//! libc's raw waits ([`RAW`], named as `libc::name`) take the marker rule:
+//! an explicit inventory of the spellings this tree uses, not every timed
+//! syscall there is.
+//!
 //! A spelling tripwire, not enforcement of the prose rule: a wrapper
 //! function, macro expansion, and spins on `Instant`, `yield_now` or
 //! `try_recv` are outside it, and a marker's reason is checked only for
@@ -28,11 +41,37 @@ use std::collections::BTreeSet;
 use crate::Corpus;
 use crate::lex::{Kind, Source, Tok};
 
-/// The names of std's timed waits.
+/// std's sleeps: refused everywhere but [`RESIDUE`].
+pub const SLEEPS: &[&str] = &["sleep", "sleep_until", "sleep_ms"];
+
+/// libc's sleeping calls, named as `libc::name`: refused like [`SLEEPS`].
+const RAW_SLEEPS: &[&str] = &["nanosleep", "clock_nanosleep", "usleep"];
+
+/// libc's timed waits, named as `libc::name`: marker rule.
+pub const RAW: &[&str] = &["poll", "ppoll", "epoll_wait", "select", "pselect"];
+
+/// The sleeps still in the tree: (file, how many, why, what removes it).
+/// It only shrinks. Each is a wait our code could end by notification and
+/// has not been converted yet; none is an accepted exception.
+pub const RESIDUE: &[(&str, usize, &str, &str)] = &[
+    (
+        "crates/lib/src/ordered_pool.rs",
+        1,
+        "the `eventually` test helper polls pool metrics counters, which ring nothing",
+        "a test-only notifier on the metrics counters the helper's callers wait on",
+    ),
+    (
+        "crates/lib/src/read/pipeline.rs",
+        1,
+        "`CountingRead` throttles the reader so an early consumer error is seen before \
+         the input is drained",
+        "a gated reader: block further reads at the consumer's failure, observe the \
+         pipeline's stop, then release, asserting at most the in-flight read follows",
+    ),
+];
+
+/// The names of std's timed waits other than sleeps: marker rule.
 pub const TIMED: &[&str] = &[
-    "sleep",
-    "sleep_until",
-    "sleep_ms",
     "park_timeout",
     "park_timeout_ms",
     "recv_timeout",
@@ -58,11 +97,60 @@ pub fn errors(corpus: &Corpus) -> Vec<String> {
                  the wait itself, or say why with `// wait-deliberate: <reason>`"
             ));
         }
+        let sleeps = sleeps(source);
+        let allowed = RESIDUE
+            .iter()
+            .find(|(file, ..)| *file == path)
+            .map_or(0, |(_, count, ..)| *count);
+        if sleeps.len() > allowed {
+            for (line, name) in &sleeps {
+                found.push(format!(
+                    "{path}:{line}: `{name}` sleeps; a time value survives only as a deadline \
+                     bounding a wait that ends on an event: wait for the event"
+                ));
+            }
+        } else if sleeps.len() < allowed {
+            found.push(format!(
+                "{path}: the sleep residue allows {allowed} but the file has {}; shrink RESIDUE",
+                sleeps.len()
+            ));
+        }
+    }
+    for (file, ..) in RESIDUE {
+        if !corpus.files.contains_key(*file) {
+            found.push(format!(
+                "{file}: a sleep residue entry names a missing file"
+            ));
+        }
     }
     found
 }
 
-/// Every timed-wait identifier no marker covers, with its line.
+/// `libc :: name` at `i`.
+fn is_libc(source: &Source, code: &[Tok], i: usize) -> bool {
+    i >= 3
+        && source.is_punct(&code[i - 1], ":")
+        && source.is_punct(&code[i - 2], ":")
+        && source.name(&code[i - 3]) == Some("libc")
+}
+
+/// Every sleep identifier, marked or not, with its line.
+pub fn sleeps(source: &Source) -> Vec<(usize, String)> {
+    let code = source.code();
+    let mut out = Vec::new();
+    for (i, tok) in code.iter().enumerate() {
+        let Some(name) = source.name(tok) else {
+            continue;
+        };
+        if SLEEPS.contains(&name) || (RAW_SLEEPS.contains(&name) && is_libc(source, &code, i)) {
+            out.push((tok.line, name.to_owned()));
+        }
+    }
+    out
+}
+
+/// Every timed-wait identifier no marker covers, with its line. Sleeps are
+/// [`sleeps`]' business, marked or not.
 pub fn unmarked(source: &Source) -> Vec<(usize, String)> {
     let code = source.code();
     let marked = marked_lines(source);
@@ -71,7 +159,8 @@ pub fn unmarked(source: &Source) -> Vec<(usize, String)> {
         let Some(name) = source.name(tok) else {
             continue;
         };
-        if !TIMED.contains(&name) || marked.contains(&tok.line) {
+        let timed = TIMED.contains(&name) || (RAW.contains(&name) && is_libc(source, &code, i));
+        if !timed || marked.contains(&tok.line) {
             continue;
         }
         if RECEIVES.contains(&name) && panics_on_expiry(source, &code, i) {
@@ -147,7 +236,7 @@ fn marked_lines(source: &Source) -> BTreeSet<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::unmarked;
+    use super::{sleeps, unmarked};
     use crate::lex::Source;
 
     fn names(src: &str) -> Vec<String> {
@@ -157,13 +246,59 @@ mod tests {
             .collect()
     }
 
+    fn sleep_names(src: &str) -> Vec<String> {
+        sleeps(&Source::new(src.to_owned()))
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
     #[test]
-    fn timed_waits_are_refused_in_every_spelling() {
+    fn sleeps_are_found_marked_or_not() {
         for src in [
             "fn f() { std::thread::sleep(d); }",
             "use std::thread::sleep as nap;",
             "fn f() { let p = std::thread::sleep; }",
             "fn f() { r#sleep(d); }",
+            "fn f() { std::thread::sleep(d); } // wait-deliberate: a reason",
+            "fn f() { libc::nanosleep(a, b); }",
+            "fn f() { libc::usleep(1); }",
+        ] {
+            assert_eq!(sleep_names(src).len(), 1, "{src}");
+            assert!(
+                names(src).is_empty(),
+                "{src}: sleeps are not marker business"
+            );
+        }
+        for src in [
+            "// std::thread::sleep(d);",
+            "fn f() { let s = \"std::thread::sleep(d)\"; }",
+            "fn f() { asleep(d); sleeper(); }",
+            "fn f() { my::nanosleep(a); }",
+        ] {
+            assert!(sleep_names(src).is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn libc_raw_waits_take_the_marker_rule() {
+        assert_eq!(names("fn f() { libc::poll(p, 1, t); }"), ["poll"]);
+        assert_eq!(names("fn f() { libc::ppoll(p, 1, t, s); }"), ["ppoll"]);
+        for src in [
+            "fn f() { libc::poll(p, 1, t); } // wait-deliberate: a reason",
+            "fn f() { fut.poll(cx); }",
+            "fn f() { Pin::new(&mut f).poll(cx); }",
+        ] {
+            assert!(names(src).is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn timed_waits_are_refused_in_every_spelling() {
+        for src in [
+            "use std::thread::park_timeout as nap;",
+            "fn f() { let p = std::thread::park_timeout; }",
+            "fn f() { r#park_timeout(d); }",
             "fn f() { std::thread::park_timeout(d); }",
             "fn f() { Receiver::recv_timeout(&rx, d).unwrap(); }",
             "fn f() { let _ = rx.recv_timeout(d); }",
@@ -173,7 +308,7 @@ mod tests {
             "fn f() { cv.wait_timeout(g, d).unwrap(); }",
             "fn f() { cv.wait_timeout_while(g, d, |s| *s).expect(\"lock\"); }",
             "fn f() { let recv_timeout = d; }",
-            "fn f() { std::thread::sleep(d); } // wait-deliberate:",
+            "fn f() { std::thread::park_timeout(d); } // wait-deliberate:",
         ] {
             assert_eq!(names(src).len(), 1, "{src}");
         }
@@ -186,11 +321,11 @@ mod tests {
             "fn f() { rx.recv_timeout(g(h(d))).expect(\"msg\"); }",
             "fn f() {\n    rx\n        .recv_timeout(d)\n        .expect(\"msg\");\n}",
             "fn f() { rx.recv_deadline(t).unwrap(); }",
-            "fn f() { std::thread::sleep(d); } // wait-deliberate: a reason",
-            "fn f() {\n    // wait-deliberate: a reason\n    std::thread::sleep(d);\n}",
-            "// std::thread::sleep(d);",
-            "fn f() { let s = \"std::thread::sleep(d)\"; }",
-            "fn f() { asleep(d); sleeper(); }",
+            "fn f() { std::thread::park_timeout(d); } // wait-deliberate: a reason",
+            "fn f() {\n    // wait-deliberate: a reason\n    std::thread::park_timeout(d);\n}",
+            "// std::thread::park_timeout(d);",
+            "fn f() { let s = \"std::thread::park_timeout(d)\"; }",
+            "fn f() { park_timeouts(d); }",
         ] {
             assert!(names(src).is_empty(), "{src}");
         }
@@ -199,9 +334,9 @@ mod tests {
     #[test]
     fn a_marker_covers_only_its_line_or_the_next() {
         for src in [
-            "fn f() {\n    // wait-deliberate: a reason\n\n    std::thread::sleep(d);\n}",
-            "fn f() { let a = 1; // wait-deliberate: a reason\n    std::thread::sleep(d);\n}",
-            "fn f() { /* // wait-deliberate: a reason */ std::thread::sleep(d); }",
+            "fn f() {\n    // wait-deliberate: a reason\n\n    std::thread::park_timeout(d);\n}",
+            "fn f() { let a = 1; // wait-deliberate: a reason\n    std::thread::park_timeout(d);\n}",
+            "fn f() { /* // wait-deliberate: a reason */ std::thread::park_timeout(d); }",
         ] {
             assert_eq!(names(src).len(), 1, "{src}");
         }

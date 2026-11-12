@@ -47,13 +47,12 @@
 //! before asserting success - tmpfs / overlayfs and hosts with low
 //! `RLIMIT_MEMLOCK` are common.
 
-use crate::common::process::OwnedChild;
+use crate::common::process::{OwnedChild, Readiness};
 use pbfhogg_test_scratch::TestScratch;
 use std::ffi::OsStr;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::Duration;
 
 /// The exit status base of a [`CliInvoker::bind_mounted`] child whose
 /// namespace setup the host refused; the failed step is added.
@@ -83,6 +82,38 @@ pub struct CliInvoker<'a> {
     scratch: &'a TestScratch,
     cmd: Command,
     stderr_closed: bool,
+    /// The read end of the announcement pipe, once a pause hook is armed.
+    announcements: Option<std::os::fd::OwnedFd>,
+}
+
+/// The variable naming the descriptor a paused child announces on.
+pub const ANNOUNCE_FD_ENV: &str = "PBFHOGG_TEST_ANNOUNCE_FD";
+
+/// The longest announcement line a child writes, newline included; a longer
+/// one is a protocol failure, not a line still arriving.
+const ANNOUNCEMENT_MAX: usize = 256;
+
+/// What a paused child announces, one line each, on the pipe
+/// [`CliInvoker::cancel_pause`] and [`CliInvoker::publish_pause`] hand it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Announcement {
+    /// The thread reaching checkpoint `k` is parked, waiting for the token.
+    Paused(u64),
+    /// The parked thread at checkpoint `k` saw the token trip (a `stuck` pause).
+    Cancelled(u64),
+    /// The publishing thread is parked after this step.
+    Published(String),
+}
+
+impl std::fmt::Display for Announcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused(k) => write!(f, "paused {k}"),
+            Self::Cancelled(k) => write!(f, "cancelled {k}"),
+            Self::Published(step) => write!(f, "published {step}"),
+        }
+    }
 }
 
 impl<'a> CliInvoker<'a> {
@@ -95,8 +126,49 @@ impl<'a> CliInvoker<'a> {
             scratch,
             cmd,
             stderr_closed: false,
+            announcements: None,
         }
         .resources(CHILD_CORES, Some(CHILD_MEMORY))
+    }
+
+    /// Hand the child the write end of an announcement pipe, once: at the
+    /// number it has here, with `FD_CLOEXEC` cleared in the child only, as
+    /// the guard hands its lease. The `Command` owns this process's copy and
+    /// drops it at spawn, so afterwards only the child holds a writer.
+    fn announce_pipe(&mut self) {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        if self.announcements.is_some() {
+            return;
+        }
+        let (reader, writer) = std::io::pipe().expect("announcement pipe");
+        let reader = OwnedFd::from(reader);
+        // SAFETY: fcntl on a live owned descriptor; nonblocking so a partial
+        // line never holds a read past the child's deadline.
+        unsafe {
+            let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+            assert!(
+                flags >= 0
+                    && libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                        >= 0,
+                "announcement pipe flags"
+            );
+        }
+        let writer = OwnedFd::from(writer);
+        assert!(writer.as_raw_fd() > 2, "the announcement pipe is not stdio");
+        self.cmd
+            .env(ANNOUNCE_FD_ENV, writer.as_raw_fd().to_string());
+        // SAFETY: the closure runs between fork and exec and calls only
+        // `fcntl`, which is async-signal-safe; it allocates nothing.
+        unsafe {
+            self.cmd.pre_exec(move || {
+                if libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        self.announcements = Some(reader);
     }
 
     /// The sizing inputs the child resolves instead of probing the runner:
@@ -133,21 +205,16 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
-    /// Park the thread reaching checkpoint `ordinal`: the child writes
-    /// `ready` and waits for cancellation; `stuck` keeps it parked after
-    /// cancellation (writing `ready` plus `.ack`). The hook's wire form is
-    /// colon-separated, so `ready` must be UTF-8 without a colon.
+    /// Park the thread reaching checkpoint `ordinal`: the child announces
+    /// [`Announcement::Paused`] and waits for cancellation; `stuck` keeps it
+    /// parked after cancellation, announcing [`Announcement::Cancelled`].
+    /// Wait for both with [`RunningCli::wait_announcement`].
     #[allow(dead_code)]
-    pub fn cancel_pause(mut self, ordinal: NonZeroU64, ready: &Path, stuck: bool) -> Self {
-        let ready = ready
-            .to_str()
-            .filter(|r| !r.is_empty() && !r.contains(':'))
-            .expect("cancel pause ready path is nonempty UTF-8 without a colon");
+    pub fn cancel_pause(mut self, ordinal: NonZeroU64, stuck: bool) -> Self {
+        self.announce_pipe();
         let suffix = if stuck { ":stuck" } else { "" };
-        self.cmd.env(
-            "PBFHOGG_TEST_CANCEL_PAUSE",
-            format!("{ordinal}:{ready}{suffix}"),
-        );
+        self.cmd
+            .env("PBFHOGG_TEST_CANCEL_PAUSE", format!("{ordinal}{suffix}"));
         self
     }
 
@@ -196,13 +263,13 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
-    /// Pause at a typed publication step and announce it at `ready`.
+    /// Pause after a typed publication step, announcing
+    /// [`Announcement::Published`].
     #[cfg(pbfhogg_test_hooks)]
     #[allow(dead_code)]
-    pub fn publish_pause(mut self, step: pbfhogg::test_hooks::PublishStep, ready: &Path) -> Self {
-        self.cmd
-            .env("PBFHOGG_TEST_PUBLISH_PAUSE", step.to_string())
-            .env("PBFHOGG_TEST_PUBLISH_READY", ready);
+    pub fn publish_pause(mut self, step: pbfhogg::test_hooks::PublishStep) -> Self {
+        self.announce_pipe();
+        self.cmd.env("PBFHOGG_TEST_PUBLISH_PAUSE", step.to_string());
         self
     }
 
@@ -453,9 +520,16 @@ impl<'a> CliInvoker<'a> {
         }
         guard(&mut self.cmd);
         let owner = OwnedChild::spawn(&mut self.cmd, self.scratch).expect("spawn pbfhogg");
+        // Drop this process's copy of the announcement writer now, so the
+        // child holds the only one.
+        drop(self.cmd);
         let own = std::time::Instant::now() + pbfhogg::TEST_CHILD_TIMEOUT;
         let deadline = owner.budget().map_or(own, |budget| own.min(budget));
-        RunningCli { owner, deadline }
+        RunningCli {
+            owner,
+            deadline,
+            announcements: self.announcements.map(|fd| (fd, Vec::new())),
+        }
     }
 
     /// Run and assert exit status is success. Returns captured output
@@ -493,13 +567,16 @@ impl<'a> CliInvoker<'a> {
 pub struct RunningCli<'a> {
     owner: OwnedChild<'a>,
     deadline: std::time::Instant,
+    /// The announcement pipe's read end and the bytes read past the last
+    /// whole line, when a pause hook is armed.
+    announcements: Option<(std::os::fd::OwnedFd, Vec<u8>)>,
 }
 
-/// How a [`RunningCli::wait_for_file`] ended without the file appearing.
+/// How a [`RunningCli::wait_announcement`] ended without the announcement.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
-pub enum NoFile {
-    /// The child exited first.
+pub enum NoAnnouncement {
+    /// The child exited first, announcing nothing more.
     Exited,
     /// The child's deadline passed.
     Expired,
@@ -511,28 +588,98 @@ impl RunningCli<'_> {
         self.owner.signal(signal).expect("signal pbfhogg");
     }
 
-    pub fn has_exited(&mut self) -> bool {
-        self.owner.has_exited().expect("inspect child")
-    }
-
-    /// Poll for `path`, a file the child writes (a pause point's ready
-    /// file), until it appears, the child exits, or the child's deadline
-    /// passes. `Ok` means the child was still running after the file
-    /// appeared, so it can still be signalled: once its exit is seen (and it
-    /// is reaped) the answer is `Exited`, even if the file appeared just
-    /// before, since a signal to a reaped PID could reach another process.
-    pub fn wait_for_file(&mut self, path: &std::path::Path) -> Result<(), NoFile> {
+    /// Block until the child announces `expected`, exits, or reaches its
+    /// deadline: the pipe and the child's exit are waited on together, so
+    /// the announcement ends the wait the moment it is written. Nothing here
+    /// reaps the child, so after `Ok` it can be signalled even if it has
+    /// since exited (the signal then reaches only its zombie). What the
+    /// child wrote before exiting is read before its exit is reported. An
+    /// announcement other than `expected`, a malformed or overlong line, or
+    /// a pipe closed while the child was not seen to exit fails the test.
+    #[allow(
+        clippy::unwrap_in_result,
+        reason = "the Err cases are outcomes a test branches on; a broken protocol fails the test"
+    )]
+    pub fn wait_announcement(&mut self, expected: &Announcement) -> Result<(), NoAnnouncement> {
+        use std::os::fd::{AsFd, AsRawFd};
+        let (fd, pending) = self
+            .announcements
+            .as_mut()
+            .expect("no pause hook was armed, so nothing announces");
+        // Set once the child is seen to have exited: from then on the pipe
+        // holds all it will ever hold, so a read that finds nothing ends it.
+        let mut exited = false;
         loop {
-            if self.has_exited() {
-                return Err(NoFile::Exited);
-            }
-            if path.exists() {
+            if let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                let line = String::from_utf8_lossy(&line[..end]).into_owned();
+                assert_eq!(
+                    line,
+                    expected.to_string(),
+                    "the child announced something other than what the test waits for"
+                );
                 return Ok(());
             }
-            if std::time::Instant::now() >= self.deadline {
-                return Err(NoFile::Expired);
+            assert!(
+                pending.len() < ANNOUNCEMENT_MAX,
+                "an announcement longer than {ANNOUNCEMENT_MAX} bytes: {:?}",
+                String::from_utf8_lossy(pending)
+            );
+            let mut chunk = [0_u8; ANNOUNCEMENT_MAX];
+            // SAFETY: reads into a live buffer from a live owned descriptor.
+            let n = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            match n {
+                0 => {
+                    // Every writer is gone: the child exited, or closed a
+                    // descriptor it promised to keep.
+                    assert!(
+                        pending.is_empty(),
+                        "the announcement pipe closed mid-line: {:?}",
+                        String::from_utf8_lossy(pending)
+                    );
+                    // A process closes its descriptors just before it
+                    // becomes a zombie, so wait (bounded) for the exit
+                    // itself before calling the pipe closed early.
+                    let exited = self
+                        .owner
+                        .wait_exited(self.deadline)
+                        .expect("observe the child");
+                    assert!(
+                        exited,
+                        "the announcement pipe closed while the child was not seen to exit"
+                    );
+                    return Err(NoAnnouncement::Exited);
+                }
+                n if n > 0 => {
+                    let n = usize::try_from(n).expect("positive read length");
+                    pending.extend_from_slice(&chunk[..n]);
+                    continue;
+                }
+                _ => {
+                    let error = std::io::Error::last_os_error();
+                    match error.kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock if exited => {
+                            // An exited child holds no writer, so only a
+                            // descriptor leaked to another process can
+                            // leave the pipe open and empty.
+                            panic!("the child exited but its announcement pipe is still open");
+                        }
+                        std::io::ErrorKind::WouldBlock => {}
+                        _ => panic!("read the announcement pipe: {error}"),
+                    }
+                }
             }
-            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; the child's deadline fails
+            match self
+                .owner
+                .wait_readable(fd.as_fd(), self.deadline)
+                .expect("wait for an announcement")
+            {
+                Readiness::Readable => {}
+                // Read what it wrote before exiting, then its EOF.
+                Readiness::Exited => exited = true,
+                Readiness::Expired => return Err(NoAnnouncement::Expired),
+            }
         }
     }
 
@@ -763,12 +910,7 @@ mod tests {
             (
                 "PBFHOGG_TEST_PUBLISH_PAUSE",
                 "installed:0",
-                "publication pause needs",
-            ),
-            (
-                "PBFHOGG_TEST_PUBLISH_READY",
-                "ready",
-                "publication pause needs",
+                "needs PBFHOGG_TEST_ANNOUNCE_FD",
             ),
         ] {
             let mut invoker = CliInvoker::new(&scratch).arg("--version");
@@ -818,16 +960,17 @@ mod tests {
     fn malformed_checkpoint_and_replacement_hooks_fail_explicitly() {
         let scratch = pbfhogg_test_scratch::scratch();
         for (key, value, message) in [
+            ("PBFHOGG_TEST_CANCEL_PAUSE", "0", "positive checkpoint"),
+            ("PBFHOGG_TEST_CANCEL_PAUSE", "1:", "suffix must be stuck"),
             (
                 "PBFHOGG_TEST_CANCEL_PAUSE",
-                "0:ready",
-                "positive checkpoint",
-            ),
-            ("PBFHOGG_TEST_CANCEL_PAUSE", "1:", "ready path"),
-            (
-                "PBFHOGG_TEST_CANCEL_PAUSE",
-                "1:ready:other",
+                "1:other",
                 "suffix must be stuck",
+            ),
+            (
+                "PBFHOGG_TEST_CANCEL_PAUSE",
+                "1",
+                "needs PBFHOGG_TEST_ANNOUNCE_FD",
             ),
             ("PBFHOGG_TEST_CANCEL_COUNT", "", "cancel count needs a path"),
             (

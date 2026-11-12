@@ -3,6 +3,7 @@
 
 pub mod counters;
 pub mod detached_threads;
+pub mod duration_literals;
 pub mod entropy;
 pub mod io_sizes;
 pub mod library_text;

@@ -1499,7 +1499,10 @@ pub const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub const TEST_CHILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 /// Bounded cleanup and pipe completion, including a descendant holding a pipe open.
 pub const TEST_CHILD_CLEANUP: std::time::Duration = std::time::Duration::from_secs(1);
-/// Test child polling avoids a busy wait while keeping cleanup responsive.
+/// How often a test child's exit is re-checked on a kernel without
+/// `pidfd_open` (before Linux 5.3), the one case where nothing notifies a
+/// non-reaping waiter of the exit; with a pidfd every child wait ends on the
+/// exit itself. Not a failure bound.
 pub const TEST_CHILD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// Keep the first and last MiB of child output, draining everything else.
 pub const TEST_CHILD_CAPTURE_EDGE: usize = 1024 * 1024;

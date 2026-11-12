@@ -45,6 +45,12 @@ fn run_held<T: Send + 'static>(
     expected: u64,
     call: impl FnOnce() -> T + Send + 'static,
 ) -> T {
+    // Declared first, so it also bounds the release guard's join.
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the held library pool call did not end",
+    );
     let faults = invocation.faults();
     faults.hold_built_pool_threads.store(true, SeqCst);
     let observer = invocation.clone();
@@ -69,7 +75,7 @@ fn run_held<T: Send + 'static>(
         faults.built_pool_joins_started.load(SeqCst)
     );
     faults.release_built_pool_threads();
-    let (result, hooks_done) = done_rx.recv_timeout(pbfhogg::TEST_HANG_BOUND).unwrap();
+    let (result, hooks_done) = done_rx.recv().unwrap();
     assert_eq!(
         faults.built_pool_threads_held.load(SeqCst),
         expected,

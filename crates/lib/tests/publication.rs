@@ -10,6 +10,8 @@ use pbfhogg::host::Invocation;
 use pbfhogg::{BoundOutput, CancelOutcome, Decision, Effect, Publication};
 
 /// Bound on every park; see the test time bounds in the library's tunables.
+/// Each test that parks also carries one fail-stop bound over all its parks,
+/// so a sequence of them cannot outrun the runner's watchdog.
 #[cfg(pbfhogg_test_hooks)]
 const PARK: std::time::Duration = pbfhogg::TEST_HANG_BOUND;
 
@@ -81,6 +83,11 @@ fn reversed_creation_and_publication_order() {
 #[cfg(pbfhogg_test_hooks)]
 #[test]
 fn ordinal_order_is_execution_order_with_a_hook_parked() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the parked publications did not finish",
+    );
     let dir = crate::common::test_scratch();
     let invocation = Invocation::new();
     let (parked_tx, parked_rx) = mpsc::channel();
@@ -299,6 +306,11 @@ mod faults {
     /// only a unit still pending.
     #[test]
     fn cancel_parked_against_a_decision_from_both_sides() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            pbfhogg::TEST_HANG_BOUND,
+            pbfhogg::TEST_HANG_REPORT_GRACE,
+            "the parked publications did not finish",
+        );
         let dir = crate::common::test_scratch();
 
         // The cancel first.

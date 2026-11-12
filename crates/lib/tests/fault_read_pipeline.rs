@@ -52,6 +52,12 @@ fn reorder_high_water(invocation: &Invocation) -> u64 {
 
 #[test]
 fn admission_high_water_bounded_under_slow_first_decode() {
+    // Declared first, so it also bounds the driver's release and join.
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "pipeline did not finish after releasing decode hook",
+    );
     let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 16);
@@ -86,8 +92,8 @@ fn admission_high_water_bounded_under_slow_first_decode() {
 
     faults.release_blocked_decode();
     let result = done_rx
-        .recv_timeout(pbfhogg::TEST_HANG_BOUND)
-        .expect("pipeline did not finish after releasing decode hook");
+        .recv()
+        .expect("pipeline driver ended without a result");
     driver.release_and_join();
     result.unwrap();
 

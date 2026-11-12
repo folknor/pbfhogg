@@ -90,6 +90,7 @@ pub fn audit(root: &Path) -> Vec<String> {
     found.extend(rules::test_imports::errors(&corpus));
     found.extend(rules::test_modules::errors(&corpus));
     found.extend(rules::library_text::errors(&corpus));
+    found.extend(rules::detached_threads::errors(&corpus));
     found
 }
 

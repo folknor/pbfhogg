@@ -15,7 +15,20 @@ use std::time::{Duration, Instant};
 
 /// Deliberate inherited values only. Hook and instrumentation variables never
 /// enter the child unless the caller sets them after this function.
+///
+/// Also the parent-death signal every test child carries: the kernel
+/// `SIGKILL`s the child when the thread that spawned it ends, so a test
+/// binary that dies without unwinding (an expired
+/// `pbfhogg_test_scratch::HangBound` aborts it) leaves no child running on
+/// its scratch. Call this right after `Command::new`, before any other
+/// `pre_exec` hook, so the promise guard's filter stays the last hook. The
+/// signal is keyed to the spawning thread, which is sound because every test
+/// child is spawned, owned and reaped by its test's own thread. It reaches
+/// the direct child only: a descendant does not inherit it, which the
+/// guarded pbfhogg binary and the harness never start; the osmium oracle is
+/// trusted not to leave one.
 pub fn isolate(cmd: &mut Command, scratch: &TestScratch) {
+    parent_death_kill(cmd);
     cmd.env_clear()
         .current_dir(scratch.path())
         .stdin(Stdio::null());
@@ -33,6 +46,28 @@ pub fn isolate(cmd: &mut Command, scratch: &TestScratch) {
         }
     }
     cmd.env("TMPDIR", scratch.path());
+}
+
+/// Register the parent-death `SIGKILL` (see [`isolate`]). The parent PID is
+/// read before the fork; a child whose parent already died between the fork
+/// and the `prctl` has been reparented, sees another PID and exits at once.
+fn parent_death_kill(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: getpid has no preconditions.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: the closure runs between fork and exec and calls only
+    // async-signal-safe functions (`prctl`, `getppid`, `_exit`).
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(127);
+            }
+            Ok(())
+        });
+    }
 }
 
 struct Capture {

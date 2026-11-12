@@ -2,6 +2,7 @@
 //! carries its own in-memory fixtures.
 
 pub mod counters;
+pub mod detached_threads;
 pub mod entropy;
 pub mod io_sizes;
 pub mod library_text;

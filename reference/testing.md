@@ -318,7 +318,20 @@ A test's own failure bounds (the hook wait, the hang bound of the timeout
 helpers, the observation bound of unit tests, the harness rendezvous, the
 child timeout) are the "Test time bounds" in `crates/lib/src/tunables.rs`,
 const-asserted below a mirror of that watchdog so a broken run fails with a
-named message before the watchdog kills it unnamed. A test never infers that
+named message before the watchdog kills it unnamed. A wait whose defect
+would be a hang is a `pbfhogg_test_scratch::HangBound` armed at
+`TEST_HANG_BOUND`, declared first in the test so it also bounds the release
+guards and joins after it, with the operation on the test thread: a hung
+thread cannot be joined, so on expiry it writes one line naming the test to
+stderr and aborts the test binary rather than panicking past a thread left
+running under later tests (brokkr reports the binary killed by signal 6
+while running that test). A test whose waits are several in sequence
+carries one such bound over all of them. Abort orphans no child: every test
+child carries a parent-death `SIGKILL` (`common::process::isolate`), keyed
+to the thread that spawned it, which is why a test child is always spawned,
+owned and reaped by its test's own thread. No test throws away a
+`thread::spawn` handle (the source-policy detached-threads rule, a lexical
+tripwire). A test never infers that
 another thread blocked from elapsed time: it waits (bounded) for an
 observation made at the wait itself - a `test_support::Parked` count under a
 primitive's mutex, a fault-plan hook at a join or a lock, a slow-path tally -
@@ -692,7 +705,8 @@ exception, not a tier - should not survive across many PRs.
   the same owner as `spawn().wait()`. Pipe reads are nonblocking, capture
   errors fail explicitly, and cleanup and EOF waits are bounded, including
   when another writer holds a pipe open. Output keeps the first and last MiB.
-  The default cwd and `TMPDIR` are the borrowed scratch and stdin is null.
+  The default cwd and `TMPDIR` are the borrowed scratch and stdin is null,
+  and the child is `SIGKILL`ed if the thread that spawned it ends.
   The environment is cleared, retaining only PATH, HOME, LANG, LC_ALL,
   LC_CTYPE, LC_MESSAGES and TZ when present. Hook, profiler and
   brokkr variables enter only through explicit setters. One setter is

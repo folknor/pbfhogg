@@ -101,30 +101,29 @@ caller pin; `crates/lib/tests/fault_apply_changes.rs` still uses it too. Residue
 caller-pin entry point on each of the two commands, and migrating the apply-changes
 fault test.
 
-## VER-023 - Hang helpers still detach the work they time out
-
-`ordered_pool.rs` `within_deadline`, `assert_completes` in `read/pipeline.rs` and
-`read/reader.rs`, the early-drop tests in `crates/lib/tests/read_paths.rs` and
-`renumber_within_deadline` in `renumber_external.rs` all bound the operation by
-`TEST_HANG_BOUND` (below the runner watchdog), but on expiry they panic and leave the
-timed-out thread running under later tests, with the fixture directory removed under it.
-Ending the process on expiry (write the reason to fd 2, abort) was argued and rejected:
-abort skips `OwnedChild`'s kill-on-drop, and nothing gives test children a parent-death
-signal, so a sibling test's child (`common/oracle.rs`, `CliInvoker`) would outlive the
-binary on its scratch. Even a joined helper cannot bound a thread's thread-local
-teardown in-process (`JoinHandle::is_finished` covers the main function only). Residue:
-run irrecoverable hang probes in a killable child (or give every test child a
-parent-death signal first, then fail-stop), and a ban on discarded test thread handles
-outside such targets.
-
 ## VER-026 - The watchdog the test bounds sit under is a copy
 
-Every test time bound now lives in `crates/lib/src/tunables.rs` ("Test time bounds")
-and is const-asserted below `TEST_RUNNER_WATCHDOG`, a mirror of brokkr's fixed 20 s
+Every test time bound lives in `crates/lib/src/tunables.rs` ("Test time bounds") and
+is const-asserted below `TEST_RUNNER_WATCHDOG`, a mirror of brokkr's fixed 20 s
 per-test watchdog: brokkr does not expose that value to the test process, so a change
-there is not seen (bz brokkr ticket filed with this change). Bounds are checked one by
-one: a test that waits on several in sequence, or starts one late, can still reach the
-watchdog unnamed; no test carries one deadline through its waits.
+there is not seen (bz brokkr#171). Library hang waits now carry one fail-stop
+`HangBound` over the whole scenario, but tests outside them still wait on bounds in
+sequence: a CLI test that runs several children, each under `TEST_CHILD_TIMEOUT`
+(10 s), can reach the watchdog unnamed, and CLI tests cannot name `TEST_HANG_BOUND`
+through the test-import audit (`crates/source-policy/src/rules/test_imports.rs`).
+
+## VER-137 - Literal test bounds and a handle joined only on success
+
+Found while closing the hang-helper work. Failure bounds still written as literals
+outside "Test time bounds": `read/decompress.rs` (5 s; its worker handle is dropped
+unjoined on expiry), the 5 s deadline loops in `ordered_pool.rs` and
+`coord_payloads.rs`, the `read/pipeline.rs` stalled-transform and teardown tests (5 s,
+10 s), `crates/cli/src/signals.rs` `BOUND` (10 s), the `fault_inspect_input.rs` and
+`fault_degrade_input.rs` feeders (10 s), and the `cli_output_contract.rs` loops and
+`READY_TIMEOUT`. `crates/lib/tests/seal.rs` joins its two spawned threads only on the
+success path - a named handle dropped on an assertion failure, which the
+detached-threads source rule (statement and `let _` discards only) cannot see.
+`capabilities.rs` bounds a thread rendezvous with `TEST_CHILD_TIMEOUT`.
 
 ## VER-132 - Nothing stops a test inferring a block from elapsed time
 

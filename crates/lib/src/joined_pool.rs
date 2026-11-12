@@ -150,6 +150,12 @@ mod tests {
     /// unwinding until every worker has exited.
     #[test]
     fn an_unwinding_owner_waits_for_its_workers() {
+        // Declared first, so it also bounds the release guard's join.
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "the unwinding owner did not finish",
+        );
         let invocation = crate::host::Invocation::new();
         invocation
             .faults()
@@ -178,9 +184,7 @@ mod tests {
             "the pool threads did not reach their exit hook, or the owner its join"
         );
         faults.release_built_pool_threads();
-        let (unwound, done) = done_rx
-            .recv_timeout(crate::tunables::TEST_HANG_BOUND)
-            .unwrap();
+        let (unwound, done) = done_rx.recv().unwrap();
         assert!(unwound);
         assert_eq!(done, 2, "both workers finished before the unwind did");
         assert!(!faults.built_pool_hook_timed_out.load(SeqCst));

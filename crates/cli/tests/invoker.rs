@@ -926,6 +926,38 @@ mod tests {
         }
     }
 
+    /// Every test child dies with the thread that spawned it, which is what
+    /// lets an expired hang bound abort the binary without orphaning one:
+    /// a child blocked forever on its input is killed when its spawning
+    /// thread ends, before its owner (moved out of that thread) kills it.
+    #[test]
+    fn a_test_child_is_killed_when_its_spawning_thread_ends() {
+        use super::OwnedChild;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+
+        let scratch = pbfhogg_test_scratch::scratch();
+        let (reader, _gate) = UnixStream::pair().expect("input gate");
+        let mut child = std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut command = Command::new("/bin/sh");
+                crate::common::process::isolate(&mut command, &scratch);
+                command
+                    .args(["-c", "read value"])
+                    .stdin(Stdio::from(OwnedFd::from(reader)));
+                OwnedChild::spawn(&mut command, &scratch).expect("gated child")
+            })
+            .join()
+            .expect("spawning thread")
+        });
+        let output = child
+            .wait(pbfhogg::TEST_CHILD_TIMEOUT)
+            .expect("the parent-death signal ends the child");
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+    }
+
     #[test]
     fn cli_invoker_has_an_explicit_execution_policy() {
         let scratch = pbfhogg_test_scratch::scratch();

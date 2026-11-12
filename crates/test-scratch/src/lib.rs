@@ -1,6 +1,8 @@
 //! The one owner of test scratch for every pbfhogg test harness: the
 //! library's unit and integration tests, the CLI's and the library
-//! harness's. Dev-only; nothing shipped depends on it.
+//! harness's. Dev-only; nothing shipped depends on it. It also holds the
+//! other support every harness shares and that needs nothing from pbfhogg:
+//! the repository root and the fail-stop hang bound ([`HangBound`]).
 //!
 //! Every scratch directory is a random child of the workspace's gitignored
 //! `data/test-scratch`. Random names cannot collide between tests, sweeps or
@@ -14,6 +16,9 @@
 //! The location is fixed relative to this crate: the workspace is two levels
 //! above `crates/test-scratch`. It is not relocatable; a test binary run from
 //! a moved or read-only checkout still names the tree it was compiled in.
+
+mod hang;
+pub use hang::HangBound;
 
 use std::fs::{File, FileType};
 use std::io;

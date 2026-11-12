@@ -1827,30 +1827,16 @@ mod tests {
         usize::try_from(first_data.offset().unwrap().0).unwrap()
     }
 
-    /// Run `f` on a helper thread and fail loudly if it does not finish within a
-    /// generous window - a deadlock would otherwise hang the whole test binary.
-    /// Returns the thread result so callers can assert an expected panic.
-    #[allow(clippy::unwrap_in_result)]
-    fn assert_completes<F, T>(label: &str, f: F) -> std::thread::Result<T>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = mpsc::sync_channel::<()>(1);
-        let handle = std::thread::spawn(move || {
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            if tx.send(()).is_err() {
-                // Watchdog already timed out and dropped the receiver; the
-                // panic below has fired and this result is unobserved.
-            }
-            out
-        });
-        match rx.recv_timeout(crate::tunables::TEST_HANG_BOUND) {
-            Ok(()) => handle
-                .join()
-                .expect("watchdog thread itself failed to join"),
-            Err(_) => panic!("{label}: did not complete within timeout - deadlock"),
-        }
+    /// Run `f` under a fail-stop hang bound: a deadlock ends the test binary
+    /// with `label` and the test's name instead of detaching a hung thread.
+    /// Returns the caught result so callers can assert an expected panic.
+    fn assert_completes<T>(label: &str, f: impl FnOnce() -> T) -> std::thread::Result<T> {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            label,
+        );
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
     }
 
     /// A `Read` that serves `data[..panic_at]` then panics on any further read,

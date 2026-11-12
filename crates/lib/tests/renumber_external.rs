@@ -1,6 +1,6 @@
 //! End-to-end tests for renumber.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::common::adversarial::{
     mutate_blob_header_indexdata, mutate_blob_payload, set_relation_memids_terminator_continuation,
@@ -1206,22 +1206,6 @@ fn run_renumber(
     .map_err(|e| e.to_string())
 }
 
-/// Run renumber on its own thread and fail the test if it has not returned
-/// within ten seconds. The defect these tests pin was a hang, which should
-/// fail as one rather than run into the harness watchdog. The outer `Err`
-/// is the timeout.
-fn renumber_within_deadline(
-    input: PathBuf,
-    output: PathBuf,
-) -> Result<Result<RenumberStats, String>, std::sync::mpsc::RecvTimeoutError> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // The receiver is gone only if the deadline already failed.
-        tx.send(run_renumber(&input, &output, &default_opts())).ok();
-    });
-    rx.recv_timeout(pbfhogg::TEST_HANG_BOUND)
-}
-
 const HUNG: &str = "renumber hung on a mid-stream error instead of failing";
 
 fn plain_node(id: i64) -> TestNode<'static> {
@@ -1279,16 +1263,22 @@ fn frame(kind_offset: i64, i: i64) -> usize {
     usize::try_from(1 + kind_offset * MANY + i).expect("frame index")
 }
 
+/// The defect these tests pin was a hang: one fail-stop bound covers the
+/// whole scenario, both runs included, and ends the test binary naming the
+/// test rather than detaching a hung run or meeting the harness watchdog.
 fn assert_fails_promptly(mutate: impl FnOnce(&[u8]) -> Vec<u8>, expect: &str) {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        HUNG,
+    );
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_many_blob_fixture(&input);
 
     // Sanity: the unmutated fixture renumbers cleanly.
-    let stats = renumber_within_deadline(input.clone(), output.clone())
-        .expect(HUNG)
-        .expect("clean fixture");
+    let stats = run_renumber(&input, &output, &default_opts()).expect("clean fixture");
     assert_eq!(stats.nodes_written, 200);
     assert_eq!(stats.ways_written, 200);
     assert_eq!(stats.relations_written, 200);
@@ -1296,8 +1286,7 @@ fn assert_fails_promptly(mutate: impl FnOnce(&[u8]) -> Vec<u8>, expect: &str) {
     let pbf = std::fs::read(&input).expect("read fixture");
     std::fs::write(&input, mutate(&pbf)).expect("rewrite fixture");
     let failed_output = dir.path().join("failed.osm.pbf");
-    let err = renumber_within_deadline(input, failed_output.clone())
-        .expect(HUNG)
+    let err = run_renumber(&input, &failed_output, &default_opts())
         .expect_err("a corrupt blob mid-stream must fail the run");
     assert!(
         err.contains(expect),

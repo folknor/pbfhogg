@@ -1416,8 +1416,14 @@ pub const TEST_RUNNER_WATCHDOG: std::time::Duration = std::time::Duration::from_
 /// A unit test's wait for a transition a correct implementation makes at
 /// once (a thread reaching a wait it was set up to reach).
 pub(crate) const TEST_OBSERVE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
-/// A test's bound on a whole operation whose defect would be a hang.
+/// A test's bound on a whole operation whose defect would be a hang. On
+/// expiry the test binary ends (`pbfhogg_test_scratch::HangBound`): a hung
+/// thread cannot be joined, and one left running would outlive its test.
 pub const TEST_HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long an expired [`TEST_HANG_BOUND`] waits for its one-line report to
+/// reach stderr before ending the binary anyway: a blocked stderr must not
+/// keep a hung binary alive.
+pub const TEST_HANG_REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Every bounded fault-hook wait (`test_hooks`): longer than any legitimate
 /// park in a fault test.
 pub(crate) const TEST_HOOK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1433,7 +1439,7 @@ pub const TEST_RENDEZVOUS_BOUND: std::time::Duration = std::time::Duration::from
 const _: () = {
     let watchdog = TEST_RUNNER_WATCHDOG.as_millis();
     assert!(TEST_OBSERVE_BOUND.as_millis() < watchdog);
-    assert!(TEST_HANG_BOUND.as_millis() < watchdog);
+    assert!(TEST_HANG_BOUND.as_millis() + TEST_HANG_REPORT_GRACE.as_millis() < watchdog);
     assert!(TEST_HOOK_WAIT.as_millis() < watchdog);
     assert!(TEST_HOOK_TICK.as_millis() < TEST_HOOK_WAIT.as_millis());
     assert!(TEST_CHILD_TIMEOUT.as_millis() < watchdog);

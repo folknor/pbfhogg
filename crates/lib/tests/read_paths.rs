@@ -13,7 +13,6 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::mpsc;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -460,21 +459,18 @@ fn block_iterator_early_drop_under_pressure() {
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 64);
 
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let reader = ElementReader::from_path(&path)
-            .unwrap()
-            .read_ahead(1)
-            .decode_ahead(1);
-        let mut blocks = reader.into_blocks_pipelined().unwrap();
-        let _first = blocks.next();
-        drop(blocks);
-        done_tx.send(()).unwrap();
-    });
-
-    done_rx
-        .recv_timeout(pbfhogg::TEST_HANG_BOUND)
-        .expect("pipeline did not stop after iterator drop");
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "pipeline did not stop after iterator drop",
+    );
+    let reader = ElementReader::from_path(&path)
+        .unwrap()
+        .read_ahead(1)
+        .decode_ahead(1);
+    let mut blocks = reader.into_blocks_pipelined().unwrap();
+    let _first = blocks.next();
+    drop(blocks);
 }
 
 #[test]
@@ -483,21 +479,17 @@ fn block_fn_error_stops_pipeline() {
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 64);
 
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = ElementReader::from_path(&path)
-            .unwrap()
-            .read_ahead(1)
-            .decode_ahead(1)
-            .for_each_block_pipelined(|_| Err(std::io::Error::other("stop").into()));
-        done_tx.send(result.is_err()).unwrap();
-    });
-
-    assert!(
-        done_rx
-            .recv_timeout(pbfhogg::TEST_HANG_BOUND)
-            .expect("pipeline did not stop after block closure error")
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "pipeline did not stop after block closure error",
     );
+    let result = ElementReader::from_path(&path)
+        .unwrap()
+        .read_ahead(1)
+        .decode_ahead(1)
+        .for_each_block_pipelined(|_| Err(std::io::Error::other("stop").into()));
+    assert!(result.is_err());
 }
 
 /// A mid-file decode failure surfaces from the plain `run_pipeline` in its
@@ -590,25 +582,20 @@ fn early_exit_does_not_read_whole_file() {
     let bytes_read = Arc::new(AtomicUsize::new(0));
 
     // Dropping `PipelinedBlocks` joins the background pipeline thread, so a
-    // shutdown regression would hang here. Run it on a spawned thread and
-    // fail via `recv_timeout` rather than hanging the whole suite.
-    let reader_count = Arc::clone(&bytes_read);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let reader = CountingRead::new(bytes, reader_count);
-        let reader = ElementReader::new(reader)
-            .unwrap()
-            .read_ahead(1)
-            .decode_ahead(1);
-        let mut blocks = reader.into_blocks_pipelined().unwrap();
-        let _first = blocks.next();
-        drop(blocks);
-        done_tx.send(()).unwrap();
-    });
-
-    done_rx
-        .recv_timeout(pbfhogg::TEST_HANG_BOUND)
-        .expect("early-drop pipeline did not stop after iterator drop");
+    // shutdown regression would hang here; the bound ends the binary instead.
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "early-drop pipeline did not stop after iterator drop",
+    );
+    let reader = CountingRead::new(bytes, Arc::clone(&bytes_read));
+    let reader = ElementReader::new(reader)
+        .unwrap()
+        .read_ahead(1)
+        .decode_ahead(1);
+    let mut blocks = reader.into_blocks_pipelined().unwrap();
+    let _first = blocks.next();
+    drop(blocks);
 
     let read = bytes_read.load(Relaxed);
     assert!(

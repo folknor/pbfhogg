@@ -939,20 +939,15 @@ mod tests {
         }
     }
 
-    fn assert_completes<F, T>(label: &str, f: F) -> T
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let handle = std::thread::spawn(move || {
-            let result = f();
-            tx.send(()).expect("watchdog receiver open");
-            result
-        });
-        rx.recv_timeout(crate::tunables::TEST_HANG_BOUND)
-            .unwrap_or_else(|_| panic!("{label}: did not complete within timeout"));
-        handle.join().expect("watchdog thread joins")
+    /// Run `f` under a fail-stop hang bound: a hang ends the test binary
+    /// with `label` and the test's name instead of detaching a hung thread.
+    fn assert_completes<T>(label: &str, f: impl FnOnce() -> T) -> T {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            label,
+        );
+        f()
     }
 
     fn fused_pbf(blocks: usize) -> Vec<u8> {

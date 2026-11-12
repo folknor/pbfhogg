@@ -381,12 +381,12 @@ message = "Test scratch constructors belong only in pbfhogg-test-scratch; use sc
 [[textlint]]
 name = "test-children-only-through-owned-runners"
 pattern = '\bCommand\s*::\s*new\b'
-paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs"]
-exclude = ["crates/cli/tests/invoker.rs", "crates/lib/tests/common/oracle.rs", "crates/harness/tests/exe.rs", "crates/cli/tests/guard.rs", "crates/harness/tests/nofile.rs"]
+paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs", "crates/test-scratch/src/**/*.rs"]
+exclude = ["crates/cli/tests/invoker.rs", "crates/lib/tests/common/oracle.rs", "crates/harness/tests/exe.rs", "crates/cli/tests/guard.rs", "crates/harness/tests/nofile.rs", "crates/test-scratch/src/hang.rs"]
 region = "code"
 test_code = "only"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_scratch.rs", "crates/lib/tests/common/process.rs"]
-message = "Construct test children only in the CLI invoker, oracle runner, harness runner, guard self-reinvocation or the harness descriptor-limit self-reinvocation"
+message = "Construct test children only in the CLI invoker, oracle runner, harness runner, guard self-reinvocation, the harness descriptor-limit self-reinvocation or the hang-bound expiry probe"
 
 [[textlint]]
 name = "repository-root-only-through-test-scratch"

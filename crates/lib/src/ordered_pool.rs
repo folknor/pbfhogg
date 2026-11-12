@@ -1428,23 +1428,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Run `f` on its own thread and fail the test if it has not returned
-    /// within a few seconds. The defect these tests pin is a hang, and a
-    /// hang should fail as one rather than eat the harness watchdog.
-    fn within_deadline<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            // Carry a panic over as a value so it is re-raised with its own
-            // payload rather than read as a hang. The receiver is gone only
-            // if the deadline already failed.
-            tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)))
-                .ok();
-        });
-        match rx.recv_timeout(crate::tunables::TEST_HANG_BOUND) {
-            Ok(Ok(value)) => value,
-            Ok(Err(payload)) => std::panic::resume_unwind(payload),
-            Err(_) => panic!("the pool hung: no return within the deadline"),
-        }
+    /// Run `f` under a fail-stop hang bound. The defect these tests pin is a
+    /// hang, which ends the test binary with the test's name rather than
+    /// eating the harness watchdog or leaving a hung pool under later tests.
+    fn within_deadline<R>(f: impl FnOnce() -> R) -> R {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "the pool hung",
+        );
+        f()
     }
 
     fn run_with(

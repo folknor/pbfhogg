@@ -442,7 +442,6 @@ mod tests {
     mod cases {
         use super::super::{LEASE_FD_ENV, apply, killed_by_guard};
         use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
 
         const PROBE_ENV: &str = "PBFHOGG_TEST_GUARD_PROBE";
         const PROBE_NAME: &str = "guard::tests::probe";
@@ -772,6 +771,7 @@ mod tests {
             let out_path = dir.path().join("out");
             let err_path = dir.path().join("err");
             let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+            crate::common::process::isolate(&mut cmd, &dir);
             cmd.args([PROBE_NAME, "--exact", "--test-threads", "1", "--nocapture"])
                 .env(PROBE_ENV, case)
                 .stdin(Stdio::null())
@@ -783,19 +783,13 @@ mod tests {
                 cmd.args(["--skip", "--io-uring"]);
             }
             apply(&mut cmd);
-            let mut child = cmd.spawn().expect("spawn the probe");
-            let start = Instant::now();
-            let status = loop {
-                if let Some(status) = child.try_wait().expect("wait for the probe") {
-                    break status;
-                }
-                if start.elapsed() > Duration::from_secs(10) {
-                    child.kill().ok();
-                    child.wait().ok();
-                    panic!("probe {case} did not finish");
-                }
-                std::thread::sleep(Duration::from_millis(2));
+            let mut child =
+                crate::common::process::OwnedChild::spawn(&mut cmd, &dir).expect("spawn the probe");
+            let status = match child.wait(pbfhogg::TEST_CHILD_TIMEOUT) {
+                Ok(output) => output.status,
+                Err(error) => panic!("probe {case} did not finish: {error}"),
             };
+            drop(child);
             let mut out = std::fs::read_to_string(&out_path).unwrap_or_default();
             out.push_str(&std::fs::read_to_string(&err_path).unwrap_or_default());
             Ran { status, out }

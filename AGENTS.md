@@ -213,7 +213,7 @@ The third member, **`pbfhogg-harness`** (`crates/harness/`, bin only, `publish =
 
 The fourth, **`pbfhogg-guard-portability`** (`crates/guard-portability/`, `publish = false`, libc only), is a compile fixture: it mounts the guard alone so the `riscv64` lint sweep can type-check the guard's unsupported-architecture fallback. It is empty on x86_64 and aarch64.
 
-The fifth, **`pbfhogg-test-scratch`** (`crates/test-scratch/`, `publish = false`, depends only on `tempfile`), is the one owner of test scratch for every harness, taken as a path-only dev-dependency; see `reference/testing.md` "Test scratch".
+The fifth, **`pbfhogg-test-scratch`** (`crates/test-scratch/`, `publish = false`, depends only on `tempfile`), is the one owner of test scratch for every harness, taken as a path-only dev-dependency, and also holds the fail-stop `HangBound` every hang wait uses; see `reference/testing.md` "Test scratch".
 
 The sixth, **`pbfhogg-source-policy`** (`crates/source-policy/`, `publish = false`, no dependency on pbfhogg), holds the repository's Rust-source audits as unit tests over one tokenized corpus; only the `all` sweep tests it.
 

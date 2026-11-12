@@ -1731,7 +1731,7 @@ mod interrupted {
                 start.elapsed() < READY_TIMEOUT,
                 "checkpoint {k} was never reached"
             );
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
         }
         if seen.completed {
             let out = child.wait();
@@ -1982,7 +1982,7 @@ fn killed_run_in(fx: &Fx, row: &Row, shared: bool) -> Result<(), String> {
             start.elapsed() < Duration::from_secs(10),
             "the pause was never reached"
         );
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
     }
     child.signal(libc::SIGKILL);
     drop(child.wait());
@@ -2401,7 +2401,7 @@ mod in_publication {
                 start.elapsed() < Duration::from_secs(10),
                 "{step}: the step was never reached"
             );
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
         }
         child.signal(libc::SIGKILL);
         drop(child.wait());
@@ -2975,7 +2975,7 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
                     "{} never appeared",
                     path.display()
                 );
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
             }
         };
         wait_for(&ready, &mut child);
@@ -3066,7 +3066,7 @@ fn a_command_without_an_output_is_interrupted_too() {
                 start.elapsed() < Duration::from_secs(10),
                 "{words:?} never paused"
             );
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll for a file the child writes; its deadline fails the test
         }
         child.signal(signal);
         let out = child.wait();

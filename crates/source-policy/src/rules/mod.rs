@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod statics;
 pub mod test_imports;
 pub mod test_modules;
+pub mod timed_waits;
 
 use crate::Corpus;
 

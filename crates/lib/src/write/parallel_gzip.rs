@@ -342,6 +342,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             }
             match self
                 .reorder_permit_rx
+                // wait-deliberate: expiry rechecks whether the pool stopped
                 .recv_timeout(GZIP_REORDER_PERMIT_POLL)
             {
                 Ok(()) => break Ok(()),

@@ -1195,6 +1195,7 @@ mod tests {
                 while router.notifications.load(SeqCst) == 0 {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     assert!(!remaining.is_zero(), "event {event} lost its notification");
+                    // wait-deliberate: waits for a counted notification; expiry fails above
                     gate = router.notify.wait_timeout(gate, remaining).expect("wait").0;
                 }
                 drop(gate);

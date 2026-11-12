@@ -410,14 +410,14 @@ pub(crate) mod test_hooks {
             }
             write_hook(&ready, ordinal.to_string());
             while !token.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(1)); // wait-deliberate: test child pacing its poll for cancellation
             }
             if stuck {
                 let mut ack = ready.clone().into_os_string();
                 ack.push(".ack");
                 write_hook(std::path::Path::new(&ack), b"cancelled");
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(std::time::Duration::from_secs(1)); // wait-deliberate: test child parked until the test kills it
                 }
             }
         });
@@ -516,7 +516,7 @@ pub(crate) mod test_hooks {
                     fail_write("publication pause ready file", ready, &e);
                 }
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(std::time::Duration::from_secs(1)); // wait-deliberate: test child parked until the test kills it
                 }
             }
         });

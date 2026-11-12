@@ -501,6 +501,7 @@ pub(super) fn recv_permit(
             Err(TryRecvError::Disconnected) => break Err(RecvError),
             Err(TryRecvError::Empty) => match executor.yield_now() {
                 Some(rayon::Yield::Executed) => {}
+                // wait-deliberate: idle park of a cooperative wait; expiry rechecks
                 Some(rayon::Yield::Idle) => match rx.recv_timeout(EXECUTOR_IDLE_RECV_TIMEOUT) {
                     Ok(()) => break Ok(()),
                     Err(RecvTimeoutError::Timeout) => {}

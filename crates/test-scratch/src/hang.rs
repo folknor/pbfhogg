@@ -46,6 +46,7 @@ impl HangBound {
             .name(format!("hang-bound {test}"))
             .spawn(move || {
                 let remaining = deadline.saturating_duration_since(Instant::now());
+                // wait-deliberate: expiry is the hang this watchdog exists to end
                 if let Err(RecvTimeoutError::Timeout) = armed.recv_timeout(remaining) {
                     expire(report, grace);
                 }
@@ -72,7 +73,7 @@ fn expire(report: String, grace: Duration) -> ! {
             let _sent = written.send(());
         });
     if reporter.is_ok() {
-        let _reported = wait.recv_timeout(grace);
+        let _reported = wait.recv_timeout(grace); // wait-deliberate: report grace before abort
     }
     std::process::abort()
 }
@@ -137,6 +138,7 @@ mod tests {
         let bound = HangBound::arm(Duration::from_millis(50), Duration::ZERO, "quick");
         drop(bound);
         // Past the deadline: the process is still here.
+        // wait-deliberate: outliving a disarmed bound is the claim under test
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -147,6 +149,7 @@ mod tests {
             panic!("the operation failed");
         });
         assert!(outcome.is_err());
+        // wait-deliberate: outliving a disarmed bound is the claim under test
         std::thread::sleep(Duration::from_millis(100));
     }
 }

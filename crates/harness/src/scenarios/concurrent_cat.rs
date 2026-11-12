@@ -101,6 +101,7 @@ impl Gate {
         }
         let (mut state, _) = self
             .met
+            // wait-deliberate: expiry marks the gate failed, a rendezvous bound, not an inference
             .wait_timeout_while(state, GATE_WAIT, |s| !s.opened && !s.failed)
             .unwrap_or_else(PoisonError::into_inner);
         if !state.opened {

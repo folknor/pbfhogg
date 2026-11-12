@@ -933,6 +933,7 @@ mod tests {
             let read = self.inner.read(buf)?;
             self.bytes_read.fetch_add(read, Ordering::Relaxed);
             if read > 0 {
+                // wait-deliberate: throttles the reader; nothing is inferred from it
                 std::thread::sleep(Duration::from_millis(1));
             }
             Ok(read)
@@ -1199,6 +1200,7 @@ mod tests {
             self.0.started.fetch_add(1, Ordering::SeqCst);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while !self.0.release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                // wait-deliberate: pace of a poll for the test's release
                 std::thread::sleep(Duration::from_millis(1));
             }
             self.0.finished.fetch_add(1, Ordering::SeqCst);
@@ -1271,6 +1273,7 @@ mod tests {
                 start.elapsed() < Duration::from_secs(5),
                 "no decode worker began tearing down, or the read never reached its join"
             );
+            // wait-deliberate: pace of a poll on observed counters; the deadline fails
             std::thread::sleep(Duration::from_millis(1));
         }
         state.release.store(true, Ordering::SeqCst);
@@ -1436,6 +1439,7 @@ mod tests {
             1,
         ));
         gate.release();
+        // wait-deliberate: expiry panics in the error arm
         match done_rx.recv_timeout(crate::test_support::OBSERVE_BOUND) {
             Ok(blocked) => assert!(blocked),
             Err(e) => panic!("child did not acquire after release: {e}"),

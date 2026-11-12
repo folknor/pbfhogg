@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use pbfhogg::host::{Executor, Invocation};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -285,13 +285,15 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
             }
             writer
         });
-        // Items 1 to WINDOW - 1 fit beside the parked head; the next waits.
+        // Items 1 to WINDOW - 1 fit beside the parked head; the next finds
+        // the window empty. No token returns while the head is parked, so
+        // the count at that observation is the window's size: a smaller
+        // window reports fewer, a larger one more or never empties.
         assert!(
-            faults.wait_for(|| admitted.load(SeqCst) == WINDOW - 1),
-            "{backend:?}: the window admitted {} raw items",
+            faults.wait_for(|| faults.window_waits.load(SeqCst) >= 1),
+            "{backend:?}: no reservation found the window empty; {} raw items admitted",
             admitted.load(SeqCst)
         );
-        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
             admitted.load(SeqCst),
             WINDOW - 1,
@@ -300,6 +302,10 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
         faults.release_framing();
         let mut writer = raw.join().unwrap();
         writer.flush().unwrap();
+        assert!(
+            !faults.framing_hook_timed_out.load(SeqCst),
+            "{backend:?}: the framing hook timed out and released the head; the check proved nothing"
+        );
         assert!(
             counter(&invocation, "writer_window_wait_ns") > 0,
             "{backend:?}: the producer never waited on the window"

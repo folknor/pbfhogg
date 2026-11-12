@@ -250,6 +250,7 @@ impl ExitFd {
     /// Return when the child has exited or `limit` has elapsed.
     fn block(&self, limit: Duration) -> io::Result<()> {
         let Some(fd) = &self.0 else {
+            // wait-deliberate: exit poll pace without a pidfd; the caller bounds it
             std::thread::sleep(TEST_CHILD_POLL.min(limit));
             return Ok(());
         };
@@ -301,6 +302,7 @@ fn finish(slot: &mut Option<Capture>) -> io::Result<Vec<u8>> {
     let Some(capture) = slot.as_ref() else {
         return Ok(Vec::new());
     };
+    // wait-deliberate: expiry is returned as an error, never taken as the answer
     let output = match capture.result.recv_timeout(TEST_CHILD_CLEANUP) {
         Ok(output) => output,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -331,7 +333,7 @@ impl Drop for OwnedChild<'_> {
             match self.child.try_wait() {
                 Ok(Some(_)) => break true,
                 _ if start.elapsed() >= TEST_CHILD_CLEANUP => break false,
-                _ => std::thread::sleep(TEST_CHILD_POLL),
+                _ => std::thread::sleep(TEST_CHILD_POLL), // wait-deliberate: exit poll pace under a bound
             }
         };
         let mut joined = true;

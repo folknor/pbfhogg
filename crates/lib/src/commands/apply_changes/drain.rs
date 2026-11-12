@@ -271,7 +271,7 @@ pub(super) fn run_drain(
     // workers idle on the candidate channel).
     //
     // The 25 ms tradeoff is recorded on `crate::tunables::DRAIN_RECV_TIMEOUT`.
-    let recv_timeout = crate::tunables::DRAIN_RECV_TIMEOUT;
+    let poll = crate::tunables::DRAIN_RECV_TIMEOUT;
 
     // The reorder map is bounded upstream, by the sequence window
     // (`window.rs`): the scanner takes a token per seq before dispatch and
@@ -300,7 +300,8 @@ pub(super) fn run_drain(
         let item_opt = if drain_disconnected {
             None
         } else {
-            match drain_rx.recv_timeout(recv_timeout) {
+            // wait-deliberate: expiry polls producer failure and cancellation
+            match drain_rx.recv_timeout(poll) {
                 Ok(DrainMessage::Item(item)) => Some(item),
                 Ok(DrainMessage::NodeBoundary { node_end_seq: end }) => {
                     #[cfg(pbfhogg_test_hooks)]

@@ -763,6 +763,7 @@ fn the_passthrough_reads_a_fifo() {
             {
                 Ok(file) => break file,
                 Err(_) if std::time::Instant::now() < deadline => {
+                    // wait-deliberate: pace of a retry for the FIFO's reader; the deadline fails
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(_) => return false,

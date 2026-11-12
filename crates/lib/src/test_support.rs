@@ -54,6 +54,7 @@ pub(crate) fn wait_parked<'a, S>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (guard, timeout) = observer
+        // wait-deliberate: waits for the parked count; expiry fails below
         .wait_timeout_while(guard, OBSERVE_BOUND, |s| parked(s).waiting < n)
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(

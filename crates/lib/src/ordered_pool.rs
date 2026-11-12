@@ -1837,7 +1837,7 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1)); // wait-deliberate: pace of a poll on an observed counter; the deadline fails
         }
         true
     }

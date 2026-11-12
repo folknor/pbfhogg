@@ -1087,6 +1087,7 @@ mod tests {
             let _sent = tx.send(result.is_err());
         });
 
+        // wait-deliberate: a hang bound; expiry fails the test
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(is_err) => {
                 handle.join().expect("decompress thread must not panic");

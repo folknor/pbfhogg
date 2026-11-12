@@ -122,6 +122,7 @@ impl Bell {
         let rings = self.rings();
         drop(
             self.rung
+                // wait-deliberate: the bell's park; callers re-evaluate their condition
                 .wait_timeout_while(rings, timeout, |rings| *rings == seen)
                 .unwrap_or_else(PoisonError::into_inner),
         );
@@ -354,6 +355,11 @@ pub struct FaultPlan {
     /// far (`MAX`: none is waiting), and how many it needs.
     framing_wait_taken: Watched<AtomicU64>,
     framing_wait_needed: Watched<AtomicU64>,
+    /// Reservations that found the delivery window empty, counted on the
+    /// producer thread before it waits for a token. An empty-window
+    /// observation, not proof the thread is parked: a producer on an
+    /// executor worker waits cooperatively.
+    pub window_waits: Watched<AtomicU64>,
 
     // --- output construction (`BoundOutput::pbf_writer`) ---
     /// Refuse every output backend as a `PlatformUnsupported` setup error,
@@ -716,6 +722,7 @@ impl FaultPlan {
             framing_hook_timed_out: AtomicBool::new(false),
             framing_wait_taken: Watched::<AtomicU64>::new(u64::MAX),
             framing_wait_needed: Watched::<AtomicU64>::new(u64::MAX),
+            window_waits: Watched::<AtomicU64>::new(0),
             refuse_output_backend: AtomicBool::new(false),
             output_backend_refusals: AtomicU64::new(0),
             diff_unit_panic: AtomicUsize::new(usize::MAX),
@@ -1024,6 +1031,7 @@ impl FaultPlan {
             let remaining = deadline.saturating_duration_since(Instant::now());
             g = self
                 .decode_gate_cv
+                // wait-deliberate: hook wait under its deadline; expiry panics
                 .wait_timeout(g, remaining)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
@@ -1262,6 +1270,12 @@ impl FaultPlan {
     pub(crate) fn on_framing_wait(&self, taken: usize, needed: usize) {
         self.framing_wait_needed.store(needed as u64, &self.bell);
         self.framing_wait_taken.store(taken as u64, &self.bell);
+    }
+
+    /// Called by a producer whose reservation found the delivery window
+    /// empty, before it waits for a token.
+    pub(crate) fn on_window_wait(&self) {
+        self.window_waits.fetch_add(1, &self.bell);
     }
 
     /// Called by a writer whose wait for its framing jobs is over.

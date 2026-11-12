@@ -185,6 +185,7 @@ impl Ledger {
             waited.get_or_insert_with(crate::counters::Stopwatch::start);
             state = self
                 .room
+                // wait-deliberate: idle park of a cooperative wait; expiry rechecks
                 .wait_timeout(state, crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
@@ -906,6 +907,7 @@ fn recv<T>(rx: &Receiver<Msg<T>>, executor: crate::host::ExecutorRef<'_>) -> cra
             Err(TryRecvError::Empty) => match executor.yield_now() {
                 Some(rayon::Yield::Executed) => {}
                 Some(rayon::Yield::Idle) => {
+                    // wait-deliberate: idle park of a cooperative wait; expiry rechecks
                     match rx.recv_timeout(crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT) {
                         Ok(item) => return Ok(item),
                         Err(RecvTimeoutError::Timeout) => {}

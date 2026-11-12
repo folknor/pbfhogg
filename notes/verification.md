@@ -101,14 +101,13 @@ caller pin; `crates/lib/tests/fault_apply_changes.rs` still uses it too. Residue
 caller-pin entry point on each of the two commands, and migrating the apply-changes
 fault test.
 
-## VER-026 - The watchdog the test bounds sit under is a copy
+## VER-026 - CLI tests wait on child bounds in sequence
 
 Every test time bound lives in `crates/lib/src/tunables.rs` ("Test time bounds") and
-is const-asserted below `TEST_RUNNER_WATCHDOG`, a mirror of brokkr's fixed 20 s
-per-test watchdog: brokkr does not expose that value to the test process, so a change
-there is not seen (bz brokkr#171). Library hang waits now carry one fail-stop
-`HangBound` over the whole scenario, but tests outside them still wait on bounds in
-sequence: a CLI test that runs several children, each under `TEST_CHILD_TIMEOUT`
+is const-asserted below `TEST_RUNNER_WATCHDOG`, brokkr's fixed 20 s per-test
+watchdog, which the maintainer confirms is always 20 s. Library hang waits now carry
+one fail-stop `HangBound` over the whole scenario, but tests outside them still wait
+on bounds in sequence: a CLI test that runs several children, each under `TEST_CHILD_TIMEOUT`
 (10 s), can reach the watchdog unnamed, and CLI tests cannot name `TEST_HANG_BOUND`
 through the test-import audit (`crates/source-policy/src/rules/test_imports.rs`).
 
@@ -124,18 +123,6 @@ unjoined on expiry), the 5 s deadline loops in `ordered_pool.rs` and
 success path - a named handle dropped on an assertion failure, which the
 detached-threads source rule (statement and `let _` discards only) cannot see.
 `capabilities.rs` bounds a thread rendezvous with `TEST_CHILD_TIMEOUT`.
-
-## VER-132 - Nothing stops a test inferring a block from elapsed time
-
-The sites the hunters named now observe the wait itself (a `test_support::Parked`
-count under the primitive's mutex, the pool join and publication-lock hooks, cfg(test)
-slow-path tallies in classify, the router's notification count), but no rule enforces
-the shape: a new sleep-then-assert or `recv_timeout`-expects-`Timeout` passes review
-unnoticed. Known remaining site: `crates/lib/tests/fault_pipelined_writer.rs` sleeps
-200 ms before asserting the admitted count, once per backend. The router test cannot
-observe that the notifier is blocked on `notify_mu` in-process and says so at the test.
-Residue: a source rule requiring an explicit exemption for `thread::sleep` and
-negative `recv_timeout` in test code, and that site.
 
 ## VER-033 - Twelve library commands have no cancellation scenario
 

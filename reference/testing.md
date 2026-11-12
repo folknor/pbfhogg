@@ -334,8 +334,18 @@ owned and reaped by its test's own thread. No test throws away a
 tripwire). A test never infers that
 another thread blocked from elapsed time: it waits (bounded) for an
 observation made at the wait itself - a `test_support::Parked` count under a
-primitive's mutex, a fault-plan hook at a join or a lock, a slow-path tally -
-and only then releases it.
+primitive's mutex, a fault-plan hook at a join, a lock or an empty delivery
+window, a slow-path tally - and only then releases it. The source-policy
+timed-waits rule (`crates/source-policy/src/rules/timed_waits.rs`) puts every
+std timed wait in front of review: each `sleep`, `sleep_until`,
+`park_timeout`, `recv_timeout`, `recv_deadline` or condvar `wait_timeout*`
+identifier in a member's `src/` or `tests/`, production included, needs a
+`// wait-deliberate: <reason>` line comment on its line or alone above it,
+except a `recv_timeout`/`recv_deadline` method call followed directly by
+`.unwrap()` or `.expect(`, whose expiry panics at the receive. It is a
+spelling tripwire: wrappers, macro expansion and spins on `Instant`,
+`yield_now` or `try_recv` are outside it, and a marker's reason is reviewed,
+not checked.
 
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication

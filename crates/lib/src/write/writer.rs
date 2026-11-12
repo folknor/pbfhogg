@@ -149,6 +149,18 @@ fn reserve(pipeline: &mut WritePipeline) -> Result<(PermitGuard, Slot)> {
         return Err(pipeline_send_error(pipeline));
     }
     let t_window = crate::counters::Stopwatch::start();
+    // Test builds probe first, so a test can observe a producer that found
+    // the window empty instead of inferring it from elapsed time.
+    #[cfg(pbfhogg_test_hooks)]
+    let window = match pipeline.window_rx.try_recv() {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            pipeline.invocation.faults().on_window_wait();
+            recv_permit(&pipeline.window_rx, &pipeline.executor, pipeline.metrics())
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::sync::mpsc::RecvError),
+    };
+    #[cfg(not(pbfhogg_test_hooks))]
     let window = recv_permit(&pipeline.window_rx, &pipeline.executor, pipeline.metrics());
     t_window.record_ns(&pipeline.metrics().window_wait_ns);
     if window.is_err() {

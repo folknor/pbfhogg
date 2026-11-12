@@ -107,7 +107,8 @@ mod tests {
     /// that never returns. Without the variable this is an empty test.
     #[test]
     fn expiry_probe() {
-        if std::env::var_os(PROBE).is_none() {
+        // PROBE's value, as a literal for the source-policy `environment` rule.
+        if std::env::var_os("PBFHOGG_HANG_BOUND_PROBE").is_none() {
             return;
         }
         let _bound = HangBound::arm(Duration::ZERO, Duration::from_secs(1), "probe label");
@@ -126,6 +127,7 @@ mod tests {
     fn an_expired_bound_aborts_the_binary_with_a_named_report() {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command.env_clear().env(PROBE, "1");
         // SAFETY: getpid has no preconditions.
         let parent = unsafe { libc::getpid() };
         // SAFETY: the closure runs between fork and exec and calls only
@@ -144,8 +146,6 @@ mod tests {
         }
         let output = command
             .args(["hang::tests::expiry_probe", "--exact", "--nocapture"])
-            .env_clear()
-            .env(PROBE, "1")
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run the probe");

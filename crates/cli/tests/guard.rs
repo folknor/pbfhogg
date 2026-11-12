@@ -437,14 +437,16 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     mod cases {
-        use super::super::{LEASE_FD_ENV, apply, killed_by_guard};
+        use super::super::{apply, killed_by_guard};
         use std::process::{Command, Stdio};
 
         const PROBE_ENV: &str = "PBFHOGG_TEST_GUARD_PROBE";
         const PROBE_NAME: &str = "guard::tests::probe";
 
+        /// The descriptor `filter::install` named in `LEASE_FD_ENV`, spelled
+        /// as its literal for the source-policy `environment` rule.
         fn lease() -> libc::c_int {
-            std::env::var(LEASE_FD_ENV)
+            std::env::var("PBFHOGG_TEST_LEASE_FD")
                 .expect("the guard names the lease")
                 .parse()
                 .expect("a descriptor number")
@@ -528,7 +530,9 @@ mod tests {
         }
 
         pub fn probe() {
-            let Ok(case) = std::env::var(PROBE_ENV) else {
+            // PROBE_ENV's value, as a literal for the source-policy
+            // `environment` rule.
+            let Ok(case) = std::env::var("PBFHOGG_TEST_GUARD_PROBE") else {
                 return;
             };
             println!("probe {case} start");

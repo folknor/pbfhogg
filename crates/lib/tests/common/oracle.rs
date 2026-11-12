@@ -1,5 +1,5 @@
 //! The sole external reference-tool spawn policy for integration tests.
-use super::process::{OwnedChild, isolate};
+use super::process::OwnedChild;
 use pbfhogg_test_scratch::TestScratch;
 use std::{
     ffi::OsStr,
@@ -43,7 +43,7 @@ impl<'a> Oracle<'a> {
     pub fn new(scratch: &'a TestScratch) -> Self {
         let command = executable().map(|path| {
             let mut cmd = Command::new(path);
-            isolate(&mut cmd, scratch);
+            super::process::isolate(&mut cmd, scratch);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd
         });

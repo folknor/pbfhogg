@@ -94,7 +94,10 @@ pub fn required(backend: Backend) -> bool {
 fn requirement() -> &'static Result<Vec<Backend>, String> {
     static REQUIREMENT: std::sync::OnceLock<Result<Vec<Backend>, String>> =
         std::sync::OnceLock::new();
-    REQUIREMENT.get_or_init(|| match std::env::var(REQUIRE_ENV) {
+    // REQUIRE_ENV's value, as a literal for the source-policy `environment`
+    // rule, which admits a read only with a literal key. This is the one
+    // runner-supplied input the tests read; it can only make a run stricter.
+    REQUIREMENT.get_or_init(|| match std::env::var("PBFHOGG_TEST_REQUIRE") {
         Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
         Err(std::env::VarError::NotUnicode(value)) => {
             Err(format!("{REQUIRE_ENV} is not unicode: {value:?}"))

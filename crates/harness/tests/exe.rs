@@ -15,8 +15,17 @@ struct Ran {
     stderr: Vec<u8>,
 }
 
-/// Run `cmd` under the promise guard with nothing inherited of the
-/// protocol's or the profiler's variables but what `env` sets.
+/// The harness executable, isolated: an empty environment but the scratch
+/// `TMPDIR`, working in `owner`'s scratch until the caller moves it.
+fn harness(owner: &pbfhogg_test_scratch::TestScratch) -> Command {
+    let mut cmd = Command::new(EXE);
+    crate::common::process::isolate(&mut cmd, owner);
+    cmd
+}
+
+/// Run `cmd` (from [`harness`]) under the promise guard; its environment
+/// holds nothing of the protocol's or the profiler's variables but what
+/// `env` sets.
 #[allow(clippy::disallowed_methods)] // capture files in test scratch
 fn run(
     mut cmd: Command,
@@ -24,11 +33,6 @@ fn run(
     scratch: &Path,
     owner: &pbfhogg_test_scratch::TestScratch,
 ) -> Ran {
-    let cwd = cmd.get_current_dir().map(Path::to_path_buf);
-    crate::common::process::isolate(&mut cmd, owner);
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
     cmd.envs(env.iter().copied());
     let out = scratch.join("stdout");
     let err = scratch.join("stderr");
@@ -56,8 +60,8 @@ fn run(
 #[test]
 fn describe_prints_one_valid_document_and_nothing_else() {
     let scratch = crate::common::test_scratch();
-    let mut cmd = Command::new(EXE);
-    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let mut cmd = harness(&scratch);
+    cmd.arg("--describe-harness");
     let ran = run(cmd, &[], scratch.path(), &scratch);
     assert!(ran.status.success(), "{}", ran.status);
     assert!(
@@ -101,7 +105,7 @@ impl RunDir {
     }
 
     fn launch(&self, fifo: &Path, env: &[(&str, &str)]) -> Ran {
-        let mut cmd = Command::new(EXE);
+        let mut cmd = harness(&self._scratch);
         cmd.arg("--test-harness")
             .arg(self.root.join("request.json"))
             .arg("--private-dir")
@@ -495,8 +499,8 @@ fn describe_ignores_a_profiling_request() {
         .iter()
         .map(|(key, value)| (*key, std::ffi::OsStr::new(value)))
         .collect();
-    let mut cmd = Command::new(EXE);
-    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let mut cmd = harness(&scratch);
+    cmd.arg("--describe-harness");
     let ran = run(cmd, &env, scratch.path(), &scratch);
     assert!(ran.status.success(), "{}", ran.status);
     assert!(
@@ -786,8 +790,8 @@ fn bad_binding_states_are_refused_before_setup() {
 /// Read the executable's declaration, without coupling tests to scenario internals.
 fn describe_scenario(id: &str) -> Value {
     let scratch = crate::common::test_scratch();
-    let mut cmd = Command::new(EXE);
-    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let mut cmd = harness(&scratch);
+    cmd.arg("--describe-harness");
     let ran = run(cmd, &[], scratch.path(), &scratch);
     assert!(ran.status.success());
     assert!(ran.stderr.is_empty());
@@ -806,8 +810,8 @@ fn describe_scenario(id: &str) -> Value {
 #[test]
 fn every_declared_scenario_executes() {
     let scratch = crate::common::test_scratch();
-    let mut cmd = Command::new(EXE);
-    cmd.arg("--describe-harness").current_dir(scratch.path());
+    let mut cmd = harness(&scratch);
+    cmd.arg("--describe-harness");
     let ran = run(cmd, &[], scratch.path(), &scratch);
     assert!(ran.status.success());
     assert!(ran.stderr.is_empty());

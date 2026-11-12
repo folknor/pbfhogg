@@ -282,14 +282,6 @@ region = "code"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs"]
 message = "O_DIRECT files open through crate::direct_io (create_for_write, open_for_read), which also returns the alignment their I/O must keep"
 
-[[textlint]]
-name = "no-env-read"
-pattern = '\benv::(?:var|var_os|vars|vars_os)\b'
-paths = ["crates/lib/src/**/*.rs"]
-region = "code"
-must_scan = ["crates/lib/src/read/blob.rs"]
-message = "Environment access belongs to the caller"
-
 # The CLI's command interval markers are reserved for it: brokkr reads exactly
 # one CLI_COMMAND_START/CLI_COMMAND_END pair per CLI process as the command's
 # span, so no library phase and no other CLI site may spell either name.

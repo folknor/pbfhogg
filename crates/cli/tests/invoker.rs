@@ -1191,7 +1191,9 @@ mod tests {
         use std::io::{BufRead, Write};
         use std::os::fd::FromRawFd;
 
-        if std::env::var_os(GATED_PROBE_ENV).is_none() {
+        // GATED_PROBE_ENV's value, as a literal for the source-policy
+        // `environment` rule.
+        if std::env::var_os("PBFHOGG_TEST_GATED_PROBE").is_none() {
             return;
         }
         // SAFETY: fd 0 is the socket the parent set as stdin; ManuallyDrop
@@ -1269,24 +1271,17 @@ mod tests {
         let scratch = pbfhogg_test_scratch::scratch();
         let invoker = CliInvoker::new(&scratch);
         assert_eq!(invoker.cmd.get_current_dir(), Some(scratch.path()));
+        // `get_envs` lists only what was set explicitly; that nothing else
+        // is inherited is `isolate`'s `env_clear`, held by the
+        // source-policy rule host_independence. Exactly these three keys:
+        // nothing of the runner's environment is copied in.
         let env: std::collections::BTreeMap<_, _> = invoker.cmd.get_envs().collect();
-        for key in env.keys() {
-            assert!(matches!(
-                key.to_str(),
-                Some(
-                    "PATH"
-                        | "HOME"
-                        | "LANG"
-                        | "LC_ALL"
-                        | "LC_CTYPE"
-                        | "LC_MESSAGES"
-                        | "TZ"
-                        | "TMPDIR"
-                        | "PBFHOGG_TEST_RESOURCES"
-                        | "RAYON_NUM_THREADS"
-                )
-            ));
-        }
+        let keys: Vec<_> = env.keys().filter_map(|key| key.to_str()).collect();
+        assert_eq!(
+            keys,
+            ["PBFHOGG_TEST_RESOURCES", "RAYON_NUM_THREADS", "TMPDIR"],
+            "{env:?}"
+        );
         // The child sizes and routes from fixed inputs, not the runner.
         assert_eq!(
             env.get(std::ffi::OsStr::new("PBFHOGG_TEST_RESOURCES")),

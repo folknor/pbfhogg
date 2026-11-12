@@ -11,8 +11,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Deliberate inherited values only. Hook and instrumentation variables never
-/// enter the child unless the caller sets them after this function.
+/// The child starts from an empty environment: nothing of the runner's is
+/// inherited (no `PATH`, `HOME`, locale or `TZ`; every child is started by
+/// absolute path, and an empty locale is the C locale), and only `TMPDIR`,
+/// pointed at the scratch, is set here. Whatever else the child sees - hook,
+/// protocol and instrumentation variables - the caller sets after this
+/// function, so a child's environment is exactly what its test wrote. The
+/// source-policy rules `host_independence` (every constructor clears) and
+/// `environment` (no test reads the runner's variables outside its closed
+/// inventory) hold the tree to this.
 ///
 /// Also the parent-death signal every test child carries: the kernel
 /// `SIGKILL`s the child when the thread that spawned it ends, so a test
@@ -26,24 +33,13 @@ use std::time::{Duration, Instant};
 /// guarded pbfhogg binary and the harness never start; the osmium oracle is
 /// trusted not to leave one.
 pub fn isolate(cmd: &mut Command, scratch: &TestScratch) {
-    parent_death_kill(cmd);
+    // First, unconditionally: the source-policy rule host_independence
+    // requires the clear to be this function's first statement.
     cmd.env_clear()
         .current_dir(scratch.path())
-        .stdin(Stdio::null());
-    for key in [
-        "PATH",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "LC_MESSAGES",
-        "TZ",
-    ] {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
-    cmd.env("TMPDIR", scratch.path());
+        .stdin(Stdio::null())
+        .env("TMPDIR", scratch.path());
+    parent_death_kill(cmd);
 }
 
 /// Register the parent-death `SIGKILL` (see [`isolate`]). The parent PID is

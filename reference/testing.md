@@ -629,6 +629,35 @@ Each `crates/cli/tests/cli_<command>.rs` splits intent inside the file:
 `crates/cli/tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
 files.
 
+### The process environment
+
+A test's inputs are what it builds, never what the runner happens to
+export. No code in the tree mutates the process environment (`set_var`,
+`remove_var`, `set_current_dir`, libc's `setenv` family), and none
+enumerates it or reads it except at a closed inventory of reads, each
+naming its variable and the reason it is admitted. Every test child starts
+from an empty environment (`common::process::isolate`, or `env_clear` in
+the leaf crate that cannot reach it) and gets only what its test sets.
+The source-policy rules `environment` (the read inventory, the refusals and
+the import spelling) and `host_independence` (every child constructor
+clears) hold the tree to this; the inventory, with each entry's reason,
+lives in `crates/source-policy/src/rules/environment.rs`.
+
+The admitted reasons are four. A **runner requirement** is a declared
+input that can only make a run stricter, strictly parsed:
+`PBFHOGG_TEST_REQUIRE`, which the gate profile sets so a refused backend
+fails instead of skipping, is the only one; a runner input that changed a
+fixture, an expected result or an execution parameter would not qualify.
+A **host tool** selection is the osmium oracle's search of `PATH`: its
+absence skips, and the parent resolves the tool to an absolute path that
+the cleared child is started by. A **parent-set** read is a re-executed
+test binary reading the gate its parent wrote into the child's
+environment. A **protocol** read is a production CLI or harness input
+(`BROKKR_*`, `HOTPATH_OUTPUT_PATH`, the `PBFHOGG_TEST_*` hooks), which a
+CLI test sets through a named `CliInvoker` setter. The library reads
+nothing (ADR-0016). Compile-time `env!` reads are build inputs and outside
+the rule.
+
 ### Tests that do not run everywhere
 
 - The O_DIRECT and io_uring tests exist only in the builds with
@@ -910,9 +939,11 @@ exception, not a tier - should not survive across many PRs.
   (`TEST_CHILD_POLL`). Output keeps the first and last MiB.
   The default cwd and `TMPDIR` are the borrowed scratch and stdin is null,
   and the child is `SIGKILL`ed if the thread that spawned it ends.
-  The environment is cleared, retaining only PATH, HOME, LANG, LC_ALL,
-  LC_CTYPE, LC_MESSAGES and TZ when present. Hook, profiler and
-  brokkr variables enter only through explicit setters. One setter is
+  The environment is cleared and nothing of the runner's is copied back:
+  no PATH, HOME, locale or TZ (the child is started by absolute path, and
+  an empty locale is the C locale). Hook, profiler and brokkr variables
+  enter only through explicit setters, so the child's environment is
+  exactly what its test set; see "The process environment" below. One setter is
   applied by default: `resources(cores, memory)`, at 4 cores and 8 GiB like
   the library's test hosts, sets `PBFHOGG_TEST_RESOURCES=<cores>:<bytes or
   none>`, which a child built with the hook cfg resolves to a `host::Fixed` in place of

@@ -18,6 +18,12 @@
 //!   constructor that would skip the guard, or a constructor in an
 //!   unlisted function fails, and so does an entry no longer found. Any
 //!   other qualified `Command::new` fails too, except `clap::Command::new`.
+//! - **Cleared environments.** An inventoried constructor is bound by
+//!   `let` and its very next statement clears the child's environment:
+//!   `isolate(&mut NAME, ...);` spelled by one of [`ISOLATE_PATHS`], or a
+//!   method chain on `NAME` calling `env_clear()`. [`CLEARER`], the shared
+//!   `isolate`, must clear its first parameter as its first statement. So no child inherits the
+//!   runner's environment; what it gets is what the test sets after.
 //! - **Cargo binaries.** A string literal whose value names `CARGO_BIN_EXE_`
 //!   appears only in the program of an inventoried constructor or as the
 //!   whole initializer of an [`EXE_CONSTS`] constant (the one module-level
@@ -49,9 +55,9 @@
 use std::ops::Range;
 
 use syn::Lit;
-use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+use super::{Owners, range};
 use crate::Corpus;
 use crate::lex::{Kind, Source, Tok};
 
@@ -95,31 +101,7 @@ pub const CONSTRUCTORS: &[Constructor] = &[
     },
     Constructor {
         file: "crates/harness/tests/exe.rs",
-        owner: "describe_prints_one_valid_document_and_nothing_else",
-        program: "EXE",
-        count: 1,
-    },
-    Constructor {
-        file: "crates/harness/tests/exe.rs",
-        owner: "RunDir::launch",
-        program: "EXE",
-        count: 1,
-    },
-    Constructor {
-        file: "crates/harness/tests/exe.rs",
-        owner: "describe_ignores_a_profiling_request",
-        program: "EXE",
-        count: 1,
-    },
-    Constructor {
-        file: "crates/harness/tests/exe.rs",
-        owner: "describe_scenario",
-        program: "EXE",
-        count: 1,
-    },
-    Constructor {
-        file: "crates/harness/tests/exe.rs",
-        owner: "every_declared_scenario_executes",
+        owner: "harness",
         program: "EXE",
         count: 1,
     },
@@ -196,19 +178,31 @@ pub struct Policy<'a> {
     pub exe_consts: &'a [ExeConst],
     pub process_creation_owners: &'a [(&'a str, &'a str)],
     pub probe_file: &'a str,
+    /// (file, top-level fn) of the `isolate` that constructors clear through.
+    pub clearer: (&'a str, &'a str),
 }
+
+/// The shared clearing helper: it starts every test child from an empty
+/// environment and adds back only the scratch `TMPDIR`.
+pub const CLEARER: (&str, &str) = ("crates/lib/tests/common/process.rs", "isolate");
 
 pub const POLICY: Policy<'static> = Policy {
     constructors: CONSTRUCTORS,
     exe_consts: EXE_CONSTS,
     process_creation_owners: PROCESS_CREATION_OWNERS,
     probe_file: PROBE_FILE,
+    clearer: CLEARER,
 };
 
 pub fn errors(corpus: &Corpus) -> Vec<String> {
     let mut found: Vec<String> = super::require_files(corpus, "crates/", "host independence")
         .into_iter()
         .collect();
+    found.extend(super::require_sentinels(
+        corpus,
+        &[CLEARER.0],
+        "host independence",
+    ));
     found.extend(check(corpus, &POLICY));
     found
 }
@@ -406,7 +400,14 @@ fn constructor(
         Some(k) => {
             seen[k] += 1;
             program_ranges.push(i + 5..close);
-            None
+            let start = code[i].start;
+            (!file.items.cleared.iter().any(|r| r.contains(&start))).then(|| {
+                format!(
+                    "{path}:{line}: child constructor in `{owner}` does not clear the \
+                     child's environment: bind it with `let` and make the next statement \
+                     `isolate(&mut NAME, ...);` or a `NAME.env_clear()` chain"
+                )
+            })
         }
         None => Some(format!(
             "{path}:{line}: child constructor `Command::new({program})` in `{owner}` is not \
@@ -460,96 +461,159 @@ fn has_shebang(text: &str) -> bool {
     })
 }
 
-/// The file's item structure, from syn: each named item's byte range with
-/// its path, and the byte ranges of inventoried `EXE` initializers.
+/// The file's item structure: owners, the byte ranges of inventoried `EXE`
+/// initializers, and the byte offsets of constructors that clear their
+/// child's environment as their next statement.
 struct Items {
-    spans: Vec<(Range<usize>, String)>,
+    owners: Owners,
     exe_initializers: Vec<Range<usize>>,
+    cleared: Vec<Range<usize>>,
 }
 
 impl Items {
-    /// The path of the innermost named item holding byte `offset`.
     fn owner(&self, offset: usize) -> &str {
-        self.spans
-            .iter()
-            .filter(|(r, _)| r.contains(&offset))
-            .max_by_key(|(r, _)| r.start)
-            .map_or("", |(_, p)| p.as_str())
+        self.owners.owner(offset)
     }
 }
 
-fn range(source: &Source, node: &impl Spanned) -> Range<usize> {
-    let span = node.span();
-    let (start, end) = (span.start(), span.end());
-    source.offset_of(start.line, start.column)..source.offset_of(end.line, end.column)
-}
-
-/// Owners are `mod` (inline), `fn`, `trait` names and an `impl`'s self
-/// type (its last path segment), joined by `::`.
-struct Walk<'s> {
+/// Finds every `let [mut] NAME = ...Command::new(...);` whose very next
+/// statement in the same block clears `NAME`'s environment: either
+/// `isolate(&mut NAME, ...);` (spelled as one of [`ISOLATE_PATHS`]) or a method
+/// chain on `NAME` that calls `env_clear()`. Records each such call's byte
+/// range. Any other shape leaves the constructor uncleared, which fails: a
+/// conditional, a clear of another command or one statements later is not
+/// accepted, so the rule needs no control flow.
+struct Clearing<'s> {
     source: &'s Source,
-    stack: Vec<String>,
-    spans: Vec<(Range<usize>, String)>,
+    cleared: Vec<Range<usize>>,
 }
 
-impl Walk<'_> {
-    fn enter(&mut self, name: String, node: &impl Spanned, inner: impl FnOnce(&mut Self)) {
-        self.stack.push(name);
-        self.spans
-            .push((range(self.source, node), self.stack.join("::")));
-        inner(self);
-        self.stack.pop();
+impl<'ast> Visit<'ast> for Clearing<'_> {
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        for pair in block.stmts.windows(2) {
+            if let Some((name, call)) = constructed(&pair[0])
+                && clears(&pair[1], &name)
+            {
+                self.cleared.push(range(self.source, call));
+            }
+        }
+        visit::visit_block(self, block);
     }
 }
 
-impl<'ast> Visit<'ast> for Walk<'_> {
-    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        self.enter(item.sig.ident.to_string(), item, |w| {
-            visit::visit_item_fn(w, item);
-        });
+/// The local a `let` binds to a `Command::new(...)` call, and that call.
+fn constructed(stmt: &syn::Stmt) -> Option<(String, &syn::ExprCall)> {
+    let syn::Stmt::Local(local) = stmt else {
+        return None;
+    };
+    let syn::Pat::Ident(pat) = &local.pat else {
+        return None;
+    };
+    let syn::Expr::Call(call) = &*local.init.as_ref()?.expr else {
+        return None;
+    };
+    let syn::Expr::Path(func) = &*call.func else {
+        return None;
+    };
+    let names: Vec<String> = func
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    names
+        .ends_with(&["Command".to_owned(), "new".to_owned()])
+        .then(|| (pat.ident.to_string(), call))
+}
+
+/// The spellings that name [`CLEARER`]: the shared `common` module is
+/// mounted at `crate::common` in every harness, and the oracle beside it
+/// reaches it as `super::process`. A bare or other path could name another
+/// function called `isolate`.
+pub const ISOLATE_PATHS: &[&[&str]] = &[
+    &["crate", "common", "process", "isolate"],
+    &["super", "process", "isolate"],
+];
+
+/// Whether `expr` is exactly the path `name`.
+fn is_local(expr: &syn::Expr, name: &str) -> bool {
+    matches!(expr, syn::Expr::Path(p) if p.qself.is_none() && p.path.is_ident(name))
+}
+
+/// Whether `stmt` is an unconditional statement clearing `name`'s
+/// environment (see [`Clearing`]).
+fn clears(stmt: &syn::Stmt, name: &str) -> bool {
+    let syn::Stmt::Expr(expr, Some(_)) = stmt else {
+        return false;
+    };
+    match expr {
+        syn::Expr::Call(call) => {
+            let isolate = matches!(&*call.func, syn::Expr::Path(p)
+            if p.qself.is_none() && p.path.leading_colon.is_none() && {
+                let names: Vec<String> =
+                    p.path.segments.iter().map(|s| s.ident.to_string()).collect();
+                ISOLATE_PATHS.iter().any(|path| names == *path)
+            });
+            let first_is_local = matches!(call.args.first(), Some(syn::Expr::Reference(r))
+                if r.mutability.is_some() && is_local(&r.expr, name));
+            isolate && first_is_local
+        }
+        syn::Expr::MethodCall(_) => chain_clears(expr, name),
+        _ => false,
     }
-    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        self.enter(item.sig.ident.to_string(), item, |w| {
-            visit::visit_impl_item_fn(w, item);
-        });
+}
+
+/// Whether a method chain's first call is `env_clear()` directly on the
+/// local `name`, so nothing in the chain runs before the clear.
+fn chain_clears(expr: &syn::Expr, name: &str) -> bool {
+    let mut at = expr;
+    while let syn::Expr::MethodCall(m) = at {
+        if !matches!(&*m.receiver, syn::Expr::MethodCall(_)) {
+            return m.method == "env_clear" && m.args.is_empty() && is_local(&m.receiver, name);
+        }
+        at = &m.receiver;
     }
-    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
-        self.enter(item.sig.ident.to_string(), item, |w| {
-            visit::visit_trait_item_fn(w, item);
-        });
-    }
-    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        self.enter(item.ident.to_string(), item, |w| {
-            visit::visit_item_mod(w, item);
-        });
-    }
-    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-        self.enter(item.ident.to_string(), item, |w| {
-            visit::visit_item_trait(w, item);
-        });
-    }
-    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        let name = match &*item.self_ty {
-            syn::Type::Path(p) => p
-                .path
-                .segments
-                .last()
-                .map_or_else(String::new, |s| s.ident.to_string()),
-            _ => "_".to_owned(),
+    false
+}
+
+/// Whether the function `owner` of `file` (one of its top-level items)
+/// clears its first parameter's environment in a top-level statement.
+fn clearer_clears(file: &syn::File, owner: &str) -> bool {
+    file.items.iter().any(|item| {
+        let syn::Item::Fn(f) = item else {
+            return false;
         };
-        self.enter(name, item, |w| visit::visit_item_impl(w, item));
-    }
+        let Some(syn::FnArg::Typed(param)) = f.sig.inputs.first() else {
+            return false;
+        };
+        let syn::Pat::Ident(param) = &*param.pat else {
+            return false;
+        };
+        let name = param.ident.to_string();
+        f.sig.ident == owner
+            && f.block.stmts.first().is_some_and(|stmt| {
+                matches!(stmt, syn::Stmt::Expr(e @ syn::Expr::MethodCall(_), Some(_))
+                    if chain_clears(e, &name))
+            })
+    })
 }
 
 fn items(source: &Source, path: &str, policy: &Policy<'_>) -> Result<Items, String> {
     let file = syn::parse_file(&source.text)
         .map_err(|e| format!("{path}:{}: does not parse: {e}", e.span().start().line))?;
-    let mut walk = Walk {
+    let owners = Owners::of(source, &file);
+    let mut clearing = Clearing {
         source,
-        stack: Vec::new(),
-        spans: Vec::new(),
+        cleared: Vec::new(),
     };
-    walk.visit_file(&file);
+    clearing.visit_file(&file);
+    if path == policy.clearer.0 && !clearer_clears(&file, policy.clearer.1) {
+        return Err(format!(
+            "{path}: {} must clear its command's environment (`cmd.env_clear()...;` \
+             as a top-level statement on its first parameter)",
+            policy.clearer.1
+        ));
+    }
     let mut exe_initializers = Vec::new();
     for entry in policy.exe_consts.iter().filter(|c| c.file == path) {
         let matching: Vec<&syn::ItemConst> = file
@@ -604,13 +668,14 @@ fn items(source: &Source, path: &str, policy: &Policy<'_>) -> Result<Items, Stri
         }
     }
     Ok(Items {
-        spans: walk.spans,
+        owners,
         exe_initializers,
+        cleared: clearing.cleared,
     })
 }
 
 /// A string literal's value: cooked escapes decoded, raw contents as written.
-fn decoded(text: &str) -> Option<String> {
+pub(crate) fn decoded(text: &str) -> Option<String> {
     match syn::parse_str::<Lit>(text).ok()? {
         Lit::Str(s) => Some(s.value()),
         Lit::ByteStr(s) => Some(String::from_utf8_lossy(&s.value()).into_owned()),
@@ -669,19 +734,22 @@ mod tests {
         }],
         process_creation_owners: &[(FILE, "probe")],
         probe_file: "crates/x/src/exempt.rs",
+        clearer: (CLEARER_FILE, "isolate"),
     };
+
+    const CLEARER_FILE: &str = "crates/x/tests/common/process.rs";
 
     /// The inventoried constructors, so the count check is satisfied and
     /// only the extra text is judged.
     const BASE: &str = r#"
         use std::process::Command;
         impl<'a> Invoker<'a> {
-            pub fn new() -> Self { let c = Command::new(env!("CARGO_BIN_EXE_pbfhogg")); }
+            pub fn new() -> Self { let mut c = Command::new(env!("CARGO_BIN_EXE_pbfhogg")); crate::common::process::isolate(&mut c, s); }
         }
         mod tests {
-            fn reexec(x: impl Into<u8>) { std::process::Command::new(std::env::current_exe().unwrap()); }
+            fn reexec(x: impl Into<u8>) { let mut c = std::process::Command::new(std::env::current_exe().unwrap()); c.env_clear().arg("x"); }
         }
-        fn literal() { Command::new("pbfhogg"); }
+        fn literal() { let mut c = Command::new("pbfhogg"); super::process::isolate(&mut c, s); }
         fn probe() { unsafe { libc::fork(); libc::syscall(libc::SYS_clone3); } }
         const EXE: &str = env!("CARGO_BIN_EXE_pbfhogg-harness");
     "#;
@@ -810,6 +878,68 @@ mod tests {
         }
         let corpus = Corpus::from_sources(sources.iter().map(|(p, s)| (*p, s.as_str())));
         check(&corpus, &POLICY)
+    }
+
+    #[test]
+    fn every_constructor_clears_its_environment_next() {
+        let constructed = r#"Command::new(env!("CARGO_BIN_EXE_pbfhogg"));"#;
+        let isolated = format!("{constructed} crate::common::process::isolate(&mut c, s);");
+        for to in [
+            "",
+            "if false { crate::common::process::isolate(&mut c, s); }",
+            "crate::common::process::isolate(&mut other, s);",
+            "crate::common::process::isolate(&c, s);",
+            "let d = 1; crate::common::process::isolate(&mut c, s);",
+            "let f = || crate::common::process::isolate(&mut c, s);",
+            "isolate(&mut c, s);",
+            "unrelated::isolate(&mut c, s);",
+            "c.env(\"K\", \"V\");",
+        ] {
+            let found = replaced(&isolated, &format!("{constructed} {to}"));
+            assert_eq!(found.len(), 1, "{to}: {found:?}");
+            assert!(found[0].contains("does not clear"), "{to}: {found:?}");
+        }
+        let chained = r#"c.env_clear().arg("x");"#;
+        for to in [
+            "c.arg(\"x\");",
+            "other.env_clear();",
+            "{ c.env_clear(); }",
+            "c.arg(\"x\").env_clear();",
+            "c.arg({ if x { return; } \"x\" }).env_clear();",
+        ] {
+            assert_eq!(replaced(chained, to).len(), 1, "{to}");
+        }
+        // An unbound constructor cannot be followed by its clear.
+        let found = replaced(
+            r#"let mut c = Command::new("pbfhogg"); super::process::isolate(&mut c, s);"#,
+            r#"Command::new("pbfhogg").env_clear();"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn the_shared_isolate_clears_its_parameter() {
+        let run = |text: &str| {
+            check(
+                &Corpus::from_sources([(FILE, BASE), (CLEARER_FILE, text)]),
+                &POLICY,
+            )
+        };
+        assert!(
+            run("pub fn isolate(cmd: &mut C, s: &S) { cmd.env_clear().stdin(n); kill(cmd); }")
+                .is_empty()
+        );
+        for text in [
+            "pub fn isolate(cmd: &mut C, s: &S) { kill(cmd); cmd.env_clear().stdin(n); }",
+            "pub fn isolate(cmd: &mut C, s: &S) { if x { return; } cmd.env_clear(); }",
+            "pub fn isolate(cmd: &mut C, s: &S) { cmd.stdin(n); }",
+            "pub fn isolate(cmd: &mut C, s: &S) { cmd.stdin(n).env_clear(); }",
+            "pub fn isolate(cmd: &mut C, s: &S) { if x { cmd.env_clear(); } }",
+            "pub fn isolate(cmd: &mut C, s: &S) { other.env_clear(); }",
+            "pub fn other(cmd: &mut C) { cmd.env_clear(); }",
+        ] {
+            assert_eq!(run(text).len(), 1, "{text}");
+        }
     }
 
     #[test]

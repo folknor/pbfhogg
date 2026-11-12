@@ -94,6 +94,7 @@ pub fn audit(root: &Path) -> Vec<String> {
     found.extend(rules::timed_waits::errors(&corpus));
     found.extend(rules::duration_literals::errors(&corpus));
     found.extend(rules::host_independence::errors(&corpus));
+    found.extend(rules::environment::errors(&corpus));
     found
 }
 

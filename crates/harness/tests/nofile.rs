@@ -71,7 +71,8 @@ fn check_count(limit: libc::rlim_t) {
 
 #[test]
 fn restricted_child() {
-    if std::env::var_os(CHILD).is_none() {
+    // CHILD's value, as a literal for the source-policy `environment` rule.
+    if std::env::var_os("PBFHOGG_NOFILE_CONTRACT_CHILD").is_none() {
         return;
     }
     assert_eq!(limits().rlim_cur, SOFT);

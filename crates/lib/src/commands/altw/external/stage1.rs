@@ -488,6 +488,13 @@ pub(super) fn stage1_pass_a(
                         ));
                     }
                     *id_shard_writers = fresh;
+                    // Test-only: hold this worker with its fleet open until
+                    // every armed party has opened its own (bounded).
+                    #[cfg(pbfhogg_test_hooks)]
+                    host.invocation.faults().on_altw_stage1_fleet(
+                        crate::test_hooks::FleetParty::Worker(worker_id),
+                        || host.invocation.is_cancelled(),
+                    );
                 }
                 let mut blob_emitted: u64 = 0;
                 let mut blob_skipped: u64 = 0;

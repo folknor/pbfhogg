@@ -28,6 +28,14 @@ pub(super) fn collect_relation_member_ids_indexed(
     cancel: &crate::host::Recorder,
 ) -> Result<RelationScanOutput> {
     let file = Arc::new(crate::read::input::InputSource::from(input).open()?);
+    // Test-only: hold the scan with its input open until every armed
+    // stage-1 party has opened its files (bounded).
+    #[cfg(pbfhogg_test_hooks)]
+    cancel
+        .faults()
+        .on_altw_stage1_fleet(crate::test_hooks::FleetParty::Relation, || {
+            cancel.is_cancelled()
+        });
     // Errors are located against the input once, not per blob.
     let source: Arc<Path> = Arc::from(input.path());
 

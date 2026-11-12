@@ -1479,8 +1479,13 @@ const _: () = assert!(TEST_FD_ADMISSION_BOUND.as_millis() < TEST_RUNNER_WATCHDOG
 pub const TEST_LIGHT_FD_GRANT: u64 = 128;
 /// One heavy run's whole-lifetime descriptor bound as the gate charges it:
 /// its stage-1 grant (at most 1024 on a test host), later stages' slot
-/// buckets and router files, outputs, scratch and fixtures. An accounting
-/// assertion, not measured; nothing checks a run stays under it.
+/// buckets and router files, outputs, scratch and fixtures. Witnessed in
+/// `crates/lib/tests/process_nofile.rs` for the largest external join the
+/// heavy grant admits (three stage-1 fleets and the relation scan's input
+/// open at once, 256 slot buckets, buffered output), which completes under a
+/// kernel limit leaving exactly this many descriptors free; Auto routing,
+/// fault paths, the direct-I/O and io_uring writers and a scenario's own
+/// fixtures stay asserted.
 pub const TEST_HEAVY_RUN_FDS: u64 = 1024;
 /// The part of the soft limit the gate never hands to heavy tickets: the
 /// process's baseline and every concurrently running light test's

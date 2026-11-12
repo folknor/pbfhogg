@@ -573,6 +573,11 @@ pub struct FaultPlan {
     /// a test relying on it proved nothing.
     pub altw_hook_timed_out: AtomicBool,
 
+    // --- altw external stage 1 ---
+    /// The stage-1 fleet rendezvous; see
+    /// [`arm_altw_stage1_fleet`](Self::arm_altw_stage1_fleet).
+    altw_stage1_fleet: Mutex<FleetRendezvous>,
+
     // --- geocode builder pass 3 ---
     /// Street way index at which the Stage A streets worker panics.
     pub geocode_streets_panic_at_way: AtomicU32,
@@ -658,6 +663,41 @@ pub const INJECTED_BACKEND_REFUSAL: &str = "test-hooks: injected output backend 
 /// The message of the injected I/O error behind a failed pool-thread spawn
 /// ([`FaultPlan::built_pool_spawn_fail_at`]).
 pub const INJECTED_POOL_SPAWN_FAILURE: &str = "test-hooks: injected pool thread spawn failure";
+
+/// How an armed stage-1 fleet rendezvous ended; see
+/// [`FaultPlan::arm_altw_stage1_fleet`]. Sticky: the first outcome stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetOutcome {
+    /// Every expected party arrived while every earlier one was still
+    /// parked: all their descriptors were open at once.
+    Complete,
+    /// The bound passed first (a party failed or never came), or the run was
+    /// cancelled: the overlap did not happen, and nothing was proved.
+    Expired,
+    /// A party arrived twice or a worker outside the armed set arrived.
+    Unexpected,
+}
+
+/// State of the stage-1 fleet rendezvous, under one lock so the overlap is
+/// decided at one instant.
+struct FleetRendezvous {
+    /// `Some(n)`: armed for stage-1 workers `0..n`.
+    workers: Option<usize>,
+    /// The relation scan is a party too.
+    relation: bool,
+    arrived_workers: Vec<usize>,
+    relation_arrived: bool,
+    outcome: Option<FleetOutcome>,
+}
+
+/// A party to the stage-1 fleet rendezvous.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FleetParty {
+    /// A stage-1 worker, after it opened its id-shard files.
+    Worker(usize),
+    /// The relation-member scan, after it opened its input.
+    Relation,
+}
 
 struct DecodeGate {
     armed_seq: Option<usize>,
@@ -783,6 +823,13 @@ impl FaultPlan {
             altw_stage4_panic_work_at: AtomicUsize::new(usize::MAX),
             altw_stage4_way0_entered: Watched::<AtomicBool>::new(false),
             altw_hook_timed_out: AtomicBool::new(false),
+            altw_stage1_fleet: Mutex::new(FleetRendezvous {
+                workers: None,
+                relation: false,
+                arrived_workers: Vec::new(),
+                relation_arrived: false,
+                outcome: None,
+            }),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
             geocode_misfile_address_at: AtomicUsize::new(usize::MAX),
             geocode_misfile_address_coarse: AtomicBool::new(false),
@@ -1602,6 +1649,90 @@ impl FaultPlan {
         if next_seq >= node_end_seq {
             self.apply_changes_late_boundaries_seen
                 .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // ---- altw external stage 1 --------------------------------------------
+
+    /// Hold every stage-1 worker `0..workers` (and the relation-member scan,
+    /// if `relation`) once it has opened its files, until all of them have:
+    /// the run then has every id-shard fleet and the scan's input open at
+    /// once, whichever worker the ordered pool hands which blob. Arm before
+    /// the run; read the result with
+    /// [`altw_stage1_fleet_outcome`](Self::altw_stage1_fleet_outcome).
+    /// Parties are released by the last arrival or by the token tripping;
+    /// a party that fails before arriving leaves the others parked until
+    /// the hook bound, and the outcome is then `Expired`.
+    pub fn arm_altw_stage1_fleet(&self, workers: usize, relation: bool) {
+        let mut fleet = self.fleet();
+        // One-shot: a second arming would inherit the first run's arrivals
+        // and outcome.
+        assert!(
+            fleet.workers.is_none(),
+            "the stage-1 fleet rendezvous is armed once per token"
+        );
+        fleet.workers = Some(workers);
+        fleet.relation = relation;
+        drop(fleet);
+        self.bell.ring();
+    }
+
+    /// How the armed rendezvous ended; `None` while it is still open or
+    /// when it was never armed.
+    pub fn altw_stage1_fleet_outcome(&self) -> Option<FleetOutcome> {
+        self.fleet().outcome
+    }
+
+    fn fleet(&self) -> MutexGuard<'_, FleetRendezvous> {
+        self.altw_stage1_fleet
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Called by a stage-1 party right after it opened its files;
+    /// `cancelled` reads the run's token. Parks as armed; see
+    /// [`arm_altw_stage1_fleet`](Self::arm_altw_stage1_fleet).
+    pub(crate) fn on_altw_stage1_fleet(&self, party: FleetParty, cancelled: impl Fn() -> bool) {
+        let mut fleet = self.fleet();
+        let Some(workers) = fleet.workers else {
+            return;
+        };
+        if fleet.outcome.is_none() {
+            let fresh = match party {
+                FleetParty::Worker(id) => {
+                    let fresh = id < workers && !fleet.arrived_workers.contains(&id);
+                    fleet.arrived_workers.push(id);
+                    fresh
+                }
+                FleetParty::Relation => {
+                    let fresh = fleet.relation && !fleet.relation_arrived;
+                    fleet.relation_arrived = true;
+                    fresh
+                }
+            };
+            if !fresh {
+                fleet.outcome = Some(FleetOutcome::Unexpected);
+            } else if fleet.arrived_workers.len() == workers
+                && fleet.relation_arrived == fleet.relation
+            {
+                // Decided under the lock while every earlier party is
+                // parked with its descriptors open.
+                fleet.outcome = Some(FleetOutcome::Complete);
+            }
+        }
+        drop(fleet);
+        self.bell.ring();
+        // Rung: the outcome is written only here, each write followed by a
+        // ring, and a tripped token rings the bell.
+        // Past the bound or on a trip with no outcome, it is `Expired`.
+        let _ = self.wait(Wake::Rung, || {
+            (self.fleet().outcome.is_some() || cancelled()).then_some(())
+        });
+        let mut fleet = self.fleet();
+        if fleet.outcome.is_none() {
+            fleet.outcome = Some(FleetOutcome::Expired);
+            drop(fleet);
+            self.bell.ring();
         }
     }
 

@@ -179,7 +179,15 @@ NAME` list each harness in turn to find one test.
   before it opens anything; on an ordinary host it never waits. What
   this does not bound: a ticket's units bound its simultaneous runs by
   the scenario's construction, which nothing checks; the per-run charge
-  and the light reserve are asserted, not measured; light tests'
+  is witnessed only for the largest buffered-output external join a heavy
+  grant admits (the `process_nofile` target forces every stage-1 fleet and
+  the relation scan's input open at once, the most slot buckets, and runs
+  it under a kernel limit leaving exactly the charge free), not for Auto
+  routing, fault paths, the direct-I/O and io_uring writers or a
+  scenario's own fixtures; the light reserve is asserted, not measured,
+  since a process-wide descriptor count in this shared binary includes
+  every concurrent test and light use grows with the runner's thread
+  count; light tests'
   descriptors, and every command that requests none, are not counted;
   and a test holding a ticket must not take another (it waits on itself
   and skips).
@@ -1012,7 +1020,15 @@ original soft limit at the end. It also refuses an external join under six
 injected descriptor counts (counted with slots left, counted past the limit,
 uncounted, a failed count, `EMFILE` and `ENFILE` exhaustion) through a
 `ProcessActions` provider on the host, so those refusal messages are tested
-without procfs, a real shortage or a limit change.
+without procfs, a real shortage or a limit change. Under the hook cfg it
+witnesses the descriptor gate's per-run charge: it lists the open
+descriptors (less the listing's own), sets the soft limit to that count
+plus `TEST_HEAVY_RUN_FDS` (skipping if an open descriptor lies at or above
+it), and runs the largest external join a heavy grant admits, its stage-1
+fleets and relation input held open together by the fault plan's fleet
+rendezvous, which must end `Complete`. Every scenario runs under one
+libtest test, since all of them open descriptors and some change the
+limit.
 The harness package tests real probes the same way without a target of its
 own: `crates/harness/tests/nofile.rs` reinvokes the `all` test binary as a
 bounded `OwnedChild` with a fixed soft and hard `RLIMIT_NOFILE` set before

@@ -14,8 +14,18 @@
 //! order against the soft limit less `TEST_LIGHT_FD_RESERVE`; a ticket's
 //! units bound the scenario's simultaneous whole runs by the scenario's
 //! construction, which nothing checks; one unit is charged
-//! `TEST_HEAVY_RUN_FDS`, an asserted bound. Light tests' descriptors are
-//! not requested or counted; the reserve covers them by assertion. A test
+//! `TEST_HEAVY_RUN_FDS`, which `process_nofile.rs` witnesses for the
+//! largest external join a heavy grant admits (every stage-1 fleet and the
+//! relation scan's input open at once, the most slot buckets, buffered
+//! output, under a kernel limit leaving exactly the charge free), not for
+//! Auto routing, fault paths, other output backends or the scenario's own
+//! fixtures and scratch. Light tests' descriptors are not requested or
+//! counted; the reserve covers them by assertion. Neither a count of
+//! `/proc/self/fd` at a ticket's release nor an invariant checked at
+//! admission observes them: the count is process-wide, includes every
+//! concurrent test and is taken after the run's peak, and light use grows
+//! with the runner's thread count, so a check would fail on large hosts
+//! against whichever test happened to be admitted. A test
 //! holding a ticket must not ask for another: that waits on itself until
 //! the admission bound and skips. A scenario that cannot be admitted (its
 //! units exceed what the limit leaves, or the admission bound expires
@@ -76,10 +86,18 @@ pub(crate) struct FdTicket {
 
 impl pbfhogg::host::ProcessActions for FdTicket {
     fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
-        pbfhogg::process::FdReservation::unreserved(pbfhogg::process::FdAllowance::host_grant(
-            wanted.min(super::TEST_FD_GRANT),
-        ))
+        heavy_grant(wanted)
     }
+}
+
+/// What every heavy host's provider grants a request: `min(wanted,
+/// TEST_FD_GRANT)`, reserving nothing. Shared with the own-process witness
+/// that runs the largest run this grant admits under a kernel limit of
+/// exactly `TEST_HEAVY_RUN_FDS` free descriptors (`process_nofile.rs`).
+pub(crate) fn heavy_grant(wanted: u64) -> pbfhogg::process::FdReservation {
+    pbfhogg::process::FdReservation::unreserved(pbfhogg::process::FdAllowance::host_grant(
+        wanted.min(super::TEST_FD_GRANT),
+    ))
 }
 
 impl Drop for FdTicket {

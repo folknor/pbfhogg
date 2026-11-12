@@ -1419,10 +1419,6 @@ pub const TEST_HANG_REPORT_GRACE: std::time::Duration = std::time::Duration::fro
 /// Every bounded fault-hook wait (`test_hooks`): longer than any legitimate
 /// park in a fault test.
 pub(crate) const TEST_HOOK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-/// The longest a fault-plan wait sleeps between checks of a condition over
-/// state that does not ring the plan's bell (`test_hooks`); a condition
-/// over rung state wakes at the transition instead. Not a failure bound.
-pub(crate) const TEST_HOOK_TICK: std::time::Duration = std::time::Duration::from_millis(1);
 /// Two parties of a harness scenario meeting each other. It runs inside a
 /// child the harness tests bound by [`TEST_CHILD_TIMEOUT`], so it must expire
 /// first for the scenario to report the broken rendezvous itself.
@@ -1433,7 +1429,6 @@ const _: () = {
     assert!(TEST_OBSERVE_BOUND.as_millis() < watchdog);
     assert!(TEST_HANG_BOUND.as_millis() + TEST_HANG_REPORT_GRACE.as_millis() < watchdog);
     assert!(TEST_HOOK_WAIT.as_millis() < watchdog);
-    assert!(TEST_HOOK_TICK.as_millis() < TEST_HOOK_WAIT.as_millis());
     assert!(TEST_CHILD_TIMEOUT.as_millis() < watchdog);
     assert!(TEST_RENDEZVOUS_BOUND.as_millis() < TEST_CHILD_TIMEOUT.as_millis());
     assert!(TEST_CHILD_CLEANUP.as_millis() < TEST_CHILD_TIMEOUT.as_millis());

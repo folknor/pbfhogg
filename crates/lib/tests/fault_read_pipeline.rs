@@ -84,9 +84,13 @@ fn admission_high_water_bounded_under_slow_first_decode() {
         faults.wait_for(|| faults.blocked_decode_ready()),
         "decode hook was not reached"
     );
-    // The counter does not ring the plan: the wait's tick re-reads it.
     assert!(
-        faults.wait_for(|| reorder_high_water(&cancel) >= 1),
+        faults.wait_for(|| {
+            faults
+                .reorder_filled_high_water
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
+        }),
         "later decode did not reach the reorder buffer"
     );
 

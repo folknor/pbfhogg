@@ -144,6 +144,17 @@ pub(super) struct ConcurrentBlobLocationRouter {
     /// from a spurious wake.
     #[cfg(test)]
     notifications: std::sync::atomic::AtomicU64,
+    /// Publishers that have reached the notification gate, counted and rung
+    /// before they lock it (test builds only), so a test holding the gate
+    /// knows the publisher has updated its predicate and is at the gate.
+    #[cfg(test)]
+    gate_arrivals: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    arrived: pbfhogg_test_scratch::Bell,
+    /// The invocation whose fault plan an abort rings (hook builds only):
+    /// a stage 3 hook waits on the plan's bell for the abort.
+    #[cfg(pbfhogg_test_hooks)]
+    plan: crate::host::Permit,
     // Counters emitted by mod.rs after the scope joins.
     pub(super) stats: std::sync::Mutex<ConcurrentRouterStats>,
 }
@@ -203,6 +214,12 @@ impl ConcurrentBlobLocationRouter {
             readiness_wait_ns: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             notifications: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            gate_arrivals: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            arrived: pbfhogg_test_scratch::Bell::new(),
+            #[cfg(pbfhogg_test_hooks)]
+            plan: invocation.permit(),
             stats: std::sync::Mutex::new(stats),
         })
     }
@@ -345,6 +362,12 @@ impl ConcurrentBlobLocationRouter {
     /// the gate only prevents a notification from passing a waiter between
     /// its last check and the atomic unlock-and-wait operation.
     fn notify_waiters(&self) {
+        #[cfg(test)]
+        {
+            self.gate_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.arrived.ring();
+        }
         let _guard = self
             .notify_mu
             .lock()
@@ -379,6 +402,8 @@ impl ConcurrentBlobLocationRouter {
         self.aborted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.notify_waiters();
+        #[cfg(pbfhogg_test_hooks)]
+        self.plan.faults().ring();
     }
 
     pub(super) fn is_aborted(&self) -> bool {
@@ -1167,21 +1192,21 @@ mod tests {
                     sent.send(()).expect("publication completed");
                 });
                 let deadline = Instant::now() + crate::test_support::OBSERVE_BOUND;
-                loop {
-                    let changed = match event {
-                        0 | 1 => router.slots[0].lock().expect("slot").is_some(),
-                        2 => router.producer_done.load(SeqCst),
-                        _ => router.aborted.load(SeqCst),
-                    };
-                    if changed {
-                        break;
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "publisher did not update predicate"
-                    );
-                    std::thread::yield_now();
-                }
+                // The publisher counts its arrival at the gate before it
+                // locks it, after updating its predicate. The wait reads
+                // only that count, never the gate this thread holds.
+                assert!(
+                    router
+                        .arrived
+                        .wait(deadline, || router.gate_arrivals.load(SeqCst) > 0),
+                    "event {event}: the publisher never reached the gate"
+                );
+                let changed = match event {
+                    0 | 1 => router.slots[0].lock().expect("slot").is_some(),
+                    2 => router.producer_done.load(SeqCst),
+                    _ => router.aborted.load(SeqCst),
+                };
+                assert!(changed, "publisher did not update predicate");
                 // The predicate is visible and the gate is still ours, so no
                 // gated notification can have been made yet. That the
                 // publisher is blocked on the gate (rather than descheduled

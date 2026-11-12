@@ -93,6 +93,15 @@ enum Out {
     Dropped,
 }
 
+/// Whether a `flush` has queued its barrier and is about to block on it,
+/// with the bell a test waits on (test builds only).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FlushWaiting {
+    set: std::sync::atomic::AtomicBool,
+    bell: pbfhogg_test_scratch::Bell,
+}
+
 /// Writer that buffers bytes, dispatches chunks to a worker pool for
 /// gzip compression, and emits compressed chunks in order to an inner
 /// writer. A sequence permit is held from dispatch until ordered drain, so a
@@ -119,8 +128,8 @@ pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     finished: bool,
     #[cfg(test)]
     /// Set by `flush` once its barrier is queued, just before it blocks on
-    /// the barrier's acknowledgement.
-    flush_waiting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// the barrier's acknowledgement, and rung.
+    flush_waiting: std::sync::Arc<FlushWaiting>,
     raw_tx: Option<SyncSender<(usize, Job)>>,
     reorder_permit_rx: Receiver<()>,
     /// Joins to the inner writer and the count of sequence numbers it
@@ -528,8 +537,12 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
         #[cfg(pbfhogg_test_hooks)]
         self.cancel.faults().on_gzip_barrier_queued();
         #[cfg(test)]
-        self.flush_waiting
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            self.flush_waiting
+                .set
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.flush_waiting.bell.ring();
+        }
         match ack_rx.recv() {
             Ok(reply) => reply,
             Err(_) => {
@@ -1081,7 +1094,7 @@ mod tests {
     struct ProbeSink {
         data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
         flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        hold: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+        hold: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<FlushWaiting>>>,
         fail: bool,
     }
 
@@ -1099,15 +1112,15 @@ mod tests {
     impl Write for ProbeSink {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if let Some(waiting) = self.hold.get() {
-                let start = std::time::Instant::now();
-                while !waiting.load(std::sync::atomic::Ordering::SeqCst) {
-                    if start.elapsed() > crate::test_support::OBSERVE_BOUND {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "probe sink: flush never waited",
-                        ));
-                    }
-                    std::thread::yield_now();
+                let deadline = std::time::Instant::now() + crate::test_support::OBSERVE_BOUND;
+                let waited = waiting.bell.wait(deadline, || {
+                    waiting.set.load(std::sync::atomic::Ordering::SeqCst)
+                });
+                if !waited {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "probe sink: flush never waited",
+                    ));
                 }
             }
             if self.fail {

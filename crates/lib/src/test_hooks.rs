@@ -57,18 +57,20 @@
 //! wakes at the transition. A code path outside this module that moves such
 //! a field calls an `on_*` hook here, and a test releases parked work
 //! through a `release_*` method. Tripping the invocation's token rings the
-//! bell too ([`Invocation::cancel`](crate::host::Invocation::cancel)).
+//! bell too ([`Invocation::cancel`](crate::host::Invocation::cancel)), and so
+//! do the two outside writers some hook wait reads, in hook builds: the
+//! merge-changes ledger's stop guard after it halts, and the altw router
+//! after it records an abort.
 //!
 //! A wait snapshots the bell's ring count, evaluates its condition without
 //! the bell's lock, and sleeps only while the count is unchanged, so a ring
 //! between the evaluation and the sleep is never lost, and a condition may
-//! take any other lock. A condition over state that does not ring (the
-//! merge-changes ledger's halt, the altw router's abort, a test's own
-//! counters) waits polled instead: it is also re-evaluated every
-//! `TEST_HOOK_TICK`. Every wait ends at one absolute deadline,
-//! `TEST_HOOK_WAIT` after it starts. [`FaultPlan::wait_for`], the test-side
-//! wait, is always polled, since a closure cannot prove that what it reads
-//! rings; the hook waits in this module are classified one by one.
+//! take any other lock. No wait polls: a condition over state that does not
+//! ring is not woken by its change. Every wait ends at one absolute
+//! deadline, `TEST_HOOK_WAIT` after it starts. [`FaultPlan::wait_for`], the
+//! test-side wait, cannot check what its closure reads, so its rule is
+//! documentation: rung state only; a test's own state rings a
+//! `pbfhogg_test_scratch::Bell` of its own.
 //!
 //! The bell is a notification, not a snapshot: a condition over several
 //! fields reads them one by one, and a transient state that comes and goes
@@ -86,9 +88,6 @@ use std::time::{Duration, Instant};
 /// test that armed it with a named message instead of hanging it; see the
 /// test time bounds in `tunables`.
 const HOOK_WAIT: Duration = crate::tunables::TEST_HOOK_WAIT;
-
-/// How often a polled wait re-evaluates a condition over unrung state.
-const HOOK_TICK: Duration = crate::tunables::TEST_HOOK_TICK;
 
 /// The plan's doorbell: a ring count under a lock, and the condition
 /// variable every waiter sleeps on. See the module docs.
@@ -127,17 +126,6 @@ impl Bell {
                 .unwrap_or_else(PoisonError::into_inner),
         );
     }
-}
-
-/// What a wait's condition reads, which decides how it waits.
-#[derive(Clone, Copy)]
-enum Wake {
-    /// Only state whose every write rings the bell: [`Watched`] fields and
-    /// the token. Sleeps until a ring or the deadline.
-    Rung,
-    /// Also state that does not ring: re-evaluated every [`HOOK_TICK`] as
-    /// well.
-    Polled,
 }
 
 /// A plan field some wait's condition reads: loadable by anyone, written
@@ -184,6 +172,13 @@ impl Watched<AtomicU64> {
     fn fetch_sub(&self, n: u64, bell: &Bell) {
         self.0.fetch_sub(n, Ordering::SeqCst);
         bell.ring();
+    }
+
+    /// Raise to at least `value`; rings only if the value rose.
+    fn fetch_max(&self, value: u64, bell: &Bell) {
+        if self.0.fetch_max(value, Ordering::SeqCst) < value {
+            bell.ring();
+        }
     }
 }
 
@@ -360,6 +355,17 @@ pub struct FaultPlan {
     /// observation, not proof the thread is parked: a producer on an
     /// executor worker waits cooperatively.
     pub window_waits: Watched<AtomicU64>,
+    /// Pipelined writer threads of this invocation that have ended, counted
+    /// after the thread's body returned or unwound, so its inbox is gone and
+    /// every later send to it fails. Invocation-wide: meaningful as one
+    /// writer's exit only where the invocation runs one pipelined writer.
+    pub writer_thread_exits: Watched<AtomicU64>,
+
+    // --- read pipeline ---
+    /// The most filled reorder slots any pipelined read of this invocation
+    /// has held (the `pipeline_reorder_high_water` counter, as a field a
+    /// test can wait on).
+    pub reorder_filled_high_water: Watched<AtomicU64>,
 
     // --- output construction (`BoundOutput::pbf_writer`) ---
     /// Refuse every output backend as a `PlatformUnsupported` setup error,
@@ -764,6 +770,8 @@ impl FaultPlan {
             framing_wait_taken: Watched::<AtomicU64>::new(u64::MAX),
             framing_wait_needed: Watched::<AtomicU64>::new(u64::MAX),
             window_waits: Watched::<AtomicU64>::new(0),
+            writer_thread_exits: Watched::<AtomicU64>::new(0),
+            reorder_filled_high_water: Watched::<AtomicU64>::new(0),
             refuse_output_backend: AtomicBool::new(false),
             output_backend_refusals: AtomicU64::new(0),
             diff_unit_panic: AtomicUsize::new(usize::MAX),
@@ -1091,7 +1099,7 @@ impl FaultPlan {
     /// The one wait: evaluates `cond` until it yields, at most
     /// [`HOOK_WAIT`] from now (`None` past it). See the module docs for why
     /// a ring is never lost.
-    fn wait<R>(&self, wake: Wake, mut cond: impl FnMut() -> Option<R>) -> Option<R> {
+    fn wait<R>(&self, mut cond: impl FnMut() -> Option<R>) -> Option<R> {
         let deadline = Instant::now() + HOOK_WAIT;
         loop {
             let seen = *self.bell.rings();
@@ -1102,33 +1110,32 @@ impl FaultPlan {
             if now >= deadline {
                 return None;
             }
-            let remaining = deadline - now;
-            let timeout = match wake {
-                Wake::Rung => remaining,
-                Wake::Polled => remaining.min(HOOK_TICK),
-            };
-            self.bell.sleep_past(seen, timeout);
+            self.bell.sleep_past(seen, deadline - now);
         }
     }
 
     /// A hook's bounded wait for `cond`; past the bound it sets
     /// `timed_out` and returns, so the test that armed it can fail named.
-    fn wait_until(&self, timed_out: &AtomicBool, wake: Wake, cond: impl Fn() -> bool) {
-        if self.wait(wake, || cond().then_some(())).is_none() {
+    fn wait_until(&self, timed_out: &AtomicBool, cond: impl Fn() -> bool) {
+        if self.wait(|| cond().then_some(())).is_none() {
             timed_out.store(true, Ordering::SeqCst);
         }
     }
 
     /// A test's wait for `cond`, at most `TEST_HOOK_WAIT`: false if it
-    /// never held, for the caller's assertion to name. It wakes at once on
-    /// any write to a [`Watched`] field or a tripped token, and re-evaluates
-    /// every `TEST_HOOK_TICK` besides, so `cond` may read anything.
+    /// never held, for the caller's assertion to name. It wakes on a ring
+    /// and at nothing else, so `cond` reads only state whose every write
+    /// rings this plan: [`Watched`] fields, the token, and the outside
+    /// state whose writers ring (the merge-changes ledger's stop, the altw
+    /// router's abort). A condition over anything else is not woken by its
+    /// change and fails at the bound. A test's own state waits on its own
+    /// `pbfhogg_test_scratch::Bell`.
     pub fn wait_for(&self, cond: impl Fn() -> bool) -> bool {
-        self.wait(Wake::Polled, || cond().then_some(())).is_some()
+        self.wait(|| cond().then_some(())).is_some()
     }
 
     /// Wait for `token`, the invocation this plan belongs to, to trip, at
-    /// most `TEST_HOOK_WAIT`: false if it never did. Rung, never polled:
+    /// most `TEST_HOOK_WAIT`: false if it never did.
     /// [`Invocation::cancel`](crate::host::Invocation::cancel) rings the
     /// bell after the trip, so the wait ends at the trip itself.
     pub fn wait_cancelled(&self, token: &crate::host::Invocation) -> bool {
@@ -1136,12 +1143,12 @@ impl FaultPlan {
             std::ptr::eq(token.faults(), self),
             "a plan waits only for its own invocation's token"
         );
-        self.wait(Wake::Rung, || token.is_cancelled().then_some(()))
-            .is_some()
+        self.wait(|| token.is_cancelled().then_some(())).is_some()
     }
 
     /// Ring the bell for a transition outside the plan that some wait
-    /// reads: the invocation's token tripping.
+    /// reads: the invocation's token tripping, the merge-changes ledger
+    /// stopping, the altw router aborting.
     pub(crate) fn ring(&self) {
         self.bell.ring();
     }
@@ -1184,7 +1191,7 @@ impl FaultPlan {
     pub(crate) fn on_built_pool_thread_exit(&self) {
         if self.hold_built_pool_threads.load(Ordering::SeqCst) {
             self.built_pool_threads_held.fetch_add(1, &self.bell);
-            self.wait_until(&self.built_pool_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.built_pool_hook_timed_out, || {
                 self.release_built_pool_threads.load(Ordering::SeqCst)
             });
         }
@@ -1199,7 +1206,7 @@ impl FaultPlan {
         let hold = self.hold_other_pool_workers.load(Ordering::SeqCst);
         if worker as u64 == self.pool_worker_panic.load(Ordering::SeqCst) {
             if hold {
-                self.wait_until(&self.pool_hook_timed_out, Wake::Rung, || {
+                self.wait_until(&self.pool_hook_timed_out, || {
                     self.held_pool_workers.load(Ordering::SeqCst) >= 1
                 });
             }
@@ -1207,7 +1214,7 @@ impl FaultPlan {
         }
         if hold {
             self.held_pool_workers.fetch_add(1, &self.bell);
-            self.wait_until(&self.pool_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.pool_hook_timed_out, || {
                 self.join_reached_held_worker.load(Ordering::SeqCst)
                     || self.release_pool_workers.load(Ordering::SeqCst)
             });
@@ -1245,7 +1252,7 @@ impl FaultPlan {
         let n = self.gzip_op_count.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.gzip_panic_at_op.load(Ordering::SeqCst) {
             if self.gzip_panic_waits_for_barrier.load(Ordering::SeqCst) {
-                self.wait_until(&self.gzip_hook_timed_out, Wake::Rung, || {
+                self.wait_until(&self.gzip_hook_timed_out, || {
                     self.gzip_barriers_queued.load(Ordering::SeqCst) != 0
                 });
             }
@@ -1291,7 +1298,7 @@ impl FaultPlan {
         self.held_framing_jobs.fetch_add(1, &self.bell);
         // A writer that has taken back every other permit wins over a test
         // release seen in the same evaluation.
-        let ended = self.wait(Wake::Rung, || {
+        let ended = self.wait(|| {
             let taken = self.framing_wait_taken.load(Ordering::SeqCst);
             let held = self.held_framing_jobs.load(Ordering::SeqCst);
             if taken != u64::MAX
@@ -1339,6 +1346,20 @@ impl FaultPlan {
         self.window_waits.fetch_add(1, &self.bell);
     }
 
+    /// Called by a pipelined writer thread once its body has returned or
+    /// unwound (its inbox dropped).
+    pub(crate) fn on_writer_thread_exit(&self) {
+        self.writer_thread_exits.fetch_add(1, &self.bell);
+    }
+
+    /// Called by a pipelined read's consumer after each push into its
+    /// reorder buffer, with the filled slots it now holds. Rings only when
+    /// the high water rises.
+    pub(crate) fn on_reorder_filled(&self, filled: usize) {
+        self.reorder_filled_high_water
+            .fetch_max(filled as u64, &self.bell);
+    }
+
     /// Called by a writer whose wait for its framing jobs is over.
     pub(crate) fn after_framing_wait(&self) {
         self.framing_wait_taken.store(u64::MAX, &self.bell);
@@ -1376,9 +1397,9 @@ impl FaultPlan {
         cond: impl Fn() -> bool,
     ) -> crate::Result<()> {
         let timed_out = &self.merge_changes_hook_timed_out;
-        // Polled: `stopped` reads the ledger's halt, which `Ledger::stop`
-        // sets without tripping the token or ringing the plan.
-        self.wait_until(timed_out, Wake::Polled, || stopped() || cond());
+        // `stopped` reads the ledger's halt and the token: the ledger's stop
+        // guard rings the plan after it halts, and a cancel rings too.
+        self.wait_until(timed_out, || stopped() || cond());
         if timed_out.load(Ordering::SeqCst) {
             return Err(crate::Error::internal(format!(
                 "test-hooks: the merge-changes spill-first handshake did not happen within \
@@ -1474,20 +1495,20 @@ impl FaultPlan {
             .apply_changes_hold_workers_until_dispatch_blocked
             .load(Ordering::SeqCst)
         {
-            self.wait_until(timed_out, Wake::Rung, || {
+            self.wait_until(timed_out, || {
                 self.apply_changes_dispatch_blocked.load(Ordering::SeqCst)
             });
         }
         if seq == self.apply_changes_park_at_blob_seq.load(Ordering::SeqCst) {
             // Rung: tripping the token rings the plan.
-            self.wait_until(timed_out, Wake::Rung, &cancelled);
+            self.wait_until(timed_out, &cancelled);
         }
         if seq == self.apply_changes_panic_at_blob_seq.load(Ordering::SeqCst) {
             if self
                 .apply_changes_panic_waits_for_barrier_wait
                 .load(Ordering::SeqCst)
             {
-                self.wait_until(timed_out, Wake::Rung, || {
+                self.wait_until(timed_out, || {
                     self.apply_changes_scanner_in_barrier_wait
                         .load(Ordering::SeqCst)
                 });
@@ -1500,7 +1521,7 @@ impl FaultPlan {
     /// exclusive end `node_end_seq`.
     pub(crate) fn before_apply_changes_boundary(&self, node_end_seq: u64) {
         if self.apply_changes_late_boundary.load(Ordering::SeqCst) {
-            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
                 self.apply_changes_drain_next_seq.load(Ordering::SeqCst) >= node_end_seq
             });
         }
@@ -1515,7 +1536,7 @@ impl FaultPlan {
             .apply_changes_hold_walk_until_drain_past_nodes
             .swap(false, Ordering::SeqCst)
         {
-            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
                 self.apply_changes_drain_past_nodes.load(Ordering::SeqCst)
             });
         }
@@ -1529,7 +1550,7 @@ impl FaultPlan {
                 .apply_changes_poll_waits_for_drain_exit_after_seq
                 .load(Ordering::SeqCst)
         {
-            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
                 self.apply_changes_drain_returned.load(Ordering::SeqCst)
             });
         }
@@ -1576,7 +1597,7 @@ impl FaultPlan {
             .load(Ordering::SeqCst)
         {
             let mark = self.apply_changes_mark_candidate_seq.load(Ordering::SeqCst);
-            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
                 // Waiting without having walked the marked descriptor, or
                 // the marked candidate done: whichever the scanner's shape
                 // allows.
@@ -1610,7 +1631,7 @@ impl FaultPlan {
             .apply_changes_signal_waits_for_scanner_wait
             .load(Ordering::SeqCst)
         {
-            self.wait_until(&self.apply_changes_hook_timed_out, Wake::Rung, || {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
                 self.apply_changes_scanner_in_barrier_wait
                     .load(Ordering::SeqCst)
             });
@@ -1725,9 +1746,7 @@ impl FaultPlan {
         // Rung: the outcome is written only here, each write followed by a
         // ring, and a tripped token rings the bell.
         // Past the bound or on a trip with no outcome, it is `Expired`.
-        let _ = self.wait(Wake::Rung, || {
-            (self.fleet().outcome.is_some() || cancelled()).then_some(())
-        });
+        let _ = self.wait(|| (self.fleet().outcome.is_some() || cancelled()).then_some(()));
         let mut fleet = self.fleet();
         if fleet.outcome.is_none() {
             fleet.outcome = Some(FleetOutcome::Expired);
@@ -1746,8 +1765,8 @@ impl FaultPlan {
             return;
         }
         self.altw_stage3_bucket_held.store(true, &self.bell);
-        // Polled: the router's abort does not ring the plan.
-        self.wait_until(&self.altw_hook_timed_out, Wake::Polled, &aborted);
+        // The router rings the plan after it records an abort.
+        self.wait_until(&self.altw_hook_timed_out, &aborted);
         self.altw_stage3_saw_abort
             .store(aborted(), Ordering::SeqCst);
     }
@@ -1767,7 +1786,7 @@ impl FaultPlan {
         if ordinal != self.altw_stage4_panic_work_at.load(Ordering::SeqCst) {
             return;
         }
-        self.wait_until(&self.altw_hook_timed_out, Wake::Rung, || {
+        self.wait_until(&self.altw_hook_timed_out, || {
             self.altw_stage3_bucket_held.load(Ordering::SeqCst)
                 && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
         });
@@ -1780,7 +1799,7 @@ impl FaultPlan {
         if !self.altw_stage4_fail_at_start.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.wait_until(&self.altw_hook_timed_out, Wake::Rung, || {
+        self.wait_until(&self.altw_hook_timed_out, || {
             self.altw_stage3_bucket_held.load(Ordering::SeqCst)
         });
         Err(crate::Error::internal(
@@ -1798,7 +1817,7 @@ impl FaultPlan {
         if !fails && !panics {
             return Ok(());
         }
-        self.wait_until(&self.altw_hook_timed_out, Wake::Rung, || {
+        self.wait_until(&self.altw_hook_timed_out, || {
             self.altw_stage3_bucket_held.load(Ordering::SeqCst)
                 && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
         });

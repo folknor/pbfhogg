@@ -211,19 +211,19 @@ mod tests {
     /// Set when the scope body has returned or unwound: a thread that waits
     /// for it is provably still running when the scope reaches its join.
     #[derive(Default)]
-    struct BodyEnded(AtomicBool);
+    struct BodyEnded {
+        ended: AtomicBool,
+        bell: pbfhogg_test_scratch::Bell,
+    }
 
     impl BodyEnded {
         /// Wait (bounded) until the body has ended.
         fn wait(&self) {
-            let start = std::time::Instant::now();
-            while !self.0.load(SeqCst) {
-                assert!(
-                    start.elapsed() < crate::test_support::OBSERVE_BOUND,
-                    "the scope body never ended"
-                );
-                std::thread::yield_now();
-            }
+            let deadline = std::time::Instant::now() + crate::test_support::OBSERVE_BOUND;
+            assert!(
+                self.bell.wait(deadline, || self.ended.load(SeqCst)),
+                "the scope body never ended"
+            );
         }
     }
 
@@ -232,7 +232,8 @@ mod tests {
 
     impl Drop for EndBody<'_> {
         fn drop(&mut self) {
-            self.0.0.store(true, SeqCst);
+            self.0.ended.store(true, SeqCst);
+            self.0.bell.ring();
         }
     }
 

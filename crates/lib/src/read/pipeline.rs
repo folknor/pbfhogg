@@ -618,6 +618,8 @@ where
         cancel.check()?;
         pending.push(seq, (item, permit));
         metrics.record_reorder_levels(pending.filled_len(), pending.pending_len());
+        #[cfg(pbfhogg_test_hooks)]
+        cancel.faults().on_reorder_filled(pending.filled_len());
 
         while let Some((item, permit)) = pending.pop_ready() {
             match item {
@@ -931,12 +933,6 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let read = self.inner.read(buf)?;
             self.bytes_read.fetch_add(read, Ordering::Relaxed);
-            if read > 0 {
-                // Residue in the timed_waits source rule, until a gated
-                // reader replaces this throttle.
-                // wait-deliberate: throttles the reader; nothing is inferred from it
-                std::thread::sleep(crate::tunables::TEST_HOOK_TICK);
-            }
             Ok(read)
         }
     }
@@ -1058,6 +1054,12 @@ mod tests {
         );
     }
 
+    /// The consumer fails at its first block; the read stops long before the
+    /// input is drained. Nothing paces the reader: with one decode thread, a
+    /// read-ahead of one and a decode-ahead of one, the reader can run only a
+    /// few blobs ahead of the consumer (the admission permit rides each item
+    /// until it is consumed, and the raw channel holds one), so draining all
+    /// 128 blobs could only be a pipeline that ignored the error.
     #[test]
     fn fused_early_consumer_error_stops_promptly() {
         let bytes = fused_pbf(128);
@@ -1065,6 +1067,9 @@ mod tests {
         let bytes_read = Arc::new(AtomicUsize::new(0));
         let result = ElementReader::for_tests(CountingRead::new(bytes, Arc::clone(&bytes_read)))
             .unwrap()
+            .decode_threads(1)
+            .read_ahead(1)
+            .decode_ahead(1)
             .for_each_fused_block(
                 |_| Ok::<_, crate::Error>(()),
                 |_| Err(crate::Error::internal("stop")),
@@ -1087,16 +1092,37 @@ mod tests {
         );
     }
 
+    /// A one-way flag a test raises and another thread waits on.
+    #[derive(Default)]
+    struct Flag {
+        value: AtomicBool,
+        bell: pbfhogg_test_scratch::Bell,
+    }
+
+    impl Flag {
+        fn raise(&self) {
+            self.value.store(true, Ordering::SeqCst);
+            self.bell.ring();
+        }
+
+        /// Wait until raised, at most one observation bound: whether it was.
+        fn wait(&self) -> bool {
+            let deadline = std::time::Instant::now() + crate::test_support::OBSERVE_BOUND;
+            self.bell
+                .wait(deadline, || self.value.load(Ordering::SeqCst))
+        }
+    }
+
     /// Release the transform before joining, including when observing the
     /// stall times out and a decode worker reaches the transform later.
     struct ReleaseTransform {
-        release: Arc<AtomicBool>,
+        release: Arc<Flag>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Drop for ReleaseTransform {
         fn drop(&mut self) {
-            self.release.store(true, Ordering::Relaxed);
+            self.release.raise();
             if let Some(handle) = self.handle.take() {
                 drop(handle.join());
             }
@@ -1105,7 +1131,7 @@ mod tests {
 
     #[test]
     fn stalled_transform_guard_releases_and_joins_on_unwind() {
-        let release = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Flag::default());
         let finished = Arc::new(AtomicBool::new(false));
         let worker_release = Arc::clone(&release);
         let worker_finished = Arc::clone(&finished);
@@ -1113,10 +1139,9 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 // This worker may only get scheduled after the assertion
                 // unwinds: release must remain set for that late arrival.
-                while !worker_release.load(Ordering::Relaxed) {
-                    std::thread::yield_now();
+                if worker_release.wait() {
+                    worker_finished.store(true, Ordering::Relaxed);
                 }
-                worker_finished.store(true, Ordering::Relaxed);
             });
             let _release = ReleaseTransform {
                 release,
@@ -1135,8 +1160,8 @@ mod tests {
             crate::tunables::TEST_HANG_REPORT_GRACE,
             "the released fused read did not return",
         );
-        let stalled = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(Flag::default());
+        let release = Arc::new(Flag::default());
         let worker_stalled = Arc::clone(&stalled);
         let worker_release = Arc::clone(&release);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -1154,9 +1179,9 @@ mod tests {
                             crate::Element::Relation(relation) => relation.id(),
                         };
                         if id == 0 {
-                            worker_stalled.store(true, Ordering::Relaxed);
-                            while !worker_release.load(Ordering::Relaxed) {
-                                std::thread::yield_now();
+                            worker_stalled.raise();
+                            if !worker_release.wait() {
+                                return Err(crate::Error::internal("the stall was never released"));
                             }
                         }
                         Ok::<_, crate::Error>(id)
@@ -1172,15 +1197,8 @@ mod tests {
             release: Arc::clone(&release),
             handle: Some(handle),
         };
-        let start = std::time::Instant::now();
-        while !stalled.load(Ordering::Relaxed) {
-            assert!(
-                start.elapsed() < crate::test_support::OBSERVE_BOUND,
-                "transform did not stall"
-            );
-            std::thread::yield_now();
-        }
-        release.store(true, Ordering::Relaxed);
+        assert!(stalled.wait(), "transform did not stall");
+        release.raise();
         let (result, ids) = done_rx.recv().unwrap();
         result.unwrap();
         assert_eq!(ids, [0, 1, 2]);

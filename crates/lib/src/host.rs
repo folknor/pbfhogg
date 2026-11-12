@@ -1367,13 +1367,20 @@ mod capability_tests {
     /// the sealer's first attempt is refused as in progress (a rendezvous,
     /// so the race is not won before any worker minted). Workers then loop
     /// minting and retiring until a mint is refused or a bound is reached,
-    /// while the sealer retries. Whenever a worker holds a capability it
+    /// while the sealer makes a bounded number of attempts; after the join
+    /// a final attempt must seal. Whenever a worker holds a capability it
     /// reads the state as Open: a live capability excludes the seal. Once
     /// sealed, nothing is counted and admission is refused.
     #[test]
     fn the_seal_exchange_races_retirement_and_nested_calls() {
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
         const WORKERS: usize = 4;
+        // Bounds the barriers and the joins.
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "the seal race's workers did not finish",
+        );
         for _ in 0..20 {
             let inv = Invocation::new();
             let held = Arc::new(std::sync::Barrier::new(WORKERS + 1));
@@ -1397,8 +1404,8 @@ mod capability_tests {
                             seen_closed.store(true, SeqCst);
                         }
                         drop((permit, nested, call));
-                        // Bounded, so a sealer that keeps losing the race
-                        // wins once the workers are done.
+                        // Bounded, so the workers end and the sealer's
+                        // final attempt after the join must win.
                         for _ in 0..5_000 {
                             let Ok(call) = inv.call() else {
                                 return;
@@ -1423,15 +1430,23 @@ mod capability_tests {
                 "every worker holds a call"
             );
             go.wait();
-            let snapshot = loop {
-                if let SealOutcome::Sealed(snapshot) = inv.seal() {
-                    break snapshot;
+            // A fixed number of attempts racing the workers, then the join,
+            // then one attempt that must win: nothing waits on timing, and a
+            // seal refused once every capability is retired fails here.
+            let mut snapshot = None;
+            for _ in 0..5_000 {
+                if let SealOutcome::Sealed(sealed) = inv.seal() {
+                    snapshot = Some(sealed);
+                    break;
                 }
-                std::hint::spin_loop();
-            };
+            }
             for w in workers {
                 w.join().expect("worker");
             }
+            let snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => sealed(&inv.seal()),
+            };
             assert!(
                 !seen_closed.load(SeqCst),
                 "a capability was alive while the invocation was not Open"

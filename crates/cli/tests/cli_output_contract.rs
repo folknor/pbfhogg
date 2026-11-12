@@ -2919,7 +2919,6 @@ mod tier3 {
 #[test]
 fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
-    use std::time::Instant;
     let fx = Fx::new();
     let row = ROWS
         .iter()
@@ -2960,7 +2959,9 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
         // The first signal is taken (the paused thread saw the token trip)
         // before the second is sent: two pending standard signals coalesce.
         wait_for(Announcement::Cancelled(ordinal.get()), &mut child);
-        let sent = Instant::now();
+        // The stuck pause parks for good, so the run can end only through
+        // the second signal: its exit code is the evidence, under the
+        // child's own deadline. No elapsed time is asserted.
         child.signal(second);
         let out = child.wait();
         assert_eq!(
@@ -2970,10 +2971,6 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
             interrupted::signal_name(first),
             interrupted::signal_name(second),
             out.stderr_str()
-        );
-        assert!(
-            sent.elapsed() < pbfhogg::TEST_OBSERVE_BOUND,
-            "the second signal did not end the run at once"
         );
         // The stuck run never cleaned up: its staging entry is still there,
         // and the next run in the same directories reports it.

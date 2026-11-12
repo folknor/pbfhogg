@@ -947,14 +947,22 @@ crate::counters::counter_set! {
         dispatch_send_blocks,
         result_recv_blocks,
     }
+    extra {
+        /// Rung after each tally (test builds; zero-sized elsewhere).
+        blocked: crate::counters::TestBell = crate::counters::TestBell::new(),
+    }
 }
 
-/// Counts one entry into a blocking slow path, in test builds only: other
-/// builds pass an empty observer, so the pools' instructions do not change.
+/// Counts one entry into a blocking slow path and rings `bell`, in test
+/// builds only: other builds pass an empty observer, so the pools'
+/// instructions do not change.
 #[inline]
-fn tally_block(_blocks: &std::sync::atomic::AtomicU64) {
+fn tally_block(_blocks: &std::sync::atomic::AtomicU64, _bell: &crate::counters::TestBell) {
     #[cfg(test)]
-    _blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        _blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        _bell.ring();
+    }
 }
 
 /// A worker's next schedule position from the shared descriptor receiver, or
@@ -990,13 +998,13 @@ fn recv_checked_recording_wait<T>(
     rx: &std::sync::mpsc::Receiver<T>,
     cancel: &crate::host::Recorder,
     wait_ns: &std::sync::atomic::AtomicU64,
-    blocks: &std::sync::atomic::AtomicU64,
+    blocks: (&std::sync::atomic::AtomicU64, &crate::counters::TestBell),
 ) -> Result<Option<T>> {
     cancel.check()?;
     let received = crate::counters::recv_recording_wait_observing(
         rx,
         wait_ns,
-        || tally_block(blocks),
+        || tally_block(blocks.0, blocks.1),
         |watch| watch.elapsed_ns(),
     );
     cancel.check()?;
@@ -1150,7 +1158,7 @@ fn run_unordered_per_blob<L, R: Send>(
                     &desc_tx,
                     position,
                     &metrics.dispatch_send_wait_ns,
-                    || tally_block(&metrics.dispatch_send_blocks),
+                    || tally_block(&metrics.dispatch_send_blocks, &metrics.blocked),
                     |watch| watch.elapsed_ns(),
                 )
                 .is_err()
@@ -1206,7 +1214,7 @@ fn run_unordered_per_blob<L, R: Send>(
             &result_rx,
             &host.invocation,
             &metrics.result_recv_wait_ns,
-            &metrics.result_recv_blocks,
+            (&metrics.result_recv_blocks, &metrics.blocked),
         )? {
             if merge(seq, result?).is_break() {
                 // Dropping the receiver - it falls out of scope when this
@@ -1763,7 +1771,7 @@ fn run_accumulate_decoded<S: Send>(
                     &desc_tx,
                     position,
                     &metrics.dispatch_send_wait_ns,
-                    || tally_block(&metrics.dispatch_send_blocks),
+                    || tally_block(&metrics.dispatch_send_blocks, &metrics.blocked),
                     |watch| watch.elapsed_ns(),
                 )
                 .is_err()
@@ -2310,16 +2318,14 @@ mod tests {
             || (),
             |_: &mut (), position: usize, _: &[u8]| -> crate::Result<()> {
                 if position == 0 {
-                    let start = std::time::Instant::now();
-                    while metrics.dispatch_send_blocks.load(Relaxed) == 0
-                        || metrics.result_recv_blocks.load(Relaxed) == 0
-                    {
-                        assert!(
-                            start.elapsed() < crate::test_support::OBSERVE_BOUND,
-                            "the dispatcher or the consumer never blocked"
-                        );
-                        std::thread::yield_now();
-                    }
+                    let deadline = std::time::Instant::now() + crate::test_support::OBSERVE_BOUND;
+                    assert!(
+                        metrics.blocked.wait(deadline, || {
+                            metrics.dispatch_send_blocks.load(Relaxed) != 0
+                                && metrics.result_recv_blocks.load(Relaxed) != 0
+                        }),
+                        "the dispatcher or the consumer never blocked"
+                    );
                 }
                 Ok(())
             },

@@ -661,9 +661,8 @@ fn a_panicking_sink_does_not_fail_the_run() {
 }
 
 /// Records the publication events of its invocation, and holds the first
-/// `PUBLISH_START` until the second publication waits on the lock or
-/// starts (a bounded fault-plan wait), so two publications that could
-/// overlap do.
+/// `PUBLISH_START` until the second publication waits on the lock (a
+/// bounded fault-plan wait), so two publications that could overlap do.
 #[cfg(pbfhogg_test_hooks)]
 struct PublishOrder {
     events: std::sync::Mutex<Vec<(String, Option<i64>)>>,
@@ -696,11 +695,13 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
                     .clone()
                     .expect("invocation set");
                 let faults = invocation.faults();
-                // `starts` is the sink's own: the wait's tick re-reads it.
+                // Only the lock wait rings the plan. Without the lock the
+                // second publication never waits on it, this wait ends at
+                // its bound, and the spans interleave, which the test's
+                // order assertions refuse.
                 assert!(
-                    faults.wait_for(|| faults.publication_lock_waits.load(SeqCst) > 0
-                        || self.starts.load(SeqCst) >= 2),
-                    "the second publication neither waited on the lock nor started"
+                    faults.wait_for(|| faults.publication_lock_waits.load(SeqCst) > 0),
+                    "the second publication never waited on the lock"
                 );
             }
         }

@@ -209,12 +209,29 @@ impl Ledger {
 }
 
 /// Stops the ledger when dropped: on every exit of the coordinator, return
-/// or unwind, before the reader scope joins.
-struct StopOnDrop<'a>(&'a Ledger);
+/// or unwind, before the reader scope joins. In hook builds it then rings
+/// the invocation's fault plan, whose spill-first hook waits on the halt.
+struct StopOnDrop<'a> {
+    ledger: &'a Ledger,
+    #[cfg(pbfhogg_test_hooks)]
+    cancel: &'a crate::host::Recorder,
+}
+
+impl<'a> StopOnDrop<'a> {
+    fn new(ledger: &'a Ledger, _cancel: &'a crate::host::Recorder) -> Self {
+        Self {
+            ledger,
+            #[cfg(pbfhogg_test_hooks)]
+            cancel: _cancel,
+        }
+    }
+}
 
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.stop();
+        self.ledger.stop();
+        #[cfg(pbfhogg_test_hooks)]
+        self.cancel.faults().ring();
     }
 }
 
@@ -392,7 +409,7 @@ pub(crate) fn run(
     let encoder_ref = &encoder;
     let result = plan.executor.scope(move |scope| {
         crate::threads::scope(|threads| {
-            let _stop = StopOnDrop(ledger_ref);
+            let _stop = StopOnDrop::new(ledger_ref, plan.cancel);
             let spawn_reader = |input: usize| -> crate::Result<()> {
                 let tx = tx.clone();
                 threads
@@ -432,7 +449,7 @@ where
     let encoder_ref = &encoder;
     let result = plan.executor.scope(move |scope| {
         crate::threads::scope(|threads| {
-            let _stop = StopOnDrop(ledger_ref);
+            let _stop = StopOnDrop::new(ledger_ref, plan.cancel);
             let spawn_reader = |input: usize| -> crate::Result<()> {
                 let tx = tx.clone();
                 threads

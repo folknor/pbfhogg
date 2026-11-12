@@ -438,12 +438,15 @@ and a child announces its pause on a pipe instead of the test polling for
 a file); a timed wait survives only where the other side cannot notify, and
 says why. The source-policy timed-waits rule
 (`crates/source-policy/src/rules/timed_waits.rs`) enforces the spellings:
-a `sleep`, `sleep_until` or `sleep_ms` identifier, or libc's `nanosleep`,
-`clock_nanosleep` or `usleep`, anywhere in a member's `src/` or `tests/`,
-production included, is refused with no exemption but the rule's own
-`RESIDUE` list, which names each remaining sleep per file with its reason
-and what removes it, and fails when an entry goes stale, so it only
-shrinks. Every other std timed wait (`park_timeout`, `recv_timeout`,
+a `sleep`, `sleep_until` or `sleep_ms` identifier, libc's `nanosleep`,
+`clock_nanosleep` or `usleep`, or a spin primitive named by its path
+(`thread::yield_now`, `hint::spin_loop`), anywhere in a member's `src/` or
+`tests/`, production included, is refused with no exemption. A test's own
+state that another thread waits on rings a `pbfhogg_test_scratch::Bell`
+after each store (the fault plan's bell protocol: snapshot the ring count,
+evaluate, sleep only while it is unchanged, one deadline); a library slow
+path a unit test observes rings a `counters::TestBell`, zero-sized outside
+test builds. Every other std timed wait (`park_timeout`, `recv_timeout`,
 `recv_deadline`, condvar `wait_timeout*`) and each libc raw wait the tree
 uses (`libc::poll`, `ppoll`, `epoll_wait`, `select`, `pselect`; an
 inventory, not every timed syscall) needs a `// wait-deliberate: <reason>`
@@ -455,8 +458,8 @@ rule (`crates/source-policy/src/rules/duration_literals.rs`) refuses a
 bound's own tests in the test-scratch crate, which cannot name the
 library's tunables), unless `// fixture-time: <reason>` says the value is
 data, not a wait. Both are spelling tripwires: wrappers, named integers,
-macro expansion and spins on `Instant`, `yield_now` or `try_recv` are
-outside them, and a marker's reason is reviewed, not checked.
+macro expansion, a bare imported `yield_now` and spins on `Instant` or
+`try_recv` are outside them, and a marker's reason is reviewed, not checked.
 
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication
@@ -743,12 +746,13 @@ exception, not a tier - should not survive across many PRs.
   and every write rings the plan's bell, so a parked hook or a waiting
   test wakes at the transition. A code path that moves such a field calls
   an `on_*` hook on the plan; a test releases parked work through a
-  `release_*` method; `Invocation::cancel` rings too. A hook wait over
-  state that does not ring (the merge-changes ledger's halt, the altw
-  router's abort) is also re-evaluated every `TEST_HOOK_TICK`. A test
-  waits with `FaultPlan::wait_for`, never its own sleep loop: it is
-  bounded by `TEST_HOOK_WAIT`, returns false for the test's assertion to
-  name, and ticks as well, so its condition may read anything. The bell
+  `release_*` method; `Invocation::cancel` rings too, and so, in hook
+  builds, do the merge-changes ledger's stop guard and the altw router's
+  abort. No wait polls. A test waits with `FaultPlan::wait_for`, never its
+  own loop: it is bounded by `TEST_HOOK_WAIT`, returns false for the
+  test's assertion to name, and wakes only on a ring, so its condition
+  reads only rung state; a test's own state rings a
+  `pbfhogg_test_scratch::Bell` of its own. The bell
   is a notification, not a snapshot: a handshake that needs several
   fields read together, or a transient state seen, keeps its state under
   one lock, as the decode gate does.

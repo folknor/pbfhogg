@@ -102,7 +102,8 @@ impl AtReturn {
 struct Cleanup {
     invocation: Invocation,
     pool: Option<Arc<rayon::ThreadPool>>,
-    exited: Arc<AtomicUsize>,
+    /// Pool threads that have exited, and the bell each exit rings.
+    exited: Arc<(AtomicUsize, pbfhogg_test_scratch::Bell)>,
 }
 
 impl Drop for Cleanup {
@@ -110,7 +111,11 @@ impl Drop for Cleanup {
         let faults = self.invocation.faults();
         faults.release_framing();
         drop(self.pool.take());
-        let joined = faults.wait_for(|| self.exited.load(SeqCst) == POOL_THREADS);
+        let deadline = Instant::now() + pbfhogg::TEST_OBSERVE_BOUND;
+        let joined = self
+            .exited
+            .1
+            .wait(deadline, || self.exited.0.load(SeqCst) == POOL_THREADS);
         if !std::thread::panicking() {
             assert!(
                 joined,
@@ -148,18 +153,16 @@ fn end_writer<W: Write>(
         }
         End::FailedWrite => {
             // Raw sends succeed while the writer thread still holds its
-            // receiver; the first one after it exits fails and recovers its
-            // error.
-            let deadline = Instant::now() + pbfhogg::TEST_HANG_BOUND;
-            let err = loop {
-                match writer.write_raw(b"raw") {
-                    Err(e) => break e,
-                    Ok(()) => assert!(
-                        Instant::now() < deadline,
-                        "the writer thread never exited after its framing error"
-                    ),
-                }
-            };
+            // receiver; once it has exited (this invocation's only pipelined
+            // writer), the next one fails and recovers its error.
+            let faults = invocation.faults();
+            assert!(
+                faults.wait_for(|| faults.writer_thread_exits.load(SeqCst) == 1),
+                "the writer thread never exited after its framing error"
+            );
+            let err = writer
+                .write_raw(b"raw")
+                .expect_err("a raw write after the writer thread exited must fail");
             let at = AtReturn::take(invocation);
             // The writer is still alive: a later framed write must be
             // refused without dispatching anything.
@@ -185,13 +188,14 @@ fn end_writer<W: Write>(
 fn run(backend: Backend, end: End) {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("out.osm.pbf");
-    let exited = Arc::new(AtomicUsize::new(0));
+    let exited = Arc::new((AtomicUsize::new(0), pbfhogg_test_scratch::Bell::new()));
     let on_exit = Arc::clone(&exited);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(POOL_THREADS)
             .exit_handler(move |_| {
-                on_exit.fetch_add(1, SeqCst);
+                on_exit.0.fetch_add(1, SeqCst);
+                on_exit.1.ring();
             })
             .build()
             .unwrap(),
@@ -267,13 +271,14 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
         let dir = crate::common::test_scratch();
         let path = dir.path().join("window.osm.pbf");
         let path = path.as_path();
-        let exited = Arc::new(AtomicUsize::new(0));
+        let exited = Arc::new((AtomicUsize::new(0), pbfhogg_test_scratch::Bell::new()));
         let on_exit = Arc::clone(&exited);
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(POOL_THREADS)
                 .exit_handler(move |_| {
-                    on_exit.fetch_add(1, SeqCst);
+                    on_exit.0.fetch_add(1, SeqCst);
+                    on_exit.1.ring();
                 })
                 .build()
                 .unwrap(),

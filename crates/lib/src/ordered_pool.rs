@@ -158,8 +158,9 @@ crate::counters::counter_set! {
     /// into the same totals; two invocations never do.
     ///
     /// The unnamed counters are never emitted; they count how often each
-    /// slow path was entered, which lets a test wait until a block has
-    /// provably begun.
+    /// slow path was entered, and `blocked` rings after each count (in test
+    /// builds; elsewhere it is zero-sized and does nothing), which lets a
+    /// test wait until a block has provably begun.
     pub(crate) struct OrderedPoolMetrics {
         /// A worker parked at the admission gate: its claimed task is a full
         /// window ahead of the consumer, which is behind a slow head (the
@@ -196,6 +197,9 @@ crate::counters::counter_set! {
         /// window). Not an admission wait: these workers hold no task.
         job_recv_wait_ns => "ordered_pool_job_recv_wait_ns",
         job_recv_blocks,
+    }
+    extra {
+        blocked: crate::counters::TestBell = crate::counters::TestBell::new(),
     }
 }
 
@@ -358,6 +362,7 @@ impl OrderedGate {
                 && let Some(m) = metrics
             {
                 m.window_parks.fetch_add(1, Ordering::Relaxed);
+                m.blocked.ring();
                 parked = Some(crate::counters::Stopwatch::start());
             }
             state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
@@ -683,6 +688,7 @@ impl<T> WorkerShared<'_, T> {
                 self.metrics
                     .result_send_blocks
                     .fetch_add(1, Ordering::Relaxed);
+                self.metrics.blocked.ring();
                 let sent = self.tx.send(item);
                 blocked.record_ns(&self.metrics.result_send_wait_ns);
                 if sent.is_err() {
@@ -914,6 +920,7 @@ fn recv_counted<M>(
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::sync::mpsc::RecvError),
         Err(std::sync::mpsc::TryRecvError::Empty) => {
             metrics.result_recv_blocks.fetch_add(1, Ordering::Relaxed);
+            metrics.blocked.ring();
             let blocked = crate::counters::Stopwatch::start();
             let received = rx.recv();
             blocked.record_ns(&metrics.result_recv_wait_ns);
@@ -966,7 +973,7 @@ pub(crate) struct StreamConfig<'a> {
 /// Used on the task's own worker thread only.
 pub(crate) struct Emitter<'a, T, E> {
     tx: std::sync::mpsc::SyncSender<StreamMsg<T, E>>,
-    abandoned: &'a AtomicBool,
+    abandoned: &'a Abandonment,
     metrics: &'a OrderedPoolMetrics,
     /// A send failed: the consumer is gone. Latched, so a task that ignores
     /// the error still ends its worker.
@@ -1009,7 +1016,14 @@ impl<T, E> Emitter<'_, T, E> {
     /// unwound), or a send already failed: nothing this task produces from
     /// here can be delivered, so a long task may stop early.
     pub(crate) fn abandoned(&self) -> bool {
-        self.gone.get() || self.abandoned.load(Ordering::Acquire)
+        self.gone.get() || self.abandoned.is_set()
+    }
+
+    /// Wait until the run is abandoned, at most until `deadline`: whether
+    /// it was. `gone` is this worker's own, so only the flag needs a wake.
+    #[cfg(test)]
+    pub(crate) fn wait_abandoned(&self, deadline: std::time::Instant) -> bool {
+        self.abandoned.raised.wait(deadline, || self.abandoned())
     }
 
     /// Send `msg`, recording a blocked send; `false` (and latched) when the
@@ -1021,6 +1035,7 @@ impl<T, E> Emitter<'_, T, E> {
                 self.metrics
                     .result_send_blocks
                     .fetch_add(1, Ordering::Relaxed);
+                self.metrics.blocked.ring();
                 let blocked = crate::counters::Stopwatch::start();
                 let sent = self.tx.send(msg).is_ok();
                 blocked.record_ns(&self.metrics.result_send_wait_ns);
@@ -1035,23 +1050,52 @@ impl<T, E> Emitter<'_, T, E> {
     }
 }
 
+/// A streamed run's abandonment flag. In test builds it also rings a bell
+/// after it is raised, so a test can wait for it; it wakes nobody in the
+/// run (see the module docs).
+struct Abandonment {
+    flag: AtomicBool,
+    #[cfg(test)]
+    raised: pbfhogg_test_scratch::Bell,
+}
+
+impl Abandonment {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            #[cfg(test)]
+            raised: pbfhogg_test_scratch::Bell::new(),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    fn set(&self) {
+        self.flag.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.raised.ring();
+    }
+}
+
 /// Sets the abandonment flag when dropped: the consumer side's guard, so
 /// every return and unwind of it raises the flag.
-struct AbandonOnDrop<'a>(&'a AtomicBool);
+struct AbandonOnDrop<'a>(&'a Abandonment);
 
 impl Drop for AbandonOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.0.set();
     }
 }
 
 /// Sets the abandonment flag if the holding worker unwinds.
-struct AbandonOnUnwind<'a>(&'a AtomicBool);
+struct AbandonOnUnwind<'a>(&'a Abandonment);
 
 impl Drop for AbandonOnUnwind<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0.store(true, Ordering::Release);
+            self.0.set();
         }
     }
 }
@@ -1070,6 +1114,7 @@ fn next_job<J>(
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             metrics.job_lock_blocks.fetch_add(1, Ordering::Relaxed);
+            metrics.blocked.ring();
             let blocked = crate::counters::Stopwatch::start();
             let guard = jobs.lock().unwrap_or_else(PoisonError::into_inner);
             blocked.record_ns(&metrics.job_lock_wait_ns);
@@ -1081,6 +1126,7 @@ fn next_job<J>(
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::sync::mpsc::RecvError),
         Err(std::sync::mpsc::TryRecvError::Empty) => {
             metrics.job_recv_blocks.fetch_add(1, Ordering::Relaxed);
+            metrics.blocked.ring();
             let blocked = crate::counters::Stopwatch::start();
             let job = guard.recv();
             blocked.record_ns(&metrics.job_recv_wait_ns);
@@ -1248,7 +1294,7 @@ where
     if workers == 0 {
         return Err(Error::internal("ordered pool started with no workers"));
     }
-    let abandoned = AtomicBool::new(false);
+    let abandoned = Abandonment::new();
     // Declared before the scope, so it drops after the scope has joined the
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, cancel);
@@ -1296,7 +1342,7 @@ where
                 let _unwind = AbandonOnUnwind(abandoned);
                 let mut local = local(worker);
                 loop {
-                    if abandoned.load(Ordering::Acquire) {
+                    if abandoned.is_set() {
                         break;
                     }
                     let job = next_job(&jobs, metrics);
@@ -1427,6 +1473,29 @@ fn refill<P, T, E>(
 mod tests {
     use super::*;
 
+    /// A test's own one-way flag that a waiting thread wakes on.
+    #[derive(Default)]
+    struct Flag {
+        value: AtomicBool,
+        bell: pbfhogg_test_scratch::Bell,
+    }
+
+    impl Flag {
+        fn raise(&self) {
+            self.value.store(true, Ordering::SeqCst);
+            self.bell.ring();
+        }
+
+        fn is_raised(&self) -> bool {
+            self.value.load(Ordering::SeqCst)
+        }
+
+        /// Wait until raised, at most one observation bound: whether it was.
+        fn wait(&self) -> bool {
+            self.bell.wait(observe_deadline(), || self.is_raised())
+        }
+    }
+
     /// Run `f` under a fail-stop hang bound. The defect these tests pin is a
     /// hang, which ends the test binary with the test's name rather than
     /// eating the harness watchdog or leaving a hung pool under later tests.
@@ -1533,21 +1602,18 @@ mod tests {
     #[test]
     fn the_lowest_failing_task_is_the_one_reported() {
         let (err, ordered) = within_deadline(|| {
-            let later_failed = AtomicBool::new(false);
+            let later_failed = Flag::default();
             let ordered = AtomicBool::new(false);
             let err = run(
                 5_000,
                 6,
                 |i| match i {
                     300 => {
-                        ordered.store(
-                            eventually(|| later_failed.load(Ordering::SeqCst)),
-                            Ordering::SeqCst,
-                        );
+                        ordered.store(later_failed.wait(), Ordering::SeqCst);
                         Err(Error::internal(format!("bad blob {i}")))
                     }
                     301 => {
-                        later_failed.store(true, Ordering::SeqCst);
+                        later_failed.raise();
                         Err(Error::internal(format!("bad blob {i}")))
                     }
                     _ => Ok(i),
@@ -1637,11 +1703,16 @@ mod tests {
     /// would deadlock if the hook ran only once the result had arrived.
     #[test]
     fn before_item_runs_before_its_result_is_awaited() {
-        struct Consumer<'a>(&'a AtomicUsize);
+        struct Prepared {
+            count: AtomicUsize,
+            bell: pbfhogg_test_scratch::Bell,
+        }
+        struct Consumer<'a>(&'a Prepared);
         impl OrderedConsumer<usize> for Consumer<'_> {
             fn before_item(&mut self, task: usize) -> crate::Result<()> {
-                assert_eq!(self.0.load(Ordering::SeqCst), task);
-                self.0.store(task + 1, Ordering::SeqCst);
+                assert_eq!(self.0.count.load(Ordering::SeqCst), task);
+                self.0.count.store(task + 1, Ordering::SeqCst);
+                self.0.bell.ring();
                 Ok(())
             }
             fn consume(&mut self, _: usize, _: usize) -> crate::Result<()> {
@@ -1649,21 +1720,27 @@ mod tests {
             }
         }
         within_deadline(|| {
-            let prepared = AtomicUsize::new(0);
+            let prepared = Prepared {
+                count: AtomicUsize::new(0),
+                bell: pbfhogg_test_scratch::Bell::new(),
+            };
             run_with(
                 200,
                 4,
                 &crate::host::Call::detached(),
                 |i| {
-                    while prepared.load(Ordering::SeqCst) <= i {
-                        std::thread::yield_now();
+                    if prepared.bell.wait(observe_deadline(), || {
+                        prepared.count.load(Ordering::SeqCst) > i
+                    }) {
+                        Ok(i)
+                    } else {
+                        Err(Error::internal(format!("before_item({i}) never ran")))
                     }
-                    Ok(i)
                 },
                 &mut Consumer(&prepared),
             )
             .unwrap();
-            assert_eq!(prepared.load(Ordering::SeqCst), 200);
+            assert_eq!(prepared.count.load(Ordering::SeqCst), 200);
         });
     }
 
@@ -1672,7 +1749,7 @@ mod tests {
     /// reaches `abandon`, which releases the wait, and returns that error.
     #[test]
     fn an_eager_before_item_failure_abandons_a_worker_on_an_outside_wait() {
-        struct Consumer<'a>(&'a AtomicBool);
+        struct Consumer<'a>(&'a Flag);
         impl OrderedConsumer<usize> for Consumer<'_> {
             fn before_item(&mut self, task: usize) -> crate::Result<()> {
                 if task == 3 {
@@ -1684,27 +1761,25 @@ mod tests {
                 Ok(())
             }
             fn abandon(&mut self, _: &Error) {
-                self.0.store(true, Ordering::SeqCst);
+                self.0.raise();
             }
         }
         let err = within_deadline(|| {
-            let released = AtomicBool::new(false);
+            let released = Flag::default();
             let err = run_with(
                 50,
                 4,
                 &crate::host::Call::detached(),
                 |i| {
-                    if i == 3 {
-                        while !released.load(Ordering::SeqCst) {
-                            std::thread::yield_now();
-                        }
+                    if i == 3 && !released.wait() {
+                        return Err(Error::internal("abandon never released task 3"));
                     }
                     Ok(i)
                 },
                 &mut Consumer(&released),
             )
             .unwrap_err();
-            assert!(released.load(Ordering::SeqCst));
+            assert!(released.is_raised());
             err
         });
         assert_eq!(err.to_string(), "passthrough before 3 failed");
@@ -1731,7 +1806,9 @@ mod tests {
                 |i| {
                     if i == 0 {
                         parked.store(
-                            eventually(|| metrics.window_parks.load(Ordering::Relaxed) > 0),
+                            blocked_until(&metrics, || {
+                                metrics.window_parks.load(Ordering::Relaxed) > 0
+                            }),
                             Ordering::SeqCst,
                         );
                     }
@@ -1829,17 +1906,15 @@ mod tests {
     // test to have been entered (the set's unnamed counters), never for a
     // sleep to have probably been long enough.
 
-    /// Poll `cond` for up to the deadline; whether it came true.
-    fn eventually(cond: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + crate::test_support::OBSERVE_BOUND;
-        while !cond() {
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            // Residue in the timed_waits source rule: the counters ring nothing yet.
-            std::thread::sleep(crate::tunables::TEST_HOOK_TICK); // wait-deliberate: pace of a poll on an observed counter; the deadline fails
-        }
-        true
+    /// One observation bound from now.
+    fn observe_deadline() -> std::time::Instant {
+        std::time::Instant::now() + crate::test_support::OBSERVE_BOUND
+    }
+
+    /// Wait for `cond` over `metrics`' slow-path tallies, which ring the
+    /// set's bell as each block begins; whether it came true in time.
+    fn blocked_until(metrics: &OrderedPoolMetrics, cond: impl FnMut() -> bool) -> bool {
+        metrics.blocked.wait(observe_deadline(), cond)
     }
 
     fn run_in(
@@ -1882,8 +1957,9 @@ mod tests {
             let mut saw_block = false;
             run_in(WIDE_TASKS, 4, WIDE_WINDOW, &metrics, Ok, |v| {
                 if v == 0 {
-                    saw_block =
-                        eventually(|| metrics.result_send_blocks.load(Ordering::Relaxed) > 0);
+                    saw_block = blocked_until(&metrics, || {
+                        metrics.result_send_blocks.load(Ordering::Relaxed) > 0
+                    });
                 }
                 got.push(v);
                 Ok(())
@@ -1909,7 +1985,7 @@ mod tests {
             let metrics = OrderedPoolMetrics::new();
             let err = run_in(WIDE_TASKS, 4, WIDE_WINDOW, &metrics, Ok, |v| {
                 assert_eq!(v, 0, "the consumer fails on its first result");
-                assert!(eventually(|| metrics
+                assert!(blocked_until(&metrics, || metrics
                     .result_send_blocks
                     .load(Ordering::Relaxed)
                     > 0));
@@ -1933,7 +2009,9 @@ mod tests {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_in(WIDE_TASKS, 4, WIDE_WINDOW, &metrics, Ok, |_| {
                     saw_block.store(
-                        eventually(|| metrics.result_send_blocks.load(Ordering::Relaxed) > 0),
+                        blocked_until(&metrics, || {
+                            metrics.result_send_blocks.load(Ordering::Relaxed) > 0
+                        }),
                         Ordering::SeqCst,
                     );
                     panic!("injected consumer panic");
@@ -1956,7 +2034,7 @@ mod tests {
     fn the_lowest_failure_wins_past_a_full_channel() {
         let (err, ordered) = within_deadline(|| {
             let metrics = OrderedPoolMetrics::new();
-            let later_failed = AtomicBool::new(false);
+            let later_failed = Flag::default();
             let ordered = AtomicBool::new(false);
             let err = run_in(
                 WIDE_TASKS,
@@ -1965,21 +2043,18 @@ mod tests {
                 &metrics,
                 |i| match i {
                     5 => {
-                        ordered.store(
-                            eventually(|| later_failed.load(Ordering::SeqCst)),
-                            Ordering::SeqCst,
-                        );
+                        ordered.store(later_failed.wait(), Ordering::SeqCst);
                         Err(Error::internal("bad 5"))
                     }
                     50 => {
-                        later_failed.store(true, Ordering::SeqCst);
+                        later_failed.raise();
                         Err(Error::internal("bad 50"))
                     }
                     _ => Ok(i),
                 },
                 |v| {
                     if v == 0 {
-                        assert!(eventually(|| metrics
+                        assert!(blocked_until(&metrics, || metrics
                             .result_send_blocks
                             .load(Ordering::Relaxed)
                             > 0));
@@ -2010,7 +2085,9 @@ mod tests {
                 |i| {
                     if i == 0 {
                         parked.store(
-                            eventually(|| metrics.window_parks.load(Ordering::Relaxed) > 0),
+                            blocked_until(&metrics, || {
+                                metrics.window_parks.load(Ordering::Relaxed) > 0
+                            }),
                             Ordering::SeqCst,
                         );
                     }
@@ -2048,7 +2125,9 @@ mod tests {
                 &metrics,
                 |i| {
                     waited.store(
-                        eventually(|| metrics.result_recv_blocks.load(Ordering::Relaxed) > 0),
+                        blocked_until(&metrics, || {
+                            metrics.result_recv_blocks.load(Ordering::Relaxed) > 0
+                        }),
                         Ordering::SeqCst,
                     );
                     Ok(i)
@@ -2204,7 +2283,7 @@ mod tests {
     fn a_streamed_failure_surfaces_in_task_order() {
         let (err, consumer, ordered) = within_deadline(|| {
             let mut consumer = Recorder::default();
-            let later_failed = AtomicBool::new(false);
+            let later_failed = Flag::default();
             let ordered = AtomicBool::new(false);
             let err = streams_in(
                 200,
@@ -2214,14 +2293,11 @@ mod tests {
                 &OrderedPoolMetrics::new(),
                 |task, emitter| {
                     if task == 20 {
-                        ordered.store(
-                            eventually(|| later_failed.load(Ordering::SeqCst)),
-                            Ordering::SeqCst,
-                        );
+                        ordered.store(later_failed.wait(), Ordering::SeqCst);
                         return Err(Error::internal("task 20 failed"));
                     }
                     if task == 23 {
-                        later_failed.store(true, Ordering::SeqCst);
+                        later_failed.raise();
                         return Err(Error::internal("task 23 failed"));
                     }
                     emit_some(task, emitter)
@@ -2310,7 +2386,7 @@ mod tests {
                     if task == 0 {
                         // Hold the consumer's first item back until another
                         // task has blocked on its full channel.
-                        assert!(eventually(|| metrics
+                        assert!(blocked_until(&metrics, || metrics
                             .result_send_blocks
                             .load(Ordering::Relaxed)
                             > 0));
@@ -2319,7 +2395,8 @@ mod tests {
                     }
                     if task == 1 {
                         // A long task: it stops once the run is abandoned.
-                        assert!(eventually(|| emitter.abandoned()));
+                        assert!(emitter.wait_abandoned(observe_deadline()));
+                        assert!(emitter.abandoned());
                         saw_abandoned.store(true, Ordering::SeqCst);
                         return Ok(0);
                     }
@@ -2409,7 +2486,7 @@ mod tests {
                     |task, emitter| {
                         if task == 0 {
                             blocked.store(
-                                eventually(|| {
+                                blocked_until(&metrics, || {
                                     metrics.result_recv_blocks.load(Ordering::Relaxed) > 0
                                         && metrics.job_recv_blocks.load(Ordering::Relaxed) > 0
                                         && metrics.job_lock_blocks.load(Ordering::Relaxed) > 0

@@ -20,55 +20,40 @@
 //!
 //! A sleep is never a deadline bounding a wait for an event, so the sleep
 //! family ([`SLEEPS`], and libc's sleeping calls) is refused outright: no
-//! marker exempts it. A wait on something our code controls ends on a
-//! notification; a wait on something that cannot notify states why through
-//! a marked bounded wait. The only sleeps left are the [`RESIDUE`] entries,
-//! each a known site with its reason and what removes it, counted per file
-//! so a new sleep in a residue file is refused too, and a stale entry (fewer
-//! sleeps than it allows) fails until it is shrunk.
+//! marker exempts it, and no file is excepted. A wait on something our code
+//! controls ends on a notification; a wait on something that cannot notify
+//! states why through a marked bounded wait. The spin primitives
+//! ([`SPINS`], named as `thread::yield_now` and `hint::spin_loop`) are
+//! refused outright too: a loop around them is a poll. An executor's own
+//! `yield_now` method (rayon's cooperative wait) is not that path and is not
+//! matched.
 //!
 //! libc's raw waits ([`RAW`], named as `libc::name`) take the marker rule:
 //! an explicit inventory of the spellings this tree uses, not every timed
 //! syscall there is.
 //!
 //! A spelling tripwire, not enforcement of the prose rule: a wrapper
-//! function, macro expansion, and spins on `Instant`, `yield_now` or
-//! `try_recv` are outside it, and a marker's reason is checked only for
-//! being present.
+//! function, macro expansion, an imported `yield_now` called bare, and spins
+//! on `Instant` or `try_recv` are outside it, and a marker's reason is
+//! checked only for being present.
 
 use std::collections::BTreeSet;
 
 use crate::Corpus;
 use crate::lex::{Kind, Source, Tok};
 
-/// std's sleeps: refused everywhere but [`RESIDUE`].
+/// std's sleeps: refused everywhere.
 pub const SLEEPS: &[&str] = &["sleep", "sleep_until", "sleep_ms"];
 
 /// libc's sleeping calls, named as `libc::name`: refused like [`SLEEPS`].
 const RAW_SLEEPS: &[&str] = &["nanosleep", "clock_nanosleep", "usleep"];
 
+/// std's spin primitives, as (module, name), matched as `module::name`:
+/// refused like [`SLEEPS`].
+pub const SPINS: &[(&str, &str)] = &[("thread", "yield_now"), ("hint", "spin_loop")];
+
 /// libc's timed waits, named as `libc::name`: marker rule.
 pub const RAW: &[&str] = &["poll", "ppoll", "epoll_wait", "select", "pselect"];
-
-/// The sleeps still in the tree: (file, how many, why, what removes it).
-/// It only shrinks. Each is a wait our code could end by notification and
-/// has not been converted yet; none is an accepted exception.
-pub const RESIDUE: &[(&str, usize, &str, &str)] = &[
-    (
-        "crates/lib/src/ordered_pool.rs",
-        1,
-        "the `eventually` test helper polls pool metrics counters, which ring nothing",
-        "a test-only notifier on the metrics counters the helper's callers wait on",
-    ),
-    (
-        "crates/lib/src/read/pipeline.rs",
-        1,
-        "`CountingRead` throttles the reader so an early consumer error is seen before \
-         the input is drained",
-        "a gated reader: block further reads at the consumer's failure, observe the \
-         pipeline's stop, then release, asserting at most the in-flight read follows",
-    ),
-];
 
 /// The names of std's timed waits other than sleeps: marker rule.
 pub const TIMED: &[&str] = &[
@@ -97,41 +82,51 @@ pub fn errors(corpus: &Corpus) -> Vec<String> {
                  the wait itself, or say why with `// wait-deliberate: <reason>`"
             ));
         }
-        let sleeps = sleeps(source);
-        let allowed = RESIDUE
-            .iter()
-            .find(|(file, ..)| *file == path)
-            .map_or(0, |(_, count, ..)| *count);
-        if sleeps.len() > allowed {
-            for (line, name) in &sleeps {
-                found.push(format!(
-                    "{path}:{line}: `{name}` sleeps; a time value survives only as a deadline \
-                     bounding a wait that ends on an event: wait for the event"
-                ));
-            }
-        } else if sleeps.len() < allowed {
+        for (line, name) in sleeps(source) {
             found.push(format!(
-                "{path}: the sleep residue allows {allowed} but the file has {}; shrink RESIDUE",
-                sleeps.len()
+                "{path}:{line}: `{name}` sleeps; a time value survives only as a deadline \
+                 bounding a wait that ends on an event: wait for the event"
             ));
         }
-    }
-    for (file, ..) in RESIDUE {
-        if !corpus.files.contains_key(*file) {
+        for (line, name) in spins(source) {
             found.push(format!(
-                "{file}: a sleep residue entry names a missing file"
+                "{path}:{line}: `{name}` spins; a loop around it polls: wait for a \
+                 notification (a bell, a condition variable, a channel) instead"
             ));
         }
     }
     found
 }
 
-/// `libc :: name` at `i`.
-fn is_libc(source: &Source, code: &[Tok], i: usize) -> bool {
+/// `module :: name` at `i`.
+fn is_path(source: &Source, code: &[Tok], i: usize, module: &str) -> bool {
     i >= 3
         && source.is_punct(&code[i - 1], ":")
         && source.is_punct(&code[i - 2], ":")
-        && source.name(&code[i - 3]) == Some("libc")
+        && source.name(&code[i - 3]) == Some(module)
+}
+
+/// `libc :: name` at `i`.
+fn is_libc(source: &Source, code: &[Tok], i: usize) -> bool {
+    is_path(source, code, i, "libc")
+}
+
+/// Every spin primitive named by its module path, with its line.
+pub fn spins(source: &Source) -> Vec<(usize, String)> {
+    let code = source.code();
+    let mut out = Vec::new();
+    for (i, tok) in code.iter().enumerate() {
+        let Some(name) = source.name(tok) else {
+            continue;
+        };
+        if let Some((module, _)) = SPINS
+            .iter()
+            .find(|(module, spin)| *spin == name && is_path(source, &code, i, module))
+        {
+            out.push((tok.line, format!("{module}::{name}")));
+        }
+    }
+    out
 }
 
 /// Every sleep identifier, marked or not, with its line.
@@ -236,7 +231,7 @@ fn marked_lines(source: &Source) -> BTreeSet<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sleeps, unmarked};
+    use super::{sleeps, spins, unmarked};
     use crate::lex::Source;
 
     fn names(src: &str) -> Vec<String> {
@@ -277,6 +272,35 @@ mod tests {
             "fn f() { my::nanosleep(a); }",
         ] {
             assert!(sleep_names(src).is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn spins_are_found_by_their_path() {
+        let spin_names = |src: &str| -> Vec<String> {
+            spins(&Source::new(src.to_owned()))
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect()
+        };
+        for (src, name) in [
+            ("fn f() { std::thread::yield_now(); }", "thread::yield_now"),
+            ("use std::thread::yield_now;", "thread::yield_now"),
+            ("fn f() { std::hint::spin_loop(); }", "hint::spin_loop"),
+            (
+                "fn f() { std::thread::yield_now(); } // wait-deliberate: a reason",
+                "thread::yield_now",
+            ),
+        ] {
+            assert_eq!(spin_names(src), [name], "{src}");
+        }
+        for src in [
+            "fn f() { executor.yield_now(); }",
+            "fn f() { rayon::yield_now(); }",
+            "// std::thread::yield_now();",
+            "fn f() { let s = \"std::hint::spin_loop()\"; }",
+        ] {
+            assert!(spin_names(src).is_empty(), "{src}");
         }
     }
 

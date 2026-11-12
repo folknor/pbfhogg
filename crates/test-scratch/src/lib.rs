@@ -2,7 +2,8 @@
 //! library's unit and integration tests, the CLI's and the library
 //! harness's. Dev-only; nothing shipped depends on it. It also holds the
 //! other support every harness shares and that needs nothing from pbfhogg:
-//! the repository root and the fail-stop hang bound ([`HangBound`]).
+//! the repository root, the fail-stop hang bound ([`HangBound`]) and the
+//! doorbell a test waits on for state it or a test build observes ([`Bell`]).
 //!
 //! Every scratch directory is a random child of the workspace's gitignored
 //! `data/test-scratch`. Random names cannot collide between tests, sweeps or
@@ -17,7 +18,9 @@
 //! above `crates/test-scratch`. It is not relocatable; a test binary run from
 //! a moved or read-only checkout still names the tree it was compiled in.
 
+mod bell;
 mod hang;
+pub use bell::Bell;
 pub use hang::HangBound;
 
 use std::fs::{File, FileType};

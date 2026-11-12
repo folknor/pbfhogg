@@ -1689,6 +1689,25 @@ mod tests {
         )
     }
 
+    /// The error a producer writing to a writer with a dead thread gets: the
+    /// first write may still succeed (its framing job is dispatched, and
+    /// only the job finds the receiver gone); once every framing job has
+    /// ended, which records the death notice before the job's permit is
+    /// returned, the next write must fail without dispatching anything.
+    fn first_failure(
+        w: &mut PbfWriter<Vec<u8>>,
+        mut write: impl FnMut(&mut PbfWriter<Vec<u8>>) -> Result<()>,
+    ) -> Error {
+        if let Err(e) = write(w) {
+            return e;
+        }
+        w.pipeline
+            .as_ref()
+            .expect("a pipelined writer")
+            .wait_for_framing();
+        write(w).expect_err("the producer must notice the dead writer thread")
+    }
+
     /// The writer thread's real error must survive, not be replaced.
     ///
     /// Every send-failure path returned a generic "writer thread
@@ -1773,26 +1792,15 @@ mod tests {
     /// that died on ENOSPC was invisible until `flush()`. Nothing throttled
     /// the producer, because the permit pool releases on closure *completion*,
     /// not on delivery - a full disk let a whole planet-scale dataset be read,
-    /// decoded and framed before anything was reported. The loop below is the
-    /// producer grinding on: it must terminate with the writer thread's own
-    /// error long before the cap.
+    /// decoded and framed before anything was reported. Here the producer's
+    /// next block once the first one's framing job has ended must come back
+    /// with the writer thread's own error (`first_failure`).
     #[test]
     fn write_primitive_block_stops_once_the_writer_thread_is_dead() {
         let mut w = writer_with_dead_thread(Err(storage_full("no space left on device")));
         // A minimal but real PrimitiveBlock: an empty PrimitiveGroup (field 2).
         let block = [0x12u8, 0x00];
-        let mut err = None;
-        for _ in 0..2_000 {
-            if let Err(e) = w.write_primitive_block(&block) {
-                err = Some(e);
-                break;
-            }
-            std::thread::yield_now();
-        }
-        let err = err.expect(
-            "the producer must notice the dead writer thread; \
-             it ran 2,000 blocks without a single report",
-        );
+        let err = first_failure(&mut w, |w| w.write_primitive_block(&block));
         assert!(
             is_storage_full(&err),
             "the ENOSPC kind must reach the caller, not a generic substitute"
@@ -1982,16 +1990,11 @@ mod tests {
 
         let mut w =
             writer_with_dead_thread(Err(storage_full("owned variant: no space left on device")));
-        let mut err = None;
-        for _ in 0..2_000 {
-            if let Err(e) = w.write_primitive_block_owned(owned_block(&block)) {
-                err = Some(e);
-                break;
-            }
-            std::thread::yield_now();
-        }
+        let err = first_failure(&mut w, |w| {
+            w.write_primitive_block_owned(owned_block(&block))
+        });
         assert!(
-            err.is_some_and(|e| e.to_string().contains("owned variant")),
+            err.to_string().contains("owned variant"),
             "write_primitive_block_owned must surface the writer thread's error"
         );
         assert!(w.flush().is_err());
@@ -2000,16 +2003,9 @@ mod tests {
         let mut w = writer_with_dead_thread(Err(storage_full(
             "no-indexdata variant: no space left on device",
         )));
-        let mut err = None;
-        for _ in 0..2_000 {
-            if let Err(e) = w.write_primitive_block_no_indexdata(&block) {
-                err = Some(e);
-                break;
-            }
-            std::thread::yield_now();
-        }
+        let err = first_failure(&mut w, |w| w.write_primitive_block_no_indexdata(&block));
         assert!(
-            err.is_some_and(|e| e.to_string().contains("no-indexdata variant")),
+            err.to_string().contains("no-indexdata variant"),
             "write_primitive_block_no_indexdata must surface the writer thread's error"
         );
         assert!(w.flush().is_err());

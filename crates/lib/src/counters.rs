@@ -416,6 +416,29 @@ pub(crate) fn recv_recording_wait_observing<T>(
     }
 }
 
+/// The doorbell a unit test waits on for a slow-path tally it observes
+/// (`pbfhogg_test_scratch::Bell`), as a field of a counter set, whose
+/// initializers cannot carry a `cfg`. Outside test builds it is
+/// [`NoBell`], a zero-sized type whose `ring` does nothing.
+#[cfg(test)]
+pub(crate) type TestBell = pbfhogg_test_scratch::Bell;
+#[cfg(not(test))]
+pub(crate) type TestBell = NoBell;
+
+/// [`TestBell`] outside test builds.
+#[cfg(not(test))]
+pub(crate) struct NoBell;
+
+#[cfg(not(test))]
+impl NoBell {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    pub(crate) fn ring(&self) {}
+}
+
 /// Depth-gated stall span shared by concurrent blockers.
 ///
 /// `brokkr sidecar --durations` pairs `WAIT_<CATEGORY>_START/_END` markers

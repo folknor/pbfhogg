@@ -410,11 +410,19 @@ impl WritePipeline {
         let (tx, window_rx, inbox) = new_channels();
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
+        #[cfg(pbfhogg_test_hooks)]
+        let exit = WriterExit(crate::host::Invocation::clone(&invocation));
         #[allow(
             clippy::disallowed_methods,
             reason = "a session thread: the writer keeps its handle and joins it at its end"
         )]
-        let handle = std::thread::spawn(move || body(inbox, &thread_expected));
+        let handle = std::thread::spawn(move || {
+            // Bound before the body runs and dropped after it returns or
+            // unwinds, so after the body's inbox is gone.
+            #[cfg(pbfhogg_test_hooks)]
+            let _exit = exit;
+            body(inbox, &thread_expected)
+        });
         Self::new(tx, window_rx, handle, expected, executor, invocation)
     }
 
@@ -472,6 +480,19 @@ impl WritePipeline {
                 })
             }
         }
+    }
+}
+
+/// Reports a pipelined writer thread's end to its invocation's fault plan
+/// when dropped (hook builds only). Holds an invocation handle, not a
+/// permit, so it never keeps the invocation from sealing.
+#[cfg(pbfhogg_test_hooks)]
+struct WriterExit(crate::host::Invocation);
+
+#[cfg(pbfhogg_test_hooks)]
+impl Drop for WriterExit {
+    fn drop(&mut self) {
+        self.0.faults().on_writer_thread_exit();
     }
 }
 

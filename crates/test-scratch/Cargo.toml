@@ -24,5 +24,9 @@ doctest = false
 [dependencies]
 tempfile = "3.27.0"
 
+# The hang bound's expiry probe arms the parent-death signal on its child.
+[dev-dependencies]
+libc = "0.2.191"
+
 [lints]
 workspace = true

@@ -390,13 +390,13 @@ and the mixed backend shapes (one of `linux-direct-io`, `linux-io-uring`
 without the other) on both targets.
 
 `brokkr check` enforces a fixed 20 s per-test watchdog with no
-override, on every profile including `--profile full`. Tests slower
-than that can never pass a `check` profile, so `brokkr.d/checks.toml`'s
-`[test.profiles.full]` carries a by-name `skip` list for the
-over-watchdog tests - without it the profile could never pass, by
-construction. Those tests are `#[ignore]`d out of `check`'s reach and
-must be exercised individually via `brokkr test <name> --timeout
-<secs>` (`brokkr test -p pbfhogg-cli <name> ...` for a CLI test), which raises the per-test timeout up to 280 s.
+override, on every profile including `--profile full`, so no test may
+run longer than that. `brokkr test --timeout` exists for debugging a test
+that overruns, and nothing is designed around it. `[test.profiles.full]`
+in `brokkr.d/checks.toml` includes ignored tests, and its by-name `skip`
+list holds only the opt-in instruments (see "Opt-in instrument"), each
+run individually via `brokkr test <name>` (`brokkr test -p pbfhogg-cli
+<name>` for a CLI test) where its precondition holds.
 
 A test's own failure bounds (the hook wait, the hang bound of the timeout
 helpers, the observation bound, the harness rendezvous, the child timeout)
@@ -415,7 +415,9 @@ stderr and aborts the test binary rather than panicking past a thread left
 running under later tests (brokkr reports the binary killed by signal 6
 while running that test). A test whose waits are several in sequence
 carries one such bound over all of them. Abort orphans no child: every test
-child carries a parent-death `SIGKILL` (`common::process::isolate`), keyed
+child carries a parent-death `SIGKILL` (`common::process::isolate`; the
+hang bound's own expiry probe in `crates/test-scratch`, which cannot reach
+`isolate`, arms the same signal itself), keyed
 to the thread that spawned it, which is why a test child is always spawned,
 owned and reaped by its test's own thread. No test throws away a
 `thread::spawn` handle (the source-policy detached-threads rule, a lexical

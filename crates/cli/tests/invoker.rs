@@ -513,23 +513,30 @@ impl<'a> CliInvoker<'a> {
     }
 
     /// Start a child owned by the borrowed scratch scope.
-    pub fn spawn(mut self) -> RunningCli<'a> {
+    pub fn spawn(self) -> RunningCli<'a> {
+        self.try_spawn().expect("spawn pbfhogg")
+    }
+
+    /// [`Self::spawn`], returning the spawn's refusal (a spent children
+    /// budget, a failed `exec`) instead of panicking on it. Preparation,
+    /// the guard's included, still panics.
+    pub fn try_spawn(mut self) -> std::io::Result<RunningCli<'a>> {
         self.cmd.stdout(Stdio::piped());
         if !self.stderr_closed {
             self.cmd.stderr(Stdio::piped());
         }
         guard(&mut self.cmd);
-        let owner = OwnedChild::spawn(&mut self.cmd, self.scratch).expect("spawn pbfhogg");
+        let owner = OwnedChild::spawn(&mut self.cmd, self.scratch)?;
         // Drop this process's copy of the announcement writer now, so the
         // child holds the only one.
         drop(self.cmd);
         let own = std::time::Instant::now() + pbfhogg::TEST_CHILD_TIMEOUT;
         let deadline = owner.budget().map_or(own, |budget| own.min(budget));
-        RunningCli {
+        Ok(RunningCli {
             owner,
             deadline,
             announcements: self.announcements.map(|fd| (fd, Vec::new())),
-        }
+        })
     }
 
     /// Run and assert exit status is success. Returns captured output
@@ -1112,15 +1119,12 @@ mod tests {
     /// earlier child ended in time.
     #[test]
     fn a_spent_children_budget_refuses_the_next_child() {
-        use super::OwnedChild;
-        use std::process::Command;
-
         let scratch = pbfhogg_test_scratch::scratch();
         CliInvoker::new(&scratch).arg("--version").assert_success();
         crate::common::process::spend_children_budget();
-        let mut command = Command::new(super::pbfhogg_bin());
-        crate::common::process::isolate(&mut command, &scratch);
-        let refused = OwnedChild::spawn(command.arg("--version"), &scratch)
+        let refused = CliInvoker::new(&scratch)
+            .arg("--version")
+            .try_spawn()
             .err()
             .expect("a spent budget refuses the spawn");
         assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);

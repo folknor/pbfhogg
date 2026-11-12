@@ -66,17 +66,6 @@ unpin. Also open: the `promise-guard` and `direct-io` requirements were not chec
 against the AGENTS.md host rule (a scratch filesystem that refuses O_DIRECT, an
 architecture or kernel without seccomp).
 
-## VER-141 - The osmium sort test is skipped as over-watchdog but takes milliseconds
-
-`sort_cross_validate_osmium` (`crates/cli/tests/cli_sort.rs`) is the one entry in
-the `full` profile's by-name skip list (`brokkr.d/checks.toml`, described there as
-over-watchdog tests), and AGENTS.md uses it as the worked example of a test run
-through `brokkr test --timeout`. It ran in 19 ms on bygg once its 110 s child
-timeout was removed; it is `#[ignore = "external"]` because it needs osmium, not
-because it is slow. Decide whether `full` (which sets `include_ignored`) should run
-it, skipping where osmium is absent as it already does, and reword the skip-list
-and AGENTS.md text that calls it over-watchdog.
-
 ## VER-090 - The requirement-table check is convention-bound
 
 `required` in `crates/harness/src/describe.rs` now refuses anything outside its convention

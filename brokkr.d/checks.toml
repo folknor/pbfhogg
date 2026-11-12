@@ -320,12 +320,12 @@ skip = ["tier2::", "tier3::", "serial::"]
 include_ignored = false
 
 # Tier 3 - focused all-feature correctness profile. include_ignored
-# picks up fast ignored tests that #[ignore] keeps out of tier 1.
-# Tests slower than brokkr check's fixed 20 s per-test kill are skipped here BY NAME
-# and must be run individually via `brokkr test <name> --timeout <secs>`
-# (add `-p pbfhogg-cli` when the test is a CLI one, as
-# sort_cross_validate_osmium is); without the skip the profile could
-# never pass, by construction.
+# picks up fast ignored tests that #[ignore] keeps out of tier 1, the
+# osmium cross-checks among them (they pass, disclosing, where osmium is
+# absent). No test may outlive brokkr check's fixed 20 s per-test kill.
+# The skip list below holds only opt-in instruments: tests that fail by
+# design without a precondition a standard host does not arrange. Run
+# one with `brokkr test <name>` where its precondition holds.
 #
 # WARNING, and it has bitten once (2026-08-20): these entries are SUBSTRING
 # matches, not exact test names. Every fast synthetic test whose name merely
@@ -335,13 +335,13 @@ include_ignored = false
 # geocode tests that way. Before adding a short name here, grep the suite for
 # it; before naming a new test, check it does not contain an entry below.
 [test.profiles.full]
-description = "Partial all-feature correctness (tier 3); over-watchdog tests run individually via brokkr test"
+description = "Partial all-feature correctness (tier 3); opt-in instruments run individually via brokkr test"
 sweeps = ["all"]
 skip = [
-    "sort_cross_validate_osmium",
-    # An opt-in instrument, not slow: it fails by design on a host whose
-    # memlock limit cannot hold the io_uring pool, which a standard host's
-    # cannot. Run it with brokkr test where the limit was raised.
+    # An opt-in instrument, not slow: it fails by design unless io_uring
+    # works, the memlock limit holds the full registered pool (a standard
+    # host's cannot) and scratch accepts O_DIRECT. Run it with brokkr test
+    # where those hold.
     "full_registered_pool_instrument",
 ]
 include_ignored = true

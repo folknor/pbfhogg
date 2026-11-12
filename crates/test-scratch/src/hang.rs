@@ -4,8 +4,10 @@
 //! running under later tests, on a fixture it may already have lost. So on
 //! expiry this ends the whole test binary instead: one line naming the test
 //! goes to stderr, then `abort`. Nothing else survives it: every test child
-//! carries a parent-death `SIGKILL` (`crates/lib/tests/common/process.rs`,
-//! `isolate`), so the kernel ends the children whose owners `abort` skips.
+//! carries a parent-death `SIGKILL` (`isolate` in
+//! `crates/lib/tests/common/process.rs`, which this leaf crate cannot reach,
+//! so its own expiry probe below arms the same signal), and the kernel ends
+//! the children whose owners `abort` skips.
 //!
 //! The bound covers the guard's lifetime and nothing else. Declare it first in
 //! the test, before the resources and release guards of the scenario, so it is
@@ -115,16 +117,38 @@ mod tests {
     }
 
     /// Expiry ends the binary by abort, with the test and label on stderr.
-    /// The child's own bound is what ends it, so the wait is bounded.
+    /// The wait ends on the child's exit, which the child's own bound - the
+    /// mechanism under test - brings about; if expiry is broken, the runner's
+    /// watchdog ends this test. The child gets a clean environment and the
+    /// parent-death `SIGKILL` every test child carries, keyed to this thread,
+    /// which stays in `output` until the child is reaped.
     #[test]
     fn an_expired_bound_aborts_the_binary_with_a_named_report() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        // SAFETY: getpid has no preconditions.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: the closure runs between fork and exec and calls only
+        // async-signal-safe functions (`prctl`, `getppid`, `_exit`). A child
+        // whose parent died before the `prctl` was reparented and exits.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(127);
+                }
+                Ok(())
+            });
+        }
+        let output = command
             .args(["hang::tests::expiry_probe", "--exact", "--nocapture"])
+            .env_clear()
             .env(PROBE, "1")
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run the probe");
-        use std::os::unix::process::ExitStatusExt;
         assert_eq!(output.status.signal(), Some(6), "{:?}", output.status);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

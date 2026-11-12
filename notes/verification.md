@@ -78,33 +78,18 @@ script and its migration manifest are retired. brokkr still lets an empty `paths
 a stale exclusion pass an ordinary check; only its audit flags them. Brokkr side: bz
 brokkr#157.
 
-## VER-018 - The complete gate does not certify the io_uring writer
+## VER-018 - The gate's backend requirement checks refusals, not execution
 
-The gate profile's `PBFHOGG_TEST_REQUIRE` makes every refusal predicate fail
-instead of skip for `direct-io` and `promise-guard`. `io-uring` is left out: the
-writer registers 16 MiB of buffers, the gate's host has an 8 MiB hard
-`RLIMIT_MEMLOCK`, and every io_uring cell is a typed refusal there (every earlier
-green gate passed all of them as skips). Residue: run the gate where the writer can
-register its pool, or land the pool sizing in VER-135, then add `io-uring` to the
-requirement in `brokkr.d/checks.toml`. A test-hooks smaller pool was ruled out: it
-certifies a configuration production does not run. Also open: the requirement checks
-refusal paths, not positive execution, so a cell that stops exercising its backend
-without consulting a predicate still passes; and the CLI predicates read the refused
-label from stderr text, which exit code 3 authenticates as a refusal but not as that
-label.
-
-## VER-135 - The io_uring writer refuses on a default 8 MiB memlock host
-
-`uring_writer.rs` registers `NUM_BUFS` (64) x `IO_BUF_BYTES` (256 KiB) = 16 MiB and
-refuses with `PlatformUnsupported` when `RLIMIT_MEMLOCK` is lower. The systemd
-default hard limit is 8 MiB, so `--io-uring` refuses for an unprivileged user on a
-stock host, this development host included. Sizing the pool from the soft limit was
-argued and found unsound on its own: the limit is a ceiling, not the remaining
-allowance (other locked memory and concurrent writers share it), `CAP_IPC_LOCK`
-exceeds it, and ADR-0016 routes host-derived resources through `Host`. Candidates: a
-caller-supplied registration budget through `Host`, or try the full pool and fall back
-to smaller ones on the memlock refusal only, with a floor that needs a rationale and a
-planet A/B where the full pool fits.
+The gate requires `direct-io`, `io-uring` and `promise-guard`. Residue: the
+requirement checks refusal paths, not positive execution, so a cell that stops
+exercising its backend without consulting a predicate still passes; a green gate need
+not have exercised the io_uring writer's smaller fallback pools or its retry (a host
+with a large limit registers the full pool first time); the CLI predicates read the
+refused label from stderr text, which exit code 3 authenticates as a refusal but not
+as that label; and concurrent io_uring test writers share the per-user memlock
+allowance with no cross-process admission, so on a low-limit host a contended
+registration can fail the gate falsely. Not yet measured: the fallback pools' wall
+against the full pool on planet (needs a raised limit, which this host lacks).
 
 ## VER-019 - Two commands cannot take an injected input pin
 

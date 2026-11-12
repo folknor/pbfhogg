@@ -35,7 +35,7 @@ suite; the rest still carry their older commit in the Notes column.
 | inspect --tags --type relation | `--bench 1` | 8.8 s | `8daf5f04` | |
 | inspect --extended | `--bench 1` | **820.7 s (13m41s)** | `19db1512` | full-decode era; superseded on bygg by "Inspect --extended: validator-projection scan" below |
 | sort (already-sorted input) | `--bench 1` | **147.0 s** | `e278faff` | commit `dcc445e`, 2026-07-14; was 132.3 s `b9c10a41` (`16e3694`). Regression flag CLOSED - see below |
-| sort `--io-uring` | `--bench 1` | 126.8 s | `9ce80125` (`16e3694`) | **not re-pinned**: host `RLIMIT_MEMLOCK` soft limit is 8 MB, io_uring preflight needs >= 16 MB. Raise via `/etc/security/limits.conf` and re-queue |
+| sort `--io-uring` | `--bench 1` | 126.8 s | `9ce80125` (`16e3694`) | **not re-pinned**: host `RLIMIT_MEMLOCK` soft limit is 8 MB, below the writer's full registered pool (it now falls back to a smaller pool, which this row did not measure). Raise via `/etc/security/limits.conf` and re-queue |
 | tags-filter -R | `--bench 1` | 51.8 s | `cf116a6b` | |
 | tags-filter (transitive) | `--bench 1` | **108.2 s** | `7e4301f9` | |
 | tags-filter --invert-match | `--bench 1` | 461.2 s (7m41s) | `6665605a` | 4.3× the match path; ~99 % of ways kept |

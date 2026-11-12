@@ -372,23 +372,22 @@ skip = ["serial::"]
 # only: a selected test that skips at run time returns and counts as passed,
 # since libtest has no skipped outcome. PBFHOGG_TEST_REQUIRE closes that for
 # the backends it lists: every refusal predicate that would let an O_DIRECT
-# or promise-guard cell skip fails the test instead (see
-# crates/lib/tests/common/skip.rs). A refusal of either therefore cannot
-# pass as a skip here; that is not proof every cell exercised its backend,
-# only that none skipped on a refusal of it. Sweeps that
+# io_uring or promise-guard cell skip fails the test instead (see
+# crates/lib/tests/common/skip.rs). A refusal of any of them therefore
+# cannot pass as a skip here; that is not proof every cell exercised its
+# backend, only that none skipped on a refusal of it. Sweeps that
 # compile a backend out (consumer, minimal) carry no claim for it. Other
 # environmental skips (osmium, namespaces, descriptor limits) still pass.
 #
-# io-uring is NOT required, and the gate does not certify the io_uring
-# writer: it registers 16 MiB of buffers, and the hosts the gate runs on
-# have an 8 MiB hard RLIMIT_MEMLOCK (the systemd default), so every
-# io_uring cell is a typed refusal and skips. Requiring it would only make
-# the gate unpassable there. Add io-uring here once the gate runs where the
-# writer can register its pool.
+# The io_uring writer halves its registered pool until the kernel accepts
+# it, so it runs under the systemd default memlock limit. That allowance is
+# per user and shared by concurrent test writers with no admission between
+# them, so on a low-limit host a contended registration can fail the gate;
+# that is a false failure, never a refusal passing as a skip.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
 sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc"]
-env = {PBFHOGG_TEST_REQUIRE = "direct-io,promise-guard" }
+env = {PBFHOGG_TEST_REQUIRE = "direct-io,io-uring,promise-guard" }
 
 # The profiling lane alone, for work on the harness or the instrumentation.
 [test.profiles.profiling]

@@ -17,7 +17,7 @@ use super::IO_BUF_BYTES;
 use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
-use crate::tunables::NUM_BUFS;
+use crate::tunables::{MIN_NUM_BUFS, NUM_BUFS};
 use crate::write::pipeline::{Inbox, OutputSink, SeqTotal, deliver_in_order};
 use io_uring::IoUring;
 use io_uring::opcode;
@@ -410,7 +410,7 @@ impl UringState {
     /// shutdown semantics and is deliberately not hidden in a retry limit.
     fn drain_best_effort(&mut self) {
         let mut rounds = 0_u32;
-        while self.in_flight > 0 && rounds < u32::from(NUM_BUFS) * 4 {
+        while self.in_flight > 0 && rounds < u32::from(self.pool.count) * 4 {
             rounds += 1;
             if self.reap_cqes(true).is_err() {
                 // A failing CQE consumes one in-flight entry; a submit error
@@ -455,8 +455,8 @@ impl UringState {
 /// (the `ReadFixed` chain this writer used to submit for `CopyRange` was
 /// exactly that shape), and it is a pin leak either way.
 ///
-/// A successful drain removes the window. There are at most `NUM_BUFS`
-/// completions outstanding, but no time bound on obtaining them. If repeated
+/// A successful drain removes the window. There are at most one completion
+/// per registered buffer outstanding, but no time bound on obtaining them. If repeated
 /// submit errors exhaust the retry cap, cleanup remains best-effort and the
 /// field-order fallback above still applies; this is not guaranteed quiescence.
 ///
@@ -626,6 +626,39 @@ fn require_write_fixed(ring: &IoUring) -> Result<()> {
 /// a platform refusal holds. The original error stays the cause inside the
 /// carried chain; `report()` prints `step: cause` after the refusal's own
 /// text.
+/// Classify the registration failure of the smallest pool the writer tried.
+///
+/// ENOMEM covers both the locked-memory allowance and generic kernel resource
+/// exhaustion, so it is a platform refusal only when the soft limit is below
+/// the full pool: that host cannot run the writer as configured whatever else
+/// it is doing. A soft limit at or above the full pool does not rule the
+/// limit out (other locked memory of the same user shares it), but the cause
+/// is then unproven and the error stays an ordinary I/O failure, as resource
+/// exhaustion is everywhere else.
+fn register_buffers_error(e: io::Error, count: u16) -> Error {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let full = u64::from(NUM_BUFS) * IO_BUF_BYTES as u64;
+    // Safety: limit is a valid writable rlimit for getrlimit.
+    let limited =
+        unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0 && limit.rlim_cur < full;
+    let step = format!("register_buffers failed for a {count}-buffer pool");
+    if limited && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) {
+        Error::platform_unsupported(
+            "io-uring",
+            io::Error::from(Error::from(e).context(format!(
+                "{step}: RLIMIT_MEMLOCK too low for even the smallest pool \
+                 (the full pool wants {} MiB, try `ulimit -l unlimited`)",
+                full / (1024 * 1024)
+            ))),
+        )
+    } else {
+        Error::from(e).context(step)
+    }
+}
+
 fn setup_step(source: io::Error, step: &'static str) -> io::Error {
     io::Error::from(Error::from(source).context(step))
 }
@@ -683,43 +716,38 @@ fn uring_init_and_run(
     // precede file creation, then allocate the pool at the alignment the
     // file reported.
     let (file, align) = crate::direct_io::create_for_write(path, Some(cancel))?;
-    pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES, align)?;
-    let iovecs = pool.iovecs();
 
     // Step 4: Register the output fd so `WriteFixed` can reference it by slot.
     ring.submitter()
         .register_files(&[file.as_raw_fd()])
         .map_err(|e| Error::from(e).context("register_files failed"))?;
 
-    // Step 5: Register buffers (this is where RLIMIT_MEMLOCK bites).
-    // Safety: iovecs point into the AlignedBufferPool allocation which
-    // lives for the duration of this function.
-    unsafe { ring.submitter().register_buffers(&iovecs) }.map_err(|e| {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // The threshold is the exact registered size, not an estimate: every
-        // buffer is whole page-aligned pages, and the kernel charges the
-        // pinned pages against RLIMIT_MEMLOCK (fewer when it coalesces huge
-        // pages, none with CAP_IPC_LOCK). A soft limit at or above it rules
-        // the limit out, so only a lower limit earns the ulimit advice.
-        // Safety: limit is a valid writable rlimit for getrlimit.
-        let limited = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0
-            && limit.rlim_cur < (u64::from(NUM_BUFS) * IO_BUF_BYTES as u64);
-        if limited && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) {
-            Error::platform_unsupported(
-                "io-uring",
-                io::Error::from(Error::from(e).context(format!(
-                    "register_buffers failed: RLIMIT_MEMLOCK too low \
-                     (need {} MB, try `ulimit -l unlimited`)",
-                    (NUM_BUFS as usize * IO_BUF_BYTES) / (1024 * 1024)
-                ))),
-            )
-        } else {
-            Error::from(e).context("register_buffers failed")
+    // Step 5: Allocate and register the buffer pool (this is where
+    // RLIMIT_MEMLOCK bites). The full pool is tried first, so a host whose
+    // allowance holds it runs exactly that pool. On ENOMEM or EPERM the count
+    // halves down to `MIN_NUM_BUFS`: the allowance is per user and shared, so
+    // only the kernel knows what remains, and a read of the limit would only
+    // guess. A failed registration releases what it charged, so the candidate
+    // pool can be dropped and a smaller one tried on the same ring. Once one
+    // registers it stays fixed through `UringState`'s drain and unregister.
+    let mut count = NUM_BUFS;
+    pool = loop {
+        let candidate = AlignedBufferPool::new(count, IO_BUF_BYTES, align)?;
+        let iovecs = candidate.iovecs();
+        // Safety: iovecs point into the candidate allocation, which is either
+        // kept as `pool` (outliving the ring's use of it) or dropped only
+        // after a failed registration, which leaves nothing registered.
+        match unsafe { ring.submitter().register_buffers(&iovecs) } {
+            Ok(()) => break candidate,
+            Err(e)
+                if count > MIN_NUM_BUFS
+                    && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) =>
+            {
+                count = (count / 2).max(MIN_NUM_BUFS);
+            }
+            Err(e) => return Err(register_buffers_error(e, count)),
         }
-    })?;
+    };
 
     // Step 6: Signal successful init.
     init_tx

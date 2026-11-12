@@ -42,12 +42,13 @@ Tests go where they couple least.
   stop its cell (the io_uring writer also needs O_DIRECT; the
   non-regular-target test accepts only `io-uring`), so the requirement
   is the cell's backend, not the refusal's label. The gate lists
-  `direct-io` and `promise-guard` only: the io_uring writer registers
-  16 MiB of buffers, the gate's hosts have an 8 MiB hard
-  `RLIMIT_MEMLOCK`, and so the gate does not certify the io_uring
-  writer; its cells skip there. Evidence for a backend outside the
-  list is still a `brokkr test <name> --sweep all` run (which passes
-  `--nocapture`) showing no `Skipping:` line for it. Environmental
+  `direct-io`, `io-uring` and `promise-guard`. The io_uring writer
+  halves its registered pool until the kernel accepts it, so it runs
+  under the systemd default `RLIMIT_MEMLOCK`; that allowance is per
+  user and shared by concurrent test writers with no admission between
+  them, so on a low-limit host contention can fail the gate (a false
+  failure, never a passing skip), and a green gate need not have
+  exercised the smaller pools or the retry. Environmental
   skips (osmium, namespaces, descriptor limits, `deny_write`) never
   fail. There is no platform module or profile.
 - **Library integration tests** in `crates/lib/tests/<topic>.rs` (e.g.
@@ -468,13 +469,9 @@ files.
   pass on a typed platform refusal, except where the complete gate
   requires the backend (see "Platform-dependent tests"): O_DIRECT where the scratch
   filesystem rejects it, io_uring when setup fails for an
-  environmental reason, most often an `RLIMIT_MEMLOCK` soft limit too
-  low for the writer's registered buffers. To run the io_uring ones on
-  a development host, raise the limit system-wide in
-  `/etc/security/limits.conf` (`@<your-group> - memlock unlimited`)
-  and log in again; `brokkr check` then runs them (confirm with a
-  named `brokkr test`, since check hides skip lines), and `io-uring` can
-  join `PBFHOGG_TEST_REQUIRE` in the gate profile.
+  environmental reason, such as a kernel without io_uring or an
+  `RLIMIT_MEMLOCK` too low for even the writer's smallest fallback
+  pool.
 - Fault-injection tests are neither `#[ignore]`d nor serial: their
   faults ride on the invocation's cancellation token, so they are
   ordinary modules of the `all` binaries and run with

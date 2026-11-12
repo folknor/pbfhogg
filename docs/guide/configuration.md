@@ -75,7 +75,7 @@ Requires the `linux-io-uring` feature at compile time, Linux 5.1+, and sufficien
 
 ## RLIMIT_MEMLOCK for io_uring
 
-io_uring with registered buffers needs to pin memory pages. The default 64-buffer pool requires about 16 MB of locked memory. If the limit is too low, the run is refused at setup with exit code 3 and an `Error: platform feature io-uring unavailable: ...` line (kernels before 5.12 can report it as a generic exit 2 instead; see [Exit codes](../cli/commands.md#exit-codes)). Raise the limit:
+io_uring with registered buffers needs to pin memory pages. The writer first asks for its full pool of 64 buffers of 256 KiB; when the kernel refuses that for lack of locked memory it halves the pool, down to two buffers, so it also runs under a default limit with a smaller pool. Only when even the smallest pool cannot be registered is the run refused at setup with exit code 3 and an `Error: platform feature io-uring unavailable: ...` line (kernels before 5.12 can report it as a generic exit 2 instead; see [Exit codes](../cli/commands.md#exit-codes)). The allowance is per user and shared by every process of that user, so concurrent io_uring writers divide it. To give each writer its full pool, raise the limit:
 
 ```sh
 ulimit -l unlimited

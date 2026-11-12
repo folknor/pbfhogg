@@ -28,6 +28,12 @@
 
 ### Changed
 
+- **`--io-uring` runs under a low `RLIMIT_MEMLOCK`** instead of exiting `3`.
+  The writer still asks for its full 64-buffer registered pool first; when the
+  kernel refuses it for lack of locked memory it halves the pool down to two
+  buffers, and refuses with exit `3` only when even that cannot be
+  registered. The systemd default 8 MiB limit no longer blocks it.
+
 - **The hidden, unsupported `getparents --full-scan-min-blobs` test flag
   and `getparents::getparents_with_min_blobs` are gone from ordinary builds.**
   They now exist only in builds compiled with the `pbfhogg_test_hooks`

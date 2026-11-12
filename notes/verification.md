@@ -109,22 +109,6 @@ Fix: decide the contract - iterate in field order (cost on the per-group state
 machine to be measured) or record the deviation - and add the plain-before-dense
 cat fixture with the expected order stated.
 
-## VER-134 - Other library fixtures still pay production thresholds
-
-Found while shrinking the diff, apply-changes and merge-changes fixtures.
-
-`crates/lib/tests/merge_pbf.rs` sizes fixtures against crate-private sweep
-constants (`PLANET_BLOB_ELEMENTS = 228_000` in
-`a_planet_density_self_merge_streams_its_run_in_bounded_chunks` and
-`sorted_views_are_charged_to_the_run`, `VERSIONS = 100_000` in
-`a_many_version_group_ships_block_by_block`), and
-`crates/lib/tests/geocode_index.rs` builds 65,536-node inputs at three sites,
-all at tier 1. Not measured per test.
-
-Fix: the same rule as the diff planner, create-run and merge-changes batching
-work: a narrow parameter or test-hooks override at the owning mechanism,
-small tier-1 fixtures, one tier-3 test of the production value.
-
 ## VER-071 - The verbose sequence budget has no registered timing bench
 
 The ignored timing probe in `commands/diff/seq.rs` is removed; its work-limit assertions

@@ -1069,6 +1069,15 @@ fn a_failed_overlap_run_ends_the_pipeline_with_its_own_error() {
 //
 // These assert the sweep's own resource counters (`overlap_run_*`, see
 // `crates/lib/src/commands/blob_merge/sweep.rs`), never the host's resident memory.
+//
+// The fixtures are sized against the production constants on purpose, with
+// no test-hooks override to shrink them: each must cross a production chunk,
+// channel depth, pinned budget or group size to reach the branch it asserts,
+// and together they cost a few seconds in the debug test build, far inside
+// the per-test watchdog. A runtime override would turn the sweep's
+// compile-time piece size (`PIECE` in `frame_owned`) into a value read on
+// the planet `cat --dedupe` path, unmeasured, to save those seconds. A test
+// here that crosses no threshold (the sorted-views charge) stays small.
 
 /// The sweep constants these tests are sized against
 /// (`OVERLAP_RUN_CHUNK_BYTES`, `OVERLAP_RUN_CHANNEL_DEPTH`,
@@ -1377,8 +1386,12 @@ fn sparse_tails_are_demoted_within_the_pinned_budget() {
 }
 
 /// An internally unsorted blob is merged through views sorted by ID, one
-/// `Element` per element, which at planet density outweigh the decoded block
-/// itself; the run's charge counts them.
+/// `Element` per element, which outweigh the decoded block itself; the run's
+/// charge counts them.
+///
+/// No sweep threshold is crossed here, so the blob is small: the views
+/// outweigh the block per element, at any count, which the fixture
+/// assertion checks.
 #[test]
 fn sorted_views_are_charged_to_the_run() {
     let dir = crate::common::test_scratch();
@@ -1387,7 +1400,7 @@ fn sorted_views_are_charged_to_the_run() {
     // A fixed permutation of 1..=N (7919 is prime and does not divide N),
     // so the blob descends; no header claim, so `sort` scans it and finds
     // it out of order.
-    let n = PLANET_BLOB_ELEMENTS;
+    let n: i64 = 10_000;
     let ids: Vec<i64> = (0..n).map(|i| (i * 7_919) % n + 1).collect();
     let payload = write_node_blobs(&input, false, std::slice::from_ref(&ids), |id| {
         id.to_string()

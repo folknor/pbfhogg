@@ -635,6 +635,11 @@ fn generate_nonzero_nodes(count: usize, start_id: i64) -> Vec<TestNode<'static>>
         .collect()
 }
 
+// The u16 overflow fixtures below are all 65 536 (u16::MAX + 1) wide on
+// purpose. The caps are on-disk format widths (`ListCount`, `node_count:
+// u16`), not tunables, so a lowered test cap would refuse representable data
+// and bypass the real `try_from` that fails; the six refusals together cost
+// about a second in the debug test build.
 #[allow(clippy::cast_possible_wrap)]
 fn write_oversized_street_input(path: &Path) {
     let node_count = 65_536;
@@ -679,7 +684,7 @@ fn write_oversized_interpolation_input(path: &Path) {
 /// Tier B5b fixture: 65 536 tiny streets all sharing the same two
 /// nodes, so every street's single segment lands in the same S2
 /// cell. Triggers the per-cell street u16 cap at
-/// `crates/lib/src/geocode_index/builder/pass3.rs:570`.
+/// `encode_list` in `crates/lib/src/geocode_index/builder/pass3.rs`.
 #[allow(clippy::cast_possible_wrap)]
 fn write_street_cell_overflow_input(path: &Path) {
     let nodes = vec![
@@ -714,7 +719,7 @@ fn write_street_cell_overflow_input(path: &Path) {
 /// Tier B5b fixture: 65 536 tiny interpolation ways all sharing the
 /// same two nodes, so every interp way's single segment lands in
 /// the same S2 cell. Triggers the per-cell interp u16 cap at
-/// `crates/lib/src/geocode_index/builder/pass3.rs:599`.
+/// `encode_list` in `crates/lib/src/geocode_index/builder/pass3.rs`.
 #[allow(clippy::cast_possible_wrap)]
 fn write_interp_cell_overflow_input(path: &Path) {
     // Pass 3 lists every interpolation way under its cells, resolved or
@@ -758,7 +763,7 @@ fn write_interp_cell_overflow_input(path: &Path) {
 /// tiny outer ring, forcing every polygon's bbox into one S2 cell.
 /// Each relation gets a unique `name` so it counts as a distinct
 /// admin polygon. Triggers the per-cell admin u16 cap at
-/// `crates/lib/src/geocode_index/builder/admin.rs:227`.
+/// `write_admin_index` in `crates/lib/src/geocode_index/builder/admin.rs`.
 #[allow(clippy::cast_possible_wrap)]
 fn write_admin_cell_overflow_input(path: &Path) {
     // Tiny closed ring: 4 nodes around (55.7, 12.5).
@@ -2948,7 +2953,7 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
 }
 
 /// Tier B5b: per-cell street u16 entry cap.
-/// `crates/lib/src/geocode_index/builder/pass3.rs:570`. Distinct from the
+/// `encode_list` in `crates/lib/src/geocode_index/builder/pass3.rs`. Distinct from the
 /// pre-batch per-WAY node_count cap test
 /// (`build_rejects_street_way_coord_count_over_u16_max`) - that one
 /// pins the cap on a single oversized way; this one pins the cap
@@ -2985,7 +2990,7 @@ fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
 }
 
 /// Tier B5b: per-cell interp u16 entry cap.
-/// `crates/lib/src/geocode_index/builder/pass3.rs:599`. Distinct from the
+/// `encode_list` in `crates/lib/src/geocode_index/builder/pass3.rs`. Distinct from the
 /// pre-batch per-WAY node_count cap test
 /// (`build_rejects_interpolation_way_coord_count_over_u16_max`).
 #[test]
@@ -3020,7 +3025,7 @@ fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
 
 /// Tier B5: per-cell admin u16 cap. Pre-batch tests covered the
 /// street, interpolation, and addr u16 caps; the admin cell cap at
-/// `crates/lib/src/geocode_index/builder/admin.rs:227` was unpinned. The
+/// `write_admin_index` in `crates/lib/src/geocode_index/builder/admin.rs` was unpinned. The
 /// fixture creates 65 536 admin relations all sharing the same
 /// outer ring (so every polygon's bbox lands in the same S2 cell).
 #[test]

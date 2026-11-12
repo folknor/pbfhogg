@@ -433,6 +433,75 @@ fn block_iterator_matches_pipelined() {
     assert_eq!(sequential, from_iter);
 }
 
+/// A group carrying several element fields (malformed: the format says one
+/// kind per group) is read in kind order - dense nodes, plain nodes, ways,
+/// relations - not in its field order, and every element read path agrees.
+/// libosmium reads such a group in field order; DEVIATIONS.md records the
+/// difference. Each field keeps its own wire order, and groups stay in order.
+#[test]
+fn mixed_field_group_is_read_in_kind_order_by_every_path() {
+    use crate::common::groups::{Field, block, write_unindexed_blocks};
+
+    fn kind_id(element: &Element<'_>) -> (char, i64) {
+        match element {
+            Element::DenseNode(dn) => ('d', dn.id()),
+            Element::Node(n) => ('n', n.id()),
+            Element::Way(w) => ('w', w.id()),
+            Element::Relation(r) => ('r', r.id()),
+            other => panic!("unexpected element {other:?}"),
+        }
+    }
+
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("mixed-group.osm.pbf");
+    let payload = block(&[
+        &[
+            Field::Ways(&[10]),
+            Field::Nodes(&[2, 1]),
+            Field::Dense(&[4, 3]),
+            Field::Relations(&[20]),
+        ],
+        &[Field::Nodes(&[5])],
+    ]);
+    write_unindexed_blocks(&path, std::slice::from_ref(&payload));
+
+    let expected = vec![
+        ('d', 4),
+        ('d', 3),
+        ('n', 2),
+        ('n', 1),
+        ('w', 10),
+        ('r', 20),
+        ('n', 5),
+    ];
+
+    let block_owned = pbfhogg::PrimitiveBlock::from_vec(payload).unwrap();
+    let elements: Vec<_> = block_owned.elements().map(|e| kind_id(&e)).collect();
+    assert_eq!(elements, expected, "elements()");
+    let skip: Vec<_> = block_owned
+        .elements_skip_metadata()
+        .map(|e| kind_id(&e))
+        .collect();
+    assert_eq!(skip, expected, "elements_skip_metadata()");
+    let mut callback = Vec::new();
+    block_owned.for_each_element(|e| callback.push(kind_id(&e)));
+    assert_eq!(callback, expected, "for_each_element");
+
+    let mut sequential = Vec::new();
+    ElementReader::from_path(&path)
+        .unwrap()
+        .for_each(|e| sequential.push(kind_id(&e)))
+        .unwrap();
+    assert_eq!(sequential, expected, "ElementReader::for_each");
+
+    let mut pipelined = Vec::new();
+    ElementReader::from_path(&path)
+        .unwrap()
+        .for_each_pipelined(|e| pipelined.push(kind_id(&e)))
+        .unwrap();
+    assert_eq!(pipelined, expected, "ElementReader::for_each_pipelined");
+}
+
 /// into_blocks_pipelined handles early drop without hanging.
 #[test]
 fn block_iterator_early_drop() {

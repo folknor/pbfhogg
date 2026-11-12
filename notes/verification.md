@@ -87,24 +87,6 @@ because it is slow. Decide whether `full` (which sets `include_ignored`) should 
 it, skipping where osmium is absent as it already does, and reword the skip-list
 and AGENTS.md text that calls it over-watchdog.
 
-## VER-138 - Element order inside a mixed-field group is pbfhogg's, not the file's
-
-Found while giving the shared oracle a wire-order view.
-
-`BlockElementsIter` (`crates/lib/src/read/block.rs`) yields a PrimitiveGroup's
-dense nodes first, then plain nodes, ways and relations; libosmium
-(`decode_primitive_block_data`) and the format yield the group's fields in wire
-order. They differ only inside a group that mixes element fields (a plain node
-before a DenseNodes field, say). Plain `cat` re-encodes such a block "in element
-order", so it would write the plain node after the dense ones; no fixture puts
-plain before dense in one group, so `cli_cat.rs`'s order-preserving tests do not
-see it, and `DEVIATIONS.md` does not record it. Unmeasured, and such groups are
-malformed-adjacent (the spec says one kind per group).
-
-Fix: decide the contract - iterate in field order (cost on the per-group state
-machine to be measured) or record the deviation - and add the plain-before-dense
-cat fixture with the expected order stated.
-
 ## VER-090 - The requirement-table check is convention-bound
 
 `required` in `crates/harness/src/describe.rs` now refuses anything outside its convention

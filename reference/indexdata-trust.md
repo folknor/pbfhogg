@@ -464,7 +464,9 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   scanned tag keys), a blob no single index describes is re-encoded into
   single-kind blocks, and one holding no element is dropped. `apply-changes`
   refuses a blob whose elements span more than one kind, which it cannot
-  place in type order; plain `cat` splits it in input order, and the merge
+  place in type order; plain `cat` splits it in element order (input order,
+  except that a group carrying several element fields is read dense nodes,
+  plain nodes, ways, relations, whatever its field order), and the merge
   engine behind `cat --dedupe` and `sort` merges each kind's share of it
   into type order.
 - **`sort` does not copy indexdata it has found false.** Under a header

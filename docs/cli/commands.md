@@ -1270,7 +1270,10 @@ single-kind blocks by the same rules `--type` and `--clean` re-encode with:
 nodes written dense, coordinates truncated toward zero to decimicrodegrees,
 timestamps truncated to whole seconds, metadata with an absent or sentinel
 version discarded, missing fields of retained metadata written as defaults,
-unknown fields discarded. One that yields no elements is omitted, with any
+unknown fields discarded. Elements keep their input order, except inside a
+group carrying several element fields, which is written dense nodes, then
+plain nodes, ways and relations, whatever its field order (libosmium follows
+the field order; see DEVIATIONS.md). One that yields no elements is omitted, with any
 unknown fields it carried. A `Note:` line says how many blobs were rebuilt
 and how many omitted; the summary counts both as decoded. A way in such a
 block is refused under a declared `WayMembers-v1`, and a way carrying pins

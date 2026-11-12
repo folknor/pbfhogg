@@ -683,7 +683,11 @@ impl PrimitiveBlock {
         any
     }
 
-    /// Returns an iterator over the elements in this `PrimitiveBlock`.
+    /// Returns an iterator over the elements in this `PrimitiveBlock`: groups
+    /// in turn, and within a group its dense nodes, plain nodes, ways, then
+    /// relations. A group the format says holds one kind but which carries
+    /// several element fields is read in that kind order, not in its field
+    /// order; each field's own elements keep their wire order.
     // wontfix(name-iter-convention): elements() is more descriptive than iter() here;
     // BlockElementsIter name matches established osmpbf public API.
     pub fn elements(&self) -> BlockElementsIter<'_> {
@@ -757,17 +761,21 @@ impl PrimitiveBlock {
         GroupIter::new(&self.block)
     }
 
-    /// Calls the given closure on each element.
+    /// Calls the given closure on each element, in the same order as
+    /// [`elements`](Self::elements): groups in turn, and within a group its
+    /// dense nodes, plain nodes, ways, then relations, whatever the group's
+    /// field order (see DEVIATIONS.md, "PBF decoding: a group holding several
+    /// element fields is read in kind order").
     pub fn for_each_element<F>(&self, mut f: F)
     where
         F: for<'a> FnMut(Element<'a>),
     {
         for group in self.groups() {
-            for node in group.nodes() {
-                f(Element::Node(node));
-            }
             for dnode in group.dense_nodes() {
                 f(Element::DenseNode(dnode));
+            }
+            for node in group.nodes() {
+                f(Element::Node(node));
             }
             for way in group.ways() {
                 f(Element::Way(way));

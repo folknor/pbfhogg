@@ -197,7 +197,9 @@ impl<R: Read + Send> ElementReader<R> {
     /// OSM ID order when [`header().is_sorted()`](HeaderBlock::is_sorted) is `true` and
     /// the file keeps that claim: the reader does not check it, and a caller whose
     /// result depends on the order checks the elements it receives. History files may
-    /// repeat an ID for multiple versions.
+    /// repeat an ID for multiple versions. File order is blob, group and element order,
+    /// except inside a group carrying several element fields, which is read in the order
+    /// of [`PrimitiveBlock::elements`], not its field order.
     ///
     /// This is **6x slower** than [`for_each_pipelined`](Self::for_each_pipelined) on large
     /// files. Prefer `for_each_pipelined` for production workloads - it has the same
@@ -295,7 +297,9 @@ impl<R: Read + Send> ElementReader<R> {
     /// Elements are delivered in file order, which is canonical OSM ID order when
     /// [`header().is_sorted()`](HeaderBlock::is_sorted) is `true` and the file keeps that
     /// claim: the reader does not check it. History files may repeat an ID for multiple
-    /// versions.
+    /// versions. File order is blob, group and element order, except inside a group
+    /// carrying several element fields, which is read in the order of
+    /// [`PrimitiveBlock::elements`], not its field order.
     #[hotpath::measure]
     pub fn for_each_pipelined<F>(self, f: F) -> Result<()>
     where

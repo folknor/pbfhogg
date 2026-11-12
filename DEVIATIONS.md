@@ -925,6 +925,33 @@ longer than their group are refused. libosmium merges differently and is not
 the reference here: its `Info` user comes from the last occurrence alone, and
 each `DenseInfo` column from its last segment.
 
+## PBF decoding: a group holding several element fields is read in kind order
+
+The PBF format puts one kind of element in each `PrimitiveGroup`, but nothing
+on the wire enforces it, and a group can carry plain `Node`, `DenseNodes`,
+`Way` and `Relation` fields together, interleaved in any order. libosmium
+decodes such a group in field order. pbfhogg reads it, without refusal, in
+kind order: the group's dense nodes, then its plain nodes, then its ways, then
+its relations. Each field keeps its own elements in wire order, and groups and
+blocks stay in file order, so the two readers differ only inside such a group
+and only when its fields are out of that kind order (a plain node before the
+`DenseNodes` field, say). Every pbfhogg read path yields the same order
+(`PrimitiveBlock::elements`, `for_each_element`, and `ElementReader`'s
+sequential and pipelined callbacks), and every command inherits it: plain
+`cat`, which rebuilds such a block into single-kind blocks, writes the dense
+nodes before the plain nodes that preceded them on the wire
+(`crates/cli/tests/cli_cat.rs::passthrough_reencode_writes_a_plain_before_dense_group_dense_first`,
+`crates/lib/tests/read_paths.rs::mixed_field_group_is_read_in_kind_order_by_every_path`).
+A command that checks element order (the `time-filter` history path,
+`check --ids` on unindexed input) judges the kind-ordered sequence.
+
+Protobuf gives the relative order of distinct field numbers in one message no
+meaning, so neither order is the file's in a sense a conforming parser must
+keep; following the wire would add a per-field state machine to the hottest
+read path for a shape no known producer writes. Refusing such groups was also
+rejected: libosmium reads them and plain `cat` is the repair recipe for blocks
+no single index describes.
+
 ## inspect --extended: metadata coverage at the edges of fileinfo
 
 The metadata census uses the value tests of `osmium fileinfo -e`

@@ -28,6 +28,14 @@
 
 ### Changed
 
+- **`PrimitiveBlock::for_each_element`, and so `ElementReader::for_each` and
+  `for_each_pipelined`, read a group carrying both plain and dense nodes
+  dense nodes first,** as `elements()` already did, so `time-filter` on a
+  history file now reads in the same order as other commands. Only
+  malformed groups holding several element fields see a difference; such a
+  group is read in kind order, not field order, unlike libosmium (recorded
+  in DEVIATIONS.md).
+
 - **`geocode_index::builder::build_geocode_index` takes its input as its
   first argument, and `BuildConfig::input_path` is gone.** The input is an
   `impl Into<InputSource>`, as on every other multi-pass entry point, so a

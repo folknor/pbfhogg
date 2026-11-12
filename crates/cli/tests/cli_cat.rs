@@ -1970,9 +1970,10 @@ mod pb {
 
 /// Every element of a PBF in wire order, through the shared oracle: kind,
 /// id, nanodegree coordinates, tags as stored, refs, inline locations,
-/// members and metadata claims. Every fixture here puts a group's dense
-/// nodes before any plain element of it, where wire order and pbfhogg's
-/// iteration order agree, so input and output must match exactly.
+/// members and metadata claims. Wire order and pbfhogg's iteration order
+/// agree except inside a group carrying several element fields out of kind
+/// order; only `passthrough_reencode_writes_a_plain_before_dense_group_dense_first`
+/// builds one, and states the reordering it expects.
 fn ordered_elements(path: &Path) -> Vec<crate::common::NormalizedElement> {
     crate::common::read_in_file_order(path)
 }
@@ -2209,6 +2210,56 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
         .arg("-o")
         .arg(dir.path().join("renumbered-output.osm.pbf"))
         .assert_success();
+}
+
+/// A group carrying plain nodes before its `DenseNodes` field is re-encoded
+/// in pbfhogg's in-group order - the group's dense nodes, then its plain
+/// nodes - not in its field order, which libosmium follows. DEVIATIONS.md
+/// records the difference; this pins the order plain cat writes.
+#[test]
+fn passthrough_reencode_writes_a_plain_before_dense_group_dense_first() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("plain-before-dense.osm.pbf");
+    let output = dir.path().join("indexed.osm.pbf");
+
+    let alice = 8;
+    write_raw_block_pbf(
+        &input,
+        false,
+        &[],
+        &[(
+            false,
+            pb::block(&[vec![
+                (1, pb::node(1, None)),
+                (1, pb::node(2, None)),
+                (2, pb::dense(&[(3, 3), (4, 3)], alice)),
+            ]]),
+        )],
+    );
+
+    CliInvoker::new(&invocation_scratch)
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+
+    // Dense nodes 3 and 4 first, then plain nodes 1 and 2, split where node
+    // metadata presence flips.
+    assert_eq!(
+        block_layout(&output),
+        [("node", 3, 4, 2), ("node", 1, 2, 2)]
+    );
+    let wire = ordered_elements(&input);
+    assert_eq!(wire.len(), 4);
+    let expected = vec![
+        wire[2].clone(),
+        wire[3].clone(),
+        wire[0].clone(),
+        wire[1].clone(),
+    ];
+    assert_eq!(ordered_elements(&output), expected);
 }
 
 /// The re-encode keeps the input's element order, not type-then-ID order:

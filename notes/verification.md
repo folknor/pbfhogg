@@ -118,16 +118,6 @@ or nested include in an included file), and the authoritative composed check is
 composed-configuration parse is ever wanted, which needs a brokkr configuration export
 brokkr does not offer.
 
-## VER-098 - The instrumented CLI and release backends are not exercised
-
-Reported by library-harness, check-machinery.
-
-The gate now runs a `release` sweep (default features, no hook cfg), a profiling lane over the
-harness, and lint-only profiling and mixed-backend shapes. Two gaps remain. The CLI is compiled
-instrumented but never run so: its `HotpathGuardBuilder` in `run()` is unconditional, so an
-instrumented CLI's quiet unprofiled run, its report placement and validity are checked by nothing but
-`brokkr bench --hotpath` use. And the O_DIRECT and io_uring backends never run in release.
-
 ## VER-104 - The document checker is not verified against renderer output
 
 `scripts/check_doc_links.py` is tested against 18 fixtures in `scripts/doc_links_fixtures/`,

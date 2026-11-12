@@ -245,6 +245,18 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
+    /// Ask for a hotpath report at `report`, as brokkr does on every call
+    /// it profiles: JSON format, metrics server off. An instrumented build
+    /// profiles only when asked; any other build ignores the request.
+    #[allow(dead_code)]
+    pub fn profile_to(mut self, report: &Path) -> Self {
+        self.cmd
+            .env("HOTPATH_OUTPUT_PATH", report)
+            .env("HOTPATH_OUTPUT_FORMAT", "json")
+            .env("HOTPATH_METRICS_SERVER_OFF", "true");
+        self
+    }
+
     /// Run the child in `dir`.
     pub fn current_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
         self.cmd.current_dir(dir);

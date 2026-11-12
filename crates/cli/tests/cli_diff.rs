@@ -50,11 +50,7 @@ impl DiffStats {
 
 fn run_diff(old: &Path, new: &Path, opts: DiffOpts) -> (String, DiffStats) {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
-    // The pbfhogg binary's `main` installs a `HotpathGuardBuilder`,
-    // and the guard emits its timing banner to stdout at drop time.
-    // That banner pollutes the diff text we want to read. Side-step
-    // it by routing diff output to a file via `-o` and reading the
-    // file - stdout from the binary is then noise we ignore.
+    // Diff output goes to a file via `-o` and is read back.
     //
     // Note: do NOT pass --summary. That flips the stderr stats line
     // from pbfhogg format to osmium format (`left=N right=N same=N

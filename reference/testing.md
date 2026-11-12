@@ -234,8 +234,8 @@ promise in `docs/cli/commands.md` "Names pbfhogg leaves behind". The guard is
 stricter than the promise (no duplicate of the lease, no `sendmsg`,
 `sendmmsg` or `pidfd_getfd` at all) and blind to io_uring submissions
 and to a `clone3` caller that ignores its `ENOSYS`; the module doc says
-why. Over the CLI it runs only builds without hotpath's features; the
-instrumented harness runs under it in the profiling lane (below). The
+why. The instrumented CLI and harness run under it in the profiling lane
+(below). The
 `no-hotpath-cpu` script check in `brokkr.d/lints.toml`
 (`scripts/check_hotpath_cpu.py`) covers every profiler build by failing
 when the resolved dependency graph, with every workspace feature on,
@@ -309,15 +309,19 @@ library and CLI suites in the shipped release profile (fat LTO, debug
 assertions and overflow checks off), default features, no hook cfg, so a
 `#[should_panic]` invariant test whose panic came from a debug-only check,
 or a path whose arithmetic wraps only in release, fails there; every other
-tested sweep builds dev. It makes no release claim for the optional
-backends. `harness-hotpath` and `harness-hotpath-alloc` are the profiling
-lane (`brokkr check --profile profiling` runs it alone): the harness suite
-built with each profiling feature, so describe mode and every unprofiled
-scenario are checked quiet in an instrumented build, describe ignores a
-profiling request, and a profiled launch must write a report naming library
-functions with calls and, under `hotpath-alloc`, allocated bytes counted.
-The CLI is not tested instrumented: its guard is unconditional and reports
-to stdout.
+tested sweep builds dev. It builds both platform backends in, the shape
+brokkr benches, so the O_DIRECT and io_uring tests run with release
+semantics under the gate's backend requirement; the feature-off refusals
+run in dev only (consumer, musl). `harness-hotpath`,
+`harness-hotpath-alloc`, `cli-hotpath` and `cli-hotpath-alloc` are the
+profiling lane (`brokkr check --profile profiling` runs it alone): the
+harness and CLI suites built with each profiling feature. Both executables
+profile only when `HOTPATH_OUTPUT_PATH` asks for a report, so every
+unprofiled test checks an instrumented build quiet, under the promise
+guard; harness describe mode ignores a profiling request; and a profiled
+launch must write a report naming library functions with calls and, under
+`hotpath-alloc`, allocated bytes counted, leaving the CLI's stdout
+byte-identical (`crates/cli/tests/cli_profiling.rs`).
 
 Gate-only lint sweeps compile and lint what no tested sweep carries: the
 `hotpath` and `hotpath-alloc` shapes over every package, `musl-hotpath-alloc`

@@ -2728,14 +2728,26 @@ pub fn run() -> process::ExitCode {
     #[cfg(pbfhogg_test_hooks)]
     signals::test_hooks::arm_merge_changes(&cancel);
     let host = host::cli_host(cancel, host::cli_resources());
-    let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
-        .percentiles(&[50.0, 95.0, 99.0])
-        .functions_limit(0)
-        .build();
+    // The profiler runs only in an instrumented build, and there only when
+    // a caller asks for a report file: brokkr sets HOTPATH_OUTPUT_PATH (with
+    // a JSON format and the metrics server off) on every call it profiles.
+    // Without the request an instrumented build stays as quiet as a shipped
+    // one: hotpath's guard would otherwise start its metrics server and
+    // print its table to stdout at drop, into the command's own output.
+    // The measurement sites still read clocks and track callers without a
+    // guard, so such a build is quiet, not inert. A shipped build compiles
+    // no guard at all.
+    #[cfg(feature = "hotpath")]
+    let _guard = std::env::var_os("HOTPATH_OUTPUT_PATH").is_some().then(|| {
+        hotpath::HotpathGuardBuilder::new("pbfhogg::main")
+            .percentiles(&[50.0, 95.0, 99.0])
+            .functions_limit(0)
+            .build()
+    });
 
     // `Cli::parse()` ends a parse error - and `--help` / `--version` - with
     // `clap::Error::exit`, which calls `process::exit` and so skips every
-    // destructor, including the hotpath guard built two lines up. Use
+    // destructor, including the hotpath guard built above. Use
     // `try_parse` and return instead so the guard is dropped normally.
     // `Error::print` writes to the same stream clap would have used
     // (stdout for help and version, stderr for a usage error), so the text

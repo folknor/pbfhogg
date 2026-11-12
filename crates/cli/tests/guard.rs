@@ -43,10 +43,10 @@
 //! created, not that none was attempted. Killing `clone3` would kill glibc's
 //! legitimate thread creation too; seccomp cannot read its flags in memory.
 //! The control probes preserve both limitations explicitly. The guard covers
-//! the runs the tests make, not every command and flag combination, with test
-//! features, never hotpath's: the `no-hotpath-cpu` script check in
-//! brokkr.toml keeps hotpath's process-starting CPU profiler out of every
-//! workspace build instead.
+//! the runs the tests make, not every command and flag combination, in the
+//! builds the sweeps make, the profiling lane's instrumented ones included;
+//! the `no-hotpath-cpu` script check in brokkr.toml keeps hotpath's
+//! process-starting CPU profiler out of every workspace build.
 //!
 //! Hosts: Linux on little-endian x86_64 or aarch64, with
 //! `SECCOMP_RET_KILL_PROCESS` (Linux 4.14). This process asks the kernel

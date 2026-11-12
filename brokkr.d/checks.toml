@@ -15,11 +15,9 @@
 #                 A per-sweep RUSTDOCFLAGS env would leak into ad-hoc runs,
 #                 which union entry env but not rustflags.
 #                 Mirrors what --all-features used to
-#                 pull in MINUS hotpath (#[hotpath::measure] turns into
-#                 runtime measurement that emits a banner to stdout at
-#                 process exit, contaminating stdout-output commands
-#                 like `pbfhogg diff` under integration tests; hotpath
-#                 stays opt-in via `brokkr <cmd> --hotpath`) and MINUS
+#                 pull in MINUS hotpath (the profiling features have
+#                 their own lane, cli-hotpath and harness-hotpath below)
+#                 and MINUS
 #                 `commands` because pbfhogg's `default = ["commands"]`
 #                 already enables it whenever no_default_features is
 #                 false, and pbfhogg-cli always pulls it in via its lib
@@ -151,9 +149,7 @@ parallel = {}
 # went unbuilt and unrun. Both musl sweeps are kept: `musl` still covers the
 # feature-off branches and the CLI's feature_missing tests on musl. Mixed
 # shapes (one platform feature without the other) and the profiling features
-# are compiled by the gate-only lint sweeps below, never tested: the
-# profiling features stay out of CLI test sweeps for the reason given for
-# `all`.
+# on musl are compiled by the gate-only lint sweeps below, never tested.
 [[check]]
 name = "musl-all"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
@@ -168,23 +164,26 @@ parallel = {}
 # with release semantics, so a #[should_panic] invariant test whose panic
 # came from a debug-only check, or a path whose arithmetic wraps in release,
 # fails. ADR-0021 requires invariants to hold in release; this is where the
-# suite says so. Default features without the hook cfg: the product shape,
-# not the optional backends, whose release behaviour this does not claim.
+# suite says so. Both platform backends on, without the hook cfg: the shape
+# brokkr builds every bench in, so O_DIRECT and io_uring run with release
+# semantics and the gate's backend requirement applies. The feature-off
+# branches (the feature_missing refusals) run in consumer and musl, dev
+# only; a second fat-LTO suite for them was judged not to pay.
 # CLI children here size on the real machine, as in consumer and musl.
 # Gate only: the LTO link of every test binary is too slow for tier1.
 [[check]]
 name = "release"
 packages = ["pbfhogg", "pbfhogg-cli"]
+features = ["linux-direct-io", "linux-io-uring"]
 profile = "release"
 parallel = {}
 
-# The profiling lane. The harness is the one instrumented executable whose
-# output contract holds under test (the CLI's guard is unconditional and
-# writes its report to stdout, see the `all` header), so these two sweeps
-# run the harness suite built with each profiling feature: describe mode and
-# every unprofiled scenario stay quiet in an instrumented build, describe
-# ignores a profiling request, and a profiled launch writes a report naming
-# library functions (crates/harness/tests/exe.rs). Gate only.
+# The profiling lane: the harness and CLI suites built with each profiling
+# feature. Both executables profile only when HOTPATH_OUTPUT_PATH asks, so
+# every unprofiled test checks an instrumented build quiet, under the
+# promise guard; describe ignores a profiling request; a profiled launch
+# writes a report naming library functions (crates/harness/tests/exe.rs,
+# crates/cli/tests/cli_profiling.rs). Gate only.
 [[check]]
 name = "harness-hotpath"
 packages = ["pbfhogg-harness"]
@@ -194,6 +193,18 @@ parallel = {}
 [[check]]
 name = "harness-hotpath-alloc"
 packages = ["pbfhogg-harness"]
+features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
+parallel = {}
+
+[[check]]
+name = "cli-hotpath"
+packages = ["pbfhogg-cli"]
+features = ["hotpath", "linux-direct-io", "linux-io-uring"]
+parallel = {}
+
+[[check]]
+name = "cli-hotpath-alloc"
+packages = ["pbfhogg-cli"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
 parallel = {}
 
@@ -386,13 +397,13 @@ skip = ["serial::"]
 # that is a false failure, never a refusal passing as a skip.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc"]
 env = {PBFHOGG_TEST_REQUIRE = "direct-io,io-uring,promise-guard" }
 
 # The profiling lane alone, for work on the harness or the instrumentation.
 [test.profiles.profiling]
-description = "The harness suite built with each profiling feature"
-sweeps = ["harness-hotpath", "harness-hotpath-alloc"]
+description = "The harness and CLI suites built with each profiling feature"
+sweeps = ["harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

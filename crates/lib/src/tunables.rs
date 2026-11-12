@@ -1411,7 +1411,8 @@ pub(crate) const GEOCODE_CELL_BOUND_SLACK_RAD: f64 = 1e-12;
 // brokkr does not expose its watchdog to the test process, so a change there
 // is not seen here. Being below the watchdog individually does not make a
 // test that waits on several of them in sequence, or starts one late, finish
-// before it; such a test carries one deadline through its waits.
+// before it; such a test carries one deadline through its waits (the
+// children of one test share TEST_CHILD_BUDGET).
 
 /// brokkr's fixed per-test watchdog (`brokkr man test`), mirrored.
 pub const TEST_RUNNER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
@@ -1448,6 +1449,9 @@ const _: () = {
     assert!(TEST_CHILD_TIMEOUT.as_millis() < watchdog);
     assert!(TEST_RENDEZVOUS_BOUND.as_millis() < TEST_CHILD_TIMEOUT.as_millis());
     assert!(TEST_CHILD_CLEANUP.as_millis() < TEST_CHILD_TIMEOUT.as_millis());
+    assert!(TEST_CHILD_TIMEOUT.as_millis() <= TEST_CHILD_BUDGET.as_millis());
+    // One owner's cleanup after an expiry: the reap, then each pipe's EOF.
+    assert!(TEST_CHILD_BUDGET.as_millis() + 3 * TEST_CHILD_CLEANUP.as_millis() < watchdog);
 };
 
 /// How long a descriptor-heavy integration test waits to be admitted by its
@@ -1487,6 +1491,12 @@ const _: () = assert!(TEST_LIGHT_FD_GRANT < NUM_BUCKETS as u64 + STAGE1_HEADROOM
 
 /// Test children leave time for cleanup before the runner's watchdog.
 pub const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// What all the children one test thread spawns share, from its first child
+/// (`crates/lib/tests/common/process.rs`): a test running children in
+/// sequence fails naming this instead of reaching the watchdog unnamed. Once
+/// spent, the next spawn is refused and a wait that has not yet seen its
+/// child exit kills it.
+pub const TEST_CHILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 /// Bounded cleanup and pipe completion, including a descendant holding a pipe open.
 pub const TEST_CHILD_CLEANUP: std::time::Duration = std::time::Duration::from_secs(1);
 /// Test child polling avoids a busy wait while keeping cleanup responsive.

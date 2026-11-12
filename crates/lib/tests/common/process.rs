@@ -1,11 +1,12 @@
 //! Owned test children with cancellable, bounded pipe capture.
 use pbfhogg::{
-    TEST_CHILD_CAPTURE_CHUNK, TEST_CHILD_CAPTURE_EDGE, TEST_CHILD_CLEANUP, TEST_CHILD_POLL,
+    TEST_CHILD_BUDGET, TEST_CHILD_CAPTURE_CHUNK, TEST_CHILD_CAPTURE_EDGE, TEST_CHILD_CLEANUP,
+    TEST_CHILD_POLL,
 };
 use pbfhogg_test_scratch::TestScratch;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -142,6 +143,56 @@ fn capture(
     Ok(Capture { thread, result })
 }
 
+std::thread_local! {
+    /// When this thread's children have spent `TEST_CHILD_BUDGET`, anchored
+    /// at its first child (see [`children_budget`]).
+    static BUDGET: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The deadline every child spawned on this thread shares, so a test that
+/// runs children in sequence fails naming the budget instead of running
+/// into the runner's watchdog unnamed. It is anchored at the thread's first
+/// child, not at test start, which nothing here can see: setup before that
+/// child is outside it, and a test spending more than the margin
+/// `TEST_RUNNER_WATCHDOG - TEST_CHILD_BUDGET - 3 * TEST_CHILD_CLEANUP` there
+/// still meets the watchdog first, as before. A test whose children span
+/// more than the budget fails here even if it would have ended under the
+/// watchdog: fitting the budget is part of the contract. libtest runs every test on a
+/// thread of its own named after the test, so the anchor is per test, except
+/// where it cannot start that thread and runs the test on its runner thread,
+/// `main`, shared by later tests: there no budget is anchored, and each child
+/// keeps only its own timeout. A helper thread that spawns a child gets an
+/// allowance of its own; the owner keeps the deadline it was spawned under
+/// wherever it moves.
+fn children_budget() -> Option<Instant> {
+    if std::thread::current().name() == Some("main") {
+        return None;
+    }
+    BUDGET.with(|budget| {
+        let deadline = budget
+            .get()
+            .unwrap_or_else(|| Instant::now() + TEST_CHILD_BUDGET);
+        budget.set(Some(deadline));
+        Some(deadline)
+    })
+}
+
+/// Spend this thread's children budget now, for the test that checks the
+/// refusal without waiting the budget out.
+#[allow(dead_code)]
+pub fn spend_children_budget() {
+    BUDGET.with(|budget| budget.set(Some(Instant::now())));
+}
+
+fn budget_spent() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "this test's children spent TEST_CHILD_BUDGET ({TEST_CHILD_BUDGET:?} from its first child)"
+        ),
+    )
+}
+
 /// The child and its pipe readers stay owned even if waiting or assertions fail.
 pub struct OwnedChild<'a> {
     child: Child,
@@ -149,10 +200,23 @@ pub struct OwnedChild<'a> {
     stop: Arc<AtomicBool>,
     stdout: Option<Capture>,
     stderr: Option<Capture>,
+    /// The spawning thread's [`children_budget`], kept with the child.
+    budget: Option<Instant>,
+    /// The exit status once any wait here has reaped the child. Every reap
+    /// goes through [`Self::reaped`], and nothing else reaches the `Child`,
+    /// so a recorded status is the one proof the PID is no longer ours.
+    status: Option<ExitStatus>,
 }
 
 impl<'a> OwnedChild<'a> {
+    /// Start `cmd`, refusing once this thread's children budget is spent: a
+    /// test whose earlier children took it all fails here, even when every
+    /// child so far ended in time.
     pub fn spawn(cmd: &mut Command, scratch: &'a TestScratch) -> io::Result<Self> {
+        let budget = children_budget();
+        if budget.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(budget_spent());
+        }
         let child = cmd.spawn()?;
         let mut owner = Self {
             child,
@@ -160,6 +224,8 @@ impl<'a> OwnedChild<'a> {
             stop: Arc::new(AtomicBool::new(false)),
             stdout: None,
             stderr: None,
+            budget,
+            status: None,
         };
         if let Some(pipe) = owner.child.stdout.take() {
             owner.stdout = Some(capture(pipe, Arc::clone(&owner.stop))?);
@@ -170,36 +236,77 @@ impl<'a> OwnedChild<'a> {
         Ok(owner)
     }
 
+    /// Check for an exit without blocking, reaping it and recording its status.
+    fn reaped(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.status.is_none() {
+            self.status = self.child.try_wait()?;
+        }
+        Ok(self.status)
+    }
+
     pub fn has_exited(&mut self) -> io::Result<bool> {
-        Ok(self.child.try_wait()?.is_some())
+        Ok(self.reaped()?.is_some())
+    }
+
+    /// The deadline the spawning thread's children share, if one is anchored.
+    #[allow(dead_code)]
+    pub fn budget(&self) -> Option<Instant> {
+        self.budget
     }
 
     pub fn id(&self) -> u32 {
         self.child.id()
     }
 
-    pub fn signal(&self, signal: libc::c_int) {
-        let pid = libc::pid_t::try_from(self.child.id()).expect("pid fits");
-        // SAFETY: this owner has not relinquished its child.
-        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal child");
+    /// Send `signal`, refused once a wait here has reaped the child: its PID
+    /// could by then name another process. An exited child not yet reaped
+    /// still holds its PID, so the signal reaches only that zombie. This
+    /// does not reap first, which would turn that harmless race into a
+    /// refusal.
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        if self.status.is_some() {
+            return Err(io::Error::other(
+                "signal refused: the child has already been reaped",
+            ));
+        }
+        let pid = libc::pid_t::try_from(self.child.id())
+            .map_err(|_| io::Error::other("pid does not fit pid_t"))?;
+        // SAFETY: the child is unreaped (no status recorded), so the PID is ours.
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
+    /// Wait at most `timeout`, and never past the thread's children budget;
+    /// on expiry the child is killed and the error names which bound ran
+    /// out. An exit already observed is returned whatever the time.
     pub fn wait(&mut self, timeout: Duration) -> io::Result<Output> {
-        // A cached status (has_exited() may already have reaped) must be read
-        // before opening a pidfd: a reaped PID could name another process.
-        let status = if let Some(status) = self.child.try_wait()? {
+        // A recorded status (has_exited() may already have reaped) must be
+        // read before opening a pidfd: a reaped PID could name another process.
+        let status = if let Some(status) = self.reaped()? {
             status
         } else {
+            let budget = self
+                .budget
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let (limit, expired) = match budget {
+                Some(left) if left < timeout => (left, budget_spent as fn() -> io::Error),
+                _ => (timeout, child_timed_out as fn() -> io::Error),
+            };
             let exit = ExitFd::open(&self.child)?;
-            wait_for_exit(
+            let status = wait_for_exit(
                 &mut self.child,
-                timeout,
+                limit,
                 |child, remaining| {
                     exit.block(remaining)?;
                     child.try_wait()
                 },
                 Child::kill,
-            )?
+                expired,
+            )?;
+            self.status = Some(status);
+            status
         };
         Ok(Output {
             status,
@@ -207,16 +314,10 @@ impl<'a> OwnedChild<'a> {
             stderr: finish(&mut self.stderr)?,
         })
     }
+}
 
-    /// Exercise ownership on a wait failure without changing normal waiting.
-    pub fn wait_with_check(
-        &mut self,
-        timeout: Duration,
-        check: impl FnOnce(&mut Child) -> io::Result<()>,
-    ) -> io::Result<Output> {
-        check(&mut self.child)?;
-        self.wait(timeout)
-    }
+fn child_timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "test child timed out")
 }
 
 /// Exit readiness for an unreaped child. A pidfd becomes readable the moment
@@ -281,6 +382,7 @@ fn wait_for_exit<S, T>(
     timeout: Duration,
     mut block: impl FnMut(&mut S, Duration) -> io::Result<Option<T>>,
     kill: impl FnOnce(&mut S) -> io::Result<()>,
+    expired: fn() -> io::Error,
 ) -> io::Result<T> {
     let start = Instant::now();
     loop {
@@ -290,10 +392,7 @@ fn wait_for_exit<S, T>(
         if start.elapsed() >= timeout {
             kill(state)?;
             // OwnedChild::drop performs bounded reaping and pipe cleanup.
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "test child timed out",
-            ));
+            return Err(expired());
         }
     }
 }
@@ -373,6 +472,7 @@ mod tests {
                     "kill refused",
                 ))
             },
+            child_timed_out,
         )
         .expect_err("kill failure must reach the owner");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);

@@ -536,7 +536,6 @@ fn sort_cross_validate_osmium() {
 
     write_unsorted_overlapping_pbf(&input);
     CliInvoker::new(&invocation_scratch)
-        .timeout(std::time::Duration::from_secs(110))
         .arg("sort")
         .arg(&input)
         .arg("-o")

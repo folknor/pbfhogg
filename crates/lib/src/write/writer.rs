@@ -1670,6 +1670,9 @@ mod tests {
         // Drop the receiver before the thread even starts, so every send is
         // guaranteed to fail without a race to synchronise against.
         drop(inbox);
+        // Never parks: it returns its stored outcome at once, and the
+        // writer under test owns the handle and joins it in flush or Drop,
+        // so no test release or bound is owed here.
         let handle = std::thread::spawn(move || outcome);
         let invocation = crate::host::Call::detached().permit();
         PbfWriter::from_pipeline(

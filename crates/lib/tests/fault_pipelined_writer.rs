@@ -120,6 +120,15 @@ impl Drop for Cleanup {
     }
 }
 
+/// Releases the parked framing job when dropped.
+struct ReleaseFraming<'a>(&'a Invocation);
+
+impl Drop for ReleaseFraming<'_> {
+    fn drop(&mut self) {
+        self.0.faults().release_framing();
+    }
+}
+
 /// End the writer as `end` says: the error it reported, if any, and the
 /// state at the moment the ending operation returned.
 fn end_writer<W: Write>(
@@ -249,10 +258,15 @@ fn run(backend: Backend, end: End) {
 fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
     const WINDOW: usize = 512;
     for backend in [Backend::Buffered, Backend::Parallel] {
+        // Declared first, so it also bounds the release guards and joins.
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            pbfhogg::TEST_HANG_BOUND,
+            pbfhogg::TEST_HANG_REPORT_GRACE,
+            "the parked-head window scenario did not end",
+        );
         let dir = crate::common::test_scratch();
-        // `open`'s writer type borrows the path, and the writer moves to
-        // another thread below.
-        let path: &'static Path = Box::leak(dir.path().join("window.osm.pbf").into_boxed_path()); // leak-deliberate: a path, not a host
+        let path = dir.path().join("window.osm.pbf");
+        let path = path.as_path();
         let exited = Arc::new(AtomicUsize::new(0));
         let on_exit = Arc::clone(&exited);
         let pool = Arc::new(
@@ -276,31 +290,35 @@ fn fault_injection_a_parked_head_bounds_admission_to_the_delivery_window() {
         writer.write_primitive_block(&EMPTY_BLOCK).unwrap();
         assert!(faults.wait_for(|| faults.held_framing_jobs.load(SeqCst) == 1));
 
-        let admitted = Arc::new(AtomicUsize::new(0));
-        let progress = Arc::clone(&admitted);
-        let raw = std::thread::spawn(move || {
-            for _ in 0..WINDOW {
-                writer.write_raw(&[]).unwrap();
-                progress.fetch_add(1, SeqCst);
-            }
-            writer
+        let admitted = AtomicUsize::new(0);
+        let mut writer = std::thread::scope(|scope| {
+            let raw = scope.spawn(|| {
+                for _ in 0..WINDOW {
+                    writer.write_raw(&[]).unwrap();
+                    admitted.fetch_add(1, SeqCst);
+                }
+                writer
+            });
+            // Releases the head on every exit, a failed assertion's unwind
+            // included, so the scope never joins a writer parked on the window.
+            let _release = ReleaseFraming(&invocation);
+            // Items 1 to WINDOW - 1 fit beside the parked head; the next finds
+            // the window empty. No token returns while the head is parked, so
+            // the count at that observation is the window's size: a smaller
+            // window reports fewer, a larger one more or never empties.
+            assert!(
+                faults.wait_for(|| faults.window_waits.load(SeqCst) >= 1),
+                "{backend:?}: no reservation found the window empty; {} raw items admitted",
+                admitted.load(SeqCst)
+            );
+            assert_eq!(
+                admitted.load(SeqCst),
+                WINDOW - 1,
+                "{backend:?}: a write past the window was admitted behind a parked head"
+            );
+            faults.release_framing();
+            raw.join().unwrap()
         });
-        // Items 1 to WINDOW - 1 fit beside the parked head; the next finds
-        // the window empty. No token returns while the head is parked, so
-        // the count at that observation is the window's size: a smaller
-        // window reports fewer, a larger one more or never empties.
-        assert!(
-            faults.wait_for(|| faults.window_waits.load(SeqCst) >= 1),
-            "{backend:?}: no reservation found the window empty; {} raw items admitted",
-            admitted.load(SeqCst)
-        );
-        assert_eq!(
-            admitted.load(SeqCst),
-            WINDOW - 1,
-            "{backend:?}: a write past the window was admitted behind a parked head"
-        );
-        faults.release_framing();
-        let mut writer = raw.join().unwrap();
         writer.flush().unwrap();
         assert!(
             !faults.framing_hook_timed_out.load(SeqCst),

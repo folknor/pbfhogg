@@ -50,39 +50,28 @@ allowance with no cross-process admission, so on a low-limit host a contended
 registration can fail the gate falsely. Not yet measured: the fallback pools' wall
 against the full pool on planet (needs a raised limit, which this host lacks).
 
-## VER-026 - CLI tests wait on child bounds in sequence
+## VER-140 - Library tests park threads in std scopes without a HangBound
 
-Every test time bound lives in `crates/lib/src/tunables.rs` ("Test time bounds") and
-is const-asserted below `TEST_RUNNER_WATCHDOG`, brokkr's fixed 20 s per-test
-watchdog, which the maintainer confirms is always 20 s. Library hang waits now carry
-one fail-stop `HangBound` over the whole scenario, but tests outside them still wait
-on bounds in sequence. One child is now one bound (`RunningCli` carries a single
-deadline from spawn through `wait_for_file` and `wait`), but a CLI test that runs
-several children, each under `TEST_CHILD_TIMEOUT` (10 s) - a row loop, or a run and
-then a next run as in `a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers`
-- can reach the watchdog unnamed, and CLI tests cannot name `TEST_HANG_BOUND`
-through the test-import audit (`crates/source-policy/src/rules/test_imports.rs`).
+Found while reading test spawns against the release-before-join rule.
+`crates/lib/tests/fault_apply_changes.rs` (a `std::thread::scope` around a merge
+parked at `apply_changes_park_at_blob_seq`, released by cancelling the invocation),
+`crates/lib/tests/cancel.rs` (two scoped sort runs) and the scopes in
+`crates/lib/tests/host_contract.rs` carry no `HangBound`, so a release that fails to
+wake the parked thread leaves the scope's join to the runner's watchdog. Not read in
+full: whether each scope body releases on an assertion unwind before the implicit
+join, and whether every park there is a hook wait already bounded by
+`TEST_HOOK_WAIT`.
 
-## VER-139 - Test threads not yet checked for release before join
+## VER-141 - The osmium sort test is skipped as over-watchdog but takes milliseconds
 
-Found while closing the literal-bound and success-only-join work, which converted
-`seal.rs`, `capabilities.rs`, the `read/reader.rs` budget and queue tests, the
-`read/pipeline.rs` gate test and the FIFO feeders. Not yet read against the rule
-(every thread a test starts is released and joined on every exit, under the test's
-`HangBound`): `crates/lib/tests/fault_pipelined_writer.rs` (the `raw` writer thread is
-declared after its `Cleanup` guard, so an assertion failure drops the handle before
-the guard releases framing, detaching the thread), `crates/lib/tests/digest_input.rs`
-FIFO writer, the `write/writer.rs`, `write/pipeline.rs` and `read/reader.rs` (the
-spawn near the `par_map_reduce` tests) unit-test spawns,
-`commands/apply_changes/window.rs` (`a_returned_drain_wakes_a_parked_scanner`, no
-bound on its join) and `crates/cli/tests/guard.rs`. `crates/cli/tests/cli_sort.rs`
-`sort_cross_validate_osmium` sets a literal 110 s child timeout, above the watchdog,
-on an `#[ignore]` test run only through `brokkr test --timeout`.
-`OwnedChild::signal` (`crates/lib/tests/common/process.rs`) still calls `kill` on the
-numeric PID after the child was reaped by `has_exited`; it should refuse instead.
-`seal.rs` and `crates/cli/src/signals.rs` join through `std::thread::scope`, which
-does not wait for thread-local destructors; their threads hold none that matter, but
-only lib unit tests can reach `crate::threads::scope`.
+`sort_cross_validate_osmium` (`crates/cli/tests/cli_sort.rs`) is the one entry in
+the `full` profile's by-name skip list (`brokkr.d/checks.toml`, described there as
+over-watchdog tests), and AGENTS.md uses it as the worked example of a test run
+through `brokkr test --timeout`. It ran in 19 ms on bygg once its 110 s child
+timeout was removed; it is `#[ignore = "external"]` because it needs osmium, not
+because it is slow. Decide whether `full` (which sets `include_ignored`) should run
+it, skipping where osmium is absent as it already does, and reword the skip-list
+and AGENTS.md text that calls it over-watchdog.
 
 ## VER-138 - Element order inside a mixed-field group is pbfhogg's, not the file's
 

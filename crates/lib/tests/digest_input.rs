@@ -151,6 +151,13 @@ fn a_blob_of_unknown_type_is_refused_at_that_blob() {
 #[cfg(unix)]
 #[test]
 fn a_stream_is_digested_like_the_file_it_carries() {
+    // Declared first: a digest that opens the FIFO and stops reading would
+    // block the feeder's write, which the feeder's join then waits on.
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "digesting a FIFO did not end",
+    );
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
@@ -162,14 +169,15 @@ fn a_stream_is_digested_like_the_file_it_carries() {
         ("whole", bytes.clone(), true),
         ("partial", stripped(&bytes, &[2]), false),
     ] {
-        let writer = {
-            let fifo = fifo.clone();
-            // A refusal may close the read end before every byte is taken;
-            // the write's own outcome is not what this test checks.
-            std::thread::spawn(move || drop(std::fs::write(&fifo, payload)))
-        };
+        let feeder = crate::common::FifoFeeder::start(&fifo, payload);
         let result = digest(&fifo);
-        writer.join().expect("the writer thread");
+        // A refusal may close the read end before every byte is taken, so
+        // the write's own outcome is not checked; that the digest opened
+        // the stream is.
+        assert!(
+            !matches!(feeder.finish(), crate::common::Fed::NeverOpened),
+            "{label}: the digest never opened the stream"
+        );
         if accepted {
             assert_eq!(
                 result.unwrap_or_else(|e| panic!("{label}: {e}")),

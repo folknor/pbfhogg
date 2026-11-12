@@ -792,13 +792,24 @@ exception, not a tier - should not survive across many PRs.
   holds at the end. It walks the step prefixes a kill would leave, without
   killing anything.
 - **CliInvoker for CLI-driven tests.** `crates/cli/tests/invoker.rs`. Every
-  new `crates/cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
-  set below `brokkr check`'s 20 s watchdog, override via
-  `.timeout(Duration)`. The timeout is one deadline from spawn shared by
+  new `crates/cli/tests/cli_*.rs` goes through it. Every child times out at
+  `TEST_CHILD_TIMEOUT`, set below `brokkr check`'s 20 s watchdog, with no
+  per-test override. The timeout is one deadline from spawn shared by
   every wait on that child: `wait_for_file` (a pause point's ready file,
   reporting whether it appeared, the child exited first, or the deadline
   passed) and the final `wait`, so a paused child is one bound, not two.
-  A test that runs several children still sums their bounds. Construction borrows `&TestScratch`, and the running
+  Every child a test thread spawns through `common::process::OwnedChild`
+  (CLI, harness and osmium children alike) also shares
+  `TEST_CHILD_BUDGET`, anchored at the thread's first child: once it is
+  spent the next spawn is refused and a wait that has not yet seen its
+  child exit kills it, each naming the budget, so a test running children
+  in sequence fails named instead of at the watchdog. The anchor is the
+  first child, not test start, so it names the failure only when setup
+  before that child stays inside the margin the tunables assert. A test
+  whose children span more than the budget fails even if it would have
+  ended under the watchdog: the budget is part of what a test must fit.
+  A signal to
+  a child the owner has already reaped is refused. Construction borrows `&TestScratch`, and the running
   handle carries that borrow through child and capture cleanup. `run` uses
   the same owner as `spawn().wait()`. Pipe reads are nonblocking, capture
   errors fail explicitly, and cleanup and EOF waits are bounded, including

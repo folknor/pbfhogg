@@ -162,6 +162,9 @@ fn concurrent_sealers_are_refused_until_the_account_is_frozen() {
             release_rx.lock().unwrap().recv().unwrap();
         }
     });
+    // std's scope returns before its threads' thread-local destructors run;
+    // these threads hold none that matters, and the library's joined scope
+    // is crate-private, out of an integration test's reach.
     let first = std::thread::scope(|scope| {
         // Owned by the scope's body: an assertion's unwind drops it before
         // the scope joins, which releases the parked sealer.

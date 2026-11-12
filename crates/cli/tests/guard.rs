@@ -607,6 +607,9 @@ mod tests {
                         libc::syscall(libc::SYS_close_range, n_long - 1, n_long, 0);
                     }
                     "thread_close" => {
+                        // Runs inside the probe child, not the test binary:
+                        // run_probe's child timeout bounds it and the child's
+                        // exit ends the thread, joined or not.
                         std::thread::spawn(move || {
                             libc::close(n);
                         })

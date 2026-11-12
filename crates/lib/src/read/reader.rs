@@ -1972,6 +1972,9 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let completed = Arc::new(AtomicBool::new(false));
             let thread_completed = Arc::clone(&completed);
+            // Never parks (it panics or sets a flag and returns), and the
+            // PipelinedBlocks under test owns the handle and joins it on
+            // drop, so no test release or bound is owed here.
             let handle = std::thread::spawn(move || {
                 let _tx = tx;
                 if panics {

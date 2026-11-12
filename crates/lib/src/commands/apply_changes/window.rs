@@ -48,6 +48,10 @@ pub(super) struct WindowAdmit {
     /// Time spent parked on an exhausted window (blocking fallback only;
     /// a token available on the first try costs nothing here).
     wait_ns: u64,
+    /// Told when an admission takes the blocking branch (test builds only),
+    /// so a test knows the scanner is past its non-blocking try.
+    #[cfg(test)]
+    blocking: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// The drain's end: returns a token per processed seq. The only sender.
@@ -69,6 +73,8 @@ pub(super) fn seq_window(size: usize) -> (WindowAdmit, WindowReturn) {
             tokens: rx,
             outstanding: Arc::clone(&outstanding),
             wait_ns: 0,
+            #[cfg(test)]
+            blocking: None,
         },
         WindowReturn {
             tokens: tx,
@@ -85,6 +91,10 @@ impl WindowAdmit {
             Ok(()) => {}
             Err(TryRecvError::Disconnected) => return Err(window_closed()),
             Err(TryRecvError::Empty) => {
+                #[cfg(test)]
+                if let Some(blocking) = &self.blocking {
+                    blocking.send(()).ok();
+                }
                 let start = crate::counters::Stopwatch::start();
                 let got = self.tokens.recv();
                 self.wait_ns += start.elapsed_ns();
@@ -138,12 +148,30 @@ mod tests {
         assert_eq!(ret.high_water(), 2);
     }
 
+    /// The drain is dropped only once the scanner has taken the blocking
+    /// branch, so the error is the blocking receive's, whether the drop
+    /// lands before that receive parks or after: a disconnect wakes it
+    /// either way. The drop is the release, on an unwind too.
     #[test]
     fn a_returned_drain_wakes_a_parked_scanner() {
         let (mut admit, ret) = seq_window(1);
         admit.admit().unwrap();
-        let parked = std::thread::spawn(move || admit.admit());
-        drop(ret);
-        assert!(parked.join().unwrap().is_err());
+        let (blocking_tx, blocking_rx) = std::sync::mpsc::channel();
+        admit.blocking = Some(blocking_tx);
+        let ret = std::sync::Mutex::new(Some(ret));
+        let release = || drop(ret.lock().unwrap().take());
+        let (admitted, ()) = crate::test_support::with_parked_thread(
+            "a returned drain did not wake the parked scanner",
+            move || admit.admit(),
+            release,
+            || {
+                blocking_rx
+                    // wait-deliberate: the scanner reaches the blocking branch at once; expiry fails
+                    .recv_timeout(crate::test_support::OBSERVE_BOUND)
+                    .expect("the scanner took the blocking branch");
+                release();
+            },
+        );
+        assert!(admitted.is_err());
     }
 }

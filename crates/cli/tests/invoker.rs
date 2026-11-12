@@ -21,12 +21,14 @@
 //!
 //! ## Timeout
 //!
-//! Every invocation has a wall-clock timeout (default 10 s,
-//! [`CliInvoker::timeout`] overrides). On expiry the child is sent
-//! `SIGKILL` and the test panics with a clear "timed out" message
-//! instead of wedging the test runner. The default leaves time to report diagnostics before the
-//! 20 s per-test watchdog in `brokkr check`. Explicit overrides
-//! remain subject to that outer watchdog.
+//! Every invocation has a wall-clock timeout, `pbfhogg::TEST_CHILD_TIMEOUT`,
+//! and every child a test thread spawns also shares
+//! `pbfhogg::TEST_CHILD_BUDGET` from its first child
+//! (`crates/lib/tests/common/process.rs`), so a test running children in
+//! sequence fails naming the budget rather than reaching the 20 s
+//! per-test watchdog in `brokkr check` unnamed. On expiry the child is
+//! sent `SIGKILL` and the test panics with a "timed out" message naming
+//! the bound; once the budget is spent the next spawn is refused.
 //!
 //! ## The promise guard
 //!
@@ -80,20 +82,18 @@ pub const CHILD_MEMORY: u64 = 8 << 30;
 pub struct CliInvoker<'a> {
     scratch: &'a TestScratch,
     cmd: Command,
-    timeout: Duration,
     stderr_closed: bool,
 }
 
 impl<'a> CliInvoker<'a> {
-    /// Start a new invocation. Default timeout is
-    /// [`pbfhogg::TEST_CHILD_TIMEOUT`]; override via [`Self::timeout`].
+    /// Start a new invocation, timed out at [`pbfhogg::TEST_CHILD_TIMEOUT`]
+    /// or the test's children budget, whichever comes first.
     pub fn new(scratch: &'a TestScratch) -> Self {
         let mut cmd = Command::new(pbfhogg_bin());
         crate::common::process::isolate(&mut cmd, scratch);
         Self {
             scratch,
             cmd,
-            timeout: pbfhogg::TEST_CHILD_TIMEOUT,
             stderr_closed: false,
         }
         .resources(CHILD_CORES, Some(CHILD_MEMORY))
@@ -438,17 +438,9 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
-    /// Override the wall-clock timeout. On expiry the child is
-    /// `SIGKILL`ed and the test panics. The default is sized for small
-    /// fixtures.
-    pub fn timeout(mut self, t: Duration) -> Self {
-        self.timeout = t;
-        self
-    }
-
     /// Run the binary, capture output, return a [`CliOutput`].
     /// Does NOT assert on exit status - the caller does that.
-    /// Panics on timeout (see [`Self::timeout`]).
+    /// Panics on timeout (see the module doc).
     pub fn run(self) -> CliOutput {
         self.spawn().wait()
     }
@@ -461,10 +453,9 @@ impl<'a> CliInvoker<'a> {
         }
         guard(&mut self.cmd);
         let owner = OwnedChild::spawn(&mut self.cmd, self.scratch).expect("spawn pbfhogg");
-        RunningCli {
-            owner,
-            deadline: std::time::Instant::now() + self.timeout,
-        }
+        let own = std::time::Instant::now() + pbfhogg::TEST_CHILD_TIMEOUT;
+        let deadline = owner.budget().map_or(own, |budget| own.min(budget));
+        RunningCli { owner, deadline }
     }
 
     /// Run and assert exit status is success. Returns captured output
@@ -496,7 +487,8 @@ impl<'a> CliInvoker<'a> {
 
 /// A child whose lifetime cannot exceed its scratch guard. Its timeout is
 /// one deadline from spawn that every wait on it shares, so a test that
-/// waits for a pause point and then for the exit waits one bound, not two.
+/// waits for a pause point and then for the exit waits one bound, not two;
+/// the deadline is never later than the test's children budget.
 /// Cleanup after a kill (reaping, pipe completion) is bounded separately.
 pub struct RunningCli<'a> {
     owner: OwnedChild<'a>,
@@ -516,7 +508,7 @@ pub enum NoFile {
 #[allow(dead_code)]
 impl RunningCli<'_> {
     pub fn signal(&self, signal: libc::c_int) {
-        self.owner.signal(signal);
+        self.owner.signal(signal).expect("signal pbfhogg");
     }
 
     pub fn has_exited(&mut self) -> bool {
@@ -531,11 +523,11 @@ impl RunningCli<'_> {
     /// before, since a signal to a reaped PID could reach another process.
     pub fn wait_for_file(&mut self, path: &std::path::Path) -> Result<(), NoFile> {
         loop {
-            if path.exists() {
-                return Ok(());
-            }
             if self.has_exited() {
                 return Err(NoFile::Exited);
+            }
+            if path.exists() {
+                return Ok(());
             }
             if std::time::Instant::now() >= self.deadline {
                 return Err(NoFile::Expired);
@@ -908,17 +900,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_invoker_reaps_on_wait_error_and_assertion_unwind() {
+    fn cli_invoker_reaps_on_assertion_unwind() {
         let scratch = pbfhogg_test_scratch::scratch();
-        let mut running = CliInvoker::new(&scratch).arg("--version").spawn();
+        let running = CliInvoker::new(&scratch).arg("--version").spawn();
         let pid = libc::pid_t::try_from(running.owner.id()).expect("pid");
+        // The owner is dropped by an unwind that never waited on it.
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            running
-                .owner
-                .wait_with_check(pbfhogg::TEST_CHILD_TIMEOUT, |_| {
-                    Err(std::io::Error::other("injected wait error"))
-                })
-                .expect("injected failure");
+            let _running = running;
+            panic!("injected failure before any wait");
         }));
         assert!(failure.is_err());
         let mut status = 0;
@@ -930,6 +919,44 @@ mod tests {
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
+        );
+    }
+
+    /// A reaped child's PID may already name another process, so a signal
+    /// after the owner saw the exit is refused, not sent.
+    #[test]
+    fn a_reaped_child_is_never_signalled() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let mut running = CliInvoker::new(&scratch).arg("--version").spawn();
+        let exit = running
+            .owner
+            .wait(pbfhogg::TEST_CHILD_TIMEOUT)
+            .expect("exit");
+        assert!(exit.status.success());
+        let refused = running.owner.signal(libc::SIGTERM).expect_err("refused");
+        assert!(refused.to_string().contains("reaped"), "{refused}");
+    }
+
+    /// Once the thread's children have spent their shared budget, the next
+    /// child is refused at spawn, naming the budget, even though every
+    /// earlier child ended in time.
+    #[test]
+    fn a_spent_children_budget_refuses_the_next_child() {
+        use super::OwnedChild;
+        use std::process::Command;
+
+        let scratch = pbfhogg_test_scratch::scratch();
+        CliInvoker::new(&scratch).arg("--version").assert_success();
+        crate::common::process::spend_children_budget();
+        let mut command = Command::new(super::pbfhogg_bin());
+        crate::common::process::isolate(&mut command, &scratch);
+        let refused = OwnedChild::spawn(command.arg("--version"), &scratch)
+            .err()
+            .expect("a spent budget refuses the spawn");
+        assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            refused.to_string().contains("TEST_CHILD_BUDGET"),
+            "{refused}"
         );
     }
 

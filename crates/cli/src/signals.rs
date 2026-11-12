@@ -231,6 +231,9 @@ pub(crate) fn name(signo: libc::c_int) -> &'static str {
     clippy::disallowed_methods,
     reason = "std::thread::scope joins its two threads before each test returns"
 )]
+// std's scope returns before its threads' thread-local destructors run; these
+// threads hold no thread-local whose destructor matters, and the library's
+// joined scope is crate-private to pbfhogg.
 mod tests {
     use super::{NoticeGate, deliver};
     use pbfhogg_test_scratch::HangBound;

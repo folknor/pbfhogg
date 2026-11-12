@@ -983,13 +983,19 @@ exception, not a tier - should not survive across many PRs.
   a background-stage writer would overlap it.
   Scratch constructor spellings are sealed outside the leaf by
   `test-scratch-via-test-scratch-crate` in `brokkr.d/lints.toml`.
-  Companion rules seal child construction to the four owned runners,
+  Companion rules seal child construction to the owned runners and
+  self-reinvocations that `test-children-only-through-owned-runners` lists,
   manifest-directory discovery to the leaf and named source-contract checks,
   checked-in PBF names out of executable code, fixed `data/` literals, and
   static fixture-name counter spellings (including `RUN`).
   Each rule explicitly covers library, CLI and harness `src/` and `tests/`
   plus `crates/lib/examples/`, with `must_scan` sentinels; the shared
   `common/process.rs` child owner is scanned and has no spawn exemption.
+  No test starts a shell, an interpreter, cargo, rustc, brokkr or any other
+  general tool: a check that needs one is a `[[script_check]]` or textlint
+  in `brokkr.d/lints.toml`. A child-owner test that needs a blocking child
+  re-executes its own test binary into a probe test, as `guard::tests` and
+  `invoker::tests::gated_child_probe` do.
   Doc-comment fixture paths remain legal, as does the fixture generator.
   These are spelling-bound tripwires, not proof of ownership: renamed
   imports and writes by absolute path outside the repository stay unseen.

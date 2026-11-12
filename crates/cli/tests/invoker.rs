@@ -1130,33 +1130,98 @@ mod tests {
         );
     }
 
+    const GATED_PROBE_ENV: &str = "PBFHOGG_TEST_GATED_PROBE";
+
+    /// The gated child the child-owner tests drive: this test binary
+    /// re-executed into `gated_child_probe`, so no shell or other tool is
+    /// started. Its stdin is one end of a socket pair, which is
+    /// bidirectional: the probe announces on it before blocking on it.
+    /// The returned owner has seen that announcement, so the child is at
+    /// its blocking read, not still starting up.
+    fn spawn_gated_child<'a>(
+        scratch: &'a pbfhogg_test_scratch::TestScratch,
+        gate: &mut std::os::unix::net::UnixStream,
+        reader: std::os::unix::net::UnixStream,
+    ) -> super::OwnedChild<'a> {
+        use std::io::Read;
+        use std::os::fd::{AsFd, OwnedFd};
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+        crate::common::process::isolate(&mut command, scratch);
+        command
+            .args([
+                "invoker::tests::gated_child_probe",
+                "--exact",
+                "--test-threads",
+                "1",
+                "--nocapture",
+            ])
+            .env(GATED_PROBE_ENV, "1")
+            .stdin(Stdio::from(OwnedFd::from(reader)))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = super::OwnedChild::spawn(&mut command, scratch).expect("gated child");
+        // The child now holds the only reader end, so a probe that dies
+        // before announcing reads as EOF here, not as a hang.
+        drop(command);
+        let own = std::time::Instant::now() + pbfhogg::TEST_CHILD_TIMEOUT;
+        let deadline = child.budget().map_or(own, |budget| own.min(budget));
+        let readiness = child
+            .wait_readable(gate.as_fd(), deadline)
+            .expect("wait for the probe");
+        assert!(
+            matches!(readiness, super::Readiness::Readable),
+            "the probe did not announce its read"
+        );
+        let mut announced = [0u8; 1];
+        gate.read_exact(&mut announced)
+            .expect("the probe announces");
+        assert_eq!(&announced, b"r");
+        child
+    }
+
+    /// Child side of `spawn_gated_child`: announces on stdin, then copies one
+    /// line of stdin to stderr verbatim (libtest writes nothing there for a
+    /// passing test). Without the environment it is an empty test.
+    #[test]
+    fn gated_child_probe() {
+        use std::io::{BufRead, Write};
+        use std::os::fd::FromRawFd;
+
+        if std::env::var_os(GATED_PROBE_ENV).is_none() {
+            return;
+        }
+        // SAFETY: fd 0 is the socket the parent set as stdin; ManuallyDrop
+        // keeps this handle from closing it.
+        let mut socket = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+        socket.write_all(b"r").expect("announce the read");
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .expect("read the gate");
+        std::io::stderr()
+            .write_all(line.as_bytes())
+            .expect("echo the gate");
+    }
+
     /// The input gate controls completion independently of host speed. Keeping
     /// it open without writing also exercises the independent timeout path.
     #[test]
     fn owned_child_blocks_for_completion_and_times_out_a_gated_child() {
-        use super::OwnedChild;
         use std::io::Write;
-        use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
-        use std::process::{Command, Stdio};
 
         let scratch = pbfhogg_test_scratch::scratch();
         for release in [true, false] {
             let (reader, mut gate) = UnixStream::pair().expect("input gate");
-            let mut command = Command::new("/bin/sh");
-            crate::common::process::isolate(&mut command, &scratch);
-            command
-                .args(["-c", "read value; printf '%s' \"$value\""])
-                .stdin(Stdio::from(OwnedFd::from(reader)))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = OwnedChild::spawn(&mut command, &scratch).expect("gated child");
+            let mut child = spawn_gated_child(&scratch, &mut gate, reader);
             if release {
                 gate.write_all(b"released\n").expect("release input gate");
                 let output = child.wait(pbfhogg::TEST_CHILD_TIMEOUT).expect("completion");
                 assert!(output.status.success());
-                assert_eq!(output.stdout, b"released");
-                assert!(output.stderr.is_empty());
+                assert_eq!(output.stderr, b"released\n");
                 // A status cached by an earlier wait must not call waitid on
                 // a PID that has already been reaped.
                 let cached = child
@@ -1181,25 +1246,15 @@ mod tests {
     /// thread ends, before its owner (moved out of that thread) kills it.
     #[test]
     fn a_test_child_is_killed_when_its_spawning_thread_ends() {
-        use super::OwnedChild;
-        use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
         use std::os::unix::process::ExitStatusExt;
-        use std::process::{Command, Stdio};
 
         let scratch = pbfhogg_test_scratch::scratch();
-        let (reader, _gate) = UnixStream::pair().expect("input gate");
+        let (reader, mut gate) = UnixStream::pair().expect("input gate");
         let mut child = std::thread::scope(|s| {
-            s.spawn(|| {
-                let mut command = Command::new("/bin/sh");
-                crate::common::process::isolate(&mut command, &scratch);
-                command
-                    .args(["-c", "read value"])
-                    .stdin(Stdio::from(OwnedFd::from(reader)));
-                OwnedChild::spawn(&mut command, &scratch).expect("gated child")
-            })
-            .join()
-            .expect("spawning thread")
+            s.spawn(|| spawn_gated_child(&scratch, &mut gate, reader))
+                .join()
+                .expect("spawning thread")
         });
         let output = child
             .wait(pbfhogg::TEST_CHILD_TIMEOUT)

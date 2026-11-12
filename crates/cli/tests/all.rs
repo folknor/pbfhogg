@@ -10,7 +10,7 @@
 //! One binary for the same reasons as the library's `crates/lib/tests/all.rs`, which
 //! this mirrors: `autotests = false` in `crates/cli/Cargo.toml`, so a file in
 //! `crates/cli/tests/` that is not declared here is never compiled; the
-//! pre-clippy `scripts/check_test_modules.py` audit reports such a file. A test's full libtest name is `<file module>::<path inside
+//! test-module audit in `crates/source-policy` reports such a file. A test's full libtest name is `<file module>::<path inside
 //! the file>` (`cli_sort::backends::...`), so brokkr's tier filters keep
 //! matching.
 //!

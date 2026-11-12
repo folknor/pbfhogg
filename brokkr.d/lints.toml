@@ -391,11 +391,11 @@ message = "Construct test children only in the CLI invoker, oracle runner, harne
 [[textlint]]
 name = "repository-root-only-through-test-scratch"
 pattern = '\bCARGO_MANIFEST_DIR\b'
-paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs"]
-exclude = ["crates/cli/src/library_text_rule.rs", "crates/lib/examples/gen_test_pbf.rs"]
+paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs", "crates/source-policy/src/**/*.rs"]
+exclude = ["crates/lib/examples/gen_test_pbf.rs"]
 region = "string"
-must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/src/io_reach.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/src/describe.rs", "crates/harness/tests/exe.rs", "crates/lib/examples/stale_way_blobs.rs", "crates/lib/tests/common/process.rs"]
-message = "Use pbfhogg_test_scratch::repository_root(); only named source-contract checks and the fixture generator resolve their manifest directory"
+must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_parallel.rs", "crates/cli/src/io_reach.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/src/describe.rs", "crates/harness/tests/exe.rs", "crates/lib/examples/stale_way_blobs.rs", "crates/lib/tests/common/process.rs", "crates/source-policy/src/lib.rs"]
+message = "Use pbfhogg_test_scratch::repository_root(); only the fixture generator resolves its manifest directory"
 
 [[textlint]]
 name = "executable-tests-never-read-checked-in-pbf"
@@ -739,85 +739,12 @@ must_scan = [
 ]
 message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
 
-# Sealed probe-open and invocation-finalization bodies and the dispatch
-# ownership shape, no `as i64` cast inside a `.counter(` call's arguments (which
-# rustfmt wraps across lines), and the counted library-wide static inventory:
-# none fits a one-line forbid rule.
-[[script_check]]
-name = "source-invariants"
-command = "python3 -B scripts/check_source_invariants.py"
-expect = "source invariants ok"
-match = "last-line"
-stage = "pre-clippy"
-
-# In-memory negative fixtures for the sealed lifecycle source shapes.
-[[script_check]]
-name = "source-lifecycle-fixtures"
-command = "python3 -B scripts/test_source_lifecycle.py"
-expect = "source lifecycle fixtures ok"
-match = "last-line"
-stage = "pre-clippy"
-
-# Inventory fixtures include enclosing modules and literal macro bodies.
-[[script_check]]
-name = "source-static-fixtures"
-command = "python3 -B scripts/test_source_statics.py"
-expect = "source static fixtures ok"
-match = "last-line"
-stage = "pre-clippy"
-
-# Every Rust file under a member's tests/ must be reachable from a test
-# target that some configured sweep builds, following mod declarations,
-# path attributes and cfg gates. Lexical: it reads source reachability, not
-# macro expansion or whether a test runs; unknown cfg forms fail closed.
-[[script_check]]
-name = "test-modules"
-command = "python3 -B scripts/check_test_modules.py"
-expect = "test module audit ok"
-match = "last-line"
-stage = "pre-clippy"
-
-[[script_check]]
-name = "test-modules-fixtures"
-command = "python3 -B scripts/test_check_test_modules.py"
-expect = "test module fixtures ok"
-match = "last-line"
-stage = "pre-clippy"
-
-# No literal integer expression in crates/lib/src/read or write evaluates to
-# IO_BUF_BYTES. Lexical: named aliases, casts and macro-built arithmetic are
-# outside its promise.
-[[script_check]]
-name = "io-sizes"
-command = "python3 -B scripts/check_io_sizes.py"
-expect = "io size audit ok"
-match = "last-line"
-stage = "pre-clippy"
-
-[[script_check]]
-name = "io-sizes-fixtures"
-command = "python3 -B scripts/test_check_io_sizes.py"
-expect = "io size fixtures ok"
-match = "last-line"
-stage = "pre-clippy"
-
-# CLI tests name the library only through its fixture and test-infrastructure
-# surface (the inventory is SURFACE in the script); any other library path
-# carries a library-deliberate reason. A direct-spelling guard: it does not
-# see crates/lib/tests/common, crate:: re-exports or macro expansion.
-[[script_check]]
-name = "test-imports"
-command = "python3 -B scripts/check_test_imports.py"
-expect = "test import audit ok"
-match = "last-line"
-stage = "pre-clippy"
-
-[[script_check]]
-name = "test-imports-fixtures"
-command = "python3 -B scripts/test_check_test_imports.py"
-expect = "test import fixtures ok"
-match = "last-line"
-stage = "pre-clippy"
+# The Rust-source audits that no one-line forbid rule can express (sealed
+# lifecycle shapes, counter casts, the library static inventory, test-module
+# reachability, I/O transfer sizes, the CLI tests' library surface, entropy
+# ownership and the library text rule) are the unit tests of
+# crates/source-policy, run once per check in the all sweep over one
+# tokenized corpus, not script checks.
 
 # scripts/vs-osmium.sh against a recording brokkr stub; brokkr's bench
 # contract tests are Lua, so the shell driver's test lives here.
@@ -850,22 +777,6 @@ paths = ["crates/harness/src/scenarios/**/*.rs"]
 region = "code"
 must_scan = ["crates/harness/src/scenarios/file_assertions.rs", "crates/harness/src/scenarios/nofile.rs"]
 message = "Use bounded file_assertions helpers for dataset-sized scenario observations"
-
-# Lexical getrandom ownership, down to the adapter function body. PID
-# acquisition is separate: output publication also uses a PID in its names.
-[[script_check]]
-name = "entropy-owner"
-command = "python3 -B scripts/check_entropy_owner.py"
-expect = "entropy owner ok"
-match = "last-line"
-stage = "pre-clippy"
-
-[[script_check]]
-name = "entropy-owner-fixtures"
-command = "python3 -B scripts/test_check_entropy_owner.py"
-expect = "entropy owner fixtures ok"
-match = "last-line"
-stage = "pre-clippy"
 
 # Test-run hygiene, owned by pbfhogg because the runner clears and checks
 # nothing: the pre-test entry empties data/test-scratch and records a

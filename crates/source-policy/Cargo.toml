@@ -1,0 +1,40 @@
+[package]
+name = "pbfhogg-source-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only: the repository's source-policy audits over one parsed corpus"
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# The audits are this library's unit tests: one real-tree test reads the
+# corpus once and runs every rule, and each rule's fixtures are in-memory
+# cases beside it. Only the `all` sweep in brokkr.d/checks.toml selects the
+# package, so the tree is audited once per check, not once per build shape.
+# No dependency on pbfhogg: the audits read source text, never link it.
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+# The rust-lang tokenizer as rust-analyzer republishes it, the one lexer
+# every rule reads: literal, comment and lifetime boundaries are the real ones.
+ra-ap-rustc_lexer = "0.184.0"
+# Structure, only where structure is the point (module graphs, test-gated
+# items). `span-locations` maps syn spans back to byte offsets outside a
+# proc-macro context.
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+toml = "1.1.3"
+
+[dev-dependencies]
+pbfhogg-test-scratch = { path = "../test-scratch" }
+
+[lints]
+workspace = true

@@ -50,9 +50,13 @@
 # alone (minimal, geocode-reader) leaves the other two out: their lib dep
 # would turn `commands` back on.
 
+# pbfhogg-source-policy is tested here and in no other sweep (all-serial
+# lists it only to stay aligned, and its serial:: filter selects none of its
+# tests): they audit the repository's source text, which no build shape
+# changes, so one run per check is the whole of it.
 [[check]]
 name = "all"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
@@ -78,7 +82,7 @@ parallel = {}
 # lane may not skip them there, so the gate carries no serial guarantee.
 [[check]]
 name = "all-serial"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 only = ["serial::"]

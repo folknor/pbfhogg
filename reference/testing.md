@@ -127,7 +127,7 @@ NAME` list each harness in turn to find one test.
   closure must pass that pin to the command rather than re-pinning the path.
 - **A new test file not declared in the `all.rs` under its package's test directory (or as
   its own `[[test]]`) is never compiled.** Add the `mod` line with the file.
-  The pre-clippy `test-modules` script check (`scripts/check_test_modules.py`)
+  The test-module audit (`crates/source-policy/src/rules/test_modules.rs`)
   reports such a file: every `.rs` under a member's `tests/` must be
   reachable from a `[[test]]` target that some sweep in `brokkr.d/checks.toml`
   builds, following `mod` declarations, `#[path]` attributes and `cfg` gates
@@ -431,8 +431,8 @@ The boundary follows what a test is for, not one list for every test.
   command's library code cannot break them by type changes alone. Any other
   library path carries a `// library-deliberate: <reason>` comment on its
   line, alone on the line above, or on the first line of its `use`
-  statement. The pre-clippy `test-imports` script check
-  (`scripts/check_test_imports.py`, self-tested by `test-imports-fixtures`)
+  statement. The test-import audit
+  (`crates/source-policy/src/rules/test_imports.rs`, with its fixtures)
   holds the surface's one inventory (the allowlist the CLI test files'
   module docs name) and refuses an unmarked path outside
   it, parsing every `use` tree. It is a direct-spelling guard: it does not
@@ -542,7 +542,7 @@ exception, not a tier - should not survive across many PRs.
   sweeps in `brokkr.d/checks.toml` pass it as `rustflags`. The
   rustdoc phase does not receive it (brokkr carries no sweep `--cfg`
   into rustdoc's flags), so doc comments on hook-only items are not
-  linted. `scripts/check_test_modules.py` reads the sweeps' rustflags
+  linted. The test-module audit reads the sweeps' rustflags
   for it, so a hook-gated test module counts as covered only while some
   sweep sets the cfg.
 - **Fault plans ride the token.** `pbfhogg::test_hooks` is the one
@@ -857,18 +857,25 @@ ambient opens, while child-process contracts test behaviour under a real
 `RLIMIT_NOFILE`. Neither stands in for the other.
 
 The shared I/O transfer size `IO_BUF_BYTES` (`crates/lib/src/tunables.rs`) has
-one owner, checked before clippy by `scripts/check_io_sizes.py` (`io-sizes`):
+one owner, checked by `crates/source-policy/src/rules/io_sizes.rs`:
 no maximal integer-only literal expression in `crates/lib/src/read/` or
 `crates/lib/src/write/` may evaluate to it. It is lexical, not Rust const
 evaluation: named aliases, casts and macro-built arithmetic are outside its
 promise, and a larger expression such as a scan budget is evaluated whole.
-The test-module and I/O-size audits, like the other Python checkers, mask Rust comments and
-literals through `scripts/rust_source_shapes.py` and carry in-memory
-self-tests run as their own pre-clippy script checks.
 
-Scratch entropy has one owner, checked before clippy by
-`scripts/check_entropy_owner.py` (`entropy-owner`, self-tested by
-`entropy-owner-fixtures`): the literal `getrandom` identifier may appear only
+The Rust-source audits (these two, the test-module and test-import audits
+above, the sealed lifecycle shapes, counter casts, the library static
+inventory and the library text rule) are one crate,
+`crates/source-policy`. Each file is read and tokenized once, with the
+rustc tokenizer (`ra-ap-rustc_lexer`); lexical rules work on those tokens,
+and only the test-module graph and the library text rule's test-only
+exemptions also parse with syn, failing on a file it cannot parse. The real
+tree is audited by one unit test, in the `all` sweep alone, so it runs once
+per check and not under brokkr's markdown-only shortcut; every rule carries
+in-memory fixtures beside it.
+
+Scratch entropy has one owner, checked by
+`crates/source-policy/src/rules/entropy.rs`: the literal `getrandom` identifier may appear only
 inside `random_u128` in `crates/lib/src/scratch.rs`, once, in production and
 test code alike. It is lexical: aliases imported elsewhere, other entropy APIs
 and macro-generated identifiers need review. Process-ID acquisition is not

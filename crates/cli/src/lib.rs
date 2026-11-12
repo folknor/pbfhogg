@@ -14,8 +14,6 @@ mod host;
 #[cfg(test)]
 mod invocation_finalization_tests;
 mod io_reach;
-#[cfg(test)]
-mod library_text_rule;
 mod output;
 mod signals;
 
@@ -6464,6 +6462,12 @@ mod geocode_query_bench_tests {
 /// enumerated value a mention in that row, every positional a mention in its
 /// section, and every global option a row under `## Global flags`. They
 /// check presence only, never what the prose says about a flag.
+///
+/// They stay here, in every build that tests this package, rather than
+/// joining the source audits in `crates/source-policy` or reading an
+/// exported command schema: the tree they check is `cli_command()` as this
+/// build shape compiles it, and the backend features change it, so no one
+/// export stands for every shape.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod doc_coverage_tests {

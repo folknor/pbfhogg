@@ -3,8 +3,9 @@
 //! The shared pieces below; counter code uses them rather than hand-rolling
 //! its own. Plain values (stats fields, schedule lengths, local tallies) need
 //! none of them: `Invocation::counter` takes unsigned integers directly
-//! and saturates, so they are passed without an `as i64` cast (a source check
-//! in `scripts/check_source_invariants.py` refuses one inside its arguments).
+//! and saturates, so they are passed without an `as i64` cast (a source audit
+//! in `crates/source-policy/src/rules/counters.rs` refuses one inside its
+//! arguments).
 //!
 //! - [`counter_set!`] declares a set of `AtomicU64` counters from one list
 //!   that pairs every field with the exact name it is emitted under, so a

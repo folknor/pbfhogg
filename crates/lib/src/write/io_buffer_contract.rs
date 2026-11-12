@@ -1,6 +1,7 @@
 //! Runtime arithmetic contract for the shared I/O transfer size.
 //!
-//! Source ownership is audited once before clippy by scripts/check_io_sizes.py.
+//! Source ownership is audited once per check by
+//! crates/source-policy/src/rules/io_sizes.rs.
 //! Backend boundary and allocation tests live beside each backend.
 
 #[test]

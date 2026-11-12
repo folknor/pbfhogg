@@ -45,9 +45,9 @@ caller would then hold.
 
 ## VER-009 - The static inventory cannot see synthesized state
 
-`scripts/check_source_invariants.py` now inventories every library static with counted,
-audited exceptions and presence checks for protected files, tested in
-`scripts/test_source_statics.py`. Unenforced: statics in synthesized macro output,
+`crates/source-policy/src/rules/statics.rs` inventories every library static with
+counted, audited exceptions and presence checks for protected files, with its fixtures
+beside it. Unenforced: statics in synthesized macro output,
 changes within audited initializers, and an architectural rule that `FaultPlan` is
 constructed only through the invocation.
 
@@ -56,26 +56,20 @@ constructed only through the invocation.
 The probe open now goes through `open_probe_lock` in `crates/lib/src/scratch.rs`,
 tested for missing-file preservation, and counter emission lives in
 `finish_invocation` in `crates/cli/src/lib.rs`, tested on success, refusal and
-cancellation. The guards in `scripts/check_source_invariants.py` and
-`scripts/rust_source_shapes.py` check a fixed lexical shape of each; they do not
-prove arbitrary Rust control flow. Residue: a general AST check, if it pays.
+cancellation. The guard in `crates/source-policy/src/rules/lifecycle.rs` checks a
+fixed token shape of each; it does not prove arbitrary Rust control flow. syn is
+now in that crate, so an AST check would not need a new parser. Residue: a general
+AST check, if it pays.
 
-## VER-012 - Source-policy checks are repeated and spread across separate parsers
+## VER-136 - The CLI reference coverage tests toggle fences on any fence-shaped line
 
-Reported by lib-core-unit, cli-tests, check-machinery.
-
-`scripts/check_source_invariants.py` scans library sources, CLI sources and library
-sources again, rebuilding comment and literal masking each time, also on brokkr's
-markdown-only shortcut. Measured at about 2.12 seconds in one execution at commit
-`c95f9998` on bygg. The library text test in `crates/cli/src/library_text_rule.rs`
-reads 203 files, about 6.53 MB, with its own lexer, cfg interpretation and module
-exclusion, and runs in the `all`, `consumer` and `musl` sweeps. Markdown coverage
-tests add another parser in the CLI unit build. `write/io_buffer_contract.rs` rescans
-read and write sources in all five tier-1 build shapes (see VER-013).
-
-Fix: one source-analysis entry point over one parsed corpus, run once per check, using
-one maintained Rust parser, with the command schema exported once. Enforcement: wiring
-into brokkr and no additional whole-tree scripts.
+`doc_coverage_tests::headings` and `table_rows` in `crates/cli/src/lib.rs` flip their
+fenced state on every line starting with three backticks or tildes, without tracking
+the delimiter character or length. A tilde line inside a backtick fence, or a longer
+opening fence, desynchronizes them, so headings or table rows in
+`docs/cli/commands.md` can be skipped or invented. `scripts/check_doc_links.py`
+already tracks both. Fix: track the opening delimiter as CommonMark does, with
+fixtures for mixed and lengthened fences.
 
 ## VER-014 - Empty textlint globs and stale exclusions are only audit-enforced
 

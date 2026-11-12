@@ -308,8 +308,9 @@ gate_profile = "gate"
 # Tier 1 - fast contracts. brokkr check's inner-loop signal during
 # refactor. Skips the tier2/tier3/serial submodules; runs everything
 # else across every listed sweep, the O_DIRECT and io_uring tests
-# included (they exist only in the `all` and `musl-all` sweeps, which build
-# both features, and skip on a typed platform refusal). `minimal` contributes
+# included (of the sweeps listed here they exist only in `all` and
+# `musl-all`, which build both features, and skip on a typed platform
+# refusal). `minimal` contributes
 # mostly a compile + clippy gate: the commands-gated test files cfg
 # themselves out there.
 [test.profiles.tier1]
@@ -385,16 +386,19 @@ skip = ["serial::"]
 # the backends it lists: every refusal predicate that would let an O_DIRECT
 # io_uring or promise-guard cell skip fails the test instead (see
 # crates/lib/tests/common/skip.rs). A refusal of any of them therefore
-# cannot pass as a skip here; that is not proof every cell exercised its
-# backend, only that none skipped on a refusal of it. Sweeps that
-# compile a backend out (consumer, minimal) carry no claim for it. Other
-# environmental skips (osmium, namespaces, descriptor limits) still pass.
+# cannot pass as a skip here. io_uring cells that write also assert that
+# their writer ran (one only in hook builds, see reference/testing.md);
+# O_DIRECT cells have no such witness, so for them this shows only that
+# none skipped on a refusal. Sweeps that compile a backend
+# out (consumer, minimal) carry no claim for it. Other environmental skips
+# (osmium, namespaces, descriptor limits) still pass.
 #
 # The io_uring writer halves its registered pool until the kernel accepts
 # it, so it runs under the systemd default memlock limit. That allowance is
-# per user and shared by concurrent test writers with no admission between
-# them, so on a low-limit host a contended registration can fail the gate;
-# that is a false failure, never a refusal passing as a skip.
+# per user; the suite's io_uring cells serialize on a test-side lease, but
+# other processes of the user and deferred kernel unpins are outside it, so
+# on a low-limit host a contended registration can still fail the gate.
+# That is a false failure, never a refusal passing as a skip.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
 sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc"]

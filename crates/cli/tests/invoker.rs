@@ -750,6 +750,14 @@ impl CliOutput {
         self.refused(crate::common::Backend::IoUring, &["io-uring", "direct-io"])
     }
 
+    /// The label is read from stderr text, which exit code 3 authenticates
+    /// as a refusal but not as that label. That cannot let a refusal pass
+    /// as a skip where the run requires the backend: the requirement checked
+    /// is `cell`'s, the backend the test asked for, never the label's, and a
+    /// refusal whose label is outside `accepted` is not a skip, so the
+    /// caller's success assertion fails on it. The label only narrows which
+    /// refusals an ordinary run may skip; a typed channel for it would
+    /// change nothing the complete gate decides.
     fn refused(&self, cell: crate::common::Backend, accepted: &[&str]) -> bool {
         let stderr = self.stderr_str();
         let refused = self.status.code() == Some(3)
@@ -761,6 +769,25 @@ impl CliOutput {
         }
         refused
     }
+}
+
+/// The value of the last `@name=` counter in a marker stream (the file a
+/// run armed with [`CliInvoker::marker_fifo`] wrote).
+///
+/// # Panics
+///
+/// If the counter's value is not an integer.
+pub fn marker_counter(events: &str, name: &str) -> Option<i64> {
+    let needle = format!(" @{name}=");
+    events
+        .lines()
+        .filter_map(|line| line.split_once(&needle).map(|(_, value)| value))
+        .next_back()
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|e| panic!("counter {name}={value}: {e}"))
+        })
 }
 
 /// Put `cmd` under the promise guard (see `guard`), registered last so that

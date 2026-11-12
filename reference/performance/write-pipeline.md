@@ -244,7 +244,7 @@ and 8.23 s at B (`d17d94db` against `2d9b1b50`). Verdict: no detected net
 regression for these workloads on the buffered backend. It is a
 regression screen, not a per-commit bound: a cost in one commit could
 cancel a gain in another. Uncovered: the `pwrite` pool and io_uring
-backends (io_uring cannot run on bygg) and the borrowed `BlobMeta::Scan`
+backends (io_uring was not measured in this screen) and the borrowed `BlobMeta::Scan`
 and `Bare` branches. Repack at both arms runs under the CLI's two-arena
 malloc cap (removed in `25172fc3`); extract and diff never asked for it.
 

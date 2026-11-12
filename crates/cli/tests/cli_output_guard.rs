@@ -392,15 +392,7 @@ fn help_exits_zero_on_stdout() {
 // makes the total exceed the publication share; a publication that stopped
 // syncing the file makes both fall short.
 
-/// The value of the last `@name=` counter in a marker stream.
-fn counter(events: &str, name: &str) -> Option<i64> {
-    let needle = format!(" @{name}=");
-    events
-        .lines()
-        .filter_map(|line| line.split_once(&needle).map(|(_, value)| value))
-        .next_back()
-        .map(|value| value.parse().unwrap())
-}
+use crate::invoker::marker_counter as counter;
 
 /// Run the CLI with the marker stream armed; `None` when the run reports
 /// that the host lacks what `args` asked for (O_DIRECT, io_uring).
@@ -560,11 +552,20 @@ mod backends {
         crate::common::write_base_pbf(&input);
         let osc = empty_osc(dir.path());
         let (input, osc) = (input.as_os_str(), osc.as_os_str());
-        let mut flags: Vec<&str> = Vec::new();
-        #[cfg(feature = "linux-direct-io")]
-        flags.push("--direct-io");
-        #[cfg(feature = "linux-io-uring")]
-        flags.push("--io-uring");
+        let flags: &[&str] = &[
+            #[cfg(feature = "linux-direct-io")]
+            "--direct-io",
+            #[cfg(feature = "linux-io-uring")]
+            "--io-uring",
+        ];
+        let flags = flags.iter().copied();
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            pbfhogg::TEST_HANG_BOUND,
+            pbfhogg::TEST_HANG_REPORT_GRACE,
+            "direct and io_uring publication syncs",
+        );
+        // The io_uring child registers locked memory.
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
         for flag in flags {
             let out = dir.path().join(format!("apply{flag}.osm.pbf"));
             let args = [
@@ -579,6 +580,13 @@ mod backends {
                 continue;
             };
             assert_publication_did_every_sync(&events, flag, 2);
+            // The witness that the io_uring run reached its backend.
+            let registered = counter(&events, "writer_uring_registered_buffers");
+            if flag == "--io-uring" {
+                assert!(registered.is_some_and(|n| n > 0), "{flag}\n{events}");
+            } else {
+                assert_eq!(registered.unwrap_or(0), 0, "{flag}\n{events}");
+            }
         }
     }
 }

@@ -74,6 +74,52 @@ fn scratch_base() -> &'static Path {
     })
 }
 
+/// Exclusive admission to the user's locked-memory allowance
+/// (`RLIMIT_MEMLOCK`) among the checkout's tests: hold it across every
+/// io_uring writer a test starts, a CLI child's included.
+///
+/// The writer halves its registered pool until the kernel accepts it, so
+/// the first of two concurrent writers can take the whole allowance and the
+/// second then fails even its smallest pool, a refusal the complete gate
+/// counts as a failure. The lease serializes the participating writers.
+/// It is an `flock` on the scratch base directory itself: that inode
+/// persists for the whole test phase (the run-boundary clear empties it, it
+/// does not remove it) and lies inside the tree the post-run check already
+/// excludes, so no lock file is ever created or unlinked. Each acquisition
+/// opens the directory afresh; dropping the lease, or the death of its
+/// process, releases it.
+///
+/// What it does not promise: it serializes live holders, not the kernel's
+/// release of what they pinned (closing a ring without unregistering can
+/// defer the unpin), and a parent that dies releases it before its child
+/// does. Other processes of the same user, and other checkouts, are outside
+/// it. The wait is unbounded and ends when the holder releases, so arm the
+/// test's `HangBound` before acquiring it and drop the writer or child
+/// before the lease.
+///
+/// # Panics
+///
+/// If the scratch base cannot be opened or locked.
+#[must_use = "the lease lasts only while it is held; bind it to a named variable"]
+pub fn locked_memory_lease() -> LockedMemoryLease {
+    let base = scratch_base();
+    let dir = File::open(base).unwrap_or_else(|error| {
+        panic!(
+            "open the scratch base {} for the locked-memory lease: {error}",
+            base.display()
+        )
+    });
+    dir.lock()
+        .unwrap_or_else(|error| panic!("take the locked-memory lease: {error}"));
+    LockedMemoryLease { _dir: dir }
+}
+
+/// Held admission from [`locked_memory_lease`]; released on drop.
+#[derive(Debug)]
+pub struct LockedMemoryLease {
+    _dir: File,
+}
+
 /// A fresh scratch directory. Keep the guard alive for the fixture's
 /// lifetime; see [`TestScratch`] for what dropping it does.
 ///

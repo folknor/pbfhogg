@@ -16,6 +16,12 @@ use pbfhogg::writer::{Compression, PbfWriter};
 /// silent short file.
 #[test]
 fn fault_injection_uring_writer_dispatch_panic_surfaces_via_flush() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "io_uring dispatch panic",
+    );
+    let _lease = pbfhogg_test_scratch::locked_memory_lease();
     let dir = crate::common::test_scratch();
     let path = dir.path().join("uring_fault.osm.pbf");
 

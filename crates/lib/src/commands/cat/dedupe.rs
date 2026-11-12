@@ -584,8 +584,23 @@ mod tests {
         ];
         #[cfg(feature = "linux-io-uring")]
         splicing.push(crate::write::OutputBackend::Uring);
+        // Held across every pass: the io_uring one registers locked memory.
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "splicing outputs over direct sources",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
+        let registered = || {
+            host.invocation
+                .metrics()
+                .writer
+                .uring_registered_buffers
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         for backend in splicing {
             assert!(backend.supports_copy_range());
+            let registered_before = registered();
             let spliced = WriteOptions {
                 backend,
                 direct_reads: true,
@@ -594,7 +609,17 @@ mod tests {
             let merge = plan_merge(&sources, &spliced, &host).expect("direct pass 1");
             let name = format!("{backend:?}.osm.pbf");
             match merged_output(dir.path(), &host, merge, &spliced, &name) {
-                Ok(copied) => assert_eq!(copied, expected, "{backend:?}"),
+                Ok(copied) => {
+                    assert_eq!(copied, expected, "{backend:?}");
+                    // Only the io_uring pass registers a pool, and it must:
+                    // the witness that the cell ran that backend.
+                    let uring = matches!(backend, crate::write::OutputBackend::Uring);
+                    assert_eq!(
+                        registered() > registered_before,
+                        uring,
+                        "{backend:?}: registered pool"
+                    );
+                }
                 // Only a typed io_uring setup refusal skips.
                 Err(e)
                     if crate::test_support::refused(

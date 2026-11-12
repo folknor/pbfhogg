@@ -768,6 +768,12 @@ fn roundtrip_pipelined_direct_io() {
 #[cfg(feature = "linux-io-uring")]
 #[test]
 fn roundtrip_uring_tiny_output() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "io_uring tiny output",
+    );
+    let _lease = pbfhogg_test_scratch::locked_memory_lease();
     let dir = crate::common::test_scratch();
     let path = dir.path().join("uring_tiny.osm.pbf");
 
@@ -798,6 +804,17 @@ fn roundtrip_uring_tiny_output() {
     writer.write_primitive_block(bytes).unwrap();
 
     writer.flush().unwrap();
+    // The witness that the io_uring sink ran (hook builds only): the block
+    // was dispatched through it.
+    #[cfg(pbfhogg_test_hooks)]
+    assert_eq!(
+        writer
+            .test_faults()
+            .uring_dispatch_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the data block went through the io_uring sink"
+    );
 
     // File must be strictly smaller than PAGE_SIZE to exercise the
     // sub-page set_len truncation path.

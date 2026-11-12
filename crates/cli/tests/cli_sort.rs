@@ -1103,14 +1103,23 @@ mod backends {
     #[cfg(feature = "linux-io-uring")]
     #[test]
     fn sort_overlapping_blobs_uring() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            pbfhogg::TEST_HANG_BOUND,
+            pbfhogg::TEST_HANG_REPORT_GRACE,
+            "sort --io-uring",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
         let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();
         let input = dir.path().join("overlapping.osm.pbf");
         let output = dir.path().join("sorted.osm.pbf");
+        let markers = dir.path().join("sort.markers");
+        std::fs::write(&markers, []).expect("create the marker file");
 
         write_unsorted_overlapping_pbf(&input);
 
         let run = CliInvoker::new(&invocation_scratch)
+            .marker_fifo(&markers)
             .arg("sort")
             .arg(&input)
             .arg("-o")
@@ -1127,6 +1136,13 @@ mod backends {
             run.status.success(),
             "sort --io-uring failed unexpectedly; stderr:\n{}",
             run.stderr_str(),
+        );
+        // The witness that the run reached the io_uring writer.
+        let events = std::fs::read_to_string(&markers).expect("read the marker stream");
+        assert!(
+            crate::invoker::marker_counter(&events, "writer_uring_registered_buffers")
+                .is_some_and(|n| n > 0),
+            "no io_uring pool registered\n{events}"
         );
 
         let contents = read_all_elements_with_coords(&output);

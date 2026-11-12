@@ -62,11 +62,13 @@ pub const SURFACE: &[&str] = &[
     "DenseNodeInfo",
     "geocode_index::reader::Reader",
     // Test infrastructure: the hook protocol the invoker spells, and the
-    // child-timeout and observation bounds.
+    // child-timeout, observation and hang bounds.
     "test_hooks::PublishFault",
     "test_hooks::PublishStep",
     "TEST_CHILD_TIMEOUT",
     "TEST_OBSERVE_BOUND",
+    "TEST_HANG_BOUND",
+    "TEST_HANG_REPORT_GRACE",
 ];
 
 pub fn errors(corpus: &Corpus) -> Vec<String> {

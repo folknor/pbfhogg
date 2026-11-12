@@ -622,10 +622,6 @@ fn require_write_fixed(ring: &IoUring) -> Result<()> {
     }
 }
 
-/// A setup failure `source` with the failing step named, as the `io::Error`
-/// a platform refusal holds. The original error stays the cause inside the
-/// carried chain; `report()` prints `step: cause` after the refusal's own
-/// text.
 /// Classify the registration failure of the smallest pool the writer tried.
 ///
 /// ENOMEM covers both the locked-memory allowance and generic kernel resource
@@ -659,6 +655,10 @@ fn register_buffers_error(e: io::Error, count: u16) -> Error {
     }
 }
 
+/// A setup failure `source` with the failing step named, as the `io::Error`
+/// a platform refusal holds. The original error stays the cause inside the
+/// carried chain; `report()` prints `step: cause` after the refusal's own
+/// text.
 fn setup_step(source: io::Error, step: &'static str) -> io::Error {
     io::Error::from(Error::from(source).context(step))
 }
@@ -734,11 +734,29 @@ fn uring_init_and_run(
     pool = loop {
         let candidate = AlignedBufferPool::new(count, IO_BUF_BYTES, align)?;
         let iovecs = candidate.iovecs();
-        // Safety: iovecs point into the candidate allocation, which is either
-        // kept as `pool` (outliving the ring's use of it) or dropped only
-        // after a failed registration, which leaves nothing registered.
-        match unsafe { ring.submitter().register_buffers(&iovecs) } {
-            Ok(()) => break candidate,
+        // Test builds may refuse an oversized candidate as the kernel would,
+        // so the retry below runs on any host (`uring_register_cap`).
+        #[cfg(pbfhogg_test_hooks)]
+        let injected = cancel.faults().uring_register_refusal(count);
+        #[cfg(not(pbfhogg_test_hooks))]
+        let injected: Option<io::Error> = None;
+        let registered = match injected {
+            Some(refusal) => Err(refusal),
+            // Safety: iovecs point into the candidate allocation, which is
+            // either kept as `pool` (outliving the ring's use of it) or
+            // dropped only after a failed registration, which leaves nothing
+            // registered.
+            None => unsafe { ring.submitter().register_buffers(&iovecs) },
+        };
+        match registered {
+            Ok(()) => {
+                cancel
+                    .metrics()
+                    .writer
+                    .uring_registered_buffers
+                    .fetch_add(u64::from(count), Relaxed);
+                break candidate;
+            }
             Err(e)
                 if count > MIN_NUM_BUFS
                     && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) =>
@@ -863,6 +881,44 @@ mod tests {
     /// not place writes at either the filesystem alignment or pool boundary.
     #[test]
     fn exact_size_padding_and_submission_boundaries() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "io_uring boundary writes",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
+        write_boundaries(None, &[]);
+    }
+
+    /// The halving retry and a smaller pool's buffer reuse, on any host:
+    /// the fault plan refuses every candidate above the cap as the kernel
+    /// refuses one for lack of locked memory, by `ENOMEM` for one cap and
+    /// `EPERM` for the other. The candidate that fits is registered for
+    /// real, and outputs spanning several whole pools then cycle its
+    /// buffers. A host whose kernel refuses even that pool skips as any
+    /// io_uring cell does, or fails where the gate requires the backend.
+    #[cfg(pbfhogg_test_hooks)]
+    #[test]
+    fn smaller_pools_register_after_refusals_and_cycle_their_buffers() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "io_uring smaller pools",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
+        for (cap, eperm, registered) in [(MIN_NUM_BUFS, false, MIN_NUM_BUFS), (5, true, 4)] {
+            let pool = usize::from(registered) * IO_BUF_BYTES;
+            write_boundaries(
+                Some((u64::from(cap), eperm, u64::from(registered))),
+                &[pool - 1, pool, pool + 1, 3 * pool + 7],
+            );
+        }
+    }
+
+    /// Write each boundary length through `uring_init_and_run`, plus
+    /// `extra`, and check bytes, length, submissions and the registered
+    /// pool. `capped` is `(cap, refuse with EPERM, expected pool)`.
+    fn write_boundaries(capped: Option<(u64, bool, u64)>, extra: &[usize]) {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("uring-boundaries.bin");
         let (probe, align) = match crate::direct_io::create_for_write(&path, None) {
@@ -893,13 +949,19 @@ mod tests {
             2 * IO_BUF_BYTES,
             2 * IO_BUF_BYTES + 1,
         ];
-        for len in lengths {
+        for len in lengths.iter().chain(extra).copied() {
             // A nonzero pattern makes stale padding or an interior gap visible.
             let bytes: Vec<u8> = (0..len)
                 .map(|i| u8::try_from(i % 251 + 1).expect("pattern fits u8"))
                 .collect();
             let invocation = crate::host::Invocation::new();
             let call = invocation.call().expect("fresh invocation");
+            #[cfg(pbfhogg_test_hooks)]
+            if let Some((cap, eperm, _)) = capped {
+                let faults = call.faults();
+                faults.uring_register_cap.store(cap, Relaxed);
+                faults.uring_register_refuse_eperm.store(eperm, Relaxed);
+            }
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             drop(tx);
             let inbox = Inbox::detached(rx);
@@ -940,6 +1002,11 @@ mod tests {
                 u64::try_from(len.div_ceil(IO_BUF_BYTES)).expect("count fits u64"),
                 "len={len}: one submission per full buffer plus final partial"
             );
+            assert_registered_pool(
+                call.metrics().writer.uring_registered_buffers.load(Relaxed),
+                capped.map(|(_, _, expected)| expected),
+                len,
+            );
             assert_eq!(
                 std::fs::metadata(&path).expect("output metadata").len(),
                 u64::try_from(len).expect("length fits u64"),
@@ -951,6 +1018,18 @@ mod tests {
                 "len={len}"
             );
         }
+    }
+
+    /// The witness that a cell ran the backend: a pool registered, and under
+    /// a cap the pool the cap admits or a further halving where the host's
+    /// own allowance refuses that one too.
+    #[track_caller]
+    fn assert_registered_pool(pool: u64, cap_admits: Option<u64>, len: usize) {
+        let largest = cap_admits.unwrap_or(u64::from(NUM_BUFS));
+        assert!(
+            pool.is_power_of_two() && (u64::from(MIN_NUM_BUFS)..=largest).contains(&pool),
+            "len={len}: registered pool {pool}, at most {largest} admitted"
+        );
     }
 
     #[test]

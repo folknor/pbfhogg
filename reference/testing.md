@@ -36,19 +36,38 @@ Tests go where they couple least.
   error directly and are not affected. What the gate guarantees is
   that a required backend's refusal cannot pass as a skip, so it goes
   green only on a host, and a test scratch filesystem, that does not
-  refuse a listed backend; it does not prove that every cell exercised
-  its backend, and sweeps that compile a backend out carry no claim
-  for it. The requirement is parsed only when a refusal consults it. Each predicate also names the labels that may
-  stop its cell (the io_uring writer also needs O_DIRECT; the
-  non-regular-target test accepts only `io-uring`), so the requirement
-  is the cell's backend, not the refusal's label. The gate lists
-  `direct-io`, `io-uring` and `promise-guard`. The io_uring writer
-  halves its registered pool until the kernel accepts it, so it runs
-  under the systemd default `RLIMIT_MEMLOCK`; that allowance is per
-  user and shared by concurrent test writers with no admission between
-  them, so on a low-limit host contention can fail the gate (a false
-  failure, never a passing skip), and a green gate need not have
-  exercised the smaller pools or the retry. Environmental
+  refuse a listed backend; sweeps that compile a backend out carry no
+  claim for it. The requirement is parsed only when a refusal consults
+  it. Each predicate also names the labels that may stop its cell (the
+  io_uring writer also needs O_DIRECT; the non-regular-target test
+  accepts only `io-uring`), so the requirement is the cell's backend,
+  not the refusal's label; the CLI predicates read that label from
+  stderr, which cannot turn a required refusal into a skip (an
+  unaccepted label is no skip, and the test fails on the error). The
+  gate lists `direct-io`, `io-uring` and `promise-guard`.
+
+  Positive execution is witnessed for io_uring only: the io_uring
+  cells that write assert that the writer ran, through the counter
+  `writer_uring_registered_buffers` (the call's metrics in unit tests,
+  the marker stream in CLI cells) or the fault plan's dispatch count,
+  so a cell that stops reaching the writer fails. The dispatch count
+  exists only in hook builds, so `roundtrip_uring_tiny_output` runs
+  unwitnessed in the `release` sweep. O_DIRECT cells carry no such
+  witness. The io_uring
+  writer halves its registered pool until the kernel accepts it; the
+  fault plan's `uring_register_cap` refuses oversized candidates as
+  the kernel would, so the retry (by `ENOMEM` and by `EPERM`) and the
+  smaller pools' buffer reuse run on every host with hooks compiled
+  in. The locked-memory allowance is per user, and the first writer
+  can take all of it, so every io_uring cell that registers a pool
+  (not the non-regular-target test, which is refused before) holds
+  `pbfhogg_test_scratch::locked_memory_lease()` (an `flock` on the
+  scratch base) across its writer or CLI child, under its
+  `HangBound`. That serializes the suite's live writers; it does not
+  wait for the kernel's deferred unpin of a ring closed without
+  unregistering, and other processes of the same user are outside it,
+  so on a low-limit host a false gate failure remains possible, never
+  a passing skip. Environmental
   skips (osmium, namespaces, descriptor limits, `deny_write`) never
   fail. There is no platform module or profile.
 - **Library integration tests** in `crates/lib/tests/<topic>.rs` (e.g.

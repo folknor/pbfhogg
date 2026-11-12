@@ -122,15 +122,17 @@ pub(crate) fn write_crud_base(path: &Path) {
 }
 
 #[derive(Default, Clone, Copy)]
-struct ApplyOpts {
+struct ApplyOpts<'a> {
     locations_on_ways: bool,
     ignore_missing_nodes: bool,
     jobs: Option<usize>,
     direct_io: bool,
     io_uring: bool,
+    /// Arm the marker stream at this (existing, regular) file.
+    markers: Option<&'a Path>,
 }
 
-fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) -> CliOutput {
+fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts<'_>) -> CliOutput {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let mut cli = CliInvoker::new(&invocation_scratch)
         .arg("apply-changes")
@@ -155,6 +157,9 @@ fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) ->
     }
     if opts.io_uring {
         cli = cli.arg("--io-uring");
+    }
+    if let Some(markers) = opts.markers {
+        cli = cli.marker_fifo(markers);
     }
     // `--locations-on-ways` needs an indexed base whatever `--force` says,
     // so it refuses the flag.
@@ -1869,7 +1874,7 @@ const LOW_WAY_EDIT_OSC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </create>
 </osmChange>"#;
 
-fn low_opts() -> ApplyOpts {
+fn low_opts() -> ApplyOpts<'static> {
     ApplyOpts {
         locations_on_ways: true,
         ..ApplyOpts::default()
@@ -3826,10 +3831,18 @@ mod backends {
     #[cfg(feature = "linux-io-uring")]
     #[test]
     fn merge_basic_create_modify_delete_uring() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            pbfhogg::TEST_HANG_BOUND,
+            pbfhogg::TEST_HANG_REPORT_GRACE,
+            "apply-changes --io-uring",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
         let dir = crate::common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");
+        let markers = dir.path().join("apply.markers");
+        std::fs::write(&markers, []).unwrap();
 
         basic_fixture(&base, &osc);
         let out = run_apply_changes(
@@ -3838,6 +3851,7 @@ mod backends {
             &output,
             ApplyOpts {
                 io_uring: true,
+                markers: Some(&markers),
                 ..ApplyOpts::default()
             },
         );
@@ -3855,6 +3869,13 @@ mod backends {
             out.stderr_str().contains("Deleted: 1"),
             "stats: {}",
             out.stderr_str(),
+        );
+        // The witness that the run reached the io_uring writer.
+        let events = std::fs::read_to_string(&markers).unwrap();
+        assert!(
+            crate::invoker::marker_counter(&events, "writer_uring_registered_buffers")
+                .is_some_and(|n| n > 0),
+            "no io_uring pool registered\n{events}"
         );
     }
 }

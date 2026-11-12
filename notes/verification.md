@@ -205,16 +205,6 @@ would be cross-builds with foreign executables. Residue is brokkr-side check pla
 resolve a runnable target from host capability, or refuse an unexecutable target before
 building. Filed as bz brokkr#170.
 
-## VER-110 - The testing record falsely says verify has no locations-on-ways path
-
-Reported by bench-verify.
-
-`reference/testing.md` says so, while brokkr's `verify_all.rs` runs that path when the keep-untagged base
-resolves.
-
-Fix: narrow it to what remains unavailable. Enforcement: generated capability inventories or a
-machine-readable describe interface; the handcrafted-fixture rationale still needs review.
-
 ## VER-112 - Orphaned expectation keys are not rejected
 
 The six integrity and diff benches take `--require-expectation yes|no` through the shared

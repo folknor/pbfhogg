@@ -16,6 +16,7 @@ research
 node_modules
 docs/.vitepress/dist
 docs/.vitepress/cache
+docs/.vitepress/.temp
 overnight.sh
 overnight-logs
 proptest-regressions

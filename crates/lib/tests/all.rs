@@ -20,7 +20,8 @@
 //! Every module here shares one process with every other, concurrently. The
 //! process-wide state they share: `RLIMIT_NOFILE`, raised to the hard
 //! limit once before `main` by `process_setup`, and the real descriptors
-//! every test holds, which nothing bounds; and the global rayon pool, which
+//! every test holds, of which only descriptor-heavy scenarios' are gated
+//! (`common::fd_gate`); and the global rayon pool, which
 //! a test reaches only by choosing `Executor::Ambient` (`common::test_host()`
 //! gives each host a pool of its own). A test that needs
 //! any of this state to itself gets its own `[[test]]` target in

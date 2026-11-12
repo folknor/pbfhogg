@@ -95,6 +95,12 @@ mod skip;
 #[allow(unused_imports)]
 pub use skip::{Backend, backend_unavailable, fail_if_required, skip};
 
+// Only the library `all` binary runs descriptor-heavy scenarios.
+#[allow(dead_code)]
+pub(crate) mod fd_gate;
+#[allow(unused_imports)]
+pub(crate) use fd_gate::{FdTicket, heavy_host, heavy_ticket};
+
 // ---------------------------------------------------------------------------
 // Test element structs - lightweight descriptions of OSM elements for building
 // test PBF files. These mirror the PBF data model but use static strings for
@@ -1632,20 +1638,23 @@ pub(crate) fn scratch_in(dir: impl AsRef<Path>) -> pbfhogg::scratch::RunScratch 
         .unwrap_or_else(|e| panic!("scratch in {}: {e}", dir.as_ref().display()))
 }
 
-/// The descriptor grant every request gets from a test host's provider.
+/// The descriptor grant every request gets from a heavy test host's
+/// provider (`fd_gate::FdTicket`).
 pub(crate) const TEST_FD_GRANT: u64 = 1024;
 
-/// A test host's descriptor provider: each request is granted
-/// `min(wanted, TEST_FD_GRANT)` as a host grant, a function of the request
-/// alone - never of sibling tests, outstanding reservations, the open count
-/// or the process limit. It reserves nothing and bounds no real descriptor
-/// use; tests of reserving behaviour build a `host::FdPool`.
+/// A light test host's descriptor provider: each request is granted
+/// `min(wanted, TEST_LIGHT_FD_GRANT)` as a host grant, a function of the
+/// request alone - never of sibling tests, outstanding reservations, the
+/// open count or the process limit. It reserves nothing; the grant is below
+/// any descriptor-heavy command's minimum, so such a run needs a host built
+/// from an admitted ticket (`fd_gate`). Tests of reserving behaviour build
+/// a `host::FdPool`.
 pub(crate) struct FixedFdGrant;
 
 impl pbfhogg::host::ProcessActions for FixedFdGrant {
     fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
         pbfhogg::process::FdReservation::unreserved(pbfhogg::process::FdAllowance::host_grant(
-            wanted.min(TEST_FD_GRANT),
+            wanted.min(pbfhogg::TEST_LIGHT_FD_GRANT),
         ))
     }
 }

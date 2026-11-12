@@ -24,10 +24,26 @@ type Command = fn(&Inputs, &Path, &Path, &pbfhogg::host::Host) -> pbfhogg::Resul
 
 struct Inputs {
     dir: TestScratch,
+    /// The heavy ticket the registry tests hold, since their scenarios
+    /// include an external join (one run at a time); `None` builds light
+    /// hosts.
+    ticket: Option<std::sync::Arc<crate::common::FdTicket>>,
 }
 
 impl Inputs {
+    /// Inputs for a test running only light scenarios.
+    #[cfg(pbfhogg_test_hooks)]
     fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Inputs for a test running every registered scenario in turn, or
+    /// `None` when its heavy ticket was not admitted (reported as a skip).
+    fn for_registry(test: &str) -> Option<Self> {
+        crate::common::heavy_ticket(1, test).map(|ticket| Self::build(Some(ticket)))
+    }
+
+    fn build(ticket: Option<std::sync::Arc<crate::common::FdTicket>>) -> Self {
         let dir = crate::common::test_scratch();
         crate::common::write_base_pbf(&dir.path().join("base.osm.pbf"));
         crate::common::write_changed_pbf(&dir.path().join("changed.osm.pbf"));
@@ -40,7 +56,7 @@ impl Inputs {
               <tag k=\"amenity\" v=\"cafe\"/></node></create></osmChange>",
         )
         .unwrap();
-        Self { dir }
+        Self { dir, ticket }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -48,10 +64,14 @@ impl Inputs {
     }
 }
 
-fn host_with(cancel: pbfhogg::host::Invocation) -> pbfhogg::host::Host {
+fn host_with(cancel: pbfhogg::host::Invocation, inputs: &Inputs) -> pbfhogg::host::Host {
+    let host = match &inputs.ticket {
+        Some(ticket) => crate::common::heavy_host(ticket),
+        None => crate::common::test_host(),
+    };
     pbfhogg::host::Host {
         invocation: cancel,
-        ..crate::common::test_host()
+        ..host
     }
 }
 
@@ -499,7 +519,7 @@ fn run_once(
     let scratch = crate::common::test_scratch();
     #[cfg(pbfhogg_test_hooks)]
     let token = cancel.clone();
-    let host = host_with(cancel);
+    let host = host_with(cancel, inputs);
     let result = command(inputs, out.path(), scratch.path(), &host);
     drop(host);
     // Every command, whatever its outcome, leaves its invocation with no
@@ -539,7 +559,11 @@ fn run_once(
 
 #[test]
 fn a_tripped_token_stops_selected_scenarios_before_they_start() {
-    let inputs = Inputs::new();
+    let Some(inputs) =
+        Inputs::for_registry("a_tripped_token_stops_selected_scenarios_before_they_start")
+    else {
+        return;
+    };
     let mut failures = Vec::new();
     for (name, command) in commands() {
         let cancel = pbfhogg::host::Invocation::new();
@@ -630,7 +654,11 @@ fn checkpoint_sampling_has_a_strict_budget_and_includes_endpoints() {
 #[cfg(pbfhogg_test_hooks)]
 #[test]
 fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision() {
-    let inputs = Inputs::new();
+    let Some(inputs) = Inputs::for_registry(
+        "a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision",
+    ) else {
+        return;
+    };
     let mut failures = Vec::new();
     for (name, command) in commands() {
         let counter = pbfhogg::host::Invocation::new();
@@ -682,7 +710,11 @@ fn a_token_tripped_at_sampled_ordinals_cancels_or_follows_a_publication_decision
 #[test]
 fn selected_scenarios_have_an_empty_census_at_observed_checkpoints() {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    let inputs = Inputs::new();
+    let Some(inputs) =
+        Inputs::for_registry("selected_scenarios_have_an_empty_census_at_observed_checkpoints")
+    else {
+        return;
+    };
     let mut failures = Vec::new();
     for (name, command) in commands() {
         let token = pbfhogg::host::Invocation::new();

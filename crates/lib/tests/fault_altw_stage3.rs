@@ -16,6 +16,12 @@ use crate::common::{
 /// directory behind after the guard drops.
 #[test]
 fn fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch() {
+    let Some(ticket) = crate::common::heavy_ticket(
+        1,
+        "fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch",
+    ) else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -32,7 +38,7 @@ fn fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch() {
     let before = snapshot_dir(dir.path());
 
     // Arm bucket 1 (middle-ish of stage-3's slot_bucket_count).
-    let host = crate::common::test_host();
+    let host = crate::common::heavy_host(&ticket);
     host.invocation
         .faults()
         .altw_stage3_panic_at_bucket

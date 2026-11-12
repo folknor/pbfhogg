@@ -442,6 +442,11 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
 /// and the refusal says so.
 #[test]
 fn altw_refusal_counts_each_unresolved_reference() {
+    let Some(ticket) =
+        crate::common::heavy_ticket(1, "altw_refusal_counts_each_unresolved_reference")
+    else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -480,7 +485,7 @@ fn altw_refusal_counts_each_unresolved_reference() {
             crate::common::out(&output),
             &opts,
             &pbfhogg::HeaderOverrides::default(),
-            &crate::common::test_host(),
+            &crate::common::heavy_host(&ticket),
             crate::common::scratch_in(dir.path()),
         ) else {
             panic!("{index_type:?}: an unresolvable way ref must fail the default policy");

@@ -1950,16 +1950,21 @@ impl std::fmt::Debug for ResourcesHandle {
     }
 }
 /// The unit tests' descriptor provider: every request is granted
-/// `min(wanted, 1024)` as a host grant, a function of the request alone -
-/// never of sibling tests, outstanding reservations, the open count or the
-/// process limit. It reserves nothing and bounds no real descriptor use;
-/// tests of reserving behaviour build an [`FdPool`].
+/// `min(wanted, TEST_LIGHT_FD_GRANT)` as a host grant, a function of the
+/// request alone - never of sibling tests, outstanding reservations, the
+/// open count or the process limit. It reserves nothing; the grant is
+/// small enough that no descriptor-heavy command (an external join's
+/// stage 1) is admitted on it, because the unit-test binary neither raises
+/// its descriptor limit nor gates concurrent heavy runs. Tests of
+/// reserving behaviour build an [`FdPool`].
 #[cfg(test)]
 pub(crate) struct FixedFdGrant;
 #[cfg(test)]
 impl ProcessActions for FixedFdGrant {
     fn fd_allowance(&self, wanted: u64) -> FdReservation {
-        FdReservation::unreserved(crate::process::FdAllowance::host_grant(wanted.min(1024)))
+        FdReservation::unreserved(crate::process::FdAllowance::host_grant(
+            wanted.min(crate::tunables::TEST_LIGHT_FD_GRANT),
+        ))
     }
 }
 

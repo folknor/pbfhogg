@@ -64,8 +64,12 @@ fn write_replacement(path: &Path) {
 
 /// The test host, reporting `memory_available` as given: auto routes
 /// external when a known page-cache budget cannot hold the store estimate.
-fn host(memory_available: Option<u64>) -> pbfhogg::host::Host {
-    let mut host = crate::common::test_host();
+/// Built from a heavy ticket, since several routes run an external join.
+fn host(
+    ticket: &Arc<crate::common::FdTicket>,
+    memory_available: Option<u64>,
+) -> pbfhogg::host::Host {
+    let mut host = crate::common::heavy_host(ticket);
     host.resources = Arc::new(pbfhogg::host::Fixed {
         memory_available,
         ..crate::common::fixed_resources()
@@ -129,6 +133,10 @@ fn run<'a>(
 /// two concurrent opens (external stage 1 and the relation scan) both
 /// follow the replacement.
 fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: Option<u64>) {
+    // One run at a time; any route may be external.
+    let Some(ticket) = crate::common::heavy_ticket(1, &format!("check_route {route:?}")) else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
@@ -140,7 +148,7 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
         route,
         &input,
         &reference,
-        &host(memory_available),
+        &host(&ticket, memory_available),
         dir.path(),
     )
     .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {e}"));
@@ -150,7 +158,7 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
         for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(&input, indexed);
             write_replacement(&replacement);
-            let host = host(memory_available);
+            let host = host(&ticket, memory_available);
             let run_cell = |pin: &pbfhogg::read::input::PinnedInput, scenario| {
                 host.invocation
                     .faults()

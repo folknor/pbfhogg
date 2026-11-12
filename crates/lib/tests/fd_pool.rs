@@ -175,6 +175,14 @@ fn dedupe_holds_its_grant_through_pass_two() {
 /// worker's need it refuses and returns the grant.
 #[test]
 fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
+    // The pool's host bypasses the ticket's provider, so the scenario holds
+    // the ticket for its one join at a time by hand.
+    let Some(_ticket) = crate::common::heavy_ticket(
+        1,
+        "external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two",
+    ) else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let [input, _] = inputs(dir.path());
     let output = dir.path().join("out.osm.pbf");

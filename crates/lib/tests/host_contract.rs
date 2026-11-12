@@ -9,14 +9,16 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering::Relaxed},
 };
 
-#[derive(Default)]
+/// Counts requests and grants from an admitted heavy ticket, since the
+/// test's external join needs a heavy grant.
 struct Actions {
     fd: AtomicUsize,
+    ticket: Arc<crate::common::FdTicket>,
 }
 impl ProcessActions for Actions {
     fn fd_allowance(&self, wanted: u64) -> FdReservation {
         self.fd.fetch_add(1, Relaxed);
-        crate::common::FixedFdGrant.fd_allowance(wanted)
+        self.ticket.fd_allowance(wanted)
     }
 }
 fn input(dir: &std::path::Path) -> std::path::PathBuf {
@@ -26,9 +28,17 @@ fn input(dir: &std::path::Path) -> std::path::PathBuf {
 }
 #[test]
 fn process_actions_fire_once_at_each_hook_site() {
+    let Some(ticket) =
+        crate::common::heavy_ticket(1, "process_actions_fire_once_at_each_hook_site")
+    else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
-    let actions = Arc::new(Actions::default());
+    let actions = Arc::new(Actions {
+        fd: AtomicUsize::new(0),
+        ticket,
+    });
     let mut host = crate::common::test_host();
     host.process = Arc::clone(&actions) as Arc<dyn ProcessActions>;
     let overrides = pbfhogg::HeaderOverrides::default();
@@ -216,10 +226,15 @@ fn input_evictions_follow_the_page_cache_policy() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_join_evicts_its_scratch_and_no_input() {
+    let Some(ticket) =
+        crate::common::heavy_ticket(1, "external_join_evicts_its_scratch_and_no_input")
+    else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let sink = Arc::new(RecordingSink::default());
-    let mut host = crate::common::test_host();
+    let mut host = crate::common::heavy_host(&ticket);
     host.page_cache = pbfhogg::host::PageCachePolicy::Keep;
     host.invocation = pbfhogg::host::Invocation::with_sink(
         Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
@@ -1087,9 +1102,15 @@ fn run_external_join(
 #[cfg(pbfhogg_test_hooks)]
 #[test]
 fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
+    let Some(ticket) = crate::common::heavy_ticket(
+        1,
+        "external_join_stage4_backend_refusal_stays_typed_across_the_join",
+    ) else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
-    let host = crate::common::test_host();
+    let host = crate::common::heavy_host(&ticket);
     let faults = host.invocation.faults();
     faults.refuse_output_backend.store(true, Relaxed);
     let output = dir.path().join("refused.pbf");
@@ -1135,6 +1156,12 @@ fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn external_backend_output_refusal_stays_typed_across_stage_join() {
+    let Some(ticket) = crate::common::heavy_ticket(
+        1,
+        "external_backend_output_refusal_stays_typed_across_stage_join",
+    ) else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -1159,7 +1186,7 @@ fn external_backend_output_refusal_stays_typed_across_stage_join() {
             ignore_missing_nodes: false,
         },
         &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
+        &crate::common::heavy_host(&ticket),
         crate::common::scratch_in(dir.path()),
     );
     match result {
@@ -1180,9 +1207,15 @@ fn external_backend_output_refusal_stays_typed_across_stage_join() {
 
 #[test]
 fn concurrent_external_joins_use_distinct_scratch() {
+    // Two joins run at once.
+    let Some(ticket) =
+        crate::common::heavy_ticket(2, "concurrent_external_joins_use_distinct_scratch")
+    else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
-    let host = crate::common::test_host();
+    let host = crate::common::heavy_host(&ticket);
     let reference = dir.path().join("reference.pbf");
     run_external_join(
         &base,
@@ -1194,18 +1227,18 @@ fn concurrent_external_joins_use_distinct_scratch() {
     // Both outputs share one parent, so both runs place their scratch
     // directory beside each other under the same pid.
     let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
-    struct Overlap(std::sync::Barrier);
+    struct Overlap(std::sync::Barrier, Arc<crate::common::FdTicket>);
     impl ProcessActions for Overlap {
         // Both requests meet at the barrier before either is granted, so
-        // the runs overlap; each grant is the fixed test grant, never a
+        // the runs overlap; each grant is the ticket's fixed grant, never a
         // live probe that the other run's descriptors would move.
         fn fd_allowance(&self, wanted: u64) -> FdReservation {
             self.0.wait();
-            crate::common::FixedFdGrant.fd_allowance(wanted)
+            self.1.fd_allowance(wanted)
         }
     }
     let mut host = host;
-    host.process = Arc::new(Overlap(std::sync::Barrier::new(2)));
+    host.process = Arc::new(Overlap(std::sync::Barrier::new(2), Arc::clone(&ticket)));
     std::thread::scope(|scope| {
         let handles: Vec<_> = outputs
             .iter()
@@ -1250,6 +1283,10 @@ fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
 /// cannot justify external and keeps sparse without a store estimate.
 #[test]
 fn fixed_memory_routes_auto() {
+    // One of the routes runs an external join.
+    let Some(ticket) = crate::common::heavy_ticket(1, "fixed_memory_routes_auto") else {
+        return;
+    };
     let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let allowance: u64 = 3 << 30;
@@ -1265,7 +1302,7 @@ fn fixed_memory_routes_auto() {
         ),
     ] {
         let sink = Arc::new(Recording::default());
-        let mut host = crate::common::test_host();
+        let mut host = crate::common::heavy_host(&ticket);
         host.diagnostics = pbfhogg::host::Diagnostics::new(
             Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
         );

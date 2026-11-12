@@ -80,10 +80,18 @@ fn assert_stage3_stopped(host: &pbfhogg::host::Host) {
     );
 }
 
+/// A host for one external join, or `None` when the descriptor gate
+/// skipped the test.
+fn heavy(test: &str) -> Option<pbfhogg::host::Host> {
+    crate::common::heavy_ticket(1, test).map(|ticket| crate::common::heavy_host(&ticket))
+}
+
 /// A failure before stage 4's pool starts aborts the router.
 #[test]
 fn a_stage4_failure_at_start_stops_stage3() {
-    let host = crate::common::test_host();
+    let Some(host) = heavy("a_stage4_failure_at_start_stops_stage3") else {
+        return;
+    };
     let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults
@@ -102,7 +110,10 @@ fn a_stage4_failure_at_start_stops_stage3() {
 /// bucket, aborts the router before the pool joins that worker.
 #[test]
 fn a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3() {
-    let host = crate::common::test_host();
+    let Some(host) = heavy("a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3")
+    else {
+        return;
+    };
     let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults
@@ -122,7 +133,10 @@ fn a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3() {
 /// during the unwind, before the pool joins.
 #[test]
 fn a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3() {
-    let host = crate::common::test_host();
+    let Some(host) = heavy("a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3")
+    else {
+        return;
+    };
     let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults
@@ -144,7 +158,10 @@ fn a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3() {
 /// panic only once every other worker has finished its task.
 #[test]
 fn a_stage4_worker_panic_releases_its_parked_workers_and_stops_stage3() {
-    let host = crate::common::test_host();
+    let Some(host) = heavy("a_stage4_worker_panic_releases_its_parked_workers_and_stops_stage3")
+    else {
+        return;
+    };
     let faults = host.invocation.faults();
     faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
     faults.altw_stage4_panic_work_at.store(0, Ordering::SeqCst);

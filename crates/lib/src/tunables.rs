@@ -1447,6 +1447,41 @@ const _: () = {
     assert!(TEST_CHILD_CLEANUP.as_millis() < TEST_CHILD_TIMEOUT.as_millis());
 };
 
+/// How long a descriptor-heavy integration test waits to be admitted by its
+/// binary's descriptor gate (`crates/lib/tests/common/fd_gate.rs`) before
+/// skipping as environmental. Not a failure bound: on an ordinary host the
+/// gate never waits, and on one whose limit admits few heavy scenarios at a
+/// time, a test that would otherwise run past the watchdog behind its
+/// siblings skips instead. Admission plus the scenario itself must still
+/// finish before the watchdog; heavy scenarios are small fixtures.
+pub const TEST_FD_ADMISSION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+const _: () = assert!(TEST_FD_ADMISSION_BOUND.as_millis() < TEST_RUNNER_WATCHDOG.as_millis());
+
+// --- Test descriptor admission ---
+//
+// Every in-process test shares its binary's one RLIMIT_NOFILE. The tests'
+// hosts split into light ones, whose provider grants little enough that no
+// descriptor-heavy command (external add-locations-to-ways stage 1 needs at
+// least 256 + 64) is admitted on them, and heavy ones, each built from a
+// ticket of whole-run units that the binary's gate admits against the soft
+// limit less a reserve for every light test's unrequested descriptors.
+
+/// What a light test host grants per request: room for small `cat` and
+/// multi-region `extract` admissions, below any external join's minimum.
+pub const TEST_LIGHT_FD_GRANT: u64 = 128;
+/// One heavy run's whole-lifetime descriptor bound as the gate charges it:
+/// its stage-1 grant (at most 1024 on a test host), later stages' slot
+/// buckets and router files, outputs, scratch and fixtures. An accounting
+/// assertion, not measured; nothing checks a run stays under it.
+pub const TEST_HEAVY_RUN_FDS: u64 = 1024;
+/// The part of the soft limit the gate never hands to heavy tickets: the
+/// process's baseline and every concurrently running light test's
+/// descriptors, which nothing requests or counts. Asserted, not measured.
+pub const TEST_LIGHT_FD_RESERVE: u64 = 1024;
+
+const _: () = assert!(TEST_LIGHT_FD_GRANT < NUM_BUCKETS as u64 + STAGE1_HEADROOM_FDS);
+
 /// Test children leave time for cleanup before the runner's watchdog.
 pub const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Bounded cleanup and pipe completion, including a descendant holding a pipe open.

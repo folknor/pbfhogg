@@ -19,19 +19,16 @@ Findings are as reported by the hunters and have not been verified. Hunters read
 source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
-## VER-130 - Concurrent tests in one binary share an unbounded descriptor limit
+## VER-130 - The descriptor gate's charges are asserted, not observed
 
-Test hosts hand the library fixed descriptor grants (`min(wanted, 1024)`,
-`common::FixedFdGrant` and `host::FixedFdGrant`), and the library `all` raises its
-soft `RLIMIT_NOFILE` once before `main` (`crates/lib/tests/process_setup.rs`). Nothing
-bounds the real descriptors concurrent tests hold: grants are not reservations, and
-later altw external stages, outputs, scratch and fixture preparation are outside any
-request. On a host whose hard limit is near 1024, two concurrent external joins can
-exhaust it. A request-level waiting budget was argued and rejected: waiting runs keep
-what they already opened, admitted runs keep opening, and tests that replace the
-provider (`fd_pool.rs`, the `host_contract.rs` concurrent joins) bypass it. Residue:
-gate whole descriptor-heavy scenarios before they acquire anything, or isolate them in
-their own process.
+Descriptor-heavy library tests take a ticket from `crates/lib/tests/common/fd_gate.rs`
+before building anything, and light hosts grant too little for an external join.
+Unobserved: the per-run charge (`TEST_HEAVY_RUN_FDS`) and the light reserve
+(`TEST_LIGHT_FD_RESERVE`) are asserted, never compared with a run's real descriptor
+high-water mark; a ticket's units bound its simultaneous runs only by the scenario's
+construction; tests that build their own `host::FdPool` hold a ticket by convention.
+Residue: measure the high-water marks (a `/proc/self/fd` count at the gate's release
+would do) and check them against the charges, if it pays.
 
 ## VER-131 - Test executor pools are released, not joined
 

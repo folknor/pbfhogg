@@ -149,9 +149,7 @@ NAME` list each harness in turn to find one test.
   `all` raises to the hard limit once before `main`
   (`crates/lib/tests/process_setup.rs`; the CLI and harness `all`
   binaries leave the inherited limit alone), and which child processes
-  inherit; the real descriptors every test holds, which nothing bounds
-  (test hosts' grants are fixed, not reserved, so a host with a low hard
-  limit can still run out under heavy concurrency); and rayon's global
+  inherit; the real descriptors every test holds; and rayon's global
   pool, which only a test choosing `Executor::Ambient` reaches, since
   every test host carries an executor pool of its own. No fixture or host
   constructor changes process state. The sidecar metric sets (the
@@ -163,6 +161,28 @@ NAME` list each harness in turn to find one test.
   never as a delta of anything another test can move.
   A test that needs anything else here to itself takes a target of its
   own.
+- **Descriptor-heavy scenarios are admitted, light ones are not
+  counted.** A light host (`common::test_host()`, and `Host::for_tests()`
+  in the unit-test binary, which neither raises its limit nor gates)
+  grants at most `TEST_LIGHT_FD_GRANT` per request, below an external
+  join's stage-1 minimum, so a descriptor-heavy run on it refuses typed
+  rather than running ungated. A scenario that runs external joins first
+  takes one ticket of whole-run units from the binary's gate
+  (`common::heavy_ticket`, in `crates/lib/tests/common/fd_gate.rs`) and
+  builds its hosts from it (`common::heavy_host`, or a test-local
+  provider delegating to the ticket); a test that builds its own
+  `host::FdPool` holds a ticket by hand. The gate admits tickets in
+  arrival order against the soft limit less `TEST_LIGHT_FD_RESERVE`,
+  charging `TEST_HEAVY_RUN_FDS` per unit. A scenario whose units exceed
+  what the limit leaves, or that is not admitted within
+  `TEST_FD_ADMISSION_BOUND` behind its siblings, skips as environmental
+  before it opens anything; on an ordinary host it never waits. What
+  this does not bound: a ticket's units bound its simultaneous runs by
+  the scenario's construction, which nothing checks; the per-run charge
+  and the light reserve are asserted, not measured; light tests'
+  descriptors, and every command that requests none, are not counted;
+  and a test holding a ticket must not take another (it waits on itself
+  and skips).
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily
   swaps the panic hook to silence its deliberate worker panic. While the
   replacement is installed, it can also suppress panic output from another
@@ -358,7 +378,8 @@ core-count, memory or rlimit preconditions. `common::test_host()` and,
 for unit tests under `crates/lib/src/`, `Host::for_tests()` hand the library a
 `host::Fixed` (a fixed core count and memory budget), an executor pool
 of its own of the same four-thread width, and a descriptor provider
-granting every request `min(wanted, 1024)` without probing the process,
+granting every request `min(wanted, TEST_LIGHT_FD_GRANT)` (a heavy host
+built from a gate ticket: `min(wanted, 1024)`) without probing the process,
 so what the library is told and where its rayon work runs are the same
 everywhere and independent of sibling tests; a test that needs a
 different machine sets its own `host::Fixed`. CLI children are told the
@@ -368,9 +389,11 @@ appears in a test only where it is the subject, marked
 `// ambient-deliberate:` on its line. Each test owns its hosts and
 invocations: none is held in a static or leaked (`Host::entered` borrows
 an entered view from the test's own host). The real descriptor limit
-is shared, as "What the shared binary shares" says. Tests may still skip where
+is shared, as "What the shared binary shares" says, and gated for
+descriptor-heavy scenarios only. Tests may still skip where
 the host lacks a feature (O_DIRECT, io_uring, osmium in PATH,
-unprivileged user namespaces).
+unprivileged user namespaces) or where the descriptor gate does not admit
+a heavy scenario.
 
 **Small configurations come through existing seams, not tunable
 overrides.** The constants in `crates/lib/src/tunables.rs` get no runtime or

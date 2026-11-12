@@ -1805,8 +1805,8 @@ mod apply_changes {
 </osmChange>"#;
 
     /// A base renamed over mid-run: every later open of the base comes from
-    /// the pin taken at the start, so on a host that reopens through
-    /// `/proc/self/fd` the run reads the file it started on and writes what
+    /// the caller's pin, so with a stable scratch reopen name
+    /// (`reopen_cell::Scenario`) the run reads the file it started on and writes what
     /// an unreplaced run writes, and where opens go through the path the
     /// run fails with `InputReplaced` and publishes nothing.
     ///
@@ -1819,6 +1819,8 @@ mod apply_changes {
     /// base while blobs are in flight.
     #[test]
     fn base_replaced_after_the_splice_open_is_never_read() {
+        use crate::reopen_cell;
+
         let dir = crate::common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
@@ -1836,9 +1838,11 @@ mod apply_changes {
             parallelism: pbfhogg::Parallelism::from_jobs(2),
             ..MergeOptions::default()
         };
-        let run = |host: &pbfhogg::host::Host, output: &Path| {
+        let run = |base: pbfhogg::read::input::InputSource<'_>,
+                   host: &pbfhogg::host::Host,
+                   output: &Path| {
             merge(
-                &base,
+                base,
                 &osc,
                 common::out(output),
                 &opts,
@@ -1848,61 +1852,59 @@ mod apply_changes {
         };
 
         let reference = dir.path().join("reference.osm.pbf");
-        run(&crate::common::test_host(), &reference).expect("unreplaced run");
+        run(
+            base.as_path().into(),
+            &crate::common::test_host(),
+            &reference,
+        )
+        .expect("unreplaced run");
         let expected = std::fs::read(&reference).expect("read reference output");
 
-        for force_path in [true, false] {
+        for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             let replacement = dir.path().join("replacement.osm.pbf");
             write_multi_block_test_pbf(&replacement, &generate_nodes(60, 1), &[], &[], 7);
             let host = crate::common::test_host();
-            host.invocation
-                .faults()
-                .force_pin_path_reopen
-                .store(force_path, std::sync::atomic::Ordering::Relaxed);
-            let procfs = pbfhogg::read::input::PinnedInput::pin(&base, &host)
-                .expect("probe pin")
-                .reopens_through_procfs();
-            host.invocation
-                .faults()
-                .arm_input_replacement(&base, &replacement, 2);
-            let output = dir.path().join(format!("output-{force_path}.osm.pbf"));
-            let before = common::snapshot_dir(dir.path());
-            let result = run(&host, &output);
+            scenario.run(&base, &host, |pin, scenario| {
+                host.invocation
+                    .faults()
+                    .arm_input_replacement(&base, &replacement, 2);
+                let output = dir.path().join(format!("output-{scenario:?}.osm.pbf"));
+                let before = common::snapshot_dir(dir.path());
+                let result = run(pin.into(), &host, &output);
 
-            let report = host
-                .invocation
-                .faults()
-                .input_replacement()
-                .expect("armed replacement");
-            assert!(report.fired, "the replacement must fire: {report:?}");
-            assert_eq!(report.attempts, 4, "{report:?}");
-            assert_eq!(report.attempts_after_fired, 2, "{report:?}");
+                let report = host
+                    .invocation
+                    .faults()
+                    .input_replacement()
+                    .expect("armed replacement");
+                assert!(report.fired, "the replacement must fire: {report:?}");
+                assert_eq!(report.attempts, 4, "{report:?}");
+                assert_eq!(report.attempts_after_fired, 2, "{report:?}");
 
-            if procfs {
-                result.expect("a procfs-pinned run is unaffected by the replacement");
-                assert_eq!(report.verified, 4, "{report:?}");
-                assert_eq!(
-                    std::fs::read(&output).expect("read output"),
-                    expected,
-                    "the run must read only the base it pinned"
-                );
-                std::fs::remove_file(&output).expect("remove output");
-            } else if cfg!(unix) {
-                // Off Unix a pin verifies nothing; the identity refusal is
-                // a Unix guarantee.
-                let err = result.err().expect("a path-reopened run must refuse");
-                assert!(
-                    matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
-                    "{err:?}"
-                );
-                assert_eq!(report.refused, 2, "{report:?}");
-                assert!(!output.exists(), "a refused run must publish nothing");
-                // The replacement file was renamed over the base, so it is
-                // the one path the run itself did not account for.
-                let mut after = common::snapshot_dir(dir.path());
-                after.insert(std::path::PathBuf::from("replacement.osm.pbf"));
-                common::assert_scratch_unchanged(&before, &after);
-            }
+                if matches!(scenario, reopen_cell::Scenario::Pinned) {
+                    result.expect("a pinned run is unaffected by the replacement");
+                    assert_eq!(report.verified, 4, "{report:?}");
+                    assert_eq!(
+                        std::fs::read(&output).expect("read output"),
+                        expected,
+                        "the run must read only the base it pinned"
+                    );
+                    std::fs::remove_file(&output).expect("remove output");
+                } else {
+                    let err = result.err().expect("a path-reopened run must refuse");
+                    assert!(
+                        matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
+                        "{err:?}"
+                    );
+                    assert_eq!(report.refused, 2, "{report:?}");
+                    assert!(!output.exists(), "a refused run must publish nothing");
+                    // The replacement file was renamed over the base, so it is
+                    // the one path the run itself did not account for.
+                    let mut after = common::snapshot_dir(dir.path());
+                    after.insert(std::path::PathBuf::from("replacement.osm.pbf"));
+                    common::assert_scratch_unchanged(&before, &after);
+                }
+            });
             // Restore the original base for the next mode.
             write_multi_block_test_pbf(&base, &generate_nodes(40, 1), &[], &[], 5);
         }

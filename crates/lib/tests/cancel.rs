@@ -244,8 +244,8 @@ fn geocode(
         &host.diagnostics,
     )?;
     pbfhogg::geocode_index::builder::build_geocode_index(
+        &i.path("geo.osm.pbf"),
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: i.path("geo.osm.pbf"),
             allow_unindexed: true,
             ..Default::default()
         },

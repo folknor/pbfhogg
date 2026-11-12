@@ -14,7 +14,6 @@ use crate::reopen_cell;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use pbfhogg::altw::{AltwOptions, IndexType, add_locations_to_ways};
 use pbfhogg::write::WriteOptions;
@@ -37,7 +36,7 @@ enum Route {
     /// Forced sparse on an unindexed input: the pass 2 walk is replaced by
     /// the decode-all reader.
     DecodeAll,
-    /// The public `external_join`, which pins on its own.
+    /// The public `external_join`, given the cell's pin.
     PublicExternal,
 }
 
@@ -77,9 +76,6 @@ fn host(
     host
 }
 
-// The public external join accepts only a path and pins it internally.
-// Keep its replacement coverage here until it can accept a caller pin;
-// passing a stable link as the input would change the fault target.
 fn run<'a>(
     route: Route,
     input: impl Into<pbfhogg::read::input::InputSource<'a>>,
@@ -91,7 +87,7 @@ fn run<'a>(
     let scratch = pbfhogg::scratch::RunScratch::create(scratch_dir, host)?;
     if let Route::PublicExternal = route {
         return pbfhogg::altw::external::external_join(
-            input.path(),
+            input,
             crate::common::out(output),
             false,
             &WriteOptions::default(),
@@ -223,20 +219,7 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
                     }
                 }
             };
-            if matches!(route, Route::PublicExternal) {
-                let force_path = matches!(scenario, reopen_cell::Scenario::Path);
-                host.invocation
-                    .faults()
-                    .force_pin_path_reopen
-                    .store(force_path, Ordering::Relaxed);
-                let pin = pbfhogg::read::input::PinnedInput::pin(&input, &host)
-                    .expect("probe public external pin");
-                if reopen_cell::available(force_path, pin.reopens_through_procfs()) {
-                    run_cell(&pin, scenario);
-                }
-            } else {
-                scenario.run(&input, &host, run_cell);
-            }
+            scenario.run(&input, &host, run_cell);
         }
     }
 }

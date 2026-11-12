@@ -20,7 +20,6 @@
 //! build a random-access node index.
 
 use std::num::NonZeroUsize;
-use std::path::Path;
 
 use crate::write::WriteOptions;
 
@@ -826,10 +825,11 @@ pub(super) fn slot_bucket_bounds(
 /// (`InvalidArgument` otherwise), and is pinned for the run
 /// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
 /// open cannot reach the pinned file, an input replaced mid-run fails with
-/// `InputReplaced`.
+/// `InputReplaced`. A path is pinned here; a caller's pin is shared as it
+/// is (see [`InputSource::pin`](crate::read::input::InputSource::pin)).
 #[allow(clippy::too_many_arguments)]
-pub fn external_join(
-    input: &Path,
+pub fn external_join<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     output: impl crate::output::BindOutput,
     keep_untagged_nodes: bool,
     write: &WriteOptions,
@@ -843,7 +843,7 @@ pub fn external_join(
     host.invocation.check()?;
     // Every stage's open of the input derives from this pin; see
     // `add_locations_to_ways_to`, which pins the same way.
-    let pin = PinnedInput::pin(input, host)?;
+    let pin = input.into().pin(host)?;
     let front = InputFront::open(&pin, write.direct_reads, host)?;
     let result = external_join_in(
         &pin,

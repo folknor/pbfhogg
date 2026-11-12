@@ -41,10 +41,8 @@ mod geocode_pass3 {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build_geocode_index(
-                &BuildConfig {
-                    input_path: input.clone(),
-                    ..Default::default()
-                },
+                &input,
+                &BuildConfig::default(),
                 index_output(
                     &index_dir,
                     pbfhogg::Overwrite::Refuse,

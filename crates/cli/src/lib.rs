@@ -3708,7 +3708,6 @@ fn run_build_geocode_index(
     // rather than silently taking its default. The clap defaults already
     // come from `BuildConfig::default()`.
     let config = GeocodeBuildConfig {
-        input_path: file.to_path_buf(),
         allow_unindexed,
         direct_io,
         street_level: levels.street_level,
@@ -3719,7 +3718,7 @@ fn run_build_geocode_index(
         coarse_search_radius_m: levels.coarse_search_radius,
     };
     // The library reports the counts itself, ahead of its closing "Done" line.
-    pbfhogg::geocode_index::builder::build_geocode_index(&config, output, host, scratch)?;
+    pbfhogg::geocode_index::builder::build_geocode_index(file, &config, output, host, scratch)?;
     Ok(())
 }
 

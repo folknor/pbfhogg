@@ -16,7 +16,8 @@ use pbfhogg::MemberId;
 /// Build an index into `output_dir`, replacing an existing one when
 /// `overwrite` is set: the output is checked and staged first, exactly as
 /// the CLI does, then handed to the builder, which publishes it.
-pub(crate) fn build_index(
+pub(crate) fn build_index<'a>(
+    input: impl Into<pbfhogg::read::input::InputSource<'a>>,
     config: &pbfhogg::geocode_index::builder::BuildConfig,
     output_dir: &Path,
     overwrite: bool,
@@ -28,6 +29,7 @@ pub(crate) fn build_index(
         &host.diagnostics,
     )?;
     pbfhogg::geocode_index::builder::build_geocode_index(
+        input,
         config,
         output,
         host,
@@ -849,8 +851,8 @@ fn synthetic_build_query_matches_low_level_api() {
     write_synthetic_indexed_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -1023,8 +1025,8 @@ fn null_island_street_vertex_is_not_treated_as_absent() {
         &[],
     );
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -1078,13 +1080,13 @@ fn street_vertex_count(index_dir: &Path) -> u64 {
 }
 
 fn build_into(
-    input: std::path::PathBuf,
+    input: &Path,
     index_dir: &Path,
     force: bool,
 ) -> pbfhogg::geocode_index::builder::BuildStats {
     build_index(
+        input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             allow_unindexed: force,
             ..Default::default()
         },
@@ -1115,7 +1117,7 @@ fn understated_node_max_id_is_an_error_not_a_panic() {
     // Non-regression first: the honest file builds, so the failure below is
     // about the forged claim and not the fixture shape.
     let honest_index = dir.path().join("honest-index");
-    let stats = build_into(honest.clone(), &honest_index, false);
+    let stats = build_into(&honest, &honest_index, false);
     assert_eq!(stats.street_ways, 1);
     assert_eq!(street_vertex_count(&honest_index), 3);
 
@@ -1129,8 +1131,8 @@ fn understated_node_max_id_is_an_error_not_a_panic() {
     std::fs::write(&lying, forged).expect("write forged");
 
     let err = build_index(
+        &lying,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: lying,
             ..Default::default()
         },
         &dir.path().join("lying-index"),
@@ -1160,7 +1162,7 @@ fn dangling_ref_above_every_node_id_is_dropped_not_fatal() {
         &[street_way(vec![1, 2, HIGH_NODE_ID])],
         &[],
     );
-    let stats = build_into(input, &index_dir, false);
+    let stats = build_into(&input, &index_dir, false);
     assert_eq!(stats.street_ways, 1);
     assert_eq!(
         street_vertex_count(&index_dir),
@@ -1185,7 +1187,7 @@ fn force_without_indexdata_bounds_node_ids_from_the_blobs() {
         &[],
     );
     crate::common::assert_non_indexed(&input);
-    let stats = build_into(input, &index_dir, true);
+    let stats = build_into(&input, &index_dir, true);
     assert_eq!(stats.street_ways, 1);
     assert_eq!(
         street_vertex_count(&index_dir),
@@ -1204,8 +1206,8 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
         &[crate::common::groups::plain_geocode_block()],
     );
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             allow_unindexed: true,
             ..Default::default()
         },
@@ -1246,8 +1248,8 @@ fn builder_refuses_a_truly_empty_index() {
         &[],
     );
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -1388,8 +1390,8 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -1400,8 +1402,8 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
     let before = std::fs::read(index_dir.join("geocode_header.bin")).expect("header exists");
 
     let err = build_index(
+        &dir.path().join("missing.pbf"),
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: dir.path().join("missing.pbf"),
             allow_unindexed: true,
             ..Default::default()
         },
@@ -1440,8 +1442,8 @@ fn force_preserves_the_index_when_pass_two_fails() {
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input.clone(),
             ..Default::default()
         },
         &index_dir,
@@ -1466,8 +1468,8 @@ fn force_preserves_the_index_when_pass_two_fails() {
         &[],
     );
     let err = build_index(
+        &empty,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: empty,
             allow_unindexed: true,
             ..Default::default()
         },
@@ -1510,8 +1512,8 @@ fn overwrite_and_allow_unindexed_are_independent_permissions() {
     crate::common::assert_non_indexed(&unindexed);
     let build = |overwrite: bool, allow_unindexed: bool| {
         build_index(
+            &unindexed,
             &pbfhogg::geocode_index::builder::BuildConfig {
-                input_path: unindexed.clone(),
                 allow_unindexed,
                 ..Default::default()
             },
@@ -1521,8 +1523,8 @@ fn overwrite_and_allow_unindexed_are_independent_permissions() {
         )
     };
     build_index(
+        &indexed,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: indexed,
             ..Default::default()
         },
         &index_dir,
@@ -1569,8 +1571,8 @@ fn symlinked_output_dir_is_refused_before_the_build() {
     std::fs::create_dir(&target).expect("create link target");
     std::os::unix::fs::symlink(&target, &link).expect("create symlink");
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             allow_unindexed: true,
             ..Default::default()
         },
@@ -1612,8 +1614,8 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
     let cases: [(&str, u8, u8); 2] = [("street", 20, 14), ("coarse", 21, 20)];
     for (name, street, coarse) in cases {
         let err = build_index(
+            &input,
             &pbfhogg::geocode_index::builder::BuildConfig {
-                input_path: input.clone(),
                 allow_unindexed: true,
                 street_level: street,
                 coarse_level: coarse,
@@ -1635,8 +1637,8 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
     }
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input.clone(),
             allow_unindexed: true,
             admin_level: 11,
             ..Default::default()
@@ -1658,8 +1660,8 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
     // Level 19 remains accepted for the segment-sampled street index while
     // admin indexing uses its separate, lower flood-fill budget.
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             allow_unindexed: true,
             street_level: 19,
             coarse_level: 14,
@@ -1687,8 +1689,8 @@ fn fallback_recovers_hits_outside_fine_radius() {
         (&coarse_fallback_dir, 100.0_f32),
     ] {
         build_index(
+            &input,
             &pbfhogg::geocode_index::builder::BuildConfig {
-                input_path: input.clone(),
                 fine_search_radius_m: 1.0,
                 coarse_search_radius_m,
                 ..Default::default()
@@ -1746,8 +1748,8 @@ fn fallback_fills_address_when_fine_street_exists() {
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             fine_search_radius_m: 2.0,
             coarse_search_radius_m: 100.0,
             ..Default::default()
@@ -1793,8 +1795,8 @@ fn synthetic_admin_polygon_query_returns_country_match() {
     write_synthetic_admin_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -1854,8 +1856,8 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
     write_synthetic_nested_admin_same_level_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -1931,8 +1933,8 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
     write_synthetic_admin_with_hole_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2059,8 +2061,8 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
     write_synthetic_large_admin_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2165,8 +2167,8 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
     write_synthetic_interpolation_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
@@ -2258,8 +2260,8 @@ fn a_streetless_interpolation_way_takes_its_street_and_sections_from_its_nodes()
     );
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
@@ -2293,8 +2295,8 @@ fn wrong_parity_interpolation_neither_answers_nor_shadows_the_fallback() {
     let index_dir = dir.path().join("index");
     write_synthetic_shadowed_interpolation_input(&input, Some("30"));
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             fine_search_radius_m: 30.0,
             coarse_search_radius_m: 300.0,
             ..Default::default()
@@ -2397,8 +2399,8 @@ fn an_unsupported_interpolation_mode_does_not_answer() {
             &[],
         );
         let stats = build_index(
+            &input,
             &pbfhogg::geocode_index::builder::BuildConfig {
-                input_path: input,
                 coarse_search_radius_m: 1.0,
                 ..Default::default()
             },
@@ -2436,8 +2438,8 @@ fn build_small_index(
     let index_dir = dir.path().join("index");
     write_test_pbf_sorted(&input, nodes, ways, &[]);
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
@@ -2551,8 +2553,8 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
     write_synthetic_unresolved_interpolation_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
@@ -2622,8 +2624,8 @@ fn fallback_recovers_interpolation_outside_fine_radius() {
         (&coarse_fallback_dir, 100.0_f32),
     ] {
         build_index(
+            &input,
             &pbfhogg::geocode_index::builder::BuildConfig {
-                input_path: input.clone(),
                 fine_search_radius_m: 1.0,
                 coarse_search_radius_m,
                 ..Default::default()
@@ -2703,8 +2705,8 @@ fn antimeridian_interpolation_snaps_on_the_short_arc() {
     write_synthetic_antimeridian_interpolation_input(&input);
 
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2759,8 +2761,8 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
     write_synthetic_shadowed_interpolation_input(&input, None);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             fine_search_radius_m: 30.0,
             coarse_search_radius_m: 300.0,
             ..Default::default()
@@ -2826,8 +2828,8 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
     write_synthetic_postal_boundary_input(&input);
 
     let stats = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2872,8 +2874,8 @@ fn build_rejects_street_way_coord_count_over_u16_max() {
     write_oversized_street_input(&input);
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2898,8 +2900,8 @@ fn build_rejects_interpolation_way_coord_count_over_u16_max() {
     write_oversized_interpolation_input(&input);
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2924,8 +2926,8 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
     write_addr_cell_overflow_input(&input);
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2961,8 +2963,8 @@ fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
     write_street_cell_overflow_input(&input);
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -2995,8 +2997,8 @@ fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
     write_interp_cell_overflow_input(&input);
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -3030,8 +3032,8 @@ fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
     write_admin_cell_overflow_input(&input);
 
     let err = build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             // The fixture ring is a centimetre across: any positive
             // tolerance collapses it, and no polygon would reach the cell.
             admin_tolerance_m: 0.0,
@@ -3070,8 +3072,8 @@ fn segment_distance_respects_the_owning_way_node_count() {
             write_synthetic_indexed_input(&input);
         }
         build_index(
+            &input,
             &builder::BuildConfig {
-                input_path: input,
                 ..Default::default()
             },
             &index_dir,
@@ -3151,11 +3153,15 @@ fn force_rebuild_preserves_open_reader_mappings() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    let config = pbfhogg::geocode_index::builder::BuildConfig {
-        input_path: input,
-        ..Default::default()
-    };
-    build_index(&config, &index_dir, false, &crate::common::test_host()).expect("initial build");
+    let config = pbfhogg::geocode_index::builder::BuildConfig::default();
+    build_index(
+        &input,
+        &config,
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("initial build");
     let old = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("old reader");
     let before = old.query(55.70005, 12.5005).expect("before");
     assert!(before.address.is_some());
@@ -3166,7 +3172,14 @@ fn force_rebuild_preserves_open_reader_mappings() {
             .expect("old strings")
             .ino()
     };
-    build_index(&config, &index_dir, true, &crate::common::test_host()).expect("refresh");
+    build_index(
+        &input,
+        &config,
+        &index_dir,
+        true,
+        &crate::common::test_host(),
+    )
+    .expect("refresh");
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -3194,8 +3207,8 @@ fn caller_built_interpolation_candidate_cannot_escape_its_way() {
     let index_dir = dir.path().join("index");
     write_synthetic_interpolation_input(&input);
     build_index(
+        &input,
         &builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,
@@ -3270,8 +3283,8 @@ fn repeated_multiblob_geocode_builds_have_identical_files() {
     let b = dir.path().join("b");
     for output_dir in [&a, &b] {
         build_index(
+            &input,
             &builder::BuildConfig {
-                input_path: input.clone(),
                 ..Default::default()
             },
             output_dir,
@@ -3322,17 +3335,15 @@ fn forged_kind_claim(dir: &Path, blob: usize, honest_kind: u8, to: u8) -> std::p
 /// Build `input` and assert the refusal: an `IndexdataMismatch` carrying
 /// the contradiction, and no index published.
 fn assert_claim_refused(
-    input: std::path::PathBuf,
+    input: &Path,
     dir: &Path,
     claimed: pbfhogg::ElementKind,
     found: pbfhogg::ElementKind,
 ) {
     let index_dir = dir.join("refused-index");
     let err = build_index(
-        &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
-            ..Default::default()
-        },
+        input,
+        &pbfhogg::geocode_index::builder::BuildConfig::default(),
         &index_dir,
         false,
         &crate::common::test_host(),
@@ -3360,7 +3371,7 @@ fn honest_kind_claims_build_the_all_record_kinds_index() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("honest.osm.pbf");
     write_all_record_kinds_input(&input);
-    let stats = build_into(input, &dir.path().join("index"), false);
+    let stats = build_into(&input, &dir.path().join("index"), false);
     assert!(stats.street_ways >= 1);
 }
 
@@ -3371,7 +3382,7 @@ fn pass_one_refuses_a_way_blob_claiming_relations() {
     let dir = crate::common::test_scratch();
     let input = forged_kind_claim(dir.path(), 2, 1, 2);
     assert_claim_refused(
-        input,
+        &input,
         dir.path(),
         pbfhogg::ElementKind::Relation,
         pbfhogg::ElementKind::Way,
@@ -3385,7 +3396,7 @@ fn pass_one_five_refuses_a_relation_blob_claiming_ways() {
     let dir = crate::common::test_scratch();
     let input = forged_kind_claim(dir.path(), 3, 2, 1);
     assert_claim_refused(
-        input,
+        &input,
         dir.path(),
         pbfhogg::ElementKind::Way,
         pbfhogg::ElementKind::Relation,
@@ -3398,7 +3409,7 @@ fn pass_one_five_refuses_a_node_blob_claiming_ways() {
     let dir = crate::common::test_scratch();
     let input = forged_kind_claim(dir.path(), 1, 0, 1);
     assert_claim_refused(
-        input,
+        &input,
         dir.path(),
         pbfhogg::ElementKind::Way,
         pbfhogg::ElementKind::Node,
@@ -3412,7 +3423,7 @@ fn pass_two_a_refuses_a_way_blob_claiming_nodes() {
     let dir = crate::common::test_scratch();
     let input = forged_kind_claim(dir.path(), 2, 1, 0);
     assert_claim_refused(
-        input,
+        &input,
         dir.path(),
         pbfhogg::ElementKind::Node,
         pbfhogg::ElementKind::Way,
@@ -3556,8 +3567,8 @@ fn build_default_index(dir: &Path, nodes: &[TestNode], ways: &[TestWay]) -> std:
     let index_dir = dir.join("index");
     write_test_pbf_sorted(&input, nodes, ways, &[]);
     build_index(
+        &input,
         &pbfhogg::geocode_index::builder::BuildConfig {
-            input_path: input,
             ..Default::default()
         },
         &index_dir,

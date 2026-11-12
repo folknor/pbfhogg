@@ -1,10 +1,12 @@
-//! Admission for the replacement matrix's two distinct reopen strategies.
+//! The replacement matrix's two distinct reopen strategies.
 //!
-//! Injected pinned reopening uses a stable scratch hard link. Legacy callers
-//! without a caller-pin API still distinguish procfs from path fallback.
-//! Off Unix there is no identity verification to assert after replacement.
-//! Decide before arming a replacement or running a command, so an unavailable
-//! strategy cannot execute a duplicate or leave an outcome unchecked.
+//! Every replacement cell injects its pin: the pinned strategy reopens
+//! through a stable scratch hard link, the path strategy through verified
+//! path reopening, so neither depends on procfs and no host runs one arm
+//! twice. Every command under the matrix takes a caller pin. This does not
+//! test procfs reopening itself; the pin's own unit tests do. Off Unix
+//! there is no identity verification to assert after replacement, so the
+//! cell skips before arming anything.
 
 /// The identity behavior a replacement scenario exercises. The stable-name
 /// case uses a scratch hard link, so neither case needs procfs.
@@ -109,25 +111,4 @@ fn injected_reopen_name_must_identify_the_pinned_file() {
     .expect_err("reject another inode even with identical contents");
     assert!(matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced));
     assert_eq!(err.source_path(), Some(input.as_path()));
-}
-
-#[must_use]
-pub fn available(force_path: bool, procfs: bool) -> bool {
-    if !cfg!(unix) {
-        crate::common::skip(
-            "input replacement cell: Unix file identity verification is unavailable",
-        );
-        return false;
-    }
-    if force_path {
-        assert!(!procfs, "forced path reopening must not select procfs");
-        return true;
-    }
-    if !procfs {
-        crate::common::skip(
-            "input replacement procfs cell: automatic reopening selected the already-covered path fallback",
-        );
-        return false;
-    }
-    true
 }

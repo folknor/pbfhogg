@@ -29,10 +29,8 @@ mod geocode_smoke {
                 .arm_geocode_misfile_address(0, level);
         }
         build_geocode_index(
-            &BuildConfig {
-                input_path: input.to_path_buf(),
-                ..Default::default()
-            },
+            input,
+            &BuildConfig::default(),
             index_output(index_dir, overwrite, &pbfhogg::host::Diagnostics::discard())?,
             &host,
             crate::common::scratch_in(scratch_root),

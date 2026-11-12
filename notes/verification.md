@@ -68,16 +68,6 @@ allowance with no cross-process admission, so on a low-limit host a contended
 registration can fail the gate falsely. Not yet measured: the fallback pools' wall
 against the full pool on planet (needs a raised limit, which this host lacks).
 
-## VER-019 - Two commands cannot take an injected input pin
-
-36 of the 38 reopen cells run through the typed `Scenario::run` seam in
-`crates/lib/tests/common/reopen_cell.rs` with injected pins. The public-external route of
-add-locations-to-ways and geocode-build still use the older `available` helper, because
-public `external_join` and `build_geocode_index` pin paths internally and accept no
-caller pin; `crates/lib/tests/fault_apply_changes.rs` still uses it too. Residue: a
-caller-pin entry point on each of the two commands, and migrating the apply-changes
-fault test.
-
 ## VER-026 - CLI tests wait on child bounds in sequence
 
 Every test time bound lives in `crates/lib/src/tunables.rs` ("Test time bounds") and

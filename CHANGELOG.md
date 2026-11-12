@@ -28,6 +28,13 @@
 
 ### Changed
 
+- **`geocode_index::builder::build_geocode_index` takes its input as its
+  first argument, and `BuildConfig::input_path` is gone.** The input is an
+  `impl Into<InputSource>`, as on every other multi-pass entry point, so a
+  caller that already pinned the input passes the `PinnedInput` and the
+  build reads that file. `altw::external::external_join` takes its input
+  the same way instead of a `&Path`. Passing a path behaves as before.
+
 - **`--io-uring` runs under a low `RLIMIT_MEMLOCK`** instead of exiting `3`.
   The writer still asks for its full 64-buffer registered pool first; when the
   kernel refuses it for lack of locked memory it halves the pool down to two

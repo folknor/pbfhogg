@@ -8,7 +8,6 @@
 compile_error!("the geocode index builder requires 64-bit pointers");
 
 use std::io::Write;
-use std::path::PathBuf;
 
 use crate::ElementReader;
 use crate::coord_fmt::e7_to_deg;
@@ -53,13 +52,12 @@ pub(super) fn sample_id(sample: &mut Vec<i64>, id: i64) {
 // Build configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for the geocode index builder.
+/// Configuration for the geocode index builder: how to build, not what
+/// from. The input is [`build_geocode_index`]'s own argument, and where
+/// the index goes, and whether an existing one may be replaced, is the
+/// [`IndexOutput`] passed beside it.
 #[derive(Clone)]
-///
-/// Where the index goes, and whether an existing one may be replaced, is the
-/// [`OutputDir`](crate::output::OutputDir) passed beside it.
 pub struct BuildConfig {
-    pub input_path: PathBuf,
     /// Permit input PBFs that do not have blob-level indexdata.
     pub allow_unindexed: bool,
     pub direct_io: bool,
@@ -78,7 +76,6 @@ pub struct BuildConfig {
 impl Default for BuildConfig {
     fn default() -> Self {
         Self {
-            input_path: PathBuf::new(),
             allow_unindexed: false,
             street_level: crate::tunables::GEOCODE_DEFAULT_STREET_LEVEL,
             coarse_level: crate::tunables::GEOCODE_DEFAULT_COARSE_LEVEL,
@@ -203,7 +200,14 @@ pub struct BuildStats {
 ///   measured peak memory and host are recorded in `reference/performance/geocode.md`
 ///   ("build-geocode-index"). A host with less memory than that record shows
 ///   needs those intermediates moved to temp files.
-pub fn build_geocode_index(
+///
+/// The input is read in several opens, so it must be a regular file
+/// (`InvalidArgument` otherwise) and is pinned for the build: a path is
+/// pinned once the configuration and output are checked, a caller's pin is
+/// shared as it is (see
+/// [`InputSource::pin`](crate::read::input::InputSource::pin)).
+pub fn build_geocode_index<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     config: &BuildConfig,
     output: IndexOutput,
     host: &crate::host::Host,
@@ -212,7 +216,7 @@ pub fn build_geocode_index(
     let host = &host.enter()?;
     let output = output.0.bind_unissued(&host.invocation)?;
     host.invocation.check()?;
-    let stats = build_geocode_index_to(config, &output, host, scratch)?;
+    let stats = build_geocode_index_to(input.into(), config, &output, host, scratch)?;
     output.publish()?;
     Ok(stats)
 }
@@ -222,6 +226,7 @@ pub fn build_geocode_index(
 /// directory swap that follow are the output's, not the build's.
 #[hotpath::measure]
 fn build_geocode_index_to(
+    input: crate::read::input::InputSource<'_>,
     config: &BuildConfig,
     output: &crate::output::BoundOutputDir,
     host: &crate::host::Entered<'_>,
@@ -237,7 +242,7 @@ fn build_geocode_index_to(
     let writer = output.writer()?;
     // Every failure of the build names the index it was building; a file
     // the failure is about is named beneath this.
-    let stats = build_generation(config, writer.path(), host, &scratch).map_err(|e| {
+    let stats = build_generation(input, config, writer.path(), host, &scratch).map_err(|e| {
         e.context(format!(
             "building geocode index {}",
             output.destination().display()
@@ -378,6 +383,7 @@ pub fn index_output_with_staging(
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn build_generation(
+    input: crate::read::input::InputSource<'_>,
     config: &BuildConfig,
     output_dir: &std::path::Path,
     host: &crate::host::Entered<'_>,
@@ -393,9 +399,10 @@ fn build_generation(
     // unindexed classify, pass 1, pass 1.5 and pass 2 then share.
     // Every open is derived from this pin, taken before any of them, so an
     // input renamed over mid-build is never read partly from each file.
-    // Pinned here rather than by the caller: nothing else reads the input
-    // before the build, and a failure to pin is named with the index.
-    let input = crate::read::input::PinnedInput::pin(&config.input_path, host)?;
+    // A path is pinned here, after the configuration and output checks, so
+    // a failure to pin is named with the index; a caller's pin (one that
+    // composes several steps on the input) is shared as it is.
+    let input = input.pin(host)?;
 
     // Validate input
     crate::commands::require_indexdata(

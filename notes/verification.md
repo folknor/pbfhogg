@@ -30,16 +30,6 @@ construction; tests that build their own `host::FdPool` hold a ticket by convent
 Residue: measure the high-water marks (a `/proc/self/fd` count at the gate's release
 would do) and check them against the charges, if it pays.
 
-## VER-131 - Test executor pools are released, not joined
-
-Every test host owns a four-thread rayon pool (`common::test_executor`,
-`Executor::for_tests`) that drops with its test. Dropping the last owner of a rayon
-pool does not join its workers, so their exit and thread-local destructors run after
-the test returns, and no test can assert that a host's threads are gone when it drops.
-Residue: a fixture type owning the pool's join handles, joined once every executor
-owner is released (never on one of the pool's own workers), which every `test_host()`
-caller would then hold.
-
 ## VER-009 - The static inventory cannot see synthesized state
 
 `crates/source-policy/src/rules/statics.rs` inventories every library static with

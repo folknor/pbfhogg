@@ -1975,6 +1975,17 @@ impl Executor {
     /// depends on the runner or competes with a sibling test for the global
     /// pool. Dropping the last owner lets the workers exit; it does not
     /// join them.
+    ///
+    /// Left unjoined on purpose. A test host is a caller, and a caller's
+    /// pool outlives calls by contract; the join promise belongs to the
+    /// pools the library builds (`joined_pool.rs`). The thread-locals a
+    /// worker can hold are buffers, compression state and test-only
+    /// per-thread probes - no descriptor, invocation or anything a sibling
+    /// test observes - so a late exit costs memory and scheduling overlap,
+    /// not a wrong outcome. A joining fixture is possible (own the
+    /// `spawn_handler` handles beside one `Arc`, drop that `Arc` on the test
+    /// thread, then join), but it would put a wait on every teardown that
+    /// hangs whenever a host or writer clone escapes, and no test needs it.
     pub(crate) fn for_tests() -> Self {
         Self::Pool(Arc::new(
             rayon::ThreadPoolBuilder::new()

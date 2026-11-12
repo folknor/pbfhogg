@@ -1663,6 +1663,13 @@ impl pbfhogg::host::ProcessActions for FixedFdGrant {
 /// [`fixed_resources`], so no test's rayon width depends on the runner or
 /// competes with a sibling test for the global pool. Dropping the last
 /// owner lets the workers exit; it does not join them.
+///
+/// Left unjoined on purpose, for the reasons on the unit tests'
+/// `Executor::for_tests` in `crates/lib/src/host.rs`: a test host is a
+/// caller whose pool outlives calls by contract, the worker thread-locals
+/// hold only memory and test-only probes, and a joining fixture would add a
+/// teardown wait that hangs on any escaped host or writer clone while no
+/// test needs it.
 pub(crate) fn test_executor() -> pbfhogg::host::Executor {
     pbfhogg::host::Executor::Pool(std::sync::Arc::new(
         rayon::ThreadPoolBuilder::new()

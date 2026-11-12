@@ -66,18 +66,6 @@ unpin. Also open: the `promise-guard` and `direct-io` requirements were not chec
 against the AGENTS.md host rule (a scratch filesystem that refuses O_DIRECT, an
 architecture or kernel without seccomp).
 
-## VER-140 - Library tests park threads in std scopes without a HangBound
-
-Found while reading test spawns against the release-before-join rule.
-`crates/lib/tests/fault_apply_changes.rs` (a `std::thread::scope` around a merge
-parked at `apply_changes_park_at_blob_seq`, released by cancelling the invocation),
-`crates/lib/tests/cancel.rs` (two scoped sort runs) and the scopes in
-`crates/lib/tests/host_contract.rs` carry no `HangBound`, so a release that fails to
-wake the parked thread leaves the scope's join to the runner's watchdog. Not read in
-full: whether each scope body releases on an assertion unwind before the implicit
-join, and whether every park there is a hook wait already bounded by
-`TEST_HOOK_WAIT`.
-
 ## VER-141 - The osmium sort test is skipped as over-watchdog but takes milliseconds
 
 `sort_cross_validate_osmium` (`crates/cli/tests/cli_sort.rs`) is the one entry in

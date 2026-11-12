@@ -1122,6 +1122,13 @@ mod apply_changes {
             for owned in [false, true] {
                 for refs in [&[2, 3][..], &[2, 999]] {
                     let label = format!("jobs={jobs} owned={owned} refs={refs:?}");
+                    // Armed first: it bounds the scope's join of the parked
+                    // merge, the release guard's unwind included.
+                    let _hang = pbfhogg_test_scratch::HangBound::arm(
+                        pbfhogg::TEST_HANG_BOUND,
+                        pbfhogg::TEST_HANG_REPORT_GRACE,
+                        "the cancelled merge did not end",
+                    );
                     let dir = crate::common::test_scratch();
                     let base = dir.path().join("base.osm.pbf");
                     let osc = dir.path().join("diff.osc.gz");
@@ -1139,7 +1146,16 @@ mod apply_changes {
                     faults.apply_changes_force_owned_route.store(owned, SeqCst);
                     faults.apply_changes_park_at_blob_seq.store(1, SeqCst);
                     let before = common::snapshot_dir(dir.path());
+                    /// Cancels on drop, so a failed assertion's unwind wakes
+                    /// the parked worker before the scope joins the merge.
+                    struct CancelOnDrop<'a>(&'a pbfhogg::host::Invocation);
+                    impl Drop for CancelOnDrop<'_> {
+                        fn drop(&mut self) {
+                            self.0.cancel();
+                        }
+                    }
                     let result = std::thread::scope(|scope| {
+                        let _release = CancelOnDrop(&host.invocation);
                         let run = scope.spawn(|| {
                             merge(
                                 &base,

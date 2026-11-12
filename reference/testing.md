@@ -424,7 +424,12 @@ assertion's unwind included: whatever the thread is parked waiting for is
 released before the join (a release sender owned inside the
 `std::thread::scope` body, a guard, or
 `test_support::with_parked_thread`), and the join sits under the test's
-`HangBound`. The rule cannot see a named handle dropped on an unwind, so
+`HangBound`. A rendezvous that cannot be released (a `std::sync::Barrier`
+whose other party failed before arriving) leaves the `HangBound` as the
+fail-stop. A scoped thread that only runs an operation, waiting on nothing
+the test or a sibling supplies, is parked on nothing and owes neither a
+release nor a bound, like the same operation on the test thread. The rule
+cannot see a named handle dropped on an unwind, so
 it rests on review. A test never infers that
 another thread blocked from elapsed time: it waits (bounded) for an
 observation made at the wait itself - a `test_support::Parked` count under a

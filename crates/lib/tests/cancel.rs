@@ -1432,6 +1432,9 @@ fn a_token_stops_only_the_runs_that_observe_it() {
             token.cancel();
         }
     });
+    // No HangBound: each scoped run cancels itself from its own check and
+    // waits on nothing the test or the other run supplies, so the scope is
+    // two operations as unbounded as one on the test thread.
     let (cancelled, completed) = std::thread::scope(|scope| {
         let a = scope.spawn(|| run_once("sort a", sort, &inputs, stopped.clone()));
         let b = scope.spawn(|| run_once("sort b", sort, &inputs, pbfhogg::host::Invocation::new()));

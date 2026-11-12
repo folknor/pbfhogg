@@ -21,6 +21,17 @@ impl ProcessActions for Actions {
         self.ticket.fd_allowance(wanted)
     }
 }
+/// The bound over a scenario whose scoped threads wait on another party (a
+/// rendezvous, a test-owned reader). Scopes whose threads only run an
+/// operation each, waiting on nothing the test or a sibling supplies, carry
+/// none: a scoped run is then no different from a run on the test thread.
+fn hang_bound(label: &'static str) -> pbfhogg_test_scratch::HangBound {
+    pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        label,
+    )
+}
 fn input(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("base.osm.pbf");
     crate::common::write_base_pbf(&path);
@@ -470,6 +481,10 @@ fn instrumentation_reaches_only_the_invocations_own_sink() {
 #[test]
 fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
     use pbfhogg::debug::{CallId, InstrumentSink, MarkerFifo};
+    // The FIFO writes never block (a full FIFO drops the line), but the
+    // capture's reader thread is released and joined by the test, in
+    // `finish` or on drop; armed first, the bound covers that join.
+    let _hang = hang_bound("the FIFO capture did not end");
     let dir = crate::common::test_scratch();
     let drain = fifo_capture::FifoCapture::new(dir.path());
     let fifo = MarkerFifo::open(&drain.path).expect("write end");
@@ -727,6 +742,8 @@ impl pbfhogg::debug::InstrumentSink for PublishOrder {
 #[cfg(pbfhogg_test_hooks)]
 #[test]
 fn concurrent_publications_of_one_invocation_do_not_interleave() {
+    // The start barrier cannot be released if one thread fails before it.
+    let _hang = hang_bound("the concurrent publications did not end");
     let sink = Arc::new(PublishOrder {
         events: std::sync::Mutex::new(Vec::new()),
         starts: std::sync::atomic::AtomicUsize::new(0),
@@ -1240,6 +1257,10 @@ fn concurrent_external_joins_use_distinct_scratch() {
     }
     let mut host = host;
     host.process = Arc::new(Overlap(std::sync::Barrier::new(2), Arc::clone(&ticket)));
+    // The barrier cannot be released if one run fails before reaching it.
+    // Armed after admission and the sequential run, which are not the
+    // scenario's hang.
+    let _hang = hang_bound("the concurrent external joins did not end");
     std::thread::scope(|scope| {
         let handles: Vec<_> = outputs
             .iter()

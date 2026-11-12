@@ -288,18 +288,6 @@ would be cross-builds with foreign executables. Residue is brokkr-side check pla
 resolve a runnable target from host capability, or refuse an unexecutable target before
 building. Filed as bz brokkr#170.
 
-## VER-109 - The testing contract contradicts itself and duplicates inventories
-
-Reported by check-machinery.
-
-The stable allowlist in `reference/testing.md` says everything outside it needs CLI conversion, later
-text permits `host` and `process`, `process_nofile` calls an internal entry point, and fault and
-host-contract tests use more. It repeats feature and package lists and labels `full` a full gate.
-
-Fix: state boundaries by test purpose, enforce through resolved imports or test-support dependencies, and
-generate configuration tables. Claims such as every internal contract having a tier-1 test still need
-human review.
-
 ## VER-110 - The testing record falsely says verify has no locations-on-ways path
 
 Reported by bench-verify.

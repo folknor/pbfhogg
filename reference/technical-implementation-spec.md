@@ -40,8 +40,8 @@ Specifications are saved to the ./notes folder.
    read against), with peak anon RSS read from `brokkr sidecar <UUID>
    --human` when memory is the axis; named unit tests for behavior no oracle
    reaches, placed and tiered per `reference/testing.md` (which pins the
-   test-placement axes, the validation tiers, and the stable allowlist a
-   test imports through). A brick whose load is unproven is not laid. Per
+   test-placement axes, the validation tiers, and what each kind of test
+   may import). A brick whose load is unproven is not laid. Per
    gate, the spec contains the EXACT command to run - copy-pasteable, flags
    and all, not "run the relevant tests" or "verify the output". Gate
    commands pin the

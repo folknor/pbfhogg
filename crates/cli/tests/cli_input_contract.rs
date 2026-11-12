@@ -579,7 +579,7 @@ fn getparents_add_self(c: &Ctx, input: &Path) -> Invocation {
 
 /// getparents with the hidden threshold instrument, which sends a small
 /// indexed file to the full-scan arm. An unindexed first blob keeps the walker.
-/// The flag exists only in test-hooks builds.
+/// The flag exists only in builds with the hook cfg.
 #[cfg(pbfhogg_test_hooks)]
 fn getparents_full_scan(c: &Ctx, input: &Path) -> Invocation {
     getparents(c, input).words(&["--full-scan-min-blobs", "1"])
@@ -2088,7 +2088,7 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
         ("getid", &[]),
         ("getid", &["--invert"]),
         ("getparents", &[]),
-        // The threshold flag exists only in test-hooks builds.
+        // The threshold flag exists only in builds with the hook cfg.
         #[cfg(pbfhogg_test_hooks)]
         ("getparents", &["--full-scan-min-blobs", "1"]),
     ];
@@ -2324,6 +2324,11 @@ mod check_composition {
                     .faults()
                     .force_pin_path_reopen
                     .store(force_path, std::sync::atomic::Ordering::Relaxed);
+                // Which reopen route this host gives a pin decides the
+                // expected outcome. Route selection is not this test's
+                // subject (the pin's own unit tests in read/input.rs cover
+                // it), and the forced-path cells expect independently.
+                // library-deliberate: probes the host's reopen route
                 let procfs = pbfhogg::read::input::PinnedInput::pin(&input, &host)
                     .expect("probe pin")
                     .reopens_through_procfs();

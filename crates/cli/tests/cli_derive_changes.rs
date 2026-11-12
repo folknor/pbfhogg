@@ -27,7 +27,7 @@ use crate::common::{
 };
 use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::MemberId;
-use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 
 // ---------------------------------------------------------------------------
@@ -141,10 +141,7 @@ fn write_versioned_pbf(path: &Path, nodes: &[(i64, i32, i32, i32)], ways: &[(i64
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().sorted().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -899,8 +896,7 @@ fn increment_version_and_update_timestamp_combined() {
         .skip(1)
         .map(|tail| {
             let value = tail.split('"').next().expect("timestamp value");
-            let seconds = pbfhogg::commands::parse_rfc3339_utc(value).expect("UTC timestamp");
-            u64::try_from(seconds).expect("timestamp after epoch")
+            utc_seconds(value).unwrap_or_else(|| panic!("UTC timestamp: {value}"))
         })
         .collect();
     assert_eq!(
@@ -917,6 +913,83 @@ fn increment_version_and_update_timestamp_combined() {
             (before..=after).contains(&timestamp),
             "timestamp outside invocation clock bounds: {xml}"
         );
+    }
+}
+
+/// Seconds since the epoch of a `YYYY-MM-DDTHH:MM:SSZ` timestamp at or after
+/// 1970, or `None` for any other text. The oracle for the CLI's emitted
+/// timestamps, so it shares nothing with the library's formatter or parser:
+/// it counts whole years and months day by day instead of converting a
+/// civil date arithmetically.
+fn utc_seconds(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    let shape_ok = b.len() == 20
+        && [4, 7].iter().all(|&i| b[i] == b'-')
+        && b[10] == b'T'
+        && [13, 16].iter().all(|&i| b[i] == b':')
+        && b[19] == b'Z';
+    if !shape_ok {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<u64> {
+        let digits = &text[from..to];
+        digits
+            .bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| digits.parse().ok())
+            .flatten()
+    };
+    let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = |y: u64, m: u64| match m {
+        2 if leap(y) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > month_days(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let mut days = 0;
+    for y in 1970..year {
+        days += if leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        days += month_days(year, m);
+    }
+    days += day - 1;
+    Some(((days * 24 + hour) * 60 + minute) * 60 + second)
+}
+
+/// The oracle's own anchors: the epoch, leap days either side of a century
+/// rule, and the shapes it must refuse.
+#[test]
+fn utc_seconds_oracle_matches_known_instants() {
+    assert_eq!(utc_seconds("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(utc_seconds("1970-01-02T00:00:01Z"), Some(86_401));
+    assert_eq!(utc_seconds("2000-02-29T00:00:00Z"), Some(951_782_400));
+    assert_eq!(utc_seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
+    assert_eq!(utc_seconds("2024-02-29T12:34:56Z"), Some(1_709_210_096));
+    assert_eq!(utc_seconds("2038-01-19T03:14:08Z"), Some(2_147_483_648));
+    for bad in [
+        "2100-02-29T00:00:00Z",
+        "2023-02-29T00:00:00Z",
+        "2024-13-01T00:00:00Z",
+        "2024-01-01T24:00:00Z",
+        "1969-12-31T23:59:59Z",
+        "2024-01-01T00:00:00",
+        "2024-01-01 00:00:00Z",
+        "+024-01-01T00:00:00Z",
+    ] {
+        assert_eq!(utc_seconds(bad), None, "{bad}");
     }
 }
 
@@ -1041,10 +1114,7 @@ fn derive_refuses_a_way_blob_claiming_another_kind() {
     let old = dir.path().join("old.osm.pbf");
     let honest = dir.path().join("honest.osm.pbf");
     let write = |path: &Path| {
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("build header");
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
         let mut writer = PbfWriter::to_path(
             path,
             Compression::default(),

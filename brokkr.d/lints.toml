@@ -801,6 +801,24 @@ expect = "io size fixtures ok"
 match = "last-line"
 stage = "pre-clippy"
 
+# CLI tests name the library only through its fixture and test-infrastructure
+# surface (the inventory is SURFACE in the script); any other library path
+# carries a library-deliberate reason. A direct-spelling guard: it does not
+# see crates/lib/tests/common, crate:: re-exports or macro expansion.
+[[script_check]]
+name = "test-imports"
+command = "python3 -B scripts/check_test_imports.py"
+expect = "test import audit ok"
+match = "last-line"
+stage = "pre-clippy"
+
+[[script_check]]
+name = "test-imports-fixtures"
+command = "python3 -B scripts/test_check_test_imports.py"
+expect = "test import fixtures ok"
+match = "last-line"
+stage = "pre-clippy"
+
 # scripts/vs-osmium.sh against a recording brokkr stub; brokkr's bench
 # contract tests are Lua, so the shell driver's test lives here.
 [[script_check]]

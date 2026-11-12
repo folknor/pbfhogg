@@ -40,7 +40,7 @@ use crate::common::{
 };
 use crate::invoker::{CliInvoker, CliOutput};
 use flate2::write::GzEncoder;
-use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
@@ -352,10 +352,7 @@ fn merge_multi_block_partial_rewrite() {
         let file = std::fs::File::create(&base).expect("create file");
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("build header");
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -845,10 +842,7 @@ fn merge_delete_entire_block() {
         let file = std::fs::File::create(&base).expect("create file");
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("build header");
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -946,10 +940,7 @@ fn merge_delete_entire_block_keeps_the_next_rewrites_strings() {
         let file = std::fs::File::create(&base).expect("create file");
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("build header");
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -1108,10 +1099,7 @@ fn merge_metadata_preservation() {
         let file = std::fs::File::create(&base).expect("create file");
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
         let mut writer = PbfWriter::new(buf, Compression::default());
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("build header");
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -1120,7 +1108,7 @@ fn merge_metadata_preservation() {
             100_000_000,
             200_000_000,
             [("name", "one")],
-            Some(&block_builder::Metadata {
+            Some(&Metadata {
                 version: 5,
                 timestamp: 1_700_000_000,
                 changeset: 12345,
@@ -1134,7 +1122,7 @@ fn merge_metadata_preservation() {
             300_000_000,
             400_000_000,
             [("name", "two")],
-            Some(&block_builder::Metadata {
+            Some(&Metadata {
                 version: 3,
                 timestamp: 1_600_000_000,
                 changeset: 67890,
@@ -1148,7 +1136,7 @@ fn merge_metadata_preservation() {
             500_000_000,
             600_000_000,
             [("name", "three")],
-            Some(&block_builder::Metadata {
+            Some(&Metadata {
                 version: 1,
                 timestamp: 1_500_000_000,
                 changeset: 11111,
@@ -1335,7 +1323,7 @@ fn write_test_pbf_with_locations(
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .optional_feature("LocationsOnWays")
         .build()
@@ -1379,10 +1367,10 @@ fn write_test_pbf_with_locations(
         {
             writer.write_primitive_block(bytes).expect("write block");
         }
-        let members: Vec<block_builder::MemberData<'_>> = r
+        let members: Vec<MemberData<'_>> = r
             .members
             .iter()
-            .map(|m| block_builder::MemberData {
+            .map(|m| MemberData {
                 id: m.id,
                 role: m.role,
             })
@@ -1845,7 +1833,7 @@ fn write_low_pbf_raw_nodes(
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .optional_feature("LocationsOnWays")
         .build()
@@ -2171,7 +2159,7 @@ fn write_low_blobs(path: &Path, nodes: &[(i64, i32, i32)], way_blobs: &[Vec<LowW
 fn write_low_raw_way_blocks(path: &Path, nodes: &[(i64, i32, i32)], way_blocks: &[Vec<u8>]) {
     let file = std::fs::File::create(path).expect("create file");
     let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .optional_feature("LocationsOnWays")
         .build()
@@ -3390,10 +3378,7 @@ fn write_node_blobs(path: &Path, blobs: &[&[i64]]) {
 fn write_node_blobs_indexed(path: &Path, blobs: &[&[i64]], indexed: bool) {
     let file = File::create(path).expect("create base");
     let mut writer = PbfWriter::new(file, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().sorted().build().expect("build header");
     writer.write_header(&header).expect("write header");
     let mut bb = BlockBuilder::new();
     for ids in blobs {
@@ -3581,10 +3566,7 @@ fn merge_refuses_a_decoded_blob_holding_another_kind_than_claimed() {
     {
         let file = File::create(&base).expect("create base");
         let mut writer = PbfWriter::new(file, Compression::default());
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("build header");
+        let header = HeaderBuilder::new().sorted().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
         bb.add_node(1, 10, 10, std::iter::empty(), None);

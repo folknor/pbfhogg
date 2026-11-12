@@ -78,7 +78,7 @@ use std::path::Path;
 
 use crate::cli_apply_changes::write_osc;
 use crate::invoker::CliInvoker;
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId, MemberType};
 
@@ -507,7 +507,7 @@ fn member_id(kind: &str, id: i64) -> MemberId {
 fn write_base(path: &Path, base: &Base) {
     let file = std::fs::File::create(path).expect("create base");
     let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .optional_feature("LocationsOnWays")
         .build()

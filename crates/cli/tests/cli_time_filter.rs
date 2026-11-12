@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::common::read_header;
 use crate::invoker::CliInvoker;
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
@@ -230,7 +230,7 @@ pub(crate) fn write_history_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .historical()
         .replication_timestamp(9_999)
@@ -294,10 +294,7 @@ fn write_metadata_stripped_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().sorted().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -361,7 +358,7 @@ pub(crate) fn write_snapshot_input(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .replication_timestamp(9_999)
         .build()
@@ -451,7 +448,7 @@ fn write_history_with_ways_and_relations(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .sorted()
         .historical()
         .build()
@@ -604,7 +601,7 @@ fn read_ways_and_relations(path: &Path) -> (Vec<WaySnapshot>, Vec<RelationSnapsh
 fn write_node_blocks(path: &Path, history: bool, indexed: bool, blocks: &[&[(i64, i32, i64)]]) {
     let file = std::fs::File::create(path).expect("create file");
     let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
-    let mut header = block_builder::HeaderBuilder::new().sorted();
+    let mut header = HeaderBuilder::new().sorted();
     if history {
         header = header.historical();
     }

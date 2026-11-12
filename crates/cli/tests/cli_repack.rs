@@ -537,7 +537,7 @@ fn write_pbf_with_relation_blob_sizes(
     relations: &[TestRelation],
     rel_blob_sizes: &[usize],
 ) {
-    use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
     use pbfhogg::writer::{Compression, PbfWriter};
 
     let total: usize = rel_blob_sizes.iter().sum();
@@ -550,10 +550,7 @@ fn write_pbf_with_relation_blob_sizes(
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().sorted().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -713,13 +710,13 @@ fn write_low_pbf(path: &Path, nodes: &[TestNode], ways: &[LowWay]) {
 /// coordinates present in the wire data but the feature flag absent from the
 /// header must not cause repack to preserve (or otherwise expose) them.
 fn write_way_coords_pbf(path: &Path, nodes: &[TestNode], ways: &[LowWay], declare_low: bool) {
-    use pbfhogg::block_builder::{self, BlockBuilder};
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
     use pbfhogg::writer::{Compression, PbfWriter};
 
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let mut header_builder = block_builder::HeaderBuilder::new().sorted();
+    let mut header_builder = HeaderBuilder::new().sorted();
     if declare_low {
         header_builder = header_builder.optional_feature("LocationsOnWays");
     }

@@ -34,7 +34,7 @@ use crate::common::{
 };
 use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::MemberId;
-use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 
 const BBOX_STR: &str = "12.4,55.6,12.7,55.8";
@@ -778,9 +778,7 @@ fn write_multi_blob_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -866,9 +864,7 @@ fn write_ways_before_nodes_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -902,7 +898,7 @@ fn write_ways_before_nodes_pbf(path: &Path) {
     bb.add_relation(
         300,
         [("type", "route")],
-        &[block_builder::MemberData {
+        &[MemberData {
             id: MemberId::Way(100),
             role: "outer",
         }],
@@ -2079,12 +2075,7 @@ fn write_plain_node_pbf(input: &Path) {
         Compression::default(),
     );
     writer
-        .write_header(
-            &block_builder::HeaderBuilder::new()
-                .sorted()
-                .build()
-                .expect("header"),
-        )
+        .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
         .expect("write header");
     // Empty string-table entry, then the two plain Node messages.
     let block = [

@@ -27,7 +27,7 @@ use crate::common::adversarial::{
 use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf};
 use crate::invoker::CliInvoker;
 use pbfhogg::MemberId;
-use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 
 const LAT: i32 = 550_000_000;
@@ -41,10 +41,7 @@ fn write_lying_sorted_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("header");
+    let header = HeaderBuilder::new().sorted().build().expect("header");
     writer.write_header(&header).expect("write header");
 
     // Three blocks in deliberately non-monotonic order:
@@ -245,10 +242,7 @@ fn write_three_kind_fixture(path: &Path) {
     let file = std::fs::File::create(path).expect("create");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("header");
+    let header = HeaderBuilder::new().sorted().build().expect("header");
     writer.write_header(&header).expect("write header");
     let mut bb = BlockBuilder::new();
     for n in &nodes {
@@ -264,10 +258,10 @@ fn write_three_kind_fixture(path: &Path) {
     writer.write_primitive_block(bytes).expect("write ways");
     let mut bb = BlockBuilder::new();
     for r in &relations {
-        let members: Vec<block_builder::MemberData<'_>> = r
+        let members: Vec<MemberData<'_>> = r
             .members
             .iter()
-            .map(|m| block_builder::MemberData {
+            .map(|m| MemberData {
                 id: m.id,
                 role: m.role,
             })
@@ -612,7 +606,7 @@ fn write_bad_string_pbf(path: &Path, bad: BadString, historical: bool) {
         std::fs::File::create(path).expect("create input"),
         Compression::default(),
     );
-    let mut header = block_builder::HeaderBuilder::new().sorted();
+    let mut header = HeaderBuilder::new().sorted();
     if historical {
         header = header.historical();
     }
@@ -994,10 +988,7 @@ fn write_raw_rewrite_pbf(path: &Path, bad: Option<(RawSid, u64)>) {
             std::fs::File::create(path).expect("create input"),
             Compression::default(),
         );
-        let header = block_builder::HeaderBuilder::new()
-            .sorted()
-            .build()
-            .expect("header");
+        let header = HeaderBuilder::new().sorted().build().expect("header");
         writer.write_header(&header).expect("write header");
         for block in [
             raw_dense_block(None),

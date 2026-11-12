@@ -17,7 +17,7 @@ use crate::common::{
     write_test_pbf_non_indexed,
 };
 use crate::invoker::CliInvoker;
-use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
 
@@ -48,9 +48,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -113,9 +111,7 @@ fn write_type_unsorted_pbf(path: &Path) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -175,9 +171,7 @@ fn write_intra_unsorted_non_indexed_pbf(path: &Path) {
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
     // Genuinely-unsorted third-party file: header does not claim sortedness.
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -395,9 +389,7 @@ fn sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let meta = Metadata {
@@ -638,9 +630,7 @@ fn sort_many_overlapping_blobs() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -707,9 +697,7 @@ fn sort_overlap_runs_scoped_to_single_kind() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -776,7 +764,7 @@ fn sort_preserves_historical_information_feature() {
     let file = std::fs::File::create(&input).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new()
+    let header = HeaderBuilder::new()
         .historical()
         .build()
         .expect("build header");
@@ -1289,7 +1277,7 @@ fn sort_refuses_non_leading_header_frames() {
 /// Frames: the header, a node blob (ids 1 and 20), a way blob (id 10).
 /// The honest file is in order; `sorted` stamps `Sort.Type_then_ID`.
 fn write_claim_fixture(path: &Path, sorted: bool) {
-    let mut hb = block_builder::HeaderBuilder::new();
+    let mut hb = HeaderBuilder::new();
     if sorted {
         hb = hb.sorted();
     }
@@ -1364,10 +1352,7 @@ fn sort_keeps_the_way_when_the_claim_is_honest() {
 /// A sorted, indexed, node-only file with one blob per entry of `blobs`,
 /// its IDs in the order given. Blob `i` is frame `i + 1`.
 pub(crate) fn write_sorted_node_blobs(path: &Path, blobs: &[&[i64]]) {
-    let header = block_builder::HeaderBuilder::new()
-        .sorted()
-        .build()
-        .expect("build header");
+    let header = HeaderBuilder::new().sorted().build().expect("build header");
     let mut writer = PbfWriter::new(
         std::fs::File::create(path).expect("create file"),
         Compression::default(),

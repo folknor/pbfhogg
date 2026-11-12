@@ -1,24 +1,9 @@
-//! `tags_count`'s tag-index blob skipping, observed through the CLI. The
-//! library-only `tags_count` tests are in the library package's
-//! `crates/lib/tests/tags_count.rs`; this one needs the binary, both to strip the tag
-//! index from a fixture and to read the skip report on stderr.
+//! `inspect tags` through the binary: its tag-index blob skipping, its
+//! summary and its row quoting. The library's `tags_count` tests are in
+//! `crates/lib/tests/tags_count.rs`.
 
 use crate::common::{generate_nodes, write_multi_block_test_pbf};
 use crate::invoker::CliInvoker;
-use pbfhogg::tags_count::{TagCount, TagCountOptions, TagCountSort, tags_count};
-
-fn default_opts() -> TagCountOptions<'static> {
-    TagCountOptions {
-        min_count: 0,
-        max_count: None,
-        sort: TagCountSort::NameAsc,
-        expressions: &[],
-        type_filter: None,
-        direct_io: false,
-        force: true,
-        parallelism: pbfhogg::Parallelism::from_jobs(1),
-    }
-}
 
 /// `tags-count -e <expr>` must skip blobs on the tag index without changing a
 /// single count.
@@ -59,50 +44,35 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
         .arg("--strip-tagdata")
         .assert_success();
 
-    let exprs = vec!["amenity=cafe".to_string()];
-    let mut opts = default_opts();
-    opts.expressions = &exprs;
-
-    let with_index = tags_count(&indexed, &opts, &crate::common::test_host())
-        .expect("tags_count indexed")
-        .rows;
-    let without_index = tags_count(&no_tagdata, &opts, &crate::common::test_host())
-        .expect("tags_count reference")
-        .rows;
-
-    let norm = |mut v: Vec<TagCount>| {
-        v.sort_by_key(|t: &TagCount| (t.key.clone(), t.value.clone()));
-        v.into_iter()
-            .map(|t| (t.key, t.value, t.count))
-            .collect::<Vec<_>>()
+    let count = |input: &std::path::Path| {
+        CliInvoker::new(&invocation_scratch)
+            .arg("inspect")
+            .arg("tags")
+            .arg(input)
+            .arg("amenity=cafe")
+            .assert_success()
     };
-    let with_index = norm(with_index);
-    let without_index = norm(without_index);
+    let with_index = count(&indexed);
+    let without_index = count(&no_tagdata);
 
     assert_eq!(
-        with_index, without_index,
+        with_index.stdout_str(),
+        without_index.stdout_str(),
         "skipping blobs on the tag index must not change a single count"
     );
     // And the fixture must actually have matched something, or the equality
-    // above is two empty vectors agreeing.
+    // above is two empty outputs agreeing.
     assert_eq!(
-        with_index,
-        vec![("amenity".to_string(), Some("cafe".to_string()), 20)],
+        with_index.stdout_str(),
+        "20\t\"amenity\"\t\"cafe\"\n",
         "20 of the 60 nodes carry amenity=cafe"
     );
 
     // The parity assertions above are only half the claim, and on their own
     // they are satisfied by the optimization not existing at all: two full
     // decodes agree just as well as a skipping run and a full one. The skip
-    // has to be observed. It is reported on stderr rather than returned, so
-    // this half goes through the CLI.
-    let skipped = CliInvoker::new(&invocation_scratch)
-        .arg("inspect")
-        .arg("tags")
-        .arg(&indexed)
-        .arg("amenity=cafe")
-        .assert_success()
-        .stderr_str();
+    // has to be observed, on stderr.
+    let skipped = with_index.stderr_str();
     assert!(
         skipped.contains("blobs skipped by tag index"),
         "the tag index must actually have skipped blobs, or this test passes \
@@ -117,13 +87,7 @@ fn expression_filtered_counts_are_identical_with_and_without_a_tag_index() {
     // Counterpart: the same run against the file with no tag index cannot
     // skip anything, so the line must be absent. Without this, a command that
     // printed the line unconditionally would pass the assertion above.
-    let unskipped = CliInvoker::new(&invocation_scratch)
-        .arg("inspect")
-        .arg("tags")
-        .arg(&no_tagdata)
-        .arg("amenity=cafe")
-        .assert_success()
-        .stderr_str();
+    let unskipped = without_index.stderr_str();
     assert!(
         !unskipped.contains("blobs skipped by tag index"),
         "a file with no tag index has nothing to skip on: {unskipped}"

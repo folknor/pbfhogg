@@ -579,13 +579,19 @@ fn every_refusal_happens_before_any_input_is_opened() {
 #[test]
 fn a_platform_switch_the_build_lacks_is_refused_before_any_input() {
     let dir = crate::common::test_scratch();
+    // The library's own predicate, not this package's `cfg!(feature)`: the
+    // CLI refuses the switch on the library's build of the backend, and
+    // feature unification can give the library a backend this package's
+    // features do not name.
     for (switch, compiled) in [
         (
             "--direct-io",
+            // library-deliberate: the linked library's compiled backends
             pbfhogg::write::OutputBackend::Direct.is_compiled(),
         ),
         (
             "--io-uring",
+            // library-deliberate: the linked library's compiled backends
             pbfhogg::write::OutputBackend::Uring.is_compiled(),
         ),
     ] {
@@ -1052,6 +1058,7 @@ fn check_takes_max_errors_wherever_a_selected_check_reads_it() {
 #[test]
 fn check_takes_direct_io_wherever_a_selected_check_reads_it() {
     let dir = crate::common::test_scratch();
+    // library-deliberate: the linked library's compiled backends, as above
     let compiled = pbfhogg::write::OutputBackend::Direct.is_compiled();
     let refused: &[&[&str]] = &[
         &["check", "IN", "--refs", "--direct-io"],

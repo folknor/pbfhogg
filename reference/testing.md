@@ -49,14 +49,14 @@ Tests go where they couple least.
   list is still a `brokkr test <name> --sweep all` run (which passes
   `--nocapture`) showing no `Skipping:` line for it. Environmental
   skips (osmium, namespaces, descriptor limits, `deny_write`) never
-  fail. There is no platform module or profile; a platform test with a
-  known bug is `#[ignore]`d and skipped by name in the `full` profile.
-- **Stable-API integration tests** in `crates/lib/tests/<topic>.rs` (e.g.
-  `crates/lib/tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
-  only the stable allowlist below.
+  fail. There is no platform module or profile.
+- **Library integration tests** in `crates/lib/tests/<topic>.rs` (e.g.
+  `crates/lib/tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - test
+  the library through what it exports; see "What a test may import".
 - **CLI integration tests** in `crates/cli/tests/cli_*.rs`, in the
-  `pbfhogg-cli` package - drive the `pbfhogg` binary via `CliInvoker`;
-  internal modules are invisible. Every test that spawns the binary
+  `pbfhogg-cli` package - drive the `pbfhogg` binary via `CliInvoker`, and
+  name the library only through the fixture surface ("What a test may
+  import"). Every test that spawns the binary
   lives there and nowhere else: cargo builds the binary for that
   package's integration tests with the test build's own features,
   profile and target, and hands its path as `CARGO_BIN_EXE_pbfhogg`.
@@ -107,7 +107,7 @@ NAME` list each harness in turn to find one test.
   `pbfhogg_test_hooks` reaches every package of a sweep alike, so a `cfg`
   gate on those means the same thing in all three packages. `commands` does not: in
   `pbfhogg` it is on by default, in `pbfhogg-cli` it is a no-op feature
-  that is off in the `all`, `musl` and `musl-all` sweeps. A
+  that a sweep may leave off while the library has it on. A
   `cfg(feature = "commands")` (or `geocode-reader`) gate in a shared
   helper would therefore silently drop CLI tests out of those sweeps, so
   the `no-library-feature-gates-in-tests-common` textlint rule in
@@ -187,10 +187,11 @@ the command-table tests in `crates/cli/tests/` take their subcommand lists
 from it (`invoker::subcommands`, `invoker::subcommand_paths`), never
 from `--help` text. It is not an API and sets `doctest = false`.
 
-The `all`, `consumer`, `musl` and `musl-all` check sweeps select all three
-packages, so the CLI tests run against a binary with the hook cfg and both
-platform features, one without the platform features (pbfhogg-cli's default
-build), and the same two shapes again for musl. No sweep pre-builds the binary
+The tested sweeps that select the CLI and harness packages (their packages,
+features and targets are in `brokkr.d/checks.toml`, the one inventory) run
+the CLI tests against a binary with the hook cfg and both platform
+features, one without the platform features (pbfhogg-cli's default build),
+and the same two shapes again for musl. No sweep pre-builds the binary
 (`build_packages`): cargo builds it for each test build. The `minimal`
 and `geocode-reader` sweeps stay library-only: the CLI's lib dep would turn
 `commands` back on. The `geocode-reader` sweep runs
@@ -305,7 +306,7 @@ without the other) on both targets.
 
 `brokkr check` enforces a fixed 20 s per-test watchdog with no
 override, on every profile including `--profile full`. Tests slower
-than that can never pass a `check` profile, so `brokkr.toml`'s
+than that can never pass a `check` profile, so `brokkr.d/checks.toml`'s
 `[test.profiles.full]` carries a by-name `skip` list for the
 over-watchdog tests - without it the profile could never pass, by
 construction. Those tests are `#[ignore]`d out of `check`'s reach and
@@ -337,8 +338,8 @@ granting every request `min(wanted, 1024)` without probing the process,
 so what the library is told and where its rayon work runs are the same
 everywhere and independent of sibling tests; a test that needs a
 different machine sets its own `host::Fixed`. CLI children are told the
-same machine through `CliInvoker` (see its entry below), in `test-hooks`
-builds. `Executor::Ambient`
+same machine through `CliInvoker` (see its entry below), in builds with
+the hook cfg. `Executor::Ambient`
 appears in a test only where it is the subject, marked
 `// ambient-deliberate:` on its line. Each test owns its hosts and
 invocations: none is held in a static or leaked (`Host::entered` borrows
@@ -356,7 +357,7 @@ private budget and batch sizes) or a crate-private dispatch function; a
 constant that blocks a named test gets a narrow private parameter at the
 mechanism that owns it (merge-changes' streaming `Batching`, apply-changes'
 `write_run` batch). A cross-crate test instrument is hidden, unsupported
-and test-hooks only: getparents' full-scan threshold, and the fault plan's
+and compiled only under the hook cfg: getparents' full-scan threshold, and the fault plan's
 nonzero scheduling overrides (`diff_unit_target_bytes`,
 `diff_unit_lone_elements`, `diff_text_chunk_bytes`,
 `diff_text_overflow_bytes`, `derive_chunk_bytes`,
@@ -398,8 +399,8 @@ osmium checks).
 
 ### Development contract
 
-- **During refactor:** edit code + inline tests + any fault test
-  whose hook moved. Run `brokkr check`. Green ⇒ refactor
+- **During refactor:** edit code + inline tests + any library
+  integration or fault test that imports what moved. Run `brokkr check`. Green ⇒ refactor
   structurally landing. Tiers 2-5 stay silent during iteration.
 - **Before merge:** require a successful `brokkr check --gate`. Use
   command profiles for focused feedback; they do not certify the merge.
@@ -410,21 +411,36 @@ Tier 1 must be both fast AND structurally complete: every internal
 contract a refactor could break needs a tier-1 test (inline unit OR
 fault hook).
 
-Tiers 2-5 are by construction internal-refactor-immune: every test
-goes through the stable allowlist or the CLI surface, so a rewrite
-of `crates/lib/src/commands/<X>/` cannot break them by type changes alone.
-That is the load-bearing property of the test reorg.
+### What a test may import
 
-### Stable allowlist
+The boundary follows what a test is for, not one list for every test.
 
-Imports from this set do not couple a test to an internal module
-shape:
-
-- `pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata}`
-- `pbfhogg::writer::{PbfWriter, Compression}`
-- `pbfhogg::{Blob, BlobDecode, BlobError, BlobReader, BlobType, Element, ElementReader, ErrorKind, HeaderBlock, HeaderOverrides, MemberId, MemberType, Way}` (including `Blob::way_members`, `Blob::way_member_count`, `BlobReader::set_parse_waymembers`, `Way::shared_node_pins`, and `HeaderBlock`'s injected-prepass feature accessors)
-
-Everything else is non-stable and requires CLI conversion.
+- **Library integration tests** (`crates/lib/tests/`, the harness tests)
+  test the library, so they import what it exports: the supported API,
+  and also the doc-hidden command entry points (`pbfhogg::altw`,
+  `pbfhogg::cat`, ...), `pbfhogg::host`, `pbfhogg::process` and, under the
+  hook cfg, `pbfhogg::test_hooks`. The doc-hidden items and the hooks are
+  test seams, not supported consumer API: a test reaching them does not
+  make them a promise to library users. A test couples to whatever it
+  imports and changes with it in a refactor; nothing makes these tests
+  immune to internal rewrites.
+- **CLI tests** (`crates/cli/tests/`) test the binary. They name the
+  library only to build inputs (the block builder and writer), to read
+  outputs (the blob and element readers and their view types, the geocode
+  reader) and to spell the binary's test-hook protocol, so a rewrite of a
+  command's library code cannot break them by type changes alone. Any other
+  library path carries a `// library-deliberate: <reason>` comment on its
+  line, alone on the line above, or on the first line of its `use`
+  statement. The pre-clippy `test-imports` script check
+  (`scripts/check_test_imports.py`, self-tested by `test-imports-fixtures`)
+  holds the surface's one inventory (the allowlist the CLI test files'
+  module docs name) and refuses an unmarked path outside
+  it, parsing every `use` tree. It is a direct-spelling guard: it does not
+  see `crates/lib/tests/common/` (mounted by path), re-exports through
+  `crate::` or macro expansion. A library call must never stand in for the
+  binary under test, and reading output through a library reader does not
+  make that reader an independent oracle; "The output oracle decodes
+  independently" is the rule for that.
 
 ### Per-command CLI test split
 
@@ -446,8 +462,9 @@ files.
 
 ### Tests that do not run everywhere
 
-- The O_DIRECT and io_uring tests exist only in the `all` and `musl-all`
-  sweeps (the builds with `linux-direct-io` and `linux-io-uring`) and skip and
+- The O_DIRECT and io_uring tests exist only in the builds with
+  `linux-direct-io` and `linux-io-uring` (which sweeps those are is in
+  `brokkr.d/checks.toml`) and skip and
   pass on a typed platform refusal, except where the complete gate
   requires the backend (see "Platform-dependent tests"): O_DIRECT where the scratch
   filesystem rejects it, io_uring when setup fails for an
@@ -521,8 +538,8 @@ exception, not a tier - should not survive across many PRs.
   unification, a registry `cargo install` included, can put hooks in an
   executable; only an explicit `--cfg pbfhogg_test_hooks` in rustflags
   can, in debug or release alike. The workspace declares the cfg in its
-  check-cfg list, so a misspelled predicate is a diagnostic. The `all`,
-  `all-serial` and `musl-all` check sweeps pass it as `rustflags`. The
+  check-cfg list, so a misspelled predicate is a diagnostic. The hook
+  sweeps in `brokkr.d/checks.toml` pass it as `rustflags`. The
   rustdoc phase does not receive it (brokkr carries no sweep `--cfg`
   into rustdoc's flags), so doc comments on hook-only items are not
   linted. `scripts/check_test_modules.py` reads the sweeps' rustflags
@@ -551,7 +568,7 @@ exception, not a tier - should not survive across many PRs.
   Publication hooks below). Per-object hooks stay with their owner and
   are listed in the module docs: the geocode reader's counter, and the
   cancellation hooks below.
-- **Cancellation hooks.** `Invocation::on_check` (per-instance, `test-hooks`)
+- **Cancellation hooks.** `Invocation::on_check` (per-instance, hook cfg)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Invocation::checks_passed` counts them. Library tests trip the token from
   the callback (`crates/lib/tests/cancel.rs`). The CLI, built with the hook cfg, reads
@@ -584,11 +601,11 @@ exception, not a tier - should not survive across many PRs.
   (at most `N`). It needs two inputs and two readers; a handshake that
   does not happen within the hook bound fails the run, so a subprocess
   cannot pass unarmed. `--simplify` is not affected. The CLI, built with
-  `test-hooks`, arms it from `PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST=<n>`
+  the hook cfg, arms it from `PBFHOGG_TEST_MERGE_CHANGES_SPILL_FIRST=<n>`
   (a value that does not parse exits 101); the two-input merge-changes
   row of the interruption sweeps runs under `1`, and `crates/lib/tests/cancel.rs`
   arms it for its merge-changes entry.
-- **Capability accounting.** `Invocation::capabilities` (`test-hooks`,
+- **Capability accounting.** `Invocation::capabilities` (hook cfg,
   doc-hidden) reads the invocation's transition word (live call guards and
   permits, and whether a count saturated) and its census (issued block
   iterators, writers, bound outputs and blocks). `crates/lib/tests/cancel.rs`
@@ -603,7 +620,7 @@ exception, not a tier - should not survive across many PRs.
   field helpers with forced boundary values, beside the seal's
   classification and a threaded race of the seal's exchange against
   retirements and nested mints.
-- **Sealing.** `crates/lib/tests/seal.rs` (`test-hooks`, Unix) seals invocations that
+- **Sealing.** `crates/lib/tests/seal.rs` (hook cfg, Unix) seals invocations that
   own a call sink on a real FIFO drained by `FifoCapture`, and reads the stream
   back. `FaultPlan::on_seal_step` parks or unwinds the finalizing thread at
   a `SealStep` (`Snapshot`, before the commit point; `Stream`, after the
@@ -669,7 +686,7 @@ exception, not a tier - should not survive across many PRs.
   brokkr variables enter only through explicit setters. One setter is
   applied by default: `resources(cores, memory)`, at 4 cores and 8 GiB like
   the library's test hosts, sets `PBFHOGG_TEST_RESOURCES=<cores>:<bytes or
-  none>`, which a `test-hooks` child resolves to a `host::Fixed` in place of
+  none>`, which a child built with the hook cfg resolves to a `host::Fixed` in place of
   `MachineProbe`, and `RAYON_NUM_THREADS=<cores>`, which bounds the CLI's
   ambient executor in any build. These are fixed sizing and routing inputs,
   not a thread cap (`-j` and concurrent stage threads can exceed them). A
@@ -812,8 +829,7 @@ exception, not a tier - should not survive across many PRs.
   `-j 2` parity test, and a scratch-leak test. Worth considering as
   a CI gate.
 
-`pbfhogg::host` and `pbfhogg::process` are stable test imports. Library tests
-get fixed descriptor grants from their test hosts; the CLI raises its
+Library tests get fixed descriptor grants from their test hosts; the CLI raises its
 descriptor limit in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
 It checks descriptor counting by a controlled delta (eight files opened

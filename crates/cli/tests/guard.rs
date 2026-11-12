@@ -328,7 +328,7 @@ mod filter {
         let lease: RawFd = writer.as_raw_fd();
         assert!(lease > 2, "the lease must not be a stdio descriptor");
         let lease_k = u32::try_from(lease).expect("descriptor numbers are non-negative");
-        let filter = program(lease_k, allows_io_uring(cmd));
+        let filter = program(lease_k, allows_io_uring(cmd.get_args()));
         cmd.env(LEASE_FD_ENV, lease.to_string());
         // SAFETY: the closure runs between fork and exec, calls only
         // async-signal-safe syscalls (`fcntl`, `prctl`, `seccomp`) and allocates
@@ -364,8 +364,8 @@ mod filter {
 }
 
 /// Only an explicit switch before the positional separator permits ring setup.
-fn allows_io_uring(cmd: &Command) -> bool {
-    cmd.get_args()
+fn allows_io_uring<'a>(args: impl IntoIterator<Item = &'a std::ffi::OsStr>) -> bool {
+    args.into_iter()
         .take_while(|arg| *arg != "--")
         .any(|arg| arg == "--io-uring")
 }
@@ -393,8 +393,6 @@ mod tests {
     //! The control: re-run this test binary's own [`probe`] under the guard,
     //! once per case, and check that every rule fires and nothing else does.
 
-    use std::process::Command;
-
     #[test]
     fn ring_exception_requires_an_explicit_switch() {
         for (args, allowed) in [
@@ -403,9 +401,8 @@ mod tests {
             (vec!["cat", "--", "--io-uring"], false),
             (vec!["cat", "--io-uring=false"], false),
         ] {
-            let mut cmd = Command::new("pbfhogg");
-            cmd.args(&args);
-            assert_eq!(super::allows_io_uring(&cmd), allowed, "{args:?}");
+            let os = args.iter().map(std::ffi::OsStr::new);
+            assert_eq!(super::allows_io_uring(os), allowed, "{args:?}");
         }
     }
 

@@ -4,7 +4,7 @@
 //! They live in this package, not the library's, because cargo builds the
 //! binary for this package's integration tests with the test build's own
 //! features, profile and target, and hands its path as
-//! `CARGO_BIN_EXE_pbfhogg` (see `invoker::pbfhogg_bin`). A test in the root
+//! `CARGO_BIN_EXE_pbfhogg` (named only in `invoker::CliInvoker::new`). A test in the root
 //! package could only guess where some earlier build left a binary.
 //!
 //! One binary for the same reasons as the library's `crates/lib/tests/all.rs`, which

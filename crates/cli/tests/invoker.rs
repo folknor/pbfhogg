@@ -4,8 +4,9 @@
 //! directly) go through this helper. It wraps [`std::process::Command`]
 //! with a fluent builder plus assertion helpers.
 //!
-//! Locating the binary: [`pbfhogg_bin`], cargo's own
-//! `CARGO_BIN_EXE_pbfhogg`. Cargo builds the binary for this package's
+//! Locating the binary: cargo's own `CARGO_BIN_EXE_pbfhogg`, named only in
+//! [`CliInvoker::new`] (the source-policy rule `host_independence` refuses
+//! it, and any other `Command::new`, anywhere else). Cargo builds the binary for this package's
 //! integration tests with the test build's own features, profile and
 //! target, and hands its path at compile time, so there is nothing to
 //! guess and no binary from another build to pick up. That is why every
@@ -120,7 +121,9 @@ impl<'a> CliInvoker<'a> {
     /// Start a new invocation, timed out at [`pbfhogg::TEST_CHILD_TIMEOUT`]
     /// or the test's children budget, whichever comes first.
     pub fn new(scratch: &'a TestScratch) -> Self {
-        let mut cmd = Command::new(pbfhogg_bin());
+        // The one place a test names the pbfhogg binary: the source-policy
+        // rule host_independence holds this constructor to this spelling.
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pbfhogg"));
         crate::common::process::isolate(&mut cmd, scratch);
         Self {
             scratch,
@@ -818,11 +821,6 @@ fn assert_not_guard_killed(status: ExitStatus) {
     );
     #[cfg(not(target_os = "linux"))]
     let _ = status;
-}
-
-/// The `pbfhogg` binary cargo built for this test build.
-pub fn pbfhogg_bin() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_pbfhogg"))
 }
 
 /// The top-level subcommands production parses, in declaration order, as

@@ -944,8 +944,8 @@ exception, not a tier - should not survive across many PRs.
   process itself is untouched; a host that refuses the namespace ends
   the child with `NAMESPACE_DENIED` plus the step (skip), any other setup
   failure with `NAMESPACE_BROKEN` plus the step (fail).
-  Binary located by cargo: `env!("CARGO_BIN_EXE_pbfhogg")`
-  (`invoker::pbfhogg_bin`), nothing read at run time.
+  Binary located by cargo: `env!("CARGO_BIN_EXE_pbfhogg")`, spelled only
+  as the program of `CliInvoker::new`'s `Command`, nothing read at run time.
 - **Skips.** A test that cannot run on this host (no O_DIRECT, no
   io_uring, no osmium in PATH, no unprivileged user namespaces) calls
   `common::skip(reason)` (`test_support::skip` in a unit test under
@@ -1024,17 +1024,27 @@ exception, not a tier - should not survive across many PRs.
   a background-stage writer would overlap it.
   Scratch constructor spellings are sealed outside the leaf by
   `test-scratch-via-test-scratch-crate` in `brokkr.d/lints.toml`.
-  Companion rules seal child construction to the owned runners and
-  self-reinvocations that `test-children-only-through-owned-runners` lists,
-  manifest-directory discovery to the leaf and named source-contract checks,
-  checked-in PBF names out of executable code, fixed `data/` literals, and
-  static fixture-name counter spellings (including `RUN`).
-  Each rule explicitly covers library, CLI and harness `src/` and `tests/`
-  plus `crates/lib/examples/`, with `must_scan` sentinels; the shared
-  `common/process.rs` child owner is scanned and has no spawn exemption.
+  Companion rules seal manifest-directory discovery to the leaf and named
+  source-contract checks, checked-in PBF names out of executable code, fixed
+  `data/` literals, and static fixture-name counter spellings (including
+  `RUN`). Each rule explicitly covers library, CLI and harness `src/` and
+  `tests/` plus `crates/lib/examples/`, with `must_scan` sentinels.
   No test starts a shell, an interpreter, cargo, rustc, brokkr or any other
   general tool: a check that needs one is a `[[script_check]]` or textlint
-  in `brokkr.d/lints.toml`. A child-owner test that needs a blocking child
+  in `brokkr.d/lints.toml`. The source-policy rule `host_independence`
+  (`crates/source-policy/src/rules/host_independence.rs`) holds every
+  member's `src/` and `tests/` to that: each `std::process::Command::new` must
+  be one entry of its closed inventory (file, enclosing item path, exact
+  program tokens, count) - the pbfhogg binary only in `CliInvoker::new`,
+  the harness executable, the osmium oracle and the self re-executions - so
+  no literal program name (`sh`, `python3`, `cat`) and no second pbfhogg
+  constructor that skips the promise guard can appear; `CARGO_BIN_EXE_`
+  names only those owners; libc process creation (`fork`, `exec*`,
+  `posix_spawn*`, `popen`, `system`, `clone`, their `SYS_` numbers) only in
+  the guard's filter and violation probes; and no string literal carries a
+  `#!/` script header. With no way to start one, a copied host binary
+  needs no rule of its own. The shared `common/process.rs` child owner
+  takes a built `Command` and constructs none. A child-owner test that needs a blocking child
   re-executes its own test binary into a probe test, as `guard::tests` and
   `invoker::tests::gated_child_probe` do.
   Doc-comment fixture paths remain legal, as does the fixture generator.

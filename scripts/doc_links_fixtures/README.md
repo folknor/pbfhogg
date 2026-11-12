@@ -4,6 +4,9 @@
 the installed source, not captured HTML and not output from the checker.
 No renderer, test or build was executed to obtain these expectations.
 The Python self-test consumes this committed corpus without Node installed.
+The rendered site is checked separately, against the real build, by
+`scripts/check_doc_site.py`; that covers the constructs the site's pages
+use, and this corpus remains the only check of the cases they do not.
 
 ## VitePress provenance
 
@@ -52,9 +55,11 @@ objects; it does not parse TypeScript with this checker's token recognizer.
 Its `dist/client/theme-default/support/sidebar.js` implements `getSidebar`,
 `getFlatSideBarLinks` and `addBase`. Its SHA-256 is
 `f8be1d829583fc7c165539b1ccb4a88c9f414c97634e79e61fc724d0caae8129`.
-The checker's coverage means a page is named somewhere, not that each route
-selects a sidebar containing it. Computed configs, spread properties, inherited
-sidebar bases and per-route selection are not renderer-verified here.
+The checker reproduces `getSidebar`'s route selection (keys ordered by
+path-segment count, config order among equals, first prefix match), so a page
+must appear in the sidebar its own route selects. Computed configs, spread
+properties and inherited sidebar bases are refused or not modelled; the
+built-site check verifies the rendered sidebars directly.
 
 Inline entities, escapes, reference links, nested inline syntax, emoji,
 multiline inline token boundaries, HTML blocks, container headings and

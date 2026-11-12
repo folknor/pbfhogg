@@ -268,16 +268,17 @@ mechanism, not the tiering model.
 |---|---|---|---|
 | 1. Fast contracts | seconds | Every edit | `brokkr check` (default) |
 | 2. Command slice | tens of seconds | While working on that command | `brokkr check --profile <cmd>` |
-| 3. Full in-project | minutes | Before merge | `brokkr check --gate` |
+| 3. Full in-project | minutes | Once, at the end of a campaign | `brokkr check --gate` |
 | 4. Scale/perf | hours | Performance work, release evidence | `brokkr bench`, `brokkr suite` |
 | 5. External cross-validation | depends | Release gate | `brokkr verify` |
 
 Tiers 1-3 use `brokkr check`. Tiers 4-5 are separate brokkr commands.
-The merge prerequisite is `brokkr check --gate`: it runs the unfiltered
-feature and target sweeps, doctests, execution accounting and gate-only
-member checks. The `full` profile is partial: it selects only `all` and
-has substring skips. Focused profiles, including `full`, do not replace
-the gate, even when they report success.
+`brokkr check --gate` runs the unfiltered feature and target sweeps,
+doctests, execution accounting and gate-only member checks. It runs once,
+at the end of a campaign of changes, not per commit: each commit lands on
+a green `brokkr check`. The `full` profile is partial: it selects only
+`all` and has substring skips. Focused profiles, including `full`, do not
+replace the gate, even when they report success.
 
 The root `brokkr.toml` enables the rustdoc phase with `[rustdoc]`.
 It resolves intra-doc links per distinct build shape after clippy, before
@@ -472,8 +473,10 @@ osmium checks).
 - **During refactor:** edit code + inline tests + any library
   integration or fault test that imports what moved. Run `brokkr check`. Green ⇒ refactor
   structurally landing. Tiers 2-5 stay silent during iteration.
-- **Before merge:** require a successful `brokkr check --gate`. Use
-  command profiles for focused feedback; they do not certify the merge.
+- **Before each commit:** require a successful `brokkr check` after the
+  last edit. Use command profiles for focused feedback.
+- **End of a campaign:** run `brokkr check --gate` once over the landed
+  commits; command profiles do not replace it.
 - **Before release:** run tier 4 for performance regression and
   tier 5 for external parity.
 
@@ -1023,6 +1026,19 @@ GitHub's published section-link rules, never produced by the checker;
 `scripts/doc_links_fixtures/README.md` records that provenance, the
 sidebar-coverage boundary and the syntax outside the corpus. On a VitePress
 upgrade the corpus is re-derived from the new source, not from checker output.
+
+The renderer itself is the oracle in the complete gate. `doc-site`
+(`scripts/check_doc_site.py`, gate only) builds the site with the pinned
+VitePress and reads the generated HTML: every internal href, sidebar and
+pager links included, names a built page and an id on it; every site page's
+rendered sidebar links to the page, which is VitePress's per-route sidebar
+selection rather than mention anywhere in the config; and the heading IDs
+`doc-links` computes for each built page equal the built IDs, in order. The
+gate therefore needs node and pnpm with the lockfile installed
+(`pnpm install --frozen-lockfile`) and fails without them. It verifies the
+site's actual pages, not general Markdown: syntax the site does not use is
+still covered only by the corpus, and the GitHub surface still rests on
+GitHub's documented rules, since GitHub's renderer cannot be run locally.
 
 Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`.
 `PbfWriter` and the file reader and writer constructors return

@@ -24,6 +24,22 @@ expect = "document checker fixtures ok"
 match = "last-line"
 stage = "pre-clippy"
 
+# The real renderer as the document checker's oracle: builds the site with
+# the pinned VitePress into the gitignored docs/.vitepress/dist and checks
+# the built links, anchors and per-route sidebars, and that doc-links'
+# heading model matches the built IDs. Needs node and pnpm with the lockfile
+# installed (pnpm install --frozen-lockfile); without them it fails, never
+# skips. Gate only: the build is the one non-text step, and doc-links covers
+# the same rules in the edit loop. Background: it writes only ignored build
+# output and reads no build input.
+[[script_check]]
+name = "doc-site"
+command = "python3 -B scripts/check_doc_site.py"
+expect = "document site ok"
+match = "last-line"
+stage = "background"
+when = "gate"
+
 # glibc-only allocator calls live in crates/lib/src/debug.rs and
 # crates/lib/src/process.rs, behind
 # `cfg(all(target_os = "linux", target_env = "gnu"))` with a no-op fallback.

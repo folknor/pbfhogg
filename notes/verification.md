@@ -100,13 +100,6 @@ or nested include in an included file), and the authoritative composed check is
 composed-configuration parse is ever wanted, which needs a brokkr configuration export
 brokkr does not offer.
 
-## VER-104 - The document checker is not verified against renderer output
-
-`scripts/check_doc_links.py` is tested against 18 fixtures in `scripts/doc_links_fixtures/`,
-twelve derived from the installed VitePress source and six GitHub contract cases. Full
-renderer parity and sidebar route and base behaviour remain unverified.
-
-
 ## VER-107 - The musl sweeps assume an x86_64 host
 
 Reported by check-machinery.

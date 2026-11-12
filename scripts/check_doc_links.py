@@ -62,8 +62,10 @@ other ignored trees never matter:
      so check 1 refuses a citation of it.)
 
   4. sidebar-coverage: every markdown page under ``docs/``, except the home
-     page and ``docs/public/``, is named by a sidebar link in the VitePress
-     config. Navigation links and sidebar section keys do not count.
+     page and ``docs/public/``, is named by a link in the sidebar its own
+     route selects in the VitePress config. Navigation links and sidebar
+     section keys do not count. scripts/check_doc_site.py checks the same
+     rule, and the heading IDs computed here, against the built site.
 
 Root-level files and ``notes/`` are not scanned at all: the first are exempt,
 the second carries no truth guarantee, so a dead link there is its own business.
@@ -146,9 +148,30 @@ def markdown_lines(text):
     trailing whitespace. Backtick info strings cannot contain backticks.
     Indented code and container blocks still need a full Markdown parser;
     this scanner deliberately does not claim renderer equivalence.
+
+    A leading front matter block is metadata, never headings: VitePress
+    strips it and GitHub shows it as a table. Its lines are blank here, so
+    its closing ``---`` is never read as a Setext underline. The rule is
+    VitePress's bundled gray-matter: the file starts with ``---`` not
+    followed by another ``-`` (a language name may follow), the block ends at
+    the first later line that starts with ``---``, whose remainder after
+    those three characters is ordinary text, and an unclosed block runs to
+    the end of the file. GitHub's handling of the unusual spellings
+    (language suffix, ``----`` closer, unclosed block) is not established;
+    the ordinary ``---`` pair is the same on both.
     """
+    lines = text.splitlines()
+    if lines and lines[0].startswith("---") and not lines[0].startswith("----"):
+        close = next(
+            (i for i in range(1, len(lines)) if lines[i].startswith("---")), None
+        )
+        if close is None:
+            yield from [""] * len(lines)
+            return
+        yield from [""] * close
+        lines = [lines[close][3:], *lines[close + 1 :]]
     fence = None
-    for line in text.splitlines():
+    for line in lines:
         match = FENCE_RE.match(line)
         if fence is not None:
             if match:
@@ -351,7 +374,9 @@ def link_targets(text):
             continue
         path, _, fragment = target.partition("#")
         path = urllib.parse.unquote(path.split("?", 1)[0])
-        fragment = urllib.parse.unquote(fragment)
+        # A text directive (`#id:~:text=...`) targets the id before it, or
+        # no element at all.
+        fragment = urllib.parse.unquote(fragment).split(":~:", 1)[0]
         if path or fragment:
             out.append((offset, path, fragment))
     return out, text
@@ -424,16 +449,24 @@ def anchors(rel, renderer):
     key = (rel, renderer)
     if key in ANCHOR_CACHE:
         return ANCHOR_CACHE[key]
-    slug = github_slug if renderer == "github" else vitepress_slug
-    found, seen = set(), set()
-    source = (ROOT / rel).read_text(encoding="utf-8")
-    for line in markdown_lines(source):
+    found = set(heading_ids(rel, renderer))
+    for line in markdown_lines((ROOT / rel).read_text(encoding="utf-8")):
         found.update(HTML_ANCHOR_RE.findall(line))
-    for text in markdown_headings(source):
+    ANCHOR_CACHE[key] = found
+    return found
+
+
+def heading_ids(rel, renderer):
+    """The heading IDs of markdown file `rel` under `renderer`, in document
+    order. scripts/check_doc_site.py compares this list with the IDs the
+    built site carries."""
+    slug = github_slug if renderer == "github" else vitepress_slug
+    ids, seen = [], set()
+    for text in markdown_headings((ROOT / rel).read_text(encoding="utf-8")):
         explicit = EXPLICIT_ID_RE.search(text)
         if explicit and renderer == "vitepress":
             name = explicit.group(1)
-            found.add(name)
+            ids.append(name)
             seen.add(name)
             continue
         base = slug(strip_inline(text, renderer))
@@ -444,9 +477,8 @@ def anchors(rel, renderer):
             count += 1
             name = f"{base}-{count}"
         seen.add(name)
-        found.add(name)
-    ANCHOR_CACHE[key] = found
-    return found
+        ids.append(name)
+    return ids
 
 
 def span_paths(text):
@@ -519,10 +551,15 @@ def site_link_problem(rel, target, fragment):
     else:
         resolved = rel
     if fragment:
+        # VitePress slugs an authored fragment when it renders the link (its
+        # link plugin's normalizeHash), so the site's href carries
+        # vitepress_slug(fragment); `#under_score` aimed at a manual
+        # `<a id="under_score">` lands on `#under-score` there.
+        rendered = {"vitepress": vitepress_slug(fragment), "github": fragment}
         missing = [
             renderer
             for renderer in ("vitepress", "github")
-            if fragment not in anchors(resolved, renderer)
+            if rendered[renderer] not in anchors(resolved, renderer)
         ]
         if missing:
             return f"no such anchor under the {' and '.join(missing)} slug rule"
@@ -558,7 +595,10 @@ def dangling_paths(rel, text, markdown):
                     out.append((offset, f"link {shown}", resolved))
                 continue
             if fragment and resolved.endswith(".md") and resolved in FILE_SET:
-                if fragment not in anchors(resolved, renderer):
+                # The rendered href's fragment: VitePress slugs it (see
+                # site_link_problem).
+                landed = vitepress_slug(fragment) if renderer == "vitepress" else fragment
+                if landed not in anchors(resolved, renderer):
                     # No path: an ignore rule never excuses a missing anchor.
                     out.append((offset, f"link {shown}: no such anchor", None))
     for offset, path in [*span_paths(text), *bare_paths(text)]:
@@ -595,8 +635,8 @@ def sidebar_coverage():
     Tokenize strings before punctuation so braces inside labels or comments
     cannot end the sidebar early. This deliberately requires an inline object
     or array; a computed sidebar needs parser support rather than a false pass.
-    This checks names anywhere in the literal sidebar, not VitePress's route
-    selection or inherited bases; see scripts/doc_links_fixtures/README.md.
+    A page must be named in the sidebar its route selects; inherited bases
+    are not modelled; see scripts/doc_links_fixtures/README.md.
     """
     config = "docs/.vitepress/config.ts"
     text = (ROOT / config).read_text(encoding="utf-8")
@@ -613,8 +653,12 @@ def sidebar_coverage():
     if len(starts) != 1 or tokens[starts[0]] not in ("{", "["):
         return [f"{config}: expected one literal sidebar object or array"]
     start = starts[0]
+    # An array is one sidebar for every route; an object maps route keys to
+    # sidebars, and links are filed under the key whose value holds them.
+    multi = tokens[start] == "{"
     depth = 0
-    links = []
+    key = None
+    links = {}
     for i in range(start, len(tokens)):
         token = tokens[i]
         if token in ("{", "["):
@@ -623,31 +667,64 @@ def sidebar_coverage():
             depth -= 1
             if depth == 0:
                 break
-        if token in ("link", "'link'", '"link"') and tokens[i + 1:i + 2] == [":"]:
+        elif multi and depth == 1 and tokens[i + 1:i + 2] == [":"]:
+            try:
+                key = ast.literal_eval(token) if token[0] in "'\"" else token
+            except (ValueError, SyntaxError):
+                return [f"{config}: invalid sidebar key {token}"]
+            links.setdefault(key, [])
+        # A route key spelled `link` is the elif above, never an item link.
+        elif token in ("link", "'link'", '"link"') and tokens[i + 1:i + 2] == [":"]:
             value = tokens[i + 2] if i + 2 < len(tokens) else ""
             if not value.startswith(("'", '"')):
                 return [f"{config}: sidebar links must be string literals"]
             try:
-                links.append(ast.literal_eval(value))
+                links.setdefault(key, []).append(ast.literal_eval(value))
             except (ValueError, SyntaxError):
                 return [f"{config}: invalid sidebar link literal {value}"]
     else:
         return [f"{config}: unterminated sidebar"]
 
-    pages = set()
-    for link in links:
-        if SCHEME_RE.match(link) or link.startswith("//"):
+    pages = {}
+    for sidebar_key, named in links.items():
+        pages[sidebar_key] = set()
+        for link in named:
+            if SCHEME_RE.match(link) or link.startswith("//"):
+                continue
+            path = urllib.parse.unquote(link.split("#", 1)[0].split("?", 1)[0])
+            resolved, ok = resolve_link("docs/index.md", path)
+            if ok:
+                pages[sidebar_key].add(resolved)
+
+    def selected(rel):
+        """The sidebar key the theme's getSidebar picks for page `rel`: keys
+        sorted by slash-separated segment count, most first (a stable sort,
+        so equal counts keep config order), then the first that prefixes the
+        page's `/`-led relative path. Not longest string prefix."""
+        if not multi:
+            return None
+        route = "/" + rel[len("docs/"):]
+        ordered = sorted(pages, key=lambda k: -len(k.split("/")))
+        return next(
+            (k for k in ordered if route.startswith(k if k.startswith("/") else "/" + k)),
+            "",
+        )
+
+    rows = []
+    for rel in FILES:
+        if not (in_site(rel) and rel.endswith(".md") and rel != "docs/index.md"):
             continue
-        path = urllib.parse.unquote(link.split("#", 1)[0].split("?", 1)[0])
-        resolved, ok = resolve_link("docs/index.md", path)
-        if ok:
-            pages.add(resolved)
-    return [
-        f"{rel}: no sidebar entry names this page in {config}"
-        for rel in FILES
-        if in_site(rel) and rel.endswith(".md")
-        and rel != "docs/index.md" and rel not in pages
-    ]
+        sidebar_key = selected(rel)
+        if rel in pages.get(sidebar_key, ()):
+            continue
+        if any(rel in named for named in pages.values()):
+            rows.append(
+                f"{rel}: named only in a sidebar its own route does not select"
+                f" (it selects {sidebar_key!r}) in {config}"
+            )
+        else:
+            rows.append(f"{rel}: no sidebar entry names this page in {config}")
+    return rows
 
 
 # ------------------------------------------------------------------- main

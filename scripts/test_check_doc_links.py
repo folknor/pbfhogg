@@ -119,7 +119,7 @@ class Compatibility(unittest.TestCase):
 
     def test_literal_sidebar_contract(self):
         sidebars = (
-            """{ '/section/': [{ text: 'Label }', items: [
+            """{ '/': [{ text: 'Label }', items: [
                 { 'link': '/one#part' }, /* link: '/missing' */
                 { "link": '/two.html?query=yes' }
             ] }] }""",
@@ -138,6 +138,61 @@ class Compatibility(unittest.TestCase):
                 self.assertEqual(checker.sidebar_coverage(), [
                     f'{page}: no sidebar entry names this page in docs/.vitepress/config.ts'
                     for page in ('docs/nav.md', 'docs/section/index.md')])
+
+    def test_sidebar_route_selection(self):
+        # The theme's getSidebar: most path segments first, config order
+        # among equals, first key prefixing the page's path. '/a/' and '/a/b'
+        # have equal segment counts, so a page under /a/b/ selects '/a/'.
+        config = """export default { sidebar: {
+            '/a/': [{ link: '/a/one' }, { link: '/a/b/two' }],
+            '/a/b': [{ link: '/a/b/three' }],
+            '/a/b/c/': [{ link: '/a/b/four' }] } }"""
+        files = ['docs/index.md', 'docs/a/one.md', 'docs/a/b/two.md',
+                 'docs/a/b/three.md', 'docs/a/b/four.md']
+        with patch.object(checker.pathlib.Path, 'read_text', return_value=config), \
+                patch.object(checker, 'FILES', files), \
+                patch.object(checker, 'FILE_SET', frozenset(files)):
+            self.assertEqual(checker.sidebar_coverage(), [
+                f"{page}: named only in a sidebar its own route does not select"
+                f" (it selects '/a/') in docs/.vitepress/config.ts"
+                for page in ('docs/a/b/three.md', 'docs/a/b/four.md')])
+
+    def test_sidebar_route_key_named_link(self):
+        config = "export default { sidebar: { link: [{ link: '/link/page' }] } }"
+        files = ['docs/index.md', 'docs/link/page.md']
+        with patch.object(checker.pathlib.Path, 'read_text', return_value=config), \
+                patch.object(checker, 'FILES', files), \
+                patch.object(checker, 'FILE_SET', frozenset(files)):
+            self.assertEqual(checker.sidebar_coverage(), [])
+
+    def test_front_matter_is_not_a_heading(self):
+        text = '---\ntitle: x\n---\n# Body\n\npara\n---\n'
+        self.assertEqual(list(checker.markdown_headings(text)), ['Body', 'para'])
+        self.assertEqual(list(checker.markdown_lines(text))[:3], ['', '', ''])
+        # gray-matter: an unclosed block runs to the end of the file.
+        self.assertEqual(list(checker.markdown_headings('---\nt: x\n# Hidden\n')),
+                         [])
+        self.assertEqual(list(checker.markdown_headings('---yaml\nt: x\n----\n# B')),
+                         ['B'])
+        self.assertEqual(list(checker.markdown_headings('----\n# Shown')), ['Shown'])
+
+    def test_rendered_underscore_fragment_reaches_heading(self):
+        with patch.object(checker.pathlib.Path, 'read_text',
+                          return_value='# under_score\n\n[j](#under_score)\n'), \
+                patch.dict(checker.ANCHOR_CACHE, clear=True):
+            self.assertEqual(checker.dangling_paths(
+                'docs/page.md', '[j](#under_score)', markdown=True), [])
+            self.assertEqual(checker.dangling_paths(
+                'docs/page.md', '[j](#under_score:~:text=x)', markdown=True), [])
+
+    def test_site_fragment_is_rendered_slugged(self):
+        page = 'docs/page.md'
+        with patch.object(checker.pathlib.Path, 'read_text',
+                          return_value='<a id="under_score"></a>\n\n# Title\n'), \
+                patch.dict(checker.ANCHOR_CACHE, clear=True):
+            self.assertIn('vitepress slug rule',
+                          checker.site_link_problem(page, '', 'under_score'))
+            self.assertIsNone(checker.site_link_problem(page, '', 'title'))
 
 
 if __name__ == '__main__':

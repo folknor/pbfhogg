@@ -32,6 +32,9 @@
 //!   claims only values padding never holds (a non-zero timestamp, a positive
 //!   changeset or uid, a non-empty user, `visible` false). An element that
 //!   claims nothing has `meta: None`.
+//! - Beside the claims, never compared by equivalence: every element in wire
+//!   order ([`DecodedPbf::sequence`]) with its metadata fields as stored
+//!   ([`RawMeta`]), for tests of the order or the encoding a writer chose.
 //!
 //! What it does not hold: the file header's content (only that a header
 //! precedes the data), BlobHeader extensions (indexdata, tagdata,
@@ -180,6 +183,39 @@ fn first_tag<'t>(tags: &'t [(String, String)], key: &str) -> Option<&'t str> {
     tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
+/// An element's metadata fields as stored, before any claim rule: each
+/// `Some` when the plain `Info` carries the field or the dense group carries
+/// the column, with the value decoded (a -1 kept, a dense absent `visible`
+/// column `None` rather than true). For asserting what a writer put on the
+/// wire, which the claims deliberately cannot tell apart (a dense -1 version
+/// and a 0 are both no version). Equivalence never compares it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawMeta {
+    pub version: Option<i32>,
+    pub milli_timestamp: Option<i64>,
+    pub changeset: Option<i64>,
+    pub uid: Option<i32>,
+    pub user: Option<String>,
+    pub visible: Option<bool>,
+}
+
+/// One element of [`DecodedPbf::sequence`]: where it is stored, and its raw
+/// metadata (`None` when it carries no `Info`, or its dense group no
+/// `DenseInfo`).
+#[derive(Debug, Clone)]
+pub struct Decoded {
+    pub element: ElementAt,
+    pub raw: Option<RawMeta>,
+}
+
+/// An index into one of [`DecodedPbf`]'s element vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementAt {
+    Node(usize),
+    Way(usize),
+    Relation(usize),
+}
+
 /// Every element of a file, each kind in file order.
 #[derive(Debug, Default)]
 pub struct DecodedPbf {
@@ -189,6 +225,24 @@ pub struct DecodedPbf {
     pub nodes: Vec<NormalizedNode>,
     pub ways: Vec<NormalizedWay>,
     pub relations: Vec<NormalizedRelation>,
+    /// Every element once, in wire order: groups in block order, a group's
+    /// fields in the order they occur. A group's DenseNodes fields merge
+    /// into one run (protobuf's merge of a singular message), placed at the
+    /// first of them. This is the format's order, which is libosmium's for
+    /// a group with one DenseNodes field; pbfhogg's reader iterates a group
+    /// dense nodes first, then plain nodes, ways and relations, so the two
+    /// differ only inside a group that mixes element fields.
+    pub sequence: Vec<Decoded>,
+}
+
+impl DecodedPbf {
+    fn push_node(&mut self, node: NormalizedNode, raw: Option<RawMeta>) {
+        self.sequence.push(Decoded {
+            element: ElementAt::Node(self.nodes.len()),
+            raw,
+        });
+        self.nodes.push(node);
+    }
 }
 
 /// Decode the PBF file at `path`. Panics on anything it cannot read.
@@ -466,18 +520,43 @@ fn decode_block(payload: &[u8], out: &mut DecodedPbf) {
     }
     for group in groups {
         let mut dense = Vec::new();
+        // Where the group's dense run goes in `sequence`: the position of
+        // its first DenseNodes field (repeated ones merge into one run).
+        let mut dense_at = None;
         for (field, wire) in fields(group, "PrimitiveGroup") {
             match field {
-                1 => out.nodes.push(decode_node(&block, bytes(wire, "Node"))),
-                2 => dense.extend_from_slice(bytes(wire, "DenseNodes")),
-                3 => out.ways.push(decode_way(&block, bytes(wire, "Way"))),
-                4 => out
-                    .relations
-                    .push(decode_relation(&block, bytes(wire, "Relation"))),
+                1 => {
+                    let (node, raw) = decode_node(&block, bytes(wire, "Node"));
+                    out.push_node(node, raw);
+                }
+                2 => {
+                    dense_at.get_or_insert(out.sequence.len());
+                    dense.extend_from_slice(bytes(wire, "DenseNodes"));
+                }
+                3 => {
+                    let (way, raw) = decode_way(&block, bytes(wire, "Way"));
+                    out.sequence.push(Decoded {
+                        element: ElementAt::Way(out.ways.len()),
+                        raw,
+                    });
+                    out.ways.push(way);
+                }
+                4 => {
+                    let (relation, raw) = decode_relation(&block, bytes(wire, "Relation"));
+                    out.sequence.push(Decoded {
+                        element: ElementAt::Relation(out.relations.len()),
+                        raw,
+                    });
+                    out.relations.push(relation);
+                }
                 _ => {}
             }
         }
-        decode_dense(&block, &dense, out);
+        if let Some(at) = dense_at {
+            let tail = out.sequence.split_off(at);
+            decode_dense(&block, &dense, out);
+            out.sequence.extend(tail);
+        }
     }
 }
 
@@ -502,36 +581,42 @@ impl Common {
     }
 }
 
-fn plain_meta(block: &Block, info: &[u8]) -> Option<NormalizedMeta> {
-    let mut meta = NormalizedMeta::default();
+/// A plain `Info`'s fields as decoded, and the claims they make: each field
+/// it carries, a version only at 1 or more, a changeset only when not -1.
+fn plain_meta(block: &Block, info: &[u8]) -> (Option<RawMeta>, Option<NormalizedMeta>) {
+    let mut raw = RawMeta::default();
     for (field, wire) in fields(info, "Info") {
         match field {
-            1 => {
-                let version = scalar(wire, "Info.version") as i32;
-                meta.version = (version >= 1).then_some(version);
-            }
+            1 => raw.version = Some(scalar(wire, "Info.version") as i32),
             2 => {
-                meta.milli_timestamp = Some(
+                raw.milli_timestamp = Some(
                     (scalar(wire, "Info.timestamp") as i64).wrapping_mul(block.date_granularity),
                 );
             }
-            3 => {
-                let changeset = scalar(wire, "Info.changeset") as i64;
-                meta.changeset = (changeset != -1).then_some(changeset);
-            }
-            4 => meta.uid = Some(scalar(wire, "Info.uid") as i32),
+            3 => raw.changeset = Some(scalar(wire, "Info.changeset") as i64),
+            4 => raw.uid = Some(scalar(wire, "Info.uid") as i32),
             5 => {
                 let sid = scalar(wire, "Info.user_sid") as i32;
-                meta.user = Some(block.string(i64::from(sid), "Info.user_sid"));
+                raw.user = Some(block.string(i64::from(sid), "Info.user_sid"));
             }
-            6 => meta.visible = Some(scalar(wire, "Info.visible") != 0),
+            6 => raw.visible = Some(scalar(wire, "Info.visible") != 0),
             _ => {}
         }
     }
-    meta.into_claimed()
+    let claims = NormalizedMeta {
+        version: raw.version.filter(|&v| v >= 1),
+        milli_timestamp: raw.milli_timestamp,
+        changeset: raw.changeset.filter(|&c| c != -1),
+        uid: raw.uid,
+        user: raw.user.clone(),
+        visible: raw.visible,
+    };
+    // No `Info` bytes: nothing carried (an empty message reads the same).
+    let raw = (!info.is_empty()).then_some(raw);
+    (raw, claims.into_claimed())
 }
 
-fn decode_node(block: &Block, msg: &[u8]) -> NormalizedNode {
+fn decode_node(block: &Block, msg: &[u8]) -> (NormalizedNode, Option<RawMeta>) {
     let mut common = Common::default();
     let (mut id, mut lat, mut lon) = (None, None, None);
     for (field, wire) in fields(msg, "Node") {
@@ -546,7 +631,8 @@ fn decode_node(block: &Block, msg: &[u8]) -> NormalizedNode {
         }
     }
     let id = id.unwrap_or_else(|| bad("Node", "no id"));
-    NormalizedNode {
+    let (raw, meta) = plain_meta(block, &common.info);
+    let node = NormalizedNode {
         id,
         nano_lat: block.nano(
             block.lat_offset,
@@ -557,11 +643,12 @@ fn decode_node(block: &Block, msg: &[u8]) -> NormalizedNode {
             lon.unwrap_or_else(|| bad("Node", "no lon")),
         ),
         tags: block.tags(&common.keys, &common.vals, "Node tags"),
-        meta: plain_meta(block, &common.info),
-    }
+        meta,
+    };
+    (node, raw)
 }
 
-fn decode_way(block: &Block, msg: &[u8]) -> NormalizedWay {
+fn decode_way(block: &Block, msg: &[u8]) -> (NormalizedWay, Option<RawMeta>) {
     let mut common = Common::default();
     let mut id = None;
     let (mut refs, mut lats, mut lons) = (Vec::new(), Vec::new(), Vec::new());
@@ -606,16 +693,18 @@ fn decode_way(block: &Block, msg: &[u8]) -> NormalizedWay {
                 .collect(),
         )
     };
-    NormalizedWay {
+    let (raw, meta) = plain_meta(block, &common.info);
+    let way = NormalizedWay {
         id,
         refs,
         locations,
         tags: block.tags(&common.keys, &common.vals, "Way tags"),
-        meta: plain_meta(block, &common.info),
-    }
+        meta,
+    };
+    (way, raw)
 }
 
-fn decode_relation(block: &Block, msg: &[u8]) -> NormalizedRelation {
+fn decode_relation(block: &Block, msg: &[u8]) -> (NormalizedRelation, Option<RawMeta>) {
     let mut common = Common::default();
     let mut id = None;
     let (mut roles, mut memids, mut types) = (Vec::new(), Vec::new(), Vec::new());
@@ -657,12 +746,14 @@ fn decode_relation(block: &Block, msg: &[u8]) -> NormalizedRelation {
             role: block.string(i64::from(role as i32), "Relation role"),
         })
         .collect();
-    NormalizedRelation {
+    let (raw, meta) = plain_meta(block, &common.info);
+    let relation = NormalizedRelation {
         id,
         members,
         tags: block.tags(&common.keys, &common.vals, "Relation tags"),
-        meta: plain_meta(block, &common.info),
-    }
+        meta,
+    };
+    (relation, raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +769,62 @@ struct DenseColumns {
     uid: Vec<u64>,
     user_sid: Vec<u64>,
     visible: Vec<u64>,
+}
+
+/// One dense slot's values, an absent column read as 0 (`visible` true).
+struct DenseSlot {
+    version: i32,
+    milli: i64,
+    changeset: i64,
+    uid: i32,
+    user_sid: i32,
+    visible: bool,
+}
+
+impl DenseSlot {
+    /// The slot's claims under CORRECTNESS.md's dense rules.
+    fn claims(&self, block: &Block, columns: &DenseColumns) -> NormalizedMeta {
+        let user = || block.string(i64::from(self.user_sid), "DenseInfo user");
+        if self.version >= 1 {
+            NormalizedMeta {
+                version: Some(self.version),
+                milli_timestamp: (!columns.timestamp.is_empty()).then_some(self.milli),
+                changeset: (!columns.changeset.is_empty()).then_some(if self.changeset == -1 {
+                    0
+                } else {
+                    self.changeset
+                }),
+                uid: (!columns.uid.is_empty()).then_some(self.uid),
+                user: (!columns.user_sid.is_empty()).then(user),
+                visible: Some(self.visible),
+            }
+        } else {
+            NormalizedMeta {
+                version: None,
+                milli_timestamp: (self.milli != 0).then_some(self.milli),
+                changeset: (self.changeset > 0).then_some(self.changeset),
+                uid: (self.uid > 0).then_some(self.uid),
+                user: (self.user_sid != 0)
+                    .then(user)
+                    .filter(|user| !user.is_empty()),
+                visible: (!self.visible).then_some(false),
+            }
+        }
+    }
+
+    /// The slot's values for the columns its group carries, as decoded: no
+    /// claim rule applied, a -1 kept.
+    fn raw(&self, block: &Block, columns: &DenseColumns) -> RawMeta {
+        RawMeta {
+            version: (!columns.version.is_empty()).then_some(self.version),
+            milli_timestamp: (!columns.timestamp.is_empty()).then_some(self.milli),
+            changeset: (!columns.changeset.is_empty()).then_some(self.changeset),
+            uid: (!columns.uid.is_empty()).then_some(self.uid),
+            user: (!columns.user_sid.is_empty())
+                .then(|| block.string(i64::from(self.user_sid), "DenseInfo user")),
+            visible: (!columns.visible.is_empty()).then_some(self.visible),
+        }
+    }
 }
 
 fn decode_dense(block: &Block, msg: &[u8], out: &mut DecodedPbf) {
@@ -744,40 +891,26 @@ fn decode_dense(block: &Block, msg: &[u8], out: &mut DecodedPbf) {
         let uid = uids.get(i).map_or(0, |&v| v as i32);
         let user_sid = user_sids.get(i).map_or(0, |&v| v as i32);
         let visible = columns.visible.get(i).is_none_or(|&v| v != 0);
-        let milli = timestamp.wrapping_mul(block.date_granularity);
-        let meta = if version >= 1 {
-            NormalizedMeta {
-                version: Some(version),
-                milli_timestamp: (!columns.timestamp.is_empty()).then_some(milli),
-                changeset: (!columns.changeset.is_empty()).then_some(if changeset == -1 {
-                    0
-                } else {
-                    changeset
-                }),
-                uid: (!columns.uid.is_empty()).then_some(uid),
-                user: (!columns.user_sid.is_empty())
-                    .then(|| block.string(i64::from(user_sid), "DenseInfo user")),
-                visible: Some(visible),
-            }
-        } else {
-            NormalizedMeta {
-                version: None,
-                milli_timestamp: (milli != 0).then_some(milli),
-                changeset: (changeset > 0).then_some(changeset),
-                uid: (uid > 0).then_some(uid),
-                user: (user_sid != 0)
-                    .then(|| block.string(i64::from(user_sid), "DenseInfo user"))
-                    .filter(|user| !user.is_empty()),
-                visible: (!visible).then_some(false),
-            }
+        let slot = DenseSlot {
+            version,
+            milli: timestamp.wrapping_mul(block.date_granularity),
+            changeset,
+            uid,
+            user_sid,
+            visible,
         };
-        out.nodes.push(NormalizedNode {
-            id: ids[i],
-            nano_lat: block.nano(block.lat_offset, lats[i]),
-            nano_lon: block.nano(block.lon_offset, lons[i]),
-            tags: node_tags,
-            meta: meta.into_claimed(),
-        });
+        let meta = slot.claims(block, &columns);
+        let raw = (!info.is_empty()).then(|| slot.raw(block, &columns));
+        out.push_node(
+            NormalizedNode {
+                id: ids[i],
+                nano_lat: block.nano(block.lat_offset, lats[i]),
+                nano_lon: block.nano(block.lon_offset, lons[i]),
+                tags: node_tags,
+                meta: meta.into_claimed(),
+            },
+            raw,
+        );
     }
 }
 

@@ -192,15 +192,12 @@ fn write_materialization_pbf(path: &Path, compression: Compression) {
     writer.flush().unwrap();
 }
 
-/// Render the metadata block of an element to a stable string.
+/// A plain `Info` as its accessors show it, every field an `Option` and a
+/// user that does not resolve a failure.
 fn info_string(info: &Info<'_>) -> String {
-    let user = match info.user() {
-        Some(Ok(u)) => u.to_string(),
-        Some(Err(_)) => "<err>".to_string(),
-        None => "<none>".to_string(),
-    };
+    let user = info.user().map(|u| u.expect("user").to_string());
     format!(
-        "v={:?} ts={:?} cs={:?} uid={:?} user={user} vis={}",
+        "v={:?} ts={:?} cs={:?} uid={:?} user={user:?} vis={}",
         info.version(),
         info.milli_timestamp(),
         info.changeset(),
@@ -209,57 +206,55 @@ fn info_string(info: &Info<'_>) -> String {
     )
 }
 
-/// Fully materialize an element into a stable string: kind, ID, coordinates,
-/// sorted tags, metadata, way references, and relation members with roles. Two
-/// decode paths that agree on every element's `materialize` output are
-/// producing byte-for-byte identical decoded content, not merely the same
-/// (kind, ID) pairs.
+/// Fully materialize an element into a stable string: kind, ID, nanodegree
+/// coordinates, tags in stored order, metadata, way references and inline
+/// locations, and relation members with roles. A decode error fails the
+/// test rather than rendering as a value. Two decode paths that agree on
+/// every element's `materialize` output are producing identical decoded
+/// content, not merely the same (kind, ID) pairs. Deliberately the
+/// production accessors, not the shared oracle: the subject is that the
+/// reader's paths agree with each other.
 fn materialize(element: &Element<'_>) -> String {
-    let sorted_tags = |mut v: Vec<(&str, &str)>| {
-        v.sort_unstable();
-        format!("{v:?}")
-    };
+    let what = format!("{element:?}");
     match element {
         Element::Node(n) => format!(
-            "node id={} dlat={} dlon={} tags={} info=[{}]",
+            "node id={} nlat={} nlon={} tags={:?} info=[{}]",
             n.id(),
-            n.decimicro_lat(),
-            n.decimicro_lon(),
-            sorted_tags(n.tags().collect()),
+            n.nano_lat(),
+            n.nano_lon(),
+            crate::common::checked_tags(n.tags_checked(), &what),
             info_string(&n.info()),
         ),
         Element::DenseNode(dn) => {
-            let info = match dn.info() {
-                Some(i) => {
-                    let user = match i.user() {
-                        Ok(u) => u.to_string(),
-                        Err(_) => "<err>".to_string(),
-                    };
-                    format!(
-                        "v={:?} ts={:?} cs={:?} uid={:?} user={user} vis={}",
-                        i.version(),
-                        i.milli_timestamp(),
-                        i.changeset(),
-                        i.uid(),
-                        i.visible(),
-                    )
-                }
-                None => "<none>".to_string(),
-            };
+            let info = dn.info().map(|i| {
+                format!(
+                    "v={:?} ts={:?} cs={:?} uid={:?} user={:?} vis={}",
+                    i.version(),
+                    i.milli_timestamp(),
+                    i.changeset(),
+                    i.uid(),
+                    i.user().expect("dense user"),
+                    i.visible(),
+                )
+            });
             format!(
-                "node id={} dlat={} dlon={} tags={} info=[{info}]",
+                "node id={} nlat={} nlon={} tags={:?} info=[{info:?}]",
                 dn.id(),
-                dn.decimicro_lat(),
-                dn.decimicro_lon(),
-                sorted_tags(dn.tags().collect()),
+                dn.nano_lat(),
+                dn.nano_lon(),
+                crate::common::checked_tags(dn.tags_checked(), &what),
             )
         }
         Element::Way(w) => {
             let refs: Vec<i64> = w.refs().collect();
+            let locations: Vec<(i64, i64)> = w
+                .node_locations()
+                .map(|l| (l.nano_lat(), l.nano_lon()))
+                .collect();
             format!(
-                "way id={} tags={} refs={refs:?} info=[{}]",
+                "way id={} tags={:?} refs={refs:?} locations={locations:?} info=[{}]",
                 w.id(),
-                sorted_tags(w.tags().collect()),
+                crate::common::checked_tags(w.tags_checked(), &what),
                 info_string(&w.info()),
             )
         }
@@ -267,18 +262,18 @@ fn materialize(element: &Element<'_>) -> String {
             let members: Vec<String> = r
                 .members()
                 .map(|m| {
-                    let role = m.role().unwrap_or("<err>");
-                    format!("{:?}:{}:{role}", m.id.member_type(), m.id.id())
+                    let role = m.role().expect("role");
+                    format!("{:?}:{}:{role:?}", m.id.member_type(), m.id.id())
                 })
                 .collect();
             format!(
-                "rel id={} tags={} members={members:?} info=[{}]",
+                "rel id={} tags={:?} members={members:?} info=[{}]",
                 r.id(),
-                sorted_tags(r.tags().collect()),
+                crate::common::checked_tags(r.tags_checked(), &what),
                 info_string(&r.info()),
             )
         }
-        _ => "unknown".to_string(),
+        other => panic!("element kind this test does not know: {other:?}"),
     }
 }
 

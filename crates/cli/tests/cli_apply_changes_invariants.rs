@@ -505,22 +505,12 @@ fn write_unindexed_blocks(path: &Path, blocks: &[Vec<u8>]) {
 /// A PBF whose data blobs are `blocks`, its header claiming
 /// `Sort.Type_then_ID` when `sorted`, every blob indexed or none.
 fn write_blocks(path: &Path, blocks: &[Vec<u8>], sorted: bool, indexed: bool) {
-    use pbfhogg::writer::{Compression, PbfWriter};
-    let file = File::create(path).unwrap();
-    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
-    let mut header = pbfhogg::block_builder::HeaderBuilder::new();
-    if sorted {
-        header = header.sorted();
-    }
-    writer.write_header(&header.build().unwrap()).unwrap();
-    for b in blocks {
-        if indexed {
-            writer.write_primitive_block(b).unwrap();
-        } else {
-            writer.write_primitive_block_no_indexdata(b).unwrap();
-        }
-    }
-    writer.flush().unwrap();
+    let framing = crate::common::FixtureFraming {
+        sorted,
+        indexdata: indexed,
+        pipelined: false,
+    };
+    crate::common::frame_fixture_blocks(path, blocks, framing);
 }
 
 /// A base whose header does not claim `Sort.Type_then_ID` is refused from

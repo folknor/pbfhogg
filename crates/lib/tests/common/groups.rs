@@ -115,20 +115,7 @@ pub fn block(groups: &[&[Field<'_>]]) -> Vec<u8> {
 /// Write `blocks` as unindexed data blobs, in order, under a header that
 /// claims no sort order.
 pub fn write_unindexed_blocks(path: &Path, blocks: &[Vec<u8>]) {
-    use pbfhogg::block_builder::HeaderBuilder;
-    use pbfhogg::writer::{Compression, PbfWriter};
-
-    let file = std::fs::File::create(path).expect("create fixture");
-    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
-    writer
-        .write_header(&HeaderBuilder::new().build().expect("header"))
-        .expect("write header");
-    for bytes in blocks {
-        writer
-            .write_primitive_block_no_indexdata(bytes)
-            .expect("write block");
-    }
-    writer.flush().expect("flush");
+    super::frame_fixture_blocks(path, blocks, super::FixtureFraming::NON_INDEXED.unsorted());
 }
 
 /// Plain nodes with coordinates and tags, followed by one named street.

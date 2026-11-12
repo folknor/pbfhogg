@@ -1968,103 +1968,13 @@ mod pb {
     }
 }
 
-fn tag_list<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, String)> {
-    tags.map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-type MetaRepr = Option<(i32, i64, i64, i32, Option<String>, bool)>;
-
-fn info_meta(i: &pbfhogg::Info<'_>) -> MetaRepr {
-    i.version().map(|v| {
-        (
-            v,
-            i.milli_timestamp().unwrap_or(0),
-            i.changeset().unwrap_or(0),
-            i.uid().unwrap_or(0),
-            i.user().map(|u| u.expect("user").to_string()),
-            i.visible(),
-        )
-    })
-}
-
-/// Every element of a PBF in file order, with everything a re-encode must
-/// keep: kind, id, coordinates, tags in order, refs, inline locations,
-/// members, and metadata.
-fn ordered_elements(path: &Path) -> Vec<String> {
-    use pbfhogg::{BlobDecode, BlobReader, Element};
-
-    let mut out = Vec::new();
-    for blob in BlobReader::from_path(path).expect("open pbf") {
-        let blob = blob.expect("read blob");
-        let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") else {
-            continue;
-        };
-        for element in block.elements() {
-            out.push(match element {
-                Element::DenseNode(n) => {
-                    // The product's presence rule (`DenseNodeInfo::claims`):
-                    // a padding slot (versionless, all zeros) is no
-                    // metadata, and a version below 1 is no version claim.
-                    let claims = |i: &pbfhogg::DenseNodeInfo<'_>| {
-                        i.claimed_version().is_some()
-                            || (i.milli_timestamp() != 0
-                                || i.changeset() > 0
-                                || i.uid() > 0
-                                || !i.user().unwrap_or("").is_empty()
-                                || !i.visible())
-                    };
-                    let meta = n.info().filter(|i| claims(i)).map(|i| {
-                        (
-                            // -1 and 0 are both "no version" (re-encoding
-                            // writes -1 as 0).
-                            i.claimed_version().unwrap_or(0),
-                            i.milli_timestamp(),
-                            i.changeset(),
-                            i.uid(),
-                            Some(i.user().expect("user").to_string()),
-                            i.visible(),
-                        )
-                    });
-                    format!(
-                        "node {} {} {} {:?} {meta:?}",
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        tag_list(n.tags()),
-                    )
-                }
-                Element::Node(n) => format!(
-                    "node {} {} {} {:?} {:?}",
-                    n.id(),
-                    n.decimicro_lat(),
-                    n.decimicro_lon(),
-                    tag_list(n.tags()),
-                    info_meta(&n.info()),
-                ),
-                Element::Way(w) => format!(
-                    "way {} {:?} {:?} {:?} {:?}",
-                    w.id(),
-                    tag_list(w.tags()),
-                    w.refs().collect::<Vec<_>>(),
-                    w.node_locations()
-                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
-                        .collect::<Vec<_>>(),
-                    info_meta(&w.info()),
-                ),
-                Element::Relation(r) => format!(
-                    "relation {} {:?} {:?} {:?}",
-                    r.id(),
-                    tag_list(r.tags()),
-                    r.members()
-                        .map(|m| (m.id, m.role().expect("role").to_string()))
-                        .collect::<Vec<_>>(),
-                    info_meta(&r.info()),
-                ),
-                other => panic!("unexpected element {other:?}"),
-            });
-        }
-    }
-    out
+/// Every element of a PBF in wire order, through the shared oracle: kind,
+/// id, nanodegree coordinates, tags as stored, refs, inline locations,
+/// members and metadata claims. Every fixture here puts a group's dense
+/// nodes before any plain element of it, where wire order and pbfhogg's
+/// iteration order agree, so input and output must match exactly.
+fn ordered_elements(path: &Path) -> Vec<crate::common::NormalizedElement> {
+    crate::common::read_in_file_order(path)
 }
 
 /// Every data block's kind, first and last id, and element count, in file

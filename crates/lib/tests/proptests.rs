@@ -4,7 +4,6 @@
 //! settings. No PROPTEST_* setting changes coverage, shrinking or replay.
 //! Persistence stays disabled; promote failures to named regression tests.
 
-use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use pbfhogg::block_builder::{BlockBuilder, MemberData, Metadata};
@@ -121,7 +120,10 @@ fn blob_reader_arbitrary_bytes_never_panics_and_terminates() {
     });
 }
 
-type Tags = BTreeMap<String, String>;
+/// Tags in order, duplicate keys allowed: the codec keeps both.
+type Tags = Vec<(String, String)>;
+/// Version, timestamp in seconds (the builder's unit), changeset, uid,
+/// user, visible.
 type Meta = (i32, i64, i64, i32, String, bool);
 
 #[derive(Clone, Debug)]
@@ -140,7 +142,8 @@ fn codec_cases() -> impl Strategy<Value = CodecCase> {
         -1_000_000i64..1_000_000,
         -900_000_000i32..=900_000_000,
         -1_800_000_000i32..=1_800_000_000,
-        proptest::collection::btree_map("[a-z]{1,8}", ".{0,16}", 0..5),
+        // Short keys, so duplicates and unsorted orders occur.
+        proptest::collection::vec(("[a-c]{1,2}", ".{0,16}"), 0..5),
         proptest::option::of((
             1i32..20,
             0i64..2_000_000_000,
@@ -216,23 +219,140 @@ fn encode(cases: &[CodecCase]) -> Vec<u8> {
     writer.into_inner().expect("finish memory fixture")
 }
 
-fn info_meta(info: &Info<'_>) -> Option<Meta> {
-    info.version().map(|version| {
-        (
-            version,
-            info.milli_timestamp().expect("timestamp") / 1000,
-            info.changeset().expect("changeset"),
-            info.uid().expect("uid"),
-            info.user()
-                .expect("user field")
-                .expect("user string")
-                .to_owned(),
+/// The generated metadata is all six fields or none, so an `Info` carrying
+/// only some of them is a codec failure here (a fixture-shape assertion, not
+/// a metadata validity rule). Timestamps compare in milliseconds against
+/// the seconds the builder took, so no sub-second residue is truncated away.
+fn info_meta(info: &Info<'_>) -> Option<(i32, i64, i64, i32, String, bool)> {
+    let fields = (
+        info.version(),
+        info.milli_timestamp(),
+        info.changeset(),
+        info.uid(),
+        info.user(),
+    );
+    match fields {
+        (None, None, None, None, None) => None,
+        (Some(v), Some(ms), Some(cs), Some(uid), Some(user)) => Some((
+            v,
+            ms,
+            cs,
+            uid,
+            user.expect("user string").to_owned(),
             info.visible(),
-        )
+        )),
+        _ => panic!("partial Info for a complete or absent generated one"),
+    }
+}
+
+/// A case's metadata in [`info_meta`]'s form.
+fn expected_meta(meta: Option<&Meta>) -> Option<(i32, i64, i64, i32, String, bool)> {
+    meta.map(|m| (m.0, m.1 * 1000, m.2, m.3, m.4.clone(), m.5))
+}
+
+fn checked<'a, E: std::fmt::Display>(
+    tags: impl Iterator<Item = Result<(&'a str, &'a str), E>>,
+) -> Tags {
+    crate::common::checked_tags(tags, "codec case")
+}
+
+/// The case's metadata as the independent decoder must read it back: a
+/// dense slot claims `visible` always; the writer omits a plain `visible`
+/// true, which a plain `Info` then does not claim.
+fn expected_model(case: &CodecCase, plain: bool) -> Option<crate::common::NormalizedMeta> {
+    case.meta.as_ref().map(|m| crate::common::NormalizedMeta {
+        version: Some(m.0),
+        milli_timestamp: Some(m.1 * 1000),
+        changeset: Some(m.2),
+        uid: Some(m.3),
+        user: Some(m.4.clone()),
+        visible: (!plain || !m.5).then_some(m.5),
     })
 }
 
+/// The writer half checked without pbfhogg's reader: the independent decode
+/// of `bytes` is exactly the cases, nodes then ways then relations.
+fn assert_model_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
+    use crate::common::{MemberKind, NormalizedMember};
+    let decoded = crate::common::model::decode_bytes(bytes);
+    assert!(decoded.header);
+    let nodes: Vec<_> = decoded
+        .nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id,
+                n.decimicro_lat(),
+                n.decimicro_lon(),
+                n.tags.clone(),
+                n.meta.clone(),
+            )
+        })
+        .collect();
+    let want: Vec<_> = cases
+        .iter()
+        .map(|c| (c.id, c.lat, c.lon, c.tags.clone(), expected_model(c, false)))
+        .collect();
+    assert_eq!(nodes, want, "nodes");
+    for n in &decoded.nodes {
+        assert_eq!(n.nano_lat % 100, 0);
+        assert_eq!(n.nano_lon % 100, 0);
+    }
+    let ways: Vec<_> = decoded
+        .ways
+        .iter()
+        .map(|w| {
+            (
+                w.id,
+                w.refs.clone(),
+                w.locations.clone(),
+                w.tags.clone(),
+                w.meta.clone(),
+            )
+        })
+        .collect();
+    let want: Vec<_> = cases
+        .iter()
+        .map(|c| {
+            (
+                c.id,
+                c.refs.clone(),
+                None,
+                c.tags.clone(),
+                expected_model(c, true),
+            )
+        })
+        .collect();
+    assert_eq!(ways, want, "ways");
+    let relations: Vec<_> = decoded
+        .relations
+        .iter()
+        .map(|r| (r.id, r.members.clone(), r.tags.clone(), r.meta.clone()))
+        .collect();
+    let want: Vec<_> = cases
+        .iter()
+        .map(|c| {
+            let members = c
+                .members
+                .iter()
+                .map(|(k, id, role)| NormalizedMember {
+                    member_type: match k {
+                        0 => MemberKind::Node,
+                        1 => MemberKind::Way,
+                        _ => MemberKind::Relation,
+                    },
+                    ref_id: *id,
+                    role: role.clone(),
+                })
+                .collect();
+            (c.id, members, c.tags.clone(), expected_model(c, true))
+        })
+        .collect();
+    assert_eq!(relations, want, "relations");
+}
+
 fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
+    assert_model_roundtrip(cases, bytes);
     let mut counts = [0; 3];
     for blob in BlobReader::new(Cursor::new(bytes)) {
         let blob = blob.expect("frame");
@@ -256,20 +376,14 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                         let meta = node.info().map(|i| {
                             (
                                 i.version(),
-                                i.milli_timestamp() / 1000,
+                                i.milli_timestamp(),
                                 i.changeset(),
                                 i.uid(),
                                 i.user().expect("dense user").to_owned(),
                                 i.visible(),
                             )
                         });
-                        (
-                            node.id(),
-                            node.tags()
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect::<Tags>(),
-                            meta,
-                        )
+                        (node.id(), checked(node.tags_checked()), meta)
                     }
                     Element::Node(node) => {
                         counts[0] += 1;
@@ -279,9 +393,7 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                         );
                         (
                             node.id(),
-                            node.tags()
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect(),
+                            checked(node.tags_checked()),
                             info_meta(&node.info()),
                         )
                     }
@@ -290,9 +402,7 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                         assert_eq!(way.refs().collect::<Vec<_>>(), case.refs);
                         (
                             way.id(),
-                            way.tags()
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect(),
+                            checked(way.tags_checked()),
                             info_meta(&way.info()),
                         )
                     }
@@ -310,10 +420,7 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                         assert_eq!(members, expected);
                         (
                             relation.id(),
-                            relation
-                                .tags()
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect(),
+                            checked(relation.tags_checked()),
                             info_meta(&relation.info()),
                         )
                     }
@@ -321,7 +428,7 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                 };
                 assert_eq!(id, case.id);
                 assert_eq!(tags, case.tags);
-                assert_eq!(meta, case.meta);
+                assert_eq!(meta, expected_meta(case.meta.as_ref()));
             }
         }
     }
@@ -354,9 +461,13 @@ fn codec_strategy_control_cases() {
                 lat: -900_000_000,
                 lon: 1_800_000_000,
                 tags: if populated {
-                    BTreeMap::from([("name".into(), "\u{00e9}\n".into())])
+                    vec![
+                        ("name".into(), "\u{00e9}\n".into()),
+                        ("a".into(), String::new()),
+                        ("name".into(), "second".into()),
+                    ]
                 } else {
-                    BTreeMap::new()
+                    Vec::new()
                 },
                 meta: populated.then(|| (2, 123, 456, 7, "user".into(), false)),
                 refs: if populated { vec![1, -1, 1, 0] } else { vec![] },
@@ -382,7 +493,7 @@ fn truncated_fixture_terminates_and_refuses_incomplete_frames() {
         id: 1,
         lat: 2,
         lon: 3,
-        tags: BTreeMap::new(),
+        tags: Vec::new(),
         meta: None,
         refs: vec![1],
         members: vec![],

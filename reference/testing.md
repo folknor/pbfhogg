@@ -429,6 +429,12 @@ Every element fixture writer in `common` encodes through one
 writers that differ in framing (sort flag, BlobHeader indexes, sync or
 pipelined writer) write the same blocks by construction;
 `crates/lib/tests/oracle_model.rs` checks paired fixtures frame for frame.
+A fixture of pre-encoded blocks (hand-built wire bytes included) frames
+through `frame_fixture_blocks` too. A test whose input is defined by what
+`FixtureFraming` cannot state - header fields beyond the sort flag,
+per-blob indexdata, a compression, an element order or encoding the shared
+encoder does not write - builds it with `PbfWriter` directly; the shared
+pair is for fixtures that differ only in framing, not for every input.
 
 **The output oracle decodes independently.** `read_normalized` and
 `assert_elements_equivalent` hold the decode of `crates/lib/tests/common/model.rs`,
@@ -438,8 +444,19 @@ keeps nanodegree coordinates, embedded way locations, tags in stored order
 with duplicates, unknown member kinds with their value and metadata claims
 per field with millisecond timestamps, and refuses any string index it cannot
 resolve. A command allowed to rewrite a claim is tested against its expected
-output, never through a weaker comparison. The `test-oracles-no-error-to-empty`
-text rule keeps empty fallbacks out of `common`.
+output, never through a weaker comparison. Under the same checks,
+`read_in_file_order` gives the elements in wire order (a group's merged
+DenseNodes run at its first field; pbfhogg's reader iterates a group dense
+nodes first, so the two differ only inside a group mixing element fields),
+for a test whose subject includes the order written, and `read_raw_meta`
+gives each element's metadata fields as stored, before any claim rule, for a
+test of what a writer encodes (a dense -1 written as 0), which claims cannot
+show. A test reading output through pbfhogg's own accessors is one whose
+subject is those accessors (decode-path parity, a codec roundtrip), and it
+reads them losslessly. The `test-oracles-no-error-to-empty` text rule is a
+tripwire over every test tree for three spellings of an error read as empty
+(`unwrap_or("")`, `Result::ok`, the infallible `.tags()`); it is not this
+rule, which it cannot see whole.
 
 `mod serial` is an orthogonal config overlay, not a tier. Same for `#[ignore = "external"]` (escape hatch for in-tree
 osmium checks).

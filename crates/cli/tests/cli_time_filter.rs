@@ -16,15 +16,15 @@ use std::path::Path;
 
 use crate::common::read_header;
 use crate::invoker::CliInvoker;
+use pbfhogg::MemberId;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NodeSnapshot {
     id: i64,
     version: i32,
-    timestamp: i64,
+    milli_timestamp: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,12 +72,12 @@ fn snapshot_keeps_latest_version_at_cutoff() {
             NodeSnapshot {
                 id: 1,
                 version: 2,
-                timestamp: 200
+                milli_timestamp: 200_000
             },
             NodeSnapshot {
                 id: 3,
                 version: 1,
-                timestamp: 50
+                milli_timestamp: 50_000
             },
         ]
     );
@@ -98,7 +98,7 @@ fn snapshot_omits_objects_deleted_at_cutoff() {
         vec![NodeSnapshot {
             id: 3,
             version: 1,
-            timestamp: 50
+            milli_timestamp: 50_000
         }]
     );
 }
@@ -157,12 +157,12 @@ fn snapshot_path_filters_non_history_input() {
             NodeSnapshot {
                 id: 1,
                 version: 1,
-                timestamp: 100,
+                milli_timestamp: 100_000,
             },
             NodeSnapshot {
                 id: 4,
                 version: 2,
-                timestamp: 250,
+                milli_timestamp: 250_000,
             },
         ]
     );
@@ -528,64 +528,56 @@ fn write_history_with_ways_and_relations(path: &Path) {
 // Allowlist readers
 // ---------------------------------------------------------------------------
 
-fn read_nodes_with_metadata(path: &Path) -> Vec<NodeSnapshot> {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut out = Vec::new();
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let info = dn.info().expect("dense info");
-                        out.push(NodeSnapshot {
-                            id: dn.id(),
-                            version: info.version(),
-                            timestamp: info.milli_timestamp() / 1000,
-                        });
-                    }
-                    Element::Node(n) => {
-                        let info = n.info();
-                        out.push(NodeSnapshot {
-                            id: n.id(),
-                            version: info.version().unwrap_or(0),
-                            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    out
+/// The claimed version of an element that must claim one.
+fn claimed_version(meta: Option<&crate::common::NormalizedMeta>, what: &str) -> i32 {
+    meta.and_then(|m| m.version)
+        .unwrap_or_else(|| panic!("{what} claims no version"))
 }
 
+/// Every node in file order, through the shared oracle, with the version
+/// and timestamp the cutoff decides on. Narrower than the element on
+/// purpose: these tests are about which versions survive; element fidelity
+/// through a rewrite is the other commands' oracle tests' subject.
+fn read_nodes_with_metadata(path: &Path) -> Vec<NodeSnapshot> {
+    use crate::common::NormalizedElement;
+    crate::common::read_in_file_order(path)
+        .into_iter()
+        .filter_map(|e| match e {
+            NormalizedElement::Node(n) => {
+                let what = format!("node {}", n.id);
+                Some(NodeSnapshot {
+                    id: n.id,
+                    version: claimed_version(n.meta.as_ref(), &what),
+                    milli_timestamp: n
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.milli_timestamp)
+                        .unwrap_or_else(|| panic!("{what} claims no timestamp")),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every way and relation in file order, through the shared oracle.
 fn read_ways_and_relations(path: &Path) -> (Vec<WaySnapshot>, Vec<RelationSnapshot>) {
-    let reader = BlobReader::from_path(path).expect("open pbf");
+    use crate::common::NormalizedElement;
     let mut ways = Vec::new();
     let mut relations = Vec::new();
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
-            for element in block.elements() {
-                match element {
-                    Element::Way(w) => {
-                        ways.push(WaySnapshot {
-                            id: w.id(),
-                            version: w.info().version().unwrap_or(0),
-                            refs: w.refs().collect(),
-                        });
-                    }
-                    Element::Relation(r) => {
-                        relations.push(RelationSnapshot {
-                            id: r.id(),
-                            version: r.info().version().unwrap_or(0),
-                            member_count: r.members().count(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
+    for e in crate::common::read_in_file_order(path) {
+        match e {
+            NormalizedElement::Way(w) => ways.push(WaySnapshot {
+                id: w.id,
+                version: claimed_version(w.meta.as_ref(), &format!("way {}", w.id)),
+                refs: w.refs,
+            }),
+            NormalizedElement::Relation(r) => relations.push(RelationSnapshot {
+                id: r.id,
+                version: claimed_version(r.meta.as_ref(), &format!("relation {}", r.id)),
+                member_count: r.members.len(),
+            }),
+            NormalizedElement::Node(_) => {}
         }
     }
     (ways, relations)
@@ -753,12 +745,12 @@ fn unindexed_sorted_history_input_still_filters() {
             NodeSnapshot {
                 id: 1,
                 version: 2,
-                timestamp: 200
+                milli_timestamp: 200_000
             },
             NodeSnapshot {
                 id: 2,
                 version: 1,
-                timestamp: 100
+                milli_timestamp: 100_000
             },
         ]
     );

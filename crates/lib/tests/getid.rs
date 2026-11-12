@@ -8,7 +8,6 @@ use crate::common::{
 };
 use pbfhogg::getid::{AddReferenced, GetidOptions, getid, parse_ids, removeid};
 use pbfhogg::write::WriteOptions;
-use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Default compression and backend with `force` set: the fixtures here are
 /// written without indexdata.
@@ -47,86 +46,37 @@ struct RawNodeMeta {
     visible: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RawWayMeta {
-    id: i64,
-    version: Option<i32>,
-    changeset: Option<i64>,
-    uid: Option<i32>,
-    user: Option<String>,
-    visible: Option<bool>,
+type RawWayMeta = RawNodeMeta;
+
+/// The stored metadata (timestamp aside) of every `kind` element, from the
+/// independent decode: what getid wrote, which the claims cannot show for a
+/// dense -1 rewritten as 0.
+fn read_raw_kind_meta(path: &std::path::Path, kind: &str) -> Vec<RawNodeMeta> {
+    crate::common::read_raw_meta(path)
+        .into_iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| {
+            let raw = e
+                .raw
+                .unwrap_or_else(|| panic!("{kind} {} carries no metadata", e.id));
+            RawNodeMeta {
+                id: e.id,
+                version: raw.version,
+                changeset: raw.changeset,
+                uid: raw.uid,
+                user: raw.user,
+                visible: raw.visible,
+            }
+        })
+        .collect()
 }
 
 fn read_raw_node_meta(path: &std::path::Path) -> Vec<RawNodeMeta> {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut metas = Vec::new();
-
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let info = dn.info();
-                        metas.push(RawNodeMeta {
-                            id: dn.id(),
-                            version: info.as_ref().map(|i| i.version()),
-                            changeset: info.as_ref().map(|i| i.changeset()),
-                            uid: info.as_ref().map(|i| i.uid()),
-                            user: info.as_ref().map(|i| i.user().unwrap_or("").to_string()),
-                            visible: info.as_ref().map(|i| i.visible()),
-                        });
-                    }
-                    Element::Node(n) => {
-                        let info = n.info();
-                        metas.push(RawNodeMeta {
-                            id: n.id(),
-                            version: info.version(),
-                            changeset: info.changeset(),
-                            uid: info.uid(),
-                            user: info
-                                .user()
-                                .and_then(std::result::Result::ok)
-                                .map(ToString::to_string),
-                            visible: Some(info.visible()),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    metas
+    read_raw_kind_meta(path, "node")
 }
 
 fn read_raw_way_meta(path: &std::path::Path) -> Vec<RawWayMeta> {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut metas = Vec::new();
-
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                if let Element::Way(w) = element {
-                    let info = w.info();
-                    metas.push(RawWayMeta {
-                        id: w.id(),
-                        version: info.version(),
-                        changeset: info.changeset(),
-                        uid: info.uid(),
-                        user: info
-                            .user()
-                            .and_then(std::result::Result::ok)
-                            .map(ToString::to_string),
-                        visible: Some(info.visible()),
-                    });
-                }
-            }
-        }
-    }
-
-    metas
+    read_raw_kind_meta(path, "way")
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +817,8 @@ fn getid_normalizes_way_version_minus_one_to_absent_version() {
             changeset: None,
             uid: Some(0),
             user: Some(String::new()),
-            visible: Some(true),
+            // The writer omits a plain `visible` true.
+            visible: None,
         }
     );
 }
@@ -1276,22 +1227,15 @@ fn write_relation_closure_fixture(path: &std::path::Path) {
 
 /// What a getid run wrote, by kind, each element with whether it kept tags.
 fn written(path: &std::path::Path) -> Vec<(char, i64, bool)> {
-    let mut out = Vec::new();
-    for blob in BlobReader::from_path(path).expect("open pbf") {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                out.push(match element {
-                    Element::DenseNode(dn) => ('n', dn.id(), dn.tags().next().is_some()),
-                    Element::Node(n) => ('n', n.id(), n.tags().next().is_some()),
-                    Element::Way(w) => ('w', w.id(), w.tags().next().is_some()),
-                    Element::Relation(r) => ('r', r.id(), r.tags().next().is_some()),
-                    _ => panic!("an element kind this test does not know"),
-                });
-            }
-        }
-    }
-    out
+    use crate::common::NormalizedElement;
+    crate::common::read_in_file_order(path)
+        .into_iter()
+        .map(|e| match e {
+            NormalizedElement::Node(n) => ('n', n.id, !n.tags.is_empty()),
+            NormalizedElement::Way(w) => ('w', w.id, !w.tags.is_empty()),
+            NormalizedElement::Relation(r) => ('r', r.id, !r.tags.is_empty()),
+        })
+        .collect()
 }
 
 /// `--add-referenced` follows relation members as osmium's `getid -r`

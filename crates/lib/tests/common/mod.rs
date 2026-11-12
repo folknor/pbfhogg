@@ -41,7 +41,8 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use model::{
-    MemberKind, NormalizedMember, NormalizedMeta, NormalizedNode, NormalizedRelation, NormalizedWay,
+    MemberKind, NormalizedMember, NormalizedMeta, NormalizedNode, NormalizedRelation,
+    NormalizedWay, RawMeta,
 };
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
@@ -1149,6 +1150,23 @@ pub struct NormalizedPbf {
 /// fails it too. Counterexamples for the decoder itself use
 /// [`model::decode_path`] directly.
 pub fn read_normalized(path: &Path) -> NormalizedPbf {
+    let decoded = decode_agreed(path);
+    let mut contents = NormalizedPbf {
+        nodes: decoded.nodes,
+        ways: decoded.ways,
+        relations: decoded.relations,
+    };
+    contents.nodes.sort_by_key(|n| n.id);
+    contents.ways.sort_by_key(|w| w.id);
+    contents.relations.sort_by_key(|r| r.id);
+    contents
+}
+
+/// [`read_normalized`]'s checks, and the independent decode unsorted. The
+/// agreement with pbfhogg's reader compares the elements as a multiset:
+/// within a group that mixes element fields the reader's iteration order is
+/// its own convention, not the file's (see [`model::DecodedPbf::sequence`]).
+fn decode_agreed(path: &Path) -> model::DecodedPbf {
     assert_complete_pbf_framing(path);
     let decoded = model::decode_path(path);
     assert!(decoded.header, "PBF header missing: {}", path.display());
@@ -1163,16 +1181,65 @@ pub fn read_normalized(path: &Path) -> NormalizedPbf {
         "pbfhogg's reader and the independent decoder disagree on {}",
         path.display()
     );
+    decoded
+}
 
-    let mut contents = NormalizedPbf {
-        nodes: decoded.nodes,
-        ways: decoded.ways,
-        relations: decoded.relations,
-    };
-    contents.nodes.sort_by_key(|n| n.id);
-    contents.ways.sort_by_key(|w| w.id);
-    contents.relations.sort_by_key(|r| r.id);
-    contents
+/// One element of [`read_in_file_order`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalizedElement {
+    Node(NormalizedNode),
+    Way(NormalizedWay),
+    Relation(NormalizedRelation),
+}
+
+/// A successful output's elements in wire order ([`model::DecodedPbf::sequence`]),
+/// under [`read_normalized`]'s checks. For a test whose subject includes the
+/// order a command writes; compares as strictly as [`read_normalized`].
+pub fn read_in_file_order(path: &Path) -> Vec<NormalizedElement> {
+    let decoded = decode_agreed(path);
+    decoded
+        .sequence
+        .iter()
+        .map(|d| match d.element {
+            model::ElementAt::Node(i) => NormalizedElement::Node(decoded.nodes[i].clone()),
+            model::ElementAt::Way(i) => NormalizedElement::Way(decoded.ways[i].clone()),
+            model::ElementAt::Relation(i) => {
+                NormalizedElement::Relation(decoded.relations[i].clone())
+            }
+        })
+        .collect()
+}
+
+/// An element kind and id with its stored metadata ([`model::RawMeta`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawElementMeta {
+    pub kind: &'static str,
+    pub id: i64,
+    pub raw: Option<model::RawMeta>,
+}
+
+/// Every element's stored metadata in wire order, from the independent
+/// decode, under [`read_normalized`]'s checks. For tests of what a writer
+/// encodes (CORRECTNESS.md: a re-encoded dense -1 version or changeset is
+/// written as 0), which the claims cannot show.
+pub fn read_raw_meta(path: &Path) -> Vec<RawElementMeta> {
+    let decoded = decode_agreed(path);
+    decoded
+        .sequence
+        .iter()
+        .map(|d| {
+            let (kind, id) = match d.element {
+                model::ElementAt::Node(i) => ("node", decoded.nodes[i].id),
+                model::ElementAt::Way(i) => ("way", decoded.ways[i].id),
+                model::ElementAt::Relation(i) => ("relation", decoded.relations[i].id),
+            };
+            RawElementMeta {
+                kind,
+                id,
+                raw: d.raw.clone(),
+            }
+        })
+        .collect()
 }
 
 /// What both decoders can state about one element. Nodes carry only the
@@ -1266,7 +1333,7 @@ fn public_view_of_model(decoded: &model::DecodedPbf) -> Vec<PublicView> {
 }
 
 /// Collect a checked tag iterator, failing on an unresolvable index.
-fn checked_tags<'a, E: std::fmt::Display>(
+pub fn checked_tags<'a, E: std::fmt::Display>(
     tags: impl Iterator<Item = Result<(&'a str, &'a str), E>>,
     what: &str,
 ) -> Vec<(String, String)> {

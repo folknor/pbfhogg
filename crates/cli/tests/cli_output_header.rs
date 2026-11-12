@@ -930,9 +930,10 @@ fn read_contents(path: &Path) -> Contents {
                     c.nodes.push((n.nano_lon(), n.nano_lat()));
                 }
                 Element::Relation(r) => {
-                    let area = r
-                        .tags()
-                        .any(|(k, v)| k == "type" && matches!(v, "multipolygon" | "boundary"));
+                    let area = r.tags_checked().any(|tag| {
+                        let (k, v) = tag.expect("relation tag");
+                        k == "type" && matches!(v, "multipolygon" | "boundary")
+                    });
                     if area {
                         for m in r.members() {
                             if let MemberId::Way(id) = m.id {

@@ -171,17 +171,20 @@ test_code = "skip"
 must_scan = ["crates/lib/src/read/block.rs", "crates/lib/src/blob_meta/mod.rs", "crates/lib/src/osc/interner.rs", "crates/lib/src/owned.rs"]
 message = "An empty-string fallback on read-side data writes a silent wrong tag, role or user; panic on the broken invariant or return the error"
 
-# The shared test oracles in crates/lib/tests/common read what a successful
-# output holds. An empty-string fallback, an error discarded into `None` or
-# the infallible `.tags()` iterator (which ends the list early on a bad
-# string index) would let a broken output read as a plausible one, so two
-# outputs compare equal when one has lost a tag, role or user.
+# Tests read what a successful output holds. An empty-string fallback, an
+# error discarded into `None` or the infallible `.tags()` iterator (which
+# ends the list early on a bad string index) would let a broken output read
+# as a plausible one, so two outputs compare equal when one has lost a tag,
+# role or user. A tripwire for these three spellings only, not the policy:
+# reference/testing.md "The output oracle decodes independently" is that. A
+# test whose subject is the infallible iterator itself marks the call
+# ok-deliberate with its reason.
 [[textlint]]
 name = "test-oracles-no-error-to-empty"
 pattern = '\.unwrap_or\(""\)|\bResult::ok\b|\.tags\(\)'
-paths = ["crates/lib/tests/common/**/*.rs"]
+paths = ["crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
 except = ['^\s*//', '//\s*ok-deliberate:\s*\S']
-must_scan = ["crates/lib/tests/common/mod.rs", "crates/lib/tests/common/model.rs"]
+must_scan = ["crates/lib/tests/common/mod.rs", "crates/lib/tests/common/model.rs", "crates/cli/tests/cli_cat.rs"]
 message = "A test oracle must refuse an unresolvable value, not read it as empty or end a tag list early; use tags_checked and expect the Result"
 
 [[textlint]]

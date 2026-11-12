@@ -134,7 +134,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             assert_eq!(dn.id(), 1001);
             assert_eq!(dn.decimicro_lat(), 556_789_000);
             assert_eq!(dn.decimicro_lon(), 126_543_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags.len(), 2);
             assert_eq!(tags[0], ("name", "TestNode"));
             assert_eq!(tags[1], ("highway", "bus_stop"));
@@ -152,7 +152,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             assert_eq!(dn.id(), 2002);
             assert_eq!(dn.decimicro_lat(), 570_000_000);
             assert_eq!(dn.decimicro_lon(), 100_000_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags.len(), 0);
             let info = dn.info().unwrap();
             assert_eq!(info.version(), 1);
@@ -167,7 +167,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             assert_eq!(dn.id(), 3003);
             assert_eq!(dn.decimicro_lat(), -335_000_000);
             assert_eq!(dn.decimicro_lon(), -580_000_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags.len(), 1);
             assert_eq!(tags[0], ("natural", "tree"));
             let info = dn.info().unwrap();
@@ -217,7 +217,7 @@ fn roundtrip_dense_nodes_no_metadata() {
             assert_eq!(dn.id(), 1);
             assert_eq!(dn.decimicro_lat(), 100_000_000);
             assert_eq!(dn.decimicro_lon(), 200_000_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags[0], ("k", "v"));
         }
         _ => panic!("expected DenseNode"),
@@ -228,7 +228,7 @@ fn roundtrip_dense_nodes_no_metadata() {
             assert_eq!(dn.id(), 2);
             assert_eq!(dn.decimicro_lat(), -100_000_000);
             assert_eq!(dn.decimicro_lon(), -200_000_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags.len(), 0);
         }
         _ => panic!("expected DenseNode"),
@@ -285,7 +285,7 @@ fn roundtrip_ways() {
     match &elements[0] {
         Element::Way(w) => {
             assert_eq!(w.id(), 5001);
-            let tags: Vec<_> = w.tags().collect();
+            let tags: Vec<_> = w.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags.len(), 2);
             assert_eq!(tags[0], ("highway", "residential"));
             assert_eq!(tags[1], ("name", "Main St"));
@@ -303,7 +303,7 @@ fn roundtrip_ways() {
     match &elements[1] {
         Element::Way(w) => {
             assert_eq!(w.id(), 5002);
-            let tags: Vec<_> = w.tags().collect();
+            let tags: Vec<_> = w.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags[0], ("building", "yes"));
             let refs: Vec<_> = w.refs().collect();
             assert_eq!(refs, vec![500, 501, 502, 500]);
@@ -369,7 +369,7 @@ fn roundtrip_relations() {
     match &elements[0] {
         Element::Relation(r) => {
             assert_eq!(r.id(), 9001);
-            let tags: Vec<_> = r.tags().collect();
+            let tags: Vec<_> = r.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags.len(), 2);
             assert_eq!(tags[0], ("type", "multipolygon"));
             assert_eq!(tags[1], ("natural", "water"));
@@ -657,7 +657,7 @@ fn roundtrip_direct_io() {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 1);
             assert_eq!(dn.decimicro_lat(), 100_000_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags[0], ("k", "v"));
         }
         _ => panic!("expected DenseNode"),
@@ -952,7 +952,7 @@ fn roundtrip_zstd() {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 100);
             assert_eq!(dn.decimicro_lat(), 556_789_000);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags, vec![("name", "ZstdNode")]);
         }
         _ => panic!("expected DenseNode"),
@@ -1059,7 +1059,7 @@ fn roundtrip_mixed_metadata() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 1);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags, vec![("name", "base")]);
             let info = dn.info().unwrap();
             assert_eq!(info.version(), 5);
@@ -1073,7 +1073,7 @@ fn roundtrip_mixed_metadata() {
     match &elements[1] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 2);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags, vec![("name", "osc")]);
             assert!(dn.info().is_none());
         }
@@ -1084,7 +1084,7 @@ fn roundtrip_mixed_metadata() {
     match &elements[2] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 3);
-            let tags: Vec<_> = dn.tags().collect();
+            let tags: Vec<_> = dn.tags_checked().collect::<Result<_, _>>().unwrap();
             assert_eq!(tags, vec![("name", "base2")]);
             let info = dn.info().unwrap();
             assert_eq!(info.version(), 2);

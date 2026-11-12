@@ -420,6 +420,103 @@ fn unknown_member_kinds_keep_their_value() {
     assert_eq!(known.relations[0].members[0].role, "outer");
 }
 
+/// `sequence` is wire order: groups in order, a group's fields in order, a
+/// group's DenseNodes fields merged into one run at the first of them (so
+/// the second's deltas continue the first's). pbfhogg refuses a repeated
+/// DenseNodes field, so this decodes without the reader agreement.
+#[test]
+fn sequence_is_wire_order_with_merged_dense_at_its_first_field() {
+    use crate::common::model::ElementAt;
+    let dir = crate::common::test_scratch();
+    let mut mixed = way(9, &[], None);
+    mixed.extend(dense_node(1, 3, 7, 1, true));
+    mixed.extend(plain_node(2, &[], None));
+    mixed.extend(dense_node(3, 3, 7, 1, true));
+    let decoded = decode_path(&write(
+        dir.path(),
+        "mixed.pbf",
+        &[mixed, relation(20, 0, 5)],
+    ));
+    let order: Vec<(ElementAt, i64)> = decoded
+        .sequence
+        .iter()
+        .map(|d| {
+            let id = match d.element {
+                ElementAt::Node(i) => decoded.nodes[i].id,
+                ElementAt::Way(i) => decoded.ways[i].id,
+                ElementAt::Relation(i) => decoded.relations[i].id,
+            };
+            (d.element, id)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (ElementAt::Way(0), 9),
+            (ElementAt::Node(1), 1),
+            (ElementAt::Node(2), 4),
+            (ElementAt::Node(0), 2),
+            (ElementAt::Relation(0), 20),
+        ]
+    );
+}
+
+/// `RawMeta` is what is stored, before the claim rules: a dense -1 version
+/// and changeset kept, a dense slot's absent column `None`, a plain absent
+/// `visible` `None`, where the claims read no version, a changeset of 0
+/// and (dense) `visible` true.
+#[test]
+fn raw_meta_keeps_what_the_claims_normalise() {
+    use crate::common::RawMeta;
+    let dir = crate::common::test_scratch();
+    let info = Msg::default()
+        .packed(1, &[(-1i64).cast_unsigned()])
+        .delta(3, &[-1]);
+    let dense = Msg::default()
+        .delta(1, &[1])
+        .bytes(5, &info.0)
+        .delta(8, &[0])
+        .delta(9, &[0]);
+    let group = Msg::default().bytes(2, &dense.0).0;
+    let decoded = decode_path(&write(dir.path(), "sentinel.pbf", &[group]));
+    assert_eq!(
+        decoded.sequence[0].raw,
+        Some(RawMeta {
+            version: Some(-1),
+            changeset: Some(-1),
+            ..RawMeta::default()
+        })
+    );
+    assert_eq!(
+        decoded.nodes[0].meta, None,
+        "a padding-valued slot claims nothing"
+    );
+
+    let plain = Info {
+        version: Some(-1),
+        changeset: Some(-1),
+        uid: Some(0),
+        ..Info::default()
+    };
+    let decoded = decode_path(&write(dir.path(), "plain.pbf", &[way(1, &[], Some(plain))]));
+    assert_eq!(
+        decoded.sequence[0].raw,
+        Some(RawMeta {
+            version: Some(-1),
+            changeset: Some(-1),
+            uid: Some(0),
+            ..RawMeta::default()
+        })
+    );
+    assert_eq!(
+        decoded.ways[0].meta,
+        Some(NormalizedMeta {
+            uid: Some(0),
+            ..NormalizedMeta::default()
+        })
+    );
+}
+
 /// A string index past the table is refused, never read as empty: tag
 /// keys and values, roles, plain and dense users. The production-reader
 /// helpers refuse a bad tag and role too.
@@ -474,6 +571,7 @@ fn read_normalized_decoded(path: &Path) -> DecodedPbf {
         nodes: n.nodes,
         ways: n.ways,
         relations: n.relations,
+        sequence: Vec::new(),
     }
 }
 

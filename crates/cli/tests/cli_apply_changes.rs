@@ -1259,7 +1259,10 @@ fn chained_apply_preserves_partial_node_metadata() {
                             partial_count += 1;
                             assert_eq!(node.id(), 2);
                             assert_eq!((node.lat(), node.lon()), (35.0, 45.0));
-                            assert_eq!(node.tags().collect::<Vec<_>>(), vec![("name", "partial")]);
+                            assert_eq!(
+                                node.tags_checked().collect::<Result<Vec<_>, _>>().unwrap(),
+                                vec![("name", "partial")]
+                            );
                             let info = node.info();
                             assert_eq!(info.version(), Some(4));
                             assert_eq!(info.milli_timestamp(), None);

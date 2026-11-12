@@ -80,7 +80,7 @@ use crate::cli_apply_changes::write_osc;
 use crate::invoker::CliInvoker;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element, MemberId, MemberType};
+use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
 /// `(lat, lon)` in decimicrodegrees.
 type Coord = (i32, i32);
@@ -477,12 +477,9 @@ fn assert_index_stays_sorted(base: &Base, case: &Case) {
 // ---------------------------------------------------------------------------
 
 fn owned(tags: Tags) -> OwnedTags {
-    let mut v: OwnedTags = tags
-        .iter()
+    tags.iter()
         .map(|&(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    v.sort();
-    v
+        .collect()
 }
 
 fn base_coord(base: &Base, id: i64) -> Coord {
@@ -616,8 +613,8 @@ fn osc_xml(osc: &Osc) -> String {
 // ---------------------------------------------------------------------------
 
 /// Decoded content keyed by ID: nodes `(coord, tags)`, ways `(refs, tags,
-/// inline coords)`, relations `(members, tags)`. Tags sorted; ref and
-/// member order kept.
+/// inline coords)`, relations `(members, tags)`. Tag, ref and member order
+/// kept.
 #[derive(Debug, Default, PartialEq, Eq)]
 #[allow(clippy::type_complexity)]
 struct State {
@@ -626,82 +623,55 @@ struct State {
     relations: BTreeMap<i64, (Vec<(String, i64, String)>, OwnedTags)>,
 }
 
-fn sorted_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> OwnedTags {
-    let mut v: OwnedTags = tags.map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    v.sort();
-    v
+/// A nanodegree coordinate as the fixture's decimicrodegrees, refusing one
+/// that is not a whole decimicrodegree rather than truncating it.
+fn decimicro((lat, lon): (i64, i64)) -> Coord {
+    let whole = |nano: i64| {
+        assert_eq!(nano % 100, 0, "coordinate {nano} nanodegrees is not whole");
+        i32::try_from(nano / 100).expect("coordinate in range")
+    };
+    (whole(lat), whole(lon))
 }
 
+/// The output through the shared oracle, keyed by id. An unknown member
+/// kind fails the read (`MemberKind::as_str`).
 fn decode(path: &Path) -> State {
     let mut state = State::default();
-    for blob in BlobReader::from_path(path).expect("open pbf") {
-        let blob = blob.expect("read blob");
-        let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") else {
-            continue;
-        };
-        for element in block.elements() {
-            let dup = match element {
-                Element::DenseNode(n) => state
-                    .nodes
-                    .insert(
-                        n.id(),
-                        (
-                            (n.decimicro_lat(), n.decimicro_lon()),
-                            sorted_tags(n.tags()),
-                        ),
-                    )
-                    .map(|_| n.id()),
-                Element::Node(n) => state
-                    .nodes
-                    .insert(
-                        n.id(),
-                        (
-                            (n.decimicro_lat(), n.decimicro_lon()),
-                            sorted_tags(n.tags()),
-                        ),
-                    )
-                    .map(|_| n.id()),
-                Element::Way(w) => {
-                    let locs = w
-                        .node_locations()
-                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
-                        .collect();
-                    state
-                        .ways
-                        .insert(w.id(), (w.refs().collect(), sorted_tags(w.tags()), locs))
-                        .map(|_| w.id())
-                }
-                Element::Relation(r) => {
-                    let members = r
-                        .members()
-                        .map(|m| {
-                            let kind = match m.id.member_type() {
-                                MemberType::Node => "node",
-                                MemberType::Way => "way",
-                                MemberType::Relation => "relation",
-                                _ => "unknown",
-                            };
-                            (
-                                kind.to_string(),
-                                m.id.id(),
-                                m.role().expect("role").to_string(),
-                            )
-                        })
-                        .collect();
-                    state
-                        .relations
-                        .insert(r.id(), (members, sorted_tags(r.tags())))
-                        .map(|_| r.id())
-                }
-                _ => None,
-            };
-            assert!(
-                dup.is_none(),
-                "{}: element {dup:?} appears twice",
-                path.display()
-            );
+    let pbf = crate::common::read_normalized(path);
+    let mut dups = Vec::new();
+    for n in pbf.nodes {
+        let coord = decimicro((n.nano_lat, n.nano_lon));
+        if state.nodes.insert(n.id, (coord, n.tags)).is_some() {
+            dups.push(n.id);
         }
     }
+    for w in pbf.ways {
+        // The model reads an empty location pair as none.
+        let locs = w
+            .locations
+            .unwrap_or_default()
+            .into_iter()
+            .map(decimicro)
+            .collect();
+        if state.ways.insert(w.id, (w.refs, w.tags, locs)).is_some() {
+            dups.push(w.id);
+        }
+    }
+    for r in pbf.relations {
+        let members = r
+            .members
+            .into_iter()
+            .map(|m| (m.member_type.as_str().to_string(), m.ref_id, m.role))
+            .collect();
+        if state.relations.insert(r.id, (members, r.tags)).is_some() {
+            dups.push(r.id);
+        }
+    }
+    assert!(
+        dups.is_empty(),
+        "{}: elements {dups:?} appear twice",
+        path.display()
+    );
     state
 }
 

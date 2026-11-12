@@ -91,28 +91,23 @@ success path - a named handle dropped on an assertion failure, which the
 detached-threads source rule (statement and `let _` discards only) cannot see.
 `capabilities.rs` bounds a thread rendezvous with `TEST_CHILD_TIMEOUT`.
 
-## VER-133 - Test-local metadata readers and PBF writers bypass the shared oracle
+## VER-138 - Element order inside a mixed-field group is pbfhogg's, not the file's
 
-Found while closing the shared-oracle work.
+Found while giving the shared oracle a wire-order view.
 
-`common::read_normalized` now decodes independently and refuses what it cannot
-resolve, but many test files keep their own lossy projections outside
-`crates/lib/tests/common`, where the `test-oracles-no-error-to-empty` text rule
-does not reach: `info_meta` and `ordered_elements` in `crates/cli/tests/cli_cat.rs`
-(version-gated, `unwrap_or(0)`, `user().unwrap_or("")`), `info_meta` and
-`assert_roundtrip` in `crates/lib/tests/proptests.rs` (seconds, `BTreeMap` tags),
-`RawNodeMeta` in `crates/lib/tests/getid.rs` and `read_raw_node_meta` in
-`crates/cli/tests/cli_sort.rs` (`unwrap_or("")`, `and_then(Result::ok)`),
-`read_nodes_with_metadata` in `crates/cli/tests/cli_time_filter.rs` (seconds,
-`version().unwrap_or(0)`), the member reader in
-`crates/cli/tests/cli_apply_changes_osmium.rs` (`_ => "unknown"`), and the sorted
-tags of `crates/lib/tests/read_paths.rs`. About 110 `PbfWriter::new` or `to_path`
-loops across some 45 test files (cli_digest's `write_full`, cli_time_filter's
-`write_node_blocks` among them) repeat the fixture traversal instead of
-`encode_fixture_blocks` plus `frame_fixture_blocks`.
+`BlockElementsIter` (`crates/lib/src/read/block.rs`) yields a PrimitiveGroup's
+dense nodes first, then plain nodes, ways and relations; libosmium
+(`decode_primitive_block_data`) and the format yield the group's fields in wire
+order. They differ only inside a group that mixes element fields (a plain node
+before a DenseNodes field, say). Plain `cat` re-encodes such a block "in element
+order", so it would write the plain node after the dense ones; no fixture puts
+plain before dense in one group, so `cli_cat.rs`'s order-preserving tests do not
+see it, and `DEVIATIONS.md` does not record it. Unmeasured, and such groups are
+malformed-adjacent (the spec says one kind per group).
 
-Fix: route each through `read_normalized` or the model, or state why a projection
-is deliberately narrower; widen the text rule to the test trees once they are clean.
+Fix: decide the contract - iterate in field order (cost on the per-group state
+machine to be measured) or record the deviation - and add the plain-before-dense
+cat fixture with the expected order stated.
 
 ## VER-134 - Other library fixtures still pay production thresholds
 

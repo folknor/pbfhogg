@@ -19,7 +19,6 @@ use crate::common::{
 use crate::invoker::CliInvoker;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element};
 
 /// Invoke `pbfhogg sort --force -o <output> <input>`.
 fn run_sort(input: &Path, output: &Path) {
@@ -266,47 +265,27 @@ struct RawNodeMeta {
     visible: Option<bool>,
 }
 
+/// Every node's stored metadata (timestamp aside), from the independent
+/// decode: what sort wrote, which the claims cannot show for a dense -1
+/// rewritten as 0.
 fn read_raw_node_meta(path: &Path) -> Vec<RawNodeMeta> {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut metas = Vec::new();
-
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let info = dn.info();
-                        metas.push(RawNodeMeta {
-                            id: dn.id(),
-                            version: info.as_ref().map(|i| i.version()),
-                            changeset: info.as_ref().map(|i| i.changeset()),
-                            uid: info.as_ref().map(|i| i.uid()),
-                            user: info.as_ref().map(|i| i.user().unwrap_or("").to_string()),
-                            visible: info.as_ref().map(|i| i.visible()),
-                        });
-                    }
-                    Element::Node(n) => {
-                        let info = n.info();
-                        metas.push(RawNodeMeta {
-                            id: n.id(),
-                            version: info.version(),
-                            changeset: info.changeset(),
-                            uid: info.uid(),
-                            user: info
-                                .user()
-                                .and_then(std::result::Result::ok)
-                                .map(ToString::to_string),
-                            visible: Some(info.visible()),
-                        });
-                    }
-                    _ => {}
-                }
+    crate::common::read_raw_meta(path)
+        .into_iter()
+        .filter(|e| e.kind == "node")
+        .map(|e| {
+            let raw = e
+                .raw
+                .unwrap_or_else(|| panic!("node {} carries no metadata", e.id));
+            RawNodeMeta {
+                id: e.id,
+                version: raw.version,
+                changeset: raw.changeset,
+                uid: raw.uid,
+                user: raw.user,
+                visible: raw.visible,
             }
-        }
-    }
-
-    metas
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -262,9 +262,9 @@ fn write_replacement(path: &Path, route: Route) {
 /// Every element of the file at `path` in file order, and the element count
 /// of each data blob.
 fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
-    let tags = |it: &mut dyn Iterator<Item = (&str, &str)>| -> Vec<(String, String)> {
-        it.map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    };
+    type Checked<'a> = dyn Iterator<Item = pbfhogg::Result<(&'a str, &'a str)>> + 'a;
+    let tags =
+        |it: &mut Checked<'_>| -> Vec<(String, String)> { crate::common::checked_tags(it, "item") };
     let mut items = Vec::new();
     let mut blobs = Vec::new();
     for blob in BlobReader::from_path(path).expect("open output") {
@@ -279,13 +279,13 @@ fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
                     id: n.id(),
                     lat: n.decimicro_lat(),
                     lon: n.decimicro_lon(),
-                    tags: tags(&mut n.tags()),
+                    tags: tags(&mut n.tags_checked()),
                 },
                 Element::Node(n) => Item::Node {
                     id: n.id(),
                     lat: n.decimicro_lat(),
                     lon: n.decimicro_lon(),
-                    tags: tags(&mut n.tags()),
+                    tags: tags(&mut n.tags_checked()),
                 },
                 Element::Way(w) => Item::Way {
                     id: w.id(),
@@ -294,12 +294,12 @@ fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
                         .node_locations()
                         .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
                         .collect(),
-                    tags: tags(&mut w.tags()),
+                    tags: tags(&mut w.tags_checked()),
                 },
                 Element::Relation(r) => Item::Relation {
                     id: r.id(),
                     members: r.members().map(|m| m.id.id()).collect(),
-                    tags: tags(&mut r.tags()),
+                    tags: tags(&mut r.tags_checked()),
                 },
                 _ => continue,
             });

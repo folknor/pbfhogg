@@ -30,16 +30,6 @@ construction; tests that build their own `host::FdPool` hold a ticket by convent
 Residue: measure the high-water marks (a `/proc/self/fd` count at the gate's release
 would do) and check them against the charges, if it pays.
 
-## VER-010 - The probe-lock and counter-emission guards are fixed-shape, not AST
-
-The probe open now goes through `open_probe_lock` in `crates/lib/src/scratch.rs`,
-tested for missing-file preservation, and counter emission lives in
-`finish_invocation` in `crates/cli/src/lib.rs`, tested on success, refusal and
-cancellation. The guard in `crates/source-policy/src/rules/lifecycle.rs` checks a
-fixed token shape of each; it does not prove arbitrary Rust control flow. syn is
-now in that crate, so an AST check would not need a new parser. Residue: a general
-AST check, if it pays.
-
 ## VER-014 - Empty textlint globs and stale exclusions are only audit-enforced
 
 Every rule in `brokkr.d/lints.toml` now has a `must_scan` sentinel, and the old coverage

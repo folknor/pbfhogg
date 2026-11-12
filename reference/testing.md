@@ -987,6 +987,15 @@ tree is audited by one unit test, in the `all` sweep alone, so it runs once
 per check and not under brokkr's markdown-only shortcut; every rule carries
 in-memory fixtures beside it.
 
+The sealed lifecycle shapes (`crates/source-policy/src/rules/lifecycle.rs`)
+compare whole bodies of the scratch probe constructor `open_probe_lock` and
+the CLI's `finish_invocation`, require `probe_lock` to open through the
+former and `run` to call the latter once outside every delimiter, and allow
+each counter-hook name only once in `crates/cli/src/lib.rs`, inside
+`finish_invocation`. They are fixed token shapes, not Rust control flow;
+behaviour is carried by the probe constructor's missing-file test and the
+finalization test over success, refusal and cancellation.
+
 Scratch entropy has one owner, checked by
 `crates/source-policy/src/rules/entropy.rs`: the literal `getrandom` identifier may appear only
 inside `random_u128` in `crates/lib/src/scratch.rs`, once, in production and

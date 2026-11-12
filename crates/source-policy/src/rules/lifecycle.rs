@@ -2,8 +2,9 @@
 //!
 //! - The CLI dispatch is owned by `finish_invocation`, whose complete body
 //!   runs the dispatch and then both counter hooks; `run` calls it directly,
-//!   once, and holds no counter hook itself. Library textlint rules restrict
-//!   other callers.
+//!   once as a statement outside every delimiter, and no other code in the
+//!   CLI file names a counter hook. Library textlint rules restrict callers
+//!   in other files.
 //! - The complete `open_probe_lock` constructor is sealed to a noncreating,
 //!   nontruncating read-write option chain, and `probe_lock` opens through it
 //!   and nothing else.
@@ -12,6 +13,13 @@
 //! opaque, so layout and comments never change the verdict and a literal or
 //! a commented-out copy cannot supply the shape. This checks fixed source
 //! shapes, not Rust control flow: a changed shape needs an explicit audit.
+//! Only `open_probe_lock` and `finish_invocation` are sealed whole; `run`
+//! and `probe_lock` are held by occurrence, delimiter-depth and forbidden-
+//! opener checks. A syn rewrite was weighed and refused: it would compare
+//! the same fixed shapes, prove no more control flow, and stop seeing macro
+//! input. What the shapes cannot show is carried by behaviour tests: the
+//! probe constructor's missing-file and contents tests in scratch.rs and the
+//! success, refusal and cancellation test of finish_invocation in the CLI.
 
 use crate::Corpus;
 use crate::lex::{Source, function_body};
@@ -78,6 +86,21 @@ pub fn shape_errors(cli: &Source, scratch: &Source) -> Vec<&'static str> {
         None => found.push("CLI run function missing"),
         Some(body) => found.extend(run_errors(&cli.compact(&body))),
     }
+    // The CLI file is excluded wholesale from the exit-hook textlint rules,
+    // so this is what keeps a hook out of every other function there: each
+    // hook name is one identifier in the file's code, the one inside the
+    // sealed finish_invocation. Counting names, not calls, also refuses a
+    // use-alias or a function-pointer pass.
+    for hook in ["emit_writer_counters", "emit_read_counters"] {
+        let named = cli
+            .code()
+            .iter()
+            .filter(|tok| cli.name(tok) == Some(hook))
+            .count();
+        if named != 1 {
+            found.push("CLI counter hooks are named only inside finish_invocation");
+        }
+    }
     found
 }
 
@@ -86,10 +109,13 @@ fn run_errors(code: &str) -> Vec<&'static str> {
     let call =
         "letresult=finish_invocation(&host.invocation,||->Result<(),Box<dynstd::error::Error>>{";
     // The dispatch owner must be a direct statement in run, not inside an
-    // unused closure, nested function or unreachable branch.
+    // unused closure, nested function, unreachable branch or macro input
+    // such as stringify!, so no delimiter of any kind may be open before it.
     let direct = code.find(call).is_some_and(|start| {
         let before = &code[..start];
-        before.matches('{').count() == before.matches('}').count()
+        [('{', '}'), ('(', ')'), ('[', ']')]
+            .iter()
+            .all(|&(open, close)| before.matches(open).count() == before.matches(close).count())
     });
     if !direct {
         found.push("CLI run must dispatch directly through finish_invocation");
@@ -199,12 +225,33 @@ fn probe_lock(dir: &Path) -> Probe {{
     #[test]
     fn the_dispatch_cannot_hide_in_a_branch_or_closure() {
         let start = "let result = finish_invocation";
-        for prefix in ["if false { ", "let unused = || { ", "fn unused() { "] {
+        for (prefix, close) in [
+            ("if false { ", "}"),
+            ("let unused = || { ", "}"),
+            ("fn unused() { ", "}"),
+            ("stringify!( ", ");"),
+            ("stringify![ ", "];"),
+        ] {
             let changed = cli()
                 .replace(start, &format!("{prefix}{start}"))
-                .replace("report(result);", "} report(result);");
+                .replace("report(result);", &format!("{close} report(result);"));
             assert!(!errors(&changed, &scratch()).is_empty(), "{prefix}");
         }
+    }
+
+    #[test]
+    fn a_hook_named_outside_finish_invocation_fails() {
+        for extra in [
+            "fn other() { pbfhogg::write::emit_writer_counters(i); }",
+            "fn other() { pbfhogg::read::emit_read_counters(i); }",
+            "use pbfhogg::write::emit_writer_counters as flush;",
+            "fn other() { call(pbfhogg::read::emit_read_counters); }",
+        ] {
+            let changed = format!("{}{extra}", cli());
+            assert!(!errors(&changed, &scratch()).is_empty(), "{extra}");
+        }
+        let quoted = format!("{}const S: &str = \"emit_writer_counters(i)\";", cli());
+        assert_eq!(errors(&quoted, &scratch()), Vec::<&str>::new());
     }
 
     #[test]

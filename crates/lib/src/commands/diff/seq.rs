@@ -189,7 +189,8 @@ mod tests {
     use super::*;
 
     // Keep the production-budget obligations in correctness coverage. Timing
-    // belongs in a registered release bench, outside the test profiles.
+    // belongs in the registered diff-verbose-budget bench, outside the test
+    // profiles.
     #[test]
     fn verbose_sequence_budget_handles_disjoint_and_scattered_edits() {
         let old: Vec<usize> = (0..30_000).collect();

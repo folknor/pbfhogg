@@ -446,6 +446,19 @@ params.new = { from = "datasets.{dataset}.snapshot", required = true, help = "th
 params.new_variant = { from = "datasets.{dataset}.snapshot.{new}.pbf", default = "raw", help = "the new side's PBF variant" }
 params.type = { choices = ["all", "node", "way", "relation"], default = "all", help = "diff's --type, all for none" }
 
+[bench.diff-verbose-budget]
+script_file = "../benches/diff/diff-verbose-budget.lua"
+description = "diff -v of synthetic 30,000-ref modified ways at the verbose sequence work budget"
+version = 1
+date = 2026-11-12
+changelog = [
+  { version = 1, date = 2026-11-12, note = "Added: disjoint and every-60th-ref-changed way pairs built untimed by getid and apply-changes, measured diff -v -c -j 1" },
+]
+profile = "release"
+params.dataset = { from = "datasets", default = "denmark", help = "dataset whose PBF supplies the sorted header for the synthetic base" }
+params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "PBF variant supplying the header" }
+params.ways = { integer = "u32", min = 1, max = 12, default = "8", help = "ways of each shape, at most 12 so each OSC stays under brokkr's 16 MiB string cap" }
+
 # -- digest
 
 [bench.canonical-digest]

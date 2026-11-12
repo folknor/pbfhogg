@@ -109,17 +109,6 @@ Fix: decide the contract - iterate in field order (cost on the per-group state
 machine to be measured) or record the deviation - and add the plain-before-dense
 cat fixture with the expected order stated.
 
-## VER-071 - The verbose sequence budget has no registered timing bench
-
-The ignored timing probe in `commands/diff/seq.rs` is removed; its work-limit assertions
-stay. Timing belongs in a registered bench: synthetic modified-way pairs with 30,000
-refs (disjoint ranges, and every 60th ref changed), measuring `diff --verbose`, requiring
-exit 1 and checking replacement versus itemized output, with fixture preparation outside
-measurement. Not written: no existing command or bench helper produces those
-pairs untimed, so the bench needs a fixture producer first.
-
-
-
 ## VER-078 - CLI children use the real machine
 
 Reported by cli-tests.

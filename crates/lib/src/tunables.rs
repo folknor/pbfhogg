@@ -871,7 +871,9 @@ pub(crate) const SWEEP_GROUP_INDEX_THRESHOLD: usize = 32;
 /// 500 scattered replacements (1000 edits) median 1.43 ms / max 1.46 ms.
 /// Keep 1 << 20: near-cap search stays in low milliseconds. This is a work
 /// bound, not a latency bound for arbitrary Eq implementations or lengths.
-/// Reproduce with the ignored seq::tests::verbose_sequence_budget_timing.
+/// The in-process probe that gave those figures is gone; the
+/// `diff-verbose-budget` script bench times the same two shapes through
+/// `diff -v` (cells in reference/performance/diff.md).
 pub(crate) const VERBOSE_SEQUENCE_DIFF_MAX_WORK: usize = 1 << 20;
 
 /// Most detail lines one tag list or ordered sequence prints

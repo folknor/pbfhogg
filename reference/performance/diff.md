@@ -186,6 +186,27 @@ in sends at the base; the variant's exact pieces cut that to 3.6 ms. The
 shape the mechanism exists for (many modified elements with long details, or
 both inputs framed past any cut) is in no dataset, so its gain is unmeasured.
 
+## Verbose sequence work budget (bygg, 2026-11-12, at `3b0e93f8`)
+
+`diff-verbose-budget` script bench (`benches/diff/diff-verbose-budget.lua`):
+`--ways` modified ways of each of two 30,000-ref shapes, disjoint (out of
+budget, one replacement line) and every 60th ref changed (1000 edits,
+itemized), built untimed; result is the `diff -v -c -j 1` child's wall,
+best of the iterations. Recorded on a tree whose only change was the bench
+itself, so the binary is `3b0e93f8`'s.
+
+| `--ways` | Searches | Cell | diff child |
+|---|---|---|---|
+| 1 | 2 | `0a8e3a23` | 6 ms |
+| 8 | 16 | `6386804f` | 27 ms |
+| 12 | 24 | `4abb2fde` | 37 ms |
+
+The slope is about 1.4 ms a modified way, sequence search plus decoding the
+refs and formatting, against the 1.18 ms (disjoint) and 1.43 ms (scattered)
+medians the removed in-process unit timing gave on 2026-11-10. The budget
+keeps a worst-case way in low milliseconds; `VERBOSE_SEQUENCE_DIFF_MAX_WORK`
+stays at `1 << 20`.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

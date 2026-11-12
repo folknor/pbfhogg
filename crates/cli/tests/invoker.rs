@@ -103,9 +103,11 @@ impl<'a> CliInvoker<'a> {
     /// `cores` for every resource-sized pool and the width of rayon's global
     /// pool (`RAYON_NUM_THREADS`, honoured by any build), `memory` (`None`
     /// for unknown) for memory-routed choices such as altw's auto backend.
-    /// The resource override is a `test-hooks` hook
-    /// (`PBFHOGG_TEST_RESOURCES`); a build without the feature ignores it and
-    /// sizes and routes from the machine. Fixed sizing inputs, not a thread
+    /// The resource override is a hook (`PBFHOGG_TEST_RESOURCES`, honoured
+    /// under the `pbfhogg_test_hooks` cfg); a build without the cfg (the
+    /// consumer, musl and release sweeps) ignores it and sizes and routes
+    /// from the machine, so no assertion those builds compile may depend on
+    /// the machine. Fixed sizing inputs, not a thread
     /// cap: `-j` and concurrent stage threads can exceed `cores`.
     pub fn resources(mut self, cores: NonZeroU64, memory: Option<u64>) -> Self {
         let memory = memory.map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());

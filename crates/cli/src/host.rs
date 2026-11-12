@@ -29,7 +29,7 @@ pub(crate) fn cli_host(cancel: pbfhogg::host::Invocation, resources: Arc<dyn Res
 }
 
 /// The resources this process sizes and routes against: the machine
-/// (`MachineProbe`). A `test-hooks` build reads
+/// (`MachineProbe`). A build with the `pbfhogg_test_hooks` cfg reads
 /// `PBFHOGG_TEST_RESOURCES=<cores>:<memory bytes or none>` first and, when it
 /// is set, uses those fixed sizing inputs instead, so a test child sizes its
 /// pools and routes its auto choices the same on every runner. It fixes

@@ -109,17 +109,6 @@ Fix: decide the contract - iterate in field order (cost on the per-group state
 machine to be measured) or record the deviation - and add the plain-before-dense
 cat fixture with the expected order stated.
 
-## VER-078 - CLI children use the real machine
-
-Reported by cli-tests.
-
-`cli_host` now takes resolved resources and `CliInvoker` gives every child fixed sizing inputs
-(`PBFHOGG_TEST_RESOURCES`, a `test-hooks` hook, plus `RAYON_NUM_THREADS`). Residue: children built
-without `test-hooks` (the `consumer` and `musl` sweeps) ignore the resource variable and still size
-resource-derived pools and route altw auto and check locations on the runner's real cores and
-memory. Release builds cannot take a private override, so closing this needs either a different
-execution boundary for those sweeps or acceptance that they are process-integration coverage only.
-
 ## VER-090 - The requirement-table check is convention-bound
 
 `required` in `crates/harness/src/describe.rs` now refuses anything outside its convention

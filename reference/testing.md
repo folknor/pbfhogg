@@ -786,10 +786,16 @@ exception, not a tier - should not survive across many PRs.
   `MachineProbe`, and `RAYON_NUM_THREADS=<cores>`, which bounds the CLI's
   ambient executor in any build. These are fixed sizing and routing inputs,
   not a thread cap (`-j` and concurrent stage threads can exceed them). A
-  child built without the hook cfg (the `consumer` and `musl` sweeps)
-  ignores the resource variable and still sizes its pools and routes altw's
-  auto backend on the runner's machine: those runs are process-integration
-  coverage, and no assertion may depend on the machine. Hook setters are
+  child built without the hook cfg (the `consumer`, `musl` and `release`
+  sweeps; `musl-all` sets it) ignores the resource variable and still sizes
+  its pools, routes altw's auto backend and sets `check --locations`' store
+  budget from the runner's machine. A shipped build has no private override
+  to take, and adding the cfg would stop those sweeps testing the shape they
+  exist for, so those runs are process-integration coverage: no assertion
+  compiled into them may depend on the machine (one pinning a routed backend
+  or a sizing outcome is gated on the hook cfg). The expected results are
+  machine-independent; the cost of reaching them is not, since pool widths
+  follow the runner's cores. Hook setters are
   named for the hook (`cancel_pause`, `cancel_count`, `publish_faults`,
   `publish_steps`, `publish_pause`, `publish_ready`, `replace_input`,
   `replace_with`, `replace_after`, `force_pin_path_reopen`,

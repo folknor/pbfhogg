@@ -865,7 +865,7 @@ fn zero_ref_ways_survive_sparse_and_external_assembly() {
 }
 
 /// Auto on a sorted + indexed input runs and names the backend it chose.
-/// Without `test-hooks` the child routes on the runner's memory, so the
+/// Without the `pbfhogg_test_hooks` cfg the child routes on the runner's memory, so the
 /// choice is pinned by `auto_routes_on_the_childs_supplied_memory` and
 /// in-process by `host_contract::fixed_memory_routes_auto`.
 #[test]

@@ -1,10 +1,13 @@
 //! One launch in `--test-harness` mode: read the request, establish the
-//! plan's process policy, run setup, run the scenario's calls (one after
-//! another, or on threads of their own where the plan runs them at once),
-//! and write the artefacts (`brokkr man library`, The run protocol and The
-//! artefacts).
+//! workload's process policy, run setup, build the resources the workload
+//! declares, drive its schedule (one call after another, or each on a
+//! harness thread of its own where it runs them at once), drop the
+//! resources, then judge each call and the scenario and write the artefacts
+//! (`brokkr man library`, The run protocol and The artefacts). Every
+//! workload choice comes from the scenario's [`Workload`]; the scenario
+//! supplies only observation and judgments ([`Observation`]).
 //!
-//! Each call, in this order:
+//! Each call, in this order, closed before its successor starts:
 //!
 //! 1. A fresh call sink on the one marker FIFO, tagged with the call id; a
 //!    fresh invocation that owns it (`Invocation::with_call_sink`); a fresh
@@ -25,7 +28,9 @@
 //!    scenario even if it has not emitted yet.
 //! 6. The call's collection closed, its publications and its call sink's
 //!    account (`Invocation::stream_account`) read.
-//! 7. The call document written.
+//!
+//! Once the schedule is done, each call's judgments, then its call
+//! document, in declared order.
 //!
 //! `scenario.json` is written last, with setup's and the harness's own
 //! diagnostics and the scenario-level results.
@@ -33,11 +38,15 @@
 use crate::diag::Collector;
 use crate::outcome::CallOutcome;
 use crate::protocol::{Outcome, PROTOCOL, ScenarioDecl, Status};
+use crate::workload::{
+    CallPlan, ExecutorPlan, Parallelism, ProcessPlan, Returned, Schedule, Workload,
+};
 use pbfhogg::debug::{CallId, InstrumentSink, MarkerFifo, StreamAccount, StreamState};
 use pbfhogg::host::{
-    Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions, PageCachePolicy,
-    ProcessActions, SealOutcome,
+    Diagnostics, Executor, FdPool, Fixed, Host, Invocation, NoProcessActions, ProcessActions,
+    SealOutcome,
 };
+use pbfhogg::process::FdReservation;
 use pbfhogg::{Decision, Effect};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -121,12 +130,16 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     let request = crate::request::parse(&text)?;
     let scenario = crate::scenarios::find(&request.scenario)
         .ok_or_else(|| format!("no scenario {:?}", request.scenario))?;
-    let decl = crate::scenarios::declared(scenario.as_ref());
+    let workload = scenario.workload();
+    workload.validate()?;
+    let plan = workload.plan()?;
+    let decl = crate::scenarios::declared(&workload);
+    decl.validate()?;
     check_bindings(&decl, &request.bindings)?;
     let fifo =
         MarkerFifo::open(fifo_path).map_err(|e| format!("cannot open the marker FIFO: {e}"))?;
     // The plan's process policy, before any library work.
-    scenario.nofile().apply()?;
+    workload.nofile.apply()?;
     // Held to the end of this function: the profile covers every call and
     // its cleanup, and is written when the guard drops, after scenario.json.
     let _guard = launch.profile.then(|| {
@@ -144,14 +157,30 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
         fifo,
         private_dir: launch.private_dir,
         calls_dir,
-        settings: Settings::establish(scenario.starts_global_pool()),
+        settings: Settings::establish(workload.starts_global_pool),
         all_passed: true,
         late: Vec::new(),
         inventory: Mutex::new(Inventory::default()),
     };
     // Setup: every generated role, before any call.
-    scenario.setup(&ctx)?;
-    let mut results = scenario.run(&mut ctx)?;
+    for input in &workload.inputs {
+        if let crate::workload::Source::Generated(recipe) = &input.source {
+            recipe
+                .write(ctx.binding(input.id))
+                .map_err(|e| format!("writing {}: {e}", input.id))?;
+        }
+    }
+    let observation = scenario.observe();
+    let records = ctx.run_schedule(&workload, observation.as_ref())?;
+    let done = Done {
+        records: &records,
+        bindings: &request.bindings,
+    };
+    for record in &records {
+        let judged = observation.judge_call(record, &done);
+        ctx.finish_call(record, &judged)?;
+    }
+    let mut results = observation.judge_scenario(&done);
     let late = ctx.late_report();
     results.push(Outcome::judge(
         crate::scenarios::DIAGNOSTICS_CLOSED,
@@ -174,7 +203,7 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     let doc = json!({
         "protocol": PROTOCOL,
         "scenario": decl.id,
-        "plan": scenario.plan(),
+        "plan": plan,
         "assertions": results.iter().map(Outcome::to_json).collect::<Vec<_>>(),
         "diagnostics": diagnostics,
     });
@@ -297,7 +326,173 @@ pub(crate) struct Published {
 /// the call (its invocation, which would otherwise keep itself alive
 /// through its own tap); what it observed stays readable.
 pub(crate) trait Tap: InstrumentSink {
+    /// Called with the call's invocation before the command runs.
+    fn armed(&self, _invocation: &Invocation) {}
     fn release(&self);
+    /// What a cancel the tap issued returned, for the call document.
+    fn cancel(&self) -> Option<pbfhogg::CancelOutcome> {
+        None
+    }
+}
+
+/// What a descriptor observer may read of the planned pool: its budget and
+/// its live free count. It can neither grant nor release.
+pub(crate) struct FdView<'a> {
+    pool: &'a FdPool,
+    budget: u64,
+}
+
+impl FdView<'_> {
+    pub(crate) fn available(&self) -> u64 {
+        self.pool.available()
+    }
+
+    pub(crate) fn budget(&self) -> u64 {
+        self.budget
+    }
+}
+
+/// Watches one call's descriptor reservations from the planned pool. The
+/// runner's wrapper takes the grant, calls `granted` while holding it (an
+/// observer may block there, to rendezvous with another call), and at
+/// release gives the descriptors back before calling `released`.
+pub(crate) trait FdObserver: Send + Sync {
+    fn granted(&self, wanted: u64, granted: u64, pool: &FdView<'_>);
+    fn released(&self, pool: &FdView<'_>);
+}
+
+/// The scenario's handwritten part of a run: the observation of each call
+/// and the judgments. It chooses nothing about the workload.
+pub(crate) trait Observation {
+    fn tap(&self, _call: &str) -> Option<Arc<dyn Tap>> {
+        None
+    }
+    fn fd_observer(&self, _call: &str) -> Option<Arc<dyn FdObserver>> {
+        None
+    }
+    /// The call's own results, once every call of the schedule is closed.
+    fn judge_call(&self, record: &CallRecord, done: &Done<'_>) -> Vec<Outcome>;
+    /// The scenario's own results (all but the shared diagnostics one).
+    fn judge_scenario(&self, _done: &Done<'_>) -> Vec<Outcome> {
+        Vec::new()
+    }
+}
+
+/// The finished schedule, for judgments.
+pub(crate) struct Done<'a> {
+    records: &'a [CallRecord],
+    bindings: &'a BTreeMap<String, PathBuf>,
+}
+
+impl Done<'_> {
+    pub(crate) fn record(&self, id: &str) -> Option<&CallRecord> {
+        self.records.iter().find(|r| r.id == id)
+    }
+
+    /// The path bound to `role`.
+    pub(crate) fn binding(&self, role: &str) -> &Path {
+        self.bindings
+            .get(role)
+            .map_or(Path::new(""), PathBuf::as_path)
+    }
+}
+
+/// One call's observation hooks: its tap and its descriptor observer.
+type Hooks = (Option<Arc<dyn Tap>>, Option<Arc<dyn FdObserver>>);
+
+/// A planned pool wrapped so its observer sees each grant.
+struct Observed {
+    pool: Arc<FdPool>,
+    budget: u64,
+    observer: Arc<dyn FdObserver>,
+}
+
+impl ProcessActions for Observed {
+    fn fd_allowance(&self, wanted: u64) -> FdReservation {
+        let inner = self.pool.fd_allowance(wanted);
+        let allowance = inner.allowance();
+        self.observer.granted(
+            wanted,
+            allowance.descriptors,
+            &FdView {
+                pool: &self.pool,
+                budget: self.budget,
+            },
+        );
+        let observer = Arc::clone(&self.observer);
+        let pool = Arc::clone(&self.pool);
+        let budget = self.budget;
+        FdReservation::with_release(allowance, move || {
+            drop(inner);
+            observer.released(&FdView {
+                pool: &pool,
+                budget,
+            });
+        })
+    }
+}
+
+/// The resources the workload declares, built by the runner before the
+/// first call, each dropped once its last user has closed.
+struct Resources {
+    executors: Vec<(&'static str, Arc<rayon::ThreadPool>)>,
+    fd_pools: Vec<(&'static str, Arc<FdPool>, u64)>,
+}
+
+impl Resources {
+    fn build(workload: &Workload) -> Result<Self, String> {
+        let mut executors = Vec::new();
+        for pool in &workload.executor_pools {
+            let id = pool.id;
+            let built = rayon::ThreadPoolBuilder::new()
+                .num_threads(pool.threads)
+                .thread_name(move |i| format!("harness-{id}-{i}"))
+                .build()
+                .map_err(|e| format!("building executor pool {id}: {e}"))?;
+            if built.current_num_threads() != pool.threads {
+                return Err(format!("executor pool {id} has the wrong size"));
+            }
+            executors.push((id, Arc::new(built)));
+        }
+        let fd_pools = workload
+            .fd_pools
+            .iter()
+            .map(|p| (p.id, Arc::new(FdPool::new(p.budget)), p.budget))
+            .collect();
+        Ok(Self {
+            executors,
+            fd_pools,
+        })
+    }
+
+    /// Drop every resource whose last user, in schedule order, is call
+    /// `index`, now that it has closed.
+    fn release_after(&mut self, workload: &Workload, index: usize) {
+        self.executors.retain(|(id, _)| {
+            workload.last_user(|h| matches!(h.executor, ExecutorPlan::Pool(p) if p == *id))
+                != Some(index)
+        });
+        self.fd_pools.retain(|(id, _, _)| {
+            workload.last_user(|h| matches!(h.process, ProcessPlan::FdPool(p) if p == *id))
+                != Some(index)
+        });
+    }
+
+    fn executor(&self, id: &str) -> Result<&Arc<rayon::ThreadPool>, String> {
+        self.executors
+            .iter()
+            .find(|(name, _)| *name == id)
+            .map(|(_, pool)| pool)
+            .ok_or_else(|| format!("no executor pool {id}"))
+    }
+
+    fn fd_pool(&self, id: &str) -> Result<(&Arc<FdPool>, u64), String> {
+        self.fd_pools
+            .iter()
+            .find(|(name, _, _)| *name == id)
+            .map(|(_, pool, budget)| (pool, *budget))
+            .ok_or_else(|| format!("no descriptor pool {id}"))
+    }
 }
 
 /// Releases a tap when dropped, so an early return cannot leave the
@@ -312,71 +507,14 @@ impl Drop for Released {
     }
 }
 
-/// The rayon pool a call's work runs on.
-pub(crate) enum Exec {
-    /// The global pool, which the scenario started during setup.
-    Ambient,
-    /// A pool the harness built for the call.
-    Pool(Arc<rayon::ThreadPool>),
-}
-
-/// A call's process actions.
-pub(crate) enum Process {
-    /// `NoProcessActions`: the descriptor allowance is the soft limit less
-    /// the descriptors open at the request.
-    None,
-    /// A reserving pool of `budget` descriptors shared by concurrent calls,
-    /// as the harness wraps it.
-    Pool {
-        actions: Arc<dyn ProcessActions>,
-        budget: u64,
-    },
-}
-
-/// The host a call gets, and the tap on its stream.
-pub(crate) struct CallSpec {
-    pub(crate) id: &'static str,
-    /// `None`: the machine's parallelism.
-    pub(crate) parallelism: Option<NonZeroUsize>,
-    pub(crate) executor: Exec,
-    pub(crate) process: Process,
-    /// The output stance the call's body uses, for its context.
-    pub(crate) overwrite: &'static str,
-    pub(crate) page_cache: PageCachePolicy,
-    pub(crate) tap: Option<Arc<dyn Tap>>,
-}
-
-impl CallSpec {
-    /// The default host: machine parallelism, the ambient pool, no process
-    /// actions, the page cache kept, refusing an existing output, no tap.
-    pub(crate) fn plain(id: &'static str) -> Self {
-        Self {
-            id,
-            parallelism: None,
-            executor: Exec::Ambient,
-            process: Process::None,
-            overwrite: "refuse",
-            page_cache: PageCachePolicy::Keep,
-            tap: None,
-        }
-    }
-}
-
-/// The protocol's spelling of a page-cache policy, as plans and contexts
-/// carry it.
-pub(crate) fn page_cache_name(policy: PageCachePolicy) -> &'static str {
-    match policy {
-        PageCachePolicy::Keep => "keep",
-        PageCachePolicy::Evict => "evict",
-    }
-}
-
 /// Everything a call document reports, before its assertions.
 pub(crate) struct CallRecord {
     pub(crate) id: &'static str,
     pub(crate) outcome: CallOutcome,
     pub(crate) publications: Vec<Published>,
     pub(crate) cancel: Option<pbfhogg::CancelOutcome>,
+    /// What the command returned, when it returned ok.
+    pub(crate) returned: Option<Returned>,
     pub(crate) entry_us: u64,
     pub(crate) return_us: u64,
     seal_us: u64,
@@ -436,41 +574,124 @@ impl Ctx<'_> {
             .map_or(Path::new(""), PathBuf::as_path)
     }
 
-    /// Run one call (steps 1 to 6 of the module's order). Takes `&self`, so
-    /// calls the plan runs concurrently run on threads of their own.
-    pub(crate) fn call(
+    /// Run the workload's schedule from harness threads, with the resources
+    /// it declares, and return every closed call's record in declared
+    /// order. Each resource is dropped once its last user has closed: in a
+    /// sequential schedule after that call, in a concurrent one after every
+    /// call has joined.
+    fn run_schedule(
         &self,
-        spec: CallSpec,
-        body: impl FnOnce(&Host, &CallEnv<'_>) -> pbfhogg::Result<()>,
+        workload: &Workload,
+        observation: &dyn Observation,
+    ) -> Result<Vec<CallRecord>, String> {
+        let mut resources = Resources::build(workload)?;
+        let hooks: Vec<Hooks> = workload
+            .calls
+            .iter()
+            .map(|c| (observation.tap(c.id), observation.fd_observer(c.id)))
+            .collect();
+        let records = match workload.schedule {
+            Schedule::Sequential => {
+                let mut records = Vec::new();
+                for (index, (plan, (tap, observer))) in workload.calls.iter().zip(hooks).enumerate()
+                {
+                    records.push(self.call(plan, &resources, tap, observer)?);
+                    resources.release_after(workload, index);
+                }
+                records
+            }
+            Schedule::Concurrent => {
+                let resources = &resources;
+                let joined: Vec<Result<CallRecord, String>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = workload
+                        .calls
+                        .iter()
+                        .zip(hooks)
+                        .map(|(plan, (tap, observer))| {
+                            scope.spawn(move || self.call(plan, resources, tap, observer))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err("a call's thread panicked".to_owned()))
+                        })
+                        .collect()
+                });
+                joined.into_iter().collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        drop(resources);
+        Ok(records)
+    }
+
+    /// Run one call (steps 1 to 6 of the module's order): its host from
+    /// its plan and the declared resources, its command from its plan.
+    /// Takes `&self`, so concurrent calls run on threads of their own.
+    fn call(
+        &self,
+        plan: &CallPlan,
+        resources: &Resources,
+        tap: Option<Arc<dyn Tap>>,
+        observer: Option<Arc<dyn FdObserver>>,
     ) -> Result<CallRecord, String> {
-        let id = spec.id;
+        let id = plan.id;
         self.inventory().start(self.decl, id)?;
-        let context = self.context(&spec)?;
+        if plan.command.names_missing()
+            && !crate::scenarios::absent(&self.private_dir.join(crate::workload::MISSING))
+                .map_err(|e| format!("inspect the missing input: {e}"))?
+        {
+            return Err(format!(
+                "call {id}: its missing input {} exists",
+                crate::workload::MISSING
+            ));
+        }
+        let context = self.context(plan, resources)?;
+        let process: Arc<dyn ProcessActions> = match plan.host.process {
+            ProcessPlan::None => Arc::new(NoProcessActions),
+            ProcessPlan::FdPool(pool_id) => {
+                let (pool, budget) = resources.fd_pool(pool_id)?;
+                match observer {
+                    Some(observer) => Arc::new(Observed {
+                        pool: Arc::clone(pool),
+                        budget,
+                        observer,
+                    }),
+                    None => Arc::clone(pool) as Arc<dyn ProcessActions>,
+                }
+            }
+        };
+        let executor = match plan.host.executor {
+            ExecutorPlan::Ambient => Executor::Ambient,
+            ExecutorPlan::Pool(pool_id) => Executor::Pool(Arc::clone(resources.executor(pool_id)?)),
+        };
+        let parallelism = match plan.host.parallelism {
+            Parallelism::Machine => self.settings.parallelism,
+            Parallelism::Fixed(n) => Some(n),
+        };
         let sink = self
             .fifo
             .call(CallId::new(id).map_err(|e| e.report())?)
             .map_err(|e| e.report())?;
-        let tap = spec.tap.clone().map(|tap| tap as Arc<dyn InstrumentSink>);
-        let invocation = Invocation::with_call_sink(sink, tap);
-        let released = Released(spec.tap);
+        let sink_tap = tap.clone().map(|tap| tap as Arc<dyn InstrumentSink>);
+        let invocation = Invocation::with_call_sink(sink, sink_tap);
+        if let Some(tap) = &tap {
+            tap.armed(&invocation);
+        }
+        let released = Released(tap.clone());
         let mut collector = Arc::new(Collector::new(self.fifo.clone()));
         let host = Host {
             diagnostics: Diagnostics::new(
                 Arc::clone(&collector) as Arc<dyn pbfhogg::host::DiagnosticSink>
             ),
-            process: match &spec.process {
-                Process::None => Arc::new(NoProcessActions),
-                Process::Pool { actions, .. } => Arc::clone(actions),
-            },
+            process,
             resources: Arc::new(Fixed {
-                parallelism: spec.parallelism.or(self.settings.parallelism),
+                parallelism,
                 memory_available: None,
             }),
-            page_cache: spec.page_cache,
-            executor: match &spec.executor {
-                Exec::Ambient => Executor::Ambient,
-                Exec::Pool(pool) => Executor::Pool(Arc::clone(pool)),
-            },
+            page_cache: plan.host.page_cache,
+            executor,
             invocation: invocation.clone(),
         };
         let env = CallEnv {
@@ -478,7 +699,7 @@ impl Ctx<'_> {
             private_dir: self.private_dir,
         };
         let entry_us = self.fifo.now_us();
-        let result = body(&host, &env);
+        let result = plan.command.execute(&env, &host);
         let return_us = self.fifo.now_us();
         pbfhogg::write::emit_writer_counters(&invocation);
         pbfhogg::read::emit_read_counters(&invocation);
@@ -497,11 +718,14 @@ impl Ctx<'_> {
         let stream = invocation
             .stream_account()
             .ok_or("the call's invocation has no call sink")?;
+        let cancel = tap.as_ref().and_then(|tap| tap.cancel());
+        drop(tap);
         Ok(CallRecord {
             id,
             outcome: CallOutcome::of(&result),
             publications,
-            cancel: None,
+            cancel,
+            returned: result.ok(),
             entry_us,
             return_us,
             seal_us,
@@ -514,33 +738,47 @@ impl Ctx<'_> {
         })
     }
 
-    /// Every effective per-call setting, from the spec the host is built
-    /// from.
-    fn context(&self, spec: &CallSpec) -> Result<Value, String> {
-        let (executor, threads) = match &spec.executor {
-            Exec::Ambient => (
-                "ambient",
-                self.settings
-                    .ambient_threads
-                    .ok_or("an ambient call in a scenario that leaves the global pool unstarted")?,
-            ),
-            Exec::Pool(pool) => ("pool", pool.current_num_threads()),
-        };
+    /// Every effective per-call setting, from the plan the host is built
+    /// from and the resources it names.
+    fn context(&self, plan: &CallPlan, resources: &Resources) -> Result<Value, String> {
         let mut context = json!({
-            "parallelism": spec.parallelism.or(self.settings.parallelism).map(NonZeroUsize::get),
+            "parallelism": match plan.host.parallelism {
+                Parallelism::Machine => self.settings.parallelism,
+                Parallelism::Fixed(n) => Some(n),
+            }.map(NonZeroUsize::get),
             "memory_available": null,
-            "executor": executor,
-            "executor_threads": threads,
-            "page_cache": page_cache_name(spec.page_cache),
+            "page_cache": crate::workload::page_cache_name(plan.host.page_cache),
             "process_actions": "none",
             "rlimit_nofile_soft": crate::process::soft_nofile()?.to_json(),
-            "overwrite": spec.overwrite,
+            "overwrite": crate::workload::overwrite_json(plan.command.overwrite()),
             "staging": "dir_with_backups_private",
         });
-        if let (Process::Pool { budget, .. }, Some(object)) =
-            (&spec.process, context.as_object_mut())
-        {
+        let Some(object) = context.as_object_mut() else {
+            return Err("the context is not an object".to_owned());
+        };
+        match plan.host.executor {
+            ExecutorPlan::Ambient => {
+                let threads = self
+                    .settings
+                    .ambient_threads
+                    .ok_or("an ambient call in a scenario that leaves the global pool unstarted")?;
+                object.insert("executor".to_owned(), json!("ambient"));
+                object.insert("executor_threads".to_owned(), json!(threads));
+            }
+            ExecutorPlan::Pool(pool_id) => {
+                let pool = resources.executor(pool_id)?;
+                object.insert("executor".to_owned(), json!("pool"));
+                object.insert("executor_pool".to_owned(), json!(pool_id));
+                object.insert(
+                    "executor_threads".to_owned(),
+                    json!(pool.current_num_threads()),
+                );
+            }
+        }
+        if let ProcessPlan::FdPool(pool_id) = plan.host.process {
+            let (_, budget) = resources.fd_pool(pool_id)?;
             object.insert("process_actions".to_owned(), json!("fd_pool"));
+            object.insert("fd_pool".to_owned(), json!(pool_id));
             object.insert("fd_pool_budget".to_owned(), json!(budget));
         }
         Ok(context)
@@ -578,7 +816,7 @@ impl Ctx<'_> {
         }
     }
 
-    /// Write the call document (step 7) with the call's own results.
+    /// Write the call document with the call's own results.
     pub(crate) fn finish_call(
         &mut self,
         record: &CallRecord,
@@ -848,7 +1086,7 @@ mod tests {
 
     fn declaration() -> ScenarioDecl {
         let scenarios = crate::scenarios::all();
-        let mut decl = scenarios[0].decl();
+        let mut decl = scenarios[0].workload().decl();
         decl.calls.truncate(1);
         decl.assertions = vec![AssertionDecl {
             id: "checked",

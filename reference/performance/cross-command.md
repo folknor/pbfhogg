@@ -593,7 +593,12 @@ fixed-resources-executor (`71eed863`) 6.96 and 6.21 s; `--all --dataset
 denmark` passed. isolation-cat planet `--bench 3` (`d73fbee8`): library
 43.1, 55.4, 54.4 s, CLI 55.9, 61.3, 69.5 s, ratio 1.28. Not published:
 the CLI arm's best is 13 s behind the typed `cat` cell above on the same
-file and commit, and that gap is unexplained.
+file and commit, later attributed to drive state (the library arm always
+ran first, so every CLI arm ran deeper into a post-burst read sag; a plain
+`copy-pbf --iterations 3` after a trim showed the same, `41328086`). The
+harness has since dropped CLI counterparts entirely, and isolation-cat with
+them (its one call remains as `hotpath-cat`, profilable, with no CLI arm),
+so these isolation rows have no successors.
 
 ## Clean cells for script benches whose engines moved (bygg, 2026-11-10, at `9d9a2a79`)
 

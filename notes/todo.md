@@ -5,21 +5,6 @@
 The README's three tables come from the campaign at `53360af4`
 (reference/performance/cross-command.md "README campaign"). Left open:
 
-- [ ] **Planet isolation-cat row, held back from the README library
-  table.** `d73fbee8`: library 43.1-55.4 s, CLI 55.9-69.5 s, ratio 1.28,
-  where the typed `brokkr cat` cell on the same file and commit
-  (`be808f35`) took 42.4 s. Explained 2026-11-10 as drive state, not
-  code: every arm does identical syscall work and the whole delta is the
-  writer waiting on input bytes; L1 matches the typed cat at 2.2 GB/s
-  and later iterations sag to 1.6 GB/s after a burst. The session ran
-  about 48 minutes disk-bound, the harness digesting each 92 GB output
-  between arms, library arm always first, so every CLI arm runs deeper
-  into the sag. A plain `copy-pbf --iterations 3` after a trim shows the
-  same with no harness: 42.4, 41.1, 50.1 s (`41328086`). Left: a
-  publishable row, three `brokkr library isolation-cat --dataset planet
-  --bench 1` runs each after a trim and a rest of about ten minutes, and
-  SMART thermal counters around one to tell throttling from SLC or GC
-  (smartctl is not on the agent allowlist).
 - [ ] **Performance guide plantasjen tables** (Japan extract, apply-changes
   at scale and with LocationsOnWays, write throughput, the io_uring and
   O_DIRECT tips) carry host and commit labels but were not re-measured on

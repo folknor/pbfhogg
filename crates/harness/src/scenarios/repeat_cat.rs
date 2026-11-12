@@ -1,122 +1,68 @@
 //! `repeat-cat`: the same cat twice in a row, each call under its own
-//! invocation and host, each with a CLI counterpart that must write an
-//! equal output.
+//! invocation and host; the two outputs must be byte-identical.
 
-use super::{CLEAN_NONE, POLICY_DIFFERENCES, Scenario, WRITE, cat_plan, installed_ok, overrides};
-use crate::protocol::{
-    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
-};
-use crate::runner::{CallSpec, Ctx};
-use pbfhogg::{Output, Overwrite, Staging};
-use serde_json::{Value, json};
+use super::{Scenario, assertion, installed_ok};
+use crate::protocol::Outcome;
+use crate::runner::{CallRecord, Done, Observation};
+use crate::workload::{CallPlan, InputRole, Workload, cat};
 
 pub(crate) struct RepeatCat;
 
 /// Both calls installed and their outputs are byte-identical.
 const REPEATABLE: &[&str] = &["calls.repeatable.v1"];
 
-/// The calls, each with the output role it owns and its assertion.
-const CALLS: [(&str, &str, &str); 2] = [("a", "out-a", "a.outcome"), ("b", "out-b", "b.outcome")];
-
-const ARGV_A: &[Arg] = &[
-    Arg::Literal("cat"),
-    Arg::Input("input"),
-    Arg::Literal("-o"),
-    Arg::Output("out-a"),
-];
-const ARGV_B: &[Arg] = &[
-    Arg::Literal("cat"),
-    Arg::Input("input"),
-    Arg::Literal("-o"),
-    Arg::Output("out-b"),
-];
-
 impl Scenario for RepeatCat {
-    fn decl(&self) -> ScenarioDecl {
-        let call = |id, label, argv| CallDecl {
-            id,
-            label,
-            cli: Some(Counterpart::output(argv, Some(false), POLICY_DIFFERENCES)),
-            stream: STREAM_SEALED,
-        };
-        ScenarioDecl {
-            id: "repeat-cat",
-            description: "cat the input twice in a row, each call under its own invocation",
-            deadline_s: 600,
-            hotpath: false,
-            isolation: false,
-            calls: vec![
-                call("a", "cat input -> out-a", ARGV_A),
-                call("b", "cat input -> out-b", ARGV_B),
-            ],
-            roles: vec![
-                RoleDecl::dataset("input", "indexed"),
-                RoleDecl::output("out-a", "a"),
-                RoleDecl::output("out-b", "b"),
-            ],
-            assertions: vec![
-                AssertionDecl {
-                    id: "a.outcome",
-                    call: Some("a"),
-                    covers: REPEATABLE,
-                },
-                AssertionDecl {
-                    id: "b.outcome",
-                    call: Some("b"),
-                    covers: REPEATABLE,
-                },
-                AssertionDecl {
-                    id: "outputs-equal",
-                    call: None,
-                    covers: REPEATABLE,
-                },
-            ],
-        }
+    fn workload(&self) -> Workload {
+        let mut w = Workload::new(
+            "repeat-cat",
+            "cat the input twice in a row, each call under its own invocation",
+            600,
+        );
+        w.inputs = vec![InputRole::dataset("input", "indexed")];
+        w.calls = vec![
+            CallPlan::plain("a", "cat input -> out-a", cat(&["input"], "out-a")),
+            CallPlan::plain("b", "cat input -> out-b", cat(&["input"], "out-b")),
+        ];
+        w.assertions = vec![
+            assertion("a.outcome", Some("a"), REPEATABLE),
+            assertion("b.outcome", Some("b"), REPEATABLE),
+            assertion("outputs-equal", None, REPEATABLE),
+        ];
+        w
     }
 
-    fn plan(&self) -> Value {
-        let call = |output| cat_plan(&json!(["input"]), output, false);
-        json!({
-            "schedule": { "order": ["a", "b"], "concurrency": "sequential",
-                          "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [], "rayon_global_pool": "started before the first call" },
-            "process": super::process_json(self.nofile()),
-            "calls": { "a": call("out-a"), "b": call("out-b") },
-        })
-    }
-
-    fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
-        for (call, output, assertion) in CALLS {
-            let record = ctx.call(CallSpec::plain(call), |host, env| {
-                let out = Output::with_staging(
-                    env.binding(output),
-                    Overwrite::Refuse,
-                    Staging::DirWithBackups(env.private_dir()),
-                    &host.diagnostics,
-                )?;
-                let input = env.binding("input");
-                pbfhogg::cat::cat(&[input], out, None, &CLEAN_NONE, &WRITE, &overrides(), host)
-                    .map(drop)
-            })?;
-            let judged = installed_ok(assertion, &record, output);
-            ctx.finish_call(&record, &[judged])?;
-        }
-        Ok(vec![outputs_equal(ctx)])
+    fn observe(&self) -> Box<dyn Observation> {
+        Box::new(Judge)
     }
 }
 
-/// `outputs-equal`: the two outputs are byte-identical.
-fn outputs_equal(ctx: &Ctx<'_>) -> Outcome {
-    match super::file_assertions::files_equal(ctx.binding("out-a"), ctx.binding("out-b")) {
-        Ok(equal) => Outcome::judge(
-            "outputs-equal",
-            equal,
-            format!("outputs byte-identical {equal}"),
-        ),
-        Err(error) => Outcome::judge(
-            "outputs-equal",
-            false,
-            format!("cannot compare outputs: {error}"),
-        ),
+struct Judge;
+
+impl Observation for Judge {
+    fn judge_call(&self, record: &CallRecord, _done: &Done<'_>) -> Vec<Outcome> {
+        if record.id == "a" {
+            vec![installed_ok("a.outcome", record, "out-a")]
+        } else {
+            vec![installed_ok("b.outcome", record, "out-b")]
+        }
+    }
+
+    /// `outputs-equal`: the two outputs are byte-identical.
+    fn judge_scenario(&self, done: &Done<'_>) -> Vec<Outcome> {
+        let judged =
+            match super::file_assertions::files_equal(done.binding("out-a"), done.binding("out-b"))
+            {
+                Ok(equal) => Outcome::judge(
+                    "outputs-equal",
+                    equal,
+                    format!("outputs byte-identical {equal}"),
+                ),
+                Err(error) => Outcome::judge(
+                    "outputs-equal",
+                    false,
+                    format!("cannot compare outputs: {error}"),
+                ),
+            };
+        vec![judged]
     }
 }

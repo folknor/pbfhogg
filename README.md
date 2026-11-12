@@ -214,20 +214,15 @@ On Japan (2.4 GB indexed), `extract` of the dataset's Tokyo bbox with complete w
 
 ⁴ osmium has one add-locations-to-ways mode (run with `--keep-member-nodes`), so both rows time the same osmium command against pbfhogg's two index types.
 
-Library mode - the same work called through the library API from the `pbfhogg-harness` executable, against the CLI running the equivalent command, measured by `brokkr library SCENARIO --bench N` on bygg (each process verified; the CLI arm timed from its command interval, inputs evicted before each arm):
+Library mode - the same work called through the library API from the `pbfhogg-harness` executable, measured by `brokkr library SCENARIO --bench N` on bygg (each process verified):
 
-<!-- The planet isolation-cat row is held back: its CLI arm ran well
-behind a typed `brokkr cat` cell at the same commit, and that gap is
-not yet explained. -->
+| Scenario | Dataset | Library | Commit |
+|----------|---------|---------|--------|
+| `repeat-cat` (two `cat` calls in one process, one after another) | Denmark | 154 ms, 140 ms | `53360af4` |
+| `concurrent-cat` (two `cat` calls at once, one descriptor pool) | generated | 0.99 ms each | `53360af4` |
+| `fixed-resources-executor` (`cat --clean` and `cat --type` on a caller-built pool) | Denmark | 6.96 s, 6.21 s | `53360af4` |
 
-| Scenario | Dataset | Library | CLI | Commit |
-|----------|---------|---------|-----|--------|
-| `isolation-cat` (one `cat` in a fresh process) | Denmark | 262 ms | 222 ms | `53360af4` |
-| `repeat-cat` (two `cat` calls in one process, one after another) | Denmark | 154 ms, 140 ms | - | `53360af4` |
-| `concurrent-cat` (two `cat` calls at once, one descriptor pool) | generated | 0.99 ms each | - | `53360af4` |
-| `fixed-resources-executor` (`cat --clean` and `cat --type` on a caller-built pool) | Denmark | 6.96 s, 6.21 s | - | `53360af4` |
-
-`isolation-cat` gives medians of five paired processes; the other rows give each call's best of three. The calls run with the page cache kept and fixed parallelism; the CLI evicts its input and sizes its work by probing the machine.
+Each row gives each call's best of three, with the page cache kept.
 
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance/README.md](reference/performance/README.md).
 

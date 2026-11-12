@@ -235,17 +235,6 @@ resource-derived pools and route altw auto and check locations on the runner's r
 memory. Release builds cannot take a private override, so closing this needs either a different
 execution boundary for those sweeps or acceptance that they are process-integration coverage only.
 
-## VER-089 - Plans, execution and CLI counterparts describe the workload independently
-
-Reported by library-harness.
-
-Each scenario implements `decl()`, `plan()` and `run()` separately, and settings and their JSON are
-duplicated in `scenarios/mod.rs`. The describe test checks names, not options, so a changed
-implementation can keep its plan identity.
-
-Fix: typed workload specifications generating the plan, the call and counterpart arguments. Types
-enforce the representation; arbitrary handwritten behaviour cannot be proven equivalent.
-
 ## VER-090 - The requirement-table check is convention-bound
 
 `required` in `crates/harness/src/describe.rs` now refuses anything outside its convention

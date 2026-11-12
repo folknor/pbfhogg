@@ -41,9 +41,9 @@ pub(crate) enum CallOutcome {
 }
 
 impl CallOutcome {
-    pub(crate) fn of(result: &pbfhogg::Result<()>) -> Self {
+    pub(crate) fn of<T>(result: &pbfhogg::Result<T>) -> Self {
         match result {
-            Ok(()) => Self::Ok,
+            Ok(_) => Self::Ok,
             Err(error) if error.is_cancelled() => Self::Cancelled,
             Err(error) => Self::Error {
                 kind: kind_id(error.kind()),
@@ -87,7 +87,7 @@ mod tests {
     fn an_error_reports_its_kind_and_one_line() {
         // A call id the wire refuses is the library's InvalidArgument.
         let error = pbfhogg::debug::CallId::new("a b").expect_err("refused");
-        let outcome = CallOutcome::of(&Err(error)).to_json();
+        let outcome = CallOutcome::of::<()>(&Err(error)).to_json();
         assert_eq!(outcome["status"], "error");
         assert_eq!(outcome["kind"], "invalid_argument");
         let message = outcome["message"].as_str().expect("a string");

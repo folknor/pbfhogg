@@ -53,8 +53,8 @@ use pbfhogg::{HeaderOverrides, TypeFilter};
 /// executed: by clap, or by the CLI's own option validation rendered through
 /// clap ([`UsageError`]). It is kept apart from `2` so a caller can tell a
 /// mistyped or malformed command line from a command that ran and refused
-/// or failed: brokkr's refusal counterparts declare `2` and must not be
-/// satisfied by a typo in their argv. What the command itself refuses - a
+/// or failed: a caller expecting a refusal checks for `2` and must not be
+/// satisfied by a typo in its argv. What the command itself refuses - a
 /// library `InvalidArgument` included, such as the geocode S2 level bounds -
 /// is `2`: by then the CLI has handed the request over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

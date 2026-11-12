@@ -8,7 +8,9 @@ use crate::runner::Exit;
 pub(crate) fn document() -> Result<serde_json::Value, String> {
     let mut scenarios = Vec::new();
     for scenario in crate::scenarios::all() {
-        let decl = crate::scenarios::declared(scenario.as_ref());
+        let workload = scenario.workload();
+        workload.validate()?;
+        let decl = crate::scenarios::declared(&workload);
         decl.validate()?;
         scenarios.push(decl.to_json());
     }
@@ -31,15 +33,16 @@ pub(crate) fn run() -> Exit {
 
 #[cfg(test)]
 mod tests {
-    /// Every declared scenario passes the protocol's rules, and the plan
-    /// names exactly the declared calls.
+    /// Every declared scenario passes the protocol's rules and its
+    /// workload's own, and the plan names exactly the declared calls.
     #[test]
     fn the_describe_document_is_valid() {
         let doc = super::document().expect("valid declarations");
         assert_eq!(doc["protocol"], 1);
         for scenario in crate::scenarios::all() {
-            let decl = crate::scenarios::declared(scenario.as_ref());
-            let plan = scenario.plan();
+            let workload = scenario.workload();
+            let decl = crate::scenarios::declared(&workload);
+            let plan = workload.plan().expect("plan");
             let planned: Vec<&String> = plan["calls"].as_object().expect("calls").keys().collect();
             let mut declared: Vec<&str> = decl.calls.iter().map(|c| c.id).collect();
             declared.sort_unstable();
@@ -176,7 +179,7 @@ mod tests {
         assert!(!required.is_empty(), "no [pbfhogg.library.require] ids");
         let mut covered = std::collections::BTreeSet::new();
         for scenario in crate::scenarios::all() {
-            let decl = crate::scenarios::declared(scenario.as_ref());
+            let decl = crate::scenarios::declared(&scenario.workload());
             for call in &decl.calls {
                 assert_eq!(
                     call.stream,

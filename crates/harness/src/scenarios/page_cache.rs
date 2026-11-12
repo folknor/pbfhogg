@@ -20,16 +20,14 @@
 //! counter cannot pass the capability. `cat` could not be the contrast: its
 //! raw-frame walk never evicts under either policy.
 
-use super::concurrent_cat::{NODES_PER_BLOCK, write_nodes};
-use super::{Scenario, host_json_paging, process_json};
-use crate::protocol::{
-    AssertionDecl, CallDecl, GeneratedKind, Outcome, Role, RoleDecl, STREAM_SEALED, ScenarioDecl,
+use super::{Scenario, assertion};
+use crate::protocol::Outcome;
+use crate::runner::{CallRecord, Done, Observation};
+use crate::workload::{
+    CallPlan, Command, HostPlan, InputRole, NODES_PER_BLOCK, Recipe, Returned, Workload,
 };
-use crate::runner::{CallRecord, CallSpec, Ctx, page_cache_name};
-use pbfhogg::digest::{Digest, Form};
+use pbfhogg::digest::Form;
 use pbfhogg::host::PageCachePolicy;
-use serde_json::{Value, json};
-use std::sync::Mutex;
 
 pub(crate) struct PageCacheKeep;
 
@@ -38,135 +36,113 @@ const BLOCKS: u64 = 3;
 /// Frames in the generated input: its header and its data blocks.
 const FRAMES: u64 = BLOCKS + 1;
 
-/// The calls: id, policy, outcome assertion.
-const CALLS: [(&str, PageCachePolicy, &str); 2] = [
-    ("keep", PageCachePolicy::Keep, "keep.outcome"),
-    ("evict", PageCachePolicy::Evict, "evict.outcome"),
-];
-
 const EVICTIONS: &str = "fadvise_input_evictions";
 
+fn digest(id: &'static str, label: &'static str, page_cache: PageCachePolicy) -> CallPlan {
+    let mut call = CallPlan::plain(
+        id,
+        label,
+        Command::Digest {
+            input: "input",
+            form: Form::Content,
+            direct_io: false,
+        },
+    );
+    call.host = HostPlan {
+        page_cache,
+        ..HostPlan::PLAIN
+    };
+    call
+}
+
 impl Scenario for PageCacheKeep {
-    fn decl(&self) -> ScenarioDecl {
-        let call = |id, label| CallDecl {
-            id,
-            label,
-            cli: None,
-            stream: STREAM_SEALED,
-        };
-        let outcome = |id, call| AssertionDecl {
-            id,
-            call: Some(call),
-            covers: &[],
-        };
-        ScenarioDecl {
-            id: "page-cache-keep",
-            description: "digest one input under PageCachePolicy::Keep, then under Evict, counting input evictions",
-            deadline_s: 120,
-            hotpath: false,
-            isolation: false,
-            calls: vec![
-                call("keep", "digest input on PageCachePolicy::Keep"),
-                call("evict", "digest input on PageCachePolicy::Evict"),
-            ],
-            roles: vec![RoleDecl {
-                id: "input",
-                role: Role::Generated {
-                    kind: GeneratedKind::Pbf,
-                },
-            }],
-            assertions: vec![
-                outcome("keep.outcome", "keep"),
-                outcome("evict.outcome", "evict"),
-                AssertionDecl {
-                    id: "keep.evicts-nothing",
-                    call: Some("keep"),
-                    covers: &["host.page-cache-keep.v1"],
-                },
-            ],
-        }
-    }
-
-    fn plan(&self) -> Value {
-        let call = |policy| {
-            json!({
-                "command": "digest",
-                "inputs": ["input"],
-                "form": "content",
-                "direct_io": false,
-                "host": host_json_paging(&json!("machine"), &json!("ambient"), &json!("none"),
-                                         page_cache_name(policy)),
-            })
-        };
-        json!({
-            "schedule": { "order": ["keep", "evict"], "concurrency": "sequential",
-                          "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [
-                           { "role": "input",
-                             "recipe": { "writer": "BlockBuilder and PbfWriter, zlib:6, sorted header",
-                                         "blocks": BLOCKS, "nodes_per_block": NODES_PER_BLOCK,
-                                         "node_ids": "1 upward", "tags": "none", "metadata": "none" } } ],
-                       "rayon_global_pool": "started before the first call" },
-            "process": process_json(self.nofile()),
-            "calls": { "keep": call(PageCachePolicy::Keep), "evict": call(PageCachePolicy::Evict) },
-        })
-    }
-
-    fn setup(&self, ctx: &Ctx<'_>) -> Result<(), String> {
-        write_nodes(ctx.binding("input"), BLOCKS).map_err(|e| format!("writing input: {e}"))
-    }
-
-    fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
-        let mut done: Vec<(CallRecord, Option<Digest>)> = Vec::new();
-        for (id, policy, _) in CALLS {
-            let digest = Mutex::new(None);
-            let mut spec = CallSpec::plain(id);
-            spec.page_cache = policy;
-            let record = ctx.call(spec, |host, env| {
-                let d = pbfhogg::digest::digest(env.binding("input"), Form::Content, false, host)?;
-                *digest
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(d);
-                Ok(())
-            })?;
-            let digest = digest
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            done.push((record, digest));
-        }
-        let nodes = BLOCKS * u64::try_from(NODES_PER_BLOCK).unwrap_or(0);
-        let kept = done[0].0.sealed_counter(EVICTIONS);
-        let evicted = done[1].0.sealed_counter(EVICTIONS);
-        let mut evicts_nothing = Some(Outcome::judge(
-            "keep.evicts-nothing",
-            kept == Some(0) && evicted == Some(FRAMES),
-            format!(
-                "{EVICTIONS} in the sealed snapshots: keep {kept:?}, expected Some(0); \
-                 evict {evicted:?}, expected Some({FRAMES}), one per frame of the input"
+    fn workload(&self) -> Workload {
+        let mut w = Workload::new(
+            "page-cache-keep",
+            "digest one input under PageCachePolicy::Keep, then under Evict, counting input evictions",
+            120,
+        );
+        w.inputs = vec![InputRole::generated(
+            "input",
+            Recipe::Nodes { blocks: BLOCKS },
+        )];
+        w.calls = vec![
+            digest(
+                "keep",
+                "digest input on PageCachePolicy::Keep",
+                PageCachePolicy::Keep,
             ),
-        ));
-        let same = done[0].1.is_some() && done[0].1 == done[1].1;
-        for (i, (record, digest)) in done.iter().enumerate() {
-            let (_, _, outcome_id) = CALLS[i];
-            let ok = record.outcome.is_ok()
-                && record.publications.is_empty()
-                && digest.is_some_and(|d| d.nodes.count == nodes)
-                && same;
-            let outcome = Outcome::judge(
-                outcome_id,
-                ok,
+            digest(
+                "evict",
+                "digest input on PageCachePolicy::Evict",
+                PageCachePolicy::Evict,
+            ),
+        ];
+        w.assertions = vec![
+            assertion("keep.outcome", Some("keep"), &[]),
+            assertion("evict.outcome", Some("evict"), &[]),
+            assertion(
+                "keep.evicts-nothing",
+                Some("keep"),
+                &["host.page-cache-keep.v1"],
+            ),
+        ];
+        w
+    }
+
+    fn observe(&self) -> Box<dyn Observation> {
+        Box::new(Judge)
+    }
+}
+
+struct Judge;
+
+fn digest_of(record: Option<&CallRecord>) -> Option<pbfhogg::digest::Digest> {
+    match record.and_then(|r| r.returned) {
+        Some(Returned::Digest(d)) => Some(d),
+        _ => None,
+    }
+}
+
+impl Observation for Judge {
+    fn judge_call(&self, record: &CallRecord, done: &Done<'_>) -> Vec<Outcome> {
+        let nodes = BLOCKS * u64::try_from(NODES_PER_BLOCK).unwrap_or(0);
+        let keep = digest_of(done.record("keep"));
+        let evict = digest_of(done.record("evict"));
+        let same = keep.is_some() && keep == evict;
+        let digest = digest_of(Some(record));
+        let ok = record.outcome.is_ok()
+            && record.publications.is_empty()
+            && digest.is_some_and(|d| d.nodes.count == nodes)
+            && same;
+        let outcome_id = if record.id == "keep" {
+            "keep.outcome"
+        } else {
+            "evict.outcome"
+        };
+        let mut results = vec![Outcome::judge(
+            outcome_id,
+            ok,
+            format!(
+                "{}, nodes {:?} of {nodes}, digests of both calls equal {same}",
+                super::account(record),
+                digest.map(|d| d.nodes.count)
+            ),
+        )];
+        if record.id == "keep" {
+            let kept = record.sealed_counter(EVICTIONS);
+            let evicted = done
+                .record("evict")
+                .and_then(|r| r.sealed_counter(EVICTIONS));
+            results.push(Outcome::judge(
+                "keep.evicts-nothing",
+                kept == Some(0) && evicted == Some(FRAMES),
                 format!(
-                    "{}, nodes {:?} of {nodes}, digests of both calls equal {same}",
-                    super::account(record),
-                    digest.map(|d| d.nodes.count)
+                    "{EVICTIONS} in the sealed snapshots: keep {kept:?}, expected Some(0); \
+                     evict {evicted:?}, expected Some({FRAMES}), one per frame of the input"
                 ),
-            );
-            let mut results = vec![outcome];
-            if i == 0 {
-                results.extend(evicts_nothing.take());
-            }
-            ctx.finish_call(record, &results)?;
+            ));
         }
-        Ok(Vec::new())
+        results
     }
 }

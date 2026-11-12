@@ -3,32 +3,28 @@
 //! block and three), so counters delivered to the wrong call show, both in
 //! each call's sink and in each call's sealed snapshot.
 //!
-//! Both hosts share one `FdPool` sized for both cats' full requests (one
-//! distinct input plus `CAT_EXTRA_FDS` each). Each host's process actions
-//! wrap the pool: a request is granted by the pool, then waits at a
-//! two-party gate until the other call's request was granted too, and the
-//! second to arrive reads the pool's free count while both are held behind
-//! the gate. That proves the lifetimes intersected and both grants were
-//! held at once, by parking, not by thread start order. The wait is in the
-//! caller's `ProcessActions::fd_allowance`, which cat calls on its own
-//! thread before pinning, outside any library lock; the taps never block.
-//! Each wrapper also tracks its own grant's release, which each call's tap
-//! reads at `CAT_SCAN_START`: cat still holds its grant while it scans.
+//! Both calls name one descriptor pool the runner builds, sized for both
+//! cats' full requests (one distinct input plus `CAT_EXTRA_FDS` each). Each
+//! call's descriptor observer is a party to a two-party gate: the runner
+//! grants a request from the pool, then the observer waits at the gate until
+//! the other call's request was granted too, and the second to arrive reads
+//! the pool's free count while both are held behind the gate. That proves
+//! the lifetimes intersected and both grants were held at once, by parking,
+//! not by thread start order. The wait is in the call's
+//! `ProcessActions::fd_allowance`, which cat calls on its own thread before
+//! pinning, outside any library lock; the taps never block. Each observer
+//! also tracks its own grant's release, which each call's tap reads at
+//! `CAT_SCAN_START`: cat still holds its grant while it scans.
 
-use super::{
-    CLEAN_NONE, POLICY_DIFFERENCES, Scenario, account, cat_into, clean_json, host_json,
-    output_policy_json, overrides_json, process_json, write_json,
+use super::{Scenario, account, assertion};
+use crate::protocol::Outcome;
+use crate::runner::{CallRecord, Done, FdObserver, FdView, Observation, Tap};
+use crate::workload::{
+    CallPlan, DescriptorPool, HostPlan, InputRole, ProcessPlan, Recipe, Schedule, Workload, cat,
 };
-use crate::protocol::{
-    Arg, AssertionDecl, CallDecl, Counterpart, GeneratedKind, Outcome, Role, RoleDecl,
-    STREAM_SEALED, ScenarioDecl,
-};
-use crate::runner::{CallRecord, CallSpec, Ctx, Process, Tap};
 use pbfhogg::debug::InstrumentSink;
-use pbfhogg::host::{FdPool, ProcessActions};
-use pbfhogg::process::FdReservation;
 use pbfhogg::{Decision, Effect};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
@@ -39,8 +35,6 @@ pub(crate) struct ConcurrentCat;
 const CAT_WANTS: u64 = 9;
 /// Both cats' full requests.
 const BUDGET: u64 = 2 * CAT_WANTS;
-/// Nodes per generated block.
-pub(crate) const NODES_PER_BLOCK: i64 = 100;
 /// Both calls ran at once and completed, each holding its full grant from
 /// the shared pool across its scan.
 const CONCURRENT_POOL: &[&str] = &["calls.concurrent.v1", "fd.pool.v1"];
@@ -66,22 +60,9 @@ const CALLS: [(&str, &str, u64, &str); 2] = [
     ("b", "input-large", 3, "out-b"),
 ];
 
-const ARGV_A: &[Arg] = &[
-    Arg::Literal("cat"),
-    Arg::Input("input-small"),
-    Arg::Literal("-o"),
-    Arg::Output("out-a"),
-];
-const ARGV_B: &[Arg] = &[
-    Arg::Literal("cat"),
-    Arg::Input("input-large"),
-    Arg::Literal("-o"),
-    Arg::Output("out-b"),
-];
-
 /// The two-party gate both calls' descriptor requests meet at.
+#[derive(Default)]
 struct Gate {
-    pool: Arc<FdPool>,
     state: Mutex<GateState>,
     met: Condvar,
 }
@@ -96,6 +77,8 @@ struct GateState {
     failed: bool,
     /// The pool's free count while both grants were held behind the gate.
     free_when_met: Option<u64>,
+    /// The pool's budget, as the second arrival saw it.
+    budget: Option<u64>,
 }
 
 impl Gate {
@@ -103,14 +86,15 @@ impl Gate {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn arrive(&self) {
+    fn arrive(&self, pool: &FdView<'_>) {
         let mut state = self.state();
         if state.failed {
             return;
         }
         state.arrived += 1;
         if state.arrived == 2 {
-            state.free_when_met = Some(self.pool.available());
+            state.free_when_met = Some(pool.available());
+            state.budget = Some(pool.budget());
             state.opened = true;
             self.met.notify_all();
             return;
@@ -126,25 +110,28 @@ impl Gate {
     }
 }
 
-/// One call's process actions: the shared pool behind the gate, with its
-/// own grant's size and release tracked.
+/// One call's descriptor observer: a party to the gate, with its own
+/// grant's size and release tracked.
 struct Gated {
     gate: Arc<Gate>,
     granted: Mutex<Option<u64>>,
     released: Arc<AtomicBool>,
+    /// The pool's free count just after this grant went back.
+    free_after_release: Mutex<Option<u64>>,
 }
 
-impl ProcessActions for Gated {
-    fn fd_allowance(&self, wanted: u64) -> FdReservation {
-        let inner = self.gate.pool.fd_allowance(wanted);
-        let allowance = inner.allowance();
-        *self.granted.lock().unwrap_or_else(PoisonError::into_inner) = Some(allowance.descriptors);
-        self.gate.arrive();
-        let released = Arc::clone(&self.released);
-        FdReservation::with_release(allowance, move || {
-            drop(inner);
-            released.store(true, Ordering::Release);
-        })
+impl FdObserver for Gated {
+    fn granted(&self, _wanted: u64, granted: u64, pool: &FdView<'_>) {
+        *self.granted.lock().unwrap_or_else(PoisonError::into_inner) = Some(granted);
+        self.gate.arrive(pool);
+    }
+
+    fn released(&self, pool: &FdView<'_>) {
+        *self
+            .free_after_release
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(pool.available());
+        self.released.store(true, Ordering::Release);
     }
 }
 
@@ -193,132 +180,63 @@ impl Watch {
     }
 }
 
-const fn generated(id: &'static str) -> RoleDecl {
-    RoleDecl {
-        id,
-        role: Role::Generated {
-            kind: GeneratedKind::Pbf,
-        },
-    }
-}
-
 impl Scenario for ConcurrentCat {
-    fn decl(&self) -> ScenarioDecl {
-        let call = |id, label, argv| CallDecl {
-            id,
-            label,
-            cli: Some(Counterpart::output(argv, Some(false), POLICY_DIFFERENCES)),
-            stream: STREAM_SEALED,
+    fn workload(&self) -> Workload {
+        let mut w = Workload::new(
+            "concurrent-cat",
+            "two cats at once over inputs of different sizes, sharing one FdPool",
+            300,
+        );
+        w.inputs = CALLS
+            .iter()
+            .map(|&(_, role, blocks, _)| InputRole::generated(role, Recipe::Nodes { blocks }))
+            .collect();
+        w.fd_pools = vec![DescriptorPool {
+            id: "shared",
+            budget: BUDGET,
+        }];
+        w.schedule = Schedule::Concurrent;
+        let call = |id, label, input: &'static [&'static str], output| {
+            let mut call = CallPlan::plain(id, label, cat(input, output));
+            call.host = HostPlan {
+                process: ProcessPlan::FdPool("shared"),
+                ..HostPlan::PLAIN
+            };
+            call.notes = Some(json!({
+                "fd_gate": "each grant waits until both calls' requests were granted"
+            }));
+            call
         };
-        ScenarioDecl {
-            id: "concurrent-cat",
-            description: "two cats at once over inputs of different sizes, sharing one FdPool",
-            deadline_s: 300,
-            hotpath: false,
-            isolation: false,
-            calls: vec![
-                call("a", "cat input-small -> out-a, beside b", ARGV_A),
-                call("b", "cat input-large -> out-b, beside a", ARGV_B),
-            ],
-            roles: vec![
-                generated("input-small"),
-                generated("input-large"),
-                RoleDecl::output("out-a", "a"),
-                RoleDecl::output("out-b", "b"),
-            ],
-            assertions: vec![
-                AssertionDecl {
-                    id: "a.outcome",
-                    call: Some("a"),
-                    covers: CONCURRENT_POOL,
-                },
-                AssertionDecl {
-                    id: "b.outcome",
-                    call: Some("b"),
-                    covers: CONCURRENT_POOL,
-                },
-                AssertionDecl {
-                    id: "a.own-counters",
-                    call: Some("a"),
-                    covers: OWN_COUNTERS,
-                },
-                AssertionDecl {
-                    id: "b.own-counters",
-                    call: Some("b"),
-                    covers: OWN_COUNTERS,
-                },
-                AssertionDecl {
-                    id: "a.own-snapshot",
-                    call: Some("a"),
-                    covers: OWN_SNAPSHOT,
-                },
-                AssertionDecl {
-                    id: "b.own-snapshot",
-                    call: Some("b"),
-                    covers: OWN_SNAPSHOT,
-                },
-                AssertionDecl {
-                    id: "lifetimes-intersected",
-                    call: None,
-                    covers: CONCURRENT_POOL,
-                },
-                AssertionDecl {
-                    id: "pool-whole-after",
-                    call: None,
-                    covers: &["fd.pool.v1"],
-                },
-            ],
-        }
+        w.calls = vec![
+            call(
+                "a",
+                "cat input-small -> out-a, beside b",
+                &["input-small"],
+                "out-a",
+            ),
+            call(
+                "b",
+                "cat input-large -> out-b, beside a",
+                &["input-large"],
+                "out-b",
+            ),
+        ];
+        w.assertions = vec![
+            assertion("a.outcome", Some("a"), CONCURRENT_POOL),
+            assertion("b.outcome", Some("b"), CONCURRENT_POOL),
+            assertion("a.own-counters", Some("a"), OWN_COUNTERS),
+            assertion("b.own-counters", Some("b"), OWN_COUNTERS),
+            assertion("a.own-snapshot", Some("a"), OWN_SNAPSHOT),
+            assertion("b.own-snapshot", Some("b"), OWN_SNAPSHOT),
+            assertion("lifetimes-intersected", None, CONCURRENT_POOL),
+            assertion("pool-whole-after", None, &["fd.pool.v1"]),
+        ];
+        w
     }
 
-    fn plan(&self) -> Value {
-        let call = |input: &str, output: &str| {
-            json!({
-                "command": "cat",
-                "inputs": [input],
-                "output": output,
-                "type_filter": null,
-                "clean": clean_json(false),
-                "write": write_json(),
-                "header_overrides": overrides_json(),
-                "output_policy": output_policy_json("refuse"),
-                "host": host_json(&json!("machine"), &json!("ambient"),
-                                  &json!({ "fd_pool": BUDGET, "shared_by": ["a", "b"],
-                                          "gate": "both requests granted before either returns" })),
-            })
-        };
-        let recipe = |blocks: u64| {
-            json!({ "writer": "BlockBuilder and PbfWriter, zlib:6, sorted header",
-                    "blocks": blocks, "nodes_per_block": NODES_PER_BLOCK,
-                    "node_ids": "1 upward", "tags": "none", "metadata": "none" })
-        };
-        json!({
-            "schedule": { "order": ["a", "b"], "concurrency": "both at once, one thread each",
-                          "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [
-                           { "role": "input-small", "recipe": recipe(1) },
-                           { "role": "input-large", "recipe": recipe(3) } ],
-                       "rayon_global_pool": "started before the first call" },
-            "process": process_json(self.nofile()),
-            "calls": { "a": call("input-small", "out-a"), "b": call("input-large", "out-b") },
-        })
-    }
-
-    fn setup(&self, ctx: &Ctx<'_>) -> Result<(), String> {
-        for (_, role, blocks, _) in CALLS {
-            write_nodes(ctx.binding(role), blocks).map_err(|e| format!("writing {role}: {e}"))?;
-        }
-        Ok(())
-    }
-
-    fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
-        let pool = Arc::new(FdPool::new(BUDGET));
-        let gate = Arc::new(Gate {
-            pool: Arc::clone(&pool),
-            state: Mutex::new(GateState::default()),
-            met: Condvar::new(),
-        });
-        let parts: Vec<(Arc<Gated>, Arc<Watch>)> = CALLS
+    fn observe(&self) -> Box<dyn Observation> {
+        let gate = Arc::new(Gate::default());
+        let parts = CALLS
             .iter()
             .map(|_| {
                 let released = Arc::new(AtomicBool::new(false));
@@ -327,6 +245,7 @@ impl Scenario for ConcurrentCat {
                         gate: Arc::clone(&gate),
                         granted: Mutex::new(None),
                         released: Arc::clone(&released),
+                        free_after_release: Mutex::new(None),
                     }),
                     Arc::new(Watch {
                         released,
@@ -337,51 +256,56 @@ impl Scenario for ConcurrentCat {
                 )
             })
             .collect();
-        let shared: &Ctx<'_> = ctx;
-        let records: Vec<Result<CallRecord, String>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = CALLS
-                .iter()
-                .zip(&parts)
-                .map(|(&(id, input, _, output), (gated, watch))| {
-                    let mut spec = CallSpec::plain(id);
-                    spec.process = Process::Pool {
-                        actions: Arc::clone(gated) as Arc<dyn ProcessActions>,
-                        budget: BUDGET,
-                    };
-                    spec.tap = Some(Arc::clone(watch) as Arc<dyn Tap>);
-                    scope.spawn(move || {
-                        shared.call(spec, |host, env| {
-                            let input = env.binding(input);
-                            cat_into(env, &[input], output, None, &CLEAN_NONE, host).map(drop)
-                        })
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err("a call's thread panicked".to_owned()))
-                })
-                .collect()
-        });
-        let mut done = Vec::new();
-        for record in records {
-            done.push(record?);
-        }
-        let mut intervals = Vec::new();
-        for ((&(id, _, blocks, output), (gated, watch)), record) in
-            CALLS.iter().zip(&parts).zip(&done)
-        {
-            let written = std::fs::metadata(ctx.binding(output)).map(|m| m.len()).ok();
-            let judged = judge(id, blocks, output, written, gated, watch, record);
-            intervals.push((record.entry_us, record.return_us));
-            ctx.finish_call(record, &judged)?;
-        }
-        let state = gate.state();
-        let overlapped = intervals
+        Box::new(Judge { gate, parts })
+    }
+}
+
+struct Judge {
+    gate: Arc<Gate>,
+    /// Per call, in [`CALLS`] order.
+    parts: Vec<(Arc<Gated>, Arc<Watch>)>,
+}
+
+impl Judge {
+    fn index(call: &str) -> Option<usize> {
+        CALLS.iter().position(|&(id, ..)| id == call)
+    }
+}
+
+impl Observation for Judge {
+    fn tap(&self, call: &str) -> Option<Arc<dyn Tap>> {
+        let i = Self::index(call)?;
+        Some(Arc::clone(&self.parts[i].1) as Arc<dyn Tap>)
+    }
+
+    fn fd_observer(&self, call: &str) -> Option<Arc<dyn FdObserver>> {
+        let i = Self::index(call)?;
+        Some(Arc::clone(&self.parts[i].0) as Arc<dyn FdObserver>)
+    }
+
+    fn judge_call(&self, record: &CallRecord, done: &Done<'_>) -> Vec<Outcome> {
+        let Some(i) = Self::index(record.id) else {
+            return Vec::new();
+        };
+        let (id, _, blocks, output) = CALLS[i];
+        let (gated, watch) = &self.parts[i];
+        let written = std::fs::metadata(done.binding(output))
+            .map(|m| m.len())
+            .ok();
+        judge(id, blocks, output, written, gated, watch, record).into()
+    }
+
+    fn judge_scenario(&self, done: &Done<'_>) -> Vec<Outcome> {
+        let intervals: Vec<(u64, u64)> = CALLS
             .iter()
-            .all(|&(entry, _)| intervals.iter().all(|&(_, ret)| entry <= ret));
+            .filter_map(|&(id, ..)| done.record(id))
+            .map(|r| (r.entry_us, r.return_us))
+            .collect();
+        let overlapped = intervals.len() == CALLS.len()
+            && intervals
+                .iter()
+                .all(|&(entry, _)| intervals.iter().all(|&(_, ret)| entry <= ret));
+        let state = self.gate.state();
         let met = state.opened && !state.failed && state.free_when_met == Some(0);
         let intersected = Outcome::judge(
             "lifetimes-intersected",
@@ -392,13 +316,31 @@ impl Scenario for ConcurrentCat {
                 state.opened, state.failed, state.free_when_met
             ),
         );
+        let budget = state.budget;
         drop(state);
+        // Every grant handed back: the later release saw the whole planned
+        // budget free again.
+        let free_after: Vec<Option<u64>> = self
+            .parts
+            .iter()
+            .map(|(gated, _)| {
+                *gated
+                    .free_after_release
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            })
+            .collect();
+        let whole_again = free_after.iter().all(Option::is_some)
+            && free_after.iter().flatten().max() == Some(&BUDGET);
         let whole = Outcome::judge(
             "pool-whole-after",
-            pool.available() == BUDGET,
-            format!("{} of {BUDGET} free after both calls", pool.available()),
+            whole_again && budget == Some(BUDGET),
+            format!(
+                "free after each release {free_after:?}, pool budget {budget:?}, \
+                 expected {BUDGET} free after the last"
+            ),
         );
-        Ok(vec![intersected, whole])
+        vec![intersected, whole]
     }
 }
 
@@ -483,27 +425,4 @@ fn judge(
         ),
     );
     [outcome, own, snapshot]
-}
-
-/// A sorted PBF of `blocks` blocks of untagged nodes, ids from 1, each
-/// block written as one blob with indexdata.
-pub(crate) fn write_nodes(path: &std::path::Path, blocks: u64) -> pbfhogg::Result<()> {
-    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
-    use pbfhogg::writer::{Compression, PbfWriter};
-    let file = std::fs::File::create(path)?;
-    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::Zlib(6));
-    writer.write_header(&HeaderBuilder::new().sorted().build()?)?;
-    let mut block = BlockBuilder::new();
-    let mut id = 1_i64;
-    for _ in 0..blocks {
-        for _ in 0..NODES_PER_BLOCK {
-            let lat = i32::try_from(id).unwrap_or(0) * 1000;
-            block.add_node(id, lat, lat, std::iter::empty(), None);
-            id += 1;
-        }
-        if let Some(bytes) = block.take()? {
-            writer.write_primitive_block(bytes)?;
-        }
-    }
-    writer.flush()
 }

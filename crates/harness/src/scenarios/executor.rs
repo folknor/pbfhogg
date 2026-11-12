@@ -1,9 +1,9 @@
 //! `fixed-resources-executor`: two cats under fixed `Resources` and one
-//! `Executor::Pool` the harness built, driven from the harness's own thread
-//! (never from a worker of that pool). Setup never starts rayon's global
-//! pool; after both calls `build_global` must still succeed, which proves no
-//! work of either call initialised the global registry (any use of the global
-//! pool does).
+//! `Executor::Pool` the runner built, driven from a harness thread (never
+//! from a worker of that pool). Rayon's global pool is never started; after
+//! both calls `build_global` must still succeed, which proves no work of
+//! either call initialised the global registry (any use of the global pool
+//! does).
 //!
 //! Call `a` is `cat --clean version` on the indexed variant. Its clean pass
 //! frames every block on cat's own classify workers and hands the writer
@@ -22,20 +22,18 @@
 //! rayon's global pool, on another pool or on any library thread counts in
 //! the first and not the second.
 
-use super::{
-    Scenario, cat_into, clean_json, host_json, output, output_policy_json, overrides,
-    overrides_json, process_json, write_json,
+use super::{Scenario, assertion, installed_ok};
+use crate::protocol::Outcome;
+use crate::runner::{CallRecord, Done, Observation};
+use crate::workload::{
+    CLEAN_NONE, CallPlan, Command, ExecutorPlan, ExecutorPool, HostPlan, InputRole, Inputs,
+    OutputPlan, Parallelism, ProcessPlan, Returned, WRITE, Workload, no_overrides,
 };
-use crate::protocol::{
-    Arg, AssertionDecl, CallDecl, Counterpart, Outcome, RoleDecl, STREAM_SEALED, ScenarioDecl,
-};
-use crate::runner::{CallSpec, Ctx, Exec};
 use pbfhogg::TypeFilter;
 use pbfhogg::cat::CleanAttrs;
+use pbfhogg::host::PageCachePolicy;
 use pbfhogg::write::WriteOptions;
-use serde_json::{Value, json};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
 
 pub(crate) struct FixedResourcesExecutor;
 
@@ -48,224 +46,130 @@ const GLOBAL_POOL_UNUSED: &[&str] = &["executor.global-pool-unused.v1"];
 const CALLER_POOL: &[&str] = &["executor.caller-pool.v1"];
 
 /// The fixed parallelism and the caller pool's size.
-const THREADS: usize = 4;
+const THREADS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(3);
 
 const CLEAN_VERSION: CleanAttrs = CleanAttrs {
     version: true,
-    changeset: false,
-    timestamp: false,
-    uid: false,
-    user: false,
+    ..CLEAN_NONE
 };
 
-/// [`super::WRITE`] with `force`: the raw input has no indexdata, which a
-/// type filter otherwise refuses.
+/// [`WRITE`] with `force`: the raw input has no indexdata, which a type
+/// filter otherwise refuses.
 const WRITE_FORCED: WriteOptions = WriteOptions {
     force: true,
-    ..super::WRITE
+    ..WRITE
 };
 
 const FRAMED: &str = "writer_payload_framed_items";
 const FRAMED_ON_EXECUTOR: &str = "writer_payload_framed_on_executor_items";
 
-const ARGV_A: &[Arg] = &[
-    Arg::Literal("cat"),
-    Arg::Input("input"),
-    Arg::Literal("--clean"),
-    Arg::Literal("version"),
-    Arg::Literal("-o"),
-    Arg::Output("out"),
-];
-
-const ARGV_B: &[Arg] = &[
-    Arg::Literal("cat"),
-    Arg::Input("raw"),
-    Arg::Literal("--type"),
-    Arg::Literal("node,way,relation"),
-    Arg::Literal("--force"),
-    Arg::Literal("-o"),
-    Arg::Output("framed"),
-];
-
-const EXECUTOR_DIFFERENCES: &[&str] = &[
-    "the CLI runs on PageCachePolicy::Evict; the call runs on Keep",
-    "the CLI raises its soft RLIMIT_NOFILE when a command asks; the harness set it at start",
-    "the CLI sizes work by probing the machine and runs on rayon's global pool; the call gets fixed parallelism and a pool of its own",
-];
+const HOST: HostPlan = HostPlan {
+    parallelism: Parallelism::Fixed(THREADS),
+    executor: ExecutorPlan::Pool("caller"),
+    process: ProcessPlan::None,
+    page_cache: PageCachePolicy::Keep,
+};
 
 impl Scenario for FixedResourcesExecutor {
-    fn decl(&self) -> ScenarioDecl {
-        ScenarioDecl {
-            id: "fixed-resources-executor",
-            description: "two cats on fixed Resources and a caller-built Executor::Pool: \
-                          the global pool unused, and writer framing on the caller's pool",
-            deadline_s: 900,
-            hotpath: false,
-            isolation: false,
-            calls: vec![
-                CallDecl {
-                    id: "a",
-                    label: "cat --clean version input -> out on the caller's pool",
-                    cli: Some(Counterpart::output(
-                        ARGV_A,
-                        Some(false),
-                        EXECUTOR_DIFFERENCES,
-                    )),
-                    stream: STREAM_SEALED,
-                },
-                CallDecl {
-                    id: "b",
-                    label: "cat --type node,way,relation --force raw -> framed on the caller's pool",
-                    cli: Some(Counterpart::output(
-                        ARGV_B,
-                        Some(false),
-                        EXECUTOR_DIFFERENCES,
-                    )),
-                    stream: STREAM_SEALED,
-                },
-            ],
-            roles: vec![
-                RoleDecl::dataset("input", "indexed"),
-                RoleDecl::dataset("raw", "raw"),
-                RoleDecl::output("out", "a"),
-                RoleDecl::output("framed", "b"),
-            ],
-            assertions: vec![
-                AssertionDecl {
-                    id: "a.outcome",
-                    call: Some("a"),
-                    covers: GLOBAL_POOL_UNUSED,
-                },
-                AssertionDecl {
-                    id: "b.outcome",
-                    call: Some("b"),
-                    covers: GLOBAL_POOL_UNUSED,
-                },
-                AssertionDecl {
-                    id: "b.framing-on-caller-pool",
-                    call: Some("b"),
-                    covers: CALLER_POOL,
-                },
-                AssertionDecl {
-                    id: "global-registry-unused",
-                    call: None,
-                    covers: GLOBAL_POOL_UNUSED,
-                },
-            ],
+    fn workload(&self) -> Workload {
+        let mut w = Workload::new(
+            "fixed-resources-executor",
+            "two cats on fixed Resources and a caller-built Executor::Pool: \
+             the global pool unused, and writer framing on the caller's pool",
+            900,
+        );
+        w.starts_global_pool = false;
+        w.inputs = vec![
+            InputRole::dataset("input", "indexed"),
+            InputRole::dataset("raw", "raw"),
+        ];
+        w.executor_pools = vec![ExecutorPool {
+            id: "caller",
+            threads: THREADS.get(),
+        }];
+        let mut a = CallPlan::plain(
+            "a",
+            "cat --clean version input -> out on the caller's pool",
+            Command::Cat {
+                inputs: Inputs::Roles(&["input"]),
+                output: OutputPlan::fresh("out"),
+                type_filter: None,
+                clean: CLEAN_VERSION,
+                write: WRITE,
+                overrides: no_overrides(),
+            },
+        );
+        a.host = HOST;
+        let mut b = CallPlan::plain(
+            "b",
+            "cat --type node,way,relation --force raw -> framed on the caller's pool",
+            Command::Cat {
+                inputs: Inputs::Roles(&["raw"]),
+                output: OutputPlan::fresh("framed"),
+                type_filter: Some(TypeFilter::all()),
+                clean: CLEAN_NONE,
+                write: WRITE_FORCED,
+                overrides: no_overrides(),
+            },
+        );
+        b.host = HOST;
+        w.calls = vec![a, b];
+        w.assertions = vec![
+            assertion("a.outcome", Some("a"), GLOBAL_POOL_UNUSED),
+            assertion("b.outcome", Some("b"), GLOBAL_POOL_UNUSED),
+            assertion("b.framing-on-caller-pool", Some("b"), CALLER_POOL),
+            assertion("global-registry-unused", None, GLOBAL_POOL_UNUSED),
+        ];
+        w
+    }
+
+    fn observe(&self) -> Box<dyn Observation> {
+        Box::new(Judge)
+    }
+}
+
+struct Judge;
+
+impl Observation for Judge {
+    fn judge_call(&self, record: &CallRecord, _done: &Done<'_>) -> Vec<Outcome> {
+        if record.id == "a" {
+            vec![installed_ok("a.outcome", record, "out")]
+        } else {
+            vec![
+                installed_ok("b.outcome", record, "framed"),
+                framing_on_caller_pool(record),
+            ]
         }
     }
 
-    fn plan(&self) -> Value {
-        let host = host_json(&json!(THREADS), &json!({ "pool": THREADS }), &json!("none"));
-        json!({
-            "schedule": { "order": ["a", "b"], "concurrency": "sequential",
-                          "invocation": "one per call", "host": "one per call" },
-            "setup": { "generated": [], "rayon_global_pool": "never started",
-                       "caller_pool": { "threads": THREADS, "built": "before the first call",
-                                        "shared_by": ["a", "b"],
-                                        "calls_driven_from": "the harness thread, off the pool" } },
-            "process": process_json(self.nofile()),
-            "calls": {
-                "a": {
-                    "command": "cat",
-                    "inputs": ["input"],
-                    "output": "out",
-                    "type_filter": null,
-                    "clean": clean_json(true),
-                    "write": write_json(),
-                    "header_overrides": overrides_json(),
-                    "output_policy": output_policy_json("refuse"),
-                    "host": host,
-                },
-                "b": {
-                    "command": "cat",
-                    "inputs": ["raw"],
-                    "output": "framed",
-                    "type_filter": { "node": true, "way": true, "relation": true },
-                    "clean": clean_json(false),
-                    "write": { "compression": "zlib:6", "backend": "buffered",
-                               "direct_reads": false, "force": true },
-                    "header_overrides": overrides_json(),
-                    "output_policy": output_policy_json("refuse"),
-                    "host": host,
-                },
-            },
-        })
-    }
-
-    fn starts_global_pool(&self) -> bool {
-        false
-    }
-
-    fn run(&self, ctx: &mut Ctx<'_>) -> Result<Vec<Outcome>, String> {
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(THREADS)
-                .thread_name(|i| format!("harness-exec-{i}"))
-                .build()
-                .map_err(|e| format!("building the caller pool: {e}"))?,
-        );
-        let spec = |id| {
-            let mut spec = CallSpec::plain(id);
-            spec.parallelism = NonZeroUsize::new(THREADS);
-            spec.executor = Exec::Pool(Arc::clone(&pool));
-            spec
-        };
-
-        let record = ctx.call(spec("a"), |host, env| {
-            let input = env.binding("input");
-            cat_into(env, &[input], "out", None, &CLEAN_VERSION, host).map(drop)
-        })?;
-        let judged = super::installed_ok("a.outcome", &record, "out");
-        ctx.finish_call(&record, &[judged])?;
-
-        let stats = Mutex::new(None);
-        let record = ctx.call(spec("b"), |host, env| {
-            let raw = env.binding("raw");
-            let out = output(env, "framed", pbfhogg::Overwrite::Refuse, host)?;
-            let got = pbfhogg::cat::cat(
-                &[raw],
-                out,
-                Some(TypeFilter::all()),
-                &super::CLEAN_NONE,
-                &WRITE_FORCED,
-                &overrides(),
-                host,
-            )?;
-            if let Ok(mut slot) = stats.lock() {
-                *slot = Some((got.blobs_passthrough, got.blobs_decoded));
-            }
-            Ok(())
-        })?;
-        let stats = stats.into_inner().ok().flatten();
-        let outcome = super::installed_ok("b.outcome", &record, "framed");
-        let framing = framing_on_caller_pool(&record, stats);
-        ctx.finish_call(&record, &[outcome, framing])?;
-        drop(pool);
-
-        // Both calls are sealed and their values dropped: whatever they did
-        // is done.
+    /// Both calls are closed and the runner dropped their pool: whatever
+    /// they did is done.
+    fn judge_scenario(&self, _done: &Done<'_>) -> Vec<Outcome> {
         let global = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build_global();
-        Ok(vec![Outcome::judge(
+        vec![Outcome::judge(
             "global-registry-unused",
             global.is_ok(),
             match global {
                 Ok(()) => "rayon's global pool was still unbuilt after both calls".to_owned(),
                 Err(e) => format!("rayon's global pool was already initialised: {e}"),
             },
-        )])
+        )]
     }
 }
 
 /// `b.framing-on-caller-pool`: no blob passed through, some decoded, some
 /// payloads framed, and every framed payload framed on a worker of the
 /// caller's pool, read from the sealed call's final counters.
-fn framing_on_caller_pool(
-    record: &crate::runner::CallRecord,
-    stats: Option<(u64, u64)>,
-) -> Outcome {
+fn framing_on_caller_pool(record: &CallRecord) -> Outcome {
+    let stats = match record.returned {
+        Some(Returned::Cat {
+            passthrough,
+            decoded,
+        }) => Some((passthrough, decoded)),
+        _ => None,
+    };
     let framed = record.sealed_counter(FRAMED);
     let on_pool = record.sealed_counter(FRAMED_ON_EXECUTOR);
     let ok = matches!(

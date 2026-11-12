@@ -99,23 +99,6 @@ pub(crate) struct RoleDecl {
 }
 
 impl RoleDecl {
-    pub(crate) const fn dataset(id: &'static str, variant: &'static str) -> Self {
-        Self {
-            id,
-            role: Role::Dataset { variant },
-        }
-    }
-
-    pub(crate) const fn output(id: &'static str, owner: &'static str) -> Self {
-        Self {
-            id,
-            role: Role::OutputPbf {
-                owner,
-                seeded: false,
-            },
-        }
-    }
-
     fn to_json(&self) -> Value {
         match self.role {
             Role::Dataset { variant } => json!({
@@ -139,88 +122,9 @@ impl RoleDecl {
     }
 }
 
-/// One argument of a CLI counterpart.
-#[derive(Clone, Copy)]
-pub(crate) enum Arg {
-    Literal(&'static str),
-    Input(&'static str),
-    Output(&'static str),
-}
-
-/// What a counterpart's replay must come to.
-#[derive(Clone, Copy)]
-pub(crate) enum Expect {
-    /// Exit 0 with outputs equal to the call's.
-    Output,
-    /// Refuse with this exit status, publishing nothing, as the call did.
-    Refusal { exit: u8 },
-}
-
-/// A call's CLI counterpart.
-pub(crate) struct Counterpart {
-    pub(crate) argv: &'static [Arg],
-    /// The command writes run scratch (`--tmp-dir` negotiated).
-    pub(crate) scratch: bool,
-    pub(crate) expect: Expect,
-    /// `Some(stance)` declares the overwrite stance; `None` leaves it to
-    /// brokkr's negotiation.
-    pub(crate) overwrite: Option<bool>,
-    pub(crate) policy_differences: &'static [&'static str],
-}
-
-impl Counterpart {
-    /// A counterpart that must write equal outputs, without scratch.
-    pub(crate) const fn output(
-        argv: &'static [Arg],
-        overwrite: Option<bool>,
-        policy_differences: &'static [&'static str],
-    ) -> Self {
-        Self {
-            argv,
-            scratch: false,
-            expect: Expect::Output,
-            overwrite,
-            policy_differences,
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        let argv: Vec<Value> = self
-            .argv
-            .iter()
-            .map(|arg| match *arg {
-                Arg::Literal(text) => json!(text),
-                Arg::Input(role) => json!({ "input": role }),
-                Arg::Output(role) => json!({ "output": role }),
-            })
-            .collect();
-        let mut cli = json!({
-            "argv": argv,
-            "scratch": self.scratch,
-            "policy_differences": self.policy_differences,
-        });
-        if let Some(object) = cli.as_object_mut() {
-            match self.expect {
-                Expect::Output => {
-                    object.insert("expect".to_owned(), json!("output"));
-                }
-                Expect::Refusal { exit } => {
-                    object.insert("expect".to_owned(), json!("refusal"));
-                    object.insert("exit".to_owned(), json!(exit));
-                }
-            }
-            if let Some(stance) = self.overwrite {
-                object.insert("overwrite".to_owned(), json!(stance));
-            }
-        }
-        cli
-    }
-}
-
 pub(crate) struct CallDecl {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
-    pub(crate) cli: Option<Counterpart>,
     /// The capabilities the call's stream verdict (`<call>/brokkr.stream`)
     /// stands for in a certification.
     pub(crate) stream: &'static [&'static str],
@@ -244,8 +148,6 @@ pub(crate) struct ScenarioDecl {
     pub(crate) deadline_s: u64,
     /// One call, no other library work in the process: profilable.
     pub(crate) hotpath: bool,
-    /// One call timed against its CLI counterpart (brokkr#58).
-    pub(crate) isolation: bool,
     pub(crate) calls: Vec<CallDecl>,
     pub(crate) roles: Vec<RoleDecl>,
     pub(crate) assertions: Vec<AssertionDecl>,
@@ -258,13 +160,8 @@ impl ScenarioDecl {
             .iter()
             .map(|call| {
                 let mut value = json!({ "id": call.id, "label": call.label });
-                if let Some(object) = value.as_object_mut() {
-                    if let Some(cli) = &call.cli {
-                        object.insert("cli".to_owned(), cli.to_json());
-                    }
-                    if !call.stream.is_empty() {
-                        object.insert("stream".to_owned(), json!(call.stream));
-                    }
+                if let (false, Some(object)) = (call.stream.is_empty(), value.as_object_mut()) {
+                    object.insert("stream".to_owned(), json!(call.stream));
                 }
                 value
             })
@@ -289,13 +186,8 @@ impl ScenarioDecl {
             "roles": roles,
             "assertions": assertions,
         });
-        if let Some(object) = value.as_object_mut() {
-            if self.hotpath {
-                object.insert("hotpath".to_owned(), json!(true));
-            }
-            if self.isolation {
-                object.insert("isolation".to_owned(), json!(true));
-            }
+        if let (true, Some(object)) = (self.hotpath, value.as_object_mut()) {
+            object.insert("hotpath".to_owned(), json!(true));
         }
         value
     }
@@ -329,29 +221,15 @@ impl ScenarioDecl {
                     self.id, call.id
                 ));
             }
-            if let Some(cli) = &call.cli {
-                self.validate_counterpart(call.id, cli)?;
-            }
             self.validate_capabilities(call.id, call.stream)?;
         }
         let generated = self
             .roles
             .iter()
             .any(|r| matches!(r.role, Role::Generated { .. }));
-        if (self.hotpath || self.isolation) && (self.calls.len() != 1 || generated) {
+        if self.hotpath && (self.calls.len() != 1 || generated) {
             return Err(format!(
-                "{}: a hotpath or isolation scenario has one call and no generated role",
-                self.id
-            ));
-        }
-        if self.isolation
-            && !self
-                .calls
-                .iter()
-                .all(|c| matches!(&c.cli, Some(cli) if matches!(cli.expect, Expect::Output)))
-        {
-            return Err(format!(
-                "{}: an isolation call needs an output-expecting counterpart",
+                "{}: a hotpath scenario has one call and no generated role",
                 self.id
             ));
         }
@@ -398,67 +276,6 @@ impl ScenarioDecl {
                     .iter()
                     .flat_map(|a| a.covers.iter().copied()),
             )
-    }
-
-    fn validate_counterpart(&self, call: &str, cli: &Counterpart) -> Result<(), String> {
-        let bad = |why: &str| Err(format!("{}: counterpart of {call}: {why}", self.id));
-        let Some(Arg::Literal(first)) = cli.argv.first() else {
-            return bad("the first token is not the subcommand");
-        };
-        if cli.argv.len() < 2 || !is_identifier(first) {
-            return bad("argv too short or bad subcommand");
-        }
-        let mut outputs = Vec::new();
-        for arg in cli.argv {
-            match *arg {
-                Arg::Literal(text) => {
-                    let refused = ["--overwrite", "-O", "--staging-dir", "--tmp-dir"]
-                        .iter()
-                        .any(|flag| text == *flag || text.starts_with(&format!("{flag}=")));
-                    if text.is_empty()
-                        || text.contains('/')
-                        || [".", "..", "--"].contains(&text)
-                        || refused
-                    {
-                        return bad("a literal names a path or a negotiated flag");
-                    }
-                }
-                Arg::Input(role) => {
-                    if !self.has_role(role, |r| {
-                        matches!(r, Role::Dataset { .. } | Role::Generated { .. })
-                    }) {
-                        return bad("an input placeholder names no input role");
-                    }
-                }
-                Arg::Output(role) => {
-                    if outputs.contains(&role)
-                        || !self.has_role(
-                            role,
-                            |r| matches!(r, Role::OutputPbf { owner, .. } if owner == call),
-                        )
-                    {
-                        return bad("an output placeholder is repeated or not this call's");
-                    }
-                    outputs.push(role);
-                }
-            }
-        }
-        if outputs.is_empty() {
-            return bad("no output placeholder");
-        }
-        if let Expect::Refusal { exit } = cli.expect
-            && (!(2..=127).contains(&exit) || exit == 64)
-        {
-            return bad("a refusal's exit is outside 2 to 127 or is 64");
-        }
-        if !cli.policy_differences.iter().all(|t| is_one_line(t)) {
-            return bad("a policy difference is not one line");
-        }
-        Ok(())
-    }
-
-    fn has_role(&self, id: &str, pred: impl Fn(Role) -> bool) -> bool {
-        self.roles.iter().any(|r| r.id == id && pred(r.role))
     }
 
     /// The output roles `call` owns.

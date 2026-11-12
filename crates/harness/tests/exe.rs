@@ -468,8 +468,8 @@ fn seeded_replace_replaces_one_seed_and_keeps_the_other() {
 }
 
 #[test]
-fn isolation_cat_runs_one_call() {
-    let (run, _) = scenario_passes("isolation-cat", true, &["out"], &[]);
+fn hotpath_cat_runs_one_call() {
+    let (run, _) = scenario_passes("hotpath-cat", true, &["out"], &[]);
     assert_eq!(run.entries("artefacts/calls"), ["a.json"]);
 }
 
@@ -520,7 +520,7 @@ fn a_profiled_launch_reports_library_functions() {
     let report = keep.path().join("report.json");
     let vars = profiling_env(&report);
     let env: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let (_run, _) = scenario_passes_with("isolation-cat", &["input"], &["out"], &[], &env);
+    let (_run, _) = scenario_passes_with("hotpath-cat", &["input"], &["out"], &[], &env);
     let text = std::fs::read(&report).expect("the profile report");
     let doc: Value = serde_json::from_slice(&text).expect("a JSON report");
     let section = if cfg!(feature = "hotpath-alloc") {

@@ -25,6 +25,7 @@ mod runner;
 mod scenarios;
 #[cfg(test)]
 mod test_scratch;
+mod workload;
 
 // hotpath 0.16 and later count allocations only through this allocator,
 // which the executable declares itself.

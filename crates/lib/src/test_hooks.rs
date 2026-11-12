@@ -1076,6 +1076,7 @@ impl FaultPlan {
         // it evaluates a condition, so this order cannot invert.
         self.bell.ring();
         let deadline = Instant::now() + HOOK_WAIT;
+        // loop-ends: parks on decode_gate_cv; release notifies, expiry panics
         while !g.released {
             if Instant::now() >= deadline {
                 drop(g);
@@ -1101,6 +1102,8 @@ impl FaultPlan {
     /// a ring is never lost.
     fn wait<R>(&self, mut cond: impl FnMut() -> Option<R>) -> Option<R> {
         let deadline = Instant::now() + HOOK_WAIT;
+        // loop-ends: parks on the plan's bell until a ring after `seen`;
+        // past the deadline it returns None
         loop {
             let seen = *self.bell.rings();
             if let Some(reason) = cond() {

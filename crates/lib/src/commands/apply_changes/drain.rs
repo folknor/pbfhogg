@@ -292,6 +292,9 @@ pub(super) fn run_drain(
     // exit (receiver and barrier sender dropped, producers unblocked, both
     // joined by `merge`), the same one a failed output write takes.
     let cancel = writer.cancel_token().permit();
+    // loop-ends: blocks in drain_rx.recv; producers send items and the node
+    // boundary, DrainWake sends Wake on cancellation or producer failure,
+    // and the drain ends once every sender has closed
     loop {
         let recv_start = crate::counters::Stopwatch::start();
         let item_opt = if drain_disconnected {

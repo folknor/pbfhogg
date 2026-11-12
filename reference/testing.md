@@ -464,9 +464,25 @@ rule (`crates/source-policy/src/rules/duration_literals.rs`) refuses a
 `Duration` built from a numeric literal outside `tunables.rs` (and the hang
 bound's own tests in the test-scratch crate, which cannot name the
 library's tunables), unless `// fixture-time: <reason>` says the value is
-data, not a wait. Both are spelling tripwires: wrappers, named integers,
-macro expansion, a bare imported `yield_now` and spins on `Instant` or
-`try_recv` are outside them, and a marker's reason is reviewed, not checked.
+data, not a wait. A poll needs none of those names, so the loop-waits rule
+(`crates/source-policy/src/rules/loop_waits.rs`) covers the loop itself:
+a `loop`, `while` or `for` whose own extent names `try_recv`, `try_lock`,
+`try_wait`, `try_send`, `Instant`, `elapsed`, `duration_since` or
+`saturating_duration_since`, or calls `.load(`, needs a
+`// loop-ends: <reason>` comment on its keyword line or opening the run
+of line comments directly above it,
+saying what wakes or ends each pass (the blocking call and its notifier, or
+that the loop never waits and how it progresses). The obligation reaches
+every enclosing loop; a `fn` item nested in the loop is not its extent; an
+atomic `.load(` in a `for` whose header spells no endless source (`0..`,
+`repeat`, `cycle` and kin) reads data and passes. Lexer tokens find the
+keywords and probes and syn only narrows: a keyword syn does not parse as
+a loop is exempt unless it sits in a macro or attribute, where the whole
+opaque region is its extent, and a file syn cannot parse fails the rule.
+All three are spelling tripwires: wrappers, named integers, code a macro
+assembles from elsewhere, a bare imported `yield_now` and a hand-written
+endless iterator are outside them, and a marker's reason is reviewed, not
+checked.
 
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication

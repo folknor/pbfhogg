@@ -10,6 +10,7 @@ pub mod host_independence;
 pub mod io_sizes;
 pub mod library_text;
 pub mod lifecycle;
+pub mod loop_waits;
 pub mod statics;
 pub mod test_imports;
 pub mod test_modules;

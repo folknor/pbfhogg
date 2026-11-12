@@ -135,6 +135,7 @@ macro_rules! counter_set {
             }
         }
 
+        // loop-ends: not a loop; inside a macro the rule cannot tell
         impl ::std::default::Default for $name {
             fn default() -> Self {
                 Self::new()

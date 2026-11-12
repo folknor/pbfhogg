@@ -490,6 +490,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     // Streets (fused fine + coarse)
     invocation.marker("GEOCODE_PASS3_STAGEA_STREETS_START");
     let mut chunk_start = 0u32;
+    // loop-ends: one chunk per pass up to the count; the loads read results
     while chunk_start < street_way_count {
         cancel.check()?;
         let chunk_end = chunk_start
@@ -578,6 +579,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     invocation.marker("GEOCODE_PASS3_STAGEA_ADDR_START");
     let addr_count = addr_point_count as usize;
     let mut chunk_start = 0usize;
+    // loop-ends: one chunk per pass up to the count; the loads read results
     while chunk_start < addr_count {
         cancel.check()?;
         let chunk_end = (chunk_start + GEOCODE_ADDR_CHUNK).min(addr_count);
@@ -643,6 +645,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     // Interpolation (fused fine + coarse, same shape as streets)
     invocation.marker("GEOCODE_PASS3_STAGEA_INTERP_START");
     let mut interp_chunk_start = 0usize;
+    // loop-ends: one chunk per pass up to the count; the loads read results
     while interp_chunk_start < interp_ways.len() {
         cancel.check()?;
         let interp_chunk_end = (interp_chunk_start + GEOCODE_INTERP_CHUNK).min(interp_ways.len());

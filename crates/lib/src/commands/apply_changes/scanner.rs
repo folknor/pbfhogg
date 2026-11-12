@@ -155,6 +155,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
     // (or at EOF if no way blobs exist) is derived.
     let mut last_node_seq: Option<u64> = None;
 
+    // loop-ends: one blob header per pass, ending at EOF; its blocking
+    // points are channel sends and the barrier receive
     loop {
         // Test-only: once the barrier has released the walk, hold here
         // before reading the next header until the drain has begun

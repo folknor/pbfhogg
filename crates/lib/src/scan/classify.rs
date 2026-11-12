@@ -1316,6 +1316,8 @@ fn advise_behind(
 ) {
     use std::sync::atomic::Ordering;
     let stopped = || shared.done.load(Ordering::Acquire);
+    // loop-ends: parks when caught up; on_advance and StopAdvisor::drop
+    // store, then unpark, and a retained unpark token means no lost wake
     while !stopped() {
         let edge = shared.edge.load(Ordering::Relaxed);
         if edge > served {
@@ -1802,6 +1804,8 @@ fn run_accumulate_decoded<S: Send>(
                 // receiver. There is no sequence to keep whole. `Ok(false)`
                 // is a worker stopped by a peer's failure.
                 let result: crate::error::Result<bool> = (|| {
+                    // loop-ends: blocks receiving the next position; ends on
+                    // channel close, a peer's stop flag or cancellation
                     loop {
                         cancel.check()?;
                         if stop.load(std::sync::atomic::Ordering::Relaxed) {

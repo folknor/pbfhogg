@@ -33,9 +33,10 @@
 //! syscall there is.
 //!
 //! A spelling tripwire, not enforcement of the prose rule: a wrapper
-//! function, macro expansion, an imported `yield_now` called bare, and spins
-//! on `Instant` or `try_recv` are outside it, and a marker's reason is
-//! checked only for being present.
+//! function, macro expansion and an imported `yield_now` called bare are
+//! outside it, and a marker's reason is checked only for being present.
+//! Spins on `Instant`, `try_recv` or an atomic load call none of these
+//! names; `loop_waits` makes each such loop state what ends it.
 
 use std::collections::BTreeSet;
 

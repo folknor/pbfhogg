@@ -543,6 +543,8 @@ struct TextUnitSink<'a> {
 impl TextUnitSink<'_> {
     /// Send held pieces, oldest first, while the channel has room.
     fn drain_held(&mut self, out: &mut dyn units::UnitOut<Vec<u8>>) -> Result<()> {
+        // loop-ends: sends one held piece per pass and stops at the first
+        // full channel; never waits
         while let Some(mut front) = self.held.pop_front() {
             let chunk = std::mem::take(&mut front.chunk);
             if let Some(back) = out.try_send(chunk)? {

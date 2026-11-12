@@ -5439,6 +5439,7 @@ where
     let mut sink = 0usize;
     let mut round_ns: Vec<u128> = Vec::with_capacity(rounds as usize);
     let timed_start = Instant::now();
+    // loop-ends: a counted round of queries, timed; nothing here waits
     for round in 0..rounds {
         let start = Instant::now();
         for (i, &(lat, lon)) in points.iter().enumerate() {

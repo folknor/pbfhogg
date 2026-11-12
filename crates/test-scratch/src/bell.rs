@@ -47,6 +47,7 @@ impl Bell {
     /// Wait until `cond` holds, at most until `deadline`: whether it held.
     /// `cond` is evaluated without the bell's lock, after every ring.
     pub fn wait(&self, deadline: Instant, mut cond: impl FnMut() -> bool) -> bool {
+        // loop-ends: parks until a ring after `seen`; the deadline fails it
         loop {
             let seen = *self.rings();
             if cond() {

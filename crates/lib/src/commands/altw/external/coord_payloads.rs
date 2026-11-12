@@ -432,6 +432,8 @@ impl ConcurrentBlobLocationRouter {
         // a publication racing the miss, or an abort or producer-done seen on
         // the first recheck, returns without waiting and records nothing.
         let mut blocked: Option<crate::counters::Stopwatch> = None;
+        // loop-ends: parks on `notify` under notify_mu; every publication,
+        // abort and producer-done notifies under that lock, rechecked here
         let outcome = loop {
             let mu_guard = self
                 .notify_mu
@@ -1147,6 +1149,7 @@ mod tests {
         // Hold the gate exactly where wait_ready holds it after its last
         // predicate check. Every event must wait for the atomic unlock/wait,
         // including completion and abort, which may be the final event.
+        // loop-ends: one router and one event per pass; its waits are below
         for event in 0..4 {
             let pwr = make_per_way_rcs(&[&[1]]);
             let router =
@@ -1217,6 +1220,8 @@ mod tests {
                 // with no notification counted is spurious and waits again.
                 assert_eq!(router.notifications.load(SeqCst), 0);
                 let mut gate = gate;
+                // loop-ends: parks on `notify`; the router counts then
+                // notifies under the gate, and the deadline fails the test
                 while router.notifications.load(SeqCst) == 0 {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     assert!(!remaining.is_zero(), "event {event} lost its notification");

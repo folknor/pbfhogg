@@ -307,6 +307,8 @@ impl<'a> OwnedChild<'a> {
     /// whether it exited.
     #[allow(dead_code)]
     pub fn wait_exited(&self, deadline: Instant) -> io::Result<bool> {
+        // loop-ends: polls the pidfd, readable on exit; without pidfd_open
+        // the poll is paced (see ExitFd), until a waitid observer exists
         loop {
             if self.exited_unreaped()? {
                 return Ok(true);
@@ -329,6 +331,8 @@ impl<'a> OwnedChild<'a> {
         fd: std::os::fd::BorrowedFd<'_>,
         deadline: Instant,
     ) -> io::Result<Readiness> {
+        // loop-ends: polls `fd` and the pidfd; a write or the exit wakes it,
+        // paced without pidfd_open as in wait_exited
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let ready = self.exit.poll_with(fd, remaining)?;
@@ -563,6 +567,8 @@ fn wait_for_exit<S, T>(
     expired: fn() -> io::Error,
 ) -> io::Result<T> {
     let start = Instant::now();
+    // loop-ends: `block` waits on the child's exit; past the timeout the
+    // child is killed and the wait fails
     loop {
         if let Some(status) = block(state, timeout.saturating_sub(start.elapsed()))? {
             return Ok(status);
@@ -609,6 +615,8 @@ impl Drop for OwnedChild<'_> {
         // std's `Child` keeps a status it has reaped and never signals then.
         let _kill = self.child.kill();
         let deadline = Instant::now() + TEST_CHILD_CLEANUP;
+        // loop-ends: after SIGKILL, polls the pidfd until exit, bounded by
+        // the cleanup deadline; paced without pidfd_open as in wait_exited
         let reaped = loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => break true,

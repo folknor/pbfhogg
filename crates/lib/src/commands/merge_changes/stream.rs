@@ -985,6 +985,8 @@ fn spill_err(path: &ScratchPath, e: io::Error) -> crate::Error {
 /// reader messages and disconnect arrive on the channel themselves.
 fn recv<T>(rx: &Receiver<Msg<T>>, executor: crate::host::ExecutorRef<'_>) -> crate::Result<Msg<T>> {
     let lost = || crate::Error::internal("merge-changes workers exited without a result");
+    // loop-ends: runs pending pool jobs while empty, then blocks in recv;
+    // every encode spawn is followed by a Wake, so the block always ends
     loop {
         let message = match rx.try_recv() {
             Ok(message) => message,

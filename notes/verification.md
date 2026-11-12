@@ -31,16 +31,6 @@ without failing on large hosts); a ticket's units versus its simultaneous runs; 
 `host::FdPool` tests holding a ticket by convention. Every current heavy holder runs
 `write_base_pbf` (one way blob, so one 256-file fleet), well under the witnessed shape.
 
-## VER-143 - Waits outside the timed-waits spelling rule are unreviewed
-
-The hardcoded-wait chain removed every production timed wait and every test
-sleep and spin primitive the `timed_waits` audit can spell. Outside its reach
-and never inventoried: loops that re-check an `Instant` deadline, and loops
-that spin on `try_recv` or an atomic without calling a banned primitive.
-Each such loop is asked the same question as the rest: does the other side
-notify, and if not, why not. Carried over from the chain's design notes, not
-re-audited.
-
 ## VER-014 - Empty textlint globs and stale exclusions are only audit-enforced
 
 Every rule in `brokkr.d/lints.toml` now has a `must_scan` sentinel, and the old coverage

@@ -528,6 +528,9 @@ pub(super) fn recv_permit(
         return rx.recv();
     }
     let start = crate::counters::Stopwatch::start();
+    // loop-ends: runs pending pool jobs while empty, then blocks in recv;
+    // only the producer spawns framing jobs, so Idle means none can return
+    // a permit except through the channel
     let result = loop {
         match rx.try_recv() {
             Ok(()) => break Ok(()),
@@ -969,6 +972,7 @@ mod tests {
     fn the_window_refills_only_as_far_as_ordered_delivery() {
         let (tx, window_rx, inbox) = new_channels();
         // Reserve three positions the way the producer does.
+        // loop-ends: three reservations from a full window; never waits
         for _ in 0..3 {
             window_rx.try_recv().unwrap();
         }

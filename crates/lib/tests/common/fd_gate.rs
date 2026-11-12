@@ -127,6 +127,8 @@ pub(crate) fn heavy_ticket(runs: u64, test: &str) -> Option<Arc<FdTicket>> {
     let id = state.next;
     state.next += 1;
     state.queue.push_back(id);
+    // loop-ends: parks on the gate's condvar; admission and every ticket
+    // drop notify, and the deadline is an environmental skip
     loop {
         if state.queue.front() == Some(&id) && state.free >= want {
             state.queue.pop_front();

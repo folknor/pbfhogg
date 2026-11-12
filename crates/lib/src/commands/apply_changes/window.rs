@@ -63,6 +63,7 @@ pub(super) struct WindowReturn {
 /// A fresh window of `size` tokens.
 pub(super) fn seq_window(size: usize) -> (WindowAdmit, WindowReturn) {
     let (tx, rx) = sync_channel::<()>(size);
+    // loop-ends: fills a fresh channel once per token; never waits
     for _ in 0..size {
         // A fresh channel with `size` capacity cannot be full or closed.
         tx.try_send(()).ok();

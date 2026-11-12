@@ -174,6 +174,9 @@ pub(super) fn stage3_slot_reorder(
 
                 let tmp_file = router.worker_file(worker_id);
 
+                // loop-ends: claims one bucket per pass by fetch_add; ends when
+                // the buckets run out, on abort or on a peer's error; the only
+                // wait is a test hook's bounded hold, released by router abort
                 loop {
                     // The first-error mutex is locked once per bucket claim.
                     if router.is_aborted()

@@ -414,6 +414,8 @@ impl Iterator for ChunkOffsets<'_> {
                 next,
                 cur,
                 cur_base,
+                // loop-ends: consumes a set bit or one word per pass, ending at
+                // the last word; the load reads the bitset, nothing waits
             } => loop {
                 if *cur != 0 {
                     let tz = cur.trailing_zeros();

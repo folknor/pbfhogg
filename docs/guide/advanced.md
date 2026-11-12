@@ -28,7 +28,7 @@ O_DIRECT requires a real filesystem (not tmpfs). The intended benefit is cache h
 
 ## io_uring writes
 
-The `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and pre-registered page-aligned buffers. Requires Linux 5.1+. The registered pool is charged to `RLIMIT_MEMLOCK`; the writer shrinks it when the full pool does not fit (see the configuration guide).
+The `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and pre-registered page-aligned buffers. Requires Linux 5.1+ and an `RLIMIT_MEMLOCK` that holds the fixed 16 MiB registered pool (64 buffers of 256 KiB); below that the run is refused with exit code 3 (see the configuration guide).
 
 ```sh
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring

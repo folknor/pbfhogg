@@ -269,10 +269,10 @@ are removed; git history keeps them. Detail stays in notes/.
   (5b) batched SQE submission inside `uring_writer` - submit count
   must drop >= 2x with wall unchanged; only matters once a command is
   actually on the io_uring path. **Blocked on host config first**:
-  RLIMIT_MEMLOCK soft limit is 8 MB, so the writer falls back to a
-  smaller registered pool; the full 16 MB pool needs a limits.conf
-  change + re-login, which also blocks a full-pool sort `--io-uring`
-  re-pin. For one session, `sudo prlimit --pid <claude pid>
+  at the distribution default 8 MiB memlock limit `--io-uring` is
+  refused (the writer registers its 16 MiB pool or nothing); raising it
+  needs a limits.conf change + re-login, which also blocks the sort
+  `--io-uring` re-pin. For one session, `sudo prlimit --pid <claude pid>
   --memlock=67108864:67108864` from another terminal raises it for every
   command run after.
 - **libdeflate at planet apply-changes** (formerly write-path plan item

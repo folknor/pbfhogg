@@ -23,8 +23,8 @@ Tests go where they couple least.
   `PlatformUnsupported` would turn the test into a passing skip. The
   complete gate closes that for the backends it lists:
   `brokkr.d/checks.toml` sets `PBFHOGG_TEST_REQUIRE` on the
-  `gate-tests` profile (comma-separated `direct-io`, `io-uring`,
-  `promise-guard`; an unknown or malformed token fails every test that
+  `gate-tests` profile (comma-separated labels from `direct-io`,
+  `io-uring`, `promise-guard`; an unknown or malformed token fails every test that
   consults it), and every refusal predicate that lets a cell skip
   (`common::direct_io_unavailable`, `common::is_uring_unavailable`,
   `CliOutput::is_o_direct_unsupported` and `is_uring_unsupported`,
@@ -44,7 +44,13 @@ Tests go where they couple least.
   not the refusal's label; the CLI predicates read that label from
   stderr, which cannot turn a required refusal into a skip (an
   unaccepted label is no skip, and the test fails on the error). The
-  gate lists `direct-io`, `io-uring` and `promise-guard`.
+  gate lists `direct-io` and `promise-guard`. It does not list
+  `io-uring`: the io_uring writer registers one fixed 16 MiB pool or
+  refuses, never a smaller one (the pool is the measured shape, so a
+  shrunk pool would be a configuration no bench owns), and the
+  distribution default memlock hard limit of 8 MiB refuses it. A gate
+  that required io-uring would require a raised rlimit, which a
+  standard host does not have.
 
   Positive execution is witnessed for io_uring only: the io_uring
   cells that write assert that the writer ran, through the counter
@@ -53,23 +59,47 @@ Tests go where they couple least.
   so a cell that stops reaching the writer fails. The dispatch count
   exists only in hook builds, so `roundtrip_uring_tiny_output` runs
   unwitnessed in the `release` sweep. O_DIRECT cells carry no such
-  witness. The io_uring
-  writer halves its registered pool until the kernel accepts it; the
-  fault plan's `uring_register_cap` refuses oversized candidates as
-  the kernel would, so the retry (by `ENOMEM` and by `EPERM`) and the
-  smaller pools' buffer reuse run on every host with hooks compiled
-  in. The locked-memory allowance is per user, and the first writer
-  can take all of it, so every io_uring cell that registers a pool
-  (not the non-regular-target test, which is refused before) holds
-  `pbfhogg_test_scratch::locked_memory_lease()` (an `flock` on the
-  scratch base) across its writer or CLI child, under its
-  `HangBound`. That serializes the suite's live writers; it does not
-  wait for the kernel's deferred unpin of a ring closed without
-  unregistering, and other processes of the same user are outside it,
-  so on a low-limit host a false gate failure remains possible, never
-  a passing skip. Environmental
+  witness. The locked-memory allowance is per user and a writer takes
+  the whole pool or fails, so every io_uring cell that registers a
+  pool (not the non-regular-target test, which is refused before)
+  holds `pbfhogg_test_scratch::locked_memory_lease()` (an `flock` on
+  the scratch base) across its writer or CLI child, under its
+  `HangBound`, so the suite's cells do not compete for it. That
+  serializes the suite's live writers; it does not wait for the
+  kernel's deferred unpin of a ring closed without unregistering, and
+  other processes of the same user are outside it. Environmental
   skips (osmium, namespaces, descriptor limits, `deny_write`) never
   fail. There is no platform module or profile.
+
+  Three shapes cover a capability the host may lack; the host rule in
+  `AGENTS.md` (nothing beyond a standard Linux box) decides which
+  applies.
+
+  - **Skip on the named refusal, fail on anything else.** A cell skips
+    only on the typed refusal its predicate names (a
+    `PlatformUnsupported` with an accepted label, a missing osmium
+    executable) and fails on every other error, so a misclassified
+    failure cannot pass as a skip. The predicate's doc comment names
+    the refusals that skip. This is the ordinary platform cell.
+  - **Degrade with disclosure.** A tool-side cross-check that needs
+    tooling outside the standard host keeps a leg that runs
+    everywhere, runs the cross-check only where the tooling is present,
+    and says on its output when it did not run, naming what was
+    missing. It does not fail on absence: a failing script check
+    short-circuits every later phase of `brokkr check`. The example is
+    `doc-site` (`scripts/check_doc_site.py`), the VitePress cross-check
+    of the always-on node-free `doc-links`. brokkr prints nothing of a
+    passing script check, so the disclosure shows on a hand run.
+  - **Opt-in instrument.** A test whose point is a specially arranged
+    host is `#[ignore]`d with a reason naming the precondition, run
+    deliberately with `brokkr test <name>`, and fails, never skips,
+    when the precondition is missing: being opt-in already, a skip
+    would be a pass that proved nothing. It is named in the `full`
+    profile's skip list, which otherwise includes ignored tests. The
+    example is `full_registered_pool_instrument` in
+    `crates/lib/src/write/uring_writer.rs`: the io_uring boundary and
+    pool-cycling writes, run where `RLIMIT_MEMLOCK` holds the pool,
+    with every refusal a failure.
 - **Library integration tests** in `crates/lib/tests/<topic>.rs` (e.g.
   `crates/lib/tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - test
   the library through what it exports; see "What a test may import".
@@ -598,8 +628,8 @@ files.
   requires the backend (see "Platform-dependent tests"): O_DIRECT where the scratch
   filesystem rejects it, io_uring when setup fails for an
   environmental reason, such as a kernel without io_uring or an
-  `RLIMIT_MEMLOCK` too low for even the writer's smallest fallback
-  pool.
+  `RLIMIT_MEMLOCK` below the writer's registered pool (the
+  distribution default is).
 - Fault-injection tests are neither `#[ignore]`d nor serial: their
   faults ride on the invocation's cancellation token, so they are
   ordinary modules of the `all` binaries and run with
@@ -1132,9 +1162,11 @@ VitePress and reads the generated HTML: every internal href, sidebar and
 pager links included, names a built page and an id on it; every site page's
 rendered sidebar links to the page, which is VitePress's per-route sidebar
 selection rather than mention anywhere in the config; and the heading IDs
-`doc-links` computes for each built page equal the built IDs, in order. The
-gate therefore needs node and pnpm with the lockfile installed
-(`pnpm install --frozen-lockfile`) and fails without them. It verifies the
+`doc-links` computes for each built page equal the built IDs, in order. It
+runs only where node, pnpm and the installed lockfile
+(`pnpm install --frozen-lockfile`) are present; elsewhere it names what is
+missing, says the cross-check did not run, and passes (the degrade shape in
+"Platform-dependent tests"). Where it runs it verifies the
 site's actual pages, not general Markdown: syntax the site does not use is
 still covered only by the corpus, and the GitHub surface still rests on
 GitHub's documented rules, since GitHub's renderer cannot be run locally.

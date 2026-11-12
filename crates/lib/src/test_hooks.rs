@@ -322,15 +322,6 @@ pub struct FaultPlan {
     pub uring_panic_at_dispatch: AtomicU64,
     /// Handoff operations the uring writer thread has dispatched.
     pub uring_dispatch_count: AtomicU64,
-    /// The largest buffer pool the uring writer's registration may pass to
-    /// the kernel. A larger candidate fails as the kernel would refuse it
-    /// for lack of locked memory, without the kernel being asked, so the
-    /// halving retry runs on any host; the candidate that fits is then
-    /// registered for real. `u64::MAX` (the default) never refuses.
-    pub uring_register_cap: AtomicU64,
-    /// The injected refusal is `EPERM` instead of `ENOMEM`; the retry takes
-    /// both.
-    pub uring_register_refuse_eperm: AtomicBool,
 
     // --- pipelined `PbfWriter` framing (`write::writer`) ---
     /// Sequence number whose framing job panics on the executor.
@@ -762,8 +753,6 @@ impl FaultPlan {
             gzip_hook_timed_out: AtomicBool::new(false),
             uring_panic_at_dispatch: AtomicU64::new(u64::MAX),
             uring_dispatch_count: AtomicU64::new(0),
-            uring_register_cap: AtomicU64::new(u64::MAX),
-            uring_register_refuse_eperm: AtomicBool::new(false),
             framing_panic_at: AtomicUsize::new(usize::MAX),
             hold_framing_at: AtomicUsize::new(usize::MAX),
             held_framing_jobs: Watched::<AtomicU64>::new(0),
@@ -1278,21 +1267,6 @@ impl FaultPlan {
         if n == self.uring_panic_at_dispatch.load(Ordering::Relaxed) {
             panic!("test-hooks: uring_writer dispatch #{n} panicking");
         }
-    }
-
-    /// The refusal `uring_register_cap` injects for a `count`-buffer
-    /// registration, or `None` to let the kernel decide.
-    #[cfg(feature = "linux-io-uring")]
-    pub(crate) fn uring_register_refusal(&self, count: u16) -> Option<std::io::Error> {
-        (u64::from(count) > self.uring_register_cap.load(Ordering::Relaxed)).then(|| {
-            std::io::Error::from_raw_os_error(
-                if self.uring_register_refuse_eperm.load(Ordering::Relaxed) {
-                    libc::EPERM
-                } else {
-                    libc::ENOMEM
-                },
-            )
-        })
     }
 
     // ---- single-shot selectors -------------------------------------------

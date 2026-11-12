@@ -339,6 +339,10 @@ description = "Partial all-feature correctness (tier 3); over-watchdog tests run
 sweeps = ["all"]
 skip = [
     "sort_cross_validate_osmium",
+    # An opt-in instrument, not slow: it fails by design on a host whose
+    # memlock limit cannot hold the io_uring pool, which a standard host's
+    # cannot. Run it with brokkr test where the limit was raised.
+    "full_registered_pool_instrument",
 ]
 include_ignored = true
 
@@ -384,25 +388,25 @@ skip = ["serial::"]
 # only: a selected test that skips at run time returns and counts as passed,
 # since libtest has no skipped outcome. PBFHOGG_TEST_REQUIRE closes that for
 # the backends it lists: every refusal predicate that would let an O_DIRECT
-# io_uring or promise-guard cell skip fails the test instead (see
-# crates/lib/tests/common/skip.rs). A refusal of any of them therefore
-# cannot pass as a skip here. io_uring cells that write also assert that
-# their writer ran (one only in hook builds, see reference/testing.md);
-# O_DIRECT cells have no such witness, so for them this shows only that
-# none skipped on a refusal. Sweeps that compile a backend
-# out (consumer, minimal) carry no claim for it. Other environmental skips
-# (osmium, namespaces, descriptor limits) still pass.
+# or promise-guard cell skip fails the test instead (see
+# crates/lib/tests/common/skip.rs). A refusal of either therefore
+# cannot pass as a skip here. O_DIRECT cells have no positive witness, so
+# for them this shows only that none skipped on a refusal. Sweeps that
+# compile a backend out (consumer, minimal) carry no claim for it. Other
+# environmental skips (osmium, namespaces, descriptor limits) still pass.
 #
-# The io_uring writer halves its registered pool until the kernel accepts
-# it, so it runs under the systemd default memlock limit. That allowance is
-# per user; the suite's io_uring cells serialize on a test-side lease, but
-# other processes of the user and deferred kernel unpins are outside it, so
-# on a low-limit host a contended registration can still fail the gate.
-# That is a false failure, never a refusal passing as a skip.
+# io-uring is not required. The io_uring writer registers one fixed
+# 16 MiB pool or refuses, and the distribution default memlock hard limit
+# (8 MiB) refuses it, so requiring it would make the gate demand a raised
+# rlimit, which the host rule in AGENTS.md forbids. Its cells skip on the
+# typed refusal; where the limit holds the pool they run and assert the
+# registered pool. The full-pool run with refusal as failure is the
+# opt-in ignored instrument full_registered_pool_instrument (see
+# reference/testing.md "Platform-dependent tests").
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
 sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc"]
-env = {PBFHOGG_TEST_REQUIRE = "direct-io,io-uring,promise-guard" }
+env = {PBFHOGG_TEST_REQUIRE = "direct-io,promise-guard" }
 
 # The profiling lane alone, for work on the harness or the instrumentation.
 [test.profiles.profiling]

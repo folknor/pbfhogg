@@ -78,10 +78,11 @@ fn scratch_base() -> &'static Path {
 /// (`RLIMIT_MEMLOCK`) among the checkout's tests: hold it across every
 /// io_uring writer a test starts, a CLI child's included.
 ///
-/// The writer halves its registered pool until the kernel accepts it, so
-/// the first of two concurrent writers can take the whole allowance and the
-/// second then fails even its smallest pool, a refusal the complete gate
-/// counts as a failure. The lease serializes the participating writers.
+/// The writer registers its full fixed pool or refuses, so under an
+/// allowance that holds one pool but not two, the second of two concurrent
+/// writers fails: an ordinary error, which fails its test, where the soft
+/// limit holds the pool. The lease keeps the participating tests from
+/// competing for the allowance by serializing their writers.
 /// It is an `flock` on the scratch base directory itself: that inode
 /// persists for the whole test phase (the run-boundary clear empties it, it
 /// does not remove it) and lies inside the tree the post-run check already

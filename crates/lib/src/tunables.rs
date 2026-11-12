@@ -480,26 +480,14 @@ pub(crate) const QUEUE_SLOTS_PER_WORKER: usize = 2;
 pub(crate) const GZIP_REORDER_PERMIT_POLL: std::time::Duration =
     std::time::Duration::from_millis(25);
 
-/// Number of io_uring registered buffers the writer asks for first, each
-/// `IO_BUF_BYTES`. Registration charges the pinned pages against the user's
-/// `RLIMIT_MEMLOCK` allowance, shared by every process of that user.
+/// Number of io_uring registered buffers, each `IO_BUF_BYTES`: 64 x 256 KiB
+/// = 16 MiB, the one pool shape every io_uring bench measures. The writer
+/// registers exactly this pool or refuses (see step 5 of
+/// `uring_init_and_run`); it never shrinks it to fit. Registration charges
+/// the pinned pages against the user's `RLIMIT_MEMLOCK` allowance, shared by
+/// every process of that user.
 #[cfg(feature = "linux-io-uring")]
 pub(crate) const NUM_BUFS: u16 = 64;
-
-/// Smallest registered pool the io_uring writer accepts when the kernel
-/// refuses a larger registration. The writer halves the count from
-/// `NUM_BUFS` until registration succeeds, because the kernel, not a read of
-/// the limit, knows the remaining locked-memory allowance. One buffer would
-/// still write correctly but serializes filling and submission; two is the
-/// least that keeps one buffer filling while another is in flight.
-#[cfg(feature = "linux-io-uring")]
-pub(crate) const MIN_NUM_BUFS: u16 = 2;
-
-#[cfg(feature = "linux-io-uring")]
-const _: () = assert!(
-    MIN_NUM_BUFS >= 1 && MIN_NUM_BUFS <= NUM_BUFS,
-    "MIN_NUM_BUFS must be a nonzero pool no larger than NUM_BUFS"
-);
 
 /// `user_data` packs `buf_idx` into the low 16 bits, but `ud_buf_idx` masks
 /// `0x3F` - six bits. The two disagree for any `NUM_BUFS` above 64, and the

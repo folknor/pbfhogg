@@ -40,29 +40,21 @@ brokkr#157.
 
 ## VER-018 - The gate's backend requirement checks refusals, not execution
 
-io_uring cells now assert a registered pool, the halving retry runs under a fault
-plan cap, and the suite's io_uring writers serialize on a locked-memory lease.
-Residue: O_DIRECT cells (about forty, library fault_*_input, host_contract and
+io_uring cells assert a registered pool and serialize on a locked-memory lease;
+io-uring is not in the gate's `PBFHOGG_TEST_REQUIRE`, because the writer registers
+its full fixed pool or refuses and a standard host's memlock limit refuses it, so
+on such a host the io_uring cells skip and only the opt-in ignored
+`full_registered_pool_instrument` proves the pool, where run by hand on a host
+whose limit was raised. Residue: O_DIRECT cells (about forty, library fault_*_input, host_contract and
 roundtrip cells, unit tests through `test_support`, seven CLI cells) still have no
 positive witness, so one that stops reaching O_DIRECT without consulting a predicate
 passes; a candidate is `writer_direct_write_calls` for writers, while direct reads
 have no counter. The io_uring witness in `roundtrip_uring_tiny_output` is the
 dispatch count and exists only in hook builds, so the `release` sweep runs that cell
 unwitnessed. The lease cannot cover other processes of the user or a deferred kernel
-unpin. Not yet measured: the fallback pools' wall against the full pool on planet
-(needs a raised limit, which this host lacks).
-
-## VER-142 - The first io_uring writer can take the whole memlock allowance
-
-Found while serializing the test suite's io_uring writers. The pool-halving loop in
-`crates/lib/src/write/uring_writer.rs` keeps the largest halving the kernel accepts,
-so under the systemd default 8 MiB (bygg's hard limit) the first writer registers
-up to 32 buffers, the whole allowance, and a second concurrent `--io-uring` process of the
-same user fails even the 2-buffer floor and exits 3. `docs/guide/configuration.md`
-now says so instead of "concurrent writers divide it". Undecided: whether production
-should leave headroom (for example stop one halving below the first fit), which
-costs single-writer runs pool size and is a measured-path change needing a planet
-A/B under a raised limit.
+unpin. Also open: the `promise-guard` and `direct-io` requirements were not checked
+against the AGENTS.md host rule (a scratch filesystem that refuses O_DIRECT, an
+architecture or kernel without seccomp).
 
 ## VER-140 - Library tests park threads in std scopes without a HangBound
 

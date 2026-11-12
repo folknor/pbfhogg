@@ -169,9 +169,9 @@ crate::counters::counter_set! {
         pub uring_submit_and_wait_ns => "writer_uring_submit_and_wait_ns",
         /// Buffers in the pool each io_uring writer registered, summed over
         /// the invocation's writers and recorded once per writer at setup.
-        /// The writer halves its pool until the kernel accepts it, so on one
-        /// writer this is the pool it actually ran; non-zero is also the
-        /// tests' witness that an io_uring cell reached the backend.
+        /// Every writer registers the full fixed pool or refuses, so this is
+        /// that pool times the writers that started; non-zero is the tests'
+        /// witness that an io_uring cell reached the backend.
         pub uring_registered_buffers => "writer_uring_registered_buffers",
 
         /// Blobs whose `tagdata` was dropped because the encoded `BlobHeader`

@@ -90,11 +90,12 @@ downstream queues keep their own bounds.
   would be as large as the two implementations it replaced. The pool has no
   buffer lifecycle at all and would sit outside the abstraction regardless.
 - **Unify anyway, for the sake of one bug-fix surface.** Rejected on
-  validation grounds, which are decisive here. The `io_uring` backend
-  cannot be exercised against real data on the current bench host: the
-  writer registers 64 x 256 KB = 16 MB and the host's `RLIMIT_MEMLOCK` soft
-  limit is 8 MB, so the preflight refuses before a single SQE is submitted.
-  A rewrite of a backend that no test run can execute end-to-end is how a
+  validation grounds, which are decisive here. The `io_uring` backend runs
+  only where the user's `RLIMIT_MEMLOCK` holds its fixed registered pool
+  of 64 x 256 KiB = 16 MiB; the distribution default memlock hard limit of
+  8 MiB does not, so on a standard host the preflight refuses before a
+  single SQE is submitted, and the ordinary test run skips it. A rewrite of
+  a backend that the ordinary test run does not execute end-to-end is how a
   silent regression ships. Separately, each of the four currently carries a
   recently-added guard at its own layer - `DirectWriter`'s write-after-flush
   refusal, `UringState`'s teardown drain and `NUM_BUFS` compile-time
@@ -104,8 +105,8 @@ downstream queues keep their own bounds.
 - **Make `Drop` without an explicit `finish()` a loud error across all
   four.** Not adopted as part of this decision. It is a real improvement in
   principle, but two of the four backends would have to change their
-  teardown behaviour to get it and one of those two is the unexercisable
-  one; the `Drop` paths are best-effort precisely because they are the paths
+  teardown behaviour to get it and one of those two is the one the
+  ordinary test run cannot exercise on a standard host; the `Drop` paths are best-effort precisely because they are the paths
   taken when something has already gone wrong. Callers that want errors call
   `flush()` and `sync()` by name, and both are documented as the way to get
   them.

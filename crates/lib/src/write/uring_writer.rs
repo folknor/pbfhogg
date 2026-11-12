@@ -17,7 +17,7 @@ use super::IO_BUF_BYTES;
 use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
-use crate::tunables::{MIN_NUM_BUFS, NUM_BUFS};
+use crate::tunables::NUM_BUFS;
 use crate::write::pipeline::{Inbox, OutputSink, SeqTotal, deliver_in_order};
 use io_uring::IoUring;
 use io_uring::opcode;
@@ -410,7 +410,7 @@ impl UringState {
     /// shutdown semantics and is deliberately not hidden in a retry limit.
     fn drain_best_effort(&mut self) {
         let mut rounds = 0_u32;
-        while self.in_flight > 0 && rounds < u32::from(self.pool.count) * 4 {
+        while self.in_flight > 0 && rounds < u32::from(NUM_BUFS) * 4 {
             rounds += 1;
             if self.reap_cqes(true).is_err() {
                 // A failing CQE consumes one in-flight entry; a submit error
@@ -455,8 +455,8 @@ impl UringState {
 /// (the `ReadFixed` chain this writer used to submit for `CopyRange` was
 /// exactly that shape), and it is a pin leak either way.
 ///
-/// A successful drain removes the window. There are at most one completion
-/// per registered buffer outstanding, but no time bound on obtaining them. If repeated
+/// A successful drain removes the window. There are at most `NUM_BUFS`
+/// completions outstanding, but no time bound on obtaining them. If repeated
 /// submit errors exhaust the retry cap, cleanup remains best-effort and the
 /// field-order fallback above still applies; this is not guaranteed quiescence.
 ///
@@ -622,36 +622,43 @@ fn require_write_fixed(ring: &IoUring) -> Result<()> {
     }
 }
 
-/// Classify the registration failure of the smallest pool the writer tried.
-///
-/// ENOMEM covers both the locked-memory allowance and generic kernel resource
-/// exhaustion, so it is a platform refusal only when the soft limit is below
-/// the full pool: that host cannot run the writer as configured whatever else
-/// it is doing. A soft limit at or above the full pool does not rule the
-/// limit out (other locked memory of the same user shares it), but the cause
-/// is then unproven and the error stays an ordinary I/O failure, as resource
-/// exhaustion is everywhere else.
-fn register_buffers_error(e: io::Error, count: u16) -> Error {
+/// The soft `RLIMIT_MEMLOCK`, or `None` where it cannot be read.
+fn memlock_soft_limit() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    let full = u64::from(NUM_BUFS) * IO_BUF_BYTES as u64;
     // Safety: limit is a valid writable rlimit for getrlimit.
-    let limited =
-        unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0 && limit.rlim_cur < full;
-    let step = format!("register_buffers failed for a {count}-buffer pool");
+    (unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0).then_some(limit.rlim_cur)
+}
+
+/// Classify a failed registration of the buffer pool, given the soft
+/// `RLIMIT_MEMLOCK` the caller read (`None` where it could not be read).
+///
+/// ENOMEM covers both the locked-memory allowance and generic kernel resource
+/// exhaustion, so the failure is attributed to the limit, and refused as a
+/// platform feature, only when the errno is ENOMEM or EPERM and the soft
+/// limit is below the pool: such a host cannot run the writer as configured
+/// whatever else it is doing. That is an attribution, not a proof (the kernel
+/// can exempt or charge less than the pool's bytes). A soft limit at or above
+/// the pool does not rule the limit out either (other locked memory of the
+/// same user shares it, a second writer among them), but the cause is then
+/// unproven and the error stays an ordinary I/O failure, as resource
+/// exhaustion is everywhere else.
+fn classify_register_failure(e: io::Error, soft_limit: Option<u64>) -> Error {
+    let full = u64::from(NUM_BUFS) * IO_BUF_BYTES as u64;
+    let limited = soft_limit.is_some_and(|soft| soft < full);
     if limited && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) {
         Error::platform_unsupported(
             "io-uring",
             io::Error::from(Error::from(e).context(format!(
-                "{step}: RLIMIT_MEMLOCK too low for even the smallest pool \
-                 (the full pool wants {} MiB, try `ulimit -l unlimited`)",
+                "register_buffers failed: RLIMIT_MEMLOCK below the registered pool \
+                 (needs {} MiB, try `ulimit -l unlimited`)",
                 full / (1024 * 1024)
             ))),
         )
     } else {
-        Error::from(e).context(step)
+        Error::from(e).context("register_buffers failed")
     }
 }
 
@@ -723,49 +730,29 @@ fn uring_init_and_run(
         .map_err(|e| Error::from(e).context("register_files failed"))?;
 
     // Step 5: Allocate and register the buffer pool (this is where
-    // RLIMIT_MEMLOCK bites). The full pool is tried first, so a host whose
-    // allowance holds it runs exactly that pool. On ENOMEM or EPERM the count
-    // halves down to `MIN_NUM_BUFS`: the allowance is per user and shared, so
-    // only the kernel knows what remains, and a read of the limit would only
-    // guess. A failed registration releases what it charged, so the candidate
-    // pool can be dropped and a smaller one tried on the same ring. Once one
-    // registers it stays fixed through `UringState`'s drain and unregister.
-    let mut count = NUM_BUFS;
-    pool = loop {
-        let candidate = AlignedBufferPool::new(count, IO_BUF_BYTES, align)?;
-        let iovecs = candidate.iovecs();
-        // Test builds may refuse an oversized candidate as the kernel would,
-        // so the retry below runs on any host (`uring_register_cap`).
-        #[cfg(pbfhogg_test_hooks)]
-        let injected = cancel.faults().uring_register_refusal(count);
-        #[cfg(not(pbfhogg_test_hooks))]
-        let injected: Option<io::Error> = None;
-        let registered = match injected {
-            Some(refusal) => Err(refusal),
-            // Safety: iovecs point into the candidate allocation, which is
-            // either kept as `pool` (outliving the ring's use of it) or
-            // dropped only after a failed registration, which leaves nothing
-            // registered.
-            None => unsafe { ring.submitter().register_buffers(&iovecs) },
-        };
-        match registered {
-            Ok(()) => {
-                cancel
-                    .metrics()
-                    .writer
-                    .uring_registered_buffers
-                    .fetch_add(u64::from(count), Relaxed);
-                break candidate;
-            }
-            Err(e)
-                if count > MIN_NUM_BUFS
-                    && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) =>
-            {
-                count = (count / 2).max(MIN_NUM_BUFS);
-            }
-            Err(e) => return Err(register_buffers_error(e, count)),
-        }
-    };
+    // RLIMIT_MEMLOCK bites). The pool is the full `NUM_BUFS` or nothing, on
+    // purpose. Its size is not a user choice but one fixed, measured shape:
+    // every bench number recorded for an io_uring command is a number for
+    // this pool, and a pool that shrank to fit the host's allowance would
+    // make those numbers depend silently on the host and on what else the
+    // user had pinned, a configuration no bench owns. So a host whose
+    // allowance cannot hold the pool is refused (exit 3 where the soft limit
+    // is below it), and a second concurrent writer under a tight allowance
+    // is refused too rather than leaving headroom for it: the remedy is
+    // raising the limit, which `docs/guide/configuration.md` describes.
+    pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES, align)?;
+    let iovecs = pool.iovecs();
+    // Safety: iovecs point into the pool allocation, which outlives the
+    // ring's use of it (`UringState` drains and unregisters before the pool
+    // drops, and on an early return `pool`, declared before `ring`, drops
+    // after it).
+    unsafe { ring.submitter().register_buffers(&iovecs) }
+        .map_err(|e| classify_register_failure(e, memlock_soft_limit()))?;
+    cancel
+        .metrics()
+        .writer
+        .uring_registered_buffers
+        .fetch_add(u64::from(NUM_BUFS), Relaxed);
 
     // Step 6: Signal successful init.
     init_tx
@@ -887,55 +874,76 @@ mod tests {
             "io_uring boundary writes",
         );
         let _lease = pbfhogg_test_scratch::locked_memory_lease();
-        write_boundaries(None, &[]);
+        write_boundaries(Refusals::Skip);
     }
 
-    /// The halving retry and a smaller pool's buffer reuse, on any host:
-    /// the fault plan refuses every candidate above the cap as the kernel
-    /// refuses one for lack of locked memory, by `ENOMEM` for one cap and
-    /// `EPERM` for the other. The candidate that fits is registered for
-    /// real, and outputs spanning several whole pools then cycle its
-    /// buffers. A host whose kernel refuses even that pool skips as any
-    /// io_uring cell does, or fails where the gate requires the backend.
-    #[cfg(pbfhogg_test_hooks)]
+    /// Opt-in instrument: the same writes, run where the host was arranged
+    /// to hold the full registered pool (a soft and hard `RLIMIT_MEMLOCK` of
+    /// at least `NUM_BUFS * IO_BUF_BYTES`, on a scratch filesystem that
+    /// accepts O_DIRECT). The ordinary cell above skips on a refusal, which
+    /// on a host with the distribution default memlock hard limit is every
+    /// run, so this is the run that proves the full pool registers and its
+    /// buffers cycle. Because it is opt-in, a missing precondition is a
+    /// failure, never a skip: a pass that ran nothing would be no evidence.
+    /// Run it with `brokkr test full_registered_pool_instrument`.
     #[test]
-    fn smaller_pools_register_after_refusals_and_cycle_their_buffers() {
+    #[ignore = "opt-in: needs RLIMIT_MEMLOCK raised to the full registered pool; fails without it"]
+    fn full_registered_pool_instrument() {
         let _bound = pbfhogg_test_scratch::HangBound::arm(
             crate::tunables::TEST_HANG_BOUND,
             crate::tunables::TEST_HANG_REPORT_GRACE,
-            "io_uring smaller pools",
+            "io_uring full-pool instrument",
         );
         let _lease = pbfhogg_test_scratch::locked_memory_lease();
-        for (cap, eperm, registered) in [(MIN_NUM_BUFS, false, MIN_NUM_BUFS), (5, true, 4)] {
-            let pool = usize::from(registered) * IO_BUF_BYTES;
-            write_boundaries(
-                Some((u64::from(cap), eperm, u64::from(registered))),
-                &[pool - 1, pool, pool + 1, 3 * pool + 7],
-            );
+        write_boundaries(Refusals::Fail);
+    }
+
+    /// What a boundary run does with a platform refusal.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Refusals {
+        /// Skip, as every ordinary platform cell does.
+        Skip,
+        /// Fail: the opt-in instrument's precondition is unmet.
+        Fail,
+    }
+
+    impl Refusals {
+        /// Handle a setup or writer error at boundary length `len`: return
+        /// after announcing a skip when it is a refusal labelled one of
+        /// `accepted` and refusals skip; panic otherwise.
+        #[track_caller]
+        fn skip_or_panic(self, e: &crate::Error, accepted: &[&str], len: usize) {
+            if self == Self::Fail {
+                panic!(
+                    "len={len}: the instrument needs io_uring with RLIMIT_MEMLOCK holding \
+                     the full pool and an O_DIRECT scratch, and setup or the writer failed: {}",
+                    e.report()
+                );
+            }
+            if crate::test_support::refused(crate::test_support::Backend::IoUring, e, accepted) {
+                crate::test_support::skip(format!("io_uring output: {e}"));
+                return;
+            }
+            panic!("len={len}: unexpected io_uring setup or writer error: {e}");
         }
     }
 
-    /// Write each boundary length through `uring_init_and_run`, plus
-    /// `extra`, and check bytes, length, submissions and the registered
-    /// pool. `capped` is `(cap, refuse with EPERM, expected pool)`.
-    fn write_boundaries(capped: Option<(u64, bool, u64)>, extra: &[usize]) {
+    /// Write each boundary length through `uring_init_and_run` and check
+    /// bytes, length, submissions and the registered pool. The lengths
+    /// include outputs spanning several whole pools, so the free list is
+    /// exhausted and every buffer is reused.
+    fn write_boundaries(refusals: Refusals) {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("uring-boundaries.bin");
         let (probe, align) = match crate::direct_io::create_for_write(&path, None) {
             Ok(opened) => opened,
-            Err(e)
-                if crate::test_support::refused(
-                    crate::test_support::Backend::IoUring,
-                    &e,
-                    &["direct-io"],
-                ) =>
-            {
-                crate::test_support::skip(format!("io_uring output: {e}"));
+            Err(e) => {
+                refusals.skip_or_panic(&e, &["direct-io"], 0);
                 return;
             }
-            Err(e) => panic!("unexpected output setup error: {e}"),
         };
         drop(probe);
+        let pool = usize::from(NUM_BUFS) * IO_BUF_BYTES;
         let lengths = [
             0,
             1,
@@ -948,20 +956,18 @@ mod tests {
             2 * IO_BUF_BYTES - 1,
             2 * IO_BUF_BYTES,
             2 * IO_BUF_BYTES + 1,
+            pool - 1,
+            pool,
+            pool + 1,
+            3 * pool + 7,
         ];
-        for len in lengths.iter().chain(extra).copied() {
+        for len in lengths {
             // A nonzero pattern makes stale padding or an interior gap visible.
             let bytes: Vec<u8> = (0..len)
                 .map(|i| u8::try_from(i % 251 + 1).expect("pattern fits u8"))
                 .collect();
             let invocation = crate::host::Invocation::new();
             let call = invocation.call().expect("fresh invocation");
-            #[cfg(pbfhogg_test_hooks)]
-            if let Some((cap, eperm, _)) = capped {
-                let faults = call.faults();
-                faults.uring_register_cap.store(cap, Relaxed);
-                faults.uring_register_refuse_eperm.store(eperm, Relaxed);
-            }
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             drop(tx);
             let inbox = Inbox::detached(rx);
@@ -979,19 +985,9 @@ mod tests {
                 super::super::Finish::Deferred,
                 &call,
             );
-            match result {
-                Ok(()) => {}
-                Err(e)
-                    if crate::test_support::refused(
-                        crate::test_support::Backend::IoUring,
-                        &e,
-                        &["io-uring", "direct-io"],
-                    ) =>
-                {
-                    crate::test_support::skip(format!("io_uring output: {e}"));
-                    return;
-                }
-                Err(e) => panic!("len={len}: unexpected writer error: {e}"),
+            if let Err(e) = result {
+                refusals.skip_or_panic(&e, &["io-uring", "direct-io"], len);
+                return;
             }
             init_rx
                 .recv()
@@ -1002,10 +998,12 @@ mod tests {
                 u64::try_from(len.div_ceil(IO_BUF_BYTES)).expect("count fits u64"),
                 "len={len}: one submission per full buffer plus final partial"
             );
-            assert_registered_pool(
+            // One writer on a fresh invocation, so the counter is its pool:
+            // the full one, the witness that the cell ran the backend.
+            assert_eq!(
                 call.metrics().writer.uring_registered_buffers.load(Relaxed),
-                capped.map(|(_, _, expected)| expected),
-                len,
+                u64::from(NUM_BUFS),
+                "len={len}: registered pool"
             );
             assert_eq!(
                 std::fs::metadata(&path).expect("output metadata").len(),
@@ -1020,16 +1018,35 @@ mod tests {
         }
     }
 
-    /// The witness that a cell ran the backend: a pool registered, and under
-    /// a cap the pool the cap admits or a further halving where the host's
-    /// own allowance refuses that one too.
-    #[track_caller]
-    fn assert_registered_pool(pool: u64, cap_admits: Option<u64>, len: usize) {
-        let largest = cap_admits.unwrap_or(u64::from(NUM_BUFS));
-        assert!(
-            pool.is_power_of_two() && (u64::from(MIN_NUM_BUFS)..=largest).contains(&pool),
-            "len={len}: registered pool {pool}, at most {largest} admitted"
-        );
+    /// The registration refusal is attributed to the memlock limit only on
+    /// ENOMEM or EPERM under a soft limit below the pool; every other
+    /// combination stays an ordinary error, and the OS error survives in
+    /// both. The limit is passed in, so no host's own limit is read.
+    #[test]
+    fn register_failure_classification() {
+        let full = u64::from(NUM_BUFS) * IO_BUF_BYTES as u64;
+        let cases = [
+            (libc::ENOMEM, Some(full - 1), true),
+            (libc::EPERM, Some(0), true),
+            (libc::ENOMEM, Some(full), false),
+            (libc::EPERM, Some(full + 1), false),
+            (libc::ENOMEM, None, false),
+            (libc::EINVAL, Some(0), false),
+            (libc::EFAULT, Some(full - 1), false),
+        ];
+        for (errno, soft, refused) in cases {
+            let e = classify_register_failure(io::Error::from_raw_os_error(errno), soft);
+            let platform = matches!(
+                e.kind(),
+                crate::ErrorKind::PlatformUnsupported { feature, .. } if *feature == "io-uring"
+            );
+            assert_eq!(platform, refused, "errno {errno}, soft limit {soft:?}: {e}");
+            let report = e.report();
+            assert!(
+                report.contains(&format!("(os error {errno})")),
+                "errno {errno}, soft limit {soft:?}: the OS error is kept: {report}"
+            );
+        }
     }
 
     #[test]

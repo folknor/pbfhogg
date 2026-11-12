@@ -195,9 +195,11 @@ NAME` list each harness in turn to find one test.
   fault hook is process-global: their state lives in the fault plan
   carried by the run's cancellation token (see "Conventions"), so an
   armed fault reaches only the run handed that token, and a fault test
-  runs concurrently with everything else in `all`. Two textlint rules
-  in `brokkr.toml` keep it that way (`no-static-fault-hook-state`,
-  `fault-hooks-only-in-test-hooks`).
+  runs concurrently with everything else in `all`. The plan's sealed
+  constructor, the library static inventory in `crates/source-policy`,
+  and the textlint rules in `brokkr.d/lints.toml`
+  (`no-static-fault-hook-state`, `fault-hooks-only-in-test-hooks`,
+  `no-static-test-hosts`) keep it that way.
 
 The `pbfhogg-cli` program is its library target (`crates/cli/src/lib.rs`,
 `pbfhogg_cli`); the `pbfhogg` bin is only `main` calling
@@ -624,7 +626,10 @@ exception, not a tier - should not survive across many PRs.
   answer to "what can a test inject". Its `FaultPlan` holds every
   token-scoped hook (arming fields and observation counters, disarmed as
   a `MAX` sentinel); one lives in each
-  `host::Invocation` and `Invocation::faults()` reaches it. The token is what
+  `host::Invocation` and `Invocation::faults()` reaches it. No other plan
+  can exist: its constructor takes a witness only `host` can build and it
+  has no `Default`, so a test reaches a plan only through an invocation it
+  owns. The token is what
   an invocation already hands every worker loop it starts (the read
   pipeline, the output writers, the diff and derive work units, altw's
   stages, the geocode passes), so a new hook is a `FaultPlan` field
@@ -974,8 +979,10 @@ above, the sealed lifecycle shapes, counter casts, the library static
 inventory and the library text rule) are one crate,
 `crates/source-policy`. Each file is read and tokenized once, with the
 rustc tokenizer (`ra-ap-rustc_lexer`); lexical rules work on those tokens,
-and only the test-module graph and the library text rule's test-only
-exemptions also parse with syn, failing on a file it cannot parse. The real
+and only the module graph (walked by the test-module audit, and by the
+static inventory to read `#[path]`-mounted library modules) and the
+library text rule's test-only exemptions also parse with syn, failing on a
+file it cannot parse. The real
 tree is audited by one unit test, in the `all` sweep alone, so it runs once
 per check and not under brokkr's markdown-only shortcut; every rule carries
 in-memory fixtures beside it.

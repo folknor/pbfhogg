@@ -105,7 +105,7 @@ struct InvocationState {
     /// The invocation's fault plan: every worker loop already holds the
     /// token, so this is where a test's injected faults reach them.
     #[cfg(pbfhogg_test_hooks)]
-    faults: crate::test_hooks::FaultPlan,
+    faults: InvocationFaults,
     /// Every engine-level metric set of the invocation. Each set is on cache
     /// lines of its own (`counters::Padded`), apart from `tripped`.
     metrics: crate::counters::InvocationMetrics,
@@ -406,6 +406,7 @@ impl Invocation {
             #[cfg(pbfhogg_test_hooks)]
             self.0
                 .faults
+                .0
                 .seal_step(crate::test_hooks::SealStep::Snapshot);
             let mut counters = Vec::new();
             self.0
@@ -426,7 +427,10 @@ impl Invocation {
         if let SinkSlot::Call { sink, .. } = &self.0.sink {
             sink.close(&snapshot, || {
                 #[cfg(pbfhogg_test_hooks)]
-                self.0.faults.seal_step(crate::test_hooks::SealStep::Stream);
+                self.0
+                    .faults
+                    .0
+                    .seal_step(crate::test_hooks::SealStep::Stream);
             });
         }
         self.0.word.0.store(word::SEALED, Release);
@@ -513,7 +517,7 @@ impl Invocation {
         // log's lock is released, so the bell never nests inside it.
         drop(log);
         #[cfg(pbfhogg_test_hooks)]
-        self.0.faults.ring();
+        self.0.faults.0.ring();
         outcome
     }
 
@@ -652,7 +656,24 @@ impl Invocation {
     #[doc(hidden)]
     #[must_use]
     pub fn faults(&self) -> &crate::test_hooks::FaultPlan {
-        &self.0.faults
+        &self.0.faults.0
+    }
+}
+
+/// The witness [`FaultPlan::new`](crate::test_hooks::FaultPlan) takes:
+/// constructible only here, so the only plan is the one an invocation
+/// builds into its state.
+#[cfg(pbfhogg_test_hooks)]
+pub(crate) struct PlanSeal(());
+
+/// An invocation's fault plan, built with the seal when its state is.
+#[cfg(pbfhogg_test_hooks)]
+struct InvocationFaults(crate::test_hooks::FaultPlan);
+
+#[cfg(pbfhogg_test_hooks)]
+impl Default for InvocationFaults {
+    fn default() -> Self {
+        Self(crate::test_hooks::FaultPlan::new(PlanSeal(())))
     }
 }
 

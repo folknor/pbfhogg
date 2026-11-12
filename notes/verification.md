@@ -30,14 +30,6 @@ construction; tests that build their own `host::FdPool` hold a ticket by convent
 Residue: measure the high-water marks (a `/proc/self/fd` count at the gate's release
 would do) and check them against the charges, if it pays.
 
-## VER-009 - The static inventory cannot see synthesized state
-
-`crates/source-policy/src/rules/statics.rs` inventories every library static with
-counted, audited exceptions and presence checks for protected files, with its fixtures
-beside it. Unenforced: statics in synthesized macro output,
-changes within audited initializers, and an architectural rule that `FaultPlan` is
-constructed only through the invocation.
-
 ## VER-010 - The probe-lock and counter-emission guards are fixed-shape, not AST
 
 The probe open now goes through `open_probe_lock` in `crates/lib/src/scratch.rs`,

@@ -665,20 +665,21 @@ struct DecodeGate {
     released: bool,
 }
 
-impl Default for FaultPlan {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FaultPlan {
     /// A plan with every fault disarmed and every counter at zero.
+    ///
+    /// Only an invocation builds one: the seal is constructible in `host`
+    /// alone, there is no `Default`, and the private `bell` field rules out a
+    /// struct literal. So every plan is the one an `Invocation` carries, and
+    /// fault state is as process-global as that invocation is: a static
+    /// invocation is refused by the static inventory in library source and
+    /// by the `no-static-test-hosts` text rule in test code.
     #[must_use]
     #[allow(
         clippy::too_many_lines,
         reason = "one initializer per field, a flat list that grows with the plan"
     )]
-    pub const fn new() -> Self {
+    pub(crate) fn new(_seal: crate::host::PlanSeal) -> Self {
         Self {
             bell: Bell::new(),
             decode_gate: Mutex::new(DecodeGate {
@@ -1680,7 +1681,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "a seal observer is already installed")]
     fn duplicate_seal_observer_is_refused() {
-        let plan = super::FaultPlan::new();
+        let invocation = crate::host::Invocation::new();
+        let plan = invocation.faults();
         plan.on_seal_step(|_| {});
         plan.on_seal_step(|_| {});
     }
@@ -1688,7 +1690,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "a publication observer is already installed")]
     fn duplicate_publication_observer_is_refused() {
-        let plan = super::FaultPlan::new();
+        let invocation = crate::host::Invocation::new();
+        let plan = invocation.faults();
         plan.on_publish_step(|_| {});
         plan.on_publish_step(|_| {});
     }

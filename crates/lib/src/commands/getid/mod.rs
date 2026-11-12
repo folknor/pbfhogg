@@ -678,7 +678,7 @@ fn filter_by_id(
     report_found: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
-    let (include, ways) = match filter {
+    let (include_mode, ways) = match filter {
         Filter::Include(ScanArm::FullScan) => {
             return filter_by_id_streaming(
                 input,
@@ -697,7 +697,7 @@ fn filter_by_id(
         input,
         output,
         ids,
-        include,
+        include_mode,
         ways,
         write,
         overrides,
@@ -712,7 +712,7 @@ fn filter_by_id_walker(
     input: &PinnedInput,
     output: &crate::output::BoundOutput,
     ids: &ElementIds,
-    include: bool,
+    include_mode: bool,
     ways: Ways,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -799,7 +799,7 @@ fn filter_by_id_walker(
                             ids.relation_ids.any_in_range(idx.min_id, idx.max_id)
                         }
                     };
-                    if include {
+                    if include_mode {
                         if !blob_filter.wants_index(idx) || !has_match {
                             blobs_skipped += 1;
                             continue;
@@ -850,7 +850,7 @@ fn filter_by_id_walker(
                 // selected element (`included_block`); invert re-encodes
                 // nearly every element of a blob it decodes, so a probe
                 // could only add work there and it builds the block outright.
-                let block = if include {
+                let block = if include_mode {
                     match included_block(buffer, ids, None).map_err(locate)? {
                         Some(block) => block,
                         None => continue,
@@ -864,7 +864,7 @@ fn filter_by_id_walker(
                     &mut bb,
                     &mut output_blocks,
                     ids,
-                    include,
+                    include_mode,
                     None,
                     false,
                     report_found,
@@ -1702,7 +1702,7 @@ fn process_block(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     ids: &ElementIds,
-    include: bool,
+    include_mode: bool,
     pulled: Option<&ElementIds>,
     strip_tags: bool,
     report_found: bool,
@@ -1717,12 +1717,12 @@ fn process_block(
 
     for element in block.elements() {
         let dominated = is_dominated(ids, pulled, &element);
-        let emit = if include { dominated } else { !dominated };
+        let emit = if include_mode { dominated } else { !dominated };
         if !emit {
             continue;
         }
 
-        if report_found && include {
+        if report_found && include_mode {
             record_found(&mut found, ids, &element);
         }
 

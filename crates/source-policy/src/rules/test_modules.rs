@@ -7,7 +7,8 @@
 //! feature closure per member manifest, its target environment and its
 //! `--cfg` rustflags), never against this crate's own build. External
 //! modules must be at file scope; inline modules may contain tests but not
-//! external declarations. Unknown cfg forms, `cfg_attr` on a module and a
+//! external declarations. Unknown cfg forms, a `cfg_attr` that could add a `cfg`
+//! or `path` (lint-only ones are read past) and a
 //! literally named `mod` the parser did not see as a module item (macro
 //! input, a function body) fail closed; a module named by a macro
 //! metavariable is outside the promise: extend the audit deliberately when the test graph needs a new
@@ -138,6 +139,16 @@ pub fn sweep_cfgs(rustflags: &[String]) -> Result<BTreeSet<String>, String> {
 
 // ---- reading one file -----------------------------------------------------
 
+/// Whether an attribute path names `name`: raw prefix stripped (`r#path` is
+/// `path` to rustc) and judged on its last segment, so a qualified spelling
+/// of a builtin is not read past.
+fn named(path: &syn::Path, name: &str) -> bool {
+    path.segments.last().is_some_and(|s| {
+        let ident = s.ident.to_string();
+        ident.strip_prefix("r#").unwrap_or(&ident) == name
+    })
+}
+
 fn gates_of(attrs: &[Attribute], inner: bool) -> Result<(Vec<Meta>, Option<String>), String> {
     let mut gates = Vec::new();
     let mut paths = Vec::new();
@@ -146,19 +157,35 @@ fn gates_of(attrs: &[Attribute], inner: bool) -> Result<(Vec<Meta>, Option<Strin
         if is_inner != inner {
             continue;
         }
-        if attr.path().is_ident("cfg_attr") {
-            return Err(format!(
-                "line {}: cfg_attr modules need explicit audit support",
-                line(attr)
-            ));
+        // A `cfg_attr` that can only add lints or docs does not move or gate
+        // the module; one that could add `cfg`, `path` or another
+        // `cfg_attr`, or that does not parse as metas, is refused.
+        if named(attr.path(), "cfg_attr") {
+            let refused = attr
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .map_or(true, |metas| {
+                    metas.len() < 2
+                        || metas.iter().skip(1).any(|m| {
+                            ["cfg", "path", "cfg_attr"]
+                                .iter()
+                                .any(|name| named(m.path(), name))
+                        })
+                });
+            if refused {
+                return Err(format!(
+                    "line {}: cfg_attr modules need explicit audit support",
+                    line(attr)
+                ));
+            }
+            continue;
         }
-        if attr.path().is_ident("cfg") {
+        if named(attr.path(), "cfg") {
             gates.push(
                 attr.parse_args::<Meta>()
                     .map_err(|e| format!("line {}: cfg: {e}", line(attr)))?,
             );
         }
-        if attr.path().is_ident("path") {
+        if named(attr.path(), "path") {
             let Meta::NameValue(pair) = &attr.meta else {
                 return Err(format!("line {}: unsupported path attribute", line(attr)));
             };
@@ -250,6 +277,19 @@ fn shape(source: &Source) -> Result<Shape, String> {
 
 // ---- the graph ------------------------------------------------------------
 
+/// Every corpus file the module graph from `root` (repo-relative) mounts
+/// under any configuration, `#[path]` targets outside the root's directory
+/// included, as repo-relative keys. The same fail-closed shapes as the test
+/// graph: a module the parser cannot place is an error, not an omission.
+pub fn mounted(corpus: &Corpus, root: &str) -> Result<BTreeSet<String>, String> {
+    let mut shapes = Shapes {
+        corpus,
+        cache: HashMap::new(),
+    };
+    let graph = shapes.reachable(&[normalize(&corpus.root.join(root))], None)?;
+    Ok(graph.iter().map(|p| relative(&corpus.root, p)).collect())
+}
+
 /// Shapes by absolute path, read through the corpus once each.
 struct Shapes<'a> {
     corpus: &'a Corpus,
@@ -278,24 +318,33 @@ impl Shapes<'_> {
     }
 
     /// Files reachable from `roots`, skipping those whose inner gates fail.
+    /// With `features` `None`, every gate is taken: the union over every
+    /// configuration, whatever cfg forms it uses.
     fn reachable(
         &mut self,
         roots: &[PathBuf],
-        features: &BTreeSet<String>,
+        features: Option<&BTreeSet<String>>,
     ) -> Result<BTreeSet<PathBuf>, String> {
+        let gated = |gates: &[Meta]| features.map_or(Ok(true), |f| all_true(gates, f));
+        // (file, owns its directory). A root, a `mod.rs` and a file loaded
+        // through `#[path]` own the directory they sit in, so their children
+        // are siblings (rustc_expand's module resolution); an ordinary
+        // `foo.rs` keeps its children under `foo/`. The same file mounted
+        // both ways resolves its children both ways.
+        let mut seen: BTreeSet<(PathBuf, bool)> = BTreeSet::new();
         let mut visited = BTreeSet::new();
-        let mut pending = roots.to_vec();
-        while let Some(path) = pending.pop() {
-            if visited.contains(&path) {
+        let mut pending: Vec<(PathBuf, bool)> = roots.iter().map(|r| (r.clone(), true)).collect();
+        while let Some((path, owns)) = pending.pop() {
+            if !seen.insert((path.clone(), owns)) {
                 continue;
             }
             let shape = self.get(&path)?;
-            if !all_true(&shape.file_gates, features)? {
+            if !gated(&shape.file_gates)? {
                 continue;
             }
             visited.insert(path.clone());
             let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
-            let base = if path.file_name().is_some_and(|n| n == "mod.rs") || roots.contains(&path) {
+            let base = if owns || path.file_name().is_some_and(|n| n == "mod.rs") {
                 parent.clone()
             } else {
                 path.with_extension("")
@@ -303,10 +352,10 @@ impl Shapes<'_> {
             for decl in &shape.decls {
                 // Evaluate every gate, even after a false one, to reject
                 // unknown syntax.
-                if decl.inline.is_some() || !all_true(&decl.gates, features)? {
+                if decl.inline.is_some() || !gated(&decl.gates)? {
                     continue;
                 }
-                pending.push(self.edge(decl, &base, &parent)?);
+                pending.push((self.edge(decl, &base, &parent)?, decl.path.is_some()));
             }
         }
         Ok(visited)
@@ -526,8 +575,8 @@ fn audit(corpus: &Corpus) -> Result<(), String> {
                     .get("path")
                     .and_then(toml::Value::as_str)
                     .map_or_else(|| format!("tests/{target_name}.rs"), str::to_owned);
-                let graph =
-                    shapes.reachable(&[normalize(&root.join(member).join(path))], &features)?;
+                let graph = shapes
+                    .reachable(&[normalize(&root.join(member).join(path))], Some(&features))?;
                 for file in &graph {
                     let mut seen = (BTreeSet::new(), BTreeSet::new());
                     presence(&shapes.get(file)?.decls, &features, true, &mut seen)?;
@@ -664,6 +713,10 @@ mod tests {
         for src in [
             "mod inline { mod child; }",
             "#[cfg_attr(test, path = \"x.rs\")]\nmod x;",
+            "#[cfg_attr(test, allow(dead_code), cfg(any()))]\nmod x;",
+            "#![cfg_attr(test, cfg_attr(test, path = \"x.rs\"))]",
+            "#[cfg_attr(all(), r#path = \"../hidden.inc\")]\nmod x;",
+            "#[r#cfg(unknown)]\nmod x;",
             "macro_rules! m { () => { #[cfg(any())] mod forgotten {} }; }\nm!();",
             "fn f() { mod hidden {} }",
             "#[cfg(unknown)]\nmod x;",
@@ -674,6 +727,10 @@ mod tests {
             });
             assert!(result.is_err(), "{src}");
         }
+        // Lint-only `cfg_attr`, inner or outer, neither moves nor gates.
+        let lints = "#![cfg_attr(not(test), deny(clippy::print_stdout))]\n\
+                     #[cfg_attr(test, allow(dead_code))]\nmod x;";
+        assert!(shape(&Source::new(lints.to_owned())).is_ok());
     }
 
     fn graph(files: &[(&str, &str)], features: &[&str]) -> Result<BTreeSet<String>, String> {
@@ -684,7 +741,7 @@ mod tests {
         };
         let root = corpus.root.join("t/all.rs");
         shapes
-            .reachable(&[root], &set(features))
+            .reachable(&[root], Some(&set(features)))
             .map(|g| g.iter().map(|p| crate::relative(&corpus.root, p)).collect())
     }
 
@@ -734,5 +791,17 @@ mod tests {
             Ok(set(&["t/all.rs", "t/helper.rs"]))
         );
         assert!(graph(&[("t/all.rs", "mod child;")], &[]).is_err());
+        // A `#[path]`-loaded file owns its directory: its children are its
+        // siblings, and a decoy under its stem is not what rustc loads.
+        let owned = [
+            ("t/all.rs", "#[path = \"../h/shared.rs\"]\nmod shared;"),
+            ("h/shared.rs", "mod child;"),
+            ("h/child.rs", ""),
+            ("h/shared/child.rs", ""),
+        ];
+        assert_eq!(
+            graph(&owned, &[]),
+            Ok(set(&["t/all.rs", "h/shared.rs", "h/child.rs"]))
+        );
     }
 }

@@ -2,10 +2,10 @@
 //!
 //! Every rule reads the same [`Corpus`]: each Rust file under a member's
 //! `src/` and `tests/` read and tokenized once. Lexical rules work on the
-//! tokens alone, so a file the parser cannot read still gets them; the two
-//! structural rules (the integration-test module graph, the library text
-//! rule's test-only exemptions) also parse with syn and fail on a file it
-//! cannot parse. None of this is macro expansion: what a rule promises about
+//! tokens alone, so a file the parser cannot read still gets them; the
+//! structural reads (the module graph, which the test-module audit and the
+//! library static inventory walk, and the library text rule's test-only
+//! exemptions) also parse with syn and fail on a file it cannot parse. None of this is macro expansion: what a rule promises about
 //! macro input is stated on the rule.
 //!
 //! The rules run as this package's unit tests, in the `all` sweep only (see

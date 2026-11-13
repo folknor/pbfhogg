@@ -454,7 +454,7 @@ cells land. This section tracks the remaining axes and dataset gaps.
   was byte-identical across four antimeridian fixes in the geocode
   builder, so the real-data gate is blind to that defect class. Split on
   2026-11-09, both halves now on pbfhogg: the dataset entry (Geofabrik
-  `australia-oceania/fiji` via `brokkr download`, plus its
+  `australia-oceania/fiji` via `brokkr run --with pbfhogg pbfhogg-datasets -- download australia-oceania/fiji`, plus its
   `brokkr.d/hosts` block) is our config, and brokkr asks what queries a
   pbfhogg-built geocode index from the command line. Nothing does today:
   the CLI only builds the index, and the reader is reached through

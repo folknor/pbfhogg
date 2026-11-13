@@ -301,3 +301,45 @@ fn scratch_selection_shares_dataset_host_rules() {
     assert!(config.scratch_root("bad").is_err());
     assert!(config.scratch_root("unknown").is_err());
 }
+
+#[test]
+fn pbfhogg_host_is_not_reserved_by_a_library_child() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let root = std::fs::canonicalize(scratch.path()).unwrap();
+    write(&root, "data/input", "local fixture");
+    for namespace in ["pbfhogg", "host.pbfhogg"] {
+        write(
+            &root,
+            "brokkr.toml",
+            &format!(
+                "[{namespace}]\ndata = 'data'\nscratch = 'work'\n[{namespace}.library]\n[{namespace}.datasets.d.pbf.raw]\nfile = 'input'\n"
+            ),
+        );
+        let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
+        assert_eq!(config.data_dir("pbfhogg").unwrap(), root.join("data"));
+        assert_eq!(config.scratch_root("pbfhogg").unwrap(), root.join("work"));
+        assert!(
+            config
+                .resolve_input("pbfhogg", "d", None, "r", "raw")
+                .is_ok()
+        );
+        config.edit_dataset("pbfhogg", "d").unwrap();
+    }
+    write(&root, "brokkr.toml", "[pbfhogg.library]\n[host.pbfhogg]\n");
+    let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
+    assert!(
+        config
+            .data_dir("pbfhogg")
+            .unwrap_err()
+            .to_string()
+            .contains("both")
+    );
+    assert!(config.edit_dataset("pbfhogg", "d").is_err());
+    write(
+        &root,
+        "brokkr.toml",
+        "[project]\n[host.project]\ndata = 'explicit'\n",
+    );
+    let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
+    assert_eq!(config.data_dir("project").unwrap(), root.join("explicit"));
+}

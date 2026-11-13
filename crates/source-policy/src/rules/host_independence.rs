@@ -87,6 +87,14 @@ pub const CONSTRUCTORS: &[Constructor] = &[
         program: "executable",
         count: 1,
     },
+    // The dataset tool's two children: curl (found on PATH at its
+    // boundary) and the pbfhogg binary brokkr hands it.
+    Constructor {
+        file: "crates/datasets/src/process.rs",
+        owner: "command",
+        program: "program",
+        count: 1,
+    },
     Constructor {
         file: "crates/library/tests/process.rs",
         owner: "descendant",

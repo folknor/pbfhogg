@@ -1,0 +1,31 @@
+[package]
+name = "pbfhogg-datasets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dataset acquisition and registration for pbfhogg development hosts"
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# Run as `brokkr run --with pbfhogg pbfhogg-datasets -- download REGION`.
+# Links no pbfhogg: the indexed variant is made by the handed CLI binary.
+[[bin]]
+name = "pbfhogg-datasets"
+path = "src/main.rs"
+
+[dependencies]
+pbfhogg-devkit = { path = "../devkit" }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+
+[dev-dependencies]
+pbfhogg-test-scratch = { path = "../test-scratch" }
+
+[lints]
+workspace = true

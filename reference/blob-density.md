@@ -219,10 +219,12 @@ file estimate (`estimate_blob_count`, `crates/lib/src/read/header_walker.rs`).
 ## Measured evidence (2026-07-10, plantasjen)
 
 The same-corpus control exists: `snapshot.8k` on the planet dataset
-(`brokkr repack --dataset planet --elements-per-blob 8000 --as-snapshot
-8k`, UUID `8027765b` at `8c1cf03`). 98.4 GB, **1,453,433 blobs** (nodes
-1,305,968 / ways 145,699 / relations 1,766) - 28.6x the primary's
-50,816. Denmark-scale controls in the other direction:
+(historical typed repack, UUID `8027765b` at `8c1cf03`).
+It contains 98.4 GB and **1,453,433 blobs** (nodes
+1,305,968 / ways 145,699 / relations 1,766), 28.6x the primary's
+50,816. To create such a snapshot today, run `brokkr run pbfhogg -- repack INPUT -o OUTPUT --elements-per-blob 8000`,
+then `brokkr run --with pbfhogg pbfhogg-datasets -- promote planet OUTPUT --producer repack --as-snapshot 8k`
+(see [promotion](dataset-promotion.md)). Denmark-scale controls in the other direction:
 `snapshot.1k` / `snapshot.64k` / `snapshot.320k`.
 
 ### getparents three-cell matrix (the dispatch decision data)

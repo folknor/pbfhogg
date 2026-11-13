@@ -4,10 +4,12 @@
 //! environment or discovers the host. Callers select the host and user config.
 mod compose;
 mod datasets;
+mod registry;
 mod tunables;
 
 pub use compose::{Config, user_config_path};
 pub use datasets::{ResolvedInput, file_digest};
+pub use registry::{DatasetEdit, DatasetView, FileEntry, Generation, replace_file};
 
 /// A configuration, input selection or file verification failure.
 #[derive(Debug)]
@@ -29,3 +31,6 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod registry_tests;

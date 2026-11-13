@@ -32,6 +32,17 @@ pub fn user_config_path(
 pub struct Config {
     pub(crate) root: PathBuf,
     pub(crate) table: toml::Table,
+    /// Every project file (the project's own first, then its includes in
+    /// visit order) with its own parsed contents, before composition. Only
+    /// the registry writer reads it, to pick the file that owns a table.
+    pub(crate) sources: Vec<Source>,
+}
+
+/// One project config file as written, for table provenance.
+#[derive(Debug)]
+pub(crate) struct Source {
+    pub(crate) path: PathBuf,
+    pub(crate) table: toml::Table,
 }
 
 impl Config {
@@ -80,7 +91,13 @@ impl Config {
             }
         }
         walk.visit(project_file, false, &mut table)?;
-        Ok(Self { root, table })
+        // The project's own file is visited last (post-order); put it first.
+        walk.sources.rotate_right(1);
+        Ok(Self {
+            root,
+            table,
+            sources: walk.sources,
+        })
     }
 
     /// The effective TOML, useful for inspecting precedence without reparsing.
@@ -102,6 +119,7 @@ fn parse(path: &Path, text: &str) -> Result<toml::Table, Error> {
 struct Walk {
     stack: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
+    sources: Vec<Source>,
 }
 
 impl Walk {
@@ -148,6 +166,10 @@ impl Walk {
             self.visit(&parent.join(name), true, merged)?;
         }
         self.stack.pop();
+        self.sources.push(Source {
+            path: canonical.clone(),
+            table: table.clone(),
+        });
         merge(merged, table, &mut Vec::new());
         Ok(())
     }

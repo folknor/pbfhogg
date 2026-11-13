@@ -225,6 +225,11 @@ brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset den
 
 The bench measures whole-worker wall time. Verification and certification belong to the driver. See [the library protocol](reference/library-protocol.md) and [historical per-call measurements](reference/performance/library-capabilities.md).
 
+Development datasets are acquired with
+`brokkr run --with pbfhogg pbfhogg-datasets -- download REGION`.
+See [dataset contracts](reference/datasets.md) and
+[completed-output promotion](reference/dataset-promotion.md).
+
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance/README.md](reference/performance/README.md).
 
 Run a workload with `brokkr bench --iterations 1 copy-pbf --dataset denmark`; use `brokkr bench NAME --help` for its params and the [bench mapping](AGENTS.md#pbfhogg-bench-mapping) for other commands. Runner options such as `--hotpath`, `--alloc`, `--commit REF` and `--dry-run` go before NAME.

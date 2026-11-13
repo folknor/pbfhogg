@@ -57,6 +57,10 @@ pub enum Reason {
     /// A production protocol input of the CLI or harness, set by brokkr or
     /// by a CLI test through a named `CliInvoker` setter.
     Protocol,
+    /// An operator setting the dataset tool forwards to its transfer child:
+    /// `PATH` to find curl, and the proxy and CA settings curl honours, read
+    /// at the tool's executable boundary and passed on by name only.
+    Operator,
 }
 
 /// One admitted read.
@@ -90,7 +94,90 @@ const fn read(
 
 const SIGNALS: &str = "crates/cli/src/signals.rs";
 
+const DATASETS: &str = "crates/datasets/src/main.rs";
+
 pub const READS: &[Read] = &[
+    read(
+        DATASETS,
+        "boundary",
+        "var_os",
+        "BROKKR_USER_CONFIG",
+        Reason::Protocol,
+    ),
+    read(
+        DATASETS,
+        "boundary",
+        "var_os",
+        "XDG_CONFIG_HOME",
+        Reason::Protocol,
+    ),
+    read(DATASETS, "boundary", "var_os", "HOME", Reason::Protocol),
+    read(
+        DATASETS,
+        "boundary",
+        "var_os",
+        "BROKKR_WITH_EXE",
+        Reason::Protocol,
+    ),
+    read(DATASETS, "boundary", "var_os", "PATH", Reason::Operator),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "http_proxy",
+        Reason::Operator,
+    ),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "https_proxy",
+        Reason::Operator,
+    ),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "HTTPS_PROXY",
+        Reason::Operator,
+    ),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "all_proxy",
+        Reason::Operator,
+    ),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "ALL_PROXY",
+        Reason::Operator,
+    ),
+    read(DATASETS, "curl_env", "var_os", "no_proxy", Reason::Operator),
+    read(DATASETS, "curl_env", "var_os", "NO_PROXY", Reason::Operator),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "SSL_CERT_FILE",
+        Reason::Operator,
+    ),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "SSL_CERT_DIR",
+        Reason::Operator,
+    ),
+    read(
+        DATASETS,
+        "curl_env",
+        "var_os",
+        "CURL_CA_BUNDLE",
+        Reason::Operator,
+    ),
     read(
         "crates/library/tests/worker.rs",
         "main",

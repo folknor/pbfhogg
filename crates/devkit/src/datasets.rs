@@ -115,7 +115,15 @@ impl Config {
             .join(optional_string(selected, "scratch")?.unwrap_or("data/scratch")))
     }
 
-    fn selected_host(&self, host: &str) -> Result<&toml::Table, Error> {
+    /// Host data directory: `data` (default "data") under the project root.
+    pub fn data_dir(&self, host: &str) -> Result<PathBuf, Error> {
+        let selected = self.selected_host(host)?;
+        Ok(self
+            .root
+            .join(optional_string(selected, "data")?.unwrap_or("data")))
+    }
+
+    pub(crate) fn selected_host(&self, host: &str) -> Result<&toml::Table, Error> {
         let explicit = match self.table.get("host") {
             Some(value) => Some(
                 value
@@ -125,10 +133,7 @@ impl Config {
             None => None,
         }
         .and_then(|hosts| hosts.get(host));
-        let legacy = self
-            .table
-            .get(host)
-            .filter(|_| !reserved_host(host, &self.table));
+        let legacy = self.table.get(host).filter(|_| !reserved_host(host));
         if explicit.is_some() && legacy.is_some() {
             return Err(Error::message(format!(
                 "host '{host}' is configured both as [{host}] and [host.{host}]; keep one spelling"
@@ -160,7 +165,7 @@ fn optional_string<'a>(table: &'a toml::Table, key: &str) -> Result<Option<&'a s
         .transpose()
 }
 
-fn normalize_digest(value: &str) -> Result<String, Error> {
+pub(crate) fn normalize_digest(value: &str) -> Result<String, Error> {
     if value.len() != 32 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::message(format!(
             "invalid XXH3-128 digest '{value}': expected 32 hex digits"
@@ -170,7 +175,7 @@ fn normalize_digest(value: &str) -> Result<String, Error> {
 }
 
 // A reserved section can still be selected through [host.NAME].
-fn reserved_host(name: &str, table: &toml::Table) -> bool {
+pub(crate) fn reserved_host(name: &str) -> bool {
     matches!(
         name,
         "project"
@@ -205,7 +210,7 @@ fn reserved_host(name: &str, table: &toml::Table) -> bool {
             | "bench"
             | "bench_params"
             | "data"
-    ) || (name == "pbfhogg" && table.get(name).is_some_and(|v| v.get("library").is_some()))
+    )
 }
 
 // Same stable-read check as brokkr's preflight digest path. This detects

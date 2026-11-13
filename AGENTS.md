@@ -113,7 +113,7 @@ answer "is this file right?" belong on `check`; descriptive flags on `inspect`.
 - `brokkr sidecar --compare <A> <B>` - phase-aligned delta (JSONL by default; `--human` for the table). Annotates host differences (memory / governor / kernel) between the two runs - **check it first**, since available RAM has explained more of our cross-run deltas than code has.
 - `brokkr sidecar dirty` - sidecar data from the most recent forced/failed run (even if OOM-killed). UUID is required; `dirty` is the alias for that latest non-DB run.
 - All `[sidecar]` narration lines (run provenance, run-index hints) go to stderr so stdout stays pure JSONL for piping into `jq`.
-- `brokkr download <region> [--osc-seq N] [--as-snapshot <key> | --refresh] [--force]` - download datasets. Primary PBF: no-op once configured (use `--refresh` to rotate). OSC: rolls forward. Indexed PBF: regenerated on cache miss. `--as-snapshot <key>` registers additional snapshot. `--refresh` archives primary into `snapshot.<key>` and downloads new. Planet uses planet.openstreetmap.org; others use Geofabrik. Short aliases (denmark, europe) or full paths (europe/france).
+- `brokkr run --with pbfhogg pbfhogg-datasets -- download REGION` acquires and registers datasets. Use `--osc-seq N` for contiguous diffs, `--as-snapshot KEY` for a new snapshot, `--snapshot KEY --osc-seq N` to extend one, or `--refresh [--force]` to archive and replace the primary. See [reference/datasets.md](reference/datasets.md) for source identity, pins, refresh and recovery contracts.
 - `brokkr lock` - show which command holds brokkr's machine-wide lock. Every brokkr command queues behind that lock on its own, so there is no need to check it before running anything. The lock is the point of brokkr: it is held machine-wide so that development work in any project never stalls on work in another.
 - `brokkr kill [--hard]` - asks the brokkr process holding the lock to wrap up cleanly and exit ASAP.
 - `brokkr clean` - remove scratch temp files.
@@ -143,12 +143,15 @@ for the primary. Snapshot-aware scripts take `--snapshot KEY`, usually with
 `merge-workload` remain primary-only. Bound params and input digests are
 stored with script results; inspect them with `brokkr results UUID`.
 
-**Producer gap (brokkr ticket 145):** script outputs are iteration-owned
-scratch. Snapshot promotion via `--as-snapshot` and `--replace-snapshot`
-still needs the typed repack/degrade producer until persistent output and
-registration land. There is no equivalent bench invocation yet. Repack
-registers `pbf.indexed`; degrade registers `pbf.raw` when stripping indexdata,
-otherwise `pbf.indexed`. `brokkr download --as-snapshot KEY` remains available.
+Script bench outputs are iteration-owned scratch. To register a completed
+cat/repack/degrade output, run the producer through `brokkr run pbfhogg -- ...`,
+then `brokkr run --with pbfhogg pbfhogg-datasets -- promote DATASET FILE --producer cat|repack|degrade --as-snapshot KEY [--replace-snapshot]`.
+Repack/cat register `pbf.indexed`; degrade with `--strip-indexdata` registers
+`pbf.raw`, otherwise `pbf.indexed`. This imports bytes without claiming
+element identity or inferring replication seq; displaced files are retained.
+See [reference/dataset-promotion.md](reference/dataset-promotion.md).
+Acquire a separate upstream snapshot with
+`brokkr run --with pbfhogg pbfhogg-datasets -- download REGION --as-snapshot KEY`.
 
 `brokkr verify <cmd> --snapshot KEY` remains available. Change-consuming
 verifies use the snapshot OSC table if present, otherwise the primary OSC
@@ -164,7 +167,7 @@ only the selected snapshot's OSC table, without this fallback.
 - `pbf.<variant>` - PBF files keyed by variant (raw/indexed/altw). `--variant` selects (default: indexed).
 - `osc.<seq>` - OSC diff files keyed by seq. `--osc` selects in apply/diff benches; `tag-select` uses `--input`, and `merge-workload` uses `--osc-seq`.
 - `snapshot.<key>` - named point-in-time captures with own `pbf`/`osc` tables.
-- `download_date` - human annotation only, not read by code.
+- `download_date` - generation date (`YYYY-MM-DD`); dataset refresh uses a valid date for its archive key, otherwise raw mtime in UTC.
 - `xxhash` - XXH128 hash. `brokkr env` shows computed values.
 - `pbf.altw-keep-untagged` - the LocationsOnWays base `brokkr verify all` runs its `apply-changes -l` check on (built with `--keep-untagged-nodes` from the same base the dataset's OSCs chain from; absent, the check is skipped). No brokkr producer registers it: build it with `brokkr run pbfhogg -- add-locations-to-ways ...` and add the block by hand with the hash `brokkr env` prints.
 - `bbox` (dataset level) - default box for `extract` / `multi-extract` benches and `verify`; absent, verify skips extract and multi-extract. Choose it for verify cost on the host, not only for lying inside the region.
@@ -174,7 +177,7 @@ Legacy typed results are in `.brokkr/results.db` (SQLite, tracked in git); scrip
 
 ## Indexdata PBFs
 
-Generated by `brokkr download` (passthrough cat after raw PBF lands). Benchmark: `brokkr bench --iterations 1 copy-pbf --dataset planet`.
+Generated by `brokkr run --with pbfhogg pbfhogg-datasets -- download REGION` (passthrough cat after raw PBF lands). Benchmark: `brokkr bench --iterations 1 copy-pbf --dataset planet`.
 
 Commands requiring indexdata: the per-command truth is the "Proceeding without indexdata" table in `docs/cli/commands.md`. For benchmarks, use the script-specific fallback param, such as `sort-pbf --force-sort yes`, `embed-locations --force-altw yes` or `reencode-pbf --force-repack yes`. `geocode-build` always enables its forced fallback. See each bench help. Use `brokkr bench index-integrity` to verify indexdata against payloads.
 
@@ -215,6 +218,12 @@ The third member, **`pbfhogg-harness`** (`crates/harness/`, bin only, `publish =
 **`pbfhogg-devkit`** (`crates/devkit/`, lib only, `publish = false`) owns shared tool config composition and dataset resolution, with explicit host/environment inputs and digest pin checks. It never links pbfhogg.
 
 **`pbfhogg-library`** (`crates/library/`, bin, `publish = false`) independently verifies the worker's protocol and owns the certification requirement table. It links devkit and generic crates only. Its process and verification test targets each own their subreaper state.
+
+**`pbfhogg-datasets`** (`crates/datasets/`, bin, `publish = false`) owns
+dataset acquisition and completed-output snapshot promotion. It links devkit,
+never pbfhogg; downloads invoke the handed CLI for indexed output. Run it as
+`brokkr run --with pbfhogg pbfhogg-datasets -- ...`. See
+[reference/datasets.md](reference/datasets.md).
 
 The fourth, **`pbfhogg-guard-portability`** (`crates/guard-portability/`, `publish = false`, libc only), is a compile fixture: it mounts the guard alone so the `riscv64` lint sweep can type-check the guard's unsupported-architecture fallback. It is empty on x86_64 and aarch64.
 

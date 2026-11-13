@@ -50,7 +50,8 @@ impl BlobTask {
 /// element count is read from `BlobIndex.count`, which is required to
 /// precompute each blob's `base_new_id` without a full decode pass. If a
 /// matching blob is missing indexdata, we error out. Use an indexed dataset
-/// from `brokkr download`; `brokkr bench copy-pbf` measures indexing into
+/// from `brokkr run --with pbfhogg pbfhogg-datasets -- download REGION`;
+/// `brokkr bench copy-pbf` measures indexing into
 /// iteration scratch and does not retain a reusable indexed file.
 /// Scan all blob headers once and build per-kind schedules.
 /// Returns `(node_schedule, way_schedule, relation_schedule)`.

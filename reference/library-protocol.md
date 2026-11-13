@@ -195,6 +195,9 @@ artefact directory paths are not request fields.
 
 ### Dataset resolution
 
+Acquisition and registry writes are documented in [datasets](datasets.md);
+completed producer outputs use [snapshot promotion](dataset-promotion.md).
+
 `pbfhogg-devkit` composes recursive includes, the optional user-wide layer,
 `[host.H.datasets.D]` and legacy `[H.datasets.D]`. A host present in both
 namespaces is refused. Includes resolve relative to their canonical source

@@ -5,12 +5,12 @@
 //! checks (`reference/testing.md` "External cross-validation"): it skips and
 //! passes on a host without osmium, and runs under `brokkr check --profile
 //! full` or `brokkr test -p pbfhogg-cli apply_changes_locations_on_ways_agrees_with_osmium`.
-//! `brokkr verify merge --locations-on-ways` (and `verify all`, on a base
+//! `brokkr run --with pbfhogg pbfhogg-verify -- apply-changes --locations-on-ways` (and the verifier's `all`, on a base
 //! that keeps its untagged nodes) covers real data, but only holds pbfhogg's
 //! output to `check --locations` and to osmium's elements: it checks that
 //! the output agrees with itself, not that each refreshed coordinate is the
 //! one the change file sets. This test asserts that expected state, so it
-//! stays in-tree even though `verify merge --osc` could run its fixture.
+//! stays in-tree even though `pbfhogg-verify -- apply-changes --osc` could run its fixture.
 //!
 //! What it pins: every surviving base way takes the OSC coordinate of each
 //! node the OSC modifies (a base way cannot reference a created node), ways

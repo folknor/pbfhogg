@@ -25,7 +25,7 @@ PASS2 and PASS3 via `Pass1Result::pass3_blob_schedule` and
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
 Europe and Planet bbox `-25.0,34.0,45.0,72.0` (full-continent). Europe's
 is its configured dataset bbox; planet's dataset bbox in `brokkr.toml` is a
-Berlin box chosen for `brokkr verify` cost, so planet extract cells that
+Berlin box chosen for `brokkr run --with pbfhogg pbfhogg-verify --` cost, so planet extract cells that
 want the continent box pass `--bbox` explicitly.
 
 Simple extract uses a 3-phase barrier pipeline with parallel classification

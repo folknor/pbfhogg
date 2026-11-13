@@ -96,7 +96,73 @@ const SIGNALS: &str = "crates/cli/src/signals.rs";
 
 const DATASETS: &str = "crates/datasets/src/main.rs";
 
+const VERIFY: &str = "crates/verify/src/main.rs";
+
 pub const READS: &[Read] = &[
+    read(VERIFY, "execute", "var_os", "PATH", Reason::Operator),
+    read(VERIFY, "curl_env", "var_os", "http_proxy", Reason::Operator),
+    read(
+        VERIFY,
+        "curl_env",
+        "var_os",
+        "https_proxy",
+        Reason::Operator,
+    ),
+    read(
+        VERIFY,
+        "curl_env",
+        "var_os",
+        "HTTPS_PROXY",
+        Reason::Operator,
+    ),
+    read(VERIFY, "curl_env", "var_os", "all_proxy", Reason::Operator),
+    read(VERIFY, "curl_env", "var_os", "ALL_PROXY", Reason::Operator),
+    read(VERIFY, "curl_env", "var_os", "no_proxy", Reason::Operator),
+    read(VERIFY, "curl_env", "var_os", "NO_PROXY", Reason::Operator),
+    read(
+        VERIFY,
+        "curl_env",
+        "var_os",
+        "SSL_CERT_FILE",
+        Reason::Operator,
+    ),
+    read(
+        VERIFY,
+        "curl_env",
+        "var_os",
+        "SSL_CERT_DIR",
+        Reason::Operator,
+    ),
+    read(
+        VERIFY,
+        "curl_env",
+        "var_os",
+        "CURL_CA_BUNDLE",
+        Reason::Operator,
+    ),
+    read(
+        VERIFY,
+        "load_config",
+        "var_os",
+        "BROKKR_USER_CONFIG",
+        Reason::Protocol,
+    ),
+    read(
+        VERIFY,
+        "load_config",
+        "var_os",
+        "XDG_CONFIG_HOME",
+        Reason::Protocol,
+    ),
+    read(VERIFY, "load_config", "var_os", "HOME", Reason::Protocol),
+    read(
+        VERIFY,
+        "boundary",
+        "var_os",
+        "BROKKR_WITH_EXE",
+        Reason::Protocol,
+    ),
+    read(VERIFY, "boundary", "var_os", "PATH", Reason::Operator),
     read(
         DATASETS,
         "boundary",

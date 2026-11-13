@@ -116,8 +116,8 @@ Tests go where they couple least.
   like every other library test (plus a few unit tests beside the
   code they fault, such as `write::parallel_gzip`'s). Coupled to the
   `pbfhogg::test_hooks` surface by design.
-- **External cross-validation** in `brokkr verify`
-  (`verify_<command>.rs` modules in brokkr) - compares pbfhogg
+- **External cross-validation** in `brokkr run --with pbfhogg pbfhogg-verify --`
+  (`crates/verify/src/checks/`) - compares pbfhogg
   output against osmium / osmosis / osmconvert.
 
 Placement and tiering are independent axes.
@@ -348,7 +348,7 @@ mechanism, not the tiering model.
 | 2. Command slice | tens of seconds | While working on that command | `brokkr check --profile <cmd>` |
 | 3. Full in-project | minutes | Once, at the end of a campaign | `brokkr check --gate` |
 | 4. Scale/perf | hours | Performance work, release evidence | `brokkr bench`, `brokkr suite` |
-| 5. External cross-validation | depends | Release gate | `brokkr verify` |
+| 5. External cross-validation | depends | Release gate | `brokkr run --with pbfhogg pbfhogg-verify --` |
 
 Tiers 1-3 use `brokkr check`. Tiers 4-5 are separate brokkr commands.
 `brokkr check --gate` runs the unfiltered feature and target sweeps,
@@ -509,7 +509,7 @@ checked.
 
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication
-diffs) is `brokkr verify` and `brokkr bench`, which resolve datasets
+diffs) is `brokkr run --with pbfhogg pbfhogg-verify --` and `brokkr bench`, which resolve datasets
 per host from `brokkr.toml`; the test suite must pass on a checkout
 with an empty `data/`.
 
@@ -719,17 +719,14 @@ the rule.
 
 ## External cross-validation
 
-Lives in `brokkr verify`, not the in-tree test crate:
-
-- The `VerifyHarness` template (`run_pbfhogg`, `run_tool`,
-  `diff_pbfs`, `check_sorted`, dataset config, variant matrix,
-  results storage) already exists. Each new comparison is
-  `verify_<command>.rs`, ~50 lines.
-- External tools (osmium, osmosis, osmconvert) are operationally a
-  brokkr concern. Contributors don't need them installed for clean
-  `brokkr check`.
-- An in-tree `mod external` tier would duplicate brokkr's verify
-  machinery and act as a gravity well.
+Lives in the independent `crates/verify` binary, run through
+`brokkr run --with pbfhogg pbfhogg-verify -- CHECK`, outside the test suite.
+[verify.md](verify.md) defines the binding comparison, selection, lifecycle,
+cache and exit contracts. New checks live in `crates/verify/src/checks/`
+and use its `Harness` and single lifecycle owner. Reference tools are an
+operational concern of this verifier; contributors need none installed for
+clean `brokkr check`. Tests of the verifier use generated fixtures and Rust
+worker protocols, never downloaded datasets or network tools.
 
 The shared `crates/lib/tests/common/oracle.rs` runner resolves osmium to an
 absolute executable before changing cwd, reports version probes, sets cwd and
@@ -741,26 +738,26 @@ launch policy and explicit protocol environment, independently of CLI replay.
 **In-tree osmium checks are migration candidates.** Each is
 `#[ignore = "external"]`, skips where osmium is absent, and exists
 because its handcrafted fixture reaches a path a dataset run does not,
-or asserts what `brokkr verify` does not. Migrating one means carrying
+or asserts what `brokkr run --with pbfhogg pbfhogg-verify --` does not. Migrating one means carrying
 over its fixture coverage and its assertions; verify accepting its
 inputs is not enough:
 
 - `crates/cli/tests/cli_sort.rs::sort_cross_validate_osmium` - overlapping-blob
-  fixture; `brokkr verify sort` on a configured dataset runs against
+  fixture; `brokkr run --with pbfhogg pbfhogg-verify -- sort` on a configured dataset runs against
   real data only and doesn't exercise the streaming sweep merge's
-  overlap-run path. `brokkr verify <command> --input <path>` already
+  overlap-run path. `brokkr run --with pbfhogg pbfhogg-verify -- <command> --input <path>` already
   accepts a handcrafted PBF; the missing piece is an overlapping-fixture
   builder under `crates/lib/examples/`, after which the comparison moves to
-  `brokkr verify sort --input`.
+  `brokkr run --with pbfhogg pbfhogg-verify -- sort --input`.
 - `crates/cli/tests/cli_digest.rs::osmium_reencodings_digest_equal` - pins the
   encodings a real dataset run does not vary.
 - `crates/cli/tests/cli_apply_changes_osmium.rs` - `apply-changes
   --locations-on-ways` against osmium on a base and change file built so
   that both tools' documented semantics coincide (osmium's location
   index has ordering defects that decide its output otherwise; the
-  module doc lists the fixture rules). `brokkr verify merge --input
+  module doc lists the fixture rules). `brokkr run --with pbfhogg pbfhogg-verify -- apply-changes --input
   <base> --osc <change> --locations-on-ways` can run this fixture, and
-  `verify all` runs `apply-changes -l` on a dataset's
+  the verifier's `all` runs `apply-changes -l` on a dataset's
   `altw-keep-untagged` base. Both hold pbfhogg's output to
   `check --locations` and to osmium's elements, which ignore inline
   coordinates; neither compares each surviving way's refreshed
@@ -771,7 +768,7 @@ inputs is not enough:
 **Escape hatch.** A contributor mid-PR can write an osmium check
 next to a fixture for the duration of that PR as
 `#[ignore = "external"]` in-tree with a runbook comment, then
-convert to a `verify_*.rs` PR against brokkr afterward, once verify can
+move the comparison into `crates/verify` afterward, once the verifier can
 carry the check's assertions (until then it is a migration candidate
 above, with its reason stated). Permitted
 exception, not a tier - should not survive across many PRs.

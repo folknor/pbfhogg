@@ -53,7 +53,7 @@ intermediate OOM kills at ~26 GB anon RSS), DenseNodes + way wire-format
 rewriters, `IdSetDense` rank fusion (collapsed stages 2a+2b+2c), fused
 R2A/R2B/R2d relation pipeline, atomic index dispatch, shared-atomic
 `IdSetDense` with concurrent `AtomicU8::fetch_or` pass 1 writes. Each
-commit verified on Denmark via `brokkr verify renumber` (306-relation
+commit verified on Denmark via `brokkr run --with pbfhogg pbfhogg-verify -- renumber` (306-relation
 orphan delta preserved exactly).
 
 Element counts: 10,447,738,627 nodes / 1,165,589,744 ways /

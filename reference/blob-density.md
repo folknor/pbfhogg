@@ -446,7 +446,9 @@ stand. Open as a repack work item.
 
 ### Correctness across the encoding axis
 
-`brokkr verify all --snapshot 1k|64k|320k` (denmark, 2026-07-10): every
+Historical legacy-verifier run (denmark, 2026-07-10; current invocation:
+`brokkr run --with pbfhogg pbfhogg-verify -- all --snapshot KEY`, KEY one of
+1k, 64k, 320k): every
 element-shaped command (sort, cat, extract, tags-filter, getid, altw
 all three backends, check-refs, renumber) passes identically on all
 three re-encodes and on primary. The four suite failures reproduce

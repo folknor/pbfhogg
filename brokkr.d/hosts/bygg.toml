@@ -33,7 +33,7 @@ seq = 4704
 
 # Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes`
 # (default sparse index, 2026-10-27): every node kept, so apply-changes
-# --locations-on-ways can resolve every OSC-way ref, and `brokkr verify merge
+# --locations-on-ways can resolve every OSC-way ref, and `brokkr run --with pbfhogg pbfhogg-verify -- apply-changes
 # --locations-on-ways` can run on the default verify dataset.
 [bygg.datasets.denmark.pbf.altw-keep-untagged]
 file = "denmark-20260220-seq4704-altw-keep-untagged.osm.pbf"
@@ -181,7 +181,7 @@ seq = 4704
 # Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes`
 # (default sparse index, 2026-10-28; run through `brokkr run pbfhogg`): every
 # node kept, so apply-changes --locations-on-ways can resolve every OSC-way
-# ref and `brokkr verify all` runs its -l check. Same seq-4704 base the
+# ref and `brokkr run --with pbfhogg pbfhogg-verify -- all` runs its -l check. Same seq-4704 base the
 # configured OSCs chain from; osc.4705 is the one that applies directly.
 [bygg.datasets.germany.pbf.altw-keep-untagged]
 file = "germany-20260224-seq4704-altw-keep-untagged.osm.pbf"

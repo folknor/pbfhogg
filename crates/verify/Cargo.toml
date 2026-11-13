@@ -1,0 +1,48 @@
+[package]
+name = "pbfhogg-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-validation of the pbfhogg CLI against osmium, osmosis and osmconvert"
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# Run as `brokkr run --with pbfhogg pbfhogg-verify -- CHECK --dataset D`.
+# Links no pbfhogg: no verdict may rest on code compiled into the verifier.
+[[bin]]
+name = "pbfhogg-verify"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+flate2 = "1"
+pbfhogg-devkit = { path = "../devkit" }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+pbfhogg-test-scratch = { path = "../test-scratch" }
+
+[lints]
+workspace = true
+
+# Each lifecycle owner runs in a worker process: signal masks and subreaper
+# adoption must never be installed in libtest's multithreaded process.
+[[test]]
+name = "process"
+path = "tests/process.rs"
+
+# Rust-only hostile worker; roles are arguments, never environment inputs.
+[[bin]]
+name = "pbfhogg-verify-test-worker"
+path = "tests/worker.rs"
+test = false

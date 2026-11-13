@@ -5,11 +5,13 @@
 mod compose;
 mod datasets;
 mod registry;
+mod selection;
 mod tunables;
 
 pub use compose::{Config, user_config_path};
 pub use datasets::{ResolvedInput, file_digest};
 pub use registry::{DatasetEdit, DatasetView, FileEntry, Generation, replace_file};
+pub use selection::Bbox;
 
 /// A configuration, input selection or file verification failure.
 #[derive(Debug)]

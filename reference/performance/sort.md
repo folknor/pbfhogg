@@ -55,7 +55,7 @@ Every arm keeps both copies of a duplicated element (HEAD's twin output:
 104,979,306 nodes, 13,233,052 ways, 92,206 relations, twice Denmark);
 output bytes differ legitimately across the move, which flushes a block
 at each component boundary. Element contents were not compared across
-arms here; `brokkr verify sort` is the correctness check.
+arms here; `brokkr run --with pbfhogg pbfhogg-verify -- sort` is the correctness check.
 
 Pass 2 runs one sweep per component, so parallelism on unsorted input is
 bounded by the component count: on `chained` three sweeps cover the whole

@@ -474,7 +474,7 @@ Two refs to the same orphan stay equal, the old id is recoverable as
 output. Relation members of an unknown type (anything but node, way or
 relation once the type is read as int32) keep their id unchanged.
 
-**Cross-validation:** `brokkr verify renumber` on a Geofabrik-style extract
+**Cross-validation:** `brokkr run --with pbfhogg pbfhogg-verify -- renumber` on a Geofabrik-style extract
 finds equal element counts and no node or way that differs; every difference
 is in a relation. Those are attributed to orphan member refs - the members of
 cross-border relations (admin boundaries, routes, TMC segments) - but the

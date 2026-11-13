@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lib", "crates/cli", "crates/harness", "crates/guard-portability", "crates/test-scratch", "crates/source-policy", "crates/devkit", "crates/library", "crates/datasets"]
+members = ["crates/lib", "crates/cli", "crates/harness", "crates/guard-portability", "crates/test-scratch", "crates/source-policy", "crates/devkit", "crates/library", "crates/datasets", "crates/verify"]
 # Explicit: edition 2024 implies resolver 3 only for a root package, and a
 # virtual manifest has no edition, so without this it would drop to 1.
 resolver = "3"

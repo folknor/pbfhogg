@@ -343,3 +343,137 @@ fn pbfhogg_host_is_not_reserved_by_a_library_child() {
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
     assert_eq!(config.data_dir("project").unwrap(), root.join("explicit"));
 }
+
+#[test]
+fn selection_primitives_distinguish_absence_from_invalid() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let root = scratch.path();
+    write(root, "data/a.osc", "change a");
+    write(root, "data/b.osc", "change b");
+    write(root, "data/polygon.json", "{}");
+    write(root, "data/base.pbf", "base");
+    write(
+        root,
+        "brokkr.toml",
+        "
+[m.datasets.d]
+bbox = '-1, 2,3,4'
+[m.datasets.d.osc.10]
+file = 'a.osc'
+[m.datasets.d.osc.11]
+file = 'b.osc'
+[m.datasets.d.polygon.z]
+file = 'polygon.json'
+[m.datasets.d.polygon.a]
+file = 'polygon.json'
+[m.datasets.d.pbf.raw]
+file = 'base.pbf'
+[m.datasets.d.snapshot.empty]
+[m.datasets.d.snapshot.one.osc.12]
+file = 'b.osc'
+[m.datasets.d.snapshot.bad.osc.10]
+file = 'missing.osc'
+",
+    );
+    let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
+    assert!(c.select_osc("m", "d", None, None).is_err());
+    assert_eq!(
+        c.select_osc("m", "d", None, Some("10"))
+            .unwrap()
+            .unwrap()
+            .variant,
+        "10"
+    );
+    assert!(c.select_osc("m", "d", None, Some("12")).is_err());
+    assert!(
+        c.select_osc("m", "d", Some("empty"), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(c.select_osc("m", "d", Some("empty"), Some("10")).is_err());
+    assert!(c.select_osc("m", "d", Some("missing"), None).is_err());
+    assert!(c.select_osc("m", "d", Some("bad"), None).is_err());
+    assert_eq!(
+        c.select_osc("m", "d", Some("one"), None)
+            .unwrap()
+            .unwrap()
+            .variant,
+        "12"
+    );
+    let range = c.select_osc_range("m", "d", None, 10, 11).unwrap();
+    assert_eq!(
+        range.iter().map(|r| r.variant.as_str()).collect::<Vec<_>>(),
+        ["10", "11"]
+    );
+    assert!(c.select_osc_range("m", "d", None, 10, 12).is_err());
+    assert!(c.select_osc_range("m", "d", None, 11, 10).is_err());
+    assert!(c.select_pbf("m", "d", None, "raw").unwrap().is_some());
+    assert!(
+        c.select_pbf("m", "d", Some("empty"), "raw")
+            .unwrap()
+            .is_none()
+    );
+    assert!(c.select_pbf("m", "d", Some("unknown"), "raw").is_err());
+    let bbox = c.select_bbox("m", "d").unwrap().unwrap();
+    assert_eq!(bbox.coordinates(), [-1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(bbox.to_pbfhogg_arg(), "-b=-1, 2,3,4");
+    let polygons = c.select_polygons("m", "d").unwrap().unwrap();
+    assert_eq!(
+        polygons
+            .iter()
+            .map(|r| r.variant.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "z"]
+    );
+    assert!(c.select_polygon("m", "d", "missing").unwrap().is_none());
+    for bad in ["1,2,3", "1,2,3,NaN", "1,2,inf,4", "a,2,3,4"] {
+        assert!(crate::Bbox::parse(bad).is_err());
+    }
+}
+
+#[test]
+fn selection_primitives_validate_configured_entries() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let root = scratch.path();
+    write(root, "data/a.osc", "change a");
+    // Pins and file validation apply uniformly to every selected file kind.
+    for kind in ["osc.1", "polygon.a", "pbf.raw"] {
+        for entry in [
+            "file = 'missing'",
+            "file = 'a.osc'\nxxhash = '00000000000000000000000000000000'",
+            "file = 3",
+            "file = ''",
+            "file = '.'",
+            "file = 'a.osc'\nsha256 = 'retired'",
+        ] {
+            write(
+                root,
+                "brokkr.toml",
+                &format!("[m.datasets.d.{kind}]\n{entry}\n"),
+            );
+            let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
+            let fails = match kind {
+                "osc.1" => c.select_osc("m", "d", None, None).is_err(),
+                "polygon.a" => c.select_polygons("m", "d").is_err(),
+                _ => c.select_pbf("m", "d", None, "raw").is_err(),
+            };
+            assert!(fails, "{kind}: {entry}");
+        }
+    }
+    for setting in [
+        "osc = 3",
+        "pbf = 3",
+        "polygon = 3",
+        "bbox = 3",
+        "bbox = '1,2,NaN,4'",
+    ] {
+        write(root, "brokkr.toml", &format!("[m.datasets.d]\n{setting}\n"));
+        let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
+        assert!(
+            c.select_osc("m", "d", None, None).is_err()
+                || c.select_pbf("m", "d", None, "raw").is_err()
+                || c.select_polygons("m", "d").is_err()
+                || c.select_bbox("m", "d").is_err()
+        );
+    }
+}

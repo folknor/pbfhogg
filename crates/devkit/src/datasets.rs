@@ -63,7 +63,6 @@ impl Config {
         variant: &str,
     ) -> Result<ResolvedInput, Error> {
         let host_table = self.selected_host(host)?;
-        let data = optional_string(host_table, "data")?.unwrap_or("data");
         let datasets = child_table(host_table, "datasets")?;
         let mut selected = child_table(datasets, dataset)?;
         if let Some(key) = snapshot.filter(|key| *key != "base") {
@@ -77,9 +76,19 @@ impl Config {
             selected = child_table(child_table(selected, "snapshot")?, key)?;
         }
         let entry = child_table(child_table(selected, "pbf")?, variant)?;
+        self.resolve_entry(host, role, variant, entry)
+    }
+
+    pub(crate) fn resolve_entry(
+        &self,
+        host: &str,
+        role: &str,
+        variant: &str,
+        entry: &toml::Table,
+    ) -> Result<ResolvedInput, Error> {
         let file = optional_string(entry, "file")?
             .filter(|file| !file.trim().is_empty())
-            .ok_or_else(|| Error::message("PBF entry requires a non-empty 'file'"))?;
+            .ok_or_else(|| Error::message("file entry requires a non-empty 'file'"))?;
         if entry.contains_key("sha256") {
             return Err(Error::message(
                 "dataset pin 'sha256' is retired; configure 'xxhash' instead",
@@ -88,7 +97,7 @@ impl Config {
         let expected_digest = optional_string(entry, "xxhash")?
             .map(normalize_digest)
             .transpose()?;
-        let path = self.root.join(data).join(file);
+        let path = self.data_dir(host)?.join(file);
         let observed_digest = file_digest(&path)?;
         if let Some(expected) = &expected_digest
             && expected != &observed_digest
@@ -147,14 +156,17 @@ impl Config {
     }
 }
 
-fn child_table<'a>(table: &'a toml::Table, key: &str) -> Result<&'a toml::Table, Error> {
+pub(crate) fn child_table<'a>(table: &'a toml::Table, key: &str) -> Result<&'a toml::Table, Error> {
     table
         .get(key)
         .and_then(toml::Value::as_table)
         .ok_or_else(|| Error::message(format!("missing or invalid table '{key}'")))
 }
 
-fn optional_string<'a>(table: &'a toml::Table, key: &str) -> Result<Option<&'a str>, Error> {
+pub(crate) fn optional_string<'a>(
+    table: &'a toml::Table,
+    key: &str,
+) -> Result<Option<&'a str>, Error> {
     table
         .get(key)
         .map(|value| {

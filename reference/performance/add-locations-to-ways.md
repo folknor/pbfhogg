@@ -429,7 +429,7 @@ of 128 KiB per bucket appended with `write_all` under a per-bucket
 mutex (wait counted as `s1a_id_shard_lock_wait_ns`), no `BufWriter`, and
 stage 2 streaming each bucket's one file in 8 MiB chunks. Its pass A
 batch RAM bound was 30 x 256 x 128 KiB = 960 MiB against about 1.9 GiB of
-`BufWriter`s. Gate green and `brokkr verify add-locations-to-ways
+`BufWriter`s. Gate green and `brokkr run --with pbfhogg pbfhogg-verify -- add-locations-to-ways
 --mode external` on denmark passed. Planet, `--bench 1`, 30 workers,
 99.5 GB of shard bytes in every cell, baseline as `--commit HEAD`
 (brokkr#105 applies to its CPU phases), variant uncommitted with

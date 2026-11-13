@@ -40,7 +40,7 @@
 -- --strategy complete_ways and --keep-member-nodes, so validation compares
 -- the semantics actually timed, and a drift in pbfhogg's default fails it
 -- wherever the input exposes the difference. The other strategies and
--- --keep-untagged-nodes are not rows of this table; brokkr verify extract
+-- --keep-untagged-nodes are not rows of this table; brokkr run --with pbfhogg pbfhogg-verify -- extract
 -- gates the extract strategies.
 -- extract uses the dataset bbox and the complete-ways strategy on both
 -- sides (pbfhogg's default, osmium's explicit complete_ways).

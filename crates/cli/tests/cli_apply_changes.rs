@@ -23,8 +23,8 @@
 //! Where a stats assertion is redundant with an element-set
 //! assertion it is dropped.
 //!
-//! Cross-validation against osmium on real data is `brokkr verify
-//! merge`, not a test here.
+//! Cross-validation against osmium on real data is `brokkr run --with pbfhogg pbfhogg-verify --
+//! apply-changes`, not a test here.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]

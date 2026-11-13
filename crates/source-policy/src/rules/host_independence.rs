@@ -76,6 +76,24 @@ const CURRENT_EXE_TEST_BINARY: &str = r#"std::env::current_exe().expect("this te
 
 pub const CONSTRUCTORS: &[Constructor] = &[
     Constructor {
+        file: "crates/verify/tests/process.rs",
+        owner: "boundary_command",
+        program: "VERIFIER",
+        count: 1,
+    },
+    Constructor {
+        file: "crates/verify/tests/process.rs",
+        owner: "run_worker",
+        program: "EXE",
+        count: 1,
+    },
+    Constructor {
+        file: "crates/verify/tests/worker.rs",
+        owner: "descendant",
+        program: "exe",
+        count: 1,
+    },
+    Constructor {
         file: "crates/library/tests/worker.rs",
         owner: "descendant",
         program: "exe",
@@ -93,6 +111,14 @@ pub const CONSTRUCTORS: &[Constructor] = &[
         file: "crates/datasets/src/process.rs",
         owner: "command",
         program: "program",
+        count: 1,
+    },
+    // The verifier's one spawn point: every pbfhogg, reference-tool and
+    // provisioning launch goes through its lifecycle owner.
+    Constructor {
+        file: "crates/verify/src/process.rs",
+        owner: "Lifecycle::run",
+        program: "launch.program",
         count: 1,
     },
     Constructor {
@@ -154,6 +180,16 @@ pub struct ExeConst {
 }
 
 pub const EXE_CONSTS: &[ExeConst] = &[
+    ExeConst {
+        file: "crates/verify/tests/process.rs",
+        name: "VERIFIER",
+        var: "CARGO_BIN_EXE_pbfhogg-verify",
+    },
+    ExeConst {
+        file: "crates/verify/tests/process.rs",
+        name: "EXE",
+        var: "CARGO_BIN_EXE_pbfhogg-verify-test-worker",
+    },
     ExeConst {
         file: "crates/library/tests/verify.rs",
         name: "EXE",

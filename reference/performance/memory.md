@@ -178,7 +178,7 @@ HEAD:
 Every phase runs the same time in both (node write 100.5 to 102.1 s, way
 write 56.6 to 58.2 s); average cores in the write phases fall from about
 23 to 21.5, the framing pool's threads that ran beside the workers. Output
-passes `brokkr verify extract` on denmark; the frames carry the same
+passes `brokkr run --with pbfhogg pbfhogg-verify -- extract` on denmark; the frames carry the same
 indexdata, tagdata and compression as the writer's (the builder's blocks
 carry no WayMembers). degrade's unsort modes are left as above.
 

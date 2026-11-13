@@ -25,7 +25,7 @@ Specifications are saved to the ./notes folder.
 5. **Verification per brick.** Every change names its gate, matched to what
    the change can break: `brokkr check` (gremlins + clippy + the full test
    suite) for anything touching read/write semantics, wire encoding, the CLI
-   surface, or an invariant; `brokkr verify <command> --dataset denmark
+   surface, or an invariant; `brokkr run --with pbfhogg pbfhogg-verify -- <command> --dataset denmark
    --variant indexed` (cross-validates the command's output against osmium /
    osmosis / osmconvert) for anything touching a command's element output,
    with zero diffs the bar save the parity exceptions already documented in
@@ -77,7 +77,7 @@ Specifications are saved to the ./notes folder.
    intrusive change that lands and is then kept or reverted on its gate
    results - never a tiny gated probe or an env-var experiment switch. The
    sequence of such landings is ordered so `brokkr check` (and, where the
-   item touches a command's output, `brokkr verify`) stays green at every
+   item touches a command's output, `brokkr run --with pbfhogg pbfhogg-verify --`) stays green at every
    boundary between them.
    Complete-but-unorderable is a failed spec. Benchmark discipline holds
    at every landing: commit first, then measure, then record numbers

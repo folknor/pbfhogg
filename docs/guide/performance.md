@@ -165,4 +165,4 @@ With pipelined writes (the production path), compression is dispatched to rayon 
 
 ## System
 
-The CLI command table was measured on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), at commit `53360af4`. The read throughput, write throughput, extract and apply-changes with LocationsOnWays tables were measured on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, at the older commits each table names; they have not been re-measured since. Measured with brokkr, and cross-validated with `brokkr verify` for every command it compares against osmium (`inspect tags` is not among them).
+The CLI command table was measured on bygg, AMD Ryzen 9 9950X3D2 (16c/32t), at commit `53360af4`. The read throughput, write throughput, extract and apply-changes with LocationsOnWays tables were measured on plantasjen, AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, at the older commits each table names; they have not been re-measured since. Measured with brokkr, and cross-validated with `brokkr run --with pbfhogg pbfhogg-verify --` for every command it compares against osmium (`inspect tags` is not among them).

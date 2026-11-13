@@ -378,7 +378,7 @@ fn splice_way_locations(
                     // it would change the output bytes for an input this
                     // rewriter used to copy through unchanged. `add-locations-
                     // to-ways` output is compared byte-wise against osmium in
-                    // `brokkr verify`, so the normalization must be a no-op on
+                    // `brokkr run --with pbfhogg pbfhogg-verify --`, so the normalization must be a no-op on
                     // every packed input, including the degenerate one.
                     encode_tag(&mut scratch.reframed_way, 8, WIRE_LEN);
                     encode_varint(&mut scratch.reframed_way, 0);
@@ -593,7 +593,7 @@ mod tests {
     /// The normalization must be exact, in both directions.
     ///
     /// `add-locations-to-ways` output is compared byte-wise against osmium in
-    /// `brokkr verify`, so re-emitting the packed form must be a no-op for
+    /// `brokkr run --with pbfhogg pbfhogg-verify --`, so re-emitting the packed form must be a no-op for
     /// every packed input - and the unpacked spelling of the same way must
     /// normalize to precisely the bytes the packed spelling produces.
     #[test]

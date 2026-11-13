@@ -506,12 +506,12 @@ fn sort_already_sorted() {
 /// handcrafted overlapping-blob fixture.
 ///
 /// **Escape hatch**, `#[ignore = "external"]`d. External
-/// cross-validation lives in `brokkr verify`, not the in-tree
+/// cross-validation lives in `brokkr run --with pbfhogg pbfhogg-verify --`, not the in-tree
 /// suite (see `reference/testing.md` > "External cross-validation").
-/// `brokkr verify sort` already covers the real-dataset case;
+/// `brokkr run --with pbfhogg pbfhogg-verify -- sort` already covers the real-dataset case;
 /// this fixture is the pathological overlap-run input that
-/// real Denmark data does not exercise. Migration target: when
-/// `brokkr verify sort --input <path>` already exists; once a fixture
+/// real Denmark data does not exercise. Migration target:
+/// `brokkr run --with pbfhogg pbfhogg-verify -- sort --input <path>` already exists; once a fixture
 /// builder under `crates/lib/examples/` writes this fixture, move the comparison
 /// there and retire this test.
 /// Skip-on-missing-osmium kept so the test still passes if

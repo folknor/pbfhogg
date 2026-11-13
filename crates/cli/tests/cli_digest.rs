@@ -1115,7 +1115,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// compression, no indexdata - must digest equal to the file they came from.
 ///
 /// `#[ignore = "external"]`: external cross-validation belongs to
-/// `brokkr verify` (see `reference/testing.md` "External cross-validation");
+/// `brokkr run --with pbfhogg pbfhogg-verify --` (see `reference/testing.md` "External cross-validation");
 /// this fixture pins the encodings a real dataset run does not vary.
 #[test]
 #[ignore = "external"]

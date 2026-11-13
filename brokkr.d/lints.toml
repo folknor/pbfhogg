@@ -116,7 +116,7 @@ message = "fault hooks go in pbfhogg::test_hooks (crates/lib/src/test_hooks.rs) 
 [[textlint]]
 name = "no-print-macro"
 pattern = '\b(?:print|println)!\s*[\(\[\{]'
-paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs"]
+paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs", "crates/verify/src/**/*.rs"]
 region = "code"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs", "crates/library/src/main.rs", "crates/datasets/src/main.rs"]
 message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | head); in the CLI write through output::buffered, in the library into a caller-supplied io::Write"
@@ -126,8 +126,8 @@ name = "no-stdout-handle"
 # Child pipe access does not acquire the driver's stdout handle.
 except = ['\.stdout\b']
 pattern = '\bstdout\b'
-paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs"]
-exclude = ["crates/cli/src/output.rs", "crates/harness/src/describe_out.rs", "crates/library/src/output.rs", "crates/datasets/src/output.rs"]
+paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs", "crates/verify/src/**/*.rs"]
+exclude = ["crates/cli/src/output.rs", "crates/harness/src/describe_out.rs", "crates/library/src/output.rs", "crates/datasets/src/output.rs", "crates/verify/src/output.rs"]
 region = "code"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs", "crates/library/src/main.rs", "crates/datasets/src/main.rs"]
 message = "only the CLI and driver output modules and the harness describe writer acquire stdout; use output::buffered, or have the library take an io::Write"
@@ -369,8 +369,8 @@ message = "Library rayon tasks must go through the caller's host::Executor, not 
 [[textlint]]
 name = "no-eprint-macro"
 pattern = '\beprint(?:ln)?!'
-paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs"]
-exclude = ["crates/cli/src/output.rs", "crates/library/src/output.rs", "crates/datasets/src/output.rs"]
+paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs", "crates/verify/src/**/*.rs"]
+exclude = ["crates/cli/src/output.rs", "crates/library/src/output.rs", "crates/datasets/src/output.rs", "crates/verify/src/output.rs"]
 region = "code"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crates/harness/src/describe.rs", "crates/library/src/main.rs", "crates/datasets/src/main.rs"]
 message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr; the library harness writes nothing to stderr at all"

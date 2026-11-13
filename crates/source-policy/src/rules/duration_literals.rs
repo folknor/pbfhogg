@@ -22,6 +22,7 @@ use crate::lex::{Kind, Source};
 const OWNERS: &[&str] = &[
     "crates/lib/src/tunables.rs",
     "crates/library/src/tunables.rs",
+    "crates/verify/src/tunables.rs",
     "crates/test-scratch/src/hang.rs",
 ];
 

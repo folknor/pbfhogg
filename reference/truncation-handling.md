@@ -470,7 +470,7 @@ parser of its own, so the policy cannot drift again:
   copied through verbatim with locations for only its prefix. The
   normalization is byte-exact for every packed input, including an
   empty packed segment: `add-locations-to-ways` output is compared
-  byte-wise against osmium in `brokkr verify`, so re-emitting the
+  byte-wise against osmium in `brokkr run --with pbfhogg pbfhogg-verify --`, so re-emitting the
   packed form has to be a no-op.
 
 Where a component rejects rather than accepts, the observable

@@ -9,7 +9,7 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 - Don't use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten.
 - Don't remind the user of the rules. They wrote them, so they know them.
 - The user can exempt you from any rule at any time.
-- ./research/* holds full vendored source for related projects, readable from any agent sandbox. Competitor reference sources available for research: `research/libosmium/` (C++ OSM library, the reference implementation), `research/osmium-tool/` (C++ CLI on libosmium, the direct competitor and `brokkr verify` oracle), `research/traccar-geocoder/` (reverse geocoder, the geocode_index precedent). `research/geoparquet/` is the GeoParquet spec repository (spec, JSON schema, examples, test data) - a standards reference, not a competitor.
+- ./research/* holds full vendored source for related projects, readable from any agent sandbox. Competitor reference sources available for research: `research/libosmium/` (C++ OSM library, the reference implementation), `research/osmium-tool/` (C++ CLI on libosmium, the direct competitor and `brokkr run --with pbfhogg pbfhogg-verify --` oracle), `research/traccar-geocoder/` (reverse geocoder, the geocode_index precedent). `research/geoparquet/` is the GeoParquet spec repository (spec, JSON schema, examples, test data) - a standards reference, not a competitor.
 - When asked to write a plan or a specification, read `reference/technical-implementation-spec.md` first; it defines what such a document must contain.
 
 ### Bash rules
@@ -119,7 +119,7 @@ answer "is this file right?" belong on `check`; descriptive flags on `inspect`.
 - `brokkr clean` - remove scratch temp files.
 - `brokkr history [--command CMD] [--failed] [--since DATE] [--slow MS] [-n N]` - global command history.
 - `brokkr run --with pbfhogg-harness pbfhogg-library -- list` lists library scenarios; `verify SCENARIO --dataset D` verifies one; `verify --all --dataset D` certifies all. Measurement is `brokkr bench library-scenario --scenario SCENARIO --dataset D`; runner options precede the bench name. See `reference/library-protocol.md`.
-- `brokkr verify <command> [--dataset name] [--snapshot key]` - cross-validate vs osmium/osmosis/osmconvert. `brokkr verify all` runs all. Default `--dataset denmark`, `--variant indexed`. `--snapshot` conflicts with explicit `--input`; OSC resolution for change-consuming verifies is three-way (see the snapshot model section). For commands with multiple modes (e.g. `add-locations-to-ways` has `--mode hash|sparse|external|all`, default `all`), pass the explicit mode to skip the others - e.g. `brokkr verify add-locations-to-ways --dataset denmark --mode sparse` runs only the sparse path against the hash reference. Brokkr may still accept `--mode dense` in its CLI surface; that maps to `pbfhogg --index-type dense` which errors out since dense was removed in commit (see `reference/performance/add-locations-to-ways.md`).
+- `brokkr run --with pbfhogg pbfhogg-verify -- <check> [--dataset name] [--snapshot key]` - cross-validate against reference tools; `all` runs the complete suite. Defaults: `--dataset denmark`, `--variant indexed`. `--snapshot` conflicts with fixture `--input`. Add-locations-to-ways accepts `--mode sparse|external|all` (default all); sparse/external compare against osmium, and all also checks engine parity. See [reference/verify.md](reference/verify.md) for selections, exact claims, cache, lifecycle and exits.
 
 ### OSC resolver
 
@@ -153,10 +153,10 @@ See [reference/dataset-promotion.md](reference/dataset-promotion.md).
 Acquire a separate upstream snapshot with
 `brokkr run --with pbfhogg pbfhogg-datasets -- download REGION --as-snapshot KEY`.
 
-`brokkr verify <cmd> --snapshot KEY` remains available. Change-consuming
+`brokkr run --with pbfhogg pbfhogg-verify -- <cmd> --snapshot KEY` remains available. Change-consuming
 verifies use the snapshot OSC table if present, otherwise the primary OSC
 table for encoding-only snapshots; they narrate fallback on stderr.
-`verify all` skips merge/derive if no OSC resolves. The script benches use
+`all` reports skips for OSC-consuming checks if no OSC resolves. The script benches use
 only the selected snapshot's OSC table, without this fallback.
 
 `diff-pair` compares independent PBFs with full decode on both sides.
@@ -169,7 +169,7 @@ only the selected snapshot's OSC table, without this fallback.
 - `snapshot.<key>` - named point-in-time captures with own `pbf`/`osc` tables.
 - `download_date` - generation date (`YYYY-MM-DD`); dataset refresh uses a valid date for its archive key, otherwise raw mtime in UTC.
 - `xxhash` - XXH128 hash. `brokkr env` shows computed values.
-- `pbf.altw-keep-untagged` - the LocationsOnWays base `brokkr verify all` runs its `apply-changes -l` check on (built with `--keep-untagged-nodes` from the same base the dataset's OSCs chain from; absent, the check is skipped). No brokkr producer registers it: build it with `brokkr run pbfhogg -- add-locations-to-ways ...` and add the block by hand with the hash `brokkr env` prints.
+- `pbf.altw-keep-untagged` - the LocationsOnWays base `brokkr run --with pbfhogg pbfhogg-verify -- all` runs its `apply-changes -l` check on (built with `--keep-untagged-nodes` from the same base the dataset's OSCs chain from; absent, the check is skipped). No brokkr producer registers it: build it with `brokkr run pbfhogg -- add-locations-to-ways ...` and add the block by hand with the hash `brokkr env` prints.
 - `bbox` (dataset level) - default box for `extract` / `multi-extract` benches and `verify`; absent, verify skips extract and multi-extract. Choose it for verify cost on the host, not only for lying inside the region.
 - `getid_ids` / `getparents_ids` (dataset level) - IDs the getid/getparents benches request; absent, brokkr's built-in Denmark IDs. A configured list qualifies the result rows' pairing key. `brokkr man datasets` has the full rules.
 
@@ -197,7 +197,7 @@ Commands requiring indexdata: the per-command truth is the "Proceeding without i
 - **Ignore performance differences below 2-3 %.** They are noise for every decision here: not a regression to fix, not a win to claim, not a reason to run more cells. Do not chase them with extra benchmark runs or code-layout tweaks (`#[inline]` attributes and the like).
 - **Modest memory at planet scale is not a reason to hold back a large wall win.** Report the peak; do not trade the win away for it.
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.
-- **Never run `brokkr verify` on any dataset larger than germany.** Planet, europe and north-america are bench-only; correctness on real data is checked on denmark and germany.
+- **Never run `brokkr run --with pbfhogg pbfhogg-verify --` on any dataset larger than germany.** Planet, europe and north-america are bench-only; correctness on real data is checked on denmark and germany.
 - Multiple benchmark runs in an optimization workflow: run sequentially, report between runs.
 - **Read the phase split before calling any delta a regression.** `brokkr sidecar <uuid> --human` attributes per-phase disk read, majflt and cores. Planet wall deltas are routinely environmental; one sidecar read regularly saves a bisect.
 - **Interleave matched A/B cells.** `--iterations N` is best-of-N *within* one cell, so it cannot cancel drift *between* cells - two adjacent `--iterations 3` cells are still confounded. Alternate `--iterations 1` cells, compare medians, and check sign consistency across pairs.
@@ -209,11 +209,11 @@ Commands requiring indexdata: the per-command truth is the "Proceeding without i
 Drive-state and cache-state evidence, with dates and UUIDs, lives in [`reference/performance/README.md`](reference/performance/README.md) - it is volatile and does not belong here.
 
 ## Workspace
-The root `Cargo.toml` is a virtual workspace manifest; every member lives under `crates/`. **`pbfhogg`** (`crates/lib/`, library) + **`pbfhogg-cli`** (`crates/cli/`, produces the `pbfhogg` binary; the program itself is the package's library target `pbfhogg_cli` in `crates/cli/src/lib.rs`, which `crates/cli/src/main.rs` only calls, so the package's tests can reach the command tree - it is not an API). Library users: `default-features = false` drops the `commands` feature (see Features below for exactly what that gates). `pbfhogg-cli` carries a no-op `commands` feature so brokkr can apply `--features commands` symmetrically across both crates - the CLI's lib dep already always pulls in `pbfhogg/commands`.
+The root `Cargo.toml` is a virtual workspace manifest; the members are listed below and all live under `crates/`. **`pbfhogg`** (`crates/lib/`, library) + **`pbfhogg-cli`** (`crates/cli/`, produces the `pbfhogg` binary; the program itself is the package's library target `pbfhogg_cli` in `crates/cli/src/lib.rs`, which `crates/cli/src/main.rs` only calls, so the package's tests can reach the command tree - it is not an API). Library users: `default-features = false` drops the `commands` feature (see Features below for exactly what that gates). `pbfhogg-cli` carries a no-op `commands` feature so brokkr can apply `--features commands` symmetrically across both crates - the CLI's lib dep already always pulls in `pbfhogg/commands`.
 
 CLI-driven integration tests live in the `pbfhogg-cli` package, `crates/cli/tests/cli_*.rs` (modules of `crates/cli/tests/all.rs`), and drive the `pbfhogg` binary via `CliInvoker` (`crates/cli/tests/invoker.rs`). The binary is cargo's `CARGO_BIN_EXE_pbfhogg`, built for that test build with its own features, profile and target; nothing is resolved at run time. Command-table tests take their subcommand lists from `pbfhogg_cli::cli_command()`, the tree production parses, never from `--help` text. `crates/lib/tests/common` is shared: the CLI harness mounts it by `#[path]`.
 
-The third member, **`pbfhogg-harness`** (`crates/harness/`, bin only, `publish = false`), is the library worker launched by `brokkr run --with pbfhogg-harness pbfhogg-library -- ...` and the `library-scenario` bench (protocol: `reference/library-protocol.md`). Its unit tests are in the bin; the tests that drive the executable are `crates/harness/tests/all.rs`, under the CLI's promise guard (`crates/cli/tests/guard.rs`, mounted by path).
+**`pbfhogg-harness`** (`crates/harness/`, bin only, `publish = false`), is the library worker launched by `brokkr run --with pbfhogg-harness pbfhogg-library -- ...` and the `library-scenario` bench (protocol: `reference/library-protocol.md`). Its unit tests are in the bin; the tests that drive the executable are `crates/harness/tests/all.rs`, under the CLI's promise guard (`crates/cli/tests/guard.rs`, mounted by path).
 
 **`pbfhogg-devkit`** (`crates/devkit/`, lib only, `publish = false`) owns shared tool config composition and dataset resolution, with explicit host/environment inputs and digest pin checks. It never links pbfhogg.
 
@@ -225,11 +225,13 @@ never pbfhogg; downloads invoke the handed CLI for indexed output. Run it as
 `brokkr run --with pbfhogg pbfhogg-datasets -- ...`. See
 [reference/datasets.md](reference/datasets.md).
 
-The fourth, **`pbfhogg-guard-portability`** (`crates/guard-portability/`, `publish = false`, libc only), is a compile fixture: it mounts the guard alone so the `riscv64` lint sweep can type-check the guard's unsupported-architecture fallback. It is empty on x86_64 and aarch64.
+**`pbfhogg-verify`** (`crates/verify/`, bin, `publish = false`) owns real-data cross-validation against reference tools. It links devkit and generic crates, never pbfhogg. Run it as `brokkr run --with pbfhogg pbfhogg-verify -- ...`; the binding contract is [reference/verify.md](reference/verify.md).
 
-The fifth, **`pbfhogg-test-scratch`** (`crates/test-scratch/`, `publish = false`, depends only on `tempfile`), is the one owner of test scratch for every harness, taken as a path-only dev-dependency, and also holds the fail-stop `HangBound` every hang wait uses; see `reference/testing.md` "Test scratch".
+**`pbfhogg-guard-portability`** (`crates/guard-portability/`, `publish = false`, libc only), is a compile fixture: it mounts the guard alone so the `riscv64` lint sweep can type-check the guard's unsupported-architecture fallback. It is empty on x86_64 and aarch64.
 
-The sixth, **`pbfhogg-source-policy`** (`crates/source-policy/`, `publish = false`, no dependency on pbfhogg), holds the repository's Rust-source audits as unit tests over one tokenized corpus; only the `all` sweep tests it.
+**`pbfhogg-test-scratch`** (`crates/test-scratch/`, `publish = false`, depends only on `tempfile`), is the one owner of test scratch for every harness, taken as a path-only dev-dependency, and also holds the fail-stop `HangBound` every hang wait uses; see `reference/testing.md` "Test scratch".
+
+**`pbfhogg-source-policy`** (`crates/source-policy/`, `publish = false`, no dependency on pbfhogg), holds the repository's Rust-source audits as unit tests over one tokenized corpus; only the `all` sweep tests it.
 
 `cargo clippy --all-targets` at the workspace root selects every member: the virtual manifest has no `default-members` restriction. Verify changes with `brokkr check` for the configured feature and target sweeps (the sweeps that run CLI tests select both `pbfhogg` and `pbfhogg-cli`).
 
@@ -254,7 +256,7 @@ The sixth, **`pbfhogg-source-policy`** (`crates/source-policy/`, `publish = fals
 - Strict clippy: `unwrap_used = "deny"`, `expect_used = "deny"` (tests exempt; a production `expect` carries `#[expect(clippy::expect_used, reason = "...")]` saying why it cannot fire - see `clippy.toml`), `cognitive_complexity = "deny"`.
 - Tunables (sizes, depths, worker counts and caps, channel and reorder capacities, timeouts, thresholds, geocode policy values) live in `crates/lib/src/tunables.rs`, grouped by scope with their rationale. A new tunable goes there, not in a local `const` or an inline literal. Format and protocol constants (field numbers, record layouts, spec limits) stay with the code that owns the format.
 - Coordinates: decimicrodegrees (10^-7 degrees) for node I/O.
-- Tests never read downloaded datasets (Denmark, planet, OSC diffs) - every test builds its own input in scratch, and the suite must pass with an empty `data/`. Real-data coverage belongs to `brokkr verify` and `brokkr bench`.
+- Tests never read downloaded datasets (Denmark, planet, OSC diffs) - every test builds its own input in scratch, and the suite must pass with an empty `data/`. Real-data coverage belongs to `brokkr run --with pbfhogg pbfhogg-verify --` and `brokkr bench`.
 - Assume nothing about the host beyond a standard Linux box: 26+ GB free memory, git, a Rust toolchain, brokkr, python3 and bash/sh, plus `data/` datasets only where brokkr configures them. No hostname, path, core count, raised rlimit or other toolchain. How tests and checks handle a missing capability: `reference/testing.md` "Platform-dependent tests".
 - Tests never depend on the specifics of a host: no goldens blessed on one machine, no core-count, memory or rlimit preconditions. Library tests get a fixed machine from `common::test_host()` and unit tests from `Host::for_tests()` (both `host::Fixed`, each with an executor pool of its own and fixed descriptor grants; no fixture changes process state). Fixture PBFs are built at test time by the `crates/lib/tests/common` writers and generators, never checked in. The one exception is `crates/lib/tests/test.osm.pbf`, the doc-example input, regenerated by `crates/lib/examples/gen_test_pbf.rs` (`reference/testing.md` says why); new tests never read it. A test whose feature the host lacks (O_DIRECT, io_uring, osmium) skips and passes in ordinary runs. The complete gate is the exception: its profile sets `PBFHOGG_TEST_REQUIRE`, and a refusal of a backend listed there fails the test instead (`crates/lib/tests/common/skip.rs`, `reference/testing.md` "Platform-dependent tests").
 - Tests never mutate the process environment and read it only at the closed inventory of the source-policy `environment` rule; every test child starts from an empty environment and gets only what its test sets (`reference/testing.md` "The process environment").

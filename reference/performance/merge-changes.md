@@ -30,7 +30,7 @@ detection on through feature unification. Both arms `--commit`,
 | planet merge-diffs 4914..4920 `--simplify yes` | 6.2 s (`5c5f081e`) | 4.2, 4.2 s (`45991a26`, `282dad7a`) |
 | planet merge-diffs 4914..4920 | 3.6 s (`eeb1edf8`) | 2.8 s (`7a125123`) |
 
-`brokkr verify merge-changes --dataset denmark` passes on the change.
+`brokkr run --with pbfhogg pbfhogg-verify -- merge-changes --dataset denmark` passes on the change.
 
 ### Simplify slowdown traced to a page-splitting CRC load (bygg, 2026-11-11)
 

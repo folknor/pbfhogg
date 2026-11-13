@@ -220,7 +220,7 @@ Library scenarios call the API through the `pbfhogg-harness` worker. List and ve
 brokkr run --with pbfhogg-harness pbfhogg-library -- list
 brokkr run --with pbfhogg-harness pbfhogg-library -- verify repeat-cat --dataset denmark
 brokkr run --with pbfhogg-harness pbfhogg-library -- verify --all --dataset denmark
-brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset denmark --variant indexed
+brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset denmark
 ```
 
 The bench measures whole-worker wall time. Verification and certification belong to the driver. See [the library protocol](reference/library-protocol.md) and [historical per-call measurements](reference/performance/library-capabilities.md).

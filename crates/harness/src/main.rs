@@ -3,14 +3,15 @@
 //! library of the tree under test and runs scripted sequences of library
 //! calls in one process.
 //!
-//! Two modes, and nothing else on the command line:
+//! Three modes, and nothing else on the command line:
 //!
 //! - `--describe-harness` prints the describe document on stdout.
 //! - `--test-harness REQUEST --private-dir DIR --artefact-dir DIR` runs the
 //!   one scenario the request names and writes its documents into the
-//!   artefact directory. The artefact directory is an argument, not an
-//!   environment variable, so a script bench (which may not set `BROKKR_*`
-//!   names in a child's environment) can launch the harness directly.
+//!   artefact directory (the library driver's launch).
+//! - `--bench-harness SCENARIO --work DIR [--dataset VARIANT PATH]...` lays
+//!   the scenario's roles out under DIR itself and runs its workload with no
+//!   judgment and no artefacts (the library-scenario bench's launch).
 //!
 //! stdout and stderr stay empty on every other path: a refusal is an exit
 //! status (2) and, where the artefact directory is known, `refusal.json`.
@@ -51,7 +52,32 @@ fn main() -> std::process::ExitCode {
                 std::path::Path::new(artefacts),
             )
         }
+        [mode, scenario, work_flag, work, datasets @ ..]
+            if mode == "--bench-harness" && work_flag == "--work" =>
+        {
+            match (scenario.to_str(), bench_datasets(datasets)) {
+                (Some(scenario), Some(datasets)) => {
+                    runner::bench_from_env(scenario, std::path::Path::new(work), &datasets)
+                }
+                _ => runner::Exit::Refused,
+            }
+        }
         _ => runner::Exit::Refused,
     };
     std::process::ExitCode::from(status.code())
+}
+
+/// `--dataset VARIANT PATH` repeated; `None` for anything else.
+fn bench_datasets(args: &[std::ffi::OsString]) -> Option<Vec<(String, std::path::PathBuf)>> {
+    let mut out = Vec::new();
+    for triple in args.chunks(3) {
+        let [flag, variant, path] = triple else {
+            return None;
+        };
+        if flag != "--dataset" {
+            return None;
+        }
+        out.push((variant.to_str()?.to_owned(), std::path::PathBuf::from(path)));
+    }
+    Some(out)
 }

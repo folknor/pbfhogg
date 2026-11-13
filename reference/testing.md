@@ -397,7 +397,7 @@ run in dev only (consumer, musl). `harness-hotpath`,
 `harness-hotpath-alloc`, `cli-hotpath` and `cli-hotpath-alloc` are the
 profiling lane (`brokkr check --profile profiling` runs it alone; operator
 profiling uses `brokkr bench --hotpath library-scenario --scenario hotpath-cat
---dataset denmark --variant indexed`): the
+--dataset denmark`): the
 harness and CLI suites built with each profiling feature. Both executables
 profile only when `HOTPATH_OUTPUT_PATH` asks for a report, so every
 unprofiled test checks an instrumented build quiet, under the promise

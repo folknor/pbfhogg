@@ -12,7 +12,7 @@ process control, external judgment and the certification requirement table.
 brokkr run --with pbfhogg-harness pbfhogg-library -- list
 brokkr run --with pbfhogg-harness pbfhogg-library -- verify repeat-cat --dataset denmark
 brokkr run --with pbfhogg-harness pbfhogg-library -- verify --all --dataset denmark
-brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset denmark --variant indexed
+brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset denmark
 ```
 
 The driver takes `--config PATH` (default `brokkr.toml`), `--host NAME`
@@ -23,12 +23,9 @@ snapshot, otherwise the primary (`base`). Each dataset role declares its
 own variant; the driver has no variant override. Listing validates config too.
 
 The bench measures worker process wall only, launching the worker directly
-so sidecar sampling, markers and profiling refer to the worker PID. A
-supervisor would include judging and sample the wrong process. Verification
-exists only on the run surface. There are no typed per-call result rows,
-CLI counterparts, isolation comparisons, cache preparation, digest replay,
-summary extension, producer status, external verdict, identity records or
-cross-iteration consistency checks in the bench.
+in its bench mode so sidecar sampling, markers and profiling refer to the
+worker PID. Verification exists only on the run surface; the bench judges
+and checks nothing.
 
 ## Worker launch
 
@@ -39,6 +36,8 @@ cross-iteration consistency checks in the bench.
   process, request below, private staging directory and artefact directory
   supplied as argv. `BROKKR_MARKER_FIFO` supplies the marker FIFO. The FIFO
   must be attached because call timestamps use its clock.
+- `--bench-harness SCENARIO --work DIR [--dataset VARIANT PATH]...`: the
+  bench's launch (Measurement and profiling below); the same FIFO rule.
 
 The verifier clears every child's environment, so no inherited `HOTPATH_*`
 reaches discovery or verification; only its own marker FIFO is supplied.
@@ -497,38 +496,27 @@ permanent run reservation namespace. Persistence failure fails the command.
 
 ## Measurement and profiling
 
-`library-scenario` discovers outside measurement (60-second bounded call),
-prepares role handles, request and exact seeds, and declares resource reads
-and writes. It makes exactly one measured call, launching the worker directly
-with `binary_with({deadline = scenario.deadline_s, ...}, ...)`. The deadline
-bounds the entire child lifetime, preflight included; brokkr kills the process
-group and fails the iteration on expiry. There is no harness timer or supervisor.
+`library-scenario` benchmarks and does nothing else. It makes one measured
+call, `pbfhogg-harness --bench-harness SCENARIO --work DIR` followed by
+`--dataset VARIANT PATH` for every bound `--inputs` variant (default `all`
+of the selected snapshot's PBF table; narrow it with `--inputs indexed`
+when the scenario needs only that). It reads no describe document, knows
+nothing of roles or seeds, sets no deadline and records nothing.
 
-Only a describe-declared hotpath scenario receives `hotpath = "worker"`.
-brokkr does not expose measurement mode to scripts (brokkr#176, wontfix):
-profiling a non-profilable scenario safely fails that arm's first iteration
-for lacking a marked call; later arms still run. Do not duplicate eligibility
-in config or add a mode workaround. Profiling features forward to the library;
-ordinary launches of instrumented builds remain quiet. No summary is written,
-no artefacts read and no verdict or consistency check runs in the bench.
+In bench mode the worker prepares its own input: it binds each dataset role
+to the `--dataset` file of its declared variant (refusing a scenario whose
+variant was not handed over), leaves generated and output roles absent
+under `DIR/roles`, writes a seeded output's seed, and uses `DIR/private` as
+its private directory. It then runs the workload exactly as `--test-harness`
+does, observation hooks included since they shape what runs, and stops:
+no call context, publication mapping, judgment, inventory completion or
+artefacts, and a library call returning an error is part of the workload.
+Exit 0 means the schedule ran; a refusal is exit 2 with empty stderr.
 
-`--inputs` is a bound many-param from the selected snapshot's PBF table,
-default `all`. Parent-table selection alone does not make nested paths into
-handles. Keys map each declared role variant to an input handle; missing
-variants fail before launch. `--variant` is bound invocation metadata, never
-a substitution for a role's variant. Default holds/hashes include unused PBF
-variants; narrow with `--inputs indexed` when the scenario needs only indexed.
-Mixed variants and named snapshots retain their declared bindings. Workload
-choices are deterministic; varying inputs are bound params defining arms.
-
-### Bench contracts
-
-Existing contracts cover argv, deadlines, measured-call count, profiling
-declaration, resource handles, mixed variants/snapshots, missing variants and
-empty records. Do not add test-only bench branches, record fields or helper
-children. No scenario declares directory roles: unseeded directories use
-`scratch()` and a seeded directory role is refused.
-
-brokkr#175 (post-measurement verification) and #178 (record-field equality)
-were rejected. A bench measures; verification remains on `brokkr run`.
-These decisions must not be quietly reopened.
+The measurement is the whole worker process wall, setup and generated-role
+construction included. Every scenario's call is marked `hotpath = "worker"`,
+so `--hotpath` and `--alloc` profile the whole worker, every call of a
+multi-call scenario together; the describe document's `hotpath` flag (one
+call, no generated role) says only which profiles attribute to a single
+call. Workload choices are deterministic; varying inputs are bound params
+defining arms.

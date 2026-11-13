@@ -1,5 +1,20 @@
 # Library Capabilities
 
+## Scenario bench version 2 wiring (bygg, 2026-11-13)
+
+Version 2 launches the worker's bench mode, which lays out its own roles and
+judges nothing. One wiring cell on commit `985aee58` with the uncommitted
+version 2 tree (dirty, excluded from comparisons), host `bygg`:
+
+```sh
+brokkr bench --iterations 1 library-scenario --scenario seeded-replace --dataset denmark --inputs indexed,raw
+```
+
+Run `fc1be648229c453a978c243a5bc5000f`: worker wall 189 ms, the only
+launched child. It shows that a seeded scenario runs with no seed in the
+script. It is not a performance comparison: version 1 walls included
+judgment and artefact writing, so they do not compare with version 2.
+
 ## Scenario bench wiring (bygg, 2026-11-13)
 
 `library-scenario` version 1 measures the direct worker process only. The

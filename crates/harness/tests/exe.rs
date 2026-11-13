@@ -469,6 +469,50 @@ fn seeded_replace_replaces_one_seed_and_keeps_the_other() {
     );
 }
 
+/// One `--bench-harness` launch of `scenario` over `work`, handing `input`
+/// over as each of `variants`.
+#[allow(clippy::disallowed_methods)] // fixtures in test scratch
+fn bench_launch(scenario: &str, input: &Path, variants: &[&str]) -> (RunDir, Ran) {
+    let run_dir = RunDir::new(|_| Vec::new());
+    let work = run_dir.root.join("work");
+    std::fs::create_dir(&work).expect("work");
+    let mut cmd = harness(&run_dir._scratch);
+    cmd.arg("--bench-harness")
+        .arg(scenario)
+        .arg("--work")
+        .arg(&work)
+        .current_dir(run_dir.root.join("cwd"));
+    for variant in variants {
+        cmd.arg("--dataset").arg(variant).arg(input);
+    }
+    let fifo = Fifo::new(&run_dir.root.join("capture"));
+    let vars = [("BROKKR_MARKER_FIFO", fifo.path.as_os_str())];
+    let ran = run(cmd, &vars, &run_dir.root.join("capture"), &run_dir._scratch);
+    fifo.finish();
+    (run_dir, ran)
+}
+
+#[test]
+fn bench_mode_lays_out_its_roles_and_writes_no_artefacts() {
+    let (_keep, input) = input();
+    let (run, ran) = bench_launch("seeded-replace", &input, &["indexed", "raw"]);
+    assert_eq!(ran.status.code(), Some(0), "{}", ran.status);
+    assert!(ran.stdout.is_empty() && ran.stderr.is_empty());
+    // The refusing call kept its seed, which only the harness wrote.
+    let kept = std::fs::read(run.root.join("work/roles/out-refuse")).expect("out-refuse");
+    assert_eq!(kept, b"brokkr-library-seed-v1 out-refuse\n");
+    assert!(run.entries("artefacts").is_empty());
+    assert_eq!(run.entries("work"), ["private", "roles"]);
+}
+
+#[test]
+fn bench_mode_refuses_a_scenario_whose_variant_was_not_handed_over() {
+    let (_keep, input) = input();
+    let (_run, ran) = bench_launch("repeat-cat", &input, &[]);
+    assert_eq!(ran.status.code(), Some(2), "{}", ran.status);
+    assert!(ran.stdout.is_empty() && ran.stderr.is_empty());
+}
+
 #[test]
 fn hotpath_cat_runs_one_call() {
     let (run, _) = scenario_passes("hotpath-cat", true, &["out"], &[]);

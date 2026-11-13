@@ -58,6 +58,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Exit {
     /// Ran every declared call and assertion exactly once, and all passed.
+    /// In bench mode, which judges nothing: ran every declared call.
     Passed,
     /// Ran, and some result it reported did not pass.
     Failed,
@@ -75,66 +76,137 @@ impl Exit {
     }
 }
 
+/// What a launch is for.
+pub(crate) enum Mode {
+    /// The library driver's launch: judge every call and the scenario and
+    /// write the artefacts into this directory.
+    Verify(PathBuf),
+    /// The library-scenario bench's launch: run the workload and nothing
+    /// else. No judgment, no inventory completion, no artefacts; a library
+    /// call that returns an error is part of the workload, not a failure.
+    Bench,
+}
+
 /// Where one launch reads and writes.
 pub(crate) struct Launch<'a> {
-    pub(crate) request: &'a Path,
+    pub(crate) scenario: &'a str,
+    pub(crate) bindings: &'a BTreeMap<String, PathBuf>,
     pub(crate) private_dir: &'a Path,
-    pub(crate) artefacts: Option<PathBuf>,
+    pub(crate) mode: Mode,
     pub(crate) fifo: Option<PathBuf>,
     pub(crate) profile: bool,
 }
 
-/// `--test-harness`, with the marker FIFO and the profiling request read
-/// from the environment the launcher (a script bench or the library
-/// driver) sets.
-pub(crate) fn run_from_env(request: &Path, private_dir: &Path, artefacts: &Path) -> Exit {
-    run(&Launch {
-        request,
-        private_dir,
-        artefacts: Some(artefacts.to_path_buf()),
-        fifo: std::env::var_os("BROKKR_MARKER_FIFO").map(PathBuf::from),
-        // Profile only when brokkr asks, whatever the build.
-        profile: std::env::var_os("HOTPATH_OUTPUT_PATH").is_some(),
-    })
+fn fifo_from_env() -> Option<PathBuf> {
+    std::env::var_os("BROKKR_MARKER_FIFO").map(PathBuf::from)
 }
 
-/// Run one launch; a refusal writes `refusal.json` when it can.
-pub(crate) fn run(launch: &Launch<'_>) -> Exit {
-    match run_launch(launch) {
+/// Profile only when brokkr asks, whatever the build.
+fn profile_from_env() -> bool {
+    std::env::var_os("HOTPATH_OUTPUT_PATH").is_some()
+}
+
+/// `--test-harness`, with the marker FIFO and the profiling request read
+/// from the environment the library driver sets. A refusal writes
+/// `refusal.json` when it can.
+pub(crate) fn run_from_env(request: &Path, private_dir: &Path, artefacts: &Path) -> Exit {
+    let outcome = std::fs::read_to_string(request)
+        .map_err(|e| format!("cannot read the request: {e}"))
+        .and_then(|text| crate::request::parse(&text))
+        .and_then(|request| {
+            run_launch(&Launch {
+                scenario: &request.scenario,
+                bindings: &request.bindings,
+                private_dir,
+                mode: Mode::Verify(artefacts.to_path_buf()),
+                fifo: fifo_from_env(),
+                profile: profile_from_env(),
+            })
+        });
+    match outcome {
         Ok(exit) => exit,
         Err(reason) => {
-            if let Some(artefacts) = &launch.artefacts {
-                let reason = crate::protocol::one_line(&reason, crate::protocol::REASON_MAX);
-                let reason = if reason.is_empty() {
-                    "refused".to_owned()
-                } else {
-                    reason
-                };
-                let doc = json!({ "protocol": PROTOCOL, "reason": reason });
-                drop(write_json(&artefacts.join("refusal.json"), &doc));
-            }
+            let reason = crate::protocol::one_line(&reason, crate::protocol::REASON_MAX);
+            let reason = if reason.is_empty() {
+                "refused".to_owned()
+            } else {
+                reason
+            };
+            let doc = json!({ "protocol": PROTOCOL, "reason": reason });
+            drop(write_json(&artefacts.join("refusal.json"), &doc));
             Exit::Refused
         }
     }
 }
 
+/// `--bench-harness`: lay the scenario's roles out under `work` (dataset
+/// roles bound to the `--dataset` file of their declared variant, written
+/// roles absent under `work/roles`, a seeded output holding its seed), then
+/// run the workload in bench mode. The layout is the launch's own input
+/// preparation, so the bench script knows nothing of roles or seeds. A
+/// refusal is exit status 2 alone: the harness writes no stderr.
+pub(crate) fn bench_from_env(scenario: &str, work: &Path, datasets: &[(String, PathBuf)]) -> Exit {
+    bench_launch(scenario, work, datasets).unwrap_or(Exit::Refused)
+}
+
+fn bench_launch(
+    scenario: &str,
+    work: &Path,
+    datasets: &[(String, PathBuf)],
+) -> Result<Exit, String> {
+    use crate::protocol::Role;
+    let work = std::path::absolute(work).map_err(|e| format!("work directory: {e}"))?;
+    let found =
+        crate::scenarios::find(scenario).ok_or_else(|| format!("no scenario {scenario:?}"))?;
+    let decl = crate::scenarios::declared(&found.workload());
+    let roles = work.join("roles");
+    let private_dir = work.join("private");
+    for dir in [&roles, &private_dir] {
+        std::fs::create_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    let mut bindings = BTreeMap::new();
+    for role in &decl.roles {
+        let path = match role.role {
+            Role::Dataset { variant } => {
+                let (_, file) = datasets
+                    .iter()
+                    .find(|(name, _)| name == variant)
+                    .ok_or_else(|| format!("role {} needs --dataset {variant}", role.id))?;
+                std::path::absolute(file).map_err(|e| format!("input {}: {e}", role.id))?
+            }
+            Role::Generated { .. } | Role::OutputPbf { seeded: false, .. } => roles.join(role.id),
+            Role::OutputPbf { seeded: true, .. } => {
+                let path = roles.join(role.id);
+                std::fs::write(&path, crate::protocol::seed(role.id))
+                    .map_err(|e| format!("seeding {}: {e}", role.id))?;
+                path
+            }
+        };
+        bindings.insert(role.id.to_owned(), path);
+    }
+    run_launch(&Launch {
+        scenario,
+        bindings: &bindings,
+        private_dir: &private_dir,
+        mode: Mode::Bench,
+        fifo: fifo_from_env(),
+        profile: profile_from_env(),
+    })
+}
+
 fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
-    let artefacts = launch.artefacts.as_deref().ok_or("no artefact directory")?;
     let fifo_path = launch
         .fifo
         .as_deref()
         .ok_or("BROKKR_MARKER_FIFO is not set")?;
-    let text = std::fs::read_to_string(launch.request)
-        .map_err(|e| format!("cannot read the request: {e}"))?;
-    let request = crate::request::parse(&text)?;
-    let scenario = crate::scenarios::find(&request.scenario)
-        .ok_or_else(|| format!("no scenario {:?}", request.scenario))?;
+    let scenario = crate::scenarios::find(launch.scenario)
+        .ok_or_else(|| format!("no scenario {:?}", launch.scenario))?;
     let workload = scenario.workload();
     workload.validate()?;
     let plan = workload.plan()?;
     let decl = crate::scenarios::declared(&workload);
     decl.validate()?;
-    check_bindings(&decl, &request.bindings)?;
+    check_bindings(&decl, launch.bindings)?;
     let fifo =
         MarkerFifo::open(fifo_path).map_err(|e| format!("cannot open the marker FIFO: {e}"))?;
     // The plan's process policy, before any library work.
@@ -147,11 +219,21 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
             .functions_limit(0)
             .build()
     });
-    let calls_dir = artefacts.join("calls");
-    std::fs::create_dir(&calls_dir).map_err(|e| format!("cannot create calls/: {e}"))?;
+    let artefacts = match &launch.mode {
+        Mode::Verify(artefacts) => Some(artefacts.as_path()),
+        Mode::Bench => None,
+    };
+    let calls_dir = match artefacts {
+        Some(artefacts) => {
+            let dir = artefacts.join("calls");
+            std::fs::create_dir(&dir).map_err(|e| format!("cannot create calls/: {e}"))?;
+            Some(dir)
+        }
+        None => None,
+    };
     let mut ctx = Ctx {
         decl: &decl,
-        bindings: &request.bindings,
+        bindings: launch.bindings,
         setup: Arc::new(Collector::new(fifo.clone())),
         fifo,
         private_dir: launch.private_dir,
@@ -171,9 +253,14 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     }
     let observation = scenario.observe();
     let records = ctx.run_schedule(&workload, observation.as_ref())?;
+    // A bench measures the workload and stops here: the records drop
+    // before the profile guard, so a whole-worker profile covers them.
+    let Some(artefacts) = artefacts else {
+        return Ok(Exit::Passed);
+    };
     let done = Done {
         records: &records,
-        bindings: &request.bindings,
+        bindings: launch.bindings,
     };
     for record in &records {
         let judged = observation.judge_call(record, &done);
@@ -549,7 +636,9 @@ pub(crate) struct Ctx<'a> {
     bindings: &'a BTreeMap<String, PathBuf>,
     fifo: MarkerFifo,
     private_dir: &'a Path,
-    calls_dir: PathBuf,
+    /// Where call documents go; `None` in bench mode, which reports nothing
+    /// and so builds no call context and maps no publications either.
+    calls_dir: Option<PathBuf>,
     /// Setup's and the harness's own diagnostics.
     setup: Arc<Collector>,
     settings: Settings,
@@ -738,8 +827,12 @@ impl Ctx<'_> {
     }
 
     /// Every effective per-call setting, from the plan the host is built
-    /// from and the resources it names.
+    /// from and the resources it names; `null` in bench mode, which reports
+    /// nothing.
     fn context(&self, plan: &CallPlan, resources: &Resources) -> Result<Value, String> {
+        if self.calls_dir.is_none() {
+            return Ok(Value::Null);
+        }
         let mut context = json!({
             "parallelism": match plan.host.parallelism {
                 Parallelism::Machine => self.settings.parallelism,
@@ -784,8 +877,12 @@ impl Ctx<'_> {
     }
 
     /// The call's publications, each member's destination mapped to the
-    /// output role of this call bound there.
+    /// output role of this call bound there; none in bench mode, which
+    /// reports nothing.
     fn publications(&self, id: &str, invocation: &Invocation) -> Result<Vec<Published>, String> {
+        if self.calls_dir.is_none() {
+            return Ok(Vec::new());
+        }
         let outputs = self.decl.outputs_of(id);
         let mut rows = Vec::new();
         let mut unmapped = None;
@@ -857,7 +954,11 @@ impl Ctx<'_> {
             "diagnostics": record.diagnostics,
             "assertions": results.iter().map(Outcome::to_json).collect::<Vec<_>>(),
         });
-        write_json(&self.calls_dir.join(format!("{}.json", record.id)), &doc)
+        let calls_dir = self
+            .calls_dir
+            .as_deref()
+            .ok_or("a call document in a launch that reports none")?;
+        write_json(&calls_dir.join(format!("{}.json", record.id)), &doc)
     }
 
     /// Ownership at close is the proof; the late count is supplemental.

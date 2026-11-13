@@ -318,14 +318,14 @@ pub const READS: &[Read] = &[
     ),
     read(
         "crates/harness/src/runner.rs",
-        "run_from_env",
+        "fifo_from_env",
         "var_os",
         "BROKKR_MARKER_FIFO",
         Reason::Protocol,
     ),
     read(
         "crates/harness/src/runner.rs",
-        "run_from_env",
+        "profile_from_env",
         "var_os",
         "HOTPATH_OUTPUT_PATH",
         Reason::Protocol,

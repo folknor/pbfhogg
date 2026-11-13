@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The pbfhogg library harness for brokkr's library protocol"
+description = "The worker for pbfhogg's library protocol"
 rust-version.workspace = true
 authors.workspace = true
-# Not published: brokkr builds it from the tree it verifies.
+# Not published: built from the tested tree by brokkr run or brokkr bench.
 publish = false
 # Targets are declared, never discovered, as in the other members: a stray
 # file in tests/ or src/bin/ is not a silent extra binary.
@@ -34,8 +34,8 @@ default = []
 # No-op: the lib dep below always pulls in `pbfhogg/commands`; the feature
 # exists so a sweep can name `commands` for every package it selects.
 commands = []
-# brokkr's --hotpath and --alloc build the harness with these (its library
-# protocol, Profiling a scenario); both forward to the library's features of
+# The library-scenario bench's --hotpath and --alloc build with these
+# (reference/library-protocol.md). Both forward to the library's features of
 # the same names. `hotpath-alloc` implies the package's own `hotpath`, as the
 # library's does, so the profiling test in tests/exe.rs runs in both shapes.
 hotpath = ["pbfhogg/hotpath"]

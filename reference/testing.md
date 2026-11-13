@@ -125,7 +125,9 @@ Placement and tiering are independent axes.
 ## Test binaries
 
 The root `Cargo.toml` is a virtual manifest; the library, CLI and harness
-packages live in `crates/lib/`, `crates/cli/` and `crates/harness/`. Every
+packages live in `crates/lib/`, `crates/cli/` and `crates/harness/`.
+The independent library verifier lives in `crates/library/`, and shared
+tool config/dataset resolution in `crates/devkit/`. Every
 package sets `autotests = false`; every integration-test target is declared
 in that package's `Cargo.toml`. One binary per file made every check
 sweep link and start one harness per file, and a focused `brokkr test
@@ -151,6 +153,21 @@ NAME` list each harness in turn to find one test.
   promise guard (`crates/cli/tests/guard.rs`, mounted at the crate root so its
   control test keeps the name `guard::tests::probe`) mounted by path.
   The harness's own unit tests live in its bin target.
+- **`crates/library/tests/process.rs` and `verify.rs`** each own a test
+  process because the verifier enables child-subreaper state. Their Rust
+  fixtures exercise process cleanup and protocol judgment independently of
+  pbfhogg types. Driver unit tests cover strict documents, publications,
+  identity and certification; devkit unit tests cover composition and pinned
+  dataset resolution. The all/musl sweeps cover these feature-independent
+  packages. See [the protocol](library-protocol.md).
+- **`crates/lib/tests/fifo_cleanup.rs`** owns its process for the immediate
+  BrokenPipe assertion after unwind cleanup. A sibling test's fork can
+  inherit the FIFO reader until exec even though it is CLOEXEC, so the
+  shared `all` binary cannot establish that no reader remains. A controlled
+  fork experiment reproduced a successful write after parent closure and
+  BrokenPipe after child reap. The assertion is unchanged; only placement
+  removes the unrelated descriptor owner. The capture implementation remains
+  shared with harness executable tests.
 - **`crates/lib/tests/common/` is shared by path, not by a crate.** Each package
   compiles it with its own features, which carry the same names
   (`linux-direct-io`, `linux-io-uring`), and the hook cfg
@@ -301,9 +318,13 @@ when the resolved dependency graph, with every workspace feature on,
 enables hotpath's process-starting CPU profiler. `guard::tests` re-runs the test binary under the guard once per
 rule to prove each one fires and that the allowed neighbours do not. A
 test that starts the binary some other way escapes the guard: do not.
-The library harness inherits brokkr's lease the same way and keeps the
+The library worker launched by the library-scenario bench inherits brokkr's lease the same way and keeps the
 same promise; every child `crates/harness/tests/exe.rs` starts runs under the
-same guard, mounted from `crates/cli/tests/guard.rs`.
+same guard, mounted from `crates/cli/tests/guard.rs`. The independent
+`pbfhogg-library` verifier uses its own subreaper/pidfd cleanup; the harness
+has no supervisor. Verification is
+`brokkr run --with pbfhogg-harness pbfhogg-library -- ...`, and measurement
+is `brokkr bench library-scenario` (see `reference/library-protocol.md`).
 On any other architecture the filter is compiled out: children run
 unguarded and the control test skips through `skip::backend_unavailable`
 with the reason (as it does on a supported architecture whose kernel
@@ -374,7 +395,9 @@ brokkr benches, so the O_DIRECT and io_uring tests run with release
 semantics under the gate's backend requirement; the feature-off refusals
 run in dev only (consumer, musl). `harness-hotpath`,
 `harness-hotpath-alloc`, `cli-hotpath` and `cli-hotpath-alloc` are the
-profiling lane (`brokkr check --profile profiling` runs it alone): the
+profiling lane (`brokkr check --profile profiling` runs it alone; operator
+profiling uses `brokkr bench --hotpath library-scenario --scenario hotpath-cat
+--dataset denmark --variant indexed`): the
 harness and CLI suites built with each profiling feature. Both executables
 profile only when `HOTPATH_OUTPUT_PATH` asks for a report, so every
 unprofiled test checks an instrumented build quiet, under the promise
@@ -668,9 +691,13 @@ A **host tool** selection is the osmium oracle's search of `PATH`: its
 absence skips, and the parent resolves the tool to an absolute path that
 the cleared child is started by. A **parent-set** read is a re-executed
 test binary reading the gate its parent wrote into the child's
-environment. A **protocol** read is a production CLI or harness input
+environment. A **protocol** read is a production CLI, harness or tool-boundary input
 (`BROKKR_*`, `HOTPATH_OUTPUT_PATH`, the `PBFHOGG_TEST_*` hooks), which a
-CLI test sets through a named `CliInvoker` setter. The library reads
+CLI test sets through a named `CliInvoker` setter. The independent driver
+reads `BROKKR_WITH_EXE` and explicit config/host selection inputs, passes
+values into devkit and clears worker environments, including `HOTPATH_*`.
+The worker reads its artefact directory from argv; only the marker FIFO
+remains a `BROKKR_*` worker input. The library reads
 nothing (ADR-0016). Compile-time `env!` reads are build inputs and outside
 the rule.
 
@@ -1118,7 +1145,8 @@ exception, not a tier - should not survive across many PRs.
   `crates/lib/tests/all.rs` and mounted by path in `crates/harness/tests/exe.rs`).
   Its reader holds both ends (so no EOF spin before a producer opens), blocks
   in `poll` on the FIFO and a `UnixStream` shutdown channel, and is woken and
-  joined by `finish` or on drop, unwinding included. Producers must be done
+  joined by `finish` or on drop, unwinding included. The cleanup assertion
+  is compiled only in the separate `fifo_cleanup` test target. Producers must be done
   before `finish`. A test feeding a FIFO to a run under test uses
   `common::FifoFeeder`, whose thread blocks in its write open until the run
   opens the read end; teardown, after the synchronous run has returned,

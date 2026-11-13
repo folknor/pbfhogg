@@ -76,6 +76,24 @@ const CURRENT_EXE_TEST_BINARY: &str = r#"std::env::current_exe().expect("this te
 
 pub const CONSTRUCTORS: &[Constructor] = &[
     Constructor {
+        file: "crates/library/tests/worker.rs",
+        owner: "descendant",
+        program: "exe",
+        count: 1,
+    },
+    Constructor {
+        file: "crates/library/src/process.rs",
+        owner: "command",
+        program: "executable",
+        count: 1,
+    },
+    Constructor {
+        file: "crates/library/tests/process.rs",
+        owner: "descendant",
+        program: "exe",
+        count: 1,
+    },
+    Constructor {
         file: "crates/cli/tests/invoker.rs",
         owner: "CliInvoker::new",
         program: r#"env!("CARGO_BIN_EXE_pbfhogg")"#,
@@ -127,11 +145,18 @@ pub struct ExeConst {
     pub var: &'static str,
 }
 
-pub const EXE_CONSTS: &[ExeConst] = &[ExeConst {
-    file: "crates/harness/tests/exe.rs",
-    name: "EXE",
-    var: "CARGO_BIN_EXE_pbfhogg-harness",
-}];
+pub const EXE_CONSTS: &[ExeConst] = &[
+    ExeConst {
+        file: "crates/library/tests/verify.rs",
+        name: "EXE",
+        var: "CARGO_BIN_EXE_pbfhogg-library-test-worker",
+    },
+    ExeConst {
+        file: "crates/harness/tests/exe.rs",
+        name: "EXE",
+        var: "CARGO_BIN_EXE_pbfhogg-harness",
+    },
+];
 
 /// (file, enclosing item path) where libc process creation may be named.
 pub const PROCESS_CREATION_OWNERS: &[(&str, &str)] = &[

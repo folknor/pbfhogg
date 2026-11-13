@@ -1,0 +1,24 @@
+[package]
+name = "pbfhogg-devkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared configuration and dataset resolution for pbfhogg development tools"
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+[dependencies]
+toml = "1.1.3"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+[dev-dependencies]
+pbfhogg-test-scratch = { path = "../test-scratch" }
+
+[lints]
+workspace = true

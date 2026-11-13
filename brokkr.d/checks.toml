@@ -48,13 +48,17 @@
 # alone (minimal, geocode-reader) leaves the other two out: their lib dep
 # would turn `commands` back on.
 
+# pbfhogg-devkit and pbfhogg-library are feature-independent and link no
+# pbfhogg. The all and
+# musl lanes test it; the corresponding gate lint lanes also select it.
+#
 # pbfhogg-source-policy is tested here and in no other sweep (all-serial
 # lists it only to stay aligned, and its serial:: filter selects none of its
 # tests): they audit the repository's source text, which no build shape
 # changes, so one run per check is the whole of it.
 [[check]]
 name = "all"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
@@ -80,7 +84,7 @@ parallel = {}
 # lane may not skip them there, so the gate carries no serial guarantee.
 [[check]]
 name = "all-serial"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 only = ["serial::"]
@@ -138,7 +142,7 @@ parallel = {}
 # musl sweeps below retain executable coverage until that support exists.
 [[check]]
 name = "musl"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 
@@ -215,13 +219,13 @@ parallel = {}
 # package, but the hotpath crate expands differently under each, so both.
 [[lint_sweep]]
 name = "hotpath"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["hotpath", "linux-direct-io", "linux-io-uring"]
 when = "gate"
 
 [[lint_sweep]]
 name = "hotpath-alloc"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
 when = "gate"
 
@@ -231,7 +235,7 @@ when = "gate"
 # feature would otherwise escape both; it fails to compile here.
 [[lint_sweep]]
 name = "musl-hotpath-alloc"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
@@ -243,21 +247,21 @@ when = "gate"
 # sweeps that build the backends are.
 [[lint_sweep]]
 name = "direct-io-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["linux-direct-io"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 when = "gate"
 
 [[lint_sweep]]
 name = "io-uring-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 when = "gate"
 
 [[lint_sweep]]
 name = "musl-direct-io-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["linux-direct-io"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
@@ -265,7 +269,7 @@ when = "gate"
 
 [[lint_sweep]]
 name = "musl-io-uring-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library"]
 features = ["linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"

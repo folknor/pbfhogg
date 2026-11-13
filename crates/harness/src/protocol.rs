@@ -1,6 +1,5 @@
-//! The documents of brokkr's library protocol, version 1, as this harness
-//! writes them, and the protocol's limits on their text (`brokkr man
-//! library`, Documents and The describe document). Every number is written
+//! The documents of pbfhogg's library protocol, version 1, as this harness
+//! writes them, and the protocol's limits on their text (`reference/library-protocol.md`, Documents and The describe document). Every number is written
 //! as a JSON integer.
 
 use serde_json::{Value, json};
@@ -263,19 +262,6 @@ impl ScenarioDecl {
             ));
         }
         unique(ids.iter().copied(), "capability", self.id)
-    }
-
-    /// Every capability the declaration covers, streams included.
-    #[cfg(test)]
-    pub(crate) fn capabilities(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.calls
-            .iter()
-            .flat_map(|c| c.stream.iter().copied())
-            .chain(
-                self.assertions
-                    .iter()
-                    .flat_map(|a| a.covers.iter().copied()),
-            )
     }
 
     /// The output roles `call` owns.

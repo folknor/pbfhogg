@@ -96,3 +96,9 @@ workspace = true
 [[test]]
 name = "process_nofile"
 path = "tests/process_nofile.rs"
+
+# Own process: concurrent fork in all may briefly inherit the FIFO reader,
+# even with CLOEXEC, invalidating the immediate BrokenPipe cleanup assertion.
+[[test]]
+name = "fifo_cleanup"
+path = "tests/fifo_cleanup.rs"

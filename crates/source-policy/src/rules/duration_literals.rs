@@ -17,10 +17,11 @@ use std::collections::BTreeSet;
 use crate::Corpus;
 use crate::lex::{Kind, Source};
 
-/// Files that own durations: the tunables, and the hang bound's own tests
-/// in the test-scratch crate, which cannot depend on the library.
+/// Files that own durations: each independent tool's tunables, plus the
+/// hang bound's own tests, which cannot depend on the library.
 const OWNERS: &[&str] = &[
     "crates/lib/src/tunables.rs",
+    "crates/library/src/tunables.rs",
     "crates/test-scratch/src/hang.rs",
 ];
 

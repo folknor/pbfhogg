@@ -1,5 +1,27 @@
 # Library Capabilities
 
+## Scenario bench wiring (bygg, 2026-11-13)
+
+`library-scenario` version 1 measures the direct worker process only. The
+first launch cell used commit `1fbb7721972d97f9687079353de5d2897e0345c9`
+with the uncommitted migration tree (dirty, excluded from comparisons), host
+`bygg`:
+
+```sh
+brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset denmark --variant indexed
+```
+
+Run `aec650ba7d3a494bac718f3430bb308d`: worker wall 357.943 ms; one
+iteration, release, resolved features default/linux-direct-io/linux-io-uring.
+Discovery was a separate unmeasured child (0.893 ms). The worker sidecar
+(`brokkr sidecar aec650ba --child 1 --human`) sampled 10020 kB peak RSS,
+5284 kB peak anon, with both cat calls emitting markers. The script record
+is empty. This cell proves launch and measurement wiring only, with no
+performance comparison or worker-output verification. Denmark indexed is
+sufficient for that question. The bound `inputs` collection defaulted to
+all snapshot PBF variants (altw-keep-untagged, indexed, raw); the selected
+scenario read its declared indexed role only.
+
 ## Library capability accounting
 
 ### Call guards on per-call methods (bygg, 2026-10-29)
@@ -88,3 +110,19 @@ no UUID). Cells interleaved.
 No cost. The run is short, so this bounds the counter to well under the
 2-3 % noise floor of a 200 ms wall, not to its absolute per-blob cost.
 
+
+## History
+
+### Retired per-call README figures (bygg, `53360af4`)
+
+The former README table reported each call's best of three with page cache
+kept. These typed-runner intervals are historical and cannot be compared
+with whole-worker wall measured by `brokkr bench library-scenario`.
+Verification now uses
+`brokkr run --with pbfhogg-harness pbfhogg-library -- ...`.
+
+| Scenario | Dataset | Per-call intervals |
+|---|---|---|
+| repeat-cat, two sequential cat calls | Denmark | 154 ms, 140 ms |
+| concurrent-cat, two calls sharing a descriptor pool | generated | 0.99 ms each |
+| fixed-resources-executor, clean and filtered cat on a caller pool | Denmark | 6.96 s, 6.21 s |

@@ -586,7 +586,9 @@ walk moved most: inspect 638 to 111 ms, getid 645 to 119 ms (osmium was
 308 ms also moved; neither row was re-attributed here. The osmium column
 is flat. Both altw rows time one osmium command, osmium having one mode.
 
-Library, `brokkr library`: isolation-cat denmark `--bench 5` (`f819d165`)
+Historical library typed-runner cells (retired; current verification is
+`brokkr run --with pbfhogg-harness pbfhogg-library -- ...`, measurement is
+`brokkr bench library-scenario`): isolation-cat denmark, five iterations (`f819d165`)
 library median 262 ms, CLI median 222 ms, CLI/library 0.86; repeat-cat
 (`2a4070ac`) 154 and 140 ms; concurrent-cat (`d1548769`) 0.99 ms each;
 fixed-resources-executor (`71eed863`) 6.96 and 6.21 s; `--all --dataset

@@ -1,0 +1,4 @@
+{"protocol": 1, "scenario": "repeat-cat",
+ "plan": {"calls": {"a": {"command": "cat", "input": "input"}}},
+ "assertions": [{"id": "whole", "status": "pass", "detail": ""}],
+ "diagnostics": []}

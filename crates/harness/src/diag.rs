@@ -3,7 +3,7 @@
 //! when it is captured.
 //!
 //! A call's collection closes once every value of the call is dropped and
-//! its work has returned (`brokkr man library`, The artefacts: the cut-off
+//! its work has returned (`reference/library-protocol.md`, The artefacts: the cut-off
 //! is the document). An event that arrives after that is a defect of the
 //! harness: it is not kept, it is counted, and the scenario's declared
 //! `call-diagnostics-closed` assertion fails on it. At collection close the

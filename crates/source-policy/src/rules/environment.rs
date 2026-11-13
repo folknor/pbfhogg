@@ -92,6 +92,55 @@ const SIGNALS: &str = "crates/cli/src/signals.rs";
 
 pub const READS: &[Read] = &[
     read(
+        "crates/library/tests/worker.rs",
+        "main",
+        "current_dir",
+        "",
+        Reason::ParentSet,
+    ),
+    read(
+        "crates/library/tests/worker.rs",
+        "marker_path",
+        "var_os",
+        "BROKKR_MARKER_FIFO",
+        Reason::Protocol,
+    ),
+    read(
+        "crates/library/tests/process.rs",
+        "fixture",
+        "var",
+        "PBFHOGG_LIBRARY_FIXTURE",
+        Reason::ParentSet,
+    ),
+    read(
+        "crates/library/src/main.rs",
+        "boundary",
+        "var_os",
+        "BROKKR_USER_CONFIG",
+        Reason::Protocol,
+    ),
+    read(
+        "crates/library/src/main.rs",
+        "boundary",
+        "var_os",
+        "XDG_CONFIG_HOME",
+        Reason::Protocol,
+    ),
+    read(
+        "crates/library/src/main.rs",
+        "boundary",
+        "var_os",
+        "HOME",
+        Reason::Protocol,
+    ),
+    read(
+        "crates/library/src/main.rs",
+        "boundary",
+        "var_os",
+        "BROKKR_WITH_EXE",
+        Reason::Protocol,
+    ),
+    read(
         "crates/lib/tests/common/skip.rs",
         "requirement",
         "var",
@@ -265,13 +314,6 @@ pub const READS: &[Read] = &[
         "test_hooks::write_count",
         "var_os",
         "PBFHOGG_TEST_CANCEL_COUNT",
-        Reason::Protocol,
-    ),
-    read(
-        "crates/harness/src/runner.rs",
-        "run_from_env",
-        "var_os",
-        "BROKKR_HARNESS_ARTEFACT_DIR",
         Reason::Protocol,
     ),
     read(

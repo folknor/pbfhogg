@@ -1,0 +1,45 @@
+[package]
+name = "pbfhogg-library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+[[bin]]
+name = "pbfhogg-library"
+path = "src/main.rs"
+
+[[test]]
+name = "process"
+path = "tests/process.rs"
+
+[dependencies]
+pbfhogg-devkit = { path = "../devkit" }
+clap = { version = "4", features = ["derive"] }
+serde = "1"
+serde_json.workspace = true
+libc = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+pbfhogg-test-scratch = { path = "../test-scratch" }
+
+[lints]
+workspace = true
+
+# Test worker has its own protocol entry point, never a shell fixture.
+[[bin]]
+name = "pbfhogg-library-test-worker"
+path = "tests/worker.rs"
+test = false
+
+[[test]]
+name = "verify"
+path = "tests/verify.rs"

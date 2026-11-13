@@ -589,6 +589,26 @@ params.jobs = { integer = "u64", help = "worker threads for nodes or tags; 0 is 
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 
+# -- library
+
+[bench.library-scenario]
+script_file = "../benches/library/library-scenario.lua"
+description = "Measure one library harness scenario's worker process"
+version = 1
+date = 2026-11-13
+changelog = [
+  { version = 1, date = 2026-11-13, note = "Direct worker measurement with describe-declared roles and deadlines; independent of verification" },
+]
+target = "pbfhogg-harness"
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.scenario = { free = true, required = true, help = "scenario id from pbfhogg-library list; discovered from the built harness" }
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot; binds all declared role variants" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "bound PBF variant; role declarations select their own variants from the snapshot" }
+params.inputs = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", many = true, default = "all", help = "bound role input variants; must include every variant the scenario declares" }
+
 # -- merge
 
 [bench.merge-workload]

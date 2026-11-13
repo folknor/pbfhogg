@@ -1,0 +1,10 @@
+{"protocol": 1, "call": "a", "entry_us": 10, "return_us": 20, "seal_us": 30,
+ "outcome": {"status": "ok"},
+ "publications": [{"ordinal": 1, "decision": "authorized", "members": [{"role": "out-a", "effect": "installed"}]}],
+ "cancel": null,
+ "seal": {"state": "sealed"},
+ "snapshot": {"writer_blocks": 3},
+ "stream": {"state": "sealed", "drops": 0},
+ "context": {"parallelism": 4},
+ "diagnostics": [{"at_us": 12, "kind": "note", "key": "sort.x", "message": "hello", "truncated": false}],
+ "assertions": [{"id": "a.outcome", "status": "pass", "detail": ""}]}

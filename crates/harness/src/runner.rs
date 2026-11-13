@@ -3,7 +3,7 @@
 //! declares, drive its schedule (one call after another, or each on a
 //! harness thread of its own where it runs them at once), drop the
 //! resources, then judge each call and the scenario and write the artefacts
-//! (`brokkr man library`, The run protocol and The artefacts). Every
+//! (`reference/library-protocol.md`, The run protocol and The artefacts). Every
 //! workload choice comes from the scenario's [`Workload`]; the scenario
 //! supplies only observation and judgments ([`Observation`]).
 //!
@@ -84,12 +84,14 @@ pub(crate) struct Launch<'a> {
     pub(crate) profile: bool,
 }
 
-/// `--test-harness`, with the paths brokkr hands over in the environment.
-pub(crate) fn run_from_env(request: &Path, private_dir: &Path) -> Exit {
+/// `--test-harness`, with the marker FIFO and the profiling request read
+/// from the environment the launcher (a script bench or the library
+/// driver) sets.
+pub(crate) fn run_from_env(request: &Path, private_dir: &Path, artefacts: &Path) -> Exit {
     run(&Launch {
         request,
         private_dir,
-        artefacts: std::env::var_os("BROKKR_HARNESS_ARTEFACT_DIR").map(PathBuf::from),
+        artefacts: Some(artefacts.to_path_buf()),
         fifo: std::env::var_os("BROKKR_MARKER_FIFO").map(PathBuf::from),
         // Profile only when brokkr asks, whatever the build.
         profile: std::env::var_os("HOTPATH_OUTPUT_PATH").is_some(),
@@ -117,10 +119,7 @@ pub(crate) fn run(launch: &Launch<'_>) -> Exit {
 }
 
 fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
-    let artefacts = launch
-        .artefacts
-        .as_deref()
-        .ok_or("BROKKR_HARNESS_ARTEFACT_DIR is not set")?;
+    let artefacts = launch.artefacts.as_deref().ok_or("no artefact directory")?;
     let fifo_path = launch
         .fifo
         .as_deref()

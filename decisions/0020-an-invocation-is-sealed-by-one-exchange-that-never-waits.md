@@ -79,8 +79,8 @@ seals again after it has dropped what it still holds.
   pipeline is blocked in the caller's own `Read` blocks until that read
   returns.
 
-The protocol this serves is brokkr's library harness protocol
-(`brokkr man library`, The artefacts and The call stream).
+The protocol this serves is pbfhogg's library harness protocol
+(`reference/library-protocol.md`, The artefacts and The call stream).
 
 ## Alternatives considered
 

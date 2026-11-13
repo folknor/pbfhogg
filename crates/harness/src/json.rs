@@ -1,5 +1,5 @@
 //! A strict JSON reader for the request: the protocol's document rules
-//! (`brokkr man library`, Documents) refuse a duplicate key, a number with a
+//! (`reference/library-protocol.md`, Documents) refuse a duplicate key, a number with a
 //! fraction or exponent, `-0`, a byte order mark and anything after the
 //! document but whitespace. A generic reader would merge duplicate keys and
 //! read `-0` as `0` before any check could see them, so the request is read

@@ -1,13 +1,16 @@
-//! The pbfhogg library harness: the program brokkr's `library` command
-//! builds and runs (`brokkr man library`, protocol version 1). It links the
+//! The pbfhogg library harness: the worker launched by pbfhogg-library
+//! and the library-scenario bench (`reference/library-protocol.md`). It links the
 //! library of the tree under test and runs scripted sequences of library
 //! calls in one process.
 //!
 //! Two modes, and nothing else on the command line:
 //!
 //! - `--describe-harness` prints the describe document on stdout.
-//! - `--test-harness REQUEST --private-dir DIR` runs the one scenario the
-//!   request names and writes its documents into the artefact directory.
+//! - `--test-harness REQUEST --private-dir DIR --artefact-dir DIR` runs the
+//!   one scenario the request names and writes its documents into the
+//!   artefact directory. The artefact directory is an argument, not an
+//!   environment variable, so a script bench (which may not set `BROKKR_*`
+//!   names in a child's environment) can launch the harness directly.
 //!
 //! stdout and stderr stay empty on every other path: a refusal is an exit
 //! status (2) and, where the artefact directory is known, `refusal.json`.
@@ -37,12 +40,15 @@ fn main() -> std::process::ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let status = match args.as_slice() {
         [mode] if mode == "--describe-harness" => describe::run(),
-        [mode, request, flag, private_dir]
-            if mode == "--test-harness" && flag == "--private-dir" =>
+        [mode, request, flag, private_dir, artefact_flag, artefacts]
+            if mode == "--test-harness"
+                && flag == "--private-dir"
+                && artefact_flag == "--artefact-dir" =>
         {
             runner::run_from_env(
                 std::path::Path::new(request),
                 std::path::Path::new(private_dir),
+                std::path::Path::new(artefacts),
             )
         }
         _ => runner::Exit::Refused,

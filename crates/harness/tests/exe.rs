@@ -1,4 +1,4 @@
-//! The harness executable against brokkr's library protocol: describe mode,
+//! The harness executable against pbfhogg's library protocol: describe mode,
 //! a passing run of every scenario over a generated input, the identity of
 //! `repeat-cat`'s plan and contexts, and quiet refusals.
 
@@ -110,12 +110,10 @@ impl RunDir {
             .arg(self.root.join("request.json"))
             .arg("--private-dir")
             .arg(self.root.join("private"))
+            .arg("--artefact-dir")
+            .arg(self.root.join("artefacts"))
             .current_dir(self.root.join("cwd"));
-        let artefacts = self.root.join("artefacts");
-        let mut vars = vec![
-            ("BROKKR_HARNESS_ARTEFACT_DIR", artefacts.as_os_str()),
-            ("BROKKR_MARKER_FIFO", fifo.as_os_str()),
-        ];
+        let mut vars = vec![("BROKKR_MARKER_FIFO", fifo.as_os_str())];
         vars.extend(
             env.iter()
                 .map(|(key, value)| (*key, std::ffi::OsStr::new(value))),

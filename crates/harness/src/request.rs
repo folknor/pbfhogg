@@ -1,4 +1,4 @@
-//! The request brokkr writes for one launch (`brokkr man library`, Running
+//! The request the driver or bench writes for one launch (`reference/library-protocol.md`, Running
 //! a scenario): `{"protocol": 1, "scenario": ID, "iteration": N,
 //! "bindings": {ROLE: PATH}}`, nothing more and nothing less.
 

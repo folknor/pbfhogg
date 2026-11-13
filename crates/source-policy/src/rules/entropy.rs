@@ -11,7 +11,13 @@ use crate::Corpus;
 use crate::lex::{Source, function_body};
 
 pub const OWNER: &str = "crates/lib/src/scratch.rs";
-const TREES: [&str; 3] = ["crates/lib/src/", "crates/cli/src/", "crates/harness/src/"];
+const TREES: [&str; 5] = [
+    "crates/lib/src/",
+    "crates/cli/src/",
+    "crates/harness/src/",
+    "crates/devkit/src/",
+    "crates/library/src/",
+];
 /// Sentinels pinning every selected source tree.
 const MUST_SCAN: [&str; 4] = [
     OWNER,

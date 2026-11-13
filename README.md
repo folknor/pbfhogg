@@ -214,15 +214,16 @@ On Japan (2.4 GB indexed), `extract` of the dataset's Tokyo bbox with complete w
 
 ⁴ osmium has one add-locations-to-ways mode (run with `--keep-member-nodes`), so both rows time the same osmium command against pbfhogg's two index types.
 
-Library mode - the same work called through the library API from the `pbfhogg-harness` executable, measured by `brokkr library SCENARIO --bench N` on bygg (each process verified):
+Library scenarios call the API through the `pbfhogg-harness` worker. List and verify them with the independent driver:
 
-| Scenario | Dataset | Library | Commit |
-|----------|---------|---------|--------|
-| `repeat-cat` (two `cat` calls in one process, one after another) | Denmark | 154 ms, 140 ms | `53360af4` |
-| `concurrent-cat` (two `cat` calls at once, one descriptor pool) | generated | 0.99 ms each | `53360af4` |
-| `fixed-resources-executor` (`cat --clean` and `cat --type` on a caller-built pool) | Denmark | 6.96 s, 6.21 s | `53360af4` |
+```sh
+brokkr run --with pbfhogg-harness pbfhogg-library -- list
+brokkr run --with pbfhogg-harness pbfhogg-library -- verify repeat-cat --dataset denmark
+brokkr run --with pbfhogg-harness pbfhogg-library -- verify --all --dataset denmark
+brokkr bench --iterations 1 library-scenario --scenario repeat-cat --dataset denmark --variant indexed
+```
 
-Each row gives each call's best of three, with the page cache kept.
+The bench measures whole-worker wall time. Verification and certification belong to the driver. See [the library protocol](reference/library-protocol.md) and [historical per-call measurements](reference/performance/library-capabilities.md).
 
 All CLI commands are cross-validated against osmium on Denmark (`brokkr verify`); `apply-changes --locations-on-ways` runs on a base that keeps its untagged nodes, with pbfhogg's output held to `check --locations`. See [reference/osmium-parity.md](reference/osmium-parity.md) for the full comparison matrix, [DEVIATIONS.md](DEVIATIONS.md) for intentional behavioral differences, and [CORRECTNESS.md](CORRECTNESS.md) for parser/encoder edge cases. Detailed per-command benchmarks and phase breakdowns are in [reference/performance/README.md](reference/performance/README.md).
 

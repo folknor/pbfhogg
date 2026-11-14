@@ -263,12 +263,6 @@ impl CommandPaths {
                 changes,
                 output,
                 ..
-            }
-            | Command::BenchMerge {
-                base,
-                changes,
-                output,
-                ..
             } => {
                 paths.inputs.extend([base.clone(), changes.clone()]);
                 paths.outputs.push(file(&output.output));
@@ -317,13 +311,9 @@ impl CommandPaths {
                     paths.inputs.extend(expressions_file.clone());
                 }
             }
-            Command::Digest { file: input, .. }
-            | Command::Check { file: input, .. }
-            | Command::BenchRead { file: input, .. }
-            | Command::BenchGeocodeQuery {
-                index_dir: input, ..
+            Command::Digest { file: input, .. } | Command::Check { file: input, .. } => {
+                paths.inputs.push(input.clone());
             }
-            | Command::BenchWrite { file: input, .. } => paths.inputs.push(input.clone()),
         }
         paths
     }

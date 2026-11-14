@@ -27,6 +27,7 @@ mod protocol;
 mod request;
 mod runner;
 mod scenarios;
+mod synthetic;
 #[cfg(test)]
 mod test_scratch;
 mod workload;

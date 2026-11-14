@@ -11,8 +11,9 @@ use super::{Scenario, account, assertion, published_once};
 use crate::protocol::Outcome;
 use crate::runner::{CallRecord, Done, Observation, Tap};
 use crate::workload::{
-    CLEAN_NONE, CallPlan, Command, DescriptorPool, ExecutorPlan, ExecutorPool, HostPlan, InputRole,
-    Inputs, OneInput, OutputPlan, Parallelism, ProcessPlan, WRITE, Workload, no_overrides,
+    CLEAN_NONE, CallPlan, Command, DescriptorPool, ExecutorPlan, ExecutorPool, Expect,
+    ExpectedError, HostPlan, InputRole, Inputs, OneInput, OutputPlan, Parallelism, ProcessPlan,
+    WRITE, Workload, no_overrides,
 };
 use pbfhogg::altw::{AltwOptions, IndexType};
 use pbfhogg::debug::InstrumentSink;
@@ -114,7 +115,8 @@ impl Scenario for NofileCatRefused {
                     write: WRITE,
                     overrides: no_overrides(),
                 },
-            ),
+            )
+            .expecting(Expect::Error(ExpectedError::InvalidArgument)),
         );
         w.assertions = vec![assertion(
             "a.refused",
@@ -177,7 +179,8 @@ impl Scenario for NofileMultiExtractRefused {
                     write: WRITE,
                     overrides: no_overrides(),
                 },
-            ),
+            )
+            .expecting(Expect::Error(ExpectedError::InvalidArgument)),
         );
         w.assertions = vec![assertion(
             "a.refused",

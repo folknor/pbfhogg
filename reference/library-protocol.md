@@ -25,7 +25,8 @@ own variant; the driver has no variant override. Listing validates config too.
 The bench measures worker process wall only, launching the worker directly
 in its bench mode so sidecar sampling, markers and profiling refer to the
 worker PID. Verification exists only on the run surface; the bench judges
-and checks nothing.
+nothing but that every call ended as its plan expects (Measurement and
+profiling).
 
 ## Worker launch
 
@@ -123,8 +124,8 @@ character.
   list makes the driver add `<call>/brokkr.stream` (see The call stream), which
   covers those capabilities in a certification; absent and `[]` mean the
   same. There is no CLI replay.
-- `roles`: every path the scenario uses, ids unique within the scenario;
-  possibly none.
+- `roles`: every path the scenario uses (the discard sink excepted, see
+  Discard sink), ids unique within the scenario; possibly none.
 - `assertions`: the scenario's assertion inventory, ids unique within the
   scenario; possibly none. `call` is required: a call id of this scenario,
   or `null` for an assertion about the scenario as a whole. `covers` is
@@ -240,8 +241,9 @@ bytes). Other exits, signals, deadlines, any stdout/stderr or capture loss
 fail verification. Diagnostics belong in documents, never output streams.
 
 Producer obligations: read only the request, input roles and private
-staging; write only owned roles, artefacts, private staging and a requested
-profiling report. Setup is deterministic and precedes calls. The schedule
+staging; write only owned roles, artefacts, private staging, a requested
+profiling report and the discard sink (see Discard sink). Setup is
+deterministic and precedes calls. The schedule
 honours ownership. Output changes use publications; publications sharing a
 role run in ordinal order, rollback included. No call publishes its seed.
 Apply declared process policy before library work and record effective
@@ -512,9 +514,14 @@ variant was not handed over), leaves generated and output roles absent
 under `DIR/roles`, writes a seeded output's seed, and uses `DIR/private` as
 its private directory. It then runs the workload exactly as `--test-harness`
 does, observation hooks included since they shape what runs, and stops:
-no call context, publication mapping, judgment, inventory completion or
-artefacts, and a library call returning an error is part of the workload.
-Exit 0 means the schedule ran; a refusal is exit 2 with empty stderr.
+no call context, publication mapping, scenario judgment, inventory
+completion or artefacts. The one check it keeps is the plan's: once the
+whole schedule has run, every call must have ended as its plan's `expect`
+says (see Planned endings). A planned error is part of the workload; an
+unplanned ending (a corrupt input that fails a call planned ok, which would
+otherwise time as a fast success) is exit 1, with empty stdout and stderr.
+Exit 0 means the schedule ran and every call ended as planned; a refusal is
+exit 2 with empty stderr.
 
 The measurement is the whole worker process wall, setup and generated-role
 construction included. Every scenario's call is marked `hotpath = "worker"`,
@@ -523,3 +530,27 @@ multi-call scenario together; the describe document's `hotpath` flag (one
 call, no generated role) says only which profiles attribute to a single
 call. Workload choices are deterministic; varying inputs are bound params
 defining arms.
+
+## Planned endings
+
+This section is the harness's own convention, not something the driver
+reads. Every call's plan entry carries `expect`: `{"status": "ok"}`,
+`{"status": "cancelled"}`, or `{"status": "error", "kind": ID}`, in the
+classes of the call document's `outcome` (a cancelled error is
+`cancelled`, never an error of kind `cancelled`; `other` is never planned).
+Every scenario carries the scenario-level assertion
+`calls-ended-as-planned`, which fails naming each call whose outcome is not
+its `expect`. A verification therefore holds the same rule a bench does,
+plus everything else it judges, so a scenario cannot certify while its
+measurement fails.
+
+## Discard sink
+
+A call whose command writes into a discard sink (the `encode-*`
+scenarios; plan `"sink": "discard"`, set by the typed command, not free
+text) opens `/dev/null` for writing. It is a character device, not a role:
+the exemption covers both the rule that `roles` names every path the
+scenario uses and the producer obligation to write only owned roles,
+artefacts, private staging and a requested profiling report. No
+publication is made for it. Like the rest of the plan, this is a producer
+obligation the driver does not check.

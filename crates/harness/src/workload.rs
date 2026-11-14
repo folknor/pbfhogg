@@ -170,13 +170,19 @@ pub(crate) struct CallPlan {
     pub(crate) stream: &'static [&'static str],
     pub(crate) command: Command,
     pub(crate) host: HostPlan,
+    /// How the call is planned to end. Both launches hold the call to it:
+    /// verification as the shared `calls-ended-as-planned` assertion, the
+    /// bench by exiting 1, so a measurement never times a call that ended
+    /// otherwise (a corrupt input read as a fast success).
+    pub(crate) expect: Expect,
     /// What the scenario's handwritten observation does to the call (a tap
     /// that cancels, a descriptor rendezvous), for the plan. Unchecked.
     pub(crate) notes: Option<Value>,
 }
 
 impl CallPlan {
-    /// A call on [`HostPlan::PLAIN`] claiming the sealed stream, no notes.
+    /// A call on [`HostPlan::PLAIN`] claiming the sealed stream, expected
+    /// to return ok, no notes.
     pub(crate) fn plain(id: &'static str, label: &'static str, command: Command) -> Self {
         Self {
             id,
@@ -184,7 +190,65 @@ impl CallPlan {
             stream: crate::protocol::STREAM_SEALED,
             command,
             host: HostPlan::PLAIN,
+            expect: Expect::Ok,
             notes: None,
+        }
+    }
+
+    /// [`Self::plain`], expected to end as `expect`.
+    pub(crate) fn expecting(mut self, expect: Expect) -> Self {
+        self.expect = expect;
+        self
+    }
+}
+
+/// How a call is planned to end, in the outcome's own classes
+/// ([`CallOutcome::of`](crate::outcome::CallOutcome::of)): a cancelled
+/// error is `Cancelled`, never an error of kind `cancelled`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expect {
+    Ok,
+    Cancelled,
+    Error(ExpectedError),
+}
+
+/// The error kinds a call may be planned to end with: the ones scenarios
+/// use, each spelled as the outcome's `kind`. `other` is never one, since
+/// it would hide an unmapped kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpectedError {
+    MissingHeader,
+    InvalidArgument,
+    Output,
+}
+
+impl ExpectedError {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::MissingHeader => "missing_header",
+            Self::InvalidArgument => "invalid_argument",
+            Self::Output => "output",
+        }
+    }
+}
+
+impl Expect {
+    fn to_json(self) -> Value {
+        match self {
+            Self::Ok => json!({ "status": "ok" }),
+            Self::Cancelled => json!({ "status": "cancelled" }),
+            Self::Error(error) => json!({ "status": "error", "kind": error.kind() }),
+        }
+    }
+
+    /// Whether `outcome` is the planned one.
+    pub(crate) fn matches(self, outcome: &crate::outcome::CallOutcome) -> bool {
+        match self {
+            Self::Ok => outcome.is_ok(),
+            Self::Cancelled => outcome.is_cancelled(),
+            Self::Error(error) => outcome
+                .error()
+                .is_some_and(|(kind, _)| kind == error.kind()),
         }
     }
 }
@@ -372,6 +436,19 @@ pub(crate) enum Command {
         options: AltwOptions,
         overrides: HeaderOverrides,
     },
+    /// Count the input's elements through one public reader
+    /// ([`crate::synthetic::decode`]).
+    Decode {
+        input: &'static str,
+        reader: crate::synthetic::Reader,
+    },
+    /// Decode the input and re-encode it into the discard sink
+    /// ([`crate::synthetic::encode`]).
+    Encode {
+        input: &'static str,
+        writer: crate::synthetic::Writer,
+        compression: Compression,
+    },
 }
 
 /// What a command returned that judgments read.
@@ -379,6 +456,7 @@ pub(crate) enum Command {
 pub(crate) enum Returned {
     Cat { passthrough: u64, decoded: u64 },
     Digest(pbfhogg::digest::Digest),
+    Counts(crate::synthetic::Counts),
     Nothing,
 }
 
@@ -429,7 +507,7 @@ impl Command {
             Self::Cat { output, .. } | Self::Altw { output, .. } => {
                 vec![(output.role, output.initial)]
             }
-            Self::Digest { .. } => Vec::new(),
+            Self::Digest { .. } | Self::Decode { .. } | Self::Encode { .. } => Vec::new(),
             Self::ExtractMulti { regions, .. } => {
                 regions.iter().map(|(_, r)| (*r, Initial::Absent)).collect()
             }
@@ -443,7 +521,10 @@ impl Command {
             Self::ExtractMulti { input, .. } => match input {
                 OneInput::Missing => Vec::new(),
             },
-            Self::Digest { input, .. } | Self::Altw { input, .. } => vec![*input],
+            Self::Digest { input, .. }
+            | Self::Altw { input, .. }
+            | Self::Decode { input, .. }
+            | Self::Encode { input, .. } => vec![*input],
         }
     }
 
@@ -452,7 +533,9 @@ impl Command {
         match self {
             Self::Cat { inputs, .. } => inputs.names_missing(),
             Self::ExtractMulti { input, .. } => matches!(input, OneInput::Missing),
-            Self::Digest { .. } | Self::Altw { .. } => false,
+            Self::Digest { .. } | Self::Altw { .. } | Self::Decode { .. } | Self::Encode { .. } => {
+                false
+            }
         }
     }
 
@@ -461,7 +544,7 @@ impl Command {
         match self {
             Self::Cat { output, .. } | Self::Altw { output, .. } => Some(output.overwrite),
             Self::ExtractMulti { overwrite, .. } => Some(*overwrite),
-            Self::Digest { .. } => None,
+            Self::Digest { .. } | Self::Decode { .. } | Self::Encode { .. } => None,
         }
     }
 
@@ -534,37 +617,18 @@ impl Command {
                 output,
                 options,
                 overrides,
-            } => {
-                let AltwOptions {
-                    keep_untagged_nodes,
-                    write,
-                    index_type,
-                    inject_prepass,
-                    ignore_missing_nodes,
-                } = *options;
-                let mut value = json!({
-                    "command": "add-locations-to-ways",
-                    "input": input,
-                    "output": output.role,
-                    "index_type": match index_type {
-                        IndexType::Sparse => "sparse",
-                        IndexType::External => "external",
-                        IndexType::Auto => "auto",
-                    },
-                    "keep_untagged_nodes": keep_untagged_nodes,
-                    "inject_prepass": inject_prepass,
-                    "ignore_missing_nodes": ignore_missing_nodes,
-                    "write": write_json(write)?,
-                    "header_overrides": overrides_json(overrides),
-                    "output_policy": output_policy_json(output.overwrite),
-                    "scratch": "a run scratch in the private directory",
-                    "host": host,
-                });
-                if output.initial == Initial::Seed {
-                    value["output_initial"] = json!("seed");
-                }
-                value
-            }
+            } => altw_json(input, output, options, overrides, host)?,
+            Self::Decode { input, reader } => crate::synthetic::decode_plan(input, *reader, host),
+            Self::Encode {
+                input,
+                writer,
+                compression,
+            } => crate::synthetic::encode_plan(
+                input,
+                *writer,
+                &compression_json(*compression)?,
+                host,
+            ),
         })
     }
 
@@ -653,8 +717,61 @@ impl Command {
                 )
                 .map(|_| Returned::Nothing)
             }
+            Self::Decode { input, reader } => {
+                crate::synthetic::decode(env.binding(input), *reader, host).map(Returned::Counts)
+            }
+            Self::Encode {
+                input,
+                writer,
+                compression,
+            } => crate::synthetic::encode(
+                env.binding(input),
+                Path::new(crate::synthetic::DISCARD),
+                *writer,
+                *compression,
+                host,
+            )
+            .map(Returned::Counts),
         }
     }
+}
+
+fn altw_json(
+    input: &str,
+    output: &OutputPlan,
+    options: &AltwOptions,
+    overrides: &HeaderOverrides,
+    host: &Value,
+) -> Result<Value, String> {
+    let AltwOptions {
+        keep_untagged_nodes,
+        write,
+        index_type,
+        inject_prepass,
+        ignore_missing_nodes,
+    } = *options;
+    let mut value = json!({
+        "command": "add-locations-to-ways",
+        "input": input,
+        "output": output.role,
+        "index_type": match index_type {
+            IndexType::Sparse => "sparse",
+            IndexType::External => "external",
+            IndexType::Auto => "auto",
+        },
+        "keep_untagged_nodes": keep_untagged_nodes,
+        "inject_prepass": inject_prepass,
+        "ignore_missing_nodes": ignore_missing_nodes,
+        "write": write_json(write)?,
+        "header_overrides": overrides_json(overrides),
+        "output_policy": output_policy_json(output.overwrite),
+        "scratch": "a run scratch in the private directory",
+        "host": host,
+    });
+    if output.initial == Initial::Seed {
+        value["output_initial"] = json!("seed");
+    }
+    Ok(value)
 }
 
 fn build_output(
@@ -835,6 +952,7 @@ impl Workload {
         let mut calls = serde_json::Map::new();
         for call in &self.calls {
             let mut value = call.command.to_json(&call.host.to_json())?;
+            value["expect"] = call.expect.to_json();
             if let Some(notes) = &call.notes {
                 value["notes"] = notes.clone();
             }

@@ -483,6 +483,20 @@ pub const READS: &[Read] = &[
         "HOTPATH_OUTPUT_PATH",
         Reason::Protocol,
     ),
+    read(
+        "crates/bench/src/host.rs",
+        "invocation",
+        "var_os",
+        "BROKKR_MARKER_FIFO",
+        Reason::Protocol,
+    ),
+    read(
+        "crates/bench/src/main.rs",
+        "main",
+        "var_os",
+        "HOTPATH_OUTPUT_PATH",
+        Reason::Protocol,
+    ),
 ];
 
 /// `std::env` names refused wherever they are spelled.

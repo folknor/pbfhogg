@@ -4,9 +4,6 @@ local stops = require("stop")
 local M = {}
 
 function M.validate(params)
-    if params["direct-io"] == "yes" then fail("synthetic workloads do not support --direct-io") end
-    if params["io-uring"] == "yes" then fail("use --uring yes on merge-workload instead of --io-uring") end
-    if params.compression then fail("use --compressions on write or merge instead of --compression") end
     if params.compressions then compression.parse(params.compressions) end
     stops.resolve(params.stop)
 end

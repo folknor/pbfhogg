@@ -18,7 +18,7 @@
 use super::{Scenario, account, assertion, published_once};
 use crate::protocol::Outcome;
 use crate::runner::{CallRecord, Done, Observation, Tap};
-use crate::workload::{CallPlan, InputRole, Workload, cat};
+use crate::workload::{CallPlan, Expect, InputRole, Workload, cat};
 use pbfhogg::debug::InstrumentSink;
 use pbfhogg::host::Invocation;
 use pbfhogg::{CancelOutcome, Decision, Effect};
@@ -102,11 +102,18 @@ impl Scenario for CancelCat {
     fn workload(&self) -> Workload {
         let mut w = Workload::new(self.id, self.description, 600);
         w.inputs = vec![InputRole::dataset("input", "indexed")];
+        // A cancel after the decision leaves the call's ok; one before it
+        // ends the call cancelled.
         let mut call = CallPlan::plain(
             "a",
             "cat input -> out, cancelled by its tap",
             cat(&["input"], "out"),
-        );
+        )
+        .expecting(if self.post {
+            Expect::Ok
+        } else {
+            Expect::Cancelled
+        });
         call.notes = Some(json!({ "cancel": {
             "by": "the call's tap, on its calling thread", "at_marker": self.marker, "times": 1,
         } }));

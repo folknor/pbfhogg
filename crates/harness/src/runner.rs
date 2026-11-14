@@ -58,9 +58,10 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Exit {
     /// Ran every declared call and assertion exactly once, and all passed.
-    /// In bench mode, which judges nothing: ran every declared call.
+    /// In bench mode: ran every declared call, each ending as planned.
     Passed,
-    /// Ran, and some result it reported did not pass.
+    /// Ran, and some result it reported did not pass; in bench mode, some
+    /// call ended other than its plan expects.
     Failed,
     /// Could not run the request.
     Refused,
@@ -82,8 +83,9 @@ pub(crate) enum Mode {
     /// write the artefacts into this directory.
     Verify(PathBuf),
     /// The library-scenario bench's launch: run the workload and nothing
-    /// else. No judgment, no inventory completion, no artefacts; a library
-    /// call that returns an error is part of the workload, not a failure.
+    /// else. No judgment, no inventory completion, no artefacts. A call's
+    /// error is part of the workload when the plan expects it; a call that
+    /// ends other than planned fails the launch (exit 1).
     Bench,
 }
 
@@ -253,10 +255,17 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     }
     let observation = scenario.observe();
     let records = ctx.run_schedule(&workload, observation.as_ref())?;
-    // A bench measures the workload and stops here: the records drop
-    // before the profile guard, so a whole-worker profile covers them.
+    let unplanned = crate::scenarios::unplanned_endings(&workload, &records);
+    // A bench measures the workload and stops here, judging only that every
+    // call ended as planned (after the whole schedule, so a failure cannot
+    // change what its siblings ran): the records drop before the profile
+    // guard, so a whole-worker profile covers them.
     let Some(artefacts) = artefacts else {
-        return Ok(Exit::Passed);
+        return Ok(if unplanned.is_empty() {
+            Exit::Passed
+        } else {
+            Exit::Failed
+        });
     };
     let done = Done {
         records: &records,
@@ -267,17 +276,7 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
         ctx.finish_call(record, &judged)?;
     }
     let mut results = observation.judge_scenario(&done);
-    let late = ctx.late_report();
-    results.push(Outcome::judge(
-        crate::scenarios::DIAGNOSTICS_CLOSED,
-        late.is_empty(),
-        if late.is_empty() {
-            "every call diagnostic sender was released at collection close; no late or over-budget event observed"
-                .to_owned()
-        } else {
-            late
-        },
-    ));
+    results.extend(shared_results(unplanned, ctx.late_report()));
     ctx.inventory().complete(&decl, &results)?;
     let passed = ctx.all_passed && results.iter().all(|r| r.status == Status::Pass);
     let diagnostics: Vec<Value> = ctx
@@ -295,6 +294,27 @@ fn run_launch(launch: &Launch<'_>) -> Result<Exit, String> {
     });
     write_json(&artefacts.join("scenario.json"), &doc)?;
     Ok(if passed { Exit::Passed } else { Exit::Failed })
+}
+
+/// The scenario-level results every scenario carries, from the unplanned
+/// endings and the late-diagnostics report (each empty when clean).
+fn shared_results(unplanned: String, late: String) -> [Outcome; 2] {
+    let judge = |id, report: String, clean: &str| {
+        let passed = report.is_empty();
+        Outcome::judge(id, passed, if passed { clean.to_owned() } else { report })
+    };
+    [
+        judge(
+            crate::scenarios::CALLS_AS_PLANNED,
+            unplanned,
+            "every call ended as its plan expects",
+        ),
+        judge(
+            crate::scenarios::DIAGNOSTICS_CLOSED,
+            late,
+            "every call diagnostic sender was released at collection close; no late or over-budget event observed",
+        ),
+    ]
 }
 
 /// Every role bound and nothing else; inputs existing files; outputs and

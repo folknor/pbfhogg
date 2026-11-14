@@ -55,10 +55,14 @@
   so no feature selection or feature unification, including a registry
   `cargo install`, can build them into an executable without that cfg. A build that named
   `--features test-hooks` now fails as an unknown feature.
-- **`bench-write` fails on a relation member whose role does not resolve**
-  instead of encoding an empty role and completing the run. It also reuses
-  one member buffer per block rather than allocating one per relation, so its
-  timings do not compare with earlier revisions.
+- **The `bench-read`, `bench-write`, `bench-merge` and hidden
+  `bench-geocode-query` subcommands are removed from the `pbfhogg` binary.**
+  They were benchmark instruments, not user commands, and only ever called
+  public library API; scripts that invoked them now get an
+  unknown-subcommand error. The read and write workloads are measured
+  through the library harness (`pbfhogg-harness`, scenarios `decode-*` and
+  `encode-*`), the merge and geocode query instruments live in the
+  unpublished `pbfhogg-bench` executable.
 
 - **`build-geocode-index` refuses to publish an index whose smoke test
   fails.** The smoke test used to query the first address point and pass on

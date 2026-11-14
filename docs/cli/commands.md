@@ -56,9 +56,6 @@ the command accepts.
   command. A quiet `check` refuses `--json`, `--show-ids` and `--max-errors`,
   and a quiet `inspect --indexed` refuses `--json`, for the same reason.
   `getid -v` is refused with `-q`: the ID lists are all it adds.
-- **Not affected:** the `bench-read`, `bench-write` and `bench-merge`
-  key=value blocks, which benchmark harnesses parse, print as they always
-  have.
 
 `diff -q` and `check --quiet` used to be flags of those two commands alone;
 they are this flag now, with the same effect there (and `diff --format osc`
@@ -2189,64 +2186,11 @@ extract, are legitimate and still build.
 
 Outputs a set of binary files. See [performance/geocode.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/geocode.md) for measured build times, index size, and peak memory.
 
-The `bench-read`, `bench-write` and `bench-merge` commands are synthetic
-diagnostic workloads. They are intentionally outside the README user-command
-benchmark surface and are not planet-scale validation targets.
-
-### bench-read
-
-Benchmark instrument: count the elements of a PBF through one of the
-library's readers and print `elapsed_ms=`, `nodes=`, `ways=` and
-`relations=` lines on stderr for a benchmark harness to parse (`-q` leaves
-them alone, see [Quiet](#quiet)). It reads through the library's public
-constructors, so, like a library user, it reads a partially indexed file the
-commands would refuse.
-
-```
-pbfhogg bench-read --mode <MODE> <FILE>
-```
-
-| Flag | Description |
-|------|-------------|
-| `--mode <MODE>` | Reader to time: `sequential`, `parallel`, `pipelined` or `blobreader` |
-
-### bench-write
-
-Benchmark instrument: decode every element of a PBF and re-encode it through
-`BlockBuilder` into a byte sink (nothing is published), printing
-`elapsed_ms=` and the element counts on stderr. A relation member whose role
-string index does not resolve fails the run with an error naming the relation,
-the member and the index, as the re-encoding commands do, rather than being
-encoded with an empty role.
-
-```
-pbfhogg bench-write [OPTIONS] <FILE>
-```
-
-| Flag | Description |
-|------|-------------|
-| `--compression <COMPRESSION>` | Compression of the encoded blobs, as in [Common flags](#common-flags) [default: zlib] |
-| `--writer <WRITER>` | Writer to time: `sync` (a buffered writer on the calling thread) or `pipelined` (the parallel-compression writer) [default: sync] |
-
-### bench-merge
-
-Benchmark instrument: run the `apply-changes` merge of `<BASE>` and
-`<CHANGES>` into `-o` and print its timing and statistics on stderr. The
-timer stops where publication begins. The merge runs as with `--force`, so
-an unindexed base is accepted; there is no `-j`, `--locations-on-ways` or
-header override.
-
-```
-pbfhogg bench-merge [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
-```
-
-| Flag | Description |
-|------|-------------|
-| `-o, --output <FILE>` | Output file |
-| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
-| `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
-| `--compression <COMPRESSION>` | Blob compression, as in [Common flags](#common-flags) [default: zlib] |
-| `--io-mode <IO_MODE>` | Output writer: `buffered` or `uring` (io_uring; needs the `linux-io-uring` feature) [default: buffered] |
+The `pbfhogg` binary carries no benchmark instruments. The synthetic
+workloads run outside it: reads and writes through the library harness
+(`brokkr bench library-scenario`, scenarios `decode-*` and `encode-*`), the
+merge workload and reverse geocoding queries through the `pbfhogg-bench`
+instruments (`brokkr bench merge-workload`, `brokkr bench geocode-query`).
 
 ---
 

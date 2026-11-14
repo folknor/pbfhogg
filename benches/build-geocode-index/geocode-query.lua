@@ -1,11 +1,14 @@
 -- geocode-query: reverse geocoding query latency against an index this
--- bench builds. Each iteration builds the dataset's index with the built
--- revision's build-geocode-index (setup, outside the measurement), then runs
--- the hidden bench-geocode-query instrument once, the measured child: it
--- opens the index, draws a fixed pseudo-random point set uniform in the bbox
--- (a pure function of bbox and seed, the same on every revision), queries
--- every point once untimed to warm the page cache and tally the answers,
--- then times the given rounds over the same points.
+-- bench builds. Builds the pbfhogg-bench package's instruments, not the
+-- pbfhogg CLI. Each iteration builds the dataset's index with the
+-- instruments' geocode-build (setup, outside the measurement: the library
+-- builder with its defaults, an unindexed input accepted), then runs
+-- geocode-query once, the measured child: it opens the index, draws a fixed
+-- pseudo-random point set uniform in the bbox (a pure function of bbox and
+-- seed, the same on every revision), queries every point once untimed to
+-- warm the page cache and tally the answers, then times the given rounds
+-- over the same points. Its warm-up and timed rounds are the marker pairs
+-- GEOCODE_QUERY_WARMUP and GEOCODE_QUERY_ROUNDS.
 --
 -- The ranked wall is the query child's, so it includes process start, the
 -- index open and the warm-up round; the per-query figure to compare is
@@ -14,10 +17,11 @@
 -- complete answer: two revisions whose digests differ answered differently.
 -- A query error in the warm-up or any timed round fails the instrument, so
 -- r:ok() fails the run: a revision whose queries fail never reads as faster.
+-- Under --hotpath or --alloc the query child is profiled.
 --
--- The instrument must exist in the built revision: a --commit before it was
--- added fails with that reason. The bbox defaults to the dataset's bbox,
--- which is host config; pass --bbox to fix the points across hosts.
+-- A --commit before the pbfhogg-bench package existed fails at the build.
+-- The bbox defaults to the dataset's bbox, which is host config; pass
+-- --bbox to fix the points across hosts.
 --
 --   brokkr bench --dry-run geocode-query --dataset germany
 --   brokkr bench --iterations 1 geocode-query --dataset germany --bbox 5.9,47.3,15.0,55.0
@@ -43,23 +47,18 @@ function bench(params)
     -- Iteration outputs are reclaimed; local reuse would bypass ownership and
     -- invalidation by input digest, producer revision and build options.
     local index = output("geocode-index")
-    binary("build-geocode-index", params.variant.file, {
+    binary("geocode-build", params.variant.file, {
         ["output-dir"] = index,
         ["tmp-dir"] = scratch("geocode"),
-        force = true,
     }):ok()
 
-    local r = binary_with({ measured = true, reads = { index } },
-        "bench-geocode-query", index.path, {
+    local r = binary_with({ measured = true, reads = { index }, hotpath = "query" },
+        "geocode-query", index.path, {
             bbox = bbox,
             queries = params.queries,
             rounds = params.rounds,
             seed = params.seed,
-        })
-    if r.exit ~= 0 and string.find(r.stderr, "unrecognized subcommand", 1, true) then
-        fail("this revision has no bench-geocode-query instrument")
-    end
-    r:ok()
+        }):ok()
     if params.verbose == "yes" then print(r.stderr) end
 
     -- Reject legacy or unknown schemas rather than comparing partial answers.

@@ -3,8 +3,7 @@
 -- typed runner's overwrite and allow-unindexed behavior on every revision.
 -- The output directory is fresh; scratch and output live under the host's
 -- scratch at bench-iterations and are removed when the iteration ends.
--- direct I/O is forwarded; io_uring and compression are refused because
--- this command writes an index, not a PBF. Profiling and marker stops combine.
+-- direct I/O is forwarded. Profiling and marker stops combine.
 -- Build overrides, commits and iteration counts belong to the bench runner.
 --
 --   brokkr bench --dry-run geocode-build --variant raw --direct-io yes
@@ -14,8 +13,6 @@ local stops = require("stop")
 local profiling = require("profiling")
 
 function validate(params)
-    if params["io-uring"] == "yes" then fail("build-geocode-index has no io_uring writer") end
-    if params.compression then fail("build-geocode-index writes no PBF: compression is unsupported") end
     stops.resolve(params.stop)
 end
 

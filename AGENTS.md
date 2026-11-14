@@ -139,8 +139,8 @@ for the primary. Snapshot-aware scripts take `--snapshot KEY`, usually with
 `--variant`; `tag-select` uses `--input` for the PBF variant (default
 `indexed`) or an explicit OSC sequence, scoped by `--input-kind`.
 `diff-pair` takes `--from` and `--to`; non-indexed pairs require both
-`--variant` and `--to-variant` set to the same key. `encode-workload` and
-`merge-workload` remain primary-only. Bound params and input digests are
+`--variant` and `--to-variant` set to the same key. `merge-workload`
+remains primary-only. Bound params and input digests are
 stored with script results; inspect them with `brokkr results UUID`.
 
 Script bench outputs are iteration-owned scratch. To register a completed
@@ -226,6 +226,8 @@ never pbfhogg; downloads invoke the handed CLI for indexed output. Run it as
 [reference/datasets.md](reference/datasets.md).
 
 **`pbfhogg-verify`** (`crates/verify/`, bin, `publish = false`) owns real-data cross-validation against reference tools. It links devkit and generic crates, never pbfhogg. Run it as `brokkr run --with pbfhogg pbfhogg-verify -- ...`; the binding contract is [reference/verify.md](reference/verify.md).
+
+**`pbfhogg-bench`** (`crates/bench/`, bin, `publish = false`) holds the benchmark instruments that are not library-harness scenarios (`geocode-build`, `geocode-query`, `merge`), over the public library API, so the user-facing `pbfhogg` binary carries none. The `geocode-query` and `merge-workload` script benches build it as their target; each instrument prints a key=value block on stderr for its script. Its host matches the CLI's, and SIGINT or SIGTERM cancels the run so a marker-stopped profiled call still writes its hotpath report.
 
 **`pbfhogg-guard-portability`** (`crates/guard-portability/`, `publish = false`, libc only), is a compile fixture: it mounts the guard alone so the `riscv64` lint sweep can type-check the guard's unsupported-architecture fallback. It is empty on x86_64 and aarch64.
 

@@ -853,6 +853,58 @@ fn unrecognised_indexdata_warning_is_per_invocation() {
     assert_eq!(read(&second, &shared), 3);
     assert_eq!(read(&first, &shared.clone()), 3);
 }
+
+/// The public readers opened under a host report a malformed indexdata
+/// through its diagnostics, as commands' readers do. Parallel map/reduce
+/// and the unfiltered pipeline skip indexdata parsing, so they stay silent:
+/// that fast path is kept, its lack of a warning included. The blob
+/// reader's warning names the file and the data blob's byte offset.
+#[test]
+fn public_readers_under_a_host_report_unrecognised_indexdata() {
+    let dir = crate::common::test_scratch();
+    let bad = dir.path().join("bad-indexdata.osm.pbf");
+    crate::common::write_bad_indexdata_pbf(&bad);
+    let warnings = |read: &dyn Fn(&pbfhogg::host::Host)| {
+        let sink = Arc::new(Recording::default());
+        let host = pbfhogg::host::Host {
+            diagnostics: pbfhogg::host::Diagnostics::new(
+                Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
+            ),
+            ..crate::common::test_host()
+        };
+        read(&host);
+        let events = sink.0.lock().expect("sink").clone();
+        events
+            .into_iter()
+            .map(|(_, message)| message)
+            .filter(|message| message.contains("indexdata has an unrecognised length"))
+            .collect::<Vec<_>>()
+    };
+    let open = |host: &pbfhogg::host::Host| {
+        pbfhogg::ElementReader::open_with(bad.as_path(), false, host).expect("open")
+    };
+    let sequential = warnings(&|host| open(host).for_each(|_| {}).expect("sequential"));
+    let parallel = warnings(&|host| {
+        open(host)
+            .par_map_reduce(|_| 0u64, || 0, |a, b| a + b)
+            .expect("parallel");
+    });
+    let pipelined = warnings(&|host| open(host).for_each_pipelined(|_| {}).expect("pipelined"));
+    let blobs = warnings(&|host| {
+        for blob in pbfhogg::BlobReader::open_with(bad.as_path(), false, host).expect("open") {
+            blob.expect("blob");
+        }
+    });
+    assert_eq!(sequential.len(), 1, "{sequential:?}");
+    assert!(parallel.is_empty(), "{parallel:?}");
+    assert!(pipelined.is_empty(), "{pipelined:?}");
+    assert_eq!(blobs.len(), 1, "{blobs:?}");
+    assert!(
+        blobs[0].contains("bad-indexdata.osm.pbf") && blobs[0].contains("at byte offset"),
+        "{blobs:?}"
+    );
+}
+
 fn one_thread_pool() -> Arc<rayon::ThreadPool> {
     Arc::new(
         rayon::ThreadPoolBuilder::new()

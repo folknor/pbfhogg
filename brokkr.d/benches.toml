@@ -97,9 +97,10 @@ params.jobs = { integer = "u64", help = "unsigned 64-bit worker count; 0 is auto
 [bench.geocode-build]
 script_file = "../benches/build-geocode-index/geocode-build.lua"
 description = "Build a reverse geocoding index from a dataset or snapshot"
-version = 2
-date = 2026-11-11
+version = 3
+date = 2026-11-14
 changelog = [
+  { version = 3, date = 2026-11-14, note = "The refusal-only io-uring and compression params are gone; brokkr refuses them as unknown, and the explicit no-op spellings are refused too; workload unchanged" },
   { version = 2, date = 2026-11-11, note = "GEOCODE_PASS3_END now fires after the admin index, before the header write and the new GEOCODE_SMOKE_TEST pair, so a stop at Pass 3 no longer includes them; full builds stay comparable" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed build-geocode-index: forced overwrite and unindexed fallback, snapshots, direct I/O and profiling with marker stops" },
@@ -112,24 +113,26 @@ params.dataset = { from = "datasets", default = "denmark", help = "the dataset" 
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes is refused: build-geocode-index has no io_uring writer" }
-params.compression = { validated = true, help = "refused: build-geocode-index writes no PBF" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
 [bench.geocode-query]
 script_file = "../benches/build-geocode-index/geocode-query.lua"
 description = "Reverse geocoding query latency over fixed pseudo-random points, against an index the bench builds"
-version = 2
-date = 2026-11-11
+version = 3
+date = 2026-11-14
 changelog = [
+  { version = 3, date = 2026-11-14, note = "Runs the pbfhogg-bench instruments instead of the CLI: geocode-build builds the index through the library, geocode-query is the moved instrument, with the same evidence keys; a SIGTERM now cancels at a round boundary; the query child is profiled under --hotpath and --alloc. Revisions before pbfhogg-bench fail at the build" },
   { version = 2, date = 2026-11-11, note = "Require reverse-result-v1 full-answer evidence: answer_digest hashes every query's complete answer, computed in the untimed warm-up; legacy admin-only evidence is refused; the timed query loop is unchanged" },
   { date = 2026-11-11, note = "Fail closed on missing, duplicate, malformed or inconsistent legacy query evidence; label the admin-only result format explicitly" },
   { date = 2026-11-11, note = "--bbox, --queries, --rounds and --seed checked by typed domains at bind; a leading + or zero is refused, and the bbox needs WGS84 range and strict order; workload unchanged" },
   { date = 2026-11-11, note = "A query error in warm-up or a timed round now fails the run instead of being dropped; errors= no longer reported; points clamped to the bbox; workload unchanged" },
   { version = 1, date = 2026-11-10, note = "Added: index built untimed, then the bench-geocode-query instrument measured; per-query means and an admin answer digest recorded" },
 ]
+target = "pbfhogg-bench"
 profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset; its bbox is the default point box" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant the index is built from" }
@@ -358,9 +361,10 @@ params.unsort = { choices = ["yes", "no"], default = "no", help = "yes: clear So
 [bench.diff-applied]
 script_file = "../benches/diff/diff-applied.lua"
 description = "Diff a base PBF against its applied OSC, measuring the diff child"
-version = 2
-date = 2026-11-10
+version = 3
+date = 2026-11-14
 changelog = [
+  { version = 3, date = 2026-11-14, note = "The refusal-only keep-cache, io-uring and compression params are gone; brokkr refuses them as unknown, and the explicit no-op spellings are refused too; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child; probe every blob with inspect --get indexed and delegate jobs validation to pbfhogg" },
   { version = 1, date = 2026-11-09, note = "Ported typed diff two-step workload, raw-vs-indexed pairs, formats, jobs, type, snapshots and profiling" },
@@ -379,10 +383,7 @@ params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "base PBF variant" }
 params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", default_only = true, help = "one OSC sequence (typed --osc-seq); omitted requires a sole entry" }
 params.type = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the element kind" }
-params.keep-cache = { choices = ["yes", "no"], default = "no", help = "yes refused: iteration outputs cannot persist as a merged cache" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "use O_DIRECT for the diff child only" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "refused by typed diff" }
-params.compression = { validated = true, help = "refused: diff writes no PBF; merge preparation uses defaults" }
 
 [bench.diff-pair]
 script_file = "../benches/diff/diff-pair.lua"
@@ -594,11 +595,12 @@ params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO o
 [bench.library-scenario]
 script_file = "../benches/library/library-scenario.lua"
 description = "Measure one library harness scenario's worker process"
-version = 2
-date = 2026-11-13
+version = 3
+date = 2026-11-14
 changelog = [
   { version = 1, date = 2026-11-13, note = "Direct worker measurement with describe-declared roles and deadlines; independent of verification" },
   { version = 2, date = 2026-11-13, note = "Worker bench mode: the harness lays out its own roles and judges nothing, so the wall no longer includes judgment or artefact writing; every scenario is profiled whole" },
+  { version = 3, date = 2026-11-14, note = "A call ending other than its plan expects fails the cell, so a corrupt input no longer times as a fast success; the decode-* and encode-* scenarios replace the decode-workload and encode-workload benches" },
 ]
 target = "pbfhogg-harness"
 profile = "release"
@@ -614,21 +616,19 @@ params.inputs = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", many = tr
 [bench.merge-workload]
 script_file = "../benches/merge/merge-workload.lua"
 description = "Apply an OSC with the synthetic merge workload across codecs and output backends"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-14
 changelog = [
+  { version = 2, date = 2026-11-14, note = "Runs the pbfhogg-bench merge instrument instead of the CLI's bench-merge, same output keys and timer boundary; the refusal-only direct-io, io-uring and compression params are gone. Revisions before pbfhogg-bench fail at the build" },
   { version = 1, date = 2026-11-09, note = "Ported typed merge: synthetic workload matrix, I/O refusals, marker stops and profiling" },
 ]
-target = "pbfhogg"
+target = "pbfhogg-bench"
 profile = "release"
 features = ["linux-io-uring"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the input PBF variant" }
-params.direct-io = { choices = ["yes", "no"], default = "no", help = "refused: this synthetic workload has no O_DIRECT path" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "refused: use uring on the merge workload instead" }
-params.compression = { validated = true, help = "refused: use compressions on write or merge instead" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print each child's captured output" }
 params.compressions = { validated = true, default = "zlib,none", help = "codec matrix: none, zlib[:0-9], zstd[:level]; each value is a separate arm" }
@@ -639,9 +639,10 @@ params.osc-seq = { from = "datasets.{dataset}.osc", many = true, default = "all"
 [bench.merge-diffs]
 script_file = "../benches/merge-changes/merge-diffs.lua"
 description = "Merge configured OSC sequences or ranges, retaining all changes or simplifying per object"
-version = 2
-date = 2026-11-10
+version = 3
+date = 2026-11-14
 changelog = [
+  { version = 3, date = 2026-11-14, note = "The refusal-only direct-io, io-uring and compression params are gone; brokkr refuses them as unknown, and the explicit no-op spellings are refused too; workload unchanged" },
   { version = 2, date = 2026-11-10, note = "Only pass --tmp-dir for multiple inputs without --simplify; omit unused scratch for simplified and single-input merges" },
   { version = 1, date = 2026-11-09, note = "Ported typed merge-changes: scoped sequences, lists and inclusive ranges, simplify, spill scratch and profiling with marker stops" },
 ]
@@ -651,36 +652,10 @@ alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot's own OSC table" }
 params.osc = { from = "datasets.{dataset}.snapshot.{snapshot}.osc", many = true, required = true, help = "OSC sequence, comma list, repeated flag, all or inclusive LO..HI range; kept in supplied order" }
-params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes is refused: merge-changes has no O_DIRECT path" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes is refused: merge-changes has no io_uring writer" }
-params.compression = { validated = true, help = "refused: merge-changes writes OSC, not PBF" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 params.simplify = { choices = ["yes", "no"], default = "no", help = "yes: keep only the last change per object" }
 
-# -- read
-
-[bench.decode-workload]
-script_file = "../benches/read/decode-workload.lua"
-description = "Decode a dataset or snapshot using each selected synthetic reader mode"
-version = 1
-date = 2026-11-09
-changelog = [
-  { version = 1, date = 2026-11-09, note = "Ported typed read: synthetic workload matrix, I/O refusals, marker stops and profiling" },
-]
-target = "pbfhogg"
-profile = "release"
-hotpath_features = ["hotpath"]
-alloc_features = ["hotpath-alloc"]
-params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
-params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
-params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
-params.direct-io = { choices = ["yes", "no"], default = "no", help = "refused: this synthetic workload has no O_DIRECT path" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "refused: use uring on the merge workload instead" }
-params.compression = { validated = true, help = "refused: use compressions on write or merge instead" }
-params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END" }
-params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print each child's captured output" }
-params.modes = { choices = ["sequential", "parallel", "pipelined", "blobreader"], default = "sequential,parallel,pipelined,blobreader", help = "reader modes; each value is a separate arm and child" }
 # -- repack
 
 [bench.reencode-pbf]
@@ -775,9 +750,10 @@ params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes: use io
 [bench.tag-select]
 script_file = "../benches/tags-filter/tag-select.lua"
 description = "Filter PBF objects with optional references, or filter OSC changes, on a dataset or snapshot"
-version = 3
-date = 2026-11-10
+version = 4
+date = 2026-11-14
 changelog = [
+  { version = 4, date = 2026-11-14, note = "The refusal-only io-uring param is gone; brokkr refuses it as unknown, and the explicit no-op spelling is refused too; workload unchanged" },
   { date = 2026-11-11, note = "--jobs checked by its typed u64 domain at bind, so a leading + or zero is refused; workload unchanged" },
   { version = 3, date = 2026-11-10, note = "Restore indexed as the PBF input default; OSC sequences remain explicit, with only the selected input kind bound" },
   { date = 2026-11-09, note = "Use shared compression, stop, profiling helpers; workload unchanged" },
@@ -798,7 +774,6 @@ params.invert-match = { choices = ["yes", "no"], default = "no", help = "yes: ke
 params.remove-tags = { choices = ["yes", "no"], default = "no", help = "yes: strip tags from referenced but unmatched PBF objects" }
 params.jobs = { integer = "u64", help = "worker threads for two-pass PBF or OSC; 0 is auto, omitted uses pbfhogg's default" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O_DIRECT on PBF input" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "yes is refused: tags-filter has no io_uring writer" }
 params.compression = { validated = true, help = "PBF only: none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
@@ -825,28 +800,3 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: use O
 params.compression = { validated = true, help = "none, zlib[:0-9] or zstd[:signed 32-bit level]; omitted keeps the binary's default" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
-
-# -- write
-
-[bench.encode-workload]
-script_file = "../benches/write/encode-workload.lua"
-description = "Decode and encode a dataset into a byte sink with sync or pipelined writers"
-version = 2
-date = 2026-11-11
-changelog = [
-  { version = 1, date = 2026-11-09, note = "Ported typed write: synthetic workload matrix, I/O refusals, marker stops and profiling" },
-  { version = 2, date = 2026-11-11, note = "bench-write refuses a bad member role and reuses one member buffer per block instead of allocating per relation" },
-]
-target = "pbfhogg"
-profile = "release"
-hotpath_features = ["hotpath"]
-alloc_features = ["hotpath-alloc"]
-params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
-params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the input PBF variant" }
-params.direct-io = { choices = ["yes", "no"], default = "no", help = "refused: this synthetic workload has no O_DIRECT path" }
-params.io-uring = { choices = ["yes", "no"], default = "no", help = "refused: use uring on the merge workload instead" }
-params.compression = { validated = true, help = "refused: use compressions on write or merge instead" }
-params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END" }
-params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print each child's captured output" }
-params.compressions = { validated = true, default = "none,zlib:6,zstd:3", help = "codec matrix; bare zlib and zstd become zlib:6 and zstd:3; each value is a separate arm" }
-params.writer = { choices = ["sync", "pipelined"], default = "sync,pipelined", help = "writer matrix; each value is a separate arm and child" }

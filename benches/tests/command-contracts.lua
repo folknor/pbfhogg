@@ -143,9 +143,24 @@ for _, case in ipairs(cases) do
     end)
 end
 
+-- Params a bench does not declare are refused by brokkr's binding, before
+-- any child: the benches carry no refusal-only params of their own.
 for _, case in ipairs({
-    { "geocode-build", { "--io-uring", "yes" }, "no io_uring writer" },
-    { "geocode-build", { "--compression", "none" }, "writes no PBF" },
+    { "geocode-build", { "--io-uring", "yes" } },
+    { "geocode-build", { "--compression", "none" } },
+    { "merge-diffs", { "--osc", "9", "--compression", "none" } },
+    { "merge-diffs", { "--osc", "9", "--direct-io", "no" } },
+    { "tag-select", { "--io-uring", "no" } },
+    { "diff-applied", { "--osc", "9", "--keep-cache", "no" } },
+}) do
+    test(case[1] .. " refuses undeclared " .. case[2][#case[2] - 1], function()
+        local r = invoke(case[1], case[2], {})
+        assert(r.outcome == "refused", r.outcome)
+        assert(#r.calls == 0)
+    end)
+end
+
+for _, case in ipairs({
     { "perturb-pbf", {}, "at least one" },
     { "id-select", { "--add-referenced", "yes", "--invert", "yes" }, "mutually exclusive" },
     { "copy-pbf", { "--dedupe", "yes", "--clean", "yes" }, "takes neither" },
@@ -153,7 +168,6 @@ for _, case in ipairs({
     { "tag-select", { "--omit-referenced", "yes", "--jobs", "2" }, "--omit-referenced refuses" },
     { "tag-select", { "--input-kind", "osc", "--input", "9", "--remove-tags", "yes" }, "OSC input refuses" },
     { "file-info", { "--mode", "metadata", "--jobs", "2" }, "--jobs requires" },
-    { "merge-diffs", { "--osc", "9", "--compression", "none" }, "writes OSC" },
 }) do
     test(case[1] .. " refuses invalid combination " .. case[3], function()
         local r = invoke(case[1], case[2], {})

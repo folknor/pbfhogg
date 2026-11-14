@@ -134,8 +134,8 @@ fn file_type(file: &File) -> Option<std::fs::FileType> {
 /// * Linux only, the platform whose semantics this is verified against.
 ///
 /// Before this, `PbfWriter::to_path` onto `/dev/null`, a FIFO or a pipe wrote
-/// every byte successfully and then failed `flush()` with `EINVAL`, and
-/// `bench-write` hid that by dropping its writer instead of flushing it.
+/// every byte successfully and then failed `flush()` with `EINVAL`, and the
+/// write benchmark hid that by dropping its writer instead of flushing it.
 ///
 /// `file_type` is only called once the errno is `EINVAL`, so every other
 /// failure propagates without an extra `fstat`; it returns `None` when `fstat`
@@ -264,8 +264,8 @@ mod tests {
     }
 
     /// `/dev/null` cannot be synchronized; the write to it succeeded, so
-    /// `sync()` must not report a failure. This is the target `bench-write`
-    /// writes to.
+    /// `sync()` must not report a failure. This is the discard sink the
+    /// library harness's `encode-*` scenarios write to.
     #[cfg(target_os = "linux")]
     #[test]
     fn sync_on_dev_null_succeeds() {

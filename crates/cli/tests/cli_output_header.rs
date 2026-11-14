@@ -348,8 +348,6 @@ const NO_PBF_HEADER: &[(&str, &str)] = &[
     ("digest", "prints a digest"),
     ("inspect", "prints a report"),
     ("check", "prints findings"),
-    ("bench-read", "reads only"),
-    ("bench-write", "encodes into a byte sink, not an output"),
     ("export", "writes GeoJSON"),
     ("diff", "writes text or OSC"),
     ("merge-changes", "writes OSC"),
@@ -741,12 +739,6 @@ const ROWS: &[Row] = &[
                 Outcome::Refused
             }
         },
-    },
-    Row {
-        command: "bench-merge",
-        label: "bench-merge",
-        build: |fx, f| simple(fx, "bench-merge", &[fx.path(f), fx.osc()], &[]),
-        expect: |f| sorted_only(f, Exp::merged(f)),
     },
 ];
 
@@ -1156,8 +1148,11 @@ fn run_fixture(fixture: Fixture) {
 #[test]
 fn every_subcommand_is_in_the_table_or_writes_no_pbf_header() {
     let commands = subcommands();
+    // A guard against reading an empty or partial tree, not a count.
     assert!(
-        commands.len() >= 20,
+        ["cat", "apply-changes", "build-geocode-index"]
+            .iter()
+            .all(|name| commands.iter().any(|c| c == name)),
         "the clap tree lists only {commands:?}"
     );
     let mut problems = Vec::new();

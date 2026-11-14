@@ -283,16 +283,6 @@ const NO_OUTPUT: &[(&str, &str, &[&str])] = &[
         "prints its findings on stdout, exit code only with --quiet",
         &["check", "--refs"],
     ),
-    (
-        "bench-read",
-        "reads and reports counters on stderr",
-        &["bench-read", "--mode", "pipelined"],
-    ),
-    (
-        "bench-write",
-        "encodes into /dev/null, a byte sink the benchmark discards, not an output",
-        &["bench-write"],
-    ),
 ];
 
 const ROWS: &[Row] = &[
@@ -474,15 +464,6 @@ const ROWS: &[Row] = &[
         command: "merge-changes",
         label: "merge-changes (one input)",
         build: merge_changes_one_input,
-        kind: Kind::File,
-        tmp_dir: false,
-        ok_codes: &[0],
-        gaps: &[],
-    },
-    Row {
-        command: "bench-merge",
-        label: "bench-merge",
-        build: bench_merge,
         kind: Kind::File,
         tmp_dir: false,
         ok_codes: &[0],
@@ -685,14 +666,6 @@ fn merge_changes_one_input(c: &Ctx, i: Input) -> Invocation {
     Invocation::new(&["merge-changes"])
         .arg(c.fx.osc(i))
         .out("-o", c.out.join("merged.osc"))
-}
-
-fn bench_merge(c: &Ctx, i: Input) -> Invocation {
-    let (base, osc) = base_and_osc(c, i);
-    Invocation::new(&["bench-merge"])
-        .arg(base)
-        .arg(osc)
-        .out("-o", pbf_out(c))
 }
 
 fn build_geocode_index(c: &Ctx, i: Input) -> Invocation {
@@ -1411,8 +1384,11 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
     let mut tree = pbfhogg_cli::cli_command();
     tree.build();
     let commands = subcommands();
+    // A guard against reading an empty or partial tree, not a count.
     assert!(
-        commands.len() >= 20,
+        ["cat", "apply-changes", "build-geocode-index"]
+            .iter()
+            .all(|name| commands.iter().any(|c| c == name)),
         "the clap tree lists only {commands:?}"
     );
     let mut problems = Vec::new();

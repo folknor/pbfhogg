@@ -325,7 +325,6 @@ const ROWS: &[Row] = &[
     row("time-filter", "time-filter", time_filter),
     row("time-filter", "time-filter (history)", time_filter_history),
     row("apply-changes", "apply-changes", apply_changes),
-    row("bench-merge", "bench-merge", bench_merge),
     // An index with nothing queryable in it is refused on purpose (exit 2);
     // what this row pins is that the header-only file is read, not held
     // against indexdata first.
@@ -367,13 +366,6 @@ const ROWS: &[Row] = &[
         ok_codes: &[0, 1],
         ..row("check", "check --index", check_index)
     },
-    row("bench-read", "bench-read", bench_read),
-    row(
-        "bench-read",
-        "bench-read --mode blobreader",
-        bench_read_blobreader,
-    ),
-    row("bench-write", "bench-write", bench_write),
 ];
 
 fn out_pbf(c: &Ctx) -> PathBuf {
@@ -661,14 +653,6 @@ fn apply_changes(c: &Ctx, input: &Path) -> Invocation {
         .arg(out_pbf(c))
 }
 
-fn bench_merge(c: &Ctx, input: &Path) -> Invocation {
-    Invocation::new(&["bench-merge"])
-        .arg(input)
-        .arg(c.fx.path("good.osc"))
-        .arg("-o")
-        .arg(out_pbf(c))
-}
-
 fn geocode(c: &Ctx, input: &Path) -> Invocation {
     Invocation::new(&["build-geocode-index"])
         .arg(input)
@@ -748,22 +732,6 @@ fn check_refs(_: &Ctx, input: &Path) -> Invocation {
 
 fn check_index(_: &Ctx, input: &Path) -> Invocation {
     Invocation::new(&["check"]).arg(input).arg("--index")
-}
-
-fn bench_read(_: &Ctx, input: &Path) -> Invocation {
-    Invocation::new(&["bench-read"])
-        .arg(input)
-        .words(&["--mode", "sequential"])
-}
-
-fn bench_read_blobreader(_: &Ctx, input: &Path) -> Invocation {
-    Invocation::new(&["bench-read"])
-        .arg(input)
-        .words(&["--mode", "blobreader"])
-}
-
-fn bench_write(_: &Ctx, input: &Path) -> Invocation {
-    Invocation::new(&["bench-write"]).arg(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -1936,8 +1904,11 @@ fn mixed_holds(
 #[test]
 fn every_subcommand_is_in_the_table_or_reads_no_pbf() {
     let commands = subcommands();
+    // A guard against reading an empty or partial tree, not a count.
     assert!(
-        commands.len() >= 20,
+        ["cat", "apply-changes", "build-geocode-index"]
+            .iter()
+            .all(|name| commands.iter().any(|c| c == name)),
         "the clap tree lists only {commands:?}"
     );
     let mut problems = Vec::new();

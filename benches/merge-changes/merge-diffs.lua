@@ -4,8 +4,8 @@
 -- Snapshot selection uses its own OSC table, without primary fallback.
 -- --simplify yes keeps the last change per object; no retains every change.
 -- Output and declared spill scratch live under host scratch's
--- bench-iterations, isolated per iteration. OSC output has no PBF compression
--- or I/O modes. The PBF-only typed --variant has no role in this workload.
+-- bench-iterations, isolated per iteration. The PBF-only typed --variant
+-- has no role in this workload.
 -- Profiling and marker stops combine; stopped output is not a complete OSC.
 -- Build overrides, commits and iteration counts belong to the bench runner.
 --
@@ -17,10 +17,6 @@ local profiling = require("profiling")
 
 function validate(params)
     if #params.osc == 0 then fail("--osc must select at least one sequence") end
-    if params["direct-io"] == "yes" or params["io-uring"] == "yes" then
-        fail("merge-changes has no O_DIRECT or io_uring path")
-    end
-    if params.compression then fail("merge-changes writes OSC, not PBF; compression is unsupported") end
     stops.resolve(params.stop)
 end
 

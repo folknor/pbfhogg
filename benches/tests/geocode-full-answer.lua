@@ -15,7 +15,7 @@ local function invoke(omit, replacement, extra)
     end
     if extra then lines[#lines + 1] = extra end
     return run {
-        bench = "geocode-query", program = "pbfhogg", host = host,
+        bench = "geocode-query", program = "pbfhogg-bench", host = host,
         params = { "--dataset", "fixture", "--queries", "2", "--rounds", "2" },
         files = { [project_root .. "/data/fixture.pbf"] = "" },
         calls = { {}, { stderr = table.concat(lines, "\n") .. "\n" } },

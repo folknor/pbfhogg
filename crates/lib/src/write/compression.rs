@@ -40,9 +40,8 @@ pub enum Compression {
 impl Default for Compression {
     fn default() -> Self {
         // The parser's bare "zlib" resolves to this value, and every CLI
-        // compression default (bench-write included) is spelled "zlib", so
-        // the write benchmark measures the level commands write. OSC gzip
-        // uses a separate level-1 policy; it does not consume this setting.
+        // compression default is spelled "zlib". OSC gzip uses a separate
+        // level-1 policy; it does not consume this setting.
         Compression::Zlib(6)
     }
 }

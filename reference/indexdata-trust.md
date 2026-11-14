@@ -402,8 +402,9 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   observation; each input of a multi-input command is judged alone. The
   public library constructors (`BlobReader::new`, `new_named`,
   `from_path`, `open`, `ElementReader::new`, `from_path`, and the like) are
-  not armed: pbfhogg as a library reads any file, and the CLI's
-  `bench-read` and `bench-write` read through them on purpose.
+  not armed: pbfhogg as a library reads any file, and the library
+  harness's `decode-*` and `encode-*` scenarios read through them on
+  purpose.
 - **Exempt, each at its call site with its reason**: `cat` in every mode,
   the remedy (plain `cat` indexes every blob that lacks indexdata, `--type`
   decodes such a blob and filters its actual elements, `--dedupe`'s first

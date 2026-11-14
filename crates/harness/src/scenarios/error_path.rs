@@ -5,7 +5,7 @@
 use super::{Scenario, account, assertion};
 use crate::protocol::Outcome;
 use crate::runner::{CallRecord, Done, Observation};
-use crate::workload::{CallPlan, InputRole, Recipe, Workload, cat};
+use crate::workload::{CallPlan, Expect, ExpectedError, InputRole, Recipe, Workload, cat};
 use pbfhogg::{Decision, Effect};
 
 pub(crate) struct ErrorPath;
@@ -18,11 +18,10 @@ impl Scenario for ErrorPath {
             120,
         );
         w.inputs = vec![InputRole::generated("bad-input", Recipe::EmptyFile)];
-        w.calls = vec![CallPlan::plain(
-            "a",
-            "cat bad-input -> out",
-            cat(&["bad-input"], "out"),
-        )];
+        w.calls = vec![
+            CallPlan::plain("a", "cat bad-input -> out", cat(&["bad-input"], "out"))
+                .expecting(Expect::Error(ExpectedError::MissingHeader)),
+        ];
         w.assertions = vec![assertion(
             "a.refused",
             Some("a"),

@@ -496,69 +496,6 @@ fn full_scan_min_blobs_exists_only_in_test_hooks_builds() {
     assert_eq!(present, cfg!(pbfhogg_test_hooks));
 }
 
-/// Public readers discard diagnostics unless the CLI explicitly attaches its
-/// handle. Benchmark commands must retain the same malformed-index warning as
-/// commands that construct their readers through the host.
-#[test]
-fn bench_commands_report_unrecognised_indexdata() {
-    let invocation_scratch = pbfhogg_test_scratch::scratch();
-    let dir = crate::common::test_scratch();
-    let path = dir.path().join("bad-indexdata.osm.pbf");
-    crate::common::write_bad_indexdata_pbf(&path);
-    let input = path.as_os_str();
-    // Parallel map/reduce and the unfiltered pipeline have always skipped
-    // indexdata parsing. Keep that fast path, including its lack of a warning.
-    for (mode, warnings) in [
-        ("sequential", 1),
-        ("parallel", 0),
-        ("pipelined", 0),
-        ("blobreader", 1),
-    ] {
-        let out = CliInvoker::new(&invocation_scratch)
-            .args([
-                std::ffi::OsStr::new("bench-read"),
-                input,
-                std::ffi::OsStr::new("--mode"),
-                std::ffi::OsStr::new(mode),
-            ])
-            .assert_success();
-        let stderr = out.stderr_str();
-        assert_eq!(
-            stderr
-                .matches("indexdata has an unrecognised length")
-                .count(),
-            warnings,
-            "bench-read {mode}: {stderr}"
-        );
-        if mode == "blobreader" {
-            // The warning names the file and the byte offset of the data
-            // blob whose header carries the bad indexdata.
-            assert!(
-                stderr.contains("bad-indexdata.osm.pbf") && stderr.contains("at byte offset"),
-                "bench-read {mode}: {stderr}"
-            );
-        }
-    }
-    for mode in ["sync", "pipelined"] {
-        let out = CliInvoker::new(&invocation_scratch)
-            .args([
-                std::ffi::OsStr::new("bench-write"),
-                input,
-                std::ffi::OsStr::new("--writer"),
-                std::ffi::OsStr::new(mode),
-            ])
-            .assert_success();
-        let stderr = out.stderr_str();
-        assert_eq!(
-            stderr
-                .matches("indexdata has an unrecognised length")
-                .count(),
-            1,
-            "bench-write {mode}: {stderr}"
-        );
-    }
-}
-
 /// Which string reference of the fixture points past its block's string
 /// table.
 #[derive(Clone, Copy)]
@@ -714,29 +651,6 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
         .args(["--clean", "user"])
         .run();
     assert_refused(&out, role_needle, "cat --clean user, bad role");
-}
-
-/// The bench-write instrument refuses a bad role under both writers instead
-/// of encoding an empty one: a revision whose role decoding fails does less
-/// work and must never complete as a faster run.
-#[test]
-fn bench_write_refuses_a_bad_role_string_index() {
-    let invocation_scratch = pbfhogg_test_scratch::scratch();
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("bad-role.osm.pbf");
-    write_bad_string_pbf(&input, BadString::Role, false);
-    for mode in ["sync", "pipelined"] {
-        let out = CliInvoker::new(&invocation_scratch)
-            .arg("bench-write")
-            .arg(&input)
-            .args(["--writer", mode])
-            .run();
-        assert_refused(
-            &out,
-            "relation 1 member 0: role string index 9",
-            &format!("bench-write --writer {mode}"),
-        );
-    }
 }
 
 /// `cat --clean user` drops the user, so it never resolves it: a file with an

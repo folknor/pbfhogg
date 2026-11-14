@@ -6,7 +6,7 @@
 -- record.meta.diff_pair = raw-vs-indexed. Text always suppresses common
 -- lines. For fixed warm/cold text paths use diff-text or diff-unindexed.
 -- Files live under host scratch's bench-iterations and are reclaimed after
--- each iteration. Cache reuse is refused until persistent files exist.
+-- each iteration, so the merged output is never reused (merged_cache miss).
 -- --osc is typed --osc-seq; omitted binds the sole scoped entry via
 -- default_only, refusing zero or multiple entries. No base fallback.
 --
@@ -17,12 +17,6 @@ local expect = require("expect")
 
 function validate(params)
     diff.validate(params)
-    if params["keep-cache"] == "yes" then
-        fail("--keep-cache yes needs persistent merged outputs; iteration files are reclaimed")
-    end
-    if params["io-uring"] == "yes" or params.compression then
-        fail("diff accepts neither io_uring nor compression; merge preparation uses defaults")
-    end
 end
 
 function bench(params, keys)

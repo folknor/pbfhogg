@@ -12,8 +12,8 @@
 -- are resolved before validate(), without conditional parameter binding.
 -- Snapshots use their own OSC table, just as the typed command does.
 -- --filter takes one whole readable expression, commas included. The built
--- revision remains the grammar authority. io_uring is refused, matching the
--- typed runner. Features, commit selection and counts belong to the runner.
+-- revision remains the grammar authority. Features, commit selection and
+-- counts belong to the runner.
 --
 --   brokkr bench --dry-run tag-select --filter 'w/highway=primary,secondary'
 --   brokkr bench --alloc tag-select --input-kind osc --input 4705 --jobs 2
@@ -27,7 +27,6 @@ function validate(params)
     if type(expr) ~= "string" or expr:sub(1, 1) == "-" or expr:find("%z") then
         fail("filter must be a string without NUL and must not start with '-'")
     end
-    if params["io-uring"] == "yes" then fail("tags-filter has no io_uring writer") end
     if params["input-kind"] == "osc" then
         if params["omit-referenced"] == "yes" or params["invert-match"] == "yes"
             or params["remove-tags"] == "yes" or params["direct-io"] == "yes"

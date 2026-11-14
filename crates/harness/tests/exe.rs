@@ -238,7 +238,7 @@ fn repeat_cat_runs_to_the_protocol() {
     }
     let scenario = run.doc("scenario.json");
     let results = scenario["assertions"].as_array().expect("results");
-    assert_eq!(results.len(), 2);
+    assert_eq!(results.len(), 3);
     assert!(results.iter().all(|r| r["status"] == "pass"), "{scenario}");
 }
 
@@ -511,6 +511,39 @@ fn bench_mode_refuses_a_scenario_whose_variant_was_not_handed_over() {
     let (_run, ran) = bench_launch("repeat-cat", &input, &[]);
     assert_eq!(ran.status.code(), Some(2), "{}", ran.status);
     assert!(ran.stdout.is_empty() && ran.stderr.is_empty());
+}
+
+/// A bench launch fails (exit 1, nothing on stdout or stderr) when a call
+/// ends other than its plan expects: a header-less input must not time as
+/// a fast success. Planned errors stay part of the workload (the
+/// seeded-replace launch above exits 0 with its refusing call).
+#[test]
+#[allow(clippy::disallowed_methods)] // fixtures in test scratch
+fn bench_mode_fails_a_call_that_ends_other_than_planned() {
+    let (_keep, input) = input();
+    for scenario in ["decode-sequential", "encode-pipelined-zstd-3"] {
+        let (_run, ran) = bench_launch(scenario, &input, &["indexed"]);
+        assert_eq!(ran.status.code(), Some(0), "{scenario}: {}", ran.status);
+        assert!(ran.stdout.is_empty() && ran.stderr.is_empty());
+    }
+    let scratch = crate::common::test_scratch();
+    let empty = scratch
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join("empty.osm.pbf");
+    std::fs::write(&empty, b"").expect("empty input");
+    for scenario in [
+        "decode-sequential",
+        "decode-blobreader",
+        "encode-sync-none",
+        "encode-pipelined-zstd-3",
+        "hotpath-cat",
+    ] {
+        let (_run, ran) = bench_launch(scenario, &empty, &["indexed"]);
+        assert_eq!(ran.status.code(), Some(1), "{scenario}: {}", ran.status);
+        assert!(ran.stdout.is_empty() && ran.stderr.is_empty());
+    }
 }
 
 #[test]

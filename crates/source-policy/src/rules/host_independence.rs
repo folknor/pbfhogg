@@ -158,6 +158,12 @@ pub const CONSTRUCTORS: &[Constructor] = &[
         count: 1,
     },
     Constructor {
+        file: "crates/bench/tests/exe.rs",
+        owner: "spawn",
+        program: "EXE",
+        count: 1,
+    },
+    Constructor {
         file: "crates/harness/tests/nofile.rs",
         owner: "real_descriptor_contract_in_restricted_child",
         program: r#"std::env::current_exe().expect("test executable")"#,
@@ -199,6 +205,11 @@ pub const EXE_CONSTS: &[ExeConst] = &[
         file: "crates/harness/tests/exe.rs",
         name: "EXE",
         var: "CARGO_BIN_EXE_pbfhogg-harness",
+    },
+    ExeConst {
+        file: "crates/bench/tests/exe.rs",
+        name: "EXE",
+        var: "CARGO_BIN_EXE_pbfhogg-bench",
     },
 ];
 

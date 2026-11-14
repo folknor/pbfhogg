@@ -13,6 +13,7 @@ mod nofile;
 mod page_cache;
 mod repeat_cat;
 mod seeded_replace;
+mod synthetic;
 
 use crate::protocol::{AssertionDecl, Outcome, ScenarioDecl};
 use crate::runner::{CallRecord, Observation};
@@ -25,6 +26,10 @@ use pbfhogg::{Decision, Effect};
 /// dropped an event over its budget.
 pub(crate) const DIAGNOSTICS_CLOSED: &str = "call-diagnostics-closed";
 
+/// The scenario-level assertion every scenario carries: every call ended
+/// as its plan's `expect` says. The bench holds the same rule by its exit.
+pub(crate) const CALLS_AS_PLANNED: &str = "calls-ended-as-planned";
+
 /// One scenario: its workload, and a fresh observation of one run.
 pub(crate) trait Scenario {
     fn workload(&self) -> Workload;
@@ -34,7 +39,7 @@ pub(crate) trait Scenario {
 /// Every scenario, in describe order. The executable registry test runs each
 /// declaration using its dataset, generated and seeded role descriptions.
 pub(crate) fn all() -> Vec<Box<dyn Scenario>> {
-    vec![
+    let fixed: Vec<Box<dyn Scenario>> = vec![
         Box::new(repeat_cat::RepeatCat),
         Box::new(concurrent_cat::ConcurrentCat),
         Box::new(executor::FixedResourcesExecutor),
@@ -47,7 +52,11 @@ pub(crate) fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(seeded_replace::SeededReplace),
         Box::new(page_cache::PageCacheKeep),
         Box::new(hotpath_cat::HotpathCat),
-    ]
+    ];
+    let synthetic = synthetic::all()
+        .into_iter()
+        .map(|arm| Box::new(arm) as Box<dyn Scenario>);
+    fixed.into_iter().chain(synthetic).collect()
 }
 
 /// The scenario named `id`.
@@ -58,12 +67,34 @@ pub(crate) fn find(id: &str) -> Option<Box<dyn Scenario>> {
 /// A workload's full declaration, the shared assertions included.
 pub(crate) fn declared(workload: &Workload) -> ScenarioDecl {
     let mut decl = workload.decl();
-    decl.assertions.push(AssertionDecl {
-        id: DIAGNOSTICS_CLOSED,
-        call: None,
-        covers: &[],
-    });
+    for id in [DIAGNOSTICS_CLOSED, CALLS_AS_PLANNED] {
+        decl.assertions.push(AssertionDecl {
+            id,
+            call: None,
+            covers: &[],
+        });
+    }
     decl
+}
+
+/// Every call whose record ended other than its plan expects, one line
+/// each; empty when all ended as planned. Matched by call id, so a
+/// concurrent schedule's order cannot matter.
+pub(crate) fn unplanned_endings(workload: &Workload, records: &[CallRecord]) -> String {
+    let mut lines = Vec::new();
+    for call in &workload.calls {
+        match records.iter().find(|r| r.id == call.id) {
+            Some(record) if call.expect.matches(&record.outcome) => {}
+            Some(record) => lines.push(format!(
+                "call {}: planned {:?}, ended {}",
+                call.id,
+                call.expect,
+                record.outcome.to_json()
+            )),
+            None => lines.push(format!("call {}: no record", call.id)),
+        }
+    }
+    lines.join("; ")
 }
 
 /// The call published exactly once, `decision`, its one member `role` with

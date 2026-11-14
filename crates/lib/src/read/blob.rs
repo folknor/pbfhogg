@@ -626,8 +626,8 @@ impl<R: Read + Send> BlobReader<R> {
     /// check with no allocation, element walk or I/O. By source estimate,
     /// not measurement, it is milliseconds on planet's 51k frames and tens
     /// of milliseconds on a europe walk of about 522k; no planet benchmark
-    /// resolves it, and `bench-read` cannot see it at all, since it opens
-    /// through the unarmed public constructors.
+    /// resolves it, and the harness's `decode-*` scenarios cannot see it at
+    /// all, since they open through the unarmed public constructors.
     pub(crate) fn set_parse_indexdata(&mut self, enable: bool) {
         self.frames.fields.indexdata = enable;
     }

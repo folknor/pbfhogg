@@ -32,9 +32,6 @@ The binary is called `pbfhogg`. Requires the Rust version named by `rust-version
 | `merge-changes` | Merge multiple OSC files into one |
 | `build-geocode-index` | Build reverse geocoding index (S2 cells, mmap-ready) |
 
-The benchmark instruments `bench-read`, `bench-write` and `bench-merge` are
-commands too.
-
 ## Flags
 
 `pbfhogg <command> --help` lists a command's flags. [Commands](./commands.md)

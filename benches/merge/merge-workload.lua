@@ -1,10 +1,11 @@
 -- merge-workload: typed merge's synthetic workload, without cache preparation.
--- Builds the pbfhogg-cli package's pbfhogg bin, not an example or harness.
--- Each selected matrix value is an arm with one child, except --uring yes,
--- which runs buffered then uring children on the same build for merge.
--- Uses the child's own library workload; no command-layer substitute.
--- Child elapsed_ms is retained separately; the measured child's wall is
--- the iteration result, not the typed runner's self-reported wall.
+-- Builds the pbfhogg-bench package's instruments and runs their merge, the
+-- library's apply-changes merge; a --commit before that package existed
+-- fails at the build. Each selected matrix value is an arm with one child,
+-- except --uring yes, which runs buffered then uring children on the same
+-- build for merge. Child elapsed_ms (which stops where publication begins)
+-- is retained separately; the measured child's wall, publication included,
+-- is the iteration result.
 -- Outputs and staging live under host scratch's bench-iterations directory.
 -- Stops return a stopped verdict; their outputs are incomplete.
 -- Build overrides, commits and iteration counts belong to the bench runner.
@@ -38,7 +39,7 @@ function bench(params)
         -- Only one child per iteration can supply the measured wall.
         options.measured = mode == "buffered"
         local r = binary_with(options,
-            "bench-merge", params.variant.file, params["osc-seq"][1].file,
+            "merge", params.variant.file, params["osc-seq"][1].file,
             { output = out, compression = compression.parse(params.compressions),
               ["io-mode"] = mode, ["staging-dir"] = scratch(mode) }):ok()
         local cell = workload.result(r, params)

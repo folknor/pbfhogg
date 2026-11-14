@@ -5,7 +5,7 @@ local function invoke(name, args, calls)
     for _, arg in ipairs(args) do params[#params + 1] = arg end
     local files = { [DATA .. "base.pbf"] = "" }
     if name == "merge-workload" then files[DATA .. "9.osc.gz"] = "" end
-    return run { bench = name, program = "pbfhogg", params = params,
+    return run { bench = name, program = "pbfhogg-bench", params = params,
         host = { datasets = { fixture = {
             pbf = { indexed = { file = "base.pbf" } }, osc = { ["9"] = { file = "9.osc.gz" } },
         } } }, files = files, calls = calls }
@@ -17,11 +17,7 @@ local function has(argv, key, value)
     return false
 end
 local cases = {
-    { name = "decode-workload", command = "bench-read", args = { "--modes", "pipelined" },
-        flags = { { "--mode", "pipelined" } } },
-    { name = "encode-workload", command = "bench-write", args = { "--writer", "pipelined", "--compressions", "zstd" },
-        flags = { { "--writer", "pipelined" }, { "--compression", "zstd:3" } } },
-    { name = "merge-workload", command = "bench-merge", args = { "--osc-seq", "9", "--compressions", "zlib" },
+    { name = "merge-workload", command = "merge", args = { "--osc-seq", "9", "--compressions", "zlib" },
         flags = { { "--io-mode", "buffered" }, { "--compression", "zlib" }, { "--staging-dir" } }, out = "buffered.osm.pbf" },
 }
 for _, case in ipairs(cases) do
@@ -66,12 +62,11 @@ for _, case in ipairs(cases) do
         local cell = case.out and r.record.cells[1] or r.record.child
         assert(cell.stopped_at == "WORK_POINT" and cell.elapsed_ms == nil and cell.output_bytes == nil)
     end)
-    test(case.name .. " refuses unsupported direct I/O before children", function()
+    test(case.name .. " refuses an undeclared direct I/O param before children", function()
         local args = { table.unpack(case.args) }
-        args[#args + 1] = "--direct-io"; args[#args + 1] = "yes"
+        args[#args + 1] = "--direct-io"; args[#args + 1] = "no"
         local r = invoke(case.name, args, {})
         assert(r.outcome == "refused" and #r.calls == 0)
-        assert(r.reason:find("do not support --direct-io", 1, true), r.reason)
     end)
 end
 

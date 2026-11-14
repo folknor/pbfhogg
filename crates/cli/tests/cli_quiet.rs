@@ -370,36 +370,6 @@ fn a_quiet_run_leaves_a_stdout_report_alone() {
     }
 }
 
-/// The bench commands' key=value blocks are left as they are: brokkr reads
-/// them. Nothing else reaches stderr.
-#[test]
-fn a_quiet_bench_run_keeps_its_key_value_block() {
-    let fx = Fx::new();
-    let commands: [&[&str]; 2] = [
-        &["bench-read", "--mode", "pipelined", "@base.osm.pbf"],
-        &["bench-write", "@base.osm.pbf"],
-    ];
-    for words in commands {
-        let out = run(&quiet(&fx.args(words), false));
-        let stderr = out.stderr_str();
-        assert!(out.status.success(), "{words:?}: {stderr}");
-        for key in ["elapsed_ms=", "nodes=300", "ways=40", "relations=5"] {
-            assert!(
-                stderr.lines().any(|line| line.starts_with(key)),
-                "{words:?}: -q dropped {key}; stderr:\n{stderr}"
-            );
-        }
-        for line in stderr.lines() {
-            assert!(
-                line.split_once('=').is_some_and(|(key, _)| key
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b == b'_')),
-                "{words:?}: a quiet bench run printed {line:?}"
-            );
-        }
-    }
-}
-
 /// `getid -v` with `-q` is refused (see `cli_flag_contract`); without `-q`
 /// the verbose lists still print, and a quiet `getid` prints nothing.
 #[test]

@@ -10,8 +10,8 @@ use super::{Scenario, account, assertion, installed_ok};
 use crate::protocol::Outcome;
 use crate::runner::{CallRecord, Done, Observation};
 use crate::workload::{
-    CLEAN_NONE, CallPlan, Command, Initial, InputRole, Inputs, OutputPlan, WRITE, Workload,
-    no_overrides,
+    CLEAN_NONE, CallPlan, Command, Expect, ExpectedError, Initial, InputRole, Inputs, OutputPlan,
+    WRITE, Workload, no_overrides,
 };
 use pbfhogg::Overwrite;
 
@@ -50,7 +50,8 @@ impl Scenario for SeededReplace {
                 "refuse",
                 "cat input -> out-refuse, refusing its seed",
                 onto_seed("out-refuse", Overwrite::Refuse),
-            ),
+            )
+            .expecting(Expect::Error(ExpectedError::Output)),
         ];
         w.assertions = vec![
             assertion("replace.outcome", Some("replace"), &["output.replace.v1"]),

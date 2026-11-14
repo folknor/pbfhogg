@@ -1,0 +1,62 @@
+[package]
+name = "pbfhogg-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmark instruments over pbfhogg's public library API"
+rust-version.workspace = true
+authors.workspace = true
+# Not published: built from the tested tree by brokkr bench. Its instruments
+# are measuring tools, kept out of the user-facing pbfhogg binary.
+publish = false
+# Targets are declared, never discovered, as in the other members.
+autotests = false
+autobins = false
+autoexamples = false
+autobenches = false
+
+# The instruments. Unit tests (the geocode point set, passes and digest) run
+# in the bin's own test target.
+[[bin]]
+name = "pbfhogg-bench"
+path = "src/main.rs"
+
+# Every test that drives the executable, as one binary: cargo builds it with
+# this test build's features and hands its path as CARGO_BIN_EXE_pbfhogg-bench
+# only to this package's tests.
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[features]
+default = []
+# No-op: the lib dep below always pulls in `pbfhogg/commands`; the feature
+# exists so a sweep can name `commands` for every package it selects.
+commands = []
+# The benches' --hotpath and --alloc build with these. `hotpath-alloc`
+# implies the package's own `hotpath`, so the profiling guard and its test
+# exist in both shapes.
+hotpath = ["pbfhogg/hotpath"]
+hotpath-alloc = ["hotpath", "pbfhogg/hotpath-alloc"]
+linux-direct-io = ["pbfhogg/linux-direct-io"]
+linux-io-uring = ["pbfhogg/linux-io-uring"]
+
+[dependencies]
+pbfhogg = { version = "0.6", path = "../lib", default-features = false, features = ["commands"] }
+clap = { version = "4.6.1", features = ["derive"] }
+hotpath = "0.31.0"
+# sigwait and pthread_sigmask for SIGINT and SIGTERM (src/signals.rs).
+libc = "0.2.191"
+
+[dev-dependencies]
+pbfhogg-test-scratch = { path = "../test-scratch" }
+serde_json.workspace = true
+# What the mounted crates/lib/tests/common needs.
+tempfile = "3.27.0"
+rayon = "1.12.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+zstd = "0.14.0"
+
+[lints]
+workspace = true

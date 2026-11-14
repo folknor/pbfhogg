@@ -58,7 +58,7 @@
 # changes, so one run per check is the whole of it.
 [[check]]
 name = "all"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
@@ -84,7 +84,7 @@ parallel = {}
 # lane may not skip them there, so the gate carries no serial guarantee.
 [[check]]
 name = "all-serial"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 only = ["serial::"]
@@ -142,7 +142,7 @@ parallel = {}
 # musl sweeps below retain executable coverage until that support exists.
 [[check]]
 name = "musl"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 target = "x86_64-unknown-linux-musl"
 parallel = {}
 
@@ -182,12 +182,14 @@ features = ["linux-direct-io", "linux-io-uring"]
 profile = "release"
 parallel = {}
 
-# The profiling lane: the harness and CLI suites built with each profiling
-# feature. Both executables profile only when HOTPATH_OUTPUT_PATH asks, so
-# every unprofiled test checks an instrumented build quiet, under the
-# promise guard; describe ignores a profiling request; a profiled launch
-# writes a report naming library functions (crates/harness/tests/exe.rs,
-# crates/cli/tests/cli_profiling.rs). Gate only.
+# The profiling lane: the harness, CLI and bench-instrument suites built with
+# each profiling feature. The executables profile only when
+# HOTPATH_OUTPUT_PATH asks, so every unprofiled test checks an instrumented
+# build quiet, under the promise guard; describe ignores a profiling request;
+# a profiled launch writes a report naming library functions, and a
+# SIGTERM-stopped instrument still writes its report
+# (crates/harness/tests/exe.rs, crates/cli/tests/cli_profiling.rs,
+# crates/bench/tests/exe.rs). Gate only.
 [[check]]
 name = "harness-hotpath"
 packages = ["pbfhogg-harness"]
@@ -212,6 +214,18 @@ packages = ["pbfhogg-cli"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
 parallel = {}
 
+[[check]]
+name = "bench-hotpath"
+packages = ["pbfhogg-bench"]
+features = ["hotpath", "linux-direct-io", "linux-io-uring"]
+parallel = {}
+
+[[check]]
+name = "bench-hotpath-alloc"
+packages = ["pbfhogg-bench"]
+features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
+parallel = {}
+
 # Compile and lint-only shapes the tested sweeps cannot carry, run by the
 # gate. The profiling features over every package, so the CLI's instrumented
 # build, its counting allocator and the code behind cfg(feature = "hotpath")
@@ -219,13 +233,13 @@ parallel = {}
 # package, but the hotpath crate expands differently under each, so both.
 [[lint_sweep]]
 name = "hotpath"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["hotpath", "linux-direct-io", "linux-io-uring"]
 when = "gate"
 
 [[lint_sweep]]
 name = "hotpath-alloc"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
 when = "gate"
 
@@ -235,7 +249,7 @@ when = "gate"
 # feature would otherwise escape both; it fails to compile here.
 [[lint_sweep]]
 name = "musl-hotpath-alloc"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
@@ -247,21 +261,21 @@ when = "gate"
 # sweeps that build the backends are.
 [[lint_sweep]]
 name = "direct-io-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-direct-io"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 when = "gate"
 
 [[lint_sweep]]
 name = "io-uring-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 when = "gate"
 
 [[lint_sweep]]
 name = "musl-direct-io-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-direct-io"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
@@ -269,7 +283,7 @@ when = "gate"
 
 [[lint_sweep]]
 name = "musl-io-uring-only"
-packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify"]
+packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "x86_64-unknown-linux-musl"
@@ -409,13 +423,13 @@ skip = ["serial::"]
 # reference/testing.md "Platform-dependent tests").
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc", "bench-hotpath", "bench-hotpath-alloc"]
 env = {PBFHOGG_TEST_REQUIRE = "direct-io,promise-guard" }
 
 # The profiling lane alone, for work on the harness or the instrumentation.
 [test.profiles.profiling]
-description = "The harness and CLI suites built with each profiling feature"
-sweeps = ["harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc"]
+description = "The harness, CLI and bench-instrument suites built with each profiling feature"
+sweeps = ["harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc", "bench-hotpath", "bench-hotpath-alloc"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

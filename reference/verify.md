@@ -67,7 +67,10 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
 - Real-data verification runs on denmark and germany only. Every
   dataset-backed input is refused for any other dataset; planet and the
   continents are bench-only. The policy is keyed on the dataset name, never
-  inferred from file size.
+  inferred from file size. Germany is the scale upper bound: on it the
+  osmium sort reference was OOM-killed, OPL decodings filled scratch and
+  renumber met far more orphans than on denmark. A new region is a
+  one-line change to the list in `crates/verify/src/main.rs`.
 - `--input PATH` names a fixture PBF instead (relative to the project root).
   It exempts only that PBF, never a dataset-resolved OSC or base.
 

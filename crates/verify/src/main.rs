@@ -339,7 +339,14 @@ fn executable(path: &Path) -> Result<PathBuf, Error> {
 /// The datasets real-data verification runs on. Project policy keyed on the
 /// dataset name, the identity the rule is stated in; a region's size class
 /// is never inferred from its bytes. Planet and continents are bench-only.
-/// Widening this list is the maintainer's decision.
+///
+/// Decided by the maintainer: the list stays a name list, with no size
+/// limit and no other home for the policy (a per-dataset key in the host
+/// config was rejected because brokkr refuses unknown dataset keys).
+/// Germany is the scale upper bound, and on germany real runs surfaced
+/// problems denmark did not: the osmium sort reference was OOM-killed, OPL
+/// decodings filled scratch, and renumber met a far larger orphan volume.
+/// More regions are not expected; a new one is a one-line change here.
 const ELIGIBLE_DATASETS: &[&str] = &["denmark", "germany"];
 
 /// Refuse a dataset-backed input from a dataset outside

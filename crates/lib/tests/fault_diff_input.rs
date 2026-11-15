@@ -151,6 +151,7 @@ fn run(
             new,
             route.type_filter(),
             parallelism,
+            false,
             route.direct,
             host,
         )?;
@@ -161,6 +162,7 @@ fn run(
         verbose: false,
         type_filter: route.type_filter(),
         parallelism,
+        locations: false,
     };
     let mut text = Vec::new();
     let stats = pbfhogg::diff::diff(old, new, &mut text, &options, route.direct, host)?;

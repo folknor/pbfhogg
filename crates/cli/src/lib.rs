@@ -808,6 +808,7 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
         osmium_summary,
         output,
         type_filter,
+        locations,
         format,
         increment_version,
         update_timestamp,
@@ -831,6 +832,8 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
                 (*verbose, "--verbose"),
                 (*osmium_summary, "--osmium-summary"),
                 (type_filter.is_some(), "--type"),
+                // OSC cannot carry a way-coordinate change.
+                (*locations, "--locations"),
             ] {
                 if set {
                     return refuse(&format!("{flag} is not valid with --format osc"));
@@ -1287,6 +1290,7 @@ impl From<DefaultTypeArg> for ElementKind {
 enum DigestForm {
     Full,
     Content,
+    ContentLocations,
 }
 
 impl From<DigestForm> for pbfhogg::digest::Form {
@@ -1294,6 +1298,7 @@ impl From<DigestForm> for pbfhogg::digest::Form {
         match arg {
             DigestForm::Full => Self::Full,
             DigestForm::Content => Self::Content,
+            DigestForm::ContentLocations => Self::ContentLocations,
         }
     }
 }
@@ -1776,6 +1781,11 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
+        /// Also compare inline LocationsOnWays way coordinates, at 1e-7
+        /// degrees. Both inputs must declare LocationsOnWays. Text format
+        /// only
+        #[arg(long = "locations")]
+        locations: bool,
         // Diff's N is the worker count of the block-pair merge over work
         // units streamed from both inputs; their text reaches the output in
         // unit order. It needs both inputs indexed; unindexed, the run uses
@@ -1803,13 +1813,15 @@ enum Command {
         #[command(flatten)]
         io: DirectIoArg,
     },
-    /// Print a digest of a PBF, in full (default) or content form.
+    /// Print a digest of a PBF, in full (default) or a content form.
     ///
-    /// `--form full` (`v2`): two files get the same digest exactly when they
+    /// `--form full`: two files get the same digest exactly when they
     /// have the same header and the same elements field for field, metadata,
     /// way coordinates and declared prepass fields included. `--form
-    /// content` (`v1`): exactly when `diff --suppress-common` reports them
-    /// identical. Either is independent of compression, blob boundaries,
+    /// content`: exactly when `diff --suppress-common` reports them
+    /// identical. `--form content-locations`: exactly when `diff --locations
+    /// --suppress-common` does; refuses a file not declaring LocationsOnWays.
+    /// Each is independent of compression, blob boundaries,
     /// string-table order and indexdata. Prints `xxh128 vN HEX`, then
     /// `node|way|relation COUNT HEX` per kind. Refuses, printing nothing,
     /// unsorted input, out-of-order or duplicate IDs, mixed blocks, partial
@@ -1818,7 +1830,8 @@ enum Command {
     Digest {
         /// Input PBF file
         file: PathBuf,
-        /// Canonical form: `full` (v2) or `content` (v1, diff's equality)
+        /// Canonical form: `full`, `content` (diff's equality) or
+        /// `content-locations` (diff --locations' equality)
         #[arg(long, value_enum, default_value_t = DigestForm::Full)]
         form: DigestForm,
         #[command(flatten)]
@@ -2427,6 +2440,7 @@ struct DiffFlags {
     verbose: bool,
     osmium_summary: bool,
     quiet: bool,
+    locations: bool,
 }
 
 /// The geocode index's S2 levels and search radii. The three `u8` levels
@@ -3003,6 +3017,7 @@ pub fn run() -> process::ExitCode {
                     output,
                     overwrite,
                     type_filter,
+                    locations,
                     jobs,
                     format,
                     increment_version,
@@ -3041,6 +3056,7 @@ pub fn run() -> process::ExitCode {
                             verbose,
                             osmium_summary,
                             quiet,
+                            locations,
                         };
                         // A text diff writes no scratch.
                         let output = overwrite.open(output.as_deref(), &host)?;
@@ -4418,6 +4434,7 @@ fn run_diff(
         verbose,
         osmium_summary,
         quiet,
+        locations,
     } = flags;
 
     let options = pbfhogg::diff::DiffOptions {
@@ -4425,11 +4442,20 @@ fn run_diff(
         verbose,
         type_filter,
         parallelism,
+        locations,
     };
     let stats = if quiet {
         // The answer is the exit code: count, formatting nothing.
         // `validate_diff` refused every flag that shapes the text.
-        pbfhogg::diff::diff_stats(old, new, type_filter, parallelism, direct_io, host)?
+        pbfhogg::diff::diff_stats(
+            old,
+            new,
+            type_filter,
+            parallelism,
+            locations,
+            direct_io,
+            host,
+        )?
     } else if let Some(output) = output {
         let output = output.bind(&host.invocation)?;
         let mut out = output.writer()?;

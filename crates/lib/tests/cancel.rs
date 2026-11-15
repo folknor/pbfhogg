@@ -240,6 +240,7 @@ fn diff_parallel(
             verbose: false,
             type_filter: None,
             parallelism: pbfhogg::Parallelism::from_jobs(2),
+            locations: false,
         },
         false,
         host,

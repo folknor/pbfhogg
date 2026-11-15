@@ -4,6 +4,17 @@
 
 ### Added
 
+- **`diff --locations`** also compares inline `LocationsOnWays` way
+  coordinates: a way whose tags and refs match but whose location list
+  differs (in length, or at any position at 1e-7 degrees, truncated toward
+  zero as libosmium reads it) is modified, and `-v` prints each differing
+  position. Both inputs must declare `LocationsOnWays`; refused with
+  `--format osc`. Applies to `-q`. **`digest --form content-locations`**
+  (`v4`) is its digest: equal exactly when `diff --locations -c` reports the
+  files identical. Together they compare the inline coordinates of two
+  producers (pbfhogg and osmium `add-locations-to-ways`, say) without their
+  metadata or header. Library: `DiffOptions::locations`, a new `locations`
+  argument to `diff::diff_stats`, and `digest::Form::ContentLocations`.
 - **`cat --repair`** rewrites a file every other command refuses for a
   repeated `Info` or `DenseInfo` (`Node.info appears twice with data` and
   its kin) into a valid one, merging each as protobuf merges a repeated

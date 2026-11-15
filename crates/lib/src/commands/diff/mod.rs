@@ -19,7 +19,6 @@ mod seq;
 mod units;
 
 use super::Result;
-use super::input_front::sorted_and_indexed;
 use crate::Element;
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
@@ -53,9 +52,22 @@ pub struct DiffOptions {
     /// `n`; `Auto` uses one per core the host reports (one when it reports
     /// none). The answer is the same at any count.
     pub parallelism: crate::host::Parallelism,
+    /// Compare inline `LocationsOnWays` way coordinates too (`--locations`):
+    /// a way whose tags and refs match but whose location list differs at
+    /// decimicrodegrees is modified. Both inputs must declare
+    /// `LocationsOnWays`, else the run is refused before it reads elements.
+    pub locations: bool,
 }
 
 impl DiffOptions {
+    fn relation(&self) -> crate::content::Relation {
+        if self.locations {
+            crate::content::Relation::ContentLocations
+        } else {
+            crate::content::Relation::Content
+        }
+    }
+
     /// The worker count this run uses: the fixed count, else one per core.
     fn workers(&self, host: &crate::host::Entered<'_>) -> usize {
         resolve_workers(self.parallelism, host)
@@ -174,7 +186,8 @@ pub fn diff<'a, 'b>(
 /// any text.
 ///
 /// The comparison is the one [`diff`] runs with `suppress_common` on,
-/// `verbose` off and the same `type_filter` and `parallelism`: the same
+/// `verbose` off and the same `type_filter`, `parallelism` and `locations`
+/// (see [`DiffOptions::locations`]): the same
 /// paths (parallel work units for indexed inputs, the sequential fallback
 /// otherwise) and the same input checks. Like `diff -c`, it skips a fresh
 /// pair of byte-equal blobs without decoding it, so `common` counts such a
@@ -190,6 +203,7 @@ pub fn diff_stats<'a, 'b>(
     new: impl Into<InputSource<'b>>,
     type_filter: Option<TypeFilter>,
     parallelism: crate::host::Parallelism,
+    locations: bool,
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
@@ -201,6 +215,7 @@ pub fn diff_stats<'a, 'b>(
         verbose: false,
         type_filter,
         parallelism,
+        locations,
     };
     let jobs = options.workers(host);
     let [old, new] = pin_pair(old.into(), new.into(), host)?;
@@ -239,9 +254,24 @@ fn compare<W: Write>(
     let filter = TypeFilter::or_all(options.type_filter);
     let (old_path, new_path) = (old.path(), new.path());
 
-    // Sorted headers + indexdata from one front read of each input.
-    let (old_sorted, old_indexed) = sorted_and_indexed(old, direct_io, host)?;
-    let (new_sorted, new_indexed) = sorted_and_indexed(new, direct_io, host)?;
+    // Sorted headers, the LocationsOnWays claim and indexdata from one front
+    // read of each input.
+    let (old_sorted, old_locations, old_indexed) = front_facts(old, direct_io, host)?;
+    let (new_sorted, new_locations, new_indexed) = front_facts(new, direct_io, host)?;
+    if options.locations {
+        for (declared, path, label) in [
+            (old_locations, old_path, "Old PBF"),
+            (new_locations, new_path, "New PBF"),
+        ] {
+            if !declared {
+                return Err(crate::Error::invalid_argument(format!(
+                    "{label} {} does not declare LocationsOnWays; a diff comparing inline way \
+                     coordinates needs both inputs to declare them",
+                    path.display()
+                )));
+            }
+        }
+    }
     super::require_sorted(
         old_sorted,
         old_path,
@@ -277,6 +307,21 @@ fn compare<W: Write>(
         diff_element_stream(old, new, output, options, direct_io, &filter, host)?
     };
     Ok(finish_scan(stats, &host.invocation))
+}
+
+/// One front read of an input: whether its header claims
+/// `Sort.Type_then_ID`, whether it declares `LocationsOnWays`, and the
+/// indexdata hint.
+fn front_facts(
+    input: &PinnedInput,
+    direct_io: bool,
+    host: &crate::host::Entered<'_>,
+) -> Result<(bool, bool, bool)> {
+    let mut front = super::input_front::InputFront::open(input, direct_io, host)?;
+    let sorted = front.is_sorted()?;
+    let locations = front.header()?.has_locations_on_ways();
+    let indexed = front.indexed()?;
+    Ok((sorted, locations, indexed))
 }
 
 /// Close the scan: the end marker and the result counters, on every path.
@@ -447,6 +492,11 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
                     write_modified_line(out, type_char, element_id(old), old_ver, new_ver)?;
                     if self.options.verbose {
                         write_modified_details_borrowed(out, old, new)?;
+                        if self.options.locations
+                            && let (Element::Way(ow), Element::Way(nw)) = (old, new)
+                        {
+                            write_way_location_details(out, ow, nw)?;
+                        }
                     }
                 }
                 self.stats.modified += 1;
@@ -465,6 +515,10 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
             }
         }
         Ok(())
+    }
+
+    fn relation(&self) -> crate::content::Relation {
+        self.options.relation()
     }
 }
 
@@ -597,6 +651,10 @@ impl TextUnitSink<'_> {
 impl units::UnitSink for TextUnitSink<'_> {
     type Item = Vec<u8>;
     type Stats = DiffStats;
+
+    fn relation(&self) -> crate::content::Relation {
+        self.sink.options.relation()
+    }
 
     /// An action is formatted whole into the local buffer, then every full
     /// chunk-size piece is copied out into its own allocation and handed
@@ -933,6 +991,69 @@ fn write_way_details_borrowed(
     Ok(())
 }
 
+/// `diff --locations -v`: one line per ref position whose inline location
+/// differs, naming the ref on each side and its coordinates, or `absent`
+/// where a side has no location there (a list shorter than the other, or
+/// none at all). Positions run to the longest of both sides' refs and
+/// location lists, so a missing list never hides a position.
+fn write_way_location_details(
+    output: &mut dyn Write,
+    old: &crate::Way<'_>,
+    new: &crate::Way<'_>,
+) -> Result<()> {
+    let old_refs: Vec<i64> = old.refs().collect();
+    let new_refs: Vec<i64> = new.refs().collect();
+    let old_locs: Vec<(i64, i64)> = crate::content::way_locations(old).collect();
+    let new_locs: Vec<(i64, i64)> = crate::content::way_locations(new).collect();
+    let positions = old_refs
+        .len()
+        .max(new_refs.len())
+        .max(old_locs.len())
+        .max(new_locs.len());
+    let differing: Vec<usize> = (0..positions)
+        .filter(|&i| old_locs.get(i) != new_locs.get(i))
+        .collect();
+    if differing.is_empty() {
+        return Ok(());
+    }
+    if differing.len() > crate::tunables::VERBOSE_SEQUENCE_DIFF_MAX_EDITS {
+        writeln!(
+            output,
+            "  locations: {} of {positions} positions differ (details omitted)",
+            differing.len()
+        )?;
+        return Ok(());
+    }
+    let side = |refs: &[i64], locs: &[(i64, i64)], i: usize| {
+        let r = refs
+            .get(i)
+            .map_or_else(|| "-".to_owned(), |r| format!("n{r}"));
+        let l = locs.get(i).map_or_else(
+            || "absent".to_owned(),
+            |&(lat, lon)| format!("({}, {})", format_e7(lat), format_e7(lon)),
+        );
+        format!("{r} {l}")
+    };
+    for i in differing {
+        writeln!(
+            output,
+            "  location {i}: {} -> {}",
+            side(&old_refs, &old_locs, i),
+            side(&new_refs, &new_locs, i)
+        )?;
+    }
+    Ok(())
+}
+
+/// A decimicrodegree value as exact decimal degrees, seven places, in
+/// integer arithmetic: an `i64` far outside the geographic domain prints as
+/// what it is, never aliased or rounded.
+fn format_e7(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let a = v.unsigned_abs();
+    format!("{sign}{}.{:07}", a / 10_000_000, a % 10_000_000)
+}
+
 fn write_relation_details_borrowed(
     output: &mut dyn Write,
     old: &crate::Relation<'_>,
@@ -1195,6 +1316,7 @@ mod text_unit_sink_tests {
             verbose: false,
             type_filter: None,
             parallelism: crate::host::Parallelism::from_jobs(1),
+            locations: false,
         }
     }
 

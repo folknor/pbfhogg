@@ -16,6 +16,8 @@
 //!   tags in stored order.
 //! - **way:** the tags in stored order, then the node refs in order.
 //!   `LocationsOnWays` coordinates are not content: they are derived data.
+//!   [`Relation::ContentLocations`] is the opt-in relation that adds them,
+//!   for comparing two `LocationsOnWays` producers.
 //! - **relation:** the tags in stored order, then the members in order, each
 //!   as (member id including its type, role).
 //!
@@ -49,7 +51,8 @@
 //!
 //! Changing what is content, or how [`write_record`] serializes it, changes
 //! what `digest --form content` prints: give `digest::Form::Content` a new,
-//! never-used version number with it.
+//! never-used version number with it. The same holds for
+//! [`Relation::ContentLocations`] and `digest::Form::ContentLocations`.
 //!
 //! # The full form
 //!
@@ -116,6 +119,49 @@ pub(crate) enum Token<'a> {
 pub(crate) trait Content {
     fn content_kind(&self) -> ElementKind;
     fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>>;
+}
+
+/// Which equality a comparison decides "common" by.
+///
+/// [`Relation::Content`] is [`content_equal`]: way coordinates are not
+/// content. [`Relation::ContentLocations`] (`diff --locations`, `digest
+/// --form content-locations`) is content equality plus, for ways, equal
+/// inline location lists: the same number of entries (a way with no list
+/// has zero, so an absent list differs from a populated one) and, position
+/// by position, the same latitude and longitude normalized to
+/// decimicrodegrees. The normalization divides the exact nanodegree value
+/// by 100 in `i64`, truncating toward zero as libosmium's decoder does, so
+/// two producers writing at different granularities compare at osmium's
+/// resolution and no out-of-domain value aliases through a narrowing cast.
+/// It compares stored values, not their validity: libosmium's undefined
+/// location (`i32::MAX` on both axes) is a value like any other, and
+/// whether a coordinate matches its node is `check --locations`' question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relation {
+    Content,
+    ContentLocations,
+}
+
+impl Relation {
+    /// Whether `a` and `b` are "common" under this relation.
+    #[inline]
+    pub(crate) fn equal(self, a: &Element<'_>, b: &Element<'_>) -> bool {
+        content_equal(a, b)
+            && match (self, a, b) {
+                (Relation::ContentLocations, Element::Way(a), Element::Way(b)) => {
+                    way_locations(a).eq(way_locations(b))
+                }
+                _ => true,
+            }
+    }
+}
+
+/// A way's inline locations as (lat, lon) in decimicrodegrees, `i64`,
+/// truncated toward zero: the one normalization [`Relation::ContentLocations`]
+/// and its digest record use.
+pub(crate) fn way_locations<'a>(w: &crate::Way<'a>) -> impl Iterator<Item = (i64, i64)> + use<'a> {
+    w.node_locations()
+        .map(|l| (l.nano_lat() / 100, l.nano_lon() / 100))
 }
 
 /// Content equality, the relation `diff` reports as "common".
@@ -258,13 +304,26 @@ const MEMBER_WAY: u8 = 0x01;
 const MEMBER_RELATION: u8 = 0x02;
 const MEMBER_UNKNOWN: u8 = 0x03;
 
-/// Append one element's canonical record to `out`: kind byte, id as
-/// little-endian i64, every content token, end byte. Integers are fixed-width
-/// little-endian; strings are a little-endian u32 byte length then the bytes.
+/// A way's location list in [`Relation::ContentLocations`] records: this
+/// byte, the entry count as u64, then each entry's lat and lon as i64
+/// decimicrodegrees ([`way_locations`]). Written for every way, a zero count
+/// included, so the record stays uniquely parseable.
+const TOKEN_LOCATION_LIST: u8 = 0x19;
+
+/// Append one element's canonical record under `relation` to `out`: kind
+/// byte, id as little-endian i64, every content token, under
+/// [`Relation::ContentLocations`] a way's [`TOKEN_LOCATION_LIST`], then the
+/// end byte. Integers are fixed-width little-endian; strings are a
+/// little-endian u32 byte length then the bytes.
 ///
 /// Fails on the first token lookup failure, leaving `out` partially written;
 /// the caller discards it.
-pub(crate) fn write_record(element: &Element<'_>, id: i64, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn write_record(
+    element: &Element<'_>,
+    id: i64,
+    relation: Relation,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     out.push(match element.content_kind() {
         ElementKind::Node => KIND_NODE,
         ElementKind::Way => KIND_WAY,
@@ -285,6 +344,18 @@ pub(crate) fn write_record(element: &Element<'_>, id: i64, out: &mut Vec<u8>) ->
             }
             Token::Member { id, role } => write_member(out, id, role)?,
         }
+    }
+    if let (Relation::ContentLocations, Element::Way(w)) = (relation, element) {
+        out.push(TOKEN_LOCATION_LIST);
+        let count_at = out.len();
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let mut count: u64 = 0;
+        for (lat, lon) in way_locations(w) {
+            out.extend_from_slice(&lat.to_le_bytes());
+            out.extend_from_slice(&lon.to_le_bytes());
+            count += 1;
+        }
+        out[count_at..count_at + 8].copy_from_slice(&count.to_le_bytes());
     }
     out.push(RECORD_END);
     Ok(())

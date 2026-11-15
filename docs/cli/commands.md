@@ -1608,9 +1608,11 @@ geometry are skipped and reported in the stderr summary.
 
 ### diff
 
-Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
+Compare two PBF files and show differences. Uses content equality (node coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#diff-content-equality-vs-version-ordering)). Inline `LocationsOnWays` way coordinates are not content by default: two files whose ways differ only in them are identical.
 
-With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
+With `--locations`, a way whose tags and refs match is also modified when its inline location list differs: a different number of entries (a way carrying no list has none, so a missing list differs from a present one), or any position whose latitude or longitude differs at 1e-7 degrees. Each coordinate is the exact decoded nanodegree value divided by 100 and truncated toward zero, the resolution and rounding libosmium uses, so two producers writing at different granularities compare equal where osmium would read the same location, and values below 1e-7 are not compared. Stored values are compared, not their validity: an undefined location (libosmium writes `2147483647` on both axes) is a value like any other, and whether an inline coordinate matches its node is [`check --locations`](#inline-location-verification)' question. Both inputs must declare `LocationsOnWays` in their header, else the run is refused (exit `2`) before any element is compared, whatever `-t` selects. A byte-identical blob pair is still skipped where the comparison may skip equal blobs, since identical bytes decode to identical locations. `--locations` applies to `-q` and `-c` alike and is refused with `--format osc`, which cannot express a way-coordinate change. Under `-v`, a modified way also prints `location i: n<ref> (lat, lon) -> n<ref> (lat, lon)` for each zero-based position whose location differs, with `absent` for a side holding no location there and `-` for a side holding no ref there, coordinates as exact seven-place decimal degrees; more than 1000 such positions print `locations: K of N positions differ (details omitted)` instead.
+
+With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-t`, `--locations`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
 
 With the global [`-q, --quiet`](#quiet) a text diff prints nothing, neither the diff text nor its summary: the exit code is the answer (`0` identical, `1` different). It compares exactly as a text diff without `-c` does (same paths and refusals) but formats nothing. `-o`, `-c`, `-v` and `-s`, which only shape that text or its summary, are refused with it, and so is `--tmp-dir`. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
@@ -1630,6 +1632,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)). Requires `-o` |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
+| `--locations` | Also compare inline `LocationsOnWays` way coordinates at 1e-7 degrees; both inputs must declare `LocationsOnWays` (text only, see above) |
 | `-j, --jobs <N>` | Worker threads for the comparison of indexed inputs (see [Worker threads](#worker-threads)). `0` (default) uses one per core. Each input is read once, as one sequential stream, and cut into work units by ID range that the workers merge; the text reaches the output in order as the run goes. The answer is the same at any `-j`. Applies to both text and `--format osc` |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
@@ -1653,10 +1656,11 @@ before comparing again.
 
 ### digest
 
-Print a digest of a PBF, in one of two canonical forms. Both are independent of compression, blob boundaries, string-table order, granularity and offsets, and indexdata presence. They differ in what they cover, and so in the equality they answer:
+Print a digest of a PBF, in one of three canonical forms. All are independent of compression, blob boundaries, string-table order, granularity and offsets, and indexdata presence. They differ in what they cover, and so in the equality they answer:
 
 - **`--form full` (the default, `v3`).** Two files the command accepts get the same digest exactly when they have the same header and the same elements field for field (barring a 128-bit hash collision). It covers element content as below, with coordinates as exact nanodegrees, plus each element's metadata claims (version, millisecond timestamp, changeset, uid, user and `visible`, each claimed or not, as every metadata printing output reads them (the `inspect --extended` coverage census counts available values instead, see [inspect](#inspect)): a plain element's field is claimed when present on the wire, so an absent timestamp, uid or user differs from a present zero or empty one and an absent `visible` from an explicit `true`; a version of 0 or below is never a claim; a dense node's versionless slot claims only values padding cannot hold, a non-zero timestamp, a positive changeset or uid, a non-empty user, `visible` false), `LocationsOnWays` way coordinates wherever a way carries them, the `pbfhogg.SharedNodePins-v1` pins and `pbfhogg.WayMembers-v1` membership of each way where the header declares those features (and only there: they are authoritative nowhere else), and the header: bbox, required and optional features (each as a set, so order and repetition do not matter), writing program, source and the three replication fields, each with its presence. It is no `diff` relation: it is for checking that two writers of one operation agree, metadata and header included. A dense node and a plain one with the same metadata digest alike, except where the two encodings cannot say the same thing (a dense versioned node claims every metadata field its group's `DenseInfo` carries, a changeset of -1 read as 0).
 - **`--form content` (`v1`).** Two files the command accepts get the same digest exactly when `diff --suppress-common` reports them identical: element content only (node coordinates in decimicrodegrees and tags, way tags and refs, relation tags and members), so dense or plain nodes, header fields, metadata and way coordinates do not change it, as diff ignores them. Element content is defined once, in `crates/lib/src/content.rs`, for both commands.
+- **`--form content-locations` (`v4`).** Two files the command accepts get the same digest exactly when `diff --locations --suppress-common` reports them identical: element content as in `content`, plus each way's inline location list as [`diff --locations`](#diff) compares it (entry count, then each position at 1e-7 degrees, truncated toward zero). It refuses, exit `2`, a file whose header does not declare `LocationsOnWays`. It is for comparing the inline coordinates of two `LocationsOnWays` producers, such as pbfhogg's and osmium's `add-locations-to-ways` output, without their metadata or header.
 
 ```
 pbfhogg digest [OPTIONS] <FILE>
@@ -1664,7 +1668,7 @@ pbfhogg digest [OPTIONS] <FILE>
 
 | Flag | Description |
 |------|-------------|
-| `--form <FORM>` | Canonical form: `full` (default, `v3`) or `content` (`v1`, diff's equality) |
+| `--form <FORM>` | Canonical form: `full` (default, `v3`), `content` (`v1`, diff's equality) or `content-locations` (`v4`, `diff --locations`' equality) |
 | `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 
 Output, on stdout:
@@ -1678,7 +1682,7 @@ relation <count> <32 hex digits>
 
 The first line names the algorithm and the form's version. A version names one canonical form and is never reused: a change to a form's definition or serialization gives it a new number, so a stored digest is only comparable with one of the same version. The per-kind lines digest each kind alone, so a mismatch shows which kind differs. In the full form the header is folded into the first line only, so a first line that differs while every kind line matches is a header difference.
 
-The command refuses, in either form, exiting non-zero and printing no digest line, any input on which diff's answer is not a function of element content:
+The command refuses, in every form, exiting non-zero and printing no digest line, any input on which diff's answer is not a function of element content:
 
 - no `OsmHeader` as the first blob, a second `OsmHeader`, or a blob of unknown type;
 - a header that does not claim `Sort.Type_then_ID`;

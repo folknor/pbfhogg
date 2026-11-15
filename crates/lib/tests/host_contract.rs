@@ -1460,6 +1460,7 @@ fn diff_writes_no_scratch_at_any_worker_count() {
                 verbose,
                 type_filter: None,
                 parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+                locations: false,
             };
             let mut text = Vec::new();
             pbfhogg::diff::diff(
@@ -1484,6 +1485,7 @@ fn diff_writes_no_scratch_at_any_worker_count() {
             &changed,
             None,
             pbfhogg::Parallelism::from_jobs(jobs),
+            false,
             false,
             &crate::common::test_host(),
         )

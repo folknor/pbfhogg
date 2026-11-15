@@ -169,10 +169,13 @@ CRC over content plus `timestamp` (always) and `changeset/uid/user` (unless
 output when inputs have mismatched or absent metadata
 ([osmium-tool#93](https://github.com/osmcode/osmium-tool/issues/93)).
 
-**pbfhogg behavior:** Compares elements field by field - coordinates, tags, refs,
-members. Metadata (version, timestamp, changeset, uid, user) is ignored entirely.
+**pbfhogg behavior:** Compares elements field by field - node coordinates, tags,
+refs, members. Metadata (version, timestamp, changeset, uid, user) is ignored entirely.
 Two elements with the same type+ID are "same" if and only if their content is
-identical.
+identical. Inline `LocationsOnWays` way coordinates are not content by default,
+while osmium's CRC folds each way node's location in when the file carries it;
+`diff --locations` adds them, at osmium's 1e-7 degree resolution, for inputs
+that both declare `LocationsOnWays`.
 
 **Cross-validation:** 14-element discrepancy out of 59.1M on Denmark. These are
 elements where osmium's version-based comparison disagrees with content comparison

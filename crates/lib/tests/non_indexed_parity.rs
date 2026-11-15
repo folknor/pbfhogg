@@ -758,6 +758,7 @@ fn diff_text(old: &Path, new: &Path) -> String {
             verbose: true,
             type_filter: None,
             parallelism: pbfhogg::Parallelism::from_jobs(1),
+            locations: false,
         },
         false,
         &crate::common::test_host(),

@@ -977,6 +977,176 @@ fn full_digest_is_independent_of_encoding() {
     assert_eq!(want, full_ok(&reordered), "feature order and repetition");
 }
 
+/// `diff --locations` exit code over the counting path (`-q`) or the text
+/// path (`-c`), at `jobs` workers.
+fn diff_locations_code(old: &Path, new: &Path, jobs: usize, quiet: bool) -> Option<i32> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let cli = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("--locations")
+        .arg(old)
+        .arg(new)
+        .arg("-j")
+        .arg(jobs.to_string());
+    let cli = if quiet {
+        cli.arg("--quiet")
+    } else {
+        cli.arg("-c")
+    };
+    cli.run().status.code()
+}
+
+/// `diff --locations` and `digest --form content-locations` answer one
+/// relation: content plus each way's inline location list. A stored-state
+/// difference (one coordinate, a missing list, an undefined location against
+/// a defined one) moves both and nothing else sees it; identical lists,
+/// undefined values included, compare equal whatever the encoding, on the
+/// indexed and unindexed routes, counting and printing alike.
+#[test]
+fn content_locations_agrees_with_diff_locations() {
+    const UNDEFINED: i32 = i32::MAX;
+    type Mutate = fn(&mut FullFixture);
+    // (name, differs from the base under --locations)
+    let variants: Vec<(&str, bool, Mutate)> = vec![
+        ("same locations, other metadata", false, |f| {
+            f.way_meta = None;
+            f.source = None;
+        }),
+        ("one coordinate", true, |f| {
+            f.locations.as_mut().unwrap()[1].0 += 1;
+        }),
+        ("one longitude", true, |f| {
+            f.locations.as_mut().unwrap()[2].1 -= 1;
+        }),
+        ("no location list", true, |f| {
+            f.locations = None;
+            f.features = vec![pbfhogg::HeaderBlock::LOCATIONS_ON_WAYS];
+        }),
+        ("an undefined location", true, |f| {
+            f.locations.as_mut().unwrap()[1] = (UNDEFINED, UNDEFINED);
+        }),
+    ];
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let base_unindexed = dir.path().join("base-unindexed.osm.pbf");
+    write_full(&base, &full_fixture(), true, false);
+    write_full(&base_unindexed, &full_fixture(), false, true);
+    let base_digest = digest_ok_in(&base, Some("content-locations"));
+    assert!(
+        base_digest[0].starts_with("xxh128 v4 "),
+        "{}",
+        base_digest[0]
+    );
+    assert_eq!(
+        base_digest,
+        digest_ok_in(&base_unindexed, Some("content-locations")),
+        "independent of indexdata and blob boundaries"
+    );
+    for (i, (name, differs, mutate)) in variants.iter().enumerate() {
+        let mut f = full_fixture();
+        mutate(&mut f);
+        for (route, indexed) in [("indexed", true), ("unindexed", false)] {
+            let path = dir.path().join(format!("variant-{i}-{route}.osm.pbf"));
+            write_full(&path, &f, indexed, false);
+            let other = if indexed { &base } else { &base_unindexed };
+            let want = Some(i32::from(*differs));
+            for jobs in [1, 3] {
+                for quiet in [true, false] {
+                    assert_eq!(
+                        diff_locations_code(other, &path, jobs, quiet),
+                        want,
+                        "{name} ({route}, -j {jobs}, quiet {quiet})"
+                    );
+                }
+            }
+            assert_eq!(
+                digest_ok_in(&path, Some("content-locations")) != base_digest,
+                *differs,
+                "{name} ({route}): the digest agrees with diff --locations"
+            );
+            assert_eq!(
+                diff_code(other, &path, None),
+                Some(0),
+                "{name}: plain diff ignores it"
+            );
+            assert_eq!(
+                digest_ok(&path),
+                digest_ok(&base),
+                "{name}: the content form ignores it"
+            );
+        }
+    }
+
+    // Identical undefined values compare equal.
+    let mut f = full_fixture();
+    f.locations.as_mut().unwrap()[1] = (UNDEFINED, UNDEFINED);
+    let a = dir.path().join("undefined-a.osm.pbf");
+    let b = dir.path().join("undefined-b.osm.pbf");
+    write_full(&a, &f, true, false);
+    write_full(&b, &f, false, true);
+    assert_eq!(diff_locations_code(&a, &b, 3, true), Some(0));
+    assert_eq!(
+        digest_ok_in(&a, Some("content-locations")),
+        digest_ok_in(&b, Some("content-locations"))
+    );
+
+    // -v names the differing position, its refs and both coordinates.
+    let mut f = full_fixture();
+    f.locations.as_mut().unwrap()[1].0 += 1;
+    let moved = dir.path().join("moved.osm.pbf");
+    write_full(&moved, &f, true, false);
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("--locations")
+        .arg("-c")
+        .arg("-v")
+        .arg(&base)
+        .arg(&moved)
+        .run();
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr_str());
+    assert!(
+        out.stdout_str()
+            .contains("  location 1: n2 (0.0000110, 0.0000210) -> n2 (0.0000111, 0.0000210)"),
+        "stdout:\n{}",
+        out.stdout_str()
+    );
+
+    // A file not declaring LocationsOnWays is refused by both.
+    let mut f = full_fixture();
+    f.locations = None;
+    let undeclared = dir.path().join("undeclared.osm.pbf");
+    write_full(&undeclared, &f, true, false);
+    for quiet in [true, false] {
+        assert_eq!(diff_locations_code(&base, &undeclared, 1, quiet), Some(2));
+        assert_eq!(diff_locations_code(&undeclared, &base, 1, quiet), Some(2));
+    }
+    assert_refused_in(
+        &undeclared,
+        "content-locations",
+        "a file not declaring LocationsOnWays",
+    );
+
+    // OSC cannot carry a way-coordinate change.
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("--locations")
+        .arg("--format")
+        .arg("osc")
+        .arg("-o")
+        .arg(dir.path().join("out.osc"))
+        .arg(&base)
+        .arg(&moved)
+        .run();
+    assert_eq!(out.status.code(), Some(64), "{}", out.stderr_str());
+    assert!(
+        out.stderr_str()
+            .contains("--locations is not valid with --format osc"),
+        "{}",
+        out.stderr_str()
+    );
+}
+
 /// The prepass fields are covered per way, so the two altw backends, which
 /// cut their way blobs alike here but run different engines, agree on the
 /// full digest; and a declared WayMembers-v1 file whose way blob lost its

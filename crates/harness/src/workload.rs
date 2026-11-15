@@ -581,7 +581,7 @@ impl Command {
             } => json!({
                 "command": "digest",
                 "inputs": [input],
-                "form": match form { Form::Content => "content", Form::Full => "full" },
+                "form": form.as_str(),
                 "direct_io": direct_io,
                 "host": host,
             }),

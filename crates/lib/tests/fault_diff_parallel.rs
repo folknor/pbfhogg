@@ -85,6 +85,7 @@ fn diff_text(old: &Path, new: &Path, jobs: usize, unit_bytes: usize, verbose: bo
         verbose,
         type_filter: None,
         parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+        locations: false,
     };
     let mut out = Vec::new();
     let stats = diff(old, new, &mut out, &options, false, &host)
@@ -172,6 +173,7 @@ fn diff_run(
         verbose,
         type_filter: None,
         parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+        locations: false,
     };
     let mut out = Vec::new();
     let stats = diff(old, new, &mut out, &options, false, &host).unwrap_or_else(|e| {
@@ -392,6 +394,7 @@ fn fault_injection_diff_unit_panic_surfaces_as_an_error() {
         verbose: false,
         type_filter: None,
         parallelism: pbfhogg::Parallelism::from_jobs(3),
+        locations: false,
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -413,6 +416,7 @@ fn fault_injection_diff_unit_panic_surfaces_as_an_error() {
             &new,
             None,
             pbfhogg::Parallelism::from_jobs(3),
+            false,
             false,
             &host,
         )

@@ -207,6 +207,26 @@ medians the removed in-process unit timing gave on 2026-11-10. The budget
 keeps a worst-case way in low milliseconds; `VERBOSE_SEQUENCE_DIFF_MAX_WORK`
 stays at `1 << 20`.
 
+## Equality relation chosen by the sink (bygg, 2026-11-15, against `a157ad55`)
+
+Adding `diff --locations` moved the same-ID equality decision from a direct
+`content_equal` call to the merge sink's relation (`MergeSink::relation`,
+then `Relation::equal`), so the flag-off path gained one relation read and
+match per equal pair. Matched planet A/B, `diff-pair --from base --to
+20260411`, default text form (`-c`), `--iterations 1`, alternated baseline
+first; baseline cells are `--commit HEAD` builds of `a157ad55`, variant
+cells the uncommitted working tree (stored as dirty).
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `71a4fafa` 1m45s | `704c1c26` 1m46s |
+| 2 | `1b9c5fd2` 1m46s | `9542f237` 1m47s |
+
+The phase split of pair 2 (`sidecar --compare`) puts the node phase at
++0 % and the way phase at +1 %, cores and disk read alike: within noise, so
+the default path is unchanged. The `--locations` path itself was not
+measured.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

@@ -544,6 +544,7 @@ fn diff_blob_layout_independence() {
         verbose: false,
         type_filter: None,
         parallelism: pbfhogg::Parallelism::from_jobs(1),
+        locations: false,
     };
     let diff_stats = |old: &Path, new: &Path| -> pbfhogg::diff::DiffStats {
         let mut sink: Vec<u8> = Vec::new();
@@ -636,6 +637,7 @@ fn diff_stats_matches_text_diff_on_every_path() {
                     verbose: false,
                     type_filter,
                     parallelism,
+                    locations: false,
                 };
                 let text =
                     pbfhogg::diff::diff(&p(old), &p(new), &mut Vec::new(), &options, false, &host)
@@ -646,6 +648,7 @@ fn diff_stats_matches_text_diff_on_every_path() {
                     &p(new),
                     type_filter,
                     parallelism,
+                    false,
                     false,
                     &host,
                 )
@@ -691,6 +694,7 @@ fn an_identical_corrupt_pair_is_skipped_wherever_equal_blobs_may_be() {
                 verbose: false,
                 type_filter: None,
                 parallelism,
+                locations: false,
             };
             pbfhogg::diff::diff(
                 &corrupt,
@@ -906,6 +910,7 @@ fn diff_counts(
         verbose,
         type_filter: Some(type_filter),
         parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+        locations: false,
     };
     let s = pbfhogg::diff::diff(
         &dir.join(old),
@@ -965,6 +970,7 @@ fn diff_type_filter_skip_still_refuses_an_earlier_kind_out_of_order() {
                 verbose,
                 type_filter: Some(type_filter),
                 parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+                locations: false,
             };
             let err = pbfhogg::diff::diff(
                 &p("unsorted.osm.pbf"),

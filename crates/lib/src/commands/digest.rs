@@ -8,6 +8,13 @@
 //!   and indexdata presence all leave it unchanged. What it covers is
 //!   defined in one place, `crate::content`, which is also what every
 //!   `diff` path compares with.
+//! - **[`Form::ContentLocations`] (`v4`).** Content plus each way's inline
+//!   `LocationsOnWays` coordinates normalized to decimicrodegrees: two PBFs
+//!   that this form accepts get the same digest exactly when
+//!   `pbfhogg diff --locations --suppress-common` reports them identical,
+//!   barring a hash collision. Both forms are one relation each of
+//!   `crate::content::Relation`. It refuses a file whose header does not
+//!   declare `LocationsOnWays`, as `diff --locations` does.
 //! - **[`Form::Full`] (`v3`).** Content plus everything a writer states
 //!   about it: metadata with its presence, `visible`, exact coordinates,
 //!   `LocationsOnWays` way coordinates, the declared prepass fields and the
@@ -94,7 +101,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::blob::{Blob, BlobType};
 use crate::blob_meta::BlobIndex;
-use crate::content::{Prepass, write_full_record, write_header_record, write_record};
+use crate::content::{Prepass, Relation, write_full_record, write_header_record, write_record};
 use crate::error::{Error, Location};
 use crate::read::input::InputSource;
 use crate::read::pipeline::DecodeTransform;
@@ -118,6 +125,9 @@ pub enum Form {
     /// Element content, the equality `diff --suppress-common` reports
     /// (`v1`).
     Content,
+    /// Element content plus inline way coordinates at decimicrodegrees, the
+    /// equality `diff --locations --suppress-common` reports (`v4`).
+    ContentLocations,
     /// Content, metadata, way coordinates, declared prepass fields and the
     /// header (`v3`; `v2` read a negative-version dense slot as no
     /// metadata, a dense changeset of -1 as a claim of -1 (now 0), and refused
@@ -133,6 +143,17 @@ impl Form {
         match self {
             Form::Content => 1,
             Form::Full => 3,
+            Form::ContentLocations => 4,
+        }
+    }
+
+    /// The equality relation a record form hashes; `None` for the full
+    /// form, which is no diff relation.
+    const fn relation(self) -> Option<Relation> {
+        match self {
+            Form::Content => Some(Relation::Content),
+            Form::ContentLocations => Some(Relation::ContentLocations),
+            Form::Full => None,
         }
     }
 
@@ -141,6 +162,7 @@ impl Form {
     pub const fn as_str(self) -> &'static str {
         match self {
             Form::Content => "content",
+            Form::ContentLocations => "content-locations",
             Form::Full => "full",
         }
     }
@@ -224,8 +246,15 @@ fn digest_inner(
         )
         .locate(Location::in_file(path)));
     }
+    if form == Form::ContentLocations && !header.has_locations_on_ways() {
+        return Err(Error::invalid_argument(
+            "the content-locations digest covers inline way coordinates, but the header does \
+             not declare LocationsOnWays",
+        )
+        .locate(Location::in_file(path)));
+    }
     let full = match form {
-        Form::Content => None,
+        Form::Content | Form::ContentLocations => None,
         Form::Full => {
             let mut header_record = Vec::new();
             write_header_record(header, &mut header_record)
@@ -241,6 +270,7 @@ fn digest_inner(
     };
     let buffers = Arc::new(RecordBuffers::default());
     let transform = DigestTransform {
+        relation: form.relation().unwrap_or(Relation::Content),
         full: full.as_ref().map(|f| (f.prepass, f.way_members)),
         buffers: Arc::clone(&buffers),
     };
@@ -267,7 +297,9 @@ struct Full {
 /// (domain rule 1) and summarizes each data blob with its indexdata and
 /// provenance, which the ordered consumer checks.
 struct DigestTransform {
-    /// `None` for the content form; the full form's prepass declarations
+    /// The relation a record form hashes; unused by the full form.
+    relation: Relation,
+    /// `None` for the record forms; the full form's prepass declarations
     /// and whether `pbfhogg.WayMembers-v1` is declared.
     full: Option<(Prepass, bool)>,
     buffers: Arc<RecordBuffers>,
@@ -336,7 +368,7 @@ impl DecodeTransform for DigestTransform {
             }
         }
         let records = match self.full {
-            None => Records::Content,
+            None => Records::Content(self.relation),
             Some((prepass, declared)) => Records::Full {
                 prepass,
                 way_members: declared.then(|| blob.way_members_checked()),
@@ -358,7 +390,8 @@ type WayMembers<'b> = (u32, &'b [u8]);
 
 /// Which records a block's elements are serialized as.
 enum Records<'b> {
-    Content,
+    /// A record form, under its relation.
+    Content(Relation),
     Full {
         prepass: Prepass,
         /// `Some` where the header declares `pbfhogg.WayMembers-v1`: the
@@ -475,8 +508,8 @@ fn summarize_block(
     let classified = block_kind(&block)?;
     // The full form's per-block inputs. A way block in a file declaring
     // pbfhogg.WayMembers-v1 needs its field-5 payload (domain rule 5).
-    let full = match records {
-        Records::Content => None,
+    let (relation, full) = match records {
+        Records::Content(relation) => (relation, None),
         Records::Full {
             prepass,
             way_members,
@@ -485,7 +518,7 @@ fn summarize_block(
                 Some(checked) if classified == Some(ElementKind::Way) => Some(checked?),
                 _ => None,
             };
-            Some((prepass, payload))
+            (Relation::Content, Some((prepass, payload)))
         }
     };
     let mut content: Option<BlockContent> = None;
@@ -520,7 +553,7 @@ fn summarize_block(
             )));
         }
         let written = match full {
-            None => write_record(&element, id, &mut c.records),
+            None => write_record(&element, id, relation, &mut c.records),
             Some((prepass, payload)) => {
                 let member = match payload {
                     Some(p) if kind == ElementKind::Way => way_member_bit(p, c.count).map(Some),

@@ -199,11 +199,21 @@ NAME` list each harness in turn to find one test.
   reports such a file: every `.rs` under a member's `tests/` must be
   reachable from a `[[test]]` target that some sweep in `brokkr.d/checks.toml`
   builds, following `mod` declarations, `#[path]` attributes and `cfg` gates
-  evaluated against that sweep's features. Module presence is checked too:
+  evaluated against that sweep's features, target and `--cfg` rustflags.
+  Module presence is checked too:
   every `mod` declaration in a test file, inline modules included, must be
   enabled (its own and its enclosing modules' `cfg` gates true) in at least
   one sweep that builds the file, so a test module gated out of every sweep
-  is reported. It is lexical: it reads source
+  is reported; a disabled declaration with an enabled same-named twin in
+  the file is a platform alternative. Because the executable sweeps follow
+  the host architecture, both requirements must hold on each gate host the
+  audit models, little-endian x86_64 and aarch64 (the promise guard's
+  supported set), never on the checking host alone: a sweep with no
+  `target` or a `{host_arch}` one runs on each, a literal triple only on
+  its own architecture, and any other target shape fails closed. So a
+  module compiled only on x86_64 needs a twin for aarch64, and a
+  file-backed alternative (`#[path]` files chosen by architecture) is
+  refused, since one of its files is unreachable on each host. It is lexical: it reads source
   reachability, not macro expansion or whether a test executes; an external
   `mod` inside an inline module, a `cfg_attr` on a module, or a `cfg` form its
   small evaluator does not know fails closed until the audit is extended.

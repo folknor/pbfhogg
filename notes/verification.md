@@ -70,15 +70,6 @@ or nested include in an included file), and the authoritative composed check is
 composed-configuration parse is ever wanted, which needs a brokkr configuration export
 brokkr does not offer.
 
-## VER-131 - The test-module audit assumes target_arch is x86_64
-
-Reported by the link implementer that moved the musl test sweeps to `{host_arch}`.
-
-`cfg_value` in `crates/source-policy/src/rules/test_modules.rs` evaluates `target_arch` as
-always `x86_64`. The executable musl sweeps now follow the host architecture, so on an
-aarch64 host the test-module audit would judge arch-gated test modules against the wrong
-architecture. No effect on x86_64 hosts.
-
 ## VER-113 - dedupe-pair does not prove its copy path
 
 `diff-unindexed.lua` now probes both fronts before measuring and fails on indexed input.

@@ -4,8 +4,9 @@
 //!
 //! The graph follows `mod` declarations, `#[path]` attributes and `cfg`
 //! gates, evaluated against each sweep in `brokkr.d/checks.toml` (its
-//! feature closure per member manifest, its target environment and its
-//! `--cfg` rustflags), never against this crate's own build. External
+//! feature closure per member manifest, its target and its `--cfg`
+//! rustflags) on each gate host in `PLATFORMS`, never against this crate's
+//! own build, and must hold on every one of them. External
 //! modules must be at file scope; inline modules may contain tests but not
 //! external declarations. Unknown cfg forms, a `cfg_attr` that could add a `cfg`
 //! or `path` (lint-only ones are read past) and a
@@ -56,9 +57,41 @@ pub fn errors(corpus: &Corpus) -> Vec<String> {
 
 // ---- cfg evaluation -------------------------------------------------------
 
-/// The value of a cfg predicate under `features` (features, the target
-/// environment `gnu`/`musl` and the custom cfgs a sweep sets).
-pub fn cfg_value(meta: &Meta, features: &BTreeSet<String>) -> Result<bool, String> {
+/// The hosts the gate is claimed to run on: the executable sweeps follow the
+/// host architecture, so the audit holds on each of these, not on this
+/// crate's own build (a verdict must not depend on the host that checks
+/// it). It is the promise guard's supported set (reference/testing.md);
+/// riscv64 and other architectures are compile-only coverage, where the
+/// guard compiles its cases out by design, not gate hosts.
+pub const PLATFORMS: [Platform; 2] = [
+    Platform {
+        arch: "x86_64",
+        endian: "little",
+    },
+    Platform {
+        arch: "aarch64",
+        endian: "little",
+    },
+];
+
+/// One gate host: the target facts a cfg can read beyond the sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Platform {
+    pub arch: &'static str,
+    pub endian: &'static str,
+}
+
+/// The target one sweep compiles for on one platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub platform: Platform,
+    /// `gnu` or `musl`.
+    pub env: &'static str,
+}
+
+/// The value of a cfg predicate under `features` (features and the custom
+/// cfgs a sweep sets) for `target`.
+pub fn cfg_value(meta: &Meta, features: &BTreeSet<String>, target: Target) -> Result<bool, String> {
     let name = meta
         .path()
         .get_ident()
@@ -73,7 +106,7 @@ pub fn cfg_value(meta: &Meta, features: &BTreeSet<String>) -> Result<bool, Strin
             // unknown syntax is always refused.
             let values = args
                 .iter()
-                .map(|arg| cfg_value(arg, features))
+                .map(|arg| cfg_value(arg, features, target))
                 .collect::<Result<Vec<_>, _>>()?;
             match name.as_str() {
                 "all" => Ok(values.iter().all(|v| *v)),
@@ -97,10 +130,11 @@ pub fn cfg_value(meta: &Meta, features: &BTreeSet<String>) -> Result<bool, Strin
             };
             let value = value.value();
             match name.as_str() {
-                "feature" | "target_env" => Ok(features.contains(&value)),
-                "target_endian" => Ok(value == "little"),
-                "target_arch" => Ok(value == "x86_64"),
-                // The executable sweeps configured by this project are Linux.
+                "feature" => Ok(features.contains(&value)),
+                "target_env" => Ok(value == target.env),
+                "target_endian" => Ok(value == target.platform.endian),
+                "target_arch" => Ok(value == target.platform.arch),
+                // `sweep_target` admits only Linux targets.
                 "target_os" => Ok(value == "linux"),
                 _ => Err(format!("unsupported cfg: {name}")),
             }
@@ -108,10 +142,10 @@ pub fn cfg_value(meta: &Meta, features: &BTreeSet<String>) -> Result<bool, Strin
     }
 }
 
-fn all_true(gates: &[Meta], features: &BTreeSet<String>) -> Result<bool, String> {
+fn all_true(gates: &[Meta], features: &BTreeSet<String>, target: Target) -> Result<bool, String> {
     let values = gates
         .iter()
-        .map(|gate| cfg_value(gate, features))
+        .map(|gate| cfg_value(gate, features, target))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(values.iter().all(|v| *v))
 }
@@ -318,14 +352,14 @@ impl Shapes<'_> {
     }
 
     /// Files reachable from `roots`, skipping those whose inner gates fail.
-    /// With `features` `None`, every gate is taken: the union over every
+    /// With `config` `None`, every gate is taken: the union over every
     /// configuration, whatever cfg forms it uses.
     fn reachable(
         &mut self,
         roots: &[PathBuf],
-        features: Option<&BTreeSet<String>>,
+        config: Option<(&BTreeSet<String>, Target)>,
     ) -> Result<BTreeSet<PathBuf>, String> {
-        let gated = |gates: &[Meta]| features.map_or(Ok(true), |f| all_true(gates, f));
+        let gated = |gates: &[Meta]| config.map_or(Ok(true), |(f, t)| all_true(gates, f, t));
         // (file, owns its directory). A root, a `mod.rs` and a file loaded
         // through `#[path]` own the directory they sit in, so their children
         // are siblings (rustc_expand's module resolution); an ordinary
@@ -393,17 +427,18 @@ impl Shapes<'_> {
 fn presence(
     decls: &[Decl],
     features: &BTreeSet<String>,
+    target: Target,
     active: bool,
     out: &mut Seen,
 ) -> Result<(), String> {
     for decl in decls {
-        let on = all_true(&decl.gates, features)? && active;
+        let on = all_true(&decl.gates, features, target)? && active;
         out.0.insert((decl.line, decl.name.clone()));
         if on {
             out.1.insert((decl.line, decl.name.clone()));
         }
         if let Some(inner) = &decl.inline {
-            presence(inner, features, on, out)?;
+            presence(inner, features, target, on, out)?;
         }
     }
     Ok(())
@@ -494,23 +529,54 @@ fn sweep_features(
     if !clash.is_empty() {
         return Err(format!("feature named like a custom cfg: {clash:?}"));
     }
-    let target = sweep
-        .get("target")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("");
-    features.insert(
-        if target.ends_with("-musl") {
-            "musl"
-        } else {
-            "gnu"
-        }
-        .to_owned(),
-    );
     features.extend(sweep_cfgs(&strings(sweep.get("rustflags")))?);
     Ok(features)
 }
 
+/// The target a sweep's `target` key compiles for on `platform`, or `None`
+/// when it pins another architecture and so earns no coverage there. Only
+/// the shapes modelled are accepted: absent (the host's own GNU target),
+/// or `ARCH-unknown-linux-gnu|musl` where ARCH is `{host_arch}` (brokkr's
+/// template, resolved to the host) or a literal gate-host architecture.
+/// Anything else fails closed, checked before the architecture skip so an
+/// unmodelled target cannot hide behind it.
+pub fn sweep_target(target: Option<&str>, platform: Platform) -> Result<Option<Target>, String> {
+    let Some(triple) = target else {
+        return Ok(Some(Target {
+            platform,
+            env: "gnu",
+        }));
+    };
+    let refused = || format!("unsupported sweep target {triple:?}");
+    let (arch, env) = triple.split_once("-unknown-linux-").ok_or_else(refused)?;
+    let env = match env {
+        "gnu" => "gnu",
+        "musl" => "musl",
+        _ => return Err(refused()),
+    };
+    if arch == "{host_arch}" {
+        return Ok(Some(Target { platform, env }));
+    }
+    if !PLATFORMS.iter().any(|p| p.arch == arch) {
+        return Err(refused());
+    }
+    Ok((arch == platform.arch).then_some(Target { platform, env }))
+}
+
+/// The audit holds on every gate host. Each platform is judged alone, so a
+/// file or module compiled only on another platform is not covered on this
+/// one; the same-name alternative rule applies to declarations, and a
+/// file-backed platform alternative (`#[path]` files chosen by
+/// architecture) is refused, since one of its files is unreachable on
+/// each host.
 fn audit(corpus: &Corpus) -> Result<(), String> {
+    for platform in PLATFORMS {
+        audit_on(corpus, platform).map_err(|e| format!("on {}: {e}", platform.arch))?;
+    }
+    Ok(())
+}
+
+fn audit_on(corpus: &Corpus, platform: Platform) -> Result<(), String> {
     let root = corpus.root.as_path();
     let checks = toml_file(root, "brokkr.d/checks.toml")?;
     let sweeps: Vec<&toml::Table> = checks
@@ -558,6 +624,11 @@ fn audit(corpus: &Corpus) -> Result<(), String> {
             .iter()
             .filter(|s| strings(s.get("packages")).iter().any(|p| p == name))
         {
+            let Some(compiled) =
+                sweep_target(sweep.get("target").and_then(toml::Value::as_str), platform)?
+            else {
+                continue;
+            };
             let features =
                 sweep_features(sweep, manifest_features).map_err(|e| format!("{member}: {e}"))?;
             for target in &targets {
@@ -575,11 +646,19 @@ fn audit(corpus: &Corpus) -> Result<(), String> {
                     .get("path")
                     .and_then(toml::Value::as_str)
                     .map_or_else(|| format!("tests/{target_name}.rs"), str::to_owned);
-                let graph = shapes
-                    .reachable(&[normalize(&root.join(member).join(path))], Some(&features))?;
+                let graph = shapes.reachable(
+                    &[normalize(&root.join(member).join(path))],
+                    Some((&features, compiled)),
+                )?;
                 for file in &graph {
                     let mut seen = (BTreeSet::new(), BTreeSet::new());
-                    presence(&shapes.get(file)?.decls, &features, true, &mut seen)?;
+                    presence(
+                        &shapes.get(file)?.decls,
+                        &features,
+                        compiled,
+                        true,
+                        &mut seen,
+                    )?;
                     enabled.extend(seen.1.into_iter().map(|(l, n)| (file.clone(), l, n)));
                 }
                 covered.extend(graph);
@@ -596,13 +675,34 @@ fn audit(corpus: &Corpus) -> Result<(), String> {
             missing.join("\n")
         ));
     }
+    let declared = declarations(&mut shapes, &found, platform)?;
+    require_module_coverage(&declared, &enabled)
+}
+
+/// Every declaration in `files`, whatever its gates say; the target only
+/// satisfies the evaluator, which still refuses unknown cfg forms.
+fn declarations(
+    shapes: &mut Shapes<'_>,
+    files: &BTreeSet<PathBuf>,
+    platform: Platform,
+) -> Result<BTreeSet<Identity>, String> {
+    let target = Target {
+        platform,
+        env: "gnu",
+    };
     let mut declared = BTreeSet::new();
-    for file in &found {
+    for file in files {
         let mut seen = (BTreeSet::new(), BTreeSet::new());
-        presence(&shapes.get(file)?.decls, &BTreeSet::new(), true, &mut seen)?;
+        presence(
+            &shapes.get(file)?.decls,
+            &BTreeSet::new(),
+            target,
+            true,
+            &mut seen,
+        )?;
         declared.extend(seen.0.into_iter().map(|(l, n)| (file.clone(), l, n)));
     }
-    require_module_coverage(&declared, &enabled)
+    Ok(declared)
 }
 
 #[cfg(test)]
@@ -611,25 +711,105 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Identity, Seen, Shapes, cfg_value, presence, require_module_coverage, shape, sweep_cfgs,
+        Identity, PLATFORMS, Seen, Shapes, Target, cfg_value, presence, require_module_coverage,
+        shape, sweep_cfgs, sweep_target,
     };
     use crate::Corpus;
     use crate::lex::Source;
+
+    const GNU: Target = Target {
+        platform: PLATFORMS[0],
+        env: "gnu",
+    };
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
-    fn cfg(text: &str, features: &[&str]) -> Result<bool, String> {
+    fn cfg_on(text: &str, features: &[&str], target: Target) -> Result<bool, String> {
         let meta = syn::parse_str(text).map_err(|e| e.to_string())?;
-        cfg_value(&meta, &set(features))
+        cfg_value(&meta, &set(features), target)
+    }
+
+    fn cfg(text: &str, features: &[&str]) -> Result<bool, String> {
+        cfg_on(text, features, GNU)
+    }
+
+    fn present_on(src: &str, features: &[&str], target: Target) -> Seen {
+        let shape = shape(&Source::new(src.to_owned())).expect("shape");
+        let mut out = (BTreeSet::new(), BTreeSet::new());
+        presence(&shape.decls, &set(features), target, true, &mut out).expect("presence");
+        out
     }
 
     fn present(src: &str, features: &[&str]) -> Seen {
-        let shape = shape(&Source::new(src.to_owned())).expect("shape");
-        let mut out = (BTreeSet::new(), BTreeSet::new());
-        presence(&shape.decls, &set(features), true, &mut out).expect("presence");
-        out
+        present_on(src, features, GNU)
+    }
+
+    #[test]
+    fn targets_follow_the_platform_and_fail_closed() {
+        let [x86, arm] = PLATFORMS;
+        let on = |t: Option<&str>, p| sweep_target(t, p);
+        assert_eq!(
+            on(None, arm),
+            Ok(Some(Target {
+                platform: arm,
+                env: "gnu"
+            }))
+        );
+        assert_eq!(
+            on(Some("{host_arch}-unknown-linux-musl"), arm),
+            Ok(Some(Target {
+                platform: arm,
+                env: "musl"
+            }))
+        );
+        // A pinned architecture earns coverage only on its own platform.
+        let pinned = Some("x86_64-unknown-linux-musl");
+        assert_eq!(on(pinned, arm), Ok(None));
+        assert_eq!(on(pinned, x86).map(|t| t.map(|t| t.env)), Ok(Some("musl")));
+        for refused in [
+            "riscv64gc-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnux32",
+            "{target_arch}-unknown-linux-gnu",
+            "musl",
+        ] {
+            assert!(on(Some(refused), arm).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn arch_gates_read_the_platform() {
+        let [x86, arm] = PLATFORMS;
+        let musl_arm = Target {
+            platform: arm,
+            env: "musl",
+        };
+        assert_eq!(cfg_on("target_arch = \"aarch64\"", &[], musl_arm), Ok(true));
+        assert_eq!(cfg_on("target_arch = \"x86_64\"", &[], musl_arm), Ok(false));
+        assert_eq!(cfg_on("target_env = \"musl\"", &[], musl_arm), Ok(true));
+        // A feature named like an environment is not the environment.
+        assert_eq!(cfg("target_env = \"musl\"", &["musl"]), Ok(false));
+        assert_eq!(cfg("feature = \"gnu\"", &[]), Ok(false));
+        // An x86_64-only module is missing on aarch64 unless a twin of the
+        // same name is enabled there.
+        let lone = "#[cfg(target_arch = \"x86_64\")]\nmod only {}";
+        let (declared, enabled) = present_on(
+            lone,
+            &[],
+            Target {
+                platform: x86,
+                env: "gnu",
+            },
+        );
+        assert!(require_module_coverage(&qualify(&declared), &qualify(&enabled)).is_ok());
+        let (_, enabled) = present_on(lone, &[], musl_arm);
+        assert!(require_module_coverage(&qualify(&declared), &qualify(&enabled)).is_err());
+        let twins = "#[cfg(target_arch = \"x86_64\")]\nmod arch {}\n\
+                     #[cfg(not(target_arch = \"x86_64\"))]\nmod arch {}";
+        let (declared, enabled) = present_on(twins, &[], musl_arm);
+        assert!(require_module_coverage(&qualify(&declared), &qualify(&enabled)).is_ok());
     }
 
     fn qualify(entries: &BTreeSet<(usize, String)>) -> BTreeSet<Identity> {
@@ -723,7 +903,7 @@ mod tests {
         ] {
             let result = shape(&Source::new(src.to_owned())).and_then(|s| {
                 let mut out = (BTreeSet::new(), BTreeSet::new());
-                presence(&s.decls, &BTreeSet::new(), true, &mut out)
+                presence(&s.decls, &BTreeSet::new(), GNU, true, &mut out)
             });
             assert!(result.is_err(), "{src}");
         }
@@ -733,7 +913,11 @@ mod tests {
         assert!(shape(&Source::new(lints.to_owned())).is_ok());
     }
 
-    fn graph(files: &[(&str, &str)], features: &[&str]) -> Result<BTreeSet<String>, String> {
+    fn graph_on(
+        files: &[(&str, &str)],
+        features: &[&str],
+        target: Target,
+    ) -> Result<BTreeSet<String>, String> {
         let corpus = Corpus::from_sources(files.iter().copied());
         let mut shapes = Shapes {
             corpus: &corpus,
@@ -741,8 +925,32 @@ mod tests {
         };
         let root = corpus.root.join("t/all.rs");
         shapes
-            .reachable(&[root], Some(&set(features)))
+            .reachable(&[root], Some((&set(features), target)))
             .map(|g| g.iter().map(|p| crate::relative(&corpus.root, p)).collect())
+    }
+
+    fn graph(files: &[(&str, &str)], features: &[&str]) -> Result<BTreeSet<String>, String> {
+        graph_on(files, features, GNU)
+    }
+
+    #[test]
+    fn a_file_backed_platform_alternative_is_unreachable_on_each_host() {
+        let files = [
+            (
+                "t/all.rs",
+                "#[cfg(target_arch = \"x86_64\")]\n#[path = \"x86.rs\"]\nmod arch;\n\
+                 #[cfg(target_arch = \"aarch64\")]\n#[path = \"arm.rs\"]\nmod arch;",
+            ),
+            ("t/x86.rs", ""),
+            ("t/arm.rs", ""),
+        ];
+        for (platform, file) in PLATFORMS.into_iter().zip(["t/x86.rs", "t/arm.rs"]) {
+            let target = Target {
+                platform,
+                env: "gnu",
+            };
+            assert_eq!(graph_on(&files, &[], target), Ok(set(&["t/all.rs", file])));
+        }
     }
 
     #[test]

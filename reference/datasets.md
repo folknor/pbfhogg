@@ -9,6 +9,7 @@ brokkr run --with pbfhogg pbfhogg-datasets -- download denmark
 brokkr run --with pbfhogg pbfhogg-datasets -- --config brokkr.toml --host HOST download europe/france
 brokkr run --with pbfhogg pbfhogg-datasets -- download denmark --osc-seq 5000
 brokkr run --with pbfhogg pbfhogg-datasets -- download denmark --as-snapshot 20261113
+brokkr run --with pbfhogg pbfhogg-datasets -- download denmark --no-indexed
 ```
 
 Global `--config PATH` defaults to `brokkr.toml`; `--host HOST` defaults
@@ -32,6 +33,19 @@ OSCs. Registered files must exist and pass their configured XXH3-128 pins;
 pins and configured replication sequences are never rewritten.
 Unregistered indexed files are always regenerated from the selected raw
 with the handed CLI's `pbfhogg cat`, never adopted.
+
+`--no-indexed` produces and registers no indexed variant in a primary,
+`--as-snapshot` or `--refresh` acquisition; it conflicts with `--snapshot`,
+which produces no PBF. It is an invocation choice, not recorded state: an
+already registered indexed entry is still verified and kept, and a later
+download without the flag generates indexed from the registered raw. A
+primary registering `pbf.indexed` but no `pbf.raw` refuses it. A refresh
+with it archives the whole old generation, indexed included, and installs a
+raw-only primary; a refresh that finds no newer upstream changes nothing.
+Under `--no-indexed` the CLI is optional. A named or handed one must still
+be an executable; without one, an `--osc-seq` that must learn the raw's
+sequence from its header (no configured raw `seq`, not planet) refuses
+before any transfer.
 
 Transfers use curl with its config disabled, bounded stalls and retries.
 Children start with a cleared environment; curl receives only the boundary's
@@ -132,3 +146,42 @@ Paths resolve through host `data` relative to the root project directory,
 not an include's parent. Provenance chooses the file to edit, not path
 resolution. See [library dataset resolution](library-protocol.md#dataset-resolution)
 for composition and input digest checking.
+
+## Another project's config
+
+`--config` may name any project's composed brokkr config, not only
+pbfhogg's; nidhogg acquires its PBFs this way, from a pbfhogg checkout:
+
+```sh
+brokkr run --with pbfhogg pbfhogg-datasets -- --config /abs/path/to/other/brokkr.toml download denmark --no-indexed
+```
+
+The tool promises this behaviour for such a config:
+
+- A relative `--config` resolves against the process working directory,
+  which under `brokkr run` is where brokkr was invoked; give an absolute
+  path. The project root is the canonicalized directory containing the
+  path as given, so a symlinked config anchors at the link's directory.
+  Includes resolve relative to each including file's canonical location.
+- The brokkr user config layers beneath the project config as it does for
+  pbfhogg, and may supply only personal convention keys, never hosts or
+  datasets.
+- The host is `--host` or the kernel hostname, and must exist in that
+  composed config as `[HOST]` or `[host.HOST]` (reserved section names only
+  as `[host.HOST]`); there is no default-host fallback, so a host that
+  stores no datasets still needs its table. Both spellings together refuse.
+- The host's `data` resolves against that project's root (an absolute
+  `data` stays absolute). The dataset lock, staged files and new
+  publications live in that directory; registered entries keep whatever
+  path they name.
+- Registration follows the ownership rule above within that project's
+  files: an existing dataset is edited in the one file holding it, a new
+  one goes to the one file holding the host's datasets table, otherwise
+  that project's root config.
+- The CLI used for indexed output and header lookups is the handed one
+  (pbfhogg's own build under `--with pbfhogg`) or `--pbfhogg`; `--config`
+  never selects or builds another.
+
+OSC names follow this tool's layout (`KEY-seqN.osc.gz`), recorded in the
+registry; a project whose own loader expects another layout, as nidhogg's
+does, acquires its diffs itself.

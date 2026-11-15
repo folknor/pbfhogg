@@ -1,5 +1,5 @@
 //! The two children the tool starts: curl for transfers and the handed
-//! pbfhogg binary for the indexed variant. Each starts from an empty
+//! pbfhogg binary for the indexed variant and header sequence lookups. Each starts from an empty
 //! environment plus what this module passes, with the dataset lock as its
 //! stdin (see `lock`).
 
@@ -16,8 +16,20 @@ pub(crate) struct Tools {
     /// Proxy and CA settings handed to curl; nothing else of the caller's
     /// environment reaches it.
     pub(crate) curl_env: Vec<(OsString, OsString)>,
-    pub(crate) pbfhogg: PathBuf,
+    /// Absent only for `download --no-indexed` run without a handed CLI;
+    /// header sequence learning then refuses.
+    pub(crate) pbfhogg: Option<PathBuf>,
 }
+
+impl Tools {
+    fn cli(&self) -> Result<&Path, String> {
+        self.pbfhogg.as_deref().ok_or_else(|| NO_CLI.to_owned())
+    }
+}
+
+/// The refusal when a pbfhogg CLI is needed but none was handed.
+pub(crate) const NO_CLI: &str =
+    "supply --pbfhogg PATH or BROKKR_WITH_EXE (brokkr run --with pbfhogg)";
 
 fn command(program: &Path, lock: &DatasetLock, child_output: Stdio) -> Result<Command, String> {
     let mut cmd = Command::new(program);
@@ -44,6 +56,11 @@ pub(crate) trait Programs {
     fn inspect_get(&self, file: &Path, key: &str, lock: &DatasetLock) -> Result<String, String>;
     fn fetch(&self, url: &str, staged: &Path, lock: &DatasetLock) -> Result<(), String>;
     fn cat(&self, input: &Path, output: &Path, lock: &DatasetLock) -> Result<(), String>;
+    /// Whether `inspect_get` and `cat` have a CLI to run, so a run that
+    /// needs one refuses before transferring anything.
+    fn has_cli(&self) -> bool {
+        true
+    }
 }
 
 impl Programs for Tools {
@@ -63,7 +80,7 @@ impl Programs for Tools {
 
     /// Header-only lookup: one unquoted value followed by a newline.
     fn inspect_get(&self, file: &Path, key: &str, lock: &DatasetLock) -> Result<String, String> {
-        let mut cmd = command(&self.pbfhogg, lock, Stdio::piped())?;
+        let mut cmd = command(self.cli()?, lock, Stdio::piped())?;
         cmd.arg("inspect").arg(file).arg("--get").arg(key);
         let output = cmd.output().map_err(|e| format!("pbfhogg inspect: {e}"))?;
         if !output.status.success() {
@@ -91,9 +108,13 @@ impl Programs for Tools {
     /// `pbfhogg cat INPUT -o OUTPUT`: the form pbfhogg documents for
     /// generating indexdata.
     fn cat(&self, input: &Path, output: &Path, lock: &DatasetLock) -> Result<(), String> {
-        let mut cmd = command(&self.pbfhogg, lock, Stdio::null())?;
+        let mut cmd = command(self.cli()?, lock, Stdio::null())?;
         cmd.arg("cat").arg(input).arg("-o").arg(output);
         run(cmd, &format!("pbfhogg cat {}", input.display()))
+    }
+
+    fn has_cli(&self) -> bool {
+        self.pbfhogg.is_some()
     }
 }
 

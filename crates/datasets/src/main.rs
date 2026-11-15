@@ -77,6 +77,10 @@ enum Action {
         /// Rotate even without evidence of a newer upstream file.
         #[arg(long, requires = "refresh")]
         force: bool,
+        /// Produce and register no indexed variant; the pbfhogg CLI is then
+        /// needed only to learn a raw header sequence for --osc-seq.
+        #[arg(long, conflicts_with = "snapshot")]
+        no_indexed: bool,
     },
 }
 
@@ -117,12 +121,22 @@ fn boundary(args: &Args) -> Result<(Config, String, Option<process::Tools>), Str
     if matches!(args.command, Action::Promote { .. }) {
         return Ok((config, host, None));
     }
-    let pbfhogg = args
-        .pbfhogg
-        .clone()
-        .or_else(|| with_exe.map(PathBuf::from))
-        .ok_or("supply --pbfhogg PATH or BROKKR_WITH_EXE (brokkr run --with pbfhogg)")?;
-    let pbfhogg = executable(&pbfhogg)?;
+    // A CLI that was named or handed must be valid; only `--no-indexed`
+    // may run without one.
+    let pbfhogg = match args.pbfhogg.clone().or_else(|| with_exe.map(PathBuf::from)) {
+        Some(path) => Some(executable(&path)?),
+        None if matches!(
+            args.command,
+            Action::Download {
+                no_indexed: true,
+                ..
+            }
+        ) =>
+        {
+            None
+        }
+        None => return Err(process::NO_CLI.into()),
+    };
     let curl = path
         .as_deref()
         .and_then(|p| find_in_path("curl", p))
@@ -195,7 +209,9 @@ fn execute(args: &Args) -> Result<(), String> {
             snapshot,
             refresh,
             force,
+            no_indexed,
         } => download::run(&download::Request {
+            indexed: !*no_indexed,
             config: &config,
             host: &host,
             region,
@@ -273,6 +289,24 @@ mod tests {
         );
         assert!(Args::try_parse_from(["x", "download", "denmark", "--refresh", "--force"]).is_ok());
         assert!(Args::try_parse_from(["x", "download"]).is_err());
+        for extra in [&["--refresh"][..], &["--as-snapshot", "s"], &[]] {
+            let mut args = vec!["x", "download", "denmark", "--no-indexed"];
+            args.extend_from_slice(extra);
+            assert!(Args::try_parse_from(args).is_ok());
+        }
+        assert!(
+            Args::try_parse_from([
+                "x",
+                "download",
+                "denmark",
+                "--no-indexed",
+                "--snapshot",
+                "s",
+                "--osc-seq",
+                "13"
+            ])
+            .is_err()
+        );
         assert!(Args::try_parse_from(["x", "download", "denmark", "--host", "h"]).is_ok());
         let parsed = Args::try_parse_from([
             "x",

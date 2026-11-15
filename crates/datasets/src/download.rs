@@ -1,5 +1,5 @@
 //! `download REGION`: acquire a dataset's primary PBF, generate its indexed
-//! variant, and register both.
+//! variant unless `--no-indexed`, and register what was produced.
 //!
 //! Registration follows the desired state, not this run's work log: every
 //! file the dataset should have and does not register is produced or, when
@@ -32,6 +32,10 @@ pub(crate) struct Request<'a> {
     pub(crate) force: bool,
     pub(crate) as_snapshot: Option<&'a str>,
     pub(crate) snapshot: Option<&'a str>,
+    /// Produce and register the indexed variant of a newly produced raw.
+    /// False (`--no-indexed`) keeps and verifies indexed entries already
+    /// registered, but never generates one.
+    pub(crate) indexed: bool,
     pub(crate) tools: &'a dyn Programs,
     pub(crate) today: CivilDate,
 }
@@ -315,6 +319,26 @@ fn acquire_osc(
     Ok(osc)
 }
 
+/// Refuse before any transfer when `--osc-seq` will have to learn the raw's
+/// sequence from its header and no CLI was handed to read it.
+fn preflight_seq_learning(
+    req: &Request<'_>,
+    source: &Source,
+    configured: Option<u64>,
+) -> Result<(), String> {
+    if req.osc_seq.is_some()
+        && configured.is_none()
+        && !matches!(source, Source::Planet)
+        && !req.tools.has_cli()
+    {
+        return Err(format!(
+            "--osc-seq must learn the raw header sequence: {}",
+            crate::process::NO_CLI
+        ));
+    }
+    Ok(())
+}
+
 fn publication_destinations(req: &Request<'_>, dir: &Path, names: &[String]) -> Result<(), String> {
     let targets = names
         .iter()
@@ -394,14 +418,12 @@ fn run_refresh(
         return Err("same-day refresh is unsupported".into());
     }
     let suffix = req.today.yyyymmdd();
-    publication_destinations(
-        req,
-        dir,
-        &[
-            raw_pbf_filename(&resolved.key, &suffix),
-            indexed_pbf_filename(&resolved.key, &suffix),
-        ],
-    )?;
+    preflight_seq_learning(req, &resolved.source, None)?;
+    let mut destinations = vec![raw_pbf_filename(&resolved.key, &suffix)];
+    if req.indexed {
+        destinations.push(indexed_pbf_filename(&resolved.key, &suffix));
+    }
+    publication_destinations(req, dir, &destinations)?;
     if let Some(target) = req.osc_seq {
         bind_osc_identity(
             lock,
@@ -414,7 +436,11 @@ fn run_refresh(
         )?;
     }
     let (raw_name, raw) = acquire_raw(req, resolved, dir, lock, &suffix)?;
-    let (indexed_name, indexed) = generate_indexed(req, resolved, &raw, dir, lock)?;
+    let indexed = if req.indexed {
+        Some(generate_indexed(req, resolved, &raw, dir, lock)?)
+    } else {
+        None
+    };
     let osc = if let Some(target) = req.osc_seq {
         acquire_osc(
             req,
@@ -428,8 +454,8 @@ fn run_refresh(
     } else {
         Osc::default()
     };
-    let entries = [("raw", raw_name, raw), ("indexed", indexed_name, indexed)]
-        .into_iter()
+    let entries = std::iter::once(("raw", raw_name, raw))
+        .chain(indexed.map(|(name, path)| ("indexed", name, path)))
         .map(|(variant, file, path)| {
             Ok((
                 variant,
@@ -494,7 +520,13 @@ pub(crate) fn run(req: &Request<'_>) -> Result<(), String> {
     let indexed_entry = primary.and_then(|g| g.pbf.get("indexed"));
     if let Some(entry) = indexed_entry {
         registered(&data_dir, entry, "pbf.indexed")?;
+        if !req.indexed && raw_entry.is_none() {
+            return Err(format!(
+                "'{key}' registers pbf.indexed but no pbf.raw; --no-indexed has no raw to keep"
+            ));
+        }
     }
+    preflight_seq_learning(req, &resolved.source, raw_entry.and_then(|e| e.seq))?;
     // Bind before any producer can rewrite the identity. Include all
     // potentially adoptable diffs, even before the raw header gives a base.
     if let Some(target) = req.osc_seq {
@@ -521,7 +553,9 @@ pub(crate) fn run(req: &Request<'_>) -> Result<(), String> {
         Some(dest)
     };
     let new_indexed: New = match (indexed_entry, &raw_path) {
-        (None, Some(raw)) => Some(generate_indexed(req, &resolved, raw, &data_dir, &lock)?),
+        (None, Some(raw)) if req.indexed => {
+            Some(generate_indexed(req, &resolved, raw, &data_dir, &lock)?)
+        }
         _ => None,
     };
     let osc = if let Some(target) = req.osc_seq {
@@ -646,17 +680,23 @@ fn run_snapshot(
             target,
         )?;
     }
-    // Check both output names before any producer runs.
-    for name in [
-        raw_pbf_filename(&resolved.key, snap),
-        indexed_pbf_filename(&resolved.key, snap),
-    ] {
+    preflight_seq_learning(req, &resolved.source, None)?;
+    // Check every output name before any producer runs.
+    let mut outputs = vec![raw_pbf_filename(&resolved.key, snap)];
+    if req.indexed {
+        outputs.push(indexed_pbf_filename(&resolved.key, snap));
+    }
+    for name in outputs {
         if names(resolved.dataset.as_ref(), &name) {
             return Err(format!("{name} is already named by another entry"));
         }
     }
     let (raw_name, raw) = acquire_raw(req, resolved, dir, lock, snap)?;
-    let (indexed_name, indexed) = generate_indexed(req, resolved, &raw, dir, lock)?;
+    let indexed = if req.indexed {
+        Some(generate_indexed(req, resolved, &raw, dir, lock)?)
+    } else {
+        None
+    };
     let osc = match req.osc_seq {
         Some(target) => acquire_osc(req, resolved, &raw, dir, lock, target, &generation)?,
         None => Osc::default(),
@@ -668,7 +708,9 @@ fn run_snapshot(
     let date = CivilDate::parse_yyyymmdd(snap).unwrap_or(req.today);
     edit.set_snapshot_header(snap, &date.iso())
         .map_err(|e| e.to_string())?;
-    for (variant, name, path) in [("raw", raw_name, raw), ("indexed", indexed_name, indexed)] {
+    let produced = std::iter::once(("raw", raw_name, raw))
+        .chain(indexed.map(|(name, path)| ("indexed", name, path)));
+    for (variant, name, path) in produced {
         let entry = FileEntry {
             file: name,
             xxhash: Some(file_digest(&path).map_err(|e| e.to_string())?),
@@ -722,13 +764,12 @@ fn register(
             edit.set_pbf(variant, &entry).map_err(|e| e.to_string())?;
         }
     }
+    // A learned seq goes on each variant the resulting generation holds,
+    // registered before or produced now, that lacks one.
     if let Some(seq) = osc.learned {
-        for variant in ["raw", "indexed"] {
-            if primary
-                .and_then(|g| g.pbf.get(variant))
-                .and_then(|e| e.seq)
-                .is_none()
-            {
+        for (variant, new) in [("raw", new_raw), ("indexed", new_indexed)] {
+            let existing = primary.and_then(|g| g.pbf.get(variant));
+            if (existing.is_some() || new.is_some()) && existing.and_then(|e| e.seq).is_none() {
                 edit.set_pbf_seq(variant, seq).map_err(|e| e.to_string())?;
             }
         }
@@ -749,10 +790,16 @@ fn register(
         note(&format!("  {change}"));
     }
     if new_raw.is_some() && osc.learned.is_none() {
-        note(
+        let entries =
+            if new_indexed.is_some() || primary.is_some_and(|g| g.pbf.contains_key("indexed")) {
+                "the pbf.raw and pbf.indexed entries"
+            } else {
+                "the pbf.raw entry"
+            };
+        note(&format!(
             "  NOTE: run 'pbfhogg inspect <file> --get header.replication.sequence' and add \
-             seq = <N> to the pbf.raw and pbf.indexed entries",
-        );
+             seq = <N> to {entries}"
+        ));
     }
     Ok(())
 }
@@ -813,6 +860,7 @@ mod tests {
                 snapshot: None,
                 as_snapshot: None,
                 osc_seq: None,
+                indexed: true,
                 tools: &tools,
                 today,
             })
@@ -829,6 +877,7 @@ mod tests {
             snapshot: None,
             as_snapshot: None,
             osc_seq: Some(13),
+            indexed: true,
             tools: &tools,
             today,
         };
@@ -903,6 +952,7 @@ mod tests {
                 snapshot: None,
                 as_snapshot: None,
                 osc_seq: None,
+                indexed: true,
                 tools: &tools,
                 today: CivilDate::parse_yyyymmdd("20260411").unwrap(),
             };
@@ -966,6 +1016,7 @@ mod tests {
             snapshot: None,
             as_snapshot: None,
             osc_seq: None,
+            indexed: true,
             tools: &tools,
             today: CivilDate::parse_yyyymmdd("20260411").unwrap(),
         };
@@ -1057,6 +1108,137 @@ mod tests {
         }
     }
 
+    /// Transfers succeed; indexed generation is a test failure.
+    struct RawOnlyPrograms {
+        cli: bool,
+        fetches: std::cell::Cell<usize>,
+    }
+    impl Programs for RawOnlyPrograms {
+        fn head(&self, _: &str, _: &DatasetLock) -> Result<Option<i64>, String> {
+            Err("unexpected HEAD".into())
+        }
+        fn inspect_get(&self, p: &Path, k: &str, l: &DatasetLock) -> Result<String, String> {
+            assert!(self.cli, "inspect without a CLI");
+            LocalPrograms.inspect_get(p, k, l)
+        }
+        fn fetch(&self, _: &str, staged: &Path, _: &DatasetLock) -> Result<(), String> {
+            self.fetches.set(self.fetches.get() + 1);
+            std::fs::write(staged, b"raw only").map_err(|e| e.to_string())
+        }
+        fn cat(&self, _: &Path, _: &Path, _: &DatasetLock) -> Result<(), String> {
+            Err("unexpected indexed generation".into())
+        }
+        fn has_cli(&self) -> bool {
+            self.cli
+        }
+    }
+
+    #[test]
+    fn no_indexed_registers_raw_only_and_needs_a_cli_only_to_learn_seq() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = std::fs::canonicalize(scratch.path()).unwrap();
+        let path = dir.join("brokkr.toml");
+        let before = format!("[h]\ndata = {:?}\n[h.datasets]\n", dir.to_str().unwrap());
+        std::fs::write(&path, &before).unwrap();
+        let config = Config::load(&path, None).unwrap();
+        let no_cli = RawOnlyPrograms {
+            cli: false,
+            fetches: std::cell::Cell::new(0),
+        };
+        let req = Request {
+            config: &config,
+            host: "h",
+            region: "denmark",
+            osc_seq: Some(11),
+            refresh: false,
+            force: false,
+            as_snapshot: None,
+            snapshot: None,
+            indexed: false,
+            tools: &no_cli,
+            today: CivilDate::parse_yyyymmdd("20260411").unwrap(),
+        };
+        // Header seq learning needs the CLI: refused before any transfer.
+        assert!(run(&req).unwrap_err().contains("--pbfhogg"));
+        assert_eq!(no_cli.fetches.get(), 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let cli = RawOnlyPrograms {
+            cli: true,
+            fetches: std::cell::Cell::new(0),
+        };
+        run(&Request { tools: &cli, ..req }).unwrap();
+        assert_eq!(cli.fetches.get(), 2);
+        let config = Config::load(&path, None).unwrap();
+        let view = config.dataset("h", "denmark").unwrap().unwrap();
+        assert_eq!(
+            view.primary
+                .pbf
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["raw"]
+        );
+        assert_eq!(view.primary.pbf["raw"].file, "denmark-20260411.osm.pbf");
+        assert_eq!(view.primary.pbf["raw"].seq, Some(10));
+        assert_eq!(view.primary.osc.keys().copied().collect::<Vec<_>>(), [11]);
+        assert!(!dir.join("denmark-20260411-with-indexdata.osm.pbf").exists());
+
+        // Without a CLI and without --osc-seq, a raw-only snapshot registers.
+        run(&Request {
+            config: &config,
+            osc_seq: None,
+            as_snapshot: Some("20260101"),
+            ..req
+        })
+        .unwrap();
+        let config = Config::load(&path, None).unwrap();
+        let view = config.dataset("h", "denmark").unwrap().unwrap();
+        assert_eq!(
+            view.snapshots["20260101"]
+                .pbf
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["raw"]
+        );
+    }
+
+    #[test]
+    fn no_indexed_refuses_an_indexed_only_primary() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = std::fs::canonicalize(scratch.path()).unwrap();
+        let path = dir.join("brokkr.toml");
+        std::fs::write(dir.join("i.osm.pbf"), b"indexed").unwrap();
+        let before = format!(
+            "[h]\ndata = {:?}\n[h.datasets.denmark]\norigin = \"download.geofabrik.de/europe/denmark\"\n[h.datasets.denmark.pbf.indexed]\nfile = \"i.osm.pbf\"\n",
+            dir.to_str().unwrap()
+        );
+        std::fs::write(&path, &before).unwrap();
+        let config = Config::load(&path, None).unwrap();
+        let tools = RawOnlyPrograms {
+            cli: false,
+            fetches: std::cell::Cell::new(0),
+        };
+        let err = run(&Request {
+            config: &config,
+            host: "h",
+            region: "denmark",
+            osc_seq: None,
+            refresh: false,
+            force: false,
+            as_snapshot: None,
+            snapshot: None,
+            indexed: false,
+            tools: &tools,
+            today: CivilDate::parse_yyyymmdd("20260411").unwrap(),
+        })
+        .unwrap_err();
+        assert!(err.contains("no pbf.raw"), "{err}");
+        assert_eq!(tools.fetches.get(), 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[test]
     fn roll_forward_adopts_fills_holes_and_commits_once() {
         let scratch = pbfhogg_test_scratch::scratch();
@@ -1087,6 +1269,7 @@ mod tests {
             osc_seq: Some(13),
             snapshot: None,
             as_snapshot: None,
+            indexed: true,
             tools: &tools,
             today: CivilDate::today(),
         };
@@ -1199,13 +1382,13 @@ mod tests {
             osc_seq: Some(13),
             snapshot: None,
             as_snapshot: Some("20260411"),
+            indexed: true,
             tools: &tools,
             today: CivilDate::from_unix_timestamp(0).unwrap(),
         };
         for key in ["", "base", "../bad", "a.b", "non ascii"] {
             assert!(
                 run(&Request {
-                    snapshot: None,
                     as_snapshot: Some(key),
                     ..req
                 })
@@ -1333,6 +1516,7 @@ mod tests {
             as_snapshot: None,
             refresh: false,
             force: false,
+            indexed: true,
             tools: &tools,
             today: CivilDate::today(),
         };
@@ -1418,6 +1602,7 @@ mod tests {
             as_snapshot: None,
             refresh: false,
             force: false,
+            indexed: true,
             tools: &tools,
             today: CivilDate::today(),
         })
@@ -1462,6 +1647,7 @@ mod tests {
             as_snapshot: None,
             refresh: false,
             force: false,
+            indexed: true,
             tools: &tools,
             today: CivilDate::today(),
         };

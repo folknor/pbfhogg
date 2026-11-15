@@ -699,6 +699,74 @@ fn block_type_classification() {
     assert!(!BlockType::Mixed.is_nodes());
 }
 
+/// `element_kinds` is the exact kind set where `block_type` is only a label:
+/// an empty dense message in front of ways, a way group carrying a relation,
+/// and dense beside plain node groups.
+#[test]
+fn element_kinds_is_exact_where_block_type_is_a_label() {
+    use crate::common::groups::{Field, block};
+    use pbfhogg::{BlockType, ElementKind};
+
+    let cases: [(&str, Vec<u8>, BlockType, &[ElementKind]); 5] = [
+        (
+            "empty dense before ways",
+            block(&[&[Field::Dense(&[]), Field::Ways(&[10])]]),
+            BlockType::DenseNodes,
+            &[ElementKind::Way],
+        ),
+        (
+            "way group carrying a relation",
+            block(&[&[Field::Ways(&[10]), Field::Relations(&[20])]]),
+            BlockType::Ways,
+            &[ElementKind::Way, ElementKind::Relation],
+        ),
+        (
+            "dense beside plain nodes",
+            block(&[&[Field::Dense(&[1])], &[Field::Nodes(&[2])]]),
+            BlockType::Mixed,
+            &[ElementKind::Node],
+        ),
+        (
+            "empty dense only",
+            block(&[&[Field::Dense(&[])]]),
+            BlockType::DenseNodes,
+            &[],
+        ),
+        (
+            "relations",
+            block(&[&[Field::Relations(&[20, 21])]]),
+            BlockType::Relations,
+            &[ElementKind::Relation],
+        ),
+    ];
+    for (what, payload, label, expected) in cases {
+        let block = pbfhogg::PrimitiveBlock::from_vec(payload).unwrap();
+        assert_eq!(block.block_type(), label, "{what}: label");
+        let kinds = block.element_kinds();
+        assert_eq!(kinds.iter().collect::<Vec<_>>(), expected, "{what}");
+        assert_eq!(kinds.len(), expected.len(), "{what}: len");
+        assert_eq!(kinds.is_empty(), expected.is_empty(), "{what}: empty");
+        let single = if expected.len() == 1 {
+            Some(expected[0])
+        } else {
+            None
+        };
+        assert_eq!(kinds.single(), single, "{what}: single");
+        let walked: Vec<ElementKind> = block
+            .elements()
+            .map(|e| match e {
+                pbfhogg::Element::DenseNode(_) | pbfhogg::Element::Node(_) => ElementKind::Node,
+                pbfhogg::Element::Way(_) => ElementKind::Way,
+                pbfhogg::Element::Relation(_) => ElementKind::Relation,
+                other => panic!("unexpected element {other:?}"),
+            })
+            .collect();
+        for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
+            assert_eq!(kinds.has(kind), walked.contains(&kind), "{what}: {kind}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // par_map_reduce tests
 // ---------------------------------------------------------------------------

@@ -43,10 +43,12 @@
 //!    `Sort.Type_then_ID` (diff refuses unsorted input). No later blob is an
 //!    `OsmHeader` and no blob has an unknown type. A header-only file is valid
 //!    and has the empty digest.
-//! 2. **Order and shape.** Every data block is classified by
-//!    [`PrimitiveBlock::block_type`] as exactly one element kind, or as
-//!    empty with no elements - never mixed - and every element in it is of
-//!    that kind, so diff's streaming merge routes it correctly. Kinds appear
+//! 2. **Order and shape.** Every data block's elements are of exactly one
+//!    kind, or it has none ([`PrimitiveBlock::element_kinds`], the kinds its
+//!    elements actually are, not the first-field label `block_type`), so
+//!    diff's streaming merge routes it correctly. Groups that yield no
+//!    element (an empty dense message, changeset or unknown fields) do not
+//!    count. Kinds appear
 //!    nodes, then ways, then relations. Within a kind, IDs strictly ascend in
 //!    canonical OSM order across the whole file: no duplicates, no disorder.
 //! 3. **Indexdata.** Either every data blob carries readable indexdata or
@@ -106,7 +108,7 @@ use crate::error::{Error, Location};
 use crate::read::input::InputSource;
 use crate::read::pipeline::DecodeTransform;
 use crate::tunables::DIGEST_RECORD_BUFFERS_KEPT;
-use crate::{BlockType, ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
+use crate::{ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
 
@@ -481,19 +483,16 @@ fn element_kind(element: &Element<'_>) -> ElementKind {
 }
 
 fn block_kind(block: &PrimitiveBlock) -> crate::Result<Option<ElementKind>> {
-    match block.block_type() {
-        // Dense and plain node groups side by side (what apply-changes writes
-        // for a node with partial metadata) hold one kind.
-        BlockType::Mixed if block.holds_only_node_groups() => Ok(Some(ElementKind::Node)),
-        BlockType::DenseNodes | BlockType::Nodes => Ok(Some(ElementKind::Node)),
-        BlockType::Ways => Ok(Some(ElementKind::Way)),
-        BlockType::Relations => Ok(Some(ElementKind::Relation)),
-        BlockType::Empty => Ok(None),
-        BlockType::Mixed => Err(Error::invalid_data(
-            "a data block mixes element kinds (or carries an unknown \
-             group field); diff's streaming merge rejects such blocks",
-        )),
+    let kinds = block.element_kinds();
+    if kinds.is_empty() {
+        return Ok(None);
     }
+    kinds.single().map(Some).ok_or_else(|| {
+        Error::invalid_data(
+            "a data block holds elements of more than one kind; diff's \
+             streaming merge rejects such blocks",
+        )
+    })
 }
 
 /// Validate one block internally (domain rules 2 and 4) and serialize it.

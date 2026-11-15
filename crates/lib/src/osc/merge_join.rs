@@ -13,7 +13,7 @@
 
 use crate::ElementKind;
 use crate::osm_id::OsmIdKey;
-use crate::{BlockType, Element, PrimitiveBlock};
+use crate::{Element, PrimitiveBlock};
 
 use crate::error::Result;
 
@@ -136,15 +136,18 @@ impl StreamingBlocks {
             let Some(block) = self.next_block()? else {
                 return Ok(());
             };
-            match element_kinds(&block) {
-                BlockKinds::Empty => {}
-                BlockKinds::One(k) if k == kind => {}
-                BlockKinds::One(k) if k > kind => {
+            let kinds = block.element_kinds();
+            if kinds.is_empty() {
+                continue;
+            }
+            match kinds.single() {
+                Some(k) if k == kind => {}
+                Some(k) if k > kind => {
                     self.stashed = Some(block);
                     return Ok(());
                 }
-                BlockKinds::One(k) => return Err(self.locate(unsorted_block(k, kind))),
-                BlockKinds::Several => return Err(self.locate(mixed_block())),
+                Some(k) => return Err(self.locate(unsorted_block(k, kind))),
+                None => return Err(self.locate(mixed_block())),
             }
         }
     }
@@ -153,33 +156,32 @@ impl StreamingBlocks {
     /// phase is over (end of file, or the first block of a later kind,
     /// stashed for the phase or skip that takes it next).
     ///
-    /// A block whose [`BlockType`] names `kind` is taken directly (the
-    /// normal sorted case); a wrong-kind element inside it is refused when
-    /// [`StreamingBlocks::admit`] meets it. Any other block is classified by
-    /// the element kinds it actually yields (see
+    /// Every block is classified by the element kinds it actually yields
+    /// ([`PrimitiveBlock::element_kinds`]; see
     /// [`StreamingBlocks::skip_kind`] for why the block type cannot decide):
     /// no elements is skipped, `kind` alone is taken, a later kind is
     /// stashed and ends the phase, an earlier kind or several kinds is
-    /// refused as unsorted. The classification also accepts a block whose
-    /// block type says `Mixed` while every element is one kind (dense and
-    /// plain node groups side by side, an empty dense group beside ways).
+    /// refused as unsorted. So a block of one kind is taken whatever its
+    /// groups' first fields say (dense and plain node groups side by side,
+    /// an empty dense group beside ways), and a block of several is refused
+    /// before any of its elements reaches the merge.
     fn next_phase_block(&mut self, kind: ElementKind) -> Result<Option<PrimitiveBlock>> {
         loop {
             let Some(block) = self.next_block()? else {
                 return Ok(None);
             };
-            if block_type_kind(block.block_type()) == Some(kind) {
-                return Ok(Some(block));
+            let kinds = block.element_kinds();
+            if kinds.is_empty() {
+                continue;
             }
-            match element_kinds(&block) {
-                BlockKinds::Empty => {}
-                BlockKinds::One(k) if k == kind => return Ok(Some(block)),
-                BlockKinds::One(k) if k > kind => {
+            match kinds.single() {
+                Some(k) if k == kind => return Ok(Some(block)),
+                Some(k) if k > kind => {
                     self.stashed = Some(block);
                     return Ok(None);
                 }
-                BlockKinds::One(k) => return Err(self.locate(unsorted_block(k, kind))),
-                BlockKinds::Several => return Err(self.locate(mixed_block())),
+                Some(k) => return Err(self.locate(unsorted_block(k, kind))),
+                None => return Err(self.locate(mixed_block())),
             }
         }
     }
@@ -216,51 +218,11 @@ impl StreamingBlocks {
     }
 }
 
-/// The element kinds a block's elements actually are.
-enum BlockKinds {
-    Empty,
-    One(ElementKind),
-    Several,
-}
-
-/// Classify `block` by the elements [`PrimitiveBlock::elements`] yields - what
-/// a conversion would see - rather than by the first field of each group.
-/// Read from the kinds block construction's validation counted
-/// ([`PrimitiveBlock::kinds`]: one per plain node, way and relation message,
-/// and a dense group only when it holds an ID), which are exactly the kinds
-/// that walk yields, so the block is not walked a second time.
-fn element_kinds(block: &PrimitiveBlock) -> BlockKinds {
-    let kinds = block.kinds();
-    let mut found: Option<ElementKind> = None;
-    for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
-        if kinds.has(kind) {
-            if found.is_some() {
-                return BlockKinds::Several;
-            }
-            found = Some(kind);
-        }
-    }
-    found.map_or(BlockKinds::Empty, BlockKinds::One)
-}
-
 fn element_kind(element: &Element<'_>) -> ElementKind {
     match element {
         Element::DenseNode(_) | Element::Node(_) => ElementKind::Node,
         Element::Way(_) => ElementKind::Way,
         Element::Relation(_) => ElementKind::Relation,
-    }
-}
-
-/// The single kind a [`BlockType`] names, when it names one.
-fn block_type_kind(bt: BlockType) -> Option<ElementKind> {
-    if bt.is_nodes() {
-        Some(ElementKind::Node)
-    } else if bt.is_ways() {
-        Some(ElementKind::Way)
-    } else if bt.is_relations() {
-        Some(ElementKind::Relation)
-    } else {
-        None
     }
 }
 

@@ -523,7 +523,7 @@ pub(super) fn detect_stale_wire(
     }
 
     let mut detection = Detection::default();
-    let mut kinds = crate::element_kind::KindSet::default();
+    let mut kinds = crate::element_kind::ElementKindSet::default();
     for &(offset, len) in groups.iter() {
         let mut group = Cursor::new(&decompressed[offset..offset + len]);
         while let Some((field, wire_type)) = group.read_tag()? {

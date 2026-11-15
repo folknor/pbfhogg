@@ -131,7 +131,7 @@ pub(crate) enum Order {
 ///
 /// An unindexed blob (`--force`) makes no claim and is checked for order
 /// only. The claimed kind is checked apart, once per blob
-/// ([`KindSet::refuse_under`](crate::element_kind::KindSet::refuse_under)),
+/// ([`ElementKindSet::refuse_under`](crate::element_kind::ElementKindSet::refuse_under)),
 /// so every ID a walk observes is of one kind.
 pub(crate) struct ClaimWalk<'c> {
     claim: Option<&'c BlobIndex>,

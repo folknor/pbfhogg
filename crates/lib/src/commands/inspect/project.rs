@@ -278,7 +278,7 @@ impl GroupProjection for InspectProjection {
         }
     }
 
-    fn group_end(&mut self, _kinds: crate::element_kind::KindSet) {
+    fn group_end(&mut self, _kinds: crate::element_kind::ElementKindSet) {
         if let Some(ids) = self.state.node_ids.as_mut() {
             ids.append(&self.dense_ids);
             ids.append(&self.plain_ids);

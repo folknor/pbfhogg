@@ -16,7 +16,7 @@ use super::block::GroupProjection;
 use super::elements::{MemberIdIter, WayRefIter};
 use super::wire::{WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation, WireWay};
 use crate::ElementKind;
-use crate::element_kind::KindSet;
+use crate::element_kind::ElementKindSet;
 use crate::idset::IdSet;
 
 /// Where a validated array lies in a blob's bytes, recorded by a hook and
@@ -167,14 +167,14 @@ impl GroupProjection for RelationSpans<'_> {
 /// element's own kind, never by the blob's claim: an unindexed blob may hold
 /// anything.
 pub(crate) struct KindIds<'s> {
-    kinds: KindSet,
+    kinds: ElementKindSet,
     scratch: &'s mut IdScratch,
 }
 
 impl<'s> KindIds<'s> {
     /// The projection of the IDs of `kinds`, recording into `scratch`, which
     /// it clears: a worker reuses one scratch across its blobs.
-    pub(crate) fn new(kinds: KindSet, scratch: &'s mut IdScratch) -> Self {
+    pub(crate) fn new(kinds: ElementKindSet, scratch: &'s mut IdScratch) -> Self {
         scratch.runs.clear();
         scratch.ids.clear();
         scratch.plain.clear();
@@ -183,7 +183,7 @@ impl<'s> KindIds<'s> {
 
     /// The projection of the IDs of one kind.
     pub(crate) fn of(kind: ElementKind, scratch: &'s mut IdScratch) -> Self {
-        let mut kinds = KindSet::default();
+        let mut kinds = ElementKindSet::default();
         kinds.add(kind);
         Self::new(kinds, scratch)
     }
@@ -246,7 +246,7 @@ impl GroupProjection for KindIds<'_> {
         }
     }
 
-    fn group_end(&mut self, _kinds: KindSet) {
+    fn group_end(&mut self, _kinds: ElementKindSet) {
         let plain = std::mem::take(&mut self.scratch.plain);
         for &id in &plain {
             self.copy(ElementKind::Node, id);
@@ -292,7 +292,7 @@ impl IdScratch {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{IdScratch, KindIds};
-    use crate::element_kind::KindSet;
+    use crate::element_kind::ElementKindSet;
     use crate::{Element, ElementKind};
 
     /// The IDs of `kind` the element walk yields, in its order.
@@ -312,10 +312,10 @@ mod tests {
     const KINDS: [ElementKind; 3] = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
 
     /// Every subset of the three kinds.
-    fn kind_sets() -> Vec<KindSet> {
+    fn kind_sets() -> Vec<ElementKindSet> {
         (1_u8..8)
             .map(|mask| {
-                let mut set = KindSet::default();
+                let mut set = ElementKindSet::default();
                 for (bit, kind) in KINDS.into_iter().enumerate() {
                     if mask & (1 << bit) != 0 {
                         set.add(kind);

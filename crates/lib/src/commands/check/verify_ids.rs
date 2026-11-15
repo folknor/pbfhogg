@@ -705,7 +705,7 @@ fn unindexed_pass(
     negatives: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<(PerKind, KindSpans<(usize, usize)>)> {
-    let mut kinds = crate::element_kind::KindSet::default();
+    let mut kinds = crate::element_kind::ElementKindSet::default();
     for kind in KINDS {
         if selects(type_filter, kind) {
             kinds.add(kind);
@@ -790,7 +790,7 @@ struct GroupKinds {
 }
 
 impl crate::read::block::GroupProjection for GroupKinds {
-    fn group_end(&mut self, kinds: crate::element_kind::KindSet) {
+    fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
         for (kind, span) in KINDS.into_iter().zip(&mut self.spans) {
             if kinds.has(kind) {
                 widen(span, self.group, self.group);

@@ -335,7 +335,7 @@ impl crate::read::block::GroupProjection for NodeCoords<'_> {
         });
     }
 
-    fn group_end(&mut self, _kinds: crate::element_kind::KindSet) {
+    fn group_end(&mut self, _kinds: crate::element_kind::ElementKindSet) {
         let count = self.scratch.group_plain.len();
         if count > 0 {
             let CoordScratch {

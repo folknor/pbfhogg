@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use pbfhogg::osc::{CompactDiffOverlay, parse_osc_file};
-use pbfhogg::{Blob, BlobReader, BlobType, BlockType, Element, ElementKind, PrimitiveBlock, Way};
+use pbfhogg::{Blob, BlobReader, BlobType, Element, ElementKind, PrimitiveBlock, Way};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use xxhash_rust::xxh3::xxh3_64;
@@ -552,8 +552,8 @@ fn scan_contents(blob: &Blob, probe: &Probe) -> pbfhogg::Result<BlobScan> {
     let block = blob.to_primitiveblock()?;
     scan.decode_ns = elapsed_ns(start);
     scan.decompressed = block.decompressed_size() as u64;
-    let block_type = block.block_type();
-    if !matches!(block_type, BlockType::Ways | BlockType::Mixed) {
+    let kinds = block.element_kinds();
+    if !kinds.has(ElementKind::Way) {
         return Ok(scan);
     }
     let start = Instant::now();
@@ -561,7 +561,7 @@ fn scan_contents(blob: &Blob, probe: &Probe) -> pbfhogg::Result<BlobScan> {
     scan.probe_ns = elapsed_ns(start);
     if scan.has_ways() {
         scan.kind = BlobKind::Way;
-        scan.mixed = block_type == BlockType::Mixed;
+        scan.mixed = kinds.len() > 1;
     }
     Ok(scan)
 }

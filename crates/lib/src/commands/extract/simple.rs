@@ -7,7 +7,7 @@ use crate::cat::CleanAttrs;
 use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
-use crate::{BlockType, Element, PrimitiveBlock};
+use crate::{Element, ElementKind, PrimitiveBlock};
 
 use super::super::{
     HeaderOverrides, Result, drain_batch_results, flush_local, release_scratch, writer_from_header,
@@ -48,10 +48,13 @@ pub(super) enum ClassifyPhase {
 /// - Ways: any ref in `bbox_node_ids` → set `matched_way_ids`
 /// - Relations: matched node/way member → set `matched_relation_ids`
 ///
-/// Uses `block_type()` (1 byte per group) to skip whole blocks that hold no
-/// element of the phase's kind, keeping the sorted path's fast rejection.
-/// `BlockType::Mixed` blocks are walked element by element under the same
-/// phase rule, so a mixed block cannot smuggle a way past the node sweep.
+/// Skips whole blocks that hold no element of the phase's kind, read from
+/// the exact kind set block validation recorded
+/// ([`PrimitiveBlock::element_kinds`]), never from `block_type()`: that label
+/// names a group by its first field, so an empty dense message in front of
+/// ways labels a way block as nodes and a ways-first group can carry
+/// relations, and a sweep skipping on the label lost those matches.
+/// A block of several kinds is walked under the same phase rule.
 #[hotpath::measure]
 fn classify_block_simple(
     block: &PrimitiveBlock,
@@ -62,14 +65,12 @@ fn classify_block_simple(
     matched_way_ids: &mut IdSet,
     matched_relation_ids: &mut IdSet,
 ) {
-    let relevant = match block.block_type() {
-        BlockType::Empty => false,
-        BlockType::Mixed => true,
-        BlockType::DenseNodes | BlockType::Nodes => phase == ClassifyPhase::Nodes,
-        BlockType::Ways => phase == ClassifyPhase::Ways,
-        BlockType::Relations => phase == ClassifyPhase::Relations,
+    let phase_kind = match phase {
+        ClassifyPhase::Nodes => ElementKind::Node,
+        ClassifyPhase::Ways => ElementKind::Way,
+        ClassifyPhase::Relations => ElementKind::Relation,
     };
-    if !relevant {
+    if !block.element_kinds().has(phase_kind) {
         return;
     }
 

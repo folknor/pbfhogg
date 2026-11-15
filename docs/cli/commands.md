@@ -1686,7 +1686,7 @@ The command refuses, in every form, exiting non-zero and printing no digest line
 
 - no `OsmHeader` as the first blob, a second `OsmHeader`, or a blob of unknown type;
 - a header that does not claim `Sort.Type_then_ID`;
-- a data block that is mixed-kind (or classified as one kind while holding another), kinds out of node, way, relation order, or IDs that do not strictly ascend within a kind (duplicates included);
+- a data block whose elements are of more than one kind (groups that yield no element, such as an empty dense message or a changeset group, do not count), kinds out of node, way, relation order, or IDs that do not strictly ascend within a kind (duplicates included);
 - indexdata on some data blobs and not others, or indexdata whose kind, minimum ID, maximum ID or count disagrees with its block, or on an empty block;
 - a tag, role or metadata user name whose string-table index does not resolve.
 

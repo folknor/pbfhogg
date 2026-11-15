@@ -303,7 +303,7 @@ pub fn parse_ids_from_pbf<'a>(
     // block validator (no block built; refused exactly as construction
     // refuses). The three sets are independent unions, so the order between
     // kinds does not matter.
-    let mut all_kinds = crate::element_kind::KindSet::default();
+    let mut all_kinds = crate::element_kind::ElementKindSet::default();
     for kind in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
         all_kinds.add(kind);
     }

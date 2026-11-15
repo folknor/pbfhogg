@@ -2569,7 +2569,10 @@ mod tests {
         bb.add_node_partial(4, 0, 0, [], None);
         bb.add_node_partial(5, 0, 0, [], Some(&partial));
         let block = crate::PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
-        assert!(block.holds_only_node_groups());
+        assert_eq!(
+            block.element_kinds().single(),
+            Some(crate::ElementKind::Node)
+        );
         assert_eq!(
             node_ids(&block),
             [(1, true), (2, false), (3, false), (4, true), (5, false)]

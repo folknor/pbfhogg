@@ -236,7 +236,7 @@ pub mod write;
 
 // Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
 pub use blob_meta::{BlobBbox, BlobFilter};
-pub use element_kind::ElementKind;
+pub use element_kind::{ElementKind, ElementKindSet};
 pub use error::{
     BlobError, Error, ErrorKind, KindContradiction, OutputError, OversizePart, Result,
     StagingProblem, Unresolved,

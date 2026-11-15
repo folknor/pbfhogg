@@ -36,6 +36,14 @@
   same worker counts everywhere. The setter probes nothing and changes nothing
   else about the reader, and an explicit `decode_threads` still wins. Readers
   that do not call it keep their sizing.
+- **`PrimitiveBlock::element_kinds`** returns the exact set of element kinds
+  a block holds, as a new `ElementKindSet` (`has`, `is_empty`, `len`,
+  `single`, `iter`), recorded by the validation every block already passes,
+  so it costs nothing. Route blocks by kind with it rather than with
+  `block_type()`, which labels each group by its first field only: an empty
+  dense message in front of ways labels a way block as nodes, a ways-first
+  group can carry relations, and `Mixed` also covers changeset and unknown
+  groups.
 
 ### Changed
 
@@ -191,6 +199,15 @@
   tag counts and saying details were omitted.
 
 ### Fixed
+
+- `extract --simple` on unsorted input no longer drops ways or relations
+  behind a misleading block label. Its per-kind sweeps skipped blocks by
+  `block_type()`, so a way after an empty dense message, or a relation in a
+  ways-first group, was never matched. `digest` and `diff`'s streaming merge
+  now classify blocks by the same exact kind set: `digest` accepts a
+  single-kind block whose groups also hold an empty dense message or a
+  changeset or unknown field, and refuses only blocks whose elements are of
+  more than one kind.
 
 - `BlockBuilder` no longer drops a way or relation whose every field is
   default (id 0, no tags, refs, members or metadata): it was written as

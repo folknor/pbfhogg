@@ -352,7 +352,9 @@ pub struct HeaderBBox {
 ///
 /// In well-formed sorted PBFs ([`Sort.Type_then_ID`](HeaderBlock::is_sorted)),
 /// each block contains exactly one type. Unsorted or hand-crafted PBFs may
-/// produce [`Mixed`](BlockType::Mixed).
+/// produce [`Mixed`](BlockType::Mixed). This is a label read from each
+/// group's first field, not a kind test; see
+/// [`PrimitiveBlock::element_kinds`] for the exact kinds a block holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockType {
     /// Block contains dense-encoded nodes (the common node encoding).
@@ -448,7 +450,7 @@ pub struct PrimitiveBlock {
     block: WireBlock<'static>,
     /// The kinds of the elements the block holds, recorded by the
     /// construction-time validation pass.
-    kinds: crate::element_kind::KindSet,
+    kinds: crate::element_kind::ElementKindSet,
     /// How many elements [`elements`](Self::elements) yields, counted by the
     /// same validation pass.
     element_count: u64,
@@ -479,7 +481,7 @@ impl PrimitiveBlock {
     fn assemble(
         bytes: Bytes,
         meta: &WireBlockMeta,
-        kinds: crate::element_kind::KindSet,
+        kinds: crate::element_kind::ElementKindSet,
         element_count: u64,
     ) -> PrimitiveBlock {
         let data: &[u8] = &bytes;
@@ -516,11 +518,17 @@ impl PrimitiveBlock {
         self.kinds.refuse_under(claim)
     }
 
-    /// The kinds of the elements [`elements`](Self::elements) yields, as
-    /// the construction-time validation counted them: a reader asking which
-    /// kinds a block holds reads them here rather than walking it.
+    /// The exact set of element kinds [`elements`](Self::elements) yields,
+    /// recorded by the validation every block passes at construction, so
+    /// reading it costs nothing and walks nothing. This is the kind test;
+    /// [`block_type`](Self::block_type) is only a label. A block of one
+    /// kind has [`ElementKindSet::single`](crate::ElementKindSet::single) set, whatever its groups' first
+    /// fields say (dense beside plain node groups, an empty dense group
+    /// beside ways); a block holding changeset or unknown groups alone has
+    /// the empty set.
+    #[must_use]
     #[inline]
-    pub(crate) fn kinds(&self) -> crate::element_kind::KindSet {
+    pub fn element_kinds(&self) -> crate::ElementKindSet {
         self.kinds
     }
 
@@ -626,16 +634,15 @@ impl PrimitiveBlock {
     /// `Mixed` also stands for a group this classifier cannot name: a
     /// changeset group (field 5), an unknown field or an unexpected wire type.
     /// Dense plus plain node groups are `Mixed` too though they hold one kind.
-    /// So `Mixed` is "look at the elements", never evidence of several kinds,
-    /// and this is not a kind test: callers either walk a `Mixed` block anyway
-    /// (extract simple), reject it (digest), or fall back to the kinds of the
-    /// elements present (the diff merge).
+    /// So `Mixed` is "look at the elements", never evidence of several kinds.
+    /// Nor is any other label evidence of one: a group is named by its
+    /// first field only, so a `Ways` group can also hold relations, and an
+    /// empty dense message in front of ways labels the block as nodes. This
+    /// is not a kind test; [`element_kinds`](Self::element_kinds) is.
     ///
     /// Empty groups carry no elements and are neutral: an empty group beside
     /// a way group is a way block, not a mixed one. A block whose groups are
-    /// all empty (or that has none) is [`Empty`](BlockType::Empty). Counting
-    /// an empty group as a type of its own used to classify spec-valid
-    /// single-kind blocks as mixed, which the streaming merge-join rejects.
+    /// all empty (or that has none) is [`Empty`](BlockType::Empty).
     pub fn block_type(&self) -> BlockType {
         let mut result: Option<BlockType> = None;
         for i in 0..self.block.group_count() {
@@ -651,36 +658,6 @@ impl PrimitiveBlock {
             }
         }
         result.unwrap_or(BlockType::Empty)
-    }
-
-    /// Whether every field of every group is a plain `Node` (field 1) or a
-    /// `DenseNodes` (field 2) message, with at least one such field: a node
-    /// block in the sense [`block_type`](Self::block_type) cannot express
-    /// once it mixes dense and plain node groups, which `BlockBuilder` writes
-    /// for nodes with partial metadata. Unlike `block_type` it walks every
-    /// field, not each group's first, so a group that begins with a node and
-    /// holds a way, a changeset or an unknown field is not a node block.
-    pub(crate) fn holds_only_node_groups(&self) -> bool {
-        let mut any = false;
-        for i in 0..self.block.group_count() {
-            let mut cursor = super::wire::Cursor::new(self.block.group(i));
-            loop {
-                match cursor.read_tag() {
-                    Ok(None) => break,
-                    Ok(Some((field, wire_type))) => {
-                        if !matches!(field, 1 | 2) || wire_type != protohoggr::WIRE_LEN {
-                            return false;
-                        }
-                        if cursor.skip_field(wire_type).is_err() {
-                            return false;
-                        }
-                        any = true;
-                    }
-                    Err(_) => return false,
-                }
-            }
-        }
-        any
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`: groups
@@ -1059,7 +1036,7 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// with the entries and the group ranges.
 ///
 /// Returns the projection and the [`BlockScan`]: the kinds of the elements
-/// the block holds ([`KindSet`](crate::element_kind::KindSet)), recorded in
+/// the block holds ([`ElementKindSet`](crate::element_kind::ElementKindSet)), recorded in
 /// the loops this pass runs anyway (one bit-or per element, and one per dense
 /// group with at least one ID), and how many elements it holds, the count
 /// `PrimitiveBlock::elements` yields: one per plain node, way and relation
@@ -1089,7 +1066,7 @@ fn validate_block<P: GroupProjection>(
 
 /// Validate a block's bytes where they lie, borrowed: [`validate_block`]
 /// with `make`'s projection, then the refusal of a kind `claim` denies
-/// (`KindSet::refuse_under`, unlocated). This is all of
+/// (`ElementKindSet::refuse_under`, unlocated). This is all of
 /// [`BlockBuffer::project`]'s check, which runs it on the bytes it owns, so a
 /// caller that needs only the verdict, the [`BlockScan`] or a projection
 /// refuses exactly the blocks construction refuses, with the same error,
@@ -1114,7 +1091,7 @@ pub(crate) struct BlockScan {
     /// The block's scalar fields, defaults applied.
     pub(crate) fields: super::wire::BlockFields,
     /// The kinds of the elements the block holds.
-    pub(crate) kinds: crate::element_kind::KindSet,
+    pub(crate) kinds: crate::element_kind::ElementKindSet,
     /// How many elements the block holds.
     pub(crate) element_count: u64,
 }
@@ -1164,7 +1141,7 @@ impl<'w> BlockBuffer<'w> {
 
     /// Validate the block with `make`'s projection riding on the validator
     /// ([`validate_block`]), then refuse it when it holds a kind its blob's
-    /// claim denies (`KindSet::refuse_under`, the error unlocated: the caller
+    /// claim denies (`ElementKindSet::refuse_under`, the error unlocated: the caller
     /// locates it at the blob, as it locates a validation error). A
     /// malformed block is refused for its malformation even when it also
     /// contradicts the claim. On success returns the projection and the
@@ -1361,7 +1338,7 @@ pub(crate) trait GroupProjection {
     /// selects: an empty group, an empty dense message and a changeset group
     /// add none. Fires for every group the validator completes, empty ones
     /// included, in group order.
-    fn group_end(&mut self, _kinds: crate::element_kind::KindSet) {}
+    fn group_end(&mut self, _kinds: crate::element_kind::ElementKindSet) {}
 }
 
 /// The projection of block construction: nothing beyond the kinds and the
@@ -1398,7 +1375,7 @@ impl<A: GroupProjection, B: GroupProjection> GroupProjection for (A, B) {
         self.0.dense(dense, ids, info);
         self.1.dense(dense, ids, info);
     }
-    fn group_end(&mut self, kinds: crate::element_kind::KindSet) {
+    fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
         self.0.group_end(kinds);
         self.1.group_end(kinds);
     }
@@ -1436,7 +1413,7 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
             p.dense(dense, ids, info);
         }
     }
-    fn group_end(&mut self, kinds: crate::element_kind::KindSet) {
+    fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
         if let Some(p) = self {
             p.group_end(kinds);
         }
@@ -1451,17 +1428,17 @@ fn validate_groups<'a>(
     group_count: usize,
     group: impl Fn(usize) -> &'a [u8],
     projection: &mut impl GroupProjection,
-) -> Result<(crate::element_kind::KindSet, u64)> {
+) -> Result<(crate::element_kind::ElementKindSet, u64)> {
     use super::wire::Cursor;
     use crate::ElementKind;
 
-    let mut kinds = crate::element_kind::KindSet::default();
+    let mut kinds = crate::element_kind::ElementKindSet::default();
     let mut count: u64 = 0;
     for index in 0..group_count {
         let data = group(index);
         // This group's kinds, handed to the projection when it ends and
         // joined into the block's.
-        let mut group_kinds = crate::element_kind::KindSet::default();
+        let mut group_kinds = crate::element_kind::ElementKindSet::default();
 
         // 1. The group's own field framing. Everything below walks this same
         //    byte range through iterators that cannot report an error.
@@ -2596,7 +2573,7 @@ mod strict_validation_tests {
         PrimitiveBlock::assemble(
             bytes::Bytes::from(buffer),
             &meta,
-            crate::element_kind::KindSet::default(),
+            crate::element_kind::ElementKindSet::default(),
             0,
         )
     }
@@ -2656,7 +2633,7 @@ mod strict_validation_tests {
                             "{what}, group {i}"
                         );
                     }
-                    let mut kinds = crate::element_kind::KindSet::default();
+                    let mut kinds = crate::element_kind::ElementKindSet::default();
                     let mut count = 0_u64;
                     for element in raw.elements() {
                         count += 1;

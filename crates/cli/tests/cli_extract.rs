@@ -237,6 +237,33 @@ fn simple_includes_ways_with_nodes_in_bbox() {
     assert_eq!(way_ids(&c), vec![10, 12]);
 }
 
+/// The unsorted simple sweep skips a block by the kinds its elements are,
+/// not by its first-field label: an empty dense message in front of ways
+/// labels the block as nodes, and skipping it in the way sweep lost the way.
+#[test]
+fn simple_unsorted_reads_ways_behind_an_empty_dense_message() {
+    use crate::common::groups::{Field, block, write_unindexed_blocks};
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_unindexed_blocks(
+        &input,
+        &[
+            block(&[&[Field::Dense(&[1])]]),
+            block(&[&[Field::Dense(&[]), Field::Ways(&[10])]]),
+        ],
+    );
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox("0,0,0.5,0.5"),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1]);
+    assert_eq!(way_ids(&c), vec![10]);
+}
+
 #[test]
 fn simple_does_not_add_extra_nodes() {
     let dir = crate::common::test_scratch();

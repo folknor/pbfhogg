@@ -693,7 +693,7 @@ fn worker_split_blob(
     // above) yields exactly its validated element count of this kind, so
     // only an unindexed blob pays a counting walk.
     let total = match usize::try_from(block.element_count()) {
-        Ok(n) if block.kinds().foreign_to(kind).is_none() => n,
+        Ok(n) if block.element_kinds().foreign_to(kind).is_none() => n,
         _ => block.elements().filter(|e| is_match(e)).count(),
     };
 

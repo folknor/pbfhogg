@@ -14,7 +14,7 @@
 //!   filtering. Mixed-type blobs in unsorted PBFs could be mislabeled.
 
 use crate::ElementKind;
-use crate::element_kind::KindSet;
+use crate::element_kind::ElementKindSet;
 use crate::error::Result;
 
 /// Extract way IDs and their node refs from decompressed PrimitiveBlock bytes.
@@ -28,13 +28,13 @@ pub(crate) fn scan_way_refs(
     refs_buf: &mut Vec<i64>,
     group_starts: &mut Vec<(usize, usize)>,
     mut callback: impl FnMut(i64, &[i64]),
-) -> Result<KindSet> {
+) -> Result<ElementKindSet> {
     use crate::read::wire::{Cursor, WIRE_LEN};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
     group_starts.clear();
-    let mut kinds = KindSet::default();
+    let mut kinds = ElementKindSet::default();
 
     // Parse PrimitiveBlock top-level: only collect group offsets.
     while let Some((field, wire_type)) = cursor.read_tag()? {
@@ -70,7 +70,7 @@ pub(crate) fn scan_way_refs(
 }
 
 /// Skip one non-way group field, recording the kind it holds under the
-/// crate's `KindSet` rule: a plain node, a dense message with at least one
+/// crate's `ElementKindSet` rule: a plain node, a dense message with at least one
 /// ID, a relation. Anything else (changeset groups, unknown fields, a
 /// mistyped tag) adds nothing. Reads the dense message only to see whether
 /// it carries an ID, which only a foreign-kind blob reaches.
@@ -78,7 +78,7 @@ pub(crate) fn skip_recording_kind(
     gcursor: &mut crate::read::wire::Cursor<'_>,
     field: u32,
     wire_type: u32,
-    kinds: &mut KindSet,
+    kinds: &mut ElementKindSet,
 ) -> Result<()> {
     use crate::read::wire::{WIRE_LEN, WireDenseNodes};
 
@@ -296,15 +296,15 @@ mod tests {
         block
     }
 
-    fn set(kinds: &[ElementKind]) -> KindSet {
-        let mut set = KindSet::default();
+    fn set(kinds: &[ElementKind]) -> ElementKindSet {
+        let mut set = ElementKindSet::default();
         for &kind in kinds {
             set.add(kind);
         }
         set
     }
 
-    /// The way walker records the kinds under the shared `KindSet` rule: a
+    /// The way walker records the kinds under the shared `ElementKindSet` rule: a
     /// way, a plain node, a dense message with an ID and a relation count;
     /// empty groups, an empty dense message and changeset groups do not.
     #[test]
@@ -316,23 +316,27 @@ mod tests {
         let dense_empty_ids = [0x0A, 0x00];
         let changeset = [0x08, 0x01];
 
-        let cases: Vec<(&str, Vec<Vec<u8>>, KindSet)> = vec![
-            ("no groups", vec![], KindSet::default()),
-            ("empty group", vec![group_of(&[])], KindSet::default()),
+        let cases: Vec<(&str, Vec<Vec<u8>>, ElementKindSet)> = vec![
+            ("no groups", vec![], ElementKindSet::default()),
+            (
+                "empty group",
+                vec![group_of(&[])],
+                ElementKindSet::default(),
+            ),
             (
                 "empty dense message",
                 vec![group_of(&[(2, &[])])],
-                KindSet::default(),
+                ElementKindSet::default(),
             ),
             (
                 "dense message with an empty id array",
                 vec![group_of(&[(2, &dense_empty_ids)])],
-                KindSet::default(),
+                ElementKindSet::default(),
             ),
             (
                 "changeset group",
                 vec![group_of(&[(5, &changeset)])],
-                KindSet::default(),
+                ElementKindSet::default(),
             ),
             (
                 "ways",

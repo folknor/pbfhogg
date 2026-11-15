@@ -33,7 +33,7 @@
 //!   with the length of a way, and a coordinate is only scaled when the
 //!   caller asks for it.
 //! - **Kinds.** The node scanner reports which element kinds the blob holds
-//!   (the crate's `KindSet` rule: a dense message counts only with an ID), so
+//!   (the crate's `ElementKindSet` rule: a dense message counts only with an ID), so
 //!   the check routes blobs on what it decoded rather than on indexdata. The
 //!   way scanner raises a kind contradiction for a blob claiming ways that
 //!   holds elements of another kind: that is the one claim the check acts on
@@ -92,7 +92,7 @@ impl Framing {
 
 /// The element kinds a block holds: the crate's decoded-kind set, recorded
 /// here by the raw scanners under the same rule.
-pub(super) type Kinds = crate::element_kind::KindSet;
+pub(super) type Kinds = crate::element_kind::ElementKindSet;
 
 /// Reusable string-table and group-range scratch for [`validate_block`].
 pub(super) type ValidateScratch = (Vec<(u32, u32)>, Vec<(u32, u32)>);

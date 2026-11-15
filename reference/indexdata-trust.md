@@ -279,9 +279,11 @@ repairs it, and a single sorted-claiming input whose elements are out of
 order yields an output header that repeats the claim. The next command that
 depends on order is the one that checks (`apply-changes`, external
 `add-locations-to-ways`, `time-filter`, `renumber`, `sort --distrust-metadata`
-as the remedy). `block_type()` is not a kind test: it returns `Mixed` for a
-changeset or unknown group as well as for mixed kinds, and no caller treats it
-as evidence of a kind.
+as the remedy). `block_type()` is not a kind test: it names each group by its
+first field, so it returns `Mixed` for a changeset or unknown group as well as
+for mixed kinds, and a single label can hide other kinds. No caller treats it
+as evidence of a kind; every kind decision reads
+`PrimitiveBlock::element_kinds()`, the exact set block validation records.
 
 ## Allocation from claims
 

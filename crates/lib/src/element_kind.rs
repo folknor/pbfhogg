@@ -73,21 +73,62 @@ impl ElementKind {
     }
 }
 
-/// The element kinds a decoded block holds, as a bit set.
+/// The element kinds a decoded block holds, as a set: what
+/// [`PrimitiveBlock::element_kinds`](crate::PrimitiveBlock::element_kinds)
+/// returns.
 ///
-/// A kind is in the set when the block holds at least one element of it: a
-/// plain `Node` message, a dense group with at least one ID, a `Way` or a
-/// `Relation` message. Empty groups, an empty dense message, changeset
-/// groups and unknown fields add nothing. It is the set a foreign-kind test
-/// against a blob's indexdata claim reads ([`KindSet::foreign_to`]), which
-/// is deliberately weaker than `check --index`: an empty block under any
-/// claim holds no foreign kind.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(crate) struct KindSet(u8);
+/// A kind is in the set when the block holds at least one element of it,
+/// which is exactly when [`PrimitiveBlock::elements`](crate::PrimitiveBlock::elements)
+/// yields one: a plain `Node` message or a dense group with at least one ID
+/// (both [`ElementKind::Node`]), a `Way` or a `Relation` message. Empty
+/// groups, an empty dense message, changeset groups and unknown fields add
+/// nothing, so a block of only those has the empty set. Unlike
+/// [`BlockType`](crate::BlockType), which labels each group by its first
+/// field, this is a kind test: a block whose set is [`single`](Self::single)
+/// holds elements of that one kind and no other.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
+pub struct ElementKindSet(u8);
 
-impl KindSet {
+impl ElementKindSet {
     const fn bit(kind: ElementKind) -> u8 {
         1 << kind.ordinal()
+    }
+
+    /// Whether `kind` is in the set.
+    #[must_use]
+    #[inline]
+    pub fn has(self, kind: ElementKind) -> bool {
+        self.0 & Self::bit(kind) != 0
+    }
+
+    /// Whether the set holds no kind: the block yields no element.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// How many kinds the set holds: 0 to 3.
+    #[must_use]
+    #[inline]
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    /// The one kind the set holds, or `None` when it holds none or several.
+    #[must_use]
+    #[inline]
+    pub fn single(self) -> Option<ElementKind> {
+        [ElementKind::Node, ElementKind::Way, ElementKind::Relation]
+            .into_iter()
+            .find(|&kind| self.0 == Self::bit(kind))
+    }
+
+    /// The kinds in the set, in node, way, relation order.
+    pub fn iter(self) -> impl Iterator<Item = ElementKind> {
+        [ElementKind::Node, ElementKind::Way, ElementKind::Relation]
+            .into_iter()
+            .filter(move |&kind| self.has(kind))
     }
 
     /// Add `kind` to the set.
@@ -98,19 +139,15 @@ impl KindSet {
 
     /// The set holding both sets' kinds.
     #[must_use]
-    pub(crate) fn union(self, other: KindSet) -> KindSet {
-        KindSet(self.0 | other.0)
-    }
-
-    /// Whether `kind` is in the set.
-    #[must_use]
-    pub(crate) fn has(self, kind: ElementKind) -> bool {
-        self.0 & Self::bit(kind) != 0
+    pub(crate) fn union(self, other: ElementKindSet) -> ElementKindSet {
+        ElementKindSet(self.0 | other.0)
     }
 
     /// A kind in the set other than `claimed`, if any: the witness that a
     /// claim of `claimed` is false. Chosen by the fixed node, way, relation
-    /// priority, so the same block always yields the same witness.
+    /// priority, so the same block always yields the same witness. This is
+    /// the test against a blob's indexdata claim, deliberately weaker than
+    /// `check --index`: an empty block under any claim holds no foreign kind.
     #[must_use]
     #[inline]
     pub(crate) fn foreign_to(self, claimed: ElementKind) -> Option<ElementKind> {
@@ -197,8 +234,8 @@ mod tests {
 
     #[test]
     fn a_kind_set_names_a_foreign_kind_by_fixed_priority() {
-        use super::KindSet;
-        let mut set = KindSet::default();
+        use super::ElementKindSet;
+        let mut set = ElementKindSet::default();
         for claim in [ElementKind::Node, ElementKind::Way, ElementKind::Relation] {
             assert_eq!(set.foreign_to(claim), None, "empty set under {claim}");
         }
@@ -213,5 +250,33 @@ mod tests {
         );
         assert_eq!(set.foreign_to(ElementKind::Node), Some(ElementKind::Way));
         assert!(set.has(ElementKind::Node));
+    }
+
+    #[test]
+    fn a_kind_set_is_single_only_with_exactly_one_kind() {
+        use super::ElementKindSet;
+        let all = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
+        let empty = ElementKindSet::default();
+        assert!(empty.is_empty());
+        assert_eq!((empty.len(), empty.single()), (0, None));
+        assert_eq!(empty.iter().count(), 0);
+        for kind in all {
+            let mut one = ElementKindSet::default();
+            one.add(kind);
+            assert!(!one.is_empty());
+            assert_eq!((one.len(), one.single()), (1, Some(kind)));
+            assert_eq!(one.iter().collect::<Vec<_>>(), [kind]);
+        }
+        let mut several = ElementKindSet::default();
+        several.add(ElementKind::Relation);
+        several.add(ElementKind::Node);
+        assert_eq!((several.len(), several.single()), (2, None));
+        assert_eq!(
+            several.iter().collect::<Vec<_>>(),
+            [ElementKind::Node, ElementKind::Relation]
+        );
+        several.add(ElementKind::Way);
+        assert_eq!(several.iter().collect::<Vec<_>>(), all);
+        assert_eq!(several.single(), None);
     }
 }

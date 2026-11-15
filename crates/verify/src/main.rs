@@ -126,6 +126,15 @@ struct ApplyArgs {
 }
 
 #[derive(ClapArgs)]
+struct DegradeArgs {
+    #[command(flatten)]
+    pbf: PbfArgs,
+    /// Require inline way coordinates in the input (fail without them).
+    #[arg(long)]
+    locations_on_ways: bool,
+}
+
+#[derive(ClapArgs)]
 struct ExtractArgs {
     #[command(flatten)]
     pbf: PbfArgs,
@@ -206,7 +215,7 @@ enum Check {
     #[command(name = "check-ids")]
     Ids(PbfArgs),
     Repack(PbfArgs),
-    Degrade(PbfArgs),
+    Degrade(DegradeArgs),
     TagsFilter(TagsArgs),
     /// pbfhogg inspect tags vs osmium tags-count
     InspectTags(PbfArgs),
@@ -499,18 +508,10 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
         | Check::GetidRemoveid(pbf)
         | Check::Ids(pbf)
         | Check::Repack(pbf)
-        | Check::Degrade(pbf) => {
+        | Check::Degrade(DegradeArgs { pbf, .. }) => {
             let input = resolve_input(b, &pbf.source)?;
             h.run.watch(&input)?;
-            let (name, run): (&str, checks::ReadCheck) = match check {
-                Check::Cat(_) => ("cat", checks::cat::run),
-                Check::InspectTags(_) => ("inspect-tags", checks::inspect_tags::run),
-                Check::Ids(_) => ("check-ids", checks::check_ids::run),
-                Check::Repack(_) => ("repack", checks::repack::run),
-                Check::Degrade(_) => ("degrade", checks::degrade::run),
-                Check::Getparents(_) => ("getparents", checks::getparents::run),
-                _ => ("getid-removeid", checks::getid_removeid::run),
-            };
+            let (name, run) = read_check(check);
             Ok(Ending::Single(
                 h.run_check(name, |h| run(h, &input, pbf.direct_io))?,
             ))
@@ -561,6 +562,23 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
             ))
         }
         Check::All(suite) => dispatch_all(b, h, suite),
+    }
+}
+
+/// The name and entry point of a check that reads one PBF.
+fn read_check(check: &Check) -> (&'static str, checks::ReadCheck) {
+    match check {
+        Check::Cat(_) => ("cat", checks::cat::run),
+        Check::InspectTags(_) => ("inspect-tags", checks::inspect_tags::run),
+        Check::Ids(_) => ("check-ids", checks::check_ids::run),
+        Check::Repack(_) => ("repack", checks::repack::run),
+        Check::Degrade(DegradeArgs {
+            locations_on_ways: true,
+            ..
+        }) => ("degrade -l", checks::degrade::run_locations),
+        Check::Degrade(_) => ("degrade", checks::degrade::run),
+        Check::Getparents(_) => ("getparents", checks::getparents::run),
+        _ => ("getid-removeid", checks::getid_removeid::run),
     }
 }
 
@@ -799,6 +817,10 @@ mod tests {
         }
         assert!(Args::try_parse_from(["x", "add-locations-to-ways", "--mode", "dense"]).is_err());
         assert!(Args::try_parse_from(["x", "check-refs", "--direct-io"]).is_err());
+        assert!(
+            matches!(Args::try_parse_from(["x", "degrade", "--locations-on-ways"]).unwrap().check,
+            Check::Degrade(a) if a.locations_on_ways)
+        );
         assert!(
             matches!(Args::try_parse_from(["x", "add-locations-to-ways", "--inject-prepass"]).unwrap().check,
             Check::AddLocationsToWays(a) if a.inject_prepass)

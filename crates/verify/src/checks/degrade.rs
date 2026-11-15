@@ -31,6 +31,14 @@
 //!   kind's lowest ID by osmium fileinfo, decoded second in the kind's first
 //!   blob: the first two objects swapped. No blob ranges overlap.
 //!
+//! On a `LocationsOnWays` input every case strips way coordinates (the
+//! decode path drops them whatever the flags), and the check first holds
+//! osmium's reading of the input with coordinates against the reference
+//! without them, to establish that some way carried one. [`run`] takes any
+//! input and names an input without coordinates as a gap;
+//! [`run_locations`] (the suite's `degrade -l` on the `altw-keep-untagged`
+//! base, or `--locations-on-ways`) fails on one instead.
+//!
 //! `--drop-ids` and the unsort modes need an input osmium reads in strict
 //! order; on other input they do not run and the PASS line says so.
 //! `--force` is passed only on an unindexed input.
@@ -110,13 +118,53 @@ impl Run<'_> {
     }
 }
 
-/// Run degrade cross-validation (module doc).
+/// Run degrade cross-validation (module doc) on any input; one without
+/// inline way coordinates is a PASS-line gap.
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
+    run_on(harness, pbf, direct_io, false)
+}
+
+/// Run degrade cross-validation on an input that must carry inline way
+/// coordinates: one that declares no `LocationsOnWays`, or whose ways carry
+/// none, fails instead of passing with a gap.
+pub fn run_locations(
+    harness: &mut Harness,
+    pbf: &Path,
+    direct_io: bool,
+) -> Result<Option<String>, Error> {
+    run_on(harness, pbf, direct_io, true)
+}
+
+fn run_on(
+    harness: &mut Harness,
+    pbf: &Path,
+    direct_io: bool,
+    require_locations: bool,
+) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("degrade")?;
     harness.msg("--- degrade: reading the input ---");
     let input = reencode::read_input(harness, &outdir, pbf)?;
+    if require_locations && !input.locations {
+        return Err(Error::Failed(
+            "the input declares no LocationsOnWays, so coordinate stripping cannot be verified \
+             on it"
+                .to_owned(),
+        ));
+    }
     let mut refs = References::new(&outdir, &input);
     let reference = refs.get(harness, false)?;
+    let coordinates = if input.locations {
+        observed_coordinates(harness, &outdir, &mut refs, &reference)?
+    } else {
+        false
+    };
+    if input.locations && !coordinates && require_locations {
+        return Err(Error::Failed(
+            "the input declares LocationsOnWays but osmium finds no way whose coordinates the \
+             reference lost, so coordinate stripping cannot be verified on it"
+                .to_owned(),
+        ));
+    }
     let mut run = Run {
         harness,
         outdir: outdir.clone(),
@@ -159,8 +207,13 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     }
     if !input.locations {
         run.gaps.push(
-            "the input declares no LocationsOnWays, so --strip-locations had no coordinate to \
-             strip"
+            "the input declares no LocationsOnWays, so no case had a way coordinate to strip"
+                .to_owned(),
+        );
+    } else if !coordinates {
+        run.gaps.push(
+            "the input declares LocationsOnWays but no way carries a coordinate, so no case had \
+             one to strip"
                 .to_owned(),
         );
     }
@@ -181,6 +234,36 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     ];
     claim.extend(run.gaps);
     Ok(Some(claim.join("; ")))
+}
+
+/// Whether any way in a `LocationsOnWays` input carries inline coordinates:
+/// osmium diff of the reference that keeps them against the one that drops
+/// them (the same stable partition when osmium reads the input out of
+/// order, so only the coordinates differ). Any unmatched object means the
+/// two references are not one sequence, an error; `different` counts the
+/// objects whose checksum, way coordinates included, changed.
+fn observed_coordinates(
+    harness: &mut Harness,
+    outdir: &Path,
+    refs: &mut References<'_>,
+    without: &Path,
+) -> Result<bool, Error> {
+    harness.msg("--- degrade: way coordinates in the input (osmium diff) ---");
+    let with = refs.get(harness, true)?;
+    let compared = reencode::compare(harness, outdir, "coordinates", &with, without)?;
+    let s = compared.summary;
+    if s.left != 0 || s.right != 0 {
+        return Err(Error::Failed(format!(
+            "the references with and without way coordinates differ beyond coordinates: \
+             osmium diff finds left={} right={}",
+            s.left, s.right
+        )));
+    }
+    harness.msg(&format!(
+        "  {} objects carry way coordinates the reference without them lost",
+        s.different
+    ));
+    Ok(s.different > 0)
 }
 
 fn strip_locations(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {

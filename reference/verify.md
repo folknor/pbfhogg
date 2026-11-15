@@ -70,12 +70,13 @@ four finite coordinates and preserve their original spelling. Only `all`,
 `extract` and `multi-extract` accept `--bbox`; change-only selection never
 implies geographic filtering.
 
-The suite reports all 19 entries in order, including explicit `SKIPPED`
+The suite reports every entry in order, including explicit `SKIPPED`
 lines counted separately from passes. Extract skips without either a bbox
 or polygons; multi-extract skips without a bbox. The six OSC-consuming
-entries skip only when no OSC is configured. The locations apply-changes
-entry also skips for a fixture PBF or an absent selected-generation
-`altw-keep-untagged` base. Configured invalid inputs fail resolution, even
+entries skip only when no OSC is configured. The two locations entries,
+`degrade -l` and `apply-changes -l`, also skip for a fixture PBF or an
+absent selected-generation `altw-keep-untagged` base; `degrade -l` needs
+no OSC. Configured invalid inputs fail resolution, even
 when another missing prerequisite would have skipped the check. Snapshot
 fallback never substitutes the primary keep-untagged base.
 
@@ -239,7 +240,7 @@ suite because a later comparison cannot make that run complete.
 | `check-refs` | `osmium check-refs` | missing counts per class in ways-only and relation modes, each exit held to its complete report |
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
 | `repack` | `osmium diff` | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
-| `degrade` | `osmium diff` | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions |
+| `degrade` | `osmium diff` | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on a `LocationsOnWays` input (`--locations-on-ways`, suite `degrade -l`) |
 | `apply-changes` | `osmium apply-changes` | strict output order and element equality, tolerating only osmium-only IDs in the input OSC delete set; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
@@ -476,6 +477,23 @@ first blob, and no blob ranges may overlap. The unsort modes must not claim
 `Sort.Type_then_ID`; the other cases claim it as the input does; none claims
 `LocationsOnWays`.
 
+Which input each arm strips coordinates on: the decode path drops inline way
+coordinates on every case, whatever the flags, so every case strips them
+when the input carries them and none does otherwise. The suite's `degrade`
+entry runs on the suite input (by default `indexed`, which declares no
+`LocationsOnWays`; the PASS line names the gap). The suite's `degrade -l`
+entry runs the whole check on the selected generation's
+`altw-keep-untagged` base, and standalone `degrade --locations-on-ways`
+does the same on the selected input. On a `LocationsOnWays` input the check
+first diffs the reference with way coordinates against the one without
+(both the input, or both the same stable partition): an unmatched object is
+a failure, and a `different` count of zero means no way carried a
+coordinate. In the locations entry an input that declares no
+`LocationsOnWays`, or whose ways carry no coordinate, fails; elsewhere it is
+a PASS-line gap. That a retained coordinate would be caught rests on
+osmium diff checksumming way node coordinates; the generated fixtures fake
+osmium and exercise only the wiring.
+
 
 Change-only checks resolve no PBF. Merge-changes takes `--osc-seq`, repeated
 fixture `--osc PATH` in argument order, or inclusive `--osc-range LO..HI`
@@ -621,6 +639,12 @@ pbfhogg-judged comparison to osmium decodings and the verifier's readers
 4705`: 18 PASS and sort ENVIRONMENT (osmium sort SIGKILLed again), diff
 failing only on scratch exhausted by cached OPL decodings; with decodings
 uncached and removed once merged, diff then passed alone.
+
+On 2026-11-15, host bygg, on the uncommitted change that added the
+locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways
+--variant altw-keep-untagged` on Denmark PASS (every case stripping real
+inline coordinates), and plain `degrade` on Denmark indexed PASS with the
+no-`LocationsOnWays` gap named.
 
 On 2026-11-15, host bygg, parent `9e9d2e84` with the uncommitted change that
 replaced renumber's 10% relation tolerance with the record-by-record orphan

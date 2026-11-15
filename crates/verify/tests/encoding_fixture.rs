@@ -52,6 +52,34 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             );
         }
     }
+    // A LocationsOnWays input: the reference is osmium cat without
+    // coordinates, and the coverage diff must find a way that lost them.
+    // Requiring coordinates fails on an input that declares none, or whose
+    // coverage diff finds none; without the requirement that is a gap.
+    let low = dir.join("low.pbf");
+    write_pbf(&low, false, 3, &["Sort.Type_then_ID"], &["LocationsOnWays"]);
+    for (fault, path, required, passed) in [
+        ("", &low, true, true),
+        ("no-coords", &low, true, false),
+        ("no-coords", &low, false, true),
+        ("", &input, true, false),
+    ] {
+        std::fs::write(dir.join("fault"), fault).unwrap();
+        h.run = run::Run::create(&dir, exe, true).unwrap();
+        h.run.watch(path).unwrap();
+        let check = if required {
+            checks::degrade::run_locations as checks::ReadCheck
+        } else {
+            checks::degrade::run
+        };
+        let status = h.run_check("degrade", |h| check(h, path, true)).unwrap();
+        assert_eq!(
+            status == harness::CheckStatus::Passed,
+            passed,
+            "fault={fault} required={required} input={}",
+            path.display()
+        );
+    }
     // Only the exact refusal with no published output is accepted.
     for (fault, accepted) in [
         ("refused", true),
@@ -94,12 +122,31 @@ pub fn tool(args: &[OsString]) -> i32 {
         }
         "diff" => {
             assert!(args.contains(&"opl,locations_on_ways=true"));
+            // The coverage diff: the input with coordinates against the
+            // reference osmium cat wrote without them.
+            if args.iter().any(|a| a.ends_with("reference-plain.osm.pbf"))
+                && args.iter().any(|a| a.ends_with("low.pbf"))
+            {
+                if fault == "no-coords" {
+                    eprintln!("Summary: left=0 right=0 same=3 different=0");
+                    return 0;
+                }
+                eprintln!("Summary: left=0 right=0 same=2 different=1");
+                println!("-w1 v1 Nn1x1y1\n+w1 v1 Nn1");
+                return 1;
+            }
             if fault == "content" {
                 eprintln!("Summary: left=0 right=0 same=2 different=1");
                 println!("-n1 v1\n+n1 v2");
                 return 1;
             }
             eprintln!("Summary: left=0 right=0 same=3 different=0");
+        }
+        "cat" => {
+            // The reference without way coordinates: plain PBF output.
+            assert!(!args.iter().any(|a| a.contains("locations_on_ways")));
+            let output = Path::new(args[args.iter().position(|a| *a == "-o").unwrap() + 1]);
+            write_pbf(output, false, 3, &["Sort.Type_then_ID"], &[]);
         }
         "repack" | "degrade" => {
             assert!(args.contains(&"--staging-dir"));

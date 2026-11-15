@@ -84,6 +84,12 @@ pub(crate) fn run(
     counts.add(h.run_check("check-ids", |h| checks::check_ids::run(h, pbf, direct_io))?);
     counts.add(h.run_check("repack", |h| checks::repack::run(h, pbf, direct_io))?);
     counts.add(h.run_check("degrade", |h| checks::degrade::run(h, pbf, direct_io))?);
+    match locations_base {
+        Ok(base) => counts.add(h.run_check("degrade -l", |h| {
+            checks::degrade::run_locations(h, base, direct_io)
+        })?),
+        Err(why) => counts.skip("degrade -l", why),
+    }
     if let Some(osc) = osc {
         counts.add(h.run_check("apply-changes", |h| {
             checks::apply_changes::run(h, pbf, osc, direct_io, false)
@@ -146,12 +152,12 @@ mod tests {
     fn complete_suite_accounts_for_skips() {
         let counts = super::Counts {
             passed: 11,
-            skipped: 8,
+            skipped: 9,
             ..Default::default()
         };
         let line = super::banner(&counts, std::time::Duration::ZERO);
         assert!(
-            line.ends_with("11 passed, 0 failed, 0 environment, 8 skipped out of 19"),
+            line.ends_with("11 passed, 0 failed, 0 environment, 9 skipped out of 20"),
             "{line}"
         );
     }

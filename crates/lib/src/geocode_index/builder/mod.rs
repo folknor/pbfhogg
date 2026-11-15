@@ -16,6 +16,7 @@ use super::format::*;
 
 mod admin;
 mod cover;
+mod input_digest;
 mod interp;
 mod pass1;
 mod pass1_5;
@@ -394,9 +395,10 @@ fn build_generation(
     // `output_dir` is the output's staging directory, which `OutputDir`
     // created when it was staged; it is not created again here.
 
-    // The input is opened three times: the indexdata probe, the replication
-    // header read and the schedule walk, whose one description the
-    // unindexed classify, pass 1, pass 1.5 and pass 2 then share.
+    // The input is opened four times: the indexdata probe, the replication
+    // header read, the schedule walk, whose one description the
+    // unindexed classify, pass 1, pass 1.5 and pass 2 then share, and the
+    // whole-file digest's own sequential description.
     // Every open is derived from this pin, taken before any of them, so an
     // input renamed over mid-build is never read partly from each file.
     // A path is pinned here, after the configuration and output checks, so
@@ -434,8 +436,6 @@ fn build_generation(
     let repl_ts = pbf_header.osmosis_replication_timestamp().unwrap_or(0) as u64;
     drop(reader);
 
-    let mut strings = StringPool::new();
-
     // -----------------------------------------------------------------------
     // One header walk produces everything the passes need: the relation
     // schedule (Pass 1), the way schedule (Pass 1.5), the node schedule
@@ -453,9 +453,83 @@ fn build_generation(
         ways: way_schedule,
         max_node_id,
         file: shared_file,
+        file_size: walked_size,
     } = pass1_5::build_schedules(&input, host)?;
     host.invocation.marker("GEOCODE_SCHEDULES_END");
     host.invocation.check()?;
+
+    // The input's whole-file digest for the header, hashed on its own
+    // description on a worker that runs beside passes 1 to 3 and is joined
+    // only for the header write (see `input_digest`). Opened here, on the
+    // calling thread, so the open is counted with the others. The worker
+    // borrows the pin, so `input` lives until the scope has joined it.
+    let digest_file = input_digest::open(&input, &host.invocation)?;
+    let digest_stop = std::sync::atomic::AtomicBool::new(false);
+    crate::threads::scope(|s| {
+        let worker =
+            s.spawn(|| input_digest::hash(digest_file, &input, &digest_stop, &host.invocation));
+        // Dropped unused (the build failed or unwound before its header),
+        // this stops the hash before the scope joins it.
+        let stop_on_failure = input_digest::StopOnDrop(&digest_stop);
+        let finish_digest = || {
+            stop_on_failure.disarm();
+            host.invocation.marker("GEOCODE_INPUT_DIGEST_JOIN_START");
+            let joined = worker.join();
+            host.invocation.marker("GEOCODE_INPUT_DIGEST_JOIN_END");
+            let digest = match joined {
+                Ok(digest) => digest?,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+            .ok_or_else(|| Error::internal("the input digest stopped before the header write"))?;
+            input_digest::check_extent(digest, walked_size, &input)
+        };
+        build_from_schedules(
+            pass1_5::Schedules {
+                relations: relation_schedule,
+                nodes: node_schedule,
+                ways: way_schedule,
+                max_node_id,
+                file: shared_file,
+                file_size: walked_size,
+            },
+            finish_digest,
+            (repl_seq, repl_ts),
+            start_time,
+            config,
+            output_dir,
+            scratch,
+            host,
+        )
+    })
+}
+
+/// Passes 1 to 3 and the header, from the schedule walk's output.
+/// `finish_digest` waits for the input digest; it is called once, just
+/// before the header is written.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments
+)]
+fn build_from_schedules(
+    schedules: pass1_5::Schedules,
+    finish_digest: impl FnOnce() -> Result<input_digest::InputDigest>,
+    (repl_seq, repl_ts): (u32, u64),
+    start_time: std::time::Instant,
+    config: &BuildConfig,
+    output_dir: &std::path::Path,
+    scratch: &crate::scratch::RunScratch,
+    host: &crate::host::Entered<'_>,
+) -> Result<BuildStats> {
+    let pass1_5::Schedules {
+        relations: relation_schedule,
+        nodes: node_schedule,
+        ways: way_schedule,
+        max_node_id,
+        file: shared_file,
+        file_size: _,
+    } = schedules;
+    let mut strings = StringPool::new();
 
     // -----------------------------------------------------------------------
     // Pass 1: Relations - collect admin boundary metadata + way member IDs
@@ -565,9 +639,9 @@ fn build_generation(
     way_store.remove(scratch);
     drop(node_schedule);
     drop(way_schedule);
+    // Pass 2 is the last pass to read the input; the digest worker may
+    // still be reading its own description of it.
     drop(shared_file);
-    // Pass 2 was the input's last reader.
-    drop(input);
     host.invocation.marker("GEOCODE_PASS2_SCAN_END");
     host.invocation.check()?;
 
@@ -821,7 +895,9 @@ fn build_generation(
         "  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells"
     );
 
-    // Write header
+    // Write header, once the input digest is in.
+    let digest = finish_digest()?;
+    host.invocation.check()?;
     let header = Header {
         format_version: FORMAT_VERSION,
         street_cell_level: config.street_level,
@@ -839,6 +915,8 @@ fn build_generation(
         geo_cell_count: fine_count,
         coarse_cell_count: coarse_count,
         admin_cell_count: admin_count,
+        input_xxh3_128: digest.xxh3_128,
+        input_bytes: digest.bytes,
     };
     write_data_file(&output_dir.join(FILE_HEADER), &header.to_bytes())?;
 

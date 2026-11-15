@@ -174,6 +174,16 @@ their own outright with a message naming `build-geocode-index` as the remedy,
 so an index built by an earlier release must be rebuilt rather than migrated -
 the index is a directory of regenerable derived files, not a document.
 
+An index records which PBF it was built from: `Reader::input_xxh3_128` is
+the whole-file XXH3-128 (seed zero) of the input and `Reader::input_bytes`
+its size. `format!("{:032x}", reader.input_xxh3_128())` is the same 32-digit
+hex any whole-file XXH3-128 of that PBF gives, so a caller that hashed its
+PBF compares the two to know the index came from those bytes. It identifies
+the input, provided the input was not changed during the build; it does not
+check that the index files are intact. The replication sequence and
+timestamp beside it describe the input's header and are no proof of origin:
+two extracts of one replication state share them.
+
 Every string an answer carries (names, house numbers, streets, postcodes,
 country codes) is the tag value whole: a value holding a NUL byte, which PBF
 allows, is not cut at it. A caller passing one to a C API or into XML has to

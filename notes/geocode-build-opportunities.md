@@ -72,7 +72,8 @@ Measured phase weights from planet result `38565e43` (`8e3a0d1`, 2026-04-20,
 
 ### G1. Full rewrite: geocode-relevant way extraction store
 
-**Status: implemented 2026-11-10, awaiting commit and bench.** Pass 1.5
+**Status: landed in `9d9a2a79`; its cells are in
+`reference/performance/geocode.md`.** Pass 1.5
 now validates each way blob with the block validator, classifies ways by
 byte equality on the accepted string table and writes relevant ways to
 per-worker scratch files (`builder/way_store.rs`, one segment per

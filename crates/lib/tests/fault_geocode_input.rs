@@ -11,7 +11,9 @@
 //!
 //! The opens, in order: the indexdata probe and the replication header read
 //! (both `O_DIRECT` under direct reads), then the schedule walk, whose one
-//! description the unindexed classify, pass 1, pass 1.5 and pass 2 share.
+//! description the unindexed classify, pass 1, pass 1.5 and pass 2 share,
+//! then the whole-file digest's own description (opened on the calling
+//! thread, read on its worker).
 //!
 //! The replacement differs in what every open feeds the index: its header
 //! carries other replication values, its boundary relation another name and
@@ -30,7 +32,7 @@ use pbfhogg::writer::{Compression, PbfWriter};
 use crate::common::snapshot_dir;
 
 /// Every build opens the input this many times, on every route.
-const OPENS: u64 = 3;
+const OPENS: u64 = 4;
 
 /// What one fixture puts in the index.
 struct Fixture {
@@ -183,9 +185,21 @@ fn index_files(index_dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>>
         .collect()
 }
 
-/// The index built from `fixture`, checked by query.
-fn assert_index_of(index_dir: &Path, fixture: &Fixture, cell: &str) {
+/// The whole-file XXH3-128 and size of the file at `path`.
+fn identity_of(path: &Path) -> (u128, u64) {
+    let bytes = std::fs::read(path).expect("read input");
+    (xxhash_rust::xxh3::xxh3_128(&bytes), bytes.len() as u64)
+}
+
+/// The index built from `fixture`, whose input file had `identity`, checked
+/// by its header and by query.
+fn assert_index_of(index_dir: &Path, fixture: &Fixture, identity: (u128, u64), cell: &str) {
     let reader = pbfhogg::geocode_index::reader::Reader::open(index_dir).expect("open index");
+    assert_eq!(
+        (reader.input_xxh3_128(), reader.input_bytes()),
+        identity,
+        "{cell}: the header records the pinned input's digest"
+    );
     assert_eq!(
         reader.replication_sequence(),
         u32::try_from(fixture.sequence).expect("small sequence"),
@@ -253,7 +267,12 @@ fn reference(
     assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
-    assert_index_of(&index_dir, &INPUT, &format!("{route:?}, unreplaced"));
+    assert_index_of(
+        &index_dir,
+        &INPUT,
+        identity_of(input),
+        &format!("{route:?}, unreplaced"),
+    );
     let files = index_files(&index_dir);
     std::fs::remove_dir_all(&index_dir).expect("remove reference index");
     Reference::Index(files)
@@ -288,7 +307,9 @@ fn check_replacements(
                 "the old index must differ from the reference"
             );
             write_fixture(input, &INPUT, route.indexdata);
+            let identity = identity_of(input);
             write_fixture(&replacement, &REPLACEMENT, route.indexdata);
+            assert_ne!(identity_of(&replacement), identity);
             let host = crate::common::test_host();
             scenario.run(input, &host, |pin, scenario| {
                 host.invocation
@@ -322,7 +343,7 @@ fn check_replacements(
                         OPENS - after,
                         "{cell}: {report:?}"
                     );
-                    assert_index_of(&index_dir, &INPUT, &cell);
+                    assert_index_of(&index_dir, &INPUT, identity, &cell);
                     assert_eq!(
                         &index_files(&index_dir),
                         expected,

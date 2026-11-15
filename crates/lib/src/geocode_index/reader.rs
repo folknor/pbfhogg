@@ -987,6 +987,23 @@ impl Reader {
         self.header.replication_timestamp
     }
 
+    /// XXH3-128 (seed zero) of every byte of the input PBF this index was
+    /// built from. `format!("{:032x}", ..)` gives the same 32-digit hex as
+    /// any whole-file XXH3-128 of that file (brokkr's dataset pins,
+    /// elivagar's `input.xxh3_128`), so a consumer that hashed its PBF can
+    /// tell whether this index was built from those bytes. It identifies
+    /// the input, under the builder's contract that the input is not
+    /// changed while it is built; it says nothing about whether the index
+    /// files are intact.
+    pub fn input_xxh3_128(&self) -> u128 {
+        self.header.input_xxh3_128
+    }
+
+    /// The size in bytes of the input PBF this index was built from.
+    pub fn input_bytes(&self) -> u64 {
+        self.header.input_bytes
+    }
+
     pub fn street_cell_level(&self) -> u8 {
         self.header.street_cell_level
     }
@@ -2493,6 +2510,8 @@ mod tests {
                 geo_cell_count: 0,
                 coarse_cell_count: 0,
                 admin_cell_count: 0,
+                input_xxh3_128: 0,
+                input_bytes: 0,
             },
             fine_max_dist_sq: 0.0,
             coarse_max_dist_sq: 0.0,

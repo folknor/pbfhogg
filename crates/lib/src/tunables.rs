@@ -1182,6 +1182,13 @@ pub(crate) const GEOCODE_MERGE_WINDOW_BLOBS: usize = 256;
 /// 0.95 s. See `reference/performance/geocode.md`, build-geocode-index.
 pub(crate) const GEOCODE_DATA_FILE_BUFFER_BYTES: usize = 1 << 20;
 
+/// Read size of the builder's background whole-file input hash, which runs
+/// on its own sequentially advised description beside passes 1 to 2. One
+/// fixed buffer, so its memory does not follow the input; 8 MiB keeps the
+/// read count low on a planet-sized input without holding a large
+/// allocation.
+pub(crate) const GEOCODE_INPUT_HASH_CHUNK_BYTES: usize = 8 << 20;
+
 /// IDs the dense node-ID bitmap may cover per input byte, passed to
 /// `IdSet::file_bounded_max_id` because `max_node_id` can come from
 /// unverified indexdata. References above the resulting bound are collected

@@ -762,7 +762,7 @@ pub(super) fn build_schedules(
         }
     }
 
-    let shared_file = walker.input();
+    let (shared_file, file_size) = (walker.input(), walker.file_size());
     drop(walker);
 
     // `max_node_id` must bound every node ID Phase 2a will see: Pass 1.5
@@ -849,6 +849,7 @@ pub(super) fn build_schedules(
         ways: way_schedule,
         max_node_id,
         file: shared_file,
+        file_size,
     })
 }
 
@@ -863,6 +864,8 @@ pub(super) struct Schedules {
     pub(super) ways: Vec<ScheduledBlob>,
     pub(super) max_node_id: i64,
     pub(super) file: InputFile,
+    /// The input's size as the walk framed it.
+    pub(super) file_size: u64,
 }
 
 /// What decoding an unindexed blob says about it: which passes need it,

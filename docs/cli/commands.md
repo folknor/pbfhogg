@@ -2061,7 +2061,14 @@ whose roles do not describe outer or inner rings are ignored (an empty role
 counts as outer). The PBF replication sequence is stored as a u32 in the
 geocode header. A missing value is stored as zero, and a present value outside
 the u32 range fails the build rather than being wrapped to a different source
-version. Names, house numbers, streets, postcodes and country codes are
+version. The header also records the input PBF's whole-file XXH3-128 (seed
+zero, over every byte of the file) and its size, so a consumer that hashed its
+PBF can tell whether an index was built from it; the library reader exposes
+them as `Reader::input_xxh3_128` (formatted `{:032x}`, the same 32-digit hex
+as any whole-file XXH3-128) and `Reader::input_bytes`. The build reads the
+whole input once more for this, sequentially and beside the passes. The input
+must not change while it is built: a size change is refused, a same-size
+rewrite is not detected. Names, house numbers, streets, postcodes and country codes are
 stored and answered whole, bytes and all: a PBF tag value holding a NUL byte
 is not cut at it.
 
@@ -2234,7 +2241,7 @@ Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring
 | apply-changes | Front read direct; scanner, body preads and passthrough reads buffered | All PBF writes direct | Yes |
 | diff | All PBF reads direct, including indexed parallel comparison | No PBF output | - |
 | digest | All reads direct | - | - |
-| build-geocode-index | Indexdata probe and replication header read direct; schedule header walk, Pass 1, Pass 1.5 and Phase 2a preads buffered | Index output buffered, not PBF | - |
+| build-geocode-index | Indexdata probe and replication header read direct; schedule header walk, Pass 1, Pass 1.5 and Phase 2a preads and the whole-file input digest buffered | Index output buffered, not PBF | - |
 | merge-changes | OSC only; no direct I/O flag | No PBF output | - |
 <!-- io-reach:end -->
 

@@ -12,6 +12,28 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Input digest in the header, format 7 (bygg, 2026-11-15, variant uncommitted against `9609d308`)
+
+The build hashes the whole input (XXH3-128, a full sequential read of the
+88 GB planet file) on its own description beside the passes. Planet,
+interleaved `--iterations 1`, baseline `--commit 9609d308`, variant
+uncommitted (dirty rows).
+
+First shape, joined after the Pass 2 scan: base 118.4 s (`b9ed7652`),
+variant 115.6 s (`e84ffb7f`), base 123.5 s (`e3f3a4da`), variant 138.2 s
+(`f37d7dd6`). The join waited 5.0 s and 9.5 s
+(GEOCODE_INPUT_DIGEST_JOIN): the hash does not finish inside the reading
+passes (about 37 s), and Pass 1.5 ran 0.6 to 1.7 s slower. Rejected.
+
+Landed shape, joined only for the header write, so Pass 3 (which reads no
+input) hides the rest: variant 112.9 s (`b21f86d6`), base 119.5 s
+(`08ed6542`), variant 126.4 s (`2506075f`). The join waited 0 ms in both
+variant cells. Through the end of the Pass 2 scan the variant is 44.8 and
+45.8 s against 43.4 to 44.0 s in the four baselines, about 1 to 2 s of
+read contention; Pass 3 swings by 10 s in both arms on identical code.
+Verdict: within noise on the wall; the digest costs no measurable time at
+planet.
+
 ### G1: way blobs decompressed once, Pass 2b off the PBF (bygg, 2026-11-10, `9d9a2a79` against `0b52650b`)
 
 Interleaved `--iterations 1` pairs after a trim, both arms `--commit`.

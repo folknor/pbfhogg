@@ -23,9 +23,13 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// [`read_pool_string`]); version 5 adds `AddrPoint.place_offset`
 /// (`addr:place`), `InterpWay.parent_kind`, and the numeric-step
 /// `interpolation_type` values; version 6 replaces the header's u16 admin
-/// vertex budget with the f32 `admin_tolerance_m` in bytes 12..16. Readers
-/// deliberately reject other versions: existing indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 6;
+/// vertex budget with the f32 `admin_tolerance_m` in bytes 12..16; version 7
+/// records the input PBF's whole-file XXH3-128 and size in header bytes
+/// 64..88, so every index a reader accepts carries its input's identity (a
+/// version 6 index's zero bytes there would be indistinguishable from a
+/// recorded digest). Readers deliberately reject other versions: existing
+/// indexes must be rebuilt.
+pub const FORMAT_VERSION: u32 = 7;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -229,7 +233,8 @@ pub const INTERIOR_FLAG: u32 = 0x8000_0000;
 /// Mask to extract the polygon index from an interior-flagged entry.
 pub const INDEX_MASK: u32 = 0x7FFF_FFFF;
 
-/// Header size on disk (128 bytes: 64 used + 64 reserved).
+/// Header size on disk (128 bytes: 88 used + 40 reserved, written zero and
+/// not read).
 pub const HEADER_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
@@ -259,6 +264,22 @@ pub struct Header {
     pub geo_cell_count: u32,
     pub coarse_cell_count: u32,
     pub admin_cell_count: u32,
+    /// XXH3-128 (seed zero) of every byte of the input PBF the index was
+    /// built from, as `xxhash_rust`'s `digest128` returns it: formatted
+    /// `{:032x}` it is the same 32-digit hex as any whole-file XXH3-128 of
+    /// that file. Stored big-endian in bytes 64..80 (the one big-endian
+    /// field), so the bytes read in file order are that hex. Zero is a
+    /// digest like any other, never an absence.
+    pub input_xxh3_128: u128,
+    /// The input PBF's size in bytes, bytes 80..88.
+    pub input_bytes: u64,
+}
+
+/// The `N` header bytes at `at`; `at + N` is within the header at every call.
+fn field<const N: usize>(buf: &[u8; HEADER_SIZE], at: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    out.copy_from_slice(&buf[at..at + N]);
+    out
 }
 
 impl Header {
@@ -282,7 +303,9 @@ impl Header {
         buf[52..56].copy_from_slice(&self.geo_cell_count.to_le_bytes());
         buf[56..60].copy_from_slice(&self.coarse_cell_count.to_le_bytes());
         buf[60..64].copy_from_slice(&self.admin_cell_count.to_le_bytes());
-        // buf[64..128] reserved (already zero)
+        buf[64..80].copy_from_slice(&self.input_xxh3_128.to_be_bytes());
+        buf[80..88].copy_from_slice(&self.input_bytes.to_le_bytes());
+        // buf[88..128] reserved (already zero)
         buf
     }
 
@@ -340,6 +363,8 @@ impl Header {
             geo_cell_count: u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]),
             coarse_cell_count: u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]),
             admin_cell_count: u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]),
+            input_xxh3_128: u128::from_be_bytes(field(buf, 64)),
+            input_bytes: u64::from_le_bytes(field(buf, 80)),
         })
     }
 }
@@ -1286,8 +1311,28 @@ mod tests {
             geo_cell_count: 0,
             coarse_cell_count: 0,
             admin_cell_count: 0,
+            input_xxh3_128: 0,
+            input_bytes: 0,
         }
         .to_bytes()
+    }
+
+    /// The digest is stored big-endian, so its bytes in file order are its
+    /// `{:032x}` hex; the size follows it little-endian, and the rest of the
+    /// header stays zero.
+    #[test]
+    fn header_input_identity_is_at_its_format_offsets() {
+        let mut header = Header::from_bytes(&valid_header_bytes()).expect("valid header");
+        header.input_xxh3_128 = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff;
+        header.input_bytes = 0x0102_0304_0506_0708;
+        let bytes = header.to_bytes();
+        let hex: String = bytes[64..80].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, format!("{:032x}", header.input_xxh3_128));
+        assert_eq!(bytes[80..88], 0x0102_0304_0506_0708_u64.to_le_bytes());
+        assert!(bytes[88..].iter().all(|&b| b == 0));
+        let parsed = Header::from_bytes(&bytes).expect("valid header");
+        assert_eq!(parsed.input_xxh3_128, header.input_xxh3_128);
+        assert_eq!(parsed.input_bytes, header.input_bytes);
     }
 
     /// Every level field, not just the street level. A test that pokes one of
@@ -1405,6 +1450,8 @@ mod tests {
             geo_cell_count: 1_500_000,
             coarse_cell_count: 200_000,
             admin_cell_count: 50_000,
+            input_xxh3_128: 0x903d_7f6c_0000_0000_0000_0000_0000_0001,
+            input_bytes: 88_000_000_000,
         };
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), HEADER_SIZE);
@@ -1425,6 +1472,8 @@ mod tests {
         assert_eq!(parsed.geo_cell_count, 1_500_000);
         assert_eq!(parsed.coarse_cell_count, 200_000);
         assert_eq!(parsed.admin_cell_count, 50_000);
+        assert_eq!(parsed.input_xxh3_128, header.input_xxh3_128);
+        assert_eq!(parsed.input_bytes, 88_000_000_000);
     }
 
     #[test]

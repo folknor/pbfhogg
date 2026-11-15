@@ -22,6 +22,8 @@ fn write_index(dir: &Path) {
         geo_cell_count: 2,
         coarse_cell_count: 0,
         admin_cell_count: 1,
+        input_xxh3_128: 0,
+        input_bytes: 0,
     };
     std::fs::write(dir.join(format::FILE_HEADER), header.to_bytes()).expect("header");
     for file in [

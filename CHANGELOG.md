@@ -4,6 +4,15 @@
 
 ### Added
 
+- **A geocode index records its input PBF's whole-file XXH3-128 and
+  size**: `Reader::input_xxh3_128()` (formatted `{:032x}`, the same hex as
+  any whole-file XXH3-128 of the file, as brokkr pins and elivagar's
+  `input.xxh3_128` record) and `Reader::input_bytes()`, so a consumer can
+  prove an index was built from its PBF; replication sequence and timestamp
+  never could. Index format is now 7 (rebuild existing indexes). The build
+  reads the input once more, sequentially beside its passes (no measurable
+  wall cost at planet), and refuses an input whose size changed during the
+  build.
 - **`geocode_index::reader::Reader::open_dir(dir: impl AsFd)`** (Unix)
   opens an index from a directory handle the caller holds. On Unix
   `Reader::open` now also opens the directory once and every index file

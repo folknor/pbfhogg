@@ -425,7 +425,7 @@ fails with an error rather than write a header that lies.
 |---|---|---|
 | `cat` (one input) | input's | all |
 | `cat` (several inputs) | not sorted | `LocationsOnWays` when every input declares it |
-| `cat --type` | input's | all |
+| `cat --type` | input's | all, none when the first data blob carries no indexdata |
 | `cat --clean` | input's | none |
 | `cat --dedupe` | sorted | as copied, none when a way blob is in an overlap run |
 | `sort` | sorted | all, none when a way blob is rewritten |

@@ -31,17 +31,16 @@ without failing on large hosts); a ticket's units versus its simultaneous runs; 
 `host::FdPool` tests holding a ticket by convention. Every current heavy holder runs
 `write_base_pbf` (one way blob, so one 256-file fleet), well under the witnessed shape.
 
-## VER-135 - A dropped LocationsOnWays claim silently turns off coordinate comparison
+## VER-135 - Kept LocationsOnWays coordinates are not compared, and permitted drops are not shown necessary
 
-`opl_compare::Policy::between` compares inline way coordinates only when both sides
-declare `LocationsOnWays`. In the `sort` check (and any check that builds its policy
-the same way from pbfhogg's output and a reference), a pbfhogg output that loses the
-claim on a LocationsOnWays input therefore switches the comparison to
-`NO_LOCATIONS` and passes without ever looking at coordinates. Nothing in the sort
-check asserts that the output keeps the input's claim. The policy should come from
-the input's (or the reference's) declaration, with a missing claim on ours being a
-failure. Raised by the spar partner while settling the germany sort reference
-strategy; not yet checked against every check that calls `between`.
+Each output's declaration is now held to its command's header rule
+(`Harness::judge_way_locations`), so a lost declaration no longer passes silently.
+Residue: (1) where pbfhogg keeps the declaration (cat, `getid --invert`, sort) the
+osmium reference of every check but sort is written without `locations_on_ways=true`,
+so `Policy::between` is `NO_LOCATIONS` and the kept coordinates are never compared;
+(2) sort and `getid --invert` may drop the declaration with the warning, and the
+verifier does not show the drop was required (no way blob rewritten, no way removed
+would make keeping it decidable for `--invert` from the requested IDs).
 
 ## VER-018 - The gate's backend requirement checks refusals, not execution
 

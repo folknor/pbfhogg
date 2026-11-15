@@ -394,6 +394,13 @@ pub fn run(
     // --- pbfhogg renumber -----------------------------------------------
     let captured = harness.pbfhogg_discard(pbfhogg_args)?;
     harness.require_success(&captured, "pbfhogg renumber")?;
+    harness.judge_way_locations(
+        "pbfhogg renumber",
+        pbf,
+        &pbfhogg_out,
+        &captured,
+        crate::harness::WayLocations::Dropped,
+    )?;
 
     let pbfhogg_size = fs::metadata(&pbfhogg_out).map(|m| m.len()).unwrap_or(0);
     harness.msg(&format!(

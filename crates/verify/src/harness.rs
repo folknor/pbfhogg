@@ -38,6 +38,31 @@ impl Verdict {
     }
 }
 
+/// What a command's documented header rule allows its output's
+/// `LocationsOnWays` declaration to be on an input that declares it
+/// ([`Harness::judge_way_locations`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WayLocations {
+    /// Every way blob is copied whole, so the declaration is kept.
+    Kept,
+    /// Ways are re-encoded without coordinates: dropped, with the warning.
+    Dropped,
+    /// Kept, or dropped with the warning where the run decides (`sort`
+    /// rewriting a way blob, `getid --invert` removing a way): the verifier
+    /// cannot see which.
+    KeptOrReported,
+}
+
+/// Whether `stderr` carries the CLI's loss warning naming `LocationsOnWays`
+/// as one member of its list.
+fn warns_locations_loss(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.strip_prefix("Warning: the input declares ")
+            .and_then(|rest| rest.split_once(", which the output does not declare"))
+            .is_some_and(|(list, _)| list.split(", ").any(|f| f == "LocationsOnWays"))
+    })
+}
+
 /// How one check ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CheckStatus {
@@ -242,6 +267,55 @@ impl Harness {
         let b = self.has_sort_flag(theirs)?;
         self.msg(&format!("  sort feature: pbfhogg {a}, reference {b}"));
         Ok(Verdict::from_pass(!b || a))
+    }
+
+    /// Judge `ours`'s `LocationsOnWays` declaration against what its command
+    /// documents for `input` (docs/cli/commands.md "Output header"), with
+    /// `ended` the run that wrote it. The element comparison reads inline
+    /// coordinates only when both compared files declare them
+    /// ([`Policy::between`]), so a declaration lost without this would pass
+    /// silently. A command may drop the declaration only where its table
+    /// says so, and then warns; that warning is read from stderr, the CLI's
+    /// rendering of the library's `header.way_metadata_loss`. An output
+    /// never declares it when the input did not. Judged on the file pbfhogg
+    /// wrote, before any osmium-sorted copy.
+    pub(crate) fn judge_way_locations(
+        &mut self,
+        label: &str,
+        input: &Path,
+        ours: &Path,
+        ended: &Ended,
+        expect: WayLocations,
+    ) -> Result<(), Error> {
+        const LOW: &str = "LocationsOnWays";
+        let had = pbf_frames::header(input)?.optional_feature(LOW);
+        let has = pbf_frames::header(ours)?.optional_feature(LOW);
+        let warned = warns_locations_loss(&ended.stderr_text());
+        let (ok, why) = match (had, has, expect) {
+            (false, true, _) => (false, "declared, but the input does not declare it"),
+            (false, false, _) => (true, "not declared, as the input does not"),
+            (true, true, WayLocations::Kept | WayLocations::KeptOrReported) => {
+                (true, "kept as the input declares")
+            }
+            (true, true, WayLocations::Dropped) => (
+                false,
+                "declared, but this command re-encodes ways without them",
+            ),
+            (true, false, WayLocations::Kept) => (false, "dropped, but this run must keep it"),
+            (true, false, WayLocations::Dropped | WayLocations::KeptOrReported) if warned => {
+                (true, "dropped with the loss warning")
+            }
+            (true, false, _) => (false, "dropped without the loss warning"),
+        };
+        self.msg(&format!(
+            "  {label}: {LOW} {why} {}",
+            if ok { "PASS" } else { "FAIL" }
+        ));
+        self.record(
+            &format!("{label} output declares {LOW} as its command documents"),
+            Verdict::from_pass(ok),
+        );
+        Ok(())
     }
 
     /// Run a declared reference run, its standard output in the file `sink`.
@@ -580,5 +654,24 @@ mod tests {
         assert!(matches!(status, Err(Error::Unsettled(_))));
         let (status, _) = conclude("x", "1ms", Err(Error::tool("boom")), &[]);
         assert!(matches!(status, Err(Error::Tool(_))));
+    }
+
+    #[test]
+    fn the_loss_warning_names_locations_on_ways_exactly() {
+        let line = |list: &str| {
+            format!(
+                "Warning: the input declares {list}, which the output does not declare: this \
+                 command does not keep it on every way it writes, or cannot vouch for it in \
+                 the output"
+            )
+        };
+        assert!(super::warns_locations_loss(&line("LocationsOnWays")));
+        assert!(super::warns_locations_loss(&format!(
+            "progress\n{}\n",
+            line("LocationsOnWays, pbfhogg.WayMembers-v1")
+        )));
+        assert!(!super::warns_locations_loss(&line("pbfhogg.WayMembers-v1")));
+        assert!(!super::warns_locations_loss(&line("LocationsOnWaysX")));
+        assert!(!super::warns_locations_loss(""));
     }
 }

@@ -440,6 +440,15 @@ impl Claims {
     }
 }
 
+/// Whether `path`'s first data blob carries indexdata: the probe pbfhogg's
+/// raw-copying `cat` paths decide their way handling from. A file without
+/// a data blob answers false, as pbfhogg's probe does.
+pub(crate) fn first_data_blob_indexed(path: &Path) -> Result<bool, Error> {
+    Ok(Claims::open(path)?
+        .next_blob()?
+        .is_some_and(|blob| blob.claim.is_some()))
+}
+
 /// The elements of one data blob, as `(kind, id)` in the order the blob
 /// stores them: its groups in turn, and within a group its nodes, dense
 /// nodes, ways and relations in field order. The payload at

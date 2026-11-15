@@ -38,6 +38,13 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
                 .arg_if(direct_io, "--direct-io"),
         )?;
         harness.require_success(&captured, "pbfhogg tags-filter")?;
+        harness.judge_way_locations(
+            &format!("pbfhogg tags-filter {expr}"),
+            pbf,
+            &pbfhogg_out,
+            &captured,
+            crate::harness::WayLocations::Dropped,
+        )?;
 
         // osmium: tags-filter <pbf> <expr> -R -o <out> --overwrite
         let osmium_out = outdir.join(format!("osmium-{label}.osm.pbf"));

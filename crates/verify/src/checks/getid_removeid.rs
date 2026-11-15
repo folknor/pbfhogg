@@ -25,7 +25,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::counts::{Counts, osmium_counts};
 use crate::error::Error;
-use crate::harness::{Harness, Verdict};
+use crate::harness::{Harness, Verdict, WayLocations};
 use crate::pbf_frames::{self, IndexSummary};
 use crate::reference::ToolRun;
 use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
@@ -115,6 +115,13 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             .args_from(requested.iter().map(String::as_str)),
     )?;
     harness.require_success(&captured, "pbfhogg getid")?;
+    harness.judge_way_locations(
+        "pbfhogg getid",
+        pbf,
+        &pbfhogg_getid,
+        &captured,
+        WayLocations::Dropped,
+    )?;
 
     let selected = osmium_counts(harness, &pbfhogg_getid)?;
     for (kind, want, got) in selection_verdicts(&ids, selected) {
@@ -168,6 +175,14 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             .args_from(requested.iter().map(String::as_str)),
     )?;
     harness.require_success(&captured, "pbfhogg getid --invert")?;
+    // Kept when no way ID is removed, else dropped with the warning.
+    harness.judge_way_locations(
+        "pbfhogg getid --invert",
+        pbf,
+        &pbfhogg_invert,
+        &captured,
+        WayLocations::KeptOrReported,
+    )?;
 
     // The complement assertion: getid selects exactly the listed IDs (the
     // element comparison above pins that) and getid --invert drops exactly them, so

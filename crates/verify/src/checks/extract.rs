@@ -228,6 +228,13 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             .arg_if(direct_io, "--direct-io");
         let captured = harness.pbfhogg_discard(pbfhogg_args)?;
         harness.require_success(&captured, "pbfhogg extract")?;
+        harness.judge_way_locations(
+            &format!("pbfhogg extract --{strategy_name}"),
+            pbf,
+            &pbfhogg_out,
+            &captured,
+            crate::harness::WayLocations::Dropped,
+        )?;
 
         // --- osmium extract ---
         // The bbox run's argv is unchanged from before polygons, so its cached

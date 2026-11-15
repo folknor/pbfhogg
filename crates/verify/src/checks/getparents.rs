@@ -185,6 +185,13 @@ fn run_mode(
             .args_from(args.iter().map(String::as_str)),
     )?;
     harness.require_success(&captured, &format!("pbfhogg {label}"))?;
+    harness.judge_way_locations(
+        &format!("pbfhogg {label}"),
+        pbf,
+        &ours,
+        &captured,
+        crate::harness::WayLocations::Dropped,
+    )?;
 
     let theirs = outdir.join(format!("osmium-{stem}.osm.pbf"));
     let mut run = ToolRun::osmium("getparents.1")

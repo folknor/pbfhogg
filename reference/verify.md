@@ -33,10 +33,26 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   boundaries are compared (osmium diff's checksum feeds tags without
   lengths). Metadata is compared everywhere except the `diff --format osc`
   roundtrips; inline way coordinates are compared when both files declare
-  `LocationsOnWays` (a command may drop the declaration with its
-  coordinates, with a warning), except in apply-changes locations mode.
-  Where coordinates are the command's promise (add-locations-to-ways), the
-  check requires both declarations.
+  `LocationsOnWays`, except in apply-changes locations mode. Where
+  coordinates are the command's promise (add-locations-to-ways), the check
+  requires both declarations.
+- **The `LocationsOnWays` declaration** of each output of sort, cat,
+  tags-filter, getid (plain, `--invert` and `--add-referenced`),
+  getparents, extract, multi-extract, renumber and apply-changes is judged
+  against the command's row in the output-header table of
+  `docs/cli/commands.md`, on the file pbfhogg wrote, so that a lost
+  declaration cannot switch the element comparison to one without
+  coordinates and pass. An output never declares it when the input does
+  not. On an input that declares it: `cat --type` on an input whose first
+  data blob carries indexdata, and `apply-changes --locations-on-ways`,
+  must keep it; sort and `getid --invert`, which keep it unless they
+  rewrite a way blob or remove a way, may keep it or drop it with the loss
+  warning; the rest must drop it with the loss warning. The warning is read
+  from pbfhogg's stderr as the CLI renders `header.way_metadata_loss`
+  (`Warning: the input declares ..., which the output does not declare`,
+  `LocationsOnWays` a member of the list). A permitted drop is not shown to
+  be the one the run had to make: the verifier cannot see whether sort
+  rewrote a way blob.
 - **Order and counts** of an output come from its osmium OPL decoding
   (`opl_compare::order`, no metadata or coordinates): a file is in strict
   order when its objects ascend by kind and then ID with none repeated.

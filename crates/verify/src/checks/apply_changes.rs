@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
+use crate::harness::WayLocations::{Dropped, Kept};
 use crate::opl_compare::Policy;
 use crate::osc::{self, OscAction, OscKind};
 use crate::output;
@@ -91,6 +92,8 @@ pub fn run(
     harness.msg("--- pbfhogg apply-changes ---");
     let captured = harness.pbfhogg_discard(pbfhogg_args)?;
     harness.require_success(&captured, "pbfhogg apply-changes")?;
+    let kept = if locations_on_ways { Kept } else { Dropped };
+    harness.judge_way_locations("pbfhogg apply-changes", pbf, &pbfhogg_out, &captured, kept)?;
 
     // --- osmium apply-changes ---
     let osmium_out = outdir.join("osmium.osm.pbf");

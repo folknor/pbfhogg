@@ -136,6 +136,13 @@ pub fn run(
         let seq_args = command.extract_args_for(pbf, &named.region, &seq_out)?;
         let captured = harness.pbfhogg_discard(seq_args)?;
         harness.require_success(&captured, &format!("pbfhogg extract {}", named.stem))?;
+        harness.judge_way_locations(
+            &format!("sequential extract {}", named.stem),
+            pbf,
+            &seq_out,
+            &captured,
+            crate::harness::WayLocations::Dropped,
+        )?;
         let compared = if input_sorted {
             seq_out
         } else {
@@ -190,6 +197,15 @@ pub fn run(
         for named in pass_regions {
             let multi_pbf = multi_dir.join(named.output_name());
             let label = format!("{label_prefix} {}", named.stem);
+            // One invocation writes every region, so its one warning covers
+            // them all: each region is held to dropping the declaration.
+            harness.judge_way_locations(
+                &label,
+                pbf,
+                &multi_pbf,
+                &captured,
+                crate::harness::WayLocations::Dropped,
+            )?;
             let (compared, order) = if input_sorted {
                 (multi_pbf.clone(), format!("{label} output order"))
             } else {

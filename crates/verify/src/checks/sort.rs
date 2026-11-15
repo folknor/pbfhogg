@@ -66,6 +66,16 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
         &outdir.join("pbfhogg.stdout"),
     )?;
     h.require_success(&ended, "pbfhogg sort")?;
+    // sort keeps the declaration unless it rewrites a way blob, which the
+    // verifier cannot see; the comparison below reads coordinates only when
+    // both files declare them, so a drop must at least be the warned one.
+    h.judge_way_locations(
+        "pbfhogg sort",
+        pbf,
+        &ours,
+        &ended,
+        crate::harness::WayLocations::KeptOrReported,
+    )?;
 
     let theirs = outdir.join(OSMIUM_SORTED);
     // Multipass: this check judges elements and pbfhogg's order, never the

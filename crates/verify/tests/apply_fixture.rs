@@ -5,6 +5,10 @@ use std::path::Path;
 
 const SORTED: &str = "Sort.Type_then_ID";
 const LOW: &str = "LocationsOnWays";
+/// The CLI's rendering of the library's `header.way_metadata_loss`.
+const LOSS_WARNING: &str = "Warning: the input declares LocationsOnWays, which the output does \
+                            not declare: this command does not keep it on every way it writes, \
+                            or cannot vouch for it in the output";
 
 /// The OPL the fake osmium decodes each output to, by fault: the element
 /// differences the apply check classifies.
@@ -61,6 +65,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         ("osmium-stale", true),
         ("unsorted", true),
         ("publish", false),
+        ("silent-drop", false),
     ] {
         std::fs::write(dir.join("fault"), fault).unwrap();
         if fault == "unsorted" || fault == "publish" {
@@ -149,9 +154,20 @@ pub fn tool(args: &[OsString]) -> i32 {
                 );
                 return 2;
             }
+            // pbfhogg keeps the declaration under -l and otherwise drops it
+            // with the loss warning; "silent-drop" loses it without one.
+            let locations = args.contains(&"--locations-on-ways");
+            let features: &[&str] = if ours && (!locations || fault == "silent-drop") {
+                if fault != "silent-drop" {
+                    eprintln!("{LOSS_WARNING}");
+                }
+                &[SORTED]
+            } else {
+                &[SORTED, LOW]
+            };
             fake_pbf::write(
                 Path::new(output),
-                &[SORTED, LOW],
+                features,
                 &format!("{}-{fault}", if ours { "pbfhogg" } else { "osmium" }),
             );
         }

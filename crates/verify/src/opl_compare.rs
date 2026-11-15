@@ -70,7 +70,11 @@ impl Policy {
     /// headers declare `LocationsOnWays`. A command may drop the declaration
     /// with its coordinates (a re-encode warns `header.way_metadata_loss`),
     /// and a reference tool may write none; where coordinates are a
-    /// command's promise, the check holds the declaration itself.
+    /// command's promise, the check holds the declaration itself. Deciding
+    /// from the input's declaration instead would fail every documented
+    /// drop (sort rewriting a way blob re-encodes it without coordinates),
+    /// so a lost declaration is caught by `Harness::judge_way_locations`,
+    /// which holds each output's declaration to its command's header rule.
     pub(crate) fn between(a: &Path, b: &Path) -> Result<Self, Error> {
         let declares = |p: &Path| -> Result<bool, Error> {
             Ok(crate::pbf_frames::header(p)?.optional_feature("LocationsOnWays"))

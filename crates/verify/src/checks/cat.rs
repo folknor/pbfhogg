@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::argv::PbfArgv;
 use crate::error::Error;
-use crate::harness::Harness;
+use crate::harness::{Harness, WayLocations};
 use crate::reference::ToolRun;
 use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
 
@@ -16,6 +16,13 @@ use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("cat")?;
     let order = InputOrder::of(harness, pbf, &outdir)?;
+    // cat --type copies indexed way blobs whole, and re-encodes them when the
+    // first data blob carries no indexdata (or there is none).
+    let locations = if crate::pbf_frames::first_data_blob_indexed(pbf)? {
+        WayLocations::Kept
+    } else {
+        WayLocations::Dropped
+    };
 
     for elem_type in &["node", "way", "relation"] {
         harness.msg(&format!("=== verify cat -t {elem_type} ==="));
@@ -32,6 +39,13 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
                 .arg_if(direct_io, "--direct-io"),
         )?;
         harness.require_success(&captured, "pbfhogg cat")?;
+        harness.judge_way_locations(
+            &format!("pbfhogg cat -t {elem_type}"),
+            pbf,
+            &pbfhogg_out,
+            &captured,
+            locations,
+        )?;
 
         // --- osmium cat ---
         let osmium_out = outdir.join(format!("osmium-{elem_type}.osm.pbf"));

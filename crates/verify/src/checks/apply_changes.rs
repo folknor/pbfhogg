@@ -1,5 +1,14 @@
-//! Verify: apply-changes - strict pbfhogg/osmium comparison, with an optional
-//! osmosis output shown for additional context.
+//! Verify: apply-changes - strict pbfhogg/osmium comparison, with deletion
+//! held to the input OSC's final deletes.
+//!
+//! osmosis is not run, on purpose. It deletes regardless of version, which
+//! once made it the independent witness for deletion, but its output only
+//! ever fed a printed element-count line, and equal counts prove no element
+//! identity. Deletion is now enforced directly from the input OSC, so the
+//! run (about 37 s of a 58 s uncached denmark check on 2026-11-15) and the
+//! osmosis and JDK provisioning behind it bought no verdict and were
+//! removed. A future deletion check built on osmosis would have to pin its
+//! semantics first and count a missing or failed run as not completing.
 //!
 //! osmconvert is not a reference here, on purpose. Run for real on
 //! 2026-11-15 (bygg, upstream osmconvert 0.8.10), it cannot read a PBF whose
@@ -8,10 +17,10 @@
 //! 880"), and some refusals exit 0 with an empty output. The check runs on
 //! the indexed variant, so osmconvert never produced anything to look at. On
 //! the raw Geofabrik denmark seq4704 base with the seq4705 change it gave the
-//! same node, way and relation counts as pbfhogg and osmosis; counts alone
+//! same node, way and relation counts as pbfhogg and osmosis did; counts alone
 //! prove no element identity, and it only ever fed a printed fileinfo line.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::argv::PbfArgv;
 use crate::error::Error;
@@ -20,15 +29,14 @@ use crate::harness::WayLocations::{Dropped, Kept};
 use crate::opl_compare::Policy;
 use crate::osc::{self, OscAction, OscKind};
 use crate::output;
-use crate::reference::{Program, ToolRun};
+use crate::reference::ToolRun;
 use crate::verify_element_diff::{self as element_diff, PerType};
 use crate::verify_input_order;
 
 /// The header feature `--locations-on-ways` requires of its base.
 const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
 
-/// Cross-validate `pbfhogg apply-changes` against osmium; print optional
-/// osmosis output for additional context.
+/// Cross-validate `pbfhogg apply-changes` against osmium.
 ///
 /// With `locations_on_ways`, both tools run with `--locations-on-ways` and
 /// pbfhogg's output must pass `pbfhogg check --locations`. The element diff
@@ -39,8 +47,7 @@ const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
 /// holds inline coordinates to node records.
 /// osmium's output is checked the same way but only reported: its location
 /// index can itself write stale coordinates (several versions of one node,
-/// unsorted lookups), so it is not the oracle. osmosis, which writes no
-/// inline locations, is not run.
+/// unsorted lookups), so it is not the oracle.
 ///
 /// On a base whose header lacks `Sort.Type_then_ID` among its optional
 /// features, apply-changes is held to its documented refusal instead and no
@@ -112,20 +119,10 @@ pub fn run(
     let captured = harness.reference(&osmium_run, &outdir.join("osmium.stdout"))?;
     harness.require_success(&captured, "osmium apply-changes")?;
 
-    // --- osmosis (optional context) ---
-    let context_outputs = if locations_on_ways {
-        Vec::new()
-    } else {
-        run_context_tools(harness, pbf, osc, &outdir)?
-    };
-
     // --- Element counts ---
     // pbfhogg's output is summarised by its sort check below.
     harness.msg("=== element counts ===");
     harness.print_fileinfo("osmium", &osmium_out)?;
-    for (label, path) in &context_outputs {
-        harness.print_fileinfo(label, path)?;
-    }
 
     // --- Sort check ---
     let order = harness.check_sorted("pbfhogg apply-changes", &pbfhogg_out)?;
@@ -169,9 +166,7 @@ pub fn run(
     // input OSC finally deletes aren't bugs. Because that exemption leaves
     // osmium no oracle for deletion, the deletion itself is enforced from
     // the input: an identity the OSC finally deletes fails wherever
-    // pbfhogg's output holds it, even where osmium agrees. osmosis, which
-    // also deletes regardless of version, is not needed for this and stays
-    // context only. Anything else (osmium-only identities not finally
+    // pbfhogg's output holds it, even where osmium agrees. Anything else (osmium-only identities not finally
     // deleted, pbfhogg-only elements, or content-level `<modify>`
     // differences) fails verify.
     // Inline coordinates are left out in locations mode: osmium's own are
@@ -186,7 +181,7 @@ pub fn run(
     Ok(Some(if locations_on_ways {
         "strict element content with final-delete tolerance; final deletes absent; output strictly ordered; inline locations pass pbfhogg check --locations; osmium locations informational"
     } else {
-        "strict element content with final-delete tolerance; final deletes absent; output strictly ordered; osmosis context only"
+        "strict element content with final-delete tolerance; final deletes absent; output strictly ordered"
     }.into()))
 }
 
@@ -242,51 +237,6 @@ fn stale_summary(report: &str) -> String {
     match count {
         Some(count) => format!("STALE ({count})"),
         None => "STALE".to_owned(),
-    }
-}
-
-/// Run the optional osmosis merge, shown for context only. Returns the
-/// `(label, output)` when it completed successfully: production is tracked
-/// from the run's outcome, not inferred from a file being present. A failed
-/// run's partial output is still removed.
-///
-/// It runs through the reference-run path (stdout to a file, death with
-/// brokkr, SIGKILL classified). No comparison depends on it, so an
-/// environment kill does not change the check's verdict; it is reported on
-/// the summary channel, where a passing check still shows it.
-fn run_context_tools(
-    harness: &mut Harness,
-    pbf: &Path,
-    osc: &Path,
-    outdir: &Path,
-) -> Result<Vec<(&'static str, PathBuf)>, Error> {
-    let label = "osmosis";
-    if !harness.has_osmosis() {
-        return Ok(Vec::new());
-    }
-    let output = outdir.join(format!("{label}.osm.pbf"));
-    let run = ToolRun::new("apply-changes-osmosis.1", Program::Osmosis)
-        .arg("--read-xml-change")
-        .input_as("file=", osc)
-        .arg("--read-pbf")
-        .input_as("file=", pbf)
-        .args(&["--apply-change", "--write-pbf"])
-        .output_as("file=", &output);
-    let result = harness
-        .reference(&run, &outdir.join(format!("{label}.stdout")))
-        .and_then(|ended| harness.require_success(&ended, label));
-    match result {
-        Ok(()) => Ok(vec![(label, output)]),
-        Err(e @ (Error::Interrupted | Error::Unsettled(_))) => Err(e),
-        Err(e) => {
-            output::note(&format!(
-                "{label} context only, no verdict depends on it: {e}"
-            ));
-            if output.exists() {
-                std::fs::remove_file(output)?;
-            }
-            Ok(Vec::new())
-        }
     }
 }
 

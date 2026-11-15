@@ -125,20 +125,6 @@ Enforcement: directory capability types.
 brokkr declined this (bz brokkr#154, wontfix); brokkr verify is to be removed and
 reimplemented in pbfhogg, which must meet the requirement tracked under VER-127.
 
-## VER-124 - Optional context tools add cost without a verdict
-
-Reported by bench-verify.
-
-`pbfhogg-verify` provisions osmosis for `all` and plain apply-changes, and `run_context_tools` in
-`crates/verify/src/checks/apply_changes.rs` runs it by default for context; its failure does not change
-the verdict (the 2026-11-15 denmark run spent 37.4 s of 58 s in osmosis). brokkr#155 closed without the
-option when brokkr verify retired.
-
-Fix: an explicit diagnostic option, or drop the run. Promoting osmosis to a deletion verdict was
-considered and declined: the check now enforces deletion itself, from the input OSC's final deletes,
-so osmosis would only re-derive a rule already checked directly. Enforcement: a declarative step
-graph rejecting unused outputs.
-
 ## VER-137 - The verifier's OSC scanner does not decode entity references in `id`
 
 Found working the apply-changes final-delete rule.

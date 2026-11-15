@@ -455,9 +455,9 @@ impl ReferenceCache {
         }
         let args = staged_args(run, &staging);
         let result = life.run(&Launch {
-            program: run.program.path(tools),
+            program: &tools.osmium,
             args,
-            env: crate::reference::program_env(run.program, tools, &staging),
+            env: crate::reference::run_env(&staging),
             cwd: &staging,
             sink: &staging.join(ARTIFACTS).join(STDOUT),
         });
@@ -522,7 +522,7 @@ fn cache_key(
     staging: &Path,
     run: &ToolRun,
 ) -> Result<Option<Key>, Error> {
-    let identity = match program_identity(life, tools, staging, run) {
+    let identity = match identity(life, &tools.osmium, staging) {
         Ok(identity) => identity,
         Err(e @ (Error::Interrupted | Error::Unsettled(_) | Error::Environment(_))) => {
             return Err(e);
@@ -564,7 +564,7 @@ fn identity_text_again(
     staging: &Path,
     run: &ToolRun,
 ) -> Result<Option<Key>, Error> {
-    program_identity(life, tools, staging, run)?
+    identity(life, &tools.osmium, staging)?
         .as_deref()
         .map(|id| key_text(run, id))
         .transpose()
@@ -577,9 +577,6 @@ fn key_text(run: &ToolRun, identity: &str) -> Result<Key, Error> {
     );
     for (k, v) in crate::reference::run_env(Path::new("<staging>")) {
         text.push_str(&format!("env {k:?}={v:?}\n"));
-    }
-    if run.program == crate::reference::Program::Osmosis {
-        text.push_str("JAVA_HOME=<identity java tree>; JAVA_OPTS=-Duser.home=<staging>/home -Djava.io.tmpdir=<staging>/scratch\n");
     }
     for arg in &run.args {
         let value = match arg {
@@ -601,83 +598,6 @@ fn extension(path: &Path) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     name.find('.')
         .map_or_else(String::new, |i| name[i..].to_owned())
-}
-
-fn program_identity(
-    life: &mut crate::process::Lifecycle,
-    tools: &crate::reference::Tools,
-    private: &Path,
-    run: &ToolRun,
-) -> Result<Option<String>, Error> {
-    if run.program != crate::reference::Program::Osmosis {
-        return identity(life, run.program.path(tools), private);
-    }
-    if !crate::reference::xargs_safe(private) {
-        return Ok(None);
-    }
-    let Some(tool) = &tools.osmosis else {
-        return Ok(None);
-    };
-    let root = tool
-        .osmosis
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| Error::tool("osmosis launcher has no install root"))?;
-    let mut text = format!(
-        "osmosis {}\njava {}\n",
-        tree_identity(root)?,
-        tree_identity(&tool.java_home)?
-    );
-    let Some(ldd) = ["/usr/bin/ldd", "/bin/ldd"]
-        .iter()
-        .map(Path::new)
-        .find(|p| p.is_file())
-    else {
-        return Ok(None);
-    };
-    for binary in [
-        tool.java_home.join("bin/java"),
-        tool.java_home.join("lib/server/libjvm.so"),
-    ] {
-        let Some(libraries) = probe(life, ldd, vec![binary.into_os_string()], private)? else {
-            return Ok(None);
-        };
-        let Some(paths) = parse_ldd(&libraries) else {
-            return Ok(None);
-        };
-        for path in paths {
-            text.push_str(&format!("lib {} {}\n", path.display(), digest(&path)?));
-        }
-    }
-    Ok(Some(text))
-}
-
-fn tree_identity(root: &Path) -> Result<String, Error> {
-    fn walk(root: &Path, path: &Path, hash: &mut xxhash_rust::xxh3::Xxh3) -> Result<(), Error> {
-        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|e| Error::tool(e.to_string()))?;
-            let meta = fs::symlink_metadata(&path)?;
-            hash.update(format!("{relative:?} {:?}\n", meta.file_type()).as_bytes());
-            if meta.is_dir() {
-                walk(root, &path, hash)?;
-            } else if meta.is_symlink() {
-                hash.update(fs::read_link(path)?.as_os_str().as_encoded_bytes());
-            } else if meta.is_file() {
-                hash.update(digest(&path)?.as_bytes());
-            } else {
-                return Err(Error::tool("unsupported entry in tool tree"));
-            }
-        }
-        Ok(())
-    }
-    let mut hash = xxhash_rust::xxh3::Xxh3::new();
-    walk(root, root, &mut hash)?;
-    Ok(format!("{} {:032x}", root.display(), hash.digest128()))
 }
 
 fn identity(
@@ -781,24 +701,6 @@ fn remove_tree(path: &Path) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-
-    #[test]
-    fn osmosis_tree_identity_follows_nested_files_and_links() {
-        let scratch = pbfhogg_test_scratch::scratch();
-        let root = scratch.path();
-        fs::create_dir(root.join("lib")).unwrap();
-        fs::write(root.join("lib/tool.jar"), "one").unwrap();
-        let first = tree_identity(root).unwrap();
-        fs::write(root.join("lib/tool.jar"), "two").unwrap();
-        let second = tree_identity(root).unwrap();
-        assert_ne!(first, second);
-        std::os::unix::fs::symlink("lib/tool.jar", root.join("link")).unwrap();
-        let third = tree_identity(root).unwrap();
-        assert_ne!(second, third);
-        fs::remove_file(root.join("link")).unwrap();
-        std::os::unix::fs::symlink("lib/other.jar", root.join("link")).unwrap();
-        assert_ne!(third, tree_identity(root).unwrap());
-    }
 
     /// An entry `hex` of `size` logical bytes, last used `age` seconds ago.
     fn entry(dir: &Path, hex: char, size: u64, age: u64) -> PathBuf {

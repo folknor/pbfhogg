@@ -1,8 +1,8 @@
 # pbfhogg-verify: cross-validation contract
 
 `pbfhogg-verify` (`crates/verify`) cross-validates the pbfhogg CLI against
-reference tools: osmium for every check, osmosis where a check asks it. It replaces pbfhogg's part of `brokkr verify`, with the complete
-19-check suite available here.
+osmium, the one reference tool. It replaces pbfhogg's part of
+`brokkr verify`, with the complete suite available here.
 
 ```sh
 brokkr run --with pbfhogg pbfhogg-verify -- sort --dataset denmark
@@ -306,28 +306,13 @@ The suite runs the locations arm separately on the selected generation's
 `altw-keep-untagged` base, when both it and an OSC are configured, and
 skips it for a fixture PBF. Configured invalid files fail resolution.
 
-Plain apply-changes also runs osmosis for context only. Its failure or
-unavailability does not change the comparison verdict; interruption and
-unsettled children still stop the run. It does not run in locations mode.
+No other tool runs beside osmium. osmosis, which deletes regardless of
+version, is not run: deletion is enforced from the input OSC's final
+deletes above, and its output only ever fed a printed element-count line,
+which proves no element identity. Nothing is downloaded or provisioned.
 osmconvert is not a reference: its PBF reader refuses BlobHeaders that carry
 indexdata, so it cannot read the indexed input the check runs on (some of
 those refusals exit 0 with an empty output).
-Osmosis 0.49.2 and its pinned Temurin JDK are downloaded by curl with only
-the boundary's proxy/CA settings added to the private launch environment.
-SHA-256 is checked in-process before unpacking. Each launch uses the same
-lifecycle owner. The completed tree, including its marker and JDK, is
-published in one rename to `<data>/osmosis-0.49.2`, after a cancellation
-checkpoint. An existing directory without the exact completion marker is
-refused, never reused. Failed staging trees remain under a unique
-`<data>/.osmosis-RUNID` for diagnosis. Installation is independent of
-brokkr's older unversioned tool directories.
-
-Osmosis reference identity includes its complete install and Java trees,
-plus the libraries ldd resolves for java and libjvm.so. Its environment
-sets JAVA_HOME and JAVA_OPTS with launch-private user.home and
-java.io.tmpdir. As in the old verifier, a staging path with whitespace,
-quotes or backslashes omits those two properties and disables caching,
-because the launcher splits JAVA_OPTS with xargs.
 
 Cat, tags-filter and getparents use the input's optional sort feature to
 route comparisons. Without it, osmium reads a sorted copy, pbfhogg outputs
@@ -711,10 +696,10 @@ polygon on this host, so extract coverage was bbox only. Text diff named
 unexercised detail shapes. These are correctness observations, not timing
 measurements or stronger claims than the checks specify.
 
-Every child, including probes and provisioning, uses `Lifecycle::run`.
+Every child, including probes, uses `Lifecycle::run`.
 Child setup clears the signal mask, installs parent-death SIGKILL and checks
 the parent race. Cancellation checkpoints precede launches, verdicts, run
-cleanup and exit, and reference or installation publication. Input stamps
+cleanup and exit, and reference publication. Input stamps
 are rechecked on error paths too. Cache safety uses the machine lock,
 run-unique staging and publication after settlement, never a cache flock.
 Dataset eligibility is a constant name allowlist in `main.rs`; widening it

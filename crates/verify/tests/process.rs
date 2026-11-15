@@ -103,17 +103,6 @@ fn verifier_apply_changes() {
 }
 
 #[test]
-fn verifier_provisioning() {
-    let _bound = pbfhogg_test_scratch::HangBound::arm(
-        tunables::TEST_HANG_BOUND,
-        tunables::TEST_REPORT_GRACE,
-        "verifier provisioning",
-    );
-    let scratch = pbfhogg_test_scratch::scratch();
-    run_worker("provision", scratch.path());
-}
-
-#[test]
 fn verifier_change_checks() {
     let _bound = pbfhogg_test_scratch::HangBound::arm(
         tunables::TEST_HANG_BOUND,

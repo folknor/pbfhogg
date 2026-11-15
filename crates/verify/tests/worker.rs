@@ -4,8 +4,6 @@
 pub(crate) mod error;
 #[path = "../src/process.rs"]
 pub(crate) mod process;
-#[path = "../src/provision.rs"]
-pub(crate) mod provision;
 #[path = "../src/tunables.rs"]
 pub(crate) mod tunables;
 
@@ -79,9 +77,6 @@ fn main() {
     }) && role != "driver"
     {
         std::process::exit(diff_fixture::tool(&args[1..]));
-    } else if role == "-q" {
-        let dest = args.iter().position(|a| a == "-o").unwrap() + 1;
-        std::fs::write(&args[dest], "abc").unwrap();
     } else if args
         .iter()
         .any(|a| a.to_string_lossy().contains("apply-fixture"))
@@ -151,11 +146,6 @@ fn driver(role: &str, dir: &Path) {
         return;
     }
     let exe = std::env::current_exe().unwrap();
-    if role == "provision" {
-        provision_driver(&mut lifecycle, &exe, dir);
-        no_children();
-        return;
-    }
     if role == "diff-family" {
         diff_fixture::driver(lifecycle, &exe, dir);
         no_children();
@@ -351,7 +341,6 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     std::fs::write(&input, b"input").unwrap();
     let tools = reference::Tools {
         osmium: exe.to_path_buf(),
-        osmosis: None,
     };
     let mut cache = reference_cache::ReferenceCache::new(dir, "fixture-run".into(), false).unwrap();
     for (n, fresh, hit) in [(0, false, false), (1, false, true), (2, true, false)] {
@@ -441,43 +430,6 @@ pub(crate) mod verify_polygon;
 pub(crate) mod diff_summary;
 #[path = "../src/verify_reencode.rs"]
 pub(crate) mod verify_reencode;
-
-fn provision_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
-    let downloader = provision::Downloader {
-        curl: exe.into(),
-        tar: exe.into(),
-        env: Vec::new(),
-    };
-    let archive = dir.join("archive");
-    let pin = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    downloader
-        .fetch(life, dir, "fixture-only", &archive, pin)
-        .unwrap();
-    assert!(
-        downloader
-            .fetch(life, dir, "fixture-only", &archive, "wrong")
-            .is_err()
-    );
-    let tree = dir.join("tree");
-    std::fs::create_dir_all(tree.join("bin")).unwrap();
-    std::fs::create_dir_all(tree.join("jdk/bin")).unwrap();
-    std::fs::write(tree.join("bin/osmosis"), "launcher").unwrap();
-    std::fs::write(tree.join("jdk/bin/java"), "java").unwrap();
-    let root = dir.join("installed");
-    provision::complete(life, &tree, &root, pin).unwrap();
-    assert!(!tree.exists());
-    assert!(root.join("complete").is_file());
-    std::fs::rename(&root, &tree).unwrap();
-    // A pending stop must prevent publishing even a fully prepared tree.
-    // SAFETY: sends SIGTERM to this worker, where Lifecycle owns its mask.
-    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-    assert!(matches!(
-        provision::complete(life, &tree, &root, pin),
-        Err(error::Error::Interrupted)
-    ));
-    assert!(!root.exists());
-    assert!(tree.join("complete").is_file());
-}
 
 #[path = "../src/verify_change_listing.rs"]
 pub(crate) mod verify_change_listing;

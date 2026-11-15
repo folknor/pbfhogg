@@ -16,39 +16,10 @@ use std::path::{Path, PathBuf};
 /// this is for what a launcher script runs.
 const RUN_PATH: &str = "/usr/bin:/bin";
 
-/// The reference programs, resolved at the executable boundary.
+/// The reference program, resolved at the executable boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct Tools {
     pub(crate) osmium: PathBuf,
-    pub(crate) osmosis: Option<OsmosisTools>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct OsmosisTools {
-    pub(crate) osmosis: PathBuf,
-    pub(crate) java_home: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Program {
-    Osmium,
-    Osmosis,
-}
-
-impl Program {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Osmium => "osmium",
-            Self::Osmosis => "osmosis",
-        }
-    }
-
-    pub(crate) fn path(self, tools: &Tools) -> &Path {
-        match self {
-            Self::Osmium => &tools.osmium,
-            Self::Osmosis => tools.osmosis.as_ref().map_or(Path::new(""), |t| &t.osmosis),
-        }
-    }
 }
 
 use crate::error::Error;
@@ -65,13 +36,12 @@ pub(crate) enum RunArg {
 /// condition to complete it.
 pub(crate) type StderrShows = fn(&[u8]) -> bool;
 
-/// One declared reference run: its id (unique per check and run, and
-/// versioned by the caller when the run's meaning changes), its program, its
+/// One declared osmium run: its id (unique per check and run, and
+/// versioned by the caller when the run's meaning changes), its
 /// argv with inputs and outputs marked, and the outcomes that complete it:
 /// the accepted exit codes, some only when the stderr shows a condition.
 pub(crate) struct ToolRun {
     pub(crate) id: String,
-    pub(crate) program: Program,
     pub(crate) args: Vec<RunArg>,
     pub(crate) accepted: Vec<i32>,
     conditions: Vec<(i32, StderrShows)>,
@@ -80,10 +50,9 @@ pub(crate) struct ToolRun {
 }
 
 impl ToolRun {
-    pub(crate) fn new(id: impl Into<String>, program: Program) -> Self {
+    pub(crate) fn osmium(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            program,
             args: Vec::new(),
             accepted: vec![0],
             conditions: Vec::new(),
@@ -97,10 +66,6 @@ impl ToolRun {
     pub(crate) fn uncached(mut self) -> Self {
         self.uncached = true;
         self
-    }
-
-    pub(crate) fn osmium(id: impl Into<String>) -> Self {
-        Self::new(id, Program::Osmium)
     }
 
     pub(crate) fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -170,15 +135,15 @@ impl ToolRun {
         self.conditions.iter().any(|(c, _)| *c == code)
     }
 
-    /// The step label: the program and its first literal argument.
+    /// The step label: `osmium` and its first literal argument.
     pub(crate) fn label(&self) -> String {
         let first = self.args.iter().find_map(|a| match a {
             RunArg::Lit(s) if !s.starts_with('-') && !s.contains('=') => Some(s.as_str()),
             _ => None,
         });
-        match (&self.program, first) {
-            (_, Some(first)) => format!("{} {first}", self.program.name()),
-            _ => self.program.name().to_owned(),
+        match first {
+            Some(first) => format!("osmium {first}"),
+            None => "osmium".to_owned(),
         }
     }
 
@@ -232,73 +197,4 @@ pub(crate) fn run_env(private: &Path) -> Vec<(OsString, OsString)> {
         ("HOME".into(), private.join("home").into_os_string()),
         ("TMPDIR".into(), private.join("scratch").into_os_string()),
     ]
-}
-
-/// Java properties are passed through the launcher's xargs parser.
-pub(crate) fn xargs_safe(path: &Path) -> bool {
-    !path
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .any(|b| b.is_ascii_whitespace() || b"\"'\\".contains(b))
-}
-
-pub(crate) fn program_env(
-    program: Program,
-    tools: &Tools,
-    private: &Path,
-) -> Vec<(OsString, OsString)> {
-    let mut env = run_env(private);
-    if program == Program::Osmosis
-        && let Some(tool) = &tools.osmosis
-    {
-        env.push(("JAVA_HOME".into(), tool.java_home.clone().into_os_string()));
-        if xargs_safe(private) {
-            env.push((
-                "JAVA_OPTS".into(),
-                format!(
-                    "-Duser.home={}/home -Djava.io.tmpdir={}/scratch",
-                    private.display(),
-                    private.display()
-                )
-                .into(),
-            ));
-        }
-    }
-    env
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn osmosis_environment_is_private_and_xargs_aware() {
-        let tools = Tools {
-            osmium: "/osmium".into(),
-            osmosis: Some(OsmosisTools {
-                osmosis: "/tool/bin/osmosis".into(),
-                java_home: "/tool/jdk".into(),
-            }),
-        };
-        let env = program_env(Program::Osmosis, &tools, Path::new("/private"));
-        assert!(env.contains(&("JAVA_HOME".into(), "/tool/jdk".into())));
-        assert!(env.contains(&(
-            "JAVA_OPTS".into(),
-            "-Duser.home=/private/home -Djava.io.tmpdir=/private/scratch".into()
-        )));
-        for bad in ["/space here", "/quote'", "/quote\"", "/slash\\", "/tab	"] {
-            assert!(!xargs_safe(Path::new(bad)));
-            assert!(
-                !program_env(Program::Osmosis, &tools, Path::new(bad))
-                    .iter()
-                    .any(|(k, _)| k == "JAVA_OPTS")
-            );
-        }
-        assert!(
-            !program_env(Program::Osmium, &tools, Path::new("/private"))
-                .iter()
-                .any(|(k, _)| k == "JAVA_HOME")
-        );
-    }
 }

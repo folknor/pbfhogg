@@ -118,8 +118,7 @@ Tests go where they couple least.
   `pbfhogg::test_hooks` surface by design.
 - **External cross-validation** in `brokkr run --with pbfhogg pbfhogg-verify --`
   (`crates/verify/src/checks/`) - compares pbfhogg
-  output against osmium, with osmosis output shown for context where a
-  check runs it.
+  output against osmium.
 
 Placement and tiering are independent axes.
 

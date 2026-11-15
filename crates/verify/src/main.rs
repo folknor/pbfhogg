@@ -31,7 +31,6 @@ mod harness;
 mod opl_compare;
 mod output;
 mod process;
-mod provision;
 mod reference;
 mod reference_cache;
 mod run;
@@ -39,7 +38,6 @@ mod selection;
 mod stream;
 mod tunables;
 
-use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -53,7 +51,7 @@ use crate::harness::{CheckStatus, ENVIRONMENT_EXIT_CODE, Harness};
 #[derive(Parser)]
 #[command(
     name = "pbfhogg-verify",
-    about = "Cross-validate the pbfhogg CLI against osmium and osmosis"
+    about = "Cross-validate the pbfhogg CLI against osmium"
 )]
 struct Args {
     /// pbfhogg CLI executable (otherwise BROKKR_WITH_EXE). Never builds one.
@@ -251,24 +249,6 @@ fn load_config(args: &Args) -> Result<Config, Error> {
     Ok(config)
 }
 
-fn curl_env() -> Vec<(OsString, OsString)> {
-    [
-        ("http_proxy", std::env::var_os("http_proxy")),
-        ("https_proxy", std::env::var_os("https_proxy")),
-        ("HTTPS_PROXY", std::env::var_os("HTTPS_PROXY")),
-        ("all_proxy", std::env::var_os("all_proxy")),
-        ("ALL_PROXY", std::env::var_os("ALL_PROXY")),
-        ("no_proxy", std::env::var_os("no_proxy")),
-        ("NO_PROXY", std::env::var_os("NO_PROXY")),
-        ("SSL_CERT_FILE", std::env::var_os("SSL_CERT_FILE")),
-        ("SSL_CERT_DIR", std::env::var_os("SSL_CERT_DIR")),
-        ("CURL_CA_BUNDLE", std::env::var_os("CURL_CA_BUNDLE")),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| value.map(|v| (OsString::from(name), v)))
-    .collect()
-}
-
 fn boundary(args: &Args) -> Result<Boundary, Error> {
     let config = load_config(args)?;
     let with_exe = std::env::var_os("BROKKR_WITH_EXE");
@@ -293,10 +273,7 @@ fn boundary(args: &Args) -> Result<Boundary, Error> {
         config,
         host,
         pbfhogg,
-        tools: reference::Tools {
-            osmium,
-            osmosis: None,
-        },
+        tools: reference::Tools { osmium },
     })
 }
 
@@ -401,7 +378,7 @@ fn execute(args: &Args, mut life: process::Lifecycle) -> Result<ExitCode, Error>
         cache.retain(Some(0));
         return Ok(ExitCode::SUCCESS);
     }
-    let mut b = boundary(args)?;
+    let b = boundary(args)?;
     let scratch = b.config.scratch_root(&b.host)?;
     let run = run::Run::create(&scratch, &b.pbfhogg, args.keep)?;
     output::note(&format!("run directory: {}", run.dir.display()));
@@ -419,37 +396,6 @@ fn execute(args: &Args, mut life: process::Lifecycle) -> Result<ExitCode, Error>
             .into_owned(),
         args.fresh_reference,
     )?;
-    if matches!(
-        &args.check,
-        Check::All(_)
-            | Check::ApplyChanges(ApplyArgs {
-                locations_on_ways: false,
-                ..
-            })
-    ) {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let downloader = find_in_path("curl", &path)
-            .zip(find_in_path("tar", &path))
-            .map(|(curl, tar)| provision::Downloader {
-                curl,
-                tar,
-                env: curl_env(),
-            });
-        if let Some(downloader) = downloader {
-            let result = downloader.ensure(
-                &mut life,
-                &b.config.data_dir(&b.host)?,
-                &run.dir.file_name().unwrap_or_default().to_string_lossy(),
-            );
-            match result {
-                Ok(tools) => b.tools.osmosis = Some(tools),
-                Err(e @ (Error::Interrupted | Error::Unsettled(_))) => return Err(e),
-                Err(e) => output::note(&format!("osmosis unavailable (context only): {e}")),
-            }
-        } else {
-            output::note("osmosis unavailable: curl or tar missing (context only)");
-        }
-    }
     let mut h = Harness::new(life, run, b.tools.clone(), args.verbose, cache);
     let ending = dispatch(&b, &mut h, &args.check);
     let passed = matches!(

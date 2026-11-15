@@ -29,10 +29,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let mut h = harness::Harness::new(
         life,
         run,
-        reference::Tools {
-            osmium: exe.into(),
-            osmosis: None,
-        },
+        reference::Tools { osmium: exe.into() },
         false,
         cache,
     );

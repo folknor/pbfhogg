@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cross-validation of the pbfhogg CLI against osmium and osmosis"
+description = "Cross-validation of the pbfhogg CLI against osmium"
 rust-version.workspace = true
 authors.workspace = true
 publish = false
@@ -20,7 +20,6 @@ name = "pbfhogg-verify"
 path = "src/main.rs"
 
 [dependencies]
-sha2 = "0.11.1"
 flate2 = "1"
 pbfhogg-devkit = { path = "../devkit" }
 clap = { version = "4", features = ["derive"] }

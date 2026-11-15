@@ -29,6 +29,9 @@ end
 function bench(params)
     local takes_form = since("16154b0d")
     local form = params.form
+    if form == "content-locations" and not since("bc714d0c") then
+        fail("digest --form content-locations arrived in bc714d0c")
+    end
     if form == "auto" then
         if takes_form then form = "full" else form = "content" end
     end

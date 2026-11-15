@@ -296,9 +296,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.ref-integrity]
 script_file = "../benches/check-refs/ref-integrity.lua"
 description = "Check way-node references, optionally relation members, on a dataset or snapshot"
-version = 3
+version = 4
 date = 2026-11-15
 changelog = [
+  { version = 4, date = 2026-11-15, note = "The direct-io param is gone: check --refs never read through O_DIRECT and refuses the flag from 930ddfc9 on, so it never selected a distinct workload" },
   { version = 3, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; answers are the verifier check-refs question; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "--check-relations yes is judged by expect.check-refs-relations, not expect.check-refs; workload unchanged" },
@@ -314,7 +315,6 @@ params.dataset = { from = "datasets", default = "denmark", help = "the dataset" 
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
 params.check-relations = { choices = ["yes", "no"], default = "no", help = "yes: also check relation member references" }
-params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO" }
 
 # -- compare
@@ -484,6 +484,7 @@ description = "Digest a dataset or snapshot in full or content canonical form"
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-15, note = "Add form content-locations, refused before bc714d0c; existing forms unchanged" },
   { date = 2026-11-15, note = "The digest report, the answer, is no longer recorded; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed digest: canonical forms, snapshots, direct I/O and profiling with marker stops" },
@@ -495,7 +496,7 @@ alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
-params.form = { choices = ["auto", "full", "content"], default = "auto", help = "auto: typed omitted-form behavior, full since 16154b0d and content before; set an explicit form for matched comparisons" }
+params.form = { choices = ["auto", "full", "content", "content-locations"], default = "auto", help = "auto: typed omitted-form behavior, full since 16154b0d and content before; content-locations needs a LocationsOnWays input and bc714d0c; set an explicit form for matched comparisons" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }

@@ -4,7 +4,7 @@ local HOST = { datasets = { fixture = {
     pbf = { indexed = { file = "base.pbf" } },
     osc = { ["9"] = { file = "9.osc.gz" }, ["10"] = { file = "10.osc.gz" } },
 } } }
-local function invoke(name, args, calls)
+local function invoke(name, args, calls, keys_counted)
     local params = { "--dataset", "fixture" }
     for _, arg in ipairs(args) do params[#params + 1] = arg end
     -- files holds only the inputs this arm binds.
@@ -22,7 +22,7 @@ local function invoke(name, args, calls)
         end
     end
     return run { bench = name, program = "pbfhogg", host = HOST, params = params,
-        files = files, calls = calls }
+        files = files, calls = calls, since = { ["9c4d6c81"] = keys_counted ~= false } }
 end
 local function has(argv, key, value)
     for i, arg in ipairs(argv) do
@@ -174,6 +174,37 @@ for _, case in ipairs({
         assert(r.outcome == "refused", r.reason)
         assert(r.reason:find(case[3], 1, true), r.reason)
         assert(#r.calls == 0)
+    end)
+end
+
+-- Before 9c4d6c81 only pair expressions mean the same workload as today.
+for _, case in ipairs({
+    { {}, false }, { { "--expr", "highway" }, false }, { { "--expr", "*=*", "--expr", "name" }, false },
+    { { "--expr", "*=*", "--expr", "a=b" }, true },
+}) do
+    local args = { "--mode", "tags" }
+    for _, arg in ipairs(case[1]) do args[#args + 1] = arg end
+    test("file-info before 9c4d6c81 " .. (case[2] and "runs " or "refuses ") .. table.concat(args, " "), function()
+        local r = invoke("file-info", args, case[2] and { {} } or {}, false)
+        if case[2] then
+            assert(r.outcome == "completed", r.reason)
+        else
+            assert(r.outcome == "failed" and r.stage == "bench", r.outcome)
+            assert(r.reason:find("9c4d6c81", 1, true), r.reason)
+            assert(#r.calls == 0)
+        end
+    end)
+end
+for _, args in ipairs({ { "--mode", "tags" }, { "--mode", "tags", "--expr", "highway" } }) do
+    test("file-info from 9c4d6c81 runs " .. table.concat(args, " "), function()
+        local r = invoke("file-info", args, { {} })
+        assert(r.outcome == "completed", r.reason)
+    end)
+end
+for _, mode in ipairs({ "metadata", "nodes" }) do
+    test("file-info before 9c4d6c81 runs mode " .. mode, function()
+        local r = invoke("file-info", { "--mode", mode }, { {} }, false)
+        assert(r.outcome == "completed", r.reason)
     end)
 end
 

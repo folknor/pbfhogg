@@ -41,6 +41,18 @@ local checks = {
     { name = "location-integrity", selector = "--locations", args = { "--agreement", "yes" }, flags = { "--agreement" } },
     { name = "ref-integrity", selector = "--refs", args = { "--check-relations", "yes" }, flags = { "--check-relations" } },
 }
+for _, value in ipairs({ "yes", "no" }) do
+    test("ref-integrity refuses undeclared --direct-io " .. value, function()
+        local r = invoke("ref-integrity", { "--direct-io", value })
+        assert(r.outcome == "refused", r.outcome)
+        assert(#r.calls == 0)
+    end)
+end
+test("ref-integrity never forwards --direct-io", function()
+    local r = invoke("ref-integrity", {}, { exit = 0 })
+    assert(r.outcome == "completed", r.reason)
+    assert(not has(r.calls[1].argv, "--direct-io"))
+end)
 for _, case in ipairs(checks) do
     for _, exit in ipairs({ 0, 1 }) do
         test(case.name .. " completes on exit " .. exit .. " without judging it", function()
@@ -61,6 +73,25 @@ for _, case in ipairs(checks) do
     test(case.name .. " fails on child failure", function()
         local r = invoke(case.name, case.args, { exit = 2, stderr = "failed" })
         assert(r.outcome == "failed", r.outcome)
+    end)
+end
+for _, modern in ipairs({ false, true }) do
+    test("canonical-digest content-locations modern=" .. tostring(modern), function()
+        local params = { "--dataset", "fixture", "--variant", "indexed", "--form", "content-locations" }
+        local r = run { bench = "canonical-digest", program = "pbfhogg", params = params,
+            host = { datasets = { fixture = { pbf = { indexed = { file = "answer.pbf" } } } } },
+            files = { [FILE] = "fixture" },
+            calls = modern and { { stderr = "summary" } } or {},
+            since = { ["bc714d0c"] = modern, ["16154b0d"] = true } }
+        if modern then
+            assert(r.outcome == "completed", r.reason)
+            assert(r.verdict == "content-locations")
+            assert(has(r.calls[1].argv, "--form", "content-locations"))
+        else
+            assert(r.outcome == "failed", r.outcome)
+            assert(r.reason:find("bc714d0c", 1, true), r.reason)
+            assert(#r.calls == 0)
+        end
     end)
 end
 test("canonical-digest fails on child failure", function()

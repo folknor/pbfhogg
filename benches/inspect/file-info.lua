@@ -30,6 +30,21 @@ function validate(params)
 end
 
 function bench(params)
+    -- Before 9c4d6c81 a bare `inspect tags` and every expression without `=`
+    -- counted key=value pairs, not keys, so under --commit the same params
+    -- would pair two workloads. Only pair expressions (`*=*` is the bare pair
+    -- count) mean the same on both sides; anything else is refused there.
+    if params.mode == "tags" and not since("9c4d6c81") then
+        local exprs = params.expr or {}
+        if #exprs == 0 then
+            fail("before 9c4d6c81 a bare inspect tags counted key=value pairs, not keys; use --expr '*=*'")
+        end
+        for _, expr in ipairs(exprs) do
+            if not expr:find("=", 1, true) then
+                fail("before 9c4d6c81 an expression without = counted key=value pairs, not keys: " .. expr)
+            end
+        end
+    end
     local args = { "inspect" }
     if params.mode == "tags" then table.insert(args, "tags") end
     table.insert(args, params.variant.file)

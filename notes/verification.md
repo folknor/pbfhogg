@@ -134,22 +134,22 @@ Reported by bench-verify.
 the verdict (the 2026-11-15 denmark run spent 37.4 s of 58 s in osmosis). brokkr#155 closed without the
 option when brokkr verify retired.
 
-Fix: an explicit diagnostic option, or promote osmosis to a verdict (VER-136). Enforcement: a
-declarative step graph rejecting unused outputs.
+Fix: an explicit diagnostic option, or drop the run. Promoting osmosis to a deletion verdict was
+considered and declined: the check now enforces deletion itself, from the input OSC's final deletes,
+so osmosis would only re-derive a rule already checked directly. Enforcement: a declarative step
+graph rejecting unused outputs.
 
-## VER-136 - No independent enforcement of unconditional deletion in apply-changes
+## VER-137 - The verifier's OSC scanner does not decode entity references in `id`
 
-Found working pbfhogg#62.
+Found working the apply-changes final-delete rule.
 
-The apply-changes check exempts osmium-only elements the input OSC deletes, because osmium deletes by
-version and pbfhogg unconditionally. So if pbfhogg and osmium both wrongly retain an element the OSC
-deletes, the check passes: nothing independent enforces the deletion. osmosis deletes unconditionally
-and reads the indexed input unchanged, but is context only (its output feeds a printed fileinfo line).
-osmconvert was removed as a reference for being unable to read indexdata PBFs.
+`extract_id` in `crates/verify/src/osc.rs` parses the raw attribute text, so a legal `id="&#49;"`
+is refused by the strict scanner (and skipped by the lenient one) instead of read as 1. Every
+strict caller fails the check rather than passing, so no false pass is known; it is a false fail
+on exotic but legal input. The same file's module header still describes the retired brokkr
+`verify_merge` ("request 4"), stale since the verifier moved into pbfhogg.
 
-Fix: a strict comparison against an independent unconditional-delete implementation, most plausibly
-osmosis, with its semantics established first for repeated changes to one identity and for metadata,
-and its failure or absence reported as the check not completing rather than a pass.
+Fix: decode `id` as `parse_meta` decodes the other attributes, and rewrite the header.
 
 
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation

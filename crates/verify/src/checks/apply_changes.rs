@@ -159,16 +159,21 @@ pub fn run(
         ));
     }
 
-    // --- Strict pbfhogg-vs-osmium element diff (with delete-set tolerance) ---
+    // --- Strict pbfhogg-vs-osmium element diff, held to the final deletes ---
     //
     // Cross-validation needs more than equal element counts. We diff
     // the two outputs element-by-element and exempt the one
-    // legitimate semantic difference: osmium does version-based
-    // deletes while pbfhogg and osmosis delete unconditionally,
-    // so osmium-only elements whose IDs appear in the input OSC's
-    // `<delete>` section aren't bugs - both behaviours are spec-allowed.
-    // Anything else (osmium-only IDs not in the delete set, pbfhogg-only
-    // elements, or content-level `<modify>` differences) fails verify.
+    // legitimate semantic difference: osmium resolves a delete by version
+    // order against the base, while pbfhogg applies the last change to an
+    // identity whatever the base's version, so osmium-only elements the
+    // input OSC finally deletes aren't bugs. Because that exemption leaves
+    // osmium no oracle for deletion, the deletion itself is enforced from
+    // the input: an identity the OSC finally deletes fails wherever
+    // pbfhogg's output holds it, even where osmium agrees. osmosis, which
+    // also deletes regardless of version, is not needed for this and stays
+    // context only. Anything else (osmium-only identities not finally
+    // deleted, pbfhogg-only elements, or content-level `<modify>`
+    // differences) fails verify.
     // Inline coordinates are left out in locations mode: osmium's own are
     // known stale there (above), so they are no reference.
     let policy = if locations_on_ways {
@@ -179,9 +184,9 @@ pub fn run(
     verify_pbfhogg_vs_osmium(harness, osc, &pbfhogg_out, &osmium_out, &outdir, policy)?;
 
     Ok(Some(if locations_on_ways {
-        "strict element content with delete-set tolerance; output strictly ordered; inline locations pass pbfhogg check --locations; osmium locations informational"
+        "strict element content with final-delete tolerance; final deletes absent; output strictly ordered; inline locations pass pbfhogg check --locations; osmium locations informational"
     } else {
-        "strict element content with delete-set tolerance; output strictly ordered; osmosis context only"
+        "strict element content with final-delete tolerance; final deletes absent; output strictly ordered; osmosis context only"
     }.into()))
 }
 
@@ -287,7 +292,8 @@ fn run_context_tools(
 
 /// Diff `(pbfhogg_out, osmium_out)` as osmium decodes them
 /// (`element_diff::scan_element_diff`), then categorise each differing
-/// identity against the input OSC's delete set. Returns
+/// identity, and every identity pbfhogg holds, against the input OSC's final
+/// deletes ([`FinalDeletes`]). Returns
 /// `Err(Error::Failed(...))` if any unexplained difference remains.
 fn verify_pbfhogg_vs_osmium(
     harness: &mut Harness,
@@ -299,9 +305,9 @@ fn verify_pbfhogg_vs_osmium(
 ) -> Result<(), Error> {
     harness.msg("=== pbfhogg vs osmium element diff ===");
 
-    let applied = DeleteSet::read(input_osc)?;
+    let applied = FinalDeletes::read(input_osc)?;
     harness.msg(&format!(
-        "  input OSC delete set: {} nodes, {} ways, {} relations",
+        "  input OSC final deletes: {} nodes, {} ways, {} relations",
         applied.ids[0].len(),
         applied.ids[1].len(),
         applied.ids[2].len(),
@@ -319,15 +325,26 @@ fn verify_pbfhogg_vs_osmium(
     // so a regression the size of the planet costs no more than a pass. The
     // verdict waits for the scan to return, which proves both sides read
     // whole and in strict order.
+    //
+    // Every identity pbfhogg holds is also held to the change's final
+    // deletes, so an element both tools wrongly keep fails here even though
+    // the two outputs agree on it.
     let mut report = MergeDiffReport::default();
-    element_diff::scan_element_diff(
+    let mut retained = PerType::default();
+    element_diff::scan_element_diff_held(
         harness,
         pbfhogg_out,
         osmium_out,
         &diff_path,
         policy,
         |action, kind, id| report.classify(action, kind, id, &applied),
+        |kind, id| {
+            if applied.contains(kind, id) {
+                retained.add(kind, id);
+            }
+        },
     )?;
+    report.retained_deleted = retained;
     drop(applied);
     if report.is_empty() {
         harness.msg("  pbfhogg and osmium outputs are element-identical PASS");
@@ -345,35 +362,43 @@ fn verify_pbfhogg_vs_osmium(
     Ok(())
 }
 
-/// The input OSC's `<delete>` IDs per kind (node, way, relation), sorted and
-/// deduplicated for binary search: the carve-out's membership test.
+/// The identities, a kind and an ID, whose last entry in the input OSC in
+/// file order is a delete, per kind (node, way, relation), sorted for binary
+/// search. The change's own answer: apply-changes resolves an identity by
+/// its last change in file order (a later create or modify re-enters a
+/// deleted identity, a later delete removes it), whatever version the base
+/// holds, so none of these may survive in its output. The verifier reads it
+/// from the input itself, so it is evidence independent of both tools.
 ///
-/// Held in memory, O(delete entries in the input change): 8-byte IDs plus
-/// vector capacity while it is read. That is the one input-sized structure
-/// here, and the step before it dominates it: osmium apply-changes, which must
+/// Held in memory, O(distinct identities in the input change) while it is
+/// read, then O(final deletes). That is the one input-sized structure here,
+/// and the step before it dominates it: osmium apply-changes, which must
 /// have succeeded first, holds every change in the file as a full object.
 /// Nothing sized by the PBF or by the difference is retained.
-struct DeleteSet {
+struct FinalDeletes {
     ids: [Vec<i64>; 3],
 }
 
-impl DeleteSet {
+impl FinalDeletes {
+    /// Read strictly: an entry the scanner cannot account for refuses the
+    /// document, so no delete drops out of the expectation unseen.
     fn read(osc_path: &Path) -> Result<Self, Error> {
-        let mut ids: [Vec<i64>; 3] = Default::default();
-        osc::scan_osc_file(osc_path, |action, kind, id| {
-            if action == OscAction::Delete {
-                ids[kind.index()].push(id);
-            }
+        let mut last: [std::collections::HashMap<i64, bool>; 3] = Default::default();
+        osc::scan_osc_file_strict(osc_path, |action, kind, id| {
+            last[kind.index()].insert(id, action == OscAction::Delete);
         })?;
-        Ok(Self::from_unsorted(ids))
+        Ok(Self::from_last(last))
     }
 
-    fn from_unsorted(mut ids: [Vec<i64>; 3]) -> Self {
-        for kind in &mut ids {
-            kind.sort_unstable();
-            kind.dedup();
-            kind.shrink_to_fit();
-        }
+    fn from_last(last: [std::collections::HashMap<i64, bool>; 3]) -> Self {
+        let ids = last.map(|kind| {
+            let mut ids: Vec<i64> = kind
+                .into_iter()
+                .filter_map(|(id, deleted)| deleted.then_some(id))
+                .collect();
+            ids.sort_unstable();
+            ids
+        });
         Self { ids }
     }
 
@@ -388,13 +413,18 @@ impl DeleteSet {
 /// report is bounded and deterministic whatever the diff's size or order.
 #[derive(Default)]
 struct MergeDiffReport {
-    /// osmium-only IDs accounted for by the input OSC's delete set.
-    /// These are *expected* differences - osmium's version-based
-    /// deletes vs pbfhogg's unconditional deletes.
+    /// osmium-only identities the input OSC finally deletes. These are
+    /// *expected* differences: osmium resolves a delete by version order
+    /// against the base, so a delete below the base's version leaves the
+    /// base element, while pbfhogg applies the last change regardless.
     osmium_only_explained: PerType,
-    /// osmium-only IDs not in the input OSC delete set. These are
-    /// pbfhogg dropping elements it shouldn't have.
+    /// osmium-only identities the input OSC does not finally delete. These
+    /// are pbfhogg dropping elements it shouldn't have.
     osmium_only_unexplained: PerType,
+    /// Identities the input OSC finally deletes that pbfhogg's output still
+    /// holds, whether osmium holds them too or not (one osmium dropped also
+    /// counts in `pbfhogg_only`).
+    retained_deleted: PerType,
     /// pbfhogg-only IDs (osmium dropped, pbfhogg kept). Always a
     /// failure - means osmium did something pbfhogg didn't.
     pbfhogg_only: PerType,
@@ -406,7 +436,7 @@ impl MergeDiffReport {
     /// Bucket one diff entry. pbfhogg is the diff's old side and osmium its
     /// new side, so `<create>` is osmium-only (exempt when the input deleted
     /// it), `<delete>` pbfhogg-only and `<modify>` a content mismatch.
-    fn classify(&mut self, action: OscAction, kind: OscKind, id: i64, applied: &DeleteSet) {
+    fn classify(&mut self, action: OscAction, kind: OscKind, id: i64, applied: &FinalDeletes) {
         let class = match action {
             OscAction::Create if applied.contains(kind, id) => &mut self.osmium_only_explained,
             OscAction::Create => &mut self.osmium_only_unexplained,
@@ -422,6 +452,7 @@ impl MergeDiffReport {
 
     fn total_failures(&self) -> u64 {
         self.osmium_only_unexplained.total()
+            + self.retained_deleted.total()
             + self.pbfhogg_only.total()
             + self.content_mismatch.total()
     }
@@ -433,15 +464,19 @@ impl MergeDiffReport {
     fn print(&self, harness: &mut Harness) {
         if self.osmium_only_explained.total() > 0 {
             harness.msg(&format!(
-                "  osmium-only explained by delete set: {} OK",
+                "  osmium-only explained by final deletes: {} OK",
                 self.osmium_only_explained.counts_line()
             ));
         }
         let mut fail =
             |label: &str, class: &PerType| class.print("FAIL ", label, |line| harness.msg(line));
         fail(
-            "osmium-only NOT in delete set",
+            "osmium-only NOT finally deleted",
             &self.osmium_only_unexplained,
+        );
+        fail(
+            "finally deleted but held by pbfhogg",
+            &self.retained_deleted,
         );
         fail("pbfhogg-only (osmium dropped)", &self.pbfhogg_only);
         fail("content differs", &self.content_mismatch);
@@ -453,11 +488,26 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    fn deletes(nodes: &[i64], ways: &[i64], relations: &[i64]) -> DeleteSet {
-        DeleteSet::from_unsorted([nodes.to_vec(), ways.to_vec(), relations.to_vec()])
+    fn from_entries(entries: &[(OscAction, OscKind, i64)]) -> FinalDeletes {
+        let mut last: [std::collections::HashMap<i64, bool>; 3] = Default::default();
+        for &(action, kind, id) in entries {
+            last[kind.index()].insert(id, action == Delete);
+        }
+        FinalDeletes::from_last(last)
     }
 
-    fn classify_all(entries: &[(OscAction, OscKind, i64)], applied: &DeleteSet) -> MergeDiffReport {
+    fn deletes(nodes: &[i64], ways: &[i64], relations: &[i64]) -> FinalDeletes {
+        let mut entries = Vec::new();
+        for (kind, ids) in [(Node, nodes), (Way, ways), (Relation, relations)] {
+            entries.extend(ids.iter().map(|&id| (Delete, kind, id)));
+        }
+        from_entries(&entries)
+    }
+
+    fn classify_all(
+        entries: &[(OscAction, OscKind, i64)],
+        applied: &FinalDeletes,
+    ) -> MergeDiffReport {
         let mut report = MergeDiffReport::default();
         for &(action, kind, id) in entries {
             report.classify(action, kind, id, applied);
@@ -469,12 +519,54 @@ mod tests {
     use OscKind::{Node, Relation, Way};
 
     #[test]
-    fn delete_set_is_sorted_deduplicated_and_searchable() {
-        let set = deletes(&[9, 1, 9, 4], &[], &[7]);
-        assert_eq!(set.ids[0], vec![1, 4, 9]);
+    fn final_deletes_are_sorted_deduplicated_and_searchable() {
+        let set = deletes(&[9, 1, 9, 4, -3], &[], &[7]);
+        assert_eq!(set.ids[0], vec![-3, 1, 4, 9]);
         assert!(set.contains(Node, 4));
+        assert!(set.contains(Node, -3));
         assert!(!set.contains(Way, 4));
         assert!(set.contains(Relation, 7));
+    }
+
+    #[test]
+    fn the_last_entry_in_file_order_decides() {
+        let set = from_entries(&[
+            // Deleted, then re-entered: live.
+            (Delete, Node, 1),
+            (Create, Node, 1),
+            // Modified, then deleted: deleted.
+            (Modify, Node, 2),
+            (Delete, Node, 2),
+            // Equal-version transitions are positional too.
+            (Delete, Node, 3),
+            (Modify, Node, 3),
+            (Delete, Node, 3),
+            // Kinds are separate identities.
+            (Delete, Way, 4),
+            (Create, Relation, 4),
+        ]);
+        assert!(!set.contains(Node, 1));
+        assert!(set.contains(Node, 2));
+        assert!(set.contains(Node, 3));
+        assert!(set.contains(Way, 4));
+        assert!(!set.contains(Relation, 4));
+        assert!(!set.contains(Node, 4));
+    }
+
+    #[test]
+    fn an_earlier_delete_does_not_excuse_an_osmium_only_reentry() {
+        let applied = from_entries(&[(Delete, Node, 5), (Create, Node, 5)]);
+        let report = classify_all(&[(Create, Node, 5)], &applied);
+        assert_eq!(report.osmium_only_unexplained.kinds[0].ids(), vec![5]);
+        assert!(report.is_failure());
+    }
+
+    #[test]
+    fn a_finally_deleted_identity_pbfhogg_holds_fails() {
+        let mut report = MergeDiffReport::default();
+        report.retained_deleted.add(Node, 7);
+        assert!(report.is_failure());
+        assert!(!report.is_empty());
     }
 
     #[test]

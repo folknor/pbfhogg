@@ -126,6 +126,44 @@ pub(crate) fn scan_element_diff(
     Ok(())
 }
 
+/// [`scan_element_diff`], also handing every identity `old` holds, whatever
+/// `new` holds, to `held` in object order: the identities both sides hold,
+/// alike or not, and those only `old` holds. A property of `old` alone (an
+/// identity it must not hold) is then judged on all of it, not only where
+/// the two sides differ.
+pub(crate) fn scan_element_diff_held(
+    harness: &mut Harness,
+    old: &Path,
+    new: &Path,
+    listing: &Path,
+    policy: Policy,
+    mut each: impl FnMut(OscAction, OscKind, i64),
+    held: impl FnMut(OscKind, i64),
+) -> Result<(), Error> {
+    let kinds = [OscKind::Node, OscKind::Way, OscKind::Relation];
+    let held = std::cell::RefCell::new(held);
+    opl_compare::compare_paired(
+        harness,
+        old,
+        new,
+        listing,
+        policy,
+        |group| {
+            let action = match group.class {
+                Class::FirstOnly => {
+                    (held.borrow_mut())(kinds[group.kind], group.id);
+                    OscAction::Delete
+                }
+                Class::SecondOnly => OscAction::Create,
+                Class::Differs => OscAction::Modify,
+            };
+            each(action, kinds[group.kind], group.id);
+        },
+        |pair| (held.borrow_mut())(kinds[pair.kind], pair.id),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

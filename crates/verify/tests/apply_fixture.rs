@@ -19,6 +19,9 @@ fn opl(fault: &str, pbfhogg: bool) -> &'static str {
         ("modified", true) => "n1 v1\nn7 v1 Ta=1\n",
         ("modified", false) => "n1 v1\nn7 v1 Ta=2\n",
         ("deleted", true) => "n1 v1\nn7 v1\n",
+        // Both tools keep the node the change deletes: the outputs agree,
+        // and only the final-delete rule can fail it.
+        ("both-retain", _) => "n1 v1\nn7 v1\n",
         _ => "n1 v1\n",
     }
 }
@@ -60,6 +63,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         ("unexplained", false),
         ("modified", false),
         ("deleted", false),
+        ("both-retain", false),
         ("stale", false),
         ("context-failure", true),
         ("osmium-stale", true),

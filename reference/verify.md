@@ -10,8 +10,10 @@ brokkr run --with pbfhogg --with-commit REF pbfhogg-verify -- all --dataset germ
 ```
 
 `--with-features LIST` builds the CLI under test with features (for
-`--direct-io`). The verifier never calls brokkr and links no pbfhogg: no
-verdict may rest on code compiled into the verifier. Nor does a verdict rest
+`--direct-io`). The verifier never calls brokkr and links no pbfhogg, so no
+verdict rests on pbfhogg code compiled into the verifier; verifier-owned
+readers and models over the inputs and reference-tool output are the
+independent evidence. Nor does a verdict rest
 on the pbfhogg CLI judging its own output, except at the residues listed in
 "Where pbfhogg is still a comparator" below.
 
@@ -274,7 +276,7 @@ suite because a later comparison cannot make that run complete.
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
 | `repack` | osmium OPL decodings, walked in file order | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
 | `degrade` | osmium OPL decodings, walked in file order | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on a `LocationsOnWays` input (`--locations-on-ways`, suite `degrade -l`) |
-| `apply-changes` | `osmium apply-changes` | strict output order and element equality, tolerating only osmium-only IDs in the input OSC delete set; optional inline-location consistency |
+| `apply-changes` | `osmium apply-changes` | strict output order and element equality, tolerating only osmium-only identities the input OSC finally deletes, and no finally deleted identity in pbfhogg's output; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
 | `diff` | osmium OPL decodings of both inputs, merged | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
@@ -286,11 +288,16 @@ Apply-changes accepts `--osc-seq` or a fixture `--osc`, and
 optional sort feature is held to exit 2 with the exact Unsorted advice and
 no published output; references do not run. In locations mode that base
 must still declare LocationsOnWays, so the refusal has only one cause.
-On sorted input, pbfhogg's output must be strictly ordered. The element diff
-tolerates only osmium-only IDs the input OSC deleted, since osmium uses
-version-based deletion and pbfhogg deletes unconditionally. All other
-differences fail. Both outputs must be in strict order for the element
-comparison to be made.
+On sorted input, pbfhogg's output must be strictly ordered. An identity
+(kind and ID) is finally deleted when its last entry in the input OSC, in
+file order, is a delete; the verifier reads that from the input itself,
+strictly. No finally deleted identity may appear in pbfhogg's output, even
+where osmium's output holds it too. The element diff tolerates only
+osmium-only identities that are finally deleted, since osmium resolves a
+delete by version order against the base, keeping a base element whose
+version is above the delete's, while pbfhogg applies the last change
+whatever the base's version. All other differences fail. Both outputs must
+be in strict order for the element comparison to be made.
 In locations mode pbfhogg's output must pass `check --locations`;
 osmium's location report is informational, with its stale count shown even
 on PASS. The element comparison does not read inline coordinates in that

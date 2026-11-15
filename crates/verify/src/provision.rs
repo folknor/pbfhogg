@@ -43,7 +43,14 @@ pub(crate) fn sha256(path: &Path) -> Result<String, Error> {
         }
         hash.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    // sha2 0.11's output array no longer implements LowerHex.
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(64);
+    for byte in hash.finalize() {
+        hex.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
+    Ok(hex)
 }
 
 fn installed(root: &Path, checksum: &str) -> Result<OsmosisTools, Error> {

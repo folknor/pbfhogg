@@ -25,11 +25,11 @@ doctest = false
 [dependencies]
 # The rust-lang tokenizer as rust-analyzer republishes it, the one lexer
 # every rule reads: literal, comment and lifetime boundaries are the real ones.
-ra-ap-rustc_lexer = "0.184.0"
+ra-ap-rustc_lexer = "0.185.0"
 # Structure, only where structure is the point (module graphs, test-gated
 # items). `span-locations` maps syn spans back to byte offsets outside a
 # proc-macro context.
-syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
+syn = { version = "3.0.10", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 toml = "1.1.3"
 

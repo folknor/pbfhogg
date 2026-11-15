@@ -20,10 +20,15 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
 - **Element equality** is the verifier's merge of osmium's decodings
   (`opl_compare`): `osmium cat -f opl[,add_metadata=false][,locations_on_ways=true]`
   of each side to a file in the check's directory, then a streaming merge
-  keyed by kind and ID that requires each side strictly ascending by kind
-  (node, way, relation) and non-negative ID, so it also certifies, as osmium
+  keyed by kind and ID in osmium's object order (kind node, way, relation;
+  then ID zero, negative IDs by magnitude, positive IDs by magnitude) that
+  requires each side strictly ascending, so it also certifies, as osmium
   decodes them, that neither side repeats or misorders an object, and
-  compares every record line byte for byte. Differing identities are
+  compares every record line byte for byte. Repack and degrade use the same
+  merge walk without the order requirement (`compare_sequence`, as osmium
+  diff walks its inputs): no unmatched or differing record then means the
+  two record sequences are equal element by element, in any order; that is
+  their claim, not identity under a sort. Differing identities are
   classified first-only, second-only or differing and written to a listing
   beside the outputs, both sides' records included; the OPL pair is removed
   once merged and kept only when the merge itself fails. This is equality of osmium-decoded records under a field
@@ -31,7 +36,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   both sides, timestamps are whole seconds, coordinates are at 1e-7 degrees
   and a string is cut at an embedded NUL. OPL escapes its separators, so tag
   boundaries are compared (osmium diff's checksum feeds tags without
-  lengths). Metadata is compared everywhere except the `diff --format osc`
+  lengths, so `a=bc` and `ab=c` collide there; no check judges with osmium
+  diff). Metadata is compared everywhere except the `diff --format osc`
   roundtrips; inline way coordinates are compared when both files declare
   `LocationsOnWays`, except in apply-changes locations mode. Where
   coordinates are the command's promise (add-locations-to-ways), the check
@@ -266,12 +272,12 @@ suite because a later comparison cannot make that run complete.
 | `multi-extract` | sequential pbfhogg extracts | simple config output per region has strict order and element equality with its sequential extract (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
 | `check-refs` | `osmium check-refs` | missing counts per class in ways-only and relation modes, each exit held to its complete report |
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
-| `repack` | `osmium diff` | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
-| `degrade` | `osmium diff` | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on a `LocationsOnWays` input (`--locations-on-ways`, suite `degrade -l`) |
+| `repack` | osmium OPL decodings, walked in file order | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
+| `degrade` | osmium OPL decodings, walked in file order | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on a `LocationsOnWays` input (`--locations-on-ways`, suite `degrade -l`) |
 | `apply-changes` | `osmium apply-changes` | strict output order and element equality, tolerating only osmium-only IDs in the input OSC delete set; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
-| `diff` | osmium diff OPL and fetched objects | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
+| `diff` | osmium OPL decodings of both inputs, merged | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
 | `diff --format osc` | osmium derive-changes and apply-changes | content-only element equality of roundtrips, pbfhogg's OSC applied by both tools, and indexed/unindexed decompressed OSC parity |
 | `renumber` | osmium renumber | every object paired at its renumbered ID; every difference is an orphan reference named past the live range on both sides, one to one |
 
@@ -429,18 +435,17 @@ an error here.
 
 `repack` and `degrade` hold pbfhogg's two re-encoders to
 osmium's reading of the input and to their documented block layout
-(`verify_reencode`, shared). Elements: `osmium diff --suppress-common
---output-format opl,locations_on_ways=true --summary` of a reference against
-the output. osmium walks both files as a merge on object order and counts a
-pair same only when a checksum over visible, timestamp, tags, changeset, uid,
-user and the location, way node references with their coordinates or members
-agrees, so no left, right or different object means the two sequences are
-identical element by element, whatever their order, barring a checksum
-collision. Tags are fed without lengths or separators, so a shifted
-key/value boundary (`a=bc` against `ab=c`) collides deterministically; this
-comparison does not catch it. An object it lists as moved or
-removed is printed, not checksummed, so its lines are compared byte for byte,
-way coordinates included. The reference is the input when osmium reads it in
+(`verify_reencode`, shared). Elements: osmium decodes a reference and the
+output to OPL with metadata and way coordinates
+(`opl,locations_on_ways=true`), and the verifier walks the two record
+streams in file order as osmium diff walks its inputs, advancing the side
+whose key is lower and pairing equal keys, but comparing whole lines byte
+for byte where osmium diff compares a checksum that feeds tags without
+lengths (`opl_compare::compare_sequence`). No unmatched or differing
+record means the two sequences are identical element by element, whatever
+their order, a shifted tag boundary (`a=bc` against `ab=c`) included; only
+reference-side records means the output is a subsequence of the reference.
+A moved or removed object is listed with its line. The reference is the input when osmium reads it in
 kind and ID order (fileinfo `objects_ordered`), else a stable partition
 osmium builds (`osmium cat -t` per kind, then `osmium cat` of the three: each
 kind keeps its input order); for degrade it is written without way
@@ -514,14 +519,13 @@ entry runs on the suite input (by default `indexed`, which declares no
 entry runs the whole check on the selected generation's
 `altw-keep-untagged` base, and standalone `degrade --locations-on-ways`
 does the same on the selected input. On a `LocationsOnWays` input the check
-first diffs the reference with way coordinates against the one without
+first compares the reference with way coordinates against the one without
 (both the input, or both the same stable partition): an unmatched object is
-a failure, and a `different` count of zero means no way carried a
-coordinate. In the locations entry an input that declares no
+a failure, and no differing record means no way carried a coordinate. In the locations entry an input that declares no
 `LocationsOnWays`, or whose ways carry no coordinate, fails; elsewhere it is
 a PASS-line gap. That a retained coordinate would be caught rests on
-osmium diff checksumming way node coordinates; the generated fixtures fake
-osmium and exercise only the wiring.
+osmium's OPL writing way node coordinates under `locations_on_ways=true`;
+the generated fixtures fake osmium and exercise only the wiring.
 
 
 Change-only checks resolve no PBF. Merge-changes takes `--osc-seq`, repeated
@@ -572,13 +576,13 @@ copy: exit 2, advice naming the input and no publication or text listing.
 No content comparison runs on that route.
 
 Text diff runs plain and verbose on the original pair and the pair stripped
-of indexdata. Osmium's OPL diff supplies one-sided and checksum-different
-objects. Every OSC-touched or pbfhogg-reported modified identity absent from
-that listing is fetched from both inputs: this catches content changes
-osmium's checksum misses. Fetch completion, missing counts, object order,
-listing consumption and osmium's summary are reconciled. A candidate found
-on only one side, or a negative ID requiring an absolute-ID fetch, refuses
-the comparison. Content excludes metadata and inline way coordinates.
+of indexdata. Osmium decodes both inputs to OPL with metadata and the
+verifier merges them strictly in object order (`opl_compare::compare`,
+negative IDs included), listing every one-sided object and every pair whose
+line differs; an identity not listed is byte-identical on both sides, so
+every identity is judged, untouched ones included. Listing consumption is
+reconciled with the merge's counts. Content excludes metadata and inline
+way coordinates.
 The verbose listing must name exactly the content differences, with the
 correct class, ID, versions and complete coordinate, tag, reference and
 member detail. Edit scripts must be faithful and shortest within the
@@ -588,9 +592,7 @@ judged. Version zero in OPL admits missing or present version spellings.
 PASS names these qualifications and detail shapes not exercised. The
 stripped verbose listing must match byte for byte, plain listings must
 match its headers, and all summaries and exits must match independent
-content counts. This assumes apply-changes preserves untouched identities
-when osmium's checksum also calls them common; apply-changes has its own
-separate check. Which equally short edit script is chosen is not judged.
+content counts. Which equally short edit script is chosen is not judged.
 
 OSC diff derives with both tools and applies each result with its
 producing tool; osmium also applies pbfhogg's OSC, so what that OSC means

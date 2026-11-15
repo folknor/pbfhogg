@@ -19,7 +19,7 @@
 //!   once with another (held to the same checks). Which N objects go is not
 //!   checked against pbfhogg's selection, which is not documented, and
 //!   whether another seed chose another set is coverage, never a verdict.
-//! - `--unsort`: osmium diff finds exactly one object moved per kind with
+//! - `--unsort`: the comparison finds exactly one object moved per kind with
 //!   more objects than the cap, its two lines identical; each kind packed
 //!   continuously ([`continuous`]); exactly that kind's first two blobs
 //!   overlap. The moved object `a` sits first in the kind's second blob,
@@ -225,8 +225,7 @@ fn run_on(
         );
     }
     let mut claim = vec![
-        "element sequence with metadata against osmium diff (removed and moved objects line by \
-         line), header claims, indexdata against payloads (the verifier's own blob decode for \
+        "element sequence with metadata, record by record against osmium's OPL decodings, header claims, indexdata against payloads (the verifier's own blob decode for \
          kind, count and ID range, check --index for the rest), cap and kind order, \
          the documented layout where it is predicted, and each unsort swap's position; which \
          objects --drop-ids removes is not compared with pbfhogg's selection"
@@ -237,33 +236,33 @@ fn run_on(
 }
 
 /// Whether any way in a `LocationsOnWays` input carries inline coordinates:
-/// osmium diff of the reference that keeps them against the one that drops
-/// them (the same stable partition when osmium reads the input out of
-/// order, so only the coordinates differ). Any unmatched object means the
-/// two references are not one sequence, an error; `different` counts the
-/// objects whose checksum, way coordinates included, changed.
+/// the reference that keeps them compared with the one that drops them (the
+/// same stable partition when osmium reads the input out of order, so only
+/// the coordinates differ). Any unmatched object means the two references
+/// are not one sequence, an error; the differing records are the objects
+/// whose OPL line, way coordinates included, changed.
 fn observed_coordinates(
     harness: &mut Harness,
     outdir: &Path,
     refs: &mut References<'_>,
     without: &Path,
 ) -> Result<bool, Error> {
-    harness.msg("--- degrade: way coordinates in the input (osmium diff) ---");
+    harness.msg("--- degrade: way coordinates in the input (OPL comparison) ---");
     let with = refs.get(harness, true)?;
     let compared = reencode::compare(harness, outdir, "coordinates", &with, without)?;
-    let s = compared.summary;
-    if s.left != 0 || s.right != 0 {
+    let s = compared.merged;
+    if s.first_only != 0 || s.second_only != 0 {
         return Err(Error::Failed(format!(
             "the references with and without way coordinates differ beyond coordinates: \
-             osmium diff finds left={} right={}",
-            s.left, s.right
+             {} objects only with them, {} only without",
+            s.first_only, s.second_only
         )));
     }
     harness.msg(&format!(
         "  {} objects carry way coordinates the reference without them lost",
-        s.different
+        s.differs
     ));
-    Ok(s.different > 0)
+    Ok(s.differs > 0)
 }
 
 fn strip_locations(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
@@ -372,15 +371,15 @@ fn judge_drop(
     n: u64,
     total: u64,
 ) -> Result<[u64; 3], Error> {
-    let s = compared.summary;
-    let ok = s.left == n && s.right == 0 && s.different == 0 && s.same + n == total;
+    let s = compared.merged;
+    let ok = s.first_only == n && s.second_only == 0 && s.differs == 0 && s.same + n == total;
     if !ok {
         run.fail(
             label,
             &format!(
-                "osmium diff finds left={} right={} same={} different={}, where exactly {n} of \
-                 {total} objects must be removed and nothing else changed",
-                s.left, s.right, s.same, s.different
+                "the comparison finds {} removed, {} added, {} same and {} changed, where \
+                 exactly {n} of {total} objects must be removed and nothing else changed",
+                s.first_only, s.second_only, s.same, s.differs
             ),
         );
         run.harness.replay_listing(&compared.listing)?;
@@ -476,14 +475,14 @@ fn unsort(run: &mut Run<'_>, reference: &Path, intra: bool) -> Result<(), Error>
     }
     let total = run.input.total();
     let compared = reencode::compare(run.harness, &run.outdir, stem, reference, &out)?;
-    let s = compared.summary;
-    if !(s.left == k && s.right == k && s.different == 0 && s.same + k == total) {
+    let s = compared.merged;
+    if !(s.first_only == k && s.second_only == k && s.differs == 0 && s.same + k == total) {
         run.fail(
             &label,
             &format!(
-                "osmium diff finds left={} right={} same={} different={}, where exactly {k} \
-                 objects must be moved and nothing else changed",
-                s.left, s.right, s.same, s.different
+                "the comparison finds {} and {} out of place, {} same and {} changed, where \
+                 exactly {k} objects must be moved and nothing else changed",
+                s.first_only, s.second_only, s.same, s.differs
             ),
         );
         run.harness.replay_listing(&compared.listing)?;

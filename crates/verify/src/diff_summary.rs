@@ -1,4 +1,4 @@
-//! Strict readers for pbfhogg and osmium diff summary counts.
+//! A strict reader for pbfhogg's diff summary counts.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Counts {
     pub created: u64,
@@ -53,37 +53,6 @@ fn parse_summary_line(line: &str) -> Option<Counts> {
     .then_some(counts)
 }
 
-/// osmium's `--summary` counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OsmiumSummary {
-    pub left: u64,
-    pub right: u64,
-    pub same: u64,
-    pub different: u64,
-}
-
-/// Exactly one `Summary: left=N right=N same=N different=N` line.
-pub(crate) fn parse_osmium_summary(text: &str) -> Option<OsmiumSummary> {
-    let mut found = None;
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("Summary: ") else {
-            continue;
-        };
-        let mut fields = rest.split(' ');
-        let mut field = |name: &str| number(fields.next()?.strip_prefix(name)?);
-        let summary = OsmiumSummary {
-            left: field("left=")?,
-            right: field("right=")?,
-            same: field("same=")?,
-            different: field("different=")?,
-        };
-        if fields.next().is_some() || found.replace(summary).is_some() {
-            return None;
-        }
-    }
-    found
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -117,24 +86,5 @@ mod tests {
         ] {
             assert_eq!(parse_pbfhogg_summary(text), None, "{text}");
         }
-    }
-
-    #[test]
-    fn osmium_summaries_parse_strictly() {
-        assert_eq!(
-            parse_osmium_summary("Summary: left=4 right=4 same=1 different=3\n"),
-            Some(OsmiumSummary {
-                left: 4,
-                right: 4,
-                same: 1,
-                different: 3
-            })
-        );
-        assert_eq!(parse_osmium_summary("Summary: left=4 right=4 same=1"), None);
-        assert_eq!(
-            parse_osmium_summary("Summary: left=4 right=4 same=1 different=3 x=1"),
-            None
-        );
-        assert_eq!(parse_osmium_summary(""), None);
     }
 }

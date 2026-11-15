@@ -2,12 +2,14 @@
 //! osmium decodes each side to OPL (`osmium cat -f opl,...`), and the
 //! verifier merges the two record streams itself.
 //!
-//! The merge reads both OPL files once, line by line, keyed by kind and ID.
-//! Each stream must ascend strictly by kind (node, way, relation) and then
-//! non-negative ID, so the pass also certifies, as osmium decodes them, that
-//! neither side repeats an object or is out of order: an identical
-//! duplicate cannot hide as common. A record is the whole OPL line, compared
-//! byte for byte. Every identity in only one stream, or in both with unequal
+//! The merge reads both OPL files once, line by line, keyed by kind and ID
+//! in osmium's object order (kind, then ID zero, negative IDs by magnitude,
+//! positive IDs by magnitude). [`compare`] requires each stream to ascend
+//! strictly in that order, so the pass also certifies, as osmium decodes
+//! them, that neither side repeats an object or is out of order: an
+//! identical duplicate cannot hide as common. [`compare_sequence`] walks the
+//! two streams the same way without that requirement, as osmium diff walks
+//! its inputs. A record is the whole OPL line, compared byte for byte. Every identity in only one stream, or in both with unequal
 //! lines, is handed to the caller as a [`Group`] and written to a listing
 //! (`-` first, `+` second), so classification is the caller's.
 //!
@@ -177,6 +179,24 @@ pub(crate) fn compare(
     compare_paired(harness, first, second, listing, policy, each, |_| {})
 }
 
+/// [`compare`] for streams in any order: the merge walk advances the side
+/// whose current key is lower and pairs equal keys, but no stream is held to
+/// ascend. No first-only, second-only or differing record then means the two
+/// record sequences are equal element by element, whatever their order (the
+/// walk consumed one equal line from each side at every step); only
+/// first-only records mean the second sequence is a subsequence of the
+/// first. Neither holds for a key-ordered reading of the counts beyond that.
+pub(crate) fn compare_sequence(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+) -> Result<Merged, Error> {
+    walk(harness, first, second, listing, policy, false, each, |_| {})
+}
+
 /// [`compare`], also handing every paired identity, alike or not, to
 /// `paired` in object order with both records.
 pub(crate) fn compare_paired(
@@ -188,11 +208,25 @@ pub(crate) fn compare_paired(
     each: impl FnMut(Group),
     paired: impl FnMut(Pair<'_>),
 ) -> Result<Merged, Error> {
+    walk(harness, first, second, listing, policy, true, each, paired)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    strict: bool,
+    each: impl FnMut(Group),
+    paired: impl FnMut(Pair<'_>),
+) -> Result<Merged, Error> {
     let a = listing.with_extension("first.opl");
     let b = listing.with_extension("second.opl");
     decode(harness, first, &a, policy)?;
     decode(harness, second, &b, policy)?;
-    let merged = merge(&a, &b, listing, each, paired)?;
+    let merged = merge(&a, &b, listing, strict, each, paired)?;
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -209,7 +243,7 @@ pub(crate) fn compare_paired(
     Ok(merged)
 }
 
-/// Whether `pbf`'s objects strictly ascend by kind and non-negative ID as
+/// Whether `pbf`'s objects strictly ascend in osmium's object order as
 /// osmium decodes them, and its object count per kind: an OPL decoding
 /// (no metadata, no inline coordinates) beside `opl`, scanned for its keys
 /// and removed. `osmium fileinfo -e` cannot stand in: it refuses a file
@@ -225,7 +259,7 @@ pub(crate) fn order(
     let mut ordered = true;
     let mut last = None;
     while let Some(key) = stream.read_record()? {
-        if last.is_some_and(|last| key <= last) {
+        if last.is_some_and(|last| rank(key) <= rank(last)) {
             ordered = false;
         }
         last = Some(key);
@@ -274,7 +308,7 @@ impl Stream {
         let Some(key) = self.read_record()? else {
             return Ok(None);
         };
-        if self.key.is_some_and(|last| key <= last) {
+        if self.key.is_some_and(|last| rank(key) <= rank(last)) {
             return Err(self.error(
                 "an object at or below the previous one: the stream is not in strict kind and ID \
                  order",
@@ -282,6 +316,16 @@ impl Stream {
         }
         self.key = Some(key);
         Ok(Some(key))
+    }
+
+    /// Advance to the next record, in [`next`](Self::next)'s order when
+    /// `strict`, else whatever its order.
+    fn advance(&mut self, strict: bool) -> Result<Option<(usize, i64)>, Error> {
+        if strict {
+            self.next()
+        } else {
+            self.read_record()
+        }
     }
 
     /// Advance to the next record and count it, whatever its order.
@@ -304,7 +348,13 @@ impl Stream {
     }
 }
 
-/// The kind and ID an OPL object line opens with.
+/// osmium's object order of a kind and ID: kind, then ID zero, the
+/// negative IDs by magnitude, the positive IDs by magnitude.
+fn rank((kind, id): (usize, i64)) -> (usize, bool, u64) {
+    (kind, id > 0, id.unsigned_abs())
+}
+
+/// The kind and signed ID an OPL object line opens with.
 fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
     let (&letter, rest) = line.split_first().ok_or("an empty line")?;
     let kind = match letter {
@@ -315,8 +365,9 @@ fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
     };
     let end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
     let digits = &rest[..end];
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return Err("an object ID that is not a non-negative decimal");
+    let magnitude = digits.strip_prefix(b"-").unwrap_or(digits);
+    if magnitude.is_empty() || !magnitude.iter().all(u8::is_ascii_digit) {
+        return Err("an object ID that is not a decimal");
     }
     let id = std::str::from_utf8(digits)
         .ok()
@@ -327,11 +378,12 @@ fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
 
 /// Merge two OPL files (see the module documentation), writing each
 /// differing identity's lines to `listing` and handing every paired
-/// identity to `paired`.
+/// identity to `paired`; `strict` holds each stream to strict order.
 fn merge(
     first: &Path,
     second: &Path,
     listing: &Path,
+    strict: bool,
     mut each: impl FnMut(Group),
     mut paired: impl FnMut(Pair<'_>),
 ) -> Result<Merged, Error> {
@@ -339,8 +391,8 @@ fn merge(
     let mut b = Stream::open(second)?;
     let mut out = BufWriter::new(File::create(listing)?);
     let mut merged = Merged::default();
-    let mut ka = a.next()?;
-    let mut kb = b.next()?;
+    let mut ka = a.advance(strict)?;
+    let mut kb = b.advance(strict)?;
     loop {
         let class = match (ka, kb) {
             (None, None) => break,
@@ -353,13 +405,13 @@ fn merge(
                 });
                 if a.line == b.line {
                     merged.same += 1;
-                    ka = a.next()?;
-                    kb = b.next()?;
+                    ka = a.advance(strict)?;
+                    kb = b.advance(strict)?;
                     continue;
                 }
                 Class::Differs
             }
-            (Some(x), Some(y)) if x < y => Class::FirstOnly,
+            (Some(x), Some(y)) if rank(x) < rank(y) => Class::FirstOnly,
             (Some(_), None) => Class::FirstOnly,
             _ => Class::SecondOnly,
         };
@@ -382,16 +434,16 @@ fn merge(
         match class {
             Class::FirstOnly => {
                 merged.first_only += 1;
-                ka = a.next()?;
+                ka = a.advance(strict)?;
             }
             Class::SecondOnly => {
                 merged.second_only += 1;
-                kb = b.next()?;
+                kb = b.advance(strict)?;
             }
             Class::Differs => {
                 merged.differs += 1;
-                ka = a.next()?;
-                kb = b.next()?;
+                ka = a.advance(strict)?;
+                kb = b.advance(strict)?;
             }
         }
     }
@@ -407,13 +459,17 @@ mod tests {
     use super::*;
 
     fn run(a: &str, b: &str) -> Result<(Merged, Vec<Group>, String), Error> {
+        walk_test(a, b, true)
+    }
+
+    fn walk_test(a: &str, b: &str, strict: bool) -> Result<(Merged, Vec<Group>, String), Error> {
         let scratch = pbfhogg_test_scratch::scratch();
         let dir = scratch.path();
         let (pa, pb, pl) = (dir.join("a.opl"), dir.join("b.opl"), dir.join("l.txt"));
         std::fs::write(&pa, a).unwrap();
         std::fs::write(&pb, b).unwrap();
         let mut groups = Vec::new();
-        let merged = merge(&pa, &pb, &pl, |g| groups.push(g), |_| {})?;
+        let merged = merge(&pa, &pb, &pl, strict, |g| groups.push(g), |_| {})?;
         Ok((merged, groups, std::fs::read_to_string(&pl).unwrap()))
     }
 
@@ -466,13 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn repeats_disorder_negatives_and_garbage_are_errors() {
+    fn repeats_disorder_and_garbage_are_errors() {
         let ok = "n1 v1\n";
         // An identical duplicate on both sides cannot pass as common.
         assert!(run("n1 v1\nn1 v1\n", "n1 v1\nn1 v1\n").is_err());
         assert!(run("n2 v1\nn1 v1\n", ok).is_err());
         assert!(run("w1 v1\nn5 v1\n", ok).is_err());
-        assert!(run(ok, "n-1 v1\n").is_err());
+        assert!(run(ok, "n- v1\n").is_err());
         assert!(run(ok, "c1 k1\n").is_err());
         assert!(run(ok, "n1 v1").is_err());
         assert!(
@@ -481,6 +537,42 @@ mod tests {
                 .0
                 .identical()
         );
+    }
+
+    #[test]
+    fn negative_ids_order_as_osmium_orders_them() {
+        // Zero, then negatives by magnitude, then positives.
+        let text = "n0 v1\nn-1 v1\nn-2 v1\nn1 v1\n";
+        assert!(run(text, text).unwrap().0.identical());
+        assert!(run("n-2 v1\nn-1 v1\n", "n-2 v1\n").is_err());
+        let (merged, _, listing) = run("n-1 v1\nn1 v1\n", "n-1 v2\nn1 v1\n").unwrap();
+        assert_eq!(merged.differs, 1);
+        assert_eq!(listing, "-n-1 v1\n+n-1 v2\n");
+    }
+
+    #[test]
+    fn a_sequence_walk_takes_any_order_and_pairs_only_equal_sequences() {
+        let text = "n3 v1\nn1 v1\nn2 v1\n";
+        assert!(walk_test(text, text, false).unwrap().0.identical());
+        // A within-kind reorder is not the same sequence.
+        assert!(
+            !walk_test(text, "n1 v1\nn3 v1\nn2 v1\n", false)
+                .unwrap()
+                .0
+                .identical()
+        );
+        // A move as osmium diff reports it: one object out, then in.
+        let (merged, groups, listing) =
+            walk_test("n1 v1\nn2 v1\nn3 v1\n", "n2 v1\nn1 v1\nn3 v1\n", false).unwrap();
+        assert_eq!(
+            (merged.first_only, merged.second_only, merged.same),
+            (1, 1, 2)
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(listing, "-n1 v1\n+n1 v1\n");
+        // A shifted tag boundary differs here too.
+        let (merged, _, _) = walk_test("n1 v1 Ta=bc\n", "n1 v1 Tab=c\n", false).unwrap();
+        assert_eq!(merged.differs, 1);
     }
 
     #[test]

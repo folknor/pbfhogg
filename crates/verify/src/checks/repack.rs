@@ -1,12 +1,13 @@
 //! Verify: repack - pbfhogg `repack` at the default cap, a cap that does not
 //! divide the input's blobs (3000) and one that grows them (64000), and the
 //! input stripped of indexdata repacked with `--force` at the default cap,
-//! each held to the input's elements through osmium diff and to repack's
+//! each held to the input's elements through osmium's OPL decodings and to
+//! repack's
 //! documented block layout (the shared rules and readers are
 //! [`crate::verify_reencode`]).
 //!
 //! Every case must keep the element sequence, metadata and way coordinates
-//! included (osmium diff against the input, or the stable partition of an
+//! included (record by record against the input, or the stable partition of an
 //! input osmium does not read in order); claim `Sort.Type_then_ID` and
 //! `LocationsOnWays` as the input does; carry indexdata on every blob, true
 //! by the verifier's own blob decode and by `check --index`; hold no blob
@@ -168,7 +169,8 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         ));
     }
     let mut claim = vec![format!(
-        "element sequence with metadata and way coordinates against osmium diff, header claims, \
+        "element sequence with metadata and way coordinates against osmium's OPL decodings, \
+         header claims, \
          indexdata against payloads (the verifier's own blob decode for kind, count and ID \
          range, check --index for the rest), cap and kind order{}",
         if input.indexed {

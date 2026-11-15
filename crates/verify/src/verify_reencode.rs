@@ -2,19 +2,18 @@
 //! input, the references osmium builds from it, the element comparison, the
 //! block-layout rules and the readers they are judged with.
 //!
-//! **Elements.** osmium diff walks both files as a merge on object order and
-//! calls an equal-key pair same only when a checksum over visible,
-//! timestamp, tags, changeset, uid, user and the node location, way node
-//! references with their coordinates, or relation members agrees. So a
-//! summary of no left, right or different object says the two object
-//! sequences are identical element by element, whatever their order (barring
-//! a checksum collision; tags are fed without lengths). A moved or dropped
-//! object is printed instead of checksummed, so its lines are compared
-//! byte for byte, way coordinates included (`opl,locations_on_ways=true`).
-//! The reference is the input when its kinds are grouped in order, else a
-//! stable partition osmium builds (each kind's objects in input order); for
-//! a comparison that must not see way coordinates (degrade drops them) it is
-//! written without them.
+//! **Elements.** osmium decodes the reference and the output to OPL with
+//! metadata and inline way coordinates, and the verifier walks the two
+//! record streams as osmium diff walks its inputs, but comparing whole lines
+//! byte for byte ([`opl_compare::compare_sequence`]): OPL escapes its
+//! separators, so a shifted tag boundary (`a=bc` against `ab=c`), which
+//! osmium diff's checksum feeds identically, differs here. No first-only,
+//! second-only or differing record says the two object sequences are
+//! identical element by element, whatever their order; a removed or moved
+//! object is listed with its line. The reference is the input when its kinds
+//! are grouped in order, else a stable partition osmium builds (each kind's
+//! objects in input order); for a comparison that must not see way
+//! coordinates (degrade drops them) it is written without them.
 //!
 //! **Layout.** Every output blob's indexdata is first held to its payload:
 //! kind, count and ID range by the verifier's own decode of every blob
@@ -39,9 +38,9 @@ use std::path::{Path, PathBuf};
 use super::pbf_frames::{self, BlobClaim, ClaimedBlob, Claims, Framing};
 use super::verify_fileinfo::{FileInfo, fileinfo};
 use crate::argv::PbfArgv;
-use crate::diff_summary::{OsmiumSummary, parse_osmium_summary};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
+use crate::opl_compare::{self, Merged, Policy};
 use crate::reference::ToolRun;
 
 /// pbfhogg's documented default `--elements-per-blob`, for repack and for
@@ -481,21 +480,21 @@ impl<'a> References<'a> {
 // The element comparison
 // ---------------------------------------------------------------------------
 
-/// One osmium diff of a reference against an output.
+/// One element comparison of a reference against an output.
 pub(super) struct Compared {
-    pub summary: OsmiumSummary,
+    pub merged: Merged,
     pub listing: PathBuf,
 }
 
 impl Compared {
     pub fn identical(&self) -> bool {
-        self.summary.left == 0 && self.summary.right == 0 && self.summary.different == 0
+        self.merged.identical()
     }
 }
 
-/// `osmium diff --suppress-common --output-format opl,locations_on_ways=true
-/// <reference> <output> --summary`, its listing at `<stem>.diff.opl`. Exit 0
-/// or 1, agreeing with the summary; anything else is an error.
+/// The reference's and the output's OPL records (metadata and inline way
+/// coordinates) walked in file order ([`opl_compare::compare_sequence`]),
+/// the listing of every unmatched or differing record at `<stem>.diff.opl`.
 pub(super) fn compare(
     harness: &mut Harness,
     outdir: &Path,
@@ -504,40 +503,9 @@ pub(super) fn compare(
     output: &Path,
 ) -> Result<Compared, Error> {
     let listing = outdir.join(format!("{stem}.diff.opl"));
-    let captured = harness.reference(
-        &ToolRun::osmium("reencode-diff.1")
-            .args(&[
-                "diff",
-                "--suppress-common",
-                "--output-format",
-                "opl,locations_on_ways=true",
-            ])
-            .input(reference)
-            .input(output)
-            .arg("--summary")
-            .accept(&[1]),
-        &listing,
-    )?;
-    let stderr = String::from_utf8_lossy(&captured.stderr);
-    let summary = parse_osmium_summary(&stderr).ok_or_else(|| {
-        Error::Failed(format!(
-            "osmium diff's summary is not one `Summary: left=N right=N same=N different=N` \
-             line: {:?}",
-            stderr.trim()
-        ))
-    })?;
-    let compared = Compared { summary, listing };
-    if (captured.code() == Some(0)) != compared.identical() {
-        return Err(Error::Failed(format!(
-            "osmium diff exited {:?} with the summary {summary:?}",
-            captured.code()
-        )));
-    }
-    harness.msg(&format!(
-        "  osmium diff {stem}: left={} right={} same={} different={}",
-        summary.left, summary.right, summary.same, summary.different
-    ));
-    Ok(compared)
+    let merged =
+        opl_compare::compare_sequence(harness, reference, output, &listing, Policy::FULL, |_| {})?;
+    Ok(Compared { merged, listing })
 }
 
 /// Record that `compared` found the two sequences identical, replaying the
@@ -564,7 +532,7 @@ pub(super) fn record_identical(
     Ok(())
 }
 
-/// One identity of an osmium diff listing: its kind, ID and the raw object
+/// One identity of a comparison listing: its kind, ID and the raw object
 /// line on each side, at least one present.
 #[derive(Debug)]
 pub(super) struct Group {
@@ -574,11 +542,11 @@ pub(super) struct Group {
     pub plus: Option<Vec<u8>>,
 }
 
-/// The groups of an `osmium diff --suppress-common -f opl` listing, in
+/// The groups of a [`compare`] listing (`-` reference, `+` output), in
 /// object order, each object kept as the bytes osmium wrote. Strict: a line
 /// that is not `-` or `+` and an object, an identity out of order, a side
 /// twice for one identity, or a last line without its newline is an error.
-/// [`finish`](Self::finish) holds the line counts to the summary.
+/// [`finish`](Self::finish) holds the line counts to the merge's.
 pub(super) struct Listing {
     path: PathBuf,
     reader: BufReader<File>,
@@ -615,7 +583,7 @@ impl Listing {
 
     fn error(&self, why: &str) -> Error {
         Error::Failed(format!(
-            "osmium diff listing {} line {}: {why}",
+            "comparison listing {} line {}: {why}",
             self.path.display(),
             self.number
         ))
@@ -677,15 +645,15 @@ impl Listing {
         }
     }
 
-    /// After the last group: the listing's `-` lines must number `left +
-    /// different` and its `+` lines `right + different`, or it was not read
-    /// whole.
-    pub fn finish(self, summary: &OsmiumSummary) -> Result<(), Error> {
-        if self.minus != summary.left + summary.different
-            || self.plus != summary.right + summary.different
+    /// After the last group: the listing's `-` lines must number the
+    /// first-only and differing records and its `+` lines the second-only
+    /// and differing ones, or it was not read whole.
+    pub fn finish(self, merged: &Merged) -> Result<(), Error> {
+        if self.minus != merged.first_only + merged.differs
+            || self.plus != merged.second_only + merged.differs
         {
             return Err(Error::Failed(format!(
-                "osmium diff listing {} has {} - and {} + lines against the summary {summary:?}",
+                "comparison listing {} has {} - and {} + lines against the merge {merged:?}",
                 self.path.display(),
                 self.minus,
                 self.plus
@@ -1099,13 +1067,12 @@ mod tests {
         let second = listing.next_group().unwrap().unwrap();
         assert!(second.plus.is_none());
         assert!(listing.next_group().unwrap().is_none());
-        let summary = OsmiumSummary {
-            left: 2,
-            right: 1,
-            same: 0,
-            different: 0,
+        let merged = Merged {
+            first_only: 2,
+            second_only: 1,
+            ..Merged::default()
         };
-        listing.finish(&summary).unwrap();
+        listing.finish(&merged).unwrap();
         std::fs::write(&path, "-n2 v1\n-n1 v1\n").unwrap();
         let mut listing = Listing::open(&path).unwrap();
         listing.next_group().unwrap();

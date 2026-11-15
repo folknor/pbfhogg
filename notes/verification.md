@@ -113,21 +113,6 @@ measured child and is gone. Nothing outside the library tests (crates/lib/tests/
 synthetic fixtures) checks reverse-geocode answers, and pbfhogg-verify has no geocode check.
 The vendored traccar-geocoder is the natural reference.
 
-## VER-134 - osmium diff's checksum cannot see a shifted tag boundary
-
-Reported by the pbfhogg#61 implementer and its codex spar.
-
-`verify_reencode::compare` (repack and degrade) and `checks/diff.rs` still judge with
-`osmium diff`, whose `update_object_crc` (research/libosmium crc.hpp) feeds each key and
-value without length or separator: tags `a=bc` and `ab=c` collide deterministically, so a
-string-table boundary bug passes as common. reference/verify.md now names the collision. The
-OPL merge comparator has no such blind spot, but these callers need more than its strict
-identity merge: repack and order-preserving degrade need sequence equality (a disordered
-kind stays disordered), unsort needs the reference with the documented swap applied and then
-every record compared, and diff needs its expected differences and common counts from the
-full decoded OLD and NEW streams, keeping its metadata exclusion and verbose-listing checks.
-
-
 ## VER-123 - Verify uses the build output directory as its workspace
 
 Reported by bench-verify.

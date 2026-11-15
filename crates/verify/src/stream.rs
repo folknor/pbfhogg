@@ -1,6 +1,6 @@
 //! Bounded-memory readers over a step's stdout file.
 //!
-//! A listing step (a diff of two PBFs, an osmium diff) writes its stdout to
+//! A listing step (a diff of two PBFs, an OPL merge) writes its listing to
 //! a file in the check's directory, because its size scales with the data.
 //! Everything here reads such a file through fixed buffers, whatever its
 //! length and however long its lines.

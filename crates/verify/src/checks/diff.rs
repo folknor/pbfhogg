@@ -10,43 +10,35 @@
 //! every run's summary must carry the expected class and common counts and
 //! its exit status must say whether anything differs.
 //!
-//! The expected listing comes from osmium, never from pbfhogg. `osmium diff
-//! --suppress-common --output-format opl` lists, with full content, every
-//! object one side lacks and every pair whose version, timestamp or osmium
-//! checksum differs. osmium's checksum feeds tags without lengths, so a pair
-//! whose content differs can still be "same" to it (`a=bc` against `ab=c`,
-//! or a replayed equal-version change that reorders tags). Every identity
-//! the input OSC touches, and every one pbfhogg reports modified, that the
-//! osmium listing lacks is therefore fetched from both inputs with `osmium
-//! getid --output-format opl` and judged on its content too. pbfhogg's content
-//! is compared as its `crates/lib/src/content.rs` defines it (location, tags, refs,
-//! members, in order; metadata never), so a version or metadata change alone
-//! is no difference.
-//!
-//! Domain assumption, not proved here: `apply-changes` preserves the diff
-//! content of every identity the OSC does not touch. An untouched object the
-//! builder changed while keeping osmium's checksum, and that pbfhogg's diff
-//! then wrongly calls common, would pass; `verify merge` is the check that
-//! holds `apply-changes` to osmium. Detail judgement limits are in
-//! [`crate::verify_diff_detail`].
+//! The expected listing comes from osmium, never from pbfhogg: osmium decodes
+//! OLD and NEW to OPL with metadata, and the verifier merges the two
+//! decodings in object order ([`opl_compare::compare`]), listing with full
+//! content every object one side lacks and every pair whose OPL line
+//! differs. Every identity is compared byte for byte, so a pair osmium
+//! diff's checksum would call same (`a=bc` against `ab=c`, which it feeds
+//! identically) is listed, and an identity not listed is byte-identical on
+//! both sides. pbfhogg's content is compared as its
+//! `crates/lib/src/content.rs` defines it (location, tags, refs, members, in
+//! order; metadata never), so a version or metadata change alone is no
+//! difference. Detail judgement limits are in [`crate::verify_diff_detail`].
 //!
 //! Input whose header lacks `Sort.Type_then_ID` among its optional features
 //! is input pbfhogg diff refuses on either side; the check then holds it to
 //! that refusal and compares nothing (`refused`).
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write as _};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::argv::PbfArgv;
-use crate::diff_summary::{Counts, parse_osmium_summary, parse_pbfhogg_summary};
+use crate::diff_summary::{Counts, parse_pbfhogg_summary};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
+use crate::opl_compare::{self, Policy};
 use crate::osc::OscKind;
-use crate::reference::ToolRun;
 use crate::stream;
 use crate::verify_diff_detail::{self as detail, Coverage, Expected};
-use crate::verify_diff_opl::{DiffGroups, Object, ObjectReader, kind_char, order_key};
+use crate::verify_diff_opl::{DiffGroups, Object, kind_char, order_key};
 use crate::verify_input_order;
 
 /// Listing mismatches printed in full before the rest are only counted.
@@ -109,15 +101,11 @@ pub fn run(
     )?;
     harness.require_success(&captured, "pbfhogg apply-changes")?;
 
-    let touched = touched_identities(osc)?;
-    harness.msg(&format!("  the OSC touches {} identities", touched.len()));
-
     let runs = DiffRuns::run(harness, &outdir, (pbf, &new_pbf), direct_io)?;
     let judgement = against_osmium(
         harness,
         &outdir,
         (pbf, &new_pbf),
-        &touched,
         &runs.indexed_verbose.listing,
     )?;
 
@@ -313,66 +301,28 @@ struct Judgement {
 }
 
 /// Judge pbfhogg's indexed verbose listing against osmium's content: the
-/// osmium diff listing, then the identities it withholds fetched from both
-/// inputs. Returns the expected counts the summaries are held to.
+/// merge of osmium's OPL decodings of both inputs, metadata included.
+/// Returns the expected counts the summaries are held to.
 fn against_osmium(
     harness: &mut Harness,
     outdir: &Path,
     (pbf, new_pbf): (&Path, &Path),
-    touched: &[(OscKind, i64)],
     listing: &Path,
 ) -> Result<Judgement, Error> {
-    harness.msg("--- osmium diff (OPL) ---");
+    harness.msg("--- osmium OPL decodings, merged ---");
     let osmium_listing = outdir.join("osmium-diff.opl");
-    let captured = harness.reference(
-        &ToolRun::osmium("diff-opl.1")
-            .args(&["diff", "--suppress-common", "--output-format", "opl"])
-            .input(pbf)
-            .input(new_pbf)
-            .arg("--summary")
-            .accept(&[1]),
+    let merged = opl_compare::compare(
+        harness,
+        pbf,
+        new_pbf,
         &osmium_listing,
+        Policy::NO_LOCATIONS,
+        |_| {},
     )?;
-    // osmium diff exits 1 when the inputs differ by its own measure, which
-    // counts metadata; anything else means its listing cannot be trusted.
-    harness.require_codes(&captured, "osmium diff", &[0, 1])?;
-    fs::write(outdir.join("osmium-summary.txt"), &captured.stderr)?;
-    let osmium =
-        parse_osmium_summary(&String::from_utf8_lossy(&captured.stderr)).ok_or_else(|| {
-            Error::Failed(format!(
-                "diff verify: osmium's summary is not one `Summary: left=N right=N same=N \
-                 different=N` line: {:?}",
-                String::from_utf8_lossy(&captured.stderr).trim()
-            ))
-        })?;
-
-    // Identities whose content the osmium listing withholds.
-    let candidates = candidates(&osmium_listing, listing, touched)?;
-    harness.msg(&format!(
-        "  {} identities to fetch from both inputs (touched or reported modified, \
-         osmium-same)",
-        candidates.len()
-    ));
-    let fetched = if candidates.is_empty() {
-        None
-    } else {
-        let ids = outdir.join("candidates.txt");
-        write_ids(&ids, &candidates)?;
-        Some((
-            fetch(harness, outdir, "old", pbf, &ids, candidates.len())?,
-            fetch(harness, outdir, "new", new_pbf, &ids, candidates.len())?,
-        ))
-    };
 
     harness.msg("=== listing vs osmium content ===");
     let mut coverage = Coverage::default();
-    let judged = judge_listing(
-        &osmium_listing,
-        &candidates,
-        fetched.as_ref().map(|(o, n)| (o, n)),
-        listing,
-        &mut coverage,
-    )?;
+    let judged = judge_listing(&osmium_listing, listing, &mut coverage)?;
     for line in &judged.shown {
         harness.msg(&format!("  {line}"));
     }
@@ -393,18 +343,23 @@ fn against_osmium(
         listing.display()
     ));
 
-    // osmium's own bookkeeping: each one-sided object and each side of a
-    // checksum-different pair is one line.
-    if judged.minus != osmium.left + osmium.different
-        || judged.plus != osmium.right + osmium.different
+    // The merge's bookkeeping: each one-sided object and each side of a
+    // differing pair is one line.
+    if judged.minus != merged.first_only + merged.differs
+        || judged.plus != merged.second_only + merged.differs
     {
         return Err(Error::Failed(format!(
-            "diff verify: osmium's listing has {} - and {} + lines, its summary left={} \
-             right={} different={}: the listing was not read whole",
-            judged.minus, judged.plus, osmium.left, osmium.right, osmium.different
+            "diff verify: the merged listing has {} - and {} + lines against the merge \
+             {merged:?}: the listing was not read whole",
+            judged.minus, judged.plus
         )));
     }
-    let expected = expected_counts(&judged, osmium.same)?;
+    // Every pair the listing lacks is byte-identical, so common; a listed
+    // pair of equal content differs in metadata only.
+    let expected = Counts {
+        common: merged.same + judged.equal_listed,
+        ..judged.expected
+    };
     harness.msg(&format!(
         "  expected: {} created, {} modified, {} deleted, {} common",
         expected.created, expected.modified, expected.deleted, expected.common
@@ -445,121 +400,13 @@ fn pbfhogg_diff(
     })
 }
 
-/// Every (kind, ID) the input OSC names in an action block, sorted in object
-/// order and deduplicated. Read strictly: an entry the scan cannot account
-/// for is an error, since an identity missing here would leave its content
-/// unjudged wherever osmium's checksum calls the pair same.
-fn touched_identities(osc: &Path) -> Result<Vec<(OscKind, i64)>, Error> {
-    let mut ids = Vec::new();
-    crate::osc::scan_osc_file_strict(osc, |_, kind, id| ids.push((kind, id)))?;
-    sort_identities(&mut ids);
-    Ok(ids)
-}
-
-fn sort_identities(ids: &mut Vec<(OscKind, i64)>) {
-    ids.sort_unstable_by_key(|&(kind, id)| order_key(kind, id));
-    ids.dedup();
-}
-
-/// The identities to fetch: those the OSC touches and those pbfhogg reports
-/// modified, less every one the osmium listing carries.
-fn candidates(
-    osmium_listing: &Path,
-    pbfhogg_listing: &Path,
-    touched: &[(OscKind, i64)],
-) -> Result<Vec<(OscKind, i64)>, Error> {
-    let mut ids = touched.to_vec();
-    let mut records = Listing::open(pbfhogg_listing)?;
-    while let Some(record) = records.next_record()? {
-        if record.header.starts_with('*') {
-            ids.push((record.kind, record.id));
-        }
-    }
-    sort_identities(&mut ids);
-    let mut groups = DiffGroups::open(osmium_listing)?;
-    let mut listed = Vec::new();
-    while let Some(group) = groups.next_group()? {
-        listed.push(order_key(group.kind, group.id));
-    }
-    ids.retain(|&(kind, id)| listed.binary_search(&order_key(kind, id)).is_err());
-    if let Some(&(kind, id)) = ids.iter().find(|&&(_, id)| id < 0) {
-        return Err(Error::Failed(format!(
-            "{}{id} must be fetched from both inputs, and osmium getid matches an ID by its \
-             absolute value; diff cannot be compared on an input whose unlisted changes carry \
-             negative IDs",
-            kind_char(kind)
-        )));
-    }
-    Ok(ids)
-}
-
-fn write_ids(path: &Path, ids: &[(OscKind, i64)]) -> Result<(), Error> {
-    let mut out = BufWriter::new(File::create(path)?);
-    for &(kind, id) in ids {
-        writeln!(out, "{}{id}", kind_char(kind))?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// One side's candidate objects, as osmium getid writes them in OPL.
-struct Fetched {
-    path: PathBuf,
-    /// The objects osmium reported it did not find.
-    missing: u64,
-}
-
-fn fetch(
-    harness: &mut Harness,
-    outdir: &Path,
-    side: &str,
-    input: &Path,
-    ids: &Path,
-    requested: usize,
-) -> Result<Fetched, Error> {
-    let path = outdir.join(format!("osmium-candidates-{side}.opl"));
-    let captured = harness.reference(
-        &ToolRun::osmium(format!("diff-candidates-{side}.1"))
-            .arg("getid")
-            .input(input)
-            .arg("--id-file")
-            .input(ids)
-            .args(&["--output-format", "opl", "--verbose", "--output"])
-            .output(&path)
-            .arg("--overwrite")
-            .accept_if(1, crate::verify_getid_refs::osmium_completed),
-        &outdir.join(format!("osmium-candidates-{side}.stdout")),
-    )?;
-    harness.require_codes(&captured, &format!("osmium getid ({side})"), &[0, 1])?;
-    let missing = match captured.code() {
-        Some(0) => 0,
-        Some(1) => crate::verify_getid_refs::osmium_missing(&captured.stderr).ok_or_else(|| {
-            Error::Failed(format!(
-                "osmium getid ({side}) exited 1 without completing: its verbose output does not \
-                 end in a missing-object count and Done."
-            ))
-        })?,
-        other => {
-            return Err(Error::Failed(format!(
-                "osmium getid ({side}) ended with {other:?}"
-            )));
-        }
-    };
-    harness.msg(&format!(
-        "  osmium getid ({side}): {requested} requested, {missing} not found"
-    ));
-    Ok(Fetched { path, missing })
-}
-
 /// What the judgement found.
 #[derive(Debug, Default)]
 struct Judged {
     /// The counts osmium's content gives (common is filled in later).
     expected: Counts,
-    /// Both-sided osmium groups whose content is equal (E).
+    /// Listed pairs whose content is equal: metadata alone differs.
     equal_listed: u64,
-    /// Fetched candidates whose content differs (K).
-    different_fetched: u64,
     mismatches: u64,
     shown: Vec<String>,
     /// osmium listing lines by side.
@@ -576,121 +423,24 @@ impl Judged {
     }
 }
 
-/// pbfhogg's common count from osmium's: osmium's `same` pairs, less the
-/// fetched ones whose content differs, plus the listed pairs whose content
-/// is equal.
-fn expected_counts(judged: &Judged, same: u64) -> Result<Counts, Error> {
-    let common = same
-        .checked_sub(judged.different_fetched)
-        .and_then(|c| c.checked_add(judged.equal_listed))
-        .ok_or_else(|| {
-            Error::Failed(format!(
-                "diff verify: {} fetched pairs differ in content, more than osmium's same={same}",
-                judged.different_fetched
-            ))
-        })?;
-    Ok(Counts {
-        common,
-        ..judged.expected
-    })
-}
-
-/// One side's fetched objects read alongside the candidate list.
-struct FetchedSide<'a> {
-    side: &'static str,
-    fetched: &'a Fetched,
-    reader: ObjectReader,
-    head: Option<Object>,
-    found: u64,
-}
-
-impl<'a> FetchedSide<'a> {
-    fn open(side: &'static str, fetched: &'a Fetched) -> Result<Self, Error> {
-        let mut reader = ObjectReader::open(&fetched.path)?;
-        let head = reader.next_object()?;
-        Ok(Self {
-            side,
-            fetched,
-            reader,
-            head,
-            found: 0,
-        })
-    }
-
-    fn unrequested(object: &Object) -> Error {
-        Error::Failed(format!(
-            "osmium getid returned {}{}, which was not requested",
-            kind_char(object.kind),
-            object.id
-        ))
-    }
-
-    /// The fetched object for `want`, or `None` when osmium did not find it;
-    /// an object before it was not requested.
-    fn take(&mut self, want: (OscKind, i64)) -> Result<Option<Object>, Error> {
-        let want = order_key(want.0, want.1);
-        match &self.head {
-            Some(object) if order_key(object.kind, object.id) < want => {
-                Err(Self::unrequested(object))
-            }
-            Some(object) if order_key(object.kind, object.id) == want => {
-                self.found += 1;
-                let taken = self.head.take();
-                self.head = self.reader.next_object()?;
-                Ok(taken)
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Nothing left over, and every request found or reported missing.
-    fn finish(&self, requested: u64) -> Result<(), Error> {
-        if let Some(extra) = &self.head {
-            return Err(Self::unrequested(extra));
-        }
-        let (side, found, missing) = (self.side, self.found, self.fetched.missing);
-        if found + missing != requested {
-            return Err(Error::Failed(format!(
-                "osmium getid ({side}) found {found} and reported {missing} missing of \
-                 {requested} requested"
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Where an identity's two objects came from.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Source {
-    /// The osmium diff listing.
-    Listed,
-    /// Fetched with osmium getid.
-    Fetched,
-    /// Neither: osmium calls the pair same and nothing named it.
-    Unlisted,
-}
-
 impl Judged {
     /// Judge one identity: what its objects say pbfhogg must print against
     /// what pbfhogg printed.
     fn identity(
         &mut self,
         (old, new): (Option<&Object>, Option<&Object>),
-        source: Source,
+        listed: bool,
         record: Option<&Record>,
         coverage: &mut Coverage,
     ) -> Result<(), Error> {
         let expected = match (old, new) {
             (Some(o), Some(n)) if o.same_content(n) => {
-                if source == Source::Listed {
+                if listed {
                     self.equal_listed += 1;
                 }
                 None
             }
             (Some(o), Some(n)) => {
-                if source == Source::Fetched {
-                    self.different_fetched += 1;
-                }
                 self.expected.modified += 1;
                 Some(Expected::Modified(o, n))
             }
@@ -734,65 +484,37 @@ impl Judged {
     }
 }
 
-/// Judge pbfhogg's verbose listing against osmium's content, all streams
-/// merged in object order: the osmium listing's groups, the fetched
-/// candidates and pbfhogg's records.
+/// Judge pbfhogg's verbose listing against osmium's content, both streams
+/// merged in object order: the merged listing's groups and pbfhogg's
+/// records. An identity the listing lacks is byte-identical on both sides,
+/// so a pbfhogg record for it is a mismatch.
 fn judge_listing(
     osmium_listing: &Path,
-    candidates: &[(OscKind, i64)],
-    fetched: Option<(&Fetched, &Fetched)>,
     pbfhogg_listing: &Path,
     coverage: &mut Coverage,
 ) -> Result<Judged, Error> {
     let mut judged = Judged::default();
     let mut groups = DiffGroups::open(osmium_listing)?;
     let mut group = groups.next_group()?;
-    let mut sides = match fetched {
-        Some((old, new)) => Some((
-            FetchedSide::open("old", old)?,
-            FetchedSide::open("new", new)?,
-        )),
-        None => None,
-    };
-    let mut pending = candidates.iter().copied().peekable();
     let mut records = Listing::open(pbfhogg_listing)?;
     let mut record = records.next_record()?;
     loop {
         let keys = [
             group.as_ref().map(|g| order_key(g.kind, g.id)),
-            pending.peek().map(|&(kind, id)| order_key(kind, id)),
             record.as_ref().map(|r| order_key(r.kind, r.id)),
         ];
         let Some(key) = keys.iter().flatten().min().copied() else {
             break;
         };
-        let (old, new, source) = if keys[0] == Some(key)
+        let (old, new, listed) = if keys[0] == Some(key)
             && let Some(g) = group.take()
         {
             group = groups.next_group()?;
-            (g.old, g.new, Source::Listed)
-        } else if keys[1] == Some(key)
-            && let Some(want) = pending.next()
-        {
-            let Some((old_side, new_side)) = sides.as_mut() else {
-                return Err(Error::Failed(
-                    "diff verify: candidates without fetched objects".into(),
-                ));
-            };
-            let (old, new) = (old_side.take(want)?, new_side.take(want)?);
-            if old.is_some() != new.is_some() {
-                return Err(Error::Failed(format!(
-                    "osmium getid found {}{} in one input only, where osmium diff lists no \
-                     change for it",
-                    kind_char(want.0),
-                    want.1
-                )));
-            }
-            (old, new, Source::Fetched)
+            (g.old, g.new, true)
         } else {
-            (None, None, Source::Unlisted)
+            (None, None, false)
         };
-        let this = if keys[2] == Some(key) {
+        let this = if keys[1] == Some(key) {
             let taken = record.take();
             record = records.next_record()?;
             taken
@@ -801,15 +523,10 @@ fn judge_listing(
         };
         judged.identity(
             (old.as_ref(), new.as_ref()),
-            source,
+            listed,
             this.as_ref(),
             coverage,
         )?;
-    }
-    if let Some((old_side, new_side)) = &sides {
-        let requested = candidates.len() as u64;
-        old_side.finish(requested)?;
-        new_side.finish(requested)?;
     }
     judged.minus = groups.minus;
     judged.plus = groups.plus;
@@ -996,25 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn osmium_summaries_parse_strictly() {
-        assert_eq!(
-            parse_osmium_summary("Summary: left=4 right=4 same=1 different=3\n"),
-            Some(crate::diff_summary::OsmiumSummary {
-                left: 4,
-                right: 4,
-                same: 1,
-                different: 3
-            })
-        );
-        assert_eq!(parse_osmium_summary("Summary: left=4 right=4 same=1"), None);
-        assert_eq!(
-            parse_osmium_summary("Summary: left=4 right=4 same=1 different=3 x=1"),
-            None
-        );
-        assert_eq!(parse_osmium_summary(""), None);
-    }
-
-    #[test]
     fn headers_name_kind_and_signed_id() {
         assert_eq!(parse_header("*n2 v1 -> v2"), Some((OscKind::Node, 2)));
         assert_eq!(parse_header("-w-7 v1"), Some((OscKind::Way, -7)));
@@ -1055,9 +753,8 @@ mod tests {
         );
     }
 
-    /// The listing judged end to end on the small pair from which the
-    /// reference behaviour was established: osmium diff -c -f opl of it and
-    /// pbfhogg diff -c -v of it.
+    /// The listing judged end to end on a small pair: the merged listing of
+    /// its OPL decodings and pbfhogg diff -c -v of it.
     #[test]
     fn listing_judgement_matches_content_and_flags_faults() {
         let dir = pbfhogg_test_scratch::scratch();
@@ -1078,7 +775,7 @@ mod tests {
         let judge = |text: &str| {
             fs::write(&listing, text).unwrap();
             let mut coverage = Coverage::default();
-            judge_listing(&osmium, &[], None, &listing, &mut coverage).unwrap()
+            judge_listing(&osmium, &listing, &mut coverage).unwrap()
         };
         let good = "*n2 v1 -> v2\n  ~\"name\": \"x\" -> \"y\"\n*n3 v1\n  coordinates: (2, 1) -> (3, 1)\n-n5 v1\n+n8 v1\n";
         let judged = judge(good);
@@ -1108,62 +805,27 @@ mod tests {
         );
     }
 
-    /// A pair osmium calls same is fetched and judged on its content.
+    /// A shifted tag boundary, the same to osmium diff's checksum, is listed
+    /// and judged on its content; an unlisted identity pbfhogg reports is a
+    /// mismatch.
     #[test]
-    fn fetched_candidates_are_judged_on_content() {
+    fn a_shifted_tag_boundary_is_judged_on_content() {
         let dir = pbfhogg_test_scratch::scratch();
         let osmium = dir.path().join("osmium.opl");
-        fs::write(&osmium, "").unwrap();
-        let old = dir.path().join("old.opl");
-        let new = dir.path().join("new.opl");
-        // n1: a=bc against ab=c, the same to osmium's checksum; n2 equal; n3 absent.
-        fs::write(&old, "n1 v1 Ta=bc x1 y2\nn2 v1 Tk=v x1 y2\n").unwrap();
-        fs::write(&new, "n1 v1 Tab=c x1 y2\nn2 v1 Tk=v x1 y2\n").unwrap();
-        let candidates = [(OscKind::Node, 1), (OscKind::Node, 2), (OscKind::Node, 3)];
-        let fetched = |path: &Path| Fetched {
-            path: path.to_path_buf(),
-            missing: 1,
-        };
-        let (fo, fnew) = (fetched(&old), fetched(&new));
+        fs::write(&osmium, "-n1 v1 Ta=bc x1 y2\n+n1 v1 Tab=c x1 y2\n").unwrap();
         let listing = dir.path().join("pbfhogg.txt");
         let run = |text: &str| {
             fs::write(&listing, text).unwrap();
             let mut coverage = Coverage::default();
-            judge_listing(
-                &osmium,
-                &candidates,
-                Some((&fo, &fnew)),
-                &listing,
-                &mut coverage,
-            )
+            judge_listing(&osmium, &listing, &mut coverage).unwrap()
         };
-        let judged = run("*n1 v1\n  -\"a\"=\"bc\"\n  +\"ab\"=\"c\"\n").unwrap();
+        let judged = run("*n1 v1\n  -\"a\"=\"bc\"\n  +\"ab\"=\"c\"\n");
         assert_eq!(judged.mismatches, 0, "{:?}", judged.shown);
-        assert_eq!(judged.different_fetched, 1);
-        assert_eq!(expected_counts(&judged, 5).unwrap().common, 4);
-        assert_eq!(run("").unwrap().mismatches, 1);
+        assert_eq!(judged.expected.modified, 1);
+        assert_eq!(run("").mismatches, 1);
         assert_eq!(
-            run("*n1 v1\n  -\"a\"=\"bc\"\n  +\"ab\"=\"c\"\n*n2 v1\n")
-                .unwrap()
-                .mismatches,
+            run("*n1 v1\n  -\"a\"=\"bc\"\n  +\"ab\"=\"c\"\n*n2 v1\n").mismatches,
             1
-        );
-        // A miscount of what osmium did not find is an error.
-        let wrong = Fetched {
-            path: old.clone(),
-            missing: 0,
-        };
-        fs::write(&listing, "*n1 v1\n  -\"a\"=\"bc\"\n  +\"ab\"=\"c\"\n").unwrap();
-        let mut coverage = Coverage::default();
-        assert!(
-            judge_listing(
-                &osmium,
-                &candidates,
-                Some((&wrong, &fnew)),
-                &listing,
-                &mut coverage
-            )
-            .is_err()
         );
     }
 }

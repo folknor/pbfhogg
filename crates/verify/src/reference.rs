@@ -143,13 +143,6 @@ impl ToolRun {
         self
     }
 
-    /// Exit codes beside 0 that complete the run (osmium diff and check-refs
-    /// exit 1 for a found difference).
-    pub(crate) fn accept(mut self, codes: &[i32]) -> Self {
-        self.accepted.extend_from_slice(codes);
-        self
-    }
-
     /// Exit `code` completes the run only when `shows` holds for its stderr:
     /// for a tool whose exit code also means something besides failure, such
     /// as osmium getid's exit 1, which is both "an object was not found" and

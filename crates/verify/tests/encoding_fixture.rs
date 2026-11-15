@@ -119,27 +119,29 @@ pub fn tool(args: &[OsString]) -> i32 {
                 serde_json::json!({"index":{"blobs":1,"blobs_with_indexdata":1,"passed":true,"total_violations": if fault == "index" { 1 } else { 0 },"violations":[]}})
             );
         }
-        "diff" => {
+        "cat" if crate::fake_pbf::is_opl_cat(&args) => {
+            // The element comparison's decodings, always with metadata and
+            // way coordinates. A LocationsOnWays input decodes with a
+            // coordinate its plain reference lacks; a pbfhogg output under
+            // the content fault decodes one tag boundary shifted, which
+            // osmium diff's checksum could not see.
             assert!(args.contains(&"opl,locations_on_ways=true"));
-            // The coverage diff: the input with coordinates against the
-            // reference osmium cat wrote without them.
-            if args.iter().any(|a| a.ends_with("reference-plain.osm.pbf"))
-                && args.iter().any(|a| a.ends_with("low.pbf"))
+            let input = Path::new(args[1]);
+            let name = input.file_name().unwrap().to_str().unwrap();
+            let way = if name == "low.pbf" && fault != "no-coords" {
+                "w1 v1 Nn1x1y1"
+            } else {
+                "w1 v1 Nn1x y"
+            };
+            let tag = if fault == "content"
+                && (name.starts_with("repack") || name.starts_with("degrade"))
             {
-                if fault == "no-coords" {
-                    eprintln!("Summary: left=0 right=0 same=3 different=0");
-                    return 0;
-                }
-                eprintln!("Summary: left=0 right=0 same=2 different=1");
-                println!("-w1 v1 Nn1x1y1\n+w1 v1 Nn1");
-                return 1;
-            }
-            if fault == "content" {
-                eprintln!("Summary: left=0 right=0 same=2 different=1");
-                println!("-n1 v1\n+n1 v2");
-                return 1;
-            }
-            eprintln!("Summary: left=0 right=0 same=3 different=0");
+                "Tab=c"
+            } else {
+                "Ta=bc"
+            };
+            let output = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
+            std::fs::write(output, format!("n1 v1 {tag}\nn2 v1\nn3 v1\n{way}\n")).unwrap();
         }
         "cat" => {
             // The reference without way coordinates: plain PBF output.

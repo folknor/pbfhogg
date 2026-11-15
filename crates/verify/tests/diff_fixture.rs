@@ -65,7 +65,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "raw-listing",
                 "plain-listing",
                 "exit",
-                "fetch",
+                "untouched",
                 "unsorted",
                 "publish",
             ],
@@ -135,7 +135,27 @@ pub fn tool(args: &[OsString]) -> i32 {
     if fake_pbf::is_opl_cat(&args) {
         // Keyed on content, as the reference cache keys the decode.
         let marker = fake_pbf::marker(Path::new(args[1]));
-        if let Some(rest) = marker.strip_prefix("renumber-") {
+        if check == "text" && marker == "sorted" {
+            // The text diff's pair: n1's name changed, as pbfhogg reports;
+            // under the untouched fault n2 also changed, by a shifted tag
+            // boundary osmium diff's checksum could not see, which pbfhogg
+            // does not report.
+            let new = args[1].ends_with("new.osm.pbf");
+            let n2 = if new && fault == "untouched" {
+                "Tab=c"
+            } else {
+                "Ta=bc"
+            };
+            std::fs::write(
+                value("-o"),
+                format!(
+                    "n1 v1 dV c1 t2020-01-01T00:00:00Z i1 ua Tname={} x1 y2\n\
+                     n2 v1 dV c1 t2020-01-01T00:00:00Z i1 ua {n2} x1 y2\n",
+                    if new { "y" } else { "x" }
+                ),
+            )
+            .unwrap();
+        } else if let Some(rest) = marker.strip_prefix("renumber-") {
             let (side, written_under) = rest.split_once('-').unwrap();
             std::fs::write(value("-o"), renumber_opl(written_under, side == "pbfhogg")).unwrap();
         } else {
@@ -145,25 +165,6 @@ pub fn tool(args: &[OsString]) -> i32 {
     }
     match args[0] {
         "fileinfo" => print!("{}", fake_pbf::fileinfo(1, 0, 10)),
-        "getid" => {
-            if fault == "fetch" {
-                return 1;
-            }
-            let new = args.iter().any(|a| a.ends_with("new.osm.pbf"));
-            std::fs::write(
-                value("--output"),
-                format!(
-                    "n1 v1 dV c1 t2020-01-01T00:00:00Z i1 ua Tname={} x1 y2\n",
-                    if new { "y" } else { "x" }
-                ),
-            )
-            .unwrap();
-        }
-        "diff" if !ours => {
-            // Simulate a checksum-blind content change. Touched identities must
-            // be fetched from both files even though osmium lists no change.
-            eprintln!("Summary: left=0 right=0 same=1 different=0");
-        }
         "diff" => return diff_tool(&args, &fault, &check),
         "renumber" | "apply-changes" | "sort" | "degrade" | "derive-changes" => {
             let output = value(if args.contains(&"--output") {
@@ -261,7 +262,7 @@ fn diff_tool(args: &[&str], fault: &str, check: &str) -> i32 {
     if fault == "summary" {
         eprintln!("Files are identical (1 common elements)");
     } else {
-        eprintln!("1 differences: 0 created, 1 modified, 0 deleted (0 common)");
+        eprintln!("1 differences: 0 created, 1 modified, 0 deleted (1 common)");
     }
     println!("*n1 v1");
     if verbose {

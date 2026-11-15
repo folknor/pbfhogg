@@ -1,8 +1,7 @@
 //! Strict streaming readers for the OPL osmium writes in `verify diff`, read
-//! for the content pbfhogg's `diff` compares: [`DiffGroups`] over
-//! `osmium diff -c -f opl` (every line `-` or `+` and an object), grouped by
-//! identity, and [`ObjectReader`] over a plain OPL file (`osmium getid -f
-//! opl`).
+//! for the content pbfhogg's `diff` compares: [`DiffGroups`] over the
+//! listing of a merge of two OPL decodings (every line `-` or `+` and an
+//! object, as `osmium diff -c -f opl` also writes), grouped by identity.
 //!
 //! An object is read in full: kind and signed ID, version, a node's location
 //! in decimicrodegrees, the tags in order with osmium's `%hex%` escapes
@@ -134,7 +133,7 @@ impl Lines {
     }
 }
 
-/// One identity of an `osmium diff -f opl` listing: the object of the first
+/// One identity of a merged OPL listing: the object of the first
 /// input (`-`) and of the second (`+`), at least one present.
 #[derive(Debug)]
 pub(super) struct Group {
@@ -144,10 +143,9 @@ pub(super) struct Group {
     pub new: Option<Object>,
 }
 
-/// The groups of an `osmium diff --suppress-common -f opl` listing, in
-/// order. osmium prints an identity on both sides as a `-` and a `+` line
-/// (in its object order, so a version going backwards prints `+` first) and
-/// a one-sided one as one line. A third line for an identity, a common (` `)
+/// The groups of a merged OPL listing ([`crate::opl_compare`]), in order:
+/// an identity on both sides is a `-` and a `+` line (either first) and a
+/// one-sided one is one line. A third line for an identity, a common (` `)
 /// line, or an identity out of order is an error.
 pub(super) struct DiffGroups {
     lines: Lines,
@@ -243,39 +241,6 @@ fn place(group: &mut Group, (side, object): (u8, Object)) -> bool {
         &mut group.new
     };
     slot.replace(object).is_none()
-}
-
-/// The objects of a plain OPL file, identities strictly ascending in object
-/// order.
-pub(super) struct ObjectReader {
-    lines: Lines,
-    last: Option<(usize, bool, u64)>,
-}
-
-impl ObjectReader {
-    pub(super) fn open(path: &Path) -> Result<Self, Error> {
-        Ok(Self {
-            lines: Lines::open(path)?,
-            last: None,
-        })
-    }
-
-    pub(super) fn next_object(&mut self) -> Result<Option<Object>, Error> {
-        let Some(line) = self.lines.next()? else {
-            return Ok(None);
-        };
-        let object = parse_object(line).map_err(|why| self.lines.error(&why))?;
-        let key = order_key(object.kind, object.id);
-        if self.last.is_some_and(|last| key <= last) {
-            return Err(self.lines.error(&format!(
-                "{}{} does not follow the previous object in object order",
-                kind_char(object.kind),
-                object.id
-            )));
-        }
-        self.last = Some(key);
-        Ok(Some(object))
-    }
 }
 
 /// One OPL object line (no prefix, no newline).

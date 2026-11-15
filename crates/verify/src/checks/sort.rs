@@ -88,7 +88,7 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     } else {
         "  diff: FAIL (differences found)"
     });
-    h.record("pbfhogg vs osmium diff", diff);
+    h.record("pbfhogg vs osmium elements", diff);
 
     let order = h.check_sorted("pbfhogg sort", &ours)?;
     h.record("pbfhogg sort output order", order);

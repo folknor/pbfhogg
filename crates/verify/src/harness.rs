@@ -94,10 +94,6 @@ impl Harness {
         self.tools.osmosis.is_some()
     }
 
-    pub(crate) fn has_osmconvert(&self) -> bool {
-        self.tools.osmconvert.is_some()
-    }
-
     pub(crate) fn retain_references(&mut self, budget: u64) -> Result<(), Error> {
         self.checkpoint()?;
         self.cache.retain(Some(budget));

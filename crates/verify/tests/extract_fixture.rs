@@ -32,7 +32,6 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         reference::Tools {
             osmium: exe.into(),
             osmosis: None,
-            osmconvert: None,
         },
         false,
         cache,

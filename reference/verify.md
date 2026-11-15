@@ -1,8 +1,7 @@
 # pbfhogg-verify: cross-validation contract
 
 `pbfhogg-verify` (`crates/verify`) cross-validates the pbfhogg CLI against
-reference tools: osmium for every check, osmosis and osmconvert where a check
-asks them. It replaces pbfhogg's part of `brokkr verify`, with the complete
+reference tools: osmium for every check, osmosis where a check asks it. It replaces pbfhogg's part of `brokkr verify`, with the complete
 19-check suite available here.
 
 ```sh
@@ -275,10 +274,12 @@ The suite runs the locations arm separately on the selected generation's
 `altw-keep-untagged` base, when both it and an OSC are configured, and
 skips it for a fixture PBF. Configured invalid files fail resolution.
 
-Plain apply-changes also runs osmosis and, if found on the caller's PATH,
-osmconvert for context only. Their failure or unavailability does not
-change the comparison verdict; interruption and unsettled children still
-stop the run. Neither tool runs in locations mode.
+Plain apply-changes also runs osmosis for context only. Its failure or
+unavailability does not change the comparison verdict; interruption and
+unsettled children still stop the run. It does not run in locations mode.
+osmconvert is not a reference: its PBF reader refuses BlobHeaders that carry
+indexdata, so it cannot read the indexed input the check runs on (some of
+those refusals exit 0 with an empty output).
 Osmosis 0.49.2 and its pinned Temurin JDK are downloaded by curl with only
 the boundary's proxy/CA settings added to the private launch environment.
 SHA-256 is checked in-process before unpacking. Each launch uses the same

@@ -29,6 +29,12 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         r#"<osmChange version="0.6"><delete><node id="7"/></delete></osmChange>"#,
     )
     .unwrap();
+    // A small osmosis install tree, since the reference cache hashes the
+    // launcher's install root and JAVA_HOME as osmosis's identity.
+    let osmosis = dir.join("osmosis-tool");
+    std::fs::create_dir_all(osmosis.join("bin")).unwrap();
+    std::fs::create_dir(osmosis.join("jdk")).unwrap();
+    std::os::unix::fs::symlink(exe, osmosis.join("bin/osmosis")).unwrap();
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(&dir, "apply".into(), false).unwrap();
     let mut h = harness::Harness::new(
@@ -36,8 +42,10 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         run,
         reference::Tools {
             osmium: exe.into(),
-            osmosis: None,
-            osmconvert: Some(exe.into()),
+            osmosis: Some(reference::OsmosisTools {
+                osmosis: osmosis.join("bin/osmosis"),
+                java_home: osmosis.join("jdk"),
+            }),
         },
         false,
         cache,
@@ -81,15 +89,31 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 },
                 "fault={fault}, locations={locations}"
             );
+            // osmosis context runs only without -l and when the check gets
+            // past the refusal; a failed run leaves no output behind.
+            if !locations && fault.is_empty() {
+                assert!(context_output(&h).exists());
+            }
+            if fault == "context-failure" {
+                assert!(!context_output(&h).exists(), "locations={locations}");
+            }
         }
     }
+}
+
+fn context_output(h: &harness::Harness) -> std::path::PathBuf {
+    h.run
+        .dir
+        .join("checks")
+        .join("apply-changes")
+        .join("osmosis.osm.pbf")
 }
 
 pub fn tool(args: &[OsString]) -> i32 {
     let args: Vec<_> = args.iter().map(|s| s.to_str().unwrap()).collect();
     let root = args
         .iter()
-        .map(|s| s.strip_prefix("-o=").unwrap_or(s))
+        .map(|s| s.strip_prefix("file=").unwrap_or(s))
         .map(Path::new)
         .flat_map(Path::ancestors)
         .find(|p| p.file_name().is_some_and(|n| n == "apply-fixture"))
@@ -142,14 +166,17 @@ pub fn tool(args: &[OsString]) -> i32 {
             }
             println!("Refs with a node record: 2 verified, 0 mismatched (0 nodes)");
         }
-        _ => {
-            // Optional osmconvert context invocation has no subcommand.
+        "--read-xml-change" => {
+            // The optional osmosis context run: its output is the last
+            // `file=` operand, after `--write-pbf`. A failure leaves a
+            // partial output the check must remove.
+            let output = args.last().and_then(|a| a.strip_prefix("file=")).unwrap();
+            std::fs::write(output, "sorted").unwrap();
             if fault == "context-failure" {
                 return 1;
             }
-            let output = args.iter().find_map(|a| a.strip_prefix("-o=")).unwrap();
-            std::fs::write(output, "sorted").unwrap();
         }
+        other => panic!("unexpected fake tool invocation {other:?}"),
     }
     0
 }

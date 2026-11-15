@@ -26,7 +26,7 @@ virtual manifest. Package names do not change.
 | `crates/harness` | `pbfhogg-harness` | no | `brokkr library` harness |
 | `crates/devkit` | `pbfhogg-devkit` | no | shared library for the tools; links no `pbfhogg` |
 | `crates/datasets` | `pbfhogg-datasets` | no | bin: promote, derive, download |
-| `crates/verify` | `pbfhogg-verify` | no | bin: cross-validation against osmium, osmosis, osmconvert |
+| `crates/verify` | `pbfhogg-verify` | no | bin: cross-validation against osmium, osmosis |
 
 Stays at the repo root: `docs/` (also the VitePress site: root
 `package.json`, `.github/workflows/docs.yml`), `reference/`,
@@ -314,7 +314,7 @@ implementation under test.
   pin.
 - **Layout.** Where a primary, a variant and a `snapshot.KEY` file live;
   snapshot key rules (`[a-zA-Z0-9_-]+`, `base` reserved).
-- **External tools.** Lookup of osmium, osmosis, osmconvert, curl.
+- **External tools.** Lookup of osmium, osmosis, curl.
 - **No building.** Only brokkr builds. devkit never invokes cargo; a tool
   that needs the pbfhogg binary is handed its path by the caller (see
   verify), and checks it exists and is executable before any capability

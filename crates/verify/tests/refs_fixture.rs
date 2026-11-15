@@ -24,7 +24,6 @@ pub fn driver(life: crate::process::Lifecycle, exe: &Path, dir: &Path) {
         reference::Tools {
             osmium: exe.into(),
             osmosis: None,
-            osmconvert: None,
         },
         true,
         cache,

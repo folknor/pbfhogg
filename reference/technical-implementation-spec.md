@@ -26,8 +26,8 @@ Specifications are saved to the ./notes folder.
    the change can break: `brokkr check` (gremlins + clippy + the full test
    suite) for anything touching read/write semantics, wire encoding, the CLI
    surface, or an invariant; `brokkr run --with pbfhogg pbfhogg-verify -- <command> --dataset denmark
-   --variant indexed` (cross-validates the command's output against osmium /
-   osmosis / osmconvert) for anything touching a command's element output,
+   --variant indexed` (cross-validates the command's output against osmium,
+   see `reference/verify.md`) for anything touching a command's element output,
    with zero diffs the bar save the parity exceptions already documented in
    `reference/osmium-parity.md`; the ignored roundtrip suite
    (`brokkr check --profile full`, or a named `brokkr test <file> <name>`)

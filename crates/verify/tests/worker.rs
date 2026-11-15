@@ -352,7 +352,6 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     let tools = reference::Tools {
         osmium: exe.to_path_buf(),
         osmosis: None,
-        osmconvert: None,
     };
     let mut cache = reference_cache::ReferenceCache::new(dir, "fixture-run".into(), false).unwrap();
     for (n, fresh, hit) in [(0, false, false), (1, false, true), (2, true, false)] {

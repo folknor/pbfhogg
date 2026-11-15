@@ -21,7 +21,6 @@ const RUN_PATH: &str = "/usr/bin:/bin";
 pub(crate) struct Tools {
     pub(crate) osmium: PathBuf,
     pub(crate) osmosis: Option<OsmosisTools>,
-    pub(crate) osmconvert: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +33,6 @@ pub(crate) struct OsmosisTools {
 pub(crate) enum Program {
     Osmium,
     Osmosis,
-    Osmconvert,
 }
 
 impl Program {
@@ -42,7 +40,6 @@ impl Program {
         match self {
             Self::Osmium => "osmium",
             Self::Osmosis => "osmosis",
-            Self::Osmconvert => "osmconvert",
         }
     }
 
@@ -50,7 +47,6 @@ impl Program {
         match self {
             Self::Osmium => &tools.osmium,
             Self::Osmosis => tools.osmosis.as_ref().map_or(Path::new(""), |t| &t.osmosis),
-            Self::Osmconvert => tools.osmconvert.as_deref().unwrap_or(Path::new("")),
         }
     }
 }
@@ -287,7 +283,6 @@ mod tests {
     fn osmosis_environment_is_private_and_xargs_aware() {
         let tools = Tools {
             osmium: "/osmium".into(),
-            osmconvert: None,
             osmosis: Some(OsmosisTools {
                 osmosis: "/tool/bin/osmosis".into(),
                 java_home: "/tool/jdk".into(),

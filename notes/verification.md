@@ -154,11 +154,27 @@ reimplemented in pbfhogg, which must meet the requirement tracked under VER-127.
 
 Reported by bench-verify.
 
-`verify all` provisions osmosis, and `run_context_tools` in brokkr runs osmosis and osmconvert for context,
-whose failures do not change the verdict.
+`pbfhogg-verify` provisions osmosis for `all` and plain apply-changes, and `run_context_tools` in
+`crates/verify/src/checks/apply_changes.rs` runs it by default for context; its failure does not change
+the verdict (the 2026-11-15 denmark run spent 37.4 s of 58 s in osmosis). brokkr#155 closed without the
+option when brokkr verify retired.
 
-Fix: an explicit diagnostic option. Enforcement: a declarative step graph rejecting unused outputs.
-Brokkr side filed as bz brokkr#155.
+Fix: an explicit diagnostic option, or promote osmosis to a verdict (VER-136). Enforcement: a
+declarative step graph rejecting unused outputs.
+
+## VER-136 - No independent enforcement of unconditional deletion in apply-changes
+
+Found working pbfhogg#62.
+
+The apply-changes check exempts osmium-only elements the input OSC deletes, because osmium deletes by
+version and pbfhogg unconditionally. So if pbfhogg and osmium both wrongly retain an element the OSC
+deletes, the check passes: nothing independent enforces the deletion. osmosis deletes unconditionally
+and reads the indexed input unchanged, but is context only (its output feeds a printed fileinfo line).
+osmconvert was removed as a reference for being unable to read indexdata PBFs.
+
+Fix: a strict comparison against an independent unconditional-delete implementation, most plausibly
+osmosis, with its semantics established first for repeated changes to one identity and for metadata,
+and its failure or absence reported as the check not completing rather than a pass.
 
 
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation

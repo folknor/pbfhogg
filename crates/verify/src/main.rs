@@ -53,7 +53,7 @@ use crate::harness::{CheckStatus, ENVIRONMENT_EXIT_CODE, Harness};
 #[derive(Parser)]
 #[command(
     name = "pbfhogg-verify",
-    about = "Cross-validate the pbfhogg CLI against osmium, osmosis and osmconvert"
+    about = "Cross-validate the pbfhogg CLI against osmium and osmosis"
 )]
 struct Args {
     /// pbfhogg CLI executable (otherwise BROKKR_WITH_EXE). Never builds one.
@@ -296,7 +296,6 @@ fn boundary(args: &Args) -> Result<Boundary, Error> {
         tools: reference::Tools {
             osmium,
             osmosis: None,
-            osmconvert: path.as_deref().and_then(|p| find_in_path("osmconvert", p)),
         },
     })
 }

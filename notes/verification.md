@@ -31,6 +31,18 @@ without failing on large hosts); a ticket's units versus its simultaneous runs; 
 `host::FdPool` tests holding a ticket by convention. Every current heavy holder runs
 `write_base_pbf` (one way blob, so one 256-file fleet), well under the witnessed shape.
 
+## VER-135 - A dropped LocationsOnWays claim silently turns off coordinate comparison
+
+`opl_compare::Policy::between` compares inline way coordinates only when both sides
+declare `LocationsOnWays`. In the `sort` check (and any check that builds its policy
+the same way from pbfhogg's output and a reference), a pbfhogg output that loses the
+claim on a LocationsOnWays input therefore switches the comparison to
+`NO_LOCATIONS` and passes without ever looking at coordinates. Nothing in the sort
+check asserts that the output keeps the input's claim. The policy should come from
+the input's (or the reference's) declaration, with a missing claim on ours being a
+failure. Raised by the spar partner while settling the germany sort reference
+strategy; not yet checked against every check that calls `between`.
+
 ## VER-018 - The gate's backend requirement checks refusals, not execution
 
 io_uring cells assert a registered pool and serialize on a locked-memory lease;

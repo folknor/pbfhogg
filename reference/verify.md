@@ -50,6 +50,15 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
 - **Sorted copies** are written by `osmium sort`, with
   `-f pbf,locations_on_ways=true` when the source declares
   `LocationsOnWays`, so inline coordinates survive into the comparison.
+  Copies fed to pbfhogg use osmium's default `simple` strategy, the only one
+  that writes the `Sort.Type_then_ID` claim pbfhogg branches on. The `sort`
+  check's own reference uses `-s multipass`: it judges elements and
+  pbfhogg's order, never the reference's header, and `simple` holds the whole
+  input in memory (osmium documents roughly ten times the PBF size), which
+  the kernel OOM killer ended on germany. Multipass holds one object type at
+  a time; its observed peak on germany is in the evidence below. A sorted
+  copy of an unsorted germany-sized input still takes the simple strategy
+  and its memory.
 
 ## Inputs
 
@@ -228,7 +237,7 @@ suite because a later comparison cannot make that run complete.
 
 | Check | Compared against | Established by |
 |---|---|---|
-| `sort` | `osmium sort` | element equality, and the output's strict order by osmium fileinfo, never the header claim |
+| `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
 | `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
@@ -628,8 +637,8 @@ legacy suites were compared sequentially, verdict for verdict, on indexed
 Denmark and Germany. Denmark: 19 PASS each, exit 0, no skips. Germany with
 `--osc-seq 4705`: 18 PASS and sort ENVIRONMENT each, exit 75, no skips.
 There were no per-check verdict differences. Both fresh Germany sort
-references were killed by SIGKILL, which neither verifier sent. Its
-comparison remains unestablished; OOM is plausible, not proved. Bare
+references were killed by SIGKILL, which neither verifier sent; the
+2026-11-15 sort evidence below identifies the kernel OOM killer. Bare
 Germany refused ambiguous selection among eight OSCs before checking
 anything, with the deliberate configuration-exit difference described above.
 
@@ -639,6 +648,17 @@ pbfhogg-judged comparison to osmium decodings and the verifier's readers
 4705`: 18 PASS and sort ENVIRONMENT (osmium sort SIGKILLed again), diff
 failing only on scratch exhausted by cached OPL decodings; with decodings
 uncached and removed once merged, diff then passed alone.
+
+On 2026-11-15, host bygg (30.5 GiB RAM, 31 GiB swap), at `95232102`:
+`sort --dataset germany --fresh-reference` with the simple strategy was
+SIGKILLed after osmium sort ran 4m11s, then passed on a rerun with osmium
+sort at 9m54s, swap-bound. The kernel's `/proc/vmstat` `oom_kill` count
+since boot equalled the number of germany osmium-sort SIGKILLs recorded
+since boot, so the killer is the OOM killer. On the uncommitted change to
+`-s multipass`, three fresh runs passed with osmium sort at 2m14s, 2m12s
+and 1m46s; the last, sampled, peaked at a resident set (VmHWM) of 26.2 GiB. That
+peak sits at the edge of the project's 26 GB free-memory host assumption:
+germany sort fits bygg, not every conceivable standard host.
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

@@ -29,8 +29,8 @@ complete gate only (brokkr.d/lints.toml), since the edit-loop checker covers
 the same rules without a build.
 
 This is a cross-check, not the node-free leg: check_doc_links.py (the
-always-on `doc-links` entry) checks the documents on every host. Node, pnpm
-and the pinned dependencies are optional extras a standard host does not
+always-on `doc-links` entry) checks the documents on every host. Node and
+the installed dependencies are optional extras a standard host does not
 have, so where any of them is absent the cross-check does not run, the
 output says which is missing and that the checker's model went unchecked
 against a real build, and the check passes: a failing script check
@@ -54,6 +54,7 @@ import check_doc_links as checker  # noqa: E402
 DIST = ROOT / "docs" / ".vitepress" / "dist"
 BASE = "/pbfhogg/"
 INSTALL = "pnpm install --frozen-lockfile"
+VITEPRESS = ROOT / "node_modules" / ".bin" / "vitepress"
 
 
 class Page(html.parser.HTMLParser):
@@ -87,19 +88,27 @@ class Page(html.parser.HTMLParser):
 
 def missing_renderer():
     """What the cross-check lacks on this host, or an empty list."""
-    missing = [tool for tool in ("node", "pnpm") if shutil.which(tool) is None]
-    if not (ROOT / "node_modules" / ".bin" / "vitepress").exists():
-        missing.append(f"the pinned dependencies ({INSTALL})")
+    missing = [] if shutil.which("node") else ["node"]
+    if not VITEPRESS.exists():
+        missing.append(f"the installed dependencies ({INSTALL})")
     return missing
 
 
 def build():
-    """None on success, else the reason the site could not be built."""
-    pnpm = shutil.which("pnpm")
-    out = subprocess.run(
-        [pnpm, "exec", "vitepress", "build", "docs"],
-        cwd=ROOT, capture_output=True, text=True, check=False,
-    )
+    """None on success, else the reason the site could not be built.
+
+    Runs the installed shim directly, not `pnpm exec`: the build needs only
+    node and the installed renderer. A pnpm launcher that switches to the
+    packageManager-pinned version writes its own global state, which fails where that state is read-only (seen with pnpm 12 in an
+    agent sandbox), so pnpm is the install tool only, never a build step.
+    """
+    try:
+        out = subprocess.run(
+            [str(VITEPRESS), "build", "docs"],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+    except OSError as err:
+        return f"vitepress build could not start (reinstall with {INSTALL}): {err}"
     if out.returncode != 0:
         tail = "\n".join((out.stdout + out.stderr).strip().splitlines()[-20:])
         return f"vitepress build failed (dependencies missing? run {INSTALL}):\n{tail}"

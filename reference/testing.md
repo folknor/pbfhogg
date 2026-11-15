@@ -1259,8 +1259,12 @@ pager links included, names a built page and an id on it; every site page's
 rendered sidebar links to the page, which is VitePress's per-route sidebar
 selection rather than mention anywhere in the config; and the heading IDs
 `doc-links` computes for each built page equal the built IDs, in order. It
-runs only where node, pnpm and the installed lockfile
-(`pnpm install --frozen-lockfile`) are present; elsewhere it names what is
+runs only where node and the installed dependencies
+(`pnpm install --frozen-lockfile`) are present, and runs the installed
+`node_modules/.bin/vitepress` directly, so pnpm installs but never builds
+(a pnpm launcher that switches to the `packageManager` pin writes its
+own global state, which fails where that state is read-only);
+elsewhere it names what is
 missing, says the cross-check did not run, and passes (the degrade shape in
 "Platform-dependent tests"). Where it runs it verifies the
 site's actual pages, not general Markdown: syntax the site does not use is

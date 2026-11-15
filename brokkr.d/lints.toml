@@ -28,8 +28,9 @@ stage = "pre-clippy"
 # The real renderer as the document checker's oracle: builds the site with
 # the pinned VitePress into the gitignored docs/.vitepress/dist and checks
 # the built links, anchors and per-route sidebars, and that doc-links'
-# heading model matches the built IDs. Runs only where node, pnpm and the
-# installed lockfile (pnpm install --frozen-lockfile) are all present; where
+# heading model matches the built IDs. Runs only where node and the
+# installed dependencies (pnpm install --frozen-lockfile) are present, and
+# runs node_modules/.bin/vitepress itself, so pnpm is never a build step; where
 # any is absent it says so on its output and passes, since none is on a
 # standard host and a failing script check short-circuits every later phase.
 # brokkr shows nothing of a passing entry, so that note is visible only on

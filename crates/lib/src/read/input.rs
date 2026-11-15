@@ -57,12 +57,6 @@ pub(crate) fn open(path: &Path) -> Result<File> {
     File::open(path).map_err(|e| named("open", path, e))
 }
 
-/// `fs::read`, naming `path` in the error.
-#[allow(clippy::disallowed_methods)]
-pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|e| named("read", path, e))
-}
-
 /// `fs::read_to_string`, naming `path` in the error. Content that is not
 /// UTF-8 is malformed input, not an I/O failure: every text input read here
 /// (an expressions file, an ID list, an extract config or region file) has
@@ -83,6 +77,50 @@ pub(crate) fn read_to_string(path: &Path) -> Result<String> {
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn metadata(path: &Path) -> Result<std::fs::Metadata> {
     std::fs::metadata(path).map_err(|e| named("stat", path, e))
+}
+
+/// Open the directory at `path` (following a symlink at `path` itself) as a
+/// handle that [`open_at`] opens entries relative to, naming `path` in the
+/// error.
+#[cfg(unix)]
+pub(crate) fn open_directory(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // A read-only open: `crate::read::input` is the one owner of these, and
+    // the error names the path.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|e| named("open", path, e))
+}
+
+/// Open the entry `name` of the directory `dir` read-only, by `openat(2)`, so
+/// the lookup resolves inside that directory inode whatever its path names
+/// now. A symlink entry is refused (`O_NOFOLLOW`), so the file opened is the
+/// directory's own entry. `label` names the entry in the error.
+#[cfg(unix)]
+pub(crate) fn open_at(dir: std::os::fd::BorrowedFd<'_>, name: &str, label: &Path) -> Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let c_name = std::ffi::CString::new(name).map_err(|_| {
+        Error::invalid_data(format!("index entry name {name:?} contains a NUL byte"))
+    })?;
+    // SAFETY: `dir` is a live borrowed descriptor and `c_name` a
+    // NUL-terminated string, both valid for the call.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(named("open", label, std::io::Error::last_os_error()));
+    }
+    // SAFETY: `openat` just returned `fd`, a new descriptor nothing else
+    // owns; wrapping it makes this function its one owner. This is a
+    // descriptor the library created, not an inherited one.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 /// Where an input is opened from: its path, resolved again by every open, or

@@ -1020,8 +1020,17 @@ pub const FILE_STRINGS: &str = "strings.bin";
 /// Map a read-only file, including valid empty record files.
 #[cfg(feature = "geocode-reader")]
 pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::Result<memmap2::Mmap> {
+    mmap_file_or_empty(&crate::read::input::open(path)?, path)
+}
+
+/// Map the already-open read-only `file`, including a valid empty one;
+/// `path` names it in an error.
+#[cfg(feature = "geocode-reader")]
+pub(crate) fn mmap_file_or_empty(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> crate::Result<memmap2::Mmap> {
     use crate::error::Error;
-    let file = crate::read::input::open(path)?;
     let len = file
         .metadata()
         .map_err(|e| Error::from(e).context(format!("failed to stat {}", path.display())))?
@@ -1041,7 +1050,7 @@ pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::Result<memmap2::Mm
     } else {
         // SAFETY: index files must remain unchanged while mapped, in both
         // the builder's post-flush phase and the Reader's lifetime.
-        unsafe { memmap2::Mmap::map(&file) }
+        unsafe { memmap2::Mmap::map(file) }
             .map_err(|e| Error::from(e).context(format!("failed to mmap {}", path.display())))?
     };
     Ok(mapped)
@@ -1067,6 +1076,14 @@ impl<T: Record> Records<T> {
     pub(crate) fn map(path: &std::path::Path) -> crate::Result<Self> {
         Ok(Self {
             map: mmap_or_empty(path)?,
+            record: std::marker::PhantomData,
+        })
+    }
+
+    /// Map the already-open `file`; `path` names it in an error.
+    pub(crate) fn map_file(file: &std::fs::File, path: &std::path::Path) -> crate::Result<Self> {
+        Ok(Self {
+            map: mmap_file_or_empty(file, path)?,
             record: std::marker::PhantomData,
         })
     }

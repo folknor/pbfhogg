@@ -2165,8 +2165,13 @@ their mapped inodes and remain usable. The entire output directory is replaced;
 use a dedicated directory for the index. Allow disk space for both generations.
 
 Publication uses two renames, so it is not crash-atomic and there is a short
-pathname gap. Serialize publication with new reader opens and other builds;
-queries on readers already open need no coordination. A publication killed
+pathname gap. On Unix a reader opens the index directory once and every file
+relative to it (`Reader::open`, or `Reader::open_dir` on a handle the caller
+holds), so an open racing a publication reads one generation or fails; an open
+that falls in the pathname gap finds no index. On other platforms the reader
+looks each file up by path, so serialize publication with new reader opens
+there. Serialize builds with each other everywhere; queries on readers already
+open need no coordination. A publication killed
 partway (SIGINT and SIGTERM do not stop one that has started) may leave the old
 index in a `.pbfhogg-backup-*` directory beside the output directory; a
 publication that fails and cannot put the old index back says so and names that
@@ -2181,7 +2186,10 @@ still make the final rename fail; on other platforms mount points are not
 preflighted and the final rename may fail after the build.
 External writers must also replace files rather than modify mapped inodes:
 reader open-time string validation cannot protect against truncation, which
-can fault before a string check can return an error.
+can fault before a string check can return an error. The one-generation
+guarantee above further needs a new generation to replace the whole directory:
+a file replaced inside a published directory can be read beside the other
+files of the old one. On Unix the reader refuses an index file that is a symlink.
 
 A build that finds nothing queryable at all - no address points, no streets, no
 interpolation ways and no admin polygons - fails rather than publishing an empty

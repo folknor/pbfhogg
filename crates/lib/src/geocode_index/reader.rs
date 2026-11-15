@@ -252,9 +252,17 @@ struct Lists<T> {
 }
 
 impl<T: Record> Lists<T> {
+    #[cfg(test)]
     fn map(path: &Path) -> Result<Self> {
         Ok(Self {
             map: format::mmap_or_empty(path)?,
+            record: PhantomData,
+        })
+    }
+
+    fn map_file(file: &std::fs::File, path: &Path) -> Result<Self> {
+        Ok(Self {
+            map: format::mmap_file_or_empty(file, path)?,
             record: PhantomData,
         })
     }
@@ -286,6 +294,53 @@ fn in_record(err: crate::Error, file: &str, index: usize) -> crate::Error {
     err.context(format!("{file} record {index}"))
 }
 
+/// The index directory an open reads every file from: on Unix a handle every
+/// file is opened relative to, elsewhere its path. `name` names it in errors
+/// (empty for a caller's handle, so errors name the bare file) and is never
+/// resolved on Unix.
+struct IndexDir<'a> {
+    #[cfg(unix)]
+    handle: std::os::fd::BorrowedFd<'a>,
+    name: &'a Path,
+}
+
+impl IndexDir<'_> {
+    fn label(&self, file: &str) -> std::path::PathBuf {
+        self.name.join(file)
+    }
+
+    #[cfg(unix)]
+    fn open(&self, file: &str) -> Result<std::fs::File> {
+        crate::read::input::open_at(self.handle, file, &self.label(file))
+    }
+
+    #[cfg(not(unix))]
+    fn open(&self, file: &str) -> Result<std::fs::File> {
+        crate::read::input::open(&self.label(file))
+    }
+
+    fn read(&self, file: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        self.open(file)?.read_to_end(&mut bytes).map_err(|e| {
+            crate::Error::from(e).context(format!("failed to read {}", self.label(file).display()))
+        })?;
+        Ok(bytes)
+    }
+
+    fn mmap(&self, file: &str) -> Result<Mmap> {
+        format::mmap_file_or_empty(&self.open(file)?, &self.label(file))
+    }
+
+    fn records<T: Record>(&self, file: &str) -> Result<Records<T>> {
+        Records::map_file(&self.open(file)?, &self.label(file))
+    }
+
+    fn lists<T: Record>(&self, file: &str) -> Result<Lists<T>> {
+        Lists::map_file(&self.open(file)?, &self.label(file))
+    }
+}
+
 impl Reader {
     /// Open an index directory. Memory-maps all files.
     ///
@@ -308,16 +363,63 @@ impl Reader {
     /// interpolation segments, eight bytes each, so a query can tell where
     /// there are none near it.
     ///
+    /// # One build per open
+    ///
+    /// On Unix the directory is opened once and every file in it is opened
+    /// relative to that handle (`openat`), so a later rename of the path
+    /// cannot redirect part of the open to another directory: when indexes
+    /// are published by replacing the whole directory (as
+    /// `build-geocode-index` does) and no file inside a published directory
+    /// is replaced or modified, a successful open reads one build. A
+    /// concurrent removal of the opened build can make the open fail, never
+    /// read another build.
+    /// An index file that is a symlink is refused, so no file of the index
+    /// resolves outside its directory; a symlink naming the directory itself
+    /// is followed. On other platforms each file is looked up by its path.
+    ///
     /// # Errors
     /// A file is missing, unreadable or malformed; the error names the
     /// index directory, and the file (and record) where one is at fault.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_in(dir).map_err(|e| e.locate(crate::error::Location::in_file(dir)))
+        Self::open_located(dir).map_err(|e| e.locate(crate::error::Location::in_file(dir)))
     }
 
-    fn open_in(dir: &Path) -> Result<Self> {
-        let header_path = dir.join(format::FILE_HEADER);
-        let header_bytes = crate::read::input::read(&header_path)?;
+    #[cfg(unix)]
+    fn open_located(dir: &Path) -> Result<Self> {
+        use std::os::fd::AsFd;
+        let handle = crate::read::input::open_directory(dir)?;
+        Self::open_in(&IndexDir {
+            handle: handle.as_fd(),
+            name: dir,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn open_located(dir: &Path) -> Result<Self> {
+        Self::open_in(&IndexDir { name: dir })
+    }
+
+    /// Open the index directory `dir`, an open handle to it (a `File`,
+    /// `OwnedFd` or `BorrowedFd` opened on the directory). Every file is
+    /// opened relative to the handle, so the open reads the directory it
+    /// names whatever its path names now; see [`Self::open`] for the one-build
+    /// guarantee, the symlink refusal and the validation pass. The handle is
+    /// only borrowed for the call: the returned reader holds its own mappings.
+    ///
+    /// # Errors
+    /// As [`Self::open`]; a handle that is not a directory fails. With no
+    /// path to name, errors name the file within the directory.
+    #[cfg(unix)]
+    pub fn open_dir(dir: impl std::os::fd::AsFd) -> Result<Self> {
+        Self::open_in(&IndexDir {
+            handle: dir.as_fd(),
+            name: Path::new(""),
+        })
+    }
+
+    fn open_in(dir: &IndexDir<'_>) -> Result<Self> {
+        let header_path = dir.label(format::FILE_HEADER);
+        let header_bytes = dir.read(format::FILE_HEADER)?;
         let in_header = |e: crate::Error| e.locate(crate::error::Location::in_file(&header_path));
         if header_bytes.len() < HEADER_SIZE {
             return Err(in_header(corrupt(format!(
@@ -331,8 +433,6 @@ impl Reader {
                 .map_err(|_| in_header(corrupt("header size mismatch")))?,
         )
         .map_err(|e| in_header(crate::Error::invalid_data_from(e)))?;
-
-        let path = |name: &str| dir.join(name);
 
         let fine_radius_m = header.fine_search_radius_m as f64;
         let coarse_radius_m = header.coarse_search_radius_m as f64;
@@ -351,24 +451,24 @@ impl Reader {
             presence_level,
             coarse_interp_cells: Vec::new(),
             header,
-            geo_cells: Records::map(&path(format::FILE_GEO_CELLS))?,
-            street_entries: Lists::map(&path(format::FILE_STREET_ENTRIES))?,
-            addr_entries: Lists::map(&path(format::FILE_ADDR_ENTRIES))?,
-            interp_entries: Lists::map(&path(format::FILE_INTERP_ENTRIES))?,
-            coarse_geo_cells: Records::map(&path(format::FILE_COARSE_GEO_CELLS))?,
-            coarse_street_entries: Lists::map(&path(format::FILE_COARSE_STREET_ENTRIES))?,
-            coarse_addr_entries: Lists::map(&path(format::FILE_COARSE_ADDR_ENTRIES))?,
-            coarse_interp_entries: Lists::map(&path(format::FILE_COARSE_INTERP_ENTRIES))?,
-            street_ways: Records::map(&path(format::FILE_STREET_WAYS))?,
-            street_nodes: Records::map(&path(format::FILE_STREET_NODES))?,
-            addr_points: Records::map(&path(format::FILE_ADDR_POINTS))?,
-            interp_ways: Records::map(&path(format::FILE_INTERP_WAYS))?,
-            interp_nodes: Records::map(&path(format::FILE_INTERP_NODES))?,
-            admin_cells: Records::map(&path(format::FILE_ADMIN_CELLS))?,
-            admin_entries: Lists::map(&path(format::FILE_ADMIN_ENTRIES))?,
-            admin_polygons: Records::map(&path(format::FILE_ADMIN_POLYGONS))?,
-            admin_vertices: Records::map(&path(format::FILE_ADMIN_VERTICES))?,
-            strings: format::mmap_or_empty(&path(format::FILE_STRINGS))?,
+            geo_cells: dir.records(format::FILE_GEO_CELLS)?,
+            street_entries: dir.lists(format::FILE_STREET_ENTRIES)?,
+            addr_entries: dir.lists(format::FILE_ADDR_ENTRIES)?,
+            interp_entries: dir.lists(format::FILE_INTERP_ENTRIES)?,
+            coarse_geo_cells: dir.records(format::FILE_COARSE_GEO_CELLS)?,
+            coarse_street_entries: dir.lists(format::FILE_COARSE_STREET_ENTRIES)?,
+            coarse_addr_entries: dir.lists(format::FILE_COARSE_ADDR_ENTRIES)?,
+            coarse_interp_entries: dir.lists(format::FILE_COARSE_INTERP_ENTRIES)?,
+            street_ways: dir.records(format::FILE_STREET_WAYS)?,
+            street_nodes: dir.records(format::FILE_STREET_NODES)?,
+            addr_points: dir.records(format::FILE_ADDR_POINTS)?,
+            interp_ways: dir.records(format::FILE_INTERP_WAYS)?,
+            interp_nodes: dir.records(format::FILE_INTERP_NODES)?,
+            admin_cells: dir.records(format::FILE_ADMIN_CELLS)?,
+            admin_entries: dir.lists(format::FILE_ADMIN_ENTRIES)?,
+            admin_polygons: dir.records(format::FILE_ADMIN_POLYGONS)?,
+            admin_vertices: dir.records(format::FILE_ADMIN_VERTICES)?,
+            strings: dir.mmap(format::FILE_STRINGS)?,
         };
         reader.validate_structure()?;
         reader.coarse_interp_cells = reader

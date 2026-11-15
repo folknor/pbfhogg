@@ -3203,6 +3203,82 @@ fn force_rebuild_preserves_open_reader_mappings() {
     pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("new reader");
 }
 
+/// An open through a directory handle reads the directory the handle names,
+/// whatever its path names now: moved aside and replaced by a broken index,
+/// the pinned build still opens and answers, and removing one of its files
+/// fails the open rather than reading the file from elsewhere.
+#[cfg(unix)]
+#[test]
+fn open_dir_reads_the_pinned_directory_only() {
+    use pbfhogg::geocode_index::reader::Reader;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    let config = pbfhogg::geocode_index::builder::BuildConfig::default();
+    build_index(
+        &input,
+        &config,
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build");
+    let pin = std::fs::File::open(&index_dir).expect("open index directory");
+    let aside = dir.path().join("aside");
+    std::fs::rename(&index_dir, &aside).expect("move aside");
+    std::fs::create_dir(&index_dir).expect("replacement directory");
+    std::fs::write(index_dir.join("geocode_header.bin"), b"broken").expect("broken header");
+    assert!(
+        Reader::open(&index_dir).is_err(),
+        "the path names the broken index"
+    );
+    let pinned = Reader::open_dir(&pin).expect("pinned build opens");
+    assert!(
+        pinned
+            .query(55.70005, 12.5005)
+            .expect("query")
+            .address
+            .is_some()
+    );
+    std::fs::remove_file(aside.join("strings.bin")).expect("remove a pinned file");
+    let Err(err) = Reader::open_dir(&pin) else {
+        panic!("a removed file fails the open");
+    };
+    assert!(err.to_string().contains("strings.bin"), "{err}");
+}
+
+/// A symlink naming the index directory is followed; an index file that is a
+/// symlink is refused, so no file resolves outside the directory.
+#[cfg(unix)]
+#[test]
+fn reader_refuses_symlinked_index_files() {
+    use pbfhogg::geocode_index::reader::Reader;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_synthetic_indexed_input(&input);
+    let config = pbfhogg::geocode_index::builder::BuildConfig::default();
+    build_index(
+        &input,
+        &config,
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&index_dir, &link).expect("directory symlink");
+    Reader::open(&link).expect("a symlinked directory opens");
+    let moved = dir.path().join("strings.bin");
+    std::fs::rename(index_dir.join("strings.bin"), &moved).expect("move strings");
+    std::os::unix::fs::symlink(&moved, index_dir.join("strings.bin")).expect("file symlink");
+    let Err(err) = Reader::open(&index_dir) else {
+        panic!("a symlinked index file is refused");
+    };
+    assert!(err.to_string().contains("strings.bin"), "{err}");
+}
+
 #[test]
 fn caller_built_interpolation_candidate_cannot_escape_its_way() {
     use pbfhogg::geocode_index::{builder, reader::Reader};

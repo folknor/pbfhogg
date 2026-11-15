@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`geocode_index::reader::Reader::open_dir(dir: impl AsFd)`** (Unix)
+  opens an index from a directory handle the caller holds. On Unix
+  `Reader::open` now also opens the directory once and every index file
+  relative to it, so an open racing a `build-geocode-index --overwrite`
+  publication reads one build or fails instead of possibly mixing files of
+  two builds. An index file that is a symlink is now refused.
 - **`diff --locations`** also compares inline `LocationsOnWays` way
   coordinates: a way whose tags and refs match but whose location list
   differs (in length, or at any position at 1e-7 degrees, truncated toward

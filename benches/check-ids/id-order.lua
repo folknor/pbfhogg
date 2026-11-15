@@ -5,36 +5,23 @@
 -- brokkr reserves, hashes and pairs the same file the typed runner uses.
 -- No cache preparation is added: the typed command does none either.
 --
--- Preserve the typed runner's answer policy: exit 0 means clean, exit 1
--- means violations, and an input's expect.check-ids narrows that to the
--- declared answer. Before 854f9465, exit 1 could also mean a failure, so
--- only exit 0 is trusted and a declared violations input is refused.
--- Lua uses since() for that boundary; the typed runner instead probes the
--- executable and caches its capability by digest. A backport outside that
--- ancestry can therefore differ. Probing inside bench() would add extra
--- pbfhogg children to every measured iteration, changing the workload.
--- The child wall is the matching measurement; the iteration wall also
--- includes Lua bookkeeping. The marked child supports bench --hotpath
--- and --alloc. Build features belong in the registry. Direct-I/O support
--- is built for both arms so only the read mode changes between them.
+-- Exit 0 (clean) and exit 1 (violations) both complete the iteration
+-- (benches/lib/answer.lua); the answer is not judged. The child wall is
+-- the matching measurement; the iteration wall also includes Lua
+-- bookkeeping. The marked child supports bench --hotpath and --alloc.
+-- Build features belong in the registry. Direct-I/O support is built for
+-- both arms so only the read mode changes between them.
 --
 --   brokkr bench --iterations 1 id-order --dataset denmark --full yes
 --   brokkr bench --dry-run id-order --full yes,no --direct-io yes,no
 
--- check-ids covers both --full settings, as brokkr documents.
-local expect = require("expect")
-
-function preflight(params)
-    expect.refuse_untrusted(params, "check-ids")
-end
+local answer = require("answer")
 
 function bench(params)
     local r = binary_with({ hotpath = "check-ids" }, "check", "--ids", params.variant.file, {
         full = params.full == "yes",
         ["direct-io"] = params["direct-io"] == "yes",
     })
-    local verdict = expect.verdict(params, "check-ids", "check --ids", r)
-    record.check_exit = r.exit
+    answer.completed("check --ids", r)
     record.summary = r.stderr
-    return verdict
 end

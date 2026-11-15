@@ -1,5 +1,6 @@
 -- Shared general diff workload. Child wall, rather than iteration wall,
 -- excludes merge preparation. No forced page-cache state.
+local answer = require("answer")
 local profiling = require("profiling")
 local stops = require("stop")
 local M = {}
@@ -18,7 +19,9 @@ function M.unindexed(input)
     return indexed == "false"
 end
 
-function M.run(params, old, new, want)
+-- Exit 0 (same) and exit 1 (differs) both complete the iteration; the
+-- answer is not judged (benches/lib/answer.lua).
+function M.run(params, old, new)
     local out = output(params.format == "osc" and "diff.osc" or "diff.txt")
     local flags = { output = out, overwrite = true, jobs = params.jobs, type = params.type,
         ["direct-io"] = params["direct-io"] == "yes" }
@@ -37,14 +40,8 @@ function M.run(params, old, new, want)
         record.stopped_at = r.stopped_at
         return "stopped"
     end
-    if r.exit ~= 0 and (r.exit ~= 1 or not since("854f9465")) then
-        fail("diff ended with exit " .. tostring(r.exit) .. ", signal " .. tostring(r.signal) .. ": " .. r.stderr)
-    end
-    local verdict = r.exit == 0 and "same" or "differs"
-    if want and want ~= verdict then fail("diff answered " .. verdict .. ", declared " .. want) end
-    record.diff_exit = r.exit
+    answer.completed("diff", r)
     record.output_bytes = filesize(out)
-    return verdict
 end
 
 return M

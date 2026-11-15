@@ -18,8 +18,8 @@
 -- all of it (warm) is resident before launch, storing the account with the
 -- child. The call is `measured`, so the result is the cat child's wall,
 -- without that preparation. The preflight checks only what page_cache()
--- can see beforehand. --cache and --check are checked by their choices in
--- brokkr.d/benches.toml.
+-- can see beforehand. --cache is checked by its choices in
+-- brokkr.d/benches.toml. The output is not judged.
 
 function preflight(params)
     local why = page_cache(params.variant.file, params.cache)
@@ -33,13 +33,4 @@ function bench(params)
     binary_with({ [params.cache] = { pbf }, measured = true },
         "cat", pbf, pbf, { dedupe = true, output = out, overwrite = true }):ok()
     record.output_bytes = filesize(out)
-    -- --check yes diffs the output against the input with the same build: a
-    -- self-merge must reproduce its input's elements exactly. It is a
-    -- separate correctness run, not a timing cell: the diff is not
-    -- measured, so the result stays the cat child's wall.
-    if params.check == "yes" then
-        local d = binary("diff", pbf, out)
-        record.diff_exit = d.exit
-        if d.exit ~= 0 then fail("the self-merge output differs from its input (diff exit " .. tostring(d.exit) .. ")") end
-    end
 end

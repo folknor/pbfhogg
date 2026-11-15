@@ -49,7 +49,7 @@ end
 local function bench(name, params, names, calls, page_cache)
     return run {
         bench = name, program = "pbfhogg", params = params, host = HOST, files = files(names),
-        calls = calls, page_cache = page_cache,
+        calls = calls, page_cache = page_cache, since = { ["854f9465"] = true },
     }
 end
 
@@ -93,18 +93,6 @@ for _, mode in ipairs({ "cold", "warm" }) do
     end)
 end
 
-test("dedupe-self --check yes diffs unmeasured after the measured cat", function()
-    local params = { "--dataset", "denmark", "--cache", "cold", "--check", "yes" }
-    local r = bench("dedupe-self", params, { "dk.pbf" }, { wrote(),{ exit = 0 } })
-    assert(r.outcome == "completed", r.reason)
-    prepared(r.calls[1], "cold", { "dk.pbf" })
-    assert(r.calls[2].argv[1] == "diff", r.calls[2].argv[1])
-    unmeasured(r.calls[2])
-    r = bench("dedupe-self", params, { "dk.pbf" }, { wrote(),{ exit = 1 } })
-    assert(r.outcome == "failed", r.outcome)
-    assert(string.find(r.reason, "differs from its input", 1, true), r.reason)
-end)
-
 -- dedupe-pair
 
 local PAIR = { "dk.pbf", "dk-later.pbf" }
@@ -125,17 +113,6 @@ for _, mode in ipairs({ "cold", "warm" }) do
         end)
     end
 end
-
-test("dedupe-pair --check yes diffs unmeasured after the measured cat", function()
-    local params = { "--dataset", "denmark", "--with", "later", "--cache", "warm", "--check", "yes" }
-    local r = bench("dedupe-pair", params, PAIR, { wrote(),{ exit = 0 } })
-    assert(r.outcome == "completed", r.reason)
-    prepared(r.calls[1], "warm", PAIR)
-    unmeasured(r.calls[2])
-    r = bench("dedupe-pair", params, PAIR, { wrote(),{ exit = 1 } })
-    assert(r.outcome == "failed", r.outcome)
-    assert(string.find(r.reason, "differs from the base", 1, true), r.reason)
-end)
 
 -- diff-unindexed and diff-text
 

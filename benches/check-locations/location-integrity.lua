@@ -8,11 +8,10 @@
 -- The fixed variant default is altw-keep-untagged. To reproduce the typed
 -- runner's agreement-dependent default, pass --agreement yes --variant altw.
 -- Bench params cannot express a default conditional on another param.
--- Exit 0 is clean, exit 1 violations, narrowed by expect.check-locations or
--- expect.check-locations-agreement, selected independently by agreement.
--- Before 854f9465 only 0 is trusted; the shared expect module holds that
--- policy. Builds before the locations selector fail on its flag.
--- Marker stops record partial runs without claiming a full verdict.
+-- Exit 0 (clean) and exit 1 (violations) both complete the iteration
+-- (benches/lib/answer.lua); the answer is not judged. Builds before the
+-- locations selector fail on its flag.
+-- A marker stop returns the "stopped" verdict for a partial run.
 -- The marked child supports --hotpath and --alloc, including marker stops.
 -- Direct I/O, io_uring and compression are absent because the typed command
 -- refuses them. Features, commit selection and iteration counts belong to
@@ -21,21 +20,12 @@
 --   brokkr bench --dry-run location-integrity --agreement yes,no
 --   brokkr bench --alloc location-integrity --agreement yes --variant altw
 
-local function key(params)
-    if params.agreement == "yes" then return "check-locations-agreement" end
-    return "check-locations"
-end
-
-local expect = require("expect")
+local answer = require("answer")
 local stops = require("stop")
 local profiling = require("profiling")
 
 function validate(params)
     stops.resolve(params.stop)
-end
-
-function preflight(params)
-    if not params.stop then expect.refuse_untrusted(params, key(params)) end
 end
 
 function bench(params)
@@ -52,7 +42,5 @@ function bench(params)
         record.stopped_at = r.stopped_at
         return "stopped"
     end
-    local verdict = expect.verdict(params, key(params), "check --locations", r)
-    record.check_exit = r.exit
-    return verdict
+    answer.completed("check --locations", r)
 end

@@ -51,19 +51,10 @@ explicitly on every row that writes a PBF (`--compression zlib:6` for
 pbfhogg, `pbf_compression=zlib,pbf_compression_level=6` for osmium), so
 a change of either tool's default cannot move the comparison. The
 timings do not establish that the two tools' outputs are equivalent: a
-successful exit proves the command ran. Equivalence is checked by a
-separate, untimed invocation, `brokkr bench vs-osmium --row ROW
---validate-only yes`, which runs both tools on the row, decodes both
-output PBFs with osmium to OPL including way locations, and compares the
-two spools byte for byte. The policy is ordered entity equality: the
-entities, their order, metadata, tags (in order), references and
-locations must match; file headers and block encoding are excluded. The
-`inspect-tags` and `inspect-tags-way` rows print reports rather than PBFs:
-their validation parses both stdouts into ordered rows of count and key,
-decoding each tool's quoting (osmium doubles quotes, pbfhogg writes JSON
-string literals, see DEVIATIONS.md), and requires the row lists to be
-equal. The `inspect` row has no osmium counterpart and refuses validation.
-To rerun the table, `scripts/vs-osmium.sh PAIRS DATASET OSC` runs every
+successful exit proves the command ran. Whether the outputs agree is
+checked by the verifier, `brokkr run --with pbfhogg pbfhogg-verify --
+CHECK`, whose checks run the same commands against osmium
+(reference/verify.md lists what each establishes). To rerun the table, `scripts/vs-osmium.sh PAIRS DATASET OSC` runs every
 row as `PAIRS` alternating single-iteration pairs (the inspect row,
 pbfhogg only), with `OSC` an explicit key in the dataset's OSC table for
 the apply-changes row; all three arguments are required.

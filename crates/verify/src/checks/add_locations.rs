@@ -1,6 +1,7 @@
 //! Verify: add-locations-to-ways - each pbfhogg node-index engine against
-//! osmium, inline coordinates against pbfhogg's own consistency check, and
-//! the engines against each other.
+//! osmium, element content and, on sorted input, every inline coordinate;
+//! inline coordinates against pbfhogg's own consistency check; and the
+//! engines against each other.
 
 use std::path::{Path, PathBuf};
 
@@ -16,24 +17,28 @@ pub(crate) enum AltwMode {
     All,
 }
 
-/// What a PASS of a single-engine run establishes. `pbfhogg diff` compares
-/// way tags and refs but treats `LocationsOnWays` coordinates as derived data,
-/// not content, so the osmium comparison never sees a coordinate; `check
-/// --locations --agreement` holds each inline coordinate to the node record
-/// the output keeps (most untagged nodes are dropped, so most references have
-/// none) and to the other references of the same absent node. A wrong but
-/// consistent coordinate for a dropped node passes both.
-const SINGLE_CLAIM: &str = "element content and sort declaration match osmium; inline locations \
-                            pass pbfhogg check --locations --agreement; inline locations are \
-                            not compared with osmium";
+/// What a PASS of a single-engine run on sorted input establishes. `pbfhogg
+/// diff` compares way tags and refs but treats `LocationsOnWays` coordinates
+/// as derived data, not content; `check --locations --agreement` holds each
+/// inline coordinate to the node record the output keeps (most untagged
+/// nodes are dropped, so most references have none) and to the other
+/// references of the same absent node. The OPL comparison
+/// ([`opl_with_locations`]) is what holds every inline coordinate, a
+/// dropped node's included, to osmium's.
+const SINGLE_CLAIM: &str = "element content and sort declaration match osmium; the osmium OPL \
+                            decoding with inline locations is identical to osmium's, so every \
+                            inline way coordinate matches at 1e-7 degrees (metadata as libosmium \
+                            decodes it, NUL-free strings); inline locations pass pbfhogg check \
+                            --locations --agreement";
 
 /// [`SINGLE_CLAIM`] plus the engine parity `all` adds: per-kind `digest
-/// --form full` records, which cover every inline coordinate exactly, agree
-/// between the engines. Two engines writing the same wrong coordinate still
-/// pass.
-const ALL_CLAIM: &str = "element content and sort declaration match osmium; inline locations \
-                         pass pbfhogg check --locations --agreement; sparse and external agree \
-                         on full element records; inline locations are not compared with osmium";
+/// --form full` records agree between the engines.
+const ALL_CLAIM: &str = "element content and sort declaration match osmium; each engine's osmium \
+                         OPL decoding with inline locations is identical to osmium's, so every \
+                         inline way coordinate matches at 1e-7 degrees (metadata as libosmium \
+                         decodes it, NUL-free strings); inline locations pass pbfhogg check \
+                         --locations --agreement; sparse and external agree on full element \
+                         records";
 
 /// [`SINGLE_CLAIM`] for the sparse engine on input without the sort claim:
 /// osmium reads an osmium-sorted copy, and sparse's output must not claim
@@ -165,6 +170,18 @@ pub fn run(
     for (engine, out_path) in &produced {
         check_output(harness, &order, osmium_out.as_path(), out_path, *engine)?;
     }
+    if sorted && !produced.is_empty() {
+        let opl_dir = outdir.join("opl");
+        std::fs::create_dir_all(&opl_dir)?;
+        let theirs = decode_opl(harness, &osmium_out, &opl_dir, "osmium")?;
+        for (engine, out_path) in &produced {
+            let verdict = opl_with_locations(harness, &opl_dir, &theirs, out_path, *engine)?;
+            harness.record(
+                &format!("{} OPL with inline locations vs osmium", engine.name()),
+                verdict,
+            );
+        }
+    }
 
     if let [(a, a_out), (b, b_out)] = produced.as_slice() {
         let verdict = engine_parity(harness, (*a, a_out), (*b, b_out))?;
@@ -257,6 +274,69 @@ fn check_output(
     let (verdict, _) = harness.check_locations(&format!("pbfhogg ({name})"), out_path, true)?;
     harness.record(&format!("{name} inline locations"), verdict);
     Ok(())
+}
+
+/// Whether one engine's original output and osmium's decode to the same
+/// osmium OPL with `locations_on_ways=true`, byte for byte: the same
+/// records in the same order, with tags in order, refs, members, metadata
+/// as libosmium decodes it, and every inline way coordinate at osmium's
+/// 1e-7 degrees - a dropped node's included, which `check --locations`
+/// cannot reach. Both files are decoded by osmium, so this judges the
+/// libosmium-decoded record stream: absent metadata fields come out as
+/// osmium's defaults on both sides (DEVIATIONS.md), timestamps are whole
+/// seconds, and a string with an embedded NUL is not represented faithfully.
+/// Only the sorted route runs it: there both tools read the input itself
+/// and write in its order, and the output is compared before any re-sort,
+/// which would drop the inline locations.
+fn opl_with_locations(
+    harness: &mut Harness,
+    opl_dir: &Path,
+    theirs: &Path,
+    out_path: &Path,
+    engine: Engine,
+) -> Result<Verdict, Error> {
+    let name = engine.name();
+    harness.msg(&format!(
+        "--- {name} vs osmium as OPL with inline locations ---"
+    ));
+    let ours = decode_opl(harness, out_path, opl_dir, &format!("pbfhogg-{name}"))?;
+    match crate::stream::first_difference(&ours, theirs)? {
+        None => {
+            harness.msg(&format!("  {name} OPL: PASS (identical)"));
+            Ok(Verdict::Pass)
+        }
+        Some(offset) => {
+            harness.msg(&format!(
+                "  {name} OPL: FAIL (first difference at byte {offset} of {} and {})",
+                ours.display(),
+                theirs.display()
+            ));
+            Ok(Verdict::Fail)
+        }
+    }
+}
+
+/// `osmium cat` of `pbf` to OPL with inline way locations, into
+/// `opl_dir/<stem>.opl`.
+fn decode_opl(
+    harness: &mut Harness,
+    pbf: &Path,
+    opl_dir: &Path,
+    stem: &str,
+) -> Result<PathBuf, Error> {
+    let opl = opl_dir.join(format!("{stem}.opl"));
+    let opl = opl.as_path();
+    let captured = harness.reference(
+        &ToolRun::osmium("add-locations-to-ways.opl.1")
+            .arg("cat")
+            .input(pbf)
+            .args(&["-f", "opl,locations_on_ways=true", "-o"])
+            .output(opl)
+            .arg("--overwrite"),
+        &opl.with_extension("stdout"),
+    )?;
+    harness.require_success(&captured, "osmium cat to OPL")?;
+    Ok(opl.to_path_buf())
 }
 
 fn engine_argv(pbf: &Path, out_path: &Path, engine: Engine, direct_io: bool) -> PbfArgv {

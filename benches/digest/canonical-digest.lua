@@ -10,8 +10,8 @@
 -- the typed runner's capability probe. The resolved form is recorded and
 -- returned as the verdict; use an explicit form for matched comparisons
 -- across the transition, since auto binds the same param on both sides.
--- Digest's stdout report and stderr are recorded. Nonzero exits fail.
--- Marker stops record partial runs without claiming a complete digest.
+-- Digest's stderr is recorded; its stdout report, the answer, is not.
+-- Nonzero exits fail. A marker stop returns the "stopped" verdict.
 -- The marked child supports --hotpath and --alloc, including marker stops.
 -- io_uring and compression are absent because the typed command refuses
 -- them. Features, commit selection and iteration counts belong to the runner.
@@ -40,7 +40,6 @@ function bench(params)
         ["direct-io"] = params["direct-io"] == "yes",
     }):ok()
     record.form = form
-    record.digest = r.stdout
     record.summary = r.stderr
     if params.verbose == "yes" then
         print(r.stdout)

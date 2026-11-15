@@ -6,15 +6,14 @@
 -- geocode-query once, the measured child: it opens the index, draws a fixed
 -- pseudo-random point set uniform in the bbox (a pure function of bbox and
 -- seed, the same on every revision), queries every point once untimed to
--- warm the page cache and tally the answers, then times the given rounds
+-- warm the page cache, then times the given rounds
 -- over the same points. Its warm-up and timed rounds are the marker pairs
 -- GEOCODE_QUERY_WARMUP and GEOCODE_QUERY_ROUNDS.
 --
 -- The ranked wall is the query child's, so it includes process start, the
 -- index open and the warm-up round; the per-query figure to compare is
 -- record.child.us_per_query_best (fastest timed round's mean), with every
--- round's mean beside it. record.child.answer_digest hashes every query's
--- complete answer: two revisions whose digests differ answered differently.
+-- round's mean beside it. The answers are not judged or recorded.
 -- A query error in the warm-up or any timed round fails the instrument, so
 -- r:ok() fails the run: a revision whose queries fail never reads as faster.
 -- Under --hotpath or --alloc the query child is profiled.
@@ -61,12 +60,12 @@ function bench(params)
         }):ok()
     if params.verbose == "yes" then print(r.stderr) end
 
-    -- Reject legacy or unknown schemas rather than comparing partial answers.
+    -- The instrument's measurement fields, each exactly once. The workload
+    -- echo and round summary must describe the requested work, so a
+    -- measurement of some other workload is never recorded as this one.
     local fields = {
         elapsed_ms = true, open_ms = true, queries = true, rounds = true,
         us_per_query_best = true, us_per_query_rounds = true,
-        admin_answered = true, admin_matches = true, addresses = true,
-        streets = true, interpolations = true, answer_digest = true, result_format = true,
     }
     local child = { bbox = bbox }
     for line in string.gmatch(r.stderr, "[^\r\n]+") do
@@ -80,7 +79,7 @@ function bench(params)
         if child[key] == nil then fail("missing geocode field: " .. key) end
     end
     for key in pairs(fields) do
-        if key ~= "answer_digest" and key ~= "us_per_query_rounds" and key ~= "result_format" then
+        if key ~= "us_per_query_rounds" then
             local value = child[key]
             local pattern = key == "us_per_query_best" and "^%d+%.%d%d$" or "^%d+$"
             local n = tonumber(value)
@@ -89,10 +88,6 @@ function bench(params)
             end
             child[key] = n
         end
-    end
-    if child.result_format ~= "reverse-result-v1" then fail("unsupported geocode result_format") end
-    if #child.answer_digest ~= 16 or not child.answer_digest:match("^%x+$") then
-        fail("invalid geocode answer_digest")
     end
     local count, best = 0, math.huge
     local values = child.us_per_query_rounds
@@ -111,9 +106,5 @@ function bench(params)
         or count ~= child.rounds or best ~= child.us_per_query_best then
         fail("geocode workload or round summary mismatch")
     end
-    for _, key in ipairs({ "admin_answered", "addresses", "streets", "interpolations" }) do
-        if child[key] > child.queries then fail("geocode count exceeds queries: " .. key) end
-    end
-    if child.admin_matches < child.admin_answered then fail("geocode admin count mismatch") end
     record.child = child
 end

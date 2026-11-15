@@ -1,14 +1,14 @@
--- Exercise the measured verdict separately from apply-changes preparation.
+-- Exercise the measured diff separately from apply-changes preparation.
+-- Either answer completes; neither is judged or recorded.
 local DATA = project_root .. "/data/"
-local function invoke(name, args, calls, want, trusted)
+local function invoke(name, args, calls, trusted)
     local params = { "--dataset", "fixture" }
     for _, arg in ipairs(args) do params[#params + 1] = arg end
     local files = { [DATA .. "base.pbf"] = "base" }
     if name == "diff-pair" then files[DATA .. "later.pbf"] = "later" else files[DATA .. "9.osc.gz"] = "osc" end
     return run { bench = name, program = "pbfhogg", params = params,
         host = { datasets = { fixture = {
-            expect = { ["diff-snapshots"] = { ["00000000000000000000000000000001+00000000000000000000000000000002"] = want } },
-            pbf = { indexed = { file = "base.pbf", xxhash = "00000000000000000000000000000002", expect = { diff = { ["9"] = want } } } },
+            pbf = { indexed = { file = "base.pbf", xxhash = "00000000000000000000000000000002" } },
             osc = { ["9"] = { file = "9.osc.gz" } },
             snapshot = { later = { pbf = { indexed = { file = "later.pbf", xxhash = "00000000000000000000000000000001" } } } },
         } } }, files = files, calls = calls,
@@ -23,18 +23,16 @@ end
 local PAIR = { "--from", "base", "--to", "later" }
 for _, format in ipairs({ "default", "osc" }) do
     for _, exit in ipairs({ 0, 1 }) do
-        test("diff-pair " .. format .. " records exit " .. exit, function()
+        test("diff-pair " .. format .. " completes on exit " .. exit, function()
             local args = { table.unpack(PAIR) }
             for _, arg in ipairs({ "--format", format, "--jobs", "2" }) do
                 args[#args + 1] = arg
             end
-            local want = exit == 0 and "same" or "differs"
             local out = format == "osc" and "diff.osc" or "diff.txt"
-            local r = invoke("diff-pair", args, { { exit = exit, outputs = { [out] = "abc" } } }, want)
+            local r = invoke("diff-pair", args, { { exit = exit, outputs = { [out] = "abc" } } })
             assert(r.outcome == "completed", r.reason)
-            assert(r.verdict == want and r.record.diff_exit == exit and r.record.output_bytes == 3)
-            assert(r.record.expectation_key == "diff-snapshots.00000000000000000000000000000001+00000000000000000000000000000002")
-            assert(r.record.expectation_applied and r.record.expectation_answer == want)
+            assert(r.verdict == nil and r.record.diff_exit == nil and r.record.output_bytes == 3)
+            assert(r.record.expectation_key == nil)
             assert(r.record.meta.to_snapshot_file == "later.pbf")
             local c = r.calls[1]
             assert(c.measured and c.argv[1] == "diff")
@@ -47,13 +45,11 @@ for _, format in ipairs({ "default", "osc" }) do
     end
 end
 for _, case in ipairs({
-    { exit = 1, trusted = true, want = "same", reason = "declared same" },
-    { exit = 0, trusted = true, want = "differs", reason = "declared differs" },
     { exit = 1, trusted = false, reason = "ended with exit 1" },
     { exit = 2, trusted = true, reason = "ended with exit 2" },
 }) do
     test("diff-pair rejects " .. case.reason, function()
-        local r = invoke("diff-pair", PAIR, { { exit = case.exit, outputs = { ["diff.txt"] = "" } } }, case.want, case.trusted)
+        local r = invoke("diff-pair", PAIR, { { exit = case.exit, outputs = { ["diff.txt"] = "" } } }, case.trusted)
         assert(r.outcome == "failed", r.outcome)
         assert(r.reason:find(case.reason, 1, true), r.reason)
     end)
@@ -64,10 +60,9 @@ for _, indexed in ipairs({ "true", "false" }) do
         local r = invoke("diff-applied", { "--osc", "9", "--jobs", "2" }, {
             { stdout = indexed .. "\n" }, { outputs = { ["merged.osm.pbf"] = "merged" } },
             { exit = 1, outputs = { ["diff.txt"] = "delta" } },
-        }, "differs")
+        })
         assert(r.outcome == "completed", r.reason)
-        assert(r.verdict == "differs" and r.record.output_bytes == 5)
-        assert(r.record.expectation_key == "diff.9" and r.record.expectation_applied)
+        assert(r.verdict == nil and r.record.output_bytes == 5)
         assert(r.record.meta.merged_cache == "miss")
         assert((r.record.meta.diff_pair == "raw-vs-indexed") == (indexed == "false"))
         assert(#r.calls == 3 and not r.calls[1].measured and not r.calls[2].measured and r.calls[3].measured)

@@ -70,6 +70,9 @@ pub(crate) fn run(
     counts.add(h.run_check("tags-filter", |h| {
         checks::tags_filter::run(h, pbf, direct_io)
     })?);
+    counts.add(h.run_check("inspect-tags", |h| {
+        checks::inspect_tags::run(h, pbf, direct_io)
+    })?);
     counts.add(h.run_check("getid-removeid", |h| {
         checks::getid_removeid::run(h, pbf, direct_io)
     })?);

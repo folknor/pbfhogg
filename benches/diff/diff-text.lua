@@ -22,9 +22,11 @@
 -- Read ordered_pool_result_send_wait_ns and diff_text_overflow_* on the
 -- diff child to see whether units outran their channels.
 --
--- Exit 0 (equal) and 1 (different) are both answers; anything else fails.
--- The output size and summary are recorded so arms can be checked for
--- parity.
+-- Exit 0 (equal) and 1 (different) both complete the iteration; the
+-- answer is not judged (benches/lib/answer.lua). The output size and
+-- summary are recorded.
+
+local answer = require("answer")
 
 function preflight(params)
     for _, f in ipairs({ params.old_variant.file, params.new_variant.file }) do
@@ -49,10 +51,7 @@ function bench(params)
     if params.verbose == "yes" then flags.verbose = true end
     if params.common == "no" then flags["suppress-common"] = true end
     local d = binary_with({ warm = { old, new }, measured = true }, "diff", old, new, flags)
-    record.diff_exit = d.exit
-    if d.exit ~= 0 and d.exit ~= 1 then
-        fail("diff exited " .. tostring(d.exit) .. ": " .. d.stderr)
-    end
+    answer.completed("diff", d)
     record.output_bytes = filesize(out)
     record.summary = d.stderr
 end

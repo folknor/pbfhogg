@@ -4,12 +4,9 @@
 -- pairing. No cache preparation: the typed runner does none either.
 -- The child wall matches that workload; iteration wall includes Lua work.
 --
--- Exit 0 is clean, exit 1 violations, narrowed by expect.check-refs for a
--- plain run and expect.check-refs-relations under --check-relations, never
--- one for the other: clean way refs say nothing about relation members,
--- which an extract cuts at its boundary. Before 854f9465, only 0 is
--- trusted; the shared expect module holds that policy.
--- A marker stop records a partial run, without claiming a full verdict.
+-- Exit 0 (clean) and exit 1 (violations) both complete the iteration
+-- (benches/lib/answer.lua); the answer is not judged.
+-- A marker stop returns the "stopped" verdict for a partial run.
 -- The marked child supports --hotpath and --alloc, including marker stops.
 -- Build features belong in the registry. Direct-I/O support is built for
 -- both read modes.
@@ -17,21 +14,12 @@
 --   brokkr bench --dry-run ref-integrity --check-relations yes,no
 --   brokkr bench --hotpath ref-integrity --direct-io yes
 
-local function key(params)
-    if params["check-relations"] == "yes" then return "check-refs-relations" end
-    return "check-refs"
-end
-
-local expect = require("expect")
+local answer = require("answer")
 local stops = require("stop")
 local profiling = require("profiling")
 
 function validate(params)
     stops.resolve(params.stop)
-end
-
-function preflight(params)
-    if not params.stop then expect.refuse_untrusted(params, key(params)) end
 end
 
 function bench(params)
@@ -44,8 +32,6 @@ function bench(params)
         record.stopped_at = r.stopped_at
         return "stopped"
     end
-    local verdict = expect.verdict(params, key(params), "check --refs", r)
-    record.check_exit = r.exit
+    answer.completed("check --refs", r)
     record.summary = r.stderr
-    return verdict
 end

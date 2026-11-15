@@ -21,6 +21,17 @@
 # and goes up, with a changelog entry and a new date, whenever a change
 # makes its runs stop comparing with earlier ones.
 #
+# A bench only benchmarks: it sets up its input, times the workload and
+# records the measurement. It never judges the workload's output - no
+# declared answers, no comparison with another tool, no check that the
+# output is right, no answer returned as the verdict or kept in record.
+# What it may refuse is what makes the measurement not this workload's:
+# invalid params, an input that would take another code path, a child that
+# did not complete (an answer exit such as check's or diff's 1 completes,
+# benches/lib/answer.lua), a measurement block that does not describe the
+# requested work. Checking results is pbfhogg-verify's, run through
+# `brokkr run --with pbfhogg pbfhogg-verify --` (reference/verify.md).
+#
 # Param convention: declare integer/bbox domains here, not hand-parsed Lua
 # replacements. A source lint cannot reliably distinguish those replacements
 # from result-evidence parsing, compression grammar or stricter bbox ordering;
@@ -119,9 +130,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.geocode-query]
 script_file = "../benches/build-geocode-index/geocode-query.lua"
 description = "Reverse geocoding query latency over fixed pseudo-random points, against an index the bench builds"
-version = 3
-date = 2026-11-14
+version = 4
+date = 2026-11-15
 changelog = [
+  { version = 4, date = 2026-11-15, note = "The instrument no longer tallies or digests its answers in the warm-up round, which is inside the ranked child wall, and the bench no longer reads answer fields; only measurement fields are parsed and the workload echo checked" },
   { version = 3, date = 2026-11-14, note = "Runs the pbfhogg-bench instruments instead of the CLI: geocode-build builds the index through the library, geocode-query is the moved instrument, with the same evidence keys; a SIGTERM now cancels at a round boundary; the query child is profiled under --hotpath and --alloc. Revisions before pbfhogg-bench fail at the build" },
   { version = 2, date = 2026-11-11, note = "Require reverse-result-v1 full-answer evidence: answer_digest hashes every query's complete answer, computed in the untimed warm-up; legacy admin-only evidence is refused; the timed query loop is unchanged" },
   { date = 2026-11-11, note = "Fail closed on missing, duplicate, malformed or inconsistent legacy query evidence; label the admin-only result format explicitly" },
@@ -174,9 +186,10 @@ params.replace-snapshot = { choices = ["yes", "no"], default = "no", help = "uns
 [bench.dedupe-self]
 script_file = "../benches/cat/dedupe-self.lua"
 description = "cat --dedupe of a dataset's file with itself, input cold or warm as the merge starts"
-version = 3
-date = 2026-11-11
+version = 4
+date = 2026-11-15
 changelog = [
+  { version = 4, date = 2026-11-15, note = "The check param is gone: the bench no longer diffs its output against its input; the cat child wall is unchanged" },
   { version = 3, date = 2026-11-11, note = "Cache state prepared and checked by brokkr's cold or warm on the measured cat call, replacing dd and fincore; the result is the cat child's wall, without the preparation; resident-byte records dropped, brokkr stores the account" },
   { date = 2026-11-09, note = "Use shared cache helpers; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Warm read moved from the preflight into the timed block, so the iteration wall includes it; the cat child's wall is unchanged" },
@@ -185,14 +198,14 @@ changelog = [
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = "the PBF variant merged with itself" }
 params.cache = { choices = ["cold", "warm"], required = true, help = "the input's page-cache state as the merge starts" }
-params.check = { choices = ["yes", "no"], default = "no", help = "yes: diff the output against the input after the merge (a correctness run, not a timing cell)" }
 
 [bench.dedupe-pair]
 script_file = "../benches/cat/dedupe-pair.lua"
 description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts; inspect counters for passthrough coverage"
-version = 3
-date = 2026-11-11
+version = 4
+date = 2026-11-15
 changelog = [
+  { version = 4, date = 2026-11-15, note = "The check param is gone: the bench no longer diffs its output against the base; the cat child wall is unchanged" },
   { version = 3, date = 2026-11-11, note = "Cache state prepared and checked by brokkr's cold or warm on the measured cat call, replacing dd and fincore; the result is the cat child's wall, without the preparation; resident-byte records dropped, brokkr stores the account" },
   { date = 2026-11-09, note = "Use shared cache helpers; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Warm read moved from the preflight into the timed block, so the iteration wall includes it; the cat child's wall is unchanged" },
@@ -204,16 +217,16 @@ params.base_variant = { from = "datasets.{dataset}.snapshot.{base}.pbf", default
 params.with = { from = "datasets.{dataset}.snapshot", required = true, help = "the second input's snapshot" }
 params.with_variant = { from = "datasets.{dataset}.snapshot.{with}.pbf", default = "indexed", help = "the second input's PBF variant" }
 params.cache = { choices = ["cold", "warm"], required = true, help = "both inputs' page-cache state as the merge starts" }
-params.check = { choices = ["yes", "no"], default = "no", help = "yes: diff the output against the first input after the merge (a correctness run, for a second input that is a subset of the first)" }
 
 # -- check-ids
 
 [bench.id-order]
 script_file = "../benches/check-ids/id-order.lua"
 description = "Check ID ordering, optionally detecting duplicate IDs, on a dataset or snapshot"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-15
 changelog = [
+  { version = 2, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; answers are the verifier check-ids question; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Enabled allocation profiling and retained hotpath capture on marker stops where supported" },
@@ -223,7 +236,6 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
-params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -235,9 +247,10 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read 
 [bench.index-integrity]
 script_file = "../benches/check-index/index-integrity.lua"
 description = "Check every blob's indexdata and tagdata against its payload on a dataset or snapshot"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-15
 changelog = [
+  { version = 2, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
@@ -247,7 +260,6 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
-params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -260,9 +272,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.location-integrity]
 script_file = "../benches/check-locations/location-integrity.lua"
 description = "Check inline way-node coordinates against node records, optionally requiring agreement across ways"
-version = 1
-date = 2026-11-09
+version = 2
+date = 2026-11-15
 changelog = [
+  { version = 2, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "Use the shared expect helper for declared verdicts; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
@@ -271,7 +284,6 @@ changelog = [
 profile = "release"
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
-params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "altw-keep-untagged", help = "the LocationsOnWays input; set altw explicitly for the typed --agreement default" }
@@ -284,9 +296,10 @@ params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print t
 [bench.ref-integrity]
 script_file = "../benches/check-refs/ref-integrity.lua"
 description = "Check way-node references, optionally relation members, on a dataset or snapshot"
-version = 2
-date = 2026-11-09
+version = 3
+date = 2026-11-15
 changelog = [
+  { version = 3, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; answers are the verifier check-refs question; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { date = 2026-11-11, note = "--check-relations yes is judged by expect.check-refs-relations, not expect.check-refs; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Refuse _END and -_END consistently with other stop benches" },
@@ -297,7 +310,6 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
-params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
@@ -310,9 +322,10 @@ params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO or -FOO
 [bench.vs-osmium]
 script_file = "../benches/compare/vs-osmium.lua"
 description = "One row of the guide's CLI command table, pbfhogg or osmium, inputs cold"
-version = 8
-date = 2026-11-12
+version = 9
+date = 2026-11-15
 changelog = [
+  { version = 9, date = 2026-11-15, note = "The validate-only param is gone: output comparison with osmium belongs to pbfhogg-verify, whose add-locations-to-ways check now compares inline way coordinates and whose inspect-tags check compares the tags-count rows; timing arms unchanged" },
   { version = 8, date = 2026-11-12, note = "--validate-only yes also covers inspect-tags and inspect-tags-way: both reports parsed into ordered count and key rows with each tool's quoting decoded, then compared; inspect still refuses; timing arms unchanged" },
   { version = 7, date = 2026-11-11, note = "Add --validate-only yes: a separate run of both PBF-producing arms, both outputs decoded by osmium to OPL with way locations and compared byte for byte; text-report rows refuse it; timing arms unchanged" },
   { version = 6, date = 2026-11-11, note = "Pin zlib level 6 for both writers; driver reads the Lua row registry and requires explicit positive pairs, dataset and dataset-scoped OSC key" },
@@ -328,7 +341,6 @@ params.variant = { from = "datasets.{dataset}.pbf", default = "indexed", help = 
 params.osc = { from = "datasets.{dataset}.osc", help = "the change file, for the apply-changes row only" }
 params.row = { validated = true, required = true, help = "inspect, sort, extract, apply-changes, tags-filter-highway, tags-filter-restaurant, cat-way, inspect-tags, inspect-tags-way, getid, altw-sparse, altw-external" }
 params.tool = { choices = ["pbfhogg", "osmium"], default = "pbfhogg,osmium", help = "pbfhogg, osmium, or both" }
-params.validate-only = { choices = ["yes", "no"], default = "no", help = "yes: run no timing; run both tools and compare their outputs: PBF rows as osmium OPL with way locations, inspect tags rows as decoded count and key rows; inspect refuses" }
 
 # -- degrade
 
@@ -361,9 +373,10 @@ params.unsort = { choices = ["yes", "no"], default = "no", help = "yes: clear So
 [bench.diff-applied]
 script_file = "../benches/diff/diff-applied.lua"
 description = "Diff a base PBF against its applied OSC, measuring the diff child"
-version = 3
-date = 2026-11-14
+version = 4
+date = 2026-11-15
 changelog = [
+  { version = 4, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; workload unchanged" },
   { version = 3, date = 2026-11-14, note = "The refusal-only keep-cache, io-uring and compression params are gone; brokkr refuses them as unknown, and the explicit no-op spellings are refused too; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child; probe every blob with inspect --get indexed and delegate jobs validation to pbfhogg" },
@@ -373,7 +386,6 @@ profile = "release"
 features = ["linux-direct-io"]
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
-params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
 params.jobs = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the worker count; omitted uses the binary default" }
@@ -388,9 +400,10 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "use O_DIRE
 [bench.diff-pair]
 script_file = "../benches/diff/diff-pair.lua"
 description = "Diff two independent snapshots with text or OSC output"
-version = 2
-date = 2026-11-10
+version = 3
+date = 2026-11-15
 changelog = [
+  { version = 3, date = 2026-11-15, note = "The require-expectation param and the declared-answer judging are gone: exit 0 and exit 1 both complete, no verdict is returned and no answer recorded; workload unchanged" },
   { date = 2026-11-11, note = "Add opt-in required expectations and record declaration selection" },
   { version = 2, date = 2026-11-10, note = "Rank iterations by the measured diff child and delegate jobs validation to pbfhogg" },
   { version = 1, date = 2026-11-09, note = "Ported typed diff-snapshots: base or named inputs, shared variant, formats, jobs and profiling" },
@@ -398,7 +411,6 @@ changelog = [
 profile = "release"
 hotpath_features = ["hotpath"]
 alloc_features = ["hotpath-alloc"]
-params.require-expectation = { choices = ["yes", "no"], default = "no", help = "yes: fail if the selected answer declaration is missing; record whether a declaration applied" }
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.format = { choices = ["default", "osc"], default = "default", help = "suppressed-common text or OSC output" }
 params.jobs = { free = true, split = false, help = "forwarded verbatim; pbfhogg validates the worker count; omitted uses the binary default" }
@@ -416,6 +428,7 @@ description = "Text diff without -c, optionally -v, of two indexed snapshots of 
 version = 3
 date = 2026-11-11
 changelog = [
+  { date = 2026-11-15, note = "diff exit 1 completes only from 854f9465 on, as in every answer-exit bench; the exit is no longer recorded; workload unchanged" },
   { version = 3, date = 2026-11-11, note = "Inputs read through and checked by brokkr's warm on the measured diff call, replacing dd and fincore; the result is the diff child's wall, without the read" },
   { date = 2026-11-09, note = "Use shared cache helpers; workload unchanged" },
   { version = 2, date = 2026-11-09, note = "Warm read moved from the preflight into the timed block, so the iteration wall includes it; the diff child's wall is unchanged" },
@@ -435,6 +448,7 @@ description = "Text diff -c of two unindexed snapshots of one dataset, inputs co
 version = 3
 date = 2026-11-11
 changelog = [
+  { date = 2026-11-15, note = "A diff exit 0 now completes too: whether the pair differs is not judged; the exit is no longer recorded; workload unchanged" },
   { version = 3, date = 2026-11-11, note = "Probe both first data blobs outside the measured diff and refuse indexed fronts, establishing sequential dispatch" },
   { version = 2, date = 2026-11-11, note = "Inputs advised out and checked by brokkr's cold on the measured diff call, replacing dd and fincore; the result is the diff child's wall, without the preparation" },
   { date = 2026-11-09, note = "Use shared cache helpers; workload unchanged" },
@@ -454,6 +468,7 @@ description = "diff -v of synthetic 30,000-ref modified ways at the verbose sequ
 version = 1
 date = 2026-11-12
 changelog = [
+  { date = 2026-11-15, note = "The listing is no longer compared line by line after the measured diff, and exit 0 completes too; the sequence-diff unit tests pin the shapes; the measured diff child is unchanged" },
   { version = 1, date = 2026-11-12, note = "Added: disjoint and every-60th-ref-changed way pairs built untimed by getid and apply-changes, measured diff -v -c -j 1" },
 ]
 profile = "release"
@@ -469,6 +484,7 @@ description = "Digest a dataset or snapshot in full or content canonical form"
 version = 1
 date = 2026-11-09
 changelog = [
+  { date = 2026-11-15, note = "The digest report, the answer, is no longer recorded; workload unchanged" },
   { date = 2026-11-09, note = "Use shared stop, profiling helpers; workload unchanged" },
   { version = 1, date = 2026-11-09, note = "Ported typed digest: canonical forms, snapshots, direct I/O and profiling with marker stops" },
 ]

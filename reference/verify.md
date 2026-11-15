@@ -192,7 +192,8 @@ suite because a later comparison cannot make that run complete.
 | `cat` | `osmium cat` | node, way and relation outputs: element diff, strict order and one-way sort-feature comparison |
 | `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
-| `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; content and sort declaration, own inline-location agreement, and full-record engine parity under mode all |
+| `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; content and sort declaration, on sorted input both outputs' osmium OPL with inline locations byte for byte, own inline-location agreement, and full-record engine parity under mode all |
+| `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
 | `getid-removeid` (alias `getid`) | `osmium getid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert count complement, recursive referenced content and tag removal, with absent witnesses named |
 | `extract` | `osmium extract` | strict order, element content and per-strategy membership on the bbox and every configured polygon; simple relations follow the any-direct-node-or-way rule judged against complete_ways |
 | `multi-extract` | sequential pbfhogg extracts | simple config output per region has strict order and identical element content, for strips alone and, when configured, strips plus polygons |
@@ -256,17 +257,33 @@ Check-refs reads pbfhogg's original input and osmium's sorted copy when
 needed. It accepts osmium exit 1 only with the complete final summary and
 requires empty stdout. It does not accept `--direct-io`.
 
+Inspect-tags runs `pbfhogg inspect tags` and `osmium tags-count` on the
+input, over every kind and over ways alone. Both reports are parsed whole
+into rows of decimal count, tab, one quoted key and newline, any other byte
+failing the comparison; osmium's doubled-quote quoting (a tab or newline in
+a key written literally) and pbfhogg's JSON string literal are each decoded,
+and the row lists must be equal in order, which DEVIATIONS.md promises. A
+pbfhogg key holding a NUL makes the check an error, not a verdict, since
+libosmium cannot count such a key faithfully.
+
 Add-locations-to-ways accepts `--mode sparse|external|all` (default all).
 On input without the optional sort feature, external must refuse with exit
 2, one Unsorted advice naming the input, and no published output. External
 alone runs no osmium comparison there. Sparse follows the unsorted content
 comparison route; all names both routes and omits engine parity there.
 Every selected engine runs before output checks, and a failed engine is
-recorded while the other still runs. Inline coordinates are never compared
-with osmium: agreement checks kept node records and repeated references,
-and parity compares the engines' full element records, ignoring the header
-digest. Both engines could share a wrong coordinate for a dropped node.
-`--inject-prepass` is refused before any check launches: enriched output is
+recorded while the other still runs. On sorted input each engine's original
+output and osmium's are decoded by `osmium cat -f
+opl,locations_on_ways=true` and must be identical byte for byte: the same
+records in order, tags in order, references, members, metadata as libosmium
+decodes it (absent fields become its defaults on both sides, timestamps are
+whole seconds) and every inline way coordinate at 1e-7 degrees, a dropped
+node's included. A string with an embedded NUL is outside what that
+decoding represents faithfully. On unsorted input inline coordinates are
+not compared with osmium, since the comparison runs through re-sorted
+copies that drop them. Agreement checks kept node records and repeated
+references, and parity compares the engines' full element records,
+ignoring the header digest. `--inject-prepass` is refused before any check launches: enriched output is
 osmium-incompatible.
 
 Getid-removeid requires a non-history snapshot with true indexdata claims

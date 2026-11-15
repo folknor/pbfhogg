@@ -19,11 +19,15 @@
 -- --ways amortises the fixed part. -j 1 because these compressible ways
 -- fit one frame, so more workers would not schedule more searches.
 --
--- The diff must exit 1 and print, under every way, exactly the replacement
--- or itemized script its shape demands; anything else fails the iteration.
+-- Exit 0 and exit 1 both complete the iteration (benches/lib/answer.lua);
+-- the listing is not judged. That each shape gets its replacement or its
+-- itemized script is pinned by the sequence-diff unit tests in
+-- crates/lib/src/commands/diff/seq.rs and the replaced-line formatting
+-- test in crates/cli/tests/cli_diff.rs.
 --
 --   brokkr bench --iterations 5 diff-verbose-budget
 --   brokkr bench diff-verbose-budget --ways 12
+local answer = require("answer")
 local REFS = 30000
 local STEP = 60
 -- --ways is capped at 12 in brokkr.d/benches.toml: each OSC is built as one
@@ -60,35 +64,6 @@ local function osc(action, ways, modified)
     return table.concat(parts)
 end
 
-local function expected(w, ways)
-    local lines = { "*w" .. w .. " v1 -> v2" }
-    if w <= ways then
-        lines[2] = "  refs: " .. REFS .. " -> " .. REFS .. ", old @0.." .. REFS
-            .. " -> new @0.." .. REFS .. " replaced (details omitted)"
-        return lines
-    end
-    for i = 0, REFS - 1, STEP do lines[#lines + 1] = "  -ref @" .. i .. " n" .. (i + 1) end
-    for i = 0, REFS - 1, STEP do lines[#lines + 1] = "  +ref @" .. i .. " n" .. (i + 1 + REFS) end
-    return lines
-end
-
-local function check(text, ways)
-    local want = {}
-    for w = 1, 2 * ways do
-        for _, line in ipairs(expected(w, ways)) do want[#want + 1] = line end
-    end
-    local n = 0
-    for line in string.gmatch(text, "([^\n]*)\n") do
-        n = n + 1
-        if line ~= want[n] then
-            fail("diff output line " .. n .. " is '" .. line .. "', expected '" .. tostring(want[n]) .. "'")
-        end
-    end
-    if n ~= #want then
-        fail("diff printed " .. n .. " lines, expected " .. #want)
-    end
-end
-
 function bench(params)
     local ways = tonumber(params.ways)
     local base = output("base.osm.pbf")
@@ -106,12 +81,8 @@ function bench(params)
     local d = binary_with({ measured = true }, "diff", old, new, {
         output = out, overwrite = true, verbose = true, ["suppress-common"] = true, jobs = 1,
     })
-    record.diff_exit = d.exit
     record.ways = ways
-    if d.exit ~= 1 then
-        fail("diff exited " .. tostring(d.exit) .. ", expected 1: " .. d.stderr)
-    end
+    answer.completed("diff", d)
     record.output_bytes = filesize(out)
     record.summary = d.stderr
-    check(read(out), ways)
 end

@@ -34,8 +34,9 @@
 --
 -- Cache handling is dedupe-self's: the cat call is `cold` or `warm` over
 -- both inputs, so brokkr prepares and checks both before launch, and the
--- call is `measured`, so the result is the cat child's wall. --cache and
--- --check are checked by their choices in brokkr.d/benches.toml.
+-- call is `measured`, so the result is the cat child's wall. --cache is
+-- checked by its choices in brokkr.d/benches.toml. The output is not
+-- judged.
 
 function preflight(params)
     for _, f in ipairs({ params.base_variant.file, params.with_variant.file }) do
@@ -60,18 +61,4 @@ function bench(params)
     binary_with({ [params.cache] = { base, with }, measured = true },
         "cat", base, with, { dedupe = true, output = out, overwrite = true }):ok()
     record.output_bytes = filesize(out)
-    -- --check yes diffs the output against the base with the same build.
-    -- For a second input whose elements are a subset of the base's (both
-    -- shapes above) the merge must have the base's element content; diff
-    -- exit 0 says that much, not that metadata or encoding match. A
-    -- correctness run, not a timing cell.
-    -- This is explicitly an output-equals-base assertion, not evidence that
-    -- every arbitrary snapshot pair should have that answer. Non-subset
-    -- pairs are valid timing inputs with --check no. A changed overlapping
-    -- element can also fail this assertion even when IDs form a subset.
-    if params.check == "yes" then
-        local d = binary("diff", base, out)
-        record.diff_exit = d.exit
-        if d.exit ~= 0 then fail("the merge output differs from the base (diff exit " .. tostring(d.exit) .. ")") end
-    end
 end

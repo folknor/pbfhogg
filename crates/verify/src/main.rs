@@ -208,6 +208,8 @@ enum Check {
     Repack(PbfArgs),
     Degrade(PbfArgs),
     TagsFilter(TagsArgs),
+    /// pbfhogg inspect tags vs osmium tags-count
+    InspectTags(PbfArgs),
     MergeChanges(MergeArgs),
     Getparents(PbfArgs),
     #[command(alias = "getid")]
@@ -492,6 +494,7 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
             })?))
         }
         Check::Cat(pbf)
+        | Check::InspectTags(pbf)
         | Check::Getparents(pbf)
         | Check::GetidRemoveid(pbf)
         | Check::Ids(pbf)
@@ -501,6 +504,7 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
             h.run.watch(&input)?;
             let (name, run): (&str, checks::ReadCheck) = match check {
                 Check::Cat(_) => ("cat", checks::cat::run),
+                Check::InspectTags(_) => ("inspect-tags", checks::inspect_tags::run),
                 Check::Ids(_) => ("check-ids", checks::check_ids::run),
                 Check::Repack(_) => ("repack", checks::repack::run),
                 Check::Degrade(_) => ("degrade", checks::degrade::run),
@@ -779,6 +783,7 @@ mod tests {
             "repack",
             "degrade",
             "tags-filter",
+            "inspect-tags",
             "getparents",
             "getid-removeid",
             "getid",

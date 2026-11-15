@@ -213,8 +213,8 @@ fn merge_failures_exit_nonzero_without_a_block() {
     assert_eq!(usage.status.code(), Some(2), "{}", usage.stderr);
 }
 
-/// geocode-build makes an index, and geocode-query over it prints the full
-/// block in the shape the script checks, the same answers on a second run.
+/// geocode-build makes an index, and geocode-query over it prints its
+/// measurement block in the shape the script reads, and nothing else.
 #[test]
 fn geocode_query_reports_its_block_over_a_built_index() {
     let scratch = crate::common::test_scratch();
@@ -248,23 +248,13 @@ fn geocode_query_reports_its_block_over_a_built_index() {
         "rounds",
         "us_per_query_best",
         "us_per_query_rounds",
-        "admin_answered",
-        "admin_matches",
-        "addresses",
-        "streets",
-        "interpolations",
-        "result_format",
-        "answer_digest",
     ] {
         assert!(keys.contains_key(key), "no {key}: {}", first.stderr);
     }
+    assert_eq!(keys.len(), 6, "only measurement fields: {}", first.stderr);
     assert_eq!(keys["queries"], "200");
     assert_eq!(keys["rounds"], "2");
     assert_eq!(keys["us_per_query_rounds"].split(',').count(), 2);
-    assert_eq!(keys["result_format"], "reverse-result-v1");
-    assert_eq!(keys["answer_digest"].len(), 16);
-    let second = query("second");
-    assert_eq!(second.keys()["answer_digest"], keys["answer_digest"]);
 }
 
 /// A built index, from the library's minimal geocode input.

@@ -18,9 +18,10 @@
 --
 --   brokkr bench --iterations 1 --commit REF diff-unindexed --dataset germany --new 20260420
 --
--- The pair must differ, so exit 0 fails the run as surely as exit 2. The
--- output size and the summary are recorded so arms can be checked for
--- parity.
+-- Exit 0 and exit 1 both complete the iteration; the answer is not judged
+-- (benches/lib/answer.lua). The output size and the summary are recorded.
+
+local answer = require("answer")
 
 function preflight(params)
     for _, f in ipairs({ params.old_variant.file, params.new_variant.file }) do
@@ -58,10 +59,7 @@ function bench(params)
     local flags = { ["suppress-common"] = true, output = out, overwrite = true }
     if params.type ~= "all" then flags.type = params.type end
     local d = binary_with({ cold = { old, new }, measured = true }, "diff", old, new, flags)
-    record.diff_exit = d.exit
-    if d.exit ~= 1 then
-        fail("diff exited " .. tostring(d.exit) .. ", expected 1 for a differing pair: " .. d.stderr)
-    end
+    answer.completed("diff", d)
     record.output_bytes = filesize(out)
     record.summary = d.stderr
 end

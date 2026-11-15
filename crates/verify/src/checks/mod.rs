@@ -8,6 +8,7 @@ pub(crate) mod add_locations;
 pub(crate) mod cat;
 pub(crate) mod check_refs;
 pub(crate) mod getparents;
+pub(crate) mod inspect_tags;
 pub(crate) mod tags_filter;
 pub(crate) type ReadCheck = fn(
     &mut crate::harness::Harness,

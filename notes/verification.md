@@ -31,13 +31,6 @@ without failing on large hosts); a ticket's units versus its simultaneous runs; 
 `host::FdPool` tests holding a ticket by convention. Every current heavy holder runs
 `write_base_pbf` (one way blob, so one 256-file fleet), well under the witnessed shape.
 
-## VER-014 - Empty textlint globs and stale exclusions are only audit-enforced
-
-Every rule in `brokkr.d/lints.toml` now has a `must_scan` sentinel, and the old coverage
-script and its migration manifest are retired. brokkr still lets an empty `paths` glob or
-a stale exclusion pass an ordinary check; only its audit flags them. Brokkr side: bz
-brokkr#157.
-
 ## VER-018 - The gate's backend requirement checks refusals, not execution
 
 io_uring cells assert a registered pool and serialize on a locked-memory lease;
@@ -65,23 +58,14 @@ or nested include in an included file), and the authoritative composed check is
 composed-configuration parse is ever wanted, which needs a brokkr configuration export
 brokkr does not offer.
 
-## VER-107 - The musl sweeps assume an x86_64 host
+## VER-131 - The test-module audit assumes target_arch is x86_64
 
-Reported by check-machinery.
+Reported by the link implementer that moved the musl test sweeps to `{host_arch}`.
 
-Both executable musl sweeps in `brokkr.d/checks.toml` hard-code `x86_64-unknown-linux-musl`,
-now with comments and a host restriction stated in `reference/testing.md`. On aarch64 they
-would be cross-builds with foreign executables. Residue is brokkr-side check planning:
-resolve a runnable target from host capability, or refuse an unexecutable target before
-building. Filed as bz brokkr#170.
-
-## VER-112 - Orphaned expectation keys are not rejected
-
-The six integrity and diff benches take `--require-expectation yes|no` through the shared
-`selected` helper in `benches/lib/expect.lua`. Still open: configuration validation rejecting
-orphaned digest-pair and OSC expectation keys (bz brokkr#161 is closed without a
-close message; whether it landed orphan-key validation is unverified), and an
-independent oracle for the correct answer.
+`cfg_value` in `crates/source-policy/src/rules/test_modules.rs` evaluates `target_arch` as
+always `x86_64`. The executable musl sweeps now follow the host architecture, so on an
+aarch64 host the test-module audit would judge arch-gated test modules against the wrong
+architecture. No effect on x86_64 hosts.
 
 ## VER-113 - dedupe-pair does not prove its copy path
 
@@ -103,6 +87,42 @@ defect can affect both sides.
 Fix: an equality policy per check and an independent decoder for promised fields. Full digest strengthens
 same-project checks but is no independent oracle. Enforcement: negative controls altering each field class.
 Brokkr side filed as bz brokkr#156.
+
+Partly met: `add-locations-to-ways` on sorted input now also compares both tools' outputs as
+`osmium cat -f opl,locations_on_ways=true`, byte for byte, which covers metadata as libosmium
+decodes it, tag order and every inline coordinate. The same ordered-OPL comparison is still
+missing from sort, cat, tags-filter, getid-removeid and extract (complete_ways and smart, whose
+membership the verifier already reconciles), and it needs a per-command enrichment policy
+first: indexed `cat --type` and passthrough `sort` keep inline way coordinates that plain
+`osmium cat`/`sort` drop, so on a LocationsOnWays input the OPL must omit locations there
+(and pbfhogg's re-encoding sort drops them, so enabling them on osmium is wrong too).
+apply-changes cannot take it: its documented delete deviation makes an ordered cmp fail by
+design. The vs-osmium bench's removed `--validate-only` had this comparison for every PBF row
+but was only ever run on the inspect-tags rows.
+
+## VER-132 - No real-data oracle for cat --dedupe
+
+The dedupe-self and dedupe-pair benches used to diff their output against the input with
+pbfhogg's own diff (`--check yes`); a bench no longer judges, and pbfhogg-verify has no dedupe
+check. `osmium merge` is not an oracle: it orders its queue by object comparison including
+timestamp, so for a shared type, ID and version with differing content its survivor need not be
+pbfhogg's earliest-input copy, and it rejects repeated ID and version inside one input. A sound
+check needs a narrow domain: inputs with unique ID and version keys, the self-merge
+`dedupe(A, A)` compared with A as osmium OPL *without* inline locations (dedupe drops enrichment
+in overlap blobs, docs/cli/commands.md), and a subset pair built by the verifier (B derived from
+A independently, then the contracted projection of `dedupe(A, B)` against A) to cover
+passthrough stretches and overlap transitions. Unsorted input must be held to dedupe's refusal,
+and unindexed input needs its forced fallback. Precedence on conflicting copies is covered only
+by crates/cli/tests/cli_cat.rs fixtures.
+
+## VER-133 - Geocode answers have no real-data verification
+
+The geocode-query bench used to record per-class answer counts and an FNV digest of every
+answer, so two revisions could be seen to answer differently; that was answer evidence inside a
+measured child and is gone. Nothing outside the library tests (crates/lib/tests/geocode_*.rs,
+synthetic fixtures) checks reverse-geocode answers, and pbfhogg-verify has no geocode check.
+The vendored traccar-geocoder is the natural reference.
+
 
 ## VER-123 - Verify uses the build output directory as its workspace
 

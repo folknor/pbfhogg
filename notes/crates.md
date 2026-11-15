@@ -409,11 +409,9 @@ verdict may rest on the code under test. It keeps its own header walker
   refusal.
 - Verdicts are consumed by nobody but the terminal, the exit code and
   `brokkr history`. The `expect` tables in the host files are not verify
-  output: they are read by brokkr's typed answer commands
-  (`src/pbfhogg/expect.rs`) and by pbfhogg's own Lua benches
-  (`params.variant.expect`, `params.dataset.expect` in `benches/diff/`,
-  `check-ids`, `check-refs`, `check-index`, `check-locations`), and
-  promotion writes one kind of them. Porting verify touches none.
+  output: they are read only by brokkr's typed answer commands
+  (`src/pbfhogg/expect.rs`); pbfhogg's Lua benches no longer judge
+  answers, and promotion writes none. Porting verify touches none.
 
 ## Order
 

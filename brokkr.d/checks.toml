@@ -8,12 +8,10 @@
 #                 linux-direct-io + linux-io-uring. The hooks are a compiler
 #                 cfg, not a feature, so no feature unification can put them
 #                 in a product build; the sweeps that test them (all,
-#                 all-serial, musl-all) pass it as rustflags. brokkr's
-#                 rustdoc phase does not carry a sweep's `--cfg` into
-#                 rustdoc's flags, so it documents these sweeps without the
-#                 hooks: hook-only doc comments go unlinted until it does.
-#                 A per-sweep RUSTDOCFLAGS env would leak into ad-hoc runs,
-#                 which union entry env but not rustflags.
+#                 all-serial, musl-all) pass it as rustflags. brokkr
+#                 carries a sweep's `--cfg` and `--check-cfg` rustflags into
+#                 rustdocflags, so these sweeps are documented and
+#                 doctested with the hooks on.
 #                 Mirrors what --all-features used to
 #                 pull in MINUS hotpath (the profiling features have
 #                 their own lane, cli-hotpath and harness-hotpath below)
@@ -133,17 +131,17 @@ parallel = {}
 # The glibc-only allocator calls (mallopt, mallinfo2, malloc_trim) are gated
 # on target_env = "gnu"; this sweep builds, lints and runs the suite against
 # musl so an ungated call fails here rather than in a downstream musl build.
-# These executable sweeps require an x86_64 Linux host able to execute musl
-# binaries directly. A per-sweep target is a literal triple, not a host
-# capability selector. Brokkr refuses configured runners but does not check
-# direct executability before building; foreign hosts fail when listing tests.
-# Host-capability resolution or an early refusal belongs in brokkr's check
-# planner, not a project script or a silent compile-only replacement. Both
-# musl sweeps below retain executable coverage until that support exists.
+# The executable musl sweeps follow the host: `{host_arch}` is the
+# architecture of the compiler cargo would use, so the target is
+# x86_64-unknown-linux-musl on an x86_64 host and aarch64-unknown-linux-musl
+# on an aarch64 one (which needs that rustup target installed). Brokkr prints
+# a planning line when a test lane's target differs from the compiler host.
+# The gate-only musl lint sweeps further down stay literal x86_64: they only
+# compile, so they need no executable target.
 [[check]]
 name = "musl"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
-target = "x86_64-unknown-linux-musl"
+target = "{host_arch}-unknown-linux-musl"
 parallel = {}
 
 # The `all` feature shape on musl. The default-feature `musl` sweep above
@@ -159,7 +157,7 @@ name = "musl-all"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
-target = "x86_64-unknown-linux-musl"
+target = "{host_arch}-unknown-linux-musl"
 parallel = {}
 
 # The shipped build profile: opt-level 3, fat LTO, one codegen unit, so

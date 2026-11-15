@@ -94,10 +94,11 @@ Surveyed 2026-11-10. Each item names where the move must touch it.
 - `brokkr.d/lints.toml`: every `[[textlint]]` rule has root-relative
   globs (`src/**`, `cli/src/**`, `harness/src/**`, `tests/**`,
   `cli/tests/**`, `harness/tests/**`) and exact paths in `exclude` and
-  `must_scan`. A glob that selects nothing is neither a failure nor a
-  warning in an ordinary check; only `brokkr check --audit` reports it
-  (`brokkr man conventions shared-convention-path-selectors`). This is the
-  main way a half-done move goes green.
+  `must_scan`. At survey time a glob that selected nothing was neither a
+  failure nor a warning in an ordinary check, only `brokkr check --audit`
+  reported it, and that was the main way a half-done move went green.
+  Every rule now sets brokkr's `require_live_paths`, so a dead paths glob
+  fails an ordinary check.
 - `scripts/check_source_invariants.py` globs `src/**/*.rs` and
   `cli/src/**/*.rs` (an empty glob is silent) and reads `cli/src/lib.rs`
   and `src/scratch.rs` (loud). `scripts/check_doc_links.py` special-cases
@@ -183,13 +184,10 @@ plan above, decided while doing it:
   its own, past the 20 s per-test kill however rows were dealt. The sweep
   now splits that row's ordinals over four units (`SPLIT` in the `tier3`
   module) and deals units to six shards, each under about 7 s.
-- `scripts/textlint_coverage.py record` also refuses a dead selector
-  (glob, exclude or `must_scan`), so the pinned manifest cannot start
-  blind. The manifest is `notes/crates-textlint-coverage.json` (38 rules,
-  6951 admitted paths, counts equal to brokkr's audit printout). It pins
-  file sets, so a `.rs` file added before step 2 shows up as "gained":
-  re-record immediately before the move. Step 2's gate is
-  `textlint_coverage.py check notes/crates-textlint-coverage.json --moved`.
+- Step 4's admitted-set recorder was a one-off for the move; its `record`
+  mode and pinned manifest were retired in b2923a40 once step 2's gate had passed,
+  and brokkr's `require_live_paths` now holds the dead-selector part
+  permanently.
 - `scripts/rewrite_citations.py` (move map shared through
   `scripts/move_map.py`): `list --out notes/crates-citations.txt` is the
   dry run (407 repo-root, 2 file-relative links, 34 package-relative, 1

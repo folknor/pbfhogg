@@ -1,7 +1,8 @@
 # Every textlint rule pins representative files with must_scan, so a dead
-# corpus fails an ordinary check. Sentinels pin representative scope;
-# they do not prove every glob or exclusion is live. Brokkr owns selector
-# validation; its check --audit reports stale selectors and exclusions.
+# corpus fails an ordinary check, and every rule sets require_live_paths,
+# so a paths glob that selects no present file, or an exclude that excuses
+# every file paths selects, also fails it. must_scan still proves the named
+# files are actually scanned; a dead exclude glob alone stays legal.
 # AGENTS.md's document-folder rule, enforced rather than trusted: nothing
 # durable (reference/, docs/, code comments) may cite notes/, and durable
 # docs must not point at files that no longer exist. Reads tracked files
@@ -62,6 +63,7 @@ when = "gate"
 # `set_mmap_threshold`) stay legal, and `region = "code"` lets comments
 # discuss the calls by name.
 [[textlint]]
+require_live_paths = true
 name = "glibc-allocator-calls-live-in-debug"
 pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -84,6 +86,7 @@ message = "glibc-only allocator calls belong in target_env gnu gated debug/proce
 # would silently drop CLI tests out of those sweeps. Comment lines are exempt
 # so the explanation can name the features.
 [[textlint]]
+require_live_paths = true
 name = "no-library-feature-gates-in-tests-common"
 pattern = 'feature\s*=\s*"(?:commands|geocode-reader)"'
 paths = ["crates/lib/tests/common/**/*.rs"]
@@ -97,6 +100,7 @@ message = "crates/lib/tests/common is shared with pbfhogg-cli, where `commands` 
 # module anywhere else, would bring back process-global hooks and the
 # one-process-per-test machinery they needed.
 [[textlint]]
+require_live_paths = true
 name = "no-static-fault-hook-state"
 pattern = '^\s*(?:pub(?:\([^)]*\))?\s+)?static\s'
 paths = ["crates/lib/src/test_hooks.rs"]
@@ -105,6 +109,7 @@ must_scan = ["crates/lib/src/test_hooks.rs"]
 message = "fault-hook state lives in FaultPlan, carried by the run's Invocation token; a static would fire in every concurrent test of the process"
 
 [[textlint]]
+require_live_paths = true
 name = "fault-hooks-only-in-test-hooks"
 pattern = '\bmod\s+\w*test_hooks\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -114,6 +119,7 @@ must_scan = ["crates/lib/src/test_hooks.rs"]
 message = "fault hooks go in pbfhogg::test_hooks (crates/lib/src/test_hooks.rs) as FaultPlan fields, not in a module of their own"
 
 [[textlint]]
+require_live_paths = true
 name = "no-print-macro"
 pattern = '\b(?:print|println)!\s*[\(\[\{]'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs", "crates/verify/src/**/*.rs"]
@@ -122,6 +128,7 @@ must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crate
 message = "print!/println! panic when stdout's reader goes away (pbfhogg ... | head); in the CLI write through output::buffered, in the library into a caller-supplied io::Write"
 
 [[textlint]]
+require_live_paths = true
 name = "no-stdout-handle"
 # Child pipe access does not acquire the driver's stdout handle.
 except = ['\.stdout\b']
@@ -136,6 +143,7 @@ message = "only the CLI and driver output modules and the harness describe write
 # sources intentionally spell them when building or checking literal fixtures.
 # The renumber wire rewriter also uses `DenseNodes` as a protobuf field label.
 [[textlint]]
+require_live_paths = true
 name = "header-features-via-feature-constants"
 pattern = '"(?:OsmSchema-V0\.6|DenseNodes|Sort\.Type_then_ID|LocationsOnWays|HistoricalInformation|pbfhogg\.WayMembers-v1|pbfhogg\.SharedNodePins-v1)"'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs"]
@@ -163,6 +171,7 @@ message = "Use the Feature constants from read/block.rs for PBF header feature n
 # are left to review, as is an `.unwrap_or(` whose `""` rustfmt leaves on
 # the next line.
 [[textlint]]
+require_live_paths = true
 name = "read-side-ok-is-deliberate"
 pattern = '\.ok\(\)'
 paths = ["crates/lib/src/read/**/*.rs", "crates/lib/src/blob_meta/**/*.rs", "crates/lib/src/osc/**/*.rs", "crates/lib/src/owned.rs"]
@@ -184,6 +193,7 @@ message = "A .ok() on validated read-side data swallows a broken invariant; pani
 # into an empty tag key, role, value or user name. Matched on the raw line
 # (`region = "code"` would blank the literal), so comment lines are exempt.
 [[textlint]]
+require_live_paths = true
 name = "read-side-no-empty-string-fallback"
 pattern = '\.unwrap_or\(""\)'
 paths = ["crates/lib/src/read/**/*.rs", "crates/lib/src/blob_meta/**/*.rs", "crates/lib/src/osc/**/*.rs", "crates/lib/src/owned.rs"]
@@ -201,6 +211,7 @@ message = "An empty-string fallback on read-side data writes a silent wrong tag,
 # test whose subject is the infallible iterator itself marks the call
 # ok-deliberate with its reason.
 [[textlint]]
+require_live_paths = true
 name = "test-oracles-no-error-to-empty"
 pattern = '\.unwrap_or\(""\)|\bResult::ok\b|\.tags\(\)'
 paths = ["crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -209,6 +220,7 @@ must_scan = ["crates/lib/tests/common/mod.rs", "crates/lib/tests/common/model.rs
 message = "A test oracle must refuse an unresolvable value, not read it as empty or end a tag list early; use tags_checked and expect the Result"
 
 [[textlint]]
+require_live_paths = true
 name = "no-process-mutation"
 pattern = '\blibc::(?:mallopt|setrlimit|prlimit|prlimit64)\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -226,6 +238,7 @@ message = "Process mutations belong to the caller's explicit process toolbox"
 # not proof: an aliased or wrapped import, or a dependency that starts a
 # process, escapes them.
 [[textlint]]
+require_live_paths = true
 name = "no-child-process-or-descriptor-reset"
 pattern = '\bprocess::(?:Command|Child|Stdio|CommandExt)\b|\buse\s+std::process::\{[^}]*\b(?:Command|CommandExt|Child)\b|\blibc::(?:fork|vfork|exec\w*|posix_spawn\w*|daemon|clone3?|close|close_range|closefrom|dup|dup2|dup3|ioctl)\b|\b(?:F_SETFD|FD_CLOEXEC|FIONBIO)\b|\bfrom_raw_fd\b'
 # The library harness inherits brokkr's lease descriptor just as the CLI
@@ -238,6 +251,7 @@ message = "The CLI promises it starts no other process and leaves inherited desc
 # The same promise covers file-status flags. The one F_SETFL clears O_NONBLOCK
 # on a descriptor crates/lib/src/read/input.rs opened itself.
 [[textlint]]
+require_live_paths = true
 name = "no-file-status-flag-change"
 pattern = '\bF_SETFL\b'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
@@ -262,6 +276,7 @@ stage = "pre-test"
 # statvfs in altw (sparse preallocation, external scratch precheck) guards
 # scratch writes and sizes no host resource.
 [[textlint]]
+require_live_paths = true
 name = "no-host-probe"
 pattern = 'available_parallelism|/proc/meminfo'
 paths = ["crates/lib/src/**/*.rs"]
@@ -276,6 +291,7 @@ message = "Host probes must use Resources at the original program point"
 # assume an alignment. Matching the identifier, not one call spelling,
 # also catches a flags variable built elsewhere.
 [[textlint]]
+require_live_paths = true
 name = "o-direct-opens-through-direct-io"
 pattern = '\bO_DIRECT\b'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs"]
@@ -289,6 +305,7 @@ message = "O_DIRECT files open through crate::direct_io (create_for_write, open_
 # span, so no library phase and no other CLI site may spell either name.
 # `crates/cli/src/host.rs` defines them and `CommandInterval` is their one emitter.
 [[textlint]]
+require_live_paths = true
 name = "cli-command-interval-names-reserved"
 pattern = 'CLI_COMMAND_(?:START|END)'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
@@ -298,6 +315,7 @@ must_scan = ["crates/lib/src/read/blob.rs", "crates/cli/src/io_reach.rs", "crate
 message = "CLI_COMMAND_START and CLI_COMMAND_END are the CLI's reserved command-interval markers; only host::CommandInterval emits them"
 
 [[textlint]]
+require_live_paths = true
 name = "no-public-reader-in-commands"
 pattern = '\b(?:BlobReader|ElementReader)::(?:open|from_path|from_path_direct|from_path_with_eviction)\b'
 paths = ["crates/lib/src/commands/**/*.rs", "crates/lib/src/geocode_index/builder/**/*.rs", "crates/lib/src/scan/**/*.rs", "crates/lib/src/osc/**/*.rs"]
@@ -319,6 +337,7 @@ message = "Command readers must inherit the caller's host"
 # step. What the owners do with them is checked in review and by the
 # harness's page-cache-keep scenario, not here.
 [[textlint]]
+require_live_paths = true
 name = "input-eviction-armed-only-by-the-reader"
 pattern = '\b(?:evict_page_cache|from_path_with_eviction)\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -329,6 +348,7 @@ must_scan = ["crates/lib/src/read/pipeline.rs", "crates/lib/src/read/header_walk
 message = "input page-cache eviction is armed only by BlobReader and ElementReader, from the host's PageCachePolicy or a public caller's opt-in; library code inherits the caller's policy"
 
 [[textlint]]
+require_live_paths = true
 name = "input-eviction-step-only-in-the-reader"
 pattern = '\bevict_consumed_prefix\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -339,6 +359,7 @@ must_scan = ["crates/lib/src/read/pipeline.rs", "crates/lib/src/read/header_walk
 message = "FileReader::evict_consumed_prefix runs only from BlobReader's armed eviction step"
 
 [[textlint]]
+require_live_paths = true
 name = "counted-input-eviction-only-from-the-reader"
 pattern = '\bevict_input\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -358,6 +379,7 @@ message = "fadvise::evict_input is called only by FileReader::evict_consumed_pre
 # `std` thread spawns outside `crate::threads::scope`, `JoinedPool` and the
 # session threads that keep and join their handles.
 [[textlint]]
+require_live_paths = true
 name = "no-ambient-rayon"
 pattern = '\brayon::(?:spawn|join|scope|in_place_scope|broadcast)\b|build_global'
 paths = ["crates/lib/src/**/*.rs"]
@@ -367,6 +389,7 @@ must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Library rayon tasks must go through the caller's host::Executor, not an ambient pool"
 
 [[textlint]]
+require_live_paths = true
 name = "no-eprint-macro"
 pattern = '\beprint(?:ln)?!'
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs", "crates/library/src/**/*.rs", "crates/datasets/src/**/*.rs", "crates/verify/src/**/*.rs"]
@@ -387,6 +410,7 @@ message = "Library diagnostics must use the caller's Diagnostics handle; the CLI
 # outside the repository stay unseen. must_scan pins representative files
 # (including the shared child owner); it is not proof of filesystem ownership.
 [[textlint]]
+require_live_paths = true
 name = "test-scratch-via-test-scratch-crate"
 pattern = '\benv::temp_dir\b|\btempfile::(?:tempdir(?:_in)?|tempfile(?:_in)?|spooled_tempfile(?:_in)?|SpooledTempFile|NamedTempFile|Builder|TempDir)\b|\b(?:TempDir|NamedTempFile)::new(?:_in)?\b|\b(?:tempfile_in|tempdir_in)\s*\('
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs"]
@@ -399,6 +423,7 @@ message = "Test scratch constructors belong only in pbfhogg-test-scratch; use sc
 # (crates/source-policy/src/rules/host_independence.rs); this text rule
 # covers only the examples, which that corpus does not read.
 [[textlint]]
+require_live_paths = true
 name = "test-children-only-through-owned-runners"
 pattern = '\bCommand\s*::\s*new\b'
 paths = ["crates/lib/examples/**/*.rs"]
@@ -407,6 +432,7 @@ must_scan = ["crates/lib/examples/gen_test_pbf.rs", "crates/lib/examples/stale_w
 message = "Examples start no process; test children are constructed only where the source-policy rule host_independence lists"
 
 [[textlint]]
+require_live_paths = true
 name = "repository-root-only-through-test-scratch"
 pattern = '\bCARGO_MANIFEST_DIR\b'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs", "crates/source-policy/src/**/*.rs"]
@@ -416,6 +442,7 @@ must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_paral
 message = "Use pbfhogg_test_scratch::repository_root(); only the fixture generator resolves its manifest directory"
 
 [[textlint]]
+require_live_paths = true
 name = "executable-tests-never-read-checked-in-pbf"
 pattern = 'test\.osm\.pbf'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs"]
@@ -425,6 +452,7 @@ must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_paral
 message = "Build executable test inputs in scratch; test.osm.pbf is reserved for doc examples and its generator"
 
 [[textlint]]
+require_live_paths = true
 name = "no-fixed-test-data-paths"
 pattern = '(^|["/])data/'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs"]
@@ -435,6 +463,7 @@ message = "Derive test data paths from owned scratch, never a fixed data/ litera
 # Fixture counters used to generate reusable names instead of fresh cells.
 # Match naming spellings, not unrelated atomic synchronization flags.
 [[textlint]]
+require_live_paths = true
 name = "no-static-fixture-name-counters"
 pattern = '\bstatic\s+(?:[A-Z0-9_]*(?:COUNTER|FIXTURE|NEXT|SEQ|RUN|_ID)[A-Z0-9_]*)\s*:\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*AtomicU(?:size|8|16|32|64)\b'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs", "crates/lib/examples/**/*.rs"]
@@ -449,6 +478,7 @@ message = "Use TestScratch::cell() for fixture names instead of a static name co
 # counters, cancellation or lifecycle, and none leaks one with Box::leak.
 # Spelling-bound tripwires: a type alias escapes them.
 [[textlint]]
+require_live_paths = true
 name = "no-static-test-hosts"
 pattern = '\bstatic\s+\w+\s*:[^=]*\b(?:Host|Entered|Invocation)\b'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -458,6 +488,7 @@ must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/fault_derive_paral
 message = "A test owns its Host, Entered and Invocation values; hand them through a per-test fixture, never a static"
 
 [[textlint]]
+require_live_paths = true
 name = "no-leak-in-tests"
 pattern = '\bBox::leak\b'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/src/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -472,6 +503,7 @@ message = "Test values drop with the test; keep the owner in the test and borrow
 # on the runner or competes for the global pool. Ambient is chosen only where
 # it is the subject, marked on its line.
 [[textlint]]
+require_live_paths = true
 name = "no-ambient-executor-in-tests"
 pattern = '\bExecutor::Ambient\b'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/src/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -485,6 +517,7 @@ message = "Tests use the test host's own executor pool; choose Executor::Ambient
 # (crates/lib/tests/process_setup.rs); fixtures and host constructors
 # change no process state. The real-limit scenarios own their processes.
 [[textlint]]
+require_live_paths = true
 name = "no-limit-changes-in-test-fixtures"
 pattern = '\braise_nofile_to_hard_cap\b|\blibc::setrlimit\b'
 paths = ["crates/lib/src/**/*.rs", "crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -503,6 +536,7 @@ message = "Fixtures change no process state; the descriptor limit is raised once
 # pipe; a drain without it stays unseen. Library and harness unit tests under
 # src/ cannot reach the test-tree helpers and stay out of scope.
 [[textlint]]
+require_live_paths = true
 name = "test-fifos-created-only-by-make-fifo"
 pattern = '\bmkfifo\s*\('
 paths = ["crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -512,6 +546,7 @@ must_scan = ["crates/lib/tests/fault_derive_parallel.rs", "crates/cli/tests/cli_
 message = "Create test FIFOs with crate::common::make_fifo"
 
 [[textlint]]
+require_live_paths = true
 name = "test-fifo-drains-only-in-fifo-capture"
 pattern = '\bF_SETPIPE_SZ\b'
 paths = ["crates/lib/tests/**/*.rs", "crates/cli/tests/**/*.rs", "crates/harness/tests/**/*.rs"]
@@ -527,6 +562,7 @@ message = "Drain a test FIFO with crate::fifo_capture::FifoCapture, the one wake
 # `crates/lib/src/error.rs`, which owns the constructors and the io carrier, out of scope.
 # The library crate only: the CLI's `Box<dyn Error>` is its program boundary.
 [[textlint]]
+require_live_paths = true
 name = "no-io-error-other"
 pattern = '\bio::Error::other\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -536,6 +572,7 @@ must_scan = ["crates/lib/src/read/blob.rs"]
 message = "io::Error::other flattens a typed error into an opaque Other; use a pbfhogg::Error constructor (Error::internal and friends) or keep the original io::Error"
 
 [[textlint]]
+require_live_paths = true
 name = "no-io-error-new-other"
 pattern = '\bErrorKind::Other\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -545,6 +582,7 @@ must_scan = ["crates/lib/src/read/blob.rs"]
 message = "io::ErrorKind::Other discards what failed; pick the real io kind, or a pbfhogg::Error constructor"
 
 [[textlint]]
+require_live_paths = true
 name = "no-io-error-restringing"
 pattern = '\bio::Error::new\(\s*\w+\.kind\(\)\s*,\s*(?:\w+\.to_string\(\)|format!)'
 paths = ["crates/lib/src/**/*.rs"]
@@ -554,6 +592,7 @@ must_scan = ["crates/lib/src/read/blob.rs"]
 message = "Rebuilding an io::Error from its own kind and text loses its OS error and its source; add context with Error::context instead"
 
 [[textlint]]
+require_live_paths = true
 name = "no-map-err-to-string"
 pattern = '\.map_err\(\|\w+\|\s*\w+\.to_string\(\)\)'
 paths = ["crates/lib/src/**/*.rs"]
@@ -563,6 +602,7 @@ must_scan = ["crates/lib/src/read/blob.rs"]
 message = "map_err to a String flattens the error's kind and cause; propagate the typed error and add context with Error::context"
 
 [[textlint]]
+require_live_paths = true
 name = "no-string-error-result"
 pattern = '\bResult<(?:[^;{<>,]|<(?:[^<>]|<[^<>]*>)*>)*,\s*String>'
 paths = ["crates/lib/src/**/*.rs"]
@@ -572,6 +612,7 @@ must_scan = ["crates/lib/src/read/blob.rs"]
 message = "A String error carries no kind and no cause; return pbfhogg::Result"
 
 [[textlint]]
+require_live_paths = true
 name = "no-box-dyn-error"
 pattern = 'Box<dyn (?:std::error::)?Error'
 paths = ["crates/lib/src/**/*.rs"]
@@ -584,6 +625,7 @@ message = "Box<dyn Error> erases the error's kind; return pbfhogg::Result"
 # (`Error::invalid_data`, `Error::internal`, `new_blob_error`, ...), so a new
 # classification is one reviewed place.
 [[textlint]]
+require_live_paths = true
 name = "no-error-kind-construction"
 pattern = '\bnew_error\(\s*(?:crate::error::)?ErrorKind::'
 paths = ["crates/lib/src/**/*.rs"]
@@ -599,6 +641,7 @@ message = "Build errors with the constructors in error.rs, not new_error(ErrorKi
 # literal, which `region = "code"` blanks out, so this rule scans the whole
 # file (no region).
 [[textlint]]
+require_live_paths = true
 name = "no-error-interpolated-into-message"
 pattern = '\b(?:invalid_argument|invalid_data|internal)\(\s*format!\(.*\{(?:e|err|error|source)(?::[^}]*)?\}'
 paths = ["crates/lib/src/**/*.rs"]
@@ -619,6 +662,7 @@ message = "Do not interpolate an error into a new error's message; keep it as th
 # pair to report the syncs a publication did, and never writes them. The
 # scan covers every library file, so a new writer file cannot escape it.
 [[textlint]]
+require_live_paths = true
 name = "writer-paired-counters-only-through-the-funnel"
 pattern = '\b(?:sync_all_ns|sync_all_calls|recv_wait_ns)\b'
 paths = ["crates/lib/src/**/*.rs"]
@@ -649,6 +693,7 @@ message = "writer counters sync_all_ns, sync_all_calls and recv_wait_ns are move
 # and keeps its own `parallel_gzip_*` counters. The next rule keeps the PBF
 # loop's records and completeness check out of it.
 [[textlint]]
+require_live_paths = true
 name = "writer-loop-primitives-only-in-the-shared-loop"
 pattern = '\b(?:pop_ready|check_stream_complete|record_recv_wait|record_reorder_high_water)\b'
 paths = ["crates/lib/src/write/**/*.rs"]
@@ -662,6 +707,7 @@ must_scan = [
 message = "the receive, reorder and completeness loop is pipeline::deliver_in_order; a backend implements OutputSink instead of looping itself"
 
 [[textlint]]
+require_live_paths = true
 name = "gzip-writer-uses-no-pbf-loop-records"
 pattern = '\b(?:check_stream_complete|record_recv_wait|record_reorder_high_water|SeqTotal)\b'
 paths = ["crates/lib/src/write/parallel_gzip.rs"]
@@ -682,6 +728,7 @@ message = "the OSC gzip writer keeps its own parallel_gzip_* counters and proves
 # write/metrics.rs (defines emit and emit_once), write/mod.rs (the hook) and
 # crates/cli/src/lib.rs (the exit path that calls it).
 [[textlint]]
+require_live_paths = true
 name = "writer-counters-emitted-only-from-the-exit-hook"
 pattern = '\.\s*emit_once\s*\('
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs"]
@@ -703,6 +750,7 @@ message = "writer counters are an invocation total; emit them only from the end-
 # CLI's exit path and the library harness's runner (once per call, after it
 # returns) call it; write/mod.rs defines it.
 [[textlint]]
+require_live_paths = true
 name = "writer-counter-hook-called-only-from-the-cli-exit-path"
 pattern = '\bemit_writer_counters\s*\('
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
@@ -726,6 +774,7 @@ message = "emit_writer_counters is the once-per-invocation exit hook; only the C
 # is called only by the hook (read/mod.rs); the hook only by the CLI exit path
 # and the library harness's runner.
 [[textlint]]
+require_live_paths = true
 name = "read-pool-counters-emitted-only-from-the-exit-hook"
 pattern = '\bemit_decompress_pool_counters\s*\('
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs"]
@@ -742,6 +791,7 @@ must_scan = [
 message = "pool-drop counters are an invocation total; only pbfhogg::read::emit_read_counters (read/mod.rs) emits them"
 
 [[textlint]]
+require_live_paths = true
 name = "read-counter-hook-called-only-from-the-cli-exit-path"
 pattern = '\bemit_read_counters\s*\('
 paths = ["crates/lib/src/**/*.rs", "crates/cli/src/**/*.rs", "crates/harness/src/**/*.rs"]
@@ -777,6 +827,7 @@ stage = "pre-clippy"
 # The identifier tripwire also catches importing sleep under an alias; it
 # intentionally covers the complete two modules, which have no sleep use.
 [[textlint]]
+require_live_paths = true
 name = "counter-modules-do-not-sleep"
 pattern = '\bsleep\b'
 paths = ["crates/lib/src/counters.rs", "crates/lib/src/write/metrics.rs"]
@@ -789,6 +840,7 @@ message = "Counter tests use exact inputs and slow-path handshakes instead of sl
 # fs::read under aliases; renamed fs modules and custom wrappers need review.
 # Small protocol and executable-test captures outside scenarios stay legal.
 [[textlint]]
+require_live_paths = true
 name = "scale-scenarios-do-not-read-whole-files"
 pattern = '\bfs\s*::\s*(?:read|read_to_string)\b|\b(?:read_to_end|read_to_string)\b'
 paths = ["crates/harness/src/scenarios/**/*.rs"]

@@ -376,14 +376,16 @@ belong in `serial::`; that module is for tests whose cost (memory, for
 instance) makes concurrent runs undesirable, and `brokkr check --profile
 serial` is how they get their sequential run.
 
-The executable `musl` and `musl-all` sweeps currently require an x86_64
-Linux host able to execute `x86_64-unknown-linux-musl` binaries directly.
-Their literal targets do not adapt to aarch64 hosts. The `riscv64` lint
+The executable `musl` and `musl-all` sweeps target
+`{host_arch}-unknown-linux-musl`, which brokkr resolves to the
+architecture of the host compiler: `x86_64-unknown-linux-musl` on an
+x86_64 host, `aarch64-unknown-linux-musl` on an aarch64 one (that host
+needs the rustup target installed). The gate-only musl lint sweeps keep
+literal x86_64 triples, since they only compile. The `riscv64` lint
 sweep is compile-only coverage of the guard fallback, not executable
-musl coverage. Brokkr refuses configured target runners, but needs a
-planner capability check to refuse an unexecutable target before building
-or resolve a native musl target. Until then this is a host restriction
-of the configured gate, not a portable execution guarantee.
+musl coverage. Brokkr refuses configured target runners and prints a
+planning line for a test lane whose target differs from the compiler
+host; it does not refuse such a lane before building.
 
 Three further tested sweeps run in the gate only. `release` runs the
 library and CLI suites in the shipped release profile (fat LTO, debug
@@ -784,10 +786,10 @@ exception, not a tier - should not survive across many PRs.
   executable; only an explicit `--cfg pbfhogg_test_hooks` in rustflags
   can, in debug or release alike. The workspace declares the cfg in its
   check-cfg list, so a misspelled predicate is a diagnostic. The hook
-  sweeps in `brokkr.d/checks.toml` pass it as `rustflags`. The
-  rustdoc phase does not receive it (brokkr carries no sweep `--cfg`
-  into rustdoc's flags), so doc comments on hook-only items are not
-  linted. The test-module audit reads the sweeps' rustflags
+  sweeps in `brokkr.d/checks.toml` pass it as `rustflags`. Brokkr carries a sweep's `--cfg` and `--check-cfg`
+  rustflags into rustdocflags, so the rustdoc phase and the doctests
+  of those sweeps see the hooks too and doc comments on hook-only items
+  are linted. The test-module audit reads the sweeps' rustflags
   for it, so a hook-gated test module counts as covered only while some
   sweep sets the cfg.
 - **Fault plans ride the token.** `pbfhogg::test_hooks` is the one

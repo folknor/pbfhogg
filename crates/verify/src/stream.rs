@@ -97,23 +97,6 @@ pub(crate) fn preview(
     Ok((lines, more))
 }
 
-/// Whether the file holds any byte that is not ASCII whitespace.
-pub(crate) fn has_content(path: &Path) -> Result<bool, Error> {
-    let mut reader = open(path)?;
-    // loop-ends: end of file or the first non-whitespace byte.
-    loop {
-        let buf = reader.fill_buf().map_err(|e| read_error(path, &e))?;
-        if buf.is_empty() {
-            return Ok(false);
-        }
-        if buf.iter().any(|b| !b.is_ascii_whitespace()) {
-            return Ok(true);
-        }
-        let len = buf.len();
-        reader.consume(len);
-    }
-}
-
 /// The byte offset at which two files first differ (a length difference
 /// counts at the shorter one's end), or `None` when they are identical.
 pub(crate) fn first_difference(a: &Path, b: &Path) -> Result<Option<u64>, Error> {
@@ -192,11 +175,7 @@ mod tests {
     fn file_helpers_read_through_fixed_buffers() {
         let scratch = pbfhogg_test_scratch::scratch();
         let a = scratch.path().join("a.txt");
-        let blank = scratch.path().join("blank.txt");
         std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
-        std::fs::write(&blank, " \n\n").unwrap();
-        assert!(super::has_content(&a).unwrap());
-        assert!(!super::has_content(&blank).unwrap());
         let (lines, more) = super::preview(&a, 2, 2).unwrap();
         assert_eq!(lines, vec!["on".to_owned(), "tw".to_owned()]);
         assert!(more);

@@ -1,7 +1,23 @@
-//! Shared inspect-based element counts for comparison context.
-use crate::{error::Error, harness::Harness, inspect_report};
-pub(crate) use inspect_report::InspectCounts as Counts;
+//! Element counts for comparison context, as osmium decodes them.
 use std::path::Path;
-pub(crate) fn inspect_counts(h: &mut Harness, pbf: &Path) -> Result<Counts, Error> {
-    Ok(inspect_report::inspect(h, pbf, false)?.counts())
+
+use crate::{error::Error, harness::Harness};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Counts {
+    pub nodes: u64,
+    pub ways: u64,
+    pub relations: u64,
+}
+
+/// osmium's object counts of `pbf`, read from its OPL decoding
+/// (`crate::opl_compare::order`).
+pub(crate) fn osmium_counts(h: &mut Harness, pbf: &Path) -> Result<Counts, Error> {
+    let (_, [nodes, ways, relations]) =
+        crate::opl_compare::order(h, pbf, &pbf.with_extension("counts.opl"))?;
+    Ok(Counts {
+        nodes,
+        ways,
+        relations,
+    })
 }

@@ -1,0 +1,456 @@
+//! The element comparison every check that once asked `pbfhogg diff` uses:
+//! osmium decodes each side to OPL (`osmium cat -f opl,...`), and the
+//! verifier merges the two record streams itself.
+//!
+//! The merge reads both OPL files once, line by line, keyed by kind and ID.
+//! Each stream must ascend strictly by kind (node, way, relation) and then
+//! non-negative ID, so the pass also certifies, as osmium decodes them, that
+//! neither side repeats an object or is out of order: an identical
+//! duplicate cannot hide as common. A record is the whole OPL line, compared
+//! byte for byte. Every identity in only one stream, or in both with unequal
+//! lines, is handed to the caller as a [`Group`] and written to a listing
+//! (`-` first, `+` second), so classification is the caller's.
+//!
+//! This judges osmium-decoded records under a [`Policy`], not wire fields:
+//! libosmium fills absent metadata with its defaults on both sides,
+//! timestamps are whole seconds, coordinates are at 1e-7 degrees, and its
+//! OPL writer stops a string at an embedded NUL. OPL escapes the separators
+//! (`=`, `,`, space, `@`, `%`), so tag boundaries are part of what is
+//! compared, unlike osmium diff's checksum. With `metadata` off the OPL
+//! carries no version, timestamp, changeset, user or visibility, which is
+//! sound only for non-history files of visible objects; with `locations`
+//! off it carries no inline way coordinate.
+
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use crate::error::Error;
+use crate::harness::Harness;
+use crate::reference::ToolRun;
+
+/// What a comparison reads from each object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Policy {
+    /// Version, timestamp, changeset, user and visibility.
+    pub metadata: bool,
+    /// Inline way-node coordinates (`locations_on_ways=true`).
+    pub locations: bool,
+}
+
+impl Policy {
+    /// Every field osmium decodes.
+    pub(crate) const FULL: Self = Self {
+        metadata: true,
+        locations: true,
+    };
+    /// Metadata, no inline coordinates.
+    pub(crate) const NO_LOCATIONS: Self = Self {
+        metadata: true,
+        locations: false,
+    };
+    /// Element content only: tags, coordinates of nodes, refs and members.
+    pub(crate) const CONTENT: Self = Self {
+        metadata: false,
+        locations: false,
+    };
+
+    fn format(self) -> String {
+        let mut format = String::from("opl");
+        if !self.metadata {
+            format.push_str(",add_metadata=false");
+        }
+        if self.locations {
+            format.push_str(",locations_on_ways=true");
+        }
+        format
+    }
+
+    /// The comparison of two files: inline coordinates are read when both
+    /// headers declare `LocationsOnWays`. A command may drop the declaration
+    /// with its coordinates (a re-encode warns `header.way_metadata_loss`),
+    /// and a reference tool may write none; where coordinates are a
+    /// command's promise, the check holds the declaration itself.
+    pub(crate) fn between(a: &Path, b: &Path) -> Result<Self, Error> {
+        let declares = |p: &Path| -> Result<bool, Error> {
+            Ok(crate::pbf_frames::header(p)?.optional_feature("LocationsOnWays"))
+        };
+        Ok(if declares(a)? && declares(b)? {
+            Self::FULL
+        } else {
+            Self::NO_LOCATIONS
+        })
+    }
+}
+
+/// How an identity differs between the two sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Class {
+    FirstOnly,
+    SecondOnly,
+    Differs,
+}
+
+/// One identity the two sides do not hold alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Group {
+    pub class: Class,
+    /// Node 0, way 1, relation 2.
+    pub kind: usize,
+    pub id: i64,
+}
+
+/// What a merge counted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Merged {
+    /// Objects per kind on each side.
+    pub first: [u64; 3],
+    pub second: [u64; 3],
+    pub same: u64,
+    pub first_only: u64,
+    pub second_only: u64,
+    pub differs: u64,
+}
+
+impl Merged {
+    pub(crate) fn identical(&self) -> bool {
+        self.first_only == 0 && self.second_only == 0 && self.differs == 0
+    }
+}
+
+/// `osmium cat` of `pbf` to OPL under `policy`, into `opl`.
+pub(crate) fn decode(
+    harness: &mut Harness,
+    pbf: &Path,
+    opl: &Path,
+    policy: Policy,
+) -> Result<(), Error> {
+    let format = policy.format();
+    // A file decoded twice in one check gets a fresh decoding each time.
+    for stale in [opl.to_path_buf(), opl.with_extension("stdout")] {
+        match std::fs::remove_file(&stale) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let captured = harness.reference(
+        &ToolRun::osmium("opl-compare.1")
+            .arg("cat")
+            .input(pbf)
+            .args(&["-f", &format, "-o"])
+            .output(opl)
+            .arg("--overwrite")
+            .uncached(),
+        &opl.with_extension("stdout"),
+    )?;
+    harness.require_success(&captured, "osmium cat to OPL")
+}
+
+/// Compare `first` with `second` under `policy`: both decoded to OPL beside
+/// `listing`, merged, every [`Group`] handed to `each` in object order and
+/// written to `listing`. The OPL pair is removed once merged; on an error it
+/// stays for diagnosis. A stream out of strict order, a negative ID or a
+/// line that is not an object is an error naming the file.
+pub(crate) fn compare(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+) -> Result<Merged, Error> {
+    let a = listing.with_extension("first.opl");
+    let b = listing.with_extension("second.opl");
+    decode(harness, first, &a, policy)?;
+    decode(harness, second, &b, policy)?;
+    let merged = merge(&a, &b, listing, each)?;
+    harness.msg(&format!(
+        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
+        listing.display(),
+        merged.same,
+        merged.first_only,
+        merged.second_only,
+        merged.differs
+    ));
+    // The listing holds every differing record from both sides, so the
+    // decodings, each as large as its input, are not kept even then.
+    for opl in [&a, &b] {
+        std::fs::remove_file(opl)?;
+    }
+    Ok(merged)
+}
+
+/// Whether `pbf`'s objects strictly ascend by kind and non-negative ID as
+/// osmium decodes them, and its object count per kind: an OPL decoding
+/// (no metadata, no inline coordinates) beside `opl`, scanned for its keys
+/// and removed. `osmium fileinfo -e` cannot stand in: it refuses a file
+/// whose ways lack their nodes (an invalid-location geometry error), which
+/// every way-only or filtered output is.
+pub(crate) fn order(
+    harness: &mut Harness,
+    pbf: &Path,
+    opl: &Path,
+) -> Result<(bool, [u64; 3]), Error> {
+    decode(harness, pbf, opl, Policy::CONTENT)?;
+    let mut stream = Stream::open(opl)?;
+    let mut ordered = true;
+    let mut last = None;
+    while let Some(key) = stream.read_record()? {
+        if last.is_some_and(|last| key <= last) {
+            ordered = false;
+        }
+        last = Some(key);
+    }
+    let counts = stream.counts;
+    drop(stream);
+    std::fs::remove_file(opl)?;
+    Ok((ordered, counts))
+}
+
+/// One OPL stream: its current record and the key it last held.
+struct Stream {
+    path: PathBuf,
+    reader: BufReader<File>,
+    line: Vec<u8>,
+    number: u64,
+    key: Option<(usize, i64)>,
+    counts: [u64; 3],
+}
+
+impl Stream {
+    fn open(path: &Path) -> Result<Self, Error> {
+        let file = File::open(path)
+            .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            reader: BufReader::new(file),
+            line: Vec::new(),
+            number: 0,
+            key: None,
+            counts: [0; 3],
+        })
+    }
+
+    fn error(&self, why: &str) -> Error {
+        Error::Failed(format!(
+            "OPL {} line {}: {why}",
+            self.path.display(),
+            self.number
+        ))
+    }
+
+    /// Advance to the next record, requiring strict order; `None` at the
+    /// end.
+    fn next(&mut self) -> Result<Option<(usize, i64)>, Error> {
+        let Some(key) = self.read_record()? else {
+            return Ok(None);
+        };
+        if self.key.is_some_and(|last| key <= last) {
+            return Err(self.error(
+                "an object at or below the previous one: the stream is not in strict kind and ID \
+                 order",
+            ));
+        }
+        self.key = Some(key);
+        Ok(Some(key))
+    }
+
+    /// Advance to the next record and count it, whatever its order.
+    fn read_record(&mut self) -> Result<Option<(usize, i64)>, Error> {
+        self.line.clear();
+        let read = self
+            .reader
+            .read_until(b'\n', &mut self.line)
+            .map_err(|e| Error::Failed(format!("cannot read {}: {e}", self.path.display())))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        self.number += 1;
+        if self.line.pop() != Some(b'\n') {
+            return Err(self.error("no terminating newline (truncated?)"));
+        }
+        let key = parse_key(&self.line).map_err(|why| self.error(why))?;
+        self.counts[key.0] += 1;
+        Ok(Some(key))
+    }
+}
+
+/// The kind and ID an OPL object line opens with.
+fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
+    let (&letter, rest) = line.split_first().ok_or("an empty line")?;
+    let kind = match letter {
+        b'n' => 0,
+        b'w' => 1,
+        b'r' => 2,
+        _ => return Err("a line that is not a node, way or relation"),
+    };
+    let end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+    let digits = &rest[..end];
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err("an object ID that is not a non-negative decimal");
+    }
+    let id = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or("an object ID out of range")?;
+    Ok((kind, id))
+}
+
+/// Merge two OPL files (see the module documentation), writing each
+/// differing identity's lines to `listing`.
+pub(crate) fn merge(
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    mut each: impl FnMut(Group),
+) -> Result<Merged, Error> {
+    let mut a = Stream::open(first)?;
+    let mut b = Stream::open(second)?;
+    let mut out = BufWriter::new(File::create(listing)?);
+    let mut merged = Merged::default();
+    let mut ka = a.next()?;
+    let mut kb = b.next()?;
+    loop {
+        let class = match (ka, kb) {
+            (None, None) => break,
+            (Some(x), Some(y)) if x == y => {
+                if a.line == b.line {
+                    merged.same += 1;
+                    ka = a.next()?;
+                    kb = b.next()?;
+                    continue;
+                }
+                Class::Differs
+            }
+            (Some(x), Some(y)) if x < y => Class::FirstOnly,
+            (Some(_), None) => Class::FirstOnly,
+            _ => Class::SecondOnly,
+        };
+        let (kind, id) = match class {
+            Class::SecondOnly => kb,
+            _ => ka,
+        }
+        .ok_or_else(|| Error::tool("merge lost its key"))?;
+        if class != Class::SecondOnly {
+            out.write_all(b"-")?;
+            out.write_all(&a.line)?;
+            out.write_all(b"\n")?;
+        }
+        if class != Class::FirstOnly {
+            out.write_all(b"+")?;
+            out.write_all(&b.line)?;
+            out.write_all(b"\n")?;
+        }
+        each(Group { class, kind, id });
+        match class {
+            Class::FirstOnly => {
+                merged.first_only += 1;
+                ka = a.next()?;
+            }
+            Class::SecondOnly => {
+                merged.second_only += 1;
+                kb = b.next()?;
+            }
+            Class::Differs => {
+                merged.differs += 1;
+                ka = a.next()?;
+                kb = b.next()?;
+            }
+        }
+    }
+    out.flush()?;
+    merged.first = a.counts;
+    merged.second = b.counts;
+    Ok(merged)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::unwrap_in_result)]
+    use super::*;
+
+    fn run(a: &str, b: &str) -> Result<(Merged, Vec<Group>, String), Error> {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (pa, pb, pl) = (dir.join("a.opl"), dir.join("b.opl"), dir.join("l.txt"));
+        std::fs::write(&pa, a).unwrap();
+        std::fs::write(&pb, b).unwrap();
+        let mut groups = Vec::new();
+        let merged = merge(&pa, &pb, &pl, |g| groups.push(g))?;
+        Ok((merged, groups, std::fs::read_to_string(&pl).unwrap()))
+    }
+
+    #[test]
+    fn identical_streams_are_identical_and_counted() {
+        let text = "n1 v1 Ta=b x1 y1\nn2 v1 T x1 y2\nw5 v1 T Nn1,n2\nr7 v1 T Mw5@\n";
+        let (merged, groups, listing) = run(text, text).unwrap();
+        assert!(merged.identical());
+        assert_eq!(merged.same, 4);
+        assert_eq!(merged.first, [2, 1, 1]);
+        assert!(groups.is_empty());
+        assert!(listing.is_empty());
+    }
+
+    #[test]
+    fn a_shifted_tag_boundary_differs() {
+        // osmium diff's checksum feeds tags without lengths, so these two
+        // collide there; the OPL records do not.
+        let (merged, groups, _) = run("n1 v1 Ta=bc x1 y1\n", "n1 v1 Tab=c x1 y1\n").unwrap();
+        assert_eq!(merged.differs, 1);
+        assert_eq!(
+            groups,
+            [Group {
+                class: Class::Differs,
+                kind: 0,
+                id: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn one_sided_identities_are_classified_in_object_order() {
+        let (merged, groups, listing) =
+            run("n1 v1\nn3 v1\nw2 v1\n", "n2 v1\nn3 v1\nr1 v1\n").unwrap();
+        assert_eq!(
+            (merged.first_only, merged.second_only, merged.same),
+            (2, 2, 1)
+        );
+        let classes: Vec<_> = groups.iter().map(|g| (g.class, g.kind, g.id)).collect();
+        assert_eq!(
+            classes,
+            [
+                (Class::FirstOnly, 0, 1),
+                (Class::SecondOnly, 0, 2),
+                (Class::FirstOnly, 1, 2),
+                (Class::SecondOnly, 2, 1),
+            ]
+        );
+        assert_eq!(listing, "-n1 v1\n+n2 v1\n-w2 v1\n+r1 v1\n");
+    }
+
+    #[test]
+    fn repeats_disorder_negatives_and_garbage_are_errors() {
+        let ok = "n1 v1\n";
+        // An identical duplicate on both sides cannot pass as common.
+        assert!(run("n1 v1\nn1 v1\n", "n1 v1\nn1 v1\n").is_err());
+        assert!(run("n2 v1\nn1 v1\n", ok).is_err());
+        assert!(run("w1 v1\nn5 v1\n", ok).is_err());
+        assert!(run(ok, "n-1 v1\n").is_err());
+        assert!(run(ok, "c1 k1\n").is_err());
+        assert!(run(ok, "n1 v1").is_err());
+        assert!(
+            run("n0 v1\nn1 v1\n", "n0 v1\nn1 v1\n")
+                .unwrap()
+                .0
+                .identical()
+        );
+    }
+
+    #[test]
+    fn the_policy_spells_osmiums_opl_options() {
+        assert_eq!(Policy::FULL.format(), "opl,locations_on_ways=true");
+        assert_eq!(Policy::NO_LOCATIONS.format(), "opl");
+        assert_eq!(Policy::CONTENT.format(), "opl,add_metadata=false");
+    }
+}

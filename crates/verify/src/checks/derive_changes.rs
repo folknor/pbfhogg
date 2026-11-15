@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
+use crate::opl_compare::Policy;
 use crate::osc;
 use crate::reference::ToolRun;
 use crate::verify_input_order;
@@ -130,26 +131,30 @@ pub fn run(
     )?;
     harness.require_success(&captured, "osmium apply-changes (roundtrip)")?;
 
-    // pbfhogg diff is a merge-join and refuses an input that does not declare
-    // Sort.Type_then_ID. osmium's apply-changes output is content-sorted but
-    // does not stamp the feature, so normalise it through `pbfhogg sort` - a
-    // passthrough plus flag stamp, content unchanged - before comparing.
-    // `--force` because osmium writes no blob-level indexdata.
-    let rt_osmium_sorted = outdir.join("roundtrip-osmium-sorted.osm.pbf");
-    harness.msg("--- pbfhogg sort (normalise osmium roundtrip for merge-join diff) ---");
-    let captured = harness.pbfhogg_discard(
-        PbfArgv::new("sort")
-            .arg("--force")
-            .input(&rt_osmium)
-            .output(&rt_osmium_sorted),
+    // What pbfhogg's OSC means is decided by osmium too: applied by osmium,
+    // it must give new's content. pbfhogg's own application of it above is
+    // kept as an interoperability comparison, but on its own a writer bug
+    // and an apply bug that cancel would pass.
+    let rt_cross = outdir.join("roundtrip-pbfhogg-osc-by-osmium.osm.pbf");
+    harness.msg("--- roundtrip: apply pbfhogg OSC with osmium ---");
+    let captured = harness.reference(
+        &ToolRun::osmium("derive-changes-cross.1")
+            .arg("apply-changes")
+            .input(pbf)
+            .input(&pbfhogg_osc)
+            .arg("-o")
+            .output(&rt_cross)
+            .arg("--overwrite"),
+        &outdir.join("osmium-cross-roundtrip.stdout"),
     )?;
-    harness.require_success(&captured, "pbfhogg sort (normalise osmium roundtrip)")?;
+    harness.require_success(&captured, "osmium apply-changes (pbfhogg OSC)")?;
 
-    // Element counts. `new` and `roundtrip-pbfhogg` are summarised by their
-    // sort checks below.
     harness.msg("=== element counts ===");
-    harness.print_inspect("roundtrip-osmium", &rt_osmium)?;
+    harness.print_fileinfo("roundtrip-osmium", &rt_osmium)?;
 
+    // Content only: pbfhogg's OSC is content-based by design (metadata and
+    // inline way coordinates are not content), so an object whose version
+    // moved without a content change is not in it.
     for (label, listing, a, b) in [
         (
             "pbfhogg roundtrip vs new",
@@ -158,21 +163,31 @@ pub fn run(
             &new_pbf,
         ),
         (
+            "pbfhogg OSC applied by osmium vs new",
+            "pbfhogg-osc-by-osmium-vs-new",
+            &rt_cross,
+            &new_pbf,
+        ),
+        (
             "osmium roundtrip vs new",
             "osmium-vs-new",
-            &rt_osmium_sorted,
+            &rt_osmium,
             &new_pbf,
         ),
         (
             "pbfhogg roundtrip vs osmium roundtrip",
             "pbfhogg-vs-osmium",
             &rt_pbfhogg,
-            &rt_osmium_sorted,
+            &rt_osmium,
         ),
     ] {
         harness.msg(&format!("=== diff: {label} ==="));
-        let diff =
-            harness.diff_pbfs(a, b, &outdir.join(format!("roundtrip-{listing}.diff.txt")))?;
+        let diff = harness.same_elements(
+            a,
+            b,
+            &outdir.join(format!("roundtrip-{listing}.diff.txt")),
+            Policy::CONTENT,
+        )?;
         if diff.is_pass() {
             harness.msg("  PASS (identical)");
         } else {
@@ -188,7 +203,7 @@ pub fn run(
     let order = harness.check_sorted("roundtrip-pbfhogg", &rt_pbfhogg)?;
     harness.record("roundtrip-pbfhogg order", order);
 
-    Ok(Some("element-content roundtrips against new and osmium; indexed/unindexed OSC decompressed bytes identical; metadata not independently judged".into()))
+    Ok(Some("element-content roundtrips against new and osmium, pbfhogg's OSC applied by both tools; indexed/unindexed OSC decompressed bytes identical; metadata, visibility and inline coordinates not judged".into()))
 }
 
 /// The check on input whose header lacks `Sort.Type_then_ID` among its

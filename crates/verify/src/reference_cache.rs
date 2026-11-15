@@ -427,7 +427,11 @@ impl ReferenceCache {
             fs::create_dir(staging.join(sub))?;
         }
         let outputs = run.outputs()?;
-        let key = cache_key(life, tools, &staging, run)?;
+        let key = if run.uncached {
+            None
+        } else {
+            cache_key(life, tools, &staging, run)?
+        };
         watched.revalidate()?;
         if !self.fresh
             && let Some(key) = &key

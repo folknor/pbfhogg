@@ -2,7 +2,10 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::{checks, harness, process, reference, reference_cache, run};
+use crate::{checks, fake_pbf, harness, process, reference, reference_cache, run};
+
+const SORTED: &str = "Sort.Type_then_ID";
+const LOW: &str = "LocationsOnWays";
 
 #[allow(
     clippy::too_many_lines,
@@ -12,7 +15,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("read-fixture");
     std::fs::create_dir(&dir).unwrap();
     let input = dir.join("input.pbf");
-    std::fs::write(&input, "sorted").unwrap();
+    fake_pbf::write(&input, &[SORTED], "sorted");
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(&dir, "read-fixture".into(), false).unwrap();
     let mut h = harness::Harness::new(
@@ -90,7 +93,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     // A separate generated input routes external to refusal only.
     h.run = run::Run::create(&dir, exe, true).unwrap();
     let unsorted = dir.join("unsorted.pbf");
-    std::fs::write(&unsorted, "unsorted").unwrap();
+    fake_pbf::write(&unsorted, &[], "unsorted");
     h.run.watch(&unsorted).unwrap();
     assert_eq!(
         h.run_check("external-refusal", |h| checks::add_locations::run(
@@ -169,14 +172,12 @@ pub fn tool(args: &[OsString]) -> i32 {
             "-o"
         }))
     };
+    if fake_pbf::is_opl_cat(&args) {
+        fake_pbf::opl_cat(&args);
+        return 0;
+    }
     match args[0] {
-        "inspect" => {
-            let sorted = std::fs::read_to_string(path).unwrap() != "unsorted";
-            let features = if sorted { r#""Sort.Type_then_ID""# } else { "" };
-            print!(
-                r#"{{"header":{{"required_features":[],"optional_features":[{features}]}},"elements":{{"nodes":3,"ways":2,"relations":1}},"ordering":{{"standard":true}},"data":{{"objects_ordered":true}}}}"#
-            );
-        }
+        "fileinfo" => print!("{}", fake_pbf::fileinfo(3, 2, 1)),
         "cat" | "tags-filter" => {
             if args.contains(&"--output") {
                 assert!(args.contains(&"--direct-io"));
@@ -185,18 +186,17 @@ pub fn tool(args: &[OsString]) -> i32 {
             }
             std::fs::copy(args[1], output()).unwrap();
             if args.contains(&"--output") && fault == "content" {
-                std::fs::write(output(), "wrong content").unwrap();
+                fake_pbf::rewrite(Path::new(args[1]), output(), "wrong content");
             }
         }
         "sort" => {
-            std::fs::write(output(), "sorted").unwrap();
-        }
-        "diff" => {
-            assert!(args.contains(&"--suppress-common"));
-            if std::fs::read(args[2]).unwrap() != std::fs::read(args[3]).unwrap() {
-                println!("*n1");
-                return 1;
-            }
+            // The copy keeps inline locations when its input has them.
+            let locations = fake_pbf::features(Path::new(args[1]))
+                .iter()
+                .any(|f| f == LOW);
+            assert_eq!(args.contains(&"pbf,locations_on_ways=true"), locations);
+            let features: &[&str] = if locations { &[SORTED, LOW] } else { &[SORTED] };
+            fake_pbf::write(output(), features, "sorted");
         }
         "check" if args.contains(&"--refs") => {
             assert!(!args.contains(&"--direct-io"));
@@ -227,7 +227,7 @@ pub fn tool(args: &[OsString]) -> i32 {
                 assert!(args.contains(&"--staging-dir"));
                 assert!(args.contains(&"--tmp-dir"));
                 let input = args[1];
-                if std::fs::read_to_string(input).unwrap() == "unsorted"
+                if fake_pbf::marker(Path::new(input)) == "unsorted"
                     && value("--index-type") == "external"
                 {
                     assert_eq!(value("--index-type"), "external");
@@ -244,8 +244,12 @@ pub fn tool(args: &[OsString]) -> i32 {
                 assert!(args.contains(&"--keep-member-nodes"));
             }
             let unsorted = args.contains(&"--index-type")
-                && std::fs::read_to_string(args[1]).unwrap() == "unsorted";
-            std::fs::write(output(), if unsorted { "unsorted" } else { "sorted" }).unwrap();
+                && fake_pbf::marker(Path::new(args[1])) == "unsorted";
+            if unsorted {
+                fake_pbf::write(output(), &[LOW], "unsorted");
+            } else {
+                fake_pbf::write(output(), &[SORTED, LOW], "sorted");
+            }
         }
         "check" => {
             assert!(args.contains(&"--locations"));

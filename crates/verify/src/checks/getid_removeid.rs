@@ -23,7 +23,7 @@
 use std::path::Path;
 
 use crate::argv::PbfArgv;
-use crate::counts::{Counts, inspect_counts};
+use crate::counts::{Counts, osmium_counts};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::pbf_frames::{self, IndexSummary};
@@ -116,7 +116,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     )?;
     harness.require_success(&captured, "pbfhogg getid")?;
 
-    let selected = inspect_counts(harness, &pbfhogg_getid)?;
+    let selected = osmium_counts(harness, &pbfhogg_getid)?;
     for (kind, want, got) in selection_verdicts(&ids, selected) {
         let verdict = Verdict::from_pass(u64::try_from(want).ok() == Some(got));
         if verdict.is_pass() {
@@ -170,17 +170,17 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     harness.require_success(&captured, "pbfhogg getid --invert")?;
 
     // The complement assertion: getid selects exactly the listed IDs (the
-    // osmium diff above pins that) and getid --invert drops exactly them, so
+    // element comparison above pins that) and getid --invert drops exactly them, so
     // per element kind the two outputs must add up to the original. A kind
     // whose sum is off means --invert kept or dropped something it shouldn't.
-    // The original's counts are its indexdata claims, from the walk above -
-    // what pbfhogg inspect reports for it too, without another pass.
+    // The original's counts are its indexdata claims, from the walk above,
+    // without another pass; the outputs' counts are osmium fileinfo's.
     let original = Counts {
         nodes: summary.count(0),
         ways: summary.count(1),
         relations: summary.count(2),
     };
-    let inverted = inspect_counts(harness, &pbfhogg_invert)?;
+    let inverted = osmium_counts(harness, &pbfhogg_invert)?;
     for (kind, orig, sel, inv) in [
         ("nodes", original.nodes, selected.nodes, inverted.nodes),
         ("ways", original.ways, selected.ways, inverted.ways),

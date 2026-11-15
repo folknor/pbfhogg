@@ -13,15 +13,17 @@
 //! parent relations. A relation of it belongs in simple exactly when one of
 //! its direct node or way members is in simple's sets.
 //!
-//! The steps, each a reference run or a pbfhogg diff:
+//! The steps, each a reference run or an element diff of osmium's decodings
+//! ([`crate::opl_compare`]):
 //! - the relations of osmium's complete_ways output as OPL
 //!   (`osmium cat -t relation -f opl`), read by [`crate::verify_opl`], whose
-//!   record count must equal the relation count inspect gave that output;
+//!   record count must equal the relation count osmium fileinfo gave that
+//!   output;
 //! - which of their node and way members simple's sets hold: `osmium
-//!   removeid` drops all of them from osmium's simple output, and a `pbfhogg
-//!   diff --format osc` from that output to the result lists exactly the ones
-//!   present, as deletes (anything else in it is an error);
-//! - a `pbfhogg diff --format osc` from pbfhogg's simple output to osmium's
+//!   removeid` drops all of them from osmium's simple output, and an element
+//!   diff from that output to the result lists exactly the ones present, as
+//!   deletes (anything else in it is an error);
+//! - an element diff from pbfhogg's simple output to osmium's
 //!   complete_ways output: simple is a subset of complete_ways in every kind,
 //!   so an element only pbfhogg holds is a FAIL, and a content difference is
 //!   a FAIL for every element pbfhogg's simple writes, including the
@@ -42,7 +44,7 @@ use crate::verify_element_diff::{self as element_diff, PerType};
 use crate::verify_opl::{self as opl, OplRelation};
 
 /// What the adjudication reads: simple's outputs as compared, osmium's
-/// complete_ways output with its inspected relation count, and the full,
+/// complete_ways output with osmium's relation count of it, and the full,
 /// sorted, distinct IDs of the relations only pbfhogg's simple holds.
 pub(super) struct SimpleRelations<'a> {
     /// The arm's label in failures, `pbfhogg extract --simple` and the
@@ -72,7 +74,7 @@ pub(super) fn adjudicate(harness: &mut Harness, input: &SimpleRelations<'_>) -> 
 }
 
 /// osmium's complete_ways relations as OPL, their record count checked
-/// against inspect's, and every node and way they reference.
+/// against osmium fileinfo's, and every node and way they reference.
 fn candidate_relations(
     harness: &mut Harness,
     input: &SimpleRelations<'_>,
@@ -98,7 +100,7 @@ fn candidate_relations(
     })?;
     if records != input.complete_relations {
         return Err(Error::Failed(format!(
-            "{} holds {records} relation records, but inspect counted {} relations in {}",
+            "{} holds {records} relation records, but osmium fileinfo counted {} relations in {}",
             relations.display(),
             input.complete_relations,
             input.osmium_complete.display()
@@ -129,11 +131,13 @@ fn simple_vs_complete(
     let mut only_simple = PerType::default();
     let mut content = PerType::default();
     let mut left_out = Vec::new();
-    element_diff::scan_osc_diff(
+    let policy = crate::opl_compare::Policy::between(input.pbfhogg_simple, input.osmium_complete)?;
+    element_diff::scan_element_diff(
         harness,
         input.pbfhogg_simple,
         input.osmium_complete,
-        &outdir.join("pbfhogg-simple-vs-osmium-complete.osc"),
+        &outdir.join("pbfhogg-simple-vs-osmium-complete.diff.txt"),
+        policy,
         |action, kind, id| match (action, kind) {
             (OscAction::Delete, _) => only_simple.add(kind, id),
             (OscAction::Modify, _) => content.add(kind, id),
@@ -326,11 +330,13 @@ fn present_members(
     )?;
     harness.require_success(&captured, "osmium removeid")?;
     let mut stray: Option<String> = None;
-    element_diff::scan_osc_diff(
+    let policy = crate::opl_compare::Policy::between(osmium_simple, &without)?;
+    element_diff::scan_element_diff(
         harness,
         osmium_simple,
         &without,
-        &outdir.join("osmium-simple-present-members.osc"),
+        &outdir.join("osmium-simple-present-members.diff.txt"),
+        policy,
         |action, kind, id| {
             if action == OscAction::Delete && requested.has(kind, id) {
                 present.push(kind, id);

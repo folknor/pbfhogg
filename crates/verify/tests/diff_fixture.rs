@@ -1,7 +1,31 @@
 //! Generated protocols for the production diff and renumber checks.
-use crate::{checks, harness, process, reference, reference_cache, run};
+use crate::{checks, fake_pbf, harness, process, reference, reference_cache, run};
 use std::ffi::OsString;
 use std::path::Path;
+
+const SORTED: &str = "Sort.Type_then_ID";
+
+/// The OPL the fake osmium decodes a renumber output to, by fault: ten
+/// relations, so one relation difference is within the 10% tolerance.
+fn renumber_opl(fault: &str, pbfhogg: bool) -> String {
+    let mut lines = vec!["n1 v1".to_owned()];
+    for r in 1..=10 {
+        let changed = pbfhogg
+            && match fault {
+                "relation-ok" => r == 1,
+                "relation" => r <= 2,
+                _ => false,
+            };
+        if pbfhogg && fault == "one-sided" && r == 10 {
+            continue;
+        }
+        lines.push(format!("r{r} v1 T{}", if changed { "a=1" } else { "" }));
+    }
+    if pbfhogg && fault == "node" {
+        lines[0] = "n1 v1 Ta=1".to_owned();
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
 
 pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("diff-fixture");
@@ -53,7 +77,6 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "node",
                 "relation",
                 "one-sided",
-                "partial",
                 "unsorted",
                 "publish",
             ],
@@ -62,15 +85,12 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         std::fs::write(dir.join("check"), check).unwrap();
         for fault in faults {
             std::fs::write(dir.join("fault"), fault).unwrap();
-            std::fs::write(
-                &input,
-                if ["unsorted", "publish"].contains(&fault) {
-                    "unsorted"
-                } else {
-                    "sorted"
-                },
-            )
-            .unwrap();
+            // A required-only sort feature must still take the refusal route.
+            if ["unsorted", "publish"].contains(&fault) {
+                fake_pbf::write_with(&input, &[SORTED], &[], "unsorted");
+            } else {
+                fake_pbf::write_with(&input, &[SORTED], &[SORTED], "sorted");
+            }
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
             h.run.watch(&osc).unwrap();
@@ -106,18 +126,20 @@ pub fn tool(args: &[OsString]) -> i32 {
     let check = std::fs::read_to_string(root.join("check")).unwrap();
     let value = |flag| args[args.iter().position(|s| *s == flag).unwrap() + 1];
     let ours = args.contains(&"--staging-dir")
-        || args[0] == "inspect"
         || (args[0] == "diff" && !args.contains(&"--output-format"));
-    match args[0] {
-        "inspect" => {
-            let input = args.iter().find(|a| a.ends_with(".pbf")).unwrap();
-            let sorted = std::fs::read_to_string(input).unwrap() != "unsorted";
-            // A required-only sort feature must still take the refusal route.
-            let feature = if sorted { "\"Sort.Type_then_ID\"" } else { "" };
-            print!(
-                r#"{{"header":{{"required_features":["Sort.Type_then_ID"],"optional_features":[{feature}]}},"elements":{{"nodes":1,"ways":0,"relations":10}},"ordering":{{"standard":true}},"data":{{"objects_ordered":true}}}}"#
-            );
+    if fake_pbf::is_opl_cat(&args) {
+        // Keyed on content, as the reference cache keys the decode.
+        let marker = fake_pbf::marker(Path::new(args[1]));
+        if let Some(rest) = marker.strip_prefix("renumber-") {
+            let (side, written_under) = rest.split_once('-').unwrap();
+            std::fs::write(value("-o"), renumber_opl(written_under, side == "pbfhogg")).unwrap();
+        } else {
+            fake_pbf::opl_cat(&args);
         }
+        return 0;
+    }
+    match args[0] {
+        "fileinfo" => print!("{}", fake_pbf::fileinfo(1, 0, 10)),
         "getid" => {
             if fault == "fetch" {
                 return 1;
@@ -159,15 +181,20 @@ pub fn tool(args: &[OsString]) -> i32 {
                 );
                 assert!(!args.contains(&"--tmp-dir"));
             }
-            std::fs::write(
-                output,
-                if args[0] == "derive-changes" {
-                    "<osmChange/>"
-                } else {
-                    "sorted"
-                },
-            )
-            .unwrap();
+            if args[0] == "derive-changes" {
+                std::fs::write(output, "<osmChange/>").unwrap();
+            } else {
+                let broken = fault == "roundtrip" && output.ends_with("roundtrip-pbfhogg.osm.pbf");
+                // The marker carries everything the fake decode reads,
+                // since the reference cache keys the decode on content.
+                let marker = match (args[0], ours) {
+                    ("renumber", true) => format!("renumber-pbfhogg-{fault}"),
+                    ("renumber", false) => format!("renumber-osmium-{fault}"),
+                    _ if broken => "wrong".to_owned(),
+                    _ => "sorted".to_owned(),
+                };
+                fake_pbf::write(Path::new(output), &[SORTED], &marker);
+            }
         }
         _ => panic!("unexpected protocol {args:?}"),
     }
@@ -222,37 +249,6 @@ fn diff_tool(args: &[&str], fault: &str, check: &str) -> i32 {
         )
         .unwrap();
         return 1;
-    }
-    if args.contains(&"-s") {
-        assert!(!args.contains(&"--direct-io"));
-        let (same, different) = match fault {
-            "node" | "relation-ok" => (10, 1),
-            "relation" => (9, 2),
-            "one-sided" => (9, 1),
-            _ => (11, 0),
-        };
-        if fault == "partial" {
-            eprintln!("Summary: left=11 right=11 same=11");
-        } else {
-            eprintln!("Summary: left=11 right=11 same={same} different={different}");
-        }
-        if fault == "node" {
-            println!("*n1");
-        }
-        if fault == "relation" {
-            println!("*r1\n*r2");
-        }
-        if ["relation-ok", "one-sided"].contains(&fault) {
-            println!("*r1");
-        }
-        return i32::from(different > 0);
-    }
-    if check == "osc" {
-        if fault == "roundtrip" {
-            println!("*n1");
-            return 1;
-        }
-        return 0;
     }
     assert!(args.contains(&"--direct-io"));
     let verbose = args.contains(&"--verbose");

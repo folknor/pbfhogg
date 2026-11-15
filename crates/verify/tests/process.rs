@@ -4,7 +4,7 @@
 // audit includes its source graph. Its main is invoked only as a binary.
 mod worker;
 use worker::{
-    argv, checks, counts, diff_summary, error, extract_config, harness, inspect_report, osc,
+    argv, checks, counts, diff_summary, error, extract_config, fake_pbf, harness, opl_compare, osc,
     output, pbf_frames, process, reference, reference_cache, run, stream, tunables,
     verify_change_listing, verify_diff_detail, verify_diff_opl, verify_element_diff,
     verify_extract_simple, verify_extsort, verify_fileinfo, verify_getid_refs, verify_input_order,

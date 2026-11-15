@@ -4,9 +4,12 @@
 //! Generates N non-overlapping longitude strips from the dataset bbox,
 //! runs `pbfhogg extract --config <json> --simple` (single-pass), then
 //! runs one `pbfhogg extract --simple` per region (the sequential
-//! reference). Per region, the multi output must be element-content
-//! identical to its sequential extract (`pbfhogg diff`, which leaves metadata
-//! and headers out).
+//! reference). Per region, the multi output must hold the same elements as
+//! its sequential extract, record for record as osmium decodes both
+//! (`crate::opl_compare`, metadata included, headers left out). The
+//! reference is pbfhogg's own sequential extract, so this is
+//! single-pass/sequential parity: an extraction bug both paths share passes,
+//! and `verify extract` is what holds extraction to osmium.
 //!
 //! Two configs. The first holds the strips alone. When the dataset
 //! configures polygons, a second holds the strips and then every polygon, as
@@ -32,9 +35,9 @@
 //! polygons happen to; identical regions with distinct outputs and a
 //! deliberately empty region are never constructed (an element can still
 //! fall in several regions, and a region can still come out empty). osmium's
-//! extract membership is not consulted (on unsorted input osmium only sorts
-//! the comparison copies); `verify extract` holds polygon membership to
-//! osmium.
+//! extract membership is not consulted (osmium only decodes the compared
+//! files and, on unsorted input, sorts the comparison copies); `verify
+//! extract` holds polygon membership to osmium.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,7 +48,7 @@ use crate::error::Error;
 use crate::extract_config::PolygonInput;
 use crate::extract_config::{ExtractStrategy, NamedRegion, PbfhoggCommand};
 use crate::harness::{Harness, Verdict};
-use crate::inspect_report::SORT_TYPE_THEN_ID;
+use crate::pbf_frames::SORT_TYPE_THEN_ID;
 use pbfhogg_devkit::Bbox;
 
 /// The claim a passing multi-extract check's summary line carries.
@@ -64,15 +67,16 @@ fn claim(input_sorted: bool, polygons: &[PolygonInput]) -> String {
     if input_sorted {
         format!(
             "per region, the simple multi-extract output is in strict order and element-content \
-             identical to a sequential pbfhogg extract, {configs}; osmium is not consulted"
+             identical, as osmium decodes both, to a sequential pbfhogg extract, {configs}; \
+             osmium's extract membership is not consulted"
         )
     } else {
         format!(
             "on unsorted input, where pbfhogg declines its single pass so no single-pass route is \
              exercised: per region neither output claims {SORT_TYPE_THEN_ID}, and the multi \
              output, through an osmium-sorted copy, repeats no ID and is element-content \
-             identical to a sequential pbfhogg extract, {configs}; osmium's extract membership \
-             is not consulted, osmium only sorts the comparison copies"
+             identical, as osmium decodes both, to a sequential pbfhogg extract, {configs}; \
+             osmium's extract membership is not consulted"
         )
     }
 }
@@ -200,10 +204,12 @@ pub fn run(
             let seq = sequential
                 .get(&named.stem)
                 .ok_or_else(|| Error::Tool(format!("no sequential extract for {}", named.stem)))?;
-            let same = harness.diff_pbfs(
+            let policy = crate::opl_compare::Policy::between(&compared, &seq.compared)?;
+            let same = harness.same_elements(
                 &compared,
                 &seq.compared,
                 &crate::harness::listing_beside(&compared),
+                policy,
             )?;
             harness.record(
                 &format!("{label} element content differs from the sequential extract"),

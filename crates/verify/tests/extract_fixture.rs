@@ -1,9 +1,12 @@
 //! Generated extract protocols: no datasets, network or installed tools.
 use crate::{
-    checks, extract_config::PolygonInput, harness, process, reference, reference_cache, run,
+    checks, extract_config::PolygonInput, fake_pbf, harness, process, reference, reference_cache,
+    run,
 };
 use std::ffi::OsString;
 use std::path::Path;
+
+const SORTED: &str = "Sort.Type_then_ID";
 
 pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("extract-fixture");
@@ -39,7 +42,11 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         (false, "", harness::CheckStatus::Passed),
         (true, "content", harness::CheckStatus::Failed),
     ] {
-        std::fs::write(&input, if sorted { "sorted" } else { "unsorted" }).unwrap();
+        if sorted {
+            fake_pbf::write(&input, &[SORTED], "sorted");
+        } else {
+            fake_pbf::write(&input, &[], "unsorted");
+        }
         std::fs::write(dir.join("fault"), fault).unwrap();
         for multi in [false, true] {
             h.run = run::Run::create(&dir, exe, true).unwrap();
@@ -91,10 +98,17 @@ pub fn tool(args: &[OsString]) -> i32 {
             "-o"
         }))
     };
+    if args[0] == "cat" && args.contains(&"relation") {
+        // osmium's complete_ways relations: the fixture has none.
+        std::fs::write(output(), "").unwrap();
+        return 0;
+    }
+    if fake_pbf::is_opl_cat(&args) {
+        fake_pbf::opl_cat(&args);
+        return 0;
+    }
     match args[0] {
-        "inspect" => {
-            inspect(path);
-        }
+        "fileinfo" => print!("{}", fake_pbf::fileinfo(1, 0, 0)),
         "extract" => {
             if args.contains(&"--config") {
                 assert!(args.contains(&"--staging-dir"));
@@ -105,9 +119,11 @@ pub fn tool(args: &[OsString]) -> i32 {
                 for region in doc["extracts"].as_array().unwrap() {
                     let output = Path::new(doc["directory"].as_str().unwrap())
                         .join(region["output"].as_str().unwrap());
-                    let text = std::fs::read_to_string(args[1]).unwrap();
-                    std::fs::write(output, if fault == "content" { "wrong" } else { &text })
-                        .unwrap();
+                    if fault == "content" {
+                        fake_pbf::rewrite(Path::new(args[1]), &output, "wrong");
+                    } else {
+                        std::fs::copy(args[1], output).unwrap();
+                    }
                 }
             } else {
                 if args.contains(&"--output") {
@@ -119,59 +135,20 @@ pub fn tool(args: &[OsString]) -> i32 {
                 } else if value("-s") == "smart" {
                     assert_eq!(value("-S"), "types=multipolygon,boundary");
                 }
-                let text = std::fs::read_to_string(args[1]).unwrap();
                 let bad = args.contains(&"--output")
                     && fault == "content"
                     && !output()
                         .ancestors()
                         .any(|a| a.file_name().is_some_and(|n| n == "sequential"));
-                std::fs::write(output(), if bad { "wrong" } else { &text }).unwrap();
-            }
-        }
-        "sort" => {
-            std::fs::write(output(), "sorted").unwrap();
-        }
-        "cat" => {
-            std::fs::write(output(), "").unwrap();
-        }
-        "diff" => {
-            if args.contains(&"--format") {
-                assert!(args.contains(&"--staging-dir"));
-                assert!(args.contains(&"--tmp-dir"));
-                let different = args.iter().any(|a| {
-                    Path::new(a).is_file() && std::fs::read_to_string(a).is_ok_and(|s| s == "wrong")
-                });
-                let body = if different {
-                    "<modify><node id=\"1\"/></modify>"
+                if bad {
+                    fake_pbf::rewrite(Path::new(args[1]), output(), "wrong");
                 } else {
-                    ""
-                };
-                std::fs::write(
-                    output(),
-                    format!("<osmChange version=\"0.6\">{body}</osmChange>"),
-                )
-                .unwrap();
-                return i32::from(different);
-            }
-            assert!(args.contains(&"--suppress-common"));
-            if std::fs::read(args[2]).unwrap() != std::fs::read(args[3]).unwrap() {
-                println!("*n1");
-                return 1;
+                    std::fs::copy(args[1], output()).unwrap();
+                }
             }
         }
+        "sort" => fake_pbf::write(output(), &[SORTED], "sorted"),
         _ => panic!("unexpected extract fixture invocation: {args:?}"),
     }
     0
-}
-
-fn inspect(path: &Path) {
-    let text = std::fs::read_to_string(path).unwrap();
-    let features = if text.contains("unsorted") {
-        ""
-    } else {
-        r#""Sort.Type_then_ID""#
-    };
-    print!(
-        r#"{{"header":{{"required_features":[],"optional_features":[{features}]}},"elements":{{"nodes":1,"ways":0,"relations":0}},"ordering":{{"standard":true}},"data":{{"objects_ordered":true}}}}"#
-    );
 }

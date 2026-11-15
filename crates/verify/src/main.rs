@@ -28,7 +28,7 @@ mod argv;
 mod checks;
 mod error;
 mod harness;
-mod inspect_report;
+mod opl_compare;
 mod output;
 mod process;
 mod provision;

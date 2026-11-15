@@ -16,9 +16,11 @@
 //! a comparison that must not see way coordinates (degrade drops them) it is
 //! written without them.
 //!
-//! **Layout.** Every output blob's indexdata is first held to its payload by
-//! `pbfhogg check --index`, a decoder independent of the writer's
-//! `BlockBuilder`, and then read by the header-only claims walk
+//! **Layout.** Every output blob's indexdata is first held to its payload:
+//! kind, count and ID range by the verifier's own decode of every blob
+//! ([`super::pbf_frames::index_truth`]), bounding box and tag index by
+//! `pbfhogg check --index` (independent of the writer's `BlockBuilder` but
+//! not of pbfhogg); then it is read by the header-only claims walk
 //! ([`super::pbf_frames::Claims`]) and compared, in constant memory, with
 //! what the documented rule predicts from the input's claims (proven the same
 //! way): [`RepackBuilder`] for repack, [`split`] for degrade's decode path
@@ -63,10 +65,14 @@ pub(super) struct Input {
     pub sorted_claim: bool,
     /// `LocationsOnWays` among the header's optional features.
     pub locations: bool,
-    /// Kinds grouped in order (`inspect`'s `ordering.standard`).
+    /// Kinds grouped in order, known from osmium reading the input in
+    /// kind and ID order (`objects_ordered`); an input with grouped kinds
+    /// but IDs out of order reads as not, which only builds a partition the
+    /// comparison did not need.
     pub standard: bool,
-    /// Every data blob carries indexdata, and `check --index` found every
-    /// claim true: its claims can feed a layout prediction.
+    /// Every data blob carries indexdata, and both the verifier's own blob
+    /// decode and `check --index` found every claim true: its claims can
+    /// feed a layout prediction.
     pub indexed: bool,
 }
 
@@ -102,6 +108,16 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
     let header = super::verify_input_order::input_header(harness, pbf, outdir)?;
     let indexed = matches!(pbf_frames::framing(pbf)?, Framing::Indexed { .. });
     if indexed {
+        let truth = pbf_frames::index_truth(pbf)?;
+        if !truth.passed() {
+            return Err(Error::Failed(format!(
+                "the verifier's blob decode finds {} claims of {} false ({}): its blob layout \
+                 cannot be predicted from them",
+                truth.violations,
+                pbf.display(),
+                truth.shown.join("; ")
+            )));
+        }
         let index = check_index(harness, outdir, "input", pbf)?;
         if !index.passed {
             return Err(Error::Failed(format!(
@@ -114,10 +130,10 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
     }
     let input = Input {
         path: pbf.to_path_buf(),
-        info,
         sorted_claim: header.optional_sorted(),
         locations: header.optional_feature(LOCATIONS_ON_WAYS),
-        standard: header.standard_order(),
+        standard: info.ordered,
+        info,
         indexed,
     };
     harness.msg(&format!(
@@ -211,13 +227,32 @@ pub(super) fn check_index(
 }
 
 /// Record that every blob of `output` carries indexdata its payload bears
-/// out, through [`check_index`].
+/// out: kind, count and ID range by the verifier's own decode
+/// ([`pbf_frames::index_truth`]), and bounding box and tag index, which
+/// that decode does not read, by [`check_index`] (pbfhogg's own decoder,
+/// so same-project evidence for those two).
 pub(super) fn judge_index(
     harness: &mut Harness,
     outdir: &Path,
     label: &str,
     output: &Path,
 ) -> Result<(), Error> {
+    let truth = pbf_frames::index_truth(output)?;
+    let ok = truth.passed() && truth.blobs_with_indexdata == truth.blobs;
+    for line in &truth.shown {
+        harness.msg(&format!("  {label}: blob decode: {line}"));
+    }
+    harness.msg(&format!(
+        "  {label}: blob decode: {} of {} blobs indexed, {} violations {}",
+        truth.blobs_with_indexdata,
+        truth.blobs,
+        truth.violations,
+        if ok { "PASS" } else { "FAIL" }
+    ));
+    harness.record(
+        &format!("{label} indexdata against the verifier's blob decode"),
+        Verdict::from_pass(ok),
+    );
     let stem = label.replace(' ', "-");
     let index = check_index(harness, outdir, &stem, output)?;
     let ok = index.passed && index.blobs_with_indexdata == index.blobs;
@@ -285,10 +320,10 @@ pub(super) fn judge_header(
     sorted: bool,
     locations: bool,
 ) -> Result<(), Error> {
-    let header = super::inspect_report::inspect(harness, output, false)?;
+    let header = pbf_frames::header(output)?;
     for (feature, want, got) in [
         (
-            crate::inspect_report::SORT_TYPE_THEN_ID,
+            pbf_frames::SORT_TYPE_THEN_ID,
             sorted,
             header.optional_sorted(),
         ),

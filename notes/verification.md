@@ -76,29 +76,17 @@ Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
 indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
 indexed inputs.
 
-## VER-122 - Verify's equality oracle is narrower than "identical" and shares the subject's code
+## VER-122 - Verify's field policies have no real-data negative controls
 
 Reported by bench-verify.
 
-`VerifyHarness::diff_pbfs` in brokkr uses pbfhogg diff and `verify_sort` prints "identical", while
-`crates/lib/src/content.rs` excludes metadata, inline way locations, headers and encoding. A shared decoder
-defect can affect both sides.
-
-Fix: an equality policy per check and an independent decoder for promised fields. Full digest strengthens
-same-project checks but is no independent oracle. Enforcement: negative controls altering each field class.
-Brokkr side filed as bz brokkr#156.
-
-Partly met: `add-locations-to-ways` on sorted input now also compares both tools' outputs as
-`osmium cat -f opl,locations_on_ways=true`, byte for byte, which covers metadata as libosmium
-decodes it, tag order and every inline coordinate. The same ordered-OPL comparison is still
-missing from sort, cat, tags-filter, getid-removeid and extract (complete_ways and smart, whose
-membership the verifier already reconciles), and it needs a per-command enrichment policy
-first: indexed `cat --type` and passthrough `sort` keep inline way coordinates that plain
-`osmium cat`/`sort` drop, so on a LocationsOnWays input the OPL must omit locations there
-(and pbfhogg's re-encoding sort drops them, so enabling them on osmium is wrong too).
-apply-changes cannot take it: its documented delete deviation makes an ordered cmp fail by
-design. The vs-osmium bench's removed `--validate-only` had this comparison for every PBF row
-but was only ever run on the inspect-tags rows.
+Every equality judgment once made by `pbfhogg diff` is now the verifier's merge of osmium's
+OPL decodings (`crates/verify/src/opl_compare.rs`) under a declared field policy, so the
+independent decoder and the per-check policy exist (reference/verify.md "How outputs are
+judged"). Residue: nothing proves each policy reads the field classes it claims on real data.
+The generated tool protocols in `crates/verify/tests` fault whole records, not one field
+class at a time; negative controls that alter metadata, inline locations, tags and members
+separately on a real derived copy, each required to fail its check, are still missing.
 
 ## VER-132 - No real-data oracle for cat --dedupe
 
@@ -122,6 +110,20 @@ answer, so two revisions could be seen to answer differently; that was answer ev
 measured child and is gone. Nothing outside the library tests (crates/lib/tests/geocode_*.rs,
 synthetic fixtures) checks reverse-geocode answers, and pbfhogg-verify has no geocode check.
 The vendored traccar-geocoder is the natural reference.
+
+## VER-134 - osmium diff's checksum cannot see a shifted tag boundary
+
+Reported by the pbfhogg#61 implementer and its codex spar.
+
+`verify_reencode::compare` (repack and degrade) and `checks/diff.rs` still judge with
+`osmium diff`, whose `update_object_crc` (research/libosmium crc.hpp) feeds each key and
+value without length or separator: tags `a=bc` and `ab=c` collide deterministically, so a
+string-table boundary bug passes as common. reference/verify.md now names the collision. The
+OPL merge comparator has no such blind spot, but these callers need more than its strict
+identity merge: repack and order-preserving degrade need sequence equality (a disordered
+kind stays disordered), unsort needs the reference with the documented swap applied and then
+every record compared, and diff needs its expected differences and common counts from the
+full decoded OLD and NEW streams, keeping its metadata exclusion and verbose-listing checks.
 
 
 ## VER-123 - Verify uses the build output directory as its workspace

@@ -12,8 +12,9 @@
 //!
 //! What a PASS establishes, per strategy: pbfhogg's output order (below),
 //! the element content of everything it writes, and which elements it writes,
-//! all against osmium. Content is pbfhogg diff's content equality
-//! (coordinates, tags, refs, members; metadata left out). Neither tool
+//! all against osmium. Content is equality of osmium's decoded records
+//! (`crate::opl_compare`: coordinates, tags, refs, members and metadata).
+//! Neither tool
 //! rewrites an element it extracts (osmium never clips ways or drops relation
 //! members, and simple's dangling refs are absent elements, not edited ones),
 //! so a content mismatch on a shared ID is a real disagreement.
@@ -45,14 +46,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::checks::sort as verify_sort;
+use crate::counts::Counts;
 use crate::error::Error;
 use crate::extract_config::PolygonInput;
 use crate::extract_config::Region;
 use crate::extract_config::{ExtractStrategy, PbfhoggCommand};
 use crate::harness::{Harness, Verdict};
-use crate::inspect_report::InspectCounts;
-use crate::inspect_report::SORT_TYPE_THEN_ID;
 use crate::osc::{OscAction, OscKind};
+use crate::pbf_frames::SORT_TYPE_THEN_ID;
 use crate::reference::ToolRun;
 use crate::verify_element_diff::{self as element_diff, PerType};
 use crate::verify_extract_simple::{self as simple_relations, SimpleRelations};
@@ -296,11 +297,13 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         // --- Element diff, classified as it streams ---
         let keep_relations = *strategy == ExtractStrategy::Simple;
         let mut report = ExtractDiffReport::default();
-        element_diff::scan_osc_diff(
+        let policy = crate::opl_compare::Policy::between(&compared, &osmium_out)?;
+        element_diff::scan_element_diff(
             harness,
             &compared,
             &osmium_out,
-            &outdir.join(format!("pbfhogg-vs-osmium-{strategy_name}.osc")),
+            &outdir.join(format!("pbfhogg-vs-osmium-{strategy_name}.diff.txt")),
+            policy,
             |action, kind, id| {
                 if keep_relations && action == OscAction::Delete && kind == OscKind::Relation {
                     report.pbfhogg_only_relations.push(id);
@@ -516,7 +519,9 @@ fn membership_line(clauses: &[String], suffix: &str, outdir: &Path) -> Option<St
         format!(
             "  extract{suffix} vs osmium, membership differences: {}; element lists in {}",
             clauses.join("; "),
-            outdir.join("pbfhogg-vs-osmium-<strategy>.osc").display()
+            outdir
+                .join("pbfhogg-vs-osmium-<strategy>.diff.txt")
+                .display()
         )
     })
 }
@@ -526,8 +531,8 @@ fn membership_line(clauses: &[String], suffix: &str, outdir: &Path) -> Option<St
 /// outputs whose order check passed, so every count is of distinct IDs; an
 /// accounting that does not close is an error, never a verdict.
 fn shared_counts(
-    ours: &InspectCounts,
-    theirs: &InspectCounts,
+    ours: &Counts,
+    theirs: &Counts,
     report: &ExtractDiffReport,
 ) -> Result<[u64; 3], Error> {
     let ours = [ours.nodes, ours.ways, ours.relations];
@@ -558,8 +563,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn counts(nodes: u64, ways: u64, relations: u64) -> InspectCounts {
-        InspectCounts {
+    fn counts(nodes: u64, ways: u64, relations: u64) -> Counts {
+        Counts {
             nodes,
             ways,
             relations,

@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 
 use crate::argv::PbfArgv;
 use crate::error::Error;
+use crate::opl_compare::{self, Policy};
 use crate::output::{self, Detail};
 use crate::process::{Ended, Launch, Lifecycle};
 use crate::reference::{ToolRun, Tools};
 use crate::run::Run;
-use crate::{inspect_report, stream, tunables};
+use crate::verify_fileinfo::{self, FileInfo};
+use crate::{pbf_frames, stream, tunables};
 
 /// The outcome of one comparison inside a check.
 #[must_use = "a discarded verdict is a silent PASS - record it on the harness"]
@@ -229,8 +231,10 @@ impl Harness {
         self.require_success(&ended, "pbfhogg degrade --strip-indexdata")
     }
 
+    /// Whether `pbf`'s header declares `Sort.Type_then_ID` in either feature
+    /// list, read by the verifier's own header reader.
     pub(crate) fn has_sort_flag(&mut self, pbf: &Path) -> Result<bool, Error> {
-        Ok(inspect_report::inspect(self, pbf, false)?.declares_sorted())
+        Ok(pbf_frames::header(pbf)?.declares_sorted())
     }
 
     pub(crate) fn compare_sort_feature(
@@ -316,54 +320,46 @@ impl Harness {
         )))
     }
 
-    /// Print the extended inspect summary of `pbf`. A failed inspect is
-    /// printed, not propagated (informational); an interrupt still is.
-    pub(crate) fn print_inspect(&mut self, label: &str, pbf: &Path) -> Result<(), Error> {
-        match inspect_report::inspect(self, pbf, true) {
-            Ok(summary) => self.print_summary(label, &summary, pbf),
+    /// osmium's reading of `pbf` (`osmium fileinfo -e`), its report beside
+    /// it; counts and order go into the detail.
+    pub(crate) fn fileinfo(&mut self, pbf: &Path) -> Result<FileInfo, Error> {
+        // A file read twice in one check gets a fresh reading each time.
+        let report = pbf.with_extension("fileinfo.json");
+        match std::fs::remove_file(&report) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        verify_fileinfo::fileinfo(self, pbf, &report)
+    }
+
+    /// Print osmium's counts and order of `pbf` for context. A failed read
+    /// is printed, not propagated (informational); an interrupt still is.
+    pub(crate) fn print_fileinfo(&mut self, label: &str, pbf: &Path) -> Result<(), Error> {
+        match self.fileinfo(pbf) {
+            Ok(_) => {}
             Err(e @ (Error::Interrupted | Error::Unsettled(_))) => return Err(e),
-            Err(e) => self.msg(&format!("inspect failed for {label}: {e}")),
+            Err(e) => self.msg(&format!("osmium fileinfo failed for {label}: {e}")),
         }
         Ok(())
     }
 
-    fn print_summary(&mut self, label: &str, summary: &inspect_report::InspectSummary, pbf: &Path) {
-        for line in summary.lines(label) {
-            self.msg(&format!("  {line}"));
-        }
-        let report = inspect_report::report_path(pbf, true);
-        self.msg(&format!("  {label}: full report in {}", report.display()));
-    }
-
-    /// Diff two PBFs with `pbfhogg diff --suppress-common`, the listing in
-    /// `listing`. Pass only on exit 0 with an empty listing; exit 1 or any
-    /// listing is a Fail; any other ending is an error, never a verdict.
-    pub(crate) fn diff_pbfs(
+    /// Compare the elements of `a` and `b` as osmium decodes them, under
+    /// `policy` ([`opl_compare`]), the differing records in `listing`. Pass
+    /// only when every object is on both sides with identical records. Both
+    /// sides must be in strict kind and ID order, else the comparison could
+    /// not be made (an error).
+    pub(crate) fn same_elements(
         &mut self,
         a: &Path,
         b: &Path,
         listing: &Path,
+        policy: Policy,
     ) -> Result<Verdict, Error> {
-        let argv = PbfArgv::new("diff")
-            .arg("--suppress-common")
-            .input(a)
-            .input(b);
-        let ended = self.pbfhogg(argv, listing)?;
-        let listed = stream::has_content(listing)?;
-        let verdict = diff_verdict(ended.code(), listed).map_err(|why| {
-            Error::Failed(format!(
-                "pbfhogg diff ({why}): {}: {}",
-                ended.status,
-                ended.stderr_text().trim()
-            ))
-        })?;
+        let merged = opl_compare::compare(self, a, b, listing, policy, |_| {})?;
+        let verdict = Verdict::from_pass(merged.identical());
         if verdict == Verdict::Fail {
             self.replay_listing(listing)?;
-            if !listed {
-                for line in ended.stderr_text().lines() {
-                    self.msg(&format!("  {line}"));
-                }
-            }
         }
         Ok(verdict)
     }
@@ -389,39 +385,43 @@ impl Harness {
         Ok(())
     }
 
-    /// Whether `pbf`'s elements are in sorted order, read from the computed
-    /// `data.objects_ordered` of an extended inspect, never from the header
-    /// claim, which can be blind to intra-blob disorder.
+    /// Whether `pbf`'s objects strictly ascend by kind and then ID as osmium
+    /// decodes them ([`opl_compare::order`]: no ID repeated), never the
+    /// header claim, which can be blind to intra-blob disorder.
     pub(crate) fn check_sorted(&mut self, label: &str, pbf: &Path) -> Result<Verdict, Error> {
         Ok(self.check_sorted_counted(label, pbf)?.0)
     }
 
-    /// The same order verdict and the counts from the same extended report.
+    /// The same order verdict and osmium's counts from the same reading.
     pub(crate) fn check_sorted_counted(
         &mut self,
         label: &str,
         pbf: &Path,
-    ) -> Result<(Verdict, inspect_report::InspectCounts), Error> {
-        let summary = inspect_report::inspect(self, pbf, true)?;
-        let counts = summary.counts();
-        self.print_summary(label, &summary, pbf);
-        let ordered = summary
-            .objects_ordered()
-            .ok_or_else(|| Error::tool("an extended inspect summary without its order"))?;
+    ) -> Result<(Verdict, crate::counts::Counts), Error> {
+        let (ordered, [nodes, ways, relations]) =
+            opl_compare::order(self, pbf, &pbf.with_extension("order.opl"))?;
+        let counts = crate::counts::Counts {
+            nodes,
+            ways,
+            relations,
+        };
+        self.msg(&format!(
+            "  {label}: {nodes} nodes, {ways} ways, {relations} relations"
+        ));
         if ordered {
-            self.msg(&format!("  {label}: ordered (element order verified) PASS"));
+            self.msg(&format!("  {label}: in strict order (osmium OPL) PASS"));
             return Ok((Verdict::Pass, counts));
         }
-        let hint = if summary.declares_sorted() {
+        let hint = if pbf_frames::header(pbf)?.declares_sorted() {
             format!(
                 " - header declares {} but element order disagrees",
-                inspect_report::SORT_TYPE_THEN_ID
+                pbf_frames::SORT_TYPE_THEN_ID
             )
         } else {
             String::new()
         };
         self.msg(&format!(
-            "  {label}: NOT ordered (inspect objects_ordered: false){hint} FAIL"
+            "  {label}: NOT in strict order (osmium OPL){hint} FAIL"
         ));
         Ok((Verdict::Fail, counts))
     }
@@ -549,22 +549,9 @@ pub(crate) fn listing_beside(output: &Path) -> PathBuf {
     output.with_extension("diff.txt")
 }
 
-/// Classify a `pbfhogg diff --suppress-common` run: 0 identical, 1
-/// differences (osmium's convention). Anything else did not complete. Exit 0
-/// with a listing is contradictory; the listing wins, since a false FAIL is
-/// investigated and a false PASS is not.
-fn diff_verdict(code: Option<i32>, listed: bool) -> Result<Verdict, &'static str> {
-    match code {
-        Some(0) => Ok(Verdict::from_pass(!listed)),
-        Some(1) => Ok(Verdict::Fail),
-        Some(_) => Err("unexpected exit code"),
-        None => Err("killed by signal"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CheckStatus, Error, Verdict, conclude, diff_verdict};
+    use super::{CheckStatus, Error, conclude};
 
     #[test]
     fn a_recorded_failure_outlives_ok_and_environment() {
@@ -597,14 +584,5 @@ mod tests {
         assert!(matches!(status, Err(Error::Unsettled(_))));
         let (status, _) = conclude("x", "1ms", Err(Error::tool("boom")), &[]);
         assert!(matches!(status, Err(Error::Tool(_))));
-    }
-
-    #[test]
-    fn diff_verdicts() {
-        assert_eq!(diff_verdict(Some(0), false), Ok(Verdict::Pass));
-        assert_eq!(diff_verdict(Some(0), true), Ok(Verdict::Fail));
-        assert_eq!(diff_verdict(Some(1), false), Ok(Verdict::Fail));
-        assert!(diff_verdict(None, false).is_err());
-        assert!(diff_verdict(Some(2), false).is_err());
     }
 }

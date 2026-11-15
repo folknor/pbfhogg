@@ -12,7 +12,44 @@ brokkr run --with pbfhogg --with-commit REF pbfhogg-verify -- all --dataset germ
 
 `--with-features LIST` builds the CLI under test with features (for
 `--direct-io`). The verifier never calls brokkr and links no pbfhogg: no
-verdict may rest on code compiled into the verifier.
+verdict may rest on code compiled into the verifier. Nor does a verdict rest
+on the pbfhogg CLI judging its own output, except at the residues listed in
+"Where pbfhogg is still a comparator" below.
+
+## How outputs are judged
+
+- **Element equality** is the verifier's merge of osmium's decodings
+  (`opl_compare`): `osmium cat -f opl[,add_metadata=false][,locations_on_ways=true]`
+  of each side to a file in the check's directory, then a streaming merge
+  keyed by kind and ID that requires each side strictly ascending by kind
+  (node, way, relation) and non-negative ID, so it also certifies, as osmium
+  decodes them, that neither side repeats or misorders an object, and
+  compares every record line byte for byte. Differing identities are
+  classified first-only, second-only or differing and written to a listing
+  beside the outputs, both sides' records included; the OPL pair is removed
+  once merged and kept only when the merge itself fails. This is equality of osmium-decoded records under a field
+  policy, not of wire fields: absent metadata becomes libosmium's defaults on
+  both sides, timestamps are whole seconds, coordinates are at 1e-7 degrees
+  and a string is cut at an embedded NUL. OPL escapes its separators, so tag
+  boundaries are compared (osmium diff's checksum feeds tags without
+  lengths). Metadata is compared everywhere except the `diff --format osc`
+  roundtrips; inline way coordinates are compared when both files declare
+  `LocationsOnWays` (a command may drop the declaration with its
+  coordinates, with a warning), except in apply-changes locations mode.
+  Where coordinates are the command's promise (add-locations-to-ways), the
+  check requires both declarations.
+- **Order and counts** of an output come from its osmium OPL decoding
+  (`opl_compare::order`, no metadata or coordinates): a file is in strict
+  order when its objects ascend by kind and then ID with none repeated.
+  `osmium fileinfo -e` cannot serve here, since it refuses a file whose ways
+  lack their nodes, as every way-only or filtered output does; it still
+  reads whole inputs for check-ids, repack and degrade.
+- **Header claims** (`Sort.Type_then_ID` and `LocationsOnWays` among the
+  optional features, and the sort feature in either list) are read by the
+  verifier's own `OSMHeader` reader (`pbf_frames::header`).
+- **Sorted copies** are written by `osmium sort`, with
+  `-f pbf,locations_on_ways=true` when the source declares
+  `LocationsOnWays`, so inline coordinates survive into the comparison.
 
 ## Inputs
 
@@ -108,7 +145,9 @@ is unsupported.
 
 Completed reference executions are stored at
 `SCRATCH/tools/verify-reference/` (format 2). No pbfhogg output, observation,
-or verdict is cached: every comparison runs again. A hit is shown as
+or verdict is cached: every comparison runs again. The element comparison's
+OPL decodings are not cached either: each is as large as its input, read
+once and removed, and publishing them filled a germany run's scratch. A hit is shown as
 `osmium sort cached` in the check's steps; `--verbose` also shows the hit in
 detail.
 
@@ -188,25 +227,25 @@ suite because a later comparison cannot make that run complete.
 
 | Check | Compared against | Established by |
 |---|---|---|
-| `sort` | `osmium sort` | `pbfhogg diff --suppress-common` empty, and the output's computed element order (`inspect --extended` `data.objects_ordered`), never the header claim |
-| `cat` | `osmium cat` | node, way and relation outputs: element diff, strict order and one-way sort-feature comparison |
+| `sort` | `osmium sort` | element equality, and the output's strict order by osmium fileinfo, never the header claim |
+| `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
 | `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
-| `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; content and sort declaration, on sorted input both outputs' osmium OPL with inline locations byte for byte, own inline-location agreement, and full-record engine parity under mode all |
+| `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
 | `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
 | `getid-removeid` (alias `getid`) | `osmium getid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert count complement, recursive referenced content and tag removal, with absent witnesses named |
 | `extract` | `osmium extract` | strict order, element content and per-strategy membership on the bbox and every configured polygon; simple relations follow the any-direct-node-or-way rule judged against complete_ways |
-| `multi-extract` | sequential pbfhogg extracts | simple config output per region has strict order and identical element content, for strips alone and, when configured, strips plus polygons |
+| `multi-extract` | sequential pbfhogg extracts | simple config output per region has strict order and element equality with its sequential extract (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
 | `check-refs` | `osmium check-refs` | missing counts per class in ways-only and relation modes, each exit held to its complete report |
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
 | `repack` | `osmium diff` | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
 | `degrade` | `osmium diff` | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions |
-| `apply-changes` | `osmium apply-changes` | strict output order and element content, tolerating only osmium-only IDs in the input OSC delete set; optional inline-location consistency |
+| `apply-changes` | `osmium apply-changes` | strict output order and element equality, tolerating only osmium-only IDs in the input OSC delete set; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
 | `diff` | osmium diff OPL and fetched objects | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
-| `diff --format osc` | osmium derive-changes and apply-changes | element-content roundtrips and indexed/unindexed decompressed OSC parity |
-| `renumber` | osmium renumber | equal paired counts, no node or way content differences, classified relation differences at most 10% of relations |
+| `diff --format osc` | osmium derive-changes and apply-changes | content-only element equality of roundtrips, pbfhogg's OSC applied by both tools, and indexed/unindexed decompressed OSC parity |
+| `renumber` | osmium renumber | every object paired, no node or way record differences, relation differences at most 10% of relations |
 
 Apply-changes accepts `--osc-seq` or a fixture `--osc`, and
 `--locations-on-ways`. A configured OSC is required. A base without the
@@ -216,11 +255,12 @@ must still declare LocationsOnWays, so the refusal has only one cause.
 On sorted input, pbfhogg's output must be strictly ordered. The element diff
 tolerates only osmium-only IDs the input OSC deleted, since osmium uses
 version-based deletion and pbfhogg deletes unconditionally. All other
-differences fail. Osmium's output is normalised with buffered
-`pbfhogg sort --force` before the merge-join diff.
+differences fail. Both outputs must be in strict order for the element
+comparison to be made.
 In locations mode pbfhogg's output must pass `check --locations`;
 osmium's location report is informational, with its stale count shown even
-on PASS. The element comparison does not read inline coordinates.
+on PASS. The element comparison does not read inline coordinates in that
+mode, since osmium's are known stale.
 The suite runs the locations arm separately on the selected generation's
 `altw-keep-untagged` base, when both it and an OSC are configured, and
 skips it for a fixture PBF. Configured invalid files fail resolution.
@@ -272,18 +312,15 @@ On input without the optional sort feature, external must refuse with exit
 alone runs no osmium comparison there. Sparse follows the unsorted content
 comparison route; all names both routes and omits engine parity there.
 Every selected engine runs before output checks, and a failed engine is
-recorded while the other still runs. On sorted input each engine's original
-output and osmium's are decoded by `osmium cat -f
-opl,locations_on_ways=true` and must be identical byte for byte: the same
-records in order, tags in order, references, members, metadata as libosmium
-decodes it (absent fields become its defaults on both sides, timestamps are
-whole seconds) and every inline way coordinate at 1e-7 degrees, a dropped
-node's included. A string with an embedded NUL is outside what that
-decoding represents faithfully. On unsorted input inline coordinates are
-not compared with osmium, since the comparison runs through re-sorted
-copies that drop them. Agreement checks kept node records and repeated
-references, and parity compares the engines' full element records,
-ignoring the header digest. `--inject-prepass` is refused before any check launches: enriched output is
+recorded while the other still runs. osmium's output and each engine's
+must declare `LocationsOnWays`, so each engine's output is held to it by element
+equality with every inline way coordinate at 1e-7 degrees, a dropped node's
+included: on sorted input the output itself, on unsorted input its
+osmium-sorted copy, which keeps the coordinates. Agreement
+(`check --locations --agreement`) checks kept node records and repeated
+references. Parity holds the engines to each other by element equality and
+by `digest --form full`, which also covers what osmium's records do not
+represent, ignoring the header digest. `--inject-prepass` is refused before any check launches: enriched output is
 osmium-incompatible.
 
 Getid-removeid requires a non-history snapshot with true indexdata claims
@@ -368,21 +405,25 @@ the output. osmium walks both files as a merge on object order and counts a
 pair same only when a checksum over visible, timestamp, tags, changeset, uid,
 user and the location, way node references with their coordinates or members
 agrees, so no left, right or different object means the two sequences are
-identical element by element, whatever their order (barring a checksum
-collision; tags are fed without lengths). An object it lists as moved or
+identical element by element, whatever their order, barring a checksum
+collision. Tags are fed without lengths or separators, so a shifted
+key/value boundary (`a=bc` against `ab=c`) collides deterministically; this
+comparison does not catch it. An object it lists as moved or
 removed is printed, not checksummed, so its lines are compared byte for byte,
-way coordinates included. The reference is the input when its kinds are
-grouped in order (`inspect`'s `ordering.standard`), else a stable partition
+way coordinates included. The reference is the input when osmium reads it in
+kind and ID order (fileinfo `objects_ordered`), else a stable partition
 osmium builds (`osmium cat -t` per kind, then `osmium cat` of the three: each
 kind keeps its input order); for degrade it is written without way
 coordinates (plain `osmium cat`), since every re-encode drops them. Layout:
-each output's indexdata must be on every blob and true by `pbfhogg check
---index`, which decodes every blob independently of the writer's
-`BlockBuilder`; then the header-only claims walk (`pbf_frames::Claims`,
+each output's indexdata must be on every blob and true: kind, count and
+exact ID range by the verifier's own decode of every blob
+(`pbf_frames::index_truth`, raw or zlib; any other compression is an error),
+bounding box and tag index by `pbfhogg check --index`; then the header-only
+claims walk (`pbf_frames::Claims`,
 pulling input and output blobs side by side in constant memory) holds the
 output's blobs, in order, to the documented rule run over the input's
-claims, which on an indexed input must pass `check --index` too (else an
-error: they feed the prediction). Every output must also claim
+claims, which on an indexed input must pass both indexdata checks too (else
+an error: they feed the prediction). Every output must also claim
 `Sort.Type_then_ID` and `LocationsOnWays` as its command documents, hold no
 blob over the cap or empty, and keep kinds in order. Both arms read the input
 with `osmium fileinfo -e` and refuse a negative ID and a header requiring
@@ -504,23 +545,49 @@ content counts. This assumes apply-changes preserves untouched identities
 when osmium's checksum also calls them common; apply-changes has its own
 separate check. Which equally short edit script is chosen is not judged.
 
-OSC diff derives with both tools, applies each result with its producing
-tool, normalises osmium's roundtrip with buffered pbfhogg sort --force,
-and compares both roundtrips with new and with each other using the element
-diff. New and pbfhogg's roundtrip must be strictly ordered. The unindexed
+OSC diff derives with both tools and applies each result with its
+producing tool; osmium also applies pbfhogg's OSC, so what that OSC means
+is decided by a tool other than pbfhogg. All three roundtrips are compared
+with new, and the two own-tool roundtrips with each other, by content-only
+element equality (no metadata, visibility or inline coordinates: pbfhogg's
+OSC is content-based by design, and the domain is a non-history snapshot).
+New and pbfhogg's roundtrip must be strictly ordered. The unindexed
 pair must produce the indexed OSC's exact decompressed bytes, including
-metadata; gzip framing is excluded. The roundtrip comparison itself does
-not independently establish metadata identity or inline coordinates.
+metadata; gzip framing is excluded. The roundtrips do not establish
+metadata identity or inline coordinates.
 
 Renumber accepts `--start-id`, forwarded to both tools. Direct IO reaches
 only pbfhogg renumber. An input without the optional sort feature must
 refuse with the exact advice and no output; osmium does not run there.
-Otherwise the buffered comparison diff must exit 0 or 1 and carry all four
-summary fields. Both totals must equal same plus different, excluding
-one-sided objects. Classified listing blocks must number exactly different;
-no node or way difference is allowed. Relation differences may not exceed
-10% of osmium's relation count, the existing tolerance for orphan-reference
-handling. Their attribution to orphan handling is not independently proved.
+Otherwise the two outputs are compared by element equality, metadata
+included: every object must pair by kind and ID, no node or way record may
+differ, and relation differences may not exceed 10% of osmium's relation
+count, the existing tolerance for orphan-reference handling. Their
+attribution to orphan handling is not independently proved.
+
+## Where pbfhogg is still a comparator
+
+Every verdict above is reached by osmium or the verifier's own readers,
+except these, each kept because nothing independent covers it:
+
+- `check --locations` (apply-changes locations mode, and `--agreement` in
+  add-locations-to-ways): no osmium command holds inline coordinates to kept
+  node records. In add-locations-to-ways the element equality with osmium
+  already holds every coordinate, so it is additional evidence there; in
+  apply-changes locations mode, where osmium's own coordinates are stale, it
+  is the only coordinate evidence.
+- `check --index` for bounding boxes and tag indexes, which the verifier's
+  blob decode does not read (it holds kind, count and ID range itself).
+- `digest --form full` engine parity, kept beside element equality for the
+  fields osmium's records do not represent.
+- Multi-extract's reference is pbfhogg's own sequential extract: the
+  comparison is independent, the expectation is not, so it is
+  single-pass/sequential parity; `extract` holds extraction to osmium.
+- Inputs pbfhogg builds rather than judges: `degrade --strip-indexdata`
+  copies (diff, diff --format osc, check-ids, repack), `apply-changes`
+  building the diff checks' second PBF, and `cat`/`degrade` deriving
+  check-ids fixtures. A defect there changes what is compared, never how.
+- Informational lines, which carry no verdict.
 
 ## Migration evidence and ownership
 
@@ -541,6 +608,13 @@ references were killed by SIGKILL, which neither verifier sent. Its
 comparison remains unestablished; OOM is plausible, not proved. Bare
 Germany refused ambiguous selection among eight OSCs before checking
 anything, with the deliberate configuration-exit difference described above.
+
+On 2026-11-15, host bygg, on the uncommitted change that moved every
+pbfhogg-judged comparison to osmium decodings and the verifier's readers
+(parent `c757c984`): Denmark 20 PASS, exit 0. Germany with `--osc-seq
+4705`: 18 PASS and sort ENVIRONMENT (osmium sort SIGKILLed again), diff
+failing only on scratch exhausted by cached OPL decodings; with decodings
+uncached and removed once merged, diff then passed alone.
 
 The matching locations checks reported informational osmium stale inline
 references: Denmark 563 refs (538 nodes), Germany 7986 refs (5346 nodes).

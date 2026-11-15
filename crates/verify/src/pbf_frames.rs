@@ -11,7 +11,10 @@
 //! never to the data. The one payload it reads is the leading `OSMHeader`'s,
 //! for the header's required features; [`blob_ids`] reads one named data
 //! blob's elements on request, the bounded exception `verify degrade` takes
-//! for the few elements it locates.
+//! for the few elements it locates, and [`index_truth`] reads every data
+//! blob to hold each claim's kind, count and ID range to its elements.
+//! [`header`] reads the header's required and optional features, the claims
+//! checks route on, without asking the pbfhogg CLI under test.
 //!
 //! The indexdata decoder follows pbfhogg's wire format (its `blob_meta`
 //! module): a version byte (1 with exactly 26 bytes, 2 or 3 with exactly 42),
@@ -209,6 +212,7 @@ struct FrameWalk<'r, R> {
     offset: u64,
     ordinal: u64,
     required_features: Vec<String>,
+    optional_features: Vec<String>,
 }
 
 impl<'r, R: Read + Seek> FrameWalk<'r, R> {
@@ -219,6 +223,7 @@ impl<'r, R: Read + Seek> FrameWalk<'r, R> {
             offset: 0,
             ordinal: 0,
             required_features: Vec::new(),
+            optional_features: Vec::new(),
         };
         if len == 0 {
             return Err("no OSMHeader blob".into());
@@ -241,7 +246,8 @@ impl<'r, R: Read + Seek> FrameWalk<'r, R> {
             .read_exact(&mut payload)
             .map_err(|e| format!("{at}: {e}"))?;
         let block = blob_content(&payload).map_err(|why| format!("{at}: {why}"))?;
-        walk.required_features = header_features(&block).map_err(|why| format!("{at}: {why}"))?;
+        (walk.required_features, walk.optional_features) =
+            header_features(&block).map_err(|why| format!("{at}: {why}"))?;
         walk.offset = payload_end;
         walk.ordinal = 1;
         Ok(walk)
@@ -394,6 +400,7 @@ impl Claims {
             offset: self.offset,
             ordinal: self.ordinal,
             required_features: Vec::new(),
+            optional_features: Vec::new(),
         };
         let frame = walk
             .next_data()
@@ -462,6 +469,79 @@ pub(crate) fn blob_ids(
         .map_err(|e| fail(e.to_string()))?;
     let block = blob_content(&payload).map_err(fail)?;
     block_ids(&block).map_err(fail)
+}
+
+/// What the verifier's own decode of every data blob finds against the
+/// blob's indexdata: the part of an indexdata claim it holds independently
+/// of pbfhogg (kind, count, exact minimum and maximum ID). Bounding boxes
+/// and tag indexes are not read here.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct IndexTruth {
+    pub blobs: u64,
+    pub blobs_with_indexdata: u64,
+    pub violations: u64,
+    /// The first few violations, each naming its data blob.
+    pub shown: Vec<String>,
+}
+
+impl IndexTruth {
+    pub(crate) fn passed(&self) -> bool {
+        self.violations == 0
+    }
+}
+
+/// Decode every data blob of `path` (raw or zlib; any other compression is
+/// an error naming it, never a skip) and hold each indexdata claim to the
+/// blob's elements: every element of the claimed kind, the claimed count,
+/// and, for a nonempty blob, the claimed minimum and maximum ID exactly.
+pub(crate) fn index_truth(path: &Path) -> Result<IndexTruth, Error> {
+    const SHOWN: usize = 10;
+    let mut truth = IndexTruth::default();
+    let mut claims = Claims::open(path)?;
+    while let Some(blob) = claims.next_blob()? {
+        truth.blobs += 1;
+        let Some(claim) = blob.claim else { continue };
+        truth.blobs_with_indexdata += 1;
+        let ids = blob_ids(path, blob.payload_offset, blob.datasize)?;
+        let mut found = Vec::new();
+        if let Some((kind, id)) = ids.iter().find(|(kind, _)| *kind != claim.kind) {
+            found.push(format!(
+                "claims kind {} but holds element {id} of kind {kind}",
+                claim.kind
+            ));
+        }
+        if ids.len() as u64 != claim.count {
+            found.push(format!(
+                "claims {} elements but holds {}",
+                claim.count,
+                ids.len()
+            ));
+        }
+        if let (Some(min), Some(max)) = (
+            ids.iter().map(|(_, id)| *id).min(),
+            ids.iter().map(|(_, id)| *id).max(),
+        ) {
+            if min != claim.min_id {
+                found.push(format!(
+                    "claims min_id {} but its smallest ID is {min}",
+                    claim.min_id
+                ));
+            }
+            if max != claim.max_id {
+                found.push(format!(
+                    "claims max_id {} but its largest ID is {max}",
+                    claim.max_id
+                ));
+            }
+        }
+        for why in found {
+            truth.violations += 1;
+            if truth.shown.len() < SHOWN {
+                truth.shown.push(format!("data blob {}: {why}", blob.index));
+            }
+        }
+    }
+    Ok(truth)
 }
 
 /// The `(kind, id)` of every element of a `PrimitiveBlock`.
@@ -842,17 +922,72 @@ fn blob_content(bytes: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// `HeaderBlock.required_features` (field 4, repeated string).
-fn header_features(block: &[u8]) -> Result<Vec<String>, String> {
-    let mut features = Vec::new();
+/// `HeaderBlock.required_features` (field 4) and `optional_features`
+/// (field 5), both repeated strings.
+fn header_features(block: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
+    let (mut required, mut optional) = (Vec::new(), Vec::new());
     for field in Fields::new(block) {
         match field? {
-            (4, Value::Bytes(v)) => features.push(String::from_utf8_lossy(v).into_owned()),
-            (4, _) => return Err("required_features has the wrong wire type".into()),
+            (4, Value::Bytes(v)) => required.push(String::from_utf8_lossy(v).into_owned()),
+            (5, Value::Bytes(v)) => optional.push(String::from_utf8_lossy(v).into_owned()),
+            (4 | 5, _) => return Err("a header feature has the wrong wire type".into()),
             _ => {}
         }
     }
-    Ok(features)
+    Ok((required, optional))
+}
+
+/// The `Sort.Type_then_ID` feature pbfhogg branches on.
+pub(crate) const SORT_TYPE_THEN_ID: &str = "Sort.Type_then_ID";
+
+/// A PBF's `OSMHeader` features, read by the verifier itself: the header
+/// claims a check routes on or holds an output to, never read through the
+/// pbfhogg CLI under test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Header {
+    pub required: Vec<String>,
+    pub optional: Vec<String>,
+}
+
+impl Header {
+    /// `Sort.Type_then_ID` among the optional features, which is where
+    /// pbfhogg reads it (`HeaderBlock::is_sorted`).
+    pub(crate) fn optional_sorted(&self) -> bool {
+        self.optional_feature(SORT_TYPE_THEN_ID)
+    }
+
+    pub(crate) fn optional_feature(&self, feature: &str) -> bool {
+        self.optional.iter().any(|f| f == feature)
+    }
+
+    /// `Sort.Type_then_ID` in either list.
+    pub(crate) fn declares_sorted(&self) -> bool {
+        self.required
+            .iter()
+            .chain(&self.optional)
+            .any(|f| f == SORT_TYPE_THEN_ID)
+    }
+}
+
+/// Read `path`'s leading `OSMHeader` (and the framing up to it).
+pub(crate) fn header(path: &Path) -> Result<Header, Error> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
+    let len = file
+        .metadata()
+        .map_err(|e| Error::Failed(format!("cannot stat {}: {e}", path.display())))?
+        .len();
+    let mut file = std::io::BufReader::new(file);
+    let walk = FrameWalk::open(&mut file, len).map_err(|why| {
+        Error::Failed(format!(
+            "cannot read the header of {}: {why}",
+            path.display()
+        ))
+    })?;
+    Ok(Header {
+        required: walk.required_features,
+        optional: walk.optional_features,
+    })
 }
 
 /// Protobuf's largest field number, `2^29 - 1`.

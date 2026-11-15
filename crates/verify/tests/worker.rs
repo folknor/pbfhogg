@@ -24,10 +24,12 @@ pub(crate) mod argv;
 pub(crate) mod checks;
 #[path = "extract_fixture.rs"]
 mod extract_fixture;
+#[path = "fake_pbf.rs"]
+pub(crate) mod fake_pbf;
 #[path = "../src/harness.rs"]
 pub(crate) mod harness;
-#[path = "../src/inspect_report.rs"]
-pub(crate) mod inspect_report;
+#[path = "../src/opl_compare.rs"]
+pub(crate) mod opl_compare;
 #[path = "../src/osc.rs"]
 pub(crate) mod osc;
 #[path = "../src/pbf_frames.rs"]
@@ -123,7 +125,7 @@ fn main() {
             .any(|p| p.file_name().is_some_and(|n| n == "read-fixture"))
     }) {
         std::process::exit(read_fixture::tool(&args[1..]));
-    } else if ["getid", "cat", "inspect", "diff"].contains(&role) {
+    } else if ["getid", "cat", "fileinfo"].contains(&role) {
         std::process::exit(refs_fixture::tool(&args[1..]));
     } else if role == "driver" {
         driver(args[2].to_str().unwrap(), Path::new(&args[3]));

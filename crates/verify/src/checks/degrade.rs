@@ -4,11 +4,12 @@
 //! are [`crate::verify_reencode`]).
 //!
 //! The reference is the input without way coordinates, since every
-//! re-encode drops them, partitioned by kind when its kinds are not grouped.
-//! Every case must claim no `LocationsOnWays`, claim `Sort.Type_then_ID` as
-//! the input does except under an unsort mode (never), carry indexdata on
-//! every blob that `check --index` finds true, and hold no blob over the cap
-//! or empty, kinds in order.
+//! re-encode drops them, partitioned by kind when osmium does not read it in
+//! order. Every case must claim no `LocationsOnWays`, claim
+//! `Sort.Type_then_ID` as the input does except under an unsort mode
+//! (never), carry indexdata on every blob, true by the verifier's own blob
+//! decode and by `check --index`, and hold no blob over the cap or empty,
+//! kinds in order.
 //!
 //! - `--strip-locations`: the element sequence unchanged; on an indexed input
 //!   each input blob re-encoded alone ([`split`]).
@@ -165,14 +166,15 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     }
     if !input.standard {
         run.gaps.push(
-            "the input's kinds are not grouped in order: elements compared with osmium's stable \
-             partition of it by kind"
+            "osmium does not read the input in kind and ID order: elements compared with \
+             osmium's stable partition of it by kind"
                 .to_owned(),
         );
     }
     let mut claim = vec![
         "element sequence with metadata against osmium diff (removed and moved objects line by \
-         line), header claims, indexdata against payloads (check --index), cap and kind order, \
+         line), header claims, indexdata against payloads (the verifier's own blob decode for \
+         kind, count and ID range, check --index for the rest), cap and kind order, \
          the documented layout where it is predicted, and each unsort swap's position; which \
          objects --drop-ids removes is not compared with pbfhogg's selection"
             .to_owned(),

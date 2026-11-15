@@ -11,21 +11,22 @@ use crate::reference::ToolRun;
 /// can share its run once runs are cached.
 pub(crate) const OSMIUM_SORTED: &str = "osmium.osm.pbf";
 
-/// `osmium sort INPUT -o OUTPUT` as a reference run, exit 0 required.
+/// `osmium sort INPUT -o OUTPUT` as a reference run, exit 0 required. When
+/// the input's header declares `LocationsOnWays` the copy is written with
+/// `-f pbf,locations_on_ways=true`, so the inline coordinates libosmium
+/// decodes survive the sort and stay comparable.
 pub(crate) fn osmium_sort(
     h: &mut Harness,
     input: &Path,
     output: &Path,
     sink: &Path,
 ) -> Result<(), Error> {
-    h.reference(
-        &ToolRun::osmium("sort.1")
-            .arg("sort")
-            .input(input)
-            .arg("-o")
-            .output(output),
-        sink,
-    )?;
+    let locations = crate::pbf_frames::header(input)?.optional_feature("LocationsOnWays");
+    let mut run = ToolRun::osmium("sort.1").arg("sort").input(input);
+    if locations {
+        run = run.args(&["-f", "pbf,locations_on_ways=true"]);
+    }
+    h.reference(&run.arg("-o").output(output), sink)?;
     Ok(())
 }
 
@@ -45,9 +46,8 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
 
     let theirs = outdir.join(OSMIUM_SORTED);
     osmium_sort(h, pbf, &theirs, &outdir.join("osmium.stdout"))?;
-    h.print_inspect("osmium", &theirs)?;
-
-    let diff = h.diff_pbfs(&ours, &theirs, &listing_beside(&ours))?;
+    let policy = crate::opl_compare::Policy::between(&ours, &theirs)?;
+    let diff = h.same_elements(&ours, &theirs, &listing_beside(&ours), policy)?;
     h.msg(if diff == crate::harness::Verdict::Pass {
         "  diff: PASS (identical)"
     } else {

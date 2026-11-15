@@ -7,9 +7,10 @@
 //!
 //! Every case must keep the element sequence, metadata and way coordinates
 //! included (osmium diff against the input, or the stable partition of an
-//! input whose kinds are not grouped); claim `Sort.Type_then_ID` and
-//! `LocationsOnWays` as the input does; carry indexdata on every blob that
-//! `check --index` finds true; hold no blob over the cap or empty, kinds in
+//! input osmium does not read in order); claim `Sort.Type_then_ID` and
+//! `LocationsOnWays` as the input does; carry indexdata on every blob, true
+//! by the verifier's own blob decode and by `check --index`; hold no blob
+//! over the cap or empty, kinds in
 //! order; and, on an indexed input, be laid out exactly as
 //! [`RepackBuilder`] predicts from the input's claims. The stripped copy must
 //! be unindexed and hold the input's data payloads byte for byte, or it is a
@@ -155,8 +156,8 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     }
     if !input.standard {
         gaps.push(
-            "the input's kinds are not grouped in order: elements compared with osmium's stable \
-             partition of it by kind"
+            "osmium does not read the input in kind and ID order: elements compared with \
+             osmium's stable partition of it by kind"
                 .to_owned(),
         );
     }
@@ -168,7 +169,8 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     }
     let mut claim = vec![format!(
         "element sequence with metadata and way coordinates against osmium diff, header claims, \
-         indexdata against payloads (check --index), cap and kind order{}",
+         indexdata against payloads (the verifier's own blob decode for kind, count and ID \
+         range, check --index for the rest), cap and kind order{}",
         if input.indexed {
             ", and the documented block layout from the input's claims"
         } else {

@@ -1,27 +1,20 @@
-//! The element diff two verify checks classify: `pbfhogg diff --format osc`
-//! between two outputs, streamed into per-class counts with bounded ID
-//! samples.
+//! The element diff the classifying checks read: the verifier's merge of
+//! osmium's decodings of two files ([`crate::opl_compare`]), streamed into
+//! per-class counts with bounded ID samples.
 //!
-//! With the first PBF as the diff's old side and the second as its new side,
-//! `<delete>` is an element only the first holds, `<create>` one only the
-//! second holds, and `<modify>` a key both hold with unequal content
-//! (coordinates, tags, refs, members; pbfhogg's content equality, which
-//! leaves metadata out). What each class means is the caller's policy:
-//! `verify_merge` exempts osmium-only IDs its input deleted, `verify_extract`
-//! gates content and per-strategy membership.
-
-#![allow(
-    dead_code,
-    reason = "shared verifier helpers consumed by the remaining family slices"
-)]
+//! With the first PBF as the old side and the second as the new side, a
+//! delete is an element only the first holds, a create one only the second
+//! holds, and a modify a key both hold with unequal records. What each class
+//! means is the caller's policy: apply-changes exempts osmium-only IDs its
+//! input deleted, extract gates content and per-strategy membership.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
-use crate::osc::{self, OscAction, OscKind};
+use crate::opl_compare::{self, Class, Policy};
+use crate::osc::{OscAction, OscKind};
 
 /// Cap on the IDs kept per kind per class, so a runaway difference does not
 /// bury the summary. The counts stay exact.
@@ -104,96 +97,38 @@ fn print_id_sample(kind: &str, sampled: &Sampled, emit: &mut impl FnMut(&str)) {
     emit(&format!("    {kind}: {list}{suffix}"));
 }
 
-/// Run `pbfhogg diff --format osc <old> <new> -o <osc>` and hand every entry
-/// of the written OSC to `each`, in file order.
+/// Compare `old` with `new` as osmium decodes them under `policy`
+/// ([`opl_compare`]), handing every differing identity to `each` in object
+/// order, its listing at `listing`: [`OscAction::Delete`] for an object only
+/// `old` holds, [`OscAction::Create`] for one only `new` holds and
+/// [`OscAction::Modify`] for one both hold with unequal records.
 ///
-/// Returns only once the whole document has been scanned, so a caller acts
-/// on what it accumulated only after `Ok`. The exit status must agree with
-/// what the document holds: 0 with no entries (identical) or 1 with at least
-/// one (different). Any other status, a missing OSC, or a disagreement (0
-/// with entries, 1 with none) is an error, never a verdict, and so is an
-/// entry without a parsable ID or outside the document's action structure
-/// ([`osc::scan_osc_file_strict`]). `osc` must lie in
-/// a fresh directory created by [`Harness::subdir`], so its existence proves
-/// this run wrote it.
-pub(crate) fn scan_osc_diff(
+/// Returns only once both streams have been read whole, so a caller acts on
+/// what it accumulated only after `Ok`. A side out of strict kind and ID
+/// order is an error, never a verdict.
+pub(crate) fn scan_element_diff(
     harness: &mut Harness,
     old: &Path,
     new: &Path,
-    osc_path: &Path,
+    listing: &Path,
+    policy: Policy,
     mut each: impl FnMut(OscAction, OscKind, i64),
 ) -> Result<(), Error> {
-    // No `--suppress-common`: pbfhogg refuses it with `--format osc`, whose
-    // document holds only differing elements anyway.
-    let captured = harness.pbfhogg_discard(
-        PbfArgv::new("diff")
-            .arg("--format")
-            .arg("osc")
-            .output(osc_path)
-            .input(old)
-            .input(new)
-            .scratch(),
-    )?;
-    let stderr = || String::from_utf8_lossy(&captured.stderr).trim().to_owned();
-    let differs = match captured.code() {
-        Some(0) => false,
-        Some(1) => true,
-        _ => {
-            return Err(Error::Failed(format!(
-                "pbfhogg diff --format osc failed: {}: {}",
-                captured.status,
-                stderr()
-            )));
-        }
-    };
-    if !osc_path.exists() {
-        return Err(Error::Failed(format!(
-            "pbfhogg diff produced no output OSC at {} - stderr: {}",
-            osc_path.display(),
-            stderr()
-        )));
-    }
-    let mut entries: u64 = 0;
-    // Strict: an entry without a parsable id is an error, so the entries
-    // counted against the exit status are every entry the diff wrote.
-    osc::scan_osc_file_strict(osc_path, |action, kind, id| {
-        entries += 1;
-        each(action, kind, id);
+    let kinds = [OscKind::Node, OscKind::Way, OscKind::Relation];
+    opl_compare::compare(harness, old, new, listing, policy, |group| {
+        let action = match group.class {
+            Class::FirstOnly => OscAction::Delete,
+            Class::SecondOnly => OscAction::Create,
+            Class::Differs => OscAction::Modify,
+        };
+        each(action, kinds[group.kind], group.id);
     })?;
-    exit_agrees(differs, entries).map_err(|why| {
-        Error::Failed(format!(
-            "pbfhogg diff --format osc: {why} in {} - stderr: {}",
-            osc_path.display(),
-            stderr()
-        ))
-    })?;
-    harness.msg(&format!(
-        "  element diff: {entries} entries in {}",
-        osc_path.display()
-    ));
     Ok(())
-}
-
-/// Whether the diff's exit status agrees with the entries its OSC holds.
-fn exit_agrees(differs: bool, entries: u64) -> Result<(), String> {
-    match (differs, entries) {
-        (false, 0) | (true, 1..) => Ok(()),
-        (false, n) => Err(format!("exit 0 (identical) but {n} entries")),
-        (true, 0) => Err("exit 1 (different) but no entries".into()),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exit_status_must_agree_with_the_entries() {
-        assert!(exit_agrees(false, 0).is_ok());
-        assert!(exit_agrees(true, 3).is_ok());
-        assert!(exit_agrees(false, 1).is_err());
-        assert!(exit_agrees(true, 0).is_err());
-    }
 
     #[test]
     fn a_huge_class_keeps_exact_counts_and_bounded_samples() {

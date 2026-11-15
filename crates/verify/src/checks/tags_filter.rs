@@ -52,10 +52,6 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         )?;
         harness.require_success(&captured, "osmium tags-filter")?;
 
-        // Print inspect output for both outputs.
-        harness.print_inspect("pbfhogg", &pbfhogg_out)?;
-        harness.print_inspect("osmium", &osmium_out)?;
-
         compare_outputs(
             harness,
             &order,

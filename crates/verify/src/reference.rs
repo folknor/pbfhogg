@@ -79,6 +79,8 @@ pub(crate) struct ToolRun {
     pub(crate) args: Vec<RunArg>,
     pub(crate) accepted: Vec<i32>,
     conditions: Vec<(i32, StderrShows)>,
+    /// Never looked up in or published to the reference cache.
+    pub(crate) uncached: bool,
 }
 
 impl ToolRun {
@@ -89,7 +91,16 @@ impl ToolRun {
             args: Vec::new(),
             accepted: vec![0],
             conditions: Vec::new(),
+            uncached: false,
         }
+    }
+
+    /// Run without the reference cache: for a decoding whose output is as
+    /// large as its input and read once, which publishing would only move
+    /// into the cache until the budget evicts it at the end of the run.
+    pub(crate) fn uncached(mut self) -> Self {
+        self.uncached = true;
+        self
     }
 
     pub(crate) fn osmium(id: impl Into<String>) -> Self {

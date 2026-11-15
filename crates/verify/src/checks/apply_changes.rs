@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
+use crate::opl_compare::Policy;
 use crate::osc::{self, OscAction, OscKind};
 use crate::output;
 use crate::reference::{Program, ToolRun};
@@ -20,9 +21,11 @@ const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
 ///
 /// With `locations_on_ways`, both tools run with `--locations-on-ways` and
 /// pbfhogg's output must pass `pbfhogg check --locations`. The element diff
-/// cannot see inline coordinates (`pbfhogg diff` treats them as derived
-/// data, not content), so that check is the only one that catches a stale
-/// coordinate - a way the diff leaves untouched under a node it moves.
+/// leaves inline coordinates out in this mode (osmium's are no reference,
+/// below), so that check, pbfhogg's own and the one same-project comparator
+/// left in this check, is the only one that catches a stale coordinate - a
+/// way the diff leaves untouched under a node it moves. No osmium command
+/// holds inline coordinates to node records.
 /// osmium's output is checked the same way but only reported: its location
 /// index can itself write stale coordinates (several versions of one node,
 /// unsorted lookups), so it is not the oracle. osmosis and osmconvert, which
@@ -106,9 +109,9 @@ pub fn run(
     // --- Element counts ---
     // pbfhogg's output is summarised by its sort check below.
     harness.msg("=== element counts ===");
-    harness.print_inspect("osmium", &osmium_out)?;
+    harness.print_fileinfo("osmium", &osmium_out)?;
     for (label, path) in &context_outputs {
-        harness.print_inspect(label, path)?;
+        harness.print_fileinfo(label, path)?;
     }
 
     // --- Sort check ---
@@ -143,27 +146,6 @@ pub fn run(
         ));
     }
 
-    // pbfhogg diff (the deep-compare below) is a merge-join and requires both
-    // inputs to declare the Sort.Type_then_ID optional feature. pbfhogg's
-    // apply-changes output does; osmium's is content-sorted but doesn't stamp
-    // the feature, so pbfhogg diff otherwise dies with "New PBF is not sorted".
-    // Normalise osmium's output through `pbfhogg sort` first - a passthrough +
-    // flag stamp on already-sorted content - so the compare sees two sorted
-    // inputs. Content is unchanged, so the element diff is unaffected.
-    let osmium_sorted = outdir.join("osmium-sorted.osm.pbf");
-    harness.msg("--- pbfhogg sort (normalise osmium output for merge-join diff) ---");
-    // `--force`: osmium's output never carries blob-level indexdata, which
-    // pbfhogg sort requires by default. With --force it decodes payloads to
-    // scan IDs (slower pass 1) but produces content-identical output, so the
-    // cross-check's independence is untouched.
-    let captured = harness.pbfhogg_discard(
-        PbfArgv::new("sort")
-            .arg("--force")
-            .input(&osmium_out)
-            .output(&osmium_sorted),
-    )?;
-    harness.require_success(&captured, "pbfhogg sort (normalise osmium output)")?;
-
     // --- Strict pbfhogg-vs-osmium element diff (with delete-set tolerance) ---
     //
     // Cross-validation needs more than equal element counts. We diff
@@ -174,7 +156,14 @@ pub fn run(
     // `<delete>` section aren't bugs - both behaviours are spec-allowed.
     // Anything else (osmium-only IDs not in the delete set, pbfhogg-only
     // elements, or content-level `<modify>` differences) fails verify.
-    verify_pbfhogg_vs_osmium(harness, osc, &pbfhogg_out, &osmium_sorted, &outdir)?;
+    // Inline coordinates are left out in locations mode: osmium's own are
+    // known stale there (above), so they are no reference.
+    let policy = if locations_on_ways {
+        Policy::NO_LOCATIONS
+    } else {
+        Policy::between(&pbfhogg_out, &osmium_out)?
+    };
+    verify_pbfhogg_vs_osmium(harness, osc, &pbfhogg_out, &osmium_out, &outdir, policy)?;
 
     Ok(Some(if locations_on_ways {
         "strict element content with delete-set tolerance; output strictly ordered; inline locations pass pbfhogg check --locations; osmium locations informational"
@@ -193,7 +182,7 @@ pub fn run(
 fn refused(
     harness: &mut Harness,
     pbf: &Path,
-    header: &crate::inspect_report::InspectSummary,
+    header: &crate::pbf_frames::Header,
     args: PbfArgv,
     direct_io: bool,
     locations_on_ways: bool,
@@ -203,7 +192,7 @@ fn refused(
             "{} declares neither {} nor {LOCATIONS_ON_WAYS}, two refusals of apply-changes \
              --locations-on-ways, so neither can be held alone",
             pbf.display(),
-            crate::inspect_report::SORT_TYPE_THEN_ID
+            crate::pbf_frames::SORT_TYPE_THEN_ID
         )));
     }
     verify_input_order::expect_unsorted_refusal(
@@ -301,16 +290,17 @@ fn run_context_tools(
     Ok(produced)
 }
 
-/// Run `pbfhogg diff --format osc` on `(pbfhogg_out, osmium_out)`,
-/// then categorise each diff entry against the input OSC's delete
-/// set. Returns `Err(Error::Failed(...))` if any unexplained
-/// difference remains.
+/// Diff `(pbfhogg_out, osmium_out)` as osmium decodes them
+/// (`element_diff::scan_element_diff`), then categorise each differing
+/// identity against the input OSC's delete set. Returns
+/// `Err(Error::Failed(...))` if any unexplained difference remains.
 fn verify_pbfhogg_vs_osmium(
     harness: &mut Harness,
     input_osc: &Path,
     pbfhogg_out: &Path,
     osmium_out: &Path,
     outdir: &Path,
+    policy: Policy,
 ) -> Result<(), Error> {
     harness.msg("=== pbfhogg vs osmium element diff ===");
 
@@ -322,24 +312,25 @@ fn verify_pbfhogg_vs_osmium(
         applied.ids[2].len(),
     ));
 
-    let diff_path = outdir.join("pbfhogg-vs-osmium.osc");
+    let diff_path = outdir.join("pbfhogg-vs-osmium.diff.txt");
 
-    // pbfhogg diff old new: <delete> blocks = old-only, <create>
-    // blocks = new-only, <modify> blocks = same id different content.
-    // We pass pbfhogg as `old` and osmium as `new` so:
+    // The element diff old new: delete = old-only, create = new-only,
+    // modify = same id, different record. We pass pbfhogg as `old` and
+    // osmium as `new` so:
     //   diff.created_* = osmium-only (carve-out candidates)
     //   diff.deleted_* = pbfhogg-only (always failures)
     //   diff.modified_* = content mismatches (always failures)
     // Classified as it streams: only counters and bounded samples are kept,
     // so a regression the size of the planet costs no more than a pass. The
-    // verdict waits for the scan to return, which proves the document whole
-    // and its entries in agreement with the diff's exit status.
+    // verdict waits for the scan to return, which proves both sides read
+    // whole and in strict order.
     let mut report = MergeDiffReport::default();
-    element_diff::scan_osc_diff(
+    element_diff::scan_element_diff(
         harness,
         pbfhogg_out,
         osmium_out,
         &diff_path,
+        policy,
         |action, kind, id| report.classify(action, kind, id, &applied),
     )?;
     drop(applied);

@@ -9,7 +9,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("encoding-fixture");
     std::fs::create_dir(&dir).unwrap();
     let input = dir.join("input.pbf");
-    write_pbf(&input, false, 3);
+    write_pbf(&input, false, 3, &["Sort.Type_then_ID"], &[]);
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(&dir, "encoding".into(), true).unwrap();
     let mut h = harness::Harness::new(
@@ -84,16 +84,7 @@ pub fn tool(args: &[OsString]) -> i32 {
         .unwrap();
     let fault = std::fs::read_to_string(root.join("fault")).unwrap_or_default();
     match args[0] {
-        "fileinfo" => println!(
-            r#"{{"data":{{"objects_ordered":false,"count":{{"nodes":3,"ways":0,"relations":0}},"minid":{{"nodes":1,"ways":0,"relations":0}},"maxid":{{"nodes":3,"ways":0,"relations":0}}}}}}"#
-        ),
-        "inspect" => println!(
-            "{}",
-            serde_json::json!({
-                "header": {"required_features": if args.iter().any(|a| a.ends_with("/input.pbf")) || fault == "required-output" { vec!["Sort.Type_then_ID"] } else { vec![] }, "optional_features": if fault == "header" && !args.iter().any(|a| a.ends_with("/input.pbf")) { vec!["LocationsOnWays"] } else { vec![] }},
-                "indexed": true, "elements": {"nodes":3,"tagged_nodes":0,"ways":0,"relations":0,"total":3}, "ordering": {"standard":true}
-            })
-        ),
+        "fileinfo" => println!("{}", crate::fake_pbf::fileinfo(3, 0, 0)),
         "check" => {
             assert!(!args.contains(&"--direct-io"));
             println!(
@@ -116,7 +107,7 @@ pub fn tool(args: &[OsString]) -> i32 {
             let output = Path::new(args[args.iter().position(|a| *a == "--output").unwrap() + 1]);
             if ["refused", "published", "wrong-advice"].contains(&fault.as_str()) {
                 if fault == "published" {
-                    write_pbf(output, true, 3);
+                    write_pbf(output, true, 3, &[], &[]);
                 }
                 eprintln!(
                     "too large{}",
@@ -130,7 +121,25 @@ pub fn tool(args: &[OsString]) -> i32 {
             }
             assert!(args.contains(&"--direct-io"));
             assert!(args.contains(&"--force"));
-            write_pbf(output, true, if fault == "layout" { 0 } else { 3 });
+            // The output claims what the faults ask of its header: a sort
+            // feature among the required ones changes no optional claim.
+            let required: &[&str] = if fault == "required-output" {
+                &["Sort.Type_then_ID"]
+            } else {
+                &[]
+            };
+            let optional: &[&str] = if fault == "header" {
+                &["LocationsOnWays"]
+            } else {
+                &[]
+            };
+            write_pbf(
+                output,
+                true,
+                if fault == "layout" { 0 } else { 3 },
+                required,
+                optional,
+            );
         }
         other => panic!("unexpected encoding protocol {other}: {args:?}"),
     }
@@ -154,19 +163,40 @@ fn frame(kind: &[u8], index: &[u8], payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
-fn write_pbf(path: &Path, indexed: bool, count: u64) {
+/// A PBF of one raw data blob holding dense nodes 1, 2 and 3, its
+/// indexdata (when `indexed`) claiming nodes 1..3 and `count` elements, its
+/// header the given features: the verifier's own header, framing and
+/// indexdata readers consume all of it.
+fn write_pbf(path: &Path, indexed: bool, count: u64, required: &[&str], optional: &[&str]) {
     let mut out = Vec::new();
-    // Raw empty HeaderBlock. The data is never decoded by this protocol;
-    // production framing and claim readers still consume its real framing.
-    frame(b"OSMHeader", &[], &[10, 0], &mut out);
+    let mut block = Vec::new();
+    for feature in required {
+        field(4, feature.as_bytes(), &mut block);
+    }
+    for feature in optional {
+        field(5, feature.as_bytes(), &mut block);
+    }
+    let mut header = Vec::new();
+    field(1, &block, &mut header);
+    frame(b"OSMHeader", &[], &header, &mut out);
     let mut index = vec![1, 0];
     index.extend_from_slice(&1_i64.to_le_bytes());
     index.extend_from_slice(&3_i64.to_le_bytes());
     index.extend_from_slice(&count.to_le_bytes());
+    // Dense ids 1, 2, 3: zigzag deltas 1, 1, 1 (each encoded as 2).
+    let mut dense = Vec::new();
+    field(1, &[2, 2, 2], &mut dense);
+    let mut group = Vec::new();
+    field(2, &dense, &mut group);
+    let mut primitive = Vec::new();
+    field(1, &[], &mut primitive);
+    field(2, &group, &mut primitive);
+    let mut data = Vec::new();
+    field(1, &primitive, &mut data);
     frame(
         b"OSMData",
         if indexed { &index } else { &[] },
-        &[10, 0],
+        &data,
         &mut out,
     );
     std::fs::write(path, out).unwrap();

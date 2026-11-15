@@ -33,21 +33,25 @@
 
 use std::path::{Path, PathBuf};
 
-use super::inspect_report::{self, InspectSummary};
 use crate::argv::PbfArgv;
 use crate::checks::sort;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::inspect_report::SORT_TYPE_THEN_ID;
+use crate::opl_compare::Policy;
+use crate::pbf_frames::{self, Header, SORT_TYPE_THEN_ID};
 
-/// The input header's report, written to the check's directory, never beside
-/// the input.
+/// The input's header features, read by the verifier itself.
 pub(crate) fn input_header(
     harness: &mut Harness,
     pbf: &Path,
-    outdir: &Path,
-) -> Result<InspectSummary, Error> {
-    inspect_report::inspect_into(harness, pbf, &outdir.join("input.inspect.json"), false)
+    _outdir: &Path,
+) -> Result<Header, Error> {
+    let header = pbf_frames::header(pbf)?;
+    harness.msg(&format!(
+        "  input header: required {:?}, optional {:?}",
+        header.required, header.optional
+    ));
+    Ok(header)
 }
 
 /// An osmium-sorted copy of `pbf` in `outdir/osmium-sorted-input/`. The
@@ -111,8 +115,10 @@ impl InputOrder {
 /// comparison cannot be made (an error); pbfhogg's must be in strict order
 /// on sorted input, and on unsorted input must not claim `Sort.Type_then_ID`
 /// and is compared through an osmium-sorted copy whose strict order proves
-/// no repeated ID; then the element diff (content and tags; metadata left
-/// out), and on sorted input the sort feature comparison.
+/// no repeated ID; then the element comparison of osmium's decodings
+/// (`crate::opl_compare`: every record, metadata included, inline
+/// coordinates when both outputs declare them), and on sorted input the
+/// sort feature comparison.
 pub(crate) fn compare_outputs(
     harness: &mut Harness,
     order: &InputOrder,
@@ -149,10 +155,12 @@ pub(crate) fn compare_outputs(
         harness.record(&format!("{pbfhogg_label} output repeats an ID"), verdict);
         copy
     };
-    let diff = harness.diff_pbfs(
+    let policy = Policy::between(&compared, theirs)?;
+    let diff = harness.same_elements(
         &compared,
         theirs,
         &crate::harness::listing_beside(&compared),
+        policy,
     )?;
     if diff.is_pass() {
         harness.msg(&format!("  {label}: PASS (identical)"));
@@ -199,15 +207,15 @@ pub(crate) fn refusal_terms(command: &str, runs: &str, direct_io: bool) -> Strin
 }
 
 /// The osmium-sorted copy a two-sided diff refusal pairs the input with,
-/// required to carry the claim pbfhogg reads (from `pbfhogg inspect`, not the
-/// command under test), or the other side's gate cannot be held.
+/// required to carry the claim pbfhogg reads (by the verifier's own header
+/// reader), or the other side's gate cannot be held.
 pub(crate) fn sorted_counterpart(
     harness: &mut Harness,
     pbf: &Path,
     outdir: &Path,
 ) -> Result<PathBuf, Error> {
     let copy = osmium_sorted_copy(harness, pbf, outdir)?;
-    if !inspect_report::inspect(harness, &copy, false)?.optional_sorted() {
+    if !pbf_frames::header(&copy)?.optional_sorted() {
         return Err(Error::Failed(format!(
             "the osmium-sorted copy {} does not declare {SORT_TYPE_THEN_ID} among its optional \
              features, so it cannot stand as the sorted side of a refused diff",

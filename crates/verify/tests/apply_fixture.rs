@@ -1,7 +1,23 @@
 //! Generated apply-changes protocol, with no datasets or network.
-use crate::{checks, harness, process, reference, reference_cache, run};
+use crate::{checks, fake_pbf, harness, process, reference, reference_cache, run};
 use std::ffi::OsString;
 use std::path::Path;
+
+const SORTED: &str = "Sort.Type_then_ID";
+const LOW: &str = "LocationsOnWays";
+
+/// The OPL the fake osmium decodes each output to, by fault: the element
+/// differences the apply check classifies.
+fn opl(fault: &str, pbfhogg: bool) -> &'static str {
+    match (fault, pbfhogg) {
+        ("explained", false) => "n1 v1\nn7 v1\n",
+        ("unexplained", false) => "n1 v1\nn8 v1\n",
+        ("modified", true) => "n1 v1\nn7 v1 Ta=1\n",
+        ("modified", false) => "n1 v1\nn7 v1 Ta=2\n",
+        ("deleted", true) => "n1 v1\nn7 v1\n",
+        _ => "n1 v1\n",
+    }
+}
 
 pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("apply-fixture");
@@ -39,17 +55,13 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         ("publish", false),
     ] {
         std::fs::write(dir.join("fault"), fault).unwrap();
-        std::fs::write(
-            &input,
-            if fault == "unsorted" || fault == "publish" {
-                "unsorted"
-            } else if fault == "context-failure" {
-                "context-sorted"
-            } else {
-                "sorted"
-            },
-        )
-        .unwrap();
+        if fault == "unsorted" || fault == "publish" {
+            fake_pbf::write(&input, &[LOW], "unsorted");
+        } else {
+            // The fault rides in the input's content, so no reference run is
+            // served from the cache entry of another fault.
+            fake_pbf::write(&input, &[SORTED, LOW], &format!("sorted {fault}"));
+        }
         for locations in [false, true] {
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
@@ -84,21 +96,16 @@ pub fn tool(args: &[OsString]) -> i32 {
         .unwrap();
     let fault = std::fs::read_to_string(root.join("fault")).unwrap();
     let value = |flag| args[args.iter().position(|s| *s == flag).unwrap() + 1];
+    if fake_pbf::is_opl_cat(&args) {
+        // Keyed on content alone, as the reference cache keys the decode:
+        // the marker names the side and the fault that wrote it.
+        let marker = fake_pbf::marker(Path::new(args[1]));
+        let (side, written_under) = marker.split_once('-').unwrap();
+        std::fs::write(value("-o"), opl(written_under, side == "pbfhogg")).unwrap();
+        return 0;
+    }
     match args[0] {
-        "inspect" => {
-            let sorted =
-                std::fs::read_to_string(args.iter().find(|a| a.ends_with(".pbf")).unwrap())
-                    .unwrap()
-                    != "unsorted";
-            let feature = if sorted {
-                r#""Sort.Type_then_ID","#
-            } else {
-                ""
-            };
-            print!(
-                r#"{{"header":{{"required_features":[],"optional_features":[{feature}"LocationsOnWays"]}},"elements":{{"nodes":1,"ways":1,"relations":0}},"ordering":{{"standard":true}},"data":{{"objects_ordered":true}}}}"#
-            );
-        }
+        "fileinfo" => print!("{}", fake_pbf::fileinfo(1, 1, 0)),
         "apply-changes" => {
             let ours = args.contains(&"--output");
             let output = value(if ours { "--output" } else { "-o" });
@@ -107,7 +114,7 @@ pub fn tool(args: &[OsString]) -> i32 {
                 assert!(args.contains(&"--staging-dir"));
                 assert!(!args.contains(&"--tmp-dir"));
             }
-            if std::fs::read_to_string(args[1]).unwrap() == "unsorted" {
+            if fake_pbf::marker(Path::new(args[1])) == "unsorted" {
                 assert!(ours, "references must not run on refusal input");
                 if fault == "publish" {
                     std::fs::write(output, "bad").unwrap();
@@ -118,10 +125,11 @@ pub fn tool(args: &[OsString]) -> i32 {
                 );
                 return 2;
             }
-            std::fs::write(output, "sorted").unwrap();
-        }
-        "sort" => {
-            std::fs::write(value("--output"), "sorted").unwrap();
+            fake_pbf::write(
+                Path::new(output),
+                &[SORTED, LOW],
+                &format!("{}-{fault}", if ours { "pbfhogg" } else { "osmium" }),
+            );
         }
         "check" => {
             assert!(args.contains(&"--locations"));
@@ -133,28 +141,6 @@ pub fn tool(args: &[OsString]) -> i32 {
                 return 1;
             }
             println!("Refs with a node record: 2 verified, 0 mismatched (0 nodes)");
-        }
-        "diff" => {
-            assert!(args.contains(&"--tmp-dir"));
-            assert!(args.contains(&"--staging-dir"));
-            let (action, id) = match fault.as_str() {
-                "explained" => ("create", 7),
-                "unexplained" => ("create", 8),
-                "modified" => ("modify", 7),
-                "deleted" => ("delete", 7),
-                _ => ("", 0),
-            };
-            let body = if action.is_empty() {
-                String::new()
-            } else {
-                format!("<{action}><node id=\"{id}\"/></{action}>")
-            };
-            std::fs::write(
-                value("--output"),
-                format!("<osmChange version=\"0.6\">{body}</osmChange>"),
-            )
-            .unwrap();
-            return i32::from(!action.is_empty());
         }
         _ => {
             // Optional osmconvert context invocation has no subcommand.

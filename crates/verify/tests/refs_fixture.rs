@@ -3,14 +3,19 @@
 use std::path::Path;
 
 use crate::{
-    harness, pbf_frames, reference, reference_cache, run, verify_getid_refs, verify_input_order,
+    fake_pbf, harness, pbf_frames, reference, reference_cache, run, verify_getid_refs,
+    verify_input_order,
 };
+
+const SORTED: &str = "Sort.Type_then_ID";
 
 const OBJECTS: &str = "n5 T x1 y1\nn6 Tname=pulled x2 y2\nn60 Tname=requested x3 y3\nw7 T Nn5,n6\nw50 T Nn60\nr1 T Mn5@,w7@,r2@\nr2 T Mr3@\nr3 T M\n";
 
 pub fn driver(life: crate::process::Lifecycle, exe: &Path, dir: &Path) {
-    let input = dir.join("input.opl");
-    std::fs::write(&input, OBJECTS).unwrap();
+    // The objects ride in the fixture PBF's marker; the fake osmium decodes
+    // them back as OPL.
+    let input = dir.join("input.opl.pbf");
+    fake_pbf::write(&input, &[SORTED], OBJECTS);
     let run = run::Run::create(dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(dir, "refs-fixture".into(), false).unwrap();
     let mut h = harness::Harness::new(
@@ -78,7 +83,7 @@ pub fn tool(args: &[std::ffi::OsString]) -> i32 {
                 assert!(text.contains(&id), "{text:?}");
             }
             let ours = text.contains(&"--add-referenced");
-            let input = Path::new(*text.iter().find(|s| s.ends_with("input.opl")).unwrap());
+            let input = Path::new(*text.iter().find(|s| s.ends_with("input.opl.pbf")).unwrap());
             assert!(input.is_file(), "{text:?}");
             if ours {
                 assert!(text.contains(&"--direct-io"));
@@ -97,11 +102,16 @@ pub fn tool(args: &[std::ffi::OsString]) -> i32 {
             if ours && fault == "one-hop" {
                 objects = objects.replace("r3 T M\n", "");
             }
-            std::fs::write(output(if ours { "--output" } else { "-o" }), objects).unwrap();
+            fake_pbf::write(
+                output(if ours { "--output" } else { "-o" }),
+                &[SORTED],
+                &objects,
+            );
         }
+        "fileinfo" => print!("{}", fake_pbf::fileinfo(3, 2, 3)),
         "cat" => {
-            assert!(text.contains(&"opl"));
-            let input = std::fs::read_to_string(text[1]).unwrap();
+            assert!(text.iter().any(|a| a.starts_with("opl")));
+            let input = fake_pbf::marker(Path::new(text[1]));
             let objects = if text.contains(&"relation") {
                 input
                     .lines()
@@ -112,17 +122,6 @@ pub fn tool(args: &[std::ffi::OsString]) -> i32 {
                 input
             };
             std::fs::write(output("-o"), objects).unwrap();
-        }
-        "inspect" => {
-            let report = r#"{"header":{"required_features":[],"optional_features":["Sort.Type_then_ID"]},"elements":{"nodes":3,"ways":2,"relations":3},"ordering":{"standard":true},"data":{"objects_ordered":true,"bbox":null,"timestamp":null}}"#;
-            print!("{report}");
-        }
-        "diff" => {
-            assert!(text.contains(&"--suppress-common"));
-            if std::fs::read(text[2]).unwrap() != std::fs::read(text[3]).unwrap() {
-                println!("*r3");
-                return 1;
-            }
         }
         _ => panic!("unexpected fixture command: {text:?}"),
     }

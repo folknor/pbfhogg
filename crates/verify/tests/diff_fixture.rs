@@ -5,24 +5,30 @@ use std::path::Path;
 
 const SORTED: &str = "Sort.Type_then_ID";
 
-/// The OPL the fake osmium decodes a renumber output to, by fault: ten
-/// relations, so one relation difference is within the 10% tolerance.
+/// The OPL the fake osmium decodes a renumber output to, by fault, under
+/// start ID 10: one node and ten relations, the first naming an orphan
+/// node, which osmium calls 11 and pbfhogg 11 + its old ID 5.
 fn renumber_opl(fault: &str, pbfhogg: bool) -> String {
-    let mut lines = vec!["n1 v1".to_owned()];
-    for r in 1..=10 {
-        let changed = pbfhogg
-            && match fault {
-                "relation-ok" => r == 1,
-                "relation" => r <= 2,
-                _ => false,
-            };
-        if pbfhogg && fault == "one-sided" && r == 10 {
+    let mut lines = vec!["n10 v1".to_owned()];
+    for r in 10..20 {
+        if pbfhogg && fault == "one-sided" && r == 19 {
             continue;
         }
-        lines.push(format!("r{r} v1 T{}", if changed { "a=1" } else { "" }));
+        let tags = if pbfhogg && fault == "relation" && r == 11 {
+            "a=1"
+        } else {
+            ""
+        };
+        let members = match (r, pbfhogg, fault) {
+            (10, false, _) => "n11@",
+            (10, true, "orphan-live") => "n10@",
+            (10, true, _) => "n16@",
+            _ => "",
+        };
+        lines.push(format!("r{r} v1 T{tags} M{members}"));
     }
     if pbfhogg && fault == "node" {
-        lines[0] = "n1 v1 Ta=1".to_owned();
+        lines[0] = "n10 v1 Ta=1".to_owned();
     }
     lines.iter().map(|l| format!("{l}\n")).collect()
 }
@@ -73,9 +79,9 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             "renumber",
             vec![
                 "",
-                "relation-ok",
                 "node",
                 "relation",
+                "orphan-live",
                 "one-sided",
                 "unsorted",
                 "publish",
@@ -103,7 +109,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 .unwrap();
             assert_eq!(
                 status,
-                if fault.is_empty() || ["unsorted", "relation-ok"].contains(&fault) {
+                if fault.is_empty() || fault == "unsorted" {
                     harness::CheckStatus::Passed
                 } else {
                     harness::CheckStatus::Failed

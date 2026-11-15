@@ -100,6 +100,16 @@ pub(crate) struct Group {
     pub id: i64,
 }
 
+/// One identity both sides hold, alike or not, with both encoded records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pair<'a> {
+    /// Node 0, way 1, relation 2.
+    pub kind: usize,
+    pub id: i64,
+    pub first: &'a [u8],
+    pub second: &'a [u8],
+}
+
 /// What a merge counted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Merged {
@@ -160,11 +170,25 @@ pub(crate) fn compare(
     policy: Policy,
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
+    compare_paired(harness, first, second, listing, policy, each, |_| {})
+}
+
+/// [`compare`], also handing every paired identity, alike or not, to
+/// `paired` in object order with both records.
+pub(crate) fn compare_paired(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+    paired: impl FnMut(Pair<'_>),
+) -> Result<Merged, Error> {
     let a = listing.with_extension("first.opl");
     let b = listing.with_extension("second.opl");
     decode(harness, first, &a, policy)?;
     decode(harness, second, &b, policy)?;
-    let merged = merge(&a, &b, listing, each)?;
+    let merged = merge(&a, &b, listing, each, paired)?;
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -298,12 +322,14 @@ fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
 }
 
 /// Merge two OPL files (see the module documentation), writing each
-/// differing identity's lines to `listing`.
-pub(crate) fn merge(
+/// differing identity's lines to `listing` and handing every paired
+/// identity to `paired`.
+fn merge(
     first: &Path,
     second: &Path,
     listing: &Path,
     mut each: impl FnMut(Group),
+    mut paired: impl FnMut(Pair<'_>),
 ) -> Result<Merged, Error> {
     let mut a = Stream::open(first)?;
     let mut b = Stream::open(second)?;
@@ -315,6 +341,12 @@ pub(crate) fn merge(
         let class = match (ka, kb) {
             (None, None) => break,
             (Some(x), Some(y)) if x == y => {
+                paired(Pair {
+                    kind: x.0,
+                    id: x.1,
+                    first: &a.line,
+                    second: &b.line,
+                });
                 if a.line == b.line {
                     merged.same += 1;
                     ka = a.next()?;
@@ -377,7 +409,7 @@ mod tests {
         std::fs::write(&pa, a).unwrap();
         std::fs::write(&pb, b).unwrap();
         let mut groups = Vec::new();
-        let merged = merge(&pa, &pb, &pl, |g| groups.push(g))?;
+        let merged = merge(&pa, &pb, &pl, |g| groups.push(g), |_| {})?;
         Ok((merged, groups, std::fs::read_to_string(&pl).unwrap()))
     }
 

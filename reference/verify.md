@@ -245,7 +245,7 @@ suite because a later comparison cannot make that run complete.
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
 | `diff` | osmium diff OPL and fetched objects | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
 | `diff --format osc` | osmium derive-changes and apply-changes | content-only element equality of roundtrips, pbfhogg's OSC applied by both tools, and indexed/unindexed decompressed OSC parity |
-| `renumber` | osmium renumber | every object paired, no node or way record differences, relation differences at most 10% of relations |
+| `renumber` | osmium renumber | every object paired at its renumbered ID; every difference is an orphan reference named past the live range on both sides, one to one |
 
 Apply-changes accepts `--osc-seq` or a fixture `--osc`, and
 `--locations-on-ways`. A configured OSC is required. A base without the
@@ -560,10 +560,16 @@ Renumber accepts `--start-id`, forwarded to both tools. Direct IO reaches
 only pbfhogg renumber. An input without the optional sort feature must
 refuse with the exact advice and no output; osmium does not run there.
 Otherwise the two outputs are compared by element equality, metadata
-included: every object must pair by kind and ID, no node or way record may
-differ, and relation differences may not exceed 10% of osmium's relation
-count, the existing tolerance for orphan-reference handling. Their
-attribution to orphan handling is not independently proved.
+included, with no tolerance. Every object must pair by kind and ID, and each
+kind's IDs must run `start, start + 1, ...` on both sides, which fixes the
+live range `start .. start + count`. No node may differ. A way or relation
+may differ only in the ref IDs of its node or member list (same fields,
+list length, member types, encoded roles and coordinate suffixes). Every
+reference in every record, alike or not, must be the same live ID on both
+sides or lie at or above its kind's live range on both, and those orphan
+names must correspond one to one per kind across the file. That proves the
+outputs the same reference graph up to orphan naming, the documented
+deviation; it does not check pbfhogg's shift formula against the input.
 
 ## Where pbfhogg is still a comparator
 
@@ -615,6 +621,15 @@ pbfhogg-judged comparison to osmium decodings and the verifier's readers
 4705`: 18 PASS and sort ENVIRONMENT (osmium sort SIGKILLed again), diff
 failing only on scratch exhausted by cached OPL decodings; with decodings
 uncached and removed once merged, diff then passed alone.
+
+On 2026-11-15, host bygg, parent `9e9d2e84` with the uncommitted change that
+replaced renumber's 10% relation tolerance with the record-by-record orphan
+proof (CLI xxh3-128 `5e68c73ce9e09358c32355d6f3552cb1`): indexed Denmark
+PASS with 306 differing records, all relations, every one an orphan name
+only (distinct orphans referenced: 441 nodes, 32943 ways, 706 relations),
+also PASS under `--start-id 1000,2000,3000`; indexed Germany PASS with 6792
+differing records, all relations, every one an orphan name only (30849
+nodes, 430276 ways, 34731 relations).
 
 The matching locations checks reported informational osmium stale inline
 references: Denmark 563 refs (538 nodes), Germany 7986 refs (5346 nodes).

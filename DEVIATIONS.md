@@ -474,12 +474,14 @@ Two refs to the same orphan stay equal, the old id is recoverable as
 output. Relation members of an unknown type (anything but node, way or
 relation once the type is read as int32) keep their id unchanged.
 
-**Cross-validation:** `brokkr run --with pbfhogg pbfhogg-verify -- renumber` on a Geofabrik-style extract
-finds equal element counts and no node or way that differs; every difference
-is in a relation. Those are attributed to orphan member refs - the members of
-cross-border relations (admin boundaries, routes, TMC segments) - but the
-harness counts relation diffs against a sanity threshold rather than checking
-each one is an orphan ref.
+**Cross-validation:** `brokkr run --with pbfhogg pbfhogg-verify -- renumber`
+proves every difference from osmium's output, record by record, to be an
+orphan name and nothing else: both sides put every object at its renumbered
+ID, every orphan ref lies past its kind's live range on both sides, and the
+orphan names correspond one to one per kind. On Geofabrik extracts only
+relations differ - the members of cross-border relations (admin boundaries,
+routes, TMC segments) - since the extracts carry complete ways. The check
+does not compare pbfhogg's shift formula against the input's ids.
 
 **Rationale:** Passing orphans through with their old id, the earlier policy,
 let an old id equal the new id of a different element, so a reference

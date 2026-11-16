@@ -56,15 +56,6 @@ stays outside the gate's requirement, so on a default-memlock host its cells ski
 and only the opt-in `full_registered_pool_instrument` proves the pool. Refusal
 predicates are the only route to a backend skip by convention, not by any audit.
 
-## VER-113 - dedupe-pair does not prove its copy path
-
-`diff-unindexed.lua` now probes both fronts before measuring and fails on indexed input.
-`dedupe-pair.lua` still cannot require passthrough or coalesced copying: that needs brokkr's
-Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
-`cat_dedupe_copy_range_coalesced`). Proving complete indexdata absence needs an
-indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
-indexed inputs.
-
 ## VER-122 - Some checks are not shown to pass the field policy their claim needs
 
 Reported by bench-verify.

@@ -17,17 +17,21 @@
 --     blob overlaps and base's nodes and relations pass through, so the
 --     wall mixes passthrough with the overlap sweep and its transitions.
 --
--- The cat child's counters say what the plan did; read them before
--- trusting a cell to measure passthrough. This remains manual: brokkr's
--- Lua child result exposes no sidecar counters. A coverage predicate must
--- live in brokkr's call contract, or consume counters it exposes, rather
--- than parse diagnostic stderr or launch a results-query subprocess:
+-- The bench deliberately does not require passthrough or coalescing. The
+-- plan is a function of the input pair and the code under measurement, so
+-- a commit that loses either is the result an A/B should show; refusing
+-- the cell on the counters would censor it. The cat child's counters,
+-- stored with every run, say what a cell did:
 --
---   brokkr sidecar UUID --child N --counters --grep cat_dedupe
+--   brokkr sidecar UUID --child N --counters
 --
 -- cat_dedupe_blobs_passthrough counts the frames passed through, and
 -- cat_dedupe_copy_range_calls and cat_dedupe_copy_range_coalesced split
--- the copy route into stretches started and frames folded into one. Take
+-- the copy route into stretches submitted to the writer and frames folded
+-- into one; they describe the plan, not executed kernel copies. The
+-- writer_copy_range_fallback_ranges, _bytes and _errno counters (and a
+-- CLI note) say whether the kernel refused copy_file_range, for example
+-- on cross-filesystem scratch, and the stretch went through userspace. Take
 -- one iteration per invocation and alternate the commits under comparison:
 --
 --   brokkr bench --iterations 1 --commit REF dedupe-pair --with one-relation --cache cold

@@ -121,8 +121,12 @@ Uuids in run order: `fb596e36` `96fe93aa` `0eb42526` `6a9853f6`;
 Since bench version 3, `diff-unindexed` probes each input's first data
 blob with `inspect --indexed` outside the measured diff and refuses an
 input whose front carries indexdata, so a stored cell has taken the
-sequential path. The probe does not prove that no later blob is indexed.
-The cells above predate the probe; their inputs were `pbf.raw` throughout.
+sequential path. That path reads both inputs whole through armed readers,
+which refuse a partially indexed file in either order
+(`reference/indexdata-trust.md`), so a completed diff behind two refused
+probes also shows that no later blob is indexed; no inspect count is
+needed. This holds for revisions that carry the partial-index refusal
+(ruled 2026-10-26); an older `--commit` gets the front check only. The cells above predate the probe; their inputs were `pbf.raw` throughout.
 
 ## Common lines cut by elements (bygg, 2026-11-09, against `71976fd7`)
 

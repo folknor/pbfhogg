@@ -201,7 +201,7 @@ params.cache = { choices = ["cold", "warm"], required = true, help = "the input'
 
 [bench.dedupe-pair]
 script_file = "../benches/cat/dedupe-pair.lua"
-description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts; inspect counters for passthrough coverage"
+description = "cat --dedupe of two snapshots of one dataset, inputs cold or warm as the merge starts; the cat child's sidecar counters say what passthrough it reached"
 version = 4
 date = 2026-11-15
 changelog = [

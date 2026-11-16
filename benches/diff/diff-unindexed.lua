@@ -40,8 +40,13 @@ end
 -- Match the diff dispatch probe, rather than the whole-file `indexed`
 -- answer: that answer is false for partially indexed inputs too, including
 -- ones whose first blob would select the indexed diff engine. This proves
--- the sequential path; proving zero indexed blobs anywhere needs a new
--- inspect count, since no current public field exposes that count.
+-- the sequential path. No indexed-blob count is needed to prove the rest
+-- of each file unindexed: the sequential path reads both inputs whole
+-- through armed readers, which refuse a partially indexed file in either
+-- order (reference/indexdata-trust.md), so a completed diff behind two
+-- refused probes had no indexed blob anywhere. That holds for revisions
+-- carrying the partial-index refusal; an older --commit gets the front
+-- check only.
 local function require_unindexed_front(input)
     local r = binary("inspect", input, { indexed = true, quiet = true })
     if r.exit ~= 1 then

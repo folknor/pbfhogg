@@ -633,10 +633,19 @@ themselves, which had no clean before-cell.
 Coverage of what a cell measured differs between the two passthrough-
 and path-sensitive benches. `diff-unindexed` (since bench version 3)
 refuses an input whose first data blob carries indexdata before the
-measured diff runs, so its cells took the sequential path. `dedupe-pair`
-has no such check: that a cell reached passthrough and its coalesced copy
-is established only by reading the cat child's `cat_dedupe` counters by
-hand (`brokkr sidecar UUID --child N --counters --grep cat_dedupe`).
+measured diff runs, so its cells took the sequential path, and the diff
+child's own partial-index refusal makes a completed cell wholly unindexed.
+`dedupe-pair` deliberately has no such check. Its blob plan is a function
+of the input pair and the code under measurement, so a commit that loses
+passthrough or coalescing is the result an A/B should show, and a
+refusal on the counters would censor it. What a cell did is read from the
+cat child's counters (`brokkr sidecar UUID --child N --counters`):
+`cat_dedupe_blobs_passthrough` and `cat_dedupe_copy_range_calls` /
+`_coalesced` describe the plan submitted to the writer, not executed
+kernel copies; `writer_copy_range_fallback_ranges`, `_bytes` and
+`_errno` say whether the kernel refused `copy_file_range` (cross-
+filesystem scratch, kernel support) and the copy went through userspace,
+which the CLI also reports in a note.
 
 The vs-osmium `extract` row's first japan run failed on every osmium arm
 ("wrong format for coordinate: '=139.5'"); `aba6ff4b` fixed the bbox

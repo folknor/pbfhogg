@@ -20,10 +20,14 @@ pub(crate) mod run;
 pub(crate) mod argv;
 #[path = "../src/checks/mod.rs"]
 pub(crate) mod checks;
+#[path = "dedupe_fixture.rs"]
+mod dedupe_fixture;
 #[path = "extract_fixture.rs"]
 mod extract_fixture;
 #[path = "fake_pbf.rs"]
 pub(crate) mod fake_pbf;
+#[path = "getid_fixture.rs"]
+mod getid_fixture;
 #[path = "../src/harness.rs"]
 pub(crate) mod harness;
 #[path = "../src/opl_compare.rs"]
@@ -155,6 +159,20 @@ fn main() {
     } else if args[1..].iter().any(|a| {
         Path::new(a)
             .ancestors()
+            .any(|p| p.file_name().is_some_and(|n| n == "dedupe-fixture"))
+    }) && role != "driver"
+    {
+        std::process::exit(dedupe_fixture::tool(&args[1..]));
+    } else if args[1..].iter().any(|a| {
+        Path::new(a)
+            .ancestors()
+            .any(|p| p.file_name().is_some_and(|n| n == "getid-fixture"))
+    }) && role != "driver"
+    {
+        std::process::exit(getid_fixture::tool(&args[1..]));
+    } else if args[1..].iter().any(|a| {
+        Path::new(a)
+            .ancestors()
             .any(|p| p.file_name().is_some_and(|n| n == "read-fixture"))
     }) {
         std::process::exit(read_fixture::tool(&args[1..]));
@@ -209,6 +227,16 @@ fn driver(role: &str, dir: &Path) {
     }
     if role == "read" {
         read_fixture::driver(lifecycle, &exe, dir);
+        no_children();
+        return;
+    }
+    if role == "dedupe" {
+        dedupe_fixture::driver(lifecycle, &exe, dir);
+        no_children();
+        return;
+    }
+    if role == "getid" {
+        getid_fixture::driver(lifecycle, &exe, dir);
         no_children();
         return;
     }

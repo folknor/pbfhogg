@@ -58,7 +58,7 @@ pub fn write_with(path: &Path, required: &[&str], optional: &[&str], marker: &st
 
 /// The whole marker of a fixture written by [`write()`], field suffixes
 /// included.
-fn full_marker(path: &Path) -> String {
+pub fn full_marker(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap();
     let at = bytes
         .windows(MARKER.len())
@@ -66,7 +66,7 @@ fn full_marker(path: &Path) -> String {
         .unwrap_or_else(|| panic!("{} is not a fixture PBF", path.display()));
     let text = &bytes[at + MARKER.len()..];
     // The marker runs to the end of a header-only fixture, or to the frame
-    // length of the data blob [`write_indexed`] appends, whose leading byte
+    // length of the first data blob [`write_blobs`] appends, whose leading byte
     // is zero; a marker never holds one.
     let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
     String::from_utf8(text[..end].to_vec()).unwrap()
@@ -77,30 +77,77 @@ fn full_marker(path: &Path) -> String {
 /// dense node 1; the fake osmium decodes by the marker alone, so the blob
 /// changes no decoding, only the indexed claim a reader of the frames sees.
 pub fn write_indexed(path: &Path, optional: &[&str], marker: &str) {
+    write_blobs(path, optional, marker, &[Data::of(0, &[1], true)]);
+}
+
+/// One data blob a fixture carries after its header: its serialized `Blob`
+/// payload and, when indexed, the indexdata claim `(kind, min, max, count)`.
+pub struct Data {
+    pub claim: Option<(u8, i64, i64, u64)>,
+    pub payload: Vec<u8>,
+}
+
+impl Data {
+    /// A raw blob holding the strictly ascending `ids` of `kind` (0 dense
+    /// nodes, 1 ways, 2 relations), each element its ID alone, claimed
+    /// truly when `indexed`.
+    pub fn of(kind: u8, ids: &[i64], indexed: bool) -> Self {
+        let mut group = Vec::new();
+        if kind == 0 {
+            let mut packed = Vec::new();
+            let mut last = 0_i64;
+            for &id in ids {
+                let delta = id - last;
+                last = id;
+                varint(((delta << 1) ^ (delta >> 63)).cast_unsigned(), &mut packed);
+            }
+            let mut dense = Vec::new();
+            field(1, &packed, &mut dense);
+            field(2, &dense, &mut group);
+        } else {
+            for &id in ids {
+                let mut element = Vec::new();
+                varint(1 << 3, &mut element);
+                varint(id.cast_unsigned(), &mut element);
+                field(u64::from(kind) + 2, &element, &mut group);
+            }
+        }
+        let mut primitive = Vec::new();
+        field(1, &[], &mut primitive);
+        field(2, &group, &mut primitive);
+        let mut payload = Vec::new();
+        field(1, &primitive, &mut payload);
+        Self {
+            claim: indexed.then(|| (kind, ids[0], ids[ids.len() - 1], ids.len() as u64)),
+            payload,
+        }
+    }
+}
+
+/// [`write()`] followed by `blobs` as `OSMData` frames, so the verifier's
+/// frame readers see their IDs and claims. The fake osmium decodes by the
+/// marker alone, so the blobs change no decoding, only what a reader of the
+/// frames sees.
+pub fn write_blobs(path: &Path, optional: &[&str], marker: &str, blobs: &[Data]) {
     write(path, optional, marker);
-    let mut dense = Vec::new();
-    field(1, &[2], &mut dense);
-    let mut group = Vec::new();
-    field(2, &dense, &mut group);
-    let mut primitive = Vec::new();
-    field(1, &[], &mut primitive);
-    field(2, &group, &mut primitive);
-    let mut blob = Vec::new();
-    field(1, &primitive, &mut blob);
-    // Indexdata: kind node, IDs 1..1, one element.
-    let mut index = vec![1, 0];
-    index.extend_from_slice(&1_i64.to_le_bytes());
-    index.extend_from_slice(&1_i64.to_le_bytes());
-    index.extend_from_slice(&1_u64.to_le_bytes());
-    let mut header = Vec::new();
-    field(1, b"OSMData", &mut header);
-    field(2, &index, &mut header);
-    varint(3 << 3, &mut header);
-    varint(blob.len() as u64, &mut header);
     let mut out = std::fs::read(path).unwrap();
-    out.extend_from_slice(&u32::try_from(header.len()).unwrap().to_be_bytes());
-    out.extend(header);
-    out.extend(blob);
+    for blob in blobs {
+        let mut header = Vec::new();
+        field(1, b"OSMData", &mut header);
+        if let Some((kind, min, max, count)) = blob.claim {
+            // Indexdata v1: version, kind, min, max, count.
+            let mut index = vec![1, kind];
+            index.extend_from_slice(&min.to_le_bytes());
+            index.extend_from_slice(&max.to_le_bytes());
+            index.extend_from_slice(&count.to_le_bytes());
+            field(2, &index, &mut header);
+        }
+        varint(3 << 3, &mut header);
+        varint(blob.payload.len() as u64, &mut header);
+        out.extend_from_slice(&u32::try_from(header.len()).unwrap().to_be_bytes());
+        out.extend(header);
+        out.extend_from_slice(&blob.payload);
+    }
     std::fs::write(path, out).unwrap();
 }
 

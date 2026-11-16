@@ -87,9 +87,17 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   input declaring `LocationsOnWays` whose first data blob is indexed, an
   inline-coordinate-only change of pbfhogg's outputs fails every cat
   arm and exactly sort's element comparison, by name, which witnesses
-  that branch on cat and sort. getid `--invert` and cat `--dedupe` are
-  not driven by any generated protocol, so their choices are not yet
-  witnessed. Each of these field-policy witnesses names the comparisons a fault fails, in
+  that branch on cat and sort. On getid-removeid, over an input with one
+  indexed node blob and one indexed way blob, the same change fails
+  exactly the `getid --invert` comparison without way IDs, the one output
+  that keeps the declaration. cat `--dedupe` is driven on four indexed
+  node blobs whose way exists only in the fake decoding, so every merge
+  keeps the declaration and the same change fails each merge's element
+  comparison; no real way blob is in that fixture, since one would always
+  be in the self-merge's run and drop the declaration. Its fake writes the
+  layout the verifier's own plan predicts, so each merge's plan is also
+  held to a hand-written segment trace, and a blob after the last segment
+  and a wrong summary count each fail their arm in every merge. Each of these field-policy witnesses names the comparisons a fault fails, in
   order, and the error it raises instead where a check reports one
   (apply-changes' element diff, encoding's index and refusal paths).
 - **The `LocationsOnWays` declaration** of each output of sort, cat,

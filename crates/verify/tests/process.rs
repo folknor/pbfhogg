@@ -70,6 +70,28 @@ fn verifier_read_checks() {
 }
 
 #[test]
+fn verifier_cat_dedupe() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        tunables::TEST_HANG_BOUND,
+        tunables::TEST_REPORT_GRACE,
+        "cat --dedupe verifier behaviour",
+    );
+    let scratch = pbfhogg_test_scratch::scratch();
+    run_worker("dedupe", scratch.path());
+}
+
+#[test]
+fn verifier_getid_removeid() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        tunables::TEST_HANG_BOUND,
+        tunables::TEST_REPORT_GRACE,
+        "getid-removeid verifier behaviour",
+    );
+    let scratch = pbfhogg_test_scratch::scratch();
+    run_worker("getid", scratch.path());
+}
+
+#[test]
 fn verifier_extract_checks() {
     let _bound = pbfhogg_test_scratch::HangBound::arm(
         tunables::TEST_HANG_BOUND,

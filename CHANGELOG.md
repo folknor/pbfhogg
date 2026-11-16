@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking
+
+- **Geocode index format is now 7; existing indexes must be rebuilt.**
+  The last release wrote format 5. Version 6 replaced the admin vertex
+  budget with `--admin-tolerance`, and version 7 records the input PBF's
+  XXH3-128 and size in the header. `Reader::open` refuses any other
+  version with an error telling you to rebuild with
+  `build-geocode-index`; there is no in-place upgrade.
+
 ### Added
 
 - **`pbfhogg geocode-query INDEX POINTS`** answers reverse geocoding

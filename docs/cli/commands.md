@@ -2072,6 +2072,12 @@ rewrite is not detected. Names, house numbers, streets, postcodes and country co
 stored and answered whole, bytes and all: a PBF tag value holding a NUL byte
 is not cut at it.
 
+The index carries an on-disk format version, currently 7. A reader accepts
+only its own version: an index of any other version (6 and earlier, such as
+one built before the input digest was recorded) is refused with an error
+telling you to rebuild it with `build-geocode-index`, and there is no
+in-place upgrade. Rebuild existing indexes after upgrading.
+
 A way segment is the line straight in latitude and longitude between its two
 nodes, taken the shorter way around in longitude: the line a query measures
 its distance to. An admin boundary edge is the edge the query's
@@ -2226,7 +2232,10 @@ index is opened, and a blank line, a third field, a value that is not a
 finite number, or a latitude outside -90 to 90 or longitude outside -180 to
 180 refuses the run (exit 2) naming the line, before any answer is printed.
 An index the reader refuses (wrong format version, a corrupt file) is
-exit 2 as well.
+exit 2 as well, as is a query the reader fails on, naming its line.
+Every answer is computed before anything is printed, so an interrupted run
+prints nothing and a successful run prints exactly one line per input line
+(an empty `POINTS` file prints nothing).
 
 Stdout carries one JSON object per query, one per line, in input order:
 
@@ -2241,7 +2250,8 @@ Stdout carries one JSON object per query, one per line, in input order:
 (shown wrapped; each object is a single line). `address`, `street` and
 `interpolation` are each the nearest of their class within the index's
 search radii (see [Search radius bounds](#search-radius-bounds)), or `null`
-when there is none; `admin` lists the smallest area containing the point
+when there is none; an `interpolation` object has the keys `street`, `place`, `house_number`
+and `distance_m`; `admin` lists the smallest area containing the point
 at each admin level, ascending by level, and is empty when none does. An
 absent `street`, `place`, `postcode` or `country_code` is `null`; a street
 `name` is a string, empty for a highway whose `name` tag is empty.

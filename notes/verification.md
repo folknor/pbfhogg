@@ -120,25 +120,3 @@ rule excludes. What remains:
   default outside the tolerance band.
 - The model refuses data near the antimeridian; unwrapping longitude would let an
   antimeridian dataset (the Fiji entry in notes/todo.md) be judged.
-
-## VER-123 - Verify uses the build output directory as its workspace
-
-Reported by bench-verify.
-
-`VerifyHarness` places outputs under `<target>/verify` and `subdir` recursively replaces each check's fixed
-directory. Cargo owns `target`, so these PBFs and reports vanish with cleanup and overwrite earlier evidence.
-
-Fix: a brokkr-owned per-run directory under configured scratch and a separate retained-evidence area.
-Enforcement: directory capability types.
-brokkr declined this (bz brokkr#154, wontfix); brokkr verify is to be removed and
-reimplemented in pbfhogg, which must meet the requirement tracked under VER-127.
-
-## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
-
-The verify workspace (see VER-123; brokkr side brokkr#154, closed wontfix).
-brokkr verify is to be removed and reimplemented in pbfhogg, so this is a
-requirement on that implementation: its outputs go to an owned per-run scratch
-directory, with any retained evidence kept separately, never under `target/`.
-The rest of the test-filesystem work is done; its settled design is stated
-in `reference/testing.md` "Test scratch" and in the leaf crate
-`crates/test-scratch`.

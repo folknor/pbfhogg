@@ -562,7 +562,7 @@ Pinning (see "One input, one file, across passes"): `verify_ids` pins (header an
 3. Nodes + ways fused scan (compact rank-indexed coord array, streaming data files)
 4. Bucketed S2 cell assignment (256 temp-file buckets per level)
 
-Outputs 19 binary files. Self-contained module in `crates/lib/src/geocode_index/`.
+Outputs one binary file per table named in `format.rs`. Self-contained module in `crates/lib/src/geocode_index/`.
 
 ### merge-changes
 

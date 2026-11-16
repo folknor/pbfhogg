@@ -16,10 +16,13 @@
 //! construction, which nothing checks; one unit is charged
 //! `TEST_HEAVY_RUN_FDS`, which `process_nofile.rs` witnesses for the
 //! largest external join a heavy grant admits (every stage-1 fleet and the
-//! relation scan's input open at once, the most slot buckets, buffered
-//! output, under a kernel limit leaving exactly the charge free), not for
-//! Auto routing, fault paths, other output backends or the scenario's own
-//! fixtures and scratch. Light tests' descriptors are not requested or
+//! relation scan's input open at once, the most slot buckets, reached as
+//! External and as Auto, with buffered, O_DIRECT and io_uring output where
+//! the host accepts them, under a kernel limit leaving exactly the charge
+//! free), not for stage 3 and stage 4 at their most simultaneous
+//! descriptors; fault paths are bounded from the code, since no fault hook
+//! opens a descriptor. A heavy scenario holds no descriptor of its own
+//! across a run beyond the input pin the run shares. Light tests' descriptors are not requested or
 //! counted; the reserve covers them by assertion. Neither a count of
 //! `/proc/self/fd` at a ticket's release nor an invariant checked at
 //! admission observes them: the count is process-wide, includes every

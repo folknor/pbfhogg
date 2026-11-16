@@ -21,15 +21,13 @@ by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 ## VER-130 - The descriptor gate's charges are asserted, not observed
 
-The per-run charge `TEST_HEAVY_RUN_FDS` is now witnessed in `process_nofile.rs` for the
-largest buffered-output external join a heavy grant admits (fleet rendezvous, kernel
-limit leaving exactly the charge free). Residue, still asserted: the charge for Auto
-routing, fault paths, the direct-I/O and io_uring writers and a scenario's own
-fixtures; the light reserve `TEST_LIGHT_FD_RESERVE` (a count in the shared binary is
-process-wide and light use scales with runner threads, so it cannot be checked
-without failing on large hosts); a ticket's units versus its simultaneous runs; own
-`host::FdPool` tests holding a ticket by convention. Every current heavy holder runs
-`write_base_pbf` (one way blob, so one 256-file fleet), well under the witnessed shape.
+Residue, still asserted: stage 3 and stage 4 at their most simultaneous descriptors
+(they start independently, so a completed witness run need not overlap them; forcing
+it would need a rendezvous like stage 1's); the io_uring arm of the witness on any
+host whose memlock limit refuses the writer; the light reserve `TEST_LIGHT_FD_RESERVE`
+(a count in the shared binary is process-wide and light use scales with runner
+threads, so it cannot be checked without failing on large hosts); a ticket's units
+versus its simultaneous runs; own `host::FdPool` tests holding a ticket by convention.
 
 ## VER-135 - sort's LocationsOnWays drop is undecided without the sort claim
 

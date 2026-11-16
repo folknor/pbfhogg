@@ -324,29 +324,34 @@ impl pbfhogg::debug::InstrumentSink for Counters {
 }
 
 /// `TEST_HEAVY_RUN_FDS`, the descriptor gate's charge for one heavy run,
-/// observed for the largest external join a heavy host's grant admits:
-/// the kernel limit leaves exactly the charge free above the descriptors
-/// already open, and the run must complete under it. The shape is forced,
+/// observed for the largest external join a heavy host's grant admits, on
+/// every route and output backend a heavy scenario can take to it: the
+/// kernel limit leaves exactly the charge free above the descriptors
+/// already open, and each run must complete under it. The shape is forced,
 /// not hoped for: eight fixed cores and the heavy grant give the most
-/// stage-1 workers the grant fits (three) and saturate the later stages'
+/// stage-1 workers the grant fits (three) and the later stages' fixed
 /// worker caps; a rendezvous holds every worker with its id-shard fleet
 /// open, and the relation scan with its input open, until all have opened
-/// theirs; 256 equal way blobs give the most slot buckets. The run's
-/// scratch and output count against the charge; the fixture written
-/// beforehand does not. Not covered: Auto routing, fault paths and the
-/// direct-I/O and io_uring writers.
+/// theirs; 256 equal way blobs give the most slot buckets. The arms are
+/// External with buffered output, Auto routed to external (memory one byte
+/// above the sparse allowance changes routing, not worker sizing), and
+/// External with O_DIRECT and with io_uring output (the direct writer's
+/// output descriptor, the io_uring writer's ring and output); an arm whose
+/// backend the host refuses skips, leaving that backend unobserved there.
+/// The run's input pin, scratch and output count against the charge; the
+/// fixture written beforehand does not.
+///
+/// Not observed: the most stage-3 and stage-4 descriptors open at once
+/// (they start independently and a completed run need not overlap them).
+/// Fault paths are bounded from the code, not witnessed: no fault hook
+/// opens a descriptor (the stage-3 hold parks before its bucket file
+/// opens, payload descriptors are shared with stage 4 rather than
+/// reopened, the input-replacement hook only renames), so a faulted run
+/// holds no set a normal run with the same scheduling could not.
 #[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
 fn the_largest_heavy_run_fits_its_descriptor_charge() {
-    use pbfhogg::host::{Host, ProcessActions};
-    use pbfhogg::test_hooks::FleetOutcome;
-    use std::sync::Arc;
-
-    struct HeavyGrant;
-    impl ProcessActions for HeavyGrant {
-        fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
-            common::fd_gate::heavy_grant(wanted)
-        }
-    }
+    use pbfhogg::altw::IndexType;
+    use pbfhogg::write::OutputBackend;
 
     let dir = common::test_scratch();
     let input = dir.path().join("fleet.osm.pbf");
@@ -357,29 +362,52 @@ fn the_largest_heavy_run_fits_its_descriptor_charge() {
         &[],
         1,
     );
-    let counters = Arc::new(Counters::default());
-    let host = Host {
-        diagnostics: pbfhogg::host::Diagnostics::discard(),
-        process: Arc::new(HeavyGrant),
-        resources: Arc::new(pbfhogg::host::Fixed {
-            parallelism: std::num::NonZeroUsize::new(8),
-            memory_available: Some(8 << 30),
-        }),
-        page_cache: pbfhogg::host::PageCachePolicy::Keep,
-        executor: crate::common::test_executor(),
-        invocation: pbfhogg::host::Invocation::with_sink(
-            Arc::clone(&counters) as Arc<dyn pbfhogg::debug::InstrumentSink>
+    // One byte above the sparse run's fixed 3 GiB anon allowance routes
+    // Auto external (as `host_contract.rs` `fixed_memory_routes_auto`).
+    let auto_memory = (3 << 30) + 1;
+    let mut arms = vec![
+        (
+            "external-buffered",
+            IndexType::External,
+            OutputBackend::Buffered,
+            8 << 30,
         ),
-    };
-    let workers = 3;
-    host.invocation
-        .faults()
-        .arm_altw_stage1_fleet(workers, true);
-    let output = dir.path().join("fleet-out.osm.pbf");
+        (
+            "auto-buffered",
+            IndexType::Auto,
+            OutputBackend::Buffered,
+            auto_memory,
+        ),
+    ];
+    #[cfg(feature = "linux-direct-io")]
+    arms.push((
+        "external-direct",
+        IndexType::External,
+        OutputBackend::Direct,
+        8 << 30,
+    ));
+    #[cfg(feature = "linux-io-uring")]
+    arms.push((
+        "external-uring",
+        IndexType::External,
+        OutputBackend::Uring,
+        8 << 30,
+    ));
+    for (name, index_type, backend, memory) in arms {
+        if !charge_arm(dir.path(), &input, name, index_type, backend, memory) {
+            return;
+        }
+    }
+}
 
+/// Lowers the soft limit to the descriptors open now plus
+/// `TEST_HEAVY_RUN_FDS`, restored when the guard drops; `None` (reported
+/// as a skip) where that cannot be set up.
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn cap_at_charge() -> Option<SoftLimit> {
     let Some(baseline) = open_descriptors() else {
         common::skip("charge witness needs /proc/self/fd");
-        return;
+        return None;
     };
     let open = u64::try_from(baseline.len()).expect("small");
     let cap = open + pbfhogg::TEST_HEAVY_RUN_FDS;
@@ -397,29 +425,102 @@ fn the_largest_heavy_run_fits_its_descriptor_charge() {
              (hard {})",
             limit.0.rlim_max
         ));
-        return;
+        return None;
     }
-    let result = external_join_keeping(&host, &input, &output, false);
+    Some(limit)
+}
+
+/// One arm of the charge witness. `false` means the whole witness skipped
+/// as environmental (no `/proc/self/fd`, no room for the cap); a refused
+/// backend skips only its own arm.
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn charge_arm(
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    name: &str,
+    index_type: pbfhogg::altw::IndexType,
+    backend: pbfhogg::write::OutputBackend,
+    memory: u64,
+) -> bool {
+    use pbfhogg::host::{Host, ProcessActions};
+    use pbfhogg::test_hooks::FleetOutcome;
+    use std::sync::Arc;
+
+    struct HeavyGrant;
+    impl ProcessActions for HeavyGrant {
+        fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
+            common::fd_gate::heavy_grant(wanted)
+        }
+    }
+
+    let counters = Arc::new(Counters::default());
+    let host = Host {
+        diagnostics: pbfhogg::host::Diagnostics::discard(),
+        process: Arc::new(HeavyGrant),
+        resources: Arc::new(pbfhogg::host::Fixed {
+            parallelism: std::num::NonZeroUsize::new(8),
+            memory_available: Some(memory),
+        }),
+        page_cache: pbfhogg::host::PageCachePolicy::Keep,
+        executor: crate::common::test_executor(),
+        invocation: pbfhogg::host::Invocation::with_sink(
+            Arc::clone(&counters) as Arc<dyn pbfhogg::debug::InstrumentSink>
+        ),
+    };
+    let workers = 3;
+    host.invocation
+        .faults()
+        .arm_altw_stage1_fleet(workers, true);
+    let output = dir.join(format!("fleet-{name}.osm.pbf"));
+    let opts = pbfhogg::altw::AltwOptions {
+        keep_untagged_nodes: false,
+        write: pbfhogg::write::WriteOptions {
+            backend,
+            ..pbfhogg::write::WriteOptions::default()
+        },
+        index_type,
+        inject_prepass: false,
+        ignore_missing_nodes: false,
+    };
+
+    let Some(limit) = cap_at_charge() else {
+        return false;
+    };
+    // Made under the cap: the run's scratch counts against the charge.
+    let result = pbfhogg::scratch::RunScratch::create(dir, &host).and_then(|scratch| {
+        pbfhogg::altw::add_locations_to_ways(
+            input,
+            crate::common::out(&output),
+            &opts,
+            &Default::default(),
+            &host,
+            scratch,
+        )
+    });
     drop(limit);
 
     let charge = pbfhogg::TEST_HEAVY_RUN_FDS;
     match result {
-        Ok(()) => {}
+        Ok(_) => {}
+        Err(e) if matches!(e.kind(), pbfhogg::ErrorKind::PlatformUnsupported { .. }) => {
+            common::skip(format!("charge witness arm {name}: backend refused: {e}"));
+            return true;
+        }
         // The system-wide file table, not this process's cap: environmental.
-        Err(e) if e.contains("os error 23") => {
+        Err(e) if e.to_string().contains("os error 23") => {
             common::skip(format!("charge witness hit a full system file table: {e}"));
-            return;
+            return false;
         }
         // EMFILE under the controlled cap means the run outgrew its charge.
-        Err(e) if e.contains("os error 24") => {
-            panic!("the largest heavy run needs more than its charge of {charge} descriptors: {e}")
-        }
-        Err(e) => panic!("charge witness run failed: {e}"),
+        Err(e) if e.to_string().contains("os error 24") => panic!(
+            "{name}: the largest heavy run needs more than its charge of {charge} descriptors: {e}"
+        ),
+        Err(e) => panic!("{name}: charge witness run failed: {}", e.report()),
     }
     assert_eq!(
         host.invocation.faults().altw_stage1_fleet_outcome(),
         Some(FleetOutcome::Complete),
-        "every stage-1 fleet and the relation input were open at once"
+        "{name}: every stage-1 fleet and the relation input were open at once"
     );
     let seen = counters.0.lock().expect("counters").clone();
     let counter = |name: &str| {
@@ -431,11 +532,12 @@ fn the_largest_heavy_run_fits_its_descriptor_charge() {
     assert_eq!(
         counter("extjoin_num_shard_workers"),
         i64::try_from(workers).expect("small"),
-        "the grant's most workers"
+        "{name}: the grant's most workers"
     );
     assert_eq!(
         counter("extjoin_slot_bucket_count"),
         256,
-        "the most slot buckets"
+        "{name}: the most slot buckets"
     );
+    true
 }

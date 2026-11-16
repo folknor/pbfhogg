@@ -255,12 +255,16 @@ NAME` list each harness in turn to find one test.
   before it opens anything; on an ordinary host it never waits. What
   this does not bound: a ticket's units bound its simultaneous runs by
   the scenario's construction, which nothing checks; the per-run charge
-  is witnessed only for the largest buffered-output external join a heavy
-  grant admits (the `process_nofile` target forces every stage-1 fleet and
-  the relation scan's input open at once, the most slot buckets, and runs
-  it under a kernel limit leaving exactly the charge free), not for Auto
-  routing, fault paths, the direct-I/O and io_uring writers or a
-  scenario's own fixtures; the light reserve is asserted, not measured,
+  is witnessed only for the largest external join a heavy grant admits
+  (the `process_nofile` target forces every stage-1 fleet and the
+  relation scan's input open at once and the most slot buckets, reaches
+  the join as External and as Auto with buffered, O_DIRECT and io_uring
+  output where the host accepts each, and runs every arm under a kernel
+  limit leaving exactly the charge free), not for stage 3 and stage 4 at
+  their most simultaneous descriptors, which a completed run need not
+  overlap; fault paths are bounded from the code, since no fault hook
+  opens a descriptor; a heavy scenario holds no descriptor of its own
+  across a run beyond the input pin the run shares; the light reserve is asserted, not measured,
   since a process-wide descriptor count in this shared binary includes
   every concurrent test and light use grows with the runner's thread
   count; light tests'
@@ -1186,7 +1190,9 @@ descriptors (less the listing's own), sets the soft limit to that count
 plus `TEST_HEAVY_RUN_FDS` (skipping if an open descriptor lies at or above
 it), and runs the largest external join a heavy grant admits, its stage-1
 fleets and relation input held open together by the fault plan's fleet
-rendezvous, which must end `Complete`. Every scenario runs under one
+rendezvous, which must end `Complete`, once per arm: External and Auto
+with buffered output, External with O_DIRECT and io_uring output in builds
+with those features, an arm whose backend the host refuses skipping. Every scenario runs under one
 libtest test, since all of them open descriptors and some change the
 limit.
 The harness package tests real probes the same way without a target of its

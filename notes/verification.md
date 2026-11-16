@@ -29,17 +29,17 @@ host whose memlock limit refuses the writer; the light reserve `TEST_LIGHT_FD_RE
 threads, so it cannot be checked without failing on large hosts); a ticket's units
 versus its simultaneous runs; own `host::FdPool` tests holding a ticket by convention.
 
-## VER-135 - sort's LocationsOnWays drop is undecided without the sort claim
+## VER-135 - sort's required LocationsOnWays drop has no real-data witness
 
-Kept coordinates are compared (cat and `getid --invert` references are written with
-`locations_on_ways=true`, and a reference or sorted copy asked for it must declare
-it), `getid --invert` is judged exactly from the requested way IDs, and sort is exact
-where the input's per-blob claims decide it (`checks::sort::sort_way_locations`).
-Residue: on input without `Sort.Type_then_ID`, or with an unindexed blob, a negative
-or an empty way claim, sort stays keep-or-warned-drop, since an internally unsorted
-blob is only visible by decoding; and the required-drop branch (overlapping way
-ranges on a `LocationsOnWays` input) has no real-data witness, as no configured
-dataset is both. A decode of each way blob's ID order would close the first.
+sort's declaration verdict is exact (`checks::sort::sort_way_locations` predicts the
+blob planner, decoding every blob pass 1 would scan), but every drop branch (overlap
+component, internally unsorted or restructured way blob on a `LocationsOnWays` input)
+is witnessed by unit tests only: no configured dataset both declares
+`LocationsOnWays` and makes sort rewrite a way blob. No producer makes one:
+re-encoding `degrade` drops the declaration, and `cat A A` keeps it but duplicates
+every identity, which the strict element comparison and order check refuse. A
+witness needs overlapping way blobs with disjoint identities that keep inline
+coordinates and true indexdata.
 
 ## VER-018 - Backend witnesses prove setup, not every transfer
 

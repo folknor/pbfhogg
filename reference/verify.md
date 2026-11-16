@@ -87,15 +87,17 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   not. On an input that declares it: `cat --type` on an input whose first
   data blob carries indexdata, `getid --invert` without a way ID, and
   `apply-changes --locations-on-ways`, must keep it; `getid --invert` with
-  a way ID must drop it with the loss warning. sort is decided from the
-  input's per-blob indexdata claims: two overlapping non-negative way ranges
-  cannot both be copied whole into order, so it must drop it with the
-  warning; with no overlap, every data blob indexed, no negative or empty way
-  claim and the sort claim, it must keep it; otherwise (no sort claim, where
-  an internally unsorted blob is rewritten and only a decode shows one, or
-  claims the overlap argument does not cover) it may keep it or drop it with
-  the warning, and that drop is not shown to be required. The rest must drop it with the
-  loss warning. The warning is read from pbfhogg's stderr as the CLI renders
+  a way ID must drop it with the loss warning. sort is decided exactly by
+  predicting its blob planner (the one `cat --dedupe` shares): under the
+  sort claim an indexed blob is believed from its claim and not decoded,
+  every other blob is decoded by the verifier, and the declaration must be
+  dropped with the warning when a way entry falls in an overlap component
+  (canonical ID order, conservative mixed-sign range keys), sits in a
+  decoded blob that is internally out of order, or sits in a decoded block
+  no single index describes; otherwise it must be kept. The domain is true
+  believed claims; a decoded blob the verifier's decoder refuses (a repeated
+  or absent scalar ID, a wrapping dense delta, compression other than raw or
+  zlib) is a verifier error. The rest must drop it with the loss warning. The warning is read from pbfhogg's stderr as the CLI renders
   `header.way_metadata_loss` (`Warning: the input declares ..., which the
   output does not declare`, `LocationsOnWays` a member of the list).
 - **Order and counts** of an output come from its osmium OPL decoding
@@ -776,6 +778,13 @@ without way IDs kept, 59152278 records equal to osmium removeid with
 coordinates) PASS; getid-removeid and sort on the `unsorted` snapshot PASS.
 No configured input both declares `LocationsOnWays` and has overlapping
 way ranges, so sort's required drop is witnessed by unit tests only.
+
+On 2026-11-16, host bygg, parent `20ad8323` with the uncommitted change that
+predicts sort's blob planner for the declaration (CLI xxh3-128
+`ce49884cb647ef14e40a20a66db25abc`): sort on Denmark `altw-keep-untagged`
+PASS in 28.5s (kept, every blob believed from its claim). No configured
+input makes sort rewrite a way blob of a `LocationsOnWays` input, so every
+drop branch is still witnessed by unit tests only.
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

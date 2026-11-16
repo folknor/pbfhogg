@@ -47,11 +47,6 @@ pub(crate) enum WayLocations {
     Kept,
     /// Ways are re-encoded without coordinates: dropped, with the warning.
     Dropped,
-    /// Kept, or dropped with the warning where the run decides and the
-    /// verifier cannot see which: `sort` where the input's claims do not
-    /// decide whether a way blob is rewritten
-    /// (`checks::sort::sort_way_locations`).
-    KeptOrReported,
 }
 
 /// Whether `stderr` carries the CLI's loss warning naming `LocationsOnWays`
@@ -296,15 +291,13 @@ impl Harness {
         let (ok, why) = match (had, has, expect) {
             (false, true, _) => (false, "declared, but the input does not declare it"),
             (false, false, _) => (true, "not declared, as the input does not"),
-            (true, true, WayLocations::Kept | WayLocations::KeptOrReported) => {
-                (true, "kept as the input declares")
-            }
+            (true, true, WayLocations::Kept) => (true, "kept as the input declares"),
             (true, true, WayLocations::Dropped) => (
                 false,
                 "declared, but this command re-encodes ways without them",
             ),
             (true, false, WayLocations::Kept) => (false, "dropped, but this run must keep it"),
-            (true, false, WayLocations::Dropped | WayLocations::KeptOrReported) if warned => {
+            (true, false, WayLocations::Dropped) if warned => {
                 (true, "dropped with the loss warning")
             }
             (true, false, _) => (false, "dropped without the loss warning"),

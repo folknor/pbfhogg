@@ -22,11 +22,21 @@
 //!   `--invert-match`: a disjoint union, each operand supplying objects the
 //!   other lacks. Both must hold an object, or the case is unexercised (a
 //!   verifier error).
+//! - `dedupe(A, W)` and `dedupe(W, A)`, W an `osmium getid` window chosen
+//!   against A's own blobs ([`window`]): overlap runs that start and end
+//!   between passthrough stretches, one of them bridging two A blobs that do
+//!   not overlap each other.
 //!
-//! B and C carry no indexdata (osmium writes none), so every run naming them
-//! passes `--force` and takes the unindexed scan. Which planner paths ran
-//! (passthrough, overlap runs) is not established: osmium packs a sparse
-//! selection into blobs whose ID ranges can span many of A's.
+//! Every run's output is also held to the blob layout the documented plan
+//! predicts from the inputs' framing as the verifier decodes it
+//! ([`dedupe_plan`]): each passthrough blob's payload bytes in its place,
+//! each run's re-encoded blobs within its ID span, the summary's blob counts
+//! (pbfhogg's own account, beside the layout) and the `LocationsOnWays`
+//! declaration (dropped exactly when a way blob is in a run). Byte equality
+//! witnesses the preserved payload, not that nothing decoded it.
+//!
+//! B, C and W carry no indexdata (osmium writes none), so every run naming
+//! them passes `--force` and takes the unindexed scan.
 //!
 //! Input without the claim is held to dedupe's Unsorted refusal of
 //! `dedupe(A, A)` and nothing else runs. `--force` is passed on unindexed
@@ -35,6 +45,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::argv::PbfArgv;
+use crate::checks::dedupe_plan::{self, Entry, Segment};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict, WayLocations, listing_beside};
 use crate::opl_compare::{self, Policy};
@@ -76,7 +87,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         )));
     }
 
-    let (ordered, counts) = opl_compare::order(harness, pbf, &outdir.join("input.order.opl"))?;
+    let (ordered, _) = opl_compare::order(harness, pbf, &outdir.join("input.order.opl"))?;
     if !ordered {
         return Err(Error::tool(
             "the input claims Sort.Type_then_ID but osmium does not decode it in strict kind and \
@@ -84,72 +95,168 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         ));
     }
     let locations = header.optional_feature("LocationsOnWays");
+    let input = dedupe_plan::entries(pbf)?;
+    let a: Operand<'_> = (pbf, &input);
 
-    // Every blob of a self-merge overlaps its twin, so every way blob is
-    // re-encoded without enrichments.
-    let self_ways = if counts[1] > 0 {
-        WayLocations::Dropped
-    } else {
-        WayLocations::Kept
+    merge(harness, &outdir, "self", pbf, [a, a], unindexed, direct_io)?;
+
+    let tags = |invert: bool| {
+        let mut args = vec![SPLIT.to_owned(), "-R".to_owned()];
+        if invert {
+            args.push("--invert-match".to_owned());
+        }
+        args
     };
-    merge(
+    let split = "cat-dedupe-split.1";
+    let selected = derive(
         harness,
         &outdir,
-        "self",
         pbf,
-        &[pbf, pbf],
-        unindexed,
-        direct_io,
-        self_ways,
+        "selected",
+        (split, "tags-filter", tags(false)),
+        locations,
     )?;
+    let rest = derive(
+        harness,
+        &outdir,
+        pbf,
+        "rest",
+        (split, "tags-filter", tags(true)),
+        locations,
+    )?;
+    let (window_ids, windowed) = window(pbf, &input)?;
+    let window = derive(
+        harness,
+        &outdir,
+        pbf,
+        "window",
+        ("cat-dedupe-window.1", "getid", window_ids),
+        locations,
+    )?;
+    let selected_entries = dedupe_plan::entries(&selected)?;
+    let rest_entries = dedupe_plan::entries(&rest)?;
+    let window_entries = dedupe_plan::entries(&window)?;
+    let s: Operand<'_> = (&selected, &selected_entries);
+    let c: Operand<'_> = (&rest, &rest_entries);
+    let w: Operand<'_> = (&window, &window_entries);
+    require_transitions(&input, &window_entries, &windowed)?;
 
-    let selected = derive(harness, &outdir, pbf, "selected", false, locations)?;
-    let rest = derive(harness, &outdir, pbf, "rest", true, locations)?;
-    let cases: [(&str, [&Path; 2]); 3] = [
-        ("input+selected", [pbf, &selected]),
-        ("selected+rest", [&selected, &rest]),
-        ("rest+selected", [&rest, &selected]),
+    let cases: [(&str, [Operand<'_>; 2]); 5] = [
+        ("input+selected", [a, s]),
+        ("selected+rest", [s, c]),
+        ("rest+selected", [c, s]),
+        ("input+window", [a, w]),
+        ("window+input", [w, a]),
     ];
     for (label, inputs) in cases {
-        merge(
-            harness,
-            &outdir,
-            label,
-            pbf,
-            &inputs,
-            true,
-            direct_io,
-            WayLocations::KeptOrReported,
-        )?;
+        merge(harness, &outdir, label, pbf, inputs, true, direct_io)?;
     }
 
     Ok(Some(format!(
         "identical to the input as osmium decodes it (metadata included): merged with itself, \
-         with its {SPLIT} selection, and as the disjoint union of that selection and its \
-         complement in both orders; the survivor rule among differing copies and which planner \
-         paths ran are not established"
+         with its {SPLIT} selection, as the disjoint union of that selection and its \
+         complement in both orders, and with a window of its own blobs in both orders; every \
+         output blob in the documented passthrough or overlap-run place, the window \
+         witnessing runs that start and end between passthrough stretches; the survivor rule \
+         among differing copies is not established"
     )))
 }
 
-/// `osmium tags-filter -R` of `pbf` by [`SPLIT`], inverted when `invert`,
-/// held to carry the sort claim (osmium-sorted when it does not), in strict
-/// order and holding at least one object.
+/// One merge input: its path and its decoded blobs.
+type Operand<'a> = (&'a Path, &'a [Entry]);
+
+/// The window must give each windowed kind one run flanked by passthroughs
+/// of its kind, the node run (when nodes are windowed) joining two input
+/// blobs, which never overlap each other in sorted input, so the run grew by
+/// its widest reach. osmium's packing of the window is read, not assumed.
+fn require_transitions(input: &[Entry], window: &[Entry], windowed: &[usize]) -> Result<(), Error> {
+    let plan = dedupe_plan::predict(&[input, window]);
+    let bridged = plan.iter().any(|seg| {
+        matches!(seg, Segment::Run { kind: 0, members, .. }
+            if members.iter().filter(|(from, _)| *from == 0).count() >= 2)
+    });
+    if dedupe_plan::shape(&plan).bounded_runs != windowed.len()
+        || (windowed.contains(&0) && !bridged)
+    {
+        return Err(Error::tool(format!(
+            "the window operand does not give one run flanked by passthroughs per windowed kind \
+             (kinds {windowed:?}) with a node run bridging two input blobs, so the transitions \
+             are unexercised"
+        )));
+    }
+    Ok(())
+}
+
+/// The `osmium getid` IDs of the window operand, and the kinds it covers:
+/// every second ID of the tail half of one interior node blob and of the
+/// head half of the next (a bridge between two disjoint blobs), and every
+/// second ID of one interior way blob and one interior relation blob. A
+/// kind needs four blobs for the bridge and three for a single blob, so
+/// each run has a passthrough of its kind on both sides; a kind with fewer
+/// is not windowed, and an input with no windowed kind is outside the
+/// domain.
+fn window(pbf: &Path, entries: &[Entry]) -> Result<(Vec<String>, Vec<usize>), Error> {
+    let mut ids = Vec::new();
+    let mut kinds = Vec::new();
+    for (kind, prefix) in [(0usize, 'n'), (1, 'w'), (2, 'r')] {
+        let of_kind: Vec<&Entry> = entries.iter().filter(|e| e.kind == kind).collect();
+        let n = of_kind.len();
+        let picks: Vec<(usize, Option<bool>)> = if kind == 0 {
+            if n < 4 {
+                continue;
+            }
+            let k = n / 2 - 1;
+            vec![(k, Some(true)), (k + 1, Some(false))]
+        } else {
+            if n < 3 {
+                continue;
+            }
+            vec![(n / 2, None)]
+        };
+        for (at, tail) in picks {
+            let blob = of_kind[at].blob;
+            let decoded = pbf_frames::blob_ids(pbf, blob.payload_offset, blob.datasize)?;
+            let half = decoded.len() / 2;
+            let span = match tail {
+                None => &decoded[..],
+                Some(true) => &decoded[half..],
+                Some(false) => &decoded[..half.max(1)],
+            };
+            ids.extend(
+                span.iter()
+                    .step_by(2)
+                    .map(|(_, id)| format!("{prefix}{id}")),
+            );
+        }
+        kinds.push(kind);
+    }
+    if kinds.is_empty() {
+        return Err(Error::tool(
+            "the input has too few blobs of every kind for a window flanked by passthroughs, \
+             outside the domain this check judges",
+        ));
+    }
+    Ok((ids, kinds))
+}
+
+/// An osmium selection of `pbf` (`tool`: the reference id, the osmium
+/// command and its arguments after the input), held to carry the sort claim
+/// (osmium-sorted when it does not), in strict order and holding at least
+/// one object.
 fn derive(
     harness: &mut Harness,
     outdir: &Path,
     pbf: &Path,
     name: &str,
-    invert: bool,
+    tool: (&str, &str, Vec<String>),
     locations: bool,
 ) -> Result<PathBuf, Error> {
+    let (id, command, args) = tool;
     harness.msg(&format!("--- deriving {name} ---"));
     let filtered = outdir.join(format!("{name}-filtered.osm.pbf"));
-    let mut run = ToolRun::osmium("cat-dedupe-split.1")
-        .arg("tags-filter")
-        .input(pbf)
-        .args(&[SPLIT, "-R"]);
-    if invert {
-        run = run.arg("--invert-match");
+    let mut run = ToolRun::osmium(id).arg(command).input(pbf);
+    for arg in args {
+        run = run.arg(arg);
     }
     if locations {
         run = run.args(&["-f", "pbf,locations_on_ways=true"]);
@@ -158,9 +265,10 @@ fn derive(
         &run.arg("-o").output(&filtered).arg("--overwrite"),
         &outdir.join(format!("{name}-filtered.stdout")),
     )?;
-    harness.require_success(&captured, "osmium tags-filter")?;
+    let what = format!("osmium {command}");
+    harness.require_success(&captured, &what)?;
     if locations {
-        crate::checks::sort::require_declared_locations(&filtered, "osmium tags-filter")?;
+        crate::checks::sort::require_declared_locations(&filtered, &what)?;
     }
     let operand = if pbf_frames::header(&filtered)?.optional_sorted() {
         filtered
@@ -192,22 +300,27 @@ fn derive(
     Ok(operand)
 }
 
-/// One `pbfhogg cat --dedupe` of `inputs`, judged against `pbf`.
-#[allow(clippy::too_many_arguments)]
+/// One `pbfhogg cat --dedupe` of `inputs`, judged against `pbf` and against
+/// the layout its plan predicts.
 fn merge(
     harness: &mut Harness,
     outdir: &Path,
     label: &str,
     pbf: &Path,
-    inputs: &[&Path],
+    inputs: [Operand<'_>; 2],
     force: bool,
     direct_io: bool,
-    expect: WayLocations,
 ) -> Result<(), Error> {
     harness.msg(&format!("--- cat --dedupe {label} ---"));
+    let plan = dedupe_plan::predict(&[inputs[0].1, inputs[1].1]);
+    let shape = dedupe_plan::shape(&plan);
+    harness.msg(&format!(
+        "  predicted: {} blobs, {} passthrough, {} rewritten, {} runs between passthroughs",
+        shape.total, shape.passthrough, shape.rewritten, shape.bounded_runs
+    ));
     let out = outdir.join(format!("pbfhogg-{label}.osm.pbf"));
     let mut argv = PbfArgv::new("cat").arg("--dedupe");
-    for input in inputs {
+    for (input, _) in inputs {
         argv = argv.input(input);
     }
     let argv = argv
@@ -217,7 +330,37 @@ fn merge(
     let captured = harness.pbfhogg_discard(argv)?;
     let name = format!("pbfhogg cat --dedupe {label}");
     harness.require_success(&captured, &name)?;
+    let expect = if shape.way_rewritten {
+        WayLocations::Dropped
+    } else {
+        WayLocations::Kept
+    };
     harness.judge_way_locations(&name, pbf, &out, &captured, expect)?;
+
+    let layout = dedupe_plan::judge(&out, &[inputs[0].0, inputs[1].0], &plan)?;
+    harness.msg(&format!(
+        "  {name}: blob layout {}",
+        match &layout {
+            Ok(()) => "as predicted PASS".to_owned(),
+            Err(why) => format!("FAIL ({why})"),
+        }
+    ));
+    harness.record(
+        &format!("{name} output blobs in the predicted layout"),
+        Verdict::from_pass(layout.is_ok()),
+    );
+    let counts = dedupe_plan::summary_counts(&captured.stderr_text());
+    let want = (shape.total, shape.passthrough, shape.rewritten);
+    let counted = counts == Some(want);
+    harness.msg(&format!(
+        "  {name}: summary blob counts {counts:?}, predicted {want:?} {}",
+        if counted { "PASS" } else { "FAIL" }
+    ));
+    harness.record(
+        &format!("{name} summary blob counts as predicted"),
+        Verdict::from_pass(counted),
+    );
+
     let claims = harness.has_sort_flag(&out)?;
     harness.msg(&format!(
         "  {name}: header {} Sort.Type_then_ID {}",

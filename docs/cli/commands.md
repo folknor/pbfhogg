@@ -1177,6 +1177,17 @@ Concatenate PBF files with optional type filtering. Embeds blob-level indexdata 
 
 With `--dedupe`, merges multiple sorted PBF files with blob-level passthrough and exact-duplicate deduplication.
 
+The data blobs of every input are ordered by kind, then by first ID, ties
+in argument then file order. An overlap run starts at a blob whose range
+the next blob of its kind starts within, and grows while the next blob of
+its kind starts at or below the highest ID the run reaches so far, so
+overlap is followed transitively. A blob in no run is passed through with
+its serialized `Blob` payload unchanged (an unindexed one under a rebuilt
+blob header, below); a run's blobs are merged, deduplicated and re-encoded
+in its place. Exceptions: a blob holding no element is omitted, and an
+unindexed blob that is internally out of order or that no single index
+describes is rewritten even where it overlaps nothing.
+
 A blob that already carries indexdata is passed through with it, unchecked,
 so plain `cat` cannot repair false indexdata; `--reindex` (below) does.
 `--type` copies a blob raw on its indexdata kind and `--dedupe` passes blobs

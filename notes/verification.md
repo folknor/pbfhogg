@@ -92,16 +92,6 @@ except `encoding_fixture.rs` (which asserts `locations_on_ways=true` only); no f
 asserts `add_metadata=false` or its absence. A fake that decodes by the requested options,
 with per-check faults altering one field class, would close it.
 
-## VER-132 - The cat --dedupe verify does not witness passthrough or overlap transitions
-
-`pbfhogg-verify cat-dedupe` merges the input with osmium `tags-filter -R` selections of it and
-judges each answer against the input, but osmium packs a sparse selection into blobs whose ID
-ranges can span many of the input's, and the planner extends overlap components by running
-maximum, so whether any blob passed through raw, or any run started and ended between passthrough
-stretches, is not established. A derived operand built from bounded ID windows chosen against the
-input's own framing (read by the verifier's frame reader), with the expected plan predicted from
-both framings, would witness them.
-
 ## VER-133 - Geocode interpolation and admin answers have no real-data verification
 
 `pbfhogg-verify geocode` judges address and street answers of `pbfhogg geocode-query` on

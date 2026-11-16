@@ -50,7 +50,7 @@ pub(crate) enum WayLocations {
     /// Kept, or dropped with the warning where the run decides and the
     /// verifier cannot see which: `sort` where the input's claims do not
     /// decide whether a way blob is rewritten
-    /// (`checks::sort::sort_way_locations`), a `cat --dedupe` merge.
+    /// (`checks::sort::sort_way_locations`).
     KeptOrReported,
 }
 

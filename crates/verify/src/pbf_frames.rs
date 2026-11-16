@@ -460,10 +460,49 @@ pub(crate) fn blob_ids(
     payload_offset: u64,
     datasize: u64,
 ) -> Result<Vec<(usize, i64)>, Error> {
-    let fail = |why: String| {
+    let (block, fail) = read_block(path, payload_offset, datasize)?;
+    block_ids(&block).map_err(fail)
+}
+
+/// [`blob_ids`] plus whether every group of the block carries at most one
+/// element field (plain nodes, dense nodes, ways or relations): a group with
+/// two is a block no single index describes, whatever its IDs decode to.
+pub(crate) fn blob_ids_and_shape(
+    path: &Path,
+    payload_offset: u64,
+    datasize: u64,
+) -> Result<(Vec<(usize, i64)>, bool), Error> {
+    let (block, fail) = read_block(path, payload_offset, datasize)?;
+    let ids = block_ids(&block).map_err(&fail)?;
+    let mut single = true;
+    for field in Fields::new(&block) {
+        if let (2, Value::Bytes(group)) = field.map_err(&fail)? {
+            let mut seen: Option<u32> = None;
+            for f in Fields::new(group) {
+                let (number, _) = f.map_err(&fail)?;
+                if (1..=4).contains(&number) {
+                    if seen.is_some_and(|s| s != number) {
+                        single = false;
+                    }
+                    seen = Some(number);
+                }
+            }
+        }
+    }
+    Ok((ids, single))
+}
+
+/// The decompressed `PrimitiveBlock` of the payload at `payload_offset`,
+/// with the error constructor naming that blob.
+fn read_block(
+    path: &Path,
+    payload_offset: u64,
+    datasize: u64,
+) -> Result<(Vec<u8>, impl Fn(String) -> Error), Error> {
+    let display = path.display().to_string();
+    let fail = move |why: String| {
         Error::Failed(format!(
-            "cannot read the data blob at byte {payload_offset} of {}: {why}",
-            path.display()
+            "cannot read the data blob at byte {payload_offset} of {display}: {why}"
         ))
     };
     if datasize >= MAX_BLOB_LEN {
@@ -476,8 +515,8 @@ pub(crate) fn blob_ids(
     let mut payload = vec![0u8; size];
     file.read_exact(&mut payload)
         .map_err(|e| fail(e.to_string()))?;
-    let block = blob_content(&payload).map_err(fail)?;
-    block_ids(&block).map_err(fail)
+    let block = blob_content(&payload).map_err(&fail)?;
+    Ok((block, fail))
 }
 
 /// What the verifier's own decode of every data blob finds against the
@@ -679,6 +718,39 @@ pub(crate) fn same_data_payloads(a: &Path, b: &Path) -> Result<Result<(), String
             rest -= n as u64;
         }
     }
+}
+
+/// Whether data blob `x` of `a` and data blob `y` of `b` carry the same
+/// serialized `Blob` payload, compression included, whatever their blob
+/// headers say.
+pub(crate) fn same_payload(
+    a: &Path,
+    x: &ClaimedBlob,
+    b: &Path,
+    y: &ClaimedBlob,
+) -> Result<bool, Error> {
+    if x.datasize != y.datasize {
+        return Ok(false);
+    }
+    let mut fa = std::fs::File::open(a)
+        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", a.display())))?;
+    let mut fb = std::fs::File::open(b)
+        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", b.display())))?;
+    fa.seek(SeekFrom::Start(x.payload_offset))?;
+    fb.seek(SeekFrom::Start(y.payload_offset))?;
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    let mut rest = x.datasize;
+    while rest > 0 {
+        let n =
+            usize::try_from(rest.min(ba.len() as u64)).map_err(|e| Error::tool(e.to_string()))?;
+        fa.read_exact(&mut ba[..n])?;
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+        rest -= n as u64;
+    }
+    Ok(true)
 }
 
 /// Append to the PBF at `path` one `OSMData` blob holding an empty

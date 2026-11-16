@@ -297,7 +297,7 @@ suite because a later comparison cannot make that run complete.
 | `field-policies` | osmium decodings of one-field edits of an osmium-built slice of the input | each policy reads exactly the field classes it claims, with every edit isolated by an independent decoding; `between` by declaration (see How outputs are judged) |
 | `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
-| `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, and the disjoint union of that subset and its complement in both orders: element equality with the input, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
+| `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, the disjoint union of that subset and its complement in both orders, and merges with a window of the input's own blobs in both orders: element equality with the input, blob layout and summary counts against the plan predicted from both framings, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
 | `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
@@ -350,12 +350,28 @@ answer is the input. On input claiming the sort order, which must also be
 strictly ordered as osmium decodes it (else a verifier error), each of
 `dedupe(A, A)`, `dedupe(A, S)`, `dedupe(S, C)` and `dedupe(C, S)` must equal
 the input under `Policy::between`, claim the sort order, and keep or drop
-`LocationsOnWays` as documented (the self-merge rewrites every way blob, so
-it drops it). The derived operands carry no indexdata, so their runs pass
-`--force`; each must be strictly ordered and hold an object, else a verifier
-error. Which planner paths ran is not established, nor the survivor rule
-among differing copies, which only `crates/cli/tests/cli_cat.rs` fixtures
-cover. Claimless input is held to the Unsorted refusal of `dedupe(A, A)`,
+`LocationsOnWays` as documented. A window operand W, `osmium getid` of
+every second ID of the tail half of one interior node blob of A and the
+head half of the next, and of one interior way and relation blob, adds
+`dedupe(A, W)` and `dedupe(W, A)`. The derived operands carry no indexdata,
+so their runs pass `--force`; each must be strictly ordered and hold an
+object, else a verifier error.
+
+Every merge is also held to the blob layout the documented plan
+(docs/cli/commands.md, cat `--dedupe`) predicts from both inputs' framing as
+`pbf_frames` decodes it (`checks/dedupe_plan.rs`): each passthrough blob's
+payload bytes in place, each run's re-encoded blobs wholly within its ID
+span and ascending, nothing after the last segment; the summary's blob
+counts equal the prediction (pbfhogg's own account, beside the layout); and
+`LocationsOnWays` is dropped exactly when a way blob is in a run. The
+prediction's domain is every blob nonempty, single-kind, one element field
+per group, strictly ascending non-negative IDs, and indexdata, where
+present, equal to the decode; else a verifier error. The window must yield
+one run flanked by same-kind passthroughs per windowed kind, the node run
+joining two A blobs, else a verifier error. Byte equality witnesses the
+preserved payload, not that nothing decoded it. The survivor rule among
+differing copies is not established; only `crates/cli/tests/cli_cat.rs`
+fixtures cover it. Claimless input is held to the Unsorted refusal of `dedupe(A, A)`,
 with `--force` on unindexed input.
 
 No other tool runs beside osmium. osmosis, which deletes regardless of
@@ -735,6 +751,13 @@ On 2026-11-16, host bygg, parent `a4a6974a` with the uncommitted change that
 added `cat-dedupe` (CLI xxh3-128 `a9b2163354aa448a02f23aebab86ed8e`): Denmark
 indexed, raw and `altw-keep-untagged` PASS (1m48s to 1m53s), the `unsorted`
 snapshot PASS as a refusal, and Germany indexed PASS in 17m21s.
+
+On 2026-11-16, host bygg, parent `fbfe8a26` with the uncommitted change that
+added the blob-layout prediction and the window operand to `cat-dedupe`
+(CLI xxh3-128 `465714c58738dbf9b612854fb37b1e48`): Denmark indexed, raw
+and `altw-keep-untagged` PASS (2m22s to 2m34s; on indexed the window merges
+predicted and matched 7392 passthrough and 7 rewritten blobs, three runs
+between passthroughs), and Germany indexed PASS in 23m28s.
 
 On 2026-11-16, host bygg, parent `ac310e17` with the uncommitted change that
 wrote the cat and removeid references with inline coordinates and decided

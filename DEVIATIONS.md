@@ -269,6 +269,21 @@ three things libosmium's XML reader accepts at the root level:
   silently discard structured content. A childless `<changeset/>` or
   `<bounds/>` is accepted and ignored.
 
+## cat --dedupe: which copy survives, and repeats inside one input
+
+`cat --dedupe` stands in for `osmium merge`, but they choose differently
+among copies of one (type, ID, version). pbfhogg keeps the copy from the
+earliest input, then the earliest frame, then the earliest position, and
+never reads the timestamp or any other field. osmium merge orders its queue
+by type, ID, version and then timestamp (when both are valid), and writes the
+last copy of an equal run, so of two copies with differing timestamps it
+keeps the later one, and with equal timestamps the choice is unspecified.
+osmium also refuses an input holding the same ID and version twice, or a
+descending version; pbfhogg accepts both, drops the repeat where its blob is
+in an overlap run and passes it through elsewhere. Where every copy of an
+object is identical, the two answers agree; osmium merge is not an oracle
+for anything else.
+
 ## merge-changes and tags-filter OSC: a deleted node's location is both coordinates or neither
 
 Both commands keep a delete's body as osmium does: tags, way node refs,

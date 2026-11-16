@@ -90,20 +90,15 @@ The generated tool protocols in `crates/verify/tests` fault whole records, not o
 class at a time; negative controls that alter metadata, inline locations, tags and members
 separately on a real derived copy, each required to fail its check, are still missing.
 
-## VER-132 - No real-data oracle for cat --dedupe
+## VER-132 - The cat --dedupe verify does not witness passthrough or overlap transitions
 
-The dedupe-self and dedupe-pair benches used to diff their output against the input with
-pbfhogg's own diff (`--check yes`); a bench no longer judges, and pbfhogg-verify has no dedupe
-check. `osmium merge` is not an oracle: it orders its queue by object comparison including
-timestamp, so for a shared type, ID and version with differing content its survivor need not be
-pbfhogg's earliest-input copy, and it rejects repeated ID and version inside one input. A sound
-check needs a narrow domain: inputs with unique ID and version keys, the self-merge
-`dedupe(A, A)` compared with A as osmium OPL *without* inline locations (dedupe drops enrichment
-in overlap blobs, docs/cli/commands.md), and a subset pair built by the verifier (B derived from
-A independently, then the contracted projection of `dedupe(A, B)` against A) to cover
-passthrough stretches and overlap transitions. Unsorted input must be held to dedupe's refusal,
-and unindexed input needs its forced fallback. Precedence on conflicting copies is covered only
-by crates/cli/tests/cli_cat.rs fixtures.
+`pbfhogg-verify cat-dedupe` merges the input with osmium `tags-filter -R` selections of it and
+judges each answer against the input, but osmium packs a sparse selection into blobs whose ID
+ranges can span many of the input's, and the planner extends overlap components by running
+maximum, so whether any blob passed through raw, or any run started and ended between passthrough
+stretches, is not established. A derived operand built from bounded ID windows chosen against the
+input's own framing (read by the verifier's frame reader), with the expected plan predicted from
+both framings, would witness them.
 
 ## VER-133 - Geocode answers have no real-data verification
 

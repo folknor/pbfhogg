@@ -1,4 +1,6 @@
-//! Merge multiple sorted PBF files into one. Equivalent to `osmium merge`.
+//! Merge multiple sorted PBF files into one: pbfhogg's `osmium merge`, with a
+//! different survivor among copies of one (type, ID, version) and no refusal
+//! of a repeat inside one input (DEVIATIONS.md, "cat --dedupe").
 //!
 //! Two-pass blob-level merge through the engine shared with `sort`
 //! (`commands::blob_merge`):

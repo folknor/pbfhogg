@@ -209,6 +209,8 @@ enum Check {
     Diff(DiffArgs),
     Renumber(RenumberArgs),
     Cat(PbfArgs),
+    /// pbfhogg cat --dedupe held to its input (self-merge, subset, disjoint union)
+    CatDedupe(PbfArgs),
     ApplyChanges(ApplyArgs),
     #[command(name = "check-ids")]
     Ids(PbfArgs),
@@ -455,6 +457,7 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
             })?))
         }
         Check::Cat(pbf)
+        | Check::CatDedupe(pbf)
         | Check::InspectTags(pbf)
         | Check::Getparents(pbf)
         | Check::GetidRemoveid(pbf)
@@ -521,6 +524,7 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
 fn read_check(check: &Check) -> (&'static str, checks::ReadCheck) {
     match check {
         Check::Cat(_) => ("cat", checks::cat::run),
+        Check::CatDedupe(_) => ("cat --dedupe", checks::cat_dedupe::run),
         Check::InspectTags(_) => ("inspect-tags", checks::inspect_tags::run),
         Check::Ids(_) => ("check-ids", checks::check_ids::run),
         Check::Repack(_) => ("repack", checks::repack::run),
@@ -746,6 +750,7 @@ mod tests {
         Args::command().debug_assert();
         for name in [
             "cat",
+            "cat-dedupe",
             "diff",
             "renumber",
             "apply-changes",

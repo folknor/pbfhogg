@@ -133,6 +133,9 @@ file holds (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-changes-are-decided
 
 osmium's `merge` (sorted k-way merge with dedup) is `cat --dedupe` in pbfhogg.
 Plain `cat` remains concatenation without dedup, just like osmium's `cat`.
+Among copies of one type, ID and version, pbfhogg keeps the earliest input's
+and never reads the timestamp, where osmium keeps the later timestamp; and
+pbfhogg does not refuse a repeated ID and version inside one input.
 
 ```
 # osmium

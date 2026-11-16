@@ -265,6 +265,7 @@ suite because a later comparison cannot make that run complete.
 |---|---|---|
 | `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
+| `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, and the disjoint union of that subset and its complement in both orders: element equality with the input, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
 | `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
@@ -305,6 +306,24 @@ mode, since osmium's are known stale.
 The suite runs the locations arm separately on the selected generation's
 `altw-keep-untagged` base, when both it and an OSC are configured, and
 skips it for a fixture PBF. Configured invalid files fail resolution.
+
+Cat --dedupe has no reference tool: osmium merge keeps the later timestamp
+among copies of one type, ID and version where pbfhogg keeps the earliest
+input's, and refuses repeats inside one input (DEVIATIONS.md). The check
+works where the survivor cannot matter: every merged operand is the input
+or an osmium `tags-filter -R` selection of it (`nwr/amenity`, and its
+`--invert-match` complement), so equal keys decode to equal records and the
+answer is the input. On input claiming the sort order, which must also be
+strictly ordered as osmium decodes it (else a verifier error), each of
+`dedupe(A, A)`, `dedupe(A, S)`, `dedupe(S, C)` and `dedupe(C, S)` must equal
+the input under `Policy::between`, claim the sort order, and keep or drop
+`LocationsOnWays` as documented (the self-merge rewrites every way blob, so
+it drops it). The derived operands carry no indexdata, so their runs pass
+`--force`; each must be strictly ordered and hold an object, else a verifier
+error. Which planner paths ran is not established, nor the survivor rule
+among differing copies, which only `crates/cli/tests/cli_cat.rs` fixtures
+cover. Claimless input is held to the Unsorted refusal of `dedupe(A, A)`,
+with `--force` on unindexed input.
 
 No other tool runs beside osmium. osmosis, which deletes regardless of
 version, is not run: deletion is enforced from the input OSC's final
@@ -673,6 +692,11 @@ since boot, so the killer is the OOM killer. On the uncommitted change to
 and 1m46s; the last, sampled, peaked at a resident set (VmHWM) of 26.2 GiB. That
 peak sits at the edge of the project's 26 GB free-memory host assumption:
 germany sort fits bygg, not every conceivable standard host.
+
+On 2026-11-16, host bygg, parent `a4a6974a` with the uncommitted change that
+added `cat-dedupe` (CLI xxh3-128 `a9b2163354aa448a02f23aebab86ed8e`): Denmark
+indexed, raw and `altw-keep-untagged` PASS (1m48s to 1m53s), the `unsorted`
+snapshot PASS as a refusal, and Germany indexed PASS in 17m21s.
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

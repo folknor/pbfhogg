@@ -46,6 +46,9 @@ pub(crate) fn run(
     let mut counts = Counts::default();
     counts.add(h.run_check("sort", |h| checks::sort::run(h, pbf, direct_io))?);
     counts.add(h.run_check("cat", |h| checks::cat::run(h, pbf, direct_io))?);
+    counts.add(h.run_check("cat --dedupe", |h| {
+        checks::cat_dedupe::run(h, pbf, direct_io)
+    })?);
     if bbox.is_some() || !polygons.is_empty() {
         counts.add(h.run_check("extract", |h| {
             checks::extract::run(h, pbf, bbox, polygons, direct_io)

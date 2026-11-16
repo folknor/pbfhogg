@@ -54,6 +54,11 @@ pub(crate) const OSC_READ_BUFFER: usize = 16 * 1024;
 /// Unicode characters retained when showing a change-listing mismatch.
 pub(crate) const CHANGE_PREVIEW_CHARS: usize = 400;
 
+/// IDs per kind the field-policies slice takes from each kind's first data
+/// blob: enough for a tagged object, a way and a relation with members to be
+/// among them on real data, few enough that the slice stays small.
+pub(crate) const FIELD_POLICY_IDS: usize = 64;
+
 /// Adjacent strips in the multi-extract check, matching the legacy verifier.
 pub(crate) const MULTI_EXTRACT_REGIONS: usize = 5;
 

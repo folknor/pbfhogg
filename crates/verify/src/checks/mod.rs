@@ -8,6 +8,7 @@ pub(crate) mod add_locations;
 pub(crate) mod cat;
 pub(crate) mod cat_dedupe;
 pub(crate) mod check_refs;
+pub(crate) mod field_policies;
 pub(crate) mod geocode;
 pub(crate) mod getparents;
 pub(crate) mod inspect_tags;

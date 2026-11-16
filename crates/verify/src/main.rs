@@ -204,6 +204,8 @@ struct RenumberArgs {
 
 #[derive(Subcommand)]
 enum Check {
+    /// The element comparison's field policies held to one-field alterations of a real slice
+    FieldPolicies(Source),
     /// pbfhogg sort vs osmium sort
     Sort(PbfArgs),
     Diff(DiffArgs),
@@ -498,6 +500,13 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
                 checks::multi_extract::run(h, &input, &bbox, &polygons, args.regions, pbf.direct_io)
             })?))
         }
+        Check::FieldPolicies(source) => {
+            let input = resolve_input(b, source)?;
+            h.run.watch(&input)?;
+            Ok(Ending::Single(h.run_check("field-policies", |h| {
+                checks::field_policies::run(h, &input, false)
+            })?))
+        }
         Check::Refs(source) => {
             let input = resolve_input(b, source)?;
             h.run.watch(&input)?;
@@ -753,6 +762,7 @@ mod tests {
     fn cli_parses_checks() {
         Args::command().debug_assert();
         for name in [
+            "field-policies",
             "cat",
             "cat-dedupe",
             "diff",

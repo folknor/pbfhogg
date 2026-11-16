@@ -44,6 +44,27 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   `LocationsOnWays`, except in apply-changes locations mode. Where
   coordinates are the command's promise (add-locations-to-ways), the check
   requires both declarations.
+- **The field policies are held to real data** by `field-policies`, the
+  first check of the suite, which runs no pbfhogg. On a slice of the input
+  built by osmium (the first IDs of each kind's first data blob, `getid -r`
+  for nodes and ways, plain `getid` for relations, `add-locations-to-ways`
+  over both), osmium's OPL decoding with metadata and coordinates is edited
+  one record and one field class at a time: version, timestamp, changeset,
+  uid, user, a tag value, a tag boundary, a node coordinate, a way ref, an
+  inline way-node coordinate, a member type, ref and role. Each edit is
+  written back by osmium and compared with the unedited copy under FULL,
+  NO_LOCATIONS, CONTENT and `Policy::between`: a policy that claims the
+  class must report exactly that identity as differing, one that does not
+  must report identical. Which field changed is read back from osmium's own
+  decoding over the whole record, not from the comparator under test, and
+  every other record must be unchanged. `between` is held to all four
+  declaration combinations and to a pair differing only in inline
+  coordinates. Visibility is not controlled: libosmium writes it only to
+  history files. A class with no candidate record is named in the PASS
+  line; any control that fails or cannot be built is a verifier error
+  (`ERROR`, exit 2), which stops a suite, since every later element verdict
+  rests on the comparator. Which policy each check passes is not
+  established by it.
 - **The `LocationsOnWays` declaration** of each output of sort, cat,
   tags-filter, getid (plain, `--invert` and `--add-referenced`),
   getparents, extract, multi-extract, renumber and apply-changes is judged
@@ -263,6 +284,7 @@ suite because a later comparison cannot make that run complete.
 
 | Check | Compared against | Established by |
 |---|---|---|
+| `field-policies` | osmium decodings of one-field edits of an osmium-built slice of the input | each policy reads exactly the field classes it claims, with every edit isolated by an independent decoding; `between` by declaration (see How outputs are judged) |
 | `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
 | `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, and the disjoint union of that subset and its complement in both orders: element equality with the input, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
@@ -720,6 +742,14 @@ pbfhogg's own locations checks passed. Neither dataset had a configured
 polygon on this host, so extract coverage was bbox only. Text diff named
 unexercised detail shapes. These are correctness observations, not timing
 measurements or stronger claims than the checks specify.
+
+On 2026-11-16, host bygg, parent `adef2fc1` with the uncommitted change
+that added `field-policies`: Denmark indexed PASS (769-record slice, all
+thirteen controls with a candidate, 64 ways in the `between` coordinate
+witness) and Germany indexed PASS. Two mutations of `Policy`'s OPL options
+were each caught as `ERROR`, exit 2: CONTENT keeping metadata (five
+controls under content) and FULL dropping metadata (ten controls under
+full and between).
 
 Every child, including probes, uses `Lifecycle::run`.
 Child setup clears the signal mask, installs parent-death SIGKILL and checks

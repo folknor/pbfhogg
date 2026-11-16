@@ -44,6 +44,10 @@ pub(crate) fn run(
 ) -> Result<Counts, Error> {
     let start = Instant::now();
     let mut counts = Counts::default();
+    // First: every element comparison below rests on what it establishes.
+    counts.add(h.run_check("field-policies", |h| {
+        checks::field_policies::run(h, pbf, direct_io)
+    })?);
     counts.add(h.run_check("sort", |h| checks::sort::run(h, pbf, direct_io))?);
     counts.add(h.run_check("cat", |h| checks::cat::run(h, pbf, direct_io))?);
     counts.add(h.run_check("cat --dedupe", |h| {

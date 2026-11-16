@@ -143,6 +143,11 @@ impl Harness {
         self.failures.push(what.into());
     }
 
+    /// Whether the check in flight has recorded a failure.
+    pub(crate) fn failed(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
     /// The fresh directory of the check in flight, named `name`.
     pub(crate) fn subdir(&mut self, name: &str) -> Result<PathBuf, Error> {
         let dir = self.run.check_dir(name)?;

@@ -78,17 +78,18 @@ Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
 indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
 indexed inputs.
 
-## VER-122 - Verify's field policies have no real-data negative controls
+## VER-122 - No check is shown to pass the field policy its claim needs
 
 Reported by bench-verify.
 
-Every equality judgment once made by `pbfhogg diff` is now the verifier's merge of osmium's
-OPL decodings (`crates/verify/src/opl_compare.rs`) under a declared field policy, so the
-independent decoder and the per-check policy exist (reference/verify.md "How outputs are
-judged"). Residue: nothing proves each policy reads the field classes it claims on real data.
-The generated tool protocols in `crates/verify/tests` fault whole records, not one field
-class at a time; negative controls that alter metadata, inline locations, tags and members
-separately on a real derived copy, each required to fail its check, are still missing.
+`pbfhogg-verify field-policies` shows on real data that each `opl_compare::Policy` reads
+exactly the field classes it claims. What it does not show is which policy each check hands
+the comparison, nor that the check's verdict follows from it: a check passing CONTENT where
+its claim needs metadata would stay green. The generated fixtures in `crates/verify/tests`
+cannot see this either, because their fake osmium ignores the `-f` format string everywhere
+except `encoding_fixture.rs` (which asserts `locations_on_ways=true` only); no fixture
+asserts `add_metadata=false` or its absence. A fake that decodes by the requested options,
+with per-check faults altering one field class, would close it.
 
 ## VER-132 - The cat --dedupe verify does not witness passthrough or overlap transitions
 

@@ -24,8 +24,10 @@
 //! Each outer ring is a polygon. An inner ring belongs to every outer ring
 //! whose trace contains its trace: that is decided only where the two
 //! traces stay at least one decimicrodegree apart (then one vertex decides,
-//! and every vertex agrees), and a hole nearer than that to an outer it may
-//! belong to leaves the relation unmodelled. A query is in a polygon when it
+//! and every vertex agrees). A hole nearer than that to an outer it may
+//! belong to is left out of that outer, and its bounding box is not judged
+//! at the level: ownership only decides answers inside the hole, and it
+//! changes no ring and no stored area. A query is in a polygon when it
 //! is inside the outer ring and in none of its holes, by even-odd crossing.
 //!
 //! The answer at a level is a containing polygon of least stored area, the
@@ -39,8 +41,15 @@
 //! Not judged at a level: a query within the band of any ring of a
 //! polygon of that level (1 mm at tolerance 0, for float crossing tests;
 //! the tolerance plus margin otherwise, where the contract lets the answer
-//! move), or inside the bounding box of an unmodelled relation of that
-//! level, which could hold any answer.
+//! move), inside the bounding box of an unmodelled relation of that
+//! level, which could hold any answer, or inside the box of an undecided
+//! hole of that level.
+//!
+//! An unassemblable group is not localised the same way, though any ring
+//! the builder makes of it lies inside the group's box: the builder's ring
+//! search refuses the whole relation when its step budget runs out, which
+//! only a branching group can cause, so the relation's other polygons may
+//! vanish and its whole box stays unjudged.
 
 use std::collections::HashMap;
 
@@ -73,12 +82,28 @@ pub(super) struct Polygon {
 #[derive(Default)]
 pub(super) struct AdminModel {
     pub(super) polygons: Vec<Polygon>,
-    /// `(level, bbox)` of each unmodelled relation's member coordinates.
+    /// `(level, bbox)` not judged: each unmodelled relation's member
+    /// coordinates, and each undecided hole.
     pub(super) unmodelled: Vec<(u8, (i32, i32, i32, i32))>,
+    /// The id, level and why of each `unmodelled` box, for the run's account.
+    pub(super) unmodelled_why: Vec<(String, u8, Unmodelled)>,
     pub(super) relations: usize,
     /// Every ring edge, `(polygon, a, b)`, and the grid over them.
     edges: Vec<(u32, Pt, Pt)>,
     edge_cells: HashMap<(i32, i32), Vec<u32>>,
+}
+
+/// Why a relation is not modelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Unmodelled {
+    /// A member way has a node osmium could not locate.
+    Unlocated,
+    /// Its outer or inner ways do not assemble uniquely: an endpoint
+    /// shared by three or more member ends, or a one-node member.
+    Junction,
+    /// A hole comes within the clearance of an outer it may belong to; the
+    /// relation is modelled and only the hole's box is unjudged.
+    HoleClearance,
 }
 
 /// A boundary relation, as selected.
@@ -424,41 +449,58 @@ impl AdminModel {
             };
             let Some((outers, inners)) = assembled else {
                 model.unmodelled.push((b.level, member_box));
+                let why = if located {
+                    Unmodelled::Junction
+                } else {
+                    Unmodelled::Unlocated
+                };
+                model.unmodelled_why.push((r.id.clone(), b.level, why));
                 continue;
             };
-            let mut polygons = Vec::new();
-            let mut decided = true;
-            for outer in outers {
-                let Some(bbox) = bbox_of(outer.iter()) else {
-                    continue;
-                };
-                let mut holes = Vec::new();
-                for hole in &inners {
-                    match owned(hole, &outer, bbox) {
-                        Some(true) => holes.push(hole.clone()),
-                        Some(false) => {}
-                        None => decided = false,
-                    }
-                }
-                let area = area_interval(&outer, bbox);
-                polygons.push(Polygon {
-                    level: b.level,
-                    name: b.name.clone(),
-                    country_code: b.country_code.clone(),
-                    outer,
-                    holes,
-                    area,
-                    bbox,
-                });
-            }
-            if !decided {
-                model.unmodelled.push((b.level, member_box));
-                continue;
-            }
-            model.polygons.extend(polygons);
+            model.add_polygons(&r.id, &b, outers, &inners);
         }
         model.index_edges()?;
         Ok(model)
+    }
+
+    /// One polygon per assembled outer ring of `b`, with its decided holes.
+    fn add_polygons(&mut self, id: &str, b: &Boundary, outers: Vec<Vec<Pt>>, inners: &[Vec<Pt>]) {
+        let mut undecided = vec![false; inners.len()];
+        for outer in outers {
+            let Some(bbox) = bbox_of(outer.iter()) else {
+                continue;
+            };
+            let mut holes = Vec::new();
+            for (h, hole) in inners.iter().enumerate() {
+                match owned(hole, &outer, bbox) {
+                    Some(true) => holes.push(hole.clone()),
+                    Some(false) => {}
+                    None => undecided[h] = true,
+                }
+            }
+            let area = area_interval(&outer, bbox);
+            self.polygons.push(Polygon {
+                level: b.level,
+                name: b.name.clone(),
+                country_code: b.country_code.clone(),
+                outer,
+                holes,
+                area,
+                bbox,
+            });
+        }
+        // A hole whose ownership by some outer is undecided is left out of
+        // that outer; whichever way the builder decides, only a query inside
+        // the hole's box can be answered differently, so only that box is
+        // unjudged at the level. Ownership changes no ring and no stored
+        // area, and every decided attachment stands.
+        for (hole, _) in inners.iter().zip(&undecided).filter(|(_, u)| **u) {
+            if let Some(hole_box) = bbox_of(hole.iter()) {
+                self.unmodelled.push((b.level, hole_box));
+                self.unmodelled_why
+                    .push((id.to_owned(), b.level, Unmodelled::HoleClearance));
+            }
+        }
     }
 
     fn index_edges(&mut self) -> Result<(), String> {
@@ -780,6 +822,28 @@ mod tests {
         assert_eq!(owned(&square(200, 200, 10), &outer, b), Some(false));
         // Sharing the outer's corner: undecided.
         assert_eq!(owned(&square(0, 0, 10), &outer, b), None);
+    }
+
+    #[test]
+    fn an_undecided_hole_leaves_only_its_box_unjudged() {
+        let record = |line: &str| super::super::parse_record(line).unwrap();
+        // An outer square of side 100 and a hole sharing its corner.
+        let relation = record(
+            "r1 v1 Tboundary=administrative,admin_level=2,name=C,ISO3166-1:alpha2=CC \
+             Mw1@outer,w2@inner",
+        );
+        let mut ways = HashMap::new();
+        ways.insert(1, square(0, 0, 1_000_000).into_iter().map(Some).collect());
+        ways.insert(2, square(0, 0, 100_000).into_iter().map(Some).collect());
+        let model = AdminModel::build(&[relation], &ways).unwrap();
+        assert_eq!(model.polygons.len(), 1);
+        assert!(model.polygons[0].holes.is_empty());
+        assert_eq!(model.unmodelled.len(), 1);
+        assert_eq!(model.unmodelled_why[0].2, Unmodelled::HoleClearance);
+        // Inside the hole's box: not judged. Elsewhere in the outer: judged.
+        let at = |lat: f64, lon: f64| model.expect(lat, lon, 1.0).levels[2].clone();
+        assert!(matches!(at(0.005, 0.005), Level::Unjudged));
+        assert!(matches!(at(0.05, 0.05), Level::Some { .. }));
     }
 
     #[test]

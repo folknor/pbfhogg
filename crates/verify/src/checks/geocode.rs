@@ -646,25 +646,35 @@ fn queries(model: &Model, admin: &admin::AdminModel) -> Result<Vec<Query>, Error
     for q in &out {
         tally(&mut filled, q);
     }
-    let anchors = model.addresses.len() + model.segments.len() + model.interp_segments.len();
+    // Anchors are drawn class first, uniformly over every class with any,
+    // then uniformly within it: a draw over the pooled anchors would almost
+    // never reach a small class (a few thousand interpolation segments
+    // beside tens of millions of addresses). A filled class keeps its share,
+    // since its anchors still witness other classes' categories.
+    let pools = [
+        model.addresses.len(),
+        model.segments.len(),
+        model.interp_segments.len(),
+    ];
+    let classes: Vec<usize> = (0..3).filter(|&c| pools[c] > 0).collect();
     let full = |filled: &[[usize; 3]; 3]| {
         (0..3).all(|c| !held[c] || filled[c].iter().all(|&n| n >= GEOCODE_WITNESS_QUOTA))
     };
     for _ in 0..GEOCODE_WITNESS_ATTEMPTS {
-        if full(&filled) {
+        if classes.is_empty() || full(&filled) {
             break;
         }
         #[allow(clippy::cast_possible_truncation)]
-        let pick = (draw.next() % anchors as u64) as usize;
-        let streets_from = model.addresses.len();
-        let interp_from = streets_from + model.segments.len();
-        let (lat, lon) = if pick < streets_from {
-            (model.addresses[pick].lat, model.addresses[pick].lon)
-        } else if pick < interp_from {
-            model.segments[pick - streets_from].a
-        } else {
-            let s = model.interp_segments[pick - interp_from];
-            model.interp.sections[s.section as usize].nodes[usize::from(s.index)]
+        let class = classes[(draw.next() % classes.len() as u64) as usize];
+        #[allow(clippy::cast_possible_truncation)]
+        let pick = (draw.next() % pools[class] as u64) as usize;
+        let (lat, lon) = match class {
+            0 => (model.addresses[pick].lat, model.addresses[pick].lon),
+            1 => model.segments[pick].a,
+            _ => {
+                let s = model.interp_segments[pick];
+                model.interp.sections[s.section as usize].nodes[usize::from(s.index)]
+            }
         };
         let reach = draw.unit() * GEOCODE_WITNESS_REACH_M;
         let (lat, lon) = offset(lat, lon, reach, draw.unit() * std::f64::consts::TAU);
@@ -979,7 +989,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     harness.msg(&format!(
         "  model: {} address points, {} street segments, {} interpolation ranges from {} \
          resolved ways ({} refused), {} admin polygons from {} boundary relations ({} \
-         unmodelled)",
+         unjudged boxes of unmodelled relations and undecided holes)",
         model.addresses.len(),
         model.segments.len(),
         model.interp.sections.len(),
@@ -989,6 +999,19 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         admin.relations,
         admin.unmodelled.len(),
     ));
+    // Every unmodelled relation makes its level unjudged across its box, so
+    // name the coarse ones: a run says which relation a gap comes from.
+    for ((id, level, why), (_, b)) in admin.unmodelled_why.iter().zip(&admin.unmodelled) {
+        if *level <= 4 {
+            harness.msg(&format!(
+                "    unmodelled level {level} {id} ({why:?}), box {:.4},{:.4} to {:.4},{:.4}",
+                f64::from(b.0) * 1e-7,
+                f64::from(b.1) * 1e-7,
+                f64::from(b.2) * 1e-7,
+                f64::from(b.3) * 1e-7,
+            ));
+        }
+    }
     let queries = queries(&model, &admin)?;
     let points = outdir.join("points.txt");
     {

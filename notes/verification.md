@@ -80,17 +80,22 @@ Not yet witnessed:
 
 ## VER-133 - Geocode admin and antimeridian paths the real-data check does not reach
 
-`pbfhogg-verify geocode` judges all four answer classes, but on the configured datasets some
-admin paths are never exercised and one domain is refused:
+`pbfhogg-verify geocode` judges all four answer classes; on the configured datasets two
+paths stay out of reach:
 
-- On germany no answer carrying a country code is judged (denmark judges over a thousand),
-  which points at an unmodelled level-2 relation whose box covers the queries (a ring
-  junction, an unlocated member node or a hole near an outer); which relation and why is not
-  yet established. Modelling junction groups (a ring decomposition that does not depend
-  on search order, or one proved unique) would close it.
-- No judged query has two containing areas at one level, so the area-ranking rule is judged
-  only as "the one containing area". Witnesses aimed at same-level overlaps would exercise it.
-- Interpolation witnesses reach only about 27 judged fine-radius queries on germany against a
-  quota of 150; witnesses anchored on range midpoints would raise it.
+- A relation whose outer or inner ways do not assemble uniquely (an endpoint shared by three
+  or more member ends) leaves its whole member box unjudged at its level. On germany that is
+  r16239 and r17511 at level 2 and r52343 at level 4 (southern Bavaria, the run prints them).
+  Localising to the branching group's box is sound for containment, but the builder refuses
+  the whole relation when its ring-search budget runs out, which only a branching group can
+  cause. A conservative placement bound over the group's member count (about 531,804
+  placements for seven members, under the 2^20 extra allowance) could certify small groups
+  safe and localise them; whether these relations' groups are small enough is not yet known.
 - The model refuses data near the antimeridian; unwrapping longitude would let an
-  antimeridian dataset (the Fiji entry in notes/todo.md) be judged.
+  antimeridian dataset (the Fiji entry in notes/todo.md) be judged. No eligible dataset
+  crosses it (the verify dataset list is denmark and germany).
+
+Same-level competition is judged only by chance (germany judges one or two queries among
+several containing areas); witnesses aimed at overlaps would need an overlap search over edge
+crossings and interiors, not only vertices, since two areas can overlap with no vertex of
+either inside the other.

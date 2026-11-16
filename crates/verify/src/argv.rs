@@ -82,6 +82,15 @@ impl PbfArgv {
         self
     }
 
+    /// An output named by a command's own long flag (`--output-dir` of
+    /// `build-geocode-index`), with the same staging effect as [`Self::output`].
+    pub(crate) fn output_flag(mut self, flag: &str, path: &Path) -> Self {
+        self.args.push(flag.into());
+        self.args.push(path.into());
+        self.outputs.push(path.to_path_buf());
+        self
+    }
+
     /// This invocation shape writes run scratch and accepts `--tmp-dir`.
     pub(crate) fn scratch(mut self) -> Self {
         self.scratch = true;

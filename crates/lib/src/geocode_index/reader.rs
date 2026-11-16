@@ -78,7 +78,8 @@ pub struct AdminMatch<'a> {
     pub name: &'a str,
     /// ISO 3166-1 alpha2, only populated for admin_level=2.
     pub country_code: Option<&'a str>,
-    /// Approximate area in square degrees (from the polygon record).
+    /// The outer ring's planar area in square decimicrodegrees (degrees
+    /// times 1e7, squared; holes not subtracted), from the polygon record.
     /// Used by `into_result()` to pick the smallest polygon per level.
     pub area: f32,
 }

@@ -10,6 +10,7 @@
 
 mod command_paths;
 mod exit_code;
+mod geocode_query;
 mod host;
 #[cfg(test)]
 mod invocation_finalization_tests;
@@ -2351,6 +2352,17 @@ enum Command {
         #[command(flatten)]
         tmp: TmpDirArg,
     },
+    /// Answer reverse geocoding queries over an index from build-geocode-index
+    ///
+    /// Reads `LAT LON` (decimal degrees) per line of POINTS and prints one
+    /// JSON object per query on stdout, in input order: the nearest address,
+    /// street and interpolation and the admin areas containing the point.
+    GeocodeQuery {
+        /// Index directory written by build-geocode-index
+        index: PathBuf,
+        /// File of queries, one `LAT LON` per line
+        points: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3520,6 +3532,9 @@ pub fn run() -> process::ExitCode {
                         &paths,
                         &host,
                     )
+                }
+                Command::GeocodeQuery { index, points } => {
+                    geocode_query::run(&index, &points, &host)
                 }
             }
         },

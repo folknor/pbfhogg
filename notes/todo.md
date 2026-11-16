@@ -455,13 +455,13 @@ cells land. This section tracks the remaining axes and dataset gaps.
   builder, so the real-data gate is blind to that defect class. Split on
   2026-11-09, both halves now on pbfhogg: the dataset entry (Geofabrik
   `australia-oceania/fiji` via `brokkr run --with pbfhogg pbfhogg-datasets -- download australia-oceania/fiji`, plus its
-  `brokkr.d/hosts` block) is our config, and brokkr asks what queries a
-  pbfhogg-built geocode index from the command line. Nothing does today:
-  the CLI only builds the index, and the reader is reached through
-  nidhogg. A lookup command (`pbfhogg geocode INDEX LAT LON` with
-  machine-readable output) would let brokkr hold pinned points per
-  dataset after its `expect` pattern; it is a feature, not yet decided.
-  The alternative is a nidhogg-served gate. Answer brokkr#138 either way.
+  `brokkr.d/hosts` block) is our config. brokkr asked what queries an
+  index from the command line: `pbfhogg geocode-query INDEX POINTS` now
+  does (JSON lines, docs/cli/commands.md), and brokkr#138 was answered.
+  Real-data answers are judged by `pbfhogg-verify geocode` against an
+  osmium-derived model, but that model refuses data near the antimeridian,
+  so a Fiji dataset needs the model to unwrap longitude before it can
+  serve here.
 
 ### Un-benched permutations (low priority)
 

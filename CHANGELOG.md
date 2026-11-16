@@ -4,6 +4,11 @@
 
 ### Added
 
+- **`pbfhogg geocode-query INDEX POINTS`** answers reverse geocoding
+  queries from the command line: one `LAT LON` per line of `POINTS`, one
+  JSON object per query on stdout (nearest address, street and
+  interpolation, admin areas per level), the answers of `Reader::query`.
+  Until now only the library could query an index.
 - **A geocode index records its input PBF's whole-file XXH3-128 and
   size**: `Reader::input_xxh3_128()` (formatted `{:032x}`, the same hex as
   any whole-file XXH3-128 of the file, as brokkr pins and elivagar's
@@ -215,6 +220,10 @@
 
 ### Fixed
 
+- `build-geocode-index` no longer drops a named highway that also carries
+  `addr:interpolation` from the street set; such a way is now answered as a
+  street (and still as an interpolation range where its ends allow one).
+  Rebuild an index to gain them.
 - `extract --simple` on unsorted input no longer drops ways or relations
   behind a misleading block label. Its per-kind sweeps skipped blocks by
   `block_type()`, so a way after an empty dense message, or a relation in a

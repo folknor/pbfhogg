@@ -577,7 +577,8 @@ record! {
     /// `admin_polygons.bin`. The trailing reserved byte is for future flags.
     #[derive(Debug, Clone, Copy)]
     pub struct AdminPolygon {
-        /// Approximate area in square degrees (for smallest-polygon selection).
+        /// The outer ring's planar area in square decimicrodegrees, holes not
+        /// subtracted (for smallest-polygon selection).
         pub area: f32,
         /// Byte offset into admin_vertices.bin.
         /// Builder-produced exterior and hole rings repeat their first vertex at

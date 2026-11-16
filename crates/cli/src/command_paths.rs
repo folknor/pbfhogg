@@ -314,6 +314,9 @@ impl CommandPaths {
             Command::Digest { file: input, .. } | Command::Check { file: input, .. } => {
                 paths.inputs.push(input.clone());
             }
+            Command::GeocodeQuery { index, points } => {
+                paths.inputs.extend([index.clone(), points.clone()]);
+            }
         }
         paths
     }

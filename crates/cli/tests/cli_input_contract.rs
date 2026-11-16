@@ -262,7 +262,10 @@ struct Row {
 }
 
 /// Subcommands that read no PBF, with the reason.
-const NO_PBF_INPUT: &[(&str, &str)] = &[("merge-changes", "reads OSC files only")];
+const NO_PBF_INPUT: &[(&str, &str)] = &[
+    ("merge-changes", "reads OSC files only"),
+    ("geocode-query", "reads a geocode index and a points file"),
+];
 
 const fn row(
     command: &'static str,

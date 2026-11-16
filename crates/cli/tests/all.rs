@@ -57,6 +57,7 @@ mod cli_exit_codes;
 mod cli_export;
 mod cli_extract;
 mod cli_flag_contract;
+mod cli_geocode_query;
 mod cli_inject_prepass;
 mod cli_input_contract;
 mod cli_merge_changes;

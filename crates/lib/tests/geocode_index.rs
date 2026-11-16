@@ -3725,6 +3725,49 @@ fn coarse_search_finds_a_street_outside_the_query_neighbourhood() {
     );
 }
 
+/// A named highway that also carries `addr:interpolation` is a street: the
+/// street rule is a named, non-excluded highway, whatever else the way is.
+/// Its interpolation role (here unusable: no address on its ends) must not
+/// drop it from the street set.
+#[test]
+fn a_named_highway_tagged_as_interpolation_is_still_a_street() {
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![],
+            meta: None,
+        },
+        TestNode {
+            id: 2,
+            lat: 550_000_000,
+            lon: 120_010_000,
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let way = TestWay {
+        id: 10,
+        refs: vec![1, 2],
+        tags: vec![
+            ("highway", "residential"),
+            ("name", "Example Road"),
+            ("addr:interpolation", "all"),
+        ],
+        meta: None,
+    };
+    let dir = crate::common::test_scratch();
+    let index_dir = build_default_index(dir.path(), &nodes, &[way]);
+    let reader =
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
+    let result = reader.query(55.0, 12.0005).expect("valid query");
+    let street = result.street.expect("the highway answers as a street");
+    assert_eq!(street.name, "Example Road", "{street:?}");
+    assert!(street.distance_m < 0.5, "{street:?}");
+    assert!(result.interpolation.is_none(), "{:?}", result.interpolation);
+}
+
 /// Interpolation ways are rare, and a query skips the coarse search for them
 /// where no coarse cell near it lists one. An interpolation way 800 m away,
 /// outside the coarse neighbourhood, is near enough to be found.

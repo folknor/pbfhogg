@@ -59,3 +59,26 @@ pub(crate) const MULTI_EXTRACT_REGIONS: usize = 5;
 
 /// Maximum detailed text-diff mismatches retained before counting only.
 pub(crate) const DIFF_SHOWN_MISMATCHES: usize = 20;
+
+/// Geocode check: the fine and coarse search radii (meters) the index is
+/// built with, passed explicitly so the model does not depend on the CLI's
+/// defaults. Both are exact in `f32`, as the index header stores them.
+pub(crate) const GEOCODE_FINE_RADIUS_M: f64 = 75.0;
+pub(crate) const GEOCODE_COARSE_RADIUS_M: f64 = 1000.0;
+/// Geocode check: queries drawn uniformly over the data's extent.
+pub(crate) const GEOCODE_UNIFORM_QUERIES: usize = 1000;
+/// Geocode check: witness queries kept per class and distance category
+/// (within the fine radius, beyond it but within the coarse one, beyond both).
+pub(crate) const GEOCODE_WITNESS_QUOTA: usize = 150;
+/// Geocode check: candidate witness points drawn before the quotas are given up.
+pub(crate) const GEOCODE_WITNESS_ATTEMPTS: usize = 40_000;
+/// Geocode check: farthest a witness point is placed from its anchor (meters).
+pub(crate) const GEOCODE_WITNESS_REACH_M: f64 = 1300.0;
+/// Geocode check: distance agreement (meters) between the model and the
+/// reader, and the band within which two candidates tie or a nearest
+/// candidate sits on the coarse radius (and is not judged).
+pub(crate) const GEOCODE_DISTANCE_TOLERANCE_M: f64 = 1e-4;
+/// Geocode check: the model's grid cell, in decimicrodegrees.
+pub(crate) const GEOCODE_GRID_E7: i32 = 100_000;
+/// Geocode check: the seed of the query draw, fixed so a run is replayable.
+pub(crate) const GEOCODE_SEED: u64 = 0x6765_6f63_6f64_6531;

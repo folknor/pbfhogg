@@ -31,6 +31,7 @@ The binary is called `pbfhogg`. Requires the Rust version named by `rust-version
 | `time-filter` | Filter history PBF to a point-in-time snapshot |
 | `merge-changes` | Merge multiple OSC files into one |
 | `build-geocode-index` | Build reverse geocoding index (S2 cells, mmap-ready) |
+| `geocode-query` | Answer reverse geocoding queries over an index, as JSON lines |
 
 ## Flags
 

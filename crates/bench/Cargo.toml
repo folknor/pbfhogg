@@ -16,7 +16,7 @@ autobins = false
 autoexamples = false
 autobenches = false
 
-# The instruments. Unit tests (the geocode point set, passes and digest) run
+# The instruments. Unit tests (the geocode point set and passes) run
 # in the bin's own test target.
 [[bin]]
 name = "pbfhogg-bench"

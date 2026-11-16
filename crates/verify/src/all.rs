@@ -83,6 +83,7 @@ pub(crate) fn run(
     counts.add(h.run_check("add-locations-to-ways", |h| {
         checks::add_locations::run(h, pbf, crate::AltwMode::All, direct_io)
     })?);
+    counts.add(h.run_check("geocode", |h| checks::geocode::run(h, pbf, direct_io))?);
     counts.add(h.run_check("check-refs", |h| checks::check_refs::run(h, pbf))?);
     counts.add(h.run_check("check-ids", |h| checks::check_ids::run(h, pbf, direct_io))?);
     counts.add(h.run_check("repack", |h| checks::repack::run(h, pbf, direct_io))?);

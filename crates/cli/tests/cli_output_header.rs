@@ -352,6 +352,7 @@ const NO_PBF_HEADER: &[(&str, &str)] = &[
     ("diff", "writes text or OSC"),
     ("merge-changes", "writes OSC"),
     ("build-geocode-index", "writes a geocode index directory"),
+    ("geocode-query", "prints answers as JSON lines"),
 ];
 
 fn words(w: &[&str]) -> Vec<OsString> {

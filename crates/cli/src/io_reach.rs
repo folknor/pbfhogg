@@ -129,6 +129,12 @@ pub(super) const REACH: &[Reach] = &[
         uring: "-",
     },
     Reach {
+        path: &["geocode-query"],
+        reads: "Index memory-mapped, points file buffered; no direct I/O flag",
+        writes: "No PBF output",
+        uring: "-",
+    },
+    Reach {
         path: &["merge-changes"],
         reads: "OSC only; no direct I/O flag",
         writes: "No PBF output",

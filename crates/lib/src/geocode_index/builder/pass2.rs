@@ -495,7 +495,12 @@ fn resolve_way_into(
                 coords: coords.to_vec(),
             });
         }
-        return;
+        // An interpolation way is never a building address (it has no
+        // `addr:housenumber`), but a named highway carrying
+        // `addr:interpolation` is still a street and goes on to be one.
+        if !is_street {
+            return;
+        }
     }
 
     // Building addresses (centroid) - main thread interns + streams.

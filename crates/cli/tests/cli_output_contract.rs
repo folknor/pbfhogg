@@ -285,6 +285,15 @@ const NO_OUTPUT: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+/// Commands that write no output and read no PBF, so the generic
+/// interruption test (which hands each command a PBF) cannot run them; each
+/// carries its own interruption test, named here.
+const NO_OUTPUT_NOT_FROM_A_PBF: &[(&str, &str)] = &[(
+    "geocode-query",
+    "prints answers on stdout from an index and a points file \
+     (interrupted in cli_geocode_query)",
+)];
+
 const ROWS: &[Row] = &[
     Row {
         command: "cat",
@@ -1394,7 +1403,10 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
     let mut problems = Vec::new();
     for command in &commands {
         let in_table = ROWS.iter().any(|row| row.command == command);
-        let no_output = NO_OUTPUT.iter().any(|(name, _, _)| name == command);
+        let no_output = NO_OUTPUT.iter().any(|(name, _, _)| name == command)
+            || NO_OUTPUT_NOT_FROM_A_PBF
+                .iter()
+                .any(|(name, _)| name == command);
         match (in_table, no_output) {
             (false, false) => problems.push(format!(
                 "`{command}` is in neither ROWS nor NO_OUTPUT: add a row for it, or say why it writes no output"
@@ -1407,6 +1419,7 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
         .iter()
         .map(|row| row.command)
         .chain(NO_OUTPUT.iter().map(|(name, _, _)| *name))
+        .chain(NO_OUTPUT_NOT_FROM_A_PBF.iter().map(|(name, _)| *name))
     {
         if !commands.iter().any(|c| c == name) {
             problems.push(format!(
@@ -1442,8 +1455,18 @@ fn every_subcommand_is_in_the_table_or_marked_as_writing_no_output() {
             ));
         }
     }
-    for (name, reason, interrupt) in NO_OUTPUT {
-        if interrupt.first() != Some(name) {
+    let no_output = NO_OUTPUT
+        .iter()
+        .map(|&(name, reason, interrupt)| (name, reason, Some(interrupt)))
+        .chain(
+            NO_OUTPUT_NOT_FROM_A_PBF
+                .iter()
+                .map(|&(name, reason)| (name, reason, None)),
+        );
+    for (name, reason, interrupt) in no_output {
+        if let Some(interrupt) = interrupt
+            && interrupt.first() != Some(&name)
+        {
             problems.push(format!(
                 "`{name}` is interrupted with {interrupt:?}, which does not run it"
             ));

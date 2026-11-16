@@ -219,6 +219,8 @@ enum Check {
     TagsFilter(TagsArgs),
     /// pbfhogg inspect tags vs osmium tags-count
     InspectTags(PbfArgs),
+    /// pbfhogg geocode-query address and street answers vs a model of the input
+    Geocode(PbfArgs),
     MergeChanges(MergeArgs),
     Getparents(PbfArgs),
     #[command(alias = "getid")]
@@ -459,6 +461,7 @@ fn dispatch(b: &Boundary, h: &mut Harness, check: &Check) -> Result<Ending, Erro
         Check::Cat(pbf)
         | Check::CatDedupe(pbf)
         | Check::InspectTags(pbf)
+        | Check::Geocode(pbf)
         | Check::Getparents(pbf)
         | Check::GetidRemoveid(pbf)
         | Check::Ids(pbf)
@@ -526,6 +529,7 @@ fn read_check(check: &Check) -> (&'static str, checks::ReadCheck) {
         Check::Cat(_) => ("cat", checks::cat::run),
         Check::CatDedupe(_) => ("cat --dedupe", checks::cat_dedupe::run),
         Check::InspectTags(_) => ("inspect-tags", checks::inspect_tags::run),
+        Check::Geocode(_) => ("geocode", checks::geocode::run),
         Check::Ids(_) => ("check-ids", checks::check_ids::run),
         Check::Repack(_) => ("repack", checks::repack::run),
         Check::Degrade(DegradeArgs {
@@ -759,6 +763,7 @@ mod tests {
             "degrade",
             "tags-filter",
             "inspect-tags",
+            "geocode",
             "getparents",
             "getid-removeid",
             "getid",

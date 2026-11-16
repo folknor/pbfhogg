@@ -2211,6 +2211,46 @@ workloads run outside it: reads and writes through the library harness
 merge workload and reverse geocoding queries through the `pbfhogg-bench`
 instruments (`brokkr bench merge-workload`, `brokkr bench geocode-query`).
 
+### geocode-query
+
+Answer reverse geocoding queries over an index written by
+`build-geocode-index`, the same answers as the library's `Reader::query`.
+
+```
+pbfhogg geocode-query <INDEX> <POINTS>
+```
+
+`POINTS` holds one query per line: latitude then longitude in decimal
+degrees, separated by ASCII whitespace. The whole file is parsed before the
+index is opened, and a blank line, a third field, a value that is not a
+finite number, or a latitude outside -90 to 90 or longitude outside -180 to
+180 refuses the run (exit 2) naming the line, before any answer is printed.
+An index the reader refuses (wrong format version, a corrupt file) is
+exit 2 as well.
+
+Stdout carries one JSON object per query, one per line, in input order:
+
+```json
+{"lat":55.6761,"lon":12.5683,
+ "address":{"lat_e7":556761000,"lon_e7":125683000,"house_number":"1","street":"Example","place":null,"postcode":"1000","distance_m":3.2},
+ "street":{"name":"Example","snap_lat_e7":556761200,"snap_lon_e7":125683100,"distance_m":1.4},
+ "interpolation":null,
+ "admin":[{"admin_level":2,"name":"Danmark","country_code":"DK","area":5.1e13}]}
+```
+
+(shown wrapped; each object is a single line). `address`, `street` and
+`interpolation` are each the nearest of their class within the index's
+search radii (see [Search radius bounds](#search-radius-bounds)), or `null`
+when there is none; `admin` lists the smallest area containing the point
+at each admin level, ascending by level, and is empty when none does. An
+absent `street`, `place`, `postcode` or `country_code` is `null`; a street
+`name` is a string, empty for a highway whose `name` tag is empty.
+Every key is always present. `lat` and `lon` echo the query in decimal
+degrees; the `_e7` coordinates are decimicrodegrees (degrees times 1e7),
+`distance_m` is the reader's flat distance in meters and `area` the
+polygon's stored ranking area: its outer ring's planar area in square
+decimicrodegrees, holes not subtracted.
+
 ---
 
 <a id="io-capability-matrix"></a>
@@ -2242,6 +2282,7 @@ Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring
 | diff | All PBF reads direct, including indexed parallel comparison | No PBF output | - |
 | digest | All reads direct | - | - |
 | build-geocode-index | Indexdata probe and replication header read direct; schedule header walk, Pass 1, Pass 1.5 and Phase 2a preads and the whole-file input digest buffered | Index output buffered, not PBF | - |
+| geocode-query | Index memory-mapped, points file buffered; no direct I/O flag | No PBF output | - |
 | merge-changes | OSC only; no direct I/O flag | No PBF output | - |
 <!-- io-reach:end -->
 

@@ -100,13 +100,25 @@ stretches, is not established. A derived operand built from bounded ID windows c
 input's own framing (read by the verifier's frame reader), with the expected plan predicted from
 both framings, would witness them.
 
-## VER-133 - Geocode answers have no real-data verification
+## VER-133 - Geocode interpolation and admin answers have no real-data verification
 
-The geocode-query bench used to record per-class answer counts and an FNV digest of every
-answer, so two revisions could be seen to answer differently; that was answer evidence inside a
-measured child and is gone. Nothing outside the library tests (crates/lib/tests/geocode_*.rs,
-synthetic fixtures) checks reverse-geocode answers, and pbfhogg-verify has no geocode check.
-The vendored traccar-geocoder is the natural reference.
+`pbfhogg-verify geocode` judges address and street answers of `pbfhogg geocode-query` on
+denmark and germany against a model built from osmium OPL; interpolation and admin answers
+are not judged. traccar-geocoder is not an oracle for either: it reads nine cells only, merges
+house and street under a 75 m cutoff, maps admin levels to per-country semantics on f32
+coordinates with an eroded interior, and needs a C++ build, which the osmium-only verifier
+rule excludes. What remains:
+
+- Interpolation: a model of the range rules in docs/cli/commands.md (street or place choice
+  from the end addresses, interior splits, step and parity, refusals), where a range the
+  model cannot support makes that query's interpolation verdict inconclusive rather than
+  dropping it from the competition.
+- Admin: an independent ring assembly with hole ownership, one polygon per outer ring ranked
+  by outer-ring area stored as f32 (polygon-index tie order is not public, so equal-area
+  levels need an allowed-set or exclusion), first at `--admin-tolerance 0`, then at the
+  default outside the tolerance band.
+- The model refuses data near the antimeridian; unwrapping longitude would let an
+  antimeridian dataset (the Fiji entry in notes/todo.md) be judged.
 
 ## VER-123 - Verify uses the build output directory as its workspace
 

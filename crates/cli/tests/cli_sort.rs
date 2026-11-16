@@ -1058,10 +1058,13 @@ mod backends {
         let dir = crate::common::test_scratch();
         let input = dir.path().join("overlapping.osm.pbf");
         let output = dir.path().join("sorted.osm.pbf");
+        let markers = dir.path().join("sort.markers");
+        std::fs::write(&markers, []).expect("create the marker file");
 
         write_unsorted_overlapping_pbf(&input);
 
         let run = CliInvoker::new(&invocation_scratch)
+            .marker_fifo(&markers)
             .arg("sort")
             .arg(&input)
             .arg("-o")
@@ -1079,6 +1082,7 @@ mod backends {
             "sort --direct-io failed unexpectedly; stderr:\n{}",
             run.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&markers, "write");
 
         let contents = read_all_elements_with_coords(&output);
         assert_eq!(contents.nodes.len(), 10);

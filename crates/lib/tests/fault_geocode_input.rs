@@ -258,6 +258,7 @@ fn reference(
         }
         Err(e) => panic!("{route:?}: unreplaced build: {e}"),
     }
+    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
     let counted = host
         .invocation
         .faults()

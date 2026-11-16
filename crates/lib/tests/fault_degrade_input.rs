@@ -388,6 +388,7 @@ fn decode_reference(
         }
         Err(e) => panic!("{route:?}: unreplaced run: {e}"),
     }
+    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
     let counted = host
         .invocation
         .faults()
@@ -409,8 +410,16 @@ fn plain_reference(
     skippable: impl Fn(&pbfhogg::Error) -> bool,
 ) -> Reference {
     let output = dir.join("reference.osm.pbf");
-    match run(route, input, out(&output), &crate::common::test_host()) {
-        Ok(()) => Reference::of(route, &output),
+    let host = crate::common::test_host();
+    match run(route, input, out(&output), &host) {
+        Ok(()) => {
+            crate::common::witness_direct_reads(
+                route.direct,
+                &host.invocation,
+                &format!("{route:?}"),
+            );
+            Reference::of(route, &output)
+        }
         Err(e) if skippable(&e) => {
             crate::common::skip(format!("{route:?}: {e}"));
             Reference::Skipped

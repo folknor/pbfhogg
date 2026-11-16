@@ -89,6 +89,7 @@ fn digest_opens_its_input_once() {
             Err(e) => panic!("direct {direct}: {e}"),
         };
         assert_eq!(digest, expected, "direct {direct}");
+        crate::common::witness_direct_reads(direct, &host.invocation, "digest");
         let report = host
             .invocation
             .faults()

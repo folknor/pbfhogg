@@ -169,6 +169,7 @@ fn reference(
         }
         Err(e) => panic!("{route:?}: unreplaced run: {e}"),
     };
+    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
     let Some(counted) = host.invocation.faults().input_replacement() else {
         panic!("{route:?}: the replacement was armed");
     };
@@ -511,6 +512,7 @@ fn check_node_stats(direct: bool, skippable: impl Fn(&pbfhogg::Error) -> bool) {
         }
         Err(e) => panic!("node_stats direct {direct}: unreplaced run: {e}"),
     };
+    crate::common::witness_direct_reads(direct, &host.invocation, "node_stats");
     let counted = host
         .invocation
         .faults()

@@ -3800,6 +3800,8 @@ mod backends {
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");
+        let markers = dir.path().join("apply.markers");
+        std::fs::write(&markers, []).unwrap();
 
         basic_fixture(&base, &osc);
         let out = run_apply_changes(
@@ -3808,6 +3810,7 @@ mod backends {
             &output,
             ApplyOpts {
                 direct_io: true,
+                markers: Some(&markers),
                 ..ApplyOpts::default()
             },
         );
@@ -3820,6 +3823,7 @@ mod backends {
             "apply-changes --direct-io failed; stderr:\n{}",
             out.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&markers, "write");
         check_basic_output(&output);
         assert!(
             out.stderr_str().contains("Deleted: 1"),

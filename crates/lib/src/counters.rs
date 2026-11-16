@@ -191,6 +191,7 @@ pub(crate) struct InvocationMetrics {
     pub(crate) ordered: Padded<crate::ordered_pool::OrderedPoolMetrics>,
     pub(crate) writer: Padded<crate::write::metrics::WriterMetrics>,
     pub(crate) fadvise: Padded<crate::fadvise::FadviseMetrics>,
+    pub(crate) direct_io: Padded<crate::direct_io::DirectIoMetrics>,
     /// Latch for the end-of-invocation read emission
     /// (`crate::read::emit_read_counters`), so repeat calls are no-ops.
     pub(crate) read_emitted: std::sync::atomic::AtomicBool,
@@ -206,6 +207,7 @@ impl InvocationMetrics {
         self.ordered.for_each(&mut visit);
         self.writer.for_each(&mut visit);
         self.fadvise.for_each(&mut visit);
+        self.direct_io.for_each(&mut visit);
     }
 }
 

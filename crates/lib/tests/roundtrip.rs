@@ -631,6 +631,7 @@ fn roundtrip_direct_io() {
     writer.write_primitive_block(bytes).unwrap();
 
     writer.flush().unwrap();
+    crate::common::assert_direct_opened(writer.invocation(), "write", "to_path_direct");
 
     // Read back with standard reader
     let reader = BlobReader::from_path(&path).unwrap();
@@ -728,6 +729,7 @@ fn roundtrip_pipelined_direct_io() {
     }
 
     writer.flush().unwrap();
+    crate::common::assert_direct_opened(writer.invocation(), "write", "to_path_direct");
 
     // Read back and verify all 500 nodes in order
     let reader = BlobReader::from_path(&path).unwrap();
@@ -804,6 +806,20 @@ fn roundtrip_uring_tiny_output() {
     writer.write_primitive_block(bytes).unwrap();
 
     writer.flush().unwrap();
+    // In every build, the release sweep's included: the ring was set up
+    // (its fixed pool registered, its output opened O_DIRECT). That is
+    // setup, not proof the block went through it.
+    let mut registered = None;
+    writer.invocation().for_each_counter(|name, value| {
+        if name == "writer_uring_registered_buffers" {
+            registered = Some(value);
+        }
+    });
+    assert!(
+        registered.is_some_and(|n| n > 0),
+        "no io_uring pool registered: {registered:?}"
+    );
+    crate::common::assert_direct_opened(writer.invocation(), "write", "to_path_uring");
     // The witness that the io_uring sink ran (hook builds only): the block
     // was dispatched through it.
     #[cfg(pbfhogg_test_hooks)]

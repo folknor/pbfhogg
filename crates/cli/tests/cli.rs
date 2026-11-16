@@ -180,8 +180,11 @@ fn cli_check_default_pair_takes_direct_io_without_a_note() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_minimal_pbf(&input);
+    let markers = dir.path().join("check.markers");
+    std::fs::write(&markers, []).expect("create the marker file");
 
     let result = CliInvoker::new(&invocation_scratch)
+        .marker_fifo(&markers)
         .arg("check")
         .arg(&input)
         .arg("--direct-io")
@@ -193,6 +196,7 @@ fn cli_check_default_pair_takes_direct_io_without_a_note() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "{stderr}");
     assert!(!stderr.contains("--direct-io"), "{stderr}");
+    crate::invoker::assert_direct_opened(&markers, "read");
 }
 
 // ---------------------------------------------------------------------------

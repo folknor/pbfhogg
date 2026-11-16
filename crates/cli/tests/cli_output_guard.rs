@@ -587,6 +587,11 @@ mod backends {
             } else {
                 assert_eq!(registered.unwrap_or(0), 0, "{flag}\n{events}");
             }
+            // Both backends open their output O_DIRECT.
+            assert!(
+                counter(&events, "direct_io_write_opens").is_some_and(|n| n > 0),
+                "{flag}: no O_DIRECT write open\n{events}"
+            );
         }
     }
 }

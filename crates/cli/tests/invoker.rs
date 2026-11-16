@@ -800,6 +800,26 @@ pub fn marker_counter(events: &str, name: &str) -> Option<i64> {
         })
 }
 
+/// The positive witness of an O_DIRECT CLI cell that ran: the marker stream
+/// of `markers` (armed with [`CliInvoker::marker_fifo`]) reports at least one
+/// successful `O_DIRECT` open for `direction` (`read` or `write`). The
+/// refusal predicate only stops a refused cell from passing; this stops one
+/// that no longer reaches O_DIRECT. It proves direct setup, not that every
+/// transfer used it.
+///
+/// # Panics
+///
+/// If the stream cannot be read or reports no such open.
+#[cfg(feature = "linux-direct-io")]
+pub fn assert_direct_opened(markers: &std::path::Path, direction: &str) {
+    let events = std::fs::read_to_string(markers).expect("read the marker stream");
+    let name = format!("direct_io_{direction}_opens");
+    assert!(
+        marker_counter(&events, &name).is_some_and(|n| n > 0),
+        "no O_DIRECT {direction} open recorded ({name})\n{events}"
+    );
+}
+
 /// Put `cmd` under the promise guard (see `guard`), registered last so that
 /// no other `pre_exec` hook runs after its filter.
 fn guard(cmd: &mut Command) {

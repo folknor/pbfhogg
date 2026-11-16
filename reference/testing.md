@@ -52,14 +52,41 @@ Tests go where they couple least.
   that required io-uring would require a raised rlimit, which a
   standard host does not have.
 
-  Positive execution is witnessed for io_uring only: the io_uring
-  cells that write assert that the writer ran, through the counter
-  `writer_uring_registered_buffers` (the call's metrics in unit tests,
-  the marker stream in CLI cells) or the fault plan's dispatch count,
-  so a cell that stops reaching the writer fails. The dispatch count
-  exists only in hook builds, so `roundtrip_uring_tiny_output` runs
-  unwitnessed in the `release` sweep. O_DIRECT cells carry no such
-  witness. The locked-memory allowance is per user and a writer takes
+  The requirement is therefore a prerequisite of the complete gate's
+  host, stated as an exception to the host rule in `AGENTS.md`: the
+  gate needs a test scratch filesystem (`data/test-scratch/`) that
+  accepts `O_DIRECT` with an alignment the transfer buffers keep, and
+  an x86_64 or aarch64 kernel that lets the promise guard install its
+  seccomp filter, `SECCOMP_RET_KILL_PROCESS` included. A standard Linux
+  box need not provide either (tmpfs or an overlay scratch, another
+  architecture, a kernel or an enclosing sandbox that refuses the
+  filter); there the gate fails on the refusal, which is its claim,
+  while every other profile skips as before.
+
+  Positive witnesses stop a cell that no longer reaches its backend
+  from passing. Every successful host-bound `O_DIRECT` open counts in
+  the invocation's `direct_io_read_opens` or `direct_io_write_opens`
+  (`crate::direct_io::DirectIoMetrics`; the io_uring writer's output
+  is a write open). The library cells that run a command or a writer
+  path constructor with a direct option assert one through
+  `common::assert_direct_opened` or `common::witness_direct_reads` on
+  their own fresh invocation (the `fault_*_input` references, the
+  roundtrip direct and io_uring cells, the `process_nofile` direct and
+  io_uring arms); the CLI cells through
+  `invoker::assert_direct_opened` on the marker stream. Cells that
+  construct a direct type themselves (`DirectReader::open`,
+  `direct_io::open_for_read`) need none: the unit test
+  `opens_carry_o_direct_and_count_once` in `direct_io.rs` holds that
+  those opens carry `O_DIRECT`. The sort and dedupe unit cells keep
+  their path-specific walker count (`header_walker::tests::direct_opens`).
+  A count proves direct setup, not that every transfer of the cell
+  used a direct descriptor, and a cell with several direct paths is
+  satisfied by any one of them; the path-specific fault-plan open
+  counts are what attribute opens. The io_uring cells that write
+  also assert `writer_uring_registered_buffers` (the call's metrics in
+  unit and library tests, the marker stream in CLI cells), which
+  proves the ring was set up; the fault plan's dispatch count, in hook
+  builds only, proves a block went through it. The locked-memory allowance is per user and a writer takes
   the whole pool or fails, so every io_uring cell that registers a
   pool (not the non-regular-target test, which is refused before)
   holds `pbfhogg_test_scratch::locked_memory_lease()` (an `flock` on

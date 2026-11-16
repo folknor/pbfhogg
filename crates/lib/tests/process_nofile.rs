@@ -483,6 +483,11 @@ fn charge_arm(
         ignore_missing_nodes: false,
     };
 
+    // The io_uring arm registers a pool where the host allows: it holds the
+    // locked-memory lease for the writer's whole life, taken before the
+    // descriptor baseline because the lease itself holds a descriptor.
+    let uring = backend_is_uring(backend);
+    let _admission = uring.then(uring_admission);
     let Some(limit) = cap_at_charge() else {
         return false;
     };
@@ -502,7 +507,10 @@ fn charge_arm(
     let charge = pbfhogg::TEST_HEAVY_RUN_FDS;
     match result {
         Ok(_) => {}
-        Err(e) if matches!(e.kind(), pbfhogg::ErrorKind::PlatformUnsupported { .. }) => {
+        // Only the arm's own backend refusal skips, and only through its
+        // refusal predicate, which fails the test where the run requires
+        // that backend.
+        Err(e) if backend_refused(backend, &e) => {
             common::skip(format!("charge witness arm {name}: backend refused: {e}"));
             return true;
         }
@@ -539,5 +547,50 @@ fn charge_arm(
         256,
         "{name}: the most slot buckets"
     );
+    #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+    if backend_is_direct(backend) || uring {
+        common::assert_direct_opened(&host.invocation, "write", name);
+    }
     true
+}
+
+/// The io_uring arm's hang bound and locked-memory lease, the bound armed
+/// first so the lease's unbounded wait is under it; dropped bound last.
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn uring_admission() -> (
+    pbfhogg_test_scratch::LockedMemoryLease,
+    pbfhogg_test_scratch::HangBound,
+) {
+    let bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "charge witness io_uring arm",
+    );
+    (pbfhogg_test_scratch::locked_memory_lease(), bound)
+}
+
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn backend_is_uring(backend: pbfhogg::write::OutputBackend) -> bool {
+    backend == pbfhogg::write::OutputBackend::Uring
+}
+
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn backend_is_direct(backend: pbfhogg::write::OutputBackend) -> bool {
+    backend == pbfhogg::write::OutputBackend::Direct
+}
+
+/// Whether `e` is the typed refusal of the arm's own backend, through that
+/// backend's refusal predicate. A buffered arm has no refusal to skip on.
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn backend_refused(backend: pbfhogg::write::OutputBackend, e: &pbfhogg::Error) -> bool {
+    #[cfg(feature = "linux-io-uring")]
+    if backend_is_uring(backend) {
+        return common::is_uring_unavailable(e);
+    }
+    #[cfg(feature = "linux-direct-io")]
+    if backend_is_direct(backend) {
+        return common::direct_io_unavailable(e);
+    }
+    let _ = (backend, e);
+    false
 }

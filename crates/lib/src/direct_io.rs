@@ -45,6 +45,34 @@
 /// multiple of it in `tunables`.
 pub(crate) const DIO_ALIGN_FLOOR: usize = 4096;
 
+crate::counters::counter_set! {
+    /// Successful `O_DIRECT` opens of one invocation, by direction: an open
+    /// is counted once its alignment has been resolved, so a refused open
+    /// counts nothing. Only host-bound opens (those handed an invocation)
+    /// record; every open a command or an output backend chooses by option
+    /// is one. The io_uring writer's output counts as a write open.
+    ///
+    /// A count is the witness that a run set up direct I/O, the positive
+    /// half the tests' refusal predicates lack. It is not proof that every
+    /// transfer used that descriptor, nor that the page cache was bypassed
+    /// (a filesystem may fall back to buffered I/O, see the module docs).
+    /// One add per open, never per transfer. Emitted at the end of the
+    /// invocation by `crate::read::emit_read_counters`.
+    pub(crate) struct DirectIoMetrics {
+        pub(crate) read_opens => "direct_io_read_opens",
+        pub(crate) write_opens => "direct_io_write_opens",
+    }
+}
+
+/// Emit an invocation's direct-open totals. Only
+/// `crate::read::emit_read_counters` calls this.
+pub(crate) fn emit_direct_io_counters(
+    metrics: &DirectIoMetrics,
+    invocation: &crate::host::Recorder,
+) {
+    metrics.emit_all(invocation);
+}
+
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
 pub(crate) use imp::*;
 
@@ -131,6 +159,7 @@ mod imp {
         }
         let align = resolve(observed(query(&file, Access::Write), invocation))
             .map_err(|r| refusal(None, r))?;
+        count_open(invocation, Access::Write);
         Ok((file, align))
     }
 
@@ -188,7 +217,23 @@ mod imp {
         verify(&file)?;
         let align = resolve(observed(query(&file, Access::Read), invocation))
             .map_err(|r| refusal(Some(display), r))?;
+        count_open(invocation, Access::Read);
         Ok((file, align))
+    }
+
+    /// Count one successful direct open in `invocation`
+    /// (`super::DirectIoMetrics`).
+    fn count_open(invocation: Option<&crate::host::Recorder>, access: Access) {
+        let Some(invocation) = invocation else {
+            return;
+        };
+        let metrics = &invocation.metrics().direct_io;
+        let field = match access {
+            #[cfg(feature = "linux-direct-io")]
+            Access::Read => &metrics.read_opens,
+            Access::Write => &metrics.write_opens,
+        };
+        field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Preserve an explicit zero report separately from an unavailable query.
@@ -357,6 +402,46 @@ mod tests {
 
     fn reported(mem: u32, offset: u32) -> Option<Reported> {
         Some(Reported { mem, offset })
+    }
+
+    /// The contract the direct types and the open counters rest on: what
+    /// these functions return carries `O_DIRECT` in its status flags, and a
+    /// host-bound open counts once in its direction. A test that constructs
+    /// a direct type (`DirectReader::open`, `DirectWriter`) needs no counter
+    /// of its own: the construction is one of these opens.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn opens_carry_o_direct_and_count_once() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering::Relaxed;
+        let flags = |file: &std::fs::File| {
+            // Safety: F_GETFL on a descriptor the file owns.
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) }
+        };
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("flags.bin");
+        let host = crate::host::Host::for_tests();
+        let call = host.invocation.call().unwrap();
+        let written = match super::imp::create_for_write(&path, Some(&call)) {
+            Ok((file, _)) => file,
+            Err(e) if crate::test_support::is_direct_io_refusal(&e) => return,
+            Err(e) => panic!("{e}"),
+        };
+        assert_ne!(flags(&written) & libc::O_DIRECT, 0, "write open");
+        drop(written);
+        let (read, _) =
+            super::imp::open_for_read_verified(&path, &path, 0, |_| Ok(()), Some(&call)).unwrap();
+        assert_ne!(flags(&read) & libc::O_DIRECT, 0, "read open");
+        let (unbound, _) = super::imp::open_for_read(&path).unwrap();
+        assert_ne!(flags(&unbound) & libc::O_DIRECT, 0, "unbound read open");
+        let metrics = &call.metrics().direct_io;
+        assert_eq!(metrics.write_opens.load(Relaxed), 1);
+        assert_eq!(
+            metrics.read_opens.load(Relaxed),
+            1,
+            "unbound opens record nothing"
+        );
     }
 
     #[test]

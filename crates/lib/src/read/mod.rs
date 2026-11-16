@@ -25,8 +25,11 @@ pub(crate) mod wire_schema;
 #[cfg(test)]
 pub(crate) mod wire_fixtures;
 
-/// Emit `invocation`'s `pipeline_decompress_pool_*` and
-/// `pipeline_read_buf_*` sidecar counters, at most once per invocation.
+/// Emit `invocation`'s `pipeline_decompress_pool_*`,
+/// `pipeline_read_buf_*` and `direct_io_*_opens` sidecar counters, at most
+/// once per invocation (the direct-open pair counts writes too; it is
+/// emitted here because this is the one end-of-invocation emitter every
+/// command reaches).
 ///
 /// The read-side twin of [`crate::write::emit_writer_counters`]: call it once,
 /// on the way out, after every thread of the invocation has joined - the CLI
@@ -46,4 +49,5 @@ pub fn emit_read_counters(invocation: &crate::host::Invocation) {
         return;
     }
     pipeline_metrics::emit_decompress_pool_counters(&metrics.decompress, &call);
+    crate::direct_io::emit_direct_io_counters(&metrics.direct_io, &call);
 }

@@ -41,23 +41,20 @@ blob is only visible by decoding; and the required-drop branch (overlapping way
 ranges on a `LocationsOnWays` input) has no real-data witness, as no configured
 dataset is both. A decode of each way blob's ID order would close the first.
 
-## VER-018 - The gate's backend requirement checks refusals, not execution
+## VER-018 - Backend witnesses prove setup, not every transfer
 
-io_uring cells assert a registered pool and serialize on a locked-memory lease;
-io-uring is not in the gate's `PBFHOGG_TEST_REQUIRE`, because the writer registers
-its full fixed pool or refuses and a standard host's memlock limit refuses it, so
-on such a host the io_uring cells skip and only the opt-in ignored
-`full_registered_pool_instrument` proves the pool, where run by hand on a host
-whose limit was raised. Residue: O_DIRECT cells (about forty, library fault_*_input, host_contract and
-roundtrip cells, unit tests through `test_support`, seven CLI cells) still have no
-positive witness, so one that stops reaching O_DIRECT without consulting a predicate
-passes; a candidate is `writer_direct_write_calls` for writers, while direct reads
-have no counter. The io_uring witness in `roundtrip_uring_tiny_output` is the
-dispatch count and exists only in hook builds, so the `release` sweep runs that cell
-unwitnessed. The lease cannot cover other processes of the user or a deferred kernel
-unpin. Also open: the `promise-guard` and `direct-io` requirements were not checked
-against the AGENTS.md host rule (a scratch filesystem that refuses O_DIRECT, an
-architecture or kernel without seccomp).
+Library and CLI cells that run a command with a direct option now assert a
+successful `O_DIRECT` open (`direct_io_*_opens`) on their own invocation
+(reference/testing.md "Platform-dependent tests"). Residue: the count proves
+setup, not that each transfer used the direct descriptor, and a cell with several
+direct paths (header walk and payload reader, two inputs) is satisfied by any one;
+only the fault plan's open counts attribute opens, and they do not record the
+transport. Unit cells gated by `test_support::direct_reads_supported` other than
+sort and dedupe (copy_range, frame_conformance_tests, getid, header_walker's
+direct-transport leg, dedupe's pass-2 helper) assert no direct count. io_uring
+stays outside the gate's requirement, so on a default-memlock host its cells skip
+and only the opt-in `full_registered_pool_instrument` proves the pool. Refusal
+predicates are the only route to a backend skip by convention, not by any audit.
 
 ## VER-090 - The requirement-table check is convention-bound
 

@@ -111,9 +111,17 @@ fn run_altw(
     }
     cli = backend_args(cli, backend);
     if direct_io {
-        cli = cli.arg("--direct-io");
+        // The witness stream: `direct_markers(output)` holds it afterwards.
+        let markers = direct_markers(output);
+        std::fs::write(&markers, []).expect("create the marker file");
+        cli = cli.marker_fifo(markers).arg("--direct-io");
     }
     cli.run()
+}
+
+/// Where [`run_altw`] puts the marker stream of a `--direct-io` run.
+fn direct_markers(output: &Path) -> std::path::PathBuf {
+    output.with_extension("markers")
 }
 
 /// `--index-type T`, plus `--force` on the backends that take it: external
@@ -1178,6 +1186,7 @@ mod backends {
             "add-locations-to-ways --direct-io failed unexpectedly; stderr:\n{}",
             out.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&direct_markers(&output), "write");
 
         let ways = read_way_locations(&output);
         assert_eq!(

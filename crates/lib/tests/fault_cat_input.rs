@@ -281,6 +281,7 @@ fn reference(
         .input_replacement()
         .expect("armed replacement");
     let cell = format!("{route:?}, input {target}");
+    crate::common::witness_direct_reads(route.direct, &host.invocation, &cell);
     assert!(!counted.fired, "{cell}: {counted:?}");
     assert_eq!(counted.attempts, opens, "{cell}: {counted:?}");
     assert_eq!(counted.verified, opens, "{cell}: {counted:?}");

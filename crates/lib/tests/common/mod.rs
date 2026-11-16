@@ -1654,6 +1654,45 @@ pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
 // Error helpers for platform-specific I/O tests
 // ---------------------------------------------------------------------------
 
+/// An invocation's `direct_io_<direction>_opens` counter: its successful
+/// `O_DIRECT` opens, `direction` being `read` or `write`.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+pub fn direct_opens(invocation: &pbfhogg::host::Invocation, direction: &str) -> u64 {
+    let name = format!("direct_io_{direction}_opens");
+    let mut found = None;
+    invocation.for_each_counter(|counter, value| {
+        if counter == name {
+            found = Some(value);
+        }
+    });
+    found.unwrap_or_else(|| panic!("the invocation has no counter {name}"))
+}
+
+/// The positive witness of an O_DIRECT cell that ran: `invocation` opened at
+/// least one file `O_DIRECT` for `direction` (`read` or `write`). The refusal
+/// predicates only stop a refused cell from passing; this stops a cell that
+/// no longer reaches O_DIRECT from passing. Use a fresh invocation per
+/// claim. It proves direct setup, not that every transfer used it.
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+pub fn assert_direct_opened(invocation: &pbfhogg::host::Invocation, direction: &str, what: &str) {
+    assert!(
+        direct_opens(invocation, direction) > 0,
+        "{what}: no O_DIRECT {direction} open was recorded"
+    );
+}
+
+/// [`assert_direct_opened`] for reads when `direct` says the run asked for
+/// them, for cells whose routes run either way. Builds without
+/// `linux-direct-io` have no direct route to witness.
+pub fn witness_direct_reads(direct: bool, invocation: &pbfhogg::host::Invocation, what: &str) {
+    #[cfg(feature = "linux-direct-io")]
+    if direct {
+        assert_direct_opened(invocation, "read", what);
+    }
+    #[cfg(not(feature = "linux-direct-io"))]
+    let _ = (direct, invocation, what);
+}
+
 /// Whether `err` authorizes dropping an O_DIRECT cell: only the typed
 /// direct-io setup refusal does. A runtime EINVAL can indicate an alignment
 /// bug, so raw errno alone must never make an I/O correctness test pass

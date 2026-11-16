@@ -406,8 +406,13 @@ skip = ["serial::"]
 # the backends it lists: every refusal predicate that would let an O_DIRECT
 # or promise-guard cell skip fails the test instead (see
 # crates/lib/tests/common/skip.rs). A refusal of either therefore
-# cannot pass as a skip here. O_DIRECT cells have no positive witness, so
-# for them this shows only that none skipped on a refusal. Sweeps that
+# cannot pass as a skip here, and the cells' positive witnesses (the
+# direct_io_*_opens counters, writer_uring_registered_buffers) fail a
+# cell that no longer reaches its backend. Requiring both makes an
+# O_DIRECT-capable test scratch filesystem and a kernel that installs the
+# promise guard's seccomp filter prerequisites of the gate's host, an
+# exception to the AGENTS.md host rule that reference/testing.md
+# "Platform-dependent tests" states. Sweeps that
 # compile a backend out (consumer, minimal) carry no claim for it. Other
 # environmental skips (osmium, namespaces, descriptor limits) still pass.
 #

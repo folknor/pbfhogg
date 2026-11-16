@@ -244,6 +244,7 @@ fn reference(
         }
         Err(e) => panic!("{route:?}: unreplaced run: {e}"),
     };
+    crate::common::witness_direct_reads(route.direct, &host.invocation, &format!("{route:?}"));
     assert_eq!(
         ran_full_scan(&host),
         route.taken() == Arm::FullScan,

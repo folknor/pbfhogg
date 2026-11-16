@@ -49,12 +49,20 @@ fn run_cat(
         cli = cli.arg("--clean").arg(*attr);
     }
     if direct_io {
-        cli = cli.arg("--direct-io");
+        // The witness stream: `direct_markers(output)` holds it afterwards.
+        let markers = direct_markers(output);
+        std::fs::write(&markers, []).expect("create the marker file");
+        cli = cli.marker_fifo(markers).arg("--direct-io");
     }
     if type_filter.is_some() {
         cli = cli.arg("--force");
     }
     cli.run()
+}
+
+/// Where [`run_cat`] puts the marker stream of a `--direct-io` run.
+fn direct_markers(output: &Path) -> std::path::PathBuf {
+    output.with_extension("markers")
 }
 
 #[test]
@@ -1696,6 +1704,7 @@ mod backends {
             "cat --direct-io failed unexpectedly; stderr:\n{}",
             out.stderr_str(),
         );
+        crate::invoker::assert_direct_opened(&direct_markers(&output), "read");
 
         assert!(
             out.stderr_str().contains("blobs passed through"),

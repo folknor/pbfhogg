@@ -249,6 +249,7 @@ fn reference(
         }
         Err(e) => panic!("{cell}: unreplaced run: {}", e.report()),
     };
+    crate::common::witness_direct_reads(route.direct, &host.invocation, &cell);
     let counted = host
         .invocation
         .faults()

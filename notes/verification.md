@@ -58,24 +58,31 @@ open (reference/testing.md "Platform-dependent tests"). Residue:
   source-policy rule could confine backend-refusal inspection to the designated
   helpers; it could not prove an early return exercised the backend.
 
-## VER-122 - Some checks are not shown to pass the field policy their claim needs
+## VER-122 - getid invert and cat-dedupe are not shown to pass the field policy their claim needs
 
 Reported by bench-verify.
 
-Every check's policy choice except the ones below is witnessed by a one-field-class fault in
-the generated protocols (reference/verify.md "How outputs are judged" lists them). Not yet:
+The both-declared coordinate branch of `Policy::between` is unwitnessed on getid `--invert`
+(its no-way-IDs request) and cat `--dedupe`: no generated protocol drives
+`getid_removeid::run` or `cat_dedupe::run`. Cat and sort are witnessed in
+`crates/verify/tests/read_fixture.rs` on `fake_pbf::write_indexed`, a fake whose first data
+blob carries indexdata. What each driver needs:
 
-- The both-declared coordinate branch of `Policy::between` on sort, cat, getid invert and
-  cat-dedupe: no generated protocol drives `sort::run`, `getid_removeid::run` or
-  `cat_dedupe::run`, and cat keeps LocationsOnWays only on an indexed first data blob
-  (`first_data_blob_indexed`), which the header-only fake PBFs lack. The fake can now carry a
-  way with an inline coordinate (`fake_pbf` `@w` suffix), so a driver for these checks is the
-  missing piece, not the decode.
-- The extract, multi-extract, repack, degrade, apply-changes and derive-changes witnesses
-  still assert only the final status, and their faults reach every arm at once; `judge` in
-  `crates/verify/tests/worker.rs` returns the failed comparison names, so asserting the
-  exact set per fault (as the cat, tags-filter, text diff, renumber and add-locations
-  witnesses do) would stop a correct arm masking one on the wrong policy.
+- getid-removeid: `pbf_frames::walk` refuses an input that is not fully indexed, so the fake
+  needs an indexed blob per kind whose claims give the endpoint IDs; the fake `fileinfo`
+  must answer per output so selection counts and the invert complement reconcile; and the
+  run continues into `verify_getid_refs`, so the fake also answers that protocol (the refs
+  fixture's arms). Mechanical, but a new fake of its own.
+- cat-dedupe (open decision, handed back): the check reads real blob IDs from every operand
+  (`dedupe_plan::entries`, the window over three or four blobs per kind) and holds pbfhogg's
+  output to the predicted blob layout byte by byte (passthrough payloads in place) and its
+  stderr summary counts. A fake pbfhogg must therefore write a byte-correct dedupe layout.
+  Either it computes the layout with the verifier's own `dedupe_plan::predict` (circular for
+  the layout arm, which is not what this witness is for, but the arm then always passes),
+  or the fixture's blobs are laid out so a simple fake rule (all passthrough, or one run)
+  is right by construction. Which, and whether the fake's decode may then read real blob IDs
+  for the operand derivations (rule: a fake decoding depends only on the fixture bytes,
+  which real blobs satisfy), wants arguing before building.
 
 ## VER-133 - Geocode admin and antimeridian paths the real-data check does not reach
 

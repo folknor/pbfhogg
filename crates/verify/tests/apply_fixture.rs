@@ -78,14 +78,13 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
             h.run.watch(&osc).unwrap();
-            let status = h
-                .run_check("apply", |h| {
-                    checks::apply_changes::run(h, &input, &osc, true, locations)
-                })
-                .unwrap();
+            let judged = super::judge(&mut h, "apply", |h| {
+                checks::apply_changes::run(h, &input, &osc, true, locations)
+            });
             let pass = expected || (fault == "stale" && !locations);
+            assert_apply(fault, locations, &judged);
             assert_eq!(
-                status,
+                judged.status,
                 if pass {
                     harness::CheckStatus::Passed
                 } else {
@@ -94,6 +93,46 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "fault={fault}, locations={locations}"
             );
         }
+    }
+}
+
+/// Hold one apply fault to the comparison it fails by name, or to the
+/// element diff's error: an element difference, the metadata fault among
+/// them, must be the unexplained-entries error in both modes, never a
+/// pass the coordinate or declaration arms could mask.
+fn assert_apply(fault: &str, locations: bool, judged: &super::Judged) {
+    let case = format!("fault={fault}, locations={locations}: {judged:?}");
+    let unexplained = match fault {
+        "unexplained" | "both-retain" | "metadata" => Some(1),
+        "modified" | "deleted" => Some(2),
+        _ => None,
+    };
+    assert_eq!(
+        judged.error,
+        unexplained.map(|n| format!(
+            "pbfhogg vs osmium: {n} unexplained difference entries (see element diff above)"
+        )),
+        "{case}"
+    );
+    match fault {
+        "stale" if locations => assert_eq!(
+            judged.failed,
+            ["pbfhogg apply-changes inline locations"],
+            "{case}"
+        ),
+        "silent-drop" => assert_eq!(
+            judged.failed,
+            ["pbfhogg apply-changes output declares LocationsOnWays as its command documents"],
+            "{case}"
+        ),
+        // The published path is per run: hold the one entry by its frame.
+        "publish" => assert!(
+            matches!(judged.failed.as_slice(), [one]
+                if one.starts_with("pbfhogg apply-changes published ")
+                    && one.ends_with("/pbfhogg.osm.pbf on input it refuses")),
+            "{case}"
+        ),
+        _ => assert!(judged.failed.is_empty(), "{case}"),
     }
 }
 

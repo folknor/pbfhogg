@@ -83,11 +83,15 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   On add-locations-to-ways, a version-only or inline-coordinate-only
   change of the external engine's output alone fails exactly its
   comparison with osmium and the engine parity, each by name, which
-  witnesses the both-declared branch of `Policy::between` there. Sort,
-  cat, getid `--invert` and cat `--dedupe` are not driven by any
-  generated protocol, so their choices are not yet witnessed. The cat,
-  tags-filter, text diff, renumber and add-locations-to-ways witnesses
-  name every failing comparison; the others assert the final status only.
+  witnesses the both-declared branch of `Policy::between` there. On an
+  input declaring `LocationsOnWays` whose first data blob is indexed, an
+  inline-coordinate-only change of pbfhogg's outputs fails every cat
+  arm and exactly sort's element comparison, by name, which witnesses
+  that branch on cat and sort. getid `--invert` and cat `--dedupe` are
+  not driven by any generated protocol, so their choices are not yet
+  witnessed. Each of these field-policy witnesses names the comparisons a fault fails, in
+  order, and the error it raises instead where a check reports one
+  (apply-changes' element diff, encoding's index and refusal paths).
 - **The `LocationsOnWays` declaration** of each output of sort, cat,
   tags-filter, getid (plain, `--invert` and `--add-referenced`),
   getparents, extract, multi-extract, renumber and apply-changes is judged

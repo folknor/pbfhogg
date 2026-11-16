@@ -71,6 +71,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             assert_eq!(judged.failed, arms, "{name}: {fault}");
         }
     }
+    kept_locations(&mut h, exe, &dir);
     std::fs::write(dir.join("fault"), "").unwrap();
     assert_eq!(
         h.run_check("refs", |h| checks::check_refs::run(h, &input))
@@ -186,6 +187,48 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     );
 }
 
+/// An input declaring LocationsOnWays whose first data blob is indexed
+/// (a believed node claim, so sort has no way blob to rewrite): cat and
+/// sort keep the declaration, so both outputs declare it and every
+/// element comparison reads inline coordinates. One way coordinate
+/// altered on pbfhogg's outputs alone must fail each element arm by
+/// name and no other; a clean run passes.
+fn kept_locations(h: &mut harness::Harness, exe: &Path, dir: &Path) {
+    let indexed = dir.join("indexed.pbf");
+    fake_pbf::write_indexed(&indexed, &[SORTED, LOW], "sorted @w1");
+    for fault in ["", "coords"] {
+        for (name, run, arms) in [
+            (
+                "indexed-cat",
+                checks::cat::run as checks::ReadCheck,
+                &[
+                    "cat -t node diff",
+                    "cat -t way diff",
+                    "cat -t relation diff",
+                ][..],
+            ),
+            (
+                "indexed-sort",
+                checks::sort::run,
+                &["pbfhogg vs osmium elements"][..],
+            ),
+        ] {
+            h.run = run::Run::create(dir, exe, true).unwrap();
+            h.run.watch(&indexed).unwrap();
+            std::fs::write(dir.join("fault"), fault).unwrap();
+            let judged = super::judge(h, name, |h| run(h, &indexed, true));
+            assert_eq!(judged.error, None, "{name} {fault}: {judged:?}");
+            if fault.is_empty() {
+                assert_eq!(judged.status, harness::CheckStatus::Passed, "{judged:?}");
+                assert!(judged.failed.is_empty(), "{name}: {judged:?}");
+            } else {
+                assert_eq!(judged.status, harness::CheckStatus::Failed, "{judged:?}");
+                assert_eq!(judged.failed, arms, "{name}: {judged:?}");
+            }
+        }
+    }
+}
+
 /// Assert that an osmium `cat` or `sort` writing PBF asks to keep inline
 /// locations exactly when its input declares them, and answer whether it does.
 fn asks_locations(args: &[&str]) -> bool {
@@ -197,11 +240,12 @@ fn asks_locations(args: &[&str]) -> bool {
 }
 
 /// Alter pbfhogg's `output` of `input` as `fault` asks: its content, its
-/// or its version alone.
+/// version alone, or its way's inline coordinate alone.
 fn fault_output(fault: &str, input: &Path, output: &Path) {
     match fault {
         "content" => fake_pbf::rewrite(input, output, "wrong content"),
         "metadata" => fake_pbf::alter(input, output, "@v2"),
+        "coords" => fake_pbf::alter(input, output, "@w2"),
         _ => {}
     }
 }
@@ -270,6 +314,16 @@ pub fn tool(args: &[OsString]) -> i32 {
             if args.contains(&"--output") {
                 fault_output(&fault, Path::new(args[1]), output());
             }
+        }
+        "sort" if args.contains(&"--output") => {
+            // pbfhogg sort: the input's believed node claim leaves no way
+            // blob to rewrite, so it keeps the features and every field.
+            let input = Path::new(args[1]);
+            let features = fake_pbf::features(input);
+            let refs: Vec<&str> = features.iter().map(String::as_str).collect();
+            let marker = format!("sorted{}", fake_pbf::suffixes(input));
+            fake_pbf::write(output(), &refs, &marker);
+            fault_output(&fault, input, output());
         }
         "sort" => {
             let locations = asks_locations(&args);

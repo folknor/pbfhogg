@@ -32,22 +32,24 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         "published",
     ] {
         std::fs::write(dir.join("fault"), fault).unwrap();
-        for check in [
-            checks::repack::run as checks::ReadCheck,
-            checks::degrade::run,
+        for (check, arms) in [
+            (
+                checks::repack::run as checks::ReadCheck,
+                &[
+                    ("repack default cap", 8000),
+                    ("repack cap 3000", 3000),
+                    ("repack cap 64000", 64000),
+                ][..],
+            ),
+            (
+                checks::degrade::run,
+                &[("degrade --strip-locations", 8000)][..],
+            ),
         ] {
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
-            let status = h.run_check("encoding", |h| check(h, &input, true)).unwrap();
-            assert_eq!(
-                status,
-                if fault.is_empty() || fault == "required-output" {
-                    harness::CheckStatus::Passed
-                } else {
-                    harness::CheckStatus::Failed
-                },
-                "fault={fault}"
-            );
+            let judged = super::judge(&mut h, "encoding", |h| check(h, &input, true));
+            assert_encoding(fault, arms, &judged);
         }
     }
     // A LocationsOnWays input: the reference is osmium cat without
@@ -70,9 +72,12 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         } else {
             checks::degrade::run
         };
-        let status = h.run_check("degrade", |h| check(h, path, true)).unwrap();
+        let judged = super::judge(&mut h, "degrade", |h| check(h, path, true));
+        // A gap in the requirement is a refusal, never a failed comparison.
+        assert!(judged.failed.is_empty(), "{judged:?}");
+        assert_eq!(judged.error.is_none(), passed, "{judged:?}");
         assert_eq!(
-            status == harness::CheckStatus::Passed,
+            judged.status == harness::CheckStatus::Passed,
             passed,
             "fault={fault} required={required} input={}",
             path.display()
@@ -97,6 +102,54 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             matches!(result, Ok(verify_reencode::Ran::TooLarge)),
             accepted
         );
+    }
+}
+
+/// Hold one encoding fault to the comparisons it must fail on every arm
+/// (`arms`, the check's re-encodings in order with their block caps), or
+/// to the error it must raise instead.
+fn assert_encoding(fault: &str, arms: &[(&str, u32)], judged: &super::Judged) {
+    let passes = fault.is_empty() || fault == "required-output";
+    assert_eq!(
+        judged.status,
+        if passes {
+            harness::CheckStatus::Passed
+        } else {
+            harness::CheckStatus::Failed
+        },
+        "fault={fault}: {judged:?}"
+    );
+    // The metadata and out-coords faults change one field class of the
+    // output alone: every arm's element comparison must read it.
+    let expected: Vec<String> = arms
+        .iter()
+        .flat_map(|(arm, cap)| match fault {
+            "content" | "metadata" | "out-coords" => vec![format!("{arm} elements")],
+            "layout" => vec![
+                format!("{arm} indexdata against the verifier's blob decode"),
+                format!("{arm} block sizes: blob 0 holds 0 nodes, cap {cap}"),
+            ],
+            "header" => vec![format!("{arm} header LocationsOnWays")],
+            _ => vec![],
+        })
+        .collect();
+    assert_eq!(judged.failed, expected, "fault={fault}");
+    let error = match fault {
+        "index" => Some(
+            "pbfhogg check --index exited Some(0) with a report that says passed true with 1 violations",
+        ),
+        "refused" => {
+            Some("as too large for the format: nothing was re-encoded, so nothing was verified")
+        }
+        "published" => Some("failed: exit status: 2: too large; lower --elements-per-blob"),
+        _ => None,
+    };
+    match error {
+        None => assert_eq!(judged.error, None, "fault={fault}"),
+        Some(text) => assert!(
+            judged.error.as_deref().is_some_and(|e| e.contains(text)),
+            "fault={fault}: {judged:?}"
+        ),
     }
 }
 

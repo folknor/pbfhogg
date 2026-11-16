@@ -189,6 +189,36 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
                 "{judged:?}"
             );
         }
+        // derive-changes: a broken roundtrip fails both roundtrip arms and
+        // nothing else, a raw OSC only the index comparison, a published
+        // refusal each side once.
+        ("osc", _) => {
+            assert_eq!(judged.error, None, "{judged:?}");
+            match fault {
+                "roundtrip" => assert_eq!(
+                    judged.failed,
+                    [
+                        "diff pbfhogg roundtrip vs new",
+                        "diff pbfhogg roundtrip vs osmium roundtrip"
+                    ],
+                    "{judged:?}"
+                ),
+                "raw-osc" => assert_eq!(
+                    judged.failed,
+                    ["unindexed OSC vs indexed OSC"],
+                    "{judged:?}"
+                ),
+                "publish" => assert!(
+                    matches!(judged.failed.as_slice(), [old, new]
+                        if old.starts_with("pbfhogg diff --format osc (input as OLD) published ")
+                            && new.starts_with("pbfhogg diff --format osc (input as NEW) published ")
+                            && old.ends_with(" on input it refuses")
+                            && new.ends_with(" on input it refuses")),
+                    "{judged:?}"
+                ),
+                _ => assert!(judged.failed.is_empty(), "{judged:?}"),
+            }
+        }
         _ => {}
     }
 }

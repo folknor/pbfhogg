@@ -64,7 +64,44 @@ fn full_marker(path: &Path) -> String {
         .windows(MARKER.len())
         .rposition(|w| w == MARKER)
         .unwrap_or_else(|| panic!("{} is not a fixture PBF", path.display()));
-    String::from_utf8(bytes[at + MARKER.len()..].to_vec()).unwrap()
+    let text = &bytes[at + MARKER.len()..];
+    // The marker runs to the end of a header-only fixture, or to the frame
+    // length of the data blob [`write_indexed`] appends, whose leading byte
+    // is zero; a marker never holds one.
+    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+    String::from_utf8(text[..end].to_vec()).unwrap()
+}
+
+/// [`write()`] followed by one raw data blob with indexdata, so the
+/// verifier reads the fixture's first data blob as indexed. The blob holds
+/// dense node 1; the fake osmium decodes by the marker alone, so the blob
+/// changes no decoding, only the indexed claim a reader of the frames sees.
+pub fn write_indexed(path: &Path, optional: &[&str], marker: &str) {
+    write(path, optional, marker);
+    let mut dense = Vec::new();
+    field(1, &[2], &mut dense);
+    let mut group = Vec::new();
+    field(2, &dense, &mut group);
+    let mut primitive = Vec::new();
+    field(1, &[], &mut primitive);
+    field(2, &group, &mut primitive);
+    let mut blob = Vec::new();
+    field(1, &primitive, &mut blob);
+    // Indexdata: kind node, IDs 1..1, one element.
+    let mut index = vec![1, 0];
+    index.extend_from_slice(&1_i64.to_le_bytes());
+    index.extend_from_slice(&1_i64.to_le_bytes());
+    index.extend_from_slice(&1_u64.to_le_bytes());
+    let mut header = Vec::new();
+    field(1, b"OSMData", &mut header);
+    field(2, &index, &mut header);
+    varint(3 << 3, &mut header);
+    varint(blob.len() as u64, &mut header);
+    let mut out = std::fs::read(path).unwrap();
+    out.extend_from_slice(&u32::try_from(header.len()).unwrap().to_be_bytes());
+    out.extend(header);
+    out.extend(blob);
+    std::fs::write(path, out).unwrap();
 }
 
 /// The content marker of a fixture written by [`write()`]: the marker

@@ -50,19 +50,25 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
             h.run.watch(&polygon).unwrap();
-            let status = h
-                .run_check("fixture", |h| {
-                    if multi {
-                        checks::multi_extract::run(h, &input, &bbox, &polygons, 2, true)
-                    } else {
-                        checks::extract::run(h, &input, Some(&bbox), &polygons, true)
-                    }
-                })
-                .unwrap();
-            assert_eq!(
-                status, expected,
-                "multi={multi}, sorted={sorted}, fault={fault}"
-            );
+            let judged = super::judge(&mut h, "fixture", |h| {
+                if multi {
+                    checks::multi_extract::run(h, &input, &bbox, &polygons, 2, true)
+                } else {
+                    checks::extract::run(h, &input, Some(&bbox), &polygons, true)
+                }
+            });
+            let case = format!("multi={multi}, sorted={sorted}, fault={fault}: {judged:?}");
+            assert_eq!(judged.status, expected, "{case}");
+            assert_eq!(judged.error, None, "{case}");
+            // Each fault alters one field class of every pbfhogg output, so
+            // every arm must fail by name: an arm on a policy blind to it
+            // shows as a missing name.
+            let failed: &[&str] = match (fault.is_empty(), multi) {
+                (true, _) => &[],
+                (false, false) => &EXTRACT_ARMS,
+                (false, true) => &MULTI_ARMS,
+            };
+            assert_eq!(judged.failed, failed, "{case}");
         }
     }
     // Gate a polygon with a known different interpretation before launching.
@@ -71,6 +77,27 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let error = checks::extract::run(&mut h, &input, None, &polygons, false).unwrap_err();
     assert!(error.to_string().contains("cannot be compared with osmium"));
 }
+
+/// The extract comparisons a content or version fault fails, in order.
+const EXTRACT_ARMS: [&str; 8] = [
+    "pbfhogg extract --simple element content differs from osmium on 1 shared IDs",
+    "pbfhogg extract --complete element content differs from osmium on 1 shared IDs",
+    "pbfhogg extract --smart element content differs from osmium on 1 shared IDs",
+    "pbfhogg extract --simple element content differs from osmium's complete_ways on 1 IDs",
+    "pbfhogg extract --simple on polygon city element content differs from osmium on 1 shared IDs",
+    "pbfhogg extract --complete on polygon city element content differs from osmium on 1 shared IDs",
+    "pbfhogg extract --smart on polygon city element content differs from osmium on 1 shared IDs",
+    "pbfhogg extract --simple on polygon city element content differs from osmium's complete_ways on 1 IDs",
+];
+
+/// The multi-extract comparisons a content or version fault fails, in order.
+const MULTI_ARMS: [&str; 5] = [
+    "multi-extract strip-0 element content differs from the sequential extract",
+    "multi-extract strip-1 element content differs from the sequential extract",
+    "multi-extract mixed strip-0 element content differs from the sequential extract",
+    "multi-extract mixed strip-1 element content differs from the sequential extract",
+    "multi-extract mixed polygon-city element content differs from the sequential extract",
+];
 
 pub fn tool(args: &[OsString]) -> i32 {
     let args: Vec<_> = args.iter().map(|a| a.to_str().unwrap()).collect();

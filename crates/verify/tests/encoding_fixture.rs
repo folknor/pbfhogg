@@ -23,6 +23,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         "",
         "required-output",
         "content",
+        "metadata",
+        "out-coords",
         "index",
         "layout",
         "header",
@@ -125,20 +127,25 @@ pub fn tool(args: &[OsString]) -> i32 {
             assert!(args.contains(&"opl,locations_on_ways=true"));
             let input = Path::new(args[1]);
             let name = input.file_name().unwrap().to_str().unwrap();
-            let way = if name == "low.pbf" && fault != "no-coords" {
-                "w1 v1 Nn1x1y1"
-            } else {
-                "w1 v1 Nn1x y"
-            };
-            let tag = if fault == "content"
-                && (name.starts_with("repack") || name.starts_with("degrade"))
-            {
+            // The metadata and out-coords faults alter one field class of
+            // the output alone: a version, and an inline coordinate its
+            // input lacks.
+            let ours = name.starts_with("repack") || name.starts_with("degrade");
+            let way =
+                if (name == "low.pbf" && fault != "no-coords") || (ours && fault == "out-coords") {
+                    "w1 v1 Nn1x1y1"
+                } else {
+                    "w1 v1 Nn1x y"
+                };
+            let tag = if fault == "content" && ours {
                 "Tab=c"
             } else {
                 "Ta=bc"
             };
+            let version = if fault == "metadata" && ours { 2 } else { 1 };
             let output = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
-            std::fs::write(output, format!("n1 v1 {tag}\nn2 v1\nn3 v1\n{way}\n")).unwrap();
+            let opl = format!("n1 v{version} {tag}\nn2 v1\nn3 v1\n{way}\n");
+            std::fs::write(output, crate::fake_pbf::project(&args, &opl)).unwrap();
         }
         "cat" => {
             // The reference without way coordinates: plain PBF output.

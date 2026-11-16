@@ -69,7 +69,14 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         ),
         (
             "osc",
-            vec!["", "roundtrip", "raw-osc", "unsorted", "publish"],
+            vec![
+                "",
+                "roundtrip",
+                "roundtrip-metadata",
+                "raw-osc",
+                "unsorted",
+                "publish",
+            ],
         ),
         (
             "renumber",
@@ -105,7 +112,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 .unwrap();
             assert_eq!(
                 status,
-                if fault.is_empty() || fault == "unsorted" {
+                if fault.is_empty() || fault == "unsorted" || fault == "roundtrip-metadata" {
                     harness::CheckStatus::Passed
                 } else {
                     harness::CheckStatus::Failed
@@ -187,13 +194,18 @@ pub fn tool(args: &[OsString]) -> i32 {
             if args[0] == "derive-changes" {
                 std::fs::write(output, "<osmChange/>").unwrap();
             } else {
-                let broken = fault == "roundtrip" && output.ends_with("roundtrip-pbfhogg.osm.pbf");
+                let roundtrip = output.ends_with("roundtrip-pbfhogg.osm.pbf");
+                let broken = fault == "roundtrip" && roundtrip;
+                // An OSC carries no metadata the roundtrip could keep, so
+                // a version-only change of the roundtrip must pass.
+                let versioned = fault == "roundtrip-metadata" && roundtrip;
                 // The marker carries everything the fake decode reads,
                 // since the reference cache keys the decode on content.
                 let marker = match (args[0], ours) {
                     ("renumber", true) => format!("renumber-pbfhogg-{fault}"),
                     ("renumber", false) => format!("renumber-osmium-{fault}"),
                     _ if broken => "wrong".to_owned(),
+                    _ if versioned => "sorted @v2".to_owned(),
                     _ => "sorted".to_owned(),
                 };
                 fake_pbf::write(Path::new(output), &[SORTED], &marker);

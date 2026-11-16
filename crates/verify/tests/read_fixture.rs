@@ -35,17 +35,22 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             harness::CheckStatus::Passed
         );
     }
-    for (name, run) in [
-        ("bad-cat", checks::cat::run as checks::ReadCheck),
-        ("bad-tags", checks::tags_filter::run),
-    ] {
-        h.run = run::Run::create(&dir, exe, true).unwrap();
-        h.run.watch(&input).unwrap();
-        std::fs::write(dir.join("fault"), "content").unwrap();
-        assert_eq!(
-            h.run_check(name, |h| run(h, &input, true)).unwrap(),
-            harness::CheckStatus::Failed
-        );
+    // A content change fails both, and so does a version-only change: both
+    // compare metadata.
+    for fault in ["content", "metadata"] {
+        for (name, run) in [
+            ("bad-cat", checks::cat::run as checks::ReadCheck),
+            ("bad-tags", checks::tags_filter::run),
+        ] {
+            h.run = run::Run::create(&dir, exe, true).unwrap();
+            h.run.watch(&input).unwrap();
+            std::fs::write(dir.join("fault"), fault).unwrap();
+            assert_eq!(
+                h.run_check(name, |h| run(h, &input, true)).unwrap(),
+                harness::CheckStatus::Failed,
+                "{name}: {fault}"
+            );
+        }
     }
     std::fs::write(dir.join("fault"), "").unwrap();
     assert_eq!(
@@ -150,6 +155,16 @@ fn asks_locations(args: &[&str]) -> bool {
     locations
 }
 
+/// Alter pbfhogg's `output` of `input` as `fault` asks: its content, its
+/// or its version alone.
+fn fault_output(fault: &str, input: &Path, output: &Path) {
+    match fault {
+        "content" => fake_pbf::rewrite(input, output, "wrong content"),
+        "metadata" => fake_pbf::alter(input, output, "@v2"),
+        _ => {}
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "One explicit arm per emulated tool invocation"
@@ -193,8 +208,8 @@ pub fn tool(args: &[OsString]) -> i32 {
                 asks_locations(&args);
             }
             std::fs::copy(args[1], output()).unwrap();
-            if args.contains(&"--output") && fault == "content" {
-                fake_pbf::rewrite(Path::new(args[1]), output(), "wrong content");
+            if args.contains(&"--output") {
+                fault_output(&fault, Path::new(args[1]), output());
             }
         }
         "sort" => {

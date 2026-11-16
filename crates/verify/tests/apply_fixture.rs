@@ -22,6 +22,12 @@ fn opl(fault: &str, pbfhogg: bool) -> &'static str {
         // Both tools keep the node the change deletes: the outputs agree,
         // and only the final-delete rule can fail it.
         ("both-retain", _) => "n1 v1\nn7 v1\n",
+        // One field class differs on a surviving object: a version, read
+        // in both modes; an inline coordinate, read in neither (plain mode
+        // drops the declaration, locations mode leaves coordinates out).
+        ("metadata", true) => "n1 v2\n",
+        ("coords", true) => "n1 v1\nw1 v1 Nn1x2y1\n",
+        ("coords", false) => "n1 v1\nw1 v1 Nn1x1y1\n",
         _ => "n1 v1\n",
     }
 }
@@ -57,6 +63,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         ("unsorted", true),
         ("publish", false),
         ("silent-drop", false),
+        ("metadata", false),
+        ("coords", true),
     ] {
         std::fs::write(dir.join("fault"), fault).unwrap();
         if fault == "unsorted" || fault == "publish" {
@@ -105,7 +113,8 @@ pub fn tool(args: &[OsString]) -> i32 {
         // the marker names the side and the fault that wrote it.
         let marker = fake_pbf::marker(Path::new(args[1]));
         let (side, written_under) = marker.split_once('-').unwrap();
-        std::fs::write(value("-o"), opl(written_under, side == "pbfhogg")).unwrap();
+        let opl = opl(written_under, side == "pbfhogg");
+        std::fs::write(value("-o"), fake_pbf::project(&args, opl)).unwrap();
         return 0;
     }
     match args[0] {

@@ -69,7 +69,14 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   line; any control that fails or cannot be built is a verifier error
   (`ERROR`, exit 2), which stops a suite, since every later element verdict
   rests on the comparator. Which policy each check passes is not
-  established by it.
+  established by it; the generated protocols in `crates/verify/tests`
+  establish it for some checks, their fake osmium decoding by the
+  requested OPL options: a version-only change of pbfhogg's output fails
+  extract, multi-extract, cat, tags-filter, repack, degrade and
+  apply-changes (both modes) and passes the derive-changes roundtrip; an
+  inline-coordinate-only change fails repack and degrade and passes
+  apply-changes in locations mode. The other checks' choices are not yet
+  witnessed.
 - **The `LocationsOnWays` declaration** of each output of sort, cat,
   tags-filter, getid (plain, `--invert` and `--add-referenced`),
   getparents, extract, multi-extract, renumber and apply-changes is judged

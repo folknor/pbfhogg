@@ -3,7 +3,9 @@
 //! `HeaderBlock` lists its optional features and ends with a marker string
 //! the fake tools key their behaviour on. The fake osmium decodes a fixture
 //! to one OPL record carrying its marker, so two fixtures compare equal
-//! exactly when their markers are equal.
+//! exactly when their markers are equal, and it decodes by the requested
+//! OPL options ([`project`]), so a fixture whose version alone differs
+//! ([`alter`]) differs exactly under a policy that reads metadata.
 use std::path::Path;
 
 const MARKER: &[u8] = b"marker:";
@@ -53,14 +55,45 @@ pub fn write_with(path: &Path, required: &[&str], optional: &[&str], marker: &st
     std::fs::write(path, out).unwrap();
 }
 
-/// The marker of a fixture written by [`write()`].
-pub fn marker(path: &Path) -> String {
+/// The whole marker of a fixture written by [`write()`], field suffixes
+/// included.
+fn full_marker(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap();
     let at = bytes
         .windows(MARKER.len())
         .rposition(|w| w == MARKER)
         .unwrap_or_else(|| panic!("{} is not a fixture PBF", path.display()));
     String::from_utf8(bytes[at + MARKER.len()..].to_vec()).unwrap()
+}
+
+/// The content marker of a fixture written by [`write()`]: the marker
+/// without its field suffixes (see [`alter`]).
+pub fn marker(path: &Path) -> String {
+    let full = full_marker(path);
+    full.split(" @").next().unwrap().to_owned()
+}
+
+/// The version a fixture's node decodes with: its marker's last `@v`
+/// suffix, default 1.
+fn version(path: &Path) -> String {
+    let full = full_marker(path);
+    let mut version = "1".to_owned();
+    for suffix in full.split(" @").skip(1) {
+        let v = suffix
+            .strip_prefix('v')
+            .unwrap_or_else(|| panic!("unknown fixture field suffix {suffix:?}"));
+        v.clone_into(&mut version);
+    }
+    version
+}
+
+/// Copy fixture `src` to `dst` (features, content and fields) with
+/// `suffix` (`@v<version>`) appended, so `dst` decodes with its metadata
+/// altered and everything else equal.
+pub fn alter(src: &Path, dst: &Path, suffix: &str) {
+    let features = features(src);
+    let refs: Vec<&str> = features.iter().map(String::as_str).collect();
+    write(dst, &refs, &format!("{} {suffix}", full_marker(src)));
 }
 
 /// The optional features of a fixture written by [`write()`].
@@ -91,13 +124,60 @@ pub fn is_opl_cat(args: &[&str]) -> bool {
 }
 
 /// Answer an [`is_opl_cat`] invocation: one node record carrying the
-/// input's marker (its non-alphanumeric bytes as `_`).
+/// input's content marker (its non-alphanumeric bytes as `_`) and its
+/// version, [`project`]ed by the requested format.
 pub fn opl_cat(args: &[&str]) {
     let input = Path::new(args[1]);
     let output = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
-    let marker: String = marker(input)
+    let content: String = marker(input)
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    std::fs::write(output, format!("n1 v1 Tm={marker} x1 y1\n")).unwrap();
+    let version = version(input);
+    let opl = format!("n1 v{version} dV c1 t i1 u Tm={content} x1 y1\n");
+    std::fs::write(output, project(args, &opl)).unwrap();
+}
+
+/// `opl`, written with every field, as osmium writes it under the `-f`
+/// format in `args`: `add_metadata=false` drops the version, visibility,
+/// changeset, timestamp, uid and user fields; without
+/// `locations_on_ways=true` way-node items keep their refs and lose their
+/// inline coordinates. Node coordinates are content and always stay.
+pub fn project(args: &[&str], opl: &str) -> String {
+    let format = args[args.iter().position(|a| *a == "-f").unwrap() + 1];
+    let options: Vec<&str> = format.split(',').collect();
+    assert_eq!(options[0], "opl", "not an OPL decode: {format}");
+    let metadata = !options.contains(&"add_metadata=false");
+    let locations = options.contains(&"locations_on_ways=true");
+    for option in &options[1..] {
+        assert!(
+            ["add_metadata=false", "locations_on_ways=true"].contains(option),
+            "unexpected OPL option {option}"
+        );
+    }
+    let mut out = String::new();
+    for line in opl.lines() {
+        let mut fields = line.split(' ');
+        let mut kept = vec![fields.next().unwrap().to_owned()];
+        let way = kept[0].starts_with('w');
+        for field in fields {
+            let letter = field.chars().next().unwrap_or(' ');
+            if !metadata && "vdctiu".contains(letter) {
+                continue;
+            }
+            if way && letter == 'N' && !locations {
+                let items: Vec<&str> = field[1..]
+                    .split(',')
+                    .filter(|i| !i.is_empty())
+                    .map(|i| i.split('x').next().unwrap())
+                    .collect();
+                kept.push(format!("N{}", items.join(",")));
+                continue;
+            }
+            kept.push(field.to_owned());
+        }
+        out.push_str(&kept.join(" "));
+        out.push('\n');
+    }
+    out
 }

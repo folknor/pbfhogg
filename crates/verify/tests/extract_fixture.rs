@@ -37,6 +37,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         (true, "", harness::CheckStatus::Passed),
         (false, "", harness::CheckStatus::Passed),
         (true, "content", harness::CheckStatus::Failed),
+        // Only the version differs: both checks compare metadata.
+        (true, "metadata", harness::CheckStatus::Failed),
     ] {
         if sorted {
             fake_pbf::write(&input, &[SORTED], "sorted");
@@ -117,6 +119,8 @@ pub fn tool(args: &[OsString]) -> i32 {
                         .join(region["output"].as_str().unwrap());
                     if fault == "content" {
                         fake_pbf::rewrite(Path::new(args[1]), &output, "wrong");
+                    } else if fault == "metadata" {
+                        fake_pbf::alter(Path::new(args[1]), &output, "@v2");
                     } else {
                         std::fs::copy(args[1], output).unwrap();
                     }
@@ -131,13 +135,16 @@ pub fn tool(args: &[OsString]) -> i32 {
                 } else if value("-s") == "smart" {
                     assert_eq!(value("-S"), "types=multipolygon,boundary");
                 }
-                let bad = args.contains(&"--output")
-                    && fault == "content"
+                // The faults alter pbfhogg's outputs but not the sequential
+                // ones multi-extract compares its own against.
+                let ours = args.contains(&"--output")
                     && !output()
                         .ancestors()
                         .any(|a| a.file_name().is_some_and(|n| n == "sequential"));
-                if bad {
+                if ours && fault == "content" {
                     fake_pbf::rewrite(Path::new(args[1]), output(), "wrong");
+                } else if ours && fault == "metadata" {
+                    fake_pbf::alter(Path::new(args[1]), output(), "@v2");
                 } else {
                     std::fs::copy(args[1], output()).unwrap();
                 }

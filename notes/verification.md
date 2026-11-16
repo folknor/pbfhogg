@@ -79,18 +79,27 @@ Lua contract to expose child counters (`cat_dedupe_blobs_passthrough`,
 indexed-blob count from `inspect`; `inspect --get indexed=false` includes partially
 indexed inputs.
 
-## VER-122 - No check is shown to pass the field policy its claim needs
+## VER-122 - Some checks are not shown to pass the field policy their claim needs
 
 Reported by bench-verify.
 
-`pbfhogg-verify field-policies` shows on real data that each `opl_compare::Policy` reads
-exactly the field classes it claims. What it does not show is which policy each check hands
-the comparison, nor that the check's verdict follows from it: a check passing CONTENT where
-its claim needs metadata would stay green. The generated fixtures in `crates/verify/tests`
-cannot see this either, because their fake osmium ignores the `-f` format string everywhere
-except `encoding_fixture.rs` (which asserts `locations_on_ways=true` only); no fixture
-asserts `add_metadata=false` or its absence. A fake that decodes by the requested options,
-with per-check faults altering one field class, would close it.
+The generated fixtures' fake osmium now decodes by the requested OPL options
+(`fake_pbf::project`), and one-field-class faults witness the policy of extract,
+multi-extract, cat, tags-filter, repack, degrade, apply-changes (metadata in both modes,
+coordinates left out in locations mode) and the derive-changes roundtrip (metadata ignored).
+Not yet witnessed:
+
+- Text diff: it classifies metadata-only differences as common (`equal_listed`) and reads
+  versions in its verbose headers, so its witness is a version change on a content-modified
+  object with a wrong listed version, plus a metadata-only change that must pass.
+- Renumber (`compare_paired` attribution parses `N`/`M` lists), add-locations engine parity
+  (the per-engine osmium comparisons and digests can supply a failure, so the parity verdict
+  itself must be asserted), and the both-declared coordinate branch of `Policy::between` on
+  sort, cat, getid invert and cat-dedupe: the header-only fake PBFs cannot keep
+  LocationsOnWays where a check requires indexed data blobs (cat's `first_data_blob_indexed`).
+- The witnesses assert a final `Failed`, and multi-arm checks fault every arm at once, so one
+  correct arm can mask another arm on the wrong policy; asserting the named comparison's
+  diagnostic per arm would close that.
 
 ## VER-133 - Geocode admin and antimeridian paths the real-data check does not reach
 

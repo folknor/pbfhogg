@@ -99,6 +99,7 @@ fn digest_opens_its_input_once() {
         assert_eq!(report.attempts, 1, "direct {direct}: {report:?}");
         assert_eq!(report.verified, 1, "direct {direct}: {report:?}");
         assert_eq!(report.refused, 0, "direct {direct}: {report:?}");
+        crate::common::witness_transports(direct, &report, || "D", "digest");
     }
 }
 

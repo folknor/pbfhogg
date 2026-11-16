@@ -58,7 +58,9 @@ enum Source {
 
 /// Every source, less the direct walk where this filesystem refuses
 /// `O_DIRECT` (the typed direct-io refusal, the one skip, announced; any
-/// other open failure fails the test).
+/// other open failure fails the test). The direct walk needs no open
+/// counter: `HeaderWalker::open_direct` returns a walker over
+/// `DirectPositional` or an error, never a buffered walker.
 fn sources(dir: &Path) -> Vec<Source> {
     let all = vec![
         Source::Read,

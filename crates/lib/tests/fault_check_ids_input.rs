@@ -154,6 +154,7 @@ fn reference(
     assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "DB", &format!("{route:?}"));
     assert_eq!(report, expected(route), "{route:?}: the unreplaced report");
     Reference::Report(report)
 }

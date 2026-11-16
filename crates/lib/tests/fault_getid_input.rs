@@ -86,6 +86,19 @@ impl Route {
         }
     }
 
+    /// The transport of each open on a direct run of the routes this file
+    /// drives direct (`common::witness_transports`): the probe direct, the
+    /// estimate and schedule walks buffered, and pass 2's sequential reader
+    /// of `add_referenced` direct.
+    fn transports(self) -> &'static str {
+        match self.mode {
+            Mode::Include if !self.unindexed => "DBB",
+            Mode::AddReferenced if self.ways || self.relations => "DBD",
+            Mode::Remove => "DB",
+            _ => panic!("{self:?}: no direct transport spec"),
+        }
+    }
+
     fn ids(self) -> Vec<String> {
         let mut ids = vec!["n10".to_string(), "n60".to_string()];
         if self.ways {
@@ -215,6 +228,12 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(
+        route.direct,
+        &counted,
+        || route.transports(),
+        &format!("{route:?}"),
+    );
     // The run selected something, so an output read from the replacement
     // could not pass for it by being empty.
     assert!(

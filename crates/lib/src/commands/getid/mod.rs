@@ -2309,6 +2309,19 @@ mod tests {
                 (OPENS, OPENS, false),
                 "direct {direct}: {counted:?}"
             );
+            // Which open took which transport, as the command's reach
+            // documents it: the probe and the streaming full scan direct,
+            // the estimate walk buffered. A count of direct opens would
+            // pass with either direct path fallen back.
+            {
+                use crate::test_hooks::Transport::{Buffered, Direct};
+                let expected = if direct {
+                    vec![Direct, Buffered, Direct]
+                } else {
+                    vec![Buffered; 3]
+                };
+                assert_eq!(counted.transports, expected, "direct {direct}: transports");
+            }
             let expected = std::fs::read(&reference).unwrap();
             assert_eq!(read_ids(&reference, &host), vec![1, 10]);
 

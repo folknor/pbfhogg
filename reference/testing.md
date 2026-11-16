@@ -77,12 +77,33 @@ Tests go where they couple least.
   construct a direct type themselves (`DirectReader::open`,
   `direct_io::open_for_read`) need none: the unit test
   `opens_carry_o_direct_and_count_once` in `direct_io.rs` holds that
-  those opens carry `O_DIRECT`. The sort and dedupe unit cells keep
-  their path-specific walker count (`header_walker::tests::direct_opens`).
-  A count proves direct setup, not that every transfer of the cell
-  used a direct descriptor, and a cell with several direct paths is
-  satisfied by any one of them; the path-specific fault-plan open
-  counts are what attribute opens. The io_uring cells that write
+  those opens carry `O_DIRECT`. Nor do cells whose direct leg is a
+  value only a `direct_io` open can produce and which the cell then
+  consumes: a walker from `HeaderWalker::open_direct` (over
+  `DirectPositional`), an `InputFile` with a direct alignment, or
+  pass 2's dedupe sources, whose per-source transport list
+  (`blob_merge::Sources::direct`) the cells assert for every input.
+  The sort and dedupe pass-1 unit cells keep their path-specific
+  walker count (`header_walker::tests::direct_opens`).
+
+  `O_DIRECT` belongs to the open file description, and nothing in the
+  crate clears it (the one `F_SETFL`, clearing `O_NONBLOCK` after a
+  pin's reopen, keeps the other flags), so every transfer on a direct
+  descriptor is direct and the question a witness has to answer is
+  which opens were direct. The count does not answer it: a cell with
+  several direct paths is satisfied by any one. The fault plan's
+  input replacement records the transport of every verified open of
+  its pinned target, in order (`InputReplacement::transports`, tagged
+  by the pin constructor, `open` or `open_direct`), and every
+  `fault_*_input` reference run, buffered runs included, asserts its
+  route's exact list through `common::witness_transports`, as does
+  the getid full-scan unit cell; the expected lists follow the reach
+  each command documents (`crates/cli/src/io_reach.rs`). That covers
+  the routes those files drive: the extract cells drive only sorted
+  single extracts direct (not the unsorted, Smart or multi-extract
+  routes), and sort and add-locations-to-ways have no direct fault
+  cell. The CLI cells assert only that a direct open happened, which
+  witnesses the flag reaching the library. The io_uring cells that write
   also assert `writer_uring_registered_buffers` (the call's metrics in
   unit and library tests, the marker stream in CLI cells), which
   proves the ring was set up; the fault plan's dispatch count, in hook

@@ -508,7 +508,7 @@ impl PinnedInput {
 
     /// See [`InputSource::open`].
     pub(crate) fn open(&self) -> Result<File> {
-        self.hooked(|| self.open_verified())
+        self.hooked(false, || self.open_verified())
     }
 
     /// See [`InputSource::open_direct`].
@@ -517,7 +517,7 @@ impl PinnedInput {
         &self,
         invocation: Option<&crate::host::Recorder>,
     ) -> Result<(File, usize)> {
-        self.hooked(|| {
+        self.hooked(true, || {
             crate::direct_io::open_for_read_verified(
                 &self.open_path(),
                 &self.0.path,
@@ -566,13 +566,21 @@ impl PinnedInput {
     }
 
     #[cfg(pbfhogg_test_hooks)]
-    fn hooked<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.0.cancel.faults().pinned_open(&self.0.path, open)
+    fn hooked<T>(&self, direct: bool, open: impl FnOnce() -> Result<T>) -> Result<T> {
+        let transport = if direct {
+            crate::test_hooks::Transport::Direct
+        } else {
+            crate::test_hooks::Transport::Buffered
+        };
+        self.0
+            .cancel
+            .faults()
+            .pinned_open(&self.0.path, transport, open)
     }
 
     #[cfg(not(pbfhogg_test_hooks))]
     #[allow(clippy::unused_self)]
-    fn hooked<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
+    fn hooked<T>(&self, _direct: bool, open: impl FnOnce() -> Result<T>) -> Result<T> {
         open()
     }
 

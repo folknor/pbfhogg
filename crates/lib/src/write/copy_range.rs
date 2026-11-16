@@ -961,6 +961,9 @@ mod tests {
 
     /// The patterned input of [`patterned_input`], opened `O_DIRECT`, or
     /// `None` (announced as a skip) where the scratch filesystem refuses it.
+    /// The direct witness is the type, not a counter: only a
+    /// `crate::direct_io` open gives an `InputFile` a direct alignment, and
+    /// the cells consume this one, so a cell that ran read direct.
     #[cfg(feature = "linux-direct-io")]
     fn direct_patterned_input(dir: &Path, len: usize) -> Option<(InputFile, Vec<u8>)> {
         if !crate::test_support::direct_reads_supported(dir, "the whole test") {

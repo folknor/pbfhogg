@@ -177,6 +177,7 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "BD", &format!("{route:?}"));
     assert_eq!(report, expected(route, input), "{route:?}: the report");
     Some(report)
 }

@@ -221,6 +221,7 @@ fn reference(
     assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "DBB", &format!("{route:?}"));
     assert_renumbered_input(&output, &stats, &format!("{route:?}, unreplaced"));
     let bytes = std::fs::read(&output).expect("read reference output");
     std::fs::remove_file(&output).expect("remove reference output");

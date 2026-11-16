@@ -79,6 +79,15 @@ impl Route {
         probe + 3
     }
 
+    /// The transport of each open on a direct run
+    /// (`common::witness_transports`): the probe, the header reads and the
+    /// `-R` stream direct, the two-pass schedule walk buffered.
+    fn transports(self) -> String {
+        let probe = if self.probes() { "D" } else { "" };
+        let rest = if self.omit_referenced { "D" } else { "DBD" };
+        format!("{probe}{rest}")
+    }
+
     fn expressions(self) -> Vec<String> {
         let mut out = vec!["w/highway=primary".to_string()];
         if self.relations {
@@ -214,6 +223,12 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(
+        route.direct,
+        &counted,
+        || route.transports(),
+        &format!("{route:?}"),
+    );
     assert_eq!(counted.attempts_after_fired, 0, "{route:?}: {counted:?}");
     if route.relations && !route.omit_referenced && !route.invert {
         // The closure ran both rounds: relation 3001, then way 2000.

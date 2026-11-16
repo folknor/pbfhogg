@@ -659,10 +659,28 @@ pub struct InputReplacement {
     pub verified: u64,
     /// Opens of `target` refused because its path named another file.
     pub refused: u64,
+    /// The transport of each verified open, in order. The tag is the pin
+    /// constructor's (`open` or `open_direct`), so `Direct` means the
+    /// descriptor came from `crate::direct_io`, whose own unit test
+    /// (`opens_carry_o_direct_and_count_once`) proves it carries
+    /// `O_DIRECT`; and since that flag belongs to the open file
+    /// description and nothing in the crate clears it, every transfer on
+    /// the descriptor is direct. What this list attributes is which open of
+    /// a route took which transport.
+    pub transports: Vec<Transport>,
     /// Whether the rename happened.
     pub fired: bool,
     /// Attempts made after the rename.
     pub attempts_after_fired: u64,
+}
+
+/// How a pinned input was opened; see [`InputReplacement::transports`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// A buffered open (`PinnedInput::open`).
+    Buffered,
+    /// An `O_DIRECT` open (`PinnedInput::open_direct`).
+    Direct,
 }
 
 /// The message of the source error behind an injected backend refusal, so a
@@ -978,6 +996,7 @@ impl FaultPlan {
             attempts: 0,
             verified: 0,
             refused: 0,
+            transports: Vec::new(),
             fired: false,
             attempts_after_fired: 0,
         });
@@ -994,10 +1013,11 @@ impl FaultPlan {
     }
 
     /// Called by a pinned input for every later open of `target`; `open`
-    /// opens and verifies.
+    /// opens and verifies, over `transport`.
     pub(crate) fn pinned_open<T>(
         &self,
         target: &Path,
+        transport: Transport,
         open: impl FnOnce() -> crate::Result<T>,
     ) -> crate::Result<T> {
         let mut guard = self.replacement();
@@ -1013,6 +1033,7 @@ impl FaultPlan {
         match &result {
             Ok(_) => {
                 armed.verified += 1;
+                armed.transports.push(transport);
                 if !armed.fired && armed.verified == armed.after {
                     // The fault itself: a file renamed over the input
                     // mid-run, as an atomic replace by a downloader does.

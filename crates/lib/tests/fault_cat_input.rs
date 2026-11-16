@@ -110,6 +110,18 @@ impl Route {
         let probed = raw_copy && self.enriched && !self.unindexed[..index].contains(&true);
         base + u64::from(probed)
     }
+
+    /// The transport of each open of input `index` on a direct run
+    /// (`common::witness_transports`): every open direct but a cleaning
+    /// route's schedule walk, the last, whose classify preads stay
+    /// buffered.
+    fn transports(self, index: usize) -> String {
+        let opens = usize::try_from(self.opens(index)).expect("open count");
+        let cleaning = self.clean().version;
+        (0..opens)
+            .map(|i| if cleaning && i + 1 == opens { 'B' } else { 'D' })
+            .collect()
+    }
 }
 
 /// What a fixture holds: nodes `first..first + 30` in blobs of ten, two ways
@@ -286,6 +298,7 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{cell}: {counted:?}");
     assert_eq!(counted.verified, opens, "{cell}: {counted:?}");
     assert_eq!(counted.refused, 0, "{cell}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || route.transports(target), &cell);
     let bytes = std::fs::read(&output).expect("read reference output");
     std::fs::remove_file(&output).expect("remove reference output");
 

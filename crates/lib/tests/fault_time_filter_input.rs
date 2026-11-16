@@ -46,6 +46,13 @@ impl Route {
     fn opens(self) -> u64 {
         if self.history { 1 } else { 2 }
     }
+
+    /// The transport of each open on a direct run
+    /// (`common::witness_transports`): the header read and the history
+    /// stream direct, a snapshot's classify preads buffered.
+    fn transports(self) -> &'static str {
+        if self.history { "D" } else { "DB" }
+    }
 }
 
 /// One fixture element: kind, ID, version, timestamp, visible.
@@ -242,6 +249,12 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(
+        route.direct,
+        &counted,
+        || route.transports(),
+        &format!("{route:?}"),
+    );
     assert_eq!(
         read_written(&output),
         expected(route),

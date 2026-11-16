@@ -1227,10 +1227,15 @@ pub(crate) struct Sources {
 }
 
 impl Sources {
-    /// Whether pass 2 reads its inputs `O_DIRECT`.
+    /// Per source, in argument order, whether pass 2 reads it `O_DIRECT`.
+    /// Only a `crate::direct_io` open gives an input a direct alignment, so
+    /// this is the transport of every source, not of any one.
     #[cfg(test)]
-    pub(crate) fn direct(&self) -> bool {
-        self.files.iter().any(|f| f.input.direct_align().is_some())
+    pub(crate) fn direct(&self) -> Vec<bool> {
+        self.files
+            .iter()
+            .map(|f| f.input.direct_align().is_some())
+            .collect()
     }
 }
 

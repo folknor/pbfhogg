@@ -684,7 +684,9 @@ mod tests {
                 &crate::host::Call::detached(),
             )
             .expect("open inputs");
-            assert_eq!(sources.direct(), direct);
+            // Every source's transport, not any one: a pass-2 input left
+            // buffered beside a direct one fails here.
+            assert_eq!(sources.direct(), vec![direct; merge.inputs.len()]);
             let mut buf = blob_merge::FrameBuf::default();
             let call = crate::host::Call::detached();
             let err = match blob_merge::read_block(&sources[entry.source], entry, &mut buf, &call) {
@@ -745,7 +747,11 @@ mod tests {
                     &crate::host::Call::detached(),
                 )
                 .expect("open inputs");
-                assert_eq!(opened.direct(), direct, "splice {splice}");
+                assert_eq!(
+                    opened.direct(),
+                    vec![direct; merge.inputs.len()],
+                    "splice {splice}"
+                );
             }
             let sources = blob_merge::open_sources(
                 merge.inputs.clone(),

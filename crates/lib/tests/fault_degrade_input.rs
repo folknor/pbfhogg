@@ -398,6 +398,7 @@ fn decode_reference(
     assert_eq!(counted.attempts, DECODE_OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, DECODE_OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "DDB", &format!("{route:?}"));
     Reference::of(route, &output)
 }
 

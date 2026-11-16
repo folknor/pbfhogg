@@ -1476,7 +1476,9 @@ pub(crate) mod tests {
 
     /// The captured extent holds for every transport: bytes appended after
     /// open are not walked, and committed bytes that vanish after open fail
-    /// the walk instead of ending it cleanly.
+    /// the walk instead of ending it cleanly. The direct leg's witness is
+    /// `open_direct`'s return type (a walker over `DirectPositional` or an
+    /// error), so it counts no opens.
     #[test]
     fn the_walk_keeps_the_extent_captured_at_open() {
         let dir = crate::path_guard::tests::scratch();

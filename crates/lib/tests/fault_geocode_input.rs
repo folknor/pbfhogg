@@ -268,6 +268,7 @@ fn reference(
     assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "DDBB", &format!("{route:?}"));
     assert_index_of(
         &index_dir,
         &INPUT,

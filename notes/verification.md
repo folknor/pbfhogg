@@ -42,20 +42,21 @@ every identity, which the strict element comparison and order check refuse. A
 witness needs overlapping way blobs with disjoint identities that keep inline
 coordinates and true indexdata.
 
-## VER-018 - Backend witnesses prove setup, not every transfer
+## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 
-Library and CLI cells that run a command with a direct option now assert a
-successful `O_DIRECT` open (`direct_io_*_opens`) on their own invocation
-(reference/testing.md "Platform-dependent tests"). Residue: the count proves
-setup, not that each transfer used the direct descriptor, and a cell with several
-direct paths (header walk and payload reader, two inputs) is satisfied by any one;
-only the fault plan's open counts attribute opens, and they do not record the
-transport. Unit cells gated by `test_support::direct_reads_supported` other than
-sort and dedupe (copy_range, frame_conformance_tests, getid, header_walker's
-direct-transport leg, dedupe's pass-2 helper) assert no direct count. io_uring
-stays outside the gate's requirement, so on a default-memlock host its cells skip
-and only the opt-in `full_registered_pool_instrument` proves the pool. Refusal
-predicates are the only route to a backend skip by convention, not by any audit.
+Every `fault_*_input` reference run asserts the exact transport of each pinned
+open (reference/testing.md "Platform-dependent tests"). Residue:
+
+- Direct routes no fault cell drives go unattributed: extract's unsorted, Smart
+  and multi-extract routes (only sorted single extracts run direct), and sort and
+  add-locations-to-ways, whose fault files have no direct route at all.
+- CLI direct cells assert only that some direct open happened (`>0`).
+- io_uring stays outside the gate's requirement (the host rule forbids an rlimit
+  precondition), so on a default-memlock host its cells skip and only the opt-in
+  `full_registered_pool_instrument` proves the pool.
+- Refusal predicates are the only route to a backend skip by convention. A
+  source-policy rule could confine backend-refusal inspection to the designated
+  helpers; it could not prove an early return exercised the backend.
 
 ## VER-122 - Some checks are not shown to pass the field policy their claim needs
 

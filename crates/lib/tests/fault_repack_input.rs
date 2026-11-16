@@ -367,6 +367,7 @@ fn reference(
     assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "DDB", &format!("{route:?}"));
 
     let (items, blobs) = read_items(&output);
     assert_eq!(

@@ -259,6 +259,7 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{cell}: {counted:?}");
     assert_eq!(counted.verified, opens, "{cell}: {counted:?}");
     assert_eq!(counted.refused, 0, "{cell}: {counted:?}");
+    crate::common::witness_transports(route.direct, &counted, || "DD", &cell);
 
     let swapped = dir.join("swapped.osm.pbf");
     write_input(&swapped, route, target, true);

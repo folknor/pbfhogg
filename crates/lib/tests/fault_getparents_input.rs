@@ -67,6 +67,18 @@ impl Route {
         2 + u64::from(!self.unindexed)
     }
 
+    /// The transport of each open on a direct run of an indexed input
+    /// (`common::witness_transports`): the dispatch probe direct, the
+    /// estimate walk buffered, then the full scan's stream direct or the
+    /// walker's scheduled preads buffered.
+    fn transports(self) -> &'static str {
+        assert!(!self.unindexed, "{self:?}: no direct transport spec");
+        match self.taken() {
+            Arm::FullScan => "DBD",
+            Arm::Walker => "DBB",
+        }
+    }
+
     fn min_blobs(self) -> u64 {
         match self.arm {
             Arm::Walker => u64::MAX,
@@ -259,6 +271,12 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(
+        route.direct,
+        &counted,
+        || route.transports(),
+        &format!("{route:?}"),
+    );
     assert_eq!(elements(&output), EXPECTED, "{route:?}");
     assert_eq!(
         (

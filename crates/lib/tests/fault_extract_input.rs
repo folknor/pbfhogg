@@ -108,6 +108,18 @@ impl Route {
         }
     }
 
+    /// The transport of each open on the direct routes this file drives,
+    /// single sorted extracts (`common::witness_transports`): the front
+    /// reads (probes, the header read) direct, the schedule walks and the
+    /// classify and write-pass preads buffered.
+    fn transports(self) -> &'static str {
+        match (self.multi, self.strategy, self.sorted) {
+            (false, Strategy::Simple, true) => "DBDBBBBBB",
+            (false, Strategy::Complete, true) => "DDBDB",
+            _ => panic!("{self:?}: no direct transport spec"),
+        }
+    }
+
     fn opens(self) -> u64 {
         let per_extract = self.strategy.opens(self.sorted);
         if !self.multi {
@@ -291,6 +303,12 @@ fn reference(
     assert_eq!(counted.attempts, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, opens, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
+    crate::common::witness_transports(
+        route.direct,
+        &counted,
+        || route.transports(),
+        &format!("{route:?}"),
+    );
     assert_eq!(counted.attempts_after_fired, 0, "{route:?}: {counted:?}");
     let bytes = outputs
         .iter()

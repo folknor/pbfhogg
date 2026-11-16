@@ -463,11 +463,14 @@ There is no startup cleanup or garbage collection by the driver.
 
 ## Certification
 
-The driver owns the 17 requirements in `crates/library/src/requirements.rs`,
+The driver owns the requirement table in `crates/library/src/requirements.rs`,
 independent of worker declarations and config. Its declaration test reads
 `crates/library/fixtures/describe.json` as a supplied serialized document,
-never through harness types. Refresh that fixture with
-`brokkr run pbfhogg-harness -- --describe-harness` when declarations change.
+never through harness types. The harness's black-box describe test
+(`crates/harness/tests/exe.rs`) holds that fixture equal, as parsed JSON, to
+the live `--describe-harness` output, so a declaration change fails there
+until the fixture is refreshed with
+`brokkr run pbfhogg-harness -- --describe-harness`.
 
 The sweep runs in describe order and resolves each scenario's dataset roles
 before its launch. Resolution failures are recorded as scenario failures;

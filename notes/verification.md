@@ -56,15 +56,6 @@ stays outside the gate's requirement, so on a default-memlock host its cells ski
 and only the opt-in `full_registered_pool_instrument` proves the pool. Refusal
 predicates are the only route to a backend skip by convention, not by any audit.
 
-## VER-090 - The requirement-table check is convention-bound
-
-`required` in `crates/harness/src/describe.rs` now refuses anything outside its convention
-(exactly one root table, exact line shape, no duplicate ids, and any pbfhogg or library key
-or nested include in an included file), and the authoritative composed check is
-`brokkr library --all`. It still does not parse composed TOML; residue only if a
-composed-configuration parse is ever wanted, which needs a brokkr configuration export
-brokkr does not offer.
-
 ## VER-113 - dedupe-pair does not prove its copy path
 
 `diff-unindexed.lua` now probes both fronts before measuring and fails on indexed input.

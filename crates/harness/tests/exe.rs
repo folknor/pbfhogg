@@ -73,6 +73,16 @@ fn describe_prints_one_valid_document_and_nothing_else() {
     assert_eq!(doc["protocol"], 1);
     let scenarios = doc["scenarios"].as_array().expect("scenarios");
     assert!(scenarios.iter().any(|s| s["id"] == "repeat-cat"));
+    // The independent driver's coverage tests read a committed copy of this
+    // document rather than harness types; holding the copy to the live
+    // output makes declaration drift fail here instead of passing there.
+    let fixture: Value =
+        serde_json::from_slice(include_bytes!("../../library/fixtures/describe.json"))
+            .expect("committed describe fixture");
+    assert_eq!(
+        doc, fixture,
+        "refresh crates/library/fixtures/describe.json from --describe-harness"
+    );
     // It wrote nothing but its two capture files.
     let entries = std::fs::read_dir(scratch.path()).expect("list").count();
     assert_eq!(entries, 2);

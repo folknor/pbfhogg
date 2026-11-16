@@ -19,18 +19,50 @@ fn renumber_opl(fault: &str, pbfhogg: bool) -> String {
         } else {
             ""
         };
+        // A version-only change of one relation: renumber keeps metadata.
+        let version = if pbfhogg && fault == "metadata" && r == 12 {
+            2
+        } else {
+            1
+        };
         let members = match (r, pbfhogg, fault) {
             (10, false, _) => "n11@",
             (10, true, "orphan-live") => "n10@",
             (10, true, _) => "n16@",
             _ => "",
         };
-        lines.push(format!("r{r} v1 T{tags} M{members}"));
+        lines.push(format!("r{r} v{version} T{tags} M{members}"));
     }
     if pbfhogg && fault == "node" {
         lines[0] = "n10 v1 Ta=1".to_owned();
     }
     lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
+/// The OPL the fake osmium decodes the text diff's pair to, with every
+/// field: OLD (`new` `None`) and NEW as written under fault `new`. n1's
+/// name changed, as pbfhogg reports. Under `untouched` n2 also changed, by
+/// a shifted tag boundary osmium diff's checksum could not see, which
+/// pbfhogg does not report; under `version` n1 also moved to v2, which
+/// pbfhogg's header does not report; under `metadata-only` n2 moved to v2
+/// alone, and under `coords` w1's inline coordinate alone changed, neither
+/// a difference pbfhogg may report.
+fn text_opl(new: Option<&str>) -> String {
+    let fault = new.unwrap_or("");
+    let n1 = if fault == "version" { 2 } else { 1 };
+    let n2 = if fault == "metadata-only" { 2 } else { 1 };
+    let n2_tags = if fault == "untouched" {
+        "Tab=c"
+    } else {
+        "Ta=bc"
+    };
+    let x = if fault == "coords" { 3 } else { 1 };
+    format!(
+        "n1 v{n1} dV c1 t2020-01-01T00:00:00Z i1 ua Tname={} x1 y2\n\
+         n2 v{n2} dV c1 t2020-01-01T00:00:00Z i1 ua {n2_tags} x1 y2\n\
+         w1 v1 dV c1 t2020-01-01T00:00:00Z i1 ua T Nn1x{x}y2\n",
+        if new.is_some() { "y" } else { "x" }
+    )
 }
 
 pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
@@ -63,6 +95,9 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "plain-listing",
                 "exit",
                 "untouched",
+                "version",
+                "metadata-only",
+                "coords",
                 "unsorted",
                 "publish",
             ],
@@ -86,6 +121,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "relation",
                 "orphan-live",
                 "one-sided",
+                "metadata",
                 "unsorted",
                 "publish",
             ],
@@ -97,29 +133,63 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             // A required-only sort feature must still take the refusal route.
             if ["unsorted", "publish"].contains(&fault) {
                 fake_pbf::write_with(&input, &[SORTED], &[], "unsorted");
+            } else if check == "text" {
+                // The text pair's decodings key on content alone.
+                fake_pbf::write_with(&input, &[SORTED], &[SORTED], "text-old");
             } else {
                 fake_pbf::write_with(&input, &[SORTED], &[SORTED], "sorted");
             }
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
             h.run.watch(&osc).unwrap();
-            let status = h
-                .run_check(check, |h| match check {
-                    "text" => checks::diff::run(h, &input, &osc, true),
-                    "osc" => checks::derive_changes::run(h, &input, &osc, true),
-                    _ => checks::renumber::run(h, &input, "fixture", Some("10"), true, true),
-                })
-                .unwrap();
+            let judged = super::judge(&mut h, check, |h| match check {
+                "text" => checks::diff::run(h, &input, &osc, true),
+                "osc" => checks::derive_changes::run(h, &input, &osc, true),
+                _ => checks::renumber::run(h, &input, "fixture", Some("10"), true, true),
+            });
+            assert_judged(check, fault, &judged);
+        }
+    }
+}
+
+/// Hold one fault's outcome to what it must be.
+fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
+    let passes = [
+        "",
+        "unsorted",
+        "roundtrip-metadata",
+        "metadata-only",
+        "coords",
+    ];
+    assert_eq!(
+        judged.status,
+        if passes.contains(&fault) {
+            harness::CheckStatus::Passed
+        } else {
+            harness::CheckStatus::Failed
+        },
+        "{check}: {fault}: {judged:?}"
+    );
+    // One field class altered: the text diff reads versions from the merged
+    // listing, renumber's attribution compares metadata.
+    match (check, fault) {
+        ("text", "version") => {
             assert_eq!(
-                status,
-                if fault.is_empty() || fault == "unsorted" || fault == "roundtrip-metadata" {
-                    harness::CheckStatus::Passed
-                } else {
-                    harness::CheckStatus::Failed
-                },
-                "{check}: {fault}"
+                judged.failed,
+                ["indexed verbose listing vs osmium content"],
+                "{judged:?}"
+            );
+            assert_eq!(judged.error, None);
+        }
+        ("renumber", "metadata") => {
+            assert!(judged.failed.is_empty(), "{judged:?}");
+            assert!(
+                judged.error.as_deref().is_some_and(|e| e
+                    .contains("relation 12 differs: a field other than its node or member refs")),
+                "{judged:?}"
             );
         }
+        _ => {}
     }
 }
 
@@ -139,29 +209,20 @@ pub fn tool(args: &[OsString]) -> i32 {
     if fake_pbf::is_opl_cat(&args) {
         // Keyed on content, as the reference cache keys the decode.
         let marker = fake_pbf::marker(Path::new(args[1]));
-        if check == "text" && marker == "sorted" {
-            // The text diff's pair: n1's name changed, as pbfhogg reports;
-            // under the untouched fault n2 also changed, by a shifted tag
-            // boundary osmium diff's checksum could not see, which pbfhogg
-            // does not report.
-            let new = args[1].ends_with("new.osm.pbf");
-            let n2 = if new && fault == "untouched" {
-                "Tab=c"
-            } else {
-                "Ta=bc"
-            };
-            std::fs::write(
-                value("-o"),
-                format!(
-                    "n1 v1 dV c1 t2020-01-01T00:00:00Z i1 ua Tname={} x1 y2\n\
-                     n2 v1 dV c1 t2020-01-01T00:00:00Z i1 ua {n2} x1 y2\n",
-                    if new { "y" } else { "x" }
-                ),
-            )
-            .unwrap();
+        // Every decoding is projected by the requested options, so a check
+        // passing the comparison the wrong field policy decodes differently.
+        let opl = if marker == "text-old" {
+            Some(text_opl(None))
+        } else if let Some(written_under) = marker.strip_prefix("text-new-") {
+            Some(text_opl(Some(written_under)))
         } else if let Some(rest) = marker.strip_prefix("renumber-") {
             let (side, written_under) = rest.split_once('-').unwrap();
-            std::fs::write(value("-o"), renumber_opl(written_under, side == "pbfhogg")).unwrap();
+            Some(renumber_opl(written_under, side == "pbfhogg"))
+        } else {
+            None
+        };
+        if let Some(opl) = opl {
+            std::fs::write(value("-o"), fake_pbf::project(&args, &opl)).unwrap();
         } else {
             fake_pbf::opl_cat(&args);
         }
@@ -204,6 +265,7 @@ pub fn tool(args: &[OsString]) -> i32 {
                 let marker = match (args[0], ours) {
                     ("renumber", true) => format!("renumber-pbfhogg-{fault}"),
                     ("renumber", false) => format!("renumber-osmium-{fault}"),
+                    ("apply-changes", _) if check == "text" => format!("text-new-{fault}"),
                     _ if broken => "wrong".to_owned(),
                     _ if versioned => "sorted @v2".to_owned(),
                     _ => "sorted".to_owned(),
@@ -271,7 +333,8 @@ fn diff_tool(args: &[&str], fault: &str, check: &str) -> i32 {
     if fault == "summary" {
         eprintln!("Files are identical (1 common elements)");
     } else {
-        eprintln!("1 differences: 0 created, 1 modified, 0 deleted (1 common)");
+        // n2 and w1 are common, as osmium's content gives them.
+        eprintln!("1 differences: 0 created, 1 modified, 0 deleted (2 common)");
     }
     println!("*n1 v1");
     if verbose {

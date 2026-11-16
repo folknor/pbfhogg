@@ -6,6 +6,7 @@
 //! exactly when their markers are equal, and it decodes by the requested
 //! OPL options ([`project`]), so a fixture whose version alone differs
 //! ([`alter`]) differs exactly under a policy that reads metadata.
+use std::fmt::Write as _;
 use std::path::Path;
 
 const MARKER: &[u8] = b"marker:";
@@ -73,23 +74,40 @@ pub fn marker(path: &Path) -> String {
     full.split(" @").next().unwrap().to_owned()
 }
 
-/// The version a fixture's node decodes with: its marker's last `@v`
-/// suffix, default 1.
-fn version(path: &Path) -> String {
+/// A fixture's field suffixes as written (` @v2 @w1`), empty when none: what
+/// a fake tool that rewrites content but keeps fields carries over.
+pub fn suffixes(path: &Path) -> String {
+    let full = full_marker(path);
+    full.find(" @")
+        .map_or_else(String::new, |at| full[at..].to_owned())
+}
+
+/// The fields a fixture decodes with, from its marker's suffixes, the last
+/// of each kind winning: the version (`@v<N>`, default 1) and, when an
+/// `@w<X>` suffix is present, a way whose one node carries the inline
+/// longitude `X`. The way's presence is content and never follows the
+/// `LocationsOnWays` declaration, so dropping the declaration does not
+/// remove an identity.
+fn fields(path: &Path) -> (String, Option<String>) {
     let full = full_marker(path);
     let mut version = "1".to_owned();
+    let mut way = None;
     for suffix in full.split(" @").skip(1) {
-        let v = suffix
-            .strip_prefix('v')
-            .unwrap_or_else(|| panic!("unknown fixture field suffix {suffix:?}"));
-        v.clone_into(&mut version);
+        if let Some(v) = suffix.strip_prefix('v') {
+            v.clone_into(&mut version);
+        } else if let Some(x) = suffix.strip_prefix('w') {
+            way = Some(x.to_owned());
+        } else {
+            panic!("unknown fixture field suffix {suffix:?}");
+        }
     }
-    version
+    (version, way)
 }
 
 /// Copy fixture `src` to `dst` (features, content and fields) with
-/// `suffix` (`@v<version>`) appended, so `dst` decodes with its metadata
-/// altered and everything else equal.
+/// `suffix` (`@v<version>` or `@w<longitude>`) appended, so `dst` decodes
+/// with its metadata or its way's inline coordinate altered and everything
+/// else equal.
 pub fn alter(src: &Path, dst: &Path, suffix: &str) {
     let features = features(src);
     let refs: Vec<&str> = features.iter().map(String::as_str).collect();
@@ -125,7 +143,8 @@ pub fn is_opl_cat(args: &[&str]) -> bool {
 
 /// Answer an [`is_opl_cat`] invocation: one node record carrying the
 /// input's content marker (its non-alphanumeric bytes as `_`) and its
-/// version, [`project`]ed by the requested format.
+/// version, then the way its fields name, [`project`]ed by the requested
+/// format.
 pub fn opl_cat(args: &[&str]) {
     let input = Path::new(args[1]);
     let output = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
@@ -133,8 +152,11 @@ pub fn opl_cat(args: &[&str]) {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let version = version(input);
-    let opl = format!("n1 v{version} dV c1 t i1 u Tm={content} x1 y1\n");
+    let (version, way) = fields(input);
+    let mut opl = format!("n1 v{version} dV c1 t i1 u Tm={content} x1 y1\n");
+    if let Some(x) = way {
+        writeln!(opl, "w1 v{version} dV c1 t i1 u T Nn1x{x}y1").unwrap();
+    }
     std::fs::write(output, project(args, &opl)).unwrap();
 }
 

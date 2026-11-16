@@ -141,7 +141,14 @@ impl Harness {
 
     /// Whether the check in flight has recorded a failure.
     pub(crate) fn failed(&self) -> bool {
-        !self.failures.is_empty()
+        !self.failures().is_empty()
+    }
+
+    /// The names of the comparisons the check in flight has failed, in the
+    /// order recorded. The generated protocols in `crates/verify/tests` read
+    /// them to tell which arm of a multi-arm check a fault reached.
+    pub(crate) fn failures(&self) -> &[String] {
+        &self.failures
     }
 
     /// The fresh directory of the check in flight, named `name`.

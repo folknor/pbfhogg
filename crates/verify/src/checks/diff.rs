@@ -311,6 +311,12 @@ fn against_osmium(
 ) -> Result<Judgement, Error> {
     harness.msg("--- osmium OPL decodings, merged ---");
     let osmium_listing = outdir.join("osmium-diff.opl");
+    // Metadata is read: a listed pair of equal content is `equal_listed` and
+    // headers carry versions. Whether inline way coordinates are read does
+    // not change the verdict: a pair differing only in them merges as
+    // listed but has equal content (`Object::same_content` compares refs,
+    // not coordinates), so it counts as common either way, and FULL would
+    // judge the same as NO_LOCATIONS.
     let merged = opl_compare::compare(
         harness,
         pbf,

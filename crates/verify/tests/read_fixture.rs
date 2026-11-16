@@ -36,20 +36,39 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         );
     }
     // A content change fails both, and so does a version-only change: both
-    // compare metadata.
+    // compare metadata, every arm by name.
     for fault in ["content", "metadata"] {
-        for (name, run) in [
-            ("bad-cat", checks::cat::run as checks::ReadCheck),
-            ("bad-tags", checks::tags_filter::run),
+        for (name, run, arms) in [
+            (
+                "bad-cat",
+                checks::cat::run as checks::ReadCheck,
+                [
+                    "cat -t node diff",
+                    "cat -t way diff",
+                    "cat -t relation diff",
+                ],
+            ),
+            (
+                "bad-tags",
+                checks::tags_filter::run,
+                [
+                    "tags-filter --omit-referenced highway=primary diff",
+                    "tags-filter --omit-referenced amenity=restaurant diff",
+                    "tags-filter --omit-referenced w/highway=primary diff",
+                ],
+            ),
         ] {
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();
             std::fs::write(dir.join("fault"), fault).unwrap();
+            let judged = super::judge(&mut h, name, |h| run(h, &input, true));
             assert_eq!(
-                h.run_check(name, |h| run(h, &input, true)).unwrap(),
+                judged.status,
                 harness::CheckStatus::Failed,
                 "{name}: {fault}"
             );
+            assert_eq!(judged.error, None, "{name}: {fault}");
+            assert_eq!(judged.failed, arms, "{name}: {fault}");
         }
     }
     std::fs::write(dir.join("fault"), "").unwrap();
@@ -90,6 +109,28 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         .unwrap(),
         harness::CheckStatus::Failed
     );
+    // One field class altered on the external engine's output alone: its
+    // comparison with osmium and the engine parity must each fail, so the
+    // parity reads metadata and inline coordinates, and the per-engine
+    // comparison of two outputs declaring LocationsOnWays reads them too.
+    for fault in ["parity-metadata", "parity-coords"] {
+        h.run = run::Run::create(&dir, exe, true).unwrap();
+        h.run.watch(&input).unwrap();
+        std::fs::write(dir.join("fault"), fault).unwrap();
+        let judged = super::judge(&mut h, fault, |h| {
+            checks::add_locations::run(h, &input, checks::add_locations::AltwMode::All, true)
+        });
+        assert_eq!(judged.status, harness::CheckStatus::Failed, "{fault}");
+        assert_eq!(judged.error, None, "{fault}");
+        assert_eq!(
+            judged.failed,
+            [
+                "add-locations-to-ways --index-type external diff",
+                "sparse vs external osmium-decoded records"
+            ],
+            "{fault}"
+        );
+    }
     std::fs::write(dir.join("fault"), "").unwrap();
     // A separate generated input routes external to refusal only.
     h.run = run::Run::create(&dir, exe, true).unwrap();
@@ -165,6 +206,24 @@ fn fault_output(fault: &str, input: &Path, output: &Path) {
     }
 }
 
+/// Write an add-locations-to-ways `output` of `input`, by pbfhogg's
+/// `engine` or (`None`) by osmium. Every output carries a way with an inline
+/// coordinate; the parity faults alter one field class of the external
+/// engine's output alone.
+fn write_located(fault: &str, input: &Path, output: &Path, engine: Option<&str>) {
+    if engine.is_some() && fake_pbf::marker(input) == "unsorted" {
+        fake_pbf::write(output, &[LOW], "unsorted @w1");
+        return;
+    }
+    let external = engine == Some("external");
+    let marker = match fault {
+        "parity-metadata" if external => "sorted @w1 @v2",
+        "parity-coords" if external => "sorted @w1 @w2",
+        _ => "sorted @w1",
+    };
+    fake_pbf::write(output, &[SORTED, LOW], marker);
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "One explicit arm per emulated tool invocation"
@@ -215,7 +274,9 @@ pub fn tool(args: &[OsString]) -> i32 {
         "sort" => {
             let locations = asks_locations(&args);
             let features: &[&str] = if locations { &[SORTED, LOW] } else { &[SORTED] };
-            fake_pbf::write(output(), features, "sorted");
+            // Sorting keeps every field, the way and its coordinate too.
+            let marker = format!("sorted{}", fake_pbf::suffixes(Path::new(args[1])));
+            fake_pbf::write(output(), features, &marker);
         }
         "check" if args.contains(&"--refs") => {
             assert!(!args.contains(&"--direct-io"));
@@ -262,13 +323,10 @@ pub fn tool(args: &[OsString]) -> i32 {
             } else {
                 assert!(args.contains(&"--keep-member-nodes"));
             }
-            let unsorted = args.contains(&"--index-type")
-                && fake_pbf::marker(Path::new(args[1])) == "unsorted";
-            if unsorted {
-                fake_pbf::write(output(), &[LOW], "unsorted");
-            } else {
-                fake_pbf::write(output(), &[SORTED, LOW], "sorted");
-            }
+            let engine = args
+                .contains(&"--index-type")
+                .then(|| value("--index-type"));
+            write_located(&fault, Path::new(args[1]), output(), engine);
         }
         "check" => {
             assert!(args.contains(&"--locations"));

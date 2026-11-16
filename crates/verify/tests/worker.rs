@@ -59,6 +59,44 @@ mod encoding_fixture;
 #[path = "diff_fixture.rs"]
 mod diff_fixture;
 
+/// How one check run under [`judge`] ended: its status, the comparisons it
+/// recorded as failed (in order, duplicates kept) and the error its closure
+/// returned, if any.
+#[derive(Debug)]
+pub(crate) struct Judged {
+    pub status: harness::CheckStatus,
+    pub failed: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Run `check` as `name` and report which comparisons failed, so a fault
+/// aimed at one arm of a check is held to failing that arm and no other: an
+/// arm on the wrong field policy shows as a missing name, which a final
+/// status alone cannot show while another arm fails.
+pub(crate) fn judge(
+    h: &mut harness::Harness,
+    name: &str,
+    check: impl FnOnce(&mut harness::Harness) -> Result<Option<String>, error::Error>,
+) -> Judged {
+    let mut failed = Vec::new();
+    let mut error = None;
+    let status = h
+        .run_check(name, |h| {
+            let result = check(h);
+            failed = h.failures().to_vec();
+            if let Err(e) = &result {
+                error = Some(e.to_string());
+            }
+            result
+        })
+        .unwrap();
+    Judged {
+        status,
+        failed,
+        error,
+    }
+}
+
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     let role = args[1].to_str().unwrap();

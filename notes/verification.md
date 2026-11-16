@@ -60,23 +60,20 @@ predicates are the only route to a backend skip by convention, not by any audit.
 
 Reported by bench-verify.
 
-The generated fixtures' fake osmium now decodes by the requested OPL options
-(`fake_pbf::project`), and one-field-class faults witness the policy of extract,
-multi-extract, cat, tags-filter, repack, degrade, apply-changes (metadata in both modes,
-coordinates left out in locations mode) and the derive-changes roundtrip (metadata ignored).
-Not yet witnessed:
+Every check's policy choice except the ones below is witnessed by a one-field-class fault in
+the generated protocols (reference/verify.md "How outputs are judged" lists them). Not yet:
 
-- Text diff: it classifies metadata-only differences as common (`equal_listed`) and reads
-  versions in its verbose headers, so its witness is a version change on a content-modified
-  object with a wrong listed version, plus a metadata-only change that must pass.
-- Renumber (`compare_paired` attribution parses `N`/`M` lists), add-locations engine parity
-  (the per-engine osmium comparisons and digests can supply a failure, so the parity verdict
-  itself must be asserted), and the both-declared coordinate branch of `Policy::between` on
-  sort, cat, getid invert and cat-dedupe: the header-only fake PBFs cannot keep
-  LocationsOnWays where a check requires indexed data blobs (cat's `first_data_blob_indexed`).
-- The witnesses assert a final `Failed`, and multi-arm checks fault every arm at once, so one
-  correct arm can mask another arm on the wrong policy; asserting the named comparison's
-  diagnostic per arm would close that.
+- The both-declared coordinate branch of `Policy::between` on sort, cat, getid invert and
+  cat-dedupe: no generated protocol drives `sort::run`, `getid_removeid::run` or
+  `cat_dedupe::run`, and cat keeps LocationsOnWays only on an indexed first data blob
+  (`first_data_blob_indexed`), which the header-only fake PBFs lack. The fake can now carry a
+  way with an inline coordinate (`fake_pbf` `@w` suffix), so a driver for these checks is the
+  missing piece, not the decode.
+- The extract, multi-extract, repack, degrade, apply-changes and derive-changes witnesses
+  still assert only the final status, and their faults reach every arm at once; `judge` in
+  `crates/verify/tests/worker.rs` returns the failed comparison names, so asserting the
+  exact set per fault (as the cat, tags-filter, text diff, renumber and add-locations
+  witnesses do) would stop a correct arm masking one on the wrong policy.
 
 ## VER-133 - Geocode admin and antimeridian paths the real-data check does not reach
 

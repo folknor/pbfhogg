@@ -75,8 +75,19 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   extract, multi-extract, cat, tags-filter, repack, degrade and
   apply-changes (both modes) and passes the derive-changes roundtrip; an
   inline-coordinate-only change fails repack and degrade and passes
-  apply-changes in locations mode. The other checks' choices are not yet
-  witnessed.
+  apply-changes in locations mode. In the text diff, a version change
+  pbfhogg's header omits fails, and a version-only or
+  inline-coordinate-only change passes as common (the listing judges
+  content, which excludes coordinates, so reading them would not change
+  the verdict); a version-only change of one relation fails renumber.
+  On add-locations-to-ways, a version-only or inline-coordinate-only
+  change of the external engine's output alone fails exactly its
+  comparison with osmium and the engine parity, each by name, which
+  witnesses the both-declared branch of `Policy::between` there. Sort,
+  cat, getid `--invert` and cat `--dedupe` are not driven by any
+  generated protocol, so their choices are not yet witnessed. The cat,
+  tags-filter, text diff, renumber and add-locations-to-ways witnesses
+  name every failing comparison; the others assert the final status only.
 - **The `LocationsOnWays` declaration** of each output of sort, cat,
   tags-filter, getid (plain, `--invert` and `--add-referenced`),
   getparents, extract, multi-extract, renumber and apply-changes is judged

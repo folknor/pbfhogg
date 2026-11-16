@@ -541,6 +541,21 @@ test_code = "only"
 must_scan = ["crates/lib/src/read/blob.rs", "crates/lib/tests/common/mod.rs", "crates/cli/tests/cli_scratch.rs", "crates/harness/tests/exe.rs"]
 message = "Fixtures change no process state; the descriptor limit is raised once at start-up in crates/lib/tests/process_setup.rs, and real-limit scenarios own their processes"
 
+# A library test's FdPool is built by crates/lib/tests/common/fd_gate.rs
+# `pool`, which routes a pool above the light grant through a descriptor
+# ticket; a pool built or installed elsewhere would run a heavy join
+# outside the gate.
+[[textlint]]
+require_live_paths = true
+name = "fd-pool-through-the-gate"
+pattern = '\bFdPool\b'
+paths = ["crates/lib/tests/**/*.rs"]
+exclude = ["crates/lib/tests/common/fd_gate.rs"]
+region = "code"
+test_code = "only"
+must_scan = ["crates/lib/tests/fd_pool.rs"]
+message = "Build a test FdPool with common::fd_gate::pool, which requires a descriptor ticket above the light grant"
+
 # FIFOs in the integration-test trees have two owners: creation is
 # crates/lib/tests/common/mod.rs make_fifo, draining is
 # crates/lib/tests/common/fifo_capture.rs, whose reader blocks in poll and is

@@ -297,6 +297,13 @@ pub(super) fn stage3_slot_reorder(
                                 ))
                             })?;
                         t_open.record_ms(&c.open_ms);
+                        // Test-only: the stage 3 and 4 peak rendezvous,
+                        // held with this bucket's file open.
+                        #[cfg(pbfhogg_test_hooks)]
+                        cancel.faults().on_altw_stage34_peak(
+                            crate::test_hooks::FleetParty::Stage3Worker(worker_id),
+                            || cancel.is_cancelled() || router.is_aborted(),
+                        );
 
                         let t_read = crate::counters::Stopwatch::start();
                         std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf).map_err(

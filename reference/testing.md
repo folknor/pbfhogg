@@ -273,31 +273,37 @@ NAME` list each harness in turn to find one test.
   takes one ticket of whole-run units from the binary's gate
   (`common::heavy_ticket`, in `crates/lib/tests/common/fd_gate.rs`) and
   builds its hosts from it (`common::heavy_host`, or a test-local
-  provider delegating to the ticket); a test that builds its own
-  `host::FdPool` holds a ticket by hand. The gate admits tickets in
-  arrival order against the soft limit less `TEST_LIGHT_FD_RESERVE`,
-  charging `TEST_HEAVY_RUN_FDS` per unit. A scenario whose units exceed
-  what the limit leaves, or that is not admitted within
+  provider delegating to the ticket). A test's `host::FdPool` is built
+  only by `fd_gate::pool` (a textlint holds the rest of the tree to it),
+  which needs a ticket for a budget above the light grant, holds a unit
+  per grant and asks the pool for at most the heavy grant. The gate
+  admits tickets in arrival order against the soft limit less
+  `TEST_LIGHT_FD_RESERVE`, charging `TEST_HEAVY_RUN_FDS` per unit. A
+  ticket panics, naming the scenario, at a request that would leave more
+  grants live through it than it has units. A scenario whose units
+  exceed what the limit leaves, or that is not admitted within
   `TEST_FD_ADMISSION_BOUND` behind its siblings, skips as environmental
   before it opens anything; on an ordinary host it never waits. What
-  this does not bound: a ticket's units bound its simultaneous runs by
-  the scenario's construction, which nothing checks; the per-run charge
-  is witnessed only for the largest external join a heavy grant admits
-  (the `process_nofile` target forces every stage-1 fleet and the
-  relation scan's input open at once and the most slot buckets, reaches
-  the join as External and as Auto with buffered, O_DIRECT and io_uring
-  output where the host accepts each, and runs every arm under a kernel
-  limit leaving exactly the charge free), not for stage 3 and stage 4 at
-  their most simultaneous descriptors, which a completed run need not
-  overlap; fault paths are bounded from the code, since no fault hook
-  opens a descriptor; a heavy scenario holds no descriptor of its own
-  across a run beyond the input pin the run shares; the light reserve is asserted, not measured,
-  since a process-wide descriptor count in this shared binary includes
-  every concurrent test and light use grows with the runner's thread
-  count; light tests'
-  descriptors, and every command that requests none, are not counted;
-  and a test holding a ticket must not take another (it waits on itself
-  and skips).
+  this does not bound: the unit check sees overlapping requests, not
+  overlapping whole runs (an external join requests only its stage-1
+  shard files, so two joins on one unit overlapping after stage 1 pass
+  it); the per-run charge is witnessed only for the largest external
+  join a heavy grant admits (the `process_nofile` target forces every
+  stage-1 fleet and the relation scan's input open at once, then every
+  stage 3 worker's bucket file with stage 4's input and output open at
+  once, with the most slot buckets, reaches the join as External and as
+  Auto with buffered, O_DIRECT and io_uring output where the host
+  accepts each, and runs every arm under a kernel limit leaving exactly
+  the charge free), so a backend the host refuses is unobserved there;
+  fault paths are bounded from the code, since no fault hook opens a
+  descriptor; a heavy scenario holds no descriptor of its own across a
+  run beyond the input pin the run shares; the light reserve is
+  asserted, not measured, since a process-wide descriptor count in this
+  shared binary includes every concurrent test and light use grows with
+  the runner's thread count; light tests' descriptors, every command
+  that requests none, and test-local providers that answer outright
+  rather than delegating to a ticket are not counted; and a test holding
+  a ticket must not take another (it waits on itself and skips).
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily
   swaps the panic hook to silence its deliberate worker panic. While the
   replacement is installed, it can also suppress panic output from another
@@ -1217,9 +1223,12 @@ descriptors (less the listing's own), sets the soft limit to that count
 plus `TEST_HEAVY_RUN_FDS` (skipping if an open descriptor lies at or above
 it), and runs the largest external join a heavy grant admits, its stage-1
 fleets and relation input held open together by the fault plan's fleet
-rendezvous, which must end `Complete`, once per arm: External and Auto
-with buffered output, External with O_DIRECT and io_uring output in builds
-with those features, an arm whose backend the host refuses skipping. Every scenario runs under one
+rendezvous, then its four stage 3 workers' bucket files and stage 4's input
+and output held open together by its stage 3 and 4 peak rendezvous, both
+of which must end `Complete`, once per arm: External and Auto with
+buffered output, External with O_DIRECT and io_uring output in builds with
+those features, an arm whose backend the host refuses skipping. Every
+scenario runs under one
 libtest test, since all of them open descriptors and some change the
 limit.
 The harness package tests real probes the same way without a target of its

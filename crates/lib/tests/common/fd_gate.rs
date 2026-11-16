@@ -12,18 +12,23 @@
 //!
 //! What it does and does not bound: the gate admits tickets in arrival
 //! order against the soft limit less `TEST_LIGHT_FD_RESERVE`; a ticket's
-//! units bound the scenario's simultaneous whole runs by the scenario's
-//! construction, which nothing checks; one unit is charged
-//! `TEST_HEAVY_RUN_FDS`, which `process_nofile.rs` witnesses for the
-//! largest external join a heavy grant admits (every stage-1 fleet and the
-//! relation scan's input open at once, the most slot buckets, reached as
-//! External and as Auto, with buffered, O_DIRECT and io_uring output where
-//! the host accepts them, under a kernel limit leaving exactly the charge
-//! free), not for stage 3 and stage 4 at their most simultaneous
-//! descriptors; fault paths are bounded from the code, since no fault hook
-//! opens a descriptor. A heavy scenario holds no descriptor of its own
-//! across a run beyond the input pin the run shares. Light tests' descriptors are not requested or
-//! counted; the reserve covers them by assertion. Neither a count of
+//! units bound the scenario's simultaneous grants, checked at each request
+//! ([`FdTicket`]), and its simultaneous whole runs by the scenario's
+//! construction; one unit is charged `TEST_HEAVY_RUN_FDS`, which
+//! `process_nofile.rs` witnesses for the largest external join a heavy
+//! grant admits (every stage-1 fleet and the relation scan's input open at
+//! once, then every stage 3 worker's bucket file with stage 4's input and
+//! output open at once, the most slot buckets, reached as External and as
+//! Auto, with buffered, O_DIRECT and io_uring output where the host
+//! accepts them, under a kernel limit leaving exactly the charge free);
+//! fault paths are bounded from the code, since no fault hook opens a
+//! descriptor. A test's `host::FdPool` is built only by [`pool`], which
+//! requires a ticket above the light grant. Test-local providers that
+//! replace a host's descriptor answers outright (rather than delegating to
+//! a ticket) are light by convention. A heavy scenario holds no descriptor
+//! of its own across a run beyond the input pin the run shares. Light
+//! tests' descriptors are not requested or counted; the reserve covers
+//! them by assertion. Neither a count of
 //! `/proc/self/fd` at a ticket's release nor an invariant checked at
 //! admission observes them: the count is process-wide, includes every
 //! concurrent test and is taken after the run's peak, and light use grows
@@ -35,6 +40,7 @@
 //! behind its siblings) skips as environmental before it opens anything.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -82,14 +88,113 @@ fn lock(gate: &Gate) -> MutexGuard<'_, State> {
 /// An admitted heavy scenario's share of the descriptor limit, and the
 /// descriptor provider of every host built from it: each request is
 /// granted `min(wanted, TEST_FD_GRANT)`, as on a host before this gate
-/// existed. Dropping the last handle returns the share.
+/// existed. The share returns when the last handle and every reservation
+/// granted through it have dropped.
+///
+/// A ticket of `units` admits at most `units` live grants at once: a
+/// request that would exceed them panics, naming the scenario. This is a
+/// conservative request-concurrency contract, not a descriptor count (two
+/// small grants could fit one charge), and it observes overlapping
+/// requests, not overlapping whole runs: an external join asks only for
+/// its stage-1 shard files, so two joins on one unit that overlap only
+/// after stage 1 are not caught.
 pub(crate) struct FdTicket {
+    admission: Arc<Admission>,
+}
+
+struct Admission {
     descriptors: u64,
+    units: u64,
+    live: AtomicU64,
+    test: String,
+}
+
+/// One live grant against an admission; dropping it ends the grant.
+struct Hold(Arc<Admission>);
+
+impl Admission {
+    fn hold(self: &Arc<Self>) -> Hold {
+        let live = self.live.fetch_add(1, Ordering::AcqRel) + 1;
+        assert!(
+            live <= self.units,
+            "{}: {live} descriptor grants live at once on a ticket of {} unit(s); \
+             take a unit per simultaneous heavy run",
+            self.test,
+            self.units
+        );
+        Hold(Arc::clone(self))
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl pbfhogg::host::ProcessActions for FdTicket {
     fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
-        heavy_grant(wanted)
+        let hold = self.admission.hold();
+        let grant = heavy_grant(wanted);
+        pbfhogg::process::FdReservation::with_release(grant.allowance(), move || drop(hold))
+    }
+}
+
+/// A test's `host::FdPool`, built only here so that a pool large enough
+/// for a heavy run is reached through a ticket.
+pub(crate) struct TestPool {
+    pool: Arc<pbfhogg::host::FdPool>,
+    provider: Arc<dyn pbfhogg::host::ProcessActions>,
+}
+
+impl TestPool {
+    /// Descriptors not granted now; see `FdPool::available`.
+    pub(crate) fn available(&self) -> u64 {
+        self.pool.available()
+    }
+
+    /// The provider a host built on this pool installs.
+    pub(crate) fn provider(&self) -> Arc<dyn pbfhogg::host::ProcessActions> {
+        Arc::clone(&self.provider)
+    }
+}
+
+/// A pool of `budget` descriptors. A budget above `TEST_LIGHT_FD_GRANT`
+/// needs `ticket`: every request then holds one of its units for as long
+/// as the pool's reservation lives and asks the pool for at most
+/// `TEST_FD_GRANT`, the grant the charge witness covers.
+pub(crate) fn pool(budget: u64, ticket: Option<&Arc<FdTicket>>) -> TestPool {
+    let pool = Arc::new(pbfhogg::host::FdPool::new(budget));
+    let provider: Arc<dyn pbfhogg::host::ProcessActions> = match ticket {
+        Some(ticket) => Arc::new(Ticketed {
+            admission: Arc::clone(&ticket.admission),
+            pool: Arc::clone(&pool),
+        }),
+        None => {
+            assert!(
+                budget <= pbfhogg::TEST_LIGHT_FD_GRANT,
+                "a pool of {budget} descriptors exceeds the light grant and needs a ticket"
+            );
+            Arc::clone(&pool) as Arc<dyn pbfhogg::host::ProcessActions>
+        }
+    };
+    TestPool { pool, provider }
+}
+
+struct Ticketed {
+    admission: Arc<Admission>,
+    pool: Arc<pbfhogg::host::FdPool>,
+}
+
+impl pbfhogg::host::ProcessActions for Ticketed {
+    fn fd_allowance(&self, wanted: u64) -> pbfhogg::process::FdReservation {
+        let hold = self.admission.hold();
+        let inner = self.pool.fd_allowance(wanted.min(super::TEST_FD_GRANT));
+        let allowance = inner.allowance();
+        pbfhogg::process::FdReservation::with_release(allowance, move || {
+            drop(inner);
+            drop(hold);
+        })
     }
 }
 
@@ -103,7 +208,7 @@ pub(crate) fn heavy_grant(wanted: u64) -> pbfhogg::process::FdReservation {
     ))
 }
 
-impl Drop for FdTicket {
+impl Drop for Admission {
     fn drop(&mut self) {
         let gate = gate();
         lock(gate).free += self.descriptors;
@@ -139,7 +244,14 @@ pub(crate) fn heavy_ticket(runs: u64, test: &str) -> Option<Arc<FdTicket>> {
             drop(state);
             // The next head may fit in what is left.
             gate.bell.notify_all();
-            return Some(Arc::new(FdTicket { descriptors: want }));
+            return Some(Arc::new(FdTicket {
+                admission: Arc::new(Admission {
+                    descriptors: want,
+                    units: runs,
+                    live: AtomicU64::new(0),
+                    test: test.to_owned(),
+                }),
+            }));
         }
         let now = Instant::now();
         if now >= deadline {

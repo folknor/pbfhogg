@@ -9,13 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use pbfhogg::cat::CleanAttrs;
 use pbfhogg::debug::InstrumentSink;
-use pbfhogg::host::{FdPool, Host, Invocation, ProcessActions};
+use pbfhogg::host::{Host, Invocation};
+
+use crate::common::fd_gate::{TestPool, pool};
 use pbfhogg::write::WriteOptions;
 
 /// Records the pool's free count at each named marker, and every counter
 /// sample.
 struct Watch {
-    pool: Arc<FdPool>,
+    pool: Arc<TestPool>,
     at: &'static [&'static str],
     seen: Mutex<Vec<(String, u64)>>,
     counters: Mutex<Vec<(String, i64)>>,
@@ -39,7 +41,7 @@ impl InstrumentSink for Watch {
     }
 }
 
-fn watched(pool: &Arc<FdPool>, at: &'static [&'static str]) -> (Host, Arc<Watch>) {
+fn watched(pool: &Arc<TestPool>, at: &'static [&'static str]) -> (Host, Arc<Watch>) {
     let watch = Arc::new(Watch {
         pool: Arc::clone(pool),
         at,
@@ -47,13 +49,13 @@ fn watched(pool: &Arc<FdPool>, at: &'static [&'static str]) -> (Host, Arc<Watch>
         counters: Mutex::new(Vec::new()),
     });
     let mut host = crate::common::test_host();
-    host.process = Arc::clone(pool) as Arc<dyn ProcessActions>;
+    host.process = pool.provider();
     host.invocation = Invocation::with_sink(Arc::clone(&watch) as Arc<dyn InstrumentSink>);
     (host, watch)
 }
 
-fn pool(budget: u64) -> Arc<FdPool> {
-    Arc::new(FdPool::new(budget))
+fn light(budget: u64) -> Arc<TestPool> {
+    Arc::new(pool(budget, None))
 }
 
 fn inputs(dir: &Path) -> [PathBuf; 2] {
@@ -90,7 +92,7 @@ fn a_retained_host_gets_its_grant_back_after_each_cat() {
     let dir = crate::common::test_scratch();
     let [a, b] = inputs(dir.path());
     let budget = 100;
-    let pool = pool(budget);
+    let pool = light(budget);
     let (host, watch) = watched(&pool, &["CAT_SCAN_START"]);
     for round in 0..2 {
         let output = dir.path().join(format!("out{round}.osm.pbf"));
@@ -120,7 +122,7 @@ fn a_refused_or_failed_cat_returns_its_grant() {
     let [a, b] = inputs(dir.path());
     let output = dir.path().join("out.osm.pbf");
 
-    let short = pool(cat_wants_for_two() - 1);
+    let short = light(cat_wants_for_two() - 1);
     let (host, _) = watched(&short, &[]);
     let err = cat(&[&a, &b], &output, &host).expect_err("one short refuses");
     assert!(err.to_string().contains("host grant"), "{err}");
@@ -128,7 +130,7 @@ fn a_refused_or_failed_cat_returns_its_grant() {
     assert!(!output.exists());
 
     let budget = 100;
-    let enough = pool(budget);
+    let enough = light(budget);
     let (host, _) = watched(&enough, &[]);
     let missing = dir.path().join("missing.osm.pbf");
     cat(&[&a, &missing], &output, &host).expect_err("a missing input fails after admission");
@@ -144,7 +146,7 @@ fn dedupe_holds_its_grant_through_pass_two() {
     let [a, b] = inputs(dir.path());
     let output = dir.path().join("out.osm.pbf");
     let budget = 100;
-    let pool = pool(budget);
+    let pool = light(budget);
     let (host, watch) = watched(&pool, &["MERGEPBF_PASS1_START", "MERGEPBF_PASS2_START"]);
     pbfhogg::cat::dedupe::merge_pbf(
         &[a.as_path(), b.as_path()],
@@ -175,9 +177,8 @@ fn dedupe_holds_its_grant_through_pass_two() {
 /// worker's need it refuses and returns the grant.
 #[test]
 fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
-    // The pool's host bypasses the ticket's provider, so the scenario holds
-    // the ticket for its one join at a time by hand.
-    let Some(_ticket) = crate::common::heavy_ticket(
+    // The pool's provider holds a ticket unit per grant.
+    let Some(ticket) = crate::common::heavy_ticket(
         1,
         "external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two",
     ) else {
@@ -188,8 +189,8 @@ fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
     let output = dir.path().join("out.osm.pbf");
     // Headroom 64 plus one worker's 256 shards, short of a second worker.
     let budget = 64 + 256 + 100;
-    let pool = pool(budget);
-    let (host, watch) = watched(&pool, &["EXTJOIN_STAGE1_END", "EXTJOIN_STAGE2_START"]);
+    let shared = Arc::new(pool(budget, Some(&ticket)));
+    let (host, watch) = watched(&shared, &["EXTJOIN_STAGE1_END", "EXTJOIN_STAGE2_START"]);
     pbfhogg::altw::external::external_join(
         &input,
         crate::common::out(&output),
@@ -229,7 +230,7 @@ fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
     );
     assert_eq!(counter("extjoin_fd_cap_workers"), 1, "capped by the pool");
 
-    let small = self::pool(64 + 256 - 1);
+    let small = Arc::new(pool(64 + 256 - 1, Some(&ticket)));
     let (host, _) = watched(&small, &[]);
     let refused = dir.path().join("refused.osm.pbf");
     let err = pbfhogg::altw::external::external_join(

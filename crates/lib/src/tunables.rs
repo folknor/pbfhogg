@@ -1447,12 +1447,12 @@ pub const TEST_LIGHT_FD_GRANT: u64 = 128;
 /// buckets and router files, the input pin, outputs and scratch. Witnessed
 /// in `crates/lib/tests/process_nofile.rs` for the largest external join the
 /// heavy grant admits (three stage-1 fleets and the relation scan's input
-/// open at once, 256 slot buckets), reached as External and as Auto, with
-/// buffered, O_DIRECT and io_uring output where the host accepts them, each
-/// completing under a kernel limit leaving exactly this many descriptors
-/// free. Stage 3 and stage 4 at their most simultaneous descriptors stay
-/// asserted; fault paths are bounded from the code (no fault hook opens a
-/// descriptor).
+/// open at once, then four stage 3 bucket files with stage 4's input and
+/// output open at once, 256 slot buckets), reached as External and as Auto,
+/// with buffered, O_DIRECT and io_uring output where the host accepts them,
+/// each completing under a kernel limit leaving exactly this many
+/// descriptors free. Fault paths are bounded from the code (no fault hook
+/// opens a descriptor).
 pub const TEST_HEAVY_RUN_FDS: u64 = 1024;
 /// The part of the soft limit the gate never hands to heavy tickets: the
 /// process's baseline and every concurrently running light test's

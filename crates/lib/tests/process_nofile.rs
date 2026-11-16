@@ -332,7 +332,12 @@ impl pbfhogg::debug::InstrumentSink for Counters {
 /// stage-1 workers the grant fits (three) and the later stages' fixed
 /// worker caps; a rendezvous holds every worker with its id-shard fleet
 /// open, and the relation scan with its input open, until all have opened
-/// theirs; 256 equal way blobs give the most slot buckets. The arms are
+/// theirs; 256 equal way blobs give the most slot buckets; a second
+/// rendezvous holds the four stage 3 workers (the stage's cap) each with a
+/// slot bucket file open, and stage 4 with its shared input and output
+/// writer open, until all have arrived, on top of what earlier stages
+/// still hold (the slot bucket writers, stage 2's input, the payload
+/// files, the pin, the output staging and the scratch lock). The arms are
 /// External with buffered output, Auto routed to external (memory one byte
 /// above the sparse allowance changes routing, not worker sizing), and
 /// External with O_DIRECT and with io_uring output (the direct writer's
@@ -341,8 +346,6 @@ impl pbfhogg::debug::InstrumentSink for Counters {
 /// The run's input pin, scratch and output count against the charge; the
 /// fixture written beforehand does not.
 ///
-/// Not observed: the most stage-3 and stage-4 descriptors open at once
-/// (they start independently and a completed run need not overlap them).
 /// Fault paths are bounded from the code, not witnessed: no fault hook
 /// opens a descriptor (the stage-3 hold parks before its bucket file
 /// opens, payload descriptors are shared with stage 4 rather than
@@ -443,7 +446,6 @@ fn charge_arm(
     memory: u64,
 ) -> bool {
     use pbfhogg::host::{Host, ProcessActions};
-    use pbfhogg::test_hooks::FleetOutcome;
     use std::sync::Arc;
 
     struct HeavyGrant;
@@ -471,6 +473,11 @@ fn charge_arm(
     host.invocation
         .faults()
         .arm_altw_stage1_fleet(workers, true);
+    // `ALTW_STAGE3_WORKERS_CAP`, which eight cores reach.
+    let stage3_workers = 4;
+    host.invocation
+        .faults()
+        .arm_altw_stage34_peak(stage3_workers);
     let output = dir.join(format!("fleet-{name}.osm.pbf"));
     let opts = pbfhogg::altw::AltwOptions {
         keep_untagged_nodes: false,
@@ -525,10 +532,34 @@ fn charge_arm(
         ),
         Err(e) => panic!("{name}: charge witness run failed: {}", e.report()),
     }
+    assert_shape(name, &host, &counters, workers, stage3_workers);
+    #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+    if backend_is_direct(backend) || uring {
+        common::assert_direct_opened(&host.invocation, "write", name);
+    }
+    true
+}
+
+/// The forced shape of a completed charge-witness run: both rendezvous
+/// complete and the worker and bucket counts at their most.
+#[cfg(all(target_os = "linux", pbfhogg_test_hooks))]
+fn assert_shape(
+    name: &str,
+    host: &pbfhogg::host::Host,
+    counters: &Counters,
+    workers: usize,
+    stage3_workers: usize,
+) {
+    use pbfhogg::test_hooks::FleetOutcome;
     assert_eq!(
         host.invocation.faults().altw_stage1_fleet_outcome(),
         Some(FleetOutcome::Complete),
         "{name}: every stage-1 fleet and the relation input were open at once"
+    );
+    assert_eq!(
+        host.invocation.faults().altw_stage34_peak_outcome(),
+        Some(FleetOutcome::Complete),
+        "{name}: every stage 3 worker's bucket file and stage 4's input and output were open at once"
     );
     let seen = counters.0.lock().expect("counters").clone();
     let counter = |name: &str| {
@@ -547,11 +578,11 @@ fn charge_arm(
         256,
         "{name}: the most slot buckets"
     );
-    #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-    if backend_is_direct(backend) || uring {
-        common::assert_direct_opened(&host.invocation, "write", name);
-    }
-    true
+    assert_eq!(
+        counter("s3_worker_count"),
+        i64::try_from(stage3_workers).expect("small"),
+        "{name}: the most stage 3 workers"
+    );
 }
 
 /// The io_uring arm's hang bound and locked-memory lease, the bound armed

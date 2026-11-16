@@ -21,13 +21,14 @@ by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 ## VER-130 - The descriptor gate's charges are asserted, not observed
 
-Residue, still asserted: stage 3 and stage 4 at their most simultaneous descriptors
-(they start independently, so a completed witness run need not overlap them; forcing
-it would need a rendezvous like stage 1's); the io_uring arm of the witness on any
-host whose memlock limit refuses the writer; the light reserve `TEST_LIGHT_FD_RESERVE`
-(a count in the shared binary is process-wide and light use scales with runner
-threads, so it cannot be checked without failing on large hosts); a ticket's units
-versus its simultaneous runs; own `host::FdPool` tests holding a ticket by convention.
+Residue, unobserved under the current design: the io_uring arm of the charge witness
+on any host whose memlock limit refuses the writer; the light reserve
+`TEST_LIGHT_FD_RESERVE` (a count in the shared binary is process-wide and light use
+scales with runner threads, so a check would fail on large hosts); a ticket's units
+versus its simultaneous whole runs (the ticket checks live grants, and an external
+join requests only stage 1, so two joins on one unit overlapping after stage 1 pass);
+test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
+`Grant` and `Fixed`) are light by convention.
 
 ## VER-135 - sort's required LocationsOnWays drop has no real-data witness
 

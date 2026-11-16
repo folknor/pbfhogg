@@ -448,6 +448,14 @@ pub(super) fn stage4_assembly(
         backend,
         host,
     )?;
+    // Test-only: the stage 3 and 4 peak rendezvous, held with the shared
+    // input and the output writer open, before the decode pool starts.
+    #[cfg(pbfhogg_test_hooks)]
+    host.invocation
+        .faults()
+        .on_altw_stage34_peak(crate::test_hooks::FleetParty::Stage4, || {
+            host.invocation.is_cancelled() || coord_payloads_reader.is_aborted()
+        });
 
     let decode_threads = crate::host::sized_workers(
         &*host.resources,

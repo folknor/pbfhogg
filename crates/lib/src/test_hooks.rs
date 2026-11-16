@@ -583,6 +583,9 @@ pub struct FaultPlan {
     /// The stage-1 fleet rendezvous; see
     /// [`arm_altw_stage1_fleet`](Self::arm_altw_stage1_fleet).
     altw_stage1_fleet: Mutex<FleetRendezvous>,
+    /// The stage 3 and stage 4 peak rendezvous; see
+    /// [`arm_altw_stage34_peak`](Self::arm_altw_stage34_peak).
+    altw_stage34_peak: Mutex<FleetRendezvous>,
 
     // --- geocode builder pass 3 ---
     /// Street way index at which the Stage A streets worker panics.
@@ -670,8 +673,9 @@ pub const INJECTED_BACKEND_REFUSAL: &str = "test-hooks: injected output backend 
 /// ([`FaultPlan::built_pool_spawn_fail_at`]).
 pub const INJECTED_POOL_SPAWN_FAILURE: &str = "test-hooks: injected pool thread spawn failure";
 
-/// How an armed stage-1 fleet rendezvous ended; see
-/// [`FaultPlan::arm_altw_stage1_fleet`]. Sticky: the first outcome stands.
+/// How an armed descriptor rendezvous ended; see
+/// [`FaultPlan::arm_altw_stage1_fleet`] and
+/// [`FaultPlan::arm_altw_stage34_peak`]. Sticky: the first outcome stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetOutcome {
     /// Every expected party arrived while every earlier one was still
@@ -684,25 +688,35 @@ pub enum FleetOutcome {
     Unexpected,
 }
 
-/// State of the stage-1 fleet rendezvous, under one lock so the overlap is
-/// decided at one instant.
+/// State of one descriptor rendezvous, under one lock so the overlap is
+/// decided at one instant: every expected party parked at once, each with
+/// its descriptors open.
 struct FleetRendezvous {
-    /// `Some(n)`: armed for stage-1 workers `0..n`.
-    workers: Option<usize>,
-    /// The relation scan is a party too.
-    relation: bool,
-    arrived_workers: Vec<usize>,
-    relation_arrived: bool,
+    /// `Some(parties)`: armed for exactly these parties.
+    expected: Option<Vec<FleetParty>>,
+    arrived: Vec<FleetParty>,
     outcome: Option<FleetOutcome>,
 }
 
-/// A party to the stage-1 fleet rendezvous.
-#[derive(Clone, Copy, Debug)]
+impl FleetRendezvous {
+    const DISARMED: Self = Self {
+        expected: None,
+        arrived: Vec::new(),
+        outcome: None,
+    };
+}
+
+/// A party to a descriptor rendezvous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FleetParty {
     /// A stage-1 worker, after it opened its id-shard files.
     Worker(usize),
     /// The relation-member scan, after it opened its input.
     Relation,
+    /// A stage 3 worker, after it opened a non-empty slot bucket's file.
+    Stage3Worker(usize),
+    /// Stage 4, after it opened its shared input and its output writer.
+    Stage4,
 }
 
 struct DecodeGate {
@@ -831,13 +845,8 @@ impl FaultPlan {
             altw_stage4_panic_work_at: AtomicUsize::new(usize::MAX),
             altw_stage4_way0_entered: Watched::<AtomicBool>::new(false),
             altw_hook_timed_out: AtomicBool::new(false),
-            altw_stage1_fleet: Mutex::new(FleetRendezvous {
-                workers: None,
-                relation: false,
-                arrived_workers: Vec::new(),
-                relation_arrived: false,
-                outcome: None,
-            }),
+            altw_stage1_fleet: Mutex::new(FleetRendezvous::DISARMED),
+            altw_stage34_peak: Mutex::new(FleetRendezvous::DISARMED),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
             geocode_misfile_address_at: AtomicUsize::new(usize::MAX),
             geocode_misfile_address_coarse: AtomicBool::new(false),
@@ -1688,72 +1697,112 @@ impl FaultPlan {
     /// a party that fails before arriving leaves the others parked until
     /// the hook bound, and the outcome is then `Expired`.
     pub fn arm_altw_stage1_fleet(&self, workers: usize, relation: bool) {
-        let mut fleet = self.fleet();
+        let mut parties: Vec<FleetParty> = (0..workers).map(FleetParty::Worker).collect();
+        if relation {
+            parties.push(FleetParty::Relation);
+        }
+        self.arm_rendezvous(&self.altw_stage1_fleet, parties, "stage-1 fleet");
+    }
+
+    /// How the armed stage-1 rendezvous ended; `None` while it is still
+    /// open or when it was never armed.
+    pub fn altw_stage1_fleet_outcome(&self) -> Option<FleetOutcome> {
+        Self::rendezvous(&self.altw_stage1_fleet).outcome
+    }
+
+    /// Hold every stage 3 worker `0..stage3_workers` with the file of the
+    /// first non-empty slot bucket it claims open, and stage 4 with its
+    /// shared input and output writer open (before its decode pool starts),
+    /// until all of them have arrived: the run then has the most stage 3
+    /// and stage 4 descriptors open at once, besides everything earlier
+    /// stages still hold. Each worker parks only at a non-empty bucket, so
+    /// the input needs at least `stage3_workers` of them. Arm before the
+    /// run; read the result with
+    /// [`altw_stage34_peak_outcome`](Self::altw_stage34_peak_outcome).
+    /// Parties are released by the last arrival, by the token tripping or
+    /// by the router aborting (a stage 4 refusal releases parked stage 3
+    /// workers at once); the outcome is then `Expired`.
+    pub fn arm_altw_stage34_peak(&self, stage3_workers: usize) {
+        let mut parties: Vec<FleetParty> =
+            (0..stage3_workers).map(FleetParty::Stage3Worker).collect();
+        parties.push(FleetParty::Stage4);
+        self.arm_rendezvous(&self.altw_stage34_peak, parties, "stage 3 and 4 peak");
+    }
+
+    /// How the armed stage 3 and 4 rendezvous ended; `None` while it is
+    /// still open or when it was never armed.
+    pub fn altw_stage34_peak_outcome(&self) -> Option<FleetOutcome> {
+        Self::rendezvous(&self.altw_stage34_peak).outcome
+    }
+
+    fn arm_rendezvous(&self, slot: &Mutex<FleetRendezvous>, parties: Vec<FleetParty>, what: &str) {
+        let mut state = Self::rendezvous(slot);
         // One-shot: a second arming would inherit the first run's arrivals
         // and outcome.
         assert!(
-            fleet.workers.is_none(),
-            "the stage-1 fleet rendezvous is armed once per token"
+            state.expected.is_none(),
+            "the {what} rendezvous is armed once per token"
         );
-        fleet.workers = Some(workers);
-        fleet.relation = relation;
-        drop(fleet);
+        state.expected = Some(parties);
+        drop(state);
         self.bell.ring();
     }
 
-    /// How the armed rendezvous ended; `None` while it is still open or
-    /// when it was never armed.
-    pub fn altw_stage1_fleet_outcome(&self) -> Option<FleetOutcome> {
-        self.fleet().outcome
-    }
-
-    fn fleet(&self) -> MutexGuard<'_, FleetRendezvous> {
-        self.altw_stage1_fleet
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn rendezvous(slot: &Mutex<FleetRendezvous>) -> MutexGuard<'_, FleetRendezvous> {
+        slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Called by a stage-1 party right after it opened its files;
     /// `cancelled` reads the run's token. Parks as armed; see
     /// [`arm_altw_stage1_fleet`](Self::arm_altw_stage1_fleet).
     pub(crate) fn on_altw_stage1_fleet(&self, party: FleetParty, cancelled: impl Fn() -> bool) {
-        let mut fleet = self.fleet();
-        let Some(workers) = fleet.workers else {
+        self.arrive(&self.altw_stage1_fleet, party, cancelled);
+    }
+
+    /// Called by a stage 3 or stage 4 party right after it opened its
+    /// descriptors; `released` reads the token and the router's abort.
+    /// Parks as armed; see
+    /// [`arm_altw_stage34_peak`](Self::arm_altw_stage34_peak).
+    pub(crate) fn on_altw_stage34_peak(&self, party: FleetParty, released: impl Fn() -> bool) {
+        self.arrive(&self.altw_stage34_peak, party, released);
+    }
+
+    /// One arrival at `slot`. Once an outcome stands, later arrivals (a
+    /// stage 3 worker's next bucket) pass straight through.
+    fn arrive(
+        &self,
+        slot: &Mutex<FleetRendezvous>,
+        party: FleetParty,
+        released: impl Fn() -> bool,
+    ) {
+        let mut state = Self::rendezvous(slot);
+        let Some(expected) = state.expected.as_ref() else {
             return;
         };
-        if fleet.outcome.is_none() {
-            let fresh = match party {
-                FleetParty::Worker(id) => {
-                    let fresh = id < workers && !fleet.arrived_workers.contains(&id);
-                    fleet.arrived_workers.push(id);
-                    fresh
-                }
-                FleetParty::Relation => {
-                    let fresh = fleet.relation && !fleet.relation_arrived;
-                    fleet.relation_arrived = true;
-                    fresh
-                }
-            };
+        if state.outcome.is_none() {
+            let fresh = expected.contains(&party) && !state.arrived.contains(&party);
+            let total = expected.len();
+            state.arrived.push(party);
             if !fresh {
-                fleet.outcome = Some(FleetOutcome::Unexpected);
-            } else if fleet.arrived_workers.len() == workers
-                && fleet.relation_arrived == fleet.relation
-            {
+                state.outcome = Some(FleetOutcome::Unexpected);
+            } else if state.arrived.len() == total {
                 // Decided under the lock while every earlier party is
                 // parked with its descriptors open.
-                fleet.outcome = Some(FleetOutcome::Complete);
+                state.outcome = Some(FleetOutcome::Complete);
             }
         }
-        drop(fleet);
+        drop(state);
         self.bell.ring();
         // Rung: the outcome is written only here, each write followed by a
-        // ring, and a tripped token rings the bell.
-        // Past the bound or on a trip with no outcome, it is `Expired`.
-        let _ = self.wait(|| (self.fleet().outcome.is_some() || cancelled()).then_some(()));
-        let mut fleet = self.fleet();
-        if fleet.outcome.is_none() {
-            fleet.outcome = Some(FleetOutcome::Expired);
-            drop(fleet);
+        // ring; a tripped token and a router abort ring the bell.
+        // Past the bound or on a release with no outcome, it is `Expired`.
+        // No lock is held while parked.
+        let _ =
+            self.wait(|| (Self::rendezvous(slot).outcome.is_some() || released()).then_some(()));
+        let mut state = Self::rendezvous(slot);
+        if state.outcome.is_none() {
+            state.outcome = Some(FleetOutcome::Expired);
+            drop(state);
             self.bell.ring();
         }
     }

@@ -1,17 +1,15 @@
 //! Minimal OSC (`.osc` / `.osc.gz`) reader for verify-side delta analysis.
 //!
-//! brokkr's verify pipeline needs to know which element IDs an OSC file
-//! creates / modifies / deletes - specifically so `verify_merge` can
-//! tell legitimate cross-tool semantic differences (osmium's
-//! version-based deletes vs pbfhogg's unconditional deletes) apart
-//! from real bugs (request 4).
+//! The verifier's checks need to know which element IDs an OSC file
+//! creates, modifies or deletes, in the input a command consumed and in
+//! the output a tool generated.
 //!
 //! The parser is deliberately narrow: it understands `<osmChange>`
 //! blocks, the `<create>` / `<modify>` / `<delete>` containers, and
 //! `<node id="N">` / `<way id="N">` / `<relation id="N">` element
 //! starts within them. It does **not** parse element bodies (tags,
 //! refs, members, coordinates) - those aren't needed for
-//! the carve-out and pulling in a full XML stack just to discard them
+//! those checks and pulling in a full XML stack just to discard them
 //! would be churn. [`scan_osc_changes`] also decodes each entry's metadata
 //! attributes, the part of a change an OPL reading cannot tell apart
 //! (`verify merge-changes` and `verify tags-filter-osc`). It scans
@@ -694,7 +692,7 @@ fn split_tag_name(tag: &str) -> (&str, &str) {
 }
 
 /// Extract the value of the `id` attribute from a tag's attribute
-/// string. Returns `None` if absent or unparseable. Tolerant of
+/// string, references resolved. Returns `None` if absent or unparseable. Tolerant of
 /// single- and double-quoted values; doesn't validate other attribute
 /// shapes.
 fn extract_id(attrs: &str) -> Option<i64> {
@@ -747,7 +745,9 @@ fn extract_id(attrs: &str) -> Option<i64> {
         let val = &attrs[val_start..i];
         i += 1; // skip closing quote
         if name == "id" {
-            return val.parse().ok();
+            // Decoded as `parse_meta` decodes the other attributes, so a
+            // legal `id="&#49;"` reads as 1 rather than as unparsable.
+            return decode_attribute(val).ok()?.parse().ok();
         }
     }
     None
@@ -1260,6 +1260,12 @@ mod tests {
         assert_eq!(extract_id(r#"version="1" id="42""#), Some(42));
         assert_eq!(extract_id(r#"id="42" version="1""#), Some(42));
         assert_eq!(extract_id(r#"  id =  "42"  "#), Some(42));
+    }
+
+    #[test]
+    fn extract_id_resolves_character_references() {
+        assert_eq!(extract_id(r#"id="&#49;&#x32;""#), Some(12));
+        assert_eq!(extract_id(r#"id="&bogus;""#), None);
     }
 
     #[test]

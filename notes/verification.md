@@ -132,19 +132,6 @@ Enforcement: directory capability types.
 brokkr declined this (bz brokkr#154, wontfix); brokkr verify is to be removed and
 reimplemented in pbfhogg, which must meet the requirement tracked under VER-127.
 
-## VER-137 - The verifier's OSC scanner does not decode entity references in `id`
-
-Found working the apply-changes final-delete rule.
-
-`extract_id` in `crates/verify/src/osc.rs` parses the raw attribute text, so a legal `id="&#49;"`
-is refused by the strict scanner (and skipped by the lenient one) instead of read as 1. Every
-strict caller fails the check rather than passing, so no false pass is known; it is a false fail
-on exotic but legal input. The same file's module header still describes the retired brokkr
-`verify_merge` ("request 4"), stale since the verifier moved into pbfhogg.
-
-Fix: decode `id` as `parse_meta` decodes the other attributes, and rewrite the header.
-
-
 ## VER-127 - Verify workspace requirement on the pbfhogg verify reimplementation
 
 The verify workspace (see VER-123; brokkr side brokkr#154, closed wontfix).

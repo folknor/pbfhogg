@@ -92,22 +92,19 @@ except `encoding_fixture.rs` (which asserts `locations_on_ways=true` only); no f
 asserts `add_metadata=false` or its absence. A fake that decodes by the requested options,
 with per-check faults altering one field class, would close it.
 
-## VER-133 - Geocode interpolation and admin answers have no real-data verification
+## VER-133 - Geocode admin and antimeridian paths the real-data check does not reach
 
-`pbfhogg-verify geocode` judges address and street answers of `pbfhogg geocode-query` on
-denmark and germany against a model built from osmium OPL; interpolation and admin answers
-are not judged. traccar-geocoder is not an oracle for either: it reads nine cells only, merges
-house and street under a 75 m cutoff, maps admin levels to per-country semantics on f32
-coordinates with an eroded interior, and needs a C++ build, which the osmium-only verifier
-rule excludes. What remains:
+`pbfhogg-verify geocode` judges all four answer classes, but on the configured datasets some
+admin paths are never exercised and one domain is refused:
 
-- Interpolation: a model of the range rules in docs/cli/commands.md (street or place choice
-  from the end addresses, interior splits, step and parity, refusals), where a range the
-  model cannot support makes that query's interpolation verdict inconclusive rather than
-  dropping it from the competition.
-- Admin: an independent ring assembly with hole ownership, one polygon per outer ring ranked
-  by outer-ring area stored as f32 (polygon-index tie order is not public, so equal-area
-  levels need an allowed-set or exclusion), first at `--admin-tolerance 0`, then at the
-  default outside the tolerance band.
+- On germany no answer carrying a country code is judged (denmark judges over a thousand),
+  which points at an unmodelled level-2 relation whose box covers the queries (a ring
+  junction, an unlocated member node or a hole near an outer); which relation and why is not
+  yet established. Modelling junction groups (a ring decomposition that does not depend
+  on search order, or one proved unique) would close it.
+- No judged query has two containing areas at one level, so the area-ranking rule is judged
+  only as "the one containing area". Witnesses aimed at same-level overlaps would exercise it.
+- Interpolation witnesses reach only about 27 judged fine-radius queries on germany against a
+  quota of 150; witnesses anchored on range midpoints would raise it.
 - The model refuses data near the antimeridian; unwrapping longitude would let an
   antimeridian dataset (the Fiji entry in notes/todo.md) be judged.

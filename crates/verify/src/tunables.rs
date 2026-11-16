@@ -87,3 +87,14 @@ pub(crate) const GEOCODE_DISTANCE_TOLERANCE_M: f64 = 1e-4;
 pub(crate) const GEOCODE_GRID_E7: i32 = 100_000;
 /// Geocode check: the seed of the query draw, fixed so a run is replayable.
 pub(crate) const GEOCODE_SEED: u64 = 0x6765_6f63_6f64_6531;
+/// Geocode check: the non-zero `--admin-tolerance` (meters) of the main
+/// build, passed explicitly; a second build runs at 0. The model leaves a
+/// query within this (plus 1 percent and 1 m) of a boundary unjudged.
+pub(crate) const GEOCODE_ADMIN_TOLERANCE_M: f64 = 20.0;
+/// Geocode check: the band (meters) round a boundary left unjudged at
+/// `--admin-tolerance 0`, for the float crossing tests alone.
+pub(crate) const GEOCODE_ADMIN_EXACT_BAND_M: f64 = 1e-3;
+/// Geocode check: admin witness queries drawn near boundary vertices.
+pub(crate) const GEOCODE_ADMIN_WITNESSES: usize = 600;
+/// Geocode check: farthest an admin witness is placed from its vertex (meters).
+pub(crate) const GEOCODE_ADMIN_WITNESS_REACH_M: f64 = 300.0;

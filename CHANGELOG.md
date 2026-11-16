@@ -229,6 +229,11 @@
 
 ### Fixed
 
+- `build-geocode-index` stores admin boundary vertices exactly: converting
+  a kept vertex back to decimicrodegrees truncated a value like
+  550000006.9999999 to the unit below, so even `--admin-tolerance 0`,
+  documented as keeping every vertex, moved boundaries by up to a
+  decimicrodegree. Rebuild an index to gain it.
 - `build-geocode-index` no longer drops a named highway that also carries
   `addr:interpolation` from the street set; such a way is now answered as a
   street (and still as an interpolation range where its ends allow one).

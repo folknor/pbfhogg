@@ -2069,7 +2069,12 @@ build. Incomplete extracts remain usable: missing way nodes and missing admin
 member ways contribute no geometry; admin boundary candidates with a missing,
 unparseable, or unsupported level or no name are skipped; relation members
 whose roles do not describe outer or inner rings are ignored (an empty role
-counts as outer). The PBF replication sequence is stored as a u32 in the
+counts as outer). Each closed outer ring is its own area, and an inner
+ring is a hole of every outer ring whose interior contains the inner
+ring's boundary;
+where an inner ring touches or crosses an outer ring, which outer it
+belongs to is not promised. A point is in the area when it is inside the
+outer ring and inside none of its holes. The PBF replication sequence is stored as a u32 in the
 geocode header. A missing value is stored as zero, and a present value outside
 the u32 range fails the build rather than being wrapped to a different source
 version. The header also records the input PBF's whole-file XXH3-128 (seed
@@ -2127,7 +2132,11 @@ on an `even` way) is dropped. `all` steps by one, `even` and `odd` by two,
 and a digit `1` to `9` by that step from the lower end, with no parity
 (`4` from 10 to 21 is 10, 14, 18 and 21); a query answers the number
 nearest its position along the range, a tie going to the lower number,
-whichever way the way runs. An interior node with a non-numeric number
+whichever way the way runs. The position is the length along the range to
+the query's nearest point over the range's whole length, each segment
+measured as a flat distance with longitude scaled by the cosine of its
+first node's latitude; the nearest point is taken to whole
+decimicrodegrees first. An interior node with a non-numeric number
 (`12b`) is passed over. The way is kept but never answers a query when its
 ends share no single street or place, an end has no address on it, the
 addresses at a node carry different house numbers, an end's number is not

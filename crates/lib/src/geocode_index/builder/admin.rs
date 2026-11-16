@@ -136,6 +136,20 @@ fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
     tested > 0 && inside * 2 > tested
 }
 
+/// A kept vertex back in decimicrodegrees. `simplify_ring` only selects
+/// vertices of the original integer ring, so this recovers the original
+/// integer: rounded, not truncated, because `x * 1e-7 * 1e7` can land just
+/// under `x` (550000007 comes back as 550000006.9999999), which moved
+/// boundaries by a unit even at `--admin-tolerance 0`, where every vertex
+/// is documented as kept.
+#[allow(clippy::cast_possible_truncation)]
+fn vertex_e7(lon_deg: f64, lat_deg: f64) -> NodeCoord {
+    NodeCoord {
+        lat_e7: deg_to_e7(lat_deg).round() as i32,
+        lon_e7: deg_to_e7(lon_deg).round() as i32,
+    }
+}
+
 /// Assemble all `AssembledPolygon`s produced by a single relation
 /// (one per outer ring, each carrying any inner rings that fall inside
 /// it). Pure function - no shared mutable state, safe to call from
@@ -201,11 +215,7 @@ fn assemble_one_relation(
 
         let mut vertices = Vec::new();
         for &(lon_deg, lat_deg) in &simplified {
-            #[allow(clippy::cast_possible_truncation)]
-            vertices.push(NodeCoord {
-                lat_e7: deg_to_e7(lat_deg) as i32,
-                lon_e7: deg_to_e7(lon_deg) as i32,
-            });
+            vertices.push(vertex_e7(lon_deg, lat_deg));
         }
 
         // Add inner rings (holes) that fall inside this outer ring.
@@ -233,11 +243,7 @@ fn assemble_one_relation(
             if sh.len() >= 3 {
                 vertices.push(RING_SENTINEL);
                 for &(lon_deg, lat_deg) in &sh {
-                    #[allow(clippy::cast_possible_truncation)]
-                    vertices.push(NodeCoord {
-                        lat_e7: deg_to_e7(lat_deg) as i32,
-                        lon_e7: deg_to_e7(lon_deg) as i32,
-                    });
+                    vertices.push(vertex_e7(lon_deg, lat_deg));
                 }
             }
         }
@@ -463,6 +469,46 @@ mod tests {
             },
             "only the two geometry-less relations are dropped"
         );
+    }
+
+    /// At tolerance 0 every vertex is kept exactly: 550000007 * 1e-7 * 1e7
+    /// is 550000006.9999999, which a truncating conversion stored one unit
+    /// off.
+    #[test]
+    fn tolerance_zero_keeps_every_vertex_exactly() {
+        let ring = vec![
+            (550_000_007, 120_000_007),
+            (550_000_007, 121_000_007),
+            (551_000_007, 121_000_007),
+            (551_000_007, 120_000_007),
+            (550_000_007, 120_000_007),
+        ];
+        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        way_geom.insert(7, ring.clone());
+        let relations = vec![RawAdminRelation {
+            id: 1,
+            admin_level: 8,
+            name_offset: 1,
+            country_code_offset: 0,
+            outer_way_ids: vec![7],
+            inner_way_ids: Vec::new(),
+        }];
+        let config = BuildConfig {
+            admin_tolerance_m: 0.0,
+            ..BuildConfig::default()
+        };
+        let (polygons, _) = assemble_admin_polygons(
+            &relations,
+            &way_geom,
+            &config,
+            &crate::host::Executor::for_tests(),
+        );
+        let stored: Vec<(i32, i32)> = polygons[0]
+            .vertices
+            .iter()
+            .map(|v| (v.lat_e7, v.lon_e7))
+            .collect();
+        assert_eq!(stored, ring);
     }
 
     /// A relation whose ring search exceeds the budget is refused as a whole

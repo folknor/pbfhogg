@@ -1,5 +1,4 @@
-//! Verify: geocode - the address and street answers of `pbfhogg
-//! geocode-query` over an index `pbfhogg build-geocode-index` built from
+//! Verify: geocode - the answers of `pbfhogg geocode-query` over an index `pbfhogg build-geocode-index` built from
 //! the input, against an exhaustive model of the documented query rules
 //! built from osmium's decoding of the same input.
 //!
@@ -40,9 +39,16 @@
 //! nearest point within two decimicrodegrees (a truncated parameter two
 //! float paths compute a rounding apart). Every key of the answer must be
 //! present; a missing one is never read as `null`.
-//! Interpolation ranges and admin areas are not modelled, so this check
-//! claims nothing about them; the classes are separate minimums in the
-//! reader, so leaving them out does not bend the two that are judged.
+//!
+//! Interpolation answers are a third nearest-candidate class, judged the
+//! same way over the ranges `interp` resolves (the filter adds
+//! `w/addr:interpolation`). On an input with no answering range only
+//! absence is judged, and the run says so. Admin answers come from a
+//! second decoding, `osmium tags-filter r/boundary=administrative,postal_code`
+//! (members and their nodes come along), modelled by `admin`, and are
+//! judged on two builds: at `--admin-tolerance 0`, and at a non-zero
+//! tolerance outside its band. Address, street and interpolation are judged
+//! on the non-zero build alone; the admin tolerance does not reach them.
 //!
 //! Comparison domain, refused as a verifier error rather than judged: an
 //! address or street way with a node osmium could not locate (the model
@@ -63,6 +69,9 @@
 //! per class and category, and a category with none is a verifier error,
 //! never a PASS that did not look.
 
+mod admin;
+mod interp;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -74,9 +83,10 @@ use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::reference::ToolRun;
 use crate::tunables::{
-    GEOCODE_COARSE_RADIUS_M, GEOCODE_DISTANCE_TOLERANCE_M as TOL, GEOCODE_FINE_RADIUS_M,
-    GEOCODE_GRID_E7, GEOCODE_SEED, GEOCODE_UNIFORM_QUERIES, GEOCODE_WITNESS_ATTEMPTS,
-    GEOCODE_WITNESS_QUOTA, GEOCODE_WITNESS_REACH_M,
+    GEOCODE_ADMIN_EXACT_BAND_M, GEOCODE_ADMIN_TOLERANCE_M, GEOCODE_ADMIN_WITNESS_REACH_M,
+    GEOCODE_ADMIN_WITNESSES, GEOCODE_COARSE_RADIUS_M, GEOCODE_DISTANCE_TOLERANCE_M as TOL,
+    GEOCODE_FINE_RADIUS_M, GEOCODE_GRID_E7, GEOCODE_SEED, GEOCODE_UNIFORM_QUERIES,
+    GEOCODE_WITNESS_ATTEMPTS, GEOCODE_WITNESS_QUOTA, GEOCODE_WITNESS_REACH_M,
 };
 use crate::verify_diff_opl::{decode, parse_decimicro};
 
@@ -125,6 +135,10 @@ struct Model {
     segment_cells: HashMap<(i32, i32), Vec<u32>>,
     /// `(min_lat, min_lon, max_lat, max_lon)` of every modelled coordinate.
     extent: Option<(i32, i32, i32, i32)>,
+    interp_ways: Vec<interp::RawWay>,
+    interp: interp::Resolved,
+    interp_segments: Vec<interp::InterpSegment>,
+    interp_cells: HashMap<(i32, i32), Vec<u32>>,
 }
 
 /// A street candidate's answer: its name and nearest point.
@@ -274,20 +288,7 @@ impl Model {
                     continue;
                 }
                 let s = self.segments[i as usize];
-                // The query at the origin of a frame in which x is longitude
-                // scaled by the query's cosine and y latitude, both radians.
-                let ax = (rad(i64::from(s.a.1)) - qlon) * cos;
-                let ay = rad(i64::from(s.a.0)) - qlat;
-                let dx = (rad(i64::from(s.b.1)) - rad(i64::from(s.a.1))) * cos;
-                let dy = rad(i64::from(s.b.0)) - rad(i64::from(s.a.0));
-                let len_sq = dx * dx + dy * dy;
-                let t = if len_sq == 0.0 {
-                    0.0
-                } else {
-                    (-(ax * dx + ay * dy) / len_sq).clamp(0.0, 1.0)
-                };
-                let (px, py) = (ax + t * dx, ay + t * dy);
-                let distance_m = (px * px + py * py).sqrt() * EARTH_RADIUS_M;
+                let (t, distance_m) = nearest_on_segment(qlat, qlon, cos, s.a, s.b);
                 #[allow(clippy::cast_possible_truncation)]
                 let along =
                     |a: i32, b: i32| (f64::from(a) + t * (f64::from(b) - f64::from(a))) as i64;
@@ -304,6 +305,54 @@ impl Model {
         let indexed: Vec<(f64, usize)> = found.iter().enumerate().map(|(i, f)| (f.0, i)).collect();
         expectation(&indexed, |i| found[i].1.clone())
     }
+
+    /// Resolve the interpolation ways once every address point is known.
+    fn finish(&mut self) -> Result<(), String> {
+        self.interp = interp::resolve(&self.interp_ways, &self.addresses);
+        let (segments, cells) = interp::grid(&self.interp.sections)?;
+        self.interp_segments = segments;
+        self.interp_cells = cells;
+        Ok(())
+    }
+
+    fn expect_interp(&self, lat: f64, lon: f64) -> Expect<interp::InterpAnswer> {
+        let (qlat, qlon, cos) = (lat.to_radians(), lon.to_radians(), lat.to_radians().cos());
+        let mut seen = std::collections::HashSet::new();
+        let mut found: Vec<(f64, interp::InterpAnswer)> = Vec::new();
+        for key in Self::cells_near(lat, lon) {
+            for &i in self.interp_cells.get(&key).into_iter().flatten() {
+                if !seen.insert(i) {
+                    continue;
+                }
+                let s = self.interp_segments[i as usize];
+                let section = &self.interp.sections[s.section as usize];
+                let index = usize::from(s.index);
+                let (a, b) = (section.nodes[index], section.nodes[index + 1]);
+                let (t, distance_m) = nearest_on_segment(qlat, qlon, cos, a, b);
+                found.push((distance_m, section.answer(index, t)));
+            }
+        }
+        let indexed: Vec<(f64, usize)> = found.iter().enumerate().map(|(i, f)| (f.0, i)).collect();
+        expectation(&indexed, |i| found[i].1.clone())
+    }
+}
+
+/// The nearest point of segment `a`-`b` to the query: its parameter and
+/// distance in meters, in the frame with the query at the origin, x the
+/// longitude scaled by the query's cosine and y the latitude, both radians.
+fn nearest_on_segment(qlat: f64, qlon: f64, cos: f64, a: (i32, i32), b: (i32, i32)) -> (f64, f64) {
+    let ax = (rad(i64::from(a.1)) - qlon) * cos;
+    let ay = rad(i64::from(a.0)) - qlat;
+    let dx = (rad(i64::from(b.1)) - rad(i64::from(a.1))) * cos;
+    let dy = rad(i64::from(b.0)) - rad(i64::from(a.0));
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq == 0.0 {
+        0.0
+    } else {
+        (-(ax * dx + ay * dy) / len_sq).clamp(0.0, 1.0)
+    };
+    let (px, py) = (ax + t * dx, ay + t * dy);
+    (t, (px * px + py * py).sqrt() * EARTH_RADIUS_M)
 }
 
 /// The expectation of one class from every candidate's distance.
@@ -342,6 +391,8 @@ struct Record {
     location: Option<(i32, i32)>,
     /// A way's node locations, `None` where osmium had none.
     nodes: Vec<Option<(i32, i32)>>,
+    /// A relation's members: type letter, id and role.
+    members: Vec<(u8, i64, String)>,
     id: String,
 }
 
@@ -350,6 +401,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
     let first = fields.next().unwrap_or_default();
     let kind = *first.as_bytes().first().ok_or("empty record")?;
     let (mut tags, mut x, mut y, mut nodes) = (Vec::new(), None, None, Vec::new());
+    let mut members = Vec::new();
     let coordinate = |text: &str| {
         parse_decimicro(text)
             .and_then(|v| i32::try_from(v).ok())
@@ -380,6 +432,18 @@ fn parse_record(line: &str) -> Result<Record, String> {
                     });
                 }
             }
+            "M" if !value.is_empty() => {
+                for token in value.split(',') {
+                    let (member, role) = token
+                        .split_once('@')
+                        .ok_or_else(|| format!("{first}: member {token:?}"))?;
+                    let (kind, id) = member.split_at(member.len().min(1));
+                    let id: i64 = id
+                        .parse()
+                        .map_err(|_| format!("{first}: member {token:?}"))?;
+                    members.push((*kind.as_bytes().first().unwrap_or(&b'?'), id, decode(role)?));
+                }
+            }
             _ => {}
         }
     }
@@ -388,6 +452,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
         tags,
         location: x.zip(y).map(|(lon, lat)| (lat, lon)),
         nodes,
+        members,
         id: first.to_owned(),
     })
 }
@@ -403,6 +468,7 @@ fn build_model(path: &Path) -> Result<Model, Error> {
         let record = parse_record(&line).map_err(at)?;
         model_record(&mut model, &record).map_err(Error::Tool)?;
     }
+    model.finish().map_err(Error::Tool)?;
     Ok(model)
 }
 
@@ -427,6 +493,30 @@ fn model_record(model: &mut Model, r: &Record) -> Result<(), String> {
             })
         }
         b'w' => {
+            if house_number.is_none()
+                && let Some(mode) = tag(&r.tags, "addr:interpolation")
+            {
+                for &(lat, lon) in r.nodes.iter().flatten() {
+                    model.widen(lat, lon)?;
+                }
+                let located: Vec<(i32, i32)> = r.nodes.iter().flatten().copied().collect();
+                if located
+                    .windows(2)
+                    .any(|w| (i64::from(w[1].1) - i64::from(w[0].1)).abs() >= 1_800_000_000)
+                {
+                    return Err(format!(
+                        "{}: an interpolation segment spans half a turn of longitude, outside \
+                         the modelled domain",
+                        r.id
+                    ));
+                }
+                model.interp_ways.push(interp::RawWay {
+                    mode: interp::Mode::from_tag(mode),
+                    street: street.clone(),
+                    place: place.clone(),
+                    nodes: r.nodes.clone(),
+                });
+            }
             let highway = tag(&r.tags, "highway");
             let is_street = highway.is_some_and(|h| !EXCLUDED_HIGHWAYS.contains(&h))
                 && tag(&r.tags, "name").is_some();
@@ -508,6 +598,7 @@ struct Query {
     lon: f64,
     address: Expect<Address>,
     street: Expect<StreetAnswer>,
+    interpolation: Expect<interp::InterpAnswer>,
 }
 
 fn query(model: &Model, lat: f64, lon: f64) -> Query {
@@ -515,15 +606,29 @@ fn query(model: &Model, lat: f64, lon: f64) -> Query {
     Query {
         address: model.expect_address(lat, lon),
         street: model.expect_street(lat, lon),
+        interpolation: model.expect_interp(lat, lon),
         text,
         lat,
         lon,
     }
 }
 
+const CLASSES: [&str; 3] = ["address", "street", "interpolation"];
+const CATEGORIES: [&str; 3] = ["within the fine radius", "between the radii", "beyond both"];
+
+/// A point `reach_m` meters from `(lat, lon)` (decimicrodegrees) at
+/// `bearing`.
+fn offset(lat: i32, lon: i32, reach_m: f64, bearing: f64) -> (f64, f64) {
+    let reach = reach_m / EARTH_RADIUS_M;
+    let lat = f64::from(lat) * 1e-7 + (reach * bearing.cos()).to_degrees();
+    let lon = f64::from(lon) * 1e-7 + (reach * bearing.sin()).to_degrees() / lat.to_radians().cos();
+    (lat, lon)
+}
+
 /// The fixed query set: uniform points over the extent, then witnesses
-/// until every class has its quota in each category.
-fn queries(model: &Model) -> Result<Vec<Query>, Error> {
+/// until every class the model holds has its quota in each category, then
+/// admin witnesses near boundary vertices.
+fn queries(model: &Model, admin: &admin::AdminModel) -> Result<Vec<Query>, Error> {
     let (min_lat, min_lon, max_lat, max_lon) = model
         .extent
         .ok_or_else(|| Error::tool("the input holds no address point and no street"))?;
@@ -535,115 +640,356 @@ fn queries(model: &Model) -> Result<Vec<Query>, Error> {
         let lon = deg(min_lon) + draw.unit() * (deg(max_lon) - deg(min_lon));
         out.push(query(model, lat, lon));
     }
-    let mut filled = [[0_usize; 3]; 2];
+    // A class the model holds nothing of has no witness to look for.
+    let held = [true, true, !model.interp_segments.is_empty()];
+    let mut filled = [[0_usize; 3]; 3];
     for q in &out {
         tally(&mut filled, q);
     }
-    let anchors = model.addresses.len() + model.segments.len();
+    let anchors = model.addresses.len() + model.segments.len() + model.interp_segments.len();
+    let full = |filled: &[[usize; 3]; 3]| {
+        (0..3).all(|c| !held[c] || filled[c].iter().all(|&n| n >= GEOCODE_WITNESS_QUOTA))
+    };
     for _ in 0..GEOCODE_WITNESS_ATTEMPTS {
-        if filled.iter().flatten().all(|&n| n >= GEOCODE_WITNESS_QUOTA) {
+        if full(&filled) {
             break;
         }
         #[allow(clippy::cast_possible_truncation)]
         let pick = (draw.next() % anchors as u64) as usize;
-        let (lat, lon) = match model.addresses.get(pick) {
-            Some(a) => (a.lat, a.lon),
-            None => model.segments[pick - model.addresses.len()].a,
+        let streets_from = model.addresses.len();
+        let interp_from = streets_from + model.segments.len();
+        let (lat, lon) = if pick < streets_from {
+            (model.addresses[pick].lat, model.addresses[pick].lon)
+        } else if pick < interp_from {
+            model.segments[pick - streets_from].a
+        } else {
+            let s = model.interp_segments[pick - interp_from];
+            model.interp.sections[s.section as usize].nodes[usize::from(s.index)]
         };
-        let reach = draw.unit() * GEOCODE_WITNESS_REACH_M / EARTH_RADIUS_M;
-        let bearing = draw.unit() * std::f64::consts::TAU;
-        let lat = deg(lat) + (reach * bearing.cos()).to_degrees();
-        let lon = deg(lon) + (reach * bearing.sin()).to_degrees() / lat.to_radians().cos();
+        let reach = draw.unit() * GEOCODE_WITNESS_REACH_M;
+        let (lat, lon) = offset(lat, lon, reach, draw.unit() * std::f64::consts::TAU);
         let q = query(model, lat, lon);
         let wanted = |class: usize, c: Option<usize>| {
-            c.is_some_and(|c| filled[class][c] < GEOCODE_WITNESS_QUOTA)
+            held[class] && c.is_some_and(|c| filled[class][c] < GEOCODE_WITNESS_QUOTA)
         };
-        if wanted(0, q.address.category()) || wanted(1, q.street.category()) {
+        if wanted(0, q.address.category())
+            || wanted(1, q.street.category())
+            || wanted(2, q.interpolation.category())
+        {
             tally(&mut filled, &q);
             out.push(q);
         }
     }
-    for (class, counts) in ["address", "street"].iter().zip(filled) {
-        for (category, n) in ["within the fine radius", "between the radii", "beyond both"]
-            .iter()
-            .zip(counts)
-        {
+    for class in 0..3 {
+        if !held[class] {
+            continue;
+        }
+        for (category, n) in CATEGORIES.iter().zip(filled[class]) {
             if n == 0 {
                 return Err(Error::tool(format!(
-                    "no {class} query {category} was found in the input; the check cannot \
-                     cover that path"
+                    "no {} query {category} was found in the input; the check cannot \
+                     cover that path",
+                    CLASSES[class]
                 )));
             }
+        }
+    }
+    // Admin witnesses: near outer and hole vertices, where containment,
+    // holes and competing polygons are decided.
+    let vertices: Vec<(i32, i32)> = admin
+        .polygons
+        .iter()
+        .flat_map(|p| {
+            p.holes
+                .iter()
+                .flatten()
+                .chain(p.outer.iter().step_by((p.outer.len() / 64).max(1)))
+        })
+        .copied()
+        .collect();
+    if !vertices.is_empty() {
+        for _ in 0..GEOCODE_ADMIN_WITNESSES {
+            #[allow(clippy::cast_possible_truncation)]
+            let (lat, lon) = vertices[(draw.next() % vertices.len() as u64) as usize];
+            let reach = draw.unit() * GEOCODE_ADMIN_WITNESS_REACH_M;
+            let (lat, lon) = offset(lat, lon, reach, draw.unit() * std::f64::consts::TAU);
+            out.push(query(model, lat, lon));
         }
     }
     Ok(out)
 }
 
-fn tally(filled: &mut [[usize; 3]; 2], q: &Query) {
-    if let Some(c) = q.address.category() {
-        filled[0][c] += 1;
-    }
-    if let Some(c) = q.street.category() {
-        filled[1][c] += 1;
+fn tally(filled: &mut [[usize; 3]; 3], q: &Query) {
+    let categories = [
+        q.address.category(),
+        q.street.category(),
+        q.interpolation.category(),
+    ];
+    for (class, c) in categories.into_iter().enumerate() {
+        if let Some(c) = c {
+            filled[class][c] += 1;
+        }
     }
 }
 
-/// osmium's located OPL of the input's address and highway objects.
-fn reference_opl(
+/// osmium's `tags-filter` of `pbf` by `filters` (keeping referenced
+/// objects), then `add-locations-to-ways` as OPL.
+fn located_opl(
     harness: &mut Harness,
     pbf: &Path,
     outdir: &Path,
+    stem: &str,
+    filters: &[&str],
 ) -> Result<std::path::PathBuf, Error> {
-    let filtered = outdir.join("geocode-filtered.osm.pbf");
+    let filtered = outdir.join(format!("{stem}-filtered.osm.pbf"));
     let ended = harness.reference(
-        &ToolRun::osmium("geocode-filter.1")
+        &ToolRun::osmium(format!("{stem}-filter.1"))
             .arg("tags-filter")
             .input(pbf)
-            .args(&["nw/addr:housenumber", "w/highway", "-o"])
+            .args(filters)
+            .arg("-o")
             .output(&filtered)
             .arg("--overwrite"),
-        &outdir.join("osmium-filter.stdout"),
+        &outdir.join(format!("osmium-{stem}-filter.stdout")),
     )?;
     harness.require_success(&ended, "osmium tags-filter")?;
-    let opl = outdir.join("geocode-located.opl");
+    let opl = outdir.join(format!("{stem}-located.opl"));
     let ended = harness.reference(
-        &ToolRun::osmium("geocode-locations.1")
+        &ToolRun::osmium(format!("{stem}-locations.1"))
             .args(&["add-locations-to-ways", "--ignore-missing-nodes"])
             .input(&filtered)
             .args(&["-f", "opl", "-o"])
             .output(&opl)
             .arg("--overwrite"),
-        &outdir.join("osmium-locations.stdout"),
+        &outdir.join(format!("osmium-{stem}-locations.stdout")),
     )?;
     harness.require_success(&ended, "osmium add-locations-to-ways")?;
     Ok(opl)
 }
 
-pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
-    let outdir = harness.subdir("geocode")?;
-    harness.msg("=== verify geocode (address and street answers) ===");
+/// The admin model of osmium's decoding of the input's boundary relations.
+fn admin_model(path: &Path) -> Result<admin::AdminModel, Error> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
+    let mut ways: HashMap<i64, Vec<Option<(i32, i32)>>> = HashMap::new();
+    let mut relations = Vec::new();
+    for (n, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
+        let at = |why: String| Error::Failed(format!("{} line {}: {why}", path.display(), n + 1));
+        let record = parse_record(&line).map_err(at)?;
+        match record.kind {
+            b'w' => {
+                let id = record.id[1..]
+                    .parse()
+                    .map_err(|_| at(format!("way id {}", record.id)))?;
+                ways.insert(id, record.nodes);
+            }
+            b'r' => relations.push(record),
+            _ => {}
+        }
+    }
+    admin::AdminModel::build(&relations, &ways).map_err(Error::Tool)
+}
 
-    let index = outdir.join("index");
+/// Build an index of `pbf` at `admin_tolerance` meters into `index`.
+fn build_index(
+    harness: &mut Harness,
+    pbf: &Path,
+    index: &Path,
+    admin_tolerance: f64,
+    direct_io: bool,
+) -> Result<(), Error> {
     let ended = harness.pbfhogg_discard(
         PbfArgv::new("build-geocode-index")
             .input(pbf)
-            .output_flag("--output-dir", &index)
+            .output_flag("--output-dir", index)
             .scratch()
             .arg("--search-radius")
             .arg(GEOCODE_FINE_RADIUS_M.to_string())
             .arg("--coarse-search-radius")
             .arg(GEOCODE_COARSE_RADIUS_M.to_string())
+            .arg("--admin-tolerance")
+            .arg(admin_tolerance.to_string())
             .arg_if(direct_io, "--direct-io"),
     )?;
-    harness.require_success(&ended, "pbfhogg build-geocode-index")?;
+    harness.require_success(&ended, "pbfhogg build-geocode-index")
+}
 
-    let model = build_model(&reference_opl(harness, pbf, &outdir)?)?;
+/// `geocode-query` over `index`: one parsed answer per query, each echoing
+/// its query.
+fn answers(
+    harness: &mut Harness,
+    index: &Path,
+    points: &Path,
+    out: &Path,
+    queries: &[Query],
+) -> Result<Vec<Value>, Error> {
+    let ended = harness.pbfhogg(
+        PbfArgv::new("geocode-query").input(index).input(points),
+        out,
+    )?;
+    harness.require_success(&ended, "pbfhogg geocode-query")?;
+    let text = std::fs::read_to_string(out)
+        .map_err(|e| Error::Failed(format!("pbfhogg answers are not readable text: {e}")))?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != queries.len() {
+        return Err(Error::Failed(format!(
+            "pbfhogg geocode-query printed {} answers for {} queries",
+            lines.len(),
+            queries.len()
+        )));
+    }
+    queries
+        .iter()
+        .zip(&lines)
+        .map(|(q, line)| {
+            let answer: Value = serde_json::from_str(line)
+                .map_err(|e| Error::Failed(format!("answer to {}: not JSON: {e}", q.text)))?;
+            if answer["lat"].as_f64() != Some(q.lat) || answer["lon"].as_f64() != Some(q.lon) {
+                return Err(Error::Failed(format!(
+                    "answer {line} does not echo its query {}",
+                    q.text
+                )));
+            }
+            Ok(answer)
+        })
+        .collect()
+}
+
+/// Judge the nearest-candidate classes, recording one verdict per class.
+fn judge_classes(harness: &mut Harness, model: &Model, queries: &[Query], answered: &[Value]) {
+    let mut judged = [[0_usize; 3]; 3];
+    let mut mismatches: [Vec<String>; 3] = Default::default();
+    for (q, answer) in queries.iter().zip(answered) {
+        let class = |key: &str| {
+            answer
+                .get(key)
+                .ok_or_else(|| format!("query {}: the answer has no {key} key", q.text))
+        };
+        let results = [
+            class("address").and_then(|v| judge(&q.address, v)),
+            class("street").and_then(|v| judge(&q.street, v)),
+            class("interpolation").and_then(|v| judge(&q.interpolation, v)),
+        ];
+        for (class, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(Some(c)) => judged[class][c] += 1,
+                Ok(None) => {}
+                Err(why) => mismatches[class].push(format!("query {}: {why}", q.text)),
+            }
+        }
+    }
+    let absence_only = model.interp_segments.is_empty();
+    for (class, name) in CLASSES.iter().enumerate() {
+        let [fine, between, none] = judged[class];
+        let wrong = &mismatches[class];
+        harness.msg(&format!(
+            "  {name}: {} judged ({fine} within the fine radius, {between} between the radii, \
+             {none} beyond both), {} wrong{}",
+            fine + between + none + wrong.len(),
+            wrong.len(),
+            if class == 2 && absence_only {
+                "; the input holds no answering range, so only absence was judged"
+            } else {
+                ""
+            }
+        ));
+        for why in wrong.iter().take(SHOWN_MISMATCHES) {
+            harness.msg(&format!("    {why}"));
+        }
+        harness.record(
+            &format!("geocode {name} answers vs the osmium-derived model"),
+            Verdict::from_pass(wrong.is_empty()),
+        );
+    }
+}
+
+/// Judge one build's admin answers at `band_m`, recording its verdict.
+fn judge_admin(
+    harness: &mut Harness,
+    admin: &admin::AdminModel,
+    queries: &[Query],
+    answered: &[Value],
+    label: &str,
+    band_m: f64,
+) -> Result<(), Error> {
+    let mut tally = admin::AdminTally::default();
+    let mut wrong = Vec::new();
+    for (q, answer) in queries.iter().zip(answered) {
+        let expect = admin.expect(q.lat, q.lon, band_m);
+        let result = answer
+            .get("admin")
+            .ok_or_else(|| "the answer has no admin key".to_owned())
+            .and_then(|v| admin.judge(&expect, v, &mut tally));
+        if let Err(why) = result {
+            wrong.push(format!("query {}: {why}", q.text));
+        }
+    }
     harness.msg(&format!(
-        "  model: {} address points, {} street segments",
-        model.addresses.len(),
-        model.segments.len()
+        "  admin {label}: {} containing answers judged ({} among several containing areas, \
+         {} postal, {} with a country code), {} empty levels inside a polygon's box, {} \
+         levels inside an owned hole, {} levels not judged, {} queries wrong",
+        tally.containing,
+        tally.several,
+        tally.postal,
+        tally.country_code,
+        tally.empty_boxed,
+        tally.in_owned_hole,
+        tally.unjudged,
+        wrong.len()
     ));
-    let queries = queries(&model)?;
+    for why in wrong.iter().take(SHOWN_MISMATCHES) {
+        harness.msg(&format!("    {why}"));
+    }
+    if admin.relations > 0 && tally.containing == 0 && wrong.is_empty() {
+        return Err(Error::tool(format!(
+            "no admin answer {label} was judged containing; the check cannot cover that path"
+        )));
+    }
+    harness.record(
+        &format!("geocode admin answers {label} vs the osmium-derived model"),
+        Verdict::from_pass(wrong.is_empty()),
+    );
+    Ok(())
+}
+
+pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
+    let outdir = harness.subdir("geocode")?;
+    harness.msg("=== verify geocode (address, street, interpolation and admin answers) ===");
+
+    let index = outdir.join("index");
+    build_index(harness, pbf, &index, GEOCODE_ADMIN_TOLERANCE_M, direct_io)?;
+    let exact_index = outdir.join("index-tolerance-0");
+    build_index(harness, pbf, &exact_index, 0.0, direct_io)?;
+
+    let model = build_model(&located_opl(
+        harness,
+        pbf,
+        &outdir,
+        "geocode",
+        &["nw/addr:housenumber", "w/highway", "w/addr:interpolation"],
+    )?)?;
+    let admin = admin_model(&located_opl(
+        harness,
+        pbf,
+        &outdir,
+        "geocode-admin",
+        &["r/boundary=administrative,postal_code"],
+    )?)?;
+    harness.msg(&format!(
+        "  model: {} address points, {} street segments, {} interpolation ranges from {} \
+         resolved ways ({} refused), {} admin polygons from {} boundary relations ({} \
+         unmodelled)",
+        model.addresses.len(),
+        model.segments.len(),
+        model.interp.sections.len(),
+        model.interp.resolved_ways,
+        model.interp.refused_ways,
+        admin.polygons.len(),
+        admin.relations,
+        admin.unmodelled.len(),
+    ));
+    let queries = queries(&model, &admin)?;
     let points = outdir.join("points.txt");
     {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&points)?);
@@ -654,85 +1000,56 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     }
     harness.run.watch(&points)?;
 
-    let answers = outdir.join("pbfhogg-answers.jsonl");
-    let ended = harness.pbfhogg(
-        PbfArgv::new("geocode-query").input(&index).input(&points),
-        &answers,
+    let answered = answers(
+        harness,
+        &index,
+        &points,
+        &outdir.join("pbfhogg-answers.jsonl"),
+        &queries,
     )?;
-    harness.require_success(&ended, "pbfhogg geocode-query")?;
-    let text = std::fs::read_to_string(&answers)
-        .map_err(|e| Error::Failed(format!("pbfhogg answers are not readable text: {e}")))?;
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() != queries.len() {
-        return Err(Error::Failed(format!(
-            "pbfhogg geocode-query printed {} answers for {} queries",
-            lines.len(),
-            queries.len()
-        )));
-    }
-
-    let mut judged = [[0_usize; 3]; 2];
-    let mut mismatches: [Vec<String>; 2] = [Vec::new(), Vec::new()];
-    for (q, line) in queries.iter().zip(&lines) {
-        let answer: Value = serde_json::from_str(line)
-            .map_err(|e| Error::Failed(format!("answer to {}: not JSON: {e}", q.text)))?;
-        if answer["lat"].as_f64() != Some(q.lat) || answer["lon"].as_f64() != Some(q.lon) {
-            return Err(Error::Failed(format!(
-                "answer {line} does not echo its query {}",
-                q.text
-            )));
-        }
-        let class = |key: &str| {
-            answer
-                .get(key)
-                .ok_or_else(|| format!("query {}: the answer has no {key} key", q.text))
-        };
-        let results = [
-            class("address").and_then(|v| judge(&q.address, v)),
-            class("street").and_then(|v| judge(&q.street, v)),
-        ];
-        for (class, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(Some(c)) => judged[class][c] += 1,
-                Ok(None) => {}
-                Err(why) => mismatches[class].push(format!("query {}: {why}", q.text)),
-            }
-        }
-    }
-
-    for (class, name) in ["address", "street"].iter().enumerate() {
-        let [fine, between, none] = judged[class];
-        let wrong = &mismatches[class];
-        harness.msg(&format!(
-            "  {name}: {} judged ({fine} within the fine radius, {between} between the radii, \
-             {none} beyond both), {} wrong",
-            fine + between + none + wrong.len(),
-            wrong.len()
-        ));
-        for why in wrong.iter().take(SHOWN_MISMATCHES) {
-            harness.msg(&format!("    {why}"));
-        }
-        harness.record(
-            &format!("geocode {name} answers vs the osmium-derived model"),
-            Verdict::from_pass(wrong.is_empty()),
-        );
-    }
+    judge_classes(harness, &model, &queries, &answered);
+    let exact = answers(
+        harness,
+        &exact_index,
+        &points,
+        &outdir.join("pbfhogg-answers-tolerance-0.jsonl"),
+        &queries,
+    )?;
+    judge_admin(
+        harness,
+        &admin,
+        &queries,
+        &exact,
+        "at --admin-tolerance 0",
+        GEOCODE_ADMIN_EXACT_BAND_M,
+    )?;
+    judge_admin(
+        harness,
+        &admin,
+        &queries,
+        &answered,
+        "outside the band of a non-zero --admin-tolerance",
+        GEOCODE_ADMIN_TOLERANCE_M * 1.01 + 1.0,
+    )?;
     Ok(Some(format!(
-        "{} queries: every judged address and street answer is the nearest documented \
-         candidate in the osmium decoding of the input, or none beyond the radii; \
-         interpolation and admin answers are not judged",
+        "{} queries: every judged address, street and interpolation answer is the nearest \
+         documented candidate in the osmium decoding of the input, or none beyond the radii, \
+         and every judged admin level the least containing area of the modelled boundaries",
         queries.len()
     )))
 }
 
 /// Whether an answer is this candidate: the same record, at the candidate's
 /// distance within the tolerance.
-trait Candidate: std::fmt::Debug + Sized {
-    fn read(v: &Value) -> Result<(Self, f64), String>;
-    fn is(&self, other: &Self) -> bool;
+trait Candidate: std::fmt::Debug {
+    type Answer: std::fmt::Debug;
+    fn read(v: &Value) -> Result<(Self::Answer, f64), String>;
+    fn is(&self, got: &Self::Answer) -> bool;
 }
 
 impl Candidate for Address {
+    type Answer = Self;
+
     fn read(v: &Value) -> Result<(Self, f64), String> {
         read_address(v)
     }
@@ -743,6 +1060,8 @@ impl Candidate for Address {
 }
 
 impl Candidate for StreetAnswer {
+    type Answer = Self;
+
     fn read(v: &Value) -> Result<(Self, f64), String> {
         read_street(v)
     }
@@ -753,6 +1072,38 @@ impl Candidate for StreetAnswer {
         self.name == other.name
             && self.snap_lat.abs_diff(other.snap_lat) <= 2
             && self.snap_lon.abs_diff(other.snap_lon) <= 2
+    }
+}
+
+/// An interpolation answer as printed.
+#[derive(Debug)]
+struct InterpGot {
+    street: Option<String>,
+    place: Option<String>,
+    house_number: u32,
+}
+
+impl Candidate for interp::InterpAnswer {
+    type Answer = InterpGot;
+
+    fn read(v: &Value) -> Result<(InterpGot, f64), String> {
+        let house_number = field(v, "house_number")?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("house_number is not a u32 in {v}"))?;
+        Ok((
+            InterpGot {
+                street: optional(v, "street")?,
+                place: optional(v, "place")?,
+                house_number,
+            },
+            distance(v)?,
+        ))
+    }
+
+    /// The street and place exactly, the number one its position allows.
+    fn is(&self, got: &InterpGot) -> bool {
+        self.street == got.street && self.place == got.place && self.allows(got.house_number)
     }
 }
 

@@ -140,6 +140,16 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     );
 }
 
+/// Assert that an osmium `cat` or `sort` writing PBF asks to keep inline
+/// locations exactly when its input declares them, and answer whether it does.
+fn asks_locations(args: &[&str]) -> bool {
+    let locations = fake_pbf::features(Path::new(args[1]))
+        .iter()
+        .any(|f| f == LOW);
+    assert_eq!(args.contains(&"pbf,locations_on_ways=true"), locations);
+    locations
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "One explicit arm per emulated tool invocation"
@@ -179,6 +189,8 @@ pub fn tool(args: &[OsString]) -> i32 {
                 assert!(args.contains(&"--direct-io"));
                 assert!(args.contains(&"--staging-dir"));
                 assert!(!args.contains(&"--tmp-dir"));
+            } else if args[0] == "cat" {
+                asks_locations(&args);
             }
             std::fs::copy(args[1], output()).unwrap();
             if args.contains(&"--output") && fault == "content" {
@@ -186,11 +198,7 @@ pub fn tool(args: &[OsString]) -> i32 {
             }
         }
         "sort" => {
-            // The copy keeps inline locations when its input has them.
-            let locations = fake_pbf::features(Path::new(args[1]))
-                .iter()
-                .any(|f| f == LOW);
-            assert_eq!(args.contains(&"pbf,locations_on_ways=true"), locations);
+            let locations = asks_locations(&args);
             let features: &[&str] = if locations { &[SORTED, LOW] } else { &[SORTED] };
             fake_pbf::write(output(), features, "sorted");
         }

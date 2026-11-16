@@ -1,10 +1,12 @@
-//! Verify: getid - pbfhogg getid vs osmium getid, the getid --invert
-//! complement test, and getid --add-referenced (plain and with
-//! --remove-tags) vs osmium getid -r (plain and with -t), the last in
-//! [`crate::verify_getid_refs`].
+//! Verify: getid - pbfhogg getid vs osmium getid, getid --invert vs osmium
+//! removeid (with way IDs, plus the complement test, and without them, where
+//! a `LocationsOnWays` declaration must be kept), and getid --add-referenced
+//! (plain and with --remove-tags) vs osmium getid -r (plain and with -t), the
+//! last in [`crate::verify_getid_refs`].
 //!
 //! Domain: a snapshot with one record per kind and ID, whose indexdata
-//! claims are true. A header declaring `HistoricalInformation` is refused;
+//! claims are true and non-negative (osmium removeid and getid -r match an
+//! ID by its absolute value). A header declaring `HistoricalInformation` is refused;
 //! repeated records in a file that does not declare it are outside the
 //! domain and not looked for in the input, though every output the check
 //! compares must be in strict order, so a repeat either tool wrote is
@@ -15,12 +17,12 @@
 //! does. Without it (an unsorted snapshot) every osmium run reads an
 //! osmium-sorted copy of the input, shared with verify sort's cached run,
 //! while pbfhogg reads the input as it is; each pbfhogg output the check
-//! diffs (the `--invert` output is only counted) must then not claim
+//! diffs must then not claim
 //! `Sort.Type_then_ID` and is compared through an osmium-sorted copy,
 //! whose strict order proves it repeats no ID. getid answers by ID alone, so
 //! reading a sorted copy changes no reference answer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::argv::PbfArgv;
 use crate::counts::{Counts, osmium_counts};
@@ -91,6 +93,9 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             pbf.display()
         )));
     }
+    // osmium removeid (and getid -r below) match an ID by its absolute
+    // value, pbfhogg by its signed one.
+    crate::verify_getid_refs::refuse_negative_ids(&summary, pbf)?;
     let ids = endpoint_ids(&summary);
     let requested = id_args(&ids);
     if requested.is_empty() {
@@ -162,27 +167,15 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         &osmium_getid,
     )?;
 
-    // --- getid --invert: complement test ---
-    harness.msg("--- getid --invert: complement test ---");
-
-    let pbfhogg_invert = outdir.join("pbfhogg-getid-invert.osm.pbf");
-    let captured = harness.pbfhogg_discard(
-        PbfArgv::new("getid")
-            .arg("--invert")
-            .input(pbf)
-            .output(&pbfhogg_invert)
-            .arg_if(direct_io, "--direct-io")
-            .args_from(requested.iter().map(String::as_str)),
-    )?;
-    harness.require_success(&captured, "pbfhogg getid --invert")?;
-    // Kept when no way ID is removed, else dropped with the warning.
-    harness.judge_way_locations(
-        "pbfhogg getid --invert",
+    // --- getid --invert: vs osmium removeid, and the complement test ---
+    harness.msg("--- getid --invert: pbfhogg vs osmium removeid ---");
+    let invert = Invert {
+        outdir: &outdir,
         pbf,
-        &pbfhogg_invert,
-        &captured,
-        WayLocations::KeptOrReported,
-    )?;
+        order: &order,
+        direct_io,
+    };
+    let pbfhogg_invert = invert.run(harness, "getid-invert", &ids)?;
 
     // The complement assertion: getid selects exactly the listed IDs (the
     // element comparison above pins that) and getid --invert drops exactly them, so
@@ -219,6 +212,22 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         harness.record(&format!("getid --invert complement ({kind})"), verdict);
     }
 
+    // A request without way IDs, where getid --invert must copy every way
+    // blob whole and so keep a LocationsOnWays declaration, which the
+    // comparison with osmium removeid then reads coordinate by coordinate.
+    // An input without ways made the request above that case already.
+    let ways_kept = [ids[0].clone(), Vec::new(), ids[2].clone()];
+    let kept_unrun = !ids[1].is_empty() && ways_kept.iter().all(Vec::is_empty);
+    if kept_unrun {
+        harness.msg(
+            "  getid --invert without way IDs: not run, the input claims no node or relation \
+             to request",
+        );
+    } else if !ids[1].is_empty() {
+        harness.msg("--- getid --invert without way IDs: pbfhogg vs osmium removeid ---");
+        invert.run(harness, "getid-invert-no-ways", &ways_kept)?;
+    }
+
     // --- getid --add-referenced, plain and --remove-tags ---
     let mut claim = crate::verify_getid_refs::run(
         harness,
@@ -230,10 +239,102 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
             direct_io,
         },
     )?;
+    if kept_unrun {
+        claim.insert(0, "no getid --invert request without way IDs".to_owned());
+    }
     if !order.sorted {
         claim.insert(0, CLAIM_UNSORTED.to_owned());
     }
     Ok((!claim.is_empty()).then(|| claim.join("; ")))
+}
+
+/// One `pbfhogg getid --invert` request, compared with `osmium removeid` of
+/// the same IDs.
+struct Invert<'a> {
+    outdir: &'a Path,
+    pbf: &'a Path,
+    order: &'a InputOrder,
+    direct_io: bool,
+}
+
+impl Invert<'_> {
+    /// Run the request `ids` under the file stem `name`, judge the output's
+    /// `LocationsOnWays` declaration and compare its elements with osmium
+    /// removeid's (written with the input's inline coordinates when it
+    /// declares them, so a kept declaration is compared coordinate by
+    /// coordinate). Returns pbfhogg's output.
+    fn run(
+        &self,
+        harness: &mut Harness,
+        name: &str,
+        ids: &[Vec<i64>; 3],
+    ) -> Result<PathBuf, Error> {
+        let requested = id_args(ids);
+        harness.msg(&format!("  requesting: {}", requested.join(" ")));
+        let ours = self.outdir.join(format!("pbfhogg-{name}.osm.pbf"));
+        let captured = harness.pbfhogg_discard(
+            PbfArgv::new("getid")
+                .arg("--invert")
+                .input(self.pbf)
+                .output(&ours)
+                .arg_if(self.direct_io, "--direct-io")
+                .args_from(requested.iter().map(String::as_str)),
+        )?;
+        harness.require_success(&captured, "pbfhogg getid --invert")?;
+        let label = if ids[1].is_empty() {
+            "pbfhogg getid --invert without way IDs"
+        } else {
+            "pbfhogg getid --invert"
+        };
+        harness.judge_way_locations(
+            label,
+            self.pbf,
+            &ours,
+            &captured,
+            invert_way_locations(ids),
+        )?;
+
+        let declares = crate::pbf_frames::header(self.pbf)?.optional_feature("LocationsOnWays");
+        let theirs = self.outdir.join(format!("osmium-{name}.osm.pbf"));
+        let mut run = ToolRun::osmium("removeid.1")
+            .arg("removeid")
+            .input(&self.order.reference_input);
+        for id in &requested {
+            run = run.arg(id.as_str());
+        }
+        if declares {
+            run = run.args(&["-f", "pbf,locations_on_ways=true"]);
+        }
+        let run = run.arg("-o").output(&theirs).arg("--overwrite");
+        let captured =
+            harness.reference(&run, &self.outdir.join(format!("osmium-{name}.stdout")))?;
+        harness.require_success(&captured, "osmium removeid")?;
+        if declares {
+            crate::checks::sort::require_declared_locations(&theirs, "osmium removeid")?;
+        }
+        compare_outputs(
+            harness,
+            self.order,
+            label.trim_start_matches("pbfhogg "),
+            "osmium removeid",
+            &ours,
+            &theirs,
+        )?;
+        Ok(ours)
+    }
+}
+
+/// What `getid --invert` must do with a `LocationsOnWays` declaration
+/// (docs/cli/commands.md, "Output header"): on an indexed input it copies
+/// every way blob whole exactly when no way ID is requested, and otherwise
+/// re-encodes its ways without coordinates. The check's input is fully
+/// indexed ([`pbf_frames::walk`] refuses anything else).
+fn invert_way_locations(ids: &[Vec<i64>; 3]) -> WayLocations {
+    if ids[1].is_empty() {
+        WayLocations::Kept
+    } else {
+        WayLocations::Dropped
+    }
 }
 
 /// `selected + inverted == original`, without overflow on absurd counts.
@@ -276,6 +377,15 @@ mod tests {
             required_features: Vec::new(),
         };
         assert!(id_args(&endpoint_ids(&negative)).is_empty());
+    }
+
+    #[test]
+    fn invert_keeps_way_locations_exactly_without_way_ids() {
+        use crate::harness::WayLocations;
+        let without = [vec![1, 9], Vec::new(), vec![4]];
+        assert_eq!(super::invert_way_locations(&without), WayLocations::Kept);
+        let with = [Vec::new(), vec![7], Vec::new()];
+        assert_eq!(super::invert_way_locations(&with), WayLocations::Dropped);
     }
 
     #[test]

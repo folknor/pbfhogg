@@ -43,7 +43,12 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   roundtrips; inline way coordinates are compared when both files declare
   `LocationsOnWays`, except in apply-changes locations mode. Where
   coordinates are the command's promise (add-locations-to-ways), the check
-  requires both declarations.
+  requires both declarations. Where pbfhogg keeps the input's declaration
+  (cat, `getid --invert`, sort), the osmium reference is written with
+  `-f pbf,locations_on_ways=true` when the input declares it, and every
+  osmium output or sorted copy written with that option must declare it (a
+  verifier error otherwise), so a kept declaration is compared coordinate
+  by coordinate.
 - **The field policies are held to real data** by `field-policies`, the
   first check of the suite, which runs no pbfhogg. On a slice of the input
   built by osmium (the first IDs of each kind's first data blob, `getid -r`
@@ -73,15 +78,19 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   declaration cannot switch the element comparison to one without
   coordinates and pass. An output never declares it when the input does
   not. On an input that declares it: `cat --type` on an input whose first
-  data blob carries indexdata, and `apply-changes --locations-on-ways`,
-  must keep it; sort and `getid --invert`, which keep it unless they
-  rewrite a way blob or remove a way, may keep it or drop it with the loss
-  warning; the rest must drop it with the loss warning. The warning is read
-  from pbfhogg's stderr as the CLI renders `header.way_metadata_loss`
-  (`Warning: the input declares ..., which the output does not declare`,
-  `LocationsOnWays` a member of the list). A permitted drop is not shown to
-  be the one the run had to make: the verifier cannot see whether sort
-  rewrote a way blob.
+  data blob carries indexdata, `getid --invert` without a way ID, and
+  `apply-changes --locations-on-ways`, must keep it; `getid --invert` with
+  a way ID must drop it with the loss warning. sort is decided from the
+  input's per-blob indexdata claims: two overlapping non-negative way ranges
+  cannot both be copied whole into order, so it must drop it with the
+  warning; with no overlap, every data blob indexed, no negative or empty way
+  claim and the sort claim, it must keep it; otherwise (no sort claim, where
+  an internally unsorted blob is rewritten and only a decode shows one, or
+  claims the overlap argument does not cover) it may keep it or drop it with
+  the warning, and that drop is not shown to be required. The rest must drop it with the
+  loss warning. The warning is read from pbfhogg's stderr as the CLI renders
+  `header.way_metadata_loss` (`Warning: the input declares ..., which the
+  output does not declare`, `LocationsOnWays` a member of the list).
 - **Order and counts** of an output come from its osmium OPL decoding
   (`opl_compare::order`, no metadata or coordinates): a file is in strict
   order when its objects ascend by kind and then ID with none repeated.
@@ -93,7 +102,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   verifier's own `OSMHeader` reader (`pbf_frames::header`).
 - **Sorted copies** are written by `osmium sort`, with
   `-f pbf,locations_on_ways=true` when the source declares
-  `LocationsOnWays`, so inline coordinates survive into the comparison.
+  `LocationsOnWays`, so inline coordinates survive into the comparison; a
+  copy that then does not declare it is a verifier error.
   Copies fed to pbfhogg use osmium's default `simple` strategy, the only one
   that writes the `Sort.Type_then_ID` claim pbfhogg branches on. The `sort`
   check's own reference uses `-s multipass`: it judges elements and
@@ -292,7 +302,7 @@ suite because a later comparison cannot make that run complete.
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
 | `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
-| `getid-removeid` (alias `getid`) | `osmium getid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert count complement, recursive referenced content and tag removal, with absent witnesses named |
+| `getid-removeid` (alias `getid`) | `osmium getid`, `removeid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert element equality with and without way IDs (inline coordinates on a `LocationsOnWays` input without them) and count complement, recursive referenced content and tag removal, with absent witnesses named |
 | `extract` | `osmium extract` | strict order, element content and per-strategy membership on the bbox and every configured polygon; simple relations follow the any-direct-node-or-way rule judged against complete_ways |
 | `multi-extract` | sequential pbfhogg extracts | simple config output per region has strict order and element equality with its sequential extract (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
 | `geocode` | a verifier-owned model of the documented query rules over `osmium tags-filter` and `osmium add-locations-to-ways` OPL | `geocode-query` over a `build-geocode-index` of the input, on seeded uniform and witness queries aiming at a quota per class within the fine radius, between the radii and beyond both (at least one each is enforced): every judged address and street answer is one of the nearest candidates (tied within 0.1 mm) with equal text and address coordinates, distance within 0.1 mm and a street's nearest point within two decimicrodegrees, or none beyond the coarse radius, every answer key present; queries within 0.1 mm of the coarse radius are not judged, interpolation and admin answers not at all; a modelled way with an unlocated node, data beyond 85 degrees of latitude or near the antimeridian, or a segment spanning half a turn of longitude is a verifier error; a tag value holding a NUL is outside the comparison (libosmium cuts it) |
@@ -394,14 +404,19 @@ represent, ignoring the header digest. `--inject-prepass` is refused before any 
 osmium-incompatible.
 
 Getid-removeid requires a non-history snapshot with true indexdata claims
-and unique records by kind and ID. Include/invert requests take the lowest
-and highest non-negative claimed IDs per kind. Each selected count must
-match its request, and selected plus inverted counts must match the input.
-The referenced request separately chooses a relation, highest way and node;
-its PASS names missing recursion, member and tag witnesses. Negative IDs or
-references that osmium could fold are refused. Without the optional sort
-feature, comparisons use the same sorted-copy route as cat; invert is
-counted only.
+and unique records by kind and ID. An input claiming a negative ID is
+refused before any run, since osmium removeid and getid -r match an ID by
+its absolute value. Include/invert requests take the lowest and highest
+claimed IDs per kind. Each selected count must match its request, and
+selected plus inverted counts must match the input; each invert output is
+compared with osmium removeid of the same IDs. A second invert request
+takes only the node and relation endpoints, so its output must keep a
+`LocationsOnWays` declaration; its PASS names it absent when the input
+claims ways but no node or relation. The referenced request separately
+chooses a relation, highest way and node; its PASS names missing
+recursion, member and tag witnesses. Negative references that osmium could
+fold are refused. Without the optional sort feature, comparisons use the
+same sorted-copy route as cat.
 
 Extract accepts `--bbox` (otherwise the dataset's bbox), and runs simple,
 complete_ways and smart on that box and every dataset polygon in name order.
@@ -720,6 +735,17 @@ On 2026-11-16, host bygg, parent `a4a6974a` with the uncommitted change that
 added `cat-dedupe` (CLI xxh3-128 `a9b2163354aa448a02f23aebab86ed8e`): Denmark
 indexed, raw and `altw-keep-untagged` PASS (1m48s to 1m53s), the `unsorted`
 snapshot PASS as a refusal, and Germany indexed PASS in 17m21s.
+
+On 2026-11-16, host bygg, parent `ac310e17` with the uncommitted change that
+wrote the cat and removeid references with inline coordinates and decided
+the sort and `getid --invert` declarations exactly (CLI xxh3-128
+`465714c58738dbf9b612854fb37b1e48`): on Denmark `altw-keep-untagged`, cat
+(each type kept), sort (kept, required by disjoint claims on sorted input)
+and getid-removeid (invert with way IDs dropped with the warning, invert
+without way IDs kept, 59152278 records equal to osmium removeid with
+coordinates) PASS; getid-removeid and sort on the `unsorted` snapshot PASS.
+No configured input both declares `LocationsOnWays` and has overlapping
+way ranges, so sort's required drop is witnessed by unit tests only.
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

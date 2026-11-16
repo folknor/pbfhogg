@@ -159,6 +159,9 @@ fn derive(
         &outdir.join(format!("{name}-filtered.stdout")),
     )?;
     harness.require_success(&captured, "osmium tags-filter")?;
+    if locations {
+        crate::checks::sort::require_declared_locations(&filtered, "osmium tags-filter")?;
+    }
     let operand = if pbf_frames::header(&filtered)?.optional_sorted() {
         filtered
     } else {

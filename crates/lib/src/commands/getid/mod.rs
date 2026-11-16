@@ -621,7 +621,7 @@ pub(crate) fn removeid_to<'a>(
          blob is decompressed and re-encoded (significantly slower).",
         host,
     )?;
-    // Every way blob is copied whole when no way ID is removed and the blobs
+    // Every way blob is copied whole when no way ID is requested and the blobs
     // carry indexdata (an unindexed blob behind an indexed first blob makes
     // the file partially indexed, which the walk refuses). The output is a
     // subset of the input with nothing changed, so the copied declarations

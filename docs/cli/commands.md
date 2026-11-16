@@ -434,7 +434,7 @@ fails with an error rather than write a header that lies.
 | `degrade` (re-encoding flags) | input's, not sorted under `--unsort*` | none |
 | `renumber`, `time-filter` | sorted (both require sorted input) | none |
 | `tags-filter`, `getid`, `getparents`, `extract` | input's | none |
-| `getid --invert` | input's | all when no way ID is removed, else none |
+| `getid --invert` | input's | all when no way ID is requested, else none (even when no requested way exists) |
 | `add-locations-to-ways` | input's | `LocationsOnWays`, plus the prepass features with `--inject-prepass` |
 | `apply-changes` | sorted | `LocationsOnWays` with `--locations-on-ways`, else none |
 

@@ -18,6 +18,11 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let order = InputOrder::of(harness, pbf, &outdir)?;
     // cat --type copies indexed way blobs whole, and re-encodes them when the
     // first data blob carries no indexdata (or there is none).
+    // The reference keeps the input's inline coordinates when it declares
+    // them (osmium writes them only when asked), so a kept declaration is
+    // compared coordinate by coordinate rather than switching the comparison
+    // to one without them.
+    let declares = crate::pbf_frames::header(pbf)?.optional_feature("LocationsOnWays");
     let locations = if crate::pbf_frames::first_data_blob_indexed(pbf)? {
         WayLocations::Kept
     } else {
@@ -50,16 +55,21 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         // --- osmium cat ---
         let osmium_out = outdir.join(format!("osmium-{elem_type}.osm.pbf"));
 
+        let mut run = ToolRun::osmium("cat.1")
+            .arg("cat")
+            .input(&order.reference_input)
+            .args(&["-t", elem_type]);
+        if declares {
+            run = run.args(&["-f", "pbf,locations_on_ways=true"]);
+        }
         let captured = harness.reference(
-            &ToolRun::osmium("cat.1")
-                .arg("cat")
-                .input(&order.reference_input)
-                .args(&["-t", elem_type, "-o"])
-                .output(&osmium_out)
-                .arg("--overwrite"),
+            &run.arg("-o").output(&osmium_out).arg("--overwrite"),
             &outdir.join(format!("osmium-{elem_type}.stdout")),
         )?;
         harness.require_success(&captured, "osmium cat")?;
+        if declares {
+            crate::checks::sort::require_declared_locations(&osmium_out, "osmium cat")?;
+        }
 
         compare_outputs(
             harness,

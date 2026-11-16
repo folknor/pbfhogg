@@ -31,16 +31,17 @@ without failing on large hosts); a ticket's units versus its simultaneous runs; 
 `host::FdPool` tests holding a ticket by convention. Every current heavy holder runs
 `write_base_pbf` (one way blob, so one 256-file fleet), well under the witnessed shape.
 
-## VER-135 - Kept LocationsOnWays coordinates are not compared, and permitted drops are not shown necessary
+## VER-135 - sort's LocationsOnWays drop is undecided without the sort claim
 
-Each output's declaration is now held to its command's header rule
-(`Harness::judge_way_locations`), so a lost declaration no longer passes silently.
-Residue: (1) where pbfhogg keeps the declaration (cat, `getid --invert`, sort) the
-osmium reference of every check but sort is written without `locations_on_ways=true`,
-so `Policy::between` is `NO_LOCATIONS` and the kept coordinates are never compared;
-(2) sort and `getid --invert` may drop the declaration with the warning, and the
-verifier does not show the drop was required (no way blob rewritten, no way removed
-would make keeping it decidable for `--invert` from the requested IDs).
+Kept coordinates are compared (cat and `getid --invert` references are written with
+`locations_on_ways=true`, and a reference or sorted copy asked for it must declare
+it), `getid --invert` is judged exactly from the requested way IDs, and sort is exact
+where the input's per-blob claims decide it (`checks::sort::sort_way_locations`).
+Residue: on input without `Sort.Type_then_ID`, or with an unindexed blob, a negative
+or an empty way claim, sort stays keep-or-warned-drop, since an internally unsorted
+blob is only visible by decoding; and the required-drop branch (overlapping way
+ranges on a `LocationsOnWays` input) has no real-data witness, as no configured
+dataset is both. A decode of each way blob's ID order would close the first.
 
 ## VER-018 - The gate's backend requirement checks refusals, not execution
 

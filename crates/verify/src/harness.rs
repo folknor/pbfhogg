@@ -47,9 +47,10 @@ pub(crate) enum WayLocations {
     Kept,
     /// Ways are re-encoded without coordinates: dropped, with the warning.
     Dropped,
-    /// Kept, or dropped with the warning where the run decides (`sort`
-    /// rewriting a way blob, `getid --invert` removing a way): the verifier
-    /// cannot see which.
+    /// Kept, or dropped with the warning where the run decides and the
+    /// verifier cannot see which: `sort` where the input's claims do not
+    /// decide whether a way blob is rewritten
+    /// (`checks::sort::sort_way_locations`), a `cat --dedupe` merge.
     KeptOrReported,
 }
 

@@ -50,7 +50,81 @@ fn osmium_sort_as(
         run = run.args(&["-f", "pbf,locations_on_ways=true"]);
     }
     h.reference(&run.arg("-o").output(output), sink)?;
+    if locations {
+        require_declared_locations(output, "osmium sort")?;
+    }
     Ok(())
+}
+
+/// Require `output`, written by `tool` with `-f pbf,locations_on_ways=true`,
+/// to declare `LocationsOnWays`. The element comparison reads inline
+/// coordinates only when both files declare them ([`Policy::between`]), so a
+/// reference or sorted copy that lost the declaration would silently turn
+/// a coordinate comparison off; that is a verifier error, not a pbfhogg
+/// verdict. Checked after the run, so a cached reference is held too.
+///
+/// [`Policy::between`]: crate::opl_compare::Policy::between
+pub(crate) fn require_declared_locations(output: &Path, tool: &str) -> Result<(), Error> {
+    if crate::pbf_frames::header(output)?.optional_feature("LocationsOnWays") {
+        return Ok(());
+    }
+    Err(Error::Failed(format!(
+        "{tool} was asked for -f pbf,locations_on_ways=true, but {} does not declare \
+         LocationsOnWays, so its inline coordinates cannot be compared",
+        output.display()
+    )))
+}
+
+/// Every data blob's indexdata claim, in file order, by a header-only walk.
+fn input_claims(pbf: &Path) -> Result<Vec<Option<crate::pbf_frames::BlobClaim>>, Error> {
+    let mut walk = crate::pbf_frames::Claims::open(pbf)?;
+    let mut claims = Vec::new();
+    while let Some(blob) = walk.next_blob()? {
+        claims.push(blob.claim);
+    }
+    Ok(claims)
+}
+
+/// What `pbfhogg sort` must do with a `LocationsOnWays` declaration, read
+/// from the input's per-blob indexdata claims (`claims`, in file order;
+/// `None` for a blob without indexdata) and its header sort claim, on the
+/// verifier's domain of true claims and one record per kind and ID.
+///
+/// sort rewrites every way entry of an overlap run, and a rewritten way blob
+/// is re-encoded without coordinates (docs/cli/commands.md, "Output header":
+/// none when a way blob is rewritten). Two non-empty, non-negative way ranges
+/// that overlap cannot be written in order by copying both blobs whole, since
+/// each holds an ID on either side of the other's first ID, so the drop is
+/// required. With no overlap and the sort claim, pbfhogg believes each blob
+/// in order and copies every way blob whole, so the declaration must be
+/// kept. Otherwise the framing does not decide it: without the sort claim
+/// pbfhogg rewrites an internally unsorted blob, which only a decode shows; a
+/// blob without indexdata may hold ways (a mixed block is restructured); and
+/// a negative ID or an empty claim falls outside the overlap argument.
+pub(crate) fn sort_way_locations(
+    claims: impl IntoIterator<Item = Option<crate::pbf_frames::BlobClaim>>,
+    sorted: bool,
+) -> crate::harness::WayLocations {
+    use crate::harness::WayLocations;
+    let mut ways = Vec::new();
+    let mut decided = true;
+    for claim in claims {
+        match claim {
+            None => decided = false,
+            Some(c) if c.kind != 1 => {}
+            Some(c) if c.count == 0 || c.min_id < 0 => decided = false,
+            Some(c) => ways.push((c.min_id, c.max_id)),
+        }
+    }
+    ways.sort_unstable();
+    if ways.windows(2).any(|w| w[1].0 <= w[0].1) {
+        return WayLocations::Dropped;
+    }
+    if decided && sorted {
+        WayLocations::Kept
+    } else {
+        WayLocations::KeptOrReported
+    }
 }
 
 pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
@@ -66,16 +140,15 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
         &outdir.join("pbfhogg.stdout"),
     )?;
     h.require_success(&ended, "pbfhogg sort")?;
-    // sort keeps the declaration unless it rewrites a way blob, which the
-    // verifier cannot see; the comparison below reads coordinates only when
-    // both files declare them, so a drop must at least be the warned one.
-    h.judge_way_locations(
-        "pbfhogg sort",
-        pbf,
-        &ours,
-        &ended,
-        crate::harness::WayLocations::KeptOrReported,
-    )?;
+    // sort keeps the declaration unless it rewrites a way blob; where the
+    // input's claims decide that, the verdict is exact. The comparison below
+    // reads coordinates only when both files declare them, so a drop must at
+    // least be the warned one.
+    let expect = sort_way_locations(
+        input_claims(pbf)?,
+        crate::pbf_frames::header(pbf)?.optional_sorted(),
+    );
+    h.judge_way_locations("pbfhogg sort", pbf, &ours, &ended, expect)?;
 
     let theirs = outdir.join(OSMIUM_SORTED);
     // Multipass: this check judges elements and pbfhogg's order, never the
@@ -93,4 +166,74 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     let order = h.check_sorted("pbfhogg sort", &ours)?;
     h.record("pbfhogg sort output order", order);
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_way_locations;
+    use crate::harness::WayLocations;
+    use crate::pbf_frames::BlobClaim;
+
+    fn claim(kind: usize, min_id: i64, max_id: i64) -> Option<BlobClaim> {
+        Some(BlobClaim {
+            kind,
+            min_id,
+            max_id,
+            count: 1,
+        })
+    }
+
+    #[test]
+    fn disjoint_ways_on_sorted_input_must_be_kept() {
+        let claims = [
+            claim(0, 1, 9),
+            claim(1, 1, 5),
+            claim(1, 6, 9),
+            claim(2, 1, 3),
+        ];
+        assert_eq!(sort_way_locations(claims, true), WayLocations::Kept);
+        // Without the sort claim intra-blob order is not visible.
+        assert_eq!(
+            sort_way_locations(claims, false),
+            WayLocations::KeptOrReported
+        );
+        // Node and relation ranges never decide the way blobs.
+        let other = [claim(0, 1, 9), claim(0, 2, 3), claim(1, 1, 5)];
+        assert_eq!(sort_way_locations(other, true), WayLocations::Kept);
+    }
+
+    #[test]
+    fn overlapping_way_ranges_require_the_drop() {
+        for sorted in [true, false] {
+            let claims = [claim(1, 6, 9), claim(1, 1, 5), claim(1, 5, 7)];
+            assert_eq!(sort_way_locations(claims, sorted), WayLocations::Dropped);
+            // Overlap with a blob not next by start, beside an unindexed blob.
+            let wide = [claim(1, 1, 100), claim(1, 2, 3), claim(1, 4, 5), None];
+            assert_eq!(sort_way_locations(wide, sorted), WayLocations::Dropped);
+        }
+    }
+
+    #[test]
+    fn undecidable_claims_leave_the_choice_to_the_run() {
+        let unindexed = [claim(1, 1, 5), None];
+        assert_eq!(
+            sort_way_locations(unindexed, true),
+            WayLocations::KeptOrReported
+        );
+        let negative = [claim(1, -5, -1), claim(1, 1, 5)];
+        assert_eq!(
+            sort_way_locations(negative, true),
+            WayLocations::KeptOrReported
+        );
+        let empty = [Some(BlobClaim {
+            kind: 1,
+            min_id: 0,
+            max_id: 0,
+            count: 0,
+        })];
+        assert_eq!(
+            sort_way_locations(empty, true),
+            WayLocations::KeptOrReported
+        );
+    }
 }

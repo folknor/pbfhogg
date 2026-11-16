@@ -232,15 +232,17 @@ impl Mode {
     }
 }
 
-/// Refuse an input whose indexdata claims a negative ID of any kind.
-fn refuse_negative_ids(summary: &IndexSummary, pbf: &Path) -> Result<(), Error> {
+/// Refuse an input whose indexdata claims a negative ID of any kind. Also
+/// the domain of the whole getid-removeid check, whose `osmium removeid`
+/// reference folds signs the same way.
+pub(crate) fn refuse_negative_ids(summary: &IndexSummary, pbf: &Path) -> Result<(), Error> {
     for (kind, claim) in summary.kinds.iter().enumerate() {
         if let Some(claim) = claim
             && claim.min_id < 0
         {
             return Err(Error::Failed(format!(
-                "{} claims {} ID {}; osmium getid -r matches an ID by its absolute value and \
-                 pbfhogg does not, so getid --add-referenced cannot be compared on it",
+                "{} claims {} ID {}; osmium getid -r and osmium removeid match an ID by its \
+                 absolute value and pbfhogg does not, so getid cannot be compared on it",
                 pbf.display(),
                 ["node", "way", "relation"][kind],
                 claim.min_id

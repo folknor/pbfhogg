@@ -1,0 +1,380 @@
+# Read, write and infrastructure defects
+
+```
+1. An entry is removed entirely when completely resolved. No historical record
+   stays here.
+2. Stable IDs never change and are never reused; removal leaves a gap.
+3. An entry adjudicated against, verified incorrect, or whose outcome is that no
+   action is taken owes comments at the code sites it names - and, where the
+   claim touches a documented contract, the relevant `reference/` or `docs/`
+   page - before the entry is removed, so the finding is not hunted again.
+4. Once all findings are resolved, the file gets deleted.
+5. Finding IDs are never written into the code or other documents. They are
+   stable only until this document is drained; the next hunt writes new ones,
+   and they are never deduplicated through git history. Carry the context
+   inline instead.
+```
+
+Defects from the 2026-11-17 defect hunt in the PBF read path, the write path,
+direct and io_uring I/O, and the library's concurrency, filesystem and output
+infrastructure. Every finding was made by one codex hunter per scope reading
+source at `63d4ec1d`. None was built, run or reproduced. "Reported by" names
+the scope or scopes, and the bracketed priority is the hunter's own label.
+Findings that match an existing mechanism were added to `notes/bugs.md`
+instead of being filed here. Entries are in no order of importance.
+
+## FMT-001 - PrimitiveBlock::from_vec can produce an invalid &str through safe code
+
+Reported by: read-block-decoding [P1].
+
+`from_vec` (`read/block.rs`) accepts an unrestricted `Vec<u8>`, while
+`inline_tables` (`read/wire.rs`) narrows buffer lengths and table positions to
+`u32`. The decompression path's size limit does not protect this public
+constructor. Witness: a buffer of exactly `2^32` bytes beginning
+`0a 03 0a 01 61 1a 00 1a`, then a five-byte length encoding `2^32 - 13`, with
+that unknown field's payload filled with `ff`. Validation sees the valid string
+`"a"` and skips the unknown fields. Construction wraps the appended
+string-table position to zero, so `string_table_entry(0)` reads the original
+first eight protobuf bytes as an offset/length pair pointing into the
+unvalidated `ff` payload and passes it to `from_utf8_unchecked`. This breaks
+Rust's string validity requirement and the type's documented UTF-8 invariant.
+The constructor must enforce the size bound its representation needs before
+scanning or narrowing.
+
+## FMT-002 - A repeated PrimitiveBlock stringtable silently replaces the earlier one
+
+Reported by: read-block-decoding [P1].
+
+`scan_block_fields` (`read/wire.rs`) keeps only the last
+`PrimitiveBlock.stringtable` occurrence. With two occurrences
+`["", "name", "original"]` then `["", "name", "replacement"]`, an element with
+key index 1 and value index 2 should resolve to `name=original` under
+protobuf's embedded-message merge (the repeated strings concatenate). The
+decoder returns `name=replacement`. Every index stays valid, so
+`tags_checked()` also succeeds. An empty final occurrence erases the earlier
+table, and earlier occurrences escape string-table validation. libosmium
+refuses multiple populated string tables. The hunter says merging and refusing
+both satisfy the correctness stance, but keeping the last does not. The
+independent metadata scanner (`blob_meta/scan.rs`) applies the same policy, so
+both ends need fixing.
+
+## FMT-003 - Unknown required features are accepted and can be erased on rewrite
+
+Reported by: read-framing [P1], read-block-decoding [P1], read-pipeline [P1].
+
+Header parsing (`read/block.rs`) collects arbitrary `required_features`
+strings, and `read_header_blob` (`read/reader.rs`) returns the header without
+checking support. None of the three hunters found enforcement later on. A file
+declaring `UnsupportedRequiredFeature` (or `UnsupportedExtension`) is decoded
+normally by sequential, parallel and pipelined element reading. A rewriting
+command can then build a fresh header through `output_header::build`
+(`commands/output_header.rs`) that keeps the recognized history declaration but
+drops the unsupported requirement. This breaks the meaning documented on
+`HeaderBlock::required_features`, which says these are features the parser
+needs to implement to interpret later blocks. It also breaks osmium parity:
+libosmium's `pbf_decoder.hpp` refuses unknown requirements, and no recorded
+deviation allows this. All three hunters agree that keeping the strings for
+inspection is fine. The wrong boundary is admitting the file to semantic
+consumption without checking them.
+
+## FMT-004 - Repeated header bbox occurrences overwrite instead of merging
+
+Reported by: read-block-decoding [P2].
+
+The bbox assignment in `WireHeaderBlock::parse` (`read/block.rs`) replaces the
+whole previous message, and `WireHeaderBBox::parse` initializes every
+coordinate to zero. A complete bbox followed by an empty bbox occurrence
+therefore becomes `(0, 0, 0, 0)`; protobuf merging would leave it unchanged.
+Splitting coordinates across occurrences also loses earlier ones. The wrong
+extent reaches `HeaderBlock::bbox`, inspection and output-header derivation.
+It is a silent embedded-message replacement outside the recorded
+repeated-`Info`/`DenseInfo` refusal policy.
+
+## FMT-005 - BlobReader::seek does not resume a failed reader
+
+Reported by: read-framing.
+
+After a malformed frame produces `Err`, a successful `BlobReader::seek`
+(`read/blob.rs`) to a valid frame still leaves `next()` and
+`next_header_skip_blob()` returning `None`: the source moved but the sticky
+failure remains. `seek_raw` and `blob_from_offset` do resume. This contradicts
+the internal statement in the same file that iteration stops "until a seek
+resumes it". The public docs should either distinguish the behaviours, or the
+public seek operations should share recovery semantics.
+
+## FMT-006 - raw_blob_payload promises refusals it does not make
+
+Reported by: read-framing.
+
+Its documentation (`read/decompress.rs`) promises the same refusals as
+`decompress_blob_raw`. It discards `raw_size` and accepts envelopes the
+decompressor rejects for size mismatch. Diff's documented byte-equality
+shortcut explains why. The hunter says the helper's promise is what is wrong.
+
+## FMT-007 - The first-data-blob probe accepts a truncated payload
+
+Reported by: read-pipeline [P1].
+
+`probe_to_first_data_blob` (`commands/mod.rs`) returns right after reading the
+first OSMData BlobHeader and never calls `skip_payload` for that frame. Take a
+complete OSMHeader followed by an indexed OSMData BlobHeader that declares a
+nonempty payload, with the file ending right after it: the probe returns
+`Ok(true)`, and `inspect --indexed` (`crates/cli/src/lib.rs`) reports success.
+This breaks the shape-4 truncation contract in
+`reference/truncation-handling.md`, which explicitly includes these probes.
+The command-side probe is wrong, because `FileReader::skip` cannot enforce a
+check its caller omits. The conformance test (`read/frame_conformance_tests.rs`)
+misses it because its substitute walk calls `skip_payload` on every frame.
+
+## FMT-008 - PipelinedBlocks returns queued blocks after cancellation
+
+Reported by: read-pipeline [P2], concurrency-host [P2].
+
+`PipelinedBlocks::next` (`read/reader.rs`) admits each call through
+`Invocation::call`, which refuses sealing but not cancellation, and it never
+checks the token itself. If the background pipeline fills the queue and blocks
+sending, and the invocation is then cancelled, later `next()` calls still
+return queued `Ok(block)` values while the session is active. read-pipeline
+adds a second case: if the pipeline already finished, the iterator can deliver
+every queued block and then a clean EOF without reporting cancellation at all.
+This breaks the next-blob cancellation guarantee documented on
+`ElementReader::invocation`. Both hunters place the fault in the session
+adapter, which needs cancellation checkpoints at its receive and delivery
+boundary.
+
+## FMT-009 - par_map_reduce's sub-2-GiB working-set guarantee is false
+
+Reported by: read-pipeline [P2].
+
+`par_map_reduce` (`read/reader.rs`) promises a working set well under 2 GiB
+even with pathological 32 MiB blobs. Its admission weight counts only the
+compressed Blob body. A legal block near 32 MiB holding millions of empty
+string-table entries expands to about 128 MiB of entry scratch plus another
+128 MiB of appended offset tables (`read/wire.rs`), on top of the payload.
+Several workers on such blocks exceed the bound while staying well inside the
+compressed-byte budget. The sizes are derived from the representation, not
+measured. Keeping the guarantee would need admission that accounts for decoded
+storage, tables and worker scratch.
+
+## FMT-010 - A replaced pinned input can surface as PlatformUnsupported
+
+Reported by: read-pipeline [P2].
+
+`PinnedInput` (`read/input.rs`) promises `InputReplaced` when its fallback path
+reopen meets a different file, including a FIFO. The direct reopen adds
+`O_DIRECT` before identity verification, and `open_for_read_verified`
+(`direct_io.rs`) classifies an open failure before it runs `verify`. With
+procfs reopening unavailable, replace the pinned path with a FIFO. The direct
+open fails with `EINVAL` and becomes `PlatformUnsupported` instead of
+`InputReplaced`. A replacement on a filesystem that refuses direct I/O behaves
+the same way. This changes the typed failure and the CLI exit classification.
+The fault is in classifying backend setup failure before establishing which
+input it concerned.
+
+## FMT-011 - An aligned direct skip validates against the length captured at open
+
+Reported by: read-pipeline [P2].
+
+`DirectReader::skip_with` (`read/direct_reader.rs`) checks an aligned target
+only against the length captured at open. Read a BlobHeader whose payload
+extends past the current buffer, then truncate the file inside that payload.
+If the declared end is aligned, the skip succeeds against the stale length,
+the next read returns zero, and the frame walk can report a clean EOF. This
+breaks the unconditional shape-4 refusal and source-equivalence claims in
+`reference/truncation-handling.md`. Pinning's documented lack of snapshot
+isolation does not establish that a declared payload still exists. The hunter
+says either the skip needs a current-extent check or the documentation must
+limit the guarantee to immutable inputs.
+
+## FMT-012 - pipeline_decode_tasks counts blobs that are never decompressed
+
+Reported by: read-pipeline [P3].
+
+The dispatcher (`read/pipeline.rs`) increments `pipeline_decode_tasks` for
+every blob, unknown extension blobs included, even though the ordinary
+transform skips those without decompressing. `pipeline_metrics.rs` defines the
+count as one per OSMData blob and says that subtracting filter skips gives the
+number of real decompressions. A file holding only extension blobs after its
+header yields a positive inferred decompression count with none performed. The
+counter and its documented interpretation disagree.
+
+## FMT-013 - Invalid compression levels panic instead of returning an error
+
+Reported by: write-encoding [P2], write-backends.
+
+`Compression::Zlib(10)` can be constructed through the public enum.
+`compress_zlib` (`write/framing.rs`) forwards it straight to
+`flate2::Compress::new`, and the locked zlib-rs backend asserts when
+initialization rejects the level. A synchronous header write or path
+constructor can therefore unwind instead of returning its declared `Result`.
+The CLI string parser protects CLI users, but library callers bypass it.
+`write/compression.rs` acknowledges this explicitly and cites compatibility.
+Both hunters say that rationale conflicts with the pre-1.0 premise. The
+proposed fix is a checked compression-level type, or validation at the writer
+boundary before any output is created.
+
+## FMT-014 - A failed io_uring submit leaves a queued request out of in_flight
+
+Reported by: write-backends [P1].
+
+In `write/uring_writer.rs` the SQE is pushed before `submit()`, but `in_flight`
+increments only after a successful submit, so a submit error leaves a queued
+request uncounted. Sequence: request A is counted, request B is queued, B's
+submit fails, and teardown's `submit_and_wait` submits B. If both completions
+are available, `reap_cqes` decrements a count of one twice. That panics under
+overflow checks or wraps in release, and the next drain can then wait forever
+for a completion that does not exist. This breaks the claimed drain accounting
+and complete writer teardown. The hunter's fix is to count a request when it
+enters the SQ, including requests whose submission then fails.
+
+## FMT-015 - io_uring cleanup can free buffers that outstanding writes still use
+
+Reported by: write-backends [P1].
+
+After `NUM_BUFS * 4` failed drain attempts, cleanup in `write/uring_writer.rs`
+proceeds even with `in_flight` nonzero: it skips buffer unregistration and
+drops the ring and the pool. The accompanying comment establishes that closing
+a ring is asynchronous. This violates the submission safety requirement that
+buffers stay valid for the life of their operations. That `WriteFixed` only
+reads the allocation does not make freeing it safe, because an allocator that
+reuses the storage can expose another allocation's contents to an outstanding
+output write. The retry limit needs an ownership fallback: keep the ring and
+allocation until quiescence, or deliberately abandon ownership without freeing.
+
+## FMT-016 - DirectWriter::flush reports success after a failed finalization
+
+Reported by: write-backends [P2].
+
+`flush_final` (`write/direct_writer.rs`) sets `flushed = true` before it writes
+the padded tail or truncates the file. If either step fails, every later
+`flush` returns `Ok(())` at once, and `Drop` skips the unfinished work. For
+example, a tail write fails with ENOSPC, space is freed, and a retried flush
+succeeds without writing the tail. A truncation failure likewise leaves the
+padding while later flushes claim success. This breaks `flush`'s documented
+finalization contract for the public `DirectWriter`, including one wrapped in
+`PbfWriter::new`. The pipelined `PbfWriter`'s retained flush error protects
+that particular route.
+
+## FMT-017 - DirectWriter::write mishandles partial failures
+
+Reported by: write-backends [P2].
+
+`logical_size` (`write/direct_writer.rs`) counts the whole supplied slice
+before it is accepted. If flushing the first buffer fails, the rest of the
+slice was never copied but is already in the eventual truncation length. With
+a two-buffer input, a failure while flushing the first buffer followed by a
+successful flush writes the first buffer and zero-extends the file over the
+missing second. Separately, `flush_buf` keeps the whole buffer after a partial
+write followed by an error, although the file cursor has advanced, so a retry
+writes the prefix again. This breaks the `Write::write` acceptance contract
+and the promised logical byte count. The hunter notes that fixing the
+finalization latch (FMT-016) alone does not fix this.
+
+## FMT-018 - PbfWriter::write_header skips the cancellation checkpoint
+
+Reported by: write-backends [P2].
+
+Every other public write entry in `write/writer.rs` checks cancellation, but
+`write_header` frames and writes directly. A synchronous writer created with
+`PbfWriter::new_in` accepts and writes a header after its invocation is
+cancelled, and returns success. This contradicts the per-write cancellation
+contract documented next to it. Publication still prevents a cancelled staged
+output from being published. The defect is in the write method's behaviour.
+
+## FMT-019 - A panicking diagnostic sink can abort the process via SummaryWriter
+
+Reported by: concurrency-host [P2].
+
+`SummaryWriter::write` (`host.rs`) calls the sink before removing the completed
+line from its buffer. If the sink panics, unwinding drops the writer, and its
+destructor sends the still-buffered text to the same sink. A sink that always
+panics therefore causes a second panic during unwinding, which aborts the
+process. This breaks the repository's stated avoidance of panicking cleanup
+and the writer's one-event-per-line behaviour, and `DiagnosticSink` imposes no
+non-panicking requirement. Fix: remove pending text from state before calling
+out, and make destructor delivery safe during unwinding. The same hunter
+separately noted, unmeasured, that repeated front-draining of the `Vec` makes
+one large write of many short lines quadratic.
+
+## FMT-020 - SummaryWriter::flush succeeds without flushing
+
+Reported by: concurrency-host [P3].
+
+Writing an unterminated line and calling `flush()` (`host.rs`) returns success
+and delivers nothing to the sink. The bytes stay buffered until a newline or
+destruction. This violates the `std::io::Write::flush` contract the type
+implements. Flushing should deliver the pending fragment, as destruction
+already does.
+
+## FMT-021 - PipelinedBlocks teardown destroys panic payloads
+
+Reported by: concurrency-host [P2].
+
+`threads::scope` keeps a primary panic and forgets secondary payloads, and
+`JoinedPool` forgets caught payloads because their destructors may panic.
+`PipelinedBlocks::drop` (`read/reader.rs`) uses `drop(h.join())`, which
+destroys an error payload. A caller-supplied `Read` can panic after the header
+with a payload whose destructor also panics. If the iterator is then dropped
+during another unwind, destroying that payload aborts the process. The
+disconnect branch of `next()` also destroys the payload after formatting it,
+and can panic instead of returning its promised internal error. This breaks
+the teardown's own stated intent to suppress the background panic during
+cleanup. The session boundary should consume caught payloads under the same
+policy as the scoped infrastructure.
+
+## FMT-022 - Scratch cleanup can abort an already-unwinding process
+
+Reported by: filesystem-output.
+
+When removal fails, `RunScratch::cleanup` (`scratch.rs`) calls the caller's
+diagnostic sink directly, including when it is invoked from `Drop` during a
+panic unwind, and `Diagnostics::emit` (`host.rs`) does not contain that
+callback's panic. An existing panic, plus a scratch removal failure, plus a
+panicking sink, gives a double panic and a process abort that interrupts the
+remaining cleanup. The output layer already handles this exact hazard by
+suppressing cleanup callbacks during unwinding (`emit_cleanup`, `output.rs`).
+Scratch has no equivalent protection.
+
+## FMT-023 - A .buckets-level directory hides a nested backup from deletion protection
+
+Reported by: filesystem-output [P1].
+
+`protected_entries` (`scratch.rs`) skips `.buckets-level*` directories
+entirely. Given an existing tree `index/geocode_header.bin` plus
+`index/.buckets-level9/.pbfhogg-backup-123-0.previous/`, replacement passes
+the protection check, and after publication `output.rs` recursively deletes
+the old tree, nested backup included. No concurrent mutation is needed. This
+breaks ADR-0017's promise to refuse protected entries anywhere inside a
+directory, and the promise that a kept backup is never deleted. The local
+helper's documentation describes the shortcut accurately. The hunter says the
+shortcut is wrong against the stronger contract: allowing removal of the
+bucket directory should not exempt its descendants from inspection.
+
+## FMT-024 - path_guard same_file stringifies the original I/O error
+
+Reported by: filesystem-output [P2].
+
+The `named` closure in `path_guard.rs` formats the original error into a
+string and builds a replacement `io::Error`. A canonicalization failure with
+`EACCES` keeps `PermissionDenied` but loses the original error object and its
+errno, and later conversion into `pbfhogg::Error` cannot recover either. This
+breaks the error-provenance contract in `reference/pipeline.md`: typed errors
+keep their causes, and intermediate layers do not stringify them. The original
+error should be kept in a typed path wrapper.
+
+## FMT-025 - ParallelGzipWriter writes nothing for an empty stream
+
+Reported by: write-encoding (flagged as a surprise).
+
+The empty-stream test in `write/parallel_gzip.rs` deliberately requires zero
+output bytes, with not even an empty gzip member. The current OSC caller
+always writes document framing, so the hunter found no CLI trigger.
+
+## FMT-026 - decompress_blob_data_into copies the whole serialized Blob
+
+Reported by: read-framing (optimization observation).
+
+`decompress_blob_data_into` (`read/decompress.rs`) copies the entire
+serialized Blob through `parse_slice`, even though it already receives
+borrowed bytes and caller-owned output storage. The hunter ties the fix to the
+shared borrowed envelope parser proposed under BUG-001 in `notes/bugs.md`.

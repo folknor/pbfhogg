@@ -628,6 +628,14 @@ without homogeneous indexed blocks need care.
 
 Kind: high conviction; the clearest concrete opportunity (pipeline).
 
+Defect hunt 2026-11-17 (extract) found the same two-pass shape and adds that
+it falsifies a documented claim: the public API says simple multi-extract
+reads the input once (`extract/mod.rs`), but node classification
+(`extract/multi.rs`) finishes before a separate node write pass, ways and
+relations repeat it, and single-extract simple does the same. Verified raw
+copies avoid the second decompression but still reread the frame. The
+documentation half is filed as DOC-018 in `notes/bugs-docs.md`.
+
 ## PERF-018 - Multi-region extract reruns whole extractions per region
 
 Reported by: spatial.
@@ -1258,6 +1266,10 @@ prior deltas.
 Kind: high conviction (cursors); medium conviction, wider payoff (comparison
 decoder).
 
+Defect hunt 2026-11-17 (diff) found the same quadratic prefix replay and notes
+that persistent decoded cursors would also fix the repeated-ID boundary defect
+filed as CMD-010 in `notes/bugs-commands.md`.
+
 ## PERF-042 - Tag predicates are evaluated per occurrence on resolved strings
 
 Reported by: tags, decode.
@@ -1323,6 +1335,11 @@ objects affect tag removal and stats differently); stored spans must not point
 into pooled decompression buffers.
 
 Kind: high conviction (fixed-point removal).
+
+Defect hunt 2026-11-17 (id-filter-selection) independently observed the
+per-nesting-level rescan and repeated collection of already reached members,
+pointing to `getid` as the existing explicit worklist; it labels this an
+unmeasured optimization, not a correctness finding.
 
 ## PERF-044 - tags-filter OSC output collects everything then gzips serially
 

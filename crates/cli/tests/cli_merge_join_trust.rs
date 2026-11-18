@@ -137,9 +137,9 @@ fn run_diff_args(old: &Path, new: &Path, jobs: &str, args: &[&str]) -> (Option<i
     (out.status.code(), out.stderr_str())
 }
 
-/// Assert `diff` with `args` exits `code` at `-j 1` and `-j 4`, one shard
-/// and up to four (an unindexed input runs the element stream at both, a
-/// negative-ID one a single shard), with `needle` in stderr when given.
+/// Assert `diff` with `args` exits `code` at `-j 1` and `-j 4`, one merge
+/// worker and up to four (an unindexed input runs the element stream at
+/// both), with `needle` in stderr when given.
 fn assert_both_paths(old: &Path, new: &Path, args: &[&str], code: i32, needle: Option<&str>) {
     for jobs in ["1", "4"] {
         let (got, stderr) = run_diff_args(old, new, jobs, args);

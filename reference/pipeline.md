@@ -634,11 +634,13 @@ bytes, without building owned elements.
   runs that take no run directory (`stream_writes_scratch`).
 - **`--simplify`** (`merge_changes/simplify.rs`): the batches are collected
   as plain rendered XML plus a per-element record (kind, ID, action, version
-  claim, byte range). A parallel sort of `(kind, id, position)` groups each
-  object's changes in input order; the version floor is applied per group and
-  the last change survives. Survivors, in `(kind, id)` order and grouped
-  create, modify, delete, are cut into one chunk per worker, and each chunk's
-  rendered bytes are spliced into its own `<action>` section and gzip member.
+  claim, byte range). A parallel sort of `(kind, canonical ID ordinal,
+  position)` groups each object's changes in input order; the version floor
+  is applied per group and the last change survives. Survivors, in kind then
+  canonical ID order (`0`, the negative IDs by magnitude, the positives) and grouped
+  create, modify, delete, are cut into at most one chunk per worker, and each
+  chunk's rendered bytes are spliced into its own `<action>` section (and,
+  under gzip, its own member).
   Memory is the rendered XML of every input change, not owned elements.
   The output order requires retaining changes until survivors are known.
   Bounding this further requires spilling rendered batches and reading

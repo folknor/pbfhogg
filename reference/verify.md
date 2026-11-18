@@ -561,10 +561,13 @@ claims, which on an indexed input must pass both indexdata checks too (else
 an error: they feed the prediction). Every output must also claim
 `Sort.Type_then_ID` and `LocationsOnWays` as its command documents, hold no
 blob over the cap or empty, and keep kinds in order. Both arms read the input
-with `osmium fileinfo -e` and refuse a negative ID and a header requiring
-`HistoricalInformation` (one object per kind and ID is the domain); `--force`
-is passed only on an unindexed input, which also gets no layout prediction
-(the PASS line says so). A run pbfhogg refuses as too large for the format
+with `osmium fileinfo -e` and refuse a header requiring
+`HistoricalInformation` (one object per kind and signed ID is the domain).
+Negative IDs are in the domain, but degrade's `--drop-ids` and unsort cases,
+whose checks read claimed ID ranges as ascending numerically, do not run on
+an input holding one, a conservative coverage limit the PASS line names;
+`--force` is passed only on an unindexed input, which also gets no layout
+prediction from claims (the PASS line says so). A run pbfhogg refuses as too large for the format
 (exit 2 with its CLI's `; lower --elements-per-blob` advice, nothing
 published) is named in the PASS line as refused, its representability and
 correctness not established; an arm all of whose runs refuse is an error.
@@ -588,8 +591,8 @@ builder.
 `degrade` runs the decode path at the default cap. `--strip-locations`
 must leave the sequence identical and, on an indexed input, re-encode each
 input blob alone (full blocks, then the remainder). On an input osmium reads
-in strict order with at least four objects, three more run, else the PASS line
-says they did not. `--drop-ids N:SEED`, N the smaller of 10000 and a quarter
+in strict order with at least four objects and no negative element ID, three
+more run, else the PASS line says they did not. `--drop-ids N:SEED`, N the smaller of 10000 and a quarter
 of the objects, must remove exactly N objects and change nothing else (each a
 `-` line alone), its layout predicted from each input blob's survivors (the
 removed IDs counted into the blob whose claimed range holds them); it runs
@@ -645,7 +648,8 @@ content as `--jobs 1` plain `.osc` output.
 
 Merge-changes default output equals its concatenated inputs. Simplify keeps
 the last change per object by input position, grouped create, modify, delete,
-then kind and signed ID. An external sort models histories with bounded
+then kind and the ID in canonical order (`0`, the negative IDs by magnitude,
+the positives). An external sort models histories with bounded
 memory. A lower claimed version than an earlier version is a regression;
 unversioned changes neither raise nor reset that floor. Both simplify runs
 must refuse the first regression by position with exit 2, the object and

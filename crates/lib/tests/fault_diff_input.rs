@@ -7,14 +7,15 @@
 //! a replaced input does not affect the run, and where opens
 //! go through the path the run fails with `InputReplaced`. The replacement
 //! is armed on each input in turn, after each of its opens, the last
-//! included. Every open is taken on the calling thread (the shard workers
-//! pread the walker's descriptor), one at a time, so the counts are exact.
+//! included. Every open is taken on the calling thread, one at a time, so
+//! the counts are exact: the planner thread streams frames from the cursors
+//! the caller opened, and the workers merge in-memory frame bodies.
 //!
 //! The opens of one input, in order (see `Route::opens`): the front read of
-//! the header and the first blob's indexdata; then the block-pair merge's
-//! header walk (more than one shard, negative IDs and type filters
-//! included), its one stream per input at one shard, or the streaming
-//! reader of a route with an unindexed side.
+//! the header and the first blob's indexdata; then, when both inputs carry
+//! indexdata, the one sequential blob cursor the work-unit planner reads (at
+//! any `-j`, mixed-sign inputs and type filters included), or the element
+//! stream reader of a route with an unindexed side.
 //!
 //! `diff` writes to a caller's `Write`, so a run refused at a later open
 //! may already have written text; what it owes is the typed refusal.
@@ -34,8 +35,7 @@ use crate::common::{
 
 #[derive(Clone, Copy, Debug)]
 struct Route {
-    /// Fixed shard count: 1 runs one shard on the calling thread, 3 the
-    /// sharded merge when both inputs carry indexdata.
+    /// Worker limit (`-j`): 1 or 3 merge workers over the same planner.
     jobs: usize,
     /// `diff_stats` instead of `diff`.
     count: bool,
@@ -63,8 +63,8 @@ impl Route {
     };
 
     /// Opens of either input through its pin: the front read, then the
-    /// header walk or the one-shard stream (both inputs indexed) or
-    /// the streaming reader (an unindexed side).
+    /// planner's blob cursor (both inputs indexed) or the element stream
+    /// reader (an unindexed side).
     fn opens(self) -> u64 {
         2
     }
@@ -377,7 +377,7 @@ fn parallel_diff_reads_only_the_pinned_inputs() {
             },
             2,
         );
-        // The walk covers the whole of both files; no tail walk.
+        // The cursor streams the excluded tail too; nothing is reopened.
         check_route(
             Route {
                 count,
@@ -389,9 +389,10 @@ fn parallel_diff_reads_only_the_pinned_inputs() {
     }
 }
 
-/// Negative IDs make a sharded run one unbounded shard, over the same walk.
+/// Mixed-sign inputs take the same planner as any other, cut in canonical
+/// key windows, and open the same pinned inputs.
 #[test]
-fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
+fn mixed_sign_inputs_read_only_the_pinned_inputs() {
     for count in [false, true] {
         let negative = Route {
             count,
@@ -409,8 +410,7 @@ fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
     }
 }
 
-/// An input without indexdata takes the streaming merge, whatever the
-/// shard count.
+/// An input without indexdata takes the element stream, whatever `-j`.
 #[test]
 fn the_streaming_diff_reads_only_the_pinned_inputs() {
     for unindexed in [[true, true], [true, false], [false, true]] {

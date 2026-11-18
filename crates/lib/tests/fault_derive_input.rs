@@ -7,15 +7,16 @@
 //! a replaced input does not affect the run, and where opens
 //! go through the path the run fails with `InputReplaced` and publishes
 //! nothing. The replacement is armed on each input in turn, after each of
-//! its opens, the last included. Every open is taken on the calling thread
-//! (the shard workers pread the walker's descriptor), one at a time, so the
-//! counts are exact. They count derived opens only: the pin itself is not
-//! one.
+//! its opens, the last included. Every open is taken on the calling thread,
+//! one at a time, so the counts are exact: the planner thread streams frames
+//! from the cursors the caller opened, and the workers merge in-memory frame
+//! bodies. They count derived opens only: the pin itself is not one.
 //!
 //! The opens of one input, in order (see `Route::opens`): the front read of
-//! the header and the first blob's indexdata; then the block-pair merge's
-//! header walk (at any shard count, negative IDs included), or the
-//! streaming reader of a route with an unindexed side.
+//! the header and the first blob's indexdata; then, when both inputs carry
+//! indexdata, the one sequential blob cursor the work-unit planner reads (at
+//! any `-j`, mixed-sign inputs included), or the element stream reader of a
+//! route with an unindexed side.
 //!
 //! The output is written only after every input open, and published only
 //! when the run succeeds: a refused run leaves an absent destination absent
@@ -38,8 +39,7 @@ const SENTINEL: &[u8] = b"an earlier output";
 
 #[derive(Clone, Copy, Debug)]
 struct Route {
-    /// Fixed shard count: 1 runs the sequential paths, 3 the parallel one
-    /// when both inputs carry indexdata.
+    /// Worker limit (`-j`): 1 or 3 merge workers over the same planner.
     jobs: usize,
     /// The fixtures hold negative IDs.
     negative: bool,
@@ -64,8 +64,8 @@ impl Route {
     };
 
     /// Opens of either input through its pin: the front read, then the
-    /// header walk (both inputs indexed, at any shard count) or the
-    /// streaming reader (an unindexed side).
+    /// planner's blob cursor (both inputs indexed, at any `-j`) or the
+    /// element stream reader (an unindexed side).
     fn opens(self) -> u64 {
         2
     }
@@ -413,7 +413,7 @@ fn sequential_derive_reads_only_the_pinned_inputs() {
             2,
         );
     }
-    // One shard takes negative IDs as they are.
+    // Mixed-sign inputs at one worker.
     check_route(
         Route {
             negative: true,
@@ -436,9 +436,10 @@ fn parallel_derive_reads_only_the_pinned_inputs() {
     }
 }
 
-/// Negative IDs make a sharded run one unbounded shard, over the same walk.
+/// Mixed-sign inputs take the same planner as any other, cut in canonical
+/// key windows, and open the same pinned inputs.
 #[test]
-fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
+fn mixed_sign_inputs_read_only_the_pinned_inputs() {
     check_route(
         Route {
             negative: true,
@@ -448,8 +449,7 @@ fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
     );
 }
 
-/// An input without indexdata takes the streaming merge, whatever the
-/// shard count.
+/// An input without indexdata takes the element stream, whatever `-j`.
 #[test]
 fn the_streaming_derive_reads_only_the_pinned_inputs() {
     for unindexed in [[true, true], [true, false], [false, true]] {
@@ -463,9 +463,8 @@ fn the_streaming_derive_reads_only_the_pinned_inputs() {
     }
 }
 
-/// The front reads and the streaming readers open `O_DIRECT` when asked
-/// to, through the pin's own direct open (the block-pair walk stays
-/// buffered).
+/// The front reads, the planner's blob cursors and the streaming readers
+/// open `O_DIRECT` when asked to, through the pin's own direct open.
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_reads_follow_the_pinned_inputs() {

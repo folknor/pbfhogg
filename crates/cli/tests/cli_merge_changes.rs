@@ -268,6 +268,36 @@ fn simplify_multiple_same_type_different_ids() {
     assert!(xml.contains(r#"<node id="2" lat="3" lon="4" version="1""#));
 }
 
+/// `--simplify` writes survivors in canonical OSM order, as osmium's
+/// `merge-changes` sorts: `0`, the negative IDs by magnitude, then the
+/// positives, whatever order the input gave them in.
+#[test]
+fn simplify_orders_survivors_canonically() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("001.osc");
+    let out = dir.path().join("out.osc");
+    write_osc_plain(
+        &input,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" lat="1.0" lon="1.0" version="1"/>
+    <node id="-7" lat="1.0" lon="1.0" version="1"/>
+    <node id="0" lat="1.0" lon="1.0" version="1"/>
+    <node id="-1" lat="1.0" lon="1.0" version="1"/>
+  </modify>
+</osmChange>"#,
+    );
+    run_merge_changes(&[&input], &out, true);
+    let xml = read_osc_plain(&out);
+    let ids: Vec<&str> = xml
+        .split("<node id=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(ids, ["0", "-1", "-7", "1"], "output was:\n{xml}");
+}
+
 #[test]
 fn simplify_preserves_metadata() {
     let dir = crate::common::test_scratch();

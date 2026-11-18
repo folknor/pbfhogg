@@ -239,7 +239,7 @@ alloc_features = ["hotpath-alloc"]
 params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
 params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
 params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
-params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs with per-type RoaringTreemap sets" }
+params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs with per-type signed ID sets" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 
 # -- check-index

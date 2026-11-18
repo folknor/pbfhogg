@@ -3,8 +3,9 @@
 //!
 //! OSM IDs are signed `i64`. The canonical osmium sort order is `0` first,
 //! then negative IDs by ascending absolute value (`-1, -2, -3, ...`), then
-//! positive IDs (`1, 2, 3, ...`). For positive-only IDs (all production
-//! PBFs), this collapses to plain `i64` comparison.
+//! positive IDs (`1, 2, 3, ...`). ADR-0028 makes it the order wherever a
+//! command orders objects or validates their order. For non-negative IDs, which is
+//! every PBF OSM publishes, it collapses to plain `i64` comparison.
 //!
 //! Distinct from the membership/cardinality concerns in [`crate::idset`]:
 //! this module is pure value semantics, no data structure.
@@ -18,8 +19,7 @@ pub(crate) type OsmIdKey = (u8, u64);
 /// Order: 0, then negative IDs by ascending absolute value (-1, -2, -3, ...),
 /// then positive IDs (1, 2, 3, ...). Matches libosmium's sort comparator.
 ///
-/// For positive-only IDs (all production PBFs), this is equivalent to plain
-/// i64 comparison - the `(2, id)` tuple compares identically to raw `id`.
+/// For positive IDs this is equivalent to plain i64 comparison - the `(2, id)` tuple compares identically to raw `id`.
 ///
 /// The magnitude is `unsigned_abs`, so the key is injective: every distinct
 /// ID gets a distinct key. A saturating negation used to map both
@@ -77,7 +77,7 @@ pub(crate) fn osm_id_from_ordinal(ordinal: u64) -> i64 {
 }
 
 /// `a` canonically at or before `b`, with a plain compare when both are
-/// non-negative (all production input).
+/// non-negative (the common case).
 #[inline]
 pub(crate) fn osm_id_le(a: i64, b: i64) -> bool {
     if (a | b) >= 0 {

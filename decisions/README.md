@@ -118,6 +118,7 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   external altw, `check --locations` and `check --refs`, canonical
   `id_order` windowing in the diff / derive work-unit planner, silent
   inheritance through `IdSet` for tags-filter / altw-external.
+  Superseded by ADR-0028.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
   hygiene: `PathGuard` for run-owned paths, plus a counters-after-write
   rule. Its caller-named-output rules are superseded by ADR-0017 and its
@@ -245,3 +246,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   inference tries shared streets, then shared places), and steps digits 1 to
   9 on a grid from its lower anchor. `addr:substreet` is not read. Format
   version 5.
+- [ADR-0028](0028-negative-ids-are-handled-like-any-other-id.md) - An
+  object's identity is its kind plus its signed ID: every command handles a
+  negative ID like any other, ordering canonically where it orders, and
+  keeps the signed identity where osmium folds IDs onto their magnitude; a
+  drop, misplacement or refusal for an ID's sign is a bug. Supersedes
+  ADR-0002.

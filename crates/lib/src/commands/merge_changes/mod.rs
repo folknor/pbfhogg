@@ -50,12 +50,15 @@ enum ChangeElement {
 
 #[cfg(test)]
 impl ChangeElement {
-    fn key(&self) -> (ElementKind, i64) {
-        match self {
+    /// The object's place in canonical OSM order: kind, then
+    /// [`crate::osm_id::osm_id_key`].
+    fn key(&self) -> (ElementKind, crate::osm_id::OsmIdKey) {
+        let (kind, id) = match self {
             Self::Node(n) => (ElementKind::Node, n.id),
             Self::Way(w) => (ElementKind::Way, w.id),
             Self::Relation(r) => (ElementKind::Relation, r.id),
-        }
+        };
+        (kind, crate::osm_id::osm_id_key(id))
     }
 }
 
@@ -761,7 +764,10 @@ fn write_simplified(
     // `--allow-version-regression` the dedupe is purely positional.
     // The owned simplify path, kept as the oracle `simplify::run` is held to
     // byte for byte (and regression for regression) by the tests below.
-    let mut last_by_object: BTreeMap<(ElementKind, i64), (Change, VersionFloor)> = BTreeMap::new();
+    let mut last_by_object: BTreeMap<
+        (ElementKind, crate::osm_id::OsmIdKey),
+        (Change, VersionFloor),
+    > = BTreeMap::new();
     for change in stream.changes {
         let key = change.element.key();
         if allow_version_regression {

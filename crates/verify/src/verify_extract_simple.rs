@@ -109,8 +109,7 @@ fn candidate_relations(
     requested.sort_distinct();
     // osmium removeid refuses negative IDs, so the presence of such a member
     // cannot be asked; that is a comparison that cannot be made, never an
-    // absence. Production data holds none (pbfhogg rejects negative IDs on
-    // most paths).
+    // absence. The limit is osmium's: pbfhogg selects negative IDs exactly.
     if let Some((kind, id)) = requested.first_negative() {
         return Err(Error::Tool(format!(
             "osmium's complete_ways relations reference {kind} {id}; osmium removeid cannot look \

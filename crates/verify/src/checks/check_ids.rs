@@ -10,8 +10,8 @@
 //! since there pbfhogg judges type order from the claims, not the elements
 //! (the header-only [`crate::pbf_frames::framing`]). `--full` adds duplicate
 //! detail, which cannot change the verdict: a repeat already breaks the
-//! strict ascent, negative IDs included (both sides order them canonically). Each mode, on each case, must
-//! exit as its report says (0 with a pass and no violation, 1 with a failure
+//! strict ascent, negative IDs included (both sides order them
+//! canonically). Each mode, on each case, must exit as its report says (0 with a pass and no violation, 1 with a failure
 //! and at least one), answer as expected, count every kind as osmium does
 //! (the guard against a reader that skips objects), and say it read
 //! indexdata exactly when the framing has it. The violations themselves are

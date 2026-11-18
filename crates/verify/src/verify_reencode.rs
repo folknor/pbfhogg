@@ -25,9 +25,15 @@
 //! way): [`RepackBuilder`] for repack, [`split`] for degrade's decode path
 //! without an unsort mode, [`continuous`] for `--unsort`.
 //!
-//! **Domain.** One object per kind and ID: an input whose header requires
-//! `HistoricalInformation` is refused, and so is one with a negative ID
-//! (pbfhogg rejects negative input IDs project-wide). A run pbfhogg refuses
+//! **Domain.** One object per kind and signed ID: an input whose header
+//! requires `HistoricalInformation` is refused. Negative IDs are in the
+//! domain; degrade's drop and unsort layout predictions, which read claimed
+//! ranges numerically, do not run on them (see `checks/degrade.rs`). The
+//! independent blob decode refuses a dense ID delta that overflows `i64`,
+//! but way refs and relation members are decoded only by osmium on both
+//! sides, so a wrapped ref delta at the `i64` extremes is certified only as
+//! far as libosmium's signed arithmetic agrees with pbfhogg's wrapping
+//! encoding. A run pbfhogg refuses
 //! because a block would be too large for the format is recorded as refused,
 //! never verified ([`Ran::TooLarge`]).
 
@@ -82,17 +88,10 @@ impl Input {
 }
 
 /// Read the input: osmium's counts and order, the header claims, the framing
-/// and, on an indexed input, `check --index`. A negative ID, a history
-/// header, or a claim its payload contradicts is an error.
+/// and, on an indexed input, `check --index`. A history header, or a claim
+/// its payload contradicts, is an error.
 pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Result<Input, Error> {
     let info = fileinfo(harness, pbf, &outdir.join("input.fileinfo.json"))?;
-    if let Some((kind, id)) = info.negative_id() {
-        return Err(Error::Failed(format!(
-            "{} holds {} ID {id}: pbfhogg rejects negative input IDs project-wide",
-            pbf.display(),
-            KINDS[kind]
-        )));
-    }
     if Claims::open(pbf)?
         .required_features()
         .iter()

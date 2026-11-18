@@ -16,8 +16,9 @@
 //!
 //! - Default mode must be its inputs concatenated, record for record.
 //! - `--simplify` must be the last change of each object by input position,
-//!   in a create, a modify and a delete group, each in (kind, signed ID)
-//!   order, and must refuse (exit 2 naming the object and both versions, no
+//!   in a create, a modify and a delete group, each in kind then canonical
+//!   ID order (`0`, the negative IDs by magnitude, the positives, as
+//!   osmium sorts), and must refuse (exit 2 naming the object and both versions, no
 //!   output published) when a change claims a version lower than one
 //!   claimed earlier for its object, an unversioned change claiming
 //!   nothing; pbfhogg reports the regression at the smallest position.
@@ -169,29 +170,37 @@ impl Record for ByObject {
     }
 }
 
-/// A survivor in pbfhogg's emitted order: action group, kind, signed ID.
+/// A survivor in pbfhogg's emitted order: action group, kind, then the ID
+/// in osmium's order (non-positive IDs before positive ones, each by
+/// magnitude), the same representation [`ByObject`] groups by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Emitted {
     group: u8,
     kind: u8,
+    positive: bool,
+    magnitude: u64,
     id: i64,
     offset: u64,
 }
 
 impl Record for Emitted {
-    const SIZE: usize = 18;
+    const SIZE: usize = 1 + 1 + 1 + 8 + 8 + 8;
     fn encode(&self, out: &mut [u8]) {
         out[0] = self.group;
         out[1] = self.kind;
-        out[2..10].copy_from_slice(&self.id.to_be_bytes());
-        out[10..18].copy_from_slice(&self.offset.to_be_bytes());
+        out[2] = u8::from(self.positive);
+        out[3..11].copy_from_slice(&self.magnitude.to_be_bytes());
+        out[11..19].copy_from_slice(&self.id.to_be_bytes());
+        out[19..27].copy_from_slice(&self.offset.to_be_bytes());
     }
     fn decode(b: &[u8]) -> Self {
         Self {
             group: b[0],
             kind: b[1],
-            id: get_i64(&b[2..10]),
-            offset: get_u64(&b[10..18]),
+            positive: b[2] == 1,
+            magnitude: get_u64(&b[3..11]),
+            id: get_i64(&b[11..19]),
+            offset: get_u64(&b[19..27]),
         }
     }
 }
@@ -339,6 +348,8 @@ fn model(concatenated: &Path, dir: &Path) -> Result<Model, Error> {
         emitted.push(Emitted {
             group: last.action,
             kind: last.kind,
+            positive: last.positive,
+            magnitude: last.magnitude,
             id: last.id,
             offset: last.offset,
         })?;
@@ -847,7 +858,7 @@ pub fn run(harness: &mut Harness, oscs: &[PathBuf]) -> Result<Option<String>, Er
     Ok(Some(format!(
         "on the inputs ({} change file{}) and the inputs twice over{}: default mode as its \
          inputs concatenated and --simplify as the last change per object by input position, \
-         grouped create, modify, delete in (kind, ID) order, comparing action labels, metadata \
+         grouped create, modify, delete in kind then canonical ID order, comparing action labels, metadata \
          attributes (an empty one held to be omitted) and osmium's decoding record for record, \
          a delete held to its input body ({} bodied input deletes checked, a deleted node \
          without a location held to none), section boundaries not compared, --jobs 1 as the automatic workers; on fixtures, \
@@ -904,11 +915,13 @@ mod tests {
         let scratch = pbfhogg_test_scratch::scratch();
         let dir = scratch.path();
         let changes = [
-            (9, Some(9)),
-            (1, Some(8)),
-            (9, None),
-            (9, Some(7)),
-            (1, Some(6)),
+            // `-1` before `-7` is canonical order; numeric order is the
+            // reverse.
+            (-7, Some(9)),
+            (-1, Some(8)),
+            (-7, None),
+            (-7, Some(7)),
+            (-1, Some(6)),
         ]
         .map(|(id, version)| Change {
             action: OscAction::Modify,
@@ -929,7 +942,7 @@ mod tests {
         let model = model(&input, dir).unwrap();
         assert_eq!(
             model.regression.unwrap().needle(),
-            "node 9 carries version 7, which is lower than version 9"
+            "node -7 carries version 7, which is lower than version 9"
         );
         assert_eq!(
             std::fs::read_to_string(model.simplified).unwrap(),
@@ -974,6 +987,8 @@ mod tests {
         let e = Emitted {
             group: 2,
             kind: 1,
+            positive: false,
+            magnitude: i64::MIN.unsigned_abs(),
             id: i64::MIN,
             offset: 3,
         };

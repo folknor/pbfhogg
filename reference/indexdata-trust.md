@@ -240,11 +240,11 @@ The worst of these, stated plainly:
 
 Believed and unchecked, with no wrong answer worth a refusal:
 
-- `BlobIndex::deserialize` bounds neither `count` nor the ID range by
-  kind: a way index with negative IDs, or an absurd count, parses. Nothing
-  sizes an allocation from it unclamped, and negative IDs are invalid input
-  (ADR-0002). An index whose bytes do not parse at all counts as absent
-  (above).
+- `BlobIndex::deserialize` does not bound `count`: an absurd count parses,
+  and nothing sizes an allocation from it unclamped. An ID range of either
+  sign is valid for every kind
+  ([ADR-0028](../decisions/0028-negative-ids-are-handled-like-any-other-id.md)).
+  An index whose bytes do not parse at all counts as absent (above).
 - `BlobFilter` with a node bbox is index-backed (`uses_index`), but the
   classify-phase filter check (`blob_filter_check`) applies only the kind
   and tag-key rules. Only extract builds a bbox filter, and it applies the

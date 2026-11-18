@@ -22,31 +22,6 @@ source at `63d4ec1d`. Where a hunter judged the code wrong instead, the
 finding is filed in the matching `notes/bugs-*.md` document. Entries are in no
 order of importance.
 
-## DOC-001 - "Negative IDs are rejected project-wide" overstates the implemented policy
-
-Reported by: read-block-decoding, read-pipeline, write-encoding,
-write-backends, osc-parsing, apply-merge, diff, altw, extract,
-id-filter-selection, export, check-inspect, cli-binary, geocode-builder.
-
-The hunt brief carried this blanket claim from the title of ADR-0002 and the
-summary line in `DEVIATIONS.md` near its negative-ID section. Fourteen hunters
-said it does not describe the code, and each pointed to the ADR's own
-detailed table of selective enforcement, accepted exceptions and silent
-omission. Sites they named:
-- the scalar and delta decoders, and the readers that deliver negative IDs;
-- `BlockBuilder`, which accepts them (a builder test finalizes node `-1`),
-  and the writer's index scanner (`blob_meta/scan.rs`), which preserves them;
-- OSC parsing, where sorted-overlay tests require them, and merge-changes;
-- diff's documented exception;
-- export, which writes a numeric `@id` of -1;
-- `inspect --show`, which deliberately supports signed queries.
-extract and id-filter-selection read it the other way: under the stated
-invariant, silent bitmap omission is not rejection, and the selection
-boundaries should refuse; the commands they named now select negative IDs
-exactly instead, as the geocode builder now uses negative admin ways and
-node refs. check-inspect cites
-ADR-0002 by a filename different from the one the other hunters used.
-
 ## DOC-002 - truncation-handling.md says partial DenseInfo column sets are rejected
 
 Reported by: read-framing, read-block-decoding.
@@ -255,3 +230,22 @@ Reported by: check-inspect.
 
 `reference/osmium-parity.md` recommends `inspect -e`. That flag now refuses
 and names `--extended` instead.
+
+## DOC-024 - diff test comments still describe a header walk and ID-range shards
+
+Reported by: the negative-ID documents commit's spar (codex).
+
+`crates/lib/src/commands/diff/units.rs` describes one engine at every `-j`:
+a planner streams each input once through a blob cursor and cuts work units
+in canonical key windows; no header is walked ahead of the merge, and `-j`
+is a worker limit, not a shard count. Test comments still describe the
+older shape, sign-neutrally: the module doc of
+`crates/cli/tests/cli_merge_join_trust.rs` (a header walk running
+`BlobOrderGuard` over both whole files, then shards) and its comments on
+the one header walk every `-j` runs, on reading every header up front and
+on the excluded kind's blob; and the shard vocabulary of
+`crates/lib/tests/roundtrip_invariants.rs` (one shard or several, `-j 4`
+planning four node shards). The negative-ID fallback wording in these files
+is already corrected; the rest needs checking against the planner's actual
+cuts before rewording, since some assertions may depend on how many units a
+fixture is cut into.

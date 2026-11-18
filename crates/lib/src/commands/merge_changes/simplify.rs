@@ -18,10 +18,11 @@
 //!    last change survives. When several objects regress, the one at the
 //!    smallest position is reported: the one a serial pass meets first.
 //!    With `--allow-version-regression` no floor is kept.
-//! 3. **Emit.** Survivors come out in `(kind, id)` order, split into
-//!    create, modify and delete groups. Each group is cut into
-//!    `len.div_ceil(workers)` chunks; a chunk is one `<action>` section and,
-//!    under gzip, one member. The surviving elements' rendered bytes are
+//! 3. **Emit.** Survivors come out in canonical OSM order (kind, then `0`,
+//!    the negative IDs by magnitude, the positives), split into
+//!    create, modify and delete groups. Each group is cut into chunks of
+//!    `len.div_ceil(workers)` survivors (so at most one per worker); a chunk
+//!    is one `<action>` section and, under gzip, one member. The surviving elements' rendered bytes are
 //!    spliced into the section, so the output is byte for byte what writing
 //!    owned elements produced (a differential test holds it to that).
 //!
@@ -72,8 +73,10 @@ fn render_batch(batch: &LexBatch, path: &std::path::Path) -> crate::Result<Rende
     })
 }
 
-/// A change's sort key: object, then place in the concatenated input.
-type Key = (ElementKind, i64, u32, u32);
+/// A change's sort key: object (kind, then the ID's canonical ordinal, so
+/// survivors come out in OSM order, negative IDs included), then place in
+/// the concatenated input.
+type Key = (ElementKind, u64, u32, u32);
 
 /// Returns `(changes in, changes out)`.
 pub(super) fn run(
@@ -157,7 +160,7 @@ pub(super) fn run(
     Ok((changes_in as u64, changes_out as u64))
 }
 
-/// Each object's surviving change as `(batch, element)`, in `(kind, id)`
+/// Each object's surviving change as `(batch, element)`, in canonical OSM
 /// order, grouped create, modify, delete.
 fn dedupe(
     plan: &stream::Plan<'_>,
@@ -169,7 +172,7 @@ fn dedupe(
     for (b, rendered) in batches.iter().enumerate() {
         let b = position(b)?;
         for (i, e) in rendered.elements.iter().enumerate() {
-            keys.push((e.kind, e.id, b, position(i)?));
+            keys.push((e.kind, crate::osm_id::osm_id_ordinal(e.id), b, position(i)?));
         }
     }
     if plan.lanes == usize::MAX {
@@ -218,7 +221,7 @@ fn dedupe(
         return Err(crate::error::new_version_regression(
             "merge-changes simplification",
             key.0,
-            key.1,
+            element(&key).id,
             version,
             held,
         ));
@@ -277,7 +280,7 @@ mod tests {
                         .wrapping_add(1);
                     let kind = kinds[usize::try_from(state >> 62).unwrap() % 3];
                     let id = i64::try_from((state >> 20) % 50).unwrap() - 25;
-                    (kind, id, i / 10, i % 10)
+                    (kind, crate::osm_id::osm_id_ordinal(id), i / 10, i % 10)
                 })
                 .collect();
             let mut expected = keys.clone();

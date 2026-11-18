@@ -628,14 +628,12 @@ fn empty_dense_block_between_kinds_loses_nothing() {
     assert_eq!(digest_ok(&with), digest_ok(&without));
 }
 
-/// A negative ID on one side sends the whole comparison to the sequential
-/// merge at any `-j`, and the other side's backwards node blobs (`[2]` then
-/// `[1]`) are refused there just as the parallel walk refuses them, so the
-/// verdict does not depend on `-j`. The sequential merge used to see only
-/// kind transitions and answered with a diff here, which is why the parallel
-/// walk had to decide the fallback before its own order check.
+/// A negative ID on one side does not excuse the other side's backwards
+/// node blobs (`[2]` then `[1]`): the comparison is refused at `-j 1` and
+/// `-j 2` alike. A negative-ID comparison once took a separate sequential
+/// merge that saw only kind transitions and answered with a diff here.
 #[test]
-fn negative_fallback_refuses_the_same_disorder_at_every_job_count() {
+fn mixed_sign_diff_refuses_backwards_blobs_at_jobs_1_and_2() {
     let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
@@ -666,9 +664,9 @@ fn extreme_negative_ids_are_distinct_objects() {
     assert_ne!(digest_ok(&a)[0], digest_ok(&b)[0]);
 }
 
-/// Indexed inputs with negative IDs run as one shard even at the default
-/// `-j`: the shard planner's raw-i64 thresholds do not order negative IDs
-/// the way the merge does.
+/// Indexed inputs with negative IDs diff and digest correctly at the default
+/// `-j`, across blob layouts: the work-unit planner cuts in canonical keys,
+/// the order the merge uses.
 #[test]
 fn negative_ids_diff_correctly_at_default_jobs() {
     let dir = crate::common::test_scratch();

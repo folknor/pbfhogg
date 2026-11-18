@@ -730,7 +730,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
 | `-j, --jobs <N>` | Worker threads for `--nodes` (see [Worker threads](#worker-threads)). **Requires `--nodes`**: passing it elsewhere is an error rather than a no-op. The full-decode modes (`--extended`, `--locations`, `--distrust-metadata`, a report on an unindexed file) decode on the read pipeline's own pool, sized from the machine, which `-j` does not set. |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
-| `--id-ranges` | Show min/max element IDs per type and monotonicity |
+| `--id-ranges` | Show the numeric min/max element IDs per type, and whether each type's IDs ascend numerically: on an indexed file judged from consecutive blobs' claimed ranges, which cannot see order inside a blob, otherwise from the decoded elements. Numeric ascent is not canonical OSM order once a file holds negative IDs; `check --ids` judges canonical order |
 | `--locations` | Show locations-on-ways diagnostics |
 | `--anomalies` | Show blocks outside inspect's per-type median thresholds, plus mixed blocks |
 | `--extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering. Coverage counts objects whose field carries an available value, as `osmium fileinfo -e`: version 1 or more, non-zero timestamp, positive changeset and uid, a user name resolving to a non-empty string; each field is judged on its own value whatever the version, so a present uid 0 or empty user is no uid or user, and a user index past the string table counts as no user. The timestamp range covers non-zero timestamps only. With no objects, "All objects have" is `(none)`. It also reports whether any decoded element ID is negative (`Negative IDs:`, `data.has_negative_ids` in `--json` and as a `--get` key), a property of the input, not a fault. CORRECTNESS.md "Metadata coverage in inspect --extended" lists the boundaries against fileinfo. (`-e` used to be its short; `-e` now refuses here, naming `--extended`.) |
@@ -1504,7 +1504,8 @@ absolute value).
 These are osmium extract's `simple`, `complete_ways` and `smart`, element for
 element on a bbox and on a polygon osmium reads the same way, except that osmium's simple decides a relation on its first
 node or way member only and osmium's smart completes `multipolygon` alone
-unless given `-S types=multipolygon,boundary`. pbfhogg has no `-S` options. See
+unless given `-S types=multipolygon,boundary`, and that on input with negative
+IDs osmium folds IDs onto their magnitude as above. pbfhogg has no `-S` options. See
 [DEVIATIONS.md](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium).
 `--set-bounds` writes the region's envelope with each edge at the
 decimicrodegree it selects.
@@ -2064,7 +2065,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
-| `--simplify` | Keep only the last change per object (type + id) |
+| `--simplify` | Keep only the last change per object (type + id). Survivors are written in create, modify and delete groups, each in type then canonical ID order (`0`, the negative IDs by magnitude, then the positives); osmium sorts by the same object order, without the action groups |
 | `--allow-version-regression` | Requires `--simplify`, which is the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` is lower than one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. An equal version is always accepted and the later change wins. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so there is nothing for the flag to allow. See DEVIATIONS.md. |
 | `-j, --jobs <N>` | Worker threads (see [Worker threads](#worker-threads)). Sizes the encoding pool and the cap on inputs read at once, and the simplify path's chunk fan-out. |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)): output produced for a later input while an earlier one is still being written is held there, so it can approach the output's size. Must exist and be writable; checked before any input is read, after the output is checked. Default: the output's directory. Only several inputs without `--simplify`, at any `-j` but `1`, can write scratch; a single input, `--simplify` or `-j 1` makes no run directory and refuses the flag (exit `64`) |

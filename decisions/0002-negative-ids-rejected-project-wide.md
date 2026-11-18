@@ -32,7 +32,7 @@ every negative ID it compares (node, way under `--check-relations`,
 relation, way ref, relation member). Its sets are `IdSet`s, so it used
 to count a negative element as untrackable and report each reference to
 it as missing; the untrackable counts are gone with the reject.
-Status: Accepted
+Status: Superseded by 0028
 
 ## Decision
 

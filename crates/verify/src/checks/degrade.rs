@@ -40,7 +40,9 @@
 //! base, or `--locations-on-ways`) fails on one instead.
 //!
 //! `--drop-ids` and the unsort modes need an input osmium reads in strict
-//! order; on other input they do not run and the PASS line says so.
+//! order and holds no negative ID (their predictions read claimed ranges
+//! numerically, which canonical order with negatives need not ascend in);
+//! on other input they do not run and the PASS line says so.
 //! `--force` is passed only on an unindexed input.
 
 use std::path::{Path, PathBuf};
@@ -175,10 +177,24 @@ fn run_on(
     };
 
     strip_locations(&mut run, &reference)?;
-    if input.info.strictly_ordered() && input.total() >= 4 {
+    // The drop and unsort predictions walk each kind's claimed ID ranges as
+    // ascending and disjoint in file order (`predict_drop`, the overlap
+    // tally, `place_cross`, `place_intra`'s lowest ID as the first).
+    // Canonical order can break that once a kind holds a negative ID (`0,
+    // -1, -2` then `-3, -4` descend numerically), so any negative element ID
+    // skips the cases: a conservative coverage limit of the verifier, not of
+    // pbfhogg, which degrades such input like any other.
+    let negative = input.info.negative_id();
+    if input.info.strictly_ordered() && input.total() >= 4 && negative.is_none() {
         drop_ids(&mut run, &reference)?;
         unsort(&mut run, &reference, false)?;
         unsort(&mut run, &reference, true)?;
+    } else if let Some((kind, id)) = negative {
+        run.gaps.push(format!(
+            "the input holds {} ID {id}, and the verifier's layout predictions read claimed \
+             ranges numerically: --drop-ids, --unsort and --unsort-intra did not run",
+            KINDS[kind]
+        ));
     } else {
         run.gaps.push(if input.info.strictly_ordered() {
             "the input holds fewer than four objects: --drop-ids, --unsort and --unsort-intra \

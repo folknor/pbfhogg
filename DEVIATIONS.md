@@ -47,14 +47,19 @@ their signed ID, so a member `n-7` keeps node `-7` only; osmium's
 negative IDs. The pass is skipped when `--keep-untagged-nodes` is set (all
 nodes are kept anyway) unless `--inject-prepass` needs its member ways.
 
-## add-locations-to-ways: missing nodes are an error (no longer a deviation)
+## add-locations-to-ways: missing nodes are an error
 
 **osmium behavior:** Fails on missing node coordinates unless
-`--ignore-missing-nodes` is passed.
+`--ignore-missing-nodes` is passed. With it, a ref whose node is missing is
+given libosmium's undefined location, replacing any inline coordinate it
+carried, which its PBF writer stores as `2147483647` on
+each axis under the default framing.
 
-**pbfhogg behavior:** The same. This used to be a deviation - missing nodes were
-always tolerated, `(0, 0)` was substituted, and the count appeared in the summary
-line as `missing locations`.
+**pbfhogg behavior:** The same by default. `--ignore-missing-nodes` writes
+every unresolved ref as `(0, 0)`; that is pbfhogg's own placeholder, not
+osmium's output. Missing nodes used to be always tolerated, `(0, 0)` was
+substituted, and the count appeared in the summary line as `missing
+locations`.
 
 **Why the deviation was withdrawn:** the substituted `(0, 0)` is Null Island, a
 real coordinate off the coast of Ghana. The output is well-formed PBF and the
@@ -311,8 +316,11 @@ as absent, as osmium's writer omits an empty user.
 
 **osmium behavior:** `osmium derive-changes` walks both inputs in
 type/id/version/timestamp order (timestamps take part only when both are
-valid). An object only in the old file is written as a delete, one only in the
-new file as a create or modify, and two objects with the same type, id and
+valid). An object only in the old file is written as a delete, except where
+the next new object has the same ID and a later kind: its "same id?" check
+compares IDs without kinds, so old `n7 v1` against new `w7 v1` writes the
+create of `w7` and no delete of `n7` (osmium 1.19.1). One only in the
+new file is written as a create or modify, and two objects with the same type, id and
 version (and timestamp, where both are valid) count as unchanged whatever
 their content. So a content change that kept its version and timestamp is
 missed, and a new version or timestamp with identical content is written as a
@@ -338,8 +346,9 @@ cannot be told apart from the padding a node without metadata gets (see
 CORRECTNESS.md, "Version 0 is not a version claim either"), so a zero-valued
 field on such a node does not survive the roundtrip.
 
-**Cross-validation:** The two tools agree on deletes: both write one for every
-object only the old file holds. A derived OSC is a snapshot delta, so neither
+**Cross-validation:** pbfhogg writes a delete for every object only the old
+file holds, matching by kind and signed ID; osmium does too except in the
+same-ID, later-kind case above. A derived OSC is a snapshot delta, so neither
 reproduces changes a replication diff for the same window also carries, such
 as an object created and deleted between the two snapshots.
 
@@ -354,7 +363,9 @@ The inclusion rules themselves are stated in `docs/cli/commands.md`
 (osmium-tool `strategy_*.cpp`) except in the two places below; everything
 else - which nodes are inside, which ways and relations are matched, the
 recursive parent relations of complete_ways and smart, smart's completion of
-direct node and way members and their way nodes - is the same element set.
+direct node and way members and their way nodes - is the same element set on
+input without negative IDs (where osmium folds IDs onto their magnitude, see
+"Negative IDs: pbfhogg answers by the signed ID").
 
 **osmium behavior (simple):** A relation is written when its *first* node or
 way member is in the extract; a later member does not count. Its manual says
@@ -518,10 +529,14 @@ sequential assignment needs per-orphan state in first-encounter order; the
 bijection needs only the rank index the live ids already use, so it is
 stateless and deterministic under parallel rewriting.
 
-**Start IDs match osmium.** A positive `--start-id` counts up and a negative
-one counts down (`-1, -2, ...`, which is canonical order, so the output stays
-sorted), and 0 means 1, as in osmium. Only a run whose last id would leave the
-64-bit range is refused; osmium does not check it.
+**Start IDs follow osmium's rule.** A positive `--start-id` counts up and a
+negative one counts down (`-1, -2, ...`, which is canonical order, so the
+output stays sorted), and 0 means 1, as in osmium. pbfhogg accepts both `i64`
+endpoints as starts, which osmium's ID parser rejects, and refuses a start
+whose last assigned id would leave the 64-bit range; osmium does not check
+that, and its offset arithmetic can overflow near either end before the last
+id does. (A rewritten block that grows past the format's size cap is refused
+too, whatever the start's sign.)
 
 **Impact:** Downstream tools that assume output ids are contiguous in the
 live range must tolerate orphan refs outside it, below it as well as above
@@ -553,51 +568,46 @@ the two numbers cannot be reconciled from pbfhogg's output on any input where a
 missing node is referenced more than once: osmium's figure is larger. Node and
 way members of relations agree.
 
-## Negative input IDs rejected project-wide
+## Negative IDs: pbfhogg answers by the signed ID
 
-See [decisions/0002](decisions/0002-negative-ids-rejected-project-wide.md)
-for the decision record (rationale, alternatives considered, migration
-path). This section documents the resulting behavior difference from
-osmium.
+See [ADR-0028](decisions/0028-negative-ids-are-handled-like-any-other-id.md)
+for the rule: an object's identity is its kind plus its signed ID, and every
+command handles a negative ID like any other. This section records where
+osmium's answer differs.
 
-**osmium behavior:** Treats negative IDs as first-class. libosmium
-defines a canonical `id_order` comparator with the order
+**osmium behavior:** Treats negative IDs as first-class in its ordering.
+libosmium defines a canonical `id_order` comparator with the order
 `0 → negatives by absolute value → positives by absolute value` and
-documents it as "the same ordering JOSM uses". `osmium renumber`'s
-man page explicitly states *"Negative IDs are allowed, they must be
-ordered before the positive IDs"*; `osmium sort`'s man page
-documents the same negative-first output order. The libosmium
-CHANGELOG calls out: *"These changes extend this ordering to
+documents it as "the same ordering JOSM uses". `osmium renumber`'s man page
+states *"Negative IDs are allowed, they must be ordered before the positive
+IDs"*; `osmium sort`'s man page documents the same negative-first output
+order. The libosmium CHANGELOG says: *"These changes extend this ordering to
 negative IDs which are sometimes used for objects that have not been
-uploaded to the OSM server yet."* JOSM interop is a designed
-feature, not a tolerated edge case.
+uploaded to the OSM server yet."* Several commands, however, look IDs up by
+their absolute value (`positive_id`, `positive_ref`), so `n-7` and `n7`
+are one key to them; the paragraphs below name them.
 
-**pbfhogg behavior:** Rejects negative input IDs project-wide.
-Production PBFs (planet, Geofabrik extracts, applied OSC streams) are
-positive-only, and several code paths rely on that invariant.
+**pbfhogg behavior:** Every command orders, selects, joins, ranks and
+renumbers a negative ID by its signed value. `diff` and `diff --format osc`
+order and cut by canonical keys (`crates/lib/src/commands/diff/units.rs`),
+`sort` and `cat --dedupe` order canonically, and `inspect --show` takes
+signed query IDs. (`inspect --extended`'s `objects_ordered` still judges
+order numerically, a known defect.) Per command:
 
-`diff` and `diff --format osc` are not among the sites below: they
-accept negative IDs and order them by the canonical `id_order`, which
-their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
+**renumber numbers live objects as osmium does.** It renumbers negative
+node, way and relation IDs, refs and members by canonical rank, as osmium's
+`id_order` numbering does, requiring each kind in canonical order as
+osmium's `CheckOrder` does. Orphan naming differs (see "renumber:
+orphan-reference handling"), and so do the limits of the start, described
+there.
 
-No site enforces the invariant any longer; the paragraphs below record, per
-command, how pbfhogg answers negative IDs.
-
-**renumber matches osmium.** It renumbers negative node, way and relation
-IDs, refs and members by canonical rank, as osmium's `id_order` numbering
-does, requiring each kind in canonical order as osmium's `CheckOrder` does.
-Only orphan naming differs (see "renumber: orphan-reference handling").
-
-`inspect --show` accepts signed query IDs. It is a read-only lookup into the
-PBF payload, not an ID set passed through `IdSet`.
-
-**check is exact.** `check --refs` (with or without `--check-relations`)
-tracks and resolves negative node, way and relation IDs by their signed
+**check is exact.** `check --refs` tracks and resolves negative node IDs
+(and, with `--check-relations`, way and relation IDs) by their signed
 value, as osmium's `check-refs` does with its second ID set for
 negatives; no difference remains except that osmium stores `0` in that
 second set and pbfhogg in the first, which changes no answer, and that
-osmium cannot represent `abs(i64::MIN)`. `check --ids` and `--ids --full`
-order and deduplicate negatives canonically, as libosmium's `CheckOrder`
+osmium cannot represent `abs(i64::MIN)`. `check --ids` judges order, and `--ids --full`
+duplicates, by canonical order and signed ID, as libosmium's `CheckOrder`
 and `osmium fileinfo -e` do, so an ordered file holding negatives passes.
 `check --locations`, which osmium has no equivalent of, gives negative
 nodes slots like any other.
@@ -624,15 +634,21 @@ matched `w-7` also writes `w7` and a ref to `n-7` also writes `n7`; its
 `-R` mode consults no ID set and is exact, like pbfhogg's.
 
 **extract is exact.** Every strategy, single and through `--config`,
-selects a negative node inside the region, a way or relation matched
-through one, a matched way's outside nodes, a smart relation's member ways
-and nodes, and a parent relation, by its exact signed ID. osmium's simple
-strategy matches node refs and members by absolute value, so a way whose
-only refs are `n-2` outside the region is written when `n2` is inside.
-osmium's complete_ways and smart record a matched way's outside node refs
-unfolded in an unsigned set, so a negative one stands for an ID near
-`2^64`; on osmium 1.19.1 a matched way referencing one outside node `n-5`
-makes the run fail "Out of memory".
+selects what its rules select (`docs/cli/commands.md` "extract") by the
+exact signed ID: a negative node inside the region, a way or relation
+matched through one, and where the strategy adds them, a matched way's
+outside nodes, a smart relation's member ways and nodes, and parent
+relations. osmium's
+complete_ways and smart record selected IDs by absolute value: with `n7`
+inside the region and `n-7` outside it, both write both nodes (osmium
+1.19.1, where simple writes `n7` only), and both look parent relations up
+by absolute value too. osmium's simple strategy matches
+node refs and members by absolute value, so a way whose only refs are
+`n-2` outside the region is written when `n2` is inside. osmium's
+complete_ways and smart record a matched way's outside node refs unfolded
+in an unsigned set, so a negative one stands for an ID near `2^64`; on
+osmium 1.19.1 a matched way referencing one outside node `n-5` makes the
+run fail "Out of memory".
 
 **add-locations-to-ways is exact with both index types.** It joins a
 negative node ref to its node, keeps an untagged negative relation-member
@@ -640,42 +656,27 @@ node, and under `--inject-prepass` marks a negative member way and pins a
 negative shared node, each by the exact signed ID, whichever index runs,
 the external one included (it keys IDs `<= 0` by magnitude in a second
 key family of its buckets). osmium joins negative refs through a second
-index keyed by absolute value, which is exact for the join; its
+index keyed by absolute value, which is exact for the join except at
+`i64::MIN`, whose negation overflows; its
 `--keep-member-nodes` retention records members by absolute value
 (`positive_ref()`), so a member `n-7` also keeps an untagged `n7`, and its
 man page says the option does not work with negative IDs. pbfhogg keeps
 only `n-7`.
 
-**Migration path to osmium-style support.** If a consumer does need
-JOSM-interop, the work is:
+**apply-changes --locations-on-ways is exact.** pbfhogg collects the refs
+of changed ways, the change file's node locations and the base's node
+locations by signed ID, and looks each ref up by its signed ID. osmium's
+`apply-changes --locations-on-ways` keys its location index by absolute
+value (`positive_id`, `positive_ref`) for the refs it collects, the change
+file's nodes, the base fallback and the final lookup, so a way referencing
+`n-7` can take `n7`'s location. (Which surviving base ways osmium refreshes
+differs as well, for every sign: see "apply-changes: --locations-on-ways
+takes new locations from the OSC only".)
 
-1. Route every ordering decision through `osm_id_cmp` in
-   `crates/lib/src/osm_id.rs` (canonical `id_order`: 0 → negatives by abs value
-   → positives by abs value), which sort, dedupe, merge-join and diff
-   already use; the remaining raw `<` / `>` / `!=` on `i64` ids
-   audited and switched.
-2. `IdSet` either split into `positives` / `negatives` sub-bitmaps
-   routed by sign at every call site, or widened to a signed index
-   with the capacity cost that implies.
-3. Renumber output numbering interleaves per `id_order` so the
-   emitted sequence matches osmium's expectations.
-4. DEVIATIONS.md entry inverts: claim alignment with osmium instead
-   of deviation.
-
-This is ~several days of work plus thorough regression testing
-against JOSM sample files. Reverse the decision only on a real user
-ask.
-
-**Osmium's own gap.** `osmium derive-changes` has a symmetric latent
-bug: after ordering-based merging by `operator<` (which is
-canonical), the "same id?" check uses raw `it1->id() != it2->id()`
-rather than the absolute-value comparator. Mixed-sign inputs can
-mis-trigger there. pbfhogg's diff orders, cuts and matches by the canonical comparator
-throughout; the gap is not pbfhogg-unique, it is ecosystem-wide.
-
-**Impact:** Users with JOSM-local staging data must resolve negative
-IDs before running pbfhogg commands that touch the invariant sites.
-This affects only hand-edited files that haven't been uploaded.
+**merge-changes --simplify orders canonically.** Its survivors are written
+in kind then canonical ID order inside each action group; osmium sorts by
+the same object order without the action groups (see `docs/cli/commands.md`
+"merge-changes").
 
 ## getid and getparents: bare numeric IDs require an explicit type
 
@@ -881,7 +882,7 @@ miss (`print_missing_ids` in `crates/cli/src/lib.rs`, fed by `record_found` in
 case, so an exit status that fails on them reports the extract, not the
 query; and the requested-ID list is the one a caller can act on. A negative
 member reference is followed by its signed ID where osmium abs-folds it, see
-"Negative input IDs rejected project-wide".
+"Negative IDs: pbfhogg answers by the signed ID".
 
 ## PBF decoding: a repeated Info or DenseInfo is refused, not merged
 

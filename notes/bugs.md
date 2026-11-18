@@ -220,7 +220,12 @@ Reported by: check.
 
 Inspect's `TypeIdRange` (`inspect/types.rs`) compares signed numerically; ID
 checking uses canonical OSM order, so `0, -1, -2, 1` is ordered for check but
-non-monotonic for inspect, also affecting `data.objects_ordered`.
+non-monotonic for inspect, also affecting `data.objects_ordered`. Under
+ADR-0028 the `--id-ranges` monotonicity is a numeric report field (and
+`docs/cli/commands.md` now says so), but `objects_ordered` claims OSM order
+and must judge it canonically; that half is the bug. The `check --locations`
+capped detail list, ordered by signed numeric ID, is a diagnostic order the
+ADR does not govern.
 
 Defect hunt 2026-11-17 (check-inspect, P2) restates this as part of its
 `data.objects_ordered` finding; the other half of that finding is a separate
@@ -464,7 +469,7 @@ wrong results.
 
 ## BUG-030 - inspect's monotonicity answer depends on whether the file is indexed
 
-Reported by: the negative-ID registry (item 2 of `notes/negative-ids-plan.md`).
+Reported by: the negative-ID registry (`crates/cli/tests/cli_negative_ids.rs`).
 
 The index-only report judges `id_ranges.<kind>.monotonic` from consecutive
 blob ID ranges, which cannot see order inside a blob; the decoding report
@@ -478,7 +483,7 @@ answer means, not about the two paths disagreeing.
 
 ## BUG-031 - check --ids --full duplicate details depend on completion order
 
-Reported by: the item 6 spar of `notes/negative-ids-plan.md` (codex).
+Reported by: the codex spar of the check negative-ID work.
 
 The duplicate pass attributes a duplicate to whichever blob reaches the
 set second: the atomic setters in the workers, and `settle_overflow` in

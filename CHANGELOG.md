@@ -166,6 +166,11 @@
 
 ### Changed
 
+- **`merge-changes --simplify` writes survivors in canonical OSM order**
+  inside each create, modify and delete group: `0`, the negative IDs by
+  magnitude, then the positives, as osmium orders objects. It used to write
+  them in numeric order, so `n-7` came before `n-1`. Positive-only changes
+  come out as before.
 - **`PrimitiveBlock::for_each_element`, and so `ElementReader::for_each` and
   `for_each_pipelined`, read a group carrying both plain and dense nodes
   dense nodes first,** as `elements()` already did, so `time-filter` on a
@@ -1090,7 +1095,7 @@ the first four entries, which were recorded without a host)
 
 ### Bug fixes
 
-- **Negative input IDs are now rejected at the input boundary** in `renumber` (every `IdSet` entry point) and in `getid` (parse-time, matching osmium's getid). Previously `renumber` could panic or produce phantom orphans, and `getid` silently dropped negative-id queries with a misleading `"no IDs specified"` message. See `DEVIATIONS.md > "Negative input IDs rejected project-wide"` for the full project-wide stance.
+- **Negative input IDs are now rejected at the input boundary** in `renumber` (every `IdSet` entry point) and in `getid` (parse-time, matching osmium's getid). Previously `renumber` could panic or produce phantom orphans, and `getid` silently dropped negative-id queries with a misleading `"no IDs specified"` message. The stance is recorded in ADR-0002, since superseded by ADR-0028.
 - **Truncated and adversarial PBF inputs now hard-error** instead of silently producing partial output. The contract covers `BlobReader::next`, `BlobReader::skip_blob_body`, `HeaderWalker::next_header`, and `FileReader::skip` (the caller-side payload-skip used by `has_indexdata`, `diff`, `cat --dedupe`, and `altw::passthrough`). Adversarial blob-header length prefixes can no longer trigger multi-GB allocations or process aborts. Truncated headers no longer produce past-EOF schedule entries that fail later inside pread workers. See `reference/truncation-handling.md`.
 - **Multiple read sites** in `renumber`, `apply-changes`, and the ALTW external pipeline now reject malformed input at the boundary instead of panicking or scrambling output: truncated relation `memids` varints, DenseNodes blocks whose `granularity * offset` would overflow `i64`, and ALTW node blobs whose indexdata advertises `max_id < min_id`.
 - **`apply-changes --io-uring`** on indexed input produced structurally-broken PBFs on the `CopyRange` fast-path. Fixed.

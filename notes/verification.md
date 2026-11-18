@@ -19,6 +19,22 @@ Findings are as reported by the hunters and have not been verified. Hunters read
 source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
+## VER-145 - The derive-changes verifier fails pbfhogg on osmium's own same-ID kind-change defect
+
+Reported by: the negative-ID documents commit's spar (codex); osmium
+behaviour confirmed on osmium 1.19.1.
+
+`osmium derive-changes` omits the delete of an old object when the next new
+object has the same ID and a later kind: its "same id?" check
+(`command_derive_changes.cpp`) compares IDs without kinds, so old `n7 v1`
+against new `w7 v1` yields only the create of `w7`. pbfhogg writes both
+(DEVIATIONS.md "derive-changes"). `crates/verify/src/checks/derive_changes.rs`
+records both "osmium roundtrip vs new" and "pbfhogg roundtrip vs osmium
+roundtrip" as required verdicts, so on input holding such a pair a correct
+pbfhogg run fails verify. The verifier needs to recognise the defect (an old-only object whose
+ID reappears under a later kind in new) and record it as osmium's, not
+pbfhogg's.
+
 ## VER-144 - Source-policy rules re-parse every file with syn, in debug
 
 Measured 2026-11-18 on bygg (debug `brokkr test`): the single real-tree

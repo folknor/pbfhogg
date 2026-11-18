@@ -1132,8 +1132,7 @@ fn parse_start_ids(value: &str) -> Result<StartIds, String> {
 
 /// The one help text of `-j/--jobs`, on every command that has it.
 const JOBS_HELP: &str = "Worker threads: 0 (default) sizes the worker pools automatically, \
-     1 runs one worker (the sequential path where there is one), N caps the worker pools at N threads. For diff, N is also the number \
-     of ID-range shards";
+     1 runs one worker (the sequential path where there is one), N caps the worker pools at N threads";
 
 /// `-j/--jobs`: `0` is auto, any other count a cap.
 fn parse_jobs(value: &str) -> Result<pbfhogg::Parallelism, String> {

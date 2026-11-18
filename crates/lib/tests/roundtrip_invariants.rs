@@ -594,7 +594,7 @@ fn diff_blob_layout_independence() {
 }
 
 /// `diff_stats` is `diff` without the text: on every path (one shard or
-/// several, the unindexed element stream, the negative-ID single shard) and
+/// several, the unindexed element stream, mixed-sign inputs) and
 /// every type filter, it either returns the same four counts as a text diff
 /// with `suppress_common` of the same inputs (both may skip byte-equal blobs,
 /// so `common` is the claimed count there), or fails with the same error.
@@ -872,8 +872,8 @@ fn diff_type_filter_excluding_an_earlier_kind_agrees_on_every_path() {
 }
 
 /// A mixed-sign pair holding every kind, indexed (`old-negk`, `new-negk`)
-/// and unindexed (`-u`), so the negative-ID fallback (the sequential merge
-/// at every -j) has an earlier kind to skip. Ways and relations differ.
+/// and unindexed (`-u`), so a type filter on mixed-sign input has an
+/// earlier kind to skip. Ways and relations differ.
 fn write_negative_all_kinds_fixtures(dir: &Path) {
     use crate::common::{
         generate_nodes_with_negatives, generate_relations_with_negatives,

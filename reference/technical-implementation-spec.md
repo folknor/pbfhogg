@@ -103,7 +103,8 @@ Specifications are saved to the ./notes folder.
    addressing why it failed is refuted by its own survey. The survey also checks whether
    the behavior the spec touches is already governed by a standing decision:
    `decisions/*` (the ADRs recording why pbfhogg is shaped as it is - e.g.
-   negative IDs rejected project-wide, debug-assert invariants), `CORRECTNESS.md`
+   negative IDs handled like any other ID, broken invariants failing in
+   release builds), `CORRECTNESS.md`
    (parser/encoder edge cases and representation limits accepted by design),
    and `DEVIATIONS.md` (intentional behavioral differences from osmium). A
    spec that changes one of these must say so and either honor the decision or

@@ -1099,8 +1099,7 @@ exception, not a tier - should not survive across many PRs.
   imports.
 - **Negative-id generators.** `crates/lib/tests/common/mod.rs` provides
   `generate_nodes_with_negatives`, `generate_ways_with_negatives`,
-  `generate_relations_with_negatives` for mixed-sign fixtures (per
-  `decisions/0002-negative-ids-rejected-project-wide.md`). Their refs are
+  `generate_relations_with_negatives` for mixed-sign fixtures. Their refs are
   all positive.
 - **Mixed-sign fixture graph.** `crates/lib/tests/common/mixed_sign.rs`
   provides one referentially complete graph whose IDs, way refs and
@@ -1116,11 +1115,17 @@ exception, not a tier - should not survive across many PRs.
   OSC between two graphs, and a small graph whose only negative IDs are
   dangling references. Its structural contract is pinned in
   `crates/lib/tests/fixture_helpers.rs`.
-- **Negative-ID registry.** `crates/cli/tests/cli_negative_ids.rs` holds
+- **Negative-ID registry.** The executable inventory of
+  [ADR-0028](../decisions/0028-negative-ids-are-handled-like-any-other-id.md)'s
+  rule that negative IDs are handled like any other ID.
+  `crates/cli/tests/cli_negative_ids.rs` holds
   one entry per command path of the binary, checked against
   `pbfhogg_cli::cli_command()` in both directions, so a new command fails
-  there until it has one: its cases, one or more per ID-sensitive mode or
-  flag, or a reasoned mark that it reads no element ID. Every case runs on
+  there until it has one: its cases, or a reasoned mark that it reads no
+  element ID. The cases cover the ID-sensitive modes and flags the graph can
+  isolate; nothing enforces one per mode (degrade's `--drop-ids` selection,
+  for one, has none), and the commands' own test files cover routes the
+  graph cannot force. Every case runs on
   the mixed-sign graph and on its twin, in each framing the command
   accepts, against an answer computed from the graph in the mixed IDs and
   mapped for the twin; the twin must pass unconditionally. A case a command

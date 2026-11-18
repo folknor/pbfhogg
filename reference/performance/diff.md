@@ -231,6 +231,27 @@ The phase split of pair 2 (`sidecar --compare`) puts the node phase at
 the default path is unchanged. The `--locations` path itself was not
 measured.
 
+## Repeated IDs held at the pair boundary (bygg, 2026-11-19, against `eb8cd7b8`)
+
+The pair merge holds a boundary ID whose peer block ran out (one compare
+and peek on a one-sided head in a decoded pair), never skips a mixed-sign
+byte-identical pair, and derive passes every element it compares or
+writes through a per-ID repeat guard. Matched planet A/B, `diff-pair
+--from base --to 20260411`, `--iterations 1`, after `fstrim`; baseline
+cells are `--commit HEAD` builds of `eb8cd7b8`, variant cells the
+uncommitted working tree (stored as dirty). The OSC pairs alternate which
+arm runs first.
+
+| Form | Pair | Baseline | Variant |
+|---|---|---|---|
+| `--format osc` | 1 | `5743ac80` 2m25s | `4b270a33` 2m14s |
+| `--format osc` | 2 | `c618edea` 2m19s | `f868967f` 2m16s |
+| text (`-c`) | 1 | `1282125f` 1m46s | `4e08aa24` 1m46s |
+
+No cost on either form. The OSC variant is faster in both pairs, the first
+pair by more than noise; nothing in the change removes work, so that is
+read as drift, not a win.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

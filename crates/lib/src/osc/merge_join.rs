@@ -394,7 +394,10 @@ pub(crate) enum BlockMergeAction<'a> {
     /// All elements in this blob are unchanged (count from indexdata).
     /// Emitted by the compressed-byte comparison when `skip_equal_blobs` is
     /// true and a fresh old/new blob pair has identical compressed bytes.
-    BlobEqual(u64),
+    /// `first` and `last` are the pair's first and last IDs in OSM order,
+    /// from its claim, which is exact because a mixed-sign claim (whose
+    /// first ID the range cannot name) is never skipped.
+    BlobEqual { count: u64, first: i64, last: i64 },
     /// Every element of the run exists only in old.
     BlobOldOnly(BlockRun<'a>),
     /// Every element of the run exists only in new.
@@ -1117,6 +1120,22 @@ fn merge_decoded_pair<S: MergeSink>(
 
     let outcome = element_merge_pair(&os, &ns, merge_up_to, kind, sink)?;
 
+    check_claimed_max(&os.index, outcome.old_past, merge_up_to, "old")?;
+    check_claimed_max(&ns.index, outcome.new_past, merge_up_to, "new")?;
+
+    // On input in canonical order at most one side keeps a residual: a side
+    // holds elements past the boundary only when its last reaches past the
+    // other's, and a side held at the boundary key is one whose peer ran
+    // out. Both keeping one means a block's elements are out of order
+    // behind truthful-looking claims, and retrying the same pair would never
+    // progress.
+    if outcome.old_has_more && outcome.new_has_more {
+        return Err(crate::error::new_unsorted(format!(
+            "block-pair merge: both blocks still hold elements after merging up to ID \
+             {merge_up_to}. Their elements are not in canonical order within the block."
+        )));
+    }
+
     // ADR-0013: metadata is trusted by default, but nothing load-bearing may
     // break when it turns out to be wrong. The residual decision below is
     // "does this block still hold elements past the boundary", and asking
@@ -1128,9 +1147,10 @@ fn merge_decoded_pair<S: MergeSink>(
     // mismatch instead of losing elements to it. A block clipped at the
     // window's end is bounded there, so what it holds past the window is the
     // next unit's and never counts as "more"; a block whose claim lies
-    // inside the window is not clipped, so its contents stay visible.
-    check_claimed_max(&os.index, outcome.old_has_more, merge_up_to, "old")?;
-    check_claimed_max(&ns.index, outcome.new_has_more, merge_up_to, "new")?;
+    // inside the window is not clipped, so its contents stay visible. The
+    // checks above take `*_past`, elements strictly past the boundary: a
+    // side held at the boundary key (see [`element_merge_pair`]) is not
+    // "more" by itself.
 
     if outcome.old_has_more {
         os.skip_count += outcome.old_consumed;
@@ -1199,7 +1219,7 @@ fn check_claimed_max(
 ///
 /// When `skip_equal_blobs` is true, a fresh overlapping blob pair (neither
 /// side partly consumed, neither crossing the window) with identical claims
-/// and identical compressed payload emits `BlobEqual(count)` without
+/// and identical compressed payload emits `BlobEqual` without
 /// decompression. Callers that need per-element output for unchanged
 /// elements (diff with `!suppress_common`, and its count-only twin) pass
 /// `false`.
@@ -1261,7 +1281,17 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                     if skip_equal_blobs && blobs_byte_equal(old, &op, new, &np)? {
                         stats.pairs_byte_equal += 1;
                         stats.elements_byte_equal += op.index.count;
-                        sink.record(kind, &BlockMergeAction::BlobEqual(op.index.count))?;
+                        sink.record(
+                            kind,
+                            &BlockMergeAction::BlobEqual {
+                                count: op.index.count,
+                                first: crate::osm_id::blob_osm_first_id(
+                                    op.index.min_id,
+                                    op.index.max_id,
+                                ),
+                                last: blob_last(&op.index),
+                            },
+                        )?;
                         continue;
                     }
                     stats.pairs_overlapping_decoded += 1;
@@ -1313,6 +1343,13 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
 /// pair crossing the window: a clipped block's count is not its claim.
 /// The envelopes are parsed (and a malformed one refused) only for a pair
 /// whose claims match.
+///
+/// Never for a claim whose range cannot name its first ID either, a range
+/// spanning negative and positive IDs, whose elements start at 0 or at any
+/// negative: there the lower bound on its first key and the first key it
+/// proves present differ. Derive needs the skipped pair's exact first ID to
+/// see an ID that repeats across its edge. That pair is decoded; a sorted input holds at most one such
+/// blob per kind.
 fn blobs_byte_equal(
     old: &BlockPairSide<'_>,
     op: &BlobDesc,
@@ -1322,6 +1359,8 @@ fn blobs_byte_equal(
     if op.index.min_id != np.index.min_id
         || op.index.max_id != np.index.max_id
         || op.index.count != np.index.count
+        || crate::osm_id::blob_osm_first_key(op.index.min_id, op.index.max_id)
+            != crate::osm_id::blob_osm_present_first_key(op.index.min_id, op.index.max_id)
     {
         return Ok(false);
     }
@@ -1361,6 +1400,10 @@ fn element_merge_pair<S: MergeSink>(
     // uses it, and for negative IDs the two disagree - a raw boundary test
     // would cut the streams somewhere the merge order does not.
     let in_range = |e: &Element<'_>| crate::osm_id::osm_id_cmp(element_id(e), merge_up_to).is_le();
+    // Whether the side whose block ran out holds the merge pair's repeats of
+    // the boundary ID back from the other side.
+    let mut old_held = false;
+    let mut new_held = false;
 
     loop {
         // Which side's head goes next, from the in-range heads alone; the
@@ -1368,10 +1411,32 @@ fn element_merge_pair<S: MergeSink>(
         // `if let`s below always match.
         let old_head = old_iter.peek().filter(|e| in_range(e)).map(element_id);
         let new_head = new_iter.peek().filter(|e| in_range(e)).map(element_id);
+        // Equal IDs pair in the order they occur on each side, as on the
+        // element stream, wherever the blobs happen to end. An ID may repeat
+        // in canonical order, and a block that has run out may be followed
+        // by a blob starting with the same ID: its next blob starts at or
+        // after its claimed last, which is at or after the boundary. So a
+        // head at the boundary ID whose peer's block is exhausted is not
+        // single-sided yet; it waits, as a residual, for the peer's next
+        // blob. A head below the boundary cannot meet that next blob, and a
+        // peer still holding an element (necessarily past the boundary)
+        // has no more of the ID, so both are decided here.
         let order = match (old_head, new_head) {
             (None, None) => break,
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(o_id), None) => {
+                if o_id == merge_up_to && new_iter.peek().is_none() {
+                    old_held = true;
+                    break;
+                }
+                std::cmp::Ordering::Less
+            }
+            (None, Some(n_id)) => {
+                if n_id == merge_up_to && old_iter.peek().is_none() {
+                    new_held = true;
+                    break;
+                }
+                std::cmp::Ordering::Greater
+            }
             (Some(o_id), Some(n_id)) => crate::osm_id::osm_id_cmp(o_id, n_id),
         };
         match order {
@@ -1404,12 +1469,45 @@ fn element_merge_pair<S: MergeSink>(
         }
     }
 
+    let old_has_more = old_iter.peek().is_some();
+    let new_has_more = new_iter.peek().is_some();
+    let old_past = if old_held {
+        held_tail_past(&os.index, old_iter, merge_up_to)
+    } else {
+        old_has_more
+    };
+    let new_past = if new_held {
+        held_tail_past(&ns.index, new_iter, merge_up_to)
+    } else {
+        new_has_more
+    };
     Ok(MergePairOutcome {
         old_consumed,
         new_consumed,
-        old_has_more: old_iter.peek().is_some(),
-        new_has_more: new_iter.peek().is_some(),
+        old_has_more,
+        new_has_more,
+        old_past,
+        new_past,
     })
+}
+
+/// Whether a block held at the boundary ID also holds an element past it,
+/// behind its repeats of that ID: what [`check_claimed_max`] asks of a held
+/// side. `rest` is the held side's iterator, at its first held element, so
+/// the walk covers only what is left. Walked only when the claim does not
+/// already reach past the boundary (the check passes for any answer
+/// otherwise), which needs a repeated ID to happen at all. An element
+/// before the boundary is disorder within the block, which is trusted, not
+/// a claim the check can refute.
+fn held_tail_past<'a>(
+    index: &crate::blob_meta::BlobIndex,
+    mut rest: impl Iterator<Item = Element<'a>>,
+    merge_up_to: i64,
+) -> bool {
+    if crate::osm_id::osm_id_cmp(blob_last(index), merge_up_to).is_gt() {
+        return false;
+    }
+    rest.any(|e| crate::osm_id::osm_id_cmp(element_id(&e), merge_up_to).is_gt())
 }
 
 /// What one [`element_merge_pair`] call did, and what it left behind.
@@ -1420,6 +1518,12 @@ fn element_merge_pair<S: MergeSink>(
 struct MergePairOutcome {
     old_consumed: usize,
     new_consumed: usize,
+    /// The side keeps a residual: elements past the boundary, or repeats of
+    /// the boundary ID held for the peer's next blob.
     old_has_more: bool,
     new_has_more: bool,
+    /// The side holds an element strictly past the boundary, the fact
+    /// [`check_claimed_max`] weighs against the claim.
+    old_past: bool,
+    new_past: bool,
 }

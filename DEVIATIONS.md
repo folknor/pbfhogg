@@ -346,6 +346,14 @@ cannot be told apart from the padding a node without metadata gets (see
 CORRECTNESS.md, "Version 0 is not a version claim either"), so a zero-valued
 field on such a node does not survive the roundtrip.
 
+An ID that occurs more than once on either side (canonical order admits
+it) is compared occurrence by occurrence, as `diff` does. A derived OSC
+states each object once and applying it rewrites every occurrence, so a
+create, modify or delete of such an ID is refused rather than written: no
+OSC maps old `[n1 a, n1 b]` to new `[n1 a, n1 c]`. osmium orders repeats by
+version and timestamp and writes what its walk finds. Repeats unchanged on
+both sides are not a change and pass.
+
 **Cross-validation:** pbfhogg writes a delete for every object only the old
 file holds, matching by kind and signed ID; osmium does too except in the
 same-ID, later-kind case above. A derived OSC is a snapshot delta, so neither

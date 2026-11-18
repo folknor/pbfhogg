@@ -324,6 +324,17 @@
 
 ### Fixed
 
+- `diff` on indexed inputs no longer depends on how a repeated ID falls
+  across blobs. Two identical records of one ID, split into two blobs on
+  one side and packed into one on the other, were reported as one common,
+  one created and one deleted (the unindexed comparison said identical),
+  and `diff --format osc` turned that into a create and a delete that
+  removed the object when applied. Occurrences of an ID now pair in the
+  order they occur on every route. `diff --format osc` now refuses
+  (exit 2, nothing published) a change to an ID that occurs more than
+  once on either side: the OSC states each object once and applying it
+  rewrites every occurrence, so it cannot carry a change to one of them.
+  Repeats unchanged on both sides still pass.
 - `apply-changes` no longer silently drops OSC creates (and modifies of
   absent IDs) for a kind that sorts before the base's first kind. A base
   starting with ways lost the OSC's new nodes, and one starting with

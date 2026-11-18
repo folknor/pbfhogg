@@ -1267,9 +1267,11 @@ prior deltas.
 Kind: high conviction (cursors); medium conviction, wider payoff (comparison
 decoder).
 
-Defect hunt 2026-11-17 (diff) found the same quadratic prefix replay and notes
-that persistent decoded cursors would also fix the repeated-ID boundary defect
-filed as CMD-010 in `notes/bugs-commands.md`.
+Defect hunt 2026-11-17 (diff) found the same quadratic prefix replay. The
+repeated-ID boundary defect it also named is fixed without cursors: the pair
+merge holds a boundary ID whose peer block ran out as a residual. A persistent
+cursor must keep that rule (equal IDs pair in occurrence order across blobs,
+and a held side's claim is checked against what lies behind its repeats).
 
 ## PERF-042 - Tag predicates are evaluated per occurrence on resolved strings
 

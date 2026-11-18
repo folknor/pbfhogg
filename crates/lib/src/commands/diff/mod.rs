@@ -453,7 +453,7 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
         use crate::osc::merge_join::{element_id, element_version};
         let type_char = kind.type_char();
         match action {
-            BlockMergeAction::BlobEqual(count) => {
+            BlockMergeAction::BlobEqual { count, .. } => {
                 self.stats.common += count;
             }
             // A single-sided run's count is the merge's (claimed or, for a

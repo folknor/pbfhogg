@@ -14,7 +14,9 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use crate::ElementKind;
 use crate::commands::input_front::sorted_and_indexed;
 use crate::error::{Error, Result};
-use crate::osc::merge_join::{BlockMergeAction, MergeSink, StreamingBlocks, stream_merge_phase};
+use crate::osc::merge_join::{
+    BlockMergeAction, MergeSink, StreamingBlocks, element_id, stream_merge_phase,
+};
 use crate::osc::write::{OwnedMetadata, write_element_xml};
 use crate::read::input::{InputSource, PinnedInput};
 
@@ -314,6 +316,107 @@ fn copy_checked(
     }
 }
 
+/// The refusal of a change OSC cannot carry: a create, modify or delete of
+/// an ID that occurs more than once on either side.
+///
+/// Both merges pair equal IDs in the order they occur, so a repeated ID is
+/// compared occurrence by occurrence. But an OSC holds one final statement
+/// per kind and ID, and applying it replaces every base occurrence of the
+/// ID with that one statement (or deletes them all), so no OSC turns old
+/// `[n1 a, n1 b]` into new `[n1 a, n1 c]`, or `[n1, n1]` into `[n1]`.
+/// Repeats that are unchanged on both sides need no statement and pass: the
+/// OSC is silent on them, and apply carries them through.
+///
+/// Actions reach the sink in OSM order within a kind (a merge emits nothing
+/// before every smaller ID), so the guard needs only the current ID: how
+/// often each side holds it, and whether any action on it is a change. It
+/// is judged once the ID is over: a larger ID, another kind, or the end of
+/// the unit or phase ([`Self::finish`]). A key going backwards means a block
+/// whose elements are out of order behind its claims, which the element
+/// stream would have refused at admission; it is refused here too.
+///
+/// A byte-identical pair is seen only at its first and last ID
+/// (`BlobEqual`). That suffices: an ID strictly inside the pair's range
+/// occurs only inside that pair, identically on both sides, so nothing
+/// changes it, and a change on an edge ID elsewhere adds an occurrence to
+/// the one the edge contributes.
+#[derive(Default)]
+struct RepeatGuard {
+    current: Option<RepeatRun>,
+}
+
+struct RepeatRun {
+    kind: ElementKind,
+    id: i64,
+    old: u32,
+    new: u32,
+    changed: bool,
+}
+
+impl RepeatGuard {
+    /// Record occurrences of `id` on the old and new side, and whether this
+    /// action changes it.
+    fn observe(
+        &mut self,
+        kind: ElementKind,
+        id: i64,
+        old: u32,
+        new: u32,
+        changed: bool,
+    ) -> Result<()> {
+        if let Some(run) = self.current.as_mut()
+            && run.kind == kind
+        {
+            match crate::osm_id::osm_id_cmp(id, run.id) {
+                std::cmp::Ordering::Equal => {
+                    run.old = run.old.saturating_add(old);
+                    run.new = run.new.saturating_add(new);
+                    run.changed |= changed;
+                    return Ok(());
+                }
+                std::cmp::Ordering::Less => {
+                    return Err(crate::error::new_unsorted(format!(
+                        "derive: {} {id} follows {} {}. The input's blocks hold their \
+                         elements out of canonical order.",
+                        kind.as_str(),
+                        kind.as_str(),
+                        run.id,
+                    )));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        self.finish()?;
+        self.current = Some(RepeatRun {
+            kind,
+            id,
+            old,
+            new,
+            changed,
+        });
+        Ok(())
+    }
+
+    /// Judge the current ID: it is over.
+    fn finish(&mut self) -> Result<()> {
+        match self.current.take() {
+            Some(run) if run.changed && (run.old > 1 || run.new > 1) => {
+                Err(Error::invalid_data(format!(
+                    "derive: {} {} occurs at least {} times in the old input and {} in the \
+                     new one, and changed. A derived change file states each object once \
+                     and applying it rewrites every occurrence, so derive refuses a change \
+                     to a repeated ID.",
+                    run.kind.as_str(),
+                    run.id,
+                    run.old,
+                    run.new,
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Element XML for the three actions, written to `W` as merge actions
 /// arrive, with their counts. The run's sink writes to its scratch files; a
 /// unit's worker writes to memory and hands the bytes over in chunks.
@@ -327,6 +430,9 @@ struct ChangeWriters<W: Write> {
     increment_version: bool,
     timestamp: Option<u64>,
     coord_buf: String,
+    /// Every element an action names passes through it, run elements
+    /// included.
+    repeats: RepeatGuard,
 }
 
 impl<W: Write> ChangeWriters<W> {
@@ -347,7 +453,20 @@ impl<W: Write> ChangeWriters<W> {
             increment_version,
             timestamp,
             coord_buf: String::new(),
+            repeats: RepeatGuard::default(),
         }
+    }
+
+    /// A create of `elem`, which only the new input holds.
+    fn created(&mut self, kind: ElementKind, elem: &crate::Element<'_>) -> Result<()> {
+        self.repeats.observe(kind, element_id(elem), 0, 1, true)?;
+        self.write_create(elem)
+    }
+
+    /// A delete of `elem`, which only the old input holds.
+    fn deleted(&mut self, kind: ElementKind, elem: &crate::Element<'_>) -> Result<()> {
+        self.repeats.observe(kind, element_id(elem), 1, 0, true)?;
+        self.write_delete(elem, kind)
     }
 
     fn write_create(&mut self, elem: &crate::Element<'_>) -> Result<()> {
@@ -393,20 +512,31 @@ impl<W: Write> MergeSink for ChangeWriters<W> {
     /// the worker count nor on whether the inputs carried indexdata.
     fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
         match action {
-            BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual(_) => {}
+            BlockMergeAction::BlobEqual { first, last, .. } => {
+                self.repeats.observe(kind, *first, 1, 1, false)?;
+                if first != last {
+                    self.repeats.observe(kind, *last, 1, 1, false)?;
+                }
+            }
+            BlockMergeAction::ElementEqual(e) => {
+                self.repeats.observe(kind, element_id(e), 1, 1, false)?;
+            }
             BlockMergeAction::BlobOldOnly(run) => {
                 for elem in run.elements() {
-                    self.write_delete(&elem, kind)?;
+                    self.deleted(kind, &elem)?;
                 }
             }
             BlockMergeAction::BlobNewOnly(run) => {
                 for elem in run.elements() {
-                    self.write_create(&elem)?;
+                    self.created(kind, &elem)?;
                 }
             }
-            BlockMergeAction::ElementModified { new, .. } => self.write_modify(new)?,
-            BlockMergeAction::ElementOldOnly(o) => self.write_delete(o, kind)?,
-            BlockMergeAction::ElementNewOnly(n) => self.write_create(n)?,
+            BlockMergeAction::ElementModified { new, .. } => {
+                self.repeats.observe(kind, element_id(new), 1, 1, true)?;
+                self.write_modify(new)?;
+            }
+            BlockMergeAction::ElementOldOnly(o) => self.deleted(kind, o)?,
+            BlockMergeAction::ElementNewOnly(n) => self.created(kind, n)?,
         }
         Ok(())
     }
@@ -544,14 +674,14 @@ impl super::units::UnitSink for UnitWriters<'_> {
         match action {
             BlockMergeAction::BlobOldOnly(run) => {
                 for elem in run.elements() {
-                    self.w.write_delete(&elem, kind)?;
+                    self.w.deleted(kind, &elem)?;
                     self.poll(out)?;
                 }
                 Ok(())
             }
             BlockMergeAction::BlobNewOnly(run) => {
                 for elem in run.elements() {
-                    self.w.write_create(&elem)?;
+                    self.w.created(kind, &elem)?;
                     self.poll(out)?;
                 }
                 Ok(())
@@ -564,6 +694,9 @@ impl super::units::UnitSink for UnitWriters<'_> {
     }
 
     fn finish_into(mut self, out: &mut dyn UnitOut<(Section, Vec<u8>)>) -> Result<UnitDone> {
+        // Units are key windows that never split an ID, so the unit's last
+        // ID is complete here.
+        self.w.repeats.finish()?;
         for section in SECTIONS {
             if !self.w.section(section).get_ref().is_empty() {
                 self.emit(section, out)?;
@@ -852,6 +985,7 @@ fn derive_changes_element_stream(
     for (kind, start, end) in phases {
         host.invocation.marker(start);
         stream_merge_phase(&mut old_src, &mut new_src, kind, &mut sink.w)?;
+        sink.w.repeats.finish()?;
         host.invocation.marker(end);
     }
 

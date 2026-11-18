@@ -120,6 +120,85 @@ fn the_answer_does_not_depend_on_the_cuts() {
     }
 }
 
+/// Nodes in the order given, every node of one ID identical, cut every
+/// `block` elements.
+fn write_ids(path: &Path, ids: &[i64], block: usize) {
+    let nodes: Vec<TestNode> = ids
+        .iter()
+        .map(|&id| TestNode {
+            id,
+            lat: 100_000_000 + i32::try_from(id).unwrap(),
+            lon: 200_000_000,
+            tags: Vec::new(),
+            meta: None,
+        })
+        .collect();
+    write_multi_block_test_pbf(path, &nodes, &[], &[], block);
+}
+
+/// Repeated IDs pair in the order they occur whatever the unit cuts and
+/// blob boundaries: the same stream with `n2` three times, cut into blobs of
+/// two on one side and three on the other, is identical at every cut,
+/// including cuts that carry a frame holding the repeats into the next unit.
+#[test]
+fn repeated_ids_pair_in_order_at_every_cut() {
+    let dir = crate::common::test_scratch();
+    let ids = [1, 2, 2, 2, 3, 4, 4, 5];
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    write_ids(&old, &ids, 2);
+    write_ids(&new, &ids, 3);
+    for jobs in [1, 3] {
+        for unit_bytes in [1, 200, 0] {
+            let text = diff_text(&old, &new, jobs, unit_bytes, false);
+            assert!(
+                !text
+                    .lines()
+                    .any(|l| l.starts_with('+') || l.starts_with('-')),
+                "jobs {jobs}, unit {unit_bytes}: nothing created or deleted; got:\n{text}"
+            );
+            assert_eq!(
+                text.lines().filter(|l| l.starts_with(' ')).count(),
+                ids.len(),
+                "jobs {jobs}, unit {unit_bytes}: every occurrence common; got:\n{text}"
+            );
+        }
+    }
+}
+
+/// A block whose elements are out of order behind honest claims can leave
+/// both sides of a pair with nothing to merge below the boundary: `[2, 1, 3]`
+/// clipped at a cut at 3 ends at `n1`, so the boundary is 1 and both heads
+/// are `n2`. Both sides keep a residual, and retrying the pair would never
+/// progress; the merge refuses it as unsorted instead.
+#[test]
+fn a_pair_that_cannot_progress_is_refused() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("disordered.osm.pbf");
+    write_ids(&path, &[2, 1, 3, 3], 3);
+    let host = crate::common::test_host();
+    host.invocation
+        .faults()
+        .diff_unit_target_bytes
+        .store(1, Ordering::Relaxed);
+    let options = DiffOptions {
+        suppress_common: false,
+        verbose: false,
+        type_filter: None,
+        parallelism: pbfhogg::Parallelism::from_jobs(1),
+        locations: false,
+    };
+    let mut out = Vec::new();
+    let err = diff(&path, &path, &mut out, &options, false, &host)
+        .expect_err("a pair that cannot progress must be refused");
+    assert!(
+        err.report()
+            .contains("not in canonical order within the block"),
+        "{}",
+        err.report()
+    );
+}
+
 /// The fault plan's planner and text settings for one run; zero keeps the
 /// production value.
 #[derive(Clone, Copy, Default)]

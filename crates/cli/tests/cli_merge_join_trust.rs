@@ -42,6 +42,9 @@ use pbfhogg::writer::{Compression, PbfWriter};
 /// What one blob in a hand-laid fixture holds.
 enum Blob {
     Nodes(&'static [i64]),
+    /// Nodes with an explicit latitude offset each, for two records of one
+    /// ID that differ in content.
+    NodesAt(&'static [(i64, i32)]),
     Ways(&'static [i64]),
     Relations(&'static [i64]),
 }
@@ -89,6 +92,11 @@ fn fill_blobs(blobs: &[Blob], mut write: impl FnMut(&[u8])) {
                 for &id in *ids {
                     let lat = 100_000_000 + i32::try_from(id).expect("small test id");
                     bb.add_node(id, lat, 200_000_000, [], None);
+                }
+            }
+            Blob::NodesAt(nodes) => {
+                for &(id, lat) in *nodes {
+                    bb.add_node(id, 100_000_000 + lat, 200_000_000, [], None);
                 }
             }
             Blob::Ways(ids) => {
@@ -826,4 +834,242 @@ fn diff_accepts_honest_claims_and_still_reports_differences() {
     write_blobs(&new, &[Blob::Nodes(&[1, 2, 3, 4]), Blob::Ways(&[100, 200])]);
     assert_both_paths(&old, &new, &[], 1, None);
     assert_both_paths(&old, &new, &["-c"], 1, None);
+}
+
+// ---------------------------------------------------------------------------
+// Repeated IDs: canonical order admits an ID twice in a row. Both merges pair
+// its occurrences in order, wherever the blobs end; derive refuses a change
+// to one, which an OSC cannot express.
+// ---------------------------------------------------------------------------
+
+/// Write `layout` both with indexdata (`<name>.osm.pbf`) and without it
+/// (`<name>-raw.osm.pbf`), so a case runs through both merges.
+fn write_both(dir: &Path, name: &str, layout: &[Blob]) -> [std::path::PathBuf; 2] {
+    let indexed = dir.join(format!("{name}.osm.pbf"));
+    let raw = dir.join(format!("{name}-raw.osm.pbf"));
+    write_blobs(&indexed, layout);
+    write_blobs_unindexed(&raw, layout);
+    [indexed, raw]
+}
+
+/// Run `diff --format osc` at `jobs` and return (exit code, stderr).
+fn run_derive_jobs(old: &Path, new: &Path, osc: &Path, jobs: &str) -> (Option<i32>, String) {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("diff")
+        .arg("--format")
+        .arg("osc")
+        .arg("-o")
+        .arg(osc)
+        .arg("-j")
+        .arg(jobs)
+        .arg(old)
+        .arg(new)
+        .run();
+    (out.status.code(), out.stderr_str())
+}
+
+/// Assert `diff --format osc` exits `code` at `-j 1` and `-j 4`, with
+/// `needle` in stderr when given, and publishes nothing when it refuses.
+fn assert_derive(dir: &Path, old: &Path, new: &Path, code: i32, needle: Option<&str>) {
+    for jobs in ["1", "4"] {
+        let osc = dir.join(format!("out-{jobs}.osc"));
+        let (got, stderr) = run_derive_jobs(old, new, &osc, jobs);
+        assert_eq!(
+            got,
+            Some(code),
+            "derive -j {jobs} {old:?} {new:?}: expected exit {code}; stderr:\n{stderr}"
+        );
+        if let Some(needle) = needle {
+            assert!(
+                stderr.contains(needle),
+                "derive -j {jobs}: expected {needle:?} in stderr; got:\n{stderr}"
+            );
+        }
+        if code == 2 {
+            assert!(!osc.exists(), "a refused derive must publish nothing");
+        }
+        std::fs::remove_file(&osc).ok();
+    }
+}
+
+/// Two identical `n1` records, split into two blobs on one side and packed
+/// into one on the other, are two common pairs on every route. The block
+/// merge used to pair the first, call the second new `n1` created once the
+/// old block ran out, and then the old side's second blob deleted - while
+/// the element stream, without indexdata, said identical. Derive turned that
+/// into a create and a delete of `n1`, which applied removes the node.
+#[test]
+fn repeated_ids_pair_in_order_whatever_the_blob_layout() {
+    let dir = crate::common::test_scratch();
+    let split = write_both(
+        dir.path(),
+        "split",
+        &[Blob::Nodes(&[1]), Blob::Nodes(&[1]), Blob::Nodes(&[2])],
+    );
+    let packed = write_both(dir.path(), "packed", &[Blob::Nodes(&[1, 1, 2])]);
+    let tail = write_both(
+        dir.path(),
+        "tail",
+        &[Blob::Nodes(&[1]), Blob::Nodes(&[1, 2])],
+    );
+    let all = [&split, &packed, &tail];
+    for a in all {
+        for b in all {
+            for (old, new) in [(&a[0], &b[0]), (&a[1], &b[1]), (&a[0], &b[1])] {
+                for args in [&[][..], &["-c"][..]] {
+                    assert_both_paths(old, new, args, 0, Some("Files are identical"));
+                }
+                // Unchanged repeats need no OSC statement, so derive answers
+                // them, with no change.
+                assert_derive(dir.path(), old, new, 0, None);
+            }
+        }
+    }
+}
+
+/// Repeats that differ in number pair as far as both sides go, whatever the
+/// blobs: three old `n1` against two new ones is two common and one
+/// deleted, on both merges.
+#[test]
+fn surplus_repeats_are_single_sided_in_order() {
+    let dir = crate::common::test_scratch();
+    let old = write_both(
+        dir.path(),
+        "old",
+        &[Blob::Nodes(&[1]), Blob::Nodes(&[1, 1]), Blob::Nodes(&[2])],
+    );
+    let new = write_both(
+        dir.path(),
+        "new",
+        &[Blob::Nodes(&[1, 1]), Blob::Nodes(&[2])],
+    );
+    for (o, n) in [(&old[0], &new[0]), (&old[1], &new[1])] {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        for jobs in ["1", "4"] {
+            let out = CliInvoker::new(&invocation_scratch)
+                .arg("diff")
+                .arg(o)
+                .arg(n)
+                .arg("-j")
+                .arg(jobs)
+                .run();
+            assert_eq!(out.status.code(), Some(1), "{}", out.stderr_str());
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let lines: Vec<&str> = text.lines().filter(|l| l.contains("n1")).collect();
+            assert_eq!(lines.len(), 3, "three n1 lines; got:\n{text}");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with('-')).count(),
+                1,
+                "exactly one n1 deleted; got:\n{text}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.starts_with('+')),
+                "no n1 created; got:\n{text}"
+            );
+        }
+    }
+}
+
+/// A block held at a repeated boundary ID still has its claim checked
+/// against what lies behind the repeats: new `[1, 1, 2]` claiming its last
+/// node is 1, against old `[1] | [2]`, is refused rather than trusted to emit
+/// the held tail as created.
+#[test]
+fn a_held_repeat_does_not_hide_an_understated_max_id() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let honest = dir.path().join("new.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    write_blobs(&old, &[Blob::Nodes(&[1]), Blob::Nodes(&[2])]);
+    write_blobs(&honest, &[Blob::Nodes(&[1, 1, 2])]);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 1, |ix| {
+        assert_eq!(ix.len(), 42, "fixture blob must carry a v3 index");
+        ix[10..18].copy_from_slice(&1i64.to_le_bytes());
+    });
+    std::fs::write(&lying, forged).expect("write forged");
+    assert_both_paths(&old, &honest, &[], 1, None);
+    assert_both_paths(
+        &old,
+        &lying,
+        &[],
+        2,
+        Some("does not match the blob's contents"),
+    );
+}
+
+/// An OSC holds one statement per object, so derive refuses any change to an
+/// ID that occurs more than once on either side, on both merges and in both
+/// argument orders, while the text diff still answers it. Covered: a
+/// modification of the second of two records, a surplus occurrence, and a
+/// change next to a byte-identical blob pair that the merge never decodes -
+/// including a mixed-sign one, whose range cannot name its first ID.
+#[test]
+fn derive_refuses_a_change_to_a_repeated_id() {
+    let dir = crate::common::test_scratch();
+    let cases: [(&str, &[Blob], &[Blob]); 4] = [
+        (
+            "modified",
+            &[Blob::NodesAt(&[(1, 1), (1, 2)])],
+            &[Blob::NodesAt(&[(1, 1), (1, 3)])],
+        ),
+        (
+            "surplus",
+            &[Blob::Nodes(&[1]), Blob::Nodes(&[1])],
+            &[Blob::Nodes(&[1])],
+        ),
+        (
+            "beside-equal",
+            &[Blob::NodesAt(&[(1, 1)]), Blob::NodesAt(&[(1, 2), (3, 3)])],
+            &[Blob::NodesAt(&[(1, 4)]), Blob::NodesAt(&[(1, 2), (3, 3)])],
+        ),
+        (
+            "beside-mixed-sign",
+            &[
+                Blob::NodesAt(&[(-1, 1)]),
+                Blob::NodesAt(&[(-1, 2), (-2, 5), (2, 6)]),
+            ],
+            &[
+                Blob::NodesAt(&[(-1, 3)]),
+                Blob::NodesAt(&[(-1, 2), (-2, 5), (2, 6)]),
+            ],
+        ),
+    ];
+    for (name, old_layout, new_layout) in cases {
+        let old = write_both(dir.path(), &format!("{name}-old"), old_layout);
+        let new = write_both(dir.path(), &format!("{name}-new"), new_layout);
+        for (o, n) in [
+            (&old[0], &new[0]),
+            (&old[1], &new[1]),
+            (&new[0], &old[0]),
+            (&new[1], &old[1]),
+        ] {
+            assert_both_paths(o, n, &[], 1, None);
+            assert_derive(dir.path(), o, n, 2, Some("repeated ID"));
+        }
+    }
+}
+
+/// The repeat check refuses nothing it should answer: a change beside an
+/// identical blob whose range spans negative and positive IDs, with no ID
+/// repeated, is derived. Skipping that pair would leave the check only the
+/// range's lower bound (ID 0) for its first ID, which sorts before the
+/// changed `n-1` and reads as disorder.
+#[test]
+fn derive_answers_a_change_beside_a_mixed_sign_identical_blob() {
+    let dir = crate::common::test_scratch();
+    let old = write_both(
+        dir.path(),
+        "old",
+        &[Blob::NodesAt(&[(-1, 1)]), Blob::NodesAt(&[(-2, 5), (2, 6)])],
+    );
+    let new = write_both(
+        dir.path(),
+        "new",
+        &[Blob::NodesAt(&[(-1, 3)]), Blob::NodesAt(&[(-2, 5), (2, 6)])],
+    );
+    for (o, n) in [(&old[0], &new[0]), (&old[1], &new[1])] {
+        assert_derive(dir.path(), o, n, 1, None);
+    }
 }

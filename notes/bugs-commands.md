@@ -127,23 +127,6 @@ an element at version 2147483647 with the flag emits the same version and
 reports success, despite the flag's documented promise to bump the version by
 one. An unrepresentable increment should be refused.
 
-## CMD-010 - Diff results depend on how repeated IDs fall across blobs
-
-Reported by: diff [P1].
-
-The merge in `osc/merge_join.rs` consumes all equal-ID elements in the current
-pair of blocks before fetching either side's next block. Take identical
-element streams with two identical `n1` records, packed into two blobs on the
-old side and one blob on the new side. The result is one common, one created
-and one deleted, whereas the sequential merge used without indexdata reports
-two common. Derive also publishes a create followed by a delete for `n1`, so
-applying it removes the object. All ranges and counts can be accurate. This
-breaks content equality, the claimed independence from indexdata, and the
-content roundtrip promise in `docs/cli/commands.md`. The merge needs to handle
-complete runs of equal IDs across blobs, and derive should refuse inputs whose
-multiplicity OSC cannot represent faithfully. PERF-041 in
-`notes/performance.md` covers the same code.
-
 ## CMD-011 - Unindexed gzip derive ignores the -j worker cap
 
 Reported by: diff [P2].

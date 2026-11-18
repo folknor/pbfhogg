@@ -258,3 +258,37 @@ implementer.
 The "BlobHeader.datasize cap" section of `CORRECTNESS.md` still describes
 two separate frame-check funnels, while `crates/lib/src/read/frame.rs` has
 had a single frame state machine since `307982d7`.
+
+## DOC-026 - apply-changes comments describe a timed receive and a relation-first fixture that is not
+
+Reported by: the CMD-001 scout and implementer (2026-11-18), not verified
+further.
+
+- The single-worker comment in
+  `crates/lib/src/commands/apply_changes/rewrite.rs` still says "within one
+  receive timeout"; the drain now blocks on its channel and is woken by a
+  message.
+- The `relation-first` fault fixture in
+  `crates/lib/tests/fault_apply_changes.rs` contains base nodes, so its name
+  promises a shape it does not build. The relation-only shape is covered by
+  `merge_writes_node_and_way_upserts_before_a_relation_only_base_with_locations`
+  in `crates/cli/tests/cli_apply_changes.rs`.
+
+## DOC-027 - diff input checks promise a claim refusal the one-sided shortcut skips
+
+Reported by: the CMD-010 spar partner (2026-11-19), checked against the
+code by the CMD-010 implementer, not fixed.
+
+- `docs/cli/commands.md` "diff", "Input checks", says that where a block
+  holds elements past its claimed last ID the merge refuses the claim when
+  it meets them. `block_pair_merge_phase` (`osc/merge_join.rs`) emits a
+  block whose claim lies entirely before the peer's as one run without
+  walking it against the claim, so old `[2]` against new `[1, 2]` claiming
+  `[1, 1]` can print `+n2` then `-n2` with no refusal. The refusal holds
+  only where a decoded pair walk meets the contradiction. Either the
+  shortcut checks the run's last element against the claim, or the
+  paragraph says where the check runs.
+- The same paragraph lists the byte-identical skip conditions without the
+  rest: both blobs fresh (no residual on either side) and neither crossing
+  its work unit's window. A pair that matches but misses those is decoded,
+  so the corrupt-body exception is narrower than stated.

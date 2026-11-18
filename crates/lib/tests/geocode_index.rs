@@ -1152,6 +1152,100 @@ fn understated_node_max_id_is_an_error_not_a_panic() {
     );
 }
 
+/// An all-negative file: the boundary `r-30` over the negative way `w-20`,
+/// whose ring runs over negative nodes and holds a dangling ref `-50` below
+/// every node present. It answers like its positive counterpart, and an
+/// understated negative `max_id` claim is refused at Pass 2a as a positive
+/// one is (the bound is the numeric maximum, not floored at zero).
+#[test]
+fn negative_admin_way_over_negative_nodes_answers_and_bounds_hold() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let ring = [
+        (-10, 556_990_000, 124_990_000),
+        (-11, 556_990_000, 125_020_000),
+        (-12, 557_010_000, 125_020_000),
+        (-13, 557_010_000, 124_990_000),
+    ];
+    let nodes: Vec<TestNode<'_>> = ring
+        .iter()
+        .map(|&(id, lat, lon)| TestNode {
+            id,
+            lat,
+            lon,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    write_test_pbf_sorted(
+        &input,
+        &nodes,
+        &[TestWay {
+            id: -20,
+            refs: vec![-10, -11, -12, -50, -13, -10],
+            tags: vec![],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: -30,
+            members: vec![TestMember {
+                id: MemberId::Way(-20),
+                role: "outer",
+            }],
+            tags: vec![
+                ("type", "boundary"),
+                ("boundary", "administrative"),
+                ("admin_level", "2"),
+                ("name", "Negativeland"),
+            ],
+            meta: None,
+        }],
+    );
+    let index_dir = dir.path().join("index");
+    let stats = build_into(&input, &index_dir, false);
+    assert_eq!(stats.admin_polygons, 1);
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open");
+    let inside = reader.query(55.7000, 12.5005).expect("valid query");
+    assert_eq!(
+        inside
+            .admin
+            .iter()
+            .map(|a| (a.admin_level, a.name))
+            .collect::<Vec<_>>(),
+        vec![(2, "Negativeland")]
+    );
+    let outside = reader.query(55.7020, 12.5005).expect("valid query");
+    assert!(outside.admin.is_empty());
+
+    // Blob 1 is the node blob. Claim its last node is -12 while the
+    // payload still holds -10.
+    let bytes = std::fs::read(&input).expect("read fixture");
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 1, |ix| {
+        assert_eq!(ix.len(), 42, "fixture blob must carry a v3 index");
+        ix[10..18].copy_from_slice(&(-12i64).to_le_bytes());
+    });
+    let lying = dir.path().join("lying.osm.pbf");
+    std::fs::write(&lying, forged).expect("write forged");
+    let err = build_index(
+        &lying,
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            ..Default::default()
+        },
+        &dir.path().join("lying-index"),
+        false,
+        &crate::common::test_host(),
+    )
+    .expect_err("an understated negative node max_id must fail the build");
+    let msg = err.to_string();
+    assert!(
+        // -10 and -11 are both above the forged bound; either may be met
+        // first.
+        msg.contains("node -10 exceeds the node-ID bound -12")
+            || msg.contains("node -11 exceeds the node-ID bound -12"),
+        "error should name the node and the understated bound; got: {msg}"
+    );
+}
+
 /// A way ref above every node in the file is a dangling ref (a simple
 /// extract keeps ways whose nodes it cut away), not an error: the street
 /// keeps the vertices it has. This used to panic in Pass 1.5 for the same

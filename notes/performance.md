@@ -1756,3 +1756,23 @@ coordinates only for the chosen ring, preserving the traversal result where
 promised.
 
 Payoff: removes pathological worst cases; not a current export throughput item.
+
+## PERF-063 - Geocode Pass 1.5 overflow lists are unbounded per worker
+
+Reported by: the negative-ID geocode change.
+
+Mechanism: `record_referenced_node` (`geocode_index/builder/pass1_5.rs`)
+spills every node ref the size-bounded pre-allocation does not cover
+(above it, or negative) onto a per-worker `Vec<i64>`. Compaction sorts and
+dedups only once a list has doubled, keeps its capacity, and workers can
+hold the same IDs; every list lives until the scan joins. A file whose
+relevant refs mostly spill (an all-negative file, or IDs far above 64 per
+input byte) holds about 8 bytes per spilled ref per worker at peak, and
+distinct dangling spills stay in the final set. Sign-neutral: large
+positive IDs had the same shape before negatives joined it; ordinary
+positive input spills nothing new.
+
+Redesign: bounded batches folded into one shared accumulator, or a
+scratch-backed sort and dedupe where the final set also needs a bound.
+
+Payoff: bounded memory on exotic ID layouts; nothing on planet-shaped input.

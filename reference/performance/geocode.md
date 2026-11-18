@@ -12,6 +12,18 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Negative node refs spill to the overflow lists (bygg, 2026-11-18, variant uncommitted against `6a823de7`)
+
+Pass 1.5 collects negative admin ways and node refs: a ref the
+pre-allocated range does not cover (negative, or above it) goes through
+`try_insert_atomic` to the worker's overflow list, replacing the sign skip
+and its tally. Germany, `--stop GEOCODE_PASS1_5_END`, `--iterations 1`
+in A B B A order, no fstrim (denied). GEOCODE_PASS1_5_SCAN: base 717 ms
+(`f7d6e98a`), variant 705 ms (`96e0dc7a`), variant 703 ms (`b8904b54`),
+base 718 ms (`ed7205d0`). Walls are 901 ms in all four (the stop lands at
+a fixed point after the marker). Verdict: neutral, about 2 % faster, within
+noise.
+
 ### Input digest in the header, format 7 (bygg, 2026-11-15, variant uncommitted against `9609d308`)
 
 The build hashes the whole input (XXH3-128, a full sequential read of the

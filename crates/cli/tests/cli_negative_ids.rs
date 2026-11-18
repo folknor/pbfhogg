@@ -188,7 +188,7 @@ macro_rules! declared {
             check_locations_agreement_disagreeing_absent,
             check_index,
         ];
-        ["build-geocode-index"] => cases [build_geocode_index_admin];
+        ["build-geocode-index"] => cases [build_geocode_index_admin, build_geocode_index_negative_outer_way];
         ["geocode-query"] => no_id_input(
             "takes a built index and coordinates; the IDs it was built from are \
 build-geocode-index's, whose case queries the index it builds"
@@ -2938,52 +2938,86 @@ fn check_index() -> Case {
 /// over `5, 7, -7, -5`: a point inside it answers "Mixed", one outside
 /// answers no boundary.
 fn build_geocode_index_admin() -> Case {
-    Case::both(
-        BOTH,
-        |w, dir, f| {
-            let mut a = vec![
-                base_input(w, dir, f),
-                "--output-dir".into(),
-                out_arg(dir, "index"),
-            ];
-            if !f.indexed() {
-                a.push("--allow-unindexed".into());
-            }
-            a
-        },
-        |_, o| {
-            let mut findings: Vec<Finding> = exit(o, 0).into_iter().collect();
-            if o.code != Some(0) {
-                return findings;
-            }
-            let reader = pbfhogg::geocode_index::reader::Reader::open(&o.file("index")).unwrap();
-            let mut got = Vec::new();
-            for (label, lat, lon) in [("inside", 55.2, 12.2), ("outside", 56.4, 13.0)] {
-                match reader.query(lat, lon) {
-                    Ok(result) => {
-                        for admin in &result.admin {
-                            got.push(format!("{label} {} {}", admin.admin_level, admin.name));
-                        }
-                    }
-                    Err(e) => got.push(format!("{label} error {e}")),
+    geocode_admin_case(geocode_admin_argv::<false>)
+}
+
+/// The same ring held by the negative way `w-9` (its refs swapped with
+/// `w7`'s) as `r1`'s outer: the admin way itself is negative.
+fn build_geocode_index_negative_outer_way() -> Case {
+    geocode_admin_case(geocode_admin_argv::<true>)
+}
+
+/// The mixed graph, with `r1`'s ring moved onto `w-9` when
+/// `NEGATIVE_OUTER`; IDs stay in the mixed graph's domain.
+fn geocode_admin_graph<const NEGATIVE_OUTER: bool>() -> MixedSignGraph {
+    let mut g = mixed_sign_graph();
+    if !NEGATIVE_OUTER {
+        return g;
+    }
+    let ring = g.way(7).refs.clone();
+    let other = g.way(-9).refs.clone();
+    for way in &mut g.ways {
+        match way.id {
+            7 => way.refs = other.clone(),
+            -9 => way.refs = ring.clone(),
+            _ => {}
+        }
+    }
+    for relation in &mut g.relations {
+        if relation.id == 1 {
+            for member in &mut relation.members {
+                if member.id == MemberId::Way(7) {
+                    member.id = MemberId::Way(-9);
                 }
             }
-            findings.extend(compare(
-                "admin",
-                &["inside 4 Mixed".to_owned()],
-                &got,
-                false,
-            ));
-            findings
-        },
-    )
-    .gaps(vec![gap(
-        "admin",
-        None,
-        Sig::Tokens {
-            missing: &["inside 4 Mixed"],
-            extra: &[],
-        },
-        "build-geocode-index skips negative node refs of admin ways",
-    )])
+        }
+    }
+    g
+}
+
+fn geocode_admin_argv<const NEGATIVE_OUTER: bool>(
+    w: &World,
+    dir: &Path,
+    f: Framing,
+) -> Vec<OsString> {
+    let g = w.graph(geocode_admin_graph::<NEGATIVE_OUTER>());
+    let mut a = vec![
+        write(dir, IN, &g, Layout::plain(f.indexed())),
+        "--output-dir".into(),
+        out_arg(dir, "index"),
+    ];
+    if !f.indexed() {
+        a.push("--allow-unindexed".into());
+    }
+    a
+}
+
+/// Build an index with `argv` and query one point inside the `r1` ring
+/// and one outside it.
+fn geocode_admin_case(argv: fn(&World, &Path, Framing) -> Vec<OsString>) -> Case {
+    Case::both(BOTH, argv, |_, o| {
+        let mut findings: Vec<Finding> = exit(o, 0).into_iter().collect();
+        if o.code != Some(0) {
+            return findings;
+        }
+        let reader = pbfhogg::geocode_index::reader::Reader::open(&o.file("index")).unwrap();
+        let mut got = Vec::new();
+        for (label, lat, lon) in [("inside", 55.2, 12.2), ("outside", 56.4, 13.0)] {
+            match reader.query(lat, lon) {
+                Ok(result) => {
+                    for admin in &result.admin {
+                        got.push(format!("{label} {} {}", admin.admin_level, admin.name));
+                    }
+                }
+                Err(e) => got.push(format!("{label} error {e}")),
+            }
+        }
+        findings.extend(compare(
+            "admin",
+            &["inside 4 Mixed".to_owned()],
+            &got,
+            false,
+        ));
+        findings
+    })
 }

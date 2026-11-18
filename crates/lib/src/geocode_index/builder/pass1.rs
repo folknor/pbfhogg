@@ -173,15 +173,12 @@ pub(super) fn run_pass1(
         host,
     )?;
 
-    // Build set of way IDs needed for admin boundary geometry. The builder
-    // does not use negative admin ways: they are left out of the set, so
-    // their geometry is never assembled.
+    // Build set of way IDs needed for admin boundary geometry, of either
+    // sign.
     let mut needed_admin_ways = crate::idset::IdSet::new();
     for r in &admin_relations {
         for &wid in r.outer_way_ids.iter().chain(&r.inner_way_ids) {
-            if wid >= 0 {
-                needed_admin_ways.insert(wid);
-            }
+            needed_admin_ways.insert(wid);
         }
     }
 

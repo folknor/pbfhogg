@@ -2090,7 +2090,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the directory containing `--output-dir` |
 
 A node whose coordinates fall outside the geographic domain fails the whole
-build. Incomplete extracts remain usable: missing way nodes and missing admin
+build. Node, way and relation IDs of either sign are used alike. Incomplete extracts remain usable: missing way nodes and missing admin
 member ways contribute no geometry; admin boundary candidates with a missing,
 unparseable, or unsupported level or no name are skipped; relation members
 whose roles do not describe outer or inner rings are ignored (an empty role

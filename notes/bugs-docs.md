@@ -39,14 +39,12 @@ omission. Sites they named:
 - OSC parsing, where sorted-overlay tests require them, and merge-changes;
 - diff's documented exception;
 - export, which writes a numeric `@id` of -1;
-- `inspect --show`, which deliberately supports signed queries;
-- the geocode builder, which indexes negative-ID address nodes and skips and
-  counts negative way references (`builder/pass1_5.rs`), an inventory ADR-0002
-  lacks.
+- `inspect --show`, which deliberately supports signed queries.
 extract and id-filter-selection read it the other way: under the stated
 invariant, silent bitmap omission is not rejection, and the selection
 boundaries should refuse; the commands they named now select negative IDs
-exactly instead. check-inspect cites
+exactly instead, as the geocode builder now uses negative admin ways and
+node refs. check-inspect cites
 ADR-0002 by a filename different from the one the other hunters used.
 
 ## DOC-002 - truncation-handling.md says partial DenseInfo column sets are rejected

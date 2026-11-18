@@ -137,7 +137,7 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 28 | ALTW external | Exact and signed since commit 8, any node ID **[S]**. | P | Joins |
 | 29 | ALTW auto, `--force` | Header admission gate and post-pass-0 recheck since commit 7; negative clause gone with commit 8 **[S]**. | P | n/a |
 | 30-32 | ALTW retention, `--inject-prepass`, `--ignore-missing-nodes` | Exact and signed since commit 7 **[S]**. | P | `--keep-member-nodes` abs-folds and unsupported **[O][C:altw]**; missing nodes get an undefined raw location **[C:altw]**, see the doc gap in section 10. |
-| 33 | build-geocode-index | pass1 drops negative admin ways **[S]**; pass1_5 skips negative refs. | S+ (section 4.7). | No counterpart. traccar is partial: signed member ways, but a `Dummy` negative location store, so a negative node ref fails **[O][C:rgp]**. |
+| 33 | build-geocode-index | Exact and signed since commit 9: negative admin ways and node refs are collected; the node bound is the numeric maximum **[S]**. | P | No counterpart. traccar is partial: signed member ways, but a `Dummy` negative location store, so a negative node ref fails **[O][C:rgp]**. |
 | 34 | geocode-query | No ID operand. | P | n/a |
 | 35-37 | diff text and OSC, digest | Canonical and exact **[S]**. | P | Canonical |
 | 38-39 | apply-changes, `--locations-on-ways` | Signed and exact. | P | The location join abs-folds `±1` **[C:inv]**; pbfhogg is exact. |
@@ -163,13 +163,6 @@ its command's guards.
 
 What remains of 4.1: a total `canonical_rank(id)` for absent IDs, needed by
 the orphan bijection, lands with commit 10.
-
-### 4.2 Membership users
-
-Row 33 uses the signed set. The specifics:
-- prefilter predicates are as in row 16;
-- the `EdgeStore` byte encoding already works for signed children
-  **[C:spar]**.
 
 ### 4.4 ALTW sparse join [landed]
 
@@ -221,17 +214,12 @@ are gone.
   canonical-compare fast path for two non-negatives. Extra work is confined
   to orphans.
 
-### 4.7 build-geocode-index [C:rgp]
+### 4.7 build-geocode-index [landed]
 
-- **pass1.** `needed_admin_ways` becomes a signed set.
-- **pass1_5.** Keep the positive atomic bitmap. A signed collector inserts
-  atomically when an ID is covered, and spills otherwise. Merge after join,
-  then freeze the signed rank. The skip and its warning are deleted. The
-  numeric upper-bound prune stays.
-- **pass2.** Signed rank into the same slots. Absent refs keep the existing
-  missing treatment. The way store already zigzags signed way IDs, and admin
-  geometry uses signed keys.
-- There is no concrete blocker: **support**.
+Commit 9: the pass1 guard and the pass1_5 skip and warning are gone;
+`try_insert_atomic` spills negatives to the existing overflow lists. The
+node bound is seeded at `i64::MIN`, so it is the numeric maximum and an
+understated negative claim is refused at Pass 2a.
 
 ## 5. Performance on positive-only input
 
@@ -246,7 +234,7 @@ implementation.
 | ALTW sparse | Landed; measured neutral (commit 7, Japan and planet). | n/a |
 | ALTW external | Landed; measured neutral (commit 8, Germany). | n/a |
 | renumber | Canonical compare and cached offset. | Fast path for two non-negatives. |
-| geocode pass1_5 | Collector spill branch. | Positive atomic path unchanged. |
+| geocode pass1_5 | Landed; measured neutral (commit 9, Germany). | n/a |
 | getid, getparents, tags-filter, extract, check | Landed; measured neutral (commits 3 to 6). | n/a |
 
 **Prior evidence [C:perf].**
@@ -278,7 +266,8 @@ implementation.
   - `renumber`, Germany;
   - `tag-select`, Germany, `r/type=route`;
   - `parent-select` and `id-select --add-referenced yes`, Germany;
-  - `geocode-build`, Germany, `--stop GEOCODE_PASS1_5_END`.
+  - (`geocode-build`, Germany, `--stop GEOCODE_PASS1_5_END`, ran with
+    commit 9, recorded in `reference/performance/geocode.md`).
 - About 13 regional cells plus the planet pair: over the threshold of about
   ten, so Q2 asks for go-ahead.
 - Record every cell, with its verdict, under `reference/performance/`.
@@ -375,7 +364,6 @@ place with `Status: Superseded by NNNN`, and the new one says
 - `renumber/mod.rs`, `wire_rewrite.rs` and `relations.rs`.
 - `blob_meta/mod.rs` `BlobIndex::deserialize`.
 - `altw/external/blob_meta.rs`: the "use sparse" error disappears.
-- The geocode warning.
 - `renumber_external.rs`.
 - In `crates/verify`, `verify_reencode.rs` keeps its refusal with its
   true reason, which is the degrade layout oracle. Its sign handling is a
@@ -385,7 +373,6 @@ Durable text never cites a finding ID.
 
 ## 8. CHANGELOG
 
-- build-geocode-index uses negative admin ways and node refs.
 - renumber accepts negative IDs, and a `--start-id` below 1, counting down
   from it as osmium does.
   - **Behaviour change:** orphan references are named by a new
@@ -461,16 +448,14 @@ lines. It passes `brokkr check` and the relevant Denmark verifies.
 The registry (`crates/cli/tests/cli_negative_ids.rs`) landed with item 2.
 Each commit below flips its own cases' known gaps (each names the check,
 framing and exact wrong observation) and adds the cases its route needs:
-a geocode boundary whose outer way is negative, and
-`degrade --drop-ids` selection (BUG-022), none of which the registry
-asserts yet. (The ALTW auto crossover and the sparse `i64::MIN` boundary
+`degrade --drop-ids` selection (BUG-022), which the registry does not
+assert yet. (The ALTW auto crossover and the sparse `i64::MIN` boundary
 landed with commit 7 as library and CLI tests, `host_contract.rs` and
 `cli_add_locations_to_ways.rs`: the registry's children cannot be given a
 memory budget outside the test-hooks build. The external `i64` extremes and
 wide-key cases landed with commit 8 in `cli_add_locations_to_ways.rs`, for
 the same reason the graph is not extended with them.)
 
-9. build-geocode-index.
 10. renumber signed remap and the new orphan mapping, plus the negative
     `--start-id` (Q1).
 11. The source-policy rule.

@@ -71,6 +71,13 @@
   exact store is judged again after the first pass, counting referenced
   IDs the file lacks and negative-ID sets, and an over-budget store
   switches to external with a second `Note:` on stderr.
+- **build-geocode-index uses negative admin ways and node refs.** A
+  boundary whose member way has a negative ID, and every way whose nodes
+  have negative IDs, now get their geometry; before, negative admin ways
+  were left out (their boundary was dropped as having no geometry) and
+  negative node refs were skipped with a `skipped N negative node refs`
+  warning, which is gone. Indexdata claiming a node `max_id` below a
+  negative node it holds is now refused like any understated claim.
 
 ### Added
 

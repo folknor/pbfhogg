@@ -599,7 +599,10 @@ pub(super) fn run_pass2(
     let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
     // Compact rank-indexed coord array. Instead of a 128 GB sparse DenseMmapIndex
     // (direct-addressed by node ID), allocate only referenced_count × 8 bytes and
-    // index by rank. Writes are sequential (sorted PBF → monotonic ranks). Reads
+    // index by numeric rank. On sorted positive input writes are sequential
+    // (monotonic ranks); canonical order visits negatives 0, -1, -2, ...,
+    // whose numeric ranks descend, which the compare-exchange slots accept in
+    // any order. Reads
     // during way processing have good locality (contiguous pages, not scattered).
     // Planet: ~16 GB contiguous vs ~83 GB scattered page cache.
     host.invocation.marker("GEOCODE_PASS2_RANK_INDEX_START");

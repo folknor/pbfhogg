@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::Result;
 use crate::error::Error;
@@ -20,8 +20,9 @@ use crate::scan::classify::ScheduledBlob;
 
 use crate::tunables::{NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN};
 
-/// Record one accepted node ref: through `set_atomic` when it falls inside
-/// the pre-allocated range, otherwise onto this worker's overflow list.
+/// Record one accepted node ref: atomically when the pre-allocated range
+/// covers it, otherwise (above that range, or negative, which
+/// `pre_allocate` never covers) onto this worker's overflow list.
 #[inline]
 fn record_referenced_node(
     referenced_nodes: &crate::idset::IdSet,
@@ -29,10 +30,8 @@ fn record_referenced_node(
     prealloc_max: i64,
     node_id: i64,
 ) {
-    if node_id > prealloc_max {
+    if node_id > prealloc_max || !referenced_nodes.try_insert_atomic(node_id) {
         overflow.push(node_id);
-    } else {
-        referenced_nodes.insert_atomic(node_id);
     }
 }
 
@@ -64,40 +63,23 @@ fn record_way_refs(
     prealloc_max: i64,
     max_node_id: i64,
     refs: &[i64],
-    negative_node_ids: &mut Vec<i64>,
-) -> u64 {
-    let mut negative_count = 0_u64;
+) {
     for &r in refs {
-        // Only refs in `0..=max_node_id`
-        // can name a node Phase 2a will
-        // see. Negative refs are skipped
-        // (the builder does not use them).
-        // A ref above the claimed bound is a
-        // dangling ref on honest input (a
-        // simple-strategy extract keeps
-        // ways whose nodes lie outside it,
-        // with IDs that can exceed every
-        // node present): no coordinate can
-        // ever be written for it, so
-        // dropping it here changes nothing
-        // downstream. That holds only while
-        // the bound is true, which is why
-        // Phase 2a errors on any decoded
-        // node above it. Accepted refs above
-        // the size-bounded dense range go to
-        // this worker's overflow list instead
-        // of extending `pre_allocate`.
-        if r < 0 {
-            negative_count = negative_count.saturating_add(1);
-            super::sample_id(negative_node_ids, r);
-            continue;
-        }
+        // Only refs up to `max_node_id`, the numeric maximum over every
+        // node, can name a node Phase 2a will see; refs of either sign
+        // below it are collected. A ref above the bound is a dangling ref
+        // on honest input (a simple-strategy extract keeps ways whose nodes
+        // lie outside it, with IDs that can exceed every node present): no
+        // coordinate can ever be written for it, so dropping it here
+        // changes nothing downstream. That holds only while the bound is
+        // true, which is why Phase 2a errors on any decoded node above it.
+        // Accepted refs the size-bounded dense range does not cover go to
+        // this worker's overflow list instead of extending `pre_allocate`.
         if r > max_node_id {
             continue;
         }
         record_referenced_node(referenced, overflow_nodes, prealloc_max, r);
     }
-    negative_count
 }
 
 /// Whether any worker has already reported an error.
@@ -128,46 +110,6 @@ fn push_overflow_list(lists: &Mutex<Vec<Vec<i64>>>, overflow_nodes: Vec<i64>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(overflow_nodes);
-    }
-}
-
-/// Fold one worker's negative-ref tally and ID sample into the shared ones,
-/// once per worker after its scan loop.
-fn publish_negative_node_refs(
-    shared_count: &AtomicU64,
-    shared_sample: &Mutex<Vec<i64>>,
-    count: u64,
-    sample: Vec<i64>,
-) {
-    shared_count.fetch_add(count, Ordering::Relaxed);
-    let mut shared_sample = shared_sample
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for id in sample {
-        super::sample_id(&mut shared_sample, id);
-    }
-}
-
-/// Emit the negative-ref counter and, when any were skipped, a warning with
-/// the bounded ID sample.
-fn report_negative_node_refs(
-    count: &AtomicU64,
-    sample: Mutex<Vec<i64>>,
-    host: &crate::host::Entered<'_>,
-) {
-    let negative_count = count.load(Ordering::Relaxed);
-    host.invocation
-        .counter("geocode_negative_node_refs", negative_count);
-    if negative_count > 0 {
-        let sample = sample
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::host::diag!(
-            host.diagnostics,
-            Warning,
-            "geocode.pass1_5.negative_node_refs",
-            "skipped {negative_count} negative node refs; node IDs (sample): {sample:?}"
-        );
     }
 }
 
@@ -331,8 +273,6 @@ struct ExtractWorker {
     refs_buf: Vec<i64>,
     segment: Vec<u8>,
     overflow_nodes: Vec<i64>,
-    negative_node_ref_count: u64,
-    negative_node_id_sample: Vec<i64>,
 }
 
 /// What the extraction of one blob reads but never writes.
@@ -428,14 +368,13 @@ fn extract_blob_ways(
         w.refs_buf.clear();
         w.refs_buf
             .extend(crate::read::elements::WayRefIter::delta_decoded(refs));
-        w.negative_node_ref_count = w.negative_node_ref_count.saturating_add(record_way_refs(
+        record_way_refs(
             shared.referenced,
             &mut w.overflow_nodes,
             shared.prealloc_max,
             shared.max_node_id,
             &w.refs_buf,
-            &mut w.negative_node_id_sample,
-        ));
+        );
         let mut values: [Option<&[u8]>; VALUE_SLOTS] = [None; VALUE_SLOTS];
         for (value, slot) in values.iter_mut().zip(slots) {
             if let Some(index) = slot {
@@ -532,10 +471,6 @@ pub(super) fn run_pass1_5(
         let first_err_ref = &first_err;
         let overflow_lists: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
         let overflow_lists_ref = &overflow_lists;
-        let negative_node_ref_count = AtomicU64::new(0);
-        let negative_node_ref_count_ref = &negative_node_ref_count;
-        let negative_node_ids: Mutex<Vec<i64>> = Mutex::new(Vec::new());
-        let negative_node_ids_ref = &negative_node_ids;
 
         crate::threads::scope(|scope| {
             for (worker, store_file) in store_files.into_iter().enumerate() {
@@ -557,8 +492,6 @@ pub(super) fn run_pass1_5(
                         refs_buf: Vec::new(),
                         segment: Vec::new(),
                         overflow_nodes: Vec::new(),
-                        negative_node_ref_count: 0,
-                        negative_node_id_sample: Vec::new(),
                     };
                     let mut overflow_compacted_len = 0_usize;
 
@@ -649,12 +582,6 @@ pub(super) fn run_pass1_5(
                             }
                         }
                     }
-                    publish_negative_node_refs(
-                        negative_node_ref_count_ref,
-                        negative_node_ids_ref,
-                        w.negative_node_ref_count,
-                        w.negative_node_id_sample,
-                    );
                     push_overflow_list(overflow_lists_ref, w.overflow_nodes);
                 });
             }
@@ -666,8 +593,6 @@ pub(super) fn run_pass1_5(
         {
             return Err(e);
         }
-
-        report_negative_node_refs(&negative_node_ref_count, negative_node_ids, host);
 
         insert_overflow_nodes(
             &mut referenced_nodes,
@@ -736,7 +661,11 @@ pub(super) fn build_schedules(
     // OsmData blobs without indexdata (a `--force` run). Their kinds and
     // node-ID range are established by decoding them, below.
     let mut unindexed: Vec<ScheduledBlob> = Vec::new();
-    let mut max_node_id: i64 = 0;
+    // The numeric maximum over every node, of either sign. Seeded below
+    // every ID, not at zero: a zero floor would let an understated
+    // negative claim through Phase 2a's check, and a file without nodes
+    // keeps no ref (none can resolve).
+    let mut max_node_id: i64 = i64::MIN;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
@@ -869,13 +798,24 @@ pub(super) struct Schedules {
 }
 
 /// What decoding an unindexed blob says about it: which passes need it,
-/// and the largest node ID it holds.
-#[derive(Clone, Copy, Default)]
+/// and the largest node ID it holds (`i64::MIN` while it holds none).
+#[derive(Clone, Copy)]
 struct UnindexedBlobKinds {
     has_nodes: bool,
     has_ways: bool,
     has_relations: bool,
     max_node_id: i64,
+}
+
+impl Default for UnindexedBlobKinds {
+    fn default() -> Self {
+        Self {
+            has_nodes: false,
+            has_ways: false,
+            has_relations: false,
+            max_node_id: i64::MIN,
+        }
+    }
 }
 
 /// Put a schedule into file order; its positions are then its order.
@@ -915,8 +855,6 @@ mod tests {
             refs_buf: Vec::new(),
             segment: Vec::new(),
             overflow_nodes: Vec::new(),
-            negative_node_ref_count: 0,
-            negative_node_id_sample: Vec::new(),
         };
         let shared = super::ExtractShared {
             referenced: &referenced,
@@ -944,6 +882,7 @@ mod tests {
                 crate::read::elements::WayRefIter::delta_decoded(way.refs).collect(),
             ));
         }
+        insert_overflow_nodes(&mut referenced, vec![w.overflow_nodes]);
         (out, referenced)
     }
 
@@ -1042,7 +981,25 @@ mod tests {
         assert_eq!(values[VALUE_STREET], None);
         assert_eq!(refs, &[-4, 2, 5000, 2]);
         assert!(referenced.get(2));
+        assert!(referenced.get(-4), "a negative ref is collected");
+        assert!(!referenced.get(4), "not as its magnitude twin");
         assert!(!referenced.get(5000), "above the node-ID bound");
+    }
+
+    #[test]
+    fn negative_references_spill_and_survive_overflow_insertion() {
+        let mut referenced = crate::idset::IdSet::new();
+        referenced.pre_allocate(100);
+        let mut overflow = Vec::new();
+        for id in [-1, 5, i64::MIN, -1] {
+            record_referenced_node(&referenced, &mut overflow, 100, id);
+        }
+        assert_eq!(overflow, vec![-1, i64::MIN, -1]);
+        insert_overflow_nodes(&mut referenced, vec![overflow]);
+        for id in [-1, 5, i64::MIN] {
+            assert!(referenced.get(id), "{id}");
+        }
+        assert!(!referenced.get(1));
     }
 
     #[test]

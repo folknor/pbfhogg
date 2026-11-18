@@ -1108,8 +1108,27 @@ exception, not a tier - should not survive across many PRs.
   magnitude twins (`n7` and `n-7`), blobs that straddle zero, and its
   relabelled twin: the same graph under a per-kind, canonical-order
   preserving bijection onto positive IDs, with the map, so a command's
-  answer on the graph can be compared with its answer on the twin. Its
-  structural contract is pinned in `crates/lib/tests/fixture_helpers.rs`.
+  answer on the graph can be compared with its answer on the twin. It also
+  writes any variant under a chosen layout (indexed or not, sorted or every
+  kind reversed, with inline way locations or without, with whatever
+  metadata the elements carry), and provides the variants and side inputs
+  the registry below needs over the same ID domain: a changed graph and the
+  OSC between two graphs, and a small graph whose only negative IDs are
+  dangling references. Its structural contract is pinned in
+  `crates/lib/tests/fixture_helpers.rs`.
+- **Negative-ID registry.** `crates/cli/tests/cli_negative_ids.rs` holds
+  one entry per command path of the binary, checked against
+  `pbfhogg_cli::cli_command()` in both directions, so a new command fails
+  there until it has one: its cases, one or more per ID-sensitive mode or
+  flag, or a reasoned mark that it reads no element ID. Every case runs on
+  the mixed-sign graph and on its twin, in each framing the command
+  accepts, against an answer computed from the graph in the mixed IDs and
+  mapped for the twin; the twin must pass unconditionally. A case a command
+  gets wrong today carries a known gap naming the check, the framing and
+  the exact wrong observation (an exit code and diagnostic, or the exact
+  elements missing and extra); the gap fails when the observation changes
+  and when the case starts passing, so the fix removes it. Each case is its
+  own test (`cli_negative_ids::entries::<case>`).
 - **Test scratch.** The dev-only workspace member `crates/test-scratch`
   (package `pbfhogg-test-scratch`) is the one owner of test scratch for
   every harness. It is a leaf: no features and no dependency on `pbfhogg`,

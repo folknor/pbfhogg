@@ -279,6 +279,7 @@ fn to_block_meta(m: &TestMeta) -> block_builder::Metadata<'_> {
 
 /// A test node with id, coordinates (in decimicrodegrees), tags, and
 /// optional metadata.
+#[derive(Clone)]
 pub struct TestNode<'a> {
     pub id: i64,
     /// Latitude in decimicrodegrees (10^-7 degrees).
@@ -292,6 +293,7 @@ pub struct TestNode<'a> {
 }
 
 /// A test way with id, node references, tags, and optional metadata.
+#[derive(Clone)]
 pub struct TestWay<'a> {
     pub id: i64,
     pub refs: Vec<i64>,
@@ -303,6 +305,7 @@ pub struct TestWay<'a> {
 ///
 /// Members use the [`TestMember`] struct which pairs a [`MemberId`] with a role
 /// string.
+#[derive(Clone)]
 pub struct TestRelation<'a> {
     pub id: i64,
     pub members: Vec<TestMember>,
@@ -311,6 +314,7 @@ pub struct TestRelation<'a> {
 }
 
 /// A single member of a test relation: a typed member id plus a role string.
+#[derive(Clone)]
 pub struct TestMember {
     pub id: MemberId,
     pub role: &'static str,
@@ -814,9 +818,9 @@ pub fn generate_relations(
 ///
 /// Canonical OSM order is `0, -1, -2, ...` (negatives by ascending
 /// absolute value) `then 1, 2, ...` (positives ascending) - see
-/// `osm_id_cmp` in `crates/lib/src/osm_id.rs`. Used by the negative-ID sweep
-/// (`cli_negative_id_invariants.rs`) to drive every command through
-/// a mixed-sign fixture in the order canonical-sorted readers expect.
+/// `osm_id_cmp` in `crates/lib/src/osm_id.rs`. For mixed-sign element
+/// streams in the order canonical-sorted readers expect; the negative-ID
+/// registry (`crates/cli/tests/cli_negative_ids.rs`) uses the graph instead.
 pub fn generate_nodes_with_negatives(n_neg: usize, n_pos: usize) -> Vec<TestNode<'static>> {
     let mut out = Vec::with_capacity(n_neg + n_pos);
     for i in 1..=n_neg {

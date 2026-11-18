@@ -62,7 +62,7 @@ mod cli_inject_prepass;
 mod cli_input_contract;
 mod cli_merge_changes;
 mod cli_merge_join_trust;
-mod cli_negative_id_invariants;
+mod cli_negative_ids;
 mod cli_output_contract;
 mod cli_output_guard;
 mod cli_output_header;

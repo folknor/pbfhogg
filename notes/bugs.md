@@ -492,3 +492,17 @@ Reported by: indexdata.
 bbox; `parallel_scan_blobs_raw` does not enforce the schedule's kind claim.
 Callers compensate today; the hunter calls these API hazards, not demonstrated
 wrong results.
+
+## BUG-030 - inspect's monotonicity answer depends on whether the file is indexed
+
+Reported by: the negative-ID registry (item 2 of `notes/negative-ids-plan.md`).
+
+The index-only report judges `id_ranges.<kind>.monotonic` from consecutive
+blob ID ranges, which cannot see order inside a blob; the decoding report
+judges the elements. On the mixed-sign graph the relation blobs `[-1, -7, 1]`,
+`[7, 9, 11]` have ascending ranges, so `inspect --id-ranges` says monotonic
+on the indexed file and not monotonic on the same file unindexed. Positive
+input can show it too (an indexed blob internally out of order under
+ascending ranges). Held as a known gap by the registry case `inspect_report`
+(indexed framing). Neighbour of BUG-012, which is about which order the
+answer means, not about the two paths disagreeing.

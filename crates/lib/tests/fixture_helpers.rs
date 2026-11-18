@@ -468,6 +468,64 @@ mod mixed_sign {
         assert_ne!(relabel.node(7), relabel.node(-7));
     }
 
+    /// The layout writer the negative-ID registry uses: its plain layout
+    /// cuts the blobs as `write` does, its unsorted layout reverses every
+    /// kind under a header claiming no order, and its locations layout
+    /// embeds each ref's own node coordinates under `LocationsOnWays`.
+    #[test]
+    fn the_layout_writer_cuts_reverses_and_embeds_as_documented() {
+        use crate::common::mixed_sign::Layout;
+        let dir = crate::common::test_scratch();
+        let g = mixed_sign_graph();
+        let written = dir.path().join("written.osm.pbf");
+        g.write(&written, true);
+        for indexdata in [true, false] {
+            let plain = dir.path().join(format!("plain-{indexdata}.osm.pbf"));
+            g.write_layout(&plain, Layout::plain(indexdata));
+            assert_eq!(blob_ids(&plain), blob_ids(&written));
+        }
+
+        let reversed = dir.path().join("reversed.osm.pbf");
+        g.write_layout(
+            &reversed,
+            Layout {
+                indexdata: true,
+                sorted: false,
+                locations: false,
+            },
+        );
+        assert!(!crate::common::read_header(&reversed).is_sorted());
+        let ids: Vec<i64> = blob_ids(&reversed).into_iter().flatten().collect();
+        let mut want: Vec<i64> = g.nodes.iter().rev().map(|n| n.id).collect();
+        want.extend(g.ways.iter().rev().map(|w| w.id));
+        want.extend(g.relations.iter().rev().map(|r| r.id));
+        assert_eq!(ids, want);
+
+        let located = dir.path().join("located.osm.pbf");
+        g.write_layout(
+            &located,
+            Layout {
+                locations: true,
+                ..Layout::plain(true)
+            },
+        );
+        let header = crate::common::read_header(&located);
+        assert!(
+            header
+                .optional_features()
+                .iter()
+                .any(|f| f == "LocationsOnWays")
+        );
+        let back = crate::common::read_normalized(&located);
+        for way in &back.ways {
+            let locations = way.locations.as_ref().expect("inline locations");
+            for (r, (lat, lon)) in way.refs.iter().zip(locations) {
+                let n = g.node(*r);
+                assert_eq!((lat / 100, lon / 100), (i64::from(n.lat), i64::from(n.lon)));
+            }
+        }
+    }
+
     /// Written, the graph has the blob layouts the negative-ID cases rely
     /// on, indexed and not, and reads back as written; the twin has the same
     /// cuts.

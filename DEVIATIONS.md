@@ -650,8 +650,10 @@ Each of these commands drops negative ids before they reach its ID sets
 
 - `tags-filter`'s parallel-classify path silently **drops**
   negative-id ways from the output, where osmium's `tags-filter`
-  silently **abs-converts** them. Pinned as the current state by
-  `crates/cli/tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
+  silently **abs-converts** them. Held as a known gap, with the exact
+  elements dropped, by the `tags_filter_way_dependencies` and
+  `tags_filter_relation_closure` cases of the negative-ID registry
+  (`crates/cli/tests/cli_negative_ids.rs`).
 - `add-locations-to-ways` silently **omits** relation-member
   retention for any relation member whose id is negative (the member
   id is dropped before the member set is built, so the write pass doesn't know

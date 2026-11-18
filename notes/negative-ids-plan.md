@@ -352,25 +352,11 @@ implementation.
      signed type calls it.
    - It catches every future membership user. It misses code that sorts,
      filters or casts IDs outside the set API.
-2. **The test registry (where the inventory lives).**
-   - A CLI matrix test derives command paths from `pbfhogg_cli::cli_command()`
-     and fails if any path lacks an entry. An entry is a mixed-sign case or a
-     reasoned "no ID input" mark.
-   - Each entry names its ID-sensitive modes, so the 46 rows become test
-     entries.
-   - Cases run on a shared mixed-sign fixture graph with edges both ways
-     across zero: same-blob and cross-blob, indexed and unindexed.
-   - Each case compares against a **relabelled positive twin** of the same
-     graph. The twin uses an order-preserving per-kind bijection, because an
-     arithmetic shift can change canonical order or overflow.
-   - Selected edges are also asserted independently, since a differential
-     test passes when both arms share a bug.
-   - The graph and its twin exist: `crates/lib/tests/common/mixed_sign.rs`
-     (`mixed_sign_graph`, `relabelled_twin`, `Relabel`, `blob_ids`), with
-     its structure pinned in `crates/lib/tests/fixture_helpers.rs`.
-   - This catches a new command that was never thought about, and a
-     regression in an old one. It misses fast paths a small fixture never
-     reaches, so the fixture must reach each strategy.
+2. **The test registry (where the inventory lives) [landed].**
+   `crates/cli/tests/cli_negative_ids.rs`, described in
+   `reference/testing.md` "Negative-ID registry". It misses fast paths a
+   small fixture never reaches, so each later commit adds the cases that
+   force its routes (section 12).
 3. **A source-policy rule (backstop).**
    - Flag sign filters (`id >= 0`, `id < 0`, reversed forms), `as u64` casts
      and `.abs()` used as an identity on recognisable OSM ID expressions in
@@ -458,8 +444,6 @@ place with `Status: Superseded by NNNN`, and the new one says
 - `blob_meta/mod.rs` `BlobIndex::deserialize`.
 - `altw/external/blob_meta.rs`: the "use sparse" error disappears.
 - The geocode warning.
-- `cli_negative_id_invariants.rs`, which becomes part of the registry or is
-  replaced by it.
 - `renumber_external.rs`.
 - In `crates/verify`, the `check_ids.rs` preflight is removed and a
   mixed-sign fixture added. `verify_reencode.rs` keeps its refusal with its
@@ -560,9 +544,17 @@ All questions are settled (2026-11-18):
 Each commit carries its tests, registry entries, docs bullets and CHANGELOG
 lines. It passes `brokkr check` and the relevant Denmark verifies.
 
-2. **The negative-ID test registry, wired to `cli_command()`.** Rows
-   already exact are pinned, and every row a later commit fixes carries a
-   marked expected failure, which that commit flips.
+The registry (`crates/cli/tests/cli_negative_ids.rs`) landed with item 2.
+Each commit below flips its own cases' known gaps (each names the check,
+framing and exact wrong observation) and adds the cases its route needs:
+route forcing (getparents `--full-scan-min-blobs`, getid's dispatch seam),
+the ALTW auto budget crossover, wide-key and `i64::MIN` boundaries, a
+geocode boundary whose outer way is negative, `check --locations`
+counterexamples (two disagreeing inline copies of an absent negative node,
+an unreferenced conflicting negative record), `degrade --drop-ids`
+selection (BUG-022), and the `has_negative_ids` report fields, none of
+which the registry asserts yet.
+
 3. getid and getparents.
 4. tags-filter.
 5. extract, including multi-extract paging.

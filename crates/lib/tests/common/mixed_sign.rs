@@ -27,6 +27,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
+use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
 use super::{
@@ -162,8 +164,19 @@ pub fn mixed_sign_graph() -> MixedSignGraph {
                 (MemberId::Relation(7), ""),
                 (MemberId::Node(0), ""),
                 (MemberId::Node(-1), ""),
+                // Untagged, so add-locations-to-ways keeps it only as a
+                // relation member.
+                (MemberId::Node(-2), ""),
             ],
             vec![("type", "site")],
+        ),
+        // A negative way of positive refs as a multipolygon member, the
+        // membership the prepass marks, and a member node outside the box
+        // that only a completing strategy reaches.
+        relation(
+            11,
+            vec![(MemberId::Way(-2), "outer"), (MemberId::Node(-11), "label")],
+            vec![("type", "multipolygon"), ("landuse", "grass")],
         ),
     ];
     MixedSignGraph {
@@ -174,6 +187,7 @@ pub fn mixed_sign_graph() -> MixedSignGraph {
 }
 
 /// The per-kind ID bijections from a graph onto its twin.
+#[derive(Clone, Debug)]
 pub struct Relabel {
     pub nodes: BTreeMap<i64, i64>,
     pub ways: BTreeMap<i64, i64>,
@@ -253,11 +267,22 @@ impl MixedSignGraph {
             ways: rank_map(ways),
             relations: rank_map(relations),
         };
-        let twin = MixedSignGraph {
+        (self.relabelled(&relabel), relabel)
+    }
+
+    /// This graph under a bijection made for another graph whose domain
+    /// holds this one's (a variant of [`mixed_sign_graph`] under the
+    /// mixed graph's [`Relabel`], so every variant's twin shares one
+    /// bijection). Panics on an ID outside the bijection's domain.
+    pub fn relabelled(&self, relabel: &Relabel) -> MixedSignGraph {
+        MixedSignGraph {
             nodes: self
                 .nodes
                 .iter()
-                .map(|n| node(relabel.node(n.id), n.lat, n.lon, n.tags.clone()))
+                .map(|n| TestNode {
+                    id: relabel.node(n.id),
+                    ..n.clone()
+                })
                 .collect(),
             ways: self
                 .ways
@@ -286,8 +311,7 @@ impl MixedSignGraph {
                     meta: r.meta,
                 })
                 .collect(),
-        };
-        (twin, relabel)
+        }
     }
 
     /// Write the graph as a sorted PBF of [`MIXED_SIGN_BLOCK`] elements per
@@ -306,6 +330,367 @@ impl MixedSignGraph {
         };
         frame_fixture_blocks(path, &blocks, framing);
     }
+
+    /// Write the graph under `layout`, [`MIXED_SIGN_BLOCK`] elements per
+    /// block. An unsorted layout reverses every kind's elements, so blobs
+    /// and the elements inside them both descend, under a header that
+    /// claims no order; a locations layout embeds each way ref's
+    /// coordinates from the graph's own node records (a ref the graph has
+    /// no record of panics) under a `LocationsOnWays` header. Each element
+    /// carries the metadata it holds (the graph's own hold none).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one encoding loop per kind, then the framing, read top to bottom"
+    )]
+    pub fn write_layout(&self, path: &Path, layout: Layout) {
+        let order = |n: usize| -> Vec<usize> {
+            if layout.sorted {
+                (0..n).collect()
+            } else {
+                (0..n).rev().collect()
+            }
+        };
+        let coords: BTreeMap<i64, (i32, i32)> =
+            self.nodes.iter().map(|n| (n.id, (n.lat, n.lon))).collect();
+        let meta = |m: &Option<super::TestMeta>| {
+            m.map(|m| Metadata {
+                version: m.version,
+                timestamp: m.timestamp,
+                changeset: m.changeset,
+                uid: m.uid,
+                user: m.user,
+                visible: m.visible,
+            })
+        };
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut bb = BlockBuilder::new();
+        let mut in_block = 0;
+        let mut flush = |bb: &mut BlockBuilder, in_block: &mut usize, force: bool| {
+            if (force || *in_block == MIXED_SIGN_BLOCK)
+                && let Some(bytes) = bb.take().expect("take block")
+            {
+                blocks.push(bytes.to_vec());
+                *in_block = 0;
+            }
+        };
+        for i in order(self.nodes.len()) {
+            let n = &self.nodes[i];
+            bb.add_node(
+                n.id,
+                n.lat,
+                n.lon,
+                n.tags.iter().copied(),
+                meta(&n.meta).as_ref(),
+            );
+            in_block += 1;
+            flush(&mut bb, &mut in_block, false);
+        }
+        flush(&mut bb, &mut in_block, true);
+        for i in order(self.ways.len()) {
+            let w = &self.ways[i];
+            if layout.locations {
+                let locations: Vec<(i32, i32)> = w
+                    .refs
+                    .iter()
+                    .map(|r| {
+                        *coords
+                            .get(r)
+                            .unwrap_or_else(|| panic!("way {} ref {r}", w.id))
+                    })
+                    .collect();
+                bb.add_way_with_locations(
+                    w.id,
+                    w.tags.iter().copied(),
+                    &w.refs,
+                    &locations,
+                    meta(&w.meta).as_ref(),
+                );
+            } else {
+                bb.add_way(
+                    w.id,
+                    w.tags.iter().copied(),
+                    &w.refs,
+                    meta(&w.meta).as_ref(),
+                );
+            }
+            in_block += 1;
+            flush(&mut bb, &mut in_block, false);
+        }
+        flush(&mut bb, &mut in_block, true);
+        for i in order(self.relations.len()) {
+            let r = &self.relations[i];
+            let members: Vec<MemberData<'_>> = r
+                .members
+                .iter()
+                .map(|m| MemberData {
+                    id: m.id,
+                    role: m.role,
+                })
+                .collect();
+            bb.add_relation(
+                r.id,
+                r.tags.iter().copied(),
+                &members,
+                meta(&r.meta).as_ref(),
+            );
+            in_block += 1;
+            flush(&mut bb, &mut in_block, false);
+        }
+        flush(&mut bb, &mut in_block, true);
+
+        let mut header = HeaderBuilder::new();
+        if layout.sorted {
+            header = header.sorted();
+        }
+        if layout.locations {
+            header = header.optional_feature("LocationsOnWays");
+        }
+        let header = header.build().expect("build header");
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        writer.write_header(&header).expect("write header");
+        for bytes in &blocks {
+            if layout.indexdata {
+                writer.write_primitive_block(bytes).expect("write block");
+            } else {
+                writer
+                    .write_primitive_block_no_indexdata(bytes)
+                    .expect("write block");
+            }
+        }
+        writer.flush().expect("flush fixture");
+    }
+
+    /// The node with `id`.
+    pub fn node(&self, id: i64) -> &TestNode<'static> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap_or_else(|| panic!("no node {id}"))
+    }
+
+    /// The way with `id`.
+    pub fn way(&self, id: i64) -> &TestWay<'static> {
+        self.ways
+            .iter()
+            .find(|w| w.id == id)
+            .unwrap_or_else(|| panic!("no way {id}"))
+    }
+
+    /// The relation with `id`.
+    pub fn relation(&self, id: i64) -> &TestRelation<'static> {
+        self.relations
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no relation {id}"))
+    }
+}
+
+/// How [`MixedSignGraph::write_layout`] writes a graph.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    /// Every data blob carries `indexdata` and `tagdata`, or none does.
+    pub indexdata: bool,
+    /// Canonical order under a sorted header, or every kind reversed under
+    /// a header claiming no order.
+    pub sorted: bool,
+    /// Ways carry their nodes' coordinates under `LocationsOnWays`.
+    pub locations: bool,
+}
+
+impl Layout {
+    /// Sorted, without locations, indexed or not.
+    pub const fn plain(indexdata: bool) -> Self {
+        Self {
+            indexdata,
+            sorted: true,
+            locations: false,
+        }
+    }
+}
+
+/// [`mixed_sign_graph`] after one change of each action: node `-7` moved
+/// (inside every region it was in), way `-9` deleted, relation `-7`
+/// retagged. Its IDs are the mixed graph's, so the mixed graph's
+/// [`Relabel`] maps it.
+pub fn changed_graph() -> MixedSignGraph {
+    let mut g = mixed_sign_graph();
+    for n in &mut g.nodes {
+        if n.id == -7 {
+            n.lat += 100_000;
+        }
+    }
+    g.ways.retain(|w| w.id != -9);
+    for r in &mut g.relations {
+        if r.id == -7 {
+            r.tags = vec![("type", "route"), ("route", "tram")];
+        }
+    }
+    g
+}
+
+/// A small graph whose references to `n-9` (from `w9`) and `n-1` (from
+/// `r9`) dangle while their magnitude twins `n9` and `n1` are present, and
+/// which holds no negative element: a negative reference is the only
+/// negative ID in it. Its IDs are the mixed graph's, so the mixed graph's
+/// [`Relabel`] maps it.
+pub fn dangling_graph() -> MixedSignGraph {
+    MixedSignGraph {
+        nodes: vec![
+            node(1, 550_100_000, 120_200_000, vec![]),
+            node(9, 550_600_000, 120_600_000, vec![]),
+        ],
+        ways: vec![way(9, &[1, -9, 9], vec![("highway", "service")])],
+        relations: vec![relation(
+            9,
+            vec![(MemberId::Node(-1), ""), (MemberId::Way(9), "")],
+            vec![("type", "site")],
+        )],
+    }
+}
+
+/// An OSC moving `base` to `changed`: a create for every element `base`
+/// lacks, a modify for every element whose content differs, a delete for
+/// every element `changed` lacks, each at version 2.
+pub fn osc_between(base: &MixedSignGraph, changed: &MixedSignGraph) -> String {
+    let fresh = MixedSignGraph {
+        nodes: changed
+            .nodes
+            .iter()
+            .filter(|c| !base.nodes.iter().any(|n| n.id == c.id))
+            .cloned()
+            .collect(),
+        ways: changed
+            .ways
+            .iter()
+            .filter(|c| !base.ways.iter().any(|w| w.id == c.id))
+            .cloned()
+            .collect(),
+        relations: changed
+            .relations
+            .iter()
+            .filter(|c| !base.relations.iter().any(|r| r.id == c.id))
+            .cloned()
+            .collect(),
+    };
+    // A create is written as a modify of an element with no prior content.
+    let (create, _) = modify_and_delete(&fresh.blank(), &fresh);
+    let (modify, delete) = modify_and_delete(base, changed);
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n  \
+         <create>\n{create}  </create>\n  <modify>\n{modify}  </modify>\n  \
+         <delete>\n{delete}  </delete>\n</osmChange>\n"
+    )
+}
+
+impl MixedSignGraph {
+    /// The same IDs with no content, which every element differs from.
+    fn blank(&self) -> MixedSignGraph {
+        MixedSignGraph {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|n| node(n.id, i32::MIN, i32::MIN, vec![("", "")]))
+                .collect(),
+            ways: self
+                .ways
+                .iter()
+                .map(|w| way(w.id, &[], vec![("", "")]))
+                .collect(),
+            relations: self
+                .relations
+                .iter()
+                .map(|r| relation(r.id, Vec::new(), vec![("", "")]))
+                .collect(),
+        }
+    }
+}
+
+/// The modify and delete sections moving `base` to `changed`.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "writing to a String cannot fail"
+)]
+fn modify_and_delete(base: &MixedSignGraph, changed: &MixedSignGraph) -> (String, String) {
+    use std::fmt::Write as _;
+    let coord = |v: i32| format!("{:.7}", f64::from(v) / 1e7);
+    let tags = |out: &mut String, tags: &[(&str, &str)]| {
+        for (k, v) in tags {
+            let _ = writeln!(out, "      <tag k=\"{k}\" v=\"{v}\"/>");
+        }
+    };
+    let mut modify = String::new();
+    let mut delete = String::new();
+    for n in &base.nodes {
+        match changed.nodes.iter().find(|c| c.id == n.id) {
+            None => {
+                let _ = writeln!(delete, "    <node id=\"{}\" version=\"2\"/>", n.id);
+            }
+            Some(c) if (c.lat, c.lon, &c.tags) != (n.lat, n.lon, &n.tags) => {
+                let _ = writeln!(
+                    modify,
+                    "    <node id=\"{}\" lat=\"{}\" lon=\"{}\" version=\"2\">",
+                    c.id,
+                    coord(c.lat),
+                    coord(c.lon)
+                );
+                tags(&mut modify, &c.tags);
+                modify.push_str("    </node>\n");
+            }
+            Some(_) => {}
+        }
+    }
+    for w in &base.ways {
+        match changed.ways.iter().find(|c| c.id == w.id) {
+            None => {
+                let _ = writeln!(delete, "    <way id=\"{}\" version=\"2\"/>", w.id);
+            }
+            Some(c) if (&c.refs, &c.tags) != (&w.refs, &w.tags) => {
+                let _ = writeln!(modify, "    <way id=\"{}\" version=\"2\">", c.id);
+                for r in &c.refs {
+                    let _ = writeln!(modify, "      <nd ref=\"{r}\"/>");
+                }
+                tags(&mut modify, &c.tags);
+                modify.push_str("    </way>\n");
+            }
+            Some(_) => {}
+        }
+    }
+    for r in &base.relations {
+        let same = |c: &TestRelation| {
+            c.tags == r.tags
+                && c.members.len() == r.members.len()
+                && c.members
+                    .iter()
+                    .zip(&r.members)
+                    .all(|(a, b)| a.id == b.id && a.role == b.role)
+        };
+        match changed.relations.iter().find(|c| c.id == r.id) {
+            None => {
+                let _ = writeln!(delete, "    <relation id=\"{}\" version=\"2\"/>", r.id);
+            }
+            Some(c) if !same(c) => {
+                let _ = writeln!(modify, "    <relation id=\"{}\" version=\"2\">", c.id);
+                for m in &c.members {
+                    let (kind, id) = match m.id {
+                        MemberId::Node(id) => ("node", id),
+                        MemberId::Way(id) => ("way", id),
+                        MemberId::Relation(id) => ("relation", id),
+                        other => panic!("unexpected member {other:?}"),
+                    };
+                    let _ = writeln!(
+                        modify,
+                        "      <member type=\"{kind}\" ref=\"{id}\" role=\"{}\"/>",
+                        m.role
+                    );
+                }
+                tags(&mut modify, &c.tags);
+                modify.push_str("    </relation>\n");
+            }
+            Some(_) => {}
+        }
+    }
+    (modify, delete)
 }
 
 /// The element IDs of every OSMData blob of `path`, in file order.

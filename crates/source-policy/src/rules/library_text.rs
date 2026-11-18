@@ -155,6 +155,24 @@ fn inner_test(attrs: &[Attribute]) -> bool {
 struct Exempt<'a> {
     source: &'a Source,
     ranges: Vec<Range<usize>>,
+    /// Whether attributes themselves are exempt (they are, for literals).
+    attributes: bool,
+}
+
+/// Byte ranges of `file` that only test builds compile: test-gated nodes
+/// as described in this module's doc, or the whole file when its own inner
+/// attribute requires `test`. Attributes are not exempt here.
+pub(crate) fn test_gated(source: &Source, file: &syn::File) -> Vec<Range<usize>> {
+    if inner_test(&file.attrs) {
+        return std::iter::once(0..source.text.len()).collect();
+    }
+    let mut exempt = Exempt {
+        source,
+        ranges: Vec::new(),
+        attributes: false,
+    };
+    exempt.visit_file(file);
+    exempt.ranges
 }
 
 impl Exempt<'_> {
@@ -214,7 +232,9 @@ fn trait_item_attrs(item: &syn::TraitItem) -> &[Attribute] {
 
 impl<'ast> Visit<'ast> for Exempt<'_> {
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
-        self.add(attr);
+        if self.attributes {
+            self.add(attr);
+        }
     }
 
     fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -296,6 +316,7 @@ pub fn literals(source: &Source) -> Result<Vec<Literal>, String> {
     let mut exempt = Exempt {
         source,
         ranges: Vec::new(),
+        attributes: true,
     };
     exempt.visit_file(&file);
     let mut out = Vec::new();

@@ -261,14 +261,13 @@ implementation.
    `reference/testing.md` "Negative-ID registry". It misses fast paths a
    small fixture never reaches, so each later commit adds the cases that
    force its routes (section 12).
-3. **A source-policy rule (backstop).**
-   - Flag sign filters (`id >= 0`, `id < 0`, reversed forms), `as u64` casts
-     and `.abs()` used as an identity on recognisable OSM ID expressions in
-     `crates/lib/src`.
-   - Narrow, reasoned exceptions: canonical ordering, wire encoding, checked
-     conversions, family routing.
-   - It needs its own fixtures. It is token based, with no type information,
-     so it is a review backstop and not proof.
+3. **A source-policy rule (backstop) [landed].** `id_signs` in
+   `crates/source-policy/src/rules/`, described in `reference/testing.md`
+   beside the registry: sign comparisons, unsigned casts, magnitudes and
+   zero clamps on recognisably named IDs in production `crates/lib/src`
+   and `crates/cli/src` code must match an inventory entry with an exact
+   count and a both-signs reason. Lexical, so a review backstop and not
+   proof.
 
 **Where the inventory lives.**
 - **Tests:** the registry above. It cannot drift, because a missing or stale
@@ -424,7 +423,6 @@ memory budget outside the test-hooks build. The external `i64` extremes and
 wide-key cases landed with commit 8 in `cli_add_locations_to_ways.rs`, for
 the same reason the graph is not extended with them.)
 
-11. The source-policy rule.
 12. ADR-0028, ADR-0002 marked superseded, the README index, the DEVIATIONS
     rewrite (including derive-changes), reference/, docs/, the remaining
     comments, verify messages and test renames.

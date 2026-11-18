@@ -38,10 +38,8 @@
 //! Spins on `Instant`, `try_recv` or an atomic load call none of these
 //! names; `loop_waits` makes each such loop state what ends it.
 
-use std::collections::BTreeSet;
-
 use crate::Corpus;
-use crate::lex::{Kind, Source, Tok};
+use crate::lex::{Source, Tok};
 
 /// std's sleeps: refused everywhere.
 pub const SLEEPS: &[&str] = &["sleep", "sleep_until", "sleep_ms"];
@@ -149,7 +147,7 @@ pub fn sleeps(source: &Source) -> Vec<(usize, String)> {
 /// [`sleeps`]' business, marked or not.
 pub fn unmarked(source: &Source) -> Vec<(usize, String)> {
     let code = source.code();
-    let marked = marked_lines(source);
+    let marked = super::marked_lines(source, MARKER);
     let mut out = Vec::new();
     for (i, tok) in code.iter().enumerate() {
         let Some(name) = source.name(tok) else {
@@ -202,32 +200,6 @@ fn matching_paren(source: &Source, code: &[Tok], open: usize) -> Option<usize> {
         }
     }
     None
-}
-
-fn is_marker(comment: &str) -> bool {
-    comment
-        .strip_prefix("//")
-        .map(str::trim_start)
-        .and_then(|rest| rest.strip_prefix(MARKER))
-        .is_some_and(|reason| !reason.trim_start().is_empty())
-}
-
-/// Lines a marker covers: its own, and the next when it stands alone.
-fn marked_lines(source: &Source) -> BTreeSet<usize> {
-    let mut code_lines = BTreeSet::new();
-    for tok in source.code() {
-        code_lines.extend(tok.line..=tok.end_line);
-    }
-    let mut marked = BTreeSet::new();
-    for tok in &source.toks {
-        if tok.kind == Kind::LineComment && is_marker(source.text_of(tok)) {
-            marked.insert(tok.line);
-            if !code_lines.contains(&tok.line) {
-                marked.insert(tok.line + 1);
-            }
-        }
-    }
-    marked
 }
 
 #[cfg(test)]

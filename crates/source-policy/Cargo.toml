@@ -13,8 +13,8 @@ autobins = false
 autoexamples = false
 autobenches = false
 
-# The audits are this library's unit tests: one real-tree test reads the
-# corpus once and runs every rule, and each rule's fixtures are in-memory
+# The audits are this library's unit tests: one real-tree test per rule,
+# all reading one corpus loaded once, and each rule's fixtures are in-memory
 # cases beside it. Only the `all` sweep in brokkr.d/checks.toml selects the
 # package, so the tree is audited once per check, not once per build shape.
 # No dependency on pbfhogg: the audits read source text, never link it.

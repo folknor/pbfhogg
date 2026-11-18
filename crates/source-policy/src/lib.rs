@@ -4,13 +4,16 @@
 //! `src/` and `tests/` read and tokenized once. Lexical rules work on the
 //! tokens alone, so a file the parser cannot read still gets them; the
 //! structural reads (the module graph, which the test-module audit and the
-//! library static inventory walk, and the library text rule's test-only
-//! exemptions) also parse with syn and fail on a file it cannot parse. None of this is macro expansion: what a rule promises about
+//! library static inventory walk, item owners, and the test-only exemptions
+//! the library text and ID sign rules share) also parse with syn and fail
+//! on a file it cannot parse. None of this is macro expansion: what a rule
+//! promises about
 //! macro input is stated on the rule.
 //!
 //! The rules run as this package's unit tests, in the `all` sweep only (see
-//! the manifest); the real tree is audited by one test that builds the
-//! corpus once and reports every finding together.
+//! the manifest); the real tree is audited by one test per rule
+//! (`tree::<rule>`), all reading one corpus built once, so each rule's
+//! audit is bounded on its own and the rules run in parallel.
 
 // Reads the repository's own source files, not an operator's inputs.
 #![allow(clippy::disallowed_methods)]
@@ -75,28 +78,72 @@ impl Corpus {
     }
 }
 
+/// One rule: its name and its audit.
+pub type Rule = (&'static str, fn(&Corpus) -> Vec<String>);
+
+/// Declares the rule list once: [`RULES`], which [`audit`] runs, and one
+/// real-tree test per rule (`tree::<rule>`) over a corpus shared by all of
+/// them, so a rule cannot be listed without being tested and each rule's
+/// audit runs, and is bounded, on its own.
+macro_rules! rules {
+    ($($rule:ident),* $(,)?) => {
+        /// Every rule, in report order.
+        pub const RULES: &[Rule] = &[$((stringify!($rule), rules::$rule::errors)),*];
+
+        #[cfg(test)]
+        mod tree {
+            $(
+                #[test]
+                fn $rule() {
+                    super::tree_satisfies(stringify!($rule), crate::rules::$rule::errors);
+                }
+            )*
+        }
+    };
+}
+
+rules!(
+    counters,
+    statics,
+    lifecycle,
+    entropy,
+    io_sizes,
+    test_imports,
+    test_modules,
+    library_text,
+    detached_threads,
+    timed_waits,
+    loop_waits,
+    duration_literals,
+    host_independence,
+    environment,
+    id_signs,
+);
+
 /// Every finding of every rule over the tree at `root`.
 pub fn audit(root: &Path) -> Vec<String> {
     let corpus = match Corpus::load(root) {
         Ok(corpus) => corpus,
         Err(error) => return vec![error],
     };
-    let mut found = Vec::new();
-    found.extend(rules::counters::errors(&corpus));
-    found.extend(rules::statics::errors(&corpus));
-    found.extend(rules::lifecycle::errors(&corpus));
-    found.extend(rules::entropy::errors(&corpus));
-    found.extend(rules::io_sizes::errors(&corpus));
-    found.extend(rules::test_imports::errors(&corpus));
-    found.extend(rules::test_modules::errors(&corpus));
-    found.extend(rules::library_text::errors(&corpus));
-    found.extend(rules::detached_threads::errors(&corpus));
-    found.extend(rules::timed_waits::errors(&corpus));
-    found.extend(rules::loop_waits::errors(&corpus));
-    found.extend(rules::duration_literals::errors(&corpus));
-    found.extend(rules::host_independence::errors(&corpus));
-    found.extend(rules::environment::errors(&corpus));
-    found
+    RULES.iter().flat_map(|(_, rule)| rule(&corpus)).collect()
+}
+
+/// The real tree, loaded once for every `tree::<rule>` test.
+#[cfg(test)]
+fn tree_satisfies(name: &str, rule: fn(&Corpus) -> Vec<String>) {
+    static TREE: std::sync::OnceLock<Result<Corpus, String>> = std::sync::OnceLock::new();
+    let corpus = TREE.get_or_init(|| Corpus::load(pbfhogg_test_scratch::repository_root()));
+    let corpus = match corpus {
+        Ok(corpus) => corpus,
+        Err(error) => panic!("source policy {name}: {error}"),
+    };
+    let found = rule(corpus);
+    assert!(
+        found.is_empty(),
+        "source policy {name}:\n{}",
+        found.join("\n")
+    );
 }
 
 pub(crate) fn read(path: &Path) -> Result<String, String> {
@@ -148,13 +195,4 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tree {
-    #[test]
-    fn the_tree_satisfies_every_source_policy() {
-        let found = super::audit(pbfhogg_test_scratch::repository_root());
-        assert!(found.is_empty(), "source policy:\n{}", found.join("\n"));
-    }
 }

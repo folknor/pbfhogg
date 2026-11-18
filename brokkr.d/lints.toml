@@ -837,11 +837,10 @@ must_scan = [
 message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path and the harness runner call it"
 
 # The Rust-source audits that no one-line forbid rule can express (sealed
-# lifecycle shapes, counter casts, the library static inventory, test-module
-# reachability, I/O transfer sizes, the CLI tests' library surface, entropy
-# ownership and the library text rule) are the unit tests of
-# crates/source-policy, run once per check in the all sweep over one
-# tokenized corpus, not script checks.
+# lifecycle shapes, counter casts, the library static inventory, the ID
+# sign inventory and the like; crates/source-policy/src/rules lists them
+# all) are the unit tests of crates/source-policy, run once per check in the
+# all sweep over one tokenized corpus, not script checks.
 
 # scripts/vs-osmium.sh against a recording brokkr stub; brokkr's bench
 # contract tests are Lua, so the shell driver's test lives here.

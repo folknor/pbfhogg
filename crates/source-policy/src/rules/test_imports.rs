@@ -22,10 +22,8 @@
 //! expansion, and whether a test's oracle is independent of the code under
 //! test (`reference/testing.md` owns that rule).
 
-use std::collections::BTreeSet;
-
 use crate::Corpus;
-use crate::lex::{Kind, Source};
+use crate::lex::Source;
 
 const ROOT: &str = "pbfhogg";
 const TREE: &str = "crates/cli/tests/";
@@ -85,32 +83,6 @@ pub fn errors(corpus: &Corpus) -> Vec<String> {
         }
     }
     found
-}
-
-fn is_marker(comment: &str) -> bool {
-    comment
-        .strip_prefix("//")
-        .map(str::trim_start)
-        .and_then(|rest| rest.strip_prefix("library-deliberate:"))
-        .is_some_and(|reason| !reason.trim_start().is_empty())
-}
-
-/// Lines a marker covers: its own, and the next when it stands alone.
-fn marked_lines(source: &Source) -> BTreeSet<usize> {
-    let mut code_lines = BTreeSet::new();
-    for tok in source.code() {
-        code_lines.extend(tok.line..=tok.end_line);
-    }
-    let mut marked = BTreeSet::new();
-    for tok in &source.toks {
-        if tok.kind == Kind::LineComment && is_marker(source.text_of(tok)) {
-            marked.insert(tok.line);
-            if !code_lines.contains(&tok.line) {
-                marked.insert(tok.line + 1);
-            }
-        }
-    }
-    marked
 }
 
 /// Code tokens as (text, line): raw identifiers normalized, `::` joined.
@@ -248,7 +220,7 @@ fn spelled((path, renamed): &Leaf) -> String {
 /// (line, path) of every unmarked path outside the surface; an error,
 /// naming the line, on use-tree syntax it cannot read.
 pub fn violations(source: &Source) -> Result<Vec<(usize, String)>, String> {
-    let marked = marked_lines(source);
+    let marked = super::marked_lines(source, "library-deliberate:");
     let toks = words(source);
     let mut found = Vec::new();
     let mut i = 0;

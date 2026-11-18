@@ -7,6 +7,7 @@ pub mod duration_literals;
 pub mod entropy;
 pub mod environment;
 pub mod host_independence;
+pub mod id_signs;
 pub mod io_sizes;
 pub mod library_text;
 pub mod lifecycle;
@@ -16,13 +17,14 @@ pub mod test_imports;
 pub mod test_modules;
 pub mod timed_waits;
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 use crate::Corpus;
-use crate::lex::Source;
+use crate::lex::{Kind, Source};
 
 /// Each named item's byte range with its path, from syn's item tree.
 /// Owners are `mod` (inline), `fn`, `trait` names and an `impl`'s self
@@ -49,6 +51,12 @@ impl Owners {
             .filter(|(r, _)| r.contains(&offset))
             .max_by_key(|(r, _)| r.start)
             .map_or("", |(_, p)| p.as_str())
+    }
+
+    /// How many named items carry `path`: more than one (two impls of one
+    /// self type, say) means the path does not identify a declaration.
+    pub(crate) fn declarations(&self, path: &str) -> usize {
+        self.spans.iter().filter(|(_, p)| p == path).count()
     }
 }
 
@@ -122,6 +130,35 @@ pub(crate) fn require_files(corpus: &Corpus, prefix: &str, rule: &str) -> Option
         .next()
         .is_none()
         .then(|| format!("{rule}: no Rust file under {prefix}"))
+}
+
+/// Whether a line comment is `// <marker> <reason>` with a reason present.
+fn is_marker(comment: &str, marker: &str) -> bool {
+    comment
+        .strip_prefix("//")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix(marker))
+        .is_some_and(|reason| !reason.trim_start().is_empty())
+}
+
+/// Lines a `// <marker> <reason>` comment covers: its own, and the next
+/// when it stands alone on its line. A marker's reason is checked only for
+/// being present.
+pub(crate) fn marked_lines(source: &Source, marker: &str) -> BTreeSet<usize> {
+    let mut code_lines = BTreeSet::new();
+    for tok in source.code() {
+        code_lines.extend(tok.line..=tok.end_line);
+    }
+    let mut marked = BTreeSet::new();
+    for tok in &source.toks {
+        if tok.kind == Kind::LineComment && is_marker(source.text_of(tok), marker) {
+            marked.insert(tok.line);
+            if !code_lines.contains(&tok.line) {
+                marked.insert(tok.line + 1);
+            }
+        }
+    }
+    marked
 }
 
 /// The listed files are present in the corpus.

@@ -1128,7 +1128,18 @@ exception, not a tier - should not survive across many PRs.
   the exact wrong observation (an exit code and diagnostic, or the exact
   elements missing and extra); the gap fails when the observation changes
   and when the case starts passing, so the fix removes it. Each case is its
-  own test (`cli_negative_ids::entries::<case>`).
+  own test (`cli_negative_ids::entries::<case>`). The registry sees what a
+  small fixture reaches; the source-policy rule `id_signs`
+  (`crates/source-policy/src/rules/id_signs.rs`) backs it in the source:
+  every ordered comparison (`<`, `<=`, `>`, `>=`) of a recognisably named
+  ID with 0, 1 or -1, unsigned cast, magnitude or sign method and zero
+  clamp in production code under `crates/lib/src/` and `crates/cli/src/`
+  must match an inventory entry (file, owning item, the operation as
+  written with its whole condition or expression, exact count, and a
+  reason saying what happens to IDs of both signs). It is lexical: an ID
+  under another name, a sign decided through a helper, or two branches
+  swapped behind an unchanged condition passes it, and its module doc
+  lists those limits.
 - **Test scratch.** The dev-only workspace member `crates/test-scratch`
   (package `pbfhogg-test-scratch`) is the one owner of test scratch for
   every harness. It is a leaf: no features and no dependency on `pbfhogg`,
@@ -1304,16 +1315,20 @@ promise, and a larger expression such as a scan budget is evaluated whole.
 
 The Rust-source audits (these two, the test-module and test-import audits
 above, the sealed lifecycle shapes, counter casts, the library static
-inventory and the library text rule) are one crate,
+inventory, the library text rule, the ID sign inventory and the rest of
+`crates/source-policy/src/rules/`) are one crate,
 `crates/source-policy`. Each file is read and tokenized once, with the
 rustc tokenizer (`ra-ap-rustc_lexer`); lexical rules work on those tokens,
-and only the module graph (walked by the test-module audit, and by the
-static inventory to read `#[path]`-mounted library modules) and the
-library text rule's test-only exemptions also parse with syn, failing on a
-file it cannot parse. The real
-tree is audited by one unit test, in the `all` sweep alone, so it runs once
-per check and not under brokkr's markdown-only shortcut; every rule carries
-in-memory fixtures beside it.
+and the structural reads (the module graph, walked by the test-module
+audit and by the static inventory to read `#[path]`-mounted library
+modules; item owners; the test-only exemptions the library text rule and
+the ID sign inventory share) also parse with syn, failing on a file it
+cannot parse. The real tree is audited by one unit test per rule
+(`tree::<rule>`, declared from the same list `audit` runs) over one corpus
+loaded once, so each rule's audit stays well inside the per-test watchdog
+on its own; they run in the `all` sweep alone, so once per check and not
+under brokkr's markdown-only shortcut. Every rule carries in-memory
+fixtures beside it.
 
 The sealed lifecycle shapes (`crates/source-policy/src/rules/lifecycle.rs`)
 compare whole bodies of the scratch probe constructor `open_probe_lock` and

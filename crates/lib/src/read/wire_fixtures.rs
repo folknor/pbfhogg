@@ -5,6 +5,7 @@
 //! handful of byte values at every position, the inputs on which a
 //! projection must refuse exactly what block construction refuses.
 
+#![cfg(test)]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 pub(crate) fn varint(out: &mut Vec<u8>, mut v: u64) {

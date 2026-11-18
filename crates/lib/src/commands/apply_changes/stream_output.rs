@@ -285,34 +285,10 @@ fn encode_and_frame(
     Ok((frame, added))
 }
 
-/// Flush remaining upserts for the previous element type during a type
-/// transition. Also handles skipped types (e.g., Node -> Relation flushes
-/// all Way upserts).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn flush_remaining_upserts(
-    prev: ElementKind,
-    next: ElementKind,
-    diff: &SortedDiff,
-    cursors: &mut UpsertCursors,
-    creates: &mut CreateEncoder<'_>,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergeStats,
-    loc: LocMode<'_>,
-) -> Result<u64> {
-    // Flush remaining creates of the previous type
-    let mut emitted = emit_rest(prev, diff, cursors, creates, writer, stats, loc)?;
-
-    // Handle skipped type: Node -> Relation (flush all Way upserts)
-    if prev == ElementKind::Node && next == ElementKind::Relation {
-        emitted += emit_rest(ElementKind::Way, diff, cursors, creates, writer, stats, loc)?;
-    }
-
-    Ok(emitted)
-}
-
 /// Write every upsert of `kind` from the cursor on and advance the cursor
-/// to the end; returns how many ids that was.
-fn emit_rest(
+/// to the end; returns how many ids that was. The drain's one rule for
+/// closing a kind (`drain::close_kinds_before`) is its only caller.
+pub(super) fn emit_rest(
     kind: ElementKind,
     diff: &SortedDiff,
     cursors: &mut UpsertCursors,

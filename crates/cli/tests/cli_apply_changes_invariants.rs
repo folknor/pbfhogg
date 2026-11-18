@@ -10,8 +10,8 @@
 //! - `base_without_the_sort_claim_*`: a base header without `Sort.Type_then_ID` is refused, after the indexdata check.
 //! - `unsorted_base_*`, `sorted_multi_blob_base_*`: the sorted stamp is only written over input in order.
 //! - `forced_run_*`: an unindexed base under `--force` comes out wholly indexed, and a blob mixing kinds is refused.
-//! - `empty_base_pbf_*`: `last_type == None` forever; trailing creates must flush all three kinds.
-//! - `trailing_creates_after_*`: Type-transition flush correctness.
+//! - `empty_base_pbf_*`: no placed item ever opens a later kind; trailing creates must flush all three kinds.
+//! - `trailing_creates_after_*`: closing the kinds after the base's last one.
 //! - `modify_on_missing_id_*`, `delete_on_missing_id_*`, `create_on_existing_id_*`: Permissive missing-element semantics (reference/osmium-parity.md).
 //! - `merge_jobs_parity_*`: Output is independent of worker count between `-j 2` and `-j 4`.
 //!

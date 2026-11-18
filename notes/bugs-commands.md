@@ -26,21 +26,6 @@ renumber (BUG-020), degrade drop counting (BUG-022), cat decode counters
 (BUG-023) and extract coordinate narrowing (BUG-025). Entries are in no
 order of importance.
 
-## CMD-001 - apply-changes drops creates for kinds that come before the base's first kind
-
-Reported by: apply-merge [P1].
-
-A sorted, indexed base containing only ways, combined with an OSC that creates
-a node, succeeds without writing that node. A base that starts with relations
-loses node and way creates the same way. The first-item handling in
-`apply_changes/drain.rs` flushes a previous kind only when one exists, and the
-final flush excludes kinds before the last base kind, so their upsert cursors
-are never touched. This breaks the insert-on-missing-ID behaviour documented
-in `reference/osmium-parity.md`. Under `--locations-on-ways`, a dropped node
-can still supply coordinates through the seeded location map without appearing
-in the output. The drain needs to advance through every kind, including kinds
-absent before the first base blob.
-
 ## CMD-002 - OSC tags-filter output can reverse an object's final state
 
 Reported by: osc-parsing [P1].

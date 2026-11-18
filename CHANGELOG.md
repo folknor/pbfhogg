@@ -324,6 +324,13 @@
 
 ### Fixed
 
+- `apply-changes` no longer silently drops OSC creates (and modifies of
+  absent IDs) for a kind that sorts before the base's first kind. A base
+  starting with ways lost the OSC's new nodes, and one starting with
+  relations lost its new nodes and ways. The run succeeded and wrote a
+  file missing them; under `--locations-on-ways` the new ways still
+  carried the dropped nodes' coordinates. They are now written in sorted
+  position, before the base's first blob.
 - `add-locations-to-ways --index-type external` (and Auto when it routes
   there) no longer hangs when the system refuses to start one of its
   stage 3 or stage 4 threads (thread or process limits reached). Such a

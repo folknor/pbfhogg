@@ -2905,6 +2905,128 @@ fn merge_gap_creates_between_blobs() {
     assert!(stderr.contains("Diff: 3 nodes, 2 ways"), "stats: {stderr}");
 }
 
+/// The kind and ID of every element of `path`, in wire order, read by the
+/// independent decoder.
+fn wire_order(path: &Path) -> Vec<(char, i64)> {
+    use crate::common::model::{ElementAt, decode_path};
+    let pbf = decode_path(path);
+    pbf.sequence
+        .iter()
+        .map(|d| match d.element {
+            ElementAt::Node(i) => ('n', pbf.nodes[i].id),
+            ElementAt::Way(i) => ('w', pbf.ways[i].id),
+            ElementAt::Relation(i) => ('r', pbf.relations[i].id),
+        })
+        .collect()
+}
+
+/// A base whose first blob holds ways still gets the OSC's node upserts,
+/// both a create and a modify of an ID the base lacks (inserted, per
+/// reference/osmium-parity.md), written before the base's ways.
+#[test]
+fn merge_writes_node_upserts_before_a_ways_only_base() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 7],
+            tags: vec![("highway", "road")],
+            meta: None,
+        }],
+        &[],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create><node id="1" lat="55.0" lon="12.0" version="1"/></create>
+  <modify><node id="7" lat="56.0" lon="13.0" version="2"/></modify>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_eq!(wire_order(&output), vec![('n', 1), ('n', 7), ('w', 10)]);
+}
+
+/// A base holding only relations, under `--locations-on-ways`: the OSC's
+/// node create, its modify of an absent node and its way create all land,
+/// in kind order before the relation, and the way's inline coordinates come
+/// from those nodes. The node records are asserted, not only the way's
+/// coordinates: the seeded location map supplies those even when the node
+/// records themselves are missing from the output.
+#[test]
+fn merge_writes_node_and_way_upserts_before_a_relation_only_base_with_locations() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[],
+        &[],
+        &[TestRelation {
+            id: 500,
+            members: vec![TestMember {
+                id: MemberId::Way(20),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="1" lat="55.0" lon="12.0" version="1"/>
+    <way id="20" version="1"><nd ref="1"/><nd ref="2"/></way>
+  </create>
+  <modify><node id="2" lat="56.0" lon="13.0" version="2"/></modify>
+</osmChange>"#,
+    );
+
+    let out = run_apply_changes(
+        &base,
+        &osc,
+        &output,
+        ApplyOpts {
+            locations_on_ways: true,
+            ..ApplyOpts::default()
+        },
+    );
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_eq!(
+        wire_order(&output),
+        vec![('n', 1), ('n', 2), ('w', 20), ('r', 500)]
+    );
+
+    let pbf = crate::common::model::decode_path(&output);
+    let coords: Vec<(i64, i32, i32)> = pbf
+        .nodes
+        .iter()
+        .map(|n| (n.id, n.decimicro_lat(), n.decimicro_lon()))
+        .collect();
+    assert_eq!(
+        coords,
+        vec![(1, 550_000_000, 120_000_000), (2, 560_000_000, 130_000_000)]
+    );
+    let locs = read_way_locations(&output);
+    let way20 = locs.iter().find(|(id, _)| *id == 20).expect("way 20");
+    assert_eq!(
+        way20.1,
+        vec![(550_000_000, 120_000_000), (560_000_000, 130_000_000)]
+    );
+}
+
 /// Base has only nodes and relations (no ways). Diff creates ways.
 #[test]
 fn merge_type_transition_node_to_relation_skipping_ways() {

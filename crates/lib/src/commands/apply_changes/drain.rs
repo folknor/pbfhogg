@@ -10,9 +10,14 @@
 //!
 //! ## Per-item processing
 //!
-//! 1. Type transition: when `item.kind != last_type`, flush the
-//!    `copy_file_range` coalescer + the `OwnedBytes` passthrough buffer,
-//!    then call [`flush_remaining_upserts`] for the previous type.
+//! 1. Kind advance: the drain holds one open kind, starting at Node; every
+//!    kind before it is closed and its upserts are all written. An item of a
+//!    later kind closes every kind from the open one up to its own
+//!    ([`close_kinds_before`]): flush the `copy_file_range` coalescer + the
+//!    `OwnedBytes` passthrough buffer, then write each closed kind's
+//!    remaining upserts. This is what writes OSC creates for kinds the base
+//!    never holds, before its first blob or between two of its kinds. An
+//!    item of an earlier kind than the open one is refused as unsorted.
 //! 2. Gap creates: when upserts of `item.kind` exist with `id <
 //!    item.min_id`, flush coalescers + write them as one create run
 //!    (`stream_output::CreateEncoder`).
@@ -53,8 +58,9 @@
 //! ## Trailing creates
 //!
 //! After the drain channel closes and the reorder buffer empties, the
-//! drain ports the existing `types_to_flush` match from `rewrite.rs`
-//! verbatim: emit any remaining upserts of the current and later kinds.
+//! same [`close_kinds_before`] rule closes the open kind and every later
+//! one, so an empty base, a base ending at any kind and a base starting
+//! past Node all reach every upsert.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -71,9 +77,7 @@ use super::descriptor::{DrainItem, DrainMessage, Route};
 use super::failure::FailureSlot;
 use super::loc_mode::{LocMap, LocMode};
 use super::stats::MergeStats;
-use super::stream_output::{
-    CreateEncoder, emit_gap_creates, flush_remaining_upserts, has_gap_creates,
-};
+use super::stream_output::{CreateEncoder, emit_gap_creates, emit_rest, has_gap_creates};
 use super::streaming::CoordSlots;
 use super::upsert_cursors::UpsertCursors;
 use super::window::WindowReturn;
@@ -123,16 +127,6 @@ enum DrainLoc {
     /// Before the barrier: node items only, ways would be written `Pending`.
     Pending(DrainLocations),
     Published(PublishedLocations),
-}
-
-impl DrainLoc {
-    /// The published map, if the barrier has run.
-    fn published_map(&self) -> Option<Arc<LocMap>> {
-        match self {
-            Self::Pending(_) => None,
-            Self::Published(p) => Some(Arc::clone(&p.map)),
-        }
-    }
 }
 
 /// How the drain writes ways in `loc`'s state. A free function over the one
@@ -202,8 +196,10 @@ crate::counters::counter_set! {
         pub passthrough_chunks_flushed => "merge_drain_passthrough_chunks_flushed",
         pub rewrite_blocks_written => "merge_drain_rewrite_blocks_written",
         pub gap_creates_emitted => "merge_drain_gap_creates_emitted",
-        /// Creates written at type transitions: the upserts of a kind left
-        /// after its last blob (and of a skipped kind), counted per id.
+        /// Creates written when an item opens a later kind: the upserts of
+        /// each kind it closes (one left after its last blob, one the base
+        /// never holds, before its first blob or between two of its kinds),
+        /// counted per id.
         pub transition_creates_emitted => "merge_drain_transition_creates_emitted",
         pub trailing_creates_emitted => "merge_drain_trailing_creates_emitted",
         pub reorder_buffer_high_water_count => "merge_drain_reorder_buffer_high_water_count",
@@ -448,57 +444,24 @@ pub(super) fn run_drain(
     flush_copy_range(&mut state, &cfg, writer, counters)?;
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
 
-    // Trailing creates: port `types_to_flush` match verbatim from
-    // `rewrite.rs` so the cursor walk after end-of-stream emits creates
-    // for any kinds whose blobs we never saw (or saw and finished).
+    // Trailing creates: close the open kind and every later one, so each
+    // kind's upserts past its last blob, or with no blob at all, are
+    // written.
     cancel.marker("MERGE_TRAILING_CREATES_START");
     #[cfg(pbfhogg_test_hooks)]
     cancel.faults().on_apply_changes_drain_past_nodes();
-    let types_to_flush = match state.last_type {
-        None | Some(ElementKind::Node) => {
-            &[ElementKind::Node, ElementKind::Way, ElementKind::Relation][..]
-        }
-        Some(ElementKind::Way) => &[ElementKind::Way, ElementKind::Relation][..],
-        Some(ElementKind::Relation) => &[ElementKind::Relation][..],
-    };
-    // Cloned rather than borrowed from `state`: the trailing loop now takes
-    // `&mut state` for the sortedness guard, so an outstanding `&state`
-    // borrow across it would not compile. The clone is one Arc refcount.
-    let trailing_loc = state.loc.as_ref().map(DrainLoc::published_map);
-    let loc = trailing_loc
-        .as_ref()
-        .map_or(LocMode::Off, |map| LocMode::on(map.as_deref()));
-    for &kind in types_to_flush {
-        let (cursor, upserts) = state.cursors.get(kind, cfg.diff);
-        let run = &upserts[cursor..];
-        // Trailing creates are a second emission channel: they do not
-        // pass through `dispatch_item`, so without these calls the
-        // sortedness guard would be blind to exactly the last thing
-        // written - the same shape of trailing blindness the write
-        // path's stream-completeness check had. A single ID is its own
-        // one-element span. `upserts` is sorted with `osm_id_cmp`, so a
-        // run of trailing creates never trips the guard on its own; a
-        // create ordered before base output already emitted does. The
-        // whole run is checked before any of it is encoded; a refusal fails
-        // the run unpublished either way.
-        for &id in run {
-            let key = crate::osm_id::osm_id_key(id);
-            check_output_order(&mut state, kind, key, key)?;
-        }
-        state.creates.emit(
-            kind,
-            cursor..upserts.len(),
-            cfg.diff,
-            loc,
-            writer,
-            &mut stats,
-        )?;
-        let (cursor, _) = state.cursors.get_mut(kind, cfg.diff);
-        *cursor = upserts.len();
-        counters
-            .trailing_creates_emitted
-            .fetch_add(run.len() as u64, Ordering::Relaxed);
+    // Under `--locations-on-ways` the scanner sends its boundary at EOF too,
+    // so a clean end with the map still pending is a broken protocol, not
+    // input: trailing way creates would have no map to resolve against.
+    if matches!(state.loc, Some(DrainLoc::Pending(_))) {
+        return Err(Error::internal(
+            "drain: input ended with the node-to-way barrier never published",
+        ));
     }
+    let emitted = close_kinds_before(KIND_END, cfg.diff, &mut state, writer, &mut stats)?;
+    counters
+        .trailing_creates_emitted
+        .fetch_add(emitted, Ordering::Relaxed);
     cancel.marker("MERGE_TRAILING_CREATES_END");
 
     writer.flush()?;
@@ -521,8 +484,10 @@ struct DrainState<'a> {
     bytes_in_buffer: usize,
     /// Next seq the drain expects to process (monotonically increasing).
     next_seq: u64,
-    /// Last item kind processed. Drives type transitions.
-    last_type: Option<ElementKind>,
+    /// Ordinal of the open kind: every kind before it is closed, its upserts
+    /// all written ([`close_kinds_before`]). Starts at Node; `KIND_END` once
+    /// the trailing close has run.
+    open_kind: u8,
     cursors: UpsertCursors,
     /// Writes every create run: gap creates, the creates left at a type
     /// transition and the trailing creates. Rewritten blobs arrive framed
@@ -551,7 +516,7 @@ impl<'a> DrainState<'a> {
             buffer: BTreeMap::new(),
             bytes_in_buffer: 0,
             next_seq: 0,
-            last_type: None,
+            open_kind: ElementKind::Node.ordinal(),
             cursors: UpsertCursors::new(),
             creates,
             copy_range_run: None,
@@ -614,14 +579,83 @@ fn check_output_order(
     Ok(())
 }
 
-/// Handle a type transition (`prev != item_kind`). Flushes coalescers,
-/// then emits any remaining upserts of the previous kind. The node→way
-/// barrier is never published here: under `--locations-on-ways` it has
-/// already fired before any way or relation item exists (see the one
-/// barrier check in `run_drain`).
-#[allow(clippy::too_many_arguments)]
-fn handle_type_transition(
-    prev: ElementKind,
+/// The ordinal past Relation: the target that closes every kind at EOF.
+const KIND_END: u8 = ElementKind::Relation.ordinal() + 1;
+
+/// Hold a create run `start..end` of `kind`'s upserts to the output-order
+/// guard before it is written. The run is sorted by `osm_id_cmp`, so its
+/// first and last keys bound it exactly; a run ordered before output already
+/// emitted is refused, and the whole run is checked before any of it is
+/// encoded.
+fn check_run_order(
+    state: &mut DrainState<'_>,
+    kind: ElementKind,
+    upserts: &[i64],
+    start: usize,
+) -> Result<()> {
+    if let (Some(&first), Some(&last)) = (upserts.get(start), upserts.last()) {
+        check_output_order(
+            state,
+            kind,
+            crate::osm_id::osm_id_key(first),
+            crate::osm_id::osm_id_key(last),
+        )?;
+    }
+    Ok(())
+}
+
+/// The drain's one rule for moving through kinds: close every kind from the
+/// open one up to (not including) `target`, writing each one's remaining
+/// upserts, and make `target` the open kind. Returns how many IDs it wrote.
+///
+/// Called with an item's kind when the item arrives and with [`KIND_END`] at
+/// EOF. That one rule covers what used to be three cases (a transition from
+/// a previous kind, a skipped kind between two, and the trailing kinds) and
+/// the case none of them reached: kinds before the base's first placed kind,
+/// whose OSC creates and absent-ID modifies were dropped when a base started
+/// at a way or a relation. Coalescers must be flushed by the caller first.
+///
+/// Before the call the node-to-way barrier has fired for any way run: a
+/// non-node item is refused while the map is pending, and EOF is checked
+/// for it. Node creates need no map.
+fn close_kinds_before(
+    target: u8,
+    diff: &SortedDiff,
+    state: &mut DrainState<'_>,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergeStats,
+) -> Result<u64> {
+    let mut emitted = 0u64;
+    while state.open_kind < target {
+        let Some(kind) = ElementKind::from_ordinal(state.open_kind) else {
+            return Err(Error::internal(
+                "drain: open kind past Relation below target",
+            ));
+        };
+        let (cursor, upserts) = state.cursors.get(kind, diff);
+        check_run_order(state, kind, upserts, cursor)?;
+        emitted += emit_rest(
+            kind,
+            diff,
+            &mut state.cursors,
+            &mut state.creates,
+            writer,
+            stats,
+            loc_mode(state.loc.as_ref()),
+        )?;
+        state.open_kind += 1;
+    }
+    Ok(emitted)
+}
+
+/// Move the drain to `item_kind` when it is later than the open kind:
+/// flush coalescers, then close every kind before it (see
+/// [`close_kinds_before`]). An earlier kind is refused as unsorted before
+/// anything is written, since the forward-only close would otherwise make
+/// a backwards step a silent no-op. The node-to-way barrier is never
+/// published here: under `--locations-on-ways` it has already fired before
+/// any way or relation item exists (see the one barrier check in `run_drain`).
+fn advance_to_kind(
     item_kind: ElementKind,
     cfg: &DrainConfig<'_>,
     state: &mut DrainState<'_>,
@@ -629,6 +663,22 @@ fn handle_type_transition(
     stats: &mut MergeStats,
     counters: &DrainCounters,
 ) -> Result<()> {
+    let target = item_kind.ordinal();
+    if target < state.open_kind {
+        let open =
+            ElementKind::from_ordinal(state.open_kind).map_or("unknown", ElementKind::as_str);
+        return Err(crate::error::new_unsorted(format!(
+            "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
+             header - a {} blob follows {} output; the base is not in the order its \
+             header declares.",
+            item_kind.as_str(),
+            open,
+        )));
+    }
+    if target == state.open_kind {
+        return Ok(());
+    }
+
     flush_copy_range(state, cfg, writer, counters)?;
     let had_chunks = !state.passthrough_chunks.is_empty();
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
@@ -638,20 +688,10 @@ fn handle_type_transition(
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    let loc = loc_mode(state.loc.as_ref());
     writer
         .cancel_token()
         .marker("MERGE_TRANSITION_CREATES_START");
-    let emitted = flush_remaining_upserts(
-        prev,
-        item_kind,
-        cfg.diff,
-        &mut state.cursors,
-        &mut state.creates,
-        writer,
-        stats,
-        loc,
-    )?;
+    let emitted = close_kinds_before(target, cfg.diff, state, writer, stats)?;
     writer.cancel_token().marker("MERGE_TRANSITION_CREATES_END");
     counters
         .transition_creates_emitted
@@ -673,6 +713,13 @@ fn handle_gap_creates(
     if !has_gap_creates(item_kind, osm_first, cfg.diff, &state.cursors) {
         return Ok(());
     }
+    // Held to the order guard like every other create run, before the blob
+    // it precedes is observed. Only the run below `osm_first` is checked:
+    // its end is the partition `emit_gap_creates` takes.
+    let (cursor, upserts) = state.cursors.get(item_kind, cfg.diff);
+    let len =
+        upserts[cursor..].partition_point(|&id| crate::osm_id::osm_id_cmp(id, osm_first).is_lt());
+    check_run_order(state, item_kind, &upserts[..cursor + len], cursor)?;
     flush_copy_range(state, cfg, writer, counters)?;
     flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
     let loc = loc_mode(state.loc.as_ref());
@@ -729,12 +776,7 @@ fn process_item(
             .on_apply_changes_drain_past_nodes();
     }
 
-    if let Some(prev) = state.last_type
-        && prev != item_kind
-    {
-        handle_type_transition(prev, item_kind, cfg, state, writer, stats, counters)?;
-    }
-    state.last_type = Some(item_kind);
+    advance_to_kind(item_kind, cfg, state, writer, stats, counters)?;
 
     // A reversed range names no real ID span. None is expected (an
     // unindexed blob with no element arrives as `DrainItem::Omitted`, and
@@ -742,13 +784,9 @@ fn process_item(
     // return `i64::MAX` and `has_gap_creates` would emit every remaining
     // upsert of `item_kind` as a gap-create. Neither gap creates nor the
     // sortedness guard run on it; the dispatch below still writes the blob.
+    // The gap run is written, and guarded, before the blob it precedes is
+    // observed, so the watermark sees output in the order it is written.
     if min_id <= max_id {
-        check_output_order(
-            state,
-            item_kind,
-            placement.order_first_key(),
-            crate::osm_id::blob_osm_last_key(min_id, max_id),
-        )?;
         handle_gap_creates(
             item_kind,
             placement.gap_bound(),
@@ -757,6 +795,12 @@ fn process_item(
             writer,
             stats,
             counters,
+        )?;
+        check_output_order(
+            state,
+            item_kind,
+            placement.order_first_key(),
+            crate::osm_id::blob_osm_last_key(min_id, max_id),
         )?;
     }
 

@@ -581,25 +581,6 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   `min_id >= 0` while the payload contains negatives still errors
   cleanly rather than panicking in `chunk_for_atomic` or silently
   dropping bits.
-- `getid` - **hard reject** at parse time. `parse_id_spec` in
-  `crates/lib/src/commands/getid/mod.rs` rejects any negative id parsed from a
-  CLI argument or `--id-file` text spec, returning an error naming
-  the offending id and its kind (node/way/relation). osmium's
-  `getid` rejects identically; its man page is explicit that the
-  command does not work with negative IDs. The reject covers CLI
-  args and id-spec text files; ids harvested from a separate PBF
-  via `--id-osm-file` are not validated (the source PBF's contents
-  are treated as opaque data, matching the project-wide stance that
-  commands do not police element values such as ID sign; structural
-  checks on decoded blocks are a separate matter, see
-  `reference/truncation-handling.md`). The blob-prefilter (`IdSet::any_in_numeric_range` at
-  `crates/lib/src/idset.rs`) asks both signs of a range, so a *target* PBF whose
-  indexdata range straddles zero correctly screens in its positive
-  portion - an unsigned cast of `min_id` would wrap and skip the
-  blob, dropping legitimate positive matches.
-  Negatives in the target PBF are still absent from output because
-  getid drops negative IDs before they reach its ID sets (no positive
-  request id can match a negative element id).
 - `add-locations-to-ways --index-type external` - **hard reject** of
   any node blob whose indexdata range holds a negative ID, in its
   metadata scan (`check_range` in
@@ -640,10 +621,22 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   pbfhogg side) is the residual divergence below.
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
-PBF payload, not an ID set passed through `IdSet`; the shared typed-ID parser
-preserves the sign and `getid` applies its own rejection afterward.
+PBF payload, not an ID set passed through `IdSet`.
 
-**Residual divergence (tags-filter, add-locations-to-ways, getid -r):**
+**getid (including `--invert`) and getparents are exact.** They accept a
+negative ID from every source (positional IDs, `--id-file`, `--id-osm-file`;
+a bare `-7` under `--default-type` needs no `--`), and select, remove,
+follow (`--add-referenced`: way refs, relation members, relations in
+relations) and find parents by the exact signed ID; any `i64` is accepted,
+both extremes included. osmium's `getid`, `removeid` and `getparents` refuse
+a negative text ID ("This command does not work with negative IDs", also
+in their man pages), refuse `LLONG_MIN` and `LLONG_MAX` as illegal IDs, and
+match every other ID, reference and member by its absolute value
+(`positive_id`, `positive_ref`): `--id-osm-file` with `n-7` selects `n7`,
+`removeid n7` also removes `n-7`, and `getid -r` follows a reference to
+`-N` as `N`. pbfhogg answers by the signed ID in each case.
+
+**Residual divergence (tags-filter, add-locations-to-ways):**
 Each of these commands drops negative ids before they reach its ID sets
 (`IdSet` in `crates/lib/src/idset.rs` itself holds any signed ID), where osmium's equivalent paths abs-fold via
 `object.positive_id()` to collapse `-N` and `+N` into a single bit.
@@ -661,12 +654,6 @@ Each of these commands drops negative ids before they reach its ID sets
   osmium's `add-locations-to-ways` abs-folds the member ref via
   `member.positive_ref()`, collapsing `-N` and `+N` member refs
   into the same retention decision.
-- `getid --add-referenced` silently **drops** a negative way ref or
-  relation member ref while following references (the ID never enters
-  the pulled-in set, and a relation-in-relation edge with a negative
-  end is never stored), so the object it names is not added. osmium's
-  `getid -r` abs-folds both (`positive_ref`), adding object `N` for a
-  reference to `-N`.
 
 These behaviors are all silent; none matches the project-wide reject
 stance, and none matches osmium's abs-fold. Promoting any of them to
@@ -725,7 +712,7 @@ in command arguments or an ID text file is rejected unless the caller selects
 node, way or relation explicitly. This is deliberate. A bare number carries
 no element kind, and silently assigning it to node can select a different
 object than the caller intended. The same parser serves both commands.
-`parse_id_spec_inner` in `crates/lib/src/commands/getid/mod.rs` owns this rule; the CLI
+`parse_id_spec` in `crates/lib/src/commands/getid/mod.rs` owns this rule; the CLI
 leaves `default_type` unset unless the user supplies `--default-type`.
 
 pbfhogg also accepts named typed forms such as `node/123`, `way/456` and
@@ -920,8 +907,8 @@ miss (`print_missing_ids` in `crates/cli/src/lib.rs`, fed by `record_found` in
 **Rationale:** on any extract, members cut off at the border are the normal
 case, so an exit status that fails on them reports the extract, not the
 query; and the requested-ID list is the one a caller can act on. A negative
-member reference is dropped where osmium abs-folds it, see "Negative input
-IDs rejected project-wide".
+member reference is followed by its signed ID where osmium abs-folds it, see
+"Negative input IDs rejected project-wide".
 
 ## PBF decoding: a repeated Info or DenseInfo is refused, not merged
 

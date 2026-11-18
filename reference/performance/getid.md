@@ -1,5 +1,20 @@
 # Getid
 
+## Signed getid and getparents queries (bygg, 2026-11-18, against `f88235d2`)
+
+getid stopped refusing negative text IDs and stopped dropping negative
+`-I` IDs, way refs, relation members and relation edges (the guards went;
+every insert is a plain signed `IdSet::insert`). Germany,
+`id-select --add-referenced yes`, `--iterations 1` cells in A B B A B A
+A B order, baseline `--commit f88235d2`, variant the uncommitted change.
+Baseline 2737.6 (first cell, after its build), 2854.7, 2891.3, 2868.7 ms,
+median 2861.7; variant 2898.6, 2930.4, 2899.1, 2881.9 ms, median 2898.9:
++1.3 %, noise. The phase split of the second pair puts the difference in
+`GETID_PASS2`, whose code the change does not touch; the relation and way
+phases, where the guards were, are level. Verdict: neutral. No
+`parent-select` cell: getparents' scan, probe and writer did not change,
+only the shared text parser, which runs once per query ID.
+
 ## getid's full scan skips rejected payloads (bygg, 2026-11-10, `04bacd00` against `93be495d`)
 
 The full-scan arm prescreens each blob's indexdata from its header and

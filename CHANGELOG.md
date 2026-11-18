@@ -18,8 +18,16 @@
   `iter_numeric_from`; `any_in_range` is `any_in_numeric_range`; the
   atomic setters are `insert_atomic`, `insert_atomic_if_new`,
   `try_insert_atomic` and `try_insert_atomic_if_new`. Inserting a
-  negative ID now stores it, where it was silently dropped before. What the
-  getid functions select is unchanged.
+  negative ID now stores it, where it was silently dropped before.
+- **getid (including `--invert`) and getparents handle negative IDs
+  exactly.** Negative query IDs are accepted from positional arguments
+  and `--id-file` (they were refused, exit 64 or 2), and from
+  `--id-osm-file` (they were silently dropped, so a source of negatives
+  alone was refused as holding no ID). `-r` now follows negative way
+  refs, relation members and relations in relations, which it silently
+  dropped. Matching is by the signed ID, where osmium matches by absolute
+  value. `parse_ids` and the other library parsers accept negative IDs.
+  A bare negative number under `--default-type` needs no `--`.
 
 ### Added
 

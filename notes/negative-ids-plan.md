@@ -133,11 +133,7 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 10 | check `--refs`, `--check-relations` | Refuses compared negatives. | S+. Signed existence via a serial side merge; signed missing tallies; signed deferred lookup. These are not rank or slot users **[C:inv]**. | Separate sign sets **[O]** |
 | 11 | check `--locations`, `--agreement` | Refuses negative refs. Unreferenced negative records get no slot, so a coordinate conflict passes clean. | S+. Negative-key ordinals in the same slot store. Cost: 8 + 8.25 bytes per distinct negative key, nothing when there are none **[C:inv]**. | No equivalent. |
 | 12 | check `--index` | Signed, exact. | P | none |
-| 13-15 | getid positional, `-i`, `-I` | Text refuses negatives **[S]**; `-I` drops them silently **[S]**. | S+. Signed queries from every source; `-I` negatives appended, then sorted and deduped once. | Refuses text; abs-folds `-I` **[O]**. pbfhogg is a superset and exact. |
-| 16 | getid include and invert prefilters | Clamped at 0. | S+. Numeric predicate on signed extrema, `min_id <= q <= max_id`; signed kind presence; `Ways::BlobsCopied` only if `indexed && !W` **[C:re]**. | n/a |
-| 17 | getid `-r` | Drops negative refs, members and seeds **[S]**. | S+. Signed `EdgeStore` children and `WaySpans`. | Abs-folds **[O]** |
-| 18 | getid `--invert` | Shares the `-I` drop. | S+. Exact signed removal. | removeid abs-folds: `n7` also removes `n-7` **[O][C:re]** |
-| 19 | getparents | Shares the query rules. | S+. Signed kind pruning and `ParentProbe` **[C:re]**. | Man page disclaims; source abs-folds **[O]** |
+| 13-19 | getid (positional, `-i`, `-I`, prefilters, `-r`, `--invert`), getparents | Exact and signed since commit 3 **[S]**. | P | Refuses text; abs-folds the rest **[O]** |
 | 20 | tags-filter PBF default | Drops negative matches and dependencies **[S]**. | S+, both passes. | Abs-folds |
 | 21-22 | tags-filter `-R`, OSC | Exact. | P | Direct; OSC unsupported. |
 | 23-26 | extract simple, complete-ways, smart, `--config` | Drop through `IdSet`/`Membership` **[S]**. | S+. Multi-extract maps the `i64` bits as `u64` into overflow chunk keys `2^38..2^39-1`, carrying region masks **[C:re]**. | Abs-folds **[O]** |
@@ -401,9 +397,8 @@ place with `Status: Superseded by NNNN`, and the new one says
 **DEVIATIONS.md.**
 - Replace the section with "Negative IDs: pbfhogg is exact where osmium
   abs-folds", listing:
-  - getid, its `--invert` (removeid) mode and getparents, which match the
-    exact signed ID, and accept negative text queries where osmium refuses
-    them;
+  - getid, its `--invert` (removeid) mode and getparents (their paragraph
+    landed with commit 3; carry it into the new section);
   - tags-filter and extract;
   - ALTW `--keep-member-nodes`-style retention;
   - the apply-changes location join;
@@ -431,7 +426,6 @@ place with `Status: Superseded by NNNN`, and the new one says
 **docs/cli/commands.md.**
 - check: the `--ids --full`, `--refs` and `--locations` rows, plus the report
   fields.
-- getid and getparents: negative text queries.
 - renumber: negative inputs and orphan naming.
 - ALTW and geocode-build.
 - inspect: the numeric monotonic wording.
@@ -440,7 +434,6 @@ place with `Status: Superseded by NNNN`, and the new one says
 - `idset.rs`, rewritten with the type.
 - `renumber/mod.rs`, `wire_rewrite.rs` and `relations.rs`.
 - `extract/membership.rs`.
-- `getid/mod.rs`.
 - `blob_meta/mod.rs` `BlobIndex::deserialize`.
 - `altw/external/blob_meta.rs`: the "use sparse" error disappears.
 - The geocode warning.
@@ -454,10 +447,9 @@ Durable text never cites a finding ID.
 
 ## 8. CHANGELOG
 
-- **Negative IDs are now handled like any other ID.** getid (including
-  `--invert`), getparents, tags-filter and extract select them exactly,
-  where before they dropped them silently.
-- getid and getparents accept negative query IDs.
+- **Negative IDs are now handled like any other ID.** tags-filter and
+  extract select them exactly, where before they dropped them silently
+  (getid and getparents landed their entry with commit 3).
 - add-locations-to-ways joins negative node refs in both index types, and
   retains and marks negative relation members. The external index no longer
   refuses node blobs below zero.
@@ -487,9 +479,6 @@ The old 0.3.x entry stays as history. Whether its anchor is checked by
     commit.
 - **`negative_id_fallback` test names [C:re].** They are stale: the tests
   check input pinning on mixed-sign fixtures. Rename them.
-- **getparents and removeid against osmium [O][C:re].** Osmium refuses text
-  negatives and abs-folds the rest, while pbfhogg matches exactly. Both go in
-  DEVIATIONS.
 
 ## 10. Separate items
 
@@ -547,7 +536,6 @@ lines. It passes `brokkr check` and the relevant Denmark verifies.
 The registry (`crates/cli/tests/cli_negative_ids.rs`) landed with item 2.
 Each commit below flips its own cases' known gaps (each names the check,
 framing and exact wrong observation) and adds the cases its route needs:
-route forcing (getparents `--full-scan-min-blobs`, getid's dispatch seam),
 the ALTW auto budget crossover, wide-key and `i64::MIN` boundaries, a
 geocode boundary whose outer way is negative, `check --locations`
 counterexamples (two disagreeing inline copies of an absent negative node,
@@ -555,7 +543,6 @@ an unreferenced conflicting negative record), `degrade --drop-ids`
 selection (BUG-022), and the `has_negative_ids` report fields, none of
 which the registry asserts yet.
 
-3. getid and getparents.
 4. tags-filter.
 5. extract, including multi-extract paging.
 6. check: `--ids --full`, `--refs`, `--locations`, and the report fields

@@ -134,13 +134,20 @@ macro_rules! declared {
         ["digest"] => cases [digest_full];
         ["getid"] => cases [
             getid_positional,
+            getid_bare_default_type,
             getid_id_file,
             getid_id_osm_file,
             getid_add_referenced,
             getid_invert_node,
             getid_invert_way,
         ];
-        ["getparents"] => cases [getparents_negative_query, getparents_negative_parents];
+        ["getparents"] => cases [
+            getparents_negative_query,
+            getparents_full_scan,
+            getparents_id_osm_file,
+            getparents_bare_default_type,
+            getparents_negative_parents,
+        ];
         ["extract"] => cases [extract_simple, extract_complete_ways, extract_smart, extract_config];
         ["add-locations-to-ways"] => cases [
             altw_sparse,
@@ -1819,12 +1826,6 @@ fn all_but(w: &World, nodes: &[i64], ways: &[i64]) -> Vec<String> {
     )
 }
 
-/// The text-query refusal, naming the query's `n-7`.
-const GETID_TEXT_REFUSAL: Sig = Sig::Exit {
-    code: 64,
-    says: "getid requires non-negative input ids. Input contains node id -7.",
-};
-
 fn getid_positional() -> Case {
     Case::both(
         BOTH,
@@ -1836,12 +1837,21 @@ fn getid_positional() -> Case {
         },
         |w, o| pbf_result(o, OUT, &picked(w, &[-7], &[-1], &[-7]), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        GETID_TEXT_REFUSAL,
-        "getid refuses negative text queries",
-    )])
+}
+
+/// A bare negative number under `--default-type`, with no `--`: the
+/// positional takes it as an ID, not as a short flag.
+fn getid_bare_default_type() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| {
+            let mut a = in_out_forced(w, dir, f);
+            a.extend(["--default-type".into(), "node".into()]);
+            a.push(w.n(-7).to_string().into());
+            a
+        },
+        |w, o| pbf_result(o, OUT, &picked(w, &[-7], &[], &[]), true),
+    )
 }
 
 fn getid_id_file() -> Case {
@@ -1856,15 +1866,6 @@ fn getid_id_file() -> Case {
         },
         |w, o| pbf_result(o, OUT, &picked(w, &[-7], &[-1], &[-7]), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 2,
-            says: "getid requires non-negative input ids. Input contains node id -7.",
-        },
-        "getid refuses negative IDs in an ID file",
-    )])
 }
 
 /// `-I` takes every ID of a PBF: here `n-7`, `n1`, `w-1` and `r-7`.
@@ -1885,19 +1886,6 @@ fn getid_id_osm_file() -> Case {
         },
         |w, o| pbf_result(o, OUT, &picked(w, &[-7, 1], &[-1], &[-7]), true),
     )
-    .gaps(vec![gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-7 551000000,123000000 amenity=bench",
-                "w-1 [-1,-2,-5] highway=residential",
-                "r-7 [n-7:stop,w7:] type=route;route=bus",
-            ],
-            extra: &[],
-        },
-        "getid -I drops negative source IDs",
-    )])
 }
 
 /// `-r` from `r9`: its members `r7`, `n0`, `n-1`, `n-2`; through `r7` the
@@ -1920,25 +1908,6 @@ fn getid_add_referenced() -> Case {
             )
         },
     )
-    .gaps(vec![gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-1 550100000,120100000 amenity=bench",
-                "n-2 550200000,120000000 ",
-                "n-5 551000000,121000000 ",
-                "n-7 551000000,123000000 amenity=bench",
-                "n5 553000000,121000000 ",
-                "n7 553000000,123000000 ",
-                "w-1 [-1,-2,-5] highway=residential",
-                "w7 [5,7,-7,-5,5] ",
-                R_MINUS_7,
-            ],
-            extra: &[],
-        },
-        "getid -r drops negative members and refs",
-    )])
 }
 
 fn getid_invert_node() -> Case {
@@ -1955,12 +1924,6 @@ fn getid_invert_node() -> Case {
         },
         |w, o| pbf_result(o, OUT, &all_but(w, &[-7], &[]), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        GETID_TEXT_REFUSAL,
-        "getid refuses negative text queries",
-    )])
 }
 
 fn getid_invert_way() -> Case {
@@ -1977,15 +1940,6 @@ fn getid_invert_way() -> Case {
         },
         |w, o| pbf_result(o, OUT, &all_but(w, &[], &[-7]), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 64,
-            says: "getid requires non-negative input ids. Input contains way id -7.",
-        },
-        "getid refuses negative text queries",
-    )])
 }
 
 /// `n-7`'s parents are `w-7`, `w7` and `r-7`; `n7` has no relation parent,
@@ -2000,12 +1954,59 @@ fn getparents_negative_query() -> Case {
         },
         |w, o| pbf_result(o, OUT, &picked(w, &[], &[-7, 7], &[-7]), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        GETID_TEXT_REFUSAL,
-        "getparents refuses negative text queries",
-    )])
+}
+
+/// The same query on the full-scan arm, which an indexed input takes when
+/// the blob-count threshold is forced to one. The forcing flag exists only
+/// in test-hooks builds; elsewhere this case runs the walker arm again.
+fn getparents_full_scan() -> Case {
+    Case::both(
+        INDEXED,
+        |w, dir, f| {
+            let mut a = in_out(w, dir, f);
+            #[cfg(pbfhogg_test_hooks)]
+            a.extend(["--full-scan-min-blobs".into(), "1".into()]);
+            a.extend(["--".into(), format!("n{}", w.n(-7)).into()]);
+            a
+        },
+        |w, o| pbf_result(o, OUT, &picked(w, &[], &[-7, 7], &[-7]), true),
+    )
+}
+
+/// `-I` from a source holding only the negative node `n-7`, with
+/// `--add-self`: the node itself and its parents, so a source of negatives
+/// alone is a request, and the node kind is not pruned.
+fn getparents_id_osm_file() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| {
+            let base = w.base();
+            let source = MixedSignGraph {
+                nodes: vec![base.node(w.n(-7)).clone()],
+                ways: Vec::new(),
+                relations: Vec::new(),
+            };
+            let source = write(dir, "ids.osm.pbf", &source, Layout::plain(true));
+            let mut a = in_out(w, dir, f);
+            a.extend(["--add-self".into(), "-I".into(), source]);
+            a
+        },
+        |w, o| pbf_result(o, OUT, &picked(w, &[-7], &[-7, 7], &[-7]), true),
+    )
+}
+
+/// A bare negative number under `--default-type`, with no `--`.
+fn getparents_bare_default_type() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| {
+            let mut a = in_out(w, dir, f);
+            a.extend(["--default-type".into(), "node".into()]);
+            a.push(w.n(-7).to_string().into());
+            a
+        },
+        |w, o| pbf_result(o, OUT, &picked(w, &[], &[-7, 7], &[-7]), true),
+    )
 }
 
 /// `n1`'s parents are the negative way `w-2`, the way `w1` and the negative

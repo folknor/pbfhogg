@@ -1874,7 +1874,8 @@ enum Command {
         /// Type for bare numeric IDs. Without this, each ID must name its type.
         #[arg(long = "default-type", value_enum)]
         default_type: Option<DefaultTypeArg>,
-        /// Element IDs (e.g. n123 w456 r789, or node/123 way/456 relation/789)
+        /// Element IDs (e.g. n123 w456 r-789, or node/123 way/456 relation/789)
+        #[arg(allow_negative_numbers = true)]
         ids: Vec<String>,
         #[command(flatten)]
         compression: CompressionArg,
@@ -1912,7 +1913,8 @@ enum Command {
         /// Type for bare numeric IDs. Without this, each ID must name its type.
         #[arg(long = "default-type", value_enum)]
         default_type: Option<DefaultTypeArg>,
-        /// Element IDs (e.g. n123 w456 r789, or node/123 way/456 relation/789)
+        /// Element IDs (e.g. n123 w456 r-789, or node/123 way/456 relation/789)
+        #[arg(allow_negative_numbers = true)]
         ids: Vec<String>,
         #[command(flatten)]
         compression: CompressionArg,

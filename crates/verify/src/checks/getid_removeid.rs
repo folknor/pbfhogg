@@ -36,9 +36,10 @@ const KIND_LETTERS: [char; 3] = ['n', 'w', 'r'];
 
 /// The IDs to request, per kind (node, way, relation): the lowest and highest
 /// ID the input's indexdata claims for that kind, so both exist in any input
-/// whose claims are true, whatever the dataset. Negative IDs are left out
-/// (pbfhogg getid does not accept them); a kind with none left requests
-/// nothing.
+/// whose claims are true, whatever the dataset. Negative IDs are left out:
+/// osmium refuses a negative text ID and matches the rest by absolute
+/// value, so a negative request has no osmium answer to compare with; a kind
+/// with none left requests nothing.
 fn endpoint_ids(summary: &IndexSummary) -> [Vec<i64>; 3] {
     let mut ids: [Vec<i64>; 3] = Default::default();
     for (kind, claim) in summary.kinds.iter().enumerate() {

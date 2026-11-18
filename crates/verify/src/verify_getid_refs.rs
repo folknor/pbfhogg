@@ -40,7 +40,7 @@
 //! indexdata claims a negative ID is refused: osmium matches an ID by its
 //! absolute value and pbfhogg does not. A negative node or member reference
 //! in any object of osmium's output is refused too: osmium folds it to its
-//! absolute value, pbfhogg drops it, and every reference either tool follows
+//! absolute value, pbfhogg follows the signed one, and every reference either tool follows
 //! belongs to an object osmium wrote.
 
 #![allow(

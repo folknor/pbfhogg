@@ -93,9 +93,8 @@ struct BlockOutcome {
 /// `inspect --show`.
 ///
 /// The parser accepts both the compact form (`n123`) and the named form
-/// (`node/123`). It keeps signed IDs intact; `getid` applies its separate
-/// non-negative query rule, while `inspect --show` can inspect signed IDs in
-/// an input PBF.
+/// (`node/123`). It keeps signed IDs intact: a negative ID is an ID like any
+/// other, and every `i64` is accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ElementRef {
     /// The referenced OSM element kind.
@@ -136,27 +135,15 @@ impl std::str::FromStr for ElementRef {
     }
 }
 
-/// Parse an ID spec like "n123", "w456", "r789".
+/// Parse an ID spec like "n123", "w456", "r-789".
+///
+/// Any `i64` is accepted, negative ones and both extremes included: getid
+/// and getparents select by the exact signed ID. osmium refuses a negative
+/// text ID (and `LLONG_MIN`/`LLONG_MAX` as illegal) while matching every
+/// other ID by its absolute value; pbfhogg is exact instead.
 // The messages show the bad input value, which is more helpful for CLI users
 // than the underlying ParseIntError.
 fn parse_id_spec(spec: &str, default_type: Option<ElementKind>) -> Result<(ElementKind, i64)> {
-    let (kind, id) = parse_id_spec_inner(spec, default_type)?;
-    if id < 0 {
-        let kind = kind.as_str();
-        return Err(Error::invalid_argument(format!(
-            "getid requires non-negative input ids. \
-             Input contains {kind} id {id}. \
-             Negative ids are JOSM editor-local staging identifiers \
-             that should be resolved before processing."
-        )));
-    }
-    Ok((kind, id))
-}
-
-fn parse_id_spec_inner(
-    spec: &str,
-    default_type: Option<ElementKind>,
-) -> Result<(ElementKind, i64)> {
     // The optional default is deliberate: unlike osmium's implicit node
     // default, pbfhogg requires an explicit --default-type for bare numbers.
     if spec.len() < 2 {
@@ -331,11 +318,9 @@ pub fn parse_ids_from_pbf<'a>(
             Ok(batch)
         },
         |_seq, batch| {
-            // getid does not select negative IDs: a source PBF's negatives
-            // are dropped here.
-            insert_non_negative(&mut set.node_ids, batch.node_ids);
-            insert_non_negative(&mut set.way_ids, batch.way_ids);
-            insert_non_negative(&mut set.relation_ids, batch.relation_ids);
+            insert_all(&mut set.node_ids, batch.node_ids);
+            insert_all(&mut set.way_ids, batch.way_ids);
+            insert_all(&mut set.relation_ids, batch.relation_ids);
         },
         host,
     )?;
@@ -343,13 +328,10 @@ pub fn parse_ids_from_pbf<'a>(
     Ok(set)
 }
 
-/// Insert the non-negative IDs of `ids` into `set`, dropping the negative
-/// ones: getid does not select or follow a negative ID.
-fn insert_non_negative(set: &mut IdSet, ids: impl IntoIterator<Item = i64>) {
+/// Insert every ID of `ids` into `set`, whatever its sign.
+fn insert_all(set: &mut IdSet, ids: impl IntoIterator<Item = i64>) {
     for id in ids {
-        if id >= 0 {
-            set.insert(id);
-        }
+        set.insert(id);
     }
 }
 
@@ -1266,7 +1248,7 @@ struct RelationRefs {
     /// Relation members of the requested relations: the closure's seeds.
     relations: Vec<i64>,
     /// `(parent, child)` for every relation member of a relation that was
-    /// not requested, both ends non-negative: the edges the closure walks.
+    /// not requested, of either sign: the edges the closure walks.
     edges: Vec<(i64, i64)>,
 }
 
@@ -1304,10 +1286,9 @@ struct RelationRefs {
 /// the store a `Vec` dropped here. The per-blob edge vectors the workers
 /// hand over are still `Vec`s, each bounded by one blob.
 ///
-/// A negative member ID is dropped from every pulled set (an edge with
-/// a negative end is never stored: no walk could reach or follow it);
-/// osmium abs-folds it (`positive_ref`). See DEVIATIONS.md "Negative input
-/// IDs rejected project-wide".
+/// Every member is followed by its exact signed ID, negative ones
+/// included; osmium abs-folds a negative member (`positive_ref`), so for
+/// a reference to `-N` it adds object `N`.
 fn close_relations(
     shared_file: &InputFile,
     schedule: &[ScheduledBlob],
@@ -1324,8 +1305,8 @@ fn close_relations(
         &ids.relation_ids,
         true,
         |refs| {
-            insert_non_negative(&mut pulled.node_ids, refs.nodes);
-            insert_non_negative(&mut pulled.way_ids, refs.ways);
+            insert_all(&mut pulled.node_ids, refs.nodes);
+            insert_all(&mut pulled.way_ids, refs.ways);
             seeds.extend(refs.relations);
             if store_failed.is_none()
                 && let Err(e) = edges.extend(&refs.edges)
@@ -1346,7 +1327,7 @@ fn close_relations(
     let mut added = false;
     let mut worklist = seeds;
     while let Some(id) = worklist.pop() {
-        if id < 0 || ids.relation_ids.get(id) || !pulled.relation_ids.insert_if_new(id) {
+        if ids.relation_ids.get(id) || !pulled.relation_ids.insert_if_new(id) {
             continue;
         }
         added = true;
@@ -1361,8 +1342,8 @@ fn close_relations(
             &pulled.relation_ids,
             false,
             |refs| {
-                insert_non_negative(&mut pulled.node_ids, refs.nodes);
-                insert_non_negative(&mut pulled.way_ids, refs.ways);
+                insert_all(&mut pulled.node_ids, refs.nodes);
+                insert_all(&mut pulled.way_ids, refs.ways);
             },
             host,
         )?;
@@ -1374,9 +1355,11 @@ fn close_relations(
 /// of its own, grown geometrically by moving to a larger mapping, so that
 /// neither its growth nor its release goes through the malloc arenas (see
 /// [`close_relations`] for why). Each edge is 16 bytes, parent then child,
-/// both big-endian: both are non-negative, so the byte order of a record is
-/// the numeric order of the pair, and the records sort as byte arrays with
-/// no unsafe view of the mapping.
+/// both big-endian two's complement. The records sort as byte arrays with
+/// no unsafe view of the mapping; that order is numeric only among
+/// non-negative IDs (a negative ID sorts after every non-negative one), but
+/// [`Self::children`] searches by the same byte order and needs only that
+/// equal parents are contiguous, which holds for every `i64`.
 #[derive(Default)]
 struct EdgeStore {
     map: Option<memmap2::MmapMut>,
@@ -1497,7 +1480,7 @@ fn relation_phase(
                         MemberId::Relation(id) if seed_edges => {
                             if collected {
                                 refs.relations.push(id);
-                            } else if relation.id >= 0 && id >= 0 {
+                            } else {
                                 refs.edges.push((relation.id, id));
                             }
                         }
@@ -1548,7 +1531,7 @@ fn collect_way_nodes(
             Ok(refs)
         },
         |_seq, refs| {
-            insert_non_negative(node_ids, refs);
+            insert_all(node_ids, refs);
         },
         host,
     )
@@ -1601,7 +1584,8 @@ fn element_key(element: &Element<'_>) -> (ElementKind, i64) {
 /// tests on the same values, read from the messages the validator already
 /// parsed. Dense node IDs decode by the wrapping running sum
 /// `DenseNodeIter` uses (`WayRefIter::delta_decoded`), and every test is
-/// an `IdSet::get`, so a negative ID matches nothing here as there. Every
+/// the same signed `IdSet::get`, so a negative ID matches here exactly as
+/// there. Every
 /// element of every
 /// kind is tested whatever the blob's claim; after the first hit the tests
 /// stop, validation does not.
@@ -1975,22 +1959,229 @@ mod tests {
     }
 
     #[test]
-    fn parse_negative_id_rejected_with_named_id_and_kind() {
-        let err = parse_id_spec("n-1", None).unwrap_err().to_string();
-        assert!(err.contains("non-negative"), "{err}");
-        assert!(err.contains("node id -1"), "{err}");
+    fn parse_accepts_every_signed_id() {
+        assert_eq!(parse_id_spec("n-1", None).unwrap(), (ElementKind::Node, -1));
+        assert_eq!(
+            parse_id_spec("w-42", None).unwrap(),
+            (ElementKind::Way, -42)
+        );
+        assert_eq!(
+            parse_id_spec("relation/-7", None).unwrap(),
+            (ElementKind::Relation, -7)
+        );
+        assert_eq!(
+            parse_id_spec("-5", Some(ElementKind::Node)).unwrap(),
+            (ElementKind::Node, -5)
+        );
+        assert_eq!(
+            parse_id_spec("n-9223372036854775808", None).unwrap(),
+            (ElementKind::Node, i64::MIN)
+        );
+        assert_eq!(
+            parse_id_spec("w9223372036854775807", None).unwrap(),
+            (ElementKind::Way, i64::MAX)
+        );
+        // One past either extreme is still a bad number.
+        assert!(parse_id_spec("n-9223372036854775809", None).is_err());
+        assert!(parse_id_spec("-", Some(ElementKind::Node)).is_err());
+        // A source holding only negative IDs is not an empty request.
+        let ids = parse_ids(&["n-3".to_owned()]).unwrap();
+        assert!(!ids.is_empty());
+        assert!(ids.node_ids.get(-3) && !ids.node_ids.get(3));
+    }
 
-        let err = parse_id_spec("w-42", None).unwrap_err().to_string();
-        assert!(err.contains("way id -42"), "{err}");
+    /// Write one sorted node blob per slice, every blob indexed.
+    fn write_node_blobs(path: &Path, blobs: &[&[i64]]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(
+                &crate::block_builder::HeaderBuilder::new()
+                    .sorted()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut block = BlockBuilder::new();
+        for ids in blobs {
+            for &id in *ids {
+                block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            }
+            writer
+                .write_primitive_block(block.take().unwrap().unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+    }
 
-        let err = parse_id_spec("r-7", None).unwrap_err().to_string();
-        assert!(err.contains("relation id -7"), "{err}");
+    /// The IDs of `path` in file order, unsorted.
+    fn ids_in_file_order(path: &Path) -> Vec<i64> {
+        let mut found = Vec::new();
+        ElementReader::open_in(path, false, &crate::host::Host::for_tests().entered())
+            .unwrap()
+            .for_each(|element| found.push(element_key(&element).1))
+            .unwrap();
+        found
+    }
 
-        // Bare negative number with default type must also reject.
-        let err = parse_id_spec("-5", Some(ElementKind::Node))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("node id -5"), "{err}");
+    /// Both include arms select negative IDs exactly, through the signed
+    /// numeric range prefilter: in a zero-and-negatives blob, a
+    /// negative-only blob, a blob straddling zero and a blob holding both
+    /// `i64` extremes (one dense run, so the output's delta wraps). A query
+    /// inside a negative-only blob's range that names no element of it, and
+    /// one outside every range, select nothing; no magnitude twin leaks in.
+    #[test]
+    fn include_arms_select_negative_ids_exactly() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("input.pbf");
+        write_node_blobs(
+            &input,
+            &[
+                &[0, -1, -2],
+                &[-5, -7, -9],
+                &[-11, i64::MIN, 1, 2],
+                &[7, i64::MAX],
+            ],
+        );
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        assert_eq!(
+            ids_from_both_arms(&input, &["n-7", "n2", "n-1"], &host),
+            vec![-7, -1, 2]
+        );
+        assert_eq!(
+            ids_from_both_arms(&input, &["n-6"], &host),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            ids_from_both_arms(&input, &["n-100"], &host),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            ids_from_both_arms(
+                &input,
+                &["n-9223372036854775808", "n9223372036854775807"],
+                &host
+            ),
+            vec![i64::MIN, i64::MAX]
+        );
+        // The emitted order is the input's canonical order.
+        let query = parse_ids(&[
+            "n9223372036854775807".to_owned(),
+            "n-9223372036854775808".to_owned(),
+            "n-11".to_owned(),
+            "n0".to_owned(),
+        ])
+        .unwrap();
+        let output = dir.path().join("ordered.pbf");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap()
+        .bind(&host.invocation)
+        .unwrap();
+        filter_by_id(
+            &PinnedInput::pin(&input, &host).unwrap(),
+            &staged,
+            &query,
+            super::Filter::Include(ScanArm::Walker),
+            &WriteOptions::default(),
+            &HeaderOverrides::default(),
+            false,
+            &host,
+        )
+        .unwrap();
+        staged.publish().unwrap();
+        assert_eq!(ids_in_file_order(&output), vec![0, -11, i64::MIN, i64::MAX]);
+    }
+
+    /// `--add-referenced` follows a closure through negative relations:
+    /// `r9 -> r-1 -> r-2 -> r9` (a cycle), where `r-1` and `r-2` are not
+    /// requested, so the walk reaches `r-2` only through an edge whose
+    /// parent is negative, and `n-4` and `w-3` (with its node `n-6`) are
+    /// reachable only through `r-2`; `n4` comes in as `w-3`'s second ref.
+    /// The magnitude twins `w3`, `n6` and `r2` are present and must stay
+    /// out.
+    #[test]
+    fn add_referenced_follows_negative_relations_and_refs() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("closure.pbf");
+        let file = std::fs::File::create(&input).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(
+                &crate::block_builder::HeaderBuilder::new()
+                    .sorted()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut block = BlockBuilder::new();
+        for id in [-4, -6, 4, 6] {
+            block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+        }
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        block.add_way(-3, std::iter::empty::<(&str, &str)>(), &[-6, 4], None);
+        block.add_way(3, std::iter::empty::<(&str, &str)>(), &[6], None);
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        let member = |id| MemberData { id, role: "" };
+        let empty = std::iter::empty::<(&str, &str)>;
+        block.add_relation(-1, empty(), &[member(MemberId::Relation(-2))], None);
+        block.add_relation(
+            -2,
+            empty(),
+            &[
+                member(MemberId::Node(-4)),
+                member(MemberId::Way(-3)),
+                member(MemberId::Relation(9)),
+            ],
+            None,
+        );
+        block.add_relation(2, empty(), &[member(MemberId::Node(6))], None);
+        block.add_relation(9, empty(), &[member(MemberId::Relation(-1))], None);
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+
+        let ids = parse_ids(&["r9".to_owned()]).unwrap();
+        let output = dir.path().join("output.pbf");
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap()
+        .bind(&host.invocation)
+        .unwrap();
+        getid_with_refs(
+            &PinnedInput::pin(&input, &host).unwrap(),
+            &staged,
+            &ids,
+            &AddReferenced { remove_tags: false },
+            false,
+            &WriteOptions::default(),
+            &HeaderOverrides::default(),
+            &host,
+        )
+        .unwrap();
+        staged.publish().unwrap();
+        // Nodes -4, -6, 4 (w-3's second ref), way -3, relations -1, -2, 9.
+        assert_eq!(ids_in_file_order(&output), vec![-4, -6, 4, -3, -1, -2, 9]);
     }
 
     /// Write a node block, then optionally a way block, which can be written
@@ -2529,5 +2720,34 @@ mod tests {
         }
         assert_eq!(store.children(7).count(), 0);
         assert_eq!(EdgeStore::default().sorted().children(1).count(), 0);
+    }
+
+    /// Negative parents and children, the extremes and magnitude twins
+    /// included, each answer with exactly their own children.
+    #[test]
+    fn edge_store_answers_signed_parents() {
+        let mut store = EdgeStore::default();
+        let edges = [
+            (-1, 5),
+            (1, -5),
+            (-1, -6),
+            (i64::MIN, i64::MAX),
+            (0, -1),
+            (i64::MAX, i64::MIN),
+            (-1, 0),
+        ];
+        store.extend(&edges).unwrap();
+        let store = store.sorted();
+        let children = |parent| {
+            let mut got: Vec<i64> = store.children(parent).collect();
+            got.sort_unstable();
+            got
+        };
+        assert_eq!(children(-1), vec![-6, 0, 5]);
+        assert_eq!(children(1), vec![-5]);
+        assert_eq!(children(0), vec![-1]);
+        assert_eq!(children(i64::MIN), vec![i64::MAX]);
+        assert_eq!(children(i64::MAX), vec![i64::MIN]);
+        assert!(children(-5).is_empty());
     }
 }

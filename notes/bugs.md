@@ -219,12 +219,6 @@ Defect hunt 2026-11-17 (extract P1, id-filter-selection P2, cli-binary):
   raw-copy blob. Claims named: complete-ways completeness and the stated
   rejection policy; `IdSet` keeps its own contract and extraction fails to
   enforce its precondition.
-- getid: `parse_ids_from_pbf` (`getid/mod.rs`) silently drops negatives from
-  an `--id-osm-file` source, so a mixed source succeeds with a shortened
-  request; reference expansion also discards negative relation seeds and
-  negative way references. `DEVIATIONS.md` acknowledges these and declines
-  further rejection; the hunter reads that as accurate but contradicting the
-  summary contract.
 See also DOC-001 in `notes/bugs-docs.md` for the blanket "rejected
 project-wide" wording.
 

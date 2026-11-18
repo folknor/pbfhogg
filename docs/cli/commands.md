@@ -1716,6 +1716,13 @@ Typed IDs accept `n123` or `node/123` (node), `w456` or `way/456` (way), and
 `--default-type` is supplied. Without it, a bare ID is an error. This also
 applies to IDs in `--id-file` text input.
 
+Negative IDs are IDs like any other, from every source (`n-7`,
+`node/-7`, or a bare `-7` under `--default-type`, which needs no `--`), and
+any 64-bit signed ID is accepted. Selection, `--invert` and `-r` match the
+exact signed ID: `n7` never selects or removes `n-7`, and a reference to
+`n-7` pulls in `n-7`, not `n7` (osmium refuses negative text IDs and matches
+the others by absolute value).
+
 At least one ID source is required (positional IDs, `-i` or `-I`).
 Positional IDs are parsed before the output is checked; the ID files are read
 after it, so an existing output is refused before a full pass over an `-I`
@@ -1757,7 +1764,9 @@ the normal command summary remains available.
 Find ways/relations referencing given IDs (reverse lookup).
 
 ID syntax and the optional `--default-type` behavior are the same as for
-`getid`: bare numeric IDs require an explicit default type.
+`getid`: bare numeric IDs require an explicit default type, and negative IDs
+are accepted and matched exactly, so the parents of `n-7` are the objects
+referencing `n-7`, never those referencing `n7`.
 
 ```
 pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...

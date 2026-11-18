@@ -448,7 +448,8 @@ fn parents_in(
 /// whose own ID is queried. Refs and member IDs decode as the element
 /// iterators decode them (`WayRefIter::delta_decoded`, `MemberIdIter`),
 /// dense node IDs by the same wrapping running sum, and every test goes
-/// through `IdSet::get`, so a negative ID matches nothing here as there.
+/// through the same signed `IdSet::get`, so a negative ID matches here
+/// exactly as there.
 ///
 /// Every element of every kind is tested whatever the blob's claim: an
 /// unindexed blob is scheduled into the walk conservatively and may hold

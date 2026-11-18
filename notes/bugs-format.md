@@ -23,24 +23,6 @@ the scope or scopes, and the bracketed priority is the hunter's own label.
 Findings that match an existing mechanism were added to `notes/bugs.md`
 instead of being filed here. Entries are in no order of importance.
 
-## FMT-001 - PrimitiveBlock::from_vec can produce an invalid &str through safe code
-
-Reported by: read-block-decoding [P1].
-
-`from_vec` (`read/block.rs`) accepts an unrestricted `Vec<u8>`, while
-`inline_tables` (`read/wire.rs`) narrows buffer lengths and table positions to
-`u32`. The decompression path's size limit does not protect this public
-constructor. Witness: a buffer of exactly `2^32` bytes beginning
-`0a 03 0a 01 61 1a 00 1a`, then a five-byte length encoding `2^32 - 13`, with
-that unknown field's payload filled with `ff`. Validation sees the valid string
-`"a"` and skips the unknown fields. Construction wraps the appended
-string-table position to zero, so `string_table_entry(0)` reads the original
-first eight protobuf bytes as an offset/length pair pointing into the
-unvalidated `ff` payload and passes it to `from_utf8_unchecked`. This breaks
-Rust's string validity requirement and the type's documented UTF-8 invariant.
-The constructor must enforce the size bound its representation needs before
-scanning or narrowing.
-
 ## FMT-002 - A repeated PrimitiveBlock stringtable silently replaces the earlier one
 
 Reported by: read-block-decoding [P1].

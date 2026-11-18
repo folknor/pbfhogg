@@ -324,6 +324,12 @@
 
 ### Fixed
 
+- `PrimitiveBlock::from_vec` refuses a buffer over 256 MiB with
+  `ErrorKind::WireFormat`. A buffer of 4 GiB or more used to wrap the
+  block's internal string-table offsets, so string lookups could return
+  a `&str` over bytes that were never checked as UTF-8 (undefined
+  behaviour reachable from safe code). Blocks decoded from a PBF are
+  capped at 32 MiB already and are unaffected.
 - The io_uring writer (`--io-uring`, `PbfWriter::to_path_uring`) no longer
   mishandles a failed `io_uring_enter` after a write was queued: the write
   is now counted from the moment it is queued, so teardown waits for it

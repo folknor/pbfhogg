@@ -123,6 +123,24 @@ working tree (`--force` runs, numbers from the run output and sidecar).
   `c5fd3184`). The signs disagree across the pairs, so no cost is shown;
   that walk is I/O bound and swings with cache state in both arms.
 
+## io_uring output after per-slot write ownership (bygg, 2026-11-18)
+
+`ecab12d4` made the ring writer track each buffer slot from SQE push and
+retain a pool teardown cannot prove idle. `sort-pbf --dataset planet
+--io-uring yes`, `--iterations 1` cells alternated, baseline the parent
+`1cddf081` through `--commit`, memlock raised so the full pool registers.
+
+| Pair | `1cddf081` | `ecab12d4` |
+|---|---|---|
+| 1 | 63.0 s (`339c1d19`) | 42.4 s (`0e3149ee`) |
+| 2 | 53.1 s (`2fe586ae`) | 53.2 s (`622d38a6`) |
+| 3 | 50.9 s (`f5fc137f`) | 52.0 s (`e440d139`) |
+
+- Verdict: no cost. Pairs 2 and 3 differ by 0.1 s and 1.1 s with opposite
+  sign to pair 1; medians 53.1 s and 52.0 s.
+- Pair 1's 20 s gap is run history, not code: its baseline cell was the
+  first after a worktree build and ran cold.
+
 ## History
 
 ### Sort

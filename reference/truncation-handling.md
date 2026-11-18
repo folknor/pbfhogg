@@ -176,7 +176,11 @@ The other contract sites are:
   check `BlockBuffer::project` runs). Note that no
   `PrimitiveBlock` constructor is a shape-5 site: they take
   already-decompressed bytes and cannot observe a decompression
-  failure.
+  failure. The block scan does refuse, with `WireFormat`, a payload
+  over 256 MiB (`MAX_BLOCK_BYTES` in `read/wire.rs`): past it the
+  `u32` offset tables appended to the buffer could wrap. That is a
+  representation limit, deliberately above the 32 MiB format cap so
+  `cat --repair` rewrites that grow a block slightly stay accepted.
 
 A truncation that reaches any of those entry points must surface
 as `Err(ErrorKind::Io)` (or a more specific variant) before the

@@ -555,7 +555,12 @@ impl PrimitiveBlock {
     ///
     /// Returns `ErrorKind::StringtableUtf8` if any stringtable entry contains
     /// invalid UTF-8 bytes. Returns `ErrorKind::WireFormat` if the protobuf
-    /// wire format is invalid or a group fails structural validation.
+    /// wire format is invalid or a group fails structural validation, and
+    /// for a buffer longer than 256 MiB, the largest payload the block's
+    /// `u32` offset tables can address. That is the decoder's limit, not the
+    /// PBF format's: a decoded blob is capped at
+    /// [`MAX_BLOB_MESSAGE_SIZE`](crate::blob::MAX_BLOB_MESSAGE_SIZE) before
+    /// it gets here.
     ///
     /// This eliminates the cross-thread `Box<[(u32, u32)]>` retention that caused
     /// 25+ GB OOM at Europe scale (520K blocks) with the pipelined reader.
@@ -694,8 +699,11 @@ impl PrimitiveBlock {
         self.block.stringtable.get(index).map(|bytes| {
             // SAFETY: All stringtable entries were validated as UTF-8 in
             // validate_block, which every constructor funnels through
-            // (BlockBuffer::project). The PrimitiveBlock struct does not
-            // expose any mutable access to the underlying buffer.
+            // (BlockBuffer::project), and the appended table this reads
+            // addresses exactly the validated entries because that scan
+            // refuses a payload over `wire::MAX_BLOCK_BYTES`, the bound under
+            // which no table position wraps. The PrimitiveBlock struct does
+            // not expose any mutable access to the underlying buffer.
             unsafe { std::str::from_utf8_unchecked(bytes) }
         })
     }
@@ -1102,9 +1110,11 @@ pub(crate) struct BlockScan {
 /// contradicted claim (`None` under `KindClaims::Unchecked` or for an
 /// unindexed blob).
 ///
-/// The only ways on are [`project`](Self::project), which validates, and
+/// The only ways on are [`project`](Self::project), which validates,
 /// [`block`](Self::block), which is `project` with [`NoProjection`] followed
-/// by [`ValidatedBlock::into_block`]: every `PrimitiveBlock` in the crate is
+/// by [`ValidatedBlock::into_block`], and
+/// [`block_rescuing`](Self::block_rescuing), which runs the same check and
+/// revalidates any rewrite: every `PrimitiveBlock` in the crate is
 /// built this way, so a projection and a block refuse the same input with the
 /// same error, and the kind-claim refusal follows validation in both. The
 /// check itself is [`validate_in_place`], which a caller holding borrowed
@@ -2155,9 +2165,11 @@ impl<'a> Iterator for GroupRelationIter<'a> {
 pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -> Result<&'a str> {
     if let Some(bytes) = block.stringtable.get(index) {
         // SAFETY: All stringtable entries were validated as UTF-8 in
-        // validate_block, which every constructor funnels through. The
-        // PrimitiveBlock struct does not expose any mutable access to the
-        // underlying buffer, so entries cannot have been modified since
+        // validate_block, which every constructor funnels through, and its
+        // scan refuses a payload over `wire::MAX_BLOCK_BYTES`, so the
+        // appended table positions cannot wrap past the validated entries.
+        // The PrimitiveBlock struct does not expose any mutable access to
+        // the underlying buffer, so entries cannot have been modified since
         // construction.
         Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
     } else {
@@ -2212,6 +2224,38 @@ mod strict_validation_tests {
         let mut out = vec![(field << 3) | 2, body.len() as u8];
         out.extend_from_slice(body);
         out
+    }
+
+    /// A block of exactly `total` bytes: a one-entry StringTable holding
+    /// `"a"`, then an unknown length-delimited field of `0xff` padding (a
+    /// four-byte length varint, so `total` must lie in `2^21 + 10 ..
+    /// 2^28 + 10`).
+    fn padded_block(total: usize) -> Vec<u8> {
+        let mut out = vec![0x0a, 0x03, 0x0a, 0x01, b'a', (15 << 3) | 2];
+        let pad = total - out.len() - 4;
+        varint(pad as u64, &mut out);
+        assert_eq!(out.len(), 10, "padding length took four varint bytes");
+        out.resize(total, 0xff);
+        out
+    }
+
+    /// The offset tables address a payload only up to the representation
+    /// bound: one byte past it is refused before any position is recorded,
+    /// so no appended table position can wrap into unvalidated bytes, and a
+    /// payload exactly at it (8x the format cap, room a repair rewrite may
+    /// need) still builds and reads its string back.
+    #[test]
+    fn from_vec_refuses_a_payload_its_offset_tables_cannot_address() {
+        let max = crate::read::wire::MAX_BLOCK_BYTES;
+        let err = PrimitiveBlock::from_vec(padded_block(max + 1)).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::WireFormat { .. }),
+            "{err}"
+        );
+        let block = PrimitiveBlock::from_vec(padded_block(max)).unwrap();
+        assert_eq!(block.string_table_entry(0), Some("a"));
+        assert_eq!(block.string_table_len(), 1);
+        assert_eq!(block.decompressed_size(), max);
     }
 
     /// A `PrimitiveBlock` carrying a one-entry (empty string) StringTable and

@@ -229,6 +229,8 @@ impl<'a> WireStringTable<'a> {
             if field == super::wire_schema::string_table::STRINGS && wire_type == WIRE_LEN {
                 let bytes = cursor.read_len_delimited()?;
                 let offset = bytes.as_ptr() as usize - buffer.as_ptr() as usize;
+                // Lossless: only `scan_block_fields` calls this, after
+                // refusing a buffer over `MAX_BLOCK_BYTES`.
                 #[allow(clippy::cast_possible_truncation)]
                 out.push((offset as u32, bytes.len() as u32));
             } else {
@@ -290,6 +292,34 @@ pub(crate) struct BlockFields {
     pub date_granularity: i32,
 }
 
+/// The largest `PrimitiveBlock` payload the offset representation can hold,
+/// refused above by [`scan_block_fields`] before it records any position.
+///
+/// Positions are stored as `u32` (scan scratch, the appended tables and
+/// [`WireBlockMeta`]), and the block's buffer grows by eight bytes per string
+/// entry and per group. Every recorded entry or group consumes at least two
+/// distinct payload bytes (a tag and a length), so for `n` payload bytes the
+/// combined count is at most `n / 2` and the extended buffer at most `5 * n`.
+/// Every recorded range ends at or before `n`. At this bound `5 * n` is
+/// 1.25 GiB: it fits `u32` and `isize` on a 32-bit target, and each scratch
+/// list holds at most `2^27` entries, so `Vec`'s doubling growth asks for
+/// under `2^31` bytes.
+///
+/// This is the decoder's representation limit, not the PBF format limit:
+/// decompression and framing enforce the 32 MiB
+/// [`MAX_BLOB_MESSAGE_SIZE`](super::blob_wire::MAX_BLOB_MESSAGE_SIZE), and
+/// `cat --repair` may rewrite a block under that cap into bytes a little over
+/// it, which are decoded and rebuilt into smaller blocks. The bound is what
+/// makes every narrowing cast below lossless, so a buffer past it handed to
+/// `PrimitiveBlock::from_vec` cannot wrap a table position into bytes UTF-8
+/// validation never saw.
+pub(crate) const MAX_BLOCK_BYTES: usize = 256 * 1024 * 1024;
+
+const _: () = {
+    assert!((MAX_BLOCK_BYTES as u64) * 5 <= u32::MAX as u64);
+    assert!((MAX_BLOCK_BYTES as u64) * 5 <= i32::MAX as u64);
+};
+
 /// Scan a `PrimitiveBlock`'s top-level fields: every field framed, the last
 /// string table's entries into `st_entries` and every group's range into
 /// `group_entries` (both buffer-relative `(offset, length)`, cleared first),
@@ -306,6 +336,11 @@ pub(crate) fn scan_block_fields(
 ) -> Result<BlockFields> {
     st_entries.clear();
     group_entries.clear();
+    if buffer.len() > MAX_BLOCK_BYTES {
+        return Err(new_wire_error(
+            "PrimitiveBlock payload exceeds the decoder's 256 MiB representation limit",
+        ));
+    }
     let mut granularity: i32 = 100;
     let mut lat_offset: i64 = 0;
     let mut lon_offset: i64 = 0;
@@ -415,6 +450,11 @@ impl<'a> WireBlock<'a> {
     /// a block pays a full payload copy before this point; that copy is the
     /// caller's to remove (validate in place, or hand over an owned buffer),
     /// not a reason to move the tables.
+    ///
+    /// The `u32` casts are lossless because `buf`, `st_entries` and
+    /// `group_entries` come from a [`scan_block_fields`] that accepted `buf`,
+    /// which refuses a payload over [`MAX_BLOCK_BYTES`]: the extended buffer
+    /// is then at most five times that, inside `u32`.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn inline_tables(
         buf: &mut Vec<u8>,

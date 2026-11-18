@@ -25,26 +25,28 @@
 //!
 //! ## Position and rank must agree
 //!
-//! An element's new ID is assigned by *position* (start plus the number of
-//! elements of its kind before it); a reference's new ID is computed by
-//! *rank* (start plus the number of input IDs below the referenced one).
-//! They name the same element only when input IDs strictly increase within
-//! each kind, so renumber verifies exactly that - per element inside every
-//! rewriter, and across blobs in schedule order - and refuses input that
-//! fails it, whatever its header claims about sorting.
+//! An element's new ID is assigned by *position* (the number of elements of
+//! its kind before it, counted up from a positive start or down from a
+//! negative one); a reference's new ID is computed by *rank* (the number of
+//! input IDs canonically before the referenced one, counted the same way).
+//! They name the same element only when input IDs strictly ascend in
+//! canonical order (`0`, then `-1, -2, ...`, then `1, 2, ...`) within each
+//! kind, as osmium requires, so renumber verifies exactly that - per element
+//! inside every rewriter, and across blobs in schedule order - and refuses
+//! input that fails it, whatever its header claims about sorting. Negative
+//! input IDs are renumbered like any other.
 //!
 //! ## Orphan references
 //!
 //! A way ref or relation member whose target is not in the input (an
-//! orphan) with old ID X becomes `start + count + X`, where `start` and
-//! `count` are that kind's start ID and number of input elements: the
-//! first ID past the renumbered range, plus the old ID. Passing it through
-//! unchanged let X equal the new ID of a different element. The shift needs
-//! no extra pass, keeps two refs to one orphan equal, keeps X recoverable by
-//! subtraction, and refuses a shift past `i64::MAX`
-//! (`wire_rewrite::IdSpace`). The rule is per kind, so it only holds when
-//! each kind's count equals its set's cardinality, which
-//! [`renumber_external`] checks after every stage.
+//! orphan) is named by a per-kind bijection of the absent IDs onto the IDs
+//! outside the renumbered range, built from the rank index alone
+//! (`wire_rewrite::IdSpace`): no extra pass, two refs to one orphan stay
+//! equal, no orphan names a renumbered element, and no orphan can overflow.
+//! Passing orphans through unchanged let one equal the new ID of a
+//! different element. The rule is per kind, so it only holds when each
+//! kind's count equals its set's cardinality, which [`renumber_external`]
+//! checks after every stage.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -61,9 +63,9 @@ use crate::writer::Compression;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Configuration for the renumber command. Every start ID must be at least
-/// 1: a negative or zero start would hand out ID 0 or negative IDs, which
-/// the rest of the crate rejects as input.
+/// Configuration for the renumber command. Each kind counts up from a
+/// positive start and down from a negative one, as osmium does; a start of
+/// 0 means 1, as in osmium. Only the last ID handed out must fit an `i64`.
 pub struct RenumberOptions {
     pub start_node_id: i64,
     pub start_way_id: i64,
@@ -77,8 +79,8 @@ pub struct RenumberStats {
     pub ways_written: u64,
     pub relations_written: u64,
     /// Way refs and relation members whose target is not in the input.
-    /// Each became old ID + start ID + input element count of its kind,
-    /// past that kind's renumbered range.
+    /// Each is named outside its kind's renumbered range, one name per
+    /// distinct absent ID.
     pub orphan_refs: u64,
 }
 
@@ -96,7 +98,7 @@ impl RenumberStats {
         Ok(())
     }
 
-    /// Report, as a warning event, the orphan refs the run shifted. Silent
+    /// Report, as a warning event, the orphan refs the run named. Silent
     /// when there are none. Separate from [`Self::write_summary`] because it
     /// is a warning, not part of the summary text.
     pub fn report_warnings(&self, diagnostics: &crate::host::Diagnostics) {
@@ -106,9 +108,9 @@ impl RenumberStats {
                 Warning,
                 "renumber.orphan_refs",
                 "{} orphan refs (referenced elements not present in \
-                 input) shifted past their kind's renumbered range: new ID = \
-                 old ID + start ID + element count, separately for nodes, \
-                 ways and relations",
+                 input) named outside their kind's renumbered range, one new \
+                 ID per absent ID, in the absent IDs' order, separately for \
+                 nodes, ways and relations",
                 self.orphan_refs,
             );
         }
@@ -300,80 +302,69 @@ trait RewriteWorker {
 }
 
 /// Per-blob base new IDs for a positionally numbered kind: blob `i` starts
-/// at `start` plus the declared element counts of blobs `0..i`.
+/// at `start` moved by the declared element counts of blobs `0..i`, up from
+/// a positive start, down from a negative one.
 ///
 /// The counts are indexdata claims, verified per blob after decode. What is
-/// checked here is that the *last* ID handed out, `start + total - 1`, fits
-/// an `i64`; the one-past-the-end cursor never has to. An empty blob's base
-/// is never used for an ID (an empty blob is not written, and a decoded
-/// count that disagrees with its claim of zero is an error), so it may
-/// saturate.
+/// checked here is that the *last* ID handed out fits an `i64`; the
+/// one-past-the-end cursor never has to. An empty blob's base is never used
+/// for an ID (an empty blob is not written, and a decoded count that
+/// disagrees with its claim of zero is an error), so it may saturate.
 fn positional_bases(start: i64, schedule: &[BlobTask], kind: &str) -> Result<Vec<i64>> {
     let mut bases = Vec::with_capacity(schedule.len());
+    let up = start > 0;
     let mut cursor = i128::from(start);
     for task in schedule {
         let count = i128::from(task.element_count);
         if count > 0 {
-            let last = cursor
-                .checked_add(count)
-                .and_then(|end| end.checked_sub(1))
-                .and_then(|last| i64::try_from(last).ok());
+            let last = if up {
+                cursor.checked_add(count).and_then(|end| end.checked_sub(1))
+            } else {
+                cursor.checked_sub(count).and_then(|end| end.checked_add(1))
+            }
+            .and_then(|last| i64::try_from(last).ok());
             if last.is_none() {
                 return Err(Error::invalid_data(format!(
                     "renumber: {kind} start id {start} plus the input's {kind} count \
-                     runs past the largest 64-bit id"
+                     runs past the 64-bit id range"
                 )));
             }
         }
-        bases.push(i64::try_from(cursor).unwrap_or(i64::MAX));
-        cursor = cursor.saturating_add(count);
+        let saturated = if up { i64::MAX } else { i64::MIN };
+        bases.push(i64::try_from(cursor).unwrap_or(saturated));
+        cursor = if up {
+            cursor.saturating_add(count)
+        } else {
+            cursor.saturating_sub(count)
+        };
     }
     Ok(bases)
 }
 
-/// The output `BlobIndex` for a non-empty, positionally numbered blob.
+/// The output `BlobIndex` for a non-empty, positionally numbered blob. Its
+/// range is the numeric extrema: `base` is the largest ID counting down.
 fn blob_index(
     kind: crate::ElementKind,
     base: i64,
     count: u64,
     bbox: Option<crate::blob_meta::BlobBbox>,
 ) -> crate::Result<crate::blob_meta::BlobIndex> {
-    let max_id = count
+    let last = count
         .checked_sub(1)
-        .and_then(|span| i64::try_from(span).ok())
-        .and_then(|span| base.checked_add(span))
-        .ok_or_else(|| {
-            Error::invalid_data(format!(
-                "renumber: blob of {count} elements from id {base} overflows"
-            ))
-        })?;
+        .ok_or_else(|| Error::internal("renumber: an index for an empty blob"))
+        .and_then(|span| wire_rewrite::offset_id(base, span))?;
     Ok(crate::blob_meta::BlobIndex {
         kind,
-        min_id: base,
-        max_id,
+        min_id: base.min(last),
+        max_id: base.max(last),
         count,
         bbox,
     })
 }
 
-/// Refuse a start ID below 1. A start of 0 hands out ID 0, a negative one
-/// hands out negative IDs and then 0 - IDs this crate refuses as input
-/// everywhere (DEVIATIONS.md, "Negative input IDs rejected project-wide").
-/// osmium counts *downwards* from a negative start instead; renumber does not
-/// offer that numbering.
-fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
-    for (kind, start) in [
-        ("node", opts.start_node_id),
-        ("way", opts.start_way_id),
-        ("relation", opts.start_relation_id),
-    ] {
-        if start < 1 {
-            return Err(Error::invalid_argument(format!(
-                "renumber: the {kind} start id must be at least 1, got {start}"
-            )));
-        }
-    }
-    Ok(())
+/// The start a kind is numbered from: 0 means 1, as in osmium.
+fn effective_start(start: i64) -> i64 {
+    if start == 0 { 1 } else { start }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,8 +379,9 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 /// relations with resolved member refs (parallel wire-format splice).
 /// No temp files.
 ///
-/// Refuses input whose node, way or relation IDs do not strictly increase
-/// in file order (see the module docs), and start IDs below 1.
+/// Refuses input whose node, way or relation IDs do not strictly ascend in
+/// canonical order in file order (see the module docs), and a start from
+/// which the input's count runs past the 64-bit range.
 ///
 /// The input is read in several passes, so it must be a regular file
 /// (`InvalidArgument` otherwise), and is pinned for the run
@@ -430,7 +422,9 @@ pub(crate) fn renumber_external_to<'a>(
         direct_reads: direct_io,
         ..
     } = *write;
-    validate_start_ids(opts)?;
+    let start_node_id = effective_start(opts.start_node_id);
+    let start_way_id = effective_start(opts.start_way_id);
+    let start_relation_id = effective_start(opts.start_relation_id);
 
     // The input is opened three times, each a new open file description
     // derived from this one pin, so a file renamed over the input mid-run
@@ -524,7 +518,7 @@ pub(crate) fn renumber_external_to<'a>(
 
     let pass1 = pass1_parallel_scan(
         &pass1_schedule,
-        opts.start_node_id,
+        start_node_id,
         &shared_file,
         &source,
         &node_id_set,
@@ -538,7 +532,8 @@ pub(crate) fn renumber_external_to<'a>(
         )));
     }
     // IDs the pre-allocation did not cover, inserted now that no worker
-    // holds the set. Already checked non-negative and strictly increasing.
+    // holds the set: negative IDs, and non-negative ones above the
+    // pre-allocation. Already checked strictly ascending.
     let mut overflow_ids: u64 = 0;
     for ids in pass1.overflow {
         overflow_ids = overflow_ids.saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
@@ -561,7 +556,7 @@ pub(crate) fn renumber_external_to<'a>(
     host.invocation
         .counter("renumber_ext_node_map_entries", node_id_set.total_count());
     set_matches_written("node", node_id_set.total_count(), pass1.nodes_written)?;
-    let nodes = IdSpace::new("node", &node_id_set, opts.start_node_id);
+    let nodes = IdSpace::new(&node_id_set, start_node_id);
 
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
     host.invocation.check()?;
@@ -576,7 +571,7 @@ pub(crate) fn renumber_external_to<'a>(
         &mut way_id_sets,
         &way_schedule,
         &nodes,
-        opts.start_way_id,
+        start_way_id,
     )?;
     host.invocation.marker("RENUMBER_EXT_STAGE2D_END");
 
@@ -610,9 +605,10 @@ pub(crate) fn renumber_external_to<'a>(
     let relation_count = relation_id_set.total_count();
     host.invocation
         .counter("renumber_ext_relation_map_entries", relation_count);
-    // Relation IDs are `start + rank`; the largest rank is count - 1.
+    // Relation IDs are the start moved by the rank; the largest rank is
+    // count - 1.
     if relation_count > 0 {
-        positional_last_fits(opts.start_relation_id, relation_count, "relation")?;
+        positional_last_fits(start_relation_id, relation_count, "relation")?;
     }
     host.invocation.marker("RENUMBER_EXT_R1_END");
 
@@ -624,9 +620,9 @@ pub(crate) fn renumber_external_to<'a>(
         &relation_schedule,
         &mut writer,
         &wire_rewrite::RelationIdSpaces {
-            relations: IdSpace::new("relation", &relation_id_set, opts.start_relation_id),
+            relations: IdSpace::new(&relation_id_set, start_relation_id),
             nodes,
-            ways: IdSpace::new("way", &way_id_set, opts.start_way_id),
+            ways: IdSpace::new(&way_id_set, start_way_id),
         },
         host,
     )?;
@@ -651,25 +647,24 @@ pub(crate) fn renumber_external_to<'a>(
 fn positional_last_fits(start: i64, count: u64, kind: &str) -> Result<()> {
     let fits = count
         .checked_sub(1)
-        .and_then(|span| i64::try_from(span).ok())
-        .and_then(|span| start.checked_add(span))
-        .is_some();
+        .is_some_and(|span| wire_rewrite::offset_id(start, span).is_ok());
     if fits {
         Ok(())
     } else {
         Err(Error::invalid_data(format!(
             "renumber: {kind} start id {start} plus the input's {count} {kind}s \
-             runs past the largest 64-bit id"
+             runs past the 64-bit id range"
         )))
     }
 }
 
 /// Refuse a run whose ID set and written count for `kind` disagree. A
 /// reference resolves by rank in the set while an element is numbered by
-/// position, and an orphan is shifted to `start + set cardinality`: if the
-/// two counts differed, a live ref could name the wrong element and an
-/// orphan could land inside the renumbered range. The order checks already
-/// make them equal; this states the invariant the orphan shift rests on.
+/// position, and orphans are named around a live range as long as the
+/// set's cardinality: if the two counts differed, a live ref could name the
+/// wrong element and an orphan could land inside the renumbered range. The
+/// order checks already make them equal; this states the invariant the
+/// orphan naming rests on.
 fn set_matches_written(kind: &str, in_set: u64, written: u64) -> Result<()> {
     if in_set == written {
         Ok(())
@@ -781,21 +776,17 @@ mod tests {
     }
 
     #[test]
-    fn start_ids_below_one_are_refused() {
-        for (n, w, r) in [(0, 1, 1), (1, -5, 1), (1, 1, 0)] {
-            let opts = RenumberOptions {
-                start_node_id: n,
-                start_way_id: w,
-                start_relation_id: r,
-            };
-            assert!(validate_start_ids(&opts).is_err(), "{n},{w},{r}");
-        }
-        let ok = RenumberOptions {
-            start_node_id: 1,
-            start_way_id: 5000,
-            start_relation_id: 1,
-        };
-        assert!(validate_start_ids(&ok).is_ok());
+    fn a_negative_start_counts_down_and_zero_means_one() {
+        assert_eq!(effective_start(0), 1);
+        assert_eq!(effective_start(-5), -5);
+        let bases = positional_bases(-10, &[task(3), task(0), task(2)], "node").expect("fits");
+        assert_eq!(bases, vec![-10, -13, -13]);
+        assert!(positional_bases(i64::MIN, &[task(1), task(0)], "node").is_ok());
+        assert!(positional_bases(i64::MIN, &[task(2)], "node").is_err());
+        let index = blob_index(crate::ElementKind::Way, -10, 3, None).expect("index");
+        assert_eq!((index.min_id, index.max_id), (-12, -10));
+        assert!(positional_last_fits(i64::MIN + 1, 2, "relation").is_ok());
+        assert!(positional_last_fits(i64::MIN + 1, 3, "relation").is_err());
     }
 
     /// An indexdata claim of `i64::MAX` from a small file must not

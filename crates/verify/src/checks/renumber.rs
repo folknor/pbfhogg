@@ -3,30 +3,35 @@
 //! Cross-validates pbfhogg's renumber output against osmium. The two tools
 //! name orphan references (a way ref or relation member whose target is not
 //! in the input) differently, a documented deviation (pbfhogg
-//! `DEVIATIONS.md`, "renumber: orphan-reference handling"): pbfhogg writes
-//! `start + count + old`, osmium `start + count + i` in first-encounter
-//! order. Both put every orphan at or above `start + count` of its kind,
-//! where no output object lives. Each difference is proved to be that and
-//! nothing else, record by record; there is no tolerance.
+//! `DEVIATIONS.md`, "renumber: orphan-reference handling"): pbfhogg maps the
+//! absent IDs one to one onto the IDs outside the live range, osmium
+//! numbers them on past the live range in first-encounter order. Both keep
+//! every orphan outside its kind's live range, where no output object
+//! lives. Each difference is proved to be that and nothing else, record by
+//! record; there is no tolerance.
 //!
 //! The comparison is the verifier's merge of osmium's decodings of both
 //! outputs (`crate::opl_compare`, metadata included), so both must be in
 //! strict order and every object must pair by kind and ID. It passes when:
 //! - every object pairs, and each kind's objects are exactly the IDs
-//!   `start, start + 1, ...` on both sides, which fixes each kind's live
-//!   range `start .. start + count`
+//!   `start, start + 1, ...` on both sides (`start, start - 1, ...` from a
+//!   negative start; a start of 0 is 1, as both tools read it), which fixes
+//!   each kind's live range
 //! - no node differs
 //! - a differing way or relation differs only in the ref IDs of its node or
 //!   member list: same fields, same list length, same member types and
 //!   encoded roles or coordinate suffixes
 //! - every reference, in every record, alike or not, is either the same
-//!   live ID on both sides or at or above its kind's live range on both
+//!   live ID on both sides or outside its kind's live range on both
 //! - the orphan names correspond one to one per kind across the whole file:
 //!   one osmium orphan is one pbfhogg orphan, and the reverse
 //!
 //! That proves the two outputs the same reference graph up to the naming of
-//! orphans. It does not prove pbfhogg's shift formula: that would need the
-//! input's references, which the comparison does not read.
+//! orphans. It does not prove pbfhogg's orphan mapping: that would need the
+//! input's references, which the comparison does not read. Starts at the
+//! ends of the ID range are not an osmium oracle (osmium refuses
+//! `i64::MIN` and `i64::MAX` as IDs and its arithmetic overflows near
+//! them); pbfhogg's own tests cover them.
 //!
 //! Input whose header lacks `Sort.Type_then_ID` among its optional features
 //! is input both tools refuse; pbfhogg's renumber is then held to its
@@ -62,7 +67,7 @@ impl Classified {
 const KINDS: [&str; 3] = ["node", "way", "relation"];
 
 /// The per-kind start IDs `--start-id` names: one value, or
-/// `node,way,relation`; 1 when absent.
+/// `node,way,relation`; 1 when absent, and 0 read as 1, as both tools do.
 fn start_ids(start_id: Option<&str>) -> Result<[i128; 3], Error> {
     let Some(value) = start_id else {
         return Ok([1; 3]);
@@ -70,7 +75,7 @@ fn start_ids(start_id: Option<&str>) -> Result<[i128; 3], Error> {
     let parse = |part: &str| {
         part.trim()
             .parse::<i64>()
-            .map(i128::from)
+            .map(|s| if s == 0 { 1 } else { i128::from(s) })
             .map_err(|_| Error::Failed(format!("renumber: invalid --start-id {value}")))
     };
     let parts: Vec<&str> = value.split(',').collect();
@@ -90,7 +95,8 @@ fn start_ids(start_id: Option<&str>) -> Result<[i128; 3], Error> {
 struct Attribution {
     start: [i128; 3],
     /// The ID the next object of each kind must have; once the streams have
-    /// passed a kind, its live range's exclusive end.
+    /// passed a kind, its live range's exclusive end (below the range when
+    /// the kind counts down).
     next: [i128; 3],
     /// The kind of the record being read: a kind below it has its final
     /// live range.
@@ -110,10 +116,15 @@ struct Attribution {
 /// the encoded remainder (an `@role`, or a way node's coordinates).
 fn split_item(item: &[u8]) -> Option<(u8, i64, &[u8])> {
     let (&letter, rest) = item.split_first()?;
-    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let sign = usize::from(rest.first() == Some(&b'-'));
+    let digits = rest[sign..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
     if digits == 0 {
         return None;
     }
+    let digits = sign + digits;
     let id = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
     Some((letter, id, &rest[digits..]))
 }
@@ -133,6 +144,22 @@ impl Attribution {
             start,
             next: start,
             ..Self::default()
+        }
+    }
+
+    /// +1 for a kind counting up from a positive start, -1 counting down.
+    fn step(&self, kind: usize) -> i128 {
+        if self.start[kind] > 0 { 1 } else { -1 }
+    }
+
+    /// Whether `id` is one of `kind`'s live IDs, between its start and the
+    /// next ID, whichever way the kind counts.
+    fn live(&self, kind: usize, id: i128) -> bool {
+        let (start, next) = (self.start[kind], self.next[kind]);
+        if start > 0 {
+            (start..next).contains(&id)
+        } else {
+            (next + 1..=start).contains(&id)
         }
     }
 
@@ -156,7 +183,7 @@ impl Attribution {
             ));
             return;
         }
-        self.next[pair.kind] += 1;
+        self.next[pair.kind] += self.step(pair.kind);
         if pair.kind == 0 {
             if pair.first != pair.second {
                 self.fail(format!("node {} differs", pair.id));
@@ -228,15 +255,18 @@ impl Attribution {
     /// live range is final.
     fn reference(&mut self, kind: usize, p: i64, o: i64) -> Result<(), String> {
         let (start, end) = (self.start[kind], self.next[kind]);
-        let (wp, wo) = (i128::from(p), i128::from(o));
+        let (lp, lo) = (
+            self.live(kind, i128::from(p)),
+            self.live(kind, i128::from(o)),
+        );
         let name = KINDS[kind];
-        if p == o && (start..end).contains(&wp) {
+        if p == o && lp {
             return Ok(());
         }
-        if wp < end || wo < end {
+        if lp || lo {
             return Err(format!(
                 "{name} ref pbfhogg {p} osmium {o} is not one live {name} on both sides nor an \
-                 orphan on both (live {name}s {start}..{end})"
+                 orphan on both (live {name}s from {start}, next {end})"
             ));
         }
         if *self.forward[kind].entry(p).or_insert(o) != o
@@ -474,9 +504,9 @@ pub fn run(
             }
             Ok(Some(
                 "every object at its renumbered ID and identical as osmium decodes it, except \
-                 orphan reference IDs, which lie past the live range on both sides and \
-                 correspond one to one; pbfhogg's orphan shift formula is not checked against \
-                 the input"
+                 orphan reference IDs, which lie outside the live range on both sides and \
+                 correspond one to one; pbfhogg's orphan mapping is not checked against the \
+                 input"
                     .into(),
             ))
         }
@@ -541,8 +571,8 @@ mod tests {
 
     #[test]
     fn orphan_names_past_the_live_range_are_the_only_difference_allowed() {
-        // Two nodes, so node orphans start at 3; pbfhogg names old node 9
-        // 3 + 9 = 12, osmium names it 3.
+        // Two nodes, so osmium names the first node orphan 3; pbfhogg's
+        // name is its own, here 12.
         let (failure, records, orphans) = attribute(&with(&[
             ("w1 v1 Nn1,n3", "w1 v1 Nn1,n12"),
             ("w2 v1 Nn3,n2", "w2 v1 Nn12,n2"),
@@ -579,8 +609,10 @@ mod tests {
         for case in bad {
             assert!(attribute(&with(case)).0.is_some(), "{case:?}");
         }
-        // An equal ref below the start names nothing.
-        assert!(attribute(&with(&[("w1 v1 Nn0", "w1 v1 Nn0")])).0.is_some());
+        // A ref below the start is an orphan on both sides: pbfhogg may
+        // name an orphan below the live range.
+        assert_eq!(attribute(&with(&[("w1 v1 Nn0", "w1 v1 Nn0")])).0, None);
+        assert_eq!(attribute(&with(&[("w1 v1 Nn-4", "w1 v1 Nn3")])).0, None);
         // A relation member naming a relation is judged once every relation
         // is known: when r1 is read r2 is not yet, but it is live, so the
         // two sides must name it alike.
@@ -588,6 +620,50 @@ mod tests {
         assert!(attribute(&renamed).0.is_some());
         let alike = with(&[("r1 v1 Mr2@", "r1 v1 Mr2@"), ("r2 v1 M", "r2 v1 M")]);
         assert_eq!(attribute(&alike).0, None);
+    }
+
+    /// Counting down from -1: objects run -1, -2, ...; osmium's orphans
+    /// continue down, pbfhogg's may sit anywhere outside the live IDs.
+    #[test]
+    fn a_negative_start_counts_down() {
+        let mut a = Attribution::new([-1; 3]);
+        let records = [
+            ("n-1 v1 x1 y1", "n-1 v1 x1 y1"),
+            ("n-2 v1 x1 y1", "n-2 v1 x1 y1"),
+            ("w-1 v1 Nn-1,n-3", "w-1 v1 Nn-1,n5"),
+            ("w-2 v1 Nn-3,n-2", "w-2 v1 Nn5,n-2"),
+        ];
+        for (first, second) in records {
+            let kind = usize::from(first.starts_with('w'));
+            let id = first[1..first.find(' ').unwrap()].parse().unwrap();
+            a.pair(opl_compare::Pair {
+                kind,
+                id,
+                first: first.as_bytes(),
+                second: second.as_bytes(),
+            });
+        }
+        let (failure, records, orphans) = a.finish();
+        assert_eq!(failure, None);
+        assert_eq!(records, [0, 2, 0]);
+        assert_eq!(orphans, [1, 0, 0]);
+        // A live ID renamed to an orphan on one side fails.
+        let mut a = Attribution::new([-1; 3]);
+        for (first, second) in [
+            ("n-1 v1 x1 y1", "n-1 v1 x1 y1"),
+            ("w-1 v1 Nn-1", "w-1 v1 Nn5"),
+        ] {
+            let kind = usize::from(first.starts_with('w'));
+            let id = first[1..first.find(' ').unwrap()].parse().unwrap();
+            a.pair(opl_compare::Pair {
+                kind,
+                id,
+                first: first.as_bytes(),
+                second: second.as_bytes(),
+            });
+        }
+        assert!(a.finish().0.is_some());
+        assert_eq!(start_ids(Some("0,-5,7")).unwrap(), [1, -5, 7]);
     }
 
     #[test]

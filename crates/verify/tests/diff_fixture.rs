@@ -7,7 +7,7 @@ const SORTED: &str = "Sort.Type_then_ID";
 
 /// The OPL the fake osmium decodes a renumber output to, by fault, under
 /// start ID 10: one node and ten relations, the first naming an orphan
-/// node, which osmium calls 11 and pbfhogg 11 + its old ID 5.
+/// node, which osmium calls 11 and pbfhogg, by its own mapping, 16.
 fn renumber_opl(fault: &str, pbfhogg: bool) -> String {
     let mut lines = vec!["n10 v1".to_owned()];
     for r in 10..20 {

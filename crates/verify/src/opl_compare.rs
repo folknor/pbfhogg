@@ -166,8 +166,9 @@ pub(crate) fn decode(
 /// Compare `first` with `second` under `policy`: both decoded to OPL beside
 /// `listing`, merged, every [`Group`] handed to `each` in object order and
 /// written to `listing`. The OPL pair is removed once merged; on an error it
-/// stays for diagnosis. A stream out of strict order, a negative ID or a
-/// line that is not an object is an error naming the file.
+/// stays for diagnosis. A stream out of strict order, an ID that is not a
+/// signed 64-bit decimal or a line that is not an object is an error naming
+/// the file.
 pub(crate) fn compare(
     harness: &mut Harness,
     first: &Path,

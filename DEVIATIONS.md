@@ -486,42 +486,49 @@ orphan way refs as 6,616,527, 6,616,528, ... in the order they're first
 encountered. Guarantees contiguous new-space output, at the cost of assigning
 ids to "phantom" objects that don't exist in the output.
 
-**pbfhogg behavior:** An orphan ref with old id X becomes `start + count + X`,
-where `start` is that kind's start id and `count` the number of elements of
-that kind in the input: the first id past the renumbered range, plus the old
-id. Nodes, ways and relations are shifted independently, with no extra pass.
-Two refs to the same orphan stay equal, the old id is recoverable as
-`new - (start + count)`, and an orphan whose shifted id would pass the largest
-64-bit id is an error. An orphan id therefore never names an element in the
-output. Relation members of an unknown type (anything but node, way or
+**pbfhogg behavior:** Orphans are named by a per-kind bijection of the
+absent ids onto the ids outside the renumbered range. Take every 64-bit id in
+canonical order (`0`, then `-1, -2, ...`, then `1, 2, ...`); an orphan's
+position among the ids absent from the input, counting from 0, is placed in
+that order before the live range when it is smaller than the start's own
+position, and after the live range otherwise. On positive input renumbered
+from 1, an orphan X becomes X plus the number of input elements of its kind
+above X, so an orphan past every input id keeps its id. Nodes, ways and
+relations are mapped independently, with no extra pass. Two refs to the same
+orphan stay equal, distinct orphans stay distinct and keep their canonical
+order, an orphan never names an element in the output, and no id overflows,
+whatever its sign or size. Recovering the old id needs the input's ids of
+that kind. Relation members of an unknown type (anything but node, way or
 relation once the type is read as int32) keep their id unchanged.
 
 **Cross-validation:** `brokkr run --with pbfhogg pbfhogg-verify -- renumber`
 proves every difference from osmium's output, record by record, to be an
 orphan name and nothing else: both sides put every object at its renumbered
-ID, every orphan ref lies past its kind's live range on both sides, and the
-orphan names correspond one to one per kind. On Geofabrik extracts only
+ID, every orphan ref lies outside its kind's live range on both sides, and
+the orphan names correspond one to one per kind. On Geofabrik extracts only
 relations differ - the members of cross-border relations (admin boundaries,
 routes, TMC segments) - since the extracts carry complete ways. The check
-does not compare pbfhogg's shift formula against the input's ids.
+does not compare pbfhogg's orphan mapping against the input's ids.
 
 **Rationale:** Passing orphans through with their old id, the earlier policy,
 let an old id equal the new id of a different element, so a reference
-silently pointed at the wrong object. osmium's sequential assignment needs
-per-orphan state in first-encounter order; the shift is stateless,
-deterministic under parallel rewriting, and keeps the old id recoverable.
+silently pointed at the wrong object. A later shift, `start + count + X`,
+collided for a negative orphan and overflowed near the largest id. osmium's
+sequential assignment needs per-orphan state in first-encounter order; the
+bijection needs only the rank index the live ids already use, so it is
+stateless and deterministic under parallel rewriting.
 
-**Start IDs below 1 are refused.** osmium accepts a negative start ID and
-counts downward from it; pbfhogg requires every `--start-id` value to be at
-least 1, since its outputs are positive-only like its inputs (see "Negative
-input IDs rejected project-wide" below), and refuses before reading the input.
+**Start IDs match osmium.** A positive `--start-id` counts up and a negative
+one counts down (`-1, -2, ...`, which is canonical order, so the output stays
+sorted), and 0 means 1, as in osmium. Only a run whose last id would leave the
+64-bit range is refused; osmium does not check it.
 
-**Impact:** Downstream tools that assume output ids are contiguous in
-`[start_id, start_id + N)` must tolerate orphan refs above that range.
-Tools that only chase live references don't hit the orphan ids at all
+**Impact:** Downstream tools that assume output ids are contiguous in the
+live range must tolerate orphan refs outside it, below it as well as above
+it. Tools that only chase live references don't hit the orphan ids at all
 (because no output element has the orphan id). Orphan ids also differ from
-osmium's, which numbers orphans `count + 1, count + 2, ...` in the order it
-meets them.
+osmium's, which numbers orphans on past the live range in the order it meets
+them.
 
 ## check-refs: occurrence-counting vs unique-counting for missing references
 
@@ -573,18 +580,13 @@ positive-only, and several code paths rely on that invariant.
 accept negative IDs and order them by the canonical `id_order`, which
 their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
 
-**Sites enforcing the invariant:**
+No site enforces the invariant any longer; the paragraphs below record, per
+command, how pbfhogg answers negative IDs.
 
-- `renumber` - **hard reject** of any negative node, way or relation
-  id, and of any negative way ref or relation member ref, in the
-  rewriters of `crates/lib/src/commands/renumber/wire_rewrite.rs`
-  (`reframe_dense_with_new_ids`, `reframe_ways_with_new_ids`,
-  `reframe_relations_with_new_ids`). Each returns an error naming
-  the offending id. The check is unconditional, not
-  indexdata-gated: a PBF whose per-blob indexdata advertises
-  `min_id >= 0` while the payload contains negatives still errors
-  cleanly rather than panicking in `chunk_for_atomic` or silently
-  dropping bits.
+**renumber matches osmium.** It renumbers negative node, way and relation
+IDs, refs and members by canonical rank, as osmium's `id_order` numbering
+does, requiring each kind in canonical order as osmium's `CheckOrder` does.
+Only orphan naming differs (see "renumber: orphan-reference handling").
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
 PBF payload, not an ID set passed through `IdSet`.
@@ -643,16 +645,6 @@ index keyed by absolute value, which is exact for the join; its
 (`positive_ref()`), so a member `n-7` also keeps an untagged `n7`, and its
 man page says the option does not work with negative IDs. pbfhogg keeps
 only `n-7`.
-
-**Rationale:** `IdSet` is the load-bearing data structure in
-renumber - a bitmap indexed by unsigned id supporting `O(1)`
-rank-based lookup and `O(n/64)` cross-worker merges. Supporting
-negatives would mean either splitting each bitmap by sign (double
-the bookkeeping, double the merge cost) or widening to a signed
-offset-mapped index (extra indirection on the hot path). Neither
-pays off against the actual demand, which is zero: no user has asked
-for JOSM-staged input, and the canonical workflow for such data is
-"upload to OSM, then re-extract."
 
 **Migration path to osmium-style support.** If a consumer does need
 JOSM-interop, the work is:

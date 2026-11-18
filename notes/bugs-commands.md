@@ -548,3 +548,19 @@ order check) and runs sparse instead of routing to external's refusal, so
 it reaches the same output. The fix belongs where the stamp is written, for
 explicit sparse and auto alike: drop the claim, or refuse, when a decoding
 pass proves it false.
+
+## CMD-041 - renumber refuses a block its rewrite grows past the raw size cap
+
+Reported by: the negative-ID renumber item (2026-11-18), while sparring the
+negative start; not reproduced.
+
+Renumber writes exactly one output block per input block (`pool.rs`
+`run_rewrite_stage`), and the writer refuses a block over the raw size cap
+(`write/framing.rs`). The rewrite can grow a block: a way or relation ID of
+1 is a one-byte varint, a large start (`2^40`) or a negative one (`-1` is
+ten bytes) widens every ID, and a way alternating between a live node and an
+orphan can widen its ref deltas. An input block close to the cap then fails
+with the size error instead of renumbering. It fails loudly and before
+publication, and is sign-neutral (a large positive start does it too). The
+fix is a split path: cut an oversized rewritten block between elements into
+two output blocks with their own indexes.

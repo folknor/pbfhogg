@@ -59,7 +59,6 @@ It is also used as a reason in places where that reason is false:
 - `crates/verify/src/checks/check_ids.rs`;
 - `crates/verify/src/verify_reencode.rs`;
 - `reference/verify.md`;
-- the `renumber/mod.rs` `validate_start_ids` doc;
 - the `idset.rs` `set` doc;
 - `reference/technical-implementation-spec.md`.
 
@@ -142,8 +141,8 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 35-37 | diff text and OSC, digest | Canonical and exact **[S]**. | P | Canonical |
 | 38-39 | apply-changes, `--locations-on-ways` | Signed and exact. | P | The location join abs-folds `±1` **[C:inv]**; pbfhogg is exact. |
 | 40 | merge-changes, `--simplify` | Signed keys. | P | Canonical |
-| 41 | renumber | Refuses negative sources and refs **[S]**. | S+. Signed remap (section 4.6). | Signed remap via `id_order` **[O]** |
-| 42 | renumber `--start-id` | Refuses below 1 **[S]**. | S+. Negative start accepted, counting down (Q1). | Counts down from a negative start **[O]** |
+| 41 | renumber | Signed remap by canonical rank since commit 10; orphans by bijection **[S]**. | P | Signed remap via `id_order` **[O]** |
+| 42 | renumber `--start-id` | Negative start counts down, 0 means 1, since commit 10 **[S]**. | P | Counts down from a negative start **[O]** |
 | 43-46 | degrade, repack, cat (all modes), sort, time-filter, export | Sign-neutral, exact. | P | sort and export support negatives **[O]** |
 
 ## 4. Code design
@@ -159,10 +158,7 @@ atomic-or-spill API `try_insert_atomic` / `try_insert_atomic_if_new` (a
 negative or uncovered ID returns "not recorded"; the caller spills it to
 `insert`). Every command that does not yet select negatives drops them with
 an explicit `id >= 0` guard at its insertion site; each later commit deletes
-its command's guards.
-
-What remains of 4.1: a total `canonical_rank(id)` for absent IDs, needed by
-the orphan bijection, lands with commit 10.
+its command's guards. The total `canonical_rank(id)` landed with commit 10.
 
 ### 4.4 ALTW sparse join [landed]
 
@@ -184,35 +180,14 @@ spans and actual first element. Packed records where keys fit (about
 auto never chooses. `check_range`'s negative clause and the 2^38 refusal
 are gone.
 
-### 4.6 renumber signed remap [C:rgp, O]
+### 4.6 renumber signed remap [landed]
 
-- **Assignment.** Live IDs are assigned by canonical rank within each kind:
-  `0, -1, -2, ...`, then `1, 2, ...`. With the default start, `0, -2, -9, 2, 7`
-  becomes `1..5`. This matches osmium's numbering on sorted unique input. A
-  numeric rank would misdirect references.
-- **Pipeline.** The parallel pipeline is kept. Freeze the signed node map,
-  then the way map and the full relation map. Each member resolves through
-  the map for its type. Unknown member types stay opaque.
-- **Wire arithmetic.** Deltas wrap modulo `2^64`, so `i64::MIN -> i64::MAX`
-  round-trips. Allocation of new IDs stays checked.
-- **Orphans: replace the shift.** The current `start + count + old_id`
-  collides for negative orphans. With start 1 and three live nodes, orphan -1
-  becomes live node 3. It also fails near `i64::MAX` today.
-  - Use a canonical ordinal over all of `i64`: `K(0) = 0`,
-    `K(neg) = |id|`, `K(pos) = 2^63 + id`.
-  - Live IDs occupy `[S, S + C)`.
-  - An absent `x` gets `r = K(x) - rank(x)`, then maps to ordinal `r` if
-    `r < S`, else to `r + C`.
-  - The result is a collision-free orphan bijection that needs only the
-    immutable rank index.
-  - This changes the documented positive orphan names, so DEVIATIONS and the
-    renumber verifier change. The verifier checks live-interval membership
-    plus a per-kind orphan bijection, since osmium names orphans in encounter
-    order.
-- **Cost on indexed positive input.** No extra scan and no hash table. There
-  is one rank lookup with a cached negative-count offset, and the
-  canonical-compare fast path for two non-negatives. Extra work is confined
-  to orphans.
+Commit 10: canonical-order checks (`osm_id_le`, numeric fast path), live
+IDs counted up or down from the start, wrapped wire deltas, and orphans by
+the ordinal bijection in `wire_rewrite::IdSpace` (live block `[K(S),
+K(S) + C)` in ordinals, so one rule for both directions). The verifier
+checks live membership in either direction plus the per-kind orphan
+correspondence.
 
 ### 4.7 build-geocode-index [landed]
 
@@ -233,7 +208,7 @@ implementation.
 |---|---|---|
 | ALTW sparse | Landed; measured neutral (commit 7, Japan and planet). | n/a |
 | ALTW external | Landed; measured neutral (commit 8, Germany). | n/a |
-| renumber | Canonical compare and cached offset. | Fast path for two non-negatives. |
+| renumber | Landed; see `reference/performance/renumber.md` (commit 10, Germany). | n/a |
 | geocode pass1_5 | Landed; measured neutral (commit 9, Germany). | n/a |
 | getid, getparents, tags-filter, extract, check | Landed; measured neutral (commits 3 to 6). | n/a |
 
@@ -263,7 +238,8 @@ implementation.
     and the planet pair of pairs, ran with commit 7; recorded in
     `reference/performance/add-locations-to-ways.md`);
   - (Germany external ran with commit 8, recorded in the same file);
-  - `renumber`, Germany;
+  - (`renumber`, Germany, ran with commit 10, recorded in
+    `reference/performance/renumber.md`);
   - `tag-select`, Germany, `r/type=route`;
   - `parent-select` and `id-select --add-referenced yes`, Germany;
   - (`geocode-build`, Germany, `--stop GEOCODE_PASS1_5_END`, ran with
@@ -336,18 +312,18 @@ place with `Status: Superseded by NNNN`, and the new one says
   - the apply-changes location join;
   - renumber orphan naming (by bijection, not encounter order).
 
-  A negative `--start-id` now matches osmium, so it is not a deviation; the
-  existing start-ID paragraph is rewritten to say so.
+  The renumber orphan section and its start-ID paragraph were rewritten
+  with commit 10, which also added "renumber matches osmium" to the
+  section and removed its renumber site and IdSet rationale; carry it.
 - Delete the residual-divergence, migration-path and "renumber first" text.
 - Fix the derive-changes paragraph (section 9).
 - If verified, record the `--ignore-missing-nodes` fill-value difference in
   the add-locations-to-ways section (section 10).
-- Update the renumber orphan section for the new mapping.
 - Fix the two inbound anchors.
 
 **reference/.**
-- `verify.md`: the renumber verifier contract and the ALTW verify path
-  (its `check --locations --agreement` is signed since commit 6).
+- `verify.md`: the ALTW verify path (its `check --locations --agreement`
+  is signed since commit 6); the renumber contract landed with commit 10.
 - `technical-implementation-spec.md`: replace the example.
 - `testing.md`: describe the negative-ID registry and the fixture graph, and
   link 0028.
@@ -355,16 +331,13 @@ place with `Status: Superseded by NNNN`, and the new one says
   paragraph was reworded in commit 6).
 
 **docs/cli/commands.md.**
-- renumber: negative inputs and orphan naming.
 - ALTW and geocode-build.
 - inspect: the numeric monotonic wording.
 
 **Doc comments and messages.**
 - `idset.rs`, rewritten with the type.
-- `renumber/mod.rs`, `wire_rewrite.rs` and `relations.rs`.
 - `blob_meta/mod.rs` `BlobIndex::deserialize`.
 - `altw/external/blob_meta.rs`: the "use sparse" error disappears.
-- `renumber_external.rs`.
 - In `crates/verify`, `verify_reencode.rs` keeps its refusal with its
   true reason, which is the degrade layout oracle. Its sign handling is a
   harness question, not a pbfhogg one.
@@ -373,12 +346,7 @@ Durable text never cites a finding ID.
 
 ## 8. CHANGELOG
 
-- renumber accepts negative IDs, and a `--start-id` below 1, counting down
-  from it as osmium does.
-  - **Behaviour change:** orphan references are named by a new
-    collision-free mapping.
-
-The old 0.3.x entry stays as history. Whether its anchor is checked by
+The renumber entries landed with commit 10. The old 0.3.x entry stays as history. Whether its anchor is checked by
 `scripts/check_doc_links.py` is still to be established.
 
 ## 9. Re-examined points (unchanged from v2)
@@ -456,8 +424,6 @@ memory budget outside the test-hooks build. The external `i64` extremes and
 wide-key cases landed with commit 8 in `cli_add_locations_to_ways.rs`, for
 the same reason the graph is not extended with them.)
 
-10. renumber signed remap and the new orphan mapping, plus the negative
-    `--start-id` (Q1).
 11. The source-policy rule.
 12. ADR-0028, ADR-0002 marked superseded, the README index, the DEVIATIONS
     rewrite (including derive-changes), reference/, docs/, the remaining
@@ -468,8 +434,6 @@ regression is fixed in the implementation before the policy is recorded.
 
 ## 13. Lateral findings
 
-- The renumber orphan shift collides near `i64::MAX` on positive input
-  **[C:rgp]**. This is a bug today.
 - The possible add-locations-to-ways fill-value doc gap in section 10.
 - traccar fails on negative node refs: it uses a `Dummy` negative store
   **[O][C:rgp]**.

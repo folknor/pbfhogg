@@ -36,12 +36,13 @@ pub(super) struct StageTotals {
     pub(super) orphans: u64,
 }
 
-/// Enforces that input IDs of one element kind strictly increase across
-/// blobs, in schedule order.
+/// Enforces that input IDs of one element kind strictly ascend in canonical
+/// order across blobs, in schedule order.
 ///
 /// Renumber assigns a new ID by *position* (blob base plus offset) while
-/// every reference is resolved by *rank* in the set of input IDs. The two
-/// agree exactly when the IDs strictly increase over the whole kind section;
+/// every reference is resolved by *canonical rank* in the set of input IDs.
+/// The two agree exactly when the IDs strictly ascend over the whole kind
+/// section;
 /// a duplicate or a step backwards silently points references at the wrong
 /// element. Within a blob the rewriters check each element against the one
 /// before; this is the cross-blob half, fed with the IDs the blob actually
@@ -61,7 +62,7 @@ impl StrictOrder {
             return Ok(());
         };
         if let Some(prev) = self.last
-            && first <= prev
+            && crate::osm_id::osm_id_le(first, prev)
         {
             return Err(super::wire_rewrite::order_error(self.kind, prev, first));
         }
@@ -169,5 +170,13 @@ mod tests {
             order.admit(Some((3, 4))).is_err(),
             "a step back must be refused"
         );
+        // Canonical order: 0, then negatives by magnitude, then positives.
+        let mut order = StrictOrder::new("node");
+        order.admit(Some((0, -3))).unwrap();
+        order.admit(Some((-4, 2))).unwrap();
+        assert!(order.admit(Some((-9, -9))).is_err());
+        let mut order = StrictOrder::new("node");
+        order.admit(Some((-3, -3))).unwrap();
+        assert!(order.admit(Some((-2, -2))).is_err());
     }
 }

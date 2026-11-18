@@ -33,7 +33,7 @@ impl super::RewriteWorker for Pass1Worker {
 pub(super) struct Pass1Result {
     pub(super) nodes_written: u64,
     /// Node IDs `node_id_set` had no pre-allocated chunk for. The caller
-    /// must `set` them before building the rank index.
+    /// must `insert` them before building the rank index.
     pub(super) overflow: Vec<Vec<i64>>,
 }
 

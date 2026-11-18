@@ -1,8 +1,8 @@
 //! Relation rewrite pipeline.
 //!
 //! - **R1**: sequential relation scan to collect all relation IDs into
-//!   an `IdSet` + rank index, refusing any relation ID that does not
-//!   strictly exceed the one before it in file order.
+//!   an `IdSet` + rank index, refusing any relation ID that does not come
+//!   canonically after the one before it in file order.
 //! - **R2d**: parallel wire-format splice rewriter for relations on the
 //!   shared ordered pool. Resolves node/way/relation member refs inline.
 
@@ -17,30 +17,14 @@ use super::wire_rewrite::{
 use super::{BlobBuffers, Phase, StageCounters};
 use crate::idset::IdSet;
 
-/// Reject negative ids at the entry of the external path.
-///
-/// Production OSM planet extracts don't contain negative ids (they're
-/// JOSM-local editor staging identifiers resolved before upload).
-/// Renumber rejects them with a clear error.
-fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
-    if id < 0 {
-        return Err(crate::Error::invalid_data(format!(
-            "renumber requires non-negative input ids. \
-             Input contains {kind} id {id}. \
-             Negative ids are JOSM editor-local staging identifiers \
-             that should be resolved before processing."
-        )));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // R1: collect relation IDs
 // ---------------------------------------------------------------------------
 
-/// R1 pass: collect relation IDs into an `IdSet`. New IDs are derived via
-/// `start_relation_id + rank(old_id)`, which equals each relation's position
-/// only because this pass proves the IDs strictly increase.
+/// R1 pass: collect relation IDs into an `IdSet`. New IDs are derived from
+/// the start and `rank(old_id)` in canonical order, which equals each
+/// relation's position only because this pass proves the IDs strictly
+/// ascend canonically.
 ///
 /// Each id is read with [`relation_id`], the same rule R2d's rewriter
 /// applies, so the set holds exactly the ids R2d will look up.
@@ -95,9 +79,8 @@ pub(super) fn relation_r1_collect_ids(
                         .read_len_delimited()
                         .map_err(|e| crate::Error::from(e).context("R1 rel"))?;
                     let rel_id = relation_id(rel_bytes)?;
-                    reject_negative_id(rel_id, "relation")?;
                     if let Some(p) = prev
-                        && rel_id <= p
+                        && crate::osm_id::osm_id_le(rel_id, p)
                     {
                         return Err(order_error("relation", p, rel_id));
                     }

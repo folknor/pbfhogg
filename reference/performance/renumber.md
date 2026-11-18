@@ -45,6 +45,25 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 
 ### Renumber
 
+#### Signed remap and orphan bijection (Germany, baseline `b974262f`, bygg, 2026-11-18)
+
+Negative IDs accepted: canonical order checks, a negative start counting
+down, wrapped deltas, and orphans named by a rank-index bijection instead
+of the `start + count + old` shift. Matched `id-remap` `--iterations 1`
+cells after `fstrim`, baseline built with `--commit b974262f`, variant
+uncommitted on it.
+
+- First variant, orphan mapping inlined into the ref lookup, A B B A:
+  6409 / 6365 / 6560 / 6344 ms (UUIDs `cf3679d5`, `5ce4af3e`, `bc33a17e`,
+  `cb201341`). The wall is within noise (+1.3 % by median, pairs disagree
+  in sign), but stage 2d ran +6 % in both pairs (2822 to 3005 ms, 2827 to
+  2999 ms): the orphan path had swelled the per-ref resolve.
+- Orphan mapping moved out of line (`#[cold]`, never inlined), B A B A:
+  6167 / 6183 / 6326 / 6076 ms (UUIDs `5bd189c3`, `04bb8606`, `446ba950`,
+  `508e1377`). Stage 2d 2830 against 2823 ms and 2804 against 2817 ms; the
+  wall spread is the `R2D_END` flush tail, which moves either way.
+  Verdict: neutral. This is the landed form.
+
 #### Signed `IdSet` (Germany, baseline `2b4e511c`, bygg, 2026-11-18)
 
 The set became signed and renumber's live map ranks in canonical order.

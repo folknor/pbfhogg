@@ -717,101 +717,91 @@ fn renumber_custom_start_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// Negative-id rejection
+// Negative ids: renumbered like any other, by canonical rank
 // ---------------------------------------------------------------------------
 
+/// Mixed-sign input in canonical order (0, then negatives by magnitude,
+/// then positives) is numbered by canonical rank, refs and members of both
+/// signs resolve, and orphans of both signs are named outside the live
+/// range: node -2 has no absent ID canonically before it, so it keeps
+/// ordinal 0 (ID 0); way -11 has ten (0 and -1..=-9; -10 is live), so it
+/// becomes -10, which the live ways 1 and 2 leave free; positive orphans
+/// past every member keep their ID.
 #[test]
-fn renumber_rejects_negative_node_id() {
+fn negative_ids_renumber_by_canonical_rank() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
-
     write_test_pbf_sorted(
         &input,
-        &[TestNode {
-            id: -5,
-            lat: 100_000_000,
-            lon: 200_000_000,
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
-        &[],
+        &[plain_node(0), plain_node(-1), plain_node(-9), plain_node(4)],
+        &[plain_way(-10, vec![-9, 0, -2, 4]), plain_way(3, vec![4, 7])],
+        &[relation_of(
+            -3,
+            vec![
+                member(MemberId::Node(-1), "a"),
+                member(MemberId::Way(-10), "b"),
+                member(MemberId::Way(-11), "c"),
+                member(MemberId::Relation(-3), "d"),
+                member(MemberId::Relation(8), "e"),
+            ],
+        )],
     );
+    let stats = run_renumber(&input, &output, &default_opts()).expect("renumber");
+    assert_eq!(stats.orphan_refs, 4, "node -2, node 7, way -11, relation 8");
+    assert_sorted_file(&output);
 
-    let err = renumber_external(
-        &input,
-        crate::common::out(&output),
-        &default_opts(),
-        &WriteOptions::default(),
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
-    )
-    .expect_err("expected rejection of negative node id");
-
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("non-negative"),
-        "error message lacks 'non-negative': {msg}"
+    let norm = read_normalized(&output);
+    assert_eq!(
+        norm.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
     );
-    assert!(
-        msg.contains("-5"),
-        "error message should mention the offending id: {msg}"
+    assert_eq!(norm.ways[0].id, 1);
+    assert_eq!(norm.ways[0].refs, vec![3, 1, 0, 4]);
+    assert_eq!(norm.ways[1].refs, vec![4, 7]);
+    assert_eq!(norm.relations[0].id, 1);
+    let members: Vec<(&str, i64)> = norm.relations[0]
+        .members
+        .iter()
+        .map(|m| (m.member_type.as_str(), m.ref_id))
+        .collect();
+    assert_eq!(
+        members,
+        vec![
+            ("node", 2),
+            ("way", 1),
+            ("way", -10),
+            ("relation", 1),
+            ("relation", 8),
+        ]
     );
 }
 
+/// Orphans at both ends of the ID range are named without error: the old
+/// shift, `start + count + old`, overflowed for a ref near `i64::MAX`.
 #[test]
-fn renumber_rejects_negative_way_ref() {
+fn orphans_at_the_ends_of_the_id_range_are_named() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
-
     write_test_pbf_sorted(
         &input,
-        &[
-            TestNode {
-                id: 10,
-                lat: 100_000_000,
-                lon: 200_000_000,
-                tags: vec![],
-                meta: None,
-            },
-            TestNode {
-                id: 20,
-                lat: 110_000_000,
-                lon: 210_000_000,
-                tags: vec![],
-                meta: None,
-            },
-        ],
-        &[TestWay {
-            id: 100,
-            refs: vec![10, -1, 20],
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
+        &[plain_node(10), plain_node(20)],
+        &[plain_way(100, vec![10, i64::MAX - 1, i64::MIN, 20])],
+        &[relation_of(
+            5,
+            vec![
+                member(MemberId::Relation(i64::MAX), "x"),
+                member(MemberId::Relation(i64::MIN), "y"),
+            ],
+        )],
     );
-
-    let err = renumber_external(
-        &input,
-        crate::common::out(&output),
-        &default_opts(),
-        &WriteOptions::default(),
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
-    )
-    .expect_err("expected rejection of negative way ref");
-
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("negative"),
-        "error message lacks 'negative': {msg}"
-    );
-    assert!(
-        msg.contains("-1"),
-        "error message should mention the offending ref: {msg}"
-    );
+    let stats = run_renumber(&input, &output, &default_opts()).expect("renumber");
+    assert_eq!(stats.orphan_refs, 4);
+    let norm = read_normalized(&output);
+    assert_eq!(norm.ways[0].refs, vec![1, i64::MAX - 1, i64::MIN, 2]);
+    let members: Vec<i64> = norm.relations[0].members.iter().map(|m| m.ref_id).collect();
+    assert_eq!(members, vec![i64::MAX, i64::MIN]);
 }
 
 // ---------------------------------------------------------------------------
@@ -819,9 +809,10 @@ fn renumber_rejects_negative_way_ref() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
-    // Way references a node id that doesn't exist in the input. The orphan
-    // becomes old id + start + node count: 99999 + 1 + 2.
+fn renumber_orphan_way_ref_is_named_outside_the_new_range() {
+    // Way references a node id that doesn't exist in the input. No live
+    // node lies above it, so it keeps its id (its id plus the number of
+    // live nodes above it).
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -866,7 +857,7 @@ fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
     assert_eq!(stats.orphan_refs, 1);
 
     let norm = read_normalized(&output);
-    assert_eq!(norm.ways[0].refs, vec![1, 100_002, 2]);
+    assert_eq!(norm.ways[0].refs, vec![1, 99_999, 2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -874,9 +865,9 @@ fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
 // ---------------------------------------------------------------------------
 
 /// B3 - relation-member orphans. Relation members pointing at objects
-/// absent from the input are shifted past their kind's renumbered range,
+/// absent from the input are named outside their kind's renumbered range,
 /// mirroring the way-ref orphan behavior pinned above
-/// (`renumber_orphan_way_ref_is_shifted_past_the_new_range`).
+/// (`renumber_orphan_way_ref_is_named_outside_the_new_range`).
 ///
 /// Reviewer pass 2 follow-up: previously the way orphan and node
 /// orphan shared id 99999, so a `contains(&99999)` check could pass
@@ -885,7 +876,7 @@ fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
 /// and asserts the full member sequence: type + ref id + role for
 /// every member, preserving order.
 #[test]
-fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
+fn renumber_orphan_relation_members_are_named_outside_the_new_range() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -958,8 +949,8 @@ fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
     assert_eq!(norm.relations.len(), 1);
     let rel = &norm.relations[0];
     // In-input refs are remapped (way 100 -> way 1, node 10 -> node
-    // 1); orphans keep their member type and become old id + start +
-    // count of their kind: way 99998 + 1 + 1, node 99999 + 1 + 2.
+    // 1); orphans keep their member type and, with no live element of
+    // their kind above them, their id.
     let member_summary: Vec<(&str, i64, &str)> = rel
         .members
         .iter()
@@ -969,9 +960,9 @@ fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
         member_summary,
         vec![
             ("way", 1, "outer"),
-            ("way", 100_000, "outer"),
+            ("way", 99_998, "outer"),
             ("node", 1, "label"),
-            ("node", 100_002, "label"),
+            ("node", 99_999, "label"),
         ],
         "member sequence must preserve type + ref id + role for both \
          in-input remaps and orphans (DEVIATIONS contract); got {member_summary:?}",
@@ -994,9 +985,10 @@ fn relation_of(id: i64, members: Vec<TestMember>) -> TestRelation<'static> {
 /// The orphan/new-id collision itself. Every orphan's old id equals the new id
 /// some *other* element of its kind receives (node 1000, way 51, relation
 /// 7), which passthrough turned into a reference to the wrong element. With
-/// distinct starts per kind each orphan lands at its own kind's
-/// `start + count + old`, refs to one orphan stay equal across a way and a
-/// relation, and no orphan ref names any element in the output.
+/// distinct starts per kind each orphan is named outside its own kind's
+/// live range (below it when fewer absent IDs precede the orphan than the
+/// start, above it otherwise), refs to one orphan stay equal across a way
+/// and a relation, and no orphan ref names any element in the output.
 #[test]
 fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
     let dir = crate::common::test_scratch();
@@ -1028,8 +1020,10 @@ fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
         ],
     );
 
-    // New ranges: nodes 1000..=1001 (base 1002), ways 50..=51 (base 52),
-    // relations 7..=8 (base 9).
+    // New ranges: nodes 1000..=1001, ways 50..=51, relations 7..=8. Node
+    // 1000 has 998 absent positive ids before it (1..=999 less 10 and 20),
+    // fewer than the start: 998. Way 51 has 51, not fewer than the start
+    // 50: 51 plus the 2 live ways = 53. Relation 7 likewise: 7 + 2 = 9.
     let opts = RenumberOptions {
         start_node_id: 1000,
         start_way_id: 50,
@@ -1049,8 +1043,8 @@ fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
     assert_eq!(norm.ways[0].refs, vec![1000, 1001]);
     assert_eq!(
         norm.ways[1].refs,
-        vec![1001, 2002, 1000],
-        "orphan node 1000 -> 1002 + 1000, not the renumbered node 10"
+        vec![1001, 998, 1000],
+        "orphan node 1000 -> 998, not the renumbered node 10"
     );
 
     let summary = |r: &crate::common::NormalizedRelation| -> Vec<(String, i64, String)> {
@@ -1063,10 +1057,10 @@ fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
     assert_eq!(
         summary(&norm.relations[0]),
         vec![
-            s("node", 2002, "a"),
-            s("way", 103, "b"),
-            s("relation", 16, "c"),
-            s("node", 2002, "d"),
+            s("node", 998, "a"),
+            s("way", 53, "b"),
+            s("relation", 9, "c"),
+            s("node", 998, "d"),
             s("way", 50, "e"),
             s("relation", 8, "f"),
             s("node", 1001, "g"),
@@ -1075,115 +1069,9 @@ fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
     assert_eq!(summary(&norm.relations[1]), vec![s("relation", 7, "h")]);
 
     // No orphan names an element of its kind in the output.
-    assert!(!node_ids.contains(&2002));
-    assert!(!way_ids.contains(&103));
-    assert!(!rel_ids.contains(&16));
-}
-
-/// An orphan whose shifted id would pass `i64::MAX` is an error, not a
-/// wrapped or saturated id: way ref to node `i64::MAX - 1` with two nodes
-/// (base 3).
-#[test]
-fn renumber_orphan_way_ref_shift_overflow_is_an_error() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
-    write_test_pbf_sorted(
-        &input,
-        &[plain_node(10), plain_node(20)],
-        &[plain_way(100, vec![10, i64::MAX - 1])],
-        &[],
-    );
-    let err = run_renumber(&input, &output, &default_opts()).expect_err("shifted orphan overflows");
-    assert!(err.contains("overflows a 64-bit id"), "got: {err}");
-    assert!(err.contains("orphan node ref"), "got: {err}");
-    assert!(err.contains("in way 100"), "got: {err}");
-}
-
-/// The relation-member half: a relation member to relation `i64::MAX`.
-#[test]
-fn renumber_orphan_relation_member_shift_overflow_is_an_error() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
-    write_test_pbf_sorted(
-        &input,
-        &[plain_node(10)],
-        &[],
-        &[relation_of(
-            5,
-            vec![member(MemberId::Relation(i64::MAX), "x")],
-        )],
-    );
-    let err = run_renumber(&input, &output, &default_opts()).expect_err("shifted orphan overflows");
-    assert!(err.contains("orphan relation ref"), "got: {err}");
-    assert!(err.contains("in relation 5"), "got: {err}");
-}
-
-/// B4 - negative relation-member ref rejection. Per DEVIATIONS.md
-/// "Negative input IDs rejected project-wide" the renumber path
-/// rejects negatives at three named entry points
-/// (`reframe_dense_with_new_ids`, `reframe_ways_with_new_ids`,
-/// `rewrite_relations_with_new_ids`). Pre-batch tests covered the
-/// first two (negative node id, negative way ref); this test pins
-/// the third (negative relation-member ref).
-#[test]
-fn renumber_rejects_negative_relation_member_ref() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
-
-    write_test_pbf_sorted(
-        &input,
-        &[TestNode {
-            id: 10,
-            lat: 100_000_000,
-            lon: 200_000_000,
-            tags: vec![],
-            meta: None,
-        }],
-        &[TestWay {
-            id: 100,
-            refs: vec![10],
-            tags: vec![],
-            meta: None,
-        }],
-        &[TestRelation {
-            id: 1000,
-            members: vec![
-                TestMember {
-                    id: MemberId::Way(100),
-                    role: "outer",
-                },
-                TestMember {
-                    id: MemberId::Way(-7),
-                    role: "outer",
-                },
-            ],
-            tags: vec![],
-            meta: None,
-        }],
-    );
-
-    let err = renumber_external(
-        &input,
-        crate::common::out(&output),
-        &default_opts(),
-        &WriteOptions::default(),
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
-    )
-    .expect_err("expected rejection of negative relation-member ref");
-
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("negative") || msg.contains("non-negative"),
-        "error must flag the negative requirement; got: {msg}",
-    );
-    assert!(
-        msg.contains("-7"),
-        "error must name the offending member ref id (-7); got: {msg}",
-    );
+    assert!(!node_ids.contains(&998));
+    assert!(!way_ids.contains(&53));
+    assert!(!rel_ids.contains(&9));
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,25 +1424,64 @@ fn node_ids_far_above_the_file_size_bound_still_renumber() {
 }
 
 // ---------------------------------------------------------------------------
-// Start ids: a start below 1 is refused
+// Start ids: 0 means 1, a negative start counts down (as osmium does)
 // ---------------------------------------------------------------------------
 
+/// Node and way counts down from -5 and -1, relations from 0 (which means
+/// 1). Refs follow the countdown, the output stays in canonical order with
+/// a true sorted claim, and only a run past `i64::MIN` is refused.
 #[test]
-fn a_start_id_below_one_is_refused() {
+fn a_negative_start_counts_down_and_zero_means_one() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
-    write_test_pbf_sorted(&input, &[plain_node(1), plain_node(2)], &[], &[]);
-    for start in [0, -5] {
-        let opts = RenumberOptions {
-            start_node_id: start,
-            start_way_id: 1,
-            start_relation_id: 1,
-        };
-        let err = run_renumber(&input, &output, &opts).expect_err("must be refused");
-        assert!(
-            err.contains("start id must be at least 1"),
-            "start {start}: got {err}"
-        );
-    }
+    write_test_pbf_sorted(
+        &input,
+        &[plain_node(1), plain_node(2), plain_node(3)],
+        &[plain_way(10, vec![3, 1]), plain_way(20, vec![2])],
+        &[relation_of(5, vec![member(MemberId::Way(20), "a")])],
+    );
+    let opts = RenumberOptions {
+        start_node_id: -5,
+        start_way_id: -1,
+        start_relation_id: 0,
+    };
+    run_renumber(&input, &output, &opts).expect("renumber");
+    assert_sorted_file(&output);
+    let ids: Vec<(char, i64, Vec<i64>)> = crate::common::read_in_file_order(&output)
+        .into_iter()
+        .map(|e| match e {
+            crate::common::NormalizedElement::Node(n) => ('n', n.id, vec![]),
+            crate::common::NormalizedElement::Way(w) => ('w', w.id, w.refs),
+            crate::common::NormalizedElement::Relation(r) => {
+                ('r', r.id, r.members.iter().map(|m| m.ref_id).collect())
+            }
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ('n', -5, vec![]),
+            ('n', -6, vec![]),
+            ('n', -7, vec![]),
+            ('w', -1, vec![-7, -5]),
+            ('w', -2, vec![-6]),
+            ('r', 1, vec![-2]),
+        ]
+    );
+
+    let at_the_end = RenumberOptions {
+        start_node_id: i64::MIN + 2,
+        start_way_id: 1,
+        start_relation_id: 1,
+    };
+    run_renumber(&input, &dir.path().join("end.osm.pbf"), &at_the_end)
+        .expect("the last node is i64::MIN");
+    let past = RenumberOptions {
+        start_node_id: i64::MIN + 1,
+        ..at_the_end
+    };
+    let err = run_renumber(&input, &dir.path().join("past.osm.pbf"), &past)
+        .expect_err("runs past i64::MIN");
+    assert!(err.contains("runs past the 64-bit id range"), "got: {err}");
 }

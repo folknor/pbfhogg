@@ -34,8 +34,8 @@
 //!
 //! A case whose mixed arm violates the rule keeps asserting the correct
 //! answer and carries a [`Gap`] naming the check, the framing, the exact
-//! wrong observation (an exit code and the diagnostic it prints, or the
-//! exact element tokens missing and extra) and the reason. A gapped check
+//! wrong observation (the exact element tokens missing and extra) and the
+//! reason. A gapped check
 //! that fails with that observation passes and is printed; one that fails
 //! differently fails, since the defect changed; one that passes fails and
 //! asks for the marker to be removed, so a gap cannot outlive its fix.
@@ -277,20 +277,10 @@ enum Arm {
     Twin,
 }
 
-/// Which arms a case runs. `TwinOnly` is for a case whose subject is not
-/// the input's sign (a negative argument on a positive input), judged by
-/// an oracle of its own.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Arms {
-    Both,
-    TwinOnly,
-}
-
-/// One case: the arguments after the entry's path words, built in the arm's
-/// scratch directory, and the judge of the run.
+/// One case, run on both arms: the arguments after the entry's path words,
+/// built in the arm's scratch directory, and the judge of the run.
 struct Case {
     framings: &'static [Framing],
-    arms: Arms,
     argv: fn(&World, &Path, Framing) -> Vec<OsString>,
     judge: fn(&World, &Observed) -> Vec<Finding>,
     gaps: Vec<Gap>,
@@ -304,7 +294,6 @@ impl Case {
     ) -> Self {
         Self {
             framings,
-            arms: Arms::Both,
             argv,
             judge,
             gaps: Vec::new(),
@@ -338,8 +327,6 @@ const fn gap(check: &'static str, framing: Option<Framing>, sig: Sig, reason: &'
 
 /// The exact wrong observation a gap expects.
 enum Sig {
-    /// The run exited `code` and its output (stdout then stderr) holds `says`.
-    Exit { code: i32, says: &'static str },
     /// The element tokens missing from and extra in the result, exactly.
     Tokens {
         missing: &'static [&'static str],
@@ -363,9 +350,6 @@ enum Discrepancy {
 impl Discrepancy {
     fn matches(&self, sig: &Sig) -> bool {
         match (self, sig) {
-            (Self::Exit { code, output }, Sig::Exit { code: want, says }) => {
-                *code == Some(*want) && output.contains(says)
-            }
             (
                 Self::Tokens { missing, extra },
                 Sig::Tokens {
@@ -467,10 +451,7 @@ fn os(args: &[&str]) -> Vec<OsString> {
 
 /// Run one case: every framing it accepts, every arm, then the verdict.
 fn run(path: &[&str], name: &str, case: &Case) {
-    let arms: &[Arm] = match case.arms {
-        Arms::Both => &[Arm::Mixed, Arm::Twin],
-        Arms::TwinOnly => &[Arm::Twin],
-    };
+    let arms: &[Arm] = &[Arm::Mixed, Arm::Twin];
     let mut failures = Vec::new();
     // Every marker applies to a run the case makes, and no run has two
     // markers for one check.
@@ -1010,92 +991,72 @@ fn renumber_default() -> Case {
         let twin = mixed_sign_graph().relabelled_twin().0;
         pbf_result(o, OUT, &expect(&twin, &ALL), true)
     })
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 2,
-            says: "renumber requires non-negative input ids. Input contains node id -1.",
-        },
-        "renumber refuses negative source IDs",
-    )])
 }
 
-/// A negative start counts down from it, as osmium's does: on the positive
-/// twin, `--start-id -1` gives every kind `-1, -2, ...` by canonical rank.
+/// A negative start counts down from it, as osmium's does: `--start-id -1`
+/// (space form, as osmium accepts it) gives every kind `-1, -2, ...` by
+/// canonical rank, the twin's bijection negated, on both arms.
 fn renumber_negative_start() -> Case {
-    Case {
-        arms: Arms::TwinOnly,
-        gaps: vec![Gap {
-            check: "exit",
-            arm: Arm::Twin,
-            framing: None,
-            sig: Sig::Exit {
-                code: 2,
-                says: "the node start id must be at least 1, got -1",
-            },
-            reason: "renumber refuses a start ID below 1",
-        }],
-        ..Case::both(
-            INDEXED,
-            |w, dir, f| {
-                let mut a = in_out(w, dir, f);
-                a.push("--start-id=-1".into());
-                a
-            },
-            |_, o| {
-                let twin = mixed_sign_graph().relabelled_twin().0;
-                let negated = |id: i64| -id;
-                let g = MixedSignGraph {
-                    nodes: twin
-                        .nodes
-                        .iter()
-                        .map(|n| TestNode {
-                            id: negated(n.id),
-                            lat: n.lat,
-                            lon: n.lon,
-                            tags: n.tags.clone(),
-                            meta: None,
-                        })
-                        .collect(),
-                    ways: twin
-                        .ways
-                        .iter()
-                        .map(|w| TestWay {
-                            id: negated(w.id),
-                            refs: w.refs.iter().map(|&r| negated(r)).collect(),
-                            tags: w.tags.clone(),
-                            meta: None,
-                        })
-                        .collect(),
-                    relations: twin
-                        .relations
-                        .iter()
-                        .map(|r| TestRelation {
-                            id: negated(r.id),
-                            members: r
-                                .members
-                                .iter()
-                                .map(|m| crate::common::TestMember {
-                                    id: match m.id {
-                                        MemberId::Node(i) => MemberId::Node(-i),
-                                        MemberId::Way(i) => MemberId::Way(-i),
-                                        MemberId::Relation(i) => MemberId::Relation(-i),
-                                        other => other,
-                                    },
-                                    role: m.role,
-                                })
-                                .collect(),
-                            tags: r.tags.clone(),
-                            meta: None,
-                        })
-                        .collect(),
-                };
-                // -1, -2, ... is canonical order already.
-                pbf_result(o, OUT, &expect(&g, &ALL), true)
-            },
-        )
-    }
+    Case::both(
+        INDEXED,
+        |w, dir, f| {
+            let mut a = in_out(w, dir, f);
+            a.push("--start-id".into());
+            a.push("-1".into());
+            a
+        },
+        |_, o| {
+            let twin = mixed_sign_graph().relabelled_twin().0;
+            let negated = |id: i64| -id;
+            let g = MixedSignGraph {
+                nodes: twin
+                    .nodes
+                    .iter()
+                    .map(|n| TestNode {
+                        id: negated(n.id),
+                        lat: n.lat,
+                        lon: n.lon,
+                        tags: n.tags.clone(),
+                        meta: None,
+                    })
+                    .collect(),
+                ways: twin
+                    .ways
+                    .iter()
+                    .map(|w| TestWay {
+                        id: negated(w.id),
+                        refs: w.refs.iter().map(|&r| negated(r)).collect(),
+                        tags: w.tags.clone(),
+                        meta: None,
+                    })
+                    .collect(),
+                relations: twin
+                    .relations
+                    .iter()
+                    .map(|r| TestRelation {
+                        id: negated(r.id),
+                        members: r
+                            .members
+                            .iter()
+                            .map(|m| crate::common::TestMember {
+                                id: match m.id {
+                                    MemberId::Node(i) => MemberId::Node(-i),
+                                    MemberId::Way(i) => MemberId::Way(-i),
+                                    MemberId::Relation(i) => MemberId::Relation(-i),
+                                    other => other,
+                                },
+                                role: m.role,
+                            })
+                            .collect(),
+                        tags: r.tags.clone(),
+                        meta: None,
+                    })
+                    .collect(),
+            };
+            // -1, -2, ... is canonical order already.
+            pbf_result(o, OUT, &expect(&g, &ALL), true)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -78,6 +78,21 @@
   negative node refs were skipped with a `skipped N negative node refs`
   warning, which is gone. Indexdata claiming a node `max_id` below a
   negative node it holds is now refused like any understated claim.
+- **renumber accepts negative IDs and a `--start-id` below 1, as osmium
+  does.** Negative node, way and relation IDs, way refs and relation
+  members are renumbered by canonical order (`0`, then `-1, -2, ...`, then
+  `1, 2, ...`), which the input must follow; they were refused (exit 2). A
+  negative start counts down from it (`-1, -2, ...`), and 0 means 1; both
+  were refused. `--start-id -5` parses in the space form. Library:
+  `RenumberOptions` takes any start the same way.
+- **renumber names orphan references differently.** A way ref or relation
+  member to an element absent from the input is now mapped one to one onto
+  the IDs outside its kind's renumbered range, below or above it; on
+  positive input from start 1, an orphan X becomes X plus the number of
+  input elements of its kind above X. The old `start + count + X` shift
+  collided for negative orphans and refused an orphan near the largest ID,
+  which now renumbers. The old ID can no longer be recovered by
+  subtraction.
 
 ### Added
 

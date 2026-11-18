@@ -77,7 +77,7 @@ interruptions, following the shell's `128 + signal` convention.
 |------|---------|
 | `0` | Success. |
 | `1` | The command ran and its answer is negative. Only four commands can produce it: `diff` (differences found), `inspect --indexed` (a data blob lacks indexdata; a header-only file is indexed), `inspect --show` (element not in the file), and `check` (integrity violations). Nothing is printed to stderr for it beyond the command's normal output. |
-| `2` | The command failed or refused: missing or unreadable input, an existing output without `--overwrite`, an output that aliases an input, unsorted or unindexed input it will not take, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error, and a value the command itself refuses once the command line was accepted (the `build-geocode-index` S2 level bounds, a `renumber --start-id` below 1, an `-i`/`-I` ID source holding no ID). `Error: ...` goes to stderr. A command line clap or the CLI refuses is `64`, not `2`. |
+| `2` | The command failed or refused: missing or unreadable input, an existing output without `--overwrite`, an output that aliases an input, unsorted or unindexed input it will not take, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error, and a value the command itself refuses once the command line was accepted (the `build-geocode-index` S2 level bounds, a `renumber --start-id` from which the input's IDs would run past the 64-bit range, an `-i`/`-I` ID source holding no ID). `Error: ...` goes to stderr. A command line clap or the CLI refuses is `64`, not `2`. |
 | `3` | The command failed because the host refused a requested I/O feature at setup: `--direct-io` on a filesystem that rejects `O_DIRECT` at open (tmpfs, some overlay and network filesystems) or on a file whose reported direct I/O alignment (`statx` `STATX_DIOALIGN`) is not a power of two or exceeds the direct I/O transfer buffer, or `--io-uring` where the kernel lacks io_uring or `WriteFixed`, a sandbox denies `io_uring_setup`, or the kernel refuses the writer's registered buffer pool while `RLIMIT_MEMLOCK` is below it. On kernels before 5.12, which also charge the ring itself to `RLIMIT_MEMLOCK`, a low limit can instead fail ring creation with a generic `ENOMEM` that pbfhogg cannot tell apart from kernel resource exhaustion; that case exits `2`. stderr carries `Error: platform feature <feature> unavailable: ...` with `<feature>` `direct-io` or `io-uring` (an `--io-uring` output also opens with `O_DIRECT`, so it can report either). A refused `--direct-io` input reads `Error: platform feature direct-io unavailable: failed to open <path>: Invalid argument (os error 22)`. Failures after setup, including an `EINVAL` or `ENOSPC` mid-run, stay `2`. The code follows the typed error chain, not the message text: it survives added context, `io::Error` carriers, and the thread joins of multi-stage commands, so it holds when the refusal is raised by a worker stage, such as the output writer of the external `add-locations-to-ways` backend (which previously exited `2` for the same refusal). |
 | `64` | Usage error (`EX_USAGE`): the command line was refused before command execution, during argument parsing (an unknown flag, a missing, malformed or conflicting argument, a retired short flag, `--direct-io` or `--io-uring` in a build without the feature, a missing subcommand) or during the CLI's own option validation (the [Flag rules](#flag-rules), malformed expressions whether given on the command line or in an `-e` file, `tags-filter` with an `-e` file holding no expression, malformed positional IDs, an unknown `inspect --get` key, an OSC output name). Printed by clap on stderr, as an `error: ...` diagnostic with a usage line, or as help when a subcommand or argument is missing; never as `Error: ...`. No output is reserved or opened and no scratch directory is created. A missing or unreadable `-e` file is a `2`. `--help` and `--version` exit `0`. Before this status existed, usage errors exited `2`. |
 | `130` | Interrupted by SIGINT (Ctrl-C). See [Interruption](#interruption). |
@@ -1425,6 +1425,20 @@ the FullScan arm unconditionally.
 
 Renumber all element IDs sequentially, remapping cross-references (way node refs, relation member refs).
 
+Each kind is numbered in canonical order (`0`, then `-1, -2, ...`, then
+`1, 2, ...`), which the input must already follow; negative IDs are
+renumbered like any other, as osmium does. A positive `--start-id` counts up,
+a negative one counts down (`-1, -2, ...`), and 0 means 1.
+
+A way ref or relation member whose element is absent from the input (an
+orphan) gets an ID outside its kind's renumbered range: one ID per distinct
+absent ID, the same for every ref to it, never the ID of an output element,
+below the range or above it. On positive input from start 1, an orphan X
+becomes X plus the number of input elements of its kind above X. osmium
+numbers orphans on past the range in the order it meets them instead (see
+DEVIATIONS.md, "renumber: orphan-reference handling"). The run reports their
+count as a warning.
+
 The output header carries no replication state: the new IDs are not the
 feed's, so its diffs would address other objects (see
 [Output header](#output-header)).
@@ -1438,7 +1452,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
-| `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1]. (`-s` used to be its short; `-s` now refuses here, naming `--start-id`.) |
+| `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1]. Positive counts up, negative counts down, 0 means 1; `--start-id -5` and `--start-id=-5` both parse. A start from which the last ID would leave the 64-bit range is refused (exit 2). (`-s` used to be its short; `-s` now refuses here, naming `--start-id`.) |
 | `--compression` | Blob compression [default for renumber: zlib:1; other commands: zlib]. Level 1 is the measured external-renumber write path (see [reference/performance/renumber.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/renumber.md)). An explicit `--compression zlib` or `zlib:6` also yields level 1 today, because the value-based API cannot tell omission from an explicit default; any other zlib level, zstd and none are honoured as given. |
 | `--direct-io` | Use O_DIRECT on the paths listed in the [I/O capability matrix](#io-capability-matrix) |
 | `--generator` | Override writing program name |

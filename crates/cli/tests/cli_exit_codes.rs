@@ -444,7 +444,8 @@ fn runtime_failures_stay_2() {
                 std::ffi::OsStr::new("-o"),
                 fresh,
                 std::ffi::OsStr::new("--start-id"),
-                std::ffi::OsStr::new("0"),
+                // Two nodes from the largest ID run past the 64-bit range.
+                std::ffi::OsStr::new("9223372036854775807"),
             ],
             "a value the library refuses",
         ),

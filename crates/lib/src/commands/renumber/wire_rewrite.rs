@@ -10,19 +10,22 @@
 //! # Every integer here comes off the wire
 //!
 //! Delta-encoded IDs are summed, positions are offset, counts are
-//! accumulated - all from bytes the input controls. A crafted delta that
-//! overflowed an `i64` used to panic in debug builds and wrap in release,
-//! landing anywhere. The lint below makes every arithmetic operator in this
-//! file a compile error, so each one is a `checked_*` call mapped to an
-//! input error, or a method whose saturation is the intended meaning.
+//! accumulated - all from bytes the input controls. The lint below makes
+//! every arithmetic operator in this file a compile error, so each one is a
+//! `checked_*` call mapped to an input error, or a method whose wrapping or
+//! saturation is the intended meaning. ID deltas are the intended wrapping:
+//! the format's deltas are modulo 2^64, as every pbfhogg reader decodes them
+//! (a canonical `i64::MIN` followed by `1` is one such step), and the deltas
+//! written are wrapped the same way so the reader recovers them.
 //!
 //! # Ordering is part of the contract
 //!
 //! Renumber gives an element its new ID by *position* and resolves every
 //! reference by *rank* among the input IDs; the two agree only when input
-//! IDs strictly increase. Each rewriter refuses an ID that does not exceed
-//! the previous one in the blob, and returns the first and last input ID it
-//! saw so the stage driver can check the boundary between blobs
+//! IDs strictly ascend in canonical order (`0`, then `-1, -2, ...`, then
+//! `1, 2, ...`). Each rewriter refuses an ID that does not come after the
+//! previous one in the blob, and returns the first and last input ID it saw
+//! so the stage driver can check the boundary between blobs
 //! (`pool::StrictOrder`). A header's `Sort.Type_then_ID` claim is not
 //! evidence: nothing verifies it.
 #![deny(clippy::arithmetic_side_effects)]
@@ -131,10 +134,11 @@ pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> Error {
         "comes after a larger id"
     };
     let text = format!(
-        "renumber requires {kind} ids to strictly increase in file order, but \
-         {kind} {id} {what} ({kind} {prev} precedes it). New ids are assigned by \
-         position and references resolved by rank, which agree only on sorted, \
-         duplicate-free input; a Sort.Type_then_ID header claim is not checked."
+        "renumber requires {kind} ids to strictly increase in file order, in \
+         canonical id order (0, then -1, -2, ..., then 1, 2, ...), but {kind} {id} \
+         {what} ({kind} {prev} precedes it). New ids are assigned by position and \
+         references resolved by rank, which agree only on sorted, duplicate-free \
+         input; a Sort.Type_then_ID header claim is not checked."
     );
     // A descent is an ordering fault that sorting cures; a repeated id is
     // not, so only the former is `Unsorted` (which front ends answer with
@@ -148,41 +152,26 @@ pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> Error {
     }
 }
 
-// The decoder reconstructs deltas modulo 2^64 (the writer encodes them that
-// way), while renumber's accumulators below stay checked. The two accept the
-// same inputs here: every accumulated id is refused when negative before the
-// next delta is added, so the running sum is non-negative, and a non-negative
-// sum that overflows on addition wraps to a negative id the modular form
-// would refuse anyway. Checked addition only gives that refusal a clearer
-// message.
-fn delta_overflow_error(field: &str) -> Error {
-    Error::invalid_data(format!(
-        "renumber: {field} delta sum overflows a 64-bit id; the input's delta \
-         encoding is corrupt."
-    ))
-}
-
-fn negative_id_error(kind: &str, id: i64) -> Error {
-    Error::invalid_data(format!(
-        "renumber requires non-negative input ids. \
-         Input contains {kind} id {id}. \
-         Negative ids are JOSM editor-local staging identifiers \
-         that should be resolved before processing."
-    ))
-}
-
 fn wire_err(e: protohoggr::WireError) -> Error {
     Error::from(e)
 }
 
-/// `start + rank` as an output ID.
-fn offset_id(start: i64, rank: u64) -> crate::Result<i64> {
+/// The output ID `rank` places past `start`: `start + rank` counting up from
+/// a positive start, `start - rank` counting down from a negative one (a
+/// start is never 0; [`super::effective_start`] makes it 1).
+pub(super) fn offset_id(start: i64, rank: u64) -> crate::Result<i64> {
     i64::try_from(rank)
         .ok()
-        .and_then(|r| start.checked_add(r))
+        .and_then(|r| {
+            if start > 0 {
+                start.checked_add(r)
+            } else {
+                start.checked_sub(r)
+            }
+        })
         .ok_or_else(|| {
             Error::invalid_data(format!(
-                "renumber: new id {start} + {rank} overflows a 64-bit id"
+                "renumber: new id {rank} past start {start} leaves the 64-bit id range"
             ))
         })
 }
@@ -194,35 +183,42 @@ fn inc(n: u64) -> crate::Result<u64> {
 
 /// One element kind's old-to-new ID mapping, for resolving references.
 ///
-/// An ID in the set becomes `start + rank`. An orphan - a reference to an
-/// object absent from the input - becomes `orphan_base + old_id`, where
-/// `orphan_base = start + count` is the first ID past the renumbered range.
-/// Passing orphans through unchanged let an old ID equal a new ID given to a
-/// different object, so a reference silently pointed at the wrong element.
-/// The shift keeps every orphan outside the new range, keeps two references
-/// to one orphan equal, and keeps the old ID recoverable by subtraction
-/// (DEVIATIONS.md, "renumber: orphan-reference handling").
+/// Work in canonical ordinals ([`crate::osm_id::osm_id_ordinal`], a
+/// bijection of `i64` onto `u64` in canonical order). A member of rank `r`
+/// becomes `start + r` (or `start - r` counting down), which is ordinal
+/// `L + r` with `L` the start's ordinal either way: the live IDs fill the
+/// ordinal interval `[L, L + C)`, `C` the member count.
 ///
-/// The base is held as an `i128`: a live range may end exactly at
-/// `i64::MAX`, which leaves no representable base, and that input is only
-/// an error once an orphan actually needs one.
+/// An orphan - a reference to an object absent from the input - with ID `x`
+/// has `a = ordinal(x) - canonical_rank(x)`, the number of absent IDs
+/// canonically before it. The absent IDs number `2^64 - C`, so `a` runs
+/// over `[0, 2^64 - C)` once each; the orphan becomes the ID of ordinal `a`
+/// when `a < L`, else of `a + C`. That is a bijection of the absent IDs onto
+/// the IDs outside the live interval: two references to one orphan stay
+/// equal, no orphan names a renumbered element, orphans keep their
+/// canonical order, nothing can overflow (`a + C <= 2^64 - 1`), and it needs
+/// only the rank index, so it is deterministic under parallel rewriting. On
+/// positive input counting up from 1 an orphan `x` becomes `x` plus the
+/// number of members above it. Passing orphans through unchanged let an old
+/// ID equal a new ID given to a different object (DEVIATIONS.md, "renumber:
+/// orphan-reference handling").
 #[derive(Clone, Copy)]
 pub(super) struct IdSpace<'a> {
-    kind: &'static str,
     set: &'a RankedIdSet,
     start: i64,
-    orphan_base: i128,
+    /// Ordinal of `start`.
+    live_first: u64,
+    count: u64,
 }
 
 impl<'a> IdSpace<'a> {
-    /// `set` is ranked, so every ID of `kind` has already been recorded.
-    pub(super) fn new(kind: &'static str, set: &'a RankedIdSet, start: i64) -> Self {
-        let orphan_base = i128::from(start).saturating_add(i128::from(set.total_count()));
+    /// `set` is ranked, so every ID of its kind has already been recorded.
+    pub(super) fn new(set: &'a RankedIdSet, start: i64) -> Self {
         Self {
-            kind,
             set,
             start,
-            orphan_base,
+            live_first: crate::osm_id::osm_id_ordinal(start),
+            count: set.total_count(),
         }
     }
 
@@ -236,22 +232,31 @@ impl<'a> IdSpace<'a> {
             .transpose()
     }
 
-    /// `(new_id, is_orphan)` for a reference, with a single chunk lookup.
+    /// `(new_id, is_orphan)` for a reference, with a single chunk lookup
+    /// for a member.
     #[inline]
     fn resolve(&self, old_id: i64) -> crate::Result<(i64, bool)> {
         if let Some(new_id) = self.live(old_id)? {
             return Ok((new_id, false));
         }
-        let shifted = self.orphan_base.saturating_add(i128::from(old_id));
-        i64::try_from(shifted).map(|id| (id, true)).map_err(|_| {
-            Error::invalid_data(format!(
-                "renumber: orphan {kind} ref {old_id} (the {kind} is not in the input) \
-                 would become {shifted}, the first id past the renumbered {kind}s \
-                 ({base}) plus its old id, which overflows a 64-bit id",
-                kind = self.kind,
-                base = self.orphan_base,
-            ))
-        })
+        self.orphan(old_id).map(|id| (id, true))
+    }
+
+    /// The new ID of an absent `old_id` (see the type docs). Out of line:
+    /// orphans are rare, and inlined this would swell every ref lookup.
+    #[cold]
+    #[inline(never)]
+    fn orphan(&self, old_id: i64) -> crate::Result<i64> {
+        let absent_before = crate::osm_id::osm_id_ordinal(old_id)
+            .checked_sub(self.set.canonical_rank(old_id))
+            .ok_or_else(|| Error::internal("renumber: a rank exceeds its id's ordinal"))?;
+        let ordinal = if absent_before < self.live_first {
+            Some(absent_before)
+        } else {
+            absent_before.checked_add(self.count)
+        }
+        .ok_or_else(|| Error::internal("renumber: an orphan ordinal overflows"))?;
+        Ok(crate::osm_id::osm_id_from_ordinal(ordinal))
     }
 }
 
@@ -272,8 +277,8 @@ fn count_varints_strict(data: &[u8]) -> crate::Result<usize> {
     Ok(count)
 }
 
-/// First and last input ID seen, refusing any ID that does not exceed the
-/// one before it.
+/// First and last input ID seen, refusing any ID that does not come
+/// canonically after the one before it.
 #[derive(Default)]
 struct Span {
     first: Option<i64>,
@@ -283,7 +288,7 @@ struct Span {
 impl Span {
     fn push(&mut self, kind: &str, id: i64) -> crate::Result<()> {
         if let Some(prev) = self.last
-            && id <= prev
+            && crate::osm_id::osm_id_le(id, prev)
         {
             return Err(order_error(kind, prev, id));
         }
@@ -316,7 +321,7 @@ pub(super) struct Scratch {
 pub(super) struct Outcome {
     /// Elements rewritten.
     pub(super) count: u64,
-    /// References whose target is not in the input, shifted past the
+    /// References whose target is not in the input, named outside the
     /// renumbered range (see [`IdSpace`]).
     pub(super) orphans: u64,
     /// First and last input ID, `None` when the block held no elements.
@@ -477,14 +482,7 @@ pub(super) fn reframe_dense_with_new_ids(
         let mut group_count: u64 = 0;
         while id_cursor.remaining() > 0 {
             let delta = id_cursor.read_sint64().map_err(wire_err)?;
-            old_id = old_id
-                .checked_add(delta)
-                .ok_or_else(|| delta_overflow_error("DenseNodes.id"))?;
-            // Unconditional: indexdata `min_id >= 0` is a claim, not a check.
-            // See DEVIATIONS.md > "Negative input IDs rejected project-wide".
-            if old_id < 0 {
-                return Err(negative_id_error("node", old_id));
-            }
+            old_id = old_id.wrapping_add(delta);
             span.push("node", old_id)?;
             if !id_set.try_insert_atomic(old_id) {
                 overflow.push(old_id);
@@ -493,17 +491,19 @@ pub(super) fn reframe_dense_with_new_ids(
         }
 
         // New IDs are consecutive from this group's base: the first delta is
-        // the absolute ID, every later one is +1 (zigzag 2). A group with no
-        // nodes gets no ID at all - writing its base anyway would fabricate a
-        // node that duplicates the next group's first.
+        // the absolute ID, every later one is +1 (zigzag 2), or -1 (zigzag 1)
+        // counting down from a negative start. A group with no nodes gets no
+        // ID at all - writing its base anyway would fabricate a node that
+        // duplicates the next group's first.
         s.packed.clear();
         if group_count > 0 {
             let first_new = offset_id(base_new_id, assigned)?;
             protohoggr::encode_varint(&mut s.packed, protohoggr::zigzag_encode_64(first_new));
             let n = usize::try_from(group_count)
                 .map_err(|_| Error::invalid_data("group node count > usize"))?;
+            let step = if base_new_id > 0 { 0x02u8 } else { 0x01u8 };
             s.packed
-                .extend(std::iter::repeat_n(0x02u8, n.saturating_sub(1)));
+                .extend(std::iter::repeat_n(step, n.saturating_sub(1)));
         }
         assigned = assigned
             .checked_add(group_count)
@@ -657,12 +657,6 @@ fn reframe_way(
     }
 
     let (old_way_id, id_r) = id.ok_or_else(|| Error::invalid_data("reframe_ways: no id field"))?;
-    // Unconditional: renumber does not remap negative IDs, and a negative
-    // way id slipping past stale indexdata would otherwise enter the way
-    // map unrefused.
-    if old_way_id < 0 {
-        return Err(negative_id_error("way", old_way_id));
-    }
     span.push("way", old_way_id)?;
     way_id_set.insert(old_way_id);
 
@@ -674,28 +668,15 @@ fn reframe_way(
     let mut refs_cursor = Cursor::new(old_refs_data);
     while !refs_cursor.is_empty() {
         let delta = refs_cursor.read_sint64().map_err(wire_err)?;
-        prev_old_ref = prev_old_ref
-            .checked_add(delta)
-            .ok_or_else(|| delta_overflow_error("Way.refs"))?;
+        prev_old_ref = prev_old_ref.wrapping_add(delta);
         let old_node_id = prev_old_ref;
-        if old_node_id < 0 {
-            return Err(Error::invalid_data(format!(
-                "renumber requires non-negative input ids. \
-                 Way references negative node id {old_node_id}. \
-                 Negative ids are JOSM editor-local staging \
-                 identifiers that should be resolved before \
-                 processing."
-            )));
-        }
         let (new_ref, is_orphan) = nodes
             .resolve(old_node_id)
             .map_err(|e| e.context(format!("in way {old_way_id}")))?;
         if is_orphan {
             orphans = inc(orphans)?;
         }
-        let new_delta = new_ref
-            .checked_sub(prev_new_ref)
-            .ok_or_else(|| delta_overflow_error("Way.refs (output)"))?;
+        let new_delta = new_ref.wrapping_sub(prev_new_ref);
         protohoggr::encode_varint(refs_out, protohoggr::zigzag_encode_64(new_delta));
         prev_new_ref = new_ref;
     }
@@ -901,9 +882,6 @@ fn reframe_relation(
 
     let (old_rel_id, id_r) =
         id.ok_or_else(|| Error::invalid_data("reframe_relations: relation without an id field"))?;
-    if old_rel_id < 0 {
-        return Err(negative_id_error("relation", old_rel_id));
-    }
     span.push("relation", old_rel_id)?;
     // R1 recorded every relation id through `relation_id`, which reads the
     // same field this loop does, so a miss is a bug rather than input.
@@ -941,21 +919,8 @@ fn reframe_relation(
             let delta = memids_cursor
                 .read_sint64()
                 .map_err(|e| Error::from(e).context("memids varint"))?;
-            prev_old_id = prev_old_id
-                .checked_add(delta)
-                .ok_or_else(|| delta_overflow_error("Relation.memids"))?;
+            prev_old_id = prev_old_id.wrapping_add(delta);
             let old_abs_id = prev_old_id;
-
-            // Unconditional reject, same policy as the node and way paths: a
-            // negative member ref would otherwise flow through as an orphan.
-            if old_abs_id < 0 {
-                return Err(Error::invalid_data(format!(
-                    "renumber requires non-negative input ids. \
-                     Input contains relation {old_rel_id} with \
-                     member ref {old_abs_id}. Resolve JOSM-style \
-                     negative staging IDs before renumbering.",
-                )));
-            }
 
             // `types` is `repeated int32`: dispatch on the varint truncated
             // to 32 bits, as protobuf and pbfhogg's own reader decode it.
@@ -982,9 +947,7 @@ fn reframe_relation(
             if is_orphan {
                 orphans = inc(orphans)?;
             }
-            let new_delta = new_abs_id
-                .checked_sub(prev_new_id)
-                .ok_or_else(|| delta_overflow_error("Relation.memids (output)"))?;
+            let new_delta = new_abs_id.wrapping_sub(prev_new_id);
             protohoggr::encode_varint(memids_out, protohoggr::zigzag_encode_64(new_delta));
             prev_new_id = new_abs_id;
         }
@@ -1087,9 +1050,9 @@ mod tests {
         let rel_ids = rel_ids.into_ranked();
         let way_ids = IdSet::new().into_ranked();
         let ids = RelationIdSpaces {
-            relations: IdSpace::new("relation", &rel_ids, 1_000),
-            nodes: IdSpace::new("node", &node_ids, 100),
-            ways: IdSpace::new("way", &way_ids, 500),
+            relations: IdSpace::new(&rel_ids, 1_000),
+            nodes: IdSpace::new(&node_ids, 100),
+            ways: IdSpace::new(&way_ids, 500),
         };
         let mut out = Vec::new();
         reframe_relations_with_new_ids(block, &ids, &mut out, &mut Scratch::default())
@@ -1115,7 +1078,7 @@ mod tests {
         let mut prev = 0_i64;
         for &m in memids {
             let mut v = Vec::new();
-            varint(zz(m - prev), &mut v);
+            varint(zz(m.wrapping_sub(prev)), &mut v);
             prev = m;
             per_member.push(v);
         }
@@ -1174,7 +1137,7 @@ mod tests {
         reframe_ways_with_new_ids(
             block,
             1_000,
-            &IdSpace::new("node", &node_ids, 100),
+            &IdSpace::new(&node_ids, 100),
             &mut way_ids,
             &mut out,
             &mut Scratch::default(),
@@ -1307,75 +1270,89 @@ mod tests {
         assert_eq!(outcome.span, Some((10, 20)));
     }
 
-    /// A crafted delta that overflows the running id. It used to
-    /// panic in debug and wrap in release.
+    /// IDs decode modulo 2^64, as the library reader decodes them: the
+    /// canonical step from `i64::MIN` to `1` is one wrapped delta, a wrap
+    /// that lands canonically backwards is an order refusal, and a zero
+    /// delta is a duplicate.
     #[test]
-    fn an_overflowing_node_delta_is_an_input_error() {
-        let block = dense_groups(&[&[i64::MAX - 1, i64::MAX - 1]]);
-        // Deltas: MAX-1, then 0 - harmless. Build an overflow explicitly:
-        // first id MAX-1, then delta +5.
-        let mut packed = Vec::new();
-        varint(zz(i64::MAX - 1), &mut packed);
-        varint(zz(5), &mut packed);
-        let mut dense = Vec::new();
-        len_delimited(1, &packed, &mut dense);
-        let mut group = Vec::new();
-        len_delimited(2, &dense, &mut group);
-        let err = run_dense(&block_of(&[group]))
+    fn node_deltas_wrap_as_the_reader_decodes_them() {
+        let ok = run_dense(&dense_groups(&[&[0, -1, i64::MIN, 1, i64::MAX]]))
+            .expect("canonical order across the wrap");
+        assert_eq!(ok.count, 5);
+        assert_eq!(ok.span, Some((0, i64::MAX)));
+        // i64::MAX - 1, then +5: wraps to a negative, canonically earlier.
+        let err = run_dense(&dense_groups(&[&[i64::MAX - 1, i64::MIN + 3]]))
             .err()
-            .expect("overflow must be refused");
-        assert!(err.to_string().contains("overflows"), "got: {err}");
-        // And the zero delta in `block` is a duplicate, refused on order.
-        let err = run_dense(&block)
+            .expect("a wrap backwards must be refused");
+        assert!(
+            err.to_string().contains("comes after a larger id"),
+            "got: {err}"
+        );
+        let err = run_dense(&dense_groups(&[&[i64::MAX - 1, i64::MAX - 1]]))
             .err()
             .expect("a duplicate must be refused");
         assert!(err.to_string().contains("appears twice"), "got: {err}");
     }
 
+    /// A wrapped way-ref or member delta names the ID the reader decodes,
+    /// here an absent one, so an orphan rather than an error.
     #[test]
-    fn an_overflowing_way_ref_delta_is_an_input_error() {
-        let mut way = Vec::new();
-        way.push(0x08);
-        varint(3, &mut way);
-        // The first ref is node 7, which resolves; the second delta then
-        // overflows. (A first ref of i64::MAX would be an orphan whose shift
-        // overflows before the delta is read.)
-        let mut refs = Vec::new();
-        varint(zz(7), &mut refs);
-        varint(zz(i64::MAX), &mut refs);
-        len_delimited(8, &refs, &mut way);
-        let mut group = Vec::new();
-        len_delimited(3, &way, &mut group);
-        let err = run_ways(&block_of(&[group]))
-            .err()
-            .expect("overflow must be refused");
-        assert!(
-            err.to_string().contains("Way.refs delta sum overflows"),
-            "got: {err}"
-        );
+    fn ref_and_member_deltas_wrap_as_the_reader_decodes_them() {
+        let outcome = run_ways(&way_block_segmented(
+            3,
+            &[7, 7_i64.wrapping_add(i64::MAX)],
+            1,
+        ))
+        .expect("wrapped ref");
+        assert_eq!(outcome.orphans, 1);
+        let outcome = run(&relation_block_segmented(
+            5,
+            &[7, 7_i64.wrapping_add(i64::MAX)],
+            1,
+            1,
+        ))
+        .expect("wrapped member");
+        assert_eq!(outcome.orphans, 1);
     }
 
+    /// Counting down: a negative start hands out `start, start - 1, ...`,
+    /// written as an absolute first ID then deltas of -1.
     #[test]
-    fn an_overflowing_member_delta_is_an_input_error() {
-        let mut rel = Vec::new();
-        rel.push(0x08);
-        varint(5, &mut rel);
-        // As for way refs: member node 7 resolves, then the delta overflows.
-        let mut memids = Vec::new();
-        varint(zz(7), &mut memids);
-        varint(zz(i64::MAX), &mut memids);
-        len_delimited(9, &memids, &mut rel);
-        len_delimited(10, &[0, 0], &mut rel);
-        let mut group = Vec::new();
-        len_delimited(4, &rel, &mut group);
-        let err = run(&block_of(&[group]))
-            .err()
-            .expect("overflow must be refused");
-        assert!(
-            err.to_string()
-                .contains("Relation.memids delta sum overflows"),
-            "got: {err}"
-        );
+    fn a_negative_start_counts_down() {
+        let ids = IdSet::new();
+        let mut out = Vec::new();
+        let outcome = reframe_dense_with_new_ids(
+            &dense_groups(&[&[-2, 3], &[9]]),
+            -5,
+            &ids,
+            &mut Vec::new(),
+            &mut out,
+            &mut Scratch::default(),
+        )
+        .expect("rewrite");
+        assert_eq!(outcome.count, 3);
+        let mut seen = Vec::new();
+        for_each_group(&out, |group| {
+            let dense = single_dense(group)?;
+            let mut c = Cursor::new(dense);
+            while let Some((f, w)) = c.read_tag().map_err(wire_err)? {
+                if f == 1 {
+                    let mut ids = Cursor::new(c.read_len_delimited().map_err(wire_err)?);
+                    let mut id = 0_i64;
+                    while ids.remaining() > 0 {
+                        id = id.wrapping_add(ids.read_sint64().map_err(wire_err)?);
+                        seen.push(id);
+                    }
+                } else {
+                    c.skip_field(w).map_err(wire_err)?;
+                }
+            }
+            Ok(())
+        })
+        .expect("reread");
+        assert_eq!(seen, vec![-5, -6, -7]);
+        assert!(offset_id(i64::MIN, 0).is_ok());
+        assert!(offset_id(i64::MIN, 1).is_err());
     }
 
     /// Strictly increasing ids, within a blob: a node id that steps back, across a group
@@ -1590,43 +1567,66 @@ mod tests {
     }
 
     /// The orphan/new-id collision: old ids 1 and 2 are orphans here and
-    /// are also the new ids of nodes 10 and 20. Shifted by start + count
-    /// they land past the renumbered range, distinct from every live id.
+    /// would be the new ids of nodes 10 and 20. Each orphan becomes its id
+    /// plus the members above it, outside the renumbered range.
     #[test]
-    fn an_orphan_is_shifted_past_the_renumbered_range() {
+    fn an_orphan_is_named_outside_the_renumbered_range() {
         let set = ranked(&[10, 20]);
-        let nodes = IdSpace::new("node", &set, 1);
+        let nodes = IdSpace::new(&set, 1);
         assert_eq!(nodes.resolve(10).unwrap(), (1, false));
         assert_eq!(nodes.resolve(20).unwrap(), (2, false));
-        assert_eq!(nodes.resolve(1).unwrap(), (4, true));
-        assert_eq!(nodes.resolve(2).unwrap(), (5, true));
-        assert_eq!(
-            nodes.resolve(0).unwrap(),
-            (3, true),
-            "orphan 0 maps to the base"
-        );
+        assert_eq!(nodes.resolve(1).unwrap(), (3, true));
+        assert_eq!(nodes.resolve(2).unwrap(), (4, true));
+        assert_eq!(nodes.resolve(15).unwrap(), (16, true));
+        assert_eq!(nodes.resolve(99).unwrap(), (99, true));
+        assert_eq!(nodes.resolve(0).unwrap(), (0, true));
+        assert_eq!(nodes.resolve(-3).unwrap(), (-3, true));
         assert_eq!(nodes.live(1).unwrap(), None);
     }
 
-    /// A live range may end exactly at i64::MAX; only an orphan that would
-    /// need an id past it is an error.
+    /// Brute force over a small window of ordinals: for starts at both
+    /// extremes, either direction, and members of both signs, no two
+    /// orphans share a name, no orphan names a live ID, and orphans keep
+    /// their canonical order. The ID-range ends never fail.
     #[test]
-    fn a_range_ending_at_the_largest_id_fails_only_on_an_orphan() {
-        let set = ranked(&[7]);
-        let nodes = IdSpace::new("node", &set, i64::MAX);
-        assert_eq!(nodes.resolve(7).unwrap(), (i64::MAX, false));
-        let err = nodes.resolve(0).expect_err("orphan 0 needs i64::MAX + 1");
-        assert!(
-            err.to_string().contains("overflows a 64-bit id"),
-            "got: {err}"
-        );
-        assert!(err.to_string().contains("orphan node ref 0"), "got: {err}");
-
-        let set = ranked(&[7]);
-        let ways = IdSpace::new("way", &set, i64::MAX - 10);
-        // Base i64::MAX - 9: orphan 9 is exactly i64::MAX, orphan 10 is past it.
-        assert_eq!(ways.resolve(9).unwrap(), (i64::MAX, true));
-        assert!(ways.resolve(10).is_err());
+    fn orphans_are_a_collision_free_order_preserving_bijection() {
+        use crate::osm_id::{osm_id_from_ordinal, osm_id_ordinal};
+        let cases: [(&[i64], i64); 7] = [
+            (&[10, 20], 1),
+            (&[0, -1, -5, 3], 1),
+            (&[0, -1, -5, 3], -1),
+            (&[7, 8], i64::MAX - 1),
+            (&[7, 8], i64::MIN + 1),
+            (&[i64::MIN, i64::MAX], 4),
+            (&[], 1),
+        ];
+        let window: Vec<i64> = (0..40_u64)
+            .chain((1 << 63) - 20..(1 << 63) + 20)
+            .chain(u64::MAX - 20..=u64::MAX)
+            .map(osm_id_from_ordinal)
+            .collect();
+        for (members, start) in cases {
+            let set = ranked(members);
+            let space = IdSpace::new(&set, start);
+            let live: Vec<i64> = members
+                .iter()
+                .map(|&m| space.resolve(m).unwrap().0)
+                .collect();
+            let mut last: Option<u64> = None;
+            let mut names = std::collections::BTreeSet::new();
+            for &x in &window {
+                if members.contains(&x) {
+                    continue;
+                }
+                let (name, orphan) = space.resolve(x).unwrap();
+                assert!(orphan);
+                assert!(!live.contains(&name), "{members:?} {start} {x} -> {name}");
+                assert!(names.insert(name), "{members:?} {start} {x} -> {name}");
+                let ord = osm_id_ordinal(name);
+                assert!(last.is_none_or(|l| l < ord), "{members:?} {start} {x}");
+                last = Some(ord);
+            }
+        }
     }
 
     /// PrimitiveBlock with relation 5 whose members are `(raw type, id)`.

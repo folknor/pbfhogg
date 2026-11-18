@@ -286,8 +286,6 @@ fn relation_referencing_relation_roundtrips() {
 /// OSM uses non-negative ids in production, but the PBF protobuf
 /// encoding permits i64 values including negatives. Test that a
 /// large positive id near the OSM production ceiling round-trips.
-/// (Negative ids are rejected by `renumber_external` explicitly per
-/// CHANGELOG; roundtrip at the reader/writer layer should still work.)
 #[test]
 fn large_positive_id_roundtrips() {
     let dir = crate::common::test_scratch();

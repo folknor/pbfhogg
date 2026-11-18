@@ -49,6 +49,44 @@ pub(crate) fn osm_id_from_key(key: OsmIdKey) -> i64 {
     }
 }
 
+/// The canonical ordinal of an ID: its position among all of `i64` in
+/// canonical order. `0` is 0, a negative ID is its magnitude (`i64::MIN` is
+/// `2^63`), a positive ID is `2^63 + id`. A bijection onto `u64`, monotone in
+/// canonical order, so comparing ordinals compares IDs canonically.
+#[inline]
+#[allow(clippy::cast_sign_loss)]
+pub(crate) fn osm_id_ordinal(id: i64) -> u64 {
+    if id > 0 {
+        // id < 2^63, so the OR is the sum.
+        (id as u64) | (1 << 63)
+    } else {
+        id.unsigned_abs()
+    }
+}
+
+/// The ID a canonical ordinal names. Inverse of [`osm_id_ordinal`].
+#[inline]
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn osm_id_from_ordinal(ordinal: u64) -> i64 {
+    if ordinal > 1 << 63 {
+        (ordinal & !(1 << 63)) as i64
+    } else {
+        // Magnitude 2^63 is i64::MIN, which wrapping_neg maps to itself.
+        (ordinal as i64).wrapping_neg()
+    }
+}
+
+/// `a` canonically at or before `b`, with a plain compare when both are
+/// non-negative (all production input).
+#[inline]
+pub(crate) fn osm_id_le(a: i64, b: i64) -> bool {
+    if (a | b) >= 0 {
+        a <= b
+    } else {
+        osm_id_ordinal(a) <= osm_id_ordinal(b)
+    }
+}
+
 /// Compare two OSM element IDs in canonical sort order.
 #[inline]
 pub(crate) fn osm_id_cmp(a: i64, b: i64) -> std::cmp::Ordering {
@@ -206,6 +244,31 @@ impl OrderWatermark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinals_are_a_canonical_bijection_onto_u64() {
+        let ids = [0, -1, -2, -i64::MAX, i64::MIN, 1, 2, i64::MAX - 1, i64::MAX];
+        let expect = [
+            0,
+            1,
+            2,
+            (1 << 63) - 1,
+            1 << 63,
+            (1 << 63) + 1,
+            (1 << 63) + 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for (id, ord) in ids.into_iter().zip(expect) {
+            assert_eq!(osm_id_ordinal(id), ord, "{id}");
+            assert_eq!(osm_id_from_ordinal(ord), id, "{ord}");
+        }
+        for a in ids {
+            for b in ids {
+                assert_eq!(osm_id_le(a, b), osm_id_cmp(a, b).is_le(), "{a} {b}");
+            }
+        }
+    }
 
     fn violation(previous_kind: u8, previous_id: i64, first_id: i64) -> OrderViolation {
         OrderViolation {

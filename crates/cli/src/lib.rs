@@ -1632,8 +1632,10 @@ enum Command {
     },
     /// Renumber all element IDs sequentially, remapping cross-references.
     ///
-    /// Input must be sorted. Negative IDs (JOSM editor-local staging
-    /// identifiers) are rejected - they must be resolved before renumbering.
+    /// Input must be sorted. Negative IDs are renumbered like any other, in
+    /// canonical order (0, then -1, -2, ..., then 1, 2, ...). A reference to
+    /// an element absent from the input gets an ID outside its kind's
+    /// renumbered range, one per absent ID.
     ///
     /// Unlike the other commands, the --compression default here is zlib:1
     /// (the measured external-renumber write path), not zlib:6. An explicit
@@ -1644,8 +1646,14 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
-        /// Starting ID(s): single value or comma-separated node,way,relation
-        #[arg(long, default_value = "1", value_parser = parse_start_ids)]
+        /// Starting ID(s): single value or comma-separated node,way,relation.
+        /// A positive start counts up, a negative one counts down; 0 means 1
+        #[arg(
+            long,
+            default_value = "1",
+            allow_hyphen_values = true,
+            value_parser = parse_start_ids
+        )]
         start_id: StartIds,
         #[command(flatten)]
         compression: CompressionArg,

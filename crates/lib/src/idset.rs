@@ -1526,6 +1526,24 @@ impl RankedIdSet {
         }
     }
 
+    /// The number of members canonically before `id` (`0`, then
+    /// `-1, -2, ...`, then `1, 2, ...`), for every `i64`, whether or not
+    /// `id` is a member. Equals [`Self::canonical_rank_if_set`] on members.
+    pub fn canonical_rank(&self, id: i64) -> u64 {
+        match family(id) {
+            Family::NonNeg(NonNegId(0)) => 0,
+            // The non-negative family's rank already counts a member 0.
+            Family::NonNeg(key) => self.neg_total + self.set.nonneg.rank(&self.nonneg_rank, key),
+            Family::Neg(key) => {
+                self.zero
+                    + self
+                        .neg_rank
+                        .as_ref()
+                        .map_or(0, |idx| self.set.neg.rank(idx, key))
+            }
+        }
+    }
+
     /// The negative-family key rank of a member, or `None`.
     #[inline]
     fn negative_rank_if_set(&self, key: NonNegId) -> Option<u64> {
@@ -2096,6 +2114,52 @@ mod tests {
             assert!(!s.is_empty());
         }
         assert_eq!(s.len(), 6, "the repeated 7 counts once");
+    }
+
+    /// The total canonical rank counts members canonically before any ID,
+    /// member or not, against a brute-force count, with and without zero
+    /// and a negative family, at both extremes.
+    #[test]
+    fn canonical_rank_is_total_and_agrees_on_members() {
+        let probes = [
+            0,
+            1,
+            2,
+            7,
+            -1,
+            -2,
+            -7,
+            -8,
+            i64::MAX,
+            i64::MAX - 1,
+            i64::MIN,
+            i64::MIN + 1,
+            1 << 50,
+            -(1 << 50),
+        ];
+        let sets: [&[i64]; 4] = [
+            &[],
+            &[1, 7, i64::MAX],
+            &[0, 2, 7, i64::MAX],
+            &[0, -1, -7, i64::MIN, 2, 1 << 50],
+        ];
+        for members in sets {
+            let mut s = IdSet::new();
+            for &id in members {
+                s.insert(id);
+            }
+            let s = s.into_ranked();
+            for &probe in &probes {
+                let expect = members
+                    .iter()
+                    .filter(|&&m| crate::osm_id::osm_id_cmp(m, probe).is_lt())
+                    .count() as u64;
+                assert_eq!(s.canonical_rank(probe), expect, "{members:?} {probe}");
+                if members.contains(&probe) {
+                    assert_eq!(s.canonical_rank_if_set(probe), Some(expect));
+                }
+            }
+        }
     }
 
     #[test]

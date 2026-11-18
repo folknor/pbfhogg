@@ -468,6 +468,10 @@ impl ConcurrentBlobLocationRouter {
             if blocked.is_none() {
                 blocked = Some(crate::counters::Stopwatch::start());
             }
+            // Test-only: the gate is still held, so a terminal change the
+            // witness lets through must notify after this thread parks.
+            #[cfg(pbfhogg_test_hooks)]
+            self.plan.faults().on_altw_router_park();
             drop(
                 self.notify
                     .wait(mu_guard)

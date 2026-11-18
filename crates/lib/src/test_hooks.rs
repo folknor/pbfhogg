@@ -567,6 +567,17 @@ pub struct FaultPlan {
     pub altw_stage3_bucket_held: Watched<AtomicBool>,
     /// Set when the held bucket saw the router aborted before the bound.
     pub altw_stage3_saw_abort: AtomicBool,
+    /// Stage 3 worker index whose spawn is refused, as an OS refusal would
+    /// be, once a stage 4 thread is parked in the router's readiness wait
+    /// (and, for a worker past the first, once the held bucket is claimed),
+    /// bounded.
+    pub altw_stage3_refuse_spawn_at: AtomicUsize,
+    /// Set when the armed stage 3 spawn refusal was delivered.
+    pub altw_stage3_spawn_refused: AtomicBool,
+    /// Set by the router when a stage 4 thread is about to park in its
+    /// readiness wait, after its final predicate check and with the
+    /// notification gate still held, so any later abort wakes it.
+    pub altw_router_parked: Watched<AtomicBool>,
 
     // --- altw external stage 4 ---
     /// Stage 4 fails as it starts, before its ordered pool, once the held
@@ -870,6 +881,9 @@ impl FaultPlan {
             altw_stage3_hold_bucket: AtomicUsize::new(usize::MAX),
             altw_stage3_bucket_held: Watched::<AtomicBool>::new(false),
             altw_stage3_saw_abort: AtomicBool::new(false),
+            altw_stage3_refuse_spawn_at: AtomicUsize::new(usize::MAX),
+            altw_stage3_spawn_refused: AtomicBool::new(false),
+            altw_router_parked: Watched::<AtomicBool>::new(false),
             altw_stage4_fail_at_start: AtomicBool::new(false),
             altw_stage4_fail_consume_at: AtomicUsize::new(usize::MAX),
             altw_stage4_panic_consume_at: AtomicUsize::new(usize::MAX),
@@ -1882,6 +1896,32 @@ impl FaultPlan {
         self.wait_until(&self.altw_hook_timed_out, &aborted);
         self.altw_stage3_saw_abort
             .store(aborted(), Ordering::SeqCst);
+    }
+
+    /// Called by stage 3 before it spawns worker `worker`: the armed worker's
+    /// spawn is refused, as the OS would refuse it, once a stage 4 thread is
+    /// parked in the router (and, past the first worker, once the held bucket
+    /// is claimed, so a born worker is mid-bucket when the refusal lands).
+    pub(crate) fn on_altw_stage3_spawn(&self, worker: usize) -> std::io::Result<()> {
+        if worker != self.altw_stage3_refuse_spawn_at.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.wait_until(&self.altw_hook_timed_out, || {
+            self.altw_router_parked.load(Ordering::SeqCst)
+                && (worker == 0 || self.altw_stage3_bucket_held.load(Ordering::SeqCst))
+        });
+        self.altw_stage3_spawn_refused.store(true, Ordering::SeqCst);
+        // The kind an OS thread refusal (EAGAIN) carries.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("test-hooks: stage 3 worker {worker} spawn refused"),
+        ))
+    }
+
+    /// Called by the router with its notification gate held, just before a
+    /// stage 4 thread parks in its readiness wait.
+    pub(crate) fn on_altw_router_park(&self) {
+        self.altw_router_parked.store(true, &self.bell);
     }
 
     /// Called by a stage 4 worker just before it waits on the router for way

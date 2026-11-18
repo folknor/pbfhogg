@@ -1420,7 +1420,14 @@ pub(crate) fn external_join_in(
     // PlatformUnsupported raised by the output writer in stage 4 keeps its
     // kind (and exit code) across the join.
     let mut stats = crate::threads::scope(|scope| -> crate::Result<Stats> {
-        let s3_handle = scope.spawn(move || -> crate::Result<()> {
+        // Stage 3 is the router's only producer, so its parent owns the
+        // router's terminal state for every way it can end: a returned error
+        // aborts, success marks the producer done, and an unwind (anything
+        // that escapes `stage3_slot_reorder`, which cannot install its
+        // workers' guards before they exist) aborts through the guard.
+        // Without one of the three a stage 4 readiness wait never ends.
+        let s3_spawned = scope.try_spawn(move || -> crate::Result<()> {
+            let guard = coord_payloads::AbortOnDrop::new(router_ref, "stage 3");
             let integrated = IntegratedInputs {
                 way_slot_starts: way_slot_starts_ref,
                 per_way_rcs: per_way_rcs_ref,
@@ -1434,14 +1441,20 @@ pub(crate) fn external_join_in(
                 num_workers,
                 &host.invocation,
             );
-            // Signal the router that no more publishes are coming. Must
-            // run whether stage 3 succeeded or errored - otherwise stage
-            // 4 waiters on unpublished slots would hang. On error the
-            // worker has already called `router.abort`, but
-            // mark_producer_done is idempotent with abort and cheap.
+            // An abort already raised keeps its first error; done after an
+            // abort is harmless (waiters check the abort first).
+            if let Err(error) = &result {
+                router_ref.abort(error.clone());
+            }
             router_ref.mark_producer_done();
+            guard.disarm();
             result
         });
+        let s3_handle = match s3_spawned {
+            Ok(handle) => handle,
+            // Stage 4 does not exist yet, so nothing waits on the router.
+            Err(e) => return Err(crate::Error::from(e).context("spawn stage 3 thread")),
+        };
         // A stage 4 failure aborts the router, so stage 3 stops at its next
         // bucket claim instead of finishing the rest for nobody: on a returned
         // error here, and through the guard on a panic. Failures inside the
@@ -1449,7 +1462,7 @@ pub(crate) fn external_join_in(
         // `S4Consumer` and the worker guards in `stage4_assembly`); this covers everything else (the schedule, the
         // writer, the final flush). An abort already raised keeps its first
         // error.
-        let s4_handle = scope.spawn(move || -> crate::Result<Stats> {
+        let s4_spawned = scope.try_spawn(move || -> crate::Result<Stats> {
             let guard = coord_payloads::AbortOnDrop::new(router_ref, "stage 4");
             let result = stage4_assembly(
                 input,
@@ -1480,12 +1493,33 @@ pub(crate) fn external_join_in(
             result
         });
 
-        let s3_res = s3_handle
-            .join()
-            .map_err(|payload| crate::error::panic_error("stage 3 thread", payload.as_ref()))?;
+        // Every started parent is joined explicitly and flattened to a
+        // Result before any error is chosen: an early return here would
+        // leave a parent to the scope's join pass, which re-raises its panic
+        // over the error this body returns.
+        let join_s3 = |handle: crate::threads::Handle<'_, '_, '_, crate::Result<()>>| {
+            handle
+                .join()
+                .map_err(|payload| crate::error::panic_error("stage 3 thread", payload.as_ref()))
+                .and_then(|r| r)
+        };
+        let s4_handle = match s4_spawned {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Stage 3 stops at its next bucket claim. A startup priority
+                // rule, not a root-cause claim: the refusal is returned even
+                // if stage 3 recorded an error of its own meanwhile.
+                let e = crate::Error::from(e).context("spawn stage 4 thread");
+                router_ref.abort(e.clone());
+                drop(join_s3(s3_handle));
+                return Err(e);
+            }
+        };
+        let s3_res = join_s3(s3_handle);
         let s4_res = s4_handle
             .join()
-            .map_err(|payload| crate::error::panic_error("stage 4 thread", payload.as_ref()))?;
+            .map_err(|payload| crate::error::panic_error("stage 4 thread", payload.as_ref()))
+            .and_then(|r| r);
 
         // Prefer the stage 3 error if both failed (it's usually the root
         // cause - stage 4 typically errors only because of an abort that

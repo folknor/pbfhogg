@@ -78,7 +78,17 @@ stage 4 also guards its consumer callbacks and each worker body, and the
 guard aborts the router during the unwind. A worker panic otherwise reaches
 the consumer only once every other worker has finished its admitted task,
 which a worker parked in the readiness wait does only when stage 3 publishes
-its slot. Every run records its gate, send and receive waits into its
+its slot. A refused worker spawn is a returned error like any other: the pool
+calls `abandon`, then joins the workers already born.
+
+On the producing side of that router, stage 3 owns its terminal state at
+every exit: a returned error aborts it, success marks the producer done, and
+an unwind of the stage 3 thread (including one before any worker, with its
+own guard, exists) aborts it through a guard. A refused stage 3 worker spawn
+is recorded as stage 3's error and aborts the router before the workers
+already born are joined, and a refused stage 4 thread aborts it before stage
+3 is joined. Both stage threads are joined explicitly before an error is
+chosen, the stage 3 error first. Every run records its gate, send and receive waits into its
 invocation's one set of stall counters (`ordered_pool_*_wait_ns`).
 
 Where only some schedule positions are decoded and the rest are passthrough

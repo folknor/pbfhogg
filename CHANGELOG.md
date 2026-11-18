@@ -325,6 +325,12 @@
 ### Fixed
 
 - `add-locations-to-ways --index-type external` (and Auto when it routes
+  there) no longer hangs when the system refuses to start one of its
+  stage 3 or stage 4 threads (thread or process limits reached). Such a
+  refusal used to be able to leave stage 4 waiting forever for
+  coordinates no thread would produce. The run now fails with the I/O
+  error and publishes nothing.
+- `add-locations-to-ways --index-type external` (and Auto when it routes
   there) no longer publishes ways with vertices at (0, 0) when it cannot
   read a scratch slot bucket back. A failed `stat` on a bucket used to be
   read as "empty", so every resolved vertex in that bucket was written as

@@ -205,7 +205,17 @@ pub(super) fn stage3_slot_reorder(
     crate::threads::scope(|scope| {
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
-            let handle = scope.spawn(move || -> crate::Result<()> {
+            // A refused spawn is this stage's failure, recorded and broadcast
+            // before the workers already born are joined: they stop at their
+            // next claim, and stage 4's readiness waits see the abort. Each
+            // worker's own guard below exists only once it runs, so creation
+            // is owned here (and any other unwind by the stage 3 parent's
+            // guard in `external_join_in`).
+            #[cfg(pbfhogg_test_hooks)]
+            let allowed = cancel.faults().on_altw_stage3_spawn(worker_id);
+            #[cfg(not(pbfhogg_test_hooks))]
+            let allowed: std::io::Result<()> = Ok(());
+            let spawned = allowed.and_then(|()| scope.try_spawn(move || -> crate::Result<()> {
                 use std::sync::atomic::Ordering::Relaxed;
 
                 // Panic-safety: if this closure unwinds before `disarm`,
@@ -424,8 +434,19 @@ pub(super) fn stage3_slot_reorder(
 
                 abort_guard.disarm();
                 Ok(())
-            });
-            handles.push(handle);
+            }));
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(e) => {
+                    let e = Error::from(e).context(format!("spawn stage 3 worker {worker_id}"));
+                    err_ref
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_with(|| e.clone());
+                    router.abort(e);
+                    break;
+                }
+            }
         }
 
         // Propagate first worker error or panic. No manifests to collect -

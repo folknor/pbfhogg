@@ -1,5 +1,6 @@
 //! Fault injection into ALTW external stage 3, through the fault plan on
-//! the run's token (`altw_stage3_panic_at_bucket`, see `pbfhogg::test_hooks`).
+//! the run's token (`altw_stage3_panic_at_bucket` and
+//! `altw_stage3_refuse_spawn_at`, see `pbfhogg::test_hooks`).
 
 use std::sync::atomic::Ordering;
 
@@ -88,5 +89,104 @@ fn fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch() {
     assert!(
         scratch_leaks.is_empty(),
         "altw external leaked scratch after panic: {scratch_leaks:?}"
+    );
+}
+
+/// Run altw external with stage 3 worker `worker`'s spawn refused while a
+/// stage 4 thread is parked in the router, and return the error. A refusal
+/// that left the router without an abort or producer completion would hang
+/// here, so the call runs under a hang bound.
+fn run_with_refused_spawn(test: &str, worker: usize, hold_bucket0: bool) {
+    let Some(ticket) = crate::common::heavy_ticket(1, test) else {
+        return;
+    };
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "altw external did not end after a stage 3 spawn refusal",
+    );
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let nodes: Vec<TestNode> = generate_nodes(60, 1);
+    let ways: Vec<TestWay> = generate_ways(10, 10_000, 6, 1);
+    write_multi_block_test_pbf(&input, &nodes, &ways, &[], 5);
+
+    let host = crate::common::heavy_host(&ticket);
+    let faults = host.invocation.faults();
+    faults
+        .altw_stage3_refuse_spawn_at
+        .store(worker, Ordering::SeqCst);
+    if hold_bucket0 {
+        faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        add_locations_to_ways(
+            &input,
+            crate::common::out(&output),
+            &AltwOptions {
+                keep_untagged_nodes: false,
+                write: WriteOptions::default(),
+                index_type: IndexType::External,
+                inject_prepass: false,
+                ignore_missing_nodes: true,
+            },
+            &pbfhogg::HeaderOverrides::default(),
+            &host,
+            crate::common::scratch_in(dir.path()),
+        )
+    }));
+    let err = match result {
+        Ok(Err(e)) => e,
+        Ok(Ok(_)) => panic!("altw external with a refused stage 3 spawn must not return Ok"),
+        Err(_) => panic!("altw external must return a spawn refusal as an error, not unwind"),
+    };
+    assert!(
+        faults.altw_stage3_spawn_refused.load(Ordering::SeqCst),
+        "stage 3 never reached the armed worker's spawn; the test proved nothing: {err}"
+    );
+    assert!(
+        !faults.altw_hook_timed_out.load(Ordering::SeqCst),
+        "a bounded altw hook wait expired (no stage 4 park observed): {err}"
+    );
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::Io(_)),
+        "the refusal must come back as the I/O error it is: {err}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!(
+            "test-hooks: stage 3 worker {worker} spawn refused"
+        )),
+        "the run failed, but not with the refusal: {text}"
+    );
+    if hold_bucket0 {
+        assert!(
+            faults.altw_stage3_saw_abort.load(Ordering::SeqCst),
+            "the born worker's held bucket never saw the router aborted"
+        );
+    }
+}
+
+/// No stage 3 worker is born: the refusal alone must end stage 4's parked
+/// readiness wait.
+#[test]
+fn a_refused_first_stage3_worker_releases_a_parked_stage4() {
+    run_with_refused_spawn(
+        "a_refused_first_stage3_worker_releases_a_parked_stage4",
+        0,
+        false,
+    );
+}
+
+/// Worker 0 is born and holds bucket 0; refusing worker 1 must stop it and
+/// release stage 4 rather than leave worker 0 to the join.
+#[test]
+fn a_refused_later_stage3_worker_stops_its_born_peers() {
+    run_with_refused_spawn(
+        "a_refused_later_stage3_worker_stops_its_born_peers",
+        1,
+        true,
     );
 }

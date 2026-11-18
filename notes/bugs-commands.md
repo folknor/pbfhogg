@@ -170,21 +170,6 @@ pool that uses every reported core. This contradicts the documented rule in
 `docs/cli/commands.md` that `N` caps worker pools at `N`. These are
 compression workers, not the separately exempted reader or drain threads.
 
-## CMD-013 - A stage 3 startup failure can deadlock the external ALTW pipeline
-
-Reported by: altw [P1].
-
-Stage 3's abort guard is built inside each worker (`altw/external/stage3.rs`).
-If creating the first worker fails, `Scope::spawn` (`threads.rs`) panics
-before any guard exists. Consider an ordering where stage 4 is already
-waiting. The stage 3 parent unwinds past `mark_producer_done`, and the outer
-join converts its panic into an error without aborting the router. Scope
-cleanup then waits for stage 4, whose readiness wait has no publication, abort
-or producer completion to observe. This breaks the router's documented
-terminal-state and panic-safety contract. The stage 3 parent needs failure
-ownership that covers worker creation as well as worker execution. The hunter
-derived this interleaving from source and did not reproduce the hang.
-
 ## CMD-014 - ALTW refuses legal non-default way coordinate framing without documenting it
 
 Reported by: altw [P2].
@@ -549,3 +534,49 @@ with the size error instead of renumbering. It fails loudly and before
 publication, and is sign-neutral (a large positive start does it too). The
 fix is a split path: cut an oversized rewritten block between elements into
 two output blocks with their own indexes.
+
+## CMD-042 - External ALTW stage 4 copies its passthrough prefix after the router aborts
+
+Reported by: the stage 3 startup-deadlock item (2026-11-18), from source
+during the spar; not reproduced.
+
+Before the ordered pool delivers its first result, stage 4's consumer runs
+`before_item(0)` (`altw/external/stage4.rs`), which copies every passthrough
+blob ahead of way blob 0, the whole untagged node prefix under
+`keep_untagged_nodes`. That loop checks only the invocation token. A router
+abort (a stage 3 bucket error, a refused stage 3 spawn) does not trip the
+token, so the call keeps copying, gigabytes at planet scale, before it
+returns the error. Nothing hangs and the error is right, but failure latency
+is a full prefix copy. The fix is to have stage 4 observe `router.is_aborted`
+at its passthrough boundaries, at the same per-blob granularity as the token
+check.
+
+## CMD-043 - The parallel output writer reports startup before its workers exist
+
+Reported by: the stage 3 startup-deadlock item (2026-11-18), from source
+during the spar; not reproduced.
+
+`write/parallel_writer.rs` sends its init success before `run_pool` attempts
+its worker spawns. A refused worker spawn is recorded in `FirstFailure`, but
+the caller has already been told the writer started, and learns of the
+refusal only at a later write or the final flush. In external ALTW stage 4
+can therefore sit in the router's readiness wait (stage 3 still making
+progress) for a writer that is already dead. A delay, not a deadlock. Init
+success should wait until the pool's workers are all born.
+
+## CMD-044 - Most library scopes still spawn with the panicking Scope::spawn
+
+Reported by: the stage 3 startup-deadlock item (2026-11-18).
+
+`threads::Scope::spawn` panics on an OS refusal, and most worker scopes in
+the library use it (stage 1, stage 2, sparse ALTW, the read pipeline,
+classify, apply-changes, diff, geocode and others; the sweep found about
+thirty sites). External ALTW stages 3 and 4 and the ordered pool now use
+`try_spawn` and own a refusal; the others were not analysed. A spawn panic
+inside a scope whose already-born threads wait on a peer that was never
+born, or on a channel the body would have fed, deadlocks the same way the
+stage 3 refusal did. The rest escape the call as a panic rather than a typed
+`Io` error. Each site needs its own wait topology checked, then `try_spawn`
+with the refusal recorded and broadcast before the join. Removing
+`Scope::spawn` once no caller needs it would keep new sites from
+reintroducing it.

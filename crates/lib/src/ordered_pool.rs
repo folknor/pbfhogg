@@ -810,11 +810,19 @@ where
                 metrics,
             };
             let (work, local) = (&work, &local);
-            scope.spawn(move || {
+            let spawned = scope.try_spawn(move || {
                 let _close = CloseOnUnwind(shared.gate);
                 let mut local = local(worker);
                 shared.run(|task| work(shard, &mut local, task));
             });
+            if let Err(e) = spawned {
+                // A returned error like any other: the consumer releases
+                // workers parked on a wait the pool cannot see, then `_close`
+                // and `rx` drop and the scope joins the workers already born.
+                let error = Error::from(e).context(format!("spawn ordered pool worker {worker}"));
+                consumer.abandon(&error);
+                return Err(error);
+            }
         }
         drop(tx);
 

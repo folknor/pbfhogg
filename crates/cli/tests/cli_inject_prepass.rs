@@ -388,8 +388,8 @@ fn inject_prepass_oracle_roundtrip() {
     }
 }
 
-/// The same contract on negative IDs, held by the same oracle. Sparse only:
-/// the external index does not yet take negative node blobs. Ring `w-12`
+/// The same contract on negative IDs, held by the same oracle, under both
+/// backends. Ring `w-12`
 /// closes on `n-2`; `n-2`'s only other use is in `w-10`, so both of the
 /// ring's endpoint bits are set, while ring `w-14` closes on `n-7`, which no
 /// other way uses, so neither endpoint is pinned. `w-13` repeats `n-6`
@@ -442,15 +442,21 @@ fn inject_prepass_oracle_roundtrip_negative_ids() {
     );
     assert_eq!(want_pins.get(&-14), Some(&None), "oracle: an unshared ring");
 
-    let output = dir.path().join("sparse.osm.pbf");
-    run_inject(&input, &output, "sparse");
-    let (ways_out, members) = read_inject_artifacts(&output);
-    assert_eq!(ways_out.len(), ways.len());
-    for (id, pins) in &ways_out {
-        assert_eq!(pins, want_pins.get(id).expect("known way"), "way {id}");
+    for backend in ["sparse", "external"] {
+        let output = dir.path().join(format!("{backend}.osm.pbf"));
+        run_inject(&input, &output, backend);
+        let (ways_out, members) = read_inject_artifacts(&output);
+        assert_eq!(ways_out.len(), ways.len(), "{backend}");
+        for (id, pins) in &ways_out {
+            assert_eq!(
+                pins,
+                want_pins.get(id).expect("known way"),
+                "{backend} way {id}"
+            );
+        }
+        assert_eq!(members.len(), 1, "{backend}: single way blob");
+        assert_eq!(members[0].0, want_members, "{backend}: field-5 membership");
     }
-    assert_eq!(members.len(), 1, "single way blob");
-    assert_eq!(members[0].0, want_members, "field-5 membership");
 }
 
 // What each command does with the enrichment declarations on its output (kept

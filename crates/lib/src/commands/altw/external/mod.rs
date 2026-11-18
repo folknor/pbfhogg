@@ -4,9 +4,10 @@
 //! Instead of building a large random-access node index, this module
 //! pre-computes the way-node join using sequential I/O and bounded memory:
 //!
-//! 1. **Way pass**: stream ways, emit `(node_id, slot_pos)` COO pairs into
-//!    256 node buckets partitioned by high bits of node_id.
-//! 2. **Node join**: per bucket, sort pairs by node_id in memory, merge-join
+//! 1. **Way pass**: stream ways, emit `(node key, slot_pos)` COO pairs into
+//!    256 node buckets partitioned by node key (signed node IDs fall into two
+//!    key families sharing the buckets; see `keys.rs`).
+//! 2. **Node join**: per bucket, sort pairs by node key in memory, merge-join
 //!    with matching node stream, emit `(slot_pos, lat, lon)` into
 //!    256 slot buckets partitioned by high bits of slot_pos.
 //! 3. **Slot reorder**: per bucket, sort by slot_pos, emit final blob-ordered
@@ -19,8 +20,6 @@
 //! input; see `reference/performance/add-locations-to-ways.md` for measurements. This path does not
 //! build a random-access node index.
 
-use std::num::NonZeroUsize;
-
 use crate::write::WriteOptions;
 
 use super::Stats;
@@ -32,6 +31,7 @@ use crate::read::input::PinnedInput;
 mod blob_bucket_index;
 mod blob_meta;
 mod coord_payloads;
+mod keys;
 mod radix;
 mod relation_scan;
 mod space;
@@ -42,7 +42,7 @@ mod stage4;
 
 use crate::tunables::{
     ALTW_STAGE3_WORKERS_CAP, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
-    MAX_BUCKET_WIDTH, NUM_BUCKETS,
+    NUM_BUCKETS,
 };
 
 use stage1::stage1_way_pass;
@@ -50,158 +50,25 @@ use stage2::{SlotBuckets, stage2_node_join};
 use stage3::{IntegratedInputs, SlotBucketRef, stage3_slot_reorder};
 use stage4::stage4_assembly;
 
-/// Width (in node-id space) of one ID bucket.
-///
-/// `bucket_width = ceil(max_node_id / num_buckets)`, with a floor of 1
-/// so empty inputs (`max_node_id = 0`) still produce a usable mapping.
-/// The `div_ceil` rounds up so every node id in `[0, max_node_id]` maps
-/// into the first `num_buckets` buckets when paired with the
-/// `min(num_buckets - 1)` clamp inside [`BucketLayout::locate`].
-///
-/// Stage-1 pass A computes `local_node_id = (node_id - bucket_lo) as
-/// u32`. [`BucketLayout::new`] refuses (with an error) any layout whose
-/// widest bucket-local id would not fit [`LOCAL_ID_MASK`], so the cast is
-/// lossless for any `node_id` inside `[0, max_node_id]`. At
-/// planet (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`,
-/// six orders of magnitude under 2^32.
-fn bucket_width(max_node_id: u64, num_buckets: NonZeroUsize) -> u64 {
-    max_node_id.div_ceil(num_buckets.get() as u64).max(1)
-}
-
-/// Layout used by stage-1 pass A and stage 2 to map a node id to its
-/// `(bucket, local-id-within-bucket)` pair.
-///
-/// Constructed once per run from the largest `max_id` advertised by
-/// any node blob's indexdata, so the bucket bounds are tight for the
-/// actual input rather than the planet-wide constant.
-///
-/// [`Self::locate`] returns `None` for any `node_id > max_node_id`
-/// instead of saturating into the last bucket. That is load-bearing:
-/// out-of-range ids (stale indexdata, corrupt input, accidental
-/// `i64 as u64` of a negative ref) would otherwise silently land in
-/// the final bucket and be truncated to a 32-bit `local_node_id` in
-/// pass A.
-///
-/// `None` means "this id cannot be encoded into the normal bucket
-/// record." Pass A treats it as an unresolved slot and skips
-/// emission. The slot's position is still consumed (per-way refcount
-/// sidecars count every ref, including unresolved ones) so stage 4
-/// fills zero coordinates and increments `missing_locations`. This
-/// matches ALTW's existing behaviour for way refs to nodes that
-/// aren't in the input - common with extracts and node-sparse
-/// fixtures. See `missing_node_refs_get_zero_coordinates` in
-/// `crates/cli/tests/cli_add_locations_to_ways.rs` for the contract canary.
-pub(super) struct BucketLayout {
-    pub(super) max_node_id: u64,
-    pub(super) bucket_width: u64,
-    pub(super) num_buckets: NonZeroUsize,
-    /// Largest bucket-local id [`Self::locate`] can return (the last bucket
-    /// absorbs the `div_ceil` remainder, so this can reach `bucket_width`).
-    /// Sizes the local-id field of the packed id-shard record ([`IdCodec`]).
-    pub(super) max_local: u64,
-}
-
-impl BucketLayout {
-    /// Build the layout for node ids `0..=max_node_id`.
-    ///
-    /// `max_node_id` comes from indexdata, which nothing verifies, so an
-    /// unrepresentable value is an error rather than a panic (CORRECTNESS.md,
-    /// "Blob sidecar metadata" residual: anything sized from indexdata must
-    /// cope with it being wrong). With 256 buckets the limit is a `max_id` of
-    /// 2^38 (~2.7e11, about 20x the live OSM node ID range). That is an
-    /// encoding limit of this backend, not an OSM validity limit: the claim
-    /// may be true, so the message says what to do either way. Clamping
-    /// instead would be wrong here - clamping an honest claim turns every
-    /// node above the clamp into a missing location.
-    pub(super) fn new(max_node_id: u64, num_buckets: usize) -> Result<Self> {
-        let num_buckets = NonZeroUsize::new(num_buckets)
-            .ok_or_else(|| crate::Error::internal("external join bucket layout with no buckets"))?;
-        let bw = bucket_width(max_node_id, num_buckets);
-        // Largest bucket-local id `locate` can produce: `bw - 1` in every
-        // bucket but the last, which absorbs the `div_ceil` remainder and
-        // reaches `max_node_id - last_lo`.
-        let last_lo = (num_buckets.get() as u64 - 1).saturating_mul(bw);
-        let max_local = (bw - 1).max(max_node_id.saturating_sub(last_lo));
-        if bw > MAX_BUCKET_WIDTH || max_local > u64::from(LOCAL_ID_MASK) {
-            return Err(crate::Error::invalid_data(format!(
-                "add-locations-to-ways, external index: the input's node \
-                 indexdata advertises max_id {max_node_id}, above the {} this \
-                 backend can encode ({num_buckets} buckets of at most {} ids). \
-                 If the input really has node ids that large, the sparse index \
-                 has no such limit; if it does not, the indexdata is wrong, and \
-                 checking the file's blob metadata reports which blobs disagree \
-                 with their contents.",
-                (num_buckets.get() as u64).saturating_mul(MAX_BUCKET_WIDTH),
-                MAX_BUCKET_WIDTH,
-            )));
-        }
-        Ok(Self {
-            max_node_id,
-            bucket_width: bw,
-            num_buckets,
-            max_local,
-        })
-    }
-
-    /// Returns `(bucket_idx, local_node_id)` for `node_id`, or `None`
-    /// when `node_id > max_node_id`.
-    pub(super) fn locate(&self, node_id: u64) -> Option<(usize, u32)> {
-        if node_id > self.max_node_id {
-            return None;
-        }
-        // For node_id <= max_node_id, raw_idx may equal num_buckets at
-        // the boundary case (when max_node_id isn't a multiple of
-        // num_buckets, div_ceil overshoots by one). Saturate into the
-        // last bucket; the bucket_lo arithmetic still yields a
-        // legitimate offset since the last bucket can extend up to
-        // max_node_id.
-        #[allow(clippy::cast_possible_truncation)]
-        let raw_idx = (node_id / self.bucket_width) as usize;
-        let bucket_idx = raw_idx.min(self.num_buckets.get() - 1);
-        let bucket_lo = (bucket_idx as u64) * self.bucket_width;
-        let offset = node_id - bucket_lo;
-        // For node_id <= max_node_id and bucket_width <= 1<<30, the
-        // last bucket can extend to max_node_id - bucket_lo. With
-        // num_buckets * bucket_width >= max_node_id, that distance is
-        // at most 2 * bucket_width - 1 < 2 * u32::MAX. u32::try_from
-        // makes the cast explicit; in practice this never fails for
-        // an in-range id, but guard the contract anyway.
-        u32::try_from(offset).ok().map(|local| (bucket_idx, local))
-    }
-}
-
-/// Largest node id advertised by any node-kind blob's indexdata.
-///
-/// This is the input to [`BucketLayout::new`]. Returns 0 when there are no
-/// node blobs (degenerate input - the layout then rejects any non-zero ref).
-///
-/// Infallible because the ranges were validated where they entered:
-/// [`blob_meta::scan_blob_metadata`], the external join's one trust boundary
-/// for indexdata ranges, refuses a reversed range and a node range reaching
-/// below zero, located at the offending blob, before any meta reaches here.
-/// The fold starts at 0, so even an unvalidated negative `max_id` could not
-/// wrap the result.
-fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> u64 {
-    blob_meta
-        .iter()
-        .filter(|meta| matches!(meta.kind, crate::ElementKind::Node))
-        .fold(0_u64, |max, meta| {
-            max.max(u64::try_from(meta.max_id).unwrap_or(0))
-        })
-}
-
-/// What this backend would refuse in an input's indexdata, judged blob by
-/// blob in the one header walk auto routing already makes, so auto never
-/// routes here an input the join then refuses on those same claims. The
-/// checks are the join's own, not copies: [`blob_meta::check_range`] over
-/// every data blob (reversed and negative node ranges, and canonical order),
-/// [`BucketLayout::new`] over the largest node `max_id`, and the `u32`
-/// way-blob ordinal of `stage1`. Refusals that need the way pass (a slot
-/// bucket's width, scratch space) stay with the join, as does the trust
-/// placed in a false but well-formed claim (`reference/indexdata-trust.md`).
+/// What this backend would refuse in an input's indexdata, or would not be
+/// chosen for, judged blob by blob in the one header walk auto routing
+/// already makes, so auto never routes here an input the join then refuses
+/// on those same claims. The checks are the join's own, not copies:
+/// [`blob_meta::check_range`] over every data blob (reversed ranges and
+/// canonical order), the `u32` way-blob ordinal of `stage1`, and the
+/// node-key plan ([`keys::KeyPlan`]) the join builds from the same claims.
+/// A plan needing the wide shard record (node keys past what the packed
+/// record encodes, about 2^38) is not one auto chooses: the join takes it,
+/// but auto keeps such an input on sparse, which it routed to before the
+/// external index could take it. A node blob holding both key families is
+/// decoded by the join's scan, not here, so a disorder hidden inside its
+/// range is the join's refusal of the payload, as for any other blob.
+/// Refusals that need the way pass (a slot bucket's width, scratch space)
+/// stay with the join, as does the trust placed in a false but well-formed
+/// claim (`reference/indexdata-trust.md`).
 pub(super) struct HeaderAdmission {
     order: crate::osm_id::OrderWatermark,
-    max_node_id: u64,
+    nodes: keys::NodeClaims,
     way_blobs: usize,
     refused: Option<crate::Error>,
 }
@@ -210,7 +77,7 @@ impl HeaderAdmission {
     pub(super) fn new() -> Self {
         Self {
             order: crate::osm_id::OrderWatermark::default(),
-            max_node_id: 0,
+            nodes: keys::NodeClaims::default(),
             way_blobs: 0,
             refused: None,
         }
@@ -222,29 +89,34 @@ impl HeaderAdmission {
         if self.refused.is_some() {
             return;
         }
-        if let Err(e) = blob_meta::check_range(idx, &mut self.order) {
+        if let Err(e) = blob_meta::check_range(idx, None, &mut self.order) {
             self.refused = Some(e);
             return;
         }
         match idx.kind {
-            crate::ElementKind::Node => {
-                // `check_range` refused a negative node range above.
-                self.max_node_id = self.max_node_id.max(u64::try_from(idx.max_id).unwrap_or(0));
-            }
+            crate::ElementKind::Node => self.nodes.observe(idx.min_id, idx.max_id, idx.count),
             crate::ElementKind::Way => self.way_blobs += 1,
             crate::ElementKind::Relation => {}
         }
     }
 
-    /// `Ok` when the join would admit the claims observed, else the
-    /// join's own refusal.
+    /// `Ok` when auto may route the input here, else why not: the join's
+    /// own refusal, or the wide plan auto does not choose.
     pub(super) fn finish(self) -> Result<()> {
         if let Some(e) = self.refused {
             return Err(e);
         }
-        BucketLayout::new(self.max_node_id, NUM_BUCKETS)?;
         if let Some(last) = self.way_blobs.checked_sub(1) {
             stage1::way_blob_ordinal(last)?;
+        }
+        let plan = keys::KeyPlan::new(&self.nodes);
+        if !plan.compact {
+            return Err(crate::Error::invalid_data(format!(
+                "its node keys reach {} (positive) and {} (negative), past what the \
+                 external index's packed record encodes, and auto does not choose its \
+                 wide record",
+                plan.pos.max_key, plan.neg.max_key,
+            )));
         }
         Ok(())
     }
@@ -284,227 +156,42 @@ mod admission_tests {
         ])
         .expect("sorted non-negative nodes");
         admit(&[]).expect("no data blob");
-        admit(&[idx(ElementKind::Node, 0, 1 << 38)]).expect("2^38 is encodable");
+        admit(&[idx(ElementKind::Node, 0, 1 << 38)]).expect("2^38 is packed");
+        admit(&[
+            idx(ElementKind::Node, -2, 0),
+            idx(ElementKind::Node, -9, -5),
+            idx(ElementKind::Node, -11, 2),
+            idx(ElementKind::Node, 3, 9),
+        ])
+        .expect("negative node blobs in canonical order");
     }
 
     #[test]
-    fn refuses_what_the_join_refuses() {
+    fn refuses_what_the_join_refuses_or_auto_does_not_choose() {
         for (blobs, says) in [
-            (vec![idx(ElementKind::Node, -2, 0)], "negative node ids"),
             (
                 vec![idx(ElementKind::Node, 5, 9), idx(ElementKind::Node, 1, 2)],
+                "contradict the sorted header",
+            ),
+            (
+                vec![idx(ElementKind::Node, -1, -1), idx(ElementKind::Node, 0, 0)],
                 "contradict the sorted header",
             ),
             (
                 vec![idx(ElementKind::Way, 1, 2), idx(ElementKind::Node, 1, 2)],
                 "contradict the sorted header",
             ),
-            (vec![idx(ElementKind::Node, 1, (1 << 38) + 1)], "max_id"),
-            (vec![idx(ElementKind::Node, 1, i64::MAX)], "max_id"),
+            (
+                vec![idx(ElementKind::Node, 1, (1 << 38) + 1)],
+                "packed record",
+            ),
+            (vec![idx(ElementKind::Node, i64::MIN, -1)], "packed record"),
         ] {
             let err = admit(&blobs).expect_err(says);
             assert!(err.to_string().contains(says), "{says}: {err}");
         }
     }
 }
-
-#[cfg(test)]
-mod max_node_id_tests {
-    use super::{blob_meta::BlobMeta, max_node_id_from_blob_meta};
-    use crate::ElementKind;
-
-    fn meta(kind: ElementKind, min_id: i64, max_id: i64) -> BlobMeta {
-        BlobMeta {
-            frame_offset: 0,
-            data_offset: 0,
-            data_size: 0,
-            kind,
-            min_id,
-            max_id,
-            count: 0,
-            has_tagindex: false,
-            has_tags: false,
-        }
-    }
-
-    #[test]
-    fn empty_input_is_zero() {
-        assert_eq!(max_node_id_from_blob_meta(&[]), 0);
-    }
-
-    #[test]
-    fn no_node_blobs_is_zero() {
-        let metas = [
-            meta(ElementKind::Way, 1, 100),
-            meta(ElementKind::Relation, 1, 50),
-        ];
-        assert_eq!(max_node_id_from_blob_meta(&metas), 0);
-    }
-
-    #[test]
-    fn picks_max_across_node_blobs() {
-        let metas = [
-            meta(ElementKind::Node, 1, 999),
-            meta(ElementKind::Way, 1, 5_000_000),
-            meta(ElementKind::Node, 1000, 12_345),
-            meta(ElementKind::Node, 12_346, 99_999),
-        ];
-        assert_eq!(max_node_id_from_blob_meta(&metas), 99_999);
-    }
-}
-
-#[cfg(test)]
-mod bucket_math_tests {
-    use super::BucketLayout;
-
-    fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
-        let Some(num_buckets) = std::num::NonZeroUsize::new(num_buckets) else {
-            panic!("a test bucket count is nonzero");
-        };
-        super::bucket_width(max_node_id, num_buckets)
-    }
-
-    #[test]
-    fn a_layout_with_no_buckets_is_an_internal_error() {
-        let err = BucketLayout::new(1000, 0)
-            .err()
-            .expect("no buckets is refused");
-        assert!(
-            matches!(err.kind(), crate::ErrorKind::Internal { .. }),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn bucket_width_handles_zero_max() {
-        assert_eq!(bucket_width(0, 256), 1);
-    }
-
-    #[test]
-    fn bucket_width_handles_small_max() {
-        assert_eq!(bucket_width(5, 256), 1);
-        assert_eq!(bucket_width(255, 256), 1);
-        assert_eq!(bucket_width(256, 256), 1);
-        assert_eq!(bucket_width(257, 256), 2);
-    }
-
-    #[test]
-    fn bucket_width_rounds_up() {
-        assert_eq!(bucket_width(1000, 256), 4);
-        assert_eq!(bucket_width(14_000_000_000, 256), 54_687_500);
-    }
-
-    #[test]
-    fn locate_clamps_last_bucket_for_in_range_ids() {
-        let layout = BucketLayout::new(1000, 4).expect("layout");
-        assert_eq!(layout.bucket_width, 250);
-        assert_eq!(layout.locate(0), Some((0, 0)));
-        assert_eq!(layout.locate(249), Some((0, 249)));
-        assert_eq!(layout.locate(250), Some((1, 0)));
-        assert_eq!(layout.locate(999), Some((3, 249)));
-        // node_id == max_node_id rounds raw_idx = 1000/250 = 4, clamped
-        // to 3. bucket_lo = 3 * 250 = 750, so local = 1000 - 750 = 250.
-        assert_eq!(layout.locate(1000), Some((3, 250)));
-    }
-
-    #[test]
-    fn locate_rejects_ids_beyond_max() {
-        let layout = BucketLayout::new(1000, 4).expect("layout");
-        assert_eq!(layout.locate(1001), None);
-        assert_eq!(layout.locate(u64::MAX), None);
-    }
-
-    #[test]
-    fn locate_returns_none_for_negative_refs_cast_via_u64() {
-        // An i64 negative id reinterpreted as u64 lands near u64::MAX.
-        // Pass A must not silently truncate it into the last bucket;
-        // the layout returns None and pass A skips emission (treating
-        // the slot as unresolved, same as a ref to an absent node).
-        let layout = BucketLayout::new(14_000_000_000, 256).expect("layout");
-        #[allow(clippy::cast_sign_loss)]
-        let neg_as_u64 = (-1_i64) as u64;
-        assert_eq!(layout.locate(neg_as_u64), None);
-    }
-
-    #[test]
-    fn locate_handles_zero_max() {
-        let layout = BucketLayout::new(0, 256).expect("layout");
-        // max_node_id=0 means only node id 0 is in range.
-        assert!(matches!(layout.locate(0), Some((b, _)) if b < 256));
-        assert_eq!(layout.locate(1), None);
-    }
-
-    #[test]
-    fn every_referenced_id_maps_to_one_bucket() {
-        let max = 12_345_678u64;
-        let layout = BucketLayout::new(max, 256).expect("layout");
-        for id in (0..=max).step_by(50_000) {
-            let (b, _) = layout.locate(id).unwrap_or_else(|| panic!("locate({id})"));
-            assert!(b < 256, "id={id} -> bucket={b}");
-        }
-        let (lo_b, _) = layout.locate(0).expect("0 in range");
-        let (hi_b, _) = layout.locate(max).expect("max in range");
-        assert!(lo_b <= hi_b);
-    }
-
-    #[test]
-    fn bucket_boundaries_are_exclusive_below_inclusive_above() {
-        let layout = BucketLayout::new(10_000, 10).expect("layout");
-        assert_eq!(layout.bucket_width, 1000);
-        for k in 0u64..10 {
-            let lo = k * 1000;
-            let hi = (k + 1) * 1000 - 1;
-            let expected = usize::try_from(k).expect("k fits in usize");
-            assert_eq!(layout.locate(lo).map(|(b, _)| b), Some(expected), "lo={lo}",);
-            assert_eq!(layout.locate(hi).map(|(b, _)| b), Some(expected), "hi={hi}",);
-        }
-    }
-
-    #[test]
-    fn local_node_id_round_trips_within_bucket() {
-        let layout = BucketLayout::new(10_000, 10).expect("layout");
-        for id in 0u64..=10_000 {
-            let (bucket_idx, local) = layout.locate(id).expect("in range");
-            let bucket_lo = (bucket_idx as u64) * layout.bucket_width;
-            let recovered = bucket_lo + u64::from(local);
-            assert_eq!(
-                recovered, id,
-                "id={id} bucket={bucket_idx} local={local} bucket_lo={bucket_lo}",
-            );
-        }
-    }
-
-    #[test]
-    fn bucket_width_fits_in_u32_at_planet_scale() {
-        // BucketLayout::new enforces this; cross-check the bare fn and
-        // confirm the constructor accepts the planet config.
-        let bw = bucket_width(14_000_000_000, 256);
-        assert!(bw <= u64::from(u32::MAX));
-        assert!(BucketLayout::new(14_000_000_000, 256).is_ok());
-    }
-
-    #[test]
-    fn oversized_indexdata_max_id_is_an_error_not_a_panic() {
-        // max_node_id comes from unverified indexdata. The largest
-        // encodable claim is accepted, one past it is refused with an
-        // error, and so is the adversarial extreme.
-        let limit = 256 * (1_u64 << 30);
-        let layout = BucketLayout::new(limit, 256).expect("2^38 is encodable");
-        let (bucket, local) = layout.locate(limit).expect("max in range");
-        assert_eq!(bucket, 255);
-        assert!(local <= super::LOCAL_ID_MASK);
-
-        let err = BucketLayout::new(limit + 1, 256)
-            .err()
-            .expect("2^38 + 1 must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("sparse index"), "{msg}");
-        assert!(msg.contains("max_id 274877906945"), "{msg}");
-        assert!(BucketLayout::new(u64::MAX, 256).is_err());
-        assert!(BucketLayout::new(u64::MAX >> 1, 256).is_err());
-    }
-}
-
 // Field widths and offsets of a resolved entry
 // `(local_slot_pos: u32, lat: i32, lon: i32)`. Stage 3 decodes these
 // records by the same offsets.
@@ -558,7 +245,8 @@ impl NodeBlobInfo {
     }
 }
 
-/// An id-bucketed occurrence record emitted by stage 1 pass A.
+/// An id-bucketed occurrence record emitted by stage 1 pass A, in the
+/// packed form ([`IdCodec`]).
 ///
 /// `(local_node_id, blob_idx, blob_local_slot)` is the parallel-safe
 /// decomposition of the audit's `(local_node_id, slot_pos)` form: stage
@@ -579,11 +267,112 @@ pub(super) struct IdRecord {
 pub(super) const CLOSURE_FLAG: u32 = 0x8000_0000;
 pub(super) const LOCAL_ID_MASK: u32 = 0x7fff_ffff;
 
-/// Size of one id-shard word. A record is one word, or two when its slot
-/// escapes (see [`IdCodec`]).
+/// An id-bucketed occurrence record in the wide form ([`WideCodec`]): the
+/// whole bucket-local key, for layouts whose keys the packed record cannot
+/// hold. The closure flag rides in the slot's top bit, which a slot never
+/// uses: a way blob decodes to at most 32 MiB and every ref takes at least
+/// one byte of it, so a blob-local slot stays below 2^25.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WideIdRecord {
+    pub(super) local: u64,
+    pub(super) blob_idx: u32,
+    /// Blob-local slot, with [`CLOSURE_FLAG`] for a trailing closed-ring
+    /// reference.
+    pub(super) slot: u32,
+}
+
+/// What stage 2 reads of a record, in either form.
+pub(super) trait ShardRecord: Copy + Send + Sync + std::fmt::Debug + 'static {
+    /// The bucket-local key, without the closure flag.
+    fn local(&self) -> u64;
+    fn closure(&self) -> bool;
+    fn blob_idx(&self) -> u32;
+    fn blob_local_slot(&self) -> u32;
+}
+
+impl ShardRecord for IdRecord {
+    #[inline]
+    fn local(&self) -> u64 {
+        u64::from(self.local_node_id & LOCAL_ID_MASK)
+    }
+    #[inline]
+    fn closure(&self) -> bool {
+        self.local_node_id & CLOSURE_FLAG != 0
+    }
+    #[inline]
+    fn blob_idx(&self) -> u32 {
+        self.blob_idx
+    }
+    #[inline]
+    fn blob_local_slot(&self) -> u32 {
+        self.blob_local_slot
+    }
+}
+
+impl ShardRecord for WideIdRecord {
+    #[inline]
+    fn local(&self) -> u64 {
+        self.local
+    }
+    #[inline]
+    fn closure(&self) -> bool {
+        self.slot & CLOSURE_FLAG != 0
+    }
+    #[inline]
+    fn blob_idx(&self) -> u32 {
+        self.blob_idx
+    }
+    #[inline]
+    fn blob_local_slot(&self) -> u32 {
+        self.slot & LOCAL_ID_MASK
+    }
+}
+
+/// An id-shard wire format: how stage 1 writes a record and stage 2 reads
+/// it back. Each format is its own type, so the emission loop and the join
+/// are compiled once per format and the packed path carries no branch for
+/// the wide one.
+pub(super) trait ShardCodec: Copy + Send + Sync + 'static {
+    type Record: ShardRecord;
+    /// Whether the layout this format serves is a cut layout
+    /// ([`keys::NodeKeyLayout::locate_wide`]).
+    const WIDE: bool;
+    /// Encode one record into `out`, returning the bytes used.
+    fn encode(
+        self,
+        local: u64,
+        closure: bool,
+        blob_idx: u32,
+        slot: u32,
+        out: &mut [u8; 2 * ID_WORD_SIZE],
+    ) -> Result<usize>;
+    /// Decode one shard file's bytes, appending its records to `out`.
+    fn decode_into(self, bytes: &[u8], out: &mut Vec<Self::Record>) -> Result<()>;
+}
+
+/// The run's id-shard format, chosen once from the key layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ShardFormat {
+    Packed(IdCodec),
+    Wide(WideCodec),
+}
+
+impl ShardFormat {
+    /// The format `layout` needs for `way_blobs` way blobs.
+    fn for_layout(layout: &keys::NodeKeyLayout, way_blobs: u64) -> Result<Self> {
+        if layout.wide() {
+            Ok(Self::Wide(WideCodec))
+        } else {
+            Ok(Self::Packed(IdCodec::new(layout.max_local(), way_blobs)?))
+        }
+    }
+}
+
+/// Size of one id-shard word. A packed record is one word, or two when its
+/// slot escapes (see [`IdCodec`]); a wide record is always two.
 pub(super) const ID_WORD_SIZE: usize = size_of::<u64>();
 
-/// The id-shard wire format, sized once per run.
+/// The packed id-shard wire format, sized once per run.
 ///
 /// Pass A is bound by scratch writes (149 GB of id shards at planet in the
 /// old 12-byte form, more than four times the bench host's RAM), so how
@@ -592,7 +381,7 @@ pub(super) const ID_WORD_SIZE: usize = size_of::<u64>();
 /// low: `local_node_id` in `local_bits`, `blob_idx` in `blob_bits`,
 /// `blob_local_slot` in `slot_bits`, then the closure bit. The widths come
 /// from what the run can produce: `local_bits` from
-/// [`BucketLayout::max_local`], `blob_bits` from the way-blob count, and the
+/// the layout's largest local key, `blob_bits` from the way-blob count, and the
 /// slot gets what is left of the 63 bits. No synchronisation between pass A
 /// workers is needed, because each field is known to the worker decoding the
 /// blob.
@@ -645,27 +434,49 @@ impl IdCodec {
     }
 
     /// Encode `rec` into `out`, returning the bytes used (8 or 16).
-    ///
-    /// Pass A's ids come from [`BucketLayout::locate`] and its ordinals from
-    /// the schedule this codec was sized from, so neither can overflow its
-    /// field; a value that does is refused rather than written into a
-    /// neighbouring field.
-    pub(super) fn encode(self, rec: &IdRecord, out: &mut [u8; 2 * ID_WORD_SIZE]) -> Result<usize> {
-        let local = u64::from(rec.local_node_id & LOCAL_ID_MASK);
-        if local >> self.local_bits != 0 || u64::from(rec.blob_idx) >> self.blob_bits != 0 {
+    #[cfg(test)]
+    fn encode_record(self, rec: &IdRecord, out: &mut [u8; 2 * ID_WORD_SIZE]) -> Result<usize> {
+        ShardCodec::encode(
+            self,
+            rec.local(),
+            rec.closure(),
+            rec.blob_idx,
+            rec.blob_local_slot,
+            out,
+        )
+    }
+}
+
+impl ShardCodec for IdCodec {
+    type Record = IdRecord;
+    const WIDE: bool = false;
+
+    /// Pass A's ids come from the layout and its ordinals from the schedule
+    /// this codec was sized from, so neither can overflow its field; a value
+    /// that does is refused rather than written into a neighbouring field.
+    #[inline]
+    fn encode(
+        self,
+        local: u64,
+        closure: bool,
+        blob_idx: u32,
+        slot: u32,
+        out: &mut [u8; 2 * ID_WORD_SIZE],
+    ) -> Result<usize> {
+        if local >> self.local_bits != 0 || u64::from(blob_idx) >> self.blob_bits != 0 {
             return Err(crate::Error::internal(format!(
-                "external join id codec: record {rec:?} does not fit {self:?}"
+                "external join id codec: record (local {local}, blob {blob_idx}) does not \
+                 fit {self:?}"
             )));
         }
-        let closure = u64::from(rec.local_node_id & CLOSURE_FLAG != 0);
-        let slot = u64::from(rec.blob_local_slot);
+        let slot = u64::from(slot);
         let escape = self.slot_escape();
         let escaped = slot >= escape;
         let slot_field = if escaped { escape } else { slot };
         let word = (local << (self.blob_bits + self.slot_bits + 1))
-            | (u64::from(rec.blob_idx) << (self.slot_bits + 1))
+            | (u64::from(blob_idx) << (self.slot_bits + 1))
             | (slot_field << 1)
-            | closure;
+            | u64::from(closure);
         out[..ID_WORD_SIZE].copy_from_slice(&word.to_le_bytes());
         if escaped {
             out[ID_WORD_SIZE..].copy_from_slice(&slot.to_le_bytes());
@@ -675,13 +486,11 @@ impl IdCodec {
         }
     }
 
-    /// Decode one shard file's bytes, appending its records to `out`.
-    ///
     /// Each file is checked on its own, so a truncated tail in one shard
     /// cannot borrow the next shard's first word: the length must be whole
     /// words and the last record must not be a dangling escape. An
     /// extension word wider than `u32` is refused, never truncated.
-    pub(super) fn decode_into(self, bytes: &[u8], out: &mut Vec<IdRecord>) -> Result<()> {
+    fn decode_into(self, bytes: &[u8], out: &mut Vec<IdRecord>) -> Result<()> {
         let (words, rem) = bytes.as_chunks::<ID_WORD_SIZE>();
         if !rem.is_empty() {
             return Err(crate::Error::internal(format!(
@@ -727,9 +536,71 @@ impl IdCodec {
     }
 }
 
+/// The wide id-shard wire format: two little-endian `u64` words per
+/// record, the whole bucket-local key, then `blob_idx << 32 | slot` with the
+/// closure flag in the slot's top bit (see [`WideIdRecord`]). Used only by
+/// runs whose node keys the packed word cannot hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WideCodec;
+
+impl ShardCodec for WideCodec {
+    type Record = WideIdRecord;
+    const WIDE: bool = true;
+
+    #[inline]
+    fn encode(
+        self,
+        local: u64,
+        closure: bool,
+        blob_idx: u32,
+        slot: u32,
+        out: &mut [u8; 2 * ID_WORD_SIZE],
+    ) -> Result<usize> {
+        if slot & CLOSURE_FLAG != 0 {
+            return Err(crate::Error::internal(format!(
+                "external join wide id codec: blob-local slot {slot} is past any way blob's \
+                 32 MiB payload"
+            )));
+        }
+        let flagged = if closure { slot | CLOSURE_FLAG } else { slot };
+        out[..ID_WORD_SIZE].copy_from_slice(&local.to_le_bytes());
+        let tail = (u64::from(blob_idx) << 32) | u64::from(flagged);
+        out[ID_WORD_SIZE..].copy_from_slice(&tail.to_le_bytes());
+        Ok(2 * ID_WORD_SIZE)
+    }
+
+    fn decode_into(self, bytes: &[u8], out: &mut Vec<WideIdRecord>) -> Result<()> {
+        let (records, rem) = bytes.as_chunks::<{ 2 * ID_WORD_SIZE }>();
+        if !rem.is_empty() {
+            return Err(crate::Error::internal(format!(
+                "wide id shard length {} is not a multiple of {}",
+                bytes.len(),
+                2 * ID_WORD_SIZE
+            )));
+        }
+        out.extend(records.iter().map(|r| {
+            let mut local = [0u8; ID_WORD_SIZE];
+            local.copy_from_slice(&r[..ID_WORD_SIZE]);
+            let mut tail = [0u8; ID_WORD_SIZE];
+            tail.copy_from_slice(&r[ID_WORD_SIZE..]);
+            let tail = u64::from_le_bytes(tail);
+            #[allow(clippy::cast_possible_truncation)]
+            WideIdRecord {
+                local: u64::from_le_bytes(local),
+                blob_idx: (tail >> 32) as u32,
+                slot: tail as u32,
+            }
+        }));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod id_record_tests {
-    use super::{BucketLayout, CLOSURE_FLAG, ID_WORD_SIZE, IdCodec, IdRecord};
+    use super::{
+        CLOSURE_FLAG, ID_WORD_SIZE, IdCodec, IdRecord, ShardCodec, ShardRecord, WideCodec,
+        WideIdRecord, keys,
+    };
 
     fn rec(local_node_id: u32, blob_idx: u32, blob_local_slot: u32) -> IdRecord {
         IdRecord {
@@ -744,7 +615,7 @@ mod id_record_tests {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 2 * ID_WORD_SIZE];
         for r in records {
-            let n = codec.encode(r, &mut buf).expect("fits");
+            let n = codec.encode_record(r, &mut buf).expect("fits");
             bytes.extend_from_slice(&buf[..n]);
         }
         bytes
@@ -758,10 +629,14 @@ mod id_record_tests {
         bytes
     }
 
+    fn max_local(max_key: u64) -> u64 {
+        keys::FamilyLayout::equal(0, 256, max_key).max_local()
+    }
+
     #[test]
     fn planet_widths_pack_one_word_per_record() {
-        let layout = BucketLayout::new(14_000_000_000, 256).expect("layout");
-        let codec = IdCodec::new(layout.max_local, 146_000).expect("codec");
+        let max = max_local(14_000_000_000);
+        let codec = IdCodec::new(max, 146_000).expect("codec");
         assert_eq!(
             codec,
             IdCodec {
@@ -770,11 +645,11 @@ mod id_record_tests {
                 slot_bits: 19
             }
         );
-        let max_local = u32::try_from(layout.max_local).expect("u32");
+        let max = u32::try_from(max).expect("u32");
         let records = [
             rec(0, 0, 0),
-            rec(max_local, 145_999, 524_286),
-            rec(max_local | CLOSURE_FLAG, 7, 9),
+            rec(max, 145_999, 524_286),
+            rec(max | CLOSURE_FLAG, 7, 9),
         ];
         assert_eq!(round_trip(codec, &records).len(), 3 * ID_WORD_SIZE);
     }
@@ -802,12 +677,11 @@ mod id_record_tests {
     }
 
     #[test]
-    fn widest_admitted_fields_leave_no_slot_bits_and_escape_every_record() {
-        // max_id 2^38 is the largest the layout admits; its last bucket's
-        // local id is 2^30, which needs 31 bits.
-        let layout = BucketLayout::new(1 << 38, 256).expect("layout");
-        assert_eq!(layout.max_local, 1 << 30);
-        let codec = IdCodec::new(layout.max_local, 1 << 32).expect("codec");
+    fn widest_packed_fields_leave_no_slot_bits_and_escape_every_record() {
+        // max_id 2^38 is the largest the packed layout takes; its last
+        // bucket's local id is 2^30, which needs 31 bits.
+        assert_eq!(max_local(1 << 38), 1 << 30);
+        let codec = IdCodec::new(1 << 30, 1 << 32).expect("codec");
         assert_eq!(codec.slot_bits, 0);
         let records = [rec(1 << 30, u32::MAX, 0), rec(0, 0, u32::MAX)];
         assert_eq!(round_trip(codec, &records).len(), 4 * ID_WORD_SIZE);
@@ -816,10 +690,9 @@ mod id_record_tests {
     #[test]
     fn exact_bucket_boundary_and_tiny_schedules() {
         // max_id 256 over 256 buckets: width 1, but node 256 is local id 1.
-        let layout = BucketLayout::new(256, 256).expect("layout");
-        assert_eq!(layout.max_local, 1);
+        assert_eq!(max_local(256), 1);
         for blobs in [0, 1, 2] {
-            let codec = IdCodec::new(layout.max_local, blobs).expect("codec");
+            let codec = IdCodec::new(1, blobs).expect("codec");
             round_trip(codec, &[rec(1, 0, 0), rec(CLOSURE_FLAG, 0, 70_000)]);
         }
     }
@@ -828,8 +701,9 @@ mod id_record_tests {
     fn a_field_past_its_width_is_refused() {
         let codec = IdCodec::new(3, 2).expect("codec");
         let mut buf = [0u8; 2 * ID_WORD_SIZE];
-        assert!(codec.encode(&rec(4, 0, 0), &mut buf).is_err());
-        assert!(codec.encode(&rec(0, 2, 0), &mut buf).is_err());
+        assert!(codec.encode_record(&rec(4, 0, 0), &mut buf).is_err());
+        assert!(codec.encode_record(&rec(0, 2, 0), &mut buf).is_err());
+        assert!(codec.encode(1 << 40, false, 0, 0, &mut buf).is_err());
         assert!(IdCodec::new(1 << 31, 1).is_err());
         assert!(IdCodec::new(1, (1 << 32) + 1).is_err());
     }
@@ -855,8 +729,44 @@ mod id_record_tests {
         wide[2 * ID_WORD_SIZE..].copy_from_slice(&(1u64 << 32).to_le_bytes());
         assert!(tight.decode_into(&wide, &mut out).is_err());
     }
-}
 
+    #[test]
+    fn wide_records_carry_the_whole_key_and_the_closure_flag() {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 2 * ID_WORD_SIZE];
+        for (local, closure, blob, slot) in [
+            (0, false, 0, 0),
+            (1u64 << 63, true, u32::MAX, (1 << 25) - 1),
+            (u64::MAX >> 1, false, 7, 9),
+        ] {
+            let n = WideCodec
+                .encode(local, closure, blob, slot, &mut buf)
+                .expect("fits");
+            assert_eq!(n, 2 * ID_WORD_SIZE);
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        let mut out: Vec<WideIdRecord> = Vec::new();
+        WideCodec.decode_into(&bytes, &mut out).expect("decode");
+        let seen: Vec<_> = out
+            .iter()
+            .map(|r| (r.local(), r.closure(), r.blob_idx(), r.blob_local_slot()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (0, false, 0, 0),
+                (1 << 63, true, u32::MAX, (1 << 25) - 1),
+                (u64::MAX >> 1, false, 7, 9),
+            ]
+        );
+        assert!(
+            WideCodec
+                .encode(0, false, 0, CLOSURE_FLAG, &mut buf)
+                .is_err()
+        );
+        assert!(WideCodec.decode_into(&bytes[..24], &mut out).is_err());
+    }
+}
 /// A resolved coordinate ready to be scattered into a slot bucket for
 /// stage 3's coord_payloads emission.
 // Scratch wire records are 12 bytes (u32 bucket-local slot, i32 lat, i32
@@ -1167,16 +1077,22 @@ pub(crate) fn external_join_in(
         .counter("extjoin_meta_tag_scan_enabled", !keep_untagged_nodes);
     host.invocation.marker("EXTJOIN_META_SCAN_END");
 
-    // Build the BucketLayout for IdRecord emission. Width is derived
-    // from the largest node-blob max_id in indexdata, not the
-    // planet-wide constant - tighter buckets on smaller fixtures
-    // and exact for any real input.
-    let max_node_id = max_node_id_from_blob_meta(&blob_meta);
-    let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS)?;
+    // The node-key layout for record emission and the join, from the node
+    // blobs' claims (and the decoded split of a blob holding both key
+    // families): tight for the actual input, not a planet-wide constant.
+    let plan = keys::KeyPlan::new(&keys::NodeClaims::of(&blob_meta));
+    let node_spans = keys::NodeSpans::build(&blob_meta, &plan)?;
+    let bucket_layout = keys::NodeKeyLayout::new(&plan, &node_spans);
     host.invocation
-        .counter("extjoin_bucket_max_node_id", max_node_id);
+        .counter("extjoin_bucket_max_node_id", bucket_layout.pos.max_key());
     host.invocation
-        .counter("extjoin_bucket_width", bucket_layout.bucket_width);
+        .counter("extjoin_bucket_width", bucket_layout.pos.width());
+    host.invocation
+        .counter("extjoin_neg_buckets", bucket_layout.neg.buckets());
+    host.invocation
+        .counter("extjoin_neg_max_key", bucket_layout.neg.max_key());
+    host.invocation
+        .counter("extjoin_id_shard_wide", bucket_layout.wide());
 
     // Stage 1: produces total_slots, id_bucket_counts, num_shard_workers
     // and the per-node-blob mapping (see `Stage1Output`).
@@ -1307,7 +1223,7 @@ pub(crate) fn external_join_in(
     let total_slots = stage1_out.total_slots;
     let id_bucket_counts = stage1_out.id_bucket_counts;
     let num_shard_workers = stage1_out.num_shard_workers;
-    let stage1_out_codec = stage1_out.id_codec;
+    let stage1_out_format = stage1_out.format;
     let node_blob_mapping = stage1_out.node_blob_mapping;
 
     // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
@@ -1384,7 +1300,7 @@ pub(crate) fn external_join_in(
         scratch,
         &id_bucket_counts,
         num_shard_workers,
-        stage1_out_codec,
+        stage1_out_format,
         bucket_layout_ref,
         &way_slot_starts,
         &slot_buckets,
@@ -1392,6 +1308,7 @@ pub(crate) fn external_join_in(
         total_slots,
         &input_pbf,
         &node_blob_mapping,
+        &node_spans,
         inject_prepass,
         host,
     )?;

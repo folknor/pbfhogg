@@ -676,10 +676,11 @@ pub(crate) const NUM_BUCKETS: usize = 256;
 /// writers, so this capacity also determines ALTW's aggregate buffering.
 pub(crate) const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
-/// Widest bucket the record encoding accepts. A bucket-local id must fit in
-/// `LOCAL_ID_MASK` (31 bits; the top bit is `CLOSURE_FLAG`), and the last
-/// bucket can extend one full width past its nominal end, so a width of 2^30
-/// keeps every local id at or below 2^30 with margin to spare.
+/// Widest equal-width bucket the packed id-shard record accepts. A
+/// bucket-local id must fit in `LOCAL_ID_MASK` (31 bits; the top bit is
+/// `CLOSURE_FLAG`), and the last bucket can extend one full width past its
+/// nominal end, so a width of 2^30 keeps every local id at or below 2^30
+/// with margin to spare. A layout past it runs the wide record instead.
 pub(crate) const MAX_BUCKET_WIDTH: u64 = 1 << 30;
 
 /// Stage-1 blob-level count stream: one u64 per way blob plus the total. This

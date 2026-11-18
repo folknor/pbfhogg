@@ -1,13 +1,13 @@
 //! Stage 1: Single-pass way scan + node-blob mapping.
 //!
-//!   Pass A: parallel scan of way blobs. Per ref it emits one
-//!     [`super::IdRecord`] into the appropriate id-bucket shard
-//!     (1 of 256, keyed by `node_id / bucket_width`) and accumulates
-//!     a per-way refcount sidecar plus the total ref count. Negative
-//!     refs and refs above the indexdata-derived `max_node_id` are
-//!     soft-skipped: the slot index still advances so stage 4 fills
-//!     zero coords for those positions, matching the existing
-//!     missing-ref behaviour.
+//!   Pass A: parallel scan of way blobs. Per ref it emits one record
+//!     into the appropriate id-bucket shard (1 of 256, by the ref's node
+//!     key; see `keys.rs`) and accumulates a per-way refcount sidecar plus
+//!     the total ref count. A ref no node blob's claim can hold (outside
+//!     its key family's range, or in a family the input has no node of) is
+//!     soft-skipped: the slot index still advances so stage 4 fills zero
+//!     coords for those positions, matching the existing missing-ref
+//!     behaviour.
 //!   Node blob mapping: header-only walk of node blobs that records
 //!     each blob's `(data_offset, data_size, min_id, max_id)`.
 //!     Stage 2 partitions the slice by `[min_id, max_id]` to find
@@ -17,7 +17,8 @@ use std::io::{BufWriter, Write as _};
 
 use super::super::Result;
 use super::blob_meta::BlobMeta;
-use super::{BucketLayout, ID_WORD_SIZE, IdCodec, IdRecord, NodeBlobInfo};
+use super::keys::NodeKeyLayout;
+use super::{ID_WORD_SIZE, NodeBlobInfo, ShardCodec, ShardFormat};
 use crate::error::Error;
 use crate::scratch::{RunScratch, ScratchPath};
 use crate::tunables::{
@@ -36,8 +37,8 @@ crate::counters::counter_set! {
         bytes_read => "s1a_bytes_read",
         pread_calls => "s1a_pread_calls",
         per_way_sidecar_bytes => "s1a_per_way_sidecar_bytes",
-        /// Per-ref IdRecord emission to id-bucket shards. Records that can't
-        /// be encoded (negative ref or node_id > max_node_id) are skipped;
+        /// Per-ref record emission to id-bucket shards. Refs no node blob's
+        /// claim can hold are skipped;
         /// those slots fall through to stage 4 as zero-coord missing
         /// locations, matching the existing missing-ref behaviour pinned by
         /// `missing_node_refs_get_zero_coordinates`.
@@ -45,7 +46,9 @@ crate::counters::counter_set! {
         id_records_emitted => "s1a_id_records_emitted",
         id_records_skipped => "s1a_id_records_skipped",
         /// Records whose slot did not fit the packed word and took a second
-        /// one (see [`IdCodec`]); `s1a_id_shard_bytes_written` includes them.
+        /// one (see [`super::IdCodec`]); `s1a_id_shard_bytes_written`
+        /// includes them. Zero under the wide record, whose two words are
+        /// its fixed size, not an escape.
         id_records_escaped => "s1a_id_records_escaped",
         id_shard_bytes_written => "s1a_id_shard_bytes_written",
         id_shard_write_ns => "s1a_id_shard_write_ms" / 1_000_000,
@@ -225,7 +228,7 @@ pub(super) struct Stage1Output {
     pub id_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
     /// The id-shard wire format pass A wrote, for stage 2 to read back.
-    pub id_codec: IdCodec,
+    pub format: ShardFormat,
     pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
@@ -244,6 +247,73 @@ fn shard_error(
         |path| path.display().to_string(),
     );
     Error::from(err).context(format!("failed to {what} id shard {shard}"))
+}
+
+/// One way blob's refs, as pass A emits them.
+struct BlobRefs<'b> {
+    ids: &'b [i64],
+    /// Per ref, whether it closes a ring; empty unless `inject_prepass`.
+    closure: &'b [bool],
+    inject_prepass: bool,
+    /// The blob's way-blob ordinal.
+    seq: u32,
+}
+
+/// Where one pass A worker writes its records.
+struct EmitSink<'s, 'a> {
+    writers: &'s mut [BufWriter<TimedShardWriter<'a>>],
+    counts: &'s mut [u64],
+    buf: &'s mut [u8; 2 * ID_WORD_SIZE],
+    scratch: &'s RunScratch,
+    worker_id: usize,
+}
+
+/// What one blob's emission did.
+struct EmitTally {
+    emitted: u64,
+    skipped: u64,
+    escaped: u64,
+    bytes: u64,
+}
+
+/// Emit one record per ref of `refs` that a node blob's claim can hold;
+/// every other ref is skipped, its slot left unresolved.
+#[inline]
+fn emit_refs<C: ShardCodec>(
+    codec: C,
+    layout: &NodeKeyLayout,
+    refs: &BlobRefs<'_>,
+    sink: &mut EmitSink<'_, '_>,
+) -> Result<EmitTally> {
+    let mut tally = EmitTally {
+        emitted: 0,
+        skipped: 0,
+        escaped: 0,
+        bytes: 0,
+    };
+    for (i, &node_id) in refs.ids.iter().enumerate() {
+        let blob_local_slot = u32::try_from(i)
+            .map_err(|_| Error::invalid_data(format!("way blob has > u32::MAX refs (i={i})")))?;
+        let location = if C::WIDE {
+            layout.locate_wide(node_id)
+        } else {
+            layout.locate_compact(node_id)
+        };
+        let Some((bucket_idx, local)) = location else {
+            tally.skipped += 1;
+            continue;
+        };
+        let closure = refs.inject_prepass && refs.closure[i];
+        let len = codec.encode(local, closure, refs.seq, blob_local_slot, sink.buf)?;
+        sink.writers[bucket_idx]
+            .write_all(&sink.buf[..len])
+            .map_err(|e| shard_error(e, "write", sink.scratch, sink.worker_id, bucket_idx))?;
+        sink.counts[bucket_idx] += 1;
+        tally.emitted += 1;
+        tally.escaped += u64::from(!C::WIDE && len > ID_WORD_SIZE);
+        tally.bytes += len as u64;
+    }
+    Ok(tally)
 }
 
 /// Build the way-blob schedule from the shared blob metadata scan.
@@ -308,8 +378,8 @@ pub(super) fn stage1_pass_a(
     schedule: &[WayBlobTask],
     num_workers: usize,
     scratch: &RunScratch,
-    layout: &BucketLayout,
-    codec: IdCodec,
+    layout: &NodeKeyLayout,
+    format: ShardFormat,
     ref_count_sidecar: &ScratchPath,
     per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
@@ -466,9 +536,8 @@ pub(super) fn stage1_pass_a(
                 let first_way = walk.finish().map_err(in_input)?;
                 t2.record_ms(&counters_ref.scan_way_refs_ms);
 
-                // Emit IdRecords per ref into
-                // id-bucket shards. Records for negative refs
-                // or out-of-range node ids (> max_node_id)
+                // Emit one record per ref into id-bucket
+                // shards. Refs no node blob's claim can hold
                 // are skipped; those slots stay unresolved
                 // and stage 4 fills zero coordinates.
                 let t_id = crate::counters::Stopwatch::start();
@@ -496,45 +565,31 @@ pub(super) fn stage1_pass_a(
                         || host.invocation.is_cancelled(),
                     );
                 }
-                let mut blob_emitted: u64 = 0;
-                let mut blob_skipped: u64 = 0;
-                let mut blob_escaped: u64 = 0;
-                let mut blob_bytes: u64 = 0;
-                for (i, &node_id) in blob_node_ids.iter().enumerate() {
-                    let blob_local_slot = u32::try_from(i).map_err(|_| {
-                        Error::invalid_data(format!("way blob has > u32::MAX refs (i={i})"))
-                    })?;
-                    let location = if node_id < 0 {
-                        None
-                    } else {
-                        #[allow(clippy::cast_sign_loss)]
-                        layout_ref.locate(node_id as u64)
-                    };
-                    if let Some((bucket_idx, local_node_id)) = location {
-                        let rec = IdRecord {
-                            local_node_id: local_node_id
-                                | if inject_prepass && closure_slots[i] {
-                                    super::CLOSURE_FLAG
-                                } else {
-                                    0
-                                },
-                            blob_idx: task.seq,
-                            blob_local_slot,
-                        };
-                        let len = codec.encode(&rec, id_rec_buf)?;
-                        id_shard_writers[bucket_idx]
-                            .write_all(&id_rec_buf[..len])
-                            .map_err(|e| {
-                                shard_error(e, "write", scratch_ref, worker_id, bucket_idx)
-                            })?;
-                        id_bucket_local_counts[bucket_idx] += 1;
-                        blob_emitted += 1;
-                        blob_escaped += u64::from(len > ID_WORD_SIZE);
-                        blob_bytes += len as u64;
-                    } else {
-                        blob_skipped += 1;
-                    }
-                }
+                let mut sink = EmitSink {
+                    writers: id_shard_writers,
+                    counts: id_bucket_local_counts,
+                    buf: id_rec_buf,
+                    scratch: scratch_ref,
+                    worker_id,
+                };
+                let refs = BlobRefs {
+                    ids: &blob_node_ids,
+                    closure: &closure_slots,
+                    inject_prepass,
+                    seq: task.seq,
+                };
+                // One dispatch per blob: each format's loop is compiled on
+                // its own, so the packed loop carries no wide branch.
+                let tally = match format {
+                    ShardFormat::Packed(codec) => emit_refs(codec, layout_ref, &refs, &mut sink)?,
+                    ShardFormat::Wide(codec) => emit_refs(codec, layout_ref, &refs, &mut sink)?,
+                };
+                let EmitTally {
+                    emitted: blob_emitted,
+                    skipped: blob_skipped,
+                    escaped: blob_escaped,
+                    bytes: blob_bytes,
+                } = tally;
                 t_id.record_ms(&counters_ref.id_emit_ms);
                 counters_ref
                     .id_records_emitted
@@ -586,8 +641,9 @@ pub(super) fn stage1_pass_a(
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
 /// happens here - for each node blob we read its indexdata `(min_id, max_id)`.
 /// Stage 2 partitions this slice by `[min_id, max_id]` to find blobs
-/// that intersect each id bucket. The ranges are well-formed, non-negative
-/// and in non-decreasing id order (equal boundaries allowed) because
+/// that intersect each id bucket, through the per-family key spans
+/// (`keys::NodeSpans`) that index this mapping. The ranges are well-formed
+/// and in canonical order (equal boundaries allowed) because
 /// `blob_meta::scan_blob_metadata` refused the input otherwise; that scan
 /// is the trust boundary, so nothing is re-checked here.
 #[hotpath::measure]
@@ -634,7 +690,7 @@ pub(super) fn stage1_way_pass(
     input: &crate::read::input::PinnedInput,
     _direct_io: bool,
     scratch: &RunScratch,
-    layout: &BucketLayout,
+    layout: &NodeKeyLayout,
     ref_count_sidecar: &ScratchPath,
     per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
@@ -737,18 +793,18 @@ pub(super) fn stage1_way_pass(
     host.invocation.counter("extjoin_cpu_cap_workers", cpu_cap);
     host.invocation.counter("extjoin_fd_cap_workers", fd_cap);
 
-    let id_codec = IdCodec::new(layout.max_local, schedule.len() as u64)?;
-    host.invocation.counter(
-        "extjoin_id_codec_slot_bits",
-        u64::from(id_codec.slot_bits()),
-    );
+    let format = ShardFormat::for_layout(layout, schedule.len() as u64)?;
+    if let ShardFormat::Packed(codec) = format {
+        host.invocation
+            .counter("extjoin_id_codec_slot_bits", u64::from(codec.slot_bits()));
+    }
     let (total_refs, id_bucket_counts) = stage1_pass_a(
         input,
         &schedule,
         num_workers,
         scratch,
         layout,
-        id_codec,
+        format,
         ref_count_sidecar,
         per_way_refcount_sidecar,
         inject_prepass,
@@ -763,7 +819,7 @@ pub(super) fn stage1_way_pass(
         total_slots: total_refs,
         id_bucket_counts,
         num_shard_workers: num_workers,
-        id_codec,
+        format,
         node_blob_mapping,
     })
 }

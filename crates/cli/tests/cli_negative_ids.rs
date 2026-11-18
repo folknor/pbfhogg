@@ -2210,16 +2210,6 @@ fn altw_external() -> Case {
         |w, dir, f| altw_args(w, dir, f, &["--index-type", "external"]),
         |w, o| pbf_result(o, OUT, &altw_expected(w), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 2,
-            says: "node blob indexdata range [min_id=-2, max_id=0] holds negative node ids, \
-                   which the external index cannot join",
-        },
-        "the external index refuses node blobs below zero",
-    )])
 }
 
 /// Unindexed with `--force`, auto routes to sparse whatever the host.

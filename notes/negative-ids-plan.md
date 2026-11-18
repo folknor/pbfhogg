@@ -134,8 +134,8 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 20-22 | tags-filter PBF default, `-R`, OSC | Exact and signed since commit 4 **[S]**. | P | Default abs-folds; `-R` direct; OSC unsupported. |
 | 23-26 | extract simple, complete-ways, smart, `--config` | Exact and signed since commit 5 **[S]**. | P | simple abs-folds; complete_ways and smart run out of memory on a negative outside way node **[O]** |
 | 27 | ALTW sparse | Exact and signed since commit 7 **[S]**. | P | Separate negative index; joins **[O]** |
-| 28 | ALTW external | `check_range` refuses a min < 0; stage 1 skips negative refs **[S]**. | S+. Two bucket families (section 4.5). | Joins |
-| 29 | ALTW auto, `--force` | Header admission gate and post-pass-0 recheck since commit 7 **[S]**. | P. Item 8 deletes the gate's negative clause with `check_range`. | n/a |
+| 28 | ALTW external | Exact and signed since commit 8, any node ID **[S]**. | P | Joins |
+| 29 | ALTW auto, `--force` | Header admission gate and post-pass-0 recheck since commit 7; negative clause gone with commit 8 **[S]**. | P | n/a |
 | 30-32 | ALTW retention, `--inject-prepass`, `--ignore-missing-nodes` | Exact and signed since commit 7 **[S]**. | P | `--keep-member-nodes` abs-folds and unsupported **[O][C:altw]**; missing nodes get an undefined raw location **[C:altw]**, see the doc gap in section 10. |
 | 33 | build-geocode-index | pass1 drops negative admin ways **[S]**; pass1_5 skips negative refs. | S+ (section 4.7). | No counterpart. traccar is partial: signed member ways, but a `Dummy` negative location store, so a negative node ref fails **[O][C:rgp]**. |
 | 34 | geocode-query | No ID operand. | P | n/a |
@@ -177,38 +177,19 @@ Commit 7 deleted the three sparse sign guards; the one signed
 `RankedIdSet` already ranks both families into one store, so no second
 store or positive-only variant was built (measured neutral). Auto holds
 indexdata to external's own header checks (`HeaderAdmission`) and rechecks
-the exact store after pass 0.
+the exact store after pass 0. Conflicting duplicate node records (a
+deterministic winner shared by both engines) are BUG-009, sign-neutral.
 
-What remains for item 8: delete the negative clause of `HeaderAdmission`
-together with `check_range`. Conflicting duplicate node records (a
-deterministic winner shared by both engines) are BUG-009, sign-neutral; a
-negative duplicate is as nondeterministic on sparse as a positive one.
+### 4.5 ALTW external join: two key families [landed]
 
-### 4.5 ALTW external join: two bucket families [C:altw]
-
-1. **Metadata.**
-   - Keep numeric signed extrema for validation.
-   - Join-key intervals are per family. A negative-only blob has
-     `[!max_id, !min_id]`.
-   - Decode the boundary blobs, those with `min_id < 0 <= max_id`. Use
-     `ClaimWalk` to check canonical order, count and extrema, and feed the
-     actual first and last IDs into the watermark.
-   - A blob `[0, -1]` belongs to both families.
-   - `[-1]` followed by `[-2, 1]` is valid, while `[-1]` followed by
-     `[0, -2, 1]` is a descent. They have the same extrema, so only a decode
-     can tell them apart.
-2. **Stage 1.** Emit records keyed by `(family, key)`. A wide record path
-   carries keys beyond the compact codec's limit of about `2^38`. Open shards
-   are charged to the descriptor and scratch plans.
-3. **Stage 2.** Partition per family. Merge only the tuples of that family,
-   and never cross families inside a mixed blob. With prepass on, count over
-   the whole `(family, key)` run. Spill runs that are too large.
-4. **Stage 4.**
-   - `AscendingTally` stays for non-negative claims.
-   - Signed claims are validated canonically.
-   - The retention skip asks whether either signed portion of the range can
-     hold a retained node.
-   - `check_range`'s refusal is deleted.
+Commit 8 (`altw/external/keys.rs`): with a negative node claim, IDs `<= 0`
+are keyed by magnitude and positive IDs by themselves, sharing the 256
+buckets by claimed node count; without one, today's single family. The one
+node blob holding both families is decoded by the metadata scan for its
+spans and actual first element. Packed records where keys fit (about
+2^38); otherwise a wide 16-byte record with node-blob cut points, which
+auto never chooses. `check_range`'s negative clause and the 2^38 refusal
+are gone.
 
 ### 4.6 renumber signed remap [C:rgp, O]
 
@@ -263,8 +244,7 @@ implementation.
 | Path | What changes on positive input | How it stays free |
 |---|---|---|
 | ALTW sparse | Landed; measured neutral (commit 7, Japan and planet). | n/a |
-| ALTW external stage 1 | `(family, key)` emit. | The compact positive record path is kept. A family branch per ref is the only addition. |
-| ALTW external stages 2 and 4 | Per-family partition. | Canonical decode only for blobs straddling zero; there are none on positive input. |
+| ALTW external | Landed; measured neutral (commit 8, Germany). | n/a |
 | renumber | Canonical compare and cached offset. | Fast path for two non-negatives. |
 | geocode pass1_5 | Collector spill branch. | Positive atomic path unchanged. |
 | getid, getparents, tags-filter, extract, check | Landed; measured neutral (commits 3 to 6). | n/a |
@@ -294,8 +274,7 @@ implementation.
   - (the sparse ALTW cells, Japan pass 0, Japan full with prepass off and on,
     and the planet pair of pairs, ran with commit 7; recorded in
     `reference/performance/add-locations-to-ways.md`);
-  - Germany external, full run (`s1a_id_emit_ms` per record, shard bytes,
-    stage 2 and 4 CPU);
+  - (Germany external ran with commit 8, recorded in the same file);
   - `renumber`, Germany;
   - `tag-select`, Germany, `r/type=route`;
   - `parent-select` and `id-select --add-referenced yes`, Germany;
@@ -406,9 +385,6 @@ Durable text never cites a finding ID.
 
 ## 8. CHANGELOG
 
-- add-locations-to-ways joins negative node refs in both index types, and
-  retains and marks negative relation members. The external index no longer
-  refuses node blobs below zero.
 - build-geocode-index uses negative admin ways and node refs.
 - renumber accepts negative IDs, and a `--start-id` below 1, counting down
   from it as osmium does.
@@ -485,14 +461,15 @@ lines. It passes `brokkr check` and the relevant Denmark verifies.
 The registry (`crates/cli/tests/cli_negative_ids.rs`) landed with item 2.
 Each commit below flips its own cases' known gaps (each names the check,
 framing and exact wrong observation) and adds the cases its route needs:
-wide-key boundaries, a geocode boundary whose outer way is negative, and
+a geocode boundary whose outer way is negative, and
 `degrade --drop-ids` selection (BUG-022), none of which the registry
 asserts yet. (The ALTW auto crossover and the sparse `i64::MIN` boundary
 landed with commit 7 as library and CLI tests, `host_contract.rs` and
 `cli_add_locations_to_ways.rs`: the registry's children cannot be given a
-memory budget outside the test-hooks build.)
+memory budget outside the test-hooks build. The external `i64` extremes and
+wide-key cases landed with commit 8 in `cli_add_locations_to_ways.rs`, for
+the same reason the graph is not extended with them.)
 
-8. ALTW external two-family join, with `check_range` removed.
 9. build-geocode-index.
 10. renumber signed remap and the new orphan mapping, plus the negative
     `--start-id` (Q1).

@@ -281,6 +281,31 @@ impl AscendingTally {
     }
 }
 
+/// Refuse `claim` unless the IDs a walk fed to `tally` are in canonical
+/// order and the claim is exact for them. A non-negative claim is decided by
+/// the tally's raw compares; a claim reaching below zero, which an
+/// `i64`-ascending walk cannot decide, replays `ids` through a
+/// [`ClaimWalk`] under `order`. So input without negative IDs pays the
+/// tally alone, and a refusal is the claim walk's in either case.
+pub(crate) fn hold_claim<I: IntoIterator<Item = i64>>(
+    tally: &AscendingTally,
+    claim: &BlobIndex,
+    order: Order,
+    ids: impl FnOnce() -> I,
+) -> Result<()> {
+    if claim.min_id >= 0 {
+        if tally.holds(claim)? {
+            return Ok(());
+        }
+        return Err(replay_refusal(claim, order, ids()));
+    }
+    let mut walk = ClaimWalk::new(Some(claim), order);
+    for id in ids() {
+        walk.observe(id)?;
+    }
+    walk.finish().map(|_| ())
+}
+
 /// The refusal for IDs an [`AscendingTally`] found not to hold `claim`: the
 /// same IDs replayed through a [`ClaimWalk`] under `order`, which names the
 /// false claim or the disorder by its precedence. Cold.
@@ -451,5 +476,33 @@ mod tests {
         t.add(-1);
         let e = t.holds(&claim(-1, -1, 1)).unwrap_err();
         assert!(matches!(e.kind(), crate::ErrorKind::Internal { .. }), "{e}");
+    }
+
+    /// `hold_claim` decides every claim: a negative one by the canonical
+    /// walk, a non-negative one by the tally, each refusing what the
+    /// required walk refuses.
+    #[test]
+    fn hold_claim_decides_claims_of_either_sign() {
+        let order = Order::Required("test");
+        let hold = |ids: &[i64], c: BlobIndex| {
+            let mut t = AscendingTally::default();
+            for &id in ids {
+                t.add(id);
+            }
+            hold_claim(&t, &c, order, || ids.iter().copied())
+        };
+        hold(&[0, -1, -2, 1, 5], claim(-2, 5, 5)).unwrap();
+        hold(&[-1, -3], claim(-3, -1, 2)).unwrap();
+        hold(&[1, 2], claim(1, 2, 2)).unwrap();
+        let e = hold(&[-1, 0, 1], claim(-1, 1, 3)).unwrap_err();
+        assert!(matches!(e.kind(), crate::ErrorKind::Unsorted { .. }), "{e}");
+        let e = hold(&[-2, -1], claim(-2, -1, 2)).unwrap_err();
+        assert!(matches!(e.kind(), crate::ErrorKind::Unsorted { .. }), "{e}");
+        let e = hold(&[0, -1], claim(-2, 0, 2)).unwrap_err();
+        assert!(
+            matches!(e.kind(), crate::ErrorKind::IndexdataMismatch { .. }),
+            "{e}"
+        );
+        assert!(hold(&[2, 1], claim(1, 2, 2)).is_err());
     }
 }

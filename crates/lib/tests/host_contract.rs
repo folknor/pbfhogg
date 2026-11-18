@@ -1412,51 +1412,56 @@ fn fixed_memory_routes_auto() {
     }
 }
 
+/// A sorted, indexed file `name` in `dir`: untagged nodes `nodes`, one way
+/// over `refs`.
+fn one_way_file(
+    dir: &std::path::Path,
+    name: &str,
+    nodes: &[i64],
+    refs: &[i64],
+) -> std::path::PathBuf {
+    use crate::common::{TestNode, TestWay};
+    let path = dir.join(name);
+    let nodes: Vec<TestNode> = nodes
+        .iter()
+        .map(|&id| TestNode {
+            id,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    let way = [TestWay {
+        id: 1,
+        refs: refs.to_vec(),
+        tags: vec![],
+        meta: None,
+    }];
+    crate::common::write_indexed_pbf(&path, &nodes, &way, &[]);
+    path
+}
+
 /// Auto's two decisions against one known budget. A way referencing six
 /// node IDs of which the file holds four has a 32-byte header estimate and
 /// a 48-byte exact store: with a 40-byte budget (80 % is 32 bytes) the
 /// estimate routes sparse and the post-pass-0 recheck re-routes external,
-/// whose output then carries the two placeholders asked for. The same
-/// budget on a file holding a negative node blob, which the external index
-/// refuses, keeps sparse up front and says why, and sparse joins it.
+/// whose output then carries the two placeholders asked for. A file holding
+/// negative node IDs routes the same way, and external joins it exactly. A
+/// file whose node keys need the external index's wide record keeps sparse
+/// up front and says why: auto does not choose that record, which only an
+/// explicit `--index-type external` runs.
 #[test]
 fn auto_rechecks_the_exact_store_and_never_routes_to_a_refusal() {
-    use crate::common::{TestNode, TestWay};
     let Some(ticket) = crate::common::heavy_ticket(1, "auto_rechecks_the_exact_store") else {
         return;
     };
     let dir = crate::common::test_scratch();
-    let node = |id: i64| TestNode {
-        id,
-        lat: 550_000_000,
-        lon: 120_000_000,
-        tags: vec![],
-        meta: None,
-    };
-    let dangling = dir.path().join("dangling.osm.pbf");
-    crate::common::write_indexed_pbf(
-        &dangling,
-        &[node(1), node(2), node(3), node(4)],
-        &[TestWay {
-            id: 1,
-            refs: vec![1, 2, 3, 4, 5, 6],
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
-    );
-    let negative = dir.path().join("negative.osm.pbf");
-    crate::common::write_indexed_pbf(
-        &negative,
-        &[node(0), node(-1), node(1), node(2)],
-        &[TestWay {
-            id: 1,
-            refs: vec![-1, 0, 1, 2],
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
-    );
+    let file =
+        |name: &str, nodes: &[i64], refs: &[i64]| one_way_file(dir.path(), name, nodes, refs);
+    let dangling = file("dangling.osm.pbf", &[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6]);
+    let negative = file("negative.osm.pbf", &[0, -1, 1, 2], &[-1, 0, 1, 2]);
+    let wide = file("wide.osm.pbf", &[1, 2, 3, 1 << 39], &[1, 2, 3, 1 << 39]);
     let memory = (3_u64 << 30) + 40;
     for (input, notes, missing) in [
         (
@@ -1472,10 +1477,21 @@ fn auto_rechecks_the_exact_store_and_never_routes_to_a_refusal() {
         ),
         (
             &negative,
+            &[
+                (
+                    "altw.auto_select",
+                    "auto-selected index type sparse (store estimate",
+                ),
+                ("altw.auto_recheck", "auto re-routed to index type external"),
+            ][..],
+            0,
+        ),
+        (
+            &wide,
             &[(
                 "altw.auto_select",
-                "auto-selected index type sparse (sorted=true, indexed=true; the external \
-                 index cannot take this input: altw external: node blob indexdata range",
+                "auto-selected index type sparse (sorted=true, indexed=true; auto does not \
+                 route this input to the external index: its node keys reach",
             )][..],
             0,
         ),

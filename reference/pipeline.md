@@ -415,8 +415,8 @@ builds no negative rank index.
 
 **External** (`altw/external/`, 4-stage bounded-memory join; requires
 sorted + indexed input):
-1. Way pass → emit `(node_id, slot_pos)` records into 256 node-id buckets
-2. Node join → per bucket, sort by node id, merge-join against the node
+1. Way pass → emit `(node key, slot_pos)` records into 256 node-key buckets
+2. Node join → per bucket, sort by node key, merge-join against the node
    stream (pread workers), emit resolved coords into slot buckets
 3. Slot reorder → per bucket, sort by slot_pos, emit blob-ordered
    delta-varint `coord_payloads`
@@ -426,12 +426,27 @@ Bounded memory with high scratch-disk demand. See
 [performance/add-locations-to-ways.md](performance/add-locations-to-ways.md) for measured resource use. Requires sorted
 input with indexdata.
 
+Node IDs are joined by key, in two families when the node claims hold a
+negative ID: the IDs `<= 0` keyed by their magnitude and the positive IDs
+keyed by themselves, so each family ascends with canonical order in every
+sorted blob and across blobs. Without a negative node claim there is one
+family, every ID `>= 0` keyed by itself. The families share the 256
+buckets, split by claimed node count. The one node blob of a sorted file
+that holds both families (its claim reaches below and above zero) is
+decoded by the metadata scan, which gives its exact per-family ranges and
+holds its first element to the sorted order its range cannot show. A
+layout whose keys fit 256 equal buckets of at most 2^30 (keys up to about
+2^38) writes one packed 8-byte record per ref; any other writes a 16-byte
+wide record carrying the whole key, with each family's bucket boundaries
+placed at node-blob ranges by claimed node count, so IDs far from zero
+still spread over buckets. Auto routing never chooses the wide record
+(see below); `--index-type external` runs it.
+
 Its scratch records carry fixed-width fields, so the backend has encoding
 limits the sparse index does not, each refused as invalid data naming the
-sparse index, never wrapped: a node `max_id` above 256 buckets of 2^30 ids
-(2^38, refused when the layout is built from indexdata, before the way
-pass); more than 2^32 way blobs (the `u32` blob ordinal of each way-pass
-record, refused while the way schedule is built); and a slot bucket of
+sparse index, never wrapped: more than 2^32 way blobs (the `u32` blob
+ordinal of each way-pass record, refused while the way schedule is built);
+more than 2^32 node blobs (refused before the way pass); and a slot bucket of
 more than 2^32 way node refs (the `u32` bucket-local slot of each resolved
 record, refused after the way pass, when the exact ref count is known and
 before the node join). Slot buckets are `refs / 256` wide with the last
@@ -493,12 +508,15 @@ sorted input whose first data blob is indexed always gets an estimate; an
 unavailable estimate would keep sparse. Unsorted or unindexed inputs always
 select sparse, since external cannot run on them. The same walk holds
 every data blob's indexdata to the external join's own header checks
-(a node range reaching below zero, the canonical order of the ranges,
-the largest node `max_id` its buckets can encode, the `u32` way-blob
-ordinal); an input that fails one runs sparse, which joins it, and the
-note names the refusal. Checks that need the way pass (slot-bucket
-widths, scratch space) and the trust placed in a false but well-formed
-claim stay with external. Whether the input is
+(the canonical order of the ranges, the `u32` way-blob ordinal) and
+builds the join's own node-key plan from the same claims; an input that
+fails a check, or whose plan needs the wide record, runs sparse, which
+joins it, and the note says why. Auto does not choose the wide record
+because such inputs ran sparse before external could take them, and
+their header estimate cannot tell a large store from many standalone
+nodes. Checks that need the way pass (slot-bucket widths, scratch space),
+the decode of a node blob holding both key families, and the trust placed
+in a false but well-formed claim stay with external. Whether the input is
 indexed is read from the first data blob's indexdata, the same hint the
 backends' own indexdata check reads, so a header-only file counts as indexed
 and frames before the first data blob are skipped. An unreadable or malformed

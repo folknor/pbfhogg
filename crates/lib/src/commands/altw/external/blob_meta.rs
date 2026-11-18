@@ -20,6 +20,27 @@ pub(super) struct BlobMeta {
     pub count: u64,
     pub has_tagindex: bool,
     pub has_tags: bool,
+    /// A node blob holding both key families (`min_id < 0 < max_id`),
+    /// decoded by the scan for its exact per-family spans
+    /// ([`super::keys`]). `None` for every other blob.
+    pub split: Option<BoundarySplit>,
+}
+
+/// One family's exact key range and node count inside a decoded blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FamilyPart {
+    pub lo: u64,
+    pub hi: u64,
+    pub count: u64,
+}
+
+/// What decoding a node blob that holds both key families showed: each
+/// family's part. Its claim reaches below zero, so the run is in the signed
+/// arm, where the negative family is the IDs `<= 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BoundarySplit {
+    pub neg: Option<FamilyPart>,
+    pub pos: Option<FamilyPart>,
 }
 
 impl BlobMeta {
@@ -55,8 +76,6 @@ pub(super) const EXTERNAL_ORDER: crate::blob_meta::Order = crate::blob_meta::Ord
 /// so every range check lives here, located at the offending blob:
 ///
 /// - a reversed range (`max_id < min_id`) is malformed indexdata;
-/// - a node range reaching below zero is refused because stage 2's bucket
-///   partition and merge walk compare node ids as unsigned values;
 /// - the ranges must follow canonical `Sort.Type_then_ID` order. Stage 2
 ///   partitions the node blobs by range with `partition_point` and walks
 ///   bucket records forward through them, so node blobs out of order or
@@ -72,8 +91,15 @@ pub(super) const EXTERNAL_ORDER: crate::blob_meta::Order = crate::blob_meta::Ord
 ///   interleaved blobs would need each blob's true last id, a per-blob
 ///   decode in this header-only scan.
 ///
-/// Header-level only: the order of elements inside one blob is not visible
-/// here.
+/// Header-level, with one exception: a node blob whose claim reaches both
+/// below and above zero (`min_id < 0 < max_id`) is decoded here, once. Its
+/// range names neither its first element (blobs `[-1]` then `[0, -2, 1]`
+/// have in-order ranges) nor where its IDs `<= 0` end and its positive ones
+/// start, which the join's key families need ([`super::keys`]). The decode
+/// holds the whole blob to its claim, its kind and canonical order, and its
+/// actual first and last elements go to the order watermark. A sorted file
+/// has at most one such blob, and a file without negative IDs none.
+/// Elsewhere the order of elements inside one blob is not visible here.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn scan_blob_metadata(
     input: &PinnedInput,
@@ -88,6 +114,7 @@ pub(super) fn scan_blob_metadata(
 
     let mut metas = Vec::new();
     let mut order = crate::osm_id::OrderWatermark::default();
+    let mut boundary = BoundaryDecoder::default();
     let mut node_blobs: u64 = 0;
     let mut way_blobs: u64 = 0;
     let mut relation_blobs: u64 = 0;
@@ -103,7 +130,17 @@ pub(super) fn scan_blob_metadata(
                 ),
             )
         })?;
-        check_range(idx, &mut order).map_err(|e| walker.locate_meta(&meta, e))?;
+        let split = if matches!(idx.kind, ElementKind::Node) && idx.min_id < 0 && idx.max_id > 0 {
+            let (split, first, last) = boundary
+                .decode(input, meta.data_offset, meta.data_size, idx)
+                .map_err(|e| walker.locate_meta(&meta, e))?;
+            check_range(idx, Some((first, last)), &mut order)
+                .map_err(|e| walker.locate_meta(&meta, e))?;
+            Some(split)
+        } else {
+            check_range(idx, None, &mut order).map_err(|e| walker.locate_meta(&meta, e))?;
+            None
+        };
         let tag_index = if parse_tagdata {
             meta.tagdata
                 .as_deref()
@@ -141,11 +178,14 @@ pub(super) fn scan_blob_metadata(
             count: idx.count,
             has_tagindex,
             has_tags,
+            split,
         });
     }
     host.invocation.marker("ALTW_BLOB_META_SCAN_END");
 
     host.invocation.counter("altw_meta_node_blobs", node_blobs);
+    host.invocation
+        .counter("altw_meta_boundary_blobs_decoded", boundary.decoded);
     host.invocation.counter("altw_meta_way_blobs", way_blobs);
     host.invocation
         .counter("altw_meta_relation_blobs", relation_blobs);
@@ -153,12 +193,15 @@ pub(super) fn scan_blob_metadata(
 }
 
 /// The range checks [`scan_blob_metadata`] documents, for one blob in file
-/// order. Unlocated: the caller locates the error at the blob. Auto routing
-/// asks the same question of the same claims through
-/// [`super::HeaderAdmission`], so it never routes here an input these checks
-/// refuse.
+/// order: not reversed, and in canonical order after the blobs before it.
+/// `decoded` is a decoded blob's actual first and last IDs, which the order
+/// check then uses instead of what the range implies. Unlocated: the caller
+/// locates the error at the blob. Auto routing asks the same question of the
+/// same claims through [`super::HeaderAdmission`], without the decode, so it
+/// never routes here an input these checks refuse on its indexdata.
 pub(super) fn check_range(
     idx: &crate::blob_meta::BlobIndex,
+    decoded: Option<(i64, i64)>,
     order: &mut crate::osm_id::OrderWatermark,
 ) -> Result<()> {
     // Defensive: `BlobIndex::deserialize` already reads an inverted range as
@@ -171,15 +214,15 @@ pub(super) fn check_range(
             idx.max_id,
         )));
     }
-    if matches!(idx.kind, ElementKind::Node) && idx.min_id < 0 {
-        return Err(crate::Error::invalid_data(format!(
-            "altw external: node blob indexdata range [min_id={}, max_id={}] holds \
-             negative node ids, which the external index cannot join; the sparse \
-             index can",
-            idx.min_id, idx.max_id,
-        )));
-    }
-    if let Err(v) = order.observe(idx.kind.ordinal(), idx.min_id, idx.max_id) {
+    let observed = match decoded {
+        Some((first, last)) => order.observe_keys(
+            idx.kind.ordinal(),
+            crate::osm_id::osm_id_key(first),
+            crate::osm_id::osm_id_key(last),
+        ),
+        None => order.observe(idx.kind.ordinal(), idx.min_id, idx.max_id),
+    };
+    if let Err(v) = observed {
         return Err(crate::error::new_unsorted(format!(
             "altw external: indexdata ranges contradict the sorted header - a {} blob \
              holding id {} follows {} blobs already reaching id {}. \
@@ -192,4 +235,84 @@ pub(super) fn check_range(
         )));
     }
     Ok(())
+}
+
+/// Decodes the node blobs the scan must see inside, opening the input on
+/// the first one, so an input without one opens nothing.
+#[derive(Default)]
+struct BoundaryDecoder {
+    file: Option<std::fs::File>,
+    read_buf: crate::read::read_buf::ReadBuf,
+    decompressed: Vec<u8>,
+    group_starts: Vec<(usize, usize)>,
+    decoded: u64,
+}
+
+impl BoundaryDecoder {
+    /// Decode one node blob holding both key families, held whole to its
+    /// claim, kind and canonical order; returns its split and its actual
+    /// first and last IDs.
+    fn decode(
+        &mut self,
+        input: &PinnedInput,
+        data_offset: u64,
+        data_size: usize,
+        claim: &crate::blob_meta::BlobIndex,
+    ) -> Result<(BoundarySplit, i64, i64)> {
+        let file = match &mut self.file {
+            Some(f) => f,
+            slot @ None => slot.insert(crate::read::input::InputSource::from(input).open()?),
+        };
+        let raw = self
+            .read_buf
+            .read_exact_at(&*file, data_offset, data_size)
+            .map_err(|e| crate::Error::from(e).context("metadata scan pread"))?;
+        crate::blob::decompress_blob_raw(raw, &mut self.decompressed)
+            .map_err(|e| e.context("metadata scan decompress"))?;
+        let mut walk = crate::blob_meta::ClaimWalk::new(Some(claim), EXTERNAL_ORDER);
+        let mut walk_error = None;
+        let mut last = 0_i64;
+        let mut neg: Option<FamilyPart> = None;
+        let mut pos: Option<FamilyPart> = None;
+        let kinds = crate::scan::node::extract_node_coords(
+            &self.decompressed,
+            &mut self.group_starts,
+            |id, _, _| {
+                if walk_error.is_none()
+                    && let Err(e) = walk.observe(id)
+                {
+                    walk_error = Some(e);
+                }
+                last = id;
+                let part = if id > 0 { &mut pos } else { &mut neg };
+                let key = id.unsigned_abs();
+                match part {
+                    Some(p) => {
+                        p.lo = p.lo.min(key);
+                        p.hi = p.hi.max(key);
+                        p.count += 1;
+                    }
+                    None => {
+                        *part = Some(FamilyPart {
+                            lo: key,
+                            hi: key,
+                            count: 1,
+                        });
+                    }
+                }
+            },
+        )
+        .map_err(|e| e.context("metadata scan node extract"))?;
+        kinds.refuse_under(Some(ElementKind::Node))?;
+        if let Some(e) = walk_error {
+            return Err(e);
+        }
+        let Some(first) = walk.finish()? else {
+            return Err(crate::Error::internal(
+                "an indexed node blob decoded to no element",
+            ));
+        };
+        self.decoded += 1;
+        Ok((BoundarySplit { neg, pos }, first, last))
+    }
 }

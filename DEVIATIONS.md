@@ -585,16 +585,6 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   `min_id >= 0` while the payload contains negatives still errors
   cleanly rather than panicking in `chunk_for_atomic` or silently
   dropping bits.
-- `add-locations-to-ways --index-type external` - **hard reject** of
-  any node blob whose indexdata range holds a negative ID, in its
-  metadata scan (`check_range` in
-  `crates/lib/src/commands/altw/external/blob_meta.rs`), before any join work.
-  Stage 2 partitions and walks node IDs as unsigned values, so a
-  mixed-sign range would silently turn present nodes, positive ones
-  included, into missing locations. The error names the sparse index,
-  which joins such input, and `--index-type auto` routes such input to
-  sparse rather than to this refusal. Way and relation blobs may hold
-  negative IDs.
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
 PBF payload, not an ID set passed through `IdSet`.
@@ -642,11 +632,12 @@ unfolded in an unsigned set, so a negative one stands for an ID near
 `2^64`; on osmium 1.19.1 a matched way referencing one outside node `n-5`
 makes the run fail "Out of memory".
 
-**add-locations-to-ways with the sparse index is exact.** It joins a
+**add-locations-to-ways is exact with both index types.** It joins a
 negative node ref to its node, keeps an untagged negative relation-member
 node, and under `--inject-prepass` marks a negative member way and pins a
-negative shared node, each by the exact signed ID, as `--index-type auto`
-does whenever it runs sparse. osmium joins negative refs through a second
+negative shared node, each by the exact signed ID, whichever index runs,
+the external one included (it keys IDs `<= 0` by magnitude in a second
+key family of its buckets). osmium joins negative refs through a second
 index keyed by absolute value, which is exact for the join; its
 `--keep-member-nodes` retention records members by absolute value
 (`positive_ref()`), so a member `n-7` also keeps an untagged `n7`, and its

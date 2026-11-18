@@ -100,7 +100,7 @@ impl Engine {
 /// running. On the ordinary route an engine that exits non-zero is a
 /// recorded failure, never a skip and never read as anything more specific:
 /// brokkr does not re-derive pbfhogg's other input preconditions (external
-/// needs indexed input without negative node IDs; `check --locations`
+/// needs indexed input; `check --locations`
 /// refuses a history file), so an input outside that domain fails the check
 /// rather than passing it. Each successful output is compared with osmium's
 /// ([`compare_outputs`]) and goes through `check --locations --agreement`.

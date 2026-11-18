@@ -744,15 +744,16 @@ fn auto_select_backend(
     host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_END");
     let store = walk.store_estimate;
 
-    // An input the external join would refuse on its indexdata runs sparse,
-    // which joins it, and is not rechecked: there is nothing to re-route to.
+    // An input the external join would refuse on its indexdata, or would
+    // need its wide record for, runs sparse, which joins it, and is not
+    // rechecked: there is nothing auto re-routes it to.
     if let Err(refusal) = walk.external {
         crate::host::diag!(
             host.diagnostics,
             Note,
             "altw.auto_select",
-            "auto-selected index type sparse (sorted=true, indexed=true; the external \
-             index cannot take this input: {refusal})"
+            "auto-selected index type sparse (sorted=true, indexed=true; auto does not \
+             route this input to the external index: {refusal})"
         );
         return Ok((ResolvedBackend::Sparse, None));
     }

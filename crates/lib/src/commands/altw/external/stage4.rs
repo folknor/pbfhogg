@@ -729,11 +729,10 @@ pub(super) fn stage4_assembly(
                     // and outside the member scan: refused, as the sparse
                     // backend refuses it. The tally holds the claim and the
                     // header's order to every node, since stage 2 decodes
-                    // only the node blobs a referenced bucket reaches; node
-                    // claims are non-negative here (the metadata scan
-                    // refused any other), so one raw compare per node
-                    // decides it, and a false verdict replays the nodes,
-                    // cold, for the exact refusal.
+                    // only the node blobs a referenced bucket reaches. On a
+                    // non-negative claim one raw compare per node decides
+                    // it; a claim reaching below zero is walked in
+                    // canonical order (`hold_claim`).
                     block
                         .refuse_foreign_kind(Some(desc.kind))
                         .map_err(at_frame)?;
@@ -747,18 +746,20 @@ pub(super) fn stage4_assembly(
                         &mut tally,
                     )
                     .map_err(at_frame)?;
-                    if !tally.holds(&desc.claim)? {
-                        return Err(at_frame(crate::blob_meta::replay_refusal(
-                            &desc.claim,
-                            super::blob_meta::EXTERNAL_ORDER,
+                    crate::blob_meta::hold_claim(
+                        &tally,
+                        &desc.claim,
+                        super::blob_meta::EXTERNAL_ORDER,
+                        || {
                             block.elements_skip_metadata().map(|e| match e {
                                 Element::DenseNode(n) => n.id(),
                                 Element::Node(n) => n.id(),
                                 Element::Way(w) => w.id(),
                                 Element::Relation(r) => r.id(),
-                            }),
-                        )));
-                    }
+                            })
+                        },
+                    )
+                    .map_err(at_frame)?;
                     block_stats.blobs_decoded = 1;
                     flush_local(bb, output_blocks).map_err(at_frame)?;
                     let elapsed = t2.elapsed_ms();

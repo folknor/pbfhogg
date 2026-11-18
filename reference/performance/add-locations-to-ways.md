@@ -570,6 +570,27 @@ the ordered pools is not decided by these cells.
 
 ### Add-locations-to-ways
 
+#### External joins negative IDs (baseline `69f83b46`, bygg, 2026-11-18)
+
+The external join gained two node-key families, the metadata-scan decode
+of a node blob straddling zero, per-family span lists in stage 2, and a
+wide record path; positive input keeps the packed record, one family and
+no decode. `embed-locations --dataset germany --index-type external`,
+`--iterations 1`, after `fstrim -av`, in A B B A order; A built with
+`--commit 69f83b46`, B the uncommitted variant on it.
+
+| Cell | UUID | Wall | `s1a_id_emit_ms` |
+|---|---|---:|---:|
+| A1 | `dd4c0d58` | 14.1 s | |
+| B1 | `a73ab1b9` | 12.8 s | |
+| B2 | `8b082924` | 12.3 s | 7,200 |
+| A2 | `686f9885` | 12.9 s | 8,701 |
+
+Medians A 13.5 s, B 12.55 s; B is faster in both pairs, and the A2 to B2
+phase split puts the gap in the stage 2 segment (5.33 against 4.81 s),
+which the change does not make cheaper on positive input: run-to-run
+noise, read as neutral. No regression on positive input.
+
 #### Sparse joins negative IDs (baseline `8b260ad2`, bygg, 2026-11-18)
 
 The three sign guards on the sparse path were deleted (pass 0 now pushes

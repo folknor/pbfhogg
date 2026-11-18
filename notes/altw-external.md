@@ -729,10 +729,10 @@ Any stage 1-4 edit must preserve these or explicitly replace them.
 - **Sorted + indexed cat-produced input.** `external_join` requires
   `Sort.Type_then_ID` and indexdata; `--force` is rejected on this path.
   The single-pass merge and all bucket range math depend on it.
-- **Node-ID bucket coverage.** Every in-range referenced node id maps to
-  exactly one bucket (`BucketLayout::locate`); ids above
-  indexdata-derived `max_node_id` and negative refs return `None` and
-  the slot stays unresolved (zero coords + `missing_locations`), matching
+- **Node-key bucket coverage.** Every referenced node id inside its key
+  family's claimed range maps to exactly one bucket (`keys::NodeKeyLayout`,
+  shared by stage 1 routing and stage 2 bounds); ids outside it return
+  `None` and the slot stays unresolved (zero coords + `missing_locations`), matching
   `missing_node_refs_get_zero_coordinates`. Silent truncation of
   `local_node_id` is forbidden - N1's packed layout must keep the
   explicit width asserts.

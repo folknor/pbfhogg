@@ -1325,13 +1325,14 @@ fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
     );
 }
 
-/// Sparse joins node IDs at both ends of `i64` and on either side of zero,
-/// and keeps an untagged relation member at `i64::MIN`: the negative family
-/// keys `i64::MIN` as `i64::MAX` and ranks it like any other. Auto on the
-/// same sorted, indexed file stays sparse, saying the external index cannot
-/// take a negative node blob, rather than routing to a refusal.
+/// Both backends join node IDs at both ends of `i64` and on either side of
+/// zero, and keep an untagged relation member at `i64::MIN`. Sparse's
+/// negative family keys `i64::MIN` as `i64::MAX` and ranks it like any
+/// other; external's keys it by its magnitude, 2^63, which only its wide
+/// record carries. Auto on the same sorted, indexed file stays sparse: it
+/// does not choose the wide record.
 #[test]
-fn sparse_joins_node_ids_at_both_ends_of_i64() {
+fn both_backends_join_node_ids_at_both_ends_of_i64() {
     let at = |id: i64, k: i32| TestNode {
         id,
         lat: 550_000_000 + k * 10_000,
@@ -1367,7 +1368,11 @@ fn sparse_joins_node_ids_at_both_ends_of_i64() {
     let loc = |k: i32| (550_000_000 + k * 10_000, 120_000_000 + k * 10_000);
     let want = vec![(10, vec![loc(2), loc(4), loc(1), loc(0), loc(3), loc(2)])];
 
-    for backend in [IndexBackend::Sparse, IndexBackend::Auto] {
+    for backend in [
+        IndexBackend::Sparse,
+        IndexBackend::External,
+        IndexBackend::Auto,
+    ] {
         let output = dir
             .path()
             .join(format!("{}.osm.pbf", backend.flag().unwrap()));
@@ -1386,13 +1391,12 @@ fn sparse_joins_node_ids_at_both_ends_of_i64() {
     }
 }
 
-/// The external backend sizes its id buckets from the node blobs'
-/// indexdata `max_id`, and used to assert (panic) when that exceeded what its
-/// 31-bit bucket-local ids can encode (2^38 with 256 buckets). It is now an
-/// error that points at the sparse index - and that pointer must be true, so
-/// the same file has to succeed under sparse.
+/// Node IDs past what the external backend's packed record encodes (2^38
+/// with 256 buckets of 31-bit local ids) take its wide record, with bucket
+/// boundaries at the node blobs rather than equal widths, and join exactly
+/// as under sparse. The external index used to refuse such a file.
 #[test]
-fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
+fn node_ids_past_the_packed_record_join_under_both_backends() {
     let big = 1_i64 << 39;
     let nodes = vec![
         TestNode {
@@ -1421,37 +1425,22 @@ fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
     let input = dir.path().join("input.osm.pbf");
     write_indexed_pbf(&input, &nodes, &ways, &[]);
 
-    let external_out = dir.path().join("external.osm.pbf");
-    let out = run_altw(&input, &external_out, true, IndexBackend::External, false);
-    assert!(
-        !out.status.success(),
-        "external must refuse a node max_id it cannot encode; stderr:\n{}",
-        out.stderr_str(),
-    );
-    let stderr = out.stderr_str();
-    assert!(
-        stderr.contains("the sparse index has no such limit") && !stderr.contains("panicked"),
-        "expected the encoding-limit error, not a panic; stderr:\n{stderr}",
-    );
-    assert!(
-        !external_out.exists(),
-        "a refused run must publish no output file"
-    );
-
-    let sparse_out = dir.path().join("sparse.osm.pbf");
-    let out = run_altw(&input, &sparse_out, true, IndexBackend::Sparse, false);
-    assert!(
-        out.status.success(),
-        "sparse must handle the node id external cannot; stderr:\n{}",
-        out.stderr_str(),
-    );
-    assert_eq!(
-        read_way_locations(&sparse_out),
-        vec![(
-            10,
-            vec![(550_000_000, 120_000_000), (551_000_000, 121_000_000)]
-        )],
-    );
+    for backend in [IndexBackend::External, IndexBackend::Sparse] {
+        let output = dir
+            .path()
+            .join(format!("{}.osm.pbf", backend.flag().unwrap()));
+        let out = run_altw(&input, &output, true, backend, false);
+        assert!(out.status.success(), "{}", out.stderr_str());
+        assert_eq!(
+            read_way_locations(&output),
+            vec![(
+                10,
+                vec![(550_000_000, 120_000_000), (551_000_000, 121_000_000)]
+            )],
+            "{}",
+            out.stderr_str()
+        );
+    }
 }
 
 /// B2 - missing-node handling for `--index-type external`.
@@ -1643,15 +1632,65 @@ fn external_refuses_way_blobs_in_descending_order() {
     );
 }
 
-/// A node blob whose range spans zero: stage 2 compares node ids unsigned,
-/// so the external index refuses it outright rather than losing nodes.
+/// Both backends join `way_refs` of `input` to every node's real
+/// coordinates.
+fn assert_both_backends_join(input: &Path, way_refs: &[i64]) {
+    let dir = input.parent().unwrap();
+    let expected: Vec<(i32, i32)> = way_refs
+        .iter()
+        .map(|&id| {
+            let n = node_at(id);
+            (n.lat, n.lon)
+        })
+        .collect();
+    for backend in [IndexBackend::External, IndexBackend::Sparse] {
+        let output = dir.join(format!("{}.osm.pbf", backend.flag().unwrap()));
+        let out = run_altw(input, &output, true, backend, false);
+        let stderr = out.stderr_str();
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(
+            read_way_locations(&output),
+            vec![(10, expected.clone())],
+            "{stderr}"
+        );
+    }
+}
+
+/// Node blobs on both sides of zero, in canonical order: `[0, -1, -2]` (zero
+/// beside negatives), `[-3, -5, 1]` (where the negatives end and the
+/// positives start, decoded by the metadata scan for its split) and `[2, 3,
+/// 4]`. The external index joins every one, as sparse does.
 #[test]
-fn external_refuses_a_node_blob_reaching_below_zero() {
+fn external_joins_node_blobs_on_both_sides_of_zero() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("mixed-sign.osm.pbf");
-    let refs = [1, 2];
-    write_three_per_blob(&input, &[-1, 1, 2], &[way_over(10, &refs)]);
-    assert_external_refuses_and_sparse_joins(&input, "negative node ids", &refs);
+    let refs = [-5, 0, 1, -1, 4, -3, -2, 2, 0];
+    write_three_per_blob(
+        &input,
+        &[0, -1, -2, -3, -5, 1, 2, 3, 4],
+        &[way_over(10, &refs)],
+    );
+    assert_both_backends_join(&input, &refs);
+}
+
+/// `[-1, -2, -3]` then `[-4, 1, 2]` is in canonical order, while `[-1, -2,
+/// -3]` then `[0, -4, 1]` is not, though the second blobs have in-order
+/// ranges either way: only the decoded first element tells them apart. The
+/// external index joins the first and refuses the second as unsorted.
+#[test]
+fn external_tells_a_mixed_sign_descent_from_a_valid_layout() {
+    let dir = crate::common::test_scratch();
+    let valid = dir.path().join("valid.osm.pbf");
+    let refs = [-4, 1, -1];
+    write_three_per_blob(&valid, &[-1, -2, -3, -4, 1, 2], &[way_over(10, &refs)]);
+    assert_both_backends_join(&valid, &refs);
+
+    let descent_dir = dir.path().join("descent");
+    std::fs::create_dir(&descent_dir).unwrap();
+    let descent = descent_dir.join("descent.osm.pbf");
+    let refs = [-4, 1, 0];
+    write_three_per_blob(&descent, &[-1, -2, -3, 0, -4, 1], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&descent, "contradict the sorted header", &refs);
 }
 
 /// Equal boundaries are in order: a node id may end one blob and start the

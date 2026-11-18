@@ -56,9 +56,9 @@ impl ElementIds {
 
     fn insert(&mut self, kind: ElementKind, id: i64) {
         match kind {
-            ElementKind::Node => self.node_ids.set(id),
-            ElementKind::Way => self.way_ids.set(id),
-            ElementKind::Relation => self.relation_ids.set(id),
+            ElementKind::Node => self.node_ids.insert(id),
+            ElementKind::Way => self.way_ids.insert(id),
+            ElementKind::Relation => self.relation_ids.insert(id),
         }
     }
 
@@ -331,20 +331,26 @@ pub fn parse_ids_from_pbf<'a>(
             Ok(batch)
         },
         |_seq, batch| {
-            for id in batch.node_ids {
-                set.node_ids.set(id);
-            }
-            for id in batch.way_ids {
-                set.way_ids.set(id);
-            }
-            for id in batch.relation_ids {
-                set.relation_ids.set(id);
-            }
+            // getid does not select negative IDs: a source PBF's negatives
+            // are dropped here.
+            insert_non_negative(&mut set.node_ids, batch.node_ids);
+            insert_non_negative(&mut set.way_ids, batch.way_ids);
+            insert_non_negative(&mut set.relation_ids, batch.relation_ids);
         },
         host,
     )?;
 
     Ok(set)
+}
+
+/// Insert the non-negative IDs of `ids` into `set`, dropping the negative
+/// ones: getid does not select or follow a negative ID.
+fn insert_non_negative(set: &mut IdSet, ids: impl IntoIterator<Item = i64>) {
+    for id in ids {
+        if id >= 0 {
+            set.insert(id);
+        }
+    }
 }
 
 /// Merge two `ElementIds`s together (union).
@@ -792,12 +798,14 @@ fn filter_by_id_walker(
                 if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
                         crate::ElementKind::Node => {
-                            ids.node_ids.any_in_range(idx.min_id, idx.max_id)
+                            ids.node_ids.any_in_numeric_range(idx.min_id, idx.max_id)
                         }
-                        crate::ElementKind::Way => ids.way_ids.any_in_range(idx.min_id, idx.max_id),
-                        crate::ElementKind::Relation => {
-                            ids.relation_ids.any_in_range(idx.min_id, idx.max_id)
+                        crate::ElementKind::Way => {
+                            ids.way_ids.any_in_numeric_range(idx.min_id, idx.max_id)
                         }
+                        crate::ElementKind::Relation => ids
+                            .relation_ids
+                            .any_in_numeric_range(idx.min_id, idx.max_id),
                     };
                     if include_mode {
                         if !blob_filter.wants_index(idx) || !has_match {
@@ -1021,12 +1029,14 @@ fn filter_by_id_streaming(
                 if let Some(ref idx) = index {
                     let has_match = match idx.kind {
                         crate::ElementKind::Node => {
-                            ids.node_ids.any_in_range(idx.min_id, idx.max_id)
+                            ids.node_ids.any_in_numeric_range(idx.min_id, idx.max_id)
                         }
-                        crate::ElementKind::Way => ids.way_ids.any_in_range(idx.min_id, idx.max_id),
-                        crate::ElementKind::Relation => {
-                            ids.relation_ids.any_in_range(idx.min_id, idx.max_id)
+                        crate::ElementKind::Way => {
+                            ids.way_ids.any_in_numeric_range(idx.min_id, idx.max_id)
                         }
+                        crate::ElementKind::Relation => ids
+                            .relation_ids
+                            .any_in_numeric_range(idx.min_id, idx.max_id),
                     };
                     if !blob_filter.wants_index(idx) || !has_match {
                         frames.skip_payload()?;
@@ -1166,16 +1176,16 @@ fn getid_with_refs(
         }
     }
     host.invocation.marker("GETID_PASS1_END");
-    // Cheap one-time iterations; give the pulled-set sizes before pass 2
+    // Cheap one-time counts; give the pulled-set sizes before pass 2
     // starts so the counters survive a SIGKILL during pass 2. The way and
     // relation counts include requested IDs where the reference walk
     // reached them.
     host.invocation
-        .counter("getid_dep_node_ids", pulled.node_ids.iter().count());
+        .counter("getid_dep_node_ids", pulled.node_ids.len());
     host.invocation
-        .counter("getid_dep_way_ids", pulled.way_ids.iter().count());
+        .counter("getid_dep_way_ids", pulled.way_ids.len());
     host.invocation
-        .counter("getid_dep_relation_ids", pulled.relation_ids.iter().count());
+        .counter("getid_dep_relation_ids", pulled.relation_ids.len());
 
     // Pass 2: Write requested and pulled-in elements (transform fused into
     // the decode workers).
@@ -1294,7 +1304,7 @@ struct RelationRefs {
 /// the store a `Vec` dropped here. The per-blob edge vectors the workers
 /// hand over are still `Vec`s, each bounded by one blob.
 ///
-/// A negative member ID is dropped, as `IdSet::set` drops it (an edge with
+/// A negative member ID is dropped from every pulled set (an edge with
 /// a negative end is never stored: no walk could reach or follow it);
 /// osmium abs-folds it (`positive_ref`). See DEVIATIONS.md "Negative input
 /// IDs rejected project-wide".
@@ -1314,12 +1324,8 @@ fn close_relations(
         &ids.relation_ids,
         true,
         |refs| {
-            for id in refs.nodes {
-                pulled.node_ids.set(id);
-            }
-            for id in refs.ways {
-                pulled.way_ids.set(id);
-            }
+            insert_non_negative(&mut pulled.node_ids, refs.nodes);
+            insert_non_negative(&mut pulled.way_ids, refs.ways);
             seeds.extend(refs.relations);
             if store_failed.is_none()
                 && let Err(e) = edges.extend(&refs.edges)
@@ -1340,7 +1346,7 @@ fn close_relations(
     let mut added = false;
     let mut worklist = seeds;
     while let Some(id) = worklist.pop() {
-        if id < 0 || ids.relation_ids.get(id) || !pulled.relation_ids.set_if_new(id) {
+        if id < 0 || ids.relation_ids.get(id) || !pulled.relation_ids.insert_if_new(id) {
             continue;
         }
         added = true;
@@ -1355,12 +1361,8 @@ fn close_relations(
             &pulled.relation_ids,
             false,
             |refs| {
-                for id in refs.nodes {
-                    pulled.node_ids.set(id);
-                }
-                for id in refs.ways {
-                    pulled.way_ids.set(id);
-                }
+                insert_non_negative(&mut pulled.node_ids, refs.nodes);
+                insert_non_negative(&mut pulled.way_ids, refs.ways);
             },
             host,
         )?;
@@ -1546,9 +1548,7 @@ fn collect_way_nodes(
             Ok(refs)
         },
         |_seq, refs| {
-            for r in refs {
-                node_ids.set(r);
-            }
+            insert_non_negative(node_ids, refs);
         },
         host,
     )
@@ -2448,10 +2448,10 @@ mod tests {
         // them, so stripping shows.
         let mut deps = ElementIds::empty();
         for id in [3, 9, 11] {
-            deps.node_ids.set(id);
+            deps.node_ids.insert(id);
         }
-        deps.way_ids.set(20);
-        deps.relation_ids.set(31);
+        deps.way_ids.insert(20);
+        deps.relation_ids.insert(31);
 
         let run = |block: &PrimitiveBlock,
                    ids: &ElementIds,

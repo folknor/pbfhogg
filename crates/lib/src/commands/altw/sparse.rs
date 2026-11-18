@@ -151,7 +151,7 @@ pub(super) struct SparseArrayIndex {
 impl SparseArrayIndex {
     #[allow(clippy::cast_possible_truncation)]
     pub(super) fn get(&self, node_id: i64) -> Option<(i32, i32)> {
-        let rank = self.referenced.rank_if_set(node_id)?;
+        let rank = self.referenced.numeric_rank_if_set(node_id)?;
         let byte_offset = (rank * 8) as usize;
         // Not a "node absent" case: `rank_if_set` just said the id is in the
         // IdSet the store was sized from, so a rank past the end is a broken
@@ -232,7 +232,7 @@ impl<'a> SharedSparseWriter<'a> {
 ///   3. `parallel_scan_blobs_raw` over node blobs: workers extract
 ///      `(id, lat, lon)` tuples via `scan::node::extract_node_tuples`
 ///      (wire-only, no `PrimitiveBlock`). Each worker stores 8 bytes
-///      into the mmap at `referenced.rank_if_set(id) << 3` for every
+///      into the mmap at `referenced.numeric_rank_if_set(id) << 3` for every
 ///      referenced id, via `AtomicU64::store(Relaxed)`. Workers do
 ///      not coordinate beyond the shared `&RankedIdSet` and
 ///      `SharedSparseWriter`.
@@ -330,7 +330,7 @@ pub(super) fn build_node_index_sparse(
                 if tup.id < 0 {
                     continue;
                 }
-                if let Some(rank) = referenced_ref.rank_if_set(tup.id) {
+                if let Some(rank) = referenced_ref.numeric_rank_if_set(tup.id) {
                     writer_ref.insert(tup.id, rank, tup.lat, tup.lon)?;
                     blob_stored += 1;
                     if rank < blob_min_rank {

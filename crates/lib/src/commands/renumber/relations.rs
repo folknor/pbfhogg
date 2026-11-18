@@ -102,7 +102,7 @@ pub(super) fn relation_r1_collect_ids(
                         return Err(order_error("relation", p, rel_id));
                     }
                     prev = Some(rel_id);
-                    relation_id_set.set(rel_id);
+                    relation_id_set.insert(rel_id);
                 }
             }
             t.record_ns(&counters.reframe_ns);

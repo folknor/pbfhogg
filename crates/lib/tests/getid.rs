@@ -1322,9 +1322,12 @@ fn getid_remove_tags_strips_every_pulled_in_kind() {
         ]
     );
     let found = stats.found.expect("report_found was set");
-    assert_eq!(found.node_ids.iter().collect::<Vec<_>>(), vec![3]);
-    assert_eq!(found.way_ids.iter().collect::<Vec<_>>(), vec![11]);
-    assert_eq!(found.relation_ids.iter().collect::<Vec<_>>(), vec![100]);
+    assert_eq!(found.node_ids.iter_canonical().collect::<Vec<_>>(), vec![3]);
+    assert_eq!(found.way_ids.iter_canonical().collect::<Vec<_>>(), vec![11]);
+    assert_eq!(
+        found.relation_ids.iter_canonical().collect::<Vec<_>>(),
+        vec![100]
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -922,19 +922,29 @@ fn tags_filter_two_pass(
                 Ok(result)
             },
             |_seq, cr| {
+                // tags-filter does not select negative IDs: each insertion
+                // below drops one, and nothing else about its element does.
                 for id in cr.matched_nodes {
-                    matched_node_ids.set(id);
+                    if id >= 0 {
+                        matched_node_ids.insert(id);
+                    }
                 }
                 for (way_id, refs) in cr.matched_ways {
-                    direct_way_ids.set(way_id);
+                    if way_id >= 0 {
+                        direct_way_ids.insert(way_id);
+                    }
                     has_included_way = true;
                     for r in refs {
-                        way_dep_node_ids.set(r);
+                        if r >= 0 {
+                            way_dep_node_ids.insert(r);
+                        }
                     }
                 }
                 for id in cr.matched_relations {
-                    direct_relation_ids.set(id);
-                    if included_relation_ids.set_if_new(id) {
+                    if id >= 0 {
+                        direct_relation_ids.insert(id);
+                    }
+                    if id >= 0 && included_relation_ids.insert_if_new(id) {
                         has_included_relation = true;
                     }
                 }
@@ -1265,18 +1275,22 @@ fn collect_relation_member_closure(
             if !cr.node_ids.is_empty() || !cr.way_ids.is_empty() || !cr.relation_ids.is_empty() {
                 summary.has_relation = true;
             }
+            // tags-filter does not select negative IDs: each insertion below
+            // drops one.
             for id in cr.node_ids {
-                relation_dep_node_ids.set(id);
+                if id >= 0 {
+                    relation_dep_node_ids.insert(id);
+                }
             }
             for id in cr.way_ids {
                 // A direct match is already included and its refs already
                 // collected; only a new non-direct way is a member way.
-                if !direct_way_ids.get(id) && member_way_ids.set_if_new(id) {
+                if id >= 0 && !direct_way_ids.get(id) && member_way_ids.insert_if_new(id) {
                     summary.has_way = true;
                 }
             }
             for id in cr.relation_ids {
-                if included_relation_ids.set_if_new(id) {
+                if id >= 0 && included_relation_ids.insert_if_new(id) {
                     added_relations += 1;
                 }
             }
@@ -1382,8 +1396,11 @@ fn collect_way_node_dependencies(
             Ok(node_ids)
         },
         |_seq, node_ids| {
+            // tags-filter does not select negative IDs.
             for id in node_ids {
-                relation_dep_node_ids.set(id);
+                if id >= 0 {
+                    relation_dep_node_ids.insert(id);
+                }
             }
         },
         host,

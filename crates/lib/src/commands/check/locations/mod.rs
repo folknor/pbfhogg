@@ -552,13 +552,16 @@ impl KeyShards {
                 .iter()
                 .position(|&id| IdSet::chunk_of(id) != chunk)
                 .unwrap_or(rest.len());
-            if let Some(chunk) = chunk {
+            // The key set holds no negative ID: a negative node record gets
+            // no slot. Negatives sort first and share no chunk key with a
+            // non-negative ID, so a run is all one sign.
+            if first >= 0 {
                 let shard = usize::try_from(chunk % self.shards.len() as u64).unwrap_or(0);
                 let mut set = self.shards[shard]
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for &id in &rest[..run] {
-                    set.set(id);
+                    set.insert(id);
                 }
             }
             rest = &rest[run..];
@@ -1059,7 +1062,7 @@ impl RunCtx<'_> {
             |_pos, block, groups| -> Result<()> {
                 scan_nodes(block, groups, |_ordinal, id, coord| {
                     if in_partition(id, range)
-                        && let Some(rank) = keys.rank_if_set(id)
+                        && let Some(rank) = keys.numeric_rank_if_set(id)
                     {
                         store.join_node(slot_index(rank, first_rank), coord);
                     }
@@ -1196,7 +1199,12 @@ impl RunCtx<'_> {
             return;
         }
         let (lo, _) = range;
-        for (i, id) in self.keys.iter_from(lo).take(store.len()).enumerate() {
+        for (i, id) in self
+            .keys
+            .iter_numeric_from(lo)
+            .take(store.len())
+            .enumerate()
+        {
             match store.reportable(i) {
                 Some(SlotState::Conflict) if want_conflicting > 0 => {
                     want_conflicting -= 1;
@@ -1307,7 +1315,7 @@ impl WayCtx<'_> {
         let coord = event.coord();
         let slot = self
             .keys
-            .rank_if_set(node_id)
+            .numeric_rank_if_set(node_id)
             .map(|rank| slot_index(rank, self.first_rank));
         let Some(i) = slot.filter(|&i| self.store.has_authority(i)) else {
             out.without_node += 1;

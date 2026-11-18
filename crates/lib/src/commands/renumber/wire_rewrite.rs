@@ -231,7 +231,7 @@ impl<'a> IdSpace<'a> {
     #[inline]
     fn live(&self, old_id: i64) -> crate::Result<Option<i64>> {
         self.set
-            .rank_if_set(old_id)
+            .canonical_rank_if_set(old_id)
             .map(|r| offset_id(self.start, r))
             .transpose()
     }
@@ -486,7 +486,7 @@ pub(super) fn reframe_dense_with_new_ids(
                 return Err(negative_id_error("node", old_id));
             }
             span.push("node", old_id)?;
-            if !id_set.set_atomic_checked(old_id) {
+            if !id_set.try_insert_atomic(old_id) {
                 overflow.push(old_id);
             }
             group_count = inc(group_count)?;
@@ -657,14 +657,14 @@ fn reframe_way(
     }
 
     let (old_way_id, id_r) = id.ok_or_else(|| Error::invalid_data("reframe_ways: no id field"))?;
-    // Unconditional: a negative way id slipping past stale indexdata would
-    // be silently dropped by `way_id_set.set` (which ignores `id < 0`),
-    // producing phantom orphan refs in relations.
+    // Unconditional: renumber does not remap negative IDs, and a negative
+    // way id slipping past stale indexdata would otherwise enter the way
+    // map unrefused.
     if old_way_id < 0 {
         return Err(negative_id_error("way", old_way_id));
     }
     span.push("way", old_way_id)?;
-    way_id_set.set(old_way_id);
+    way_id_set.insert(old_way_id);
 
     // Decode old ref deltas, resolve via rank, delta-encode new refs.
     refs_out.clear();
@@ -1080,10 +1080,10 @@ mod tests {
 
     fn run(block: &[u8]) -> crate::Result<Outcome> {
         let mut node_ids = IdSet::new();
-        node_ids.set(7);
+        node_ids.insert(7);
         let node_ids = node_ids.into_ranked();
         let mut rel_ids = IdSet::new();
-        rel_ids.set(5);
+        rel_ids.insert(5);
         let rel_ids = rel_ids.into_ranked();
         let way_ids = IdSet::new().into_ranked();
         let ids = RelationIdSpaces {
@@ -1167,7 +1167,7 @@ mod tests {
 
     fn run_ways(block: &[u8]) -> crate::Result<Outcome> {
         let mut node_ids = IdSet::new();
-        node_ids.set(7);
+        node_ids.insert(7);
         let node_ids = node_ids.into_ranked();
         let mut way_ids = IdSet::new();
         let mut out = Vec::new();
@@ -1584,7 +1584,7 @@ mod tests {
     fn ranked(ids: &[i64]) -> RankedIdSet {
         let mut set = IdSet::new();
         for &id in ids {
-            set.set(id);
+            set.insert(id);
         }
         set.into_ranked()
     }

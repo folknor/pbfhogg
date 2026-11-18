@@ -214,7 +214,7 @@ fn append_capped_missing_refs(
 /// found first. The main thread merges per-blob results in completion order.
 ///
 /// On an indexed file, phase 1 reads the node blobs and writes `node_ids` via
-/// `IdSet::set_atomic`. Phase 2 reads the way blobs, checks their refs
+/// `IdSet::try_insert_atomic`. Phase 2 reads the way blobs, checks their refs
 /// against `node_ids` and, under `check_relations`, writes `way_ids`. Phase 3
 /// (only under `check_relations`) reads the relation blobs, checks their
 /// members against both and populates `relation_ids`. Forward
@@ -344,7 +344,7 @@ fn replay_nodes(scratch: &IdScratch, bytes: &[u8], node_ids: &IdSet) -> Result<(
     let mut count: u64 = 0;
     let mut overflow = Vec::new();
     scratch.each(bytes, |_, id| {
-        if !node_ids.set_atomic_checked(id) {
+        if !node_ids.try_insert_atomic(id) {
             if id < 0 {
                 return Err(negative_id_error("node", id));
             }
@@ -364,7 +364,7 @@ fn judge_ways(ways: &[WaySpan], bytes: &[u8], sets: &Sets, judge: Judge) -> Resu
         let wid = way.id;
         // Way IDs are tracked only for the relation phase; without it no
         // comparison reads them, so a negative one is refused only here.
-        if judge.check_relations && !sets.ways.set_atomic_checked(wid) {
+        if judge.check_relations && !sets.ways.try_insert_atomic(wid) {
             if wid < 0 {
                 return Err(negative_id_error("way", wid));
             }
@@ -406,7 +406,7 @@ fn judge_relations(
     let mut r = RelBlobResult::default();
     for rel in relations {
         let rid = rel.id;
-        if !sets.relations.set_atomic_checked(rid) {
+        if !sets.relations.try_insert_atomic(rid) {
             if rid < 0 {
                 return Err(negative_id_error("relation", rid));
             }
@@ -525,7 +525,7 @@ impl Tally {
         self.way_refs_checked += r.way_refs_checked;
         self.missing_node_refs_occurrences += r.missing_node_ref_occurrences;
         for id in r.missing_node_refs {
-            self.missing_nodes_in_ways.set(id);
+            self.missing_nodes_in_ways.insert(id);
         }
         if let Some(show_ids) = judge.show_ids {
             append_capped_missing_refs(&mut self.missing_refs, r.missing_refs, show_ids.max_errors);
@@ -541,10 +541,10 @@ impl Tally {
         self.missing_node_members_occurrences += r.missing_node_member_occurrences;
         self.missing_way_refs_occurrences += r.missing_way_ref_occurrences;
         for id in r.missing_node_members {
-            self.missing_nodes_in_relations.set(id);
+            self.missing_nodes_in_relations.insert(id);
         }
         for id in r.missing_way_refs {
-            self.missing_ways_in_relations.set(id);
+            self.missing_ways_in_relations.insert(id);
         }
         self.deferred_relation_refs.extend(r.deferred_relation_refs);
         if let Some(show_ids) = judge.show_ids {
@@ -899,7 +899,7 @@ fn check_refs_inner(
         // `deferred_relation_refs` under `show_ids`, and empty otherwise.
         for (i, &id) in tally.deferred_relation_refs.iter().enumerate() {
             if !sets.relations.get(id) {
-                missing_relation_members.set(id);
+                missing_relation_members.insert(id);
                 occurrences += 1;
                 if judge.keeps_detail(missing_refs.len()) {
                     missing_refs.push(MissingRef {

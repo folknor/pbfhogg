@@ -56,7 +56,8 @@
 //! re-chooses the smaller form for every page left in Incidence form.
 //!
 //! Negative IDs are not members and are dropped before any arithmetic, as
-//! `IdSet::set` drops them (decisions/0002-negative-ids-rejected-project-wide.md).
+//! extract drops them before its `IdSet`s
+//! (decisions/0002-negative-ids-rejected-project-wide.md).
 
 // Offsets are masked to 12 bits, page-in-chunk indices to 13, region
 // numbers are below N; every narrowing cast is bounded by construction.

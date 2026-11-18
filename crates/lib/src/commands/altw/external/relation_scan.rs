@@ -88,7 +88,7 @@ pub(super) fn collect_relation_member_ids_indexed(
             // A kind that was not requested has no set and nothing to
             // record.
             if let Some(set) = if way { &mut way_ids } else { &mut node_ids } {
-                set.set(id);
+                set.insert(id);
             }
         })
         .map_err(locate)?;

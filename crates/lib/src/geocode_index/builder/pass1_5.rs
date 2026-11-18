@@ -32,7 +32,7 @@ fn record_referenced_node(
     if node_id > prealloc_max {
         overflow.push(node_id);
     } else {
-        referenced_nodes.set_atomic(node_id);
+        referenced_nodes.insert_atomic(node_id);
     }
 }
 
@@ -52,7 +52,7 @@ fn compact_overflow_nodes(overflow: &mut Vec<i64>, compacted_len: &mut usize) {
 fn insert_overflow_nodes(referenced_nodes: &mut crate::idset::IdSet, lists: Vec<Vec<i64>>) {
     for list in lists {
         for node_id in list {
-            referenced_nodes.set(node_id);
+            referenced_nodes.insert(node_id);
         }
     }
 }
@@ -71,7 +71,7 @@ fn record_way_refs(
         // Only refs in `0..=max_node_id`
         // can name a node Phase 2a will
         // see. Negative refs are skipped
-        // as non-atomic `IdSet::set` does.
+        // (the builder does not use them).
         // A ref above the claimed bound is a
         // dangling ref on honest input (a
         // simple-strategy extract keeps
@@ -995,7 +995,7 @@ mod tests {
                 for admin_way in [false, true] {
                     let mut admin = crate::idset::IdSet::new();
                     if admin_way {
-                        admin.set(1);
+                        admin.insert(1);
                     }
                     let want = if admin_way { want | ROLE_ADMIN } else { want };
                     let (records, referenced) = extract(blob, &admin);

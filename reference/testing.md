@@ -1100,7 +1100,16 @@ exception, not a tier - should not survive across many PRs.
 - **Negative-id generators.** `crates/lib/tests/common/mod.rs` provides
   `generate_nodes_with_negatives`, `generate_ways_with_negatives`,
   `generate_relations_with_negatives` for mixed-sign fixtures (per
-  `decisions/0002-negative-ids-rejected-project-wide.md`).
+  `decisions/0002-negative-ids-rejected-project-wide.md`). Their refs are
+  all positive.
+- **Mixed-sign fixture graph.** `crates/lib/tests/common/mixed_sign.rs`
+  provides one referentially complete graph whose IDs, way refs and
+  relation members cross zero in both directions in every kind, with
+  magnitude twins (`n7` and `n-7`), blobs that straddle zero, and its
+  relabelled twin: the same graph under a per-kind, canonical-order
+  preserving bijection onto positive IDs, with the map, so a command's
+  answer on the graph can be compared with its answer on the twin. Its
+  structural contract is pinned in `crates/lib/tests/fixture_helpers.rs`.
 - **Test scratch.** The dev-only workspace member `crates/test-scratch`
   (package `pbfhogg-test-scratch`) is the one owner of test scratch for
   every harness. It is a leaf: no features and no dependency on `pbfhogg`,

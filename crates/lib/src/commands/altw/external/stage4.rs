@@ -375,7 +375,7 @@ pub(super) fn stage4_assembly(
                 s4_node_blobs_kept_by_tags += 1;
             } else {
                 let has_members = relation_member_node_ids
-                    .is_some_and(|ids| ids.any_in_range(meta.min_id, meta.max_id));
+                    .is_some_and(|ids| ids.any_in_numeric_range(meta.min_id, meta.max_id));
                 if has_members {
                     s4_node_blobs_kept_by_members += 1;
                 }

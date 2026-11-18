@@ -1192,7 +1192,7 @@ pub(crate) const GEOCODE_INPUT_HASH_CHUNK_BYTES: usize = 8 << 20;
 /// IDs the dense node-ID bitmap may cover per input byte, passed to
 /// `IdSet::file_bounded_max_id` because `max_node_id` can come from
 /// unverified indexdata. References above the resulting bound are collected
-/// as plain per-worker ID lists and inserted with `IdSet::set` after the
+/// as plain per-worker ID lists and inserted with `IdSet::insert` after the
 /// parallel scan, as in external renumber, so an honest high-ID extract is
 /// not rejected or silently dropped. Same factor as renumber's, for the same
 /// reason: country-sized extracts stay on the parallel path.

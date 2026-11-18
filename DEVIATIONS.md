@@ -592,14 +592,14 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   are treated as opaque data, matching the project-wide stance that
   commands do not police element values such as ID sign; structural
   checks on decoded blocks are a separate matter, see
-  `reference/truncation-handling.md`). The blob-prefilter (`IdSet::any_in_range` at
-  `crates/lib/src/idset.rs`) clamps `min_id < 0` to 0 so a *target* PBF whose
+  `reference/truncation-handling.md`). The blob-prefilter (`IdSet::any_in_numeric_range` at
+  `crates/lib/src/idset.rs`) asks both signs of a range, so a *target* PBF whose
   indexdata range straddles zero correctly screens in its positive
-  portion - without the clamp the unsigned cast wraps and the blob
-  is silently skipped, dropping legitimate positive matches.
+  portion - an unsigned cast of `min_id` would wrap and skip the
+  blob, dropping legitimate positive matches.
   Negatives in the target PBF are still absent from output because
-  `IdSet::set` is a silent no-op on negatives (no positive request
-  id can match a negative element id).
+  getid drops negative IDs before they reach its ID sets (no positive
+  request id can match a negative element id).
 - `add-locations-to-ways --index-type external` - **hard reject** of
   any node blob whose indexdata range holds a negative ID, in its
   metadata scan (`check_range` in
@@ -609,7 +609,7 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   included, into missing locations. The error names the sparse index,
   which joins such input. Way and relation blobs may hold negative IDs.
 - `check --locations` - **hard reject** of any way referencing a
-  negative node ID. Its coordinate store is keyed through an `IdSet`,
+  negative node ID. Its coordinate store gives no negative node a slot,
   so such a reference could not be compared, and a verifier that
   skipped it would pass a stale coordinate unseen. Negative node
   records are still counted and their coordinates domain-checked.
@@ -629,24 +629,23 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   (`crates/lib/src/commands/check/verify_ids.rs`). The streaming `check --ids`
   orders negatives canonically by `osm_id_cmp` and does not fail on
   them, as libosmium's `CheckOrder` and `osmium fileinfo` do not.
-- `add-locations-to-ways` (both backends) - **silent**, by
-  inheritance from `IdSet`, for negative relation-member refs.
-  Relation-member node IDs are collected into an `IdSet` that decides
-  which untagged nodes to keep; the external backend's stage 4 also
-  consults `relation_member_node_ids.any_in_range(min_id, max_id)` to
+- `add-locations-to-ways` (both backends) - **silent**, for negative
+  relation-member refs, which the relation scan drops before collecting
+  relation-member node IDs into the `IdSet` that decides which untagged
+  nodes to keep; the external backend's stage 4 also
+  consults `relation_member_node_ids.any_in_numeric_range(min_id, max_id)` to
   skip node blobs that contain no relation-referenced nodes (no node
   blob reaching that check holds a negative ID, given the reject
-  above). The per-id silent no-op on `IdSet::set` (and the matching
-  abs-fold absence on the pbfhogg side) is the residual divergence
-  below.
+  above). That per-id drop (and the matching abs-fold absence on the
+  pbfhogg side) is the residual divergence below.
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
 PBF payload, not an ID set passed through `IdSet`; the shared typed-ID parser
 preserves the sign and `getid` applies its own rejection afterward.
 
 **Residual divergence (tags-filter, add-locations-to-ways, getid -r):**
-The shared root is `IdSet::set` in `crates/lib/src/idset.rs`, a silent
-no-op on negative ids, where osmium's equivalent paths abs-fold via
+Each of these commands drops negative ids before they reach its ID sets
+(`IdSet` in `crates/lib/src/idset.rs` itself holds any signed ID), where osmium's equivalent paths abs-fold via
 `object.positive_id()` to collapse `-N` and `+N` into a single bit.
 
 - `tags-filter`'s parallel-classify path silently **drops**
@@ -655,7 +654,7 @@ no-op on negative ids, where osmium's equivalent paths abs-fold via
   `crates/cli/tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
 - `add-locations-to-ways` silently **omits** relation-member
   retention for any relation member whose id is negative (the member
-  id is dropped at `IdSet::set` time, so the write pass doesn't know
+  id is dropped before the member set is built, so the write pass doesn't know
   to keep the corresponding untagged node).
   osmium's `add-locations-to-ways` abs-folds the member ref via
   `member.positive_ref()`, collapsing `-N` and `+N` member refs

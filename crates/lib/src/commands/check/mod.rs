@@ -215,7 +215,7 @@ use crate::tunables::CHECK_IDS_PER_BYTE;
 ///
 /// This is an allocation bound, not an input validity bound. Both callers
 /// insert observed positive IDs refused by atomic setters into a side set
-/// from the phase's serial merge (`IdSet::set`, or `set_if_new`), and merge
+/// from the phase's serial merge (`IdSet::insert`, or `insert_if_new`), and merge
 /// it in after workers join. Only those decoded IDs can allocate sparse
 /// overflow chunks; unverified indexdata cannot.
 pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i64 {
@@ -247,7 +247,7 @@ pub(super) fn insert_overflow_ids(
     #[cfg(not(pbfhogg_test_hooks))]
     let _ = host;
     for id in ids {
-        overflow.set(id);
+        overflow.insert(id);
     }
 }
 

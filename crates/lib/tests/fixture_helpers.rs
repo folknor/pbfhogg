@@ -346,3 +346,185 @@ fn scratch_snapshot_does_not_follow_symlink_cycles_or_escapes() {
             .collect()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mixed-sign graph and its relabelled twin
+// ---------------------------------------------------------------------------
+
+mod mixed_sign {
+    use crate::common::mixed_sign::{
+        MIXED_SIGN_BBOX, MixedSignGraph, blob_ids, canonical_key, mixed_sign_graph,
+    };
+    use crate::common::{
+        assert_every_data_blob_indexed, assert_non_indexed, assert_sorted_file,
+        read_all_elements_with_coords,
+    };
+    use pbfhogg::MemberId;
+
+    fn member_ids(g: &MixedSignGraph) -> Vec<(i64, MemberId)> {
+        g.relations
+            .iter()
+            .flat_map(|r| r.members.iter().map(move |m| (r.id, m.id)))
+            .collect()
+    }
+
+    /// The graph has the edges the negative-ID cases need: way refs and
+    /// relation members of every kind crossing zero in both directions,
+    /// magnitude twins in every kind, and nothing dangling.
+    #[test]
+    fn the_graph_crosses_zero_both_ways_and_is_complete() {
+        let g = mixed_sign_graph();
+        let refs: Vec<(i64, i64)> = g
+            .ways
+            .iter()
+            .flat_map(|w| w.refs.iter().map(move |&r| (w.id, r)))
+            .collect();
+        assert!(refs.iter().any(|&(w, n)| w < 0 && n > 0));
+        assert!(refs.iter().any(|&(w, n)| w > 0 && n < 0));
+        assert!(refs.iter().any(|&(w, n)| w < 0 && n < 0));
+        let members = member_ids(&g);
+        for kind in 0..3 {
+            let of_kind = |m: &MemberId| match (kind, m) {
+                (0, MemberId::Node(id)) | (1, MemberId::Way(id)) | (2, MemberId::Relation(id)) => {
+                    Some(*id)
+                }
+                _ => None,
+            };
+            assert!(
+                members
+                    .iter()
+                    .any(|(r, m)| *r < 0 && of_kind(m).is_some_and(|id| id > 0)),
+                "kind {kind}: negative relation over a positive member"
+            );
+            assert!(
+                members
+                    .iter()
+                    .any(|(r, m)| *r > 0 && of_kind(m).is_some_and(|id| id < 0)),
+                "kind {kind}: positive relation over a negative member"
+            );
+        }
+        for ids in [
+            g.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            g.ways.iter().map(|w| w.id).collect(),
+            g.relations.iter().map(|r| r.id).collect(),
+        ] {
+            assert!(ids.contains(&7) && ids.contains(&-7), "magnitude twins");
+            assert!(
+                ids.is_sorted_by_key(|&id| canonical_key(id)),
+                "canonical order"
+            );
+        }
+        let node_ids: Vec<i64> = g.nodes.iter().map(|n| n.id).collect();
+        let way_ids: Vec<i64> = g.ways.iter().map(|w| w.id).collect();
+        let rel_ids: Vec<i64> = g.relations.iter().map(|r| r.id).collect();
+        assert!(refs.iter().all(|(_, n)| node_ids.contains(n)));
+        assert!(members.iter().all(|(_, m)| match m {
+            MemberId::Node(id) => node_ids.contains(id),
+            MemberId::Way(id) => way_ids.contains(id),
+            MemberId::Relation(id) => rel_ids.contains(id),
+            _ => false,
+        }));
+        let (min_lat, min_lon, max_lat, max_lon) = MIXED_SIGN_BBOX;
+        let inside = |id: i64| {
+            g.nodes.iter().find(|n| n.id == id).is_some_and(|n| {
+                (min_lat..=max_lat).contains(&n.lat) && (min_lon..=max_lon).contains(&n.lon)
+            })
+        };
+        assert!(inside(-7) && inside(7) && !inside(-11) && !inside(11));
+        // The boundary's outer ring is closed.
+        let ring = g.ways.iter().find(|w| w.id == 7).expect("ring");
+        assert_eq!(ring.refs.first(), ring.refs.last());
+    }
+
+    /// The twin is the same graph under an order-preserving bijection onto
+    /// positive IDs, per kind.
+    #[test]
+    fn the_twin_is_an_order_preserving_positive_relabelling() {
+        let g = mixed_sign_graph();
+        let (twin, relabel) = g.relabelled_twin();
+        for map in [&relabel.nodes, &relabel.ways, &relabel.relations] {
+            let mut pairs: Vec<(i64, i64)> = map.iter().map(|(&a, &b)| (a, b)).collect();
+            pairs.sort_by_key(|&(a, _)| canonical_key(a));
+            let images: Vec<i64> = pairs.iter().map(|&(_, b)| b).collect();
+            let want: Vec<i64> = (1..=i64::try_from(images.len()).expect("fits")).collect();
+            assert_eq!(images, want);
+        }
+        assert_eq!(twin.nodes.len(), g.nodes.len());
+        for (a, b) in g.nodes.iter().zip(&twin.nodes) {
+            assert_eq!(relabel.node(a.id), b.id);
+            assert_eq!((a.lat, a.lon, &a.tags), (b.lat, b.lon, &b.tags));
+        }
+        for (a, b) in g.ways.iter().zip(&twin.ways) {
+            assert_eq!(relabel.way(a.id), b.id);
+            let refs: Vec<i64> = a.refs.iter().map(|&r| relabel.node(r)).collect();
+            assert_eq!(refs, b.refs);
+        }
+        let mapped: Vec<(i64, MemberId)> = member_ids(&g)
+            .into_iter()
+            .map(|(r, m)| (relabel.relation(r), relabel.member(m)))
+            .collect();
+        assert_eq!(mapped, member_ids(&twin));
+        // The magnitude twins land apart.
+        assert_ne!(relabel.node(7), relabel.node(-7));
+    }
+
+    /// Written, the graph has the blob layouts the negative-ID cases rely
+    /// on, indexed and not, and reads back as written; the twin has the same
+    /// cuts.
+    #[test]
+    fn the_written_graph_has_the_zero_straddling_blob_layouts() {
+        let dir = crate::common::test_scratch();
+        let g = mixed_sign_graph();
+        let (twin, relabel) = g.relabelled_twin();
+        let indexed = dir.path().join("mixed.osm.pbf");
+        let plain = dir.path().join("mixed-plain.osm.pbf");
+        let twin_path = dir.path().join("twin.osm.pbf");
+        g.write(&indexed, true);
+        g.write(&plain, false);
+        twin.write(&twin_path, true);
+        assert_every_data_blob_indexed(&indexed);
+        assert_non_indexed(&plain);
+        assert_sorted_file(&indexed);
+        assert_sorted_file(&twin_path);
+
+        let blobs = blob_ids(&indexed);
+        assert_eq!(blobs, blob_ids(&plain));
+        assert_eq!(
+            &blobs[..3],
+            &[vec![0, -1, -2], vec![-5, -7, -9], vec![-11, 1, 2]],
+            "zero beside negatives, a negative-only blob, then one straddling zero"
+        );
+        let straddles = |ids: &[i64]| ids.iter().any(|&i| i < 0) && ids.iter().any(|&i| i > 0);
+        assert_eq!(
+            blobs.iter().filter(|ids| straddles(ids)).count(),
+            3,
+            "one per kind"
+        );
+        let twin_blobs = blob_ids(&twin_path);
+        assert_eq!(
+            twin_blobs.iter().map(Vec::len).collect::<Vec<_>>(),
+            blobs.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(twin_blobs.iter().flatten().all(|&id| id > 0));
+
+        let back = read_all_elements_with_coords(&indexed);
+        let nodes: Vec<(i64, i32, i32)> = back.nodes.iter().map(|n| (n.0, n.1, n.2)).collect();
+        let want: Vec<(i64, i32, i32)> = g.nodes.iter().map(|n| (n.id, n.lat, n.lon)).collect();
+        assert_eq!(nodes, want);
+        let ways: Vec<(i64, Vec<i64>)> = back.ways.iter().map(|w| (w.0, w.1.clone())).collect();
+        let want: Vec<(i64, Vec<i64>)> = g.ways.iter().map(|w| (w.id, w.refs.clone())).collect();
+        assert_eq!(ways, want);
+        let twin_back = read_all_elements_with_coords(&twin_path);
+        assert_eq!(
+            twin_back
+                .ways
+                .iter()
+                .map(|w| w.1.clone())
+                .collect::<Vec<_>>(),
+            g.ways
+                .iter()
+                .map(|w| w.refs.iter().map(|&r| relabel.node(r)).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+}

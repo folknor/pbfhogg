@@ -570,6 +570,16 @@ the ordered pools is not decided by these cells.
 
 ### Add-locations-to-ways
 
+#### Signed `IdSet` (Japan, sparse, baseline `2b4e511c`, bygg, 2026-11-18)
+
+The set became signed (a second, empty bitmap for negative IDs and one
+sign branch per insert and rank). Matched `--iterations 1` cells in A B B A
+order, baseline built with `--commit 2b4e511c`, variant uncommitted on it:
+walls 6.05 s (cold first cell) / 5.54 / 5.45 / 5.43 s; `altw_pass0_union_ms`
+over 322,807,555 refs 774 / 781 / 776 / 737 ms, so 2.34 ns/ref median
+baseline against 2.41 variant (about 3 %, under the noise rule). UUIDs
+`54097cb1`, `3ceecaf5`, `f469929d`, `5f29e8d0`. Verdict: neutral.
+
 #### External join stage breakdown (Europe, commit `d3e13ed`, plantasjen)
 
 Shared blob-metadata pass replaced three earlier separate scans

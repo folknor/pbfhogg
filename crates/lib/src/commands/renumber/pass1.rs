@@ -3,7 +3,7 @@
 //! Workers rewrite node blobs in any order; each blob's base new id comes
 //! from a prefix sum over the schedule's element counts, so no worker waits
 //! on another. Old node IDs go into one shared, pre-allocated `IdSet` via
-//! `set_atomic_checked`; an ID outside the pre-allocation is collected per
+//! `try_insert_atomic`; an ID outside the pre-allocation is collected per
 //! worker and returned for the caller to insert after the pass.
 
 use super::super::Result;

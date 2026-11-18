@@ -418,7 +418,7 @@ mod tests {
         type Relations = Vec<(i64, Vec<MemberId>)>;
         let mut only = IdSet::new();
         for id in [20, -41, 42, 30, 2] {
-            only.set(id);
+            only.insert(id);
         }
 
         for (what, bytes) in projection_fixtures() {

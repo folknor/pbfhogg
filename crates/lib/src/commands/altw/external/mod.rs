@@ -1532,7 +1532,7 @@ pub(crate) fn external_join_in(
     stats.missing_locations = total_slots.saturating_sub(resolved_count);
 
     if inject_prepass {
-        let member_ways = member_way_ids_ref.map_or(0, |set| set.iter().count() as u64);
+        let member_ways = member_way_ids_ref.map_or(0, crate::idset::IdSet::len);
         inject_metrics.emit(member_ways, &host.invocation);
     }
 

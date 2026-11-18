@@ -4373,21 +4373,21 @@ fn print_requested_ids(ids: &pbfhogg::getid::ElementIds) {
     output::cli_eprintln!("Requested IDs:");
     if ids.node_ids.has_any() {
         output::cli_eprint!("  nodes:");
-        for id in ids.node_ids.iter() {
+        for id in ids.node_ids.iter_canonical() {
             output::cli_eprint!(" {id}");
         }
         output::cli_eprintln!();
     }
     if ids.way_ids.has_any() {
         output::cli_eprint!("  ways:");
-        for id in ids.way_ids.iter() {
+        for id in ids.way_ids.iter_canonical() {
             output::cli_eprint!(" {id}");
         }
         output::cli_eprintln!();
     }
     if ids.relation_ids.has_any() {
         output::cli_eprint!("  relations:");
-        for id in ids.relation_ids.iter() {
+        for id in ids.relation_ids.iter_canonical() {
             output::cli_eprint!(" {id}");
         }
         output::cli_eprintln!();
@@ -4402,17 +4402,17 @@ fn print_requested_ids(ids: &pbfhogg::getid::ElementIds) {
 fn print_missing_ids(requested: &pbfhogg::getid::ElementIds, found: &pbfhogg::getid::ElementIds) {
     let missing_nodes: Vec<_> = requested
         .node_ids
-        .iter()
+        .iter_canonical()
         .filter(|&id| !found.node_ids.get(id))
         .collect();
     let missing_ways: Vec<_> = requested
         .way_ids
-        .iter()
+        .iter_canonical()
         .filter(|&id| !found.way_ids.get(id))
         .collect();
     let missing_rels: Vec<_> = requested
         .relation_ids
-        .iter()
+        .iter_canonical()
         .filter(|&id| !found.relation_ids.get(id))
         .collect();
 

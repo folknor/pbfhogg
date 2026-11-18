@@ -100,11 +100,16 @@ impl RelationHandler for SmartRelationHandler {
     const COLLECT_MEMBER_IDS: bool = true;
 
     fn merge_extras(&mut self, way_ids: &mut Vec<i64>, node_ids: &mut Vec<i64>) {
+        // extract does not select negative IDs.
         for id in way_ids.drain(..) {
-            self.extra_way_ids.set(id);
+            if id >= 0 {
+                self.extra_way_ids.insert(id);
+            }
         }
         for id in node_ids.drain(..) {
-            self.extra_node_ids.set(id);
+            if id >= 0 {
+                self.extra_node_ids.insert(id);
+            }
         }
     }
 }
@@ -228,6 +233,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 crate::commands::release_scratch(&mut st_scratch);
                 crate::commands::release_scratch(&mut gr_scratch);
                 super::common::refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
+                // extract does not select negative IDs: every insertion
+                // below drops one.
                 for element in block.elements_skip_metadata() {
                     match (phase, &element) {
                         (UnsortedPhase::Nodes, Element::DenseNode(dn))
@@ -237,7 +244,9 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                                 dn.decimicro_lon(),
                             ) =>
                         {
-                            bbox_node_ids.set(dn.id());
+                            if dn.id() >= 0 {
+                                bbox_node_ids.insert(dn.id());
+                            }
                         }
                         (UnsortedPhase::Nodes, Element::Node(n))
                             if region.contains_decimicro(
@@ -246,20 +255,26 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                                 n.decimicro_lon(),
                             ) =>
                         {
-                            bbox_node_ids.set(n.id());
+                            if n.id() >= 0 {
+                                bbox_node_ids.insert(n.id());
+                            }
                         }
                         (UnsortedPhase::Ways, Element::Way(w))
                             if w.refs().any(|r| bbox_node_ids.get(r)) =>
                         {
-                            matched_way_ids.set(w.id());
-                            for r in w.refs().filter(|&r| !bbox_node_ids.get(r)) {
-                                outside_way_node_ids.set(r);
+                            if w.id() >= 0 {
+                                matched_way_ids.insert(w.id());
+                            }
+                            for r in w.refs().filter(|&r| r >= 0 && !bbox_node_ids.get(r)) {
+                                outside_way_node_ids.insert(r);
                             }
                         }
                         (UnsortedPhase::Relations, Element::Relation(r)) => {
                             push_parent_edges(r, &mut parent_edges);
                             if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                                matched_relation_ids.set(r.id());
+                                if r.id() >= 0 {
+                                    matched_relation_ids.insert(r.id());
+                                }
                                 if H::COLLECT_MEMBER_IDS && is_smart_relation(r) {
                                     let known = Pass1Known {
                                         bbox_node_ids: &bbox_node_ids,
@@ -457,8 +472,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             Ok(std::mem::take(ids))
         },
         |_seq, ids| {
+            // extract does not select negative IDs.
             for id in ids {
-                bbox_node_ids.set(id);
+                if id >= 0 {
+                    bbox_node_ids.insert(id);
+                }
             }
         },
         host,
@@ -494,11 +512,16 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             Ok((way_ids, node_ids))
         },
         |_seq, (way_ids, node_ids)| {
+            // extract does not select negative IDs.
             for id in way_ids {
-                matched_way_ids.set(id);
+                if id >= 0 {
+                    matched_way_ids.insert(id);
+                }
             }
             for id in node_ids {
-                outside_way_node_ids.set(id);
+                if id >= 0 {
+                    outside_way_node_ids.insert(id);
+                }
             }
         },
         host,
@@ -550,8 +573,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             Ok((rel_ids, extra_ways, extra_nodes, edges))
         },
         |_seq, (rel_ids, mut extra_ways, mut extra_nodes, edges)| {
+            // extract does not select negative IDs.
             for id in rel_ids {
-                matched_relation_ids.set(id);
+                if id >= 0 {
+                    matched_relation_ids.insert(id);
+                }
             }
             handler.merge_extras(&mut extra_ways, &mut extra_nodes);
             parent_edges.extend(edges);
@@ -684,8 +710,11 @@ pub(super) fn extract_smart(
                 Ok(std::mem::take(scratch))
             },
             |_seq, refs| {
+                // extract does not select negative IDs.
                 for id in refs {
-                    extra_node_ids.set(id);
+                    if id >= 0 {
+                        extra_node_ids.insert(id);
+                    }
                 }
             },
             host,
@@ -946,7 +975,7 @@ fn add_parent_relations(
     }
     edges.sort_unstable();
     edges.dedup();
-    let mut work: Vec<i64> = included.iter().collect();
+    let mut work: Vec<i64> = included.iter_canonical().collect();
     let mut added: u64 = 0;
     while let Some(child) = work.pop() {
         let start = edges.partition_point(|&(c, _)| c < child);
@@ -954,7 +983,8 @@ fn add_parent_relations(
             if c != child {
                 break;
             }
-            if included.set_if_new(parent) {
+            // extract does not select negative IDs.
+            if parent >= 0 && included.insert_if_new(parent) {
                 added += 1;
                 work.push(parent);
             }

@@ -300,7 +300,7 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// - **Full:** the streaming scan first, which proves a kind with no order
 ///   violation duplicate-free (strictly increasing under `osm_id_cmp`), then
 ///   for each kind it found out of order only, a second read with a shared
-///   `IdSet` populated via `set_atomic_if_new_checked` for cross-blob
+///   `IdSet` populated via `try_insert_atomic_if_new` for cross-blob
 ///   duplicate detection. Negative IDs are reported as `IdOutOfRange` by
 ///   whichever pass settles their kind.
 ///
@@ -622,7 +622,7 @@ impl KindJudge {
         // IDs are inserted after workers join; negatives remain invalid
         // under the command's existing policy.
         if let Some(atomic_ids) = atomic_ids {
-            match atomic_ids.set_atomic_if_new_checked(id) {
+            match atomic_ids.try_insert_atomic_if_new(id) {
                 Some(true) => {}
                 Some(false) => r.duplicate_ids.push(id),
                 None => r.out_of_range_ids.push(id),
@@ -1059,7 +1059,7 @@ fn settle_overflow(
             return true;
         }
         inserted += 1;
-        if !overflow.set_if_new(id) {
+        if !overflow.insert_if_new(id) {
             duplicates.push(id);
         }
         false

@@ -506,7 +506,7 @@ pub(crate) fn renumber_external_to<'a>(
         .iter()
         .fold(0_u64, |acc, t| acc.saturating_add(t.element_count));
 
-    // One shared IdSet, pre-allocated so workers can `set_atomic_checked`
+    // One shared IdSet, pre-allocated so workers can `try_insert_atomic`
     // through `&self`. The whole schedule is scanned for the claimed max
     // rather than trusting the last blob; the claim is then bounded by the
     // file size (see `RENUMBER_PREALLOC_IDS_PER_BYTE`).
@@ -543,7 +543,7 @@ pub(crate) fn renumber_external_to<'a>(
     for ids in pass1.overflow {
         overflow_ids = overflow_ids.saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
         for id in ids {
-            node_id_set.set(id);
+            node_id_set.insert(id);
         }
     }
     host.invocation

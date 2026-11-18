@@ -33,6 +33,7 @@
 
 pub mod adversarial;
 pub mod groups;
+pub mod mixed_sign;
 pub mod model;
 pub mod oracle;
 pub mod process;
@@ -807,9 +808,9 @@ pub fn generate_relations(
 }
 
 /// Generate `n_neg + n_pos` nodes with mixed-sign ids in canonical OSM
-/// order: `[-1, -2, ..., -n_neg, 1, 2, ..., n_pos]`. Zero is not a valid
-/// OSM id and is omitted. Coordinates and tags follow the
-/// [`generate_nodes`] pattern.
+/// order: `[-1, -2, ..., -n_neg, 1, 2, ..., n_pos]`. Zero is omitted.
+/// Coordinates and tags follow the [`generate_nodes`] pattern. For a graph
+/// with references across zero, see [`mixed_sign::mixed_sign_graph`].
 ///
 /// Canonical OSM order is `0, -1, -2, ...` (negatives by ascending
 /// absolute value) `then 1, 2, ...` (positives ascending) - see

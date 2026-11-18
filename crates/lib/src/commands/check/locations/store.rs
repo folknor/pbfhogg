@@ -125,7 +125,7 @@ fn lowest_id_with_rank_at_least(keys: &RankedIdSet, target: u64) -> i64 {
     let (mut lo, mut hi) = (0_i64, i64::MAX);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if keys.rank(mid) >= target {
+        if keys.numeric_rank(mid) >= target {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -485,7 +485,7 @@ mod tests {
         let mut set = IdSet::new();
         let ids = [0_i64, 5, 6, 7, 1 << 30, (1 << 30) + 1, 1 << 40, i64::MAX];
         for id in ids {
-            set.set(id);
+            set.insert(id);
         }
         let keys = set.into_ranked();
         for per in 1..=9 {
@@ -502,7 +502,7 @@ mod tests {
                     .collect();
                 assert_eq!(members.len() as u64, len, "per {per} partition {k}");
                 for (offset, id) in members.iter().enumerate() {
-                    assert_eq!(keys.rank_if_set(*id), Some(first + offset as u64));
+                    assert_eq!(keys.numeric_rank_if_set(*id), Some(first + offset as u64));
                 }
                 seen += members.len();
             }

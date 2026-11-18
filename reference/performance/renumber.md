@@ -45,6 +45,13 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 
 ### Renumber
 
+#### Signed `IdSet` (Germany, baseline `2b4e511c`, bygg, 2026-11-18)
+
+The set became signed and renumber's live map ranks in canonical order.
+Matched `id-remap` `--iterations 1` cells, A B B A, baseline built with
+`--commit 2b4e511c`, variant uncommitted on it: 7.6 / 6.9 / 6.5 / 6.8 s
+(UUIDs `9e86c30a`, `31419a11`, `dadf81f8`, `cebebd5a`). Verdict: neutral.
+
 #### Optimization history
 
 Planet 3,456 s → 194 s (-94 %) across ~30 commits from `e156e97` to

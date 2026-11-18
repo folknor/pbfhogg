@@ -10,6 +10,16 @@
   XXH3-128 and size in the header. `Reader::open` refuses any other
   version with an error telling you to rebuild with
   `build-geocode-index`; there is no in-place upgrade.
+- **The ID sets in `getid::ElementIds` (`node_ids`, `way_ids`,
+  `relation_ids`) are signed and their methods renamed.** They hold any
+  `i64`, negative IDs included. `set` / `set_if_new` are now `insert` /
+  `insert_if_new`; `iter` is gone in favour of `iter_canonical` (OSM
+  `id_order`: `0`, then `-1, -2, ...`, then `1, 2, ...`) and
+  `iter_numeric_from`; `any_in_range` is `any_in_numeric_range`; the
+  atomic setters are `insert_atomic`, `insert_atomic_if_new`,
+  `try_insert_atomic` and `try_insert_atomic_if_new`. Inserting a
+  negative ID now stores it, where it was silently dropped before. What the
+  getid functions select is unchanged.
 
 ### Added
 

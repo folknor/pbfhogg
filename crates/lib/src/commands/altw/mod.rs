@@ -137,7 +137,7 @@ fn relation_member_ids(
 pub enum IndexType {
     /// Rank-indexed flat sparse array, sized at `referenced.total_count() * 8`
     /// bytes. Workers store coordinates with relaxed `AtomicU64` mmap stores
-    /// at byte offset `IdSet::rank_if_set(node_id) << 3` (not pwrites, so no
+    /// at byte offset `RankedIdSet::numeric_rank_if_set(node_id) << 3` (not pwrites, so no
     /// syscall per tuple). Works on any PBF. Runtime and page-cache behavior
     /// depend on the input and host; see `reference/performance/add-locations-to-ways.md` for
     /// measurements.
@@ -292,7 +292,7 @@ type NodeIndex = SparseArrayIndex;
 // Keep the reframe wire-format tests independent of an mmap-backed index.
 #[cfg(test)]
 enum NodeIndex {
-    Sparse(SparseArrayIndex),
+    Sparse(Box<SparseArrayIndex>),
     InMemory(std::collections::HashMap<i64, (i32, i32)>),
 }
 
@@ -491,17 +491,17 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         host,
     )?;
     host.invocation.marker("ALTW_PASS0_END");
-    // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
-    // the index build so the counter survives SIGKILL during pass 1.
+    // Cheap one-shot count; surfaces the way-ref IdSet size before the index
+    // build so the counter survives SIGKILL during pass 1.
     host.invocation
-        .counter("altw_referenced_node_ids", referenced.iter().count());
+        .counter("altw_referenced_node_ids", referenced.len());
     host.invocation.counter("altw_index_kind", 1);
 
     host.invocation.marker("ALTW_PASS1_START");
     let index =
         build_node_index_sparse(input, options.write.direct_reads, scratch, referenced, host)?;
     #[cfg(test)]
-    let index = NodeIndex::Sparse(index);
+    let index = NodeIndex::Sparse(Box::new(index));
     host.invocation.marker("ALTW_PASS1_END");
 
     let relation_scan = if options.keep_untagged_nodes && !options.inject_prepass {
@@ -518,7 +518,7 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         host.invocation.marker("ALTW_REL_MEMBER_SCAN_END");
         host.invocation.counter(
             "altw_relation_member_node_ids",
-            ids.0.as_ref().map_or(0, |set| set.iter().count()),
+            ids.0.as_ref().map_or(0, IdSet::len),
         );
         ids
     };
@@ -542,10 +542,7 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     host.invocation.marker("ALTW_PASS2_END");
     emit_stats_counters(&stats, &host.invocation);
     if options.inject_prepass {
-        let member_ways = relation_scan
-            .1
-            .as_ref()
-            .map_or(0, |set| set.iter().count() as u64);
+        let member_ways = relation_scan.1.as_ref().map_or(0, IdSet::len);
         inject_metrics.emit(member_ways, &host.invocation);
     }
     enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
@@ -1009,15 +1006,15 @@ fn collect_way_referenced_node_ids(
                 Some(shared) => {
                     for &node_id in &refs_vec {
                         if referenced.get(node_id) {
-                            shared.set(node_id);
+                            shared.insert(node_id);
                         } else {
-                            referenced.set(node_id);
+                            referenced.insert(node_id);
                         }
                     }
                 }
                 None => {
                     for &node_id in &refs_vec {
-                        referenced.set(node_id);
+                        referenced.insert(node_id);
                     }
                 }
             }
@@ -1031,7 +1028,7 @@ fn collect_way_referenced_node_ids(
         .counter("altw_pass0_refs_total", union_refs_total);
     if let Some(shared_set) = &shared {
         host.invocation
-            .counter("altw_pass0_shared_node_ids", shared_set.iter().count());
+            .counter("altw_pass0_shared_node_ids", shared_set.len());
     }
     Ok((referenced, shared))
 }
@@ -1101,7 +1098,7 @@ pub(crate) fn collect_relation_member_ids(
                     &mut member_node_ids
                 };
                 if let Some(set) = set {
-                    set.set(id);
+                    set.insert(id);
                 }
             }
             std::ops::ControlFlow::Continue(())

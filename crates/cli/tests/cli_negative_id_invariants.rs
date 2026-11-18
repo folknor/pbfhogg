@@ -351,12 +351,12 @@ fn getid_rejects_negative_ids_with_named_id_and_kind() {
 /// Source: `build_fixture` (mixed-sign 3 neg + 3 pos per kind).
 /// Input: positives-only (`generate_*_with_negatives(0, N_POS)`).
 /// Splitting the inputs this way keeps the test focused on the
-/// source-PBF parse path. (`IdSet::any_in_range` now clamps negative
-/// `min` to 0 so a straddling-zero indexdata range correctly screens
-/// in its positive portion; see the doc comment on `any_in_range` and
+/// source-PBF parse path. (`IdSet::any_in_numeric_range` asks both signs
+/// of a straddling-zero indexdata range, so it screens in its positive
+/// portion; see the doc comment on `any_in_numeric_range` and
 /// the "Negative input IDs rejected project-wide" entry in
 /// `DEVIATIONS.md`. The narrower input keeps this test orthogonal to
-/// that fix even if the clamp ever changes.)
+/// that fix even if the prefilter ever changes.)
 #[test]
 fn getid_id_osm_file_passes_through_negative_source_ids() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
@@ -370,7 +370,7 @@ fn getid_id_osm_file_passes_through_negative_source_ids() {
     build_fixture(&source);
 
     // Input: positives only, so the input blob's indexdata range is
-    // wholly positive and IdSet::any_in_range can match cleanly.
+    // wholly positive and IdSet::any_in_numeric_range can match cleanly.
     let pos_nodes = generate_nodes_with_negatives(0, N_POS);
     let pos_ways = generate_ways_with_negatives(0, N_POS, 3);
     let pos_relations = generate_relations_with_negatives(0, N_POS, 2);

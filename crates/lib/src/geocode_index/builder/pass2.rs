@@ -426,7 +426,7 @@ fn resolve_way_into(
     coords.clear();
     coords.extend(
         crate::read::elements::WayRefIter::delta_decoded(way.refs).filter_map(|nid| {
-            let Some(rank) = referenced_nodes.rank_if_set(nid) else {
+            let Some(rank) = referenced_nodes.numeric_rank_if_set(nid) else {
                 missing_node_ref_count = missing_node_ref_count.saturating_add(1);
                 return None;
             };
@@ -688,7 +688,7 @@ pub(super) fn run_pass2(
                                 )));
                                 continue;
                             };
-                            if let Some(rank) = referenced_ref.rank_if_set(node_id) {
+                            if let Some(rank) = referenced_ref.numeric_rank_if_set(node_id) {
                                 let Some(slot) = coord_slot(coord_store, rank) else {
                                     state.error = Some(Error::internal(format!(
                                         "internal error: node {node_id} has coordinate rank {rank}, \

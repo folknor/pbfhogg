@@ -83,10 +83,6 @@ pub enum IdViolation {
         found: &'static str,
         after: &'static str,
     },
-    /// A negative element ID cannot be tracked for duplicates. Positive IDs
-    /// above the bounded parallel allocation are tracked in a side set filled
-    /// from the phase's serial merge.
-    IdOutOfRange { elem_type: &'static str, id: i64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +107,10 @@ pub struct VerifyIdsReport {
     pub violations: Vec<IdViolation>,
     /// Total violation count (may exceed `violations.len()`).
     pub total_violations: u64,
+    /// Whether some element ID of a selected kind is negative. Element IDs
+    /// only, never a reference or member; independent of the verdict and of
+    /// `max_errors`.
+    pub has_negative_ids: bool,
     /// True when no violations were found.
     pub passed: bool,
 }
@@ -130,6 +130,7 @@ impl VerifyIdsReport {
                 "ways": self.way_count,
                 "relations": self.relation_count,
             },
+            "has_negative_ids": self.has_negative_ids,
             "passed": self.passed,
             "total_violations": self.total_violations,
             "violations": violations_json,
@@ -155,6 +156,7 @@ impl VerifyIdsReport {
         writeln!(out, "  Header sorted: {}", yes_no(self.header_sorted))?;
         writeln!(out, "  Indexed: {}", yes_no(self.indexed))?;
         write_mode_line(out, self.full)?;
+        writeln!(out, "  Negative IDs: {}", yes_no(self.has_negative_ids))?;
         writeln!(out)?;
 
         writeln!(
@@ -230,10 +232,6 @@ fn write_single_violation(out: &mut impl std::io::Write, v: &IdViolation) -> std
         IdViolation::TypeOrder { found, after } => {
             writeln!(out, "  type order: {found} after {after}")
         }
-        IdViolation::IdOutOfRange { elem_type, id } => writeln!(
-            out,
-            "  {elem_type} {id}: outside the duplicate-detection ID range"
-        ),
     }
 }
 
@@ -276,11 +274,6 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
             "found": found,
             "after": after,
         }),
-        IdViolation::IdOutOfRange { elem_type, id } => serde_json::json!({
-            "type": "id_out_of_range",
-            "elem_type": elem_type,
-            "id": id,
-        }),
     }
 }
 
@@ -301,8 +294,10 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 ///   violation duplicate-free (strictly increasing under `osm_id_cmp`), then
 ///   for each kind it found out of order only, a second read with a shared
 ///   `IdSet` populated via `try_insert_atomic_if_new` for cross-blob
-///   duplicate detection. Negative IDs are reported as `IdOutOfRange` by
-///   whichever pass settles their kind.
+///   duplicate detection. A negative ID is judged like any other: its order
+///   by `osm_id_cmp`, its duplicates through the set's negative family,
+///   which no pre-allocation covers, so every negative goes through the
+///   phase's serial side set.
 ///
 /// No kind's judgement depends on another's, so an unindexed file, whose
 /// blobs' kinds the header walk cannot know, is read in one phase instead:
@@ -385,9 +380,8 @@ fn verify_ids_inner(
 // ---------------------------------------------------------------------------
 //
 // Streaming mode and `--full`'s proof pass run without an IdSet: their
-// workers report `BlobVerifyResult` with `duplicate_ids` always empty, and
-// `out_of_range_ids` empty in streaming mode and holding the negative IDs in
-// the proof pass.
+// workers report `BlobVerifyResult` with `duplicate_ids` and `overflow_ids`
+// always empty.
 
 const KINDS: [ElementKind; 3] = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
 
@@ -415,6 +409,8 @@ struct KindScan {
     violations: Vec<IdViolation>,
     total: u64,
     non_monotonic: u64,
+    /// Some element ID of the kind is negative.
+    negative: bool,
 }
 
 /// What both modes scan: the type-order findings and each selected kind's,
@@ -431,29 +427,60 @@ impl Scanned {
     /// counted. Each component already holds a prefix of at most
     /// `max_errors`, so truncating the concatenation once stores what a
     /// running remaining-limit would.
-    fn into_report(self, max_errors: usize) -> ([u64; 3], Vec<IdViolation>, u64) {
+    fn into_report(self, max_errors: usize) -> Findings {
         let mut counts = [0; 3];
         let mut violations = self.type_order;
         let mut total = self.type_order_total;
+        let mut negative = false;
         for (count, kind) in counts.iter_mut().zip(self.kinds) {
             if let Some(kind) = kind {
                 *count = kind.count;
                 total += kind.total;
+                negative |= kind.negative;
                 violations.extend(kind.violations);
             }
         }
         if let Some(limit) = effective_error_limit(max_errors) {
             violations.truncate(limit);
         }
-        (counts, violations, total)
+        Findings {
+            counts,
+            violations,
+            total,
+            negative,
+        }
+    }
+}
+
+/// What [`Scanned::into_report`] assembles for the report.
+struct Findings {
+    counts: [u64; 3],
+    violations: Vec<IdViolation>,
+    total: u64,
+    negative: bool,
+}
+
+impl Findings {
+    fn into_report(self, header_sorted: bool, indexed: bool, full: bool) -> VerifyIdsReport {
+        let [node_count, way_count, relation_count] = self.counts;
+        VerifyIdsReport {
+            header_sorted,
+            indexed,
+            full,
+            node_count,
+            way_count,
+            relation_count,
+            passed: self.total == 0,
+            total_violations: self.total,
+            has_negative_ids: self.negative,
+            violations: self.violations,
+        }
     }
 }
 
 /// Scan the selected kinds of a file sorted by kind. `sets` holds a
 /// pre-allocated `IdSet` per kind under `--full`'s duplicate pass and none
-/// otherwise. `negatives` (the `--full` proof pass, which runs without sets)
-/// records each negative ID as out of range, as the duplicate pass does, so
-/// a kind the proof pass settles reports exactly what that pass would.
+/// otherwise.
 ///
 /// An indexed file is read one phase per selected kind, each over the blobs
 /// claiming that kind, and its type order judged from the claims (the
@@ -470,7 +497,6 @@ fn scan_kinds(
     schedules: &KindSchedules,
     type_filter: &TypeFilter,
     mut sets: [Option<&mut IdSet>; 3],
-    negatives: bool,
     max_errors: usize,
     host: &crate::host::Entered<'_>,
 ) -> Result<Scanned> {
@@ -503,8 +529,7 @@ fn scan_kinds(
                 let index = usize::from(kind.ordinal());
                 let (start, end) = KIND_MARKERS[index];
                 host.invocation.marker(start);
-                let per_blob =
-                    kind_phase(file, schedule, kind, sets[index].take(), negatives, host)?;
+                let per_blob = kind_phase(file, schedule, kind, sets[index].take(), host)?;
                 scanned.kinds[index] = Some(merge_kind(per_blob, kind, limit)?);
                 host.invocation.marker(end);
             }
@@ -512,8 +537,7 @@ fn scan_kinds(
         KindSchedules::Unindexed(blobs) => {
             host.invocation.marker("VERIFYIDS_UNINDEXED_START");
             let sets = sets.each_ref().map(|set| set.as_deref());
-            let (per_kind, spans) =
-                unindexed_pass(file, blobs, type_filter, sets, negatives, host)?;
+            let (per_kind, spans) = unindexed_pass(file, blobs, type_filter, sets, host)?;
             check_type_order(
                 &spans,
                 &mut scanned.type_order,
@@ -555,26 +579,15 @@ fn verify_ids_streaming_parallel(
         &schedules,
         &type_filter,
         [None, None, None],
-        false,
         opts.max_errors,
         host,
     )?;
 
     host.invocation.marker("VERIFYIDS_SCAN_END");
 
-    let ([node_count, way_count, relation_count], violations, total_violations) =
-        scanned.into_report(opts.max_errors);
-    Ok(VerifyIdsReport {
-        header_sorted,
-        indexed,
-        full: false,
-        node_count,
-        way_count,
-        relation_count,
-        passed: total_violations == 0,
-        total_violations,
-        violations,
-    })
+    Ok(scanned
+        .into_report(opts.max_errors)
+        .into_report(header_sorted, indexed, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +597,7 @@ fn verify_ids_streaming_parallel(
 /// One blob's judgement of the IDs of one kind, fed in element-walk order:
 /// the blob's first and last ID, count and order violations, and with the
 /// kind's `IdSet` (`--full`) its duplicates and the IDs outside the set's
-/// allocation.
+/// allocation, every negative among them.
 struct KindJudge {
     elem_type: &'static str,
     prev: Option<i64>,
@@ -601,9 +614,10 @@ impl KindJudge {
     }
 
     #[inline]
-    fn push(&mut self, id: i64, atomic_ids: Option<&IdSet>, negatives: bool) {
+    fn push(&mut self, id: i64, atomic_ids: Option<&IdSet>) {
         let r = &mut self.r;
         r.count += 1;
+        r.negative |= id < 0;
         if r.first_id.is_none() {
             r.first_id = Some(id);
         }
@@ -618,17 +632,14 @@ impl KindJudge {
             });
         }
         self.prev = Some(id);
-        // Retain IDs the bounded atomic allocation cannot cover. Positive
-        // IDs are inserted after workers join; negatives remain invalid
-        // under the command's existing policy.
+        // Retain the IDs the bounded atomic allocation does not cover (those
+        // above it and every negative) for the phase's serial merge.
         if let Some(atomic_ids) = atomic_ids {
             match atomic_ids.try_insert_atomic_if_new(id) {
                 Some(true) => {}
                 Some(false) => r.duplicate_ids.push(id),
-                None => r.out_of_range_ids.push(id),
+                None => r.overflow_ids.push(id),
             }
-        } else if negatives && id < 0 {
-            r.out_of_range_ids.push(id);
         }
     }
 }
@@ -641,13 +652,12 @@ fn verify_blob(
     buffer: BlockBuffer<'_>,
     kind: ElementKind,
     atomic_ids: Option<&IdSet>,
-    negatives: bool,
     scratch: &mut IdScratch,
 ) -> Result<BlobVerifyResult> {
     let (KindIds { .. }, accepted) = buffer.project(|_, _| KindIds::of(kind, &mut *scratch))?;
     let mut judge = KindJudge::new(kind);
     scratch.each(accepted.bytes(), |_, id| {
-        judge.push(id, atomic_ids, negatives);
+        judge.push(id, atomic_ids);
         Ok(())
     })?;
     // The bytes go back to their pool.
@@ -664,7 +674,6 @@ fn kind_phase(
     schedule: &[crate::scan::classify::ScheduledBlob],
     kind: ElementKind,
     id_set: Option<&mut IdSet>,
-    negatives: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<Vec<Option<BlobVerifyResult>>> {
     let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
@@ -675,7 +684,7 @@ fn kind_phase(
         schedule,
         None,
         IdScratch::default,
-        |_, buffer, scratch| verify_blob(buffer, kind, atomic_ids, negatives, scratch),
+        |_, buffer, scratch| verify_blob(buffer, kind, atomic_ids, scratch),
         |seq, mut r| {
             settle_overflow(&mut overflow, &mut r, host);
             per_blob[seq] = Some(r);
@@ -702,7 +711,6 @@ fn unindexed_pass(
     blobs: &[crate::scan::classify::ScheduledBlob],
     type_filter: &TypeFilter,
     sets: [Option<&IdSet>; 3],
-    negatives: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<(PerKind, KindSpans<(usize, usize)>)> {
     let mut kinds = crate::element_kind::ElementKindSet::default();
@@ -725,7 +733,7 @@ fn unindexed_pass(
             let mut judges = KINDS.map(KindJudge::new);
             scratch.each(accepted.bytes(), |kind, id| {
                 let index = usize::from(kind.ordinal());
-                judges[index].push(id, sets[index], negatives);
+                judges[index].push(id, sets[index]);
                 Ok(())
             })?;
             drop(accepted);
@@ -802,8 +810,7 @@ impl crate::read::block::GroupProjection for GroupKinds {
 
 /// Merge one kind's per-blob results in file order: counts summed, each
 /// blob's own violations, then a step down from the previous blob's last ID,
-/// its duplicates and its IDs outside the duplicate-detection range, stored
-/// up to `max_errors_remaining` and all counted.
+/// then its duplicates, stored up to `max_errors_remaining` and all counted.
 fn merge_kind(
     per_blob: Vec<Option<BlobVerifyResult>>,
     kind: ElementKind,
@@ -815,6 +822,7 @@ fn merge_kind(
     let mut total_violations: u64 = 0;
     let mut non_monotonic: u64 = 0;
     let mut prev_last: Option<i64> = None;
+    let mut negative = false;
     for slot in per_blob {
         let Some(r) = slot else {
             return Err(crate::error::Error::internal(
@@ -822,6 +830,7 @@ fn merge_kind(
             ));
         };
         count += r.count;
+        negative |= r.negative;
         for v in r.within_violations {
             total_violations += 1;
             non_monotonic += 1;
@@ -848,12 +857,6 @@ fn merge_kind(
                 violations.push(IdViolation::Duplicate { elem_type, id });
             }
         }
-        for id in r.out_of_range_ids {
-            total_violations += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(IdViolation::IdOutOfRange { elem_type, id });
-            }
-        }
         if r.last_id.is_some() {
             prev_last = r.last_id;
         }
@@ -863,6 +866,7 @@ fn merge_kind(
         violations,
         total: total_violations,
         non_monotonic,
+        negative,
     })
 }
 
@@ -893,11 +897,12 @@ struct BlobVerifyResult {
     /// distinct duplicate occurrences count separately, matching the
     /// pre-swap RoaringTreemap::insert-returns-false semantics).
     duplicate_ids: Vec<i64>,
-    /// IDs outside the parallel allocation. `settle_overflow` drains the
-    /// positive ones into the phase's overflow set as the result arrives, for
-    /// exact duplicate detection; the negatives left are reported as
-    /// `IdOutOfRange` violations.
-    out_of_range_ids: Vec<i64>,
+    /// IDs the parallel allocation does not cover: those above it and every
+    /// negative. `settle_overflow` takes them into the phase's overflow set
+    /// as the result arrives, for exact duplicate detection.
+    overflow_ids: Vec<i64>,
+    /// Some ID of the kind in this blob is negative.
+    negative: bool,
 }
 
 impl BlobVerifyResult {
@@ -908,7 +913,8 @@ impl BlobVerifyResult {
             count: 0,
             within_violations: Vec::new(),
             duplicate_ids: Vec::new(),
-            out_of_range_ids: Vec::new(),
+            overflow_ids: Vec::new(),
+            negative: false,
         }
     }
 }
@@ -938,9 +944,8 @@ fn verify_ids_full_parallel(
         host,
     )?;
 
-    // The proof pass: the streaming scan, which also records each negative
-    // ID as out of range. `osm_id_cmp` is a strict total order (its key is
-    // injective), so a kind with no order violation, within a blob or across
+    // The proof pass: the streaming scan. `osm_id_cmp` is a strict total
+    // order over every `i64` (its key is injective), so a kind with no order violation, within a blob or across
     // blobs in file order, is strictly increasing and holds no duplicate:
     // its findings are final and it never allocates an ID set. Nothing a
     // header or indexdata claims is believed for this. Type order is judged
@@ -951,15 +956,14 @@ fn verify_ids_full_parallel(
         &schedules,
         &type_filter,
         [None, None, None],
-        true,
         opts.max_errors,
         host,
     )?;
 
     // The duplicate pass, over the kinds the proof pass found out of order
     // only, each read again with its ID set. Its findings replace that
-    // kind's wholesale: they include the order violations and negatives the
-    // proof pass found, so combining the two would count them twice.
+    // kind's wholesale: they include the order violations the proof pass
+    // found, so combining the two would count them twice.
     let mut dup_filter = TypeFilter {
         nodes: false,
         ways: false,
@@ -1008,7 +1012,6 @@ fn verify_ids_full_parallel(
                 dup_filter.ways.then_some(ways),
                 dup_filter.relations.then_some(relations),
             ],
-            false,
             opts.max_errors,
             host,
         )?;
@@ -1023,27 +1026,18 @@ fn verify_ids_full_parallel(
 
     host.invocation.marker("VERIFYIDS_SCAN_END");
 
-    let ([node_count, way_count, relation_count], violations, total_violations) =
-        scanned.into_report(opts.max_errors);
-    Ok(VerifyIdsReport {
-        header_sorted,
-        indexed,
-        full: true,
-        node_count,
-        way_count,
-        relation_count,
-        passed: total_violations == 0,
-        total_violations,
-        violations,
-    })
+    Ok(scanned
+        .into_report(opts.max_errors)
+        .into_report(header_sorted, indexed, true))
 }
 
-/// Settle the IDs one blob found outside the phase's pre-allocation, from the
-/// phase's serial merge as its result arrives. A positive one goes into
-/// `overflow`, the side set the workers never see (see
+/// Settle the IDs one blob found outside the phase's pre-allocation (above
+/// it, or negative), from the phase's serial merge as its result arrives.
+/// Each goes into `overflow`, the side set the workers never see (see
 /// `check::insert_overflow_ids` for why it is not retained until the phase
-/// ends), and moves to `duplicate_ids` if already there; a negative one stays
-/// in `out_of_range_ids` for the ordered merge to report. Results arrive in
+/// ends), and moves to `duplicate_ids` if already there. The spill vector is
+/// taken and dropped here, so a saved result holds no allocation for it
+/// until the ordered merge. Results arrive in
 /// completion order, so which blob a duplicate is attributed to depends on
 /// it, as it already does for duplicates the atomic setters find; the totals
 /// do not. Test builds count the insertions on the run's token.
@@ -1053,17 +1047,12 @@ fn settle_overflow(
     host: &crate::host::Entered<'_>,
 ) {
     let mut inserted: u64 = 0;
-    let duplicates = &mut r.duplicate_ids;
-    r.out_of_range_ids.retain(|&id| {
-        if id < 0 {
-            return true;
-        }
+    for id in std::mem::take(&mut r.overflow_ids) {
         inserted += 1;
         if !overflow.insert_if_new(id) {
-            duplicates.push(id);
+            r.duplicate_ids.push(id);
         }
-        false
-    });
+    }
     #[cfg(pbfhogg_test_hooks)]
     host.invocation
         .faults()

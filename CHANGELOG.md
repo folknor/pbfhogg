@@ -42,8 +42,24 @@
   references, and `--simple` kept negative nodes only from node blobs it
   copied raw. Matching is by the signed ID, where osmium matches by
   absolute value.
+- **check handles negative IDs exactly.** `--ids --full` no longer fails
+  an ordered file holding negative IDs (every negative was an
+  `id_out_of_range` violation, exit 1); it finds negative duplicates by
+  their signed ID. The `id_out_of_range` JSON violation type and the
+  library's `IdViolation::IdOutOfRange` are removed. `--refs` (and the
+  default `check`) and `--locations` check negative IDs where they
+  refused the file (exit 2); `--locations` now reports conflicting
+  records and, with `--agreement`, disagreeing inline copies of negative
+  nodes.
 
 ### Added
+
+- **`has_negative_ids` report fields.** The ID check reports whether
+  any element ID of a selected kind is negative (`has_negative_ids` in
+  `check --ids --json`, a `Negative IDs:` line in its text, and the
+  public `VerifyIdsReport::has_negative_ids`), and `inspect --extended`
+  reports it for every decoded element (`data.has_negative_ids` in
+  `--json` and as a `--get` key, `Negative IDs:` in its text).
 
 - **`pbfhogg geocode-query INDEX POINTS`** answers reverse geocoding
   queries from the command line: one `LAT LON` per line of `POINTS`, one

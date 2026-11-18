@@ -110,6 +110,7 @@ fn expected(route: Route) -> serde_json::Value {
         "header_sorted": true,
         "indexed": !route.unindexed,
         "counts": { "nodes": nodes, "ways": ways, "relations": 0 },
+        "has_negative_ids": false,
         "passed": true,
         "total_violations": 0,
         "violations": [],

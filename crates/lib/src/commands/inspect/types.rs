@@ -385,6 +385,9 @@ pub(super) struct ExtendedStats {
     pub(super) data_bbox: DataBbox,
     pub(super) metadata: MetadataCoverage,
     pub(super) objects_ordered: bool,
+    /// Some decoded element ID is negative. Decided after the scan, from
+    /// the ID ranges, like `objects_ordered`.
+    pub(super) has_negative_ids: bool,
 }
 
 impl ExtendedStats {
@@ -395,6 +398,7 @@ impl ExtendedStats {
             data_bbox: DataBbox::new(),
             metadata: MetadataCoverage::default(),
             objects_ordered: true,
+            has_negative_ids: false,
         }
     }
 
@@ -409,8 +413,8 @@ impl ExtendedStats {
         self.min_timestamp != i64::MAX
     }
 
-    /// Fold in a later blob's stats. `objects_ordered` is decided after the
-    /// scan, so it is not merged.
+    /// Fold in a later blob's stats. `objects_ordered` and
+    /// `has_negative_ids` are decided after the scan, so they are not merged.
     fn append(&mut self, part: &ExtendedStats) {
         self.min_timestamp = self.min_timestamp.min(part.min_timestamp);
         self.max_timestamp = self.max_timestamp.max(part.max_timestamp);

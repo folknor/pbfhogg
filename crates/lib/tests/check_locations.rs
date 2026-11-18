@@ -436,18 +436,61 @@ fn a_file_without_the_locations_claim_is_refused() {
     );
 }
 
+/// Negative node IDs get slots like any other, in every partitioning: a
+/// stale coordinate on a negative ref is a mismatch (its positive twin's
+/// record never answers for it), a negative node with conflicting records
+/// is reported though no way references it, and the capped node details
+/// are the numerically smallest IDs, negatives first.
 #[test]
-fn a_negative_ref_is_refused() {
+fn negative_node_ids_are_checked_like_any_other() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("negative.osm.pbf");
     Fixture::new(
-        vec![vec![(1, 10, 10)]],
-        vec![vec![(5, vec![-1, 1], Some(vec![(10, 10), (10, 10)]))]],
+        vec![
+            vec![(-9, 1, 1), (-9, 2, 2), (-1, 10, 10)],
+            vec![(0, 0, 0), (1, 20, 20), (B, 3, 3), (B, 4, 4)],
+        ],
+        vec![vec![(
+            5,
+            vec![-1, 1, 0],
+            Some(vec![(20, 20), (20, 20), (0, 0)]),
+        )]],
     )
     .write(&path);
-    let err = check_locations(&path, &opts(false, None), &crate::common::test_host())
-        .expect_err("negative refs are not checked");
-    assert!(err.to_string().contains("negative node ID"), "{err}");
+    for budget in [None, Some(1), Some(9)] {
+        let mut o = opts(false, budget);
+        o.max_errors = 0;
+        let report = check_locations(&path, &o, &crate::common::test_host())
+            .unwrap()
+            .complete()
+            .unwrap();
+        assert_eq!(report.refs_mismatched, 1, "budget {budget:?}");
+        assert_eq!(report.refs_verified, 2, "budget {budget:?}");
+        assert_eq!(report.nodes_conflicting, 2, "budget {budget:?}");
+        let kinds: Vec<_> = report.violations.iter().map(|v| v.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            [
+                LocationViolationKind::Mismatch {
+                    way_id: 5,
+                    node_id: -1,
+                    position: 0,
+                    inline: (20, 20),
+                    node: (10, 10),
+                },
+                LocationViolationKind::ConflictingNode { node_id: -9 },
+                LocationViolationKind::ConflictingNode { node_id: B },
+            ],
+            "budget {budget:?}"
+        );
+        o.max_errors = 2;
+        let capped = check_locations(&path, &o, &crate::common::test_host())
+            .unwrap()
+            .complete()
+            .unwrap();
+        let capped: Vec<_> = capped.violations.iter().map(|v| v.kind.clone()).collect();
+        assert_eq!(capped, kinds[..2], "budget {budget:?}");
+    }
 }
 
 fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
@@ -700,21 +743,34 @@ fn a_history_file_is_refused() {
     assert!(err.to_string().contains("history files"), "{err}");
 }
 
-/// The agreement pass reads every reference before the partitions do and
-/// does not key a negative one; the first partition's way pass still
-/// refuses it, as without agreement.
+/// Agreement mode keys every negative reference: two inline copies of an
+/// absent negative node that disagree are reported, while its present
+/// positive twin is verified, in every partitioning.
 #[test]
-fn a_negative_ref_is_refused_in_agreement_mode() {
+fn agreement_mode_checks_absent_negative_nodes() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("negative.osm.pbf");
     Fixture::new(
         vec![vec![(1, 10, 10)]],
-        vec![vec![(5, vec![1, -1], Some(vec![(10, 10), (10, 10)]))]],
+        vec![vec![
+            (5, vec![1, -1], Some(vec![(10, 10), (10, 10)])),
+            (6, vec![-1], Some(vec![(10, 11)])),
+        ]],
     )
     .write(&path);
-    let err = check_locations(&path, &opts(true, Some(1)), &crate::common::test_host())
-        .expect_err("negative refs are not checked");
-    assert!(err.to_string().contains("negative node ID"), "{err}");
+    for budget in [None, Some(1)] {
+        let report = run(&path, true, budget);
+        assert_eq!(report.refs_verified, 1, "budget {budget:?}");
+        assert_eq!(report.refs_without_node, 2, "budget {budget:?}");
+        assert_eq!(report.nodes_absent, Some(1), "budget {budget:?}");
+        assert_eq!(report.nodes_disagreeing, 1, "budget {budget:?}");
+        let kinds: Vec<_> = report.violations.iter().map(|v| v.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            [LocationViolationKind::DisagreeingRefs { node_id: -1 }],
+            "budget {budget:?}"
+        );
+    }
 }
 
 /// Indexdata that understates a node blob's ID range must not hide a node

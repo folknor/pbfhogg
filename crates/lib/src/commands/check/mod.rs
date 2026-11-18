@@ -214,7 +214,8 @@ use crate::tunables::CHECK_IDS_PER_BYTE;
 /// renumber and the geocode builder via `IdSet::file_bounded_max_id`.
 ///
 /// This is an allocation bound, not an input validity bound. Both callers
-/// insert observed positive IDs refused by atomic setters into a side set
+/// insert observed IDs refused by atomic setters (above the bound, or
+/// negative, which no pre-allocation covers) into a side set
 /// from the phase's serial merge (`IdSet::insert`, or `insert_if_new`), and merge
 /// it in after workers join. Only those decoded IDs can allocate sparse
 /// overflow chunks; unverified indexdata cannot.
@@ -222,8 +223,8 @@ pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i
     crate::idset::IdSet::file_bounded_max_id(indexdata_max, file_len, CHECK_IDS_PER_BYTE).max(floor)
 }
 
-/// Insert the positive IDs one blob found above its phase's pre-allocation
-/// into `overflow`, a set the phase's workers never see, which the caller
+/// Insert the IDs one blob found outside its phase's pre-allocation (above
+/// it, or negative) into `overflow`, a set the phase's workers never see, which the caller
 /// merges into the phase's own set once the workers join.
 ///
 /// Called from the phase's merge, which runs serially on the consumer thread,

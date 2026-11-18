@@ -160,6 +160,7 @@ fn extended_json(ext: &ExtendedStats) -> serde_json::Value {
         "bbox": bbox,
         "timestamp": timestamp,
         "objects_ordered": ext.objects_ordered,
+        "has_negative_ids": ext.has_negative_ids,
     })
 }
 

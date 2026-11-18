@@ -486,3 +486,22 @@ input can show it too (an indexed blob internally out of order under
 ascending ranges). Held as a known gap by the registry case `inspect_report`
 (indexed framing). Neighbour of BUG-012, which is about which order the
 answer means, not about the two paths disagreeing.
+
+## BUG-031 - check --ids --full duplicate details depend on completion order
+
+Reported by: the item 6 spar of `notes/negative-ids-plan.md` (codex).
+
+The duplicate pass attributes a duplicate to whichever blob reaches the
+set second: the atomic setters in the workers, and `settle_overflow` in
+the phase's merge, which takes results in completion order
+(`check/verify_ids.rs`). Totals are exact, but the order of the stored
+violations is not, so `--max-errors` can keep a different finding from run
+to run, and even the uncapped list can be ordered differently. Witness:
+node blobs `[-1] | [-2] | [-1]`, one per blob. Both schedules report two
+violations, `Duplicate -1` and `NonMonotonic -1 after -2`, but in either
+order, and `--max-errors 1` keeps whichever came first. Positive IDs above
+the allocation and atomic duplicates already behaved this way; since
+negatives took the same path they do too. Fix: give duplicates a fixed place
+in report order and pick their examples by canonical ID, or settle every
+occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
+redesign of the same per-blob retention.

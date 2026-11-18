@@ -293,11 +293,12 @@ order pass found out of order; a kind in strict order is proven
 duplicate-free from the decoded IDs alone and gets no set) pre-allocate their
 ID bitsets to the claimed `max_id` bounded by the input file's size,
 floored at the live-OSM ID range (`id_alloc_bound` in
-`crates/lib/src/commands/check/mod.rs`), and insert any decoded positive ID above the
-allocation after the parallel phase. A claim therefore cannot cause an
+`crates/lib/src/commands/check/mod.rs`), and insert any decoded ID the
+allocation does not cover (above it, or negative, which no pre-allocation
+covers) after the parallel phase. A claim therefore cannot cause an
 unbounded allocation, and an ID beyond the allocation is still tracked
 correctly; a wrong claim can change the run's memory and time, not its
-answer. A negative ID is reported as a property of the input.
+answer.
 `repack` bounds its `BlockBuilder` pre-allocation the same way. `renumber`
 pre-allocates its node set to the smaller of the claimed `max_id` and a
 file-size bound and inserts any ID above it afterwards, so an overstated or

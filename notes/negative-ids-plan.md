@@ -124,14 +124,10 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 
 | # | Path | Today | Plan | Osmium |
 |---|---|---|---|---|
-| 1-3 | inspect default, `--indexed`/`--nodes`/`--get`, `--show` | Exact. `--show` takes signed queries **[S]**. | P. `has_negative_ids` report field. | fileinfo; no lookup. |
+| 1-3 | inspect default, `--indexed`/`--nodes`/`--get`, `--show` | Exact. `--show` takes signed queries; `data.has_negative_ids` since commit 6 **[S]**. | P | fileinfo; no lookup. |
 | 4-5 | inspect `--id-ranges`, `--extended` | Numeric extrema and monotonicity. | P. Label as numeric; the canonical `objects_ordered` is BUG-012. | `fileinfo -e`, canonical. |
 | 6 | inspect tags | Exact. | P | tags-count |
-| 7 | check (bare) | Refs phase refuses negatives. | S+ via row 10. | check-refs supports. |
-| 8 | check `--ids` | Canonical, exact. | P, plus field. | CheckOrder **[O]** |
-| 9 | check `--ids --full` | Negatives are `IdOutOfRange`; exit 1 **[S]**. | V. Lazy `HashSet<i64>` per kind in the serial merge. Overturns the pbfhogg#50 ruling. | Accepts ordered. |
-| 10 | check `--refs`, `--check-relations` | Refuses compared negatives. | S+. Signed existence via a serial side merge; signed missing tallies; signed deferred lookup. These are not rank or slot users **[C:inv]**. | Separate sign sets **[O]** |
-| 11 | check `--locations`, `--agreement` | Refuses negative refs. Unreferenced negative records get no slot, so a coordinate conflict passes clean. | S+. Negative-key ordinals in the same slot store. Cost: 8 + 8.25 bytes per distinct negative key, nothing when there are none **[C:inv]**. | No equivalent. |
+| 7-11 | check (bare), `--ids`, `--ids --full`, `--refs`, `--check-relations`, `--locations`, `--agreement` | Exact and signed since commit 6, with the `has_negative_ids` field **[S]**. | P | check-refs and CheckOrder support negatives **[O]**; no `--locations` equivalent. |
 | 12 | check `--index` | Signed, exact. | P | none |
 | 13-19 | getid (positional, `-i`, `-I`, prefilters, `-r`, `--invert`), getparents | Exact and signed since commit 3 **[S]**. | P | Refuses text; abs-folds the rest **[O]** |
 | 20-22 | tags-filter PBF default, `-R`, OSC | Exact and signed since commit 4 **[S]**. | P | Default abs-folds; `-R` direct; OSC unsupported. |
@@ -166,27 +162,15 @@ negative or uncovered ID returns "not recorded"; the caller spills it to
 an explicit `id >= 0` guard at its insertion site; each later commit deletes
 its command's guards.
 
-What remains of 4.1:
-- A total `canonical_rank(id)` for absent IDs, needed by the orphan
-  bijection, lands with commit 10.
-- `check --locations` partitions its keys by a binary search of
-  `numeric_rank` over `0..=i64::MAX`; commit 6 widens it to `i64::MIN..` with
-  an overflow-safe midpoint once negatives are keyed.
+What remains of 4.1: a total `canonical_rank(id)` for absent IDs, needed by
+the orphan bijection, lands with commit 10.
 
 ### 4.2 Membership users
 
-Rows 10, 30, 31 and 33 use the signed set. The specifics:
+Rows 30, 31 and 33 use the signed set. The specifics:
 - prefilter predicates are as in row 16;
 - the `EdgeStore` byte encoding already works for signed children
   **[C:spar]**.
-
-### 4.3 check
-
-- `--ids --full`: as in row 9.
-- `--refs`: as in row 10.
-- `--locations`: signed slot ordinals, as in row 11.
-- The `has_negative_ids` field on `VerifyIdsReport` and on inspect's
-  `data` **[C:re]**.
 
 ### 4.4 ALTW sparse join [C:altw]
 
@@ -295,8 +279,7 @@ implementation.
 | ALTW external stages 2 and 4 | Per-family partition. | Canonical decode only for blobs straddling zero; there are none on positive input. |
 | renumber | Canonical compare and cached offset. | Fast path for two non-negatives. |
 | geocode pass1_5 | Collector spill branch. | Positive atomic path unchanged. |
-| getid, getparents, tags-filter, extract | Landed; measured neutral (commits 3 to 5). | n/a |
-| check `--refs`, `--locations`, `--ids --full` | Side merge or side Vec. | Empty, so no allocation. |
+| getid, getparents, tags-filter, extract, check | Landed; measured neutral (commits 3 to 6). | n/a |
 
 **Prior evidence [C:perf].**
 - `notes/altw.md`: an unconditional extra bitmap probe in the sparse serial
@@ -331,8 +314,7 @@ implementation.
   - `renumber`, Germany;
   - `tag-select`, Germany, `r/type=route`;
   - `parent-select` and `id-select --add-referenced yes`, Germany;
-  - `geocode-build`, Germany, `--stop GEOCODE_PASS1_5_END`;
-  - `id-order --full yes`, Denmark `--snapshot unsorted`.
+  - `geocode-build`, Germany, `--stop GEOCODE_PASS1_5_END`.
 - About 13 regional cells plus the planet pair: over the threshold of about
   ten, so Q2 asks for go-ahead.
 - Record every cell, with its verdict, under `reference/performance/`.
@@ -394,12 +376,11 @@ place with `Status: Superseded by NNNN`, and the new one says
 **DEVIATIONS.md.**
 - Replace the section with "Negative IDs: pbfhogg is exact where osmium
   abs-folds", listing:
-  - getid, its `--invert` (removeid) mode and getparents, tags-filter and
-    extract (their paragraphs landed with commits 3 to 5; carry them into
-    the new section);
+  - getid, its `--invert` (removeid) mode and getparents, tags-filter,
+    extract and check (their paragraphs landed with commits 3 to 6; carry
+    them into the new section);
   - ALTW `--keep-member-nodes`-style retention;
   - the apply-changes location join;
-  - `check --ids --full` (no difference left);
   - renumber orphan naming (by bijection, not encounter order).
 
   A negative `--start-id` now matches osmium, so it is not a deviation; the
@@ -412,17 +393,15 @@ place with `Status: Superseded by NNNN`, and the new one says
 - Fix the two inbound anchors.
 
 **reference/.**
-- `verify.md`: check-ids, the renumber verifier contract, and the ALTW
-  verify path. That path currently runs `check --locations --agreement`,
-  which refuses negatives; after row 11 it is signed **[C:altw]**.
+- `verify.md`: the renumber verifier contract and the ALTW verify path
+  (its `check --locations --agreement` is signed since commit 6).
 - `technical-implementation-spec.md`: replace the example.
 - `testing.md`: describe the negative-ID registry and the fixture graph, and
   link 0028.
-- `indexdata-trust.md`: reword it.
+- `indexdata-trust.md`: reword its ADR-0002 citation (the check allocation
+  paragraph was reworded in commit 6).
 
 **docs/cli/commands.md.**
-- check: the `--ids --full`, `--refs` and `--locations` rows, plus the report
-  fields.
 - renumber: negative inputs and orphan naming.
 - ALTW and geocode-build.
 - inspect: the numeric monotonic wording.
@@ -434,8 +413,7 @@ place with `Status: Superseded by NNNN`, and the new one says
 - `altw/external/blob_meta.rs`: the "use sparse" error disappears.
 - The geocode warning.
 - `renumber_external.rs`.
-- In `crates/verify`, the `check_ids.rs` preflight is removed and a
-  mixed-sign fixture added. `verify_reencode.rs` keeps its refusal with its
+- In `crates/verify`, `verify_reencode.rs` keeps its refusal with its
   true reason, which is the degrade layout oracle. Its sign handling is a
   harness question, not a pbfhogg one.
 
@@ -451,13 +429,6 @@ Durable text never cites a finding ID.
   from it as osmium does.
   - **Behaviour change:** orphan references are named by a new
     collision-free mapping.
-- check:
-  - `--ids --full` no longer fails ordered files holding negatives.
-    **Breaking:** the JSON `IdOutOfRange` variant is removed.
-  - `--refs` and `--locations` check negatives, where before they refused
-    them.
-  - `--locations` now reports coordinate conflicts on negative nodes.
-- New `has_negative_ids` report fields in check and inspect.
 
 The old 0.3.x entry stays as history. Whether its anchor is checked by
 `scripts/check_doc_links.py` is still to be established.
@@ -530,14 +501,9 @@ The registry (`crates/cli/tests/cli_negative_ids.rs`) landed with item 2.
 Each commit below flips its own cases' known gaps (each names the check,
 framing and exact wrong observation) and adds the cases its route needs:
 the ALTW auto budget crossover, wide-key and `i64::MIN` boundaries, a
-geocode boundary whose outer way is negative, `check --locations`
-counterexamples (two disagreeing inline copies of an absent negative node,
-an unreferenced conflicting negative record), `degrade --drop-ids`
-selection (BUG-022), and the `has_negative_ids` report fields, none of
-which the registry asserts yet.
+geocode boundary whose outer way is negative, and `degrade --drop-ids`
+selection (BUG-022), none of which the registry asserts yet.
 
-6. check: `--ids --full`, `--refs`, `--locations`, and the report fields
-   (with inspect's).
 7. ALTW sparse signed join, signed retention, prepass and pins, and the auto
    recheck.
 8. ALTW external two-family join, with `check_range` removed.
@@ -554,8 +520,6 @@ regression is fixed in the implementation before the policy is recorded.
 
 ## 13. Lateral findings
 
-- `check --locations` passes clean on conflicting unreferenced negative
-  records **[C:inv]**.
 - The renumber orphan shift collides near `i64::MAX` on positive input
   **[C:rgp]**. This is a bug today.
 - The sparse auto estimate `8 * node_count` underestimates the store, because
@@ -566,7 +530,6 @@ regression is fixed in the implementation before the policy is recorded.
 - traccar fails on negative node refs: it uses a `Dummy` negative store
   **[O][C:rgp]**.
 - The DEVIATIONS derive-changes paragraph names the wrong osmium bug.
-- Stale "untrackable" text in verify and `reference/verify.md` **[S]**.
 - Stale `negative_id_fallback` test names.
 - DEVIATIONS uses "project-wide" in three incompatible senses **[S]**.
 - `merge-changes --simplify` orders action groups numerically **[C:inv]**.

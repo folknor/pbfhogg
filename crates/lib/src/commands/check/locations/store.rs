@@ -118,13 +118,16 @@ impl Plan {
     }
 }
 
-/// The smallest ID `x >= 0` whose rank is at least `target`. The caller
-/// asks only for `target < total`, which `x = i64::MAX` always satisfies
-/// (its rank counts every member but possibly `i64::MAX` itself).
+/// The smallest ID whose rank is at least `target`, searched over every
+/// `i64`. The caller asks only for `target < total`, which `x = i64::MAX`
+/// always satisfies (its rank counts every member but possibly `i64::MAX`
+/// itself). The midpoint is taken through the unsigned distance, which
+/// `hi - lo` would overflow for `lo < 0 < hi`.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn lowest_id_with_rank_at_least(keys: &RankedIdSet, target: u64) -> i64 {
-    let (mut lo, mut hi) = (0_i64, i64::MAX);
+    let (mut lo, mut hi) = (i64::MIN, i64::MAX);
     while lo < hi {
-        let mid = lo + (hi - lo) / 2;
+        let mid = lo.wrapping_add((hi.wrapping_sub(lo) as u64 / 2) as i64);
         if keys.numeric_rank(mid) >= target {
             hi = mid;
         } else {
@@ -482,9 +485,34 @@ mod tests {
 
     #[test]
     fn partitions_cover_every_member_exactly_once() {
+        covers_each_member_once(&[0_i64, 5, 6, 7, 1 << 30, (1 << 30) + 1, 1 << 40, i64::MAX]);
+    }
+
+    /// Both signs and both extremes: the boundary search runs over all of
+    /// `i64`, so a partition may start at a negative ID, at zero, or in the
+    /// gap between two members of different signs.
+    #[test]
+    fn signed_partitions_cover_every_member_exactly_once() {
+        covers_each_member_once(&[
+            i64::MIN,
+            i64::MIN + 1,
+            -(1 << 40),
+            -7,
+            -1,
+            0,
+            1,
+            7,
+            i64::MAX,
+        ]);
+        covers_each_member_once(&[i64::MIN, -1, 0, i64::MAX]);
+        covers_each_member_once(&[-9, -5, -2]);
+    }
+
+    /// Every member falls in exactly one partition of every plan, at the
+    /// slot its numeric rank names. `ids` ascends.
+    fn covers_each_member_once(ids: &[i64]) {
         let mut set = IdSet::new();
-        let ids = [0_i64, 5, 6, 7, 1 << 30, (1 << 30) + 1, 1 << 40, i64::MAX];
-        for id in ids {
+        for &id in ids {
             set.insert(id);
         }
         let keys = set.into_ranked();

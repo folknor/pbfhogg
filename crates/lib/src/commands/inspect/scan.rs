@@ -439,6 +439,12 @@ fn full_decode_scan(
                 .as_ref()
                 .is_none_or(|r| !r.has_data() || r.monotonic);
         ext.objects_ordered = type_ordered && ids_monotonic;
+        // `--extended` always decodes, so these ranges are the elements'
+        // own IDs, never an indexdata claim.
+        ext.has_negative_ids = [&state.node_ids, &state.way_ids, &state.relation_ids]
+            .into_iter()
+            .flatten()
+            .any(|r| r.has_data() && r.min_id < 0);
     }
 
     Ok(InspectReport {

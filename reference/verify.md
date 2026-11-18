@@ -523,10 +523,13 @@ must fail. Each fixture must show the property it exists for, read from
 osmium and the framing. The PASS line names each kind of case, indexed or
 not and in order or not, that neither the input nor a copy derived from it
 gave (an input osmium reads out of order derives nothing, and neither does
-one with no object); the fixtures do not count toward it. An input with
-a negative ID is refused (pbfhogg rejects negative input IDs project-wide,
-and `--full` reports each as untrackable), and one whose framing mixes blobs
-with and without indexdata too. Kind claims must be true: a blob whose
+one with no object); the fixtures do not count toward it. An input whose
+framing mixes blobs with and without indexdata is refused. Negative IDs are
+in the domain: both sides order them canonically. An input whose dense
+delta arithmetic overflows a signed 64-bit add (such as a node `-1`
+followed by `i64::MAX`, or a derived unsorted copy introducing that step)
+is not a portable oracle, since libosmium adds deltas as signed C++
+integers; pbfhogg's own tests cover such inputs. Kind claims must be true: a blob whose
 decoded kind contradicts its claim stops pbfhogg's check without an answer,
 an error here.
 

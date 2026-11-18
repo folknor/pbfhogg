@@ -46,6 +46,8 @@ pub enum InspectGetKeyKind {
     ElementsTotal,
     /// Whether the elements follow standard ordering.
     DataObjectsOrdered,
+    /// Whether some decoded element ID is negative.
+    DataHasNegativeIds,
     /// The first element timestamp.
     DataTimestampFirst,
     /// The last element timestamp.
@@ -157,6 +159,11 @@ const INSPECT_GET_KEYS: &[(&str, InspectGetKeyKind, InspectGetNeed)] = &[
     (
         "data.objects_ordered",
         InspectGetKeyKind::DataObjectsOrdered,
+        InspectGetNeed::Extended,
+    ),
+    (
+        "data.has_negative_ids",
+        InspectGetKeyKind::DataHasNegativeIds,
         InspectGetNeed::Extended,
     ),
     (

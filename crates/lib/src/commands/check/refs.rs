@@ -132,27 +132,6 @@ fn sort_dedup(ids: &mut Vec<i64>) {
     ids.dedup();
 }
 
-/// A negative element ID the check would have to track. Negative IDs are
-/// invalid input (ADR-0002) and the tracking sets cannot hold them, so a
-/// check that went on would report every reference to the element as
-/// missing.
-#[cold]
-fn negative_id_error(kind: &str, id: i64) -> crate::Error {
-    crate::Error::invalid_data(format!(
-        "{kind} {id} has a negative ID; the reference check does not check \
-         negative IDs, which no production PBF carries"
-    ))
-}
-
-/// A checked reference to a negative ID (see [`negative_id_error`]).
-#[cold]
-fn negative_ref_error(from: char, from_id: i64, to: char, to_id: i64) -> crate::Error {
-    crate::Error::invalid_data(format!(
-        "{from}{from_id} references negative ID {to}{to_id}; the reference \
-         check does not check negative IDs, which no production PBF carries"
-    ))
-}
-
 /// A relation member of a type the check cannot resolve against any of its
 /// sets. Passing it unchecked would certify a reference nobody looked at.
 #[cold]
@@ -194,9 +173,8 @@ fn append_capped_missing_refs(
 ///
 /// # Errors
 ///
-/// `InvalidData` for a negative ID the check would compare and for a
-/// relation member of an unknown type (see "Negative IDs" below), besides
-/// the read and decode errors of any scan.
+/// `InvalidData` for a relation member of an unknown type, besides the read
+/// and decode errors of any scan.
 ///
 /// # Architecture
 ///
@@ -209,8 +187,8 @@ fn append_capped_missing_refs(
 /// own call, so a blob is refused exactly as building its block would refuse
 /// it, with the same error. Only after the blob is accepted does the worker
 /// replay what the projection recorded, in element-walk order, through the
-/// same checks the element walk ran (shared-set insertion, the refusals
-/// below, missing references), so a blob's first refusal is the one the walk
+/// same checks the element walk ran (shared-set insertion, the
+/// unknown-member refusal, missing references), so a blob's first refusal is the one the walk
 /// found first. The main thread merges per-blob results in completion order.
 ///
 /// On an indexed file, phase 1 reads the node blobs and writes `node_ids` via
@@ -236,7 +214,8 @@ fn append_capped_missing_refs(
 /// way judgement found any missing reference has that judgement dropped
 /// whole and is read again by phase 2, after `node_ids` is complete; one
 /// whose relation judgement missed a node or way member likewise by phase 3.
-/// The refusals do not depend on order, so they stand wherever they are met.
+/// The refusal of an unknown member type does not depend on order, so it
+/// stands wherever it is met.
 /// A sorted file re-reads only the blobs whose references raced the blobs
 /// still being replayed and the blobs with references that are missing in
 /// fact; no blob is read more than once per phase, so no order costs more
@@ -268,13 +247,14 @@ fn append_capped_missing_refs(
 ///
 /// # Negative IDs
 ///
-/// Negative IDs are invalid input (ADR-0002) and the tracking sets cannot
-/// hold them, so a negative ID the check would compare is refused: a node,
-/// a way under `check_relations` (the only mode that tracks way IDs), a
-/// relation, and every checked reference. The refusals sit where a set
-/// lookup or insertion has already failed, except for relation members,
-/// which are deferred unlooked-up and take one sign compare. A member of an
-/// unknown type is refused too, since no set can resolve it.
+/// A negative ID is checked like any other: the sets are signed. No
+/// pre-allocation covers a negative, so every negative element ID takes the
+/// path an ID above the allocation takes (the phase's side set, merged after
+/// the phase), and on an unindexed file a reference to a negative element
+/// that the combined phase met before the merge is judged again by the next
+/// phase, as one above the allocation is. A positive-only file pays nothing
+/// for this. A member of an unknown type is refused, since no set can
+/// resolve it.
 ///
 /// # What a phase reads
 ///
@@ -339,15 +319,13 @@ struct Sets {
 }
 
 /// Insert one accepted blob's node IDs into `node_ids`, returning how many
-/// there were and those above the pre-allocation, for the serial merge.
+/// there were and those the pre-allocation does not cover (above it, or
+/// negative), for the serial merge.
 fn replay_nodes(scratch: &IdScratch, bytes: &[u8], node_ids: &IdSet) -> Result<(u64, Vec<i64>)> {
     let mut count: u64 = 0;
     let mut overflow = Vec::new();
     scratch.each(bytes, |_, id| {
         if !node_ids.try_insert_atomic(id) {
-            if id < 0 {
-                return Err(negative_id_error("node", id));
-            }
             overflow.push(id);
         }
         count += 1;
@@ -362,21 +340,14 @@ fn judge_ways(ways: &[WaySpan], bytes: &[u8], sets: &Sets, judge: Judge) -> Resu
     let mut r = WayBlobResult::default();
     for way in ways {
         let wid = way.id;
-        // Way IDs are tracked only for the relation phase; without it no
-        // comparison reads them, so a negative one is refused only here.
+        // Way IDs are tracked only for the relation phase.
         if judge.check_relations && !sets.ways.try_insert_atomic(wid) {
-            if wid < 0 {
-                return Err(negative_id_error("way", wid));
-            }
             r.overflow_ids.push(wid);
         }
         r.way_count += 1;
         for nref in way.refs(bytes)? {
             r.way_refs_checked += 1;
             if !sets.nodes.get(nref) {
-                if nref < 0 {
-                    return Err(negative_ref_error('w', wid, 'n', nref));
-                }
                 r.missing_node_refs.push(nref);
                 if judge.keeps_detail(r.missing_refs.len()) {
                     r.missing_refs.push(MissingRef {
@@ -407,9 +378,6 @@ fn judge_relations(
     for rel in relations {
         let rid = rel.id;
         if !sets.relations.try_insert_atomic(rid) {
-            if rid < 0 {
-                return Err(negative_id_error("relation", rid));
-            }
             r.overflow_ids.push(rid);
         }
         r.relation_count += 1;
@@ -418,9 +386,6 @@ fn judge_relations(
                 MemberId::Node(id) => {
                     r.rel_node_members_checked += 1;
                     if !sets.nodes.get(id) {
-                        if id < 0 {
-                            return Err(negative_ref_error('r', rid, 'n', id));
-                        }
                         r.missing_node_members.push(id);
                         if judge.keeps_detail(r.missing_refs.len()) {
                             r.missing_refs.push(MissingRef {
@@ -435,9 +400,6 @@ fn judge_relations(
                 MemberId::Way(id) => {
                     r.rel_way_members_checked += 1;
                     if !sets.ways.get(id) {
-                        if id < 0 {
-                            return Err(negative_ref_error('r', rid, 'w', id));
-                        }
                         r.missing_way_refs.push(id);
                         if judge.keeps_detail(r.missing_refs.len()) {
                             r.missing_refs.push(MissingRef {
@@ -450,11 +412,6 @@ fn judge_relations(
                     }
                 }
                 MemberId::Relation(id) => {
-                    // Deferred without a lookup, so the sign is checked
-                    // here rather than in a failed `get`.
-                    if id < 0 {
-                        return Err(negative_ref_error('r', rid, 'r', id));
-                    }
                     r.rel_rel_members_deferred += 1;
                     r.deferred_relation_refs.push(id);
                     // Every deferred reference keeps its source, uncapped:
@@ -772,8 +729,9 @@ fn check_refs_inner(
     let (schedules, shared_file, max_ids) =
         build_classify_schedules_split(input, crate::scan::classify::KindClaims::Refuse, host)?;
 
-    // Bound indexdata-driven allocation, then insert observed positive IDs
-    // above that allocation after each parallel phase joins. A regional
+    // Bound indexdata-driven allocation, then insert observed IDs outside
+    // that allocation (above it, or negative) after each parallel phase
+    // joins. A regional
     // extract retains global IDs; its file size is not a validity ceiling.
     // The size is an fstat of the walk's own descriptor, the one every phase
     // reads, so it describes that file even when `input` is a bare path a

@@ -41,7 +41,6 @@ omission. Sites they named:
 - ALTW: negative way and relation IDs survive, while negative relation-member
   node IDs are silently excluded from retention (`altw/mod.rs`);
 - export, which writes a numeric `@id` of -1;
-- `check --ids`, which passes a negative ID that `--full` reports;
 - `inspect --show`, which deliberately supports signed queries;
 - the geocode builder, which indexes negative-ID address nodes and skips and
   counts negative way references (`builder/pass1_5.rs`), an inventory ADR-0002

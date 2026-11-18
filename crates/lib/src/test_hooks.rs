@@ -542,8 +542,9 @@ pub struct FaultPlan {
     apply_changes_worker_counters: Mutex<Vec<(&'static str, u64)>>,
 
     // --- check ID sets (`commands::check::{refs, verify_ids}`) ---
-    /// Positive element IDs `check --refs` or `check --ids --full` inserted
-    /// after a parallel phase because they lay above the pre-allocated range.
+    /// Element IDs `check --refs` or `check --ids --full` inserted after a
+    /// parallel phase because the pre-allocated range did not cover them
+    /// (above it, or negative).
     pub check_overflow_ids: AtomicU64,
 
     // --- altw external stage 3 ---

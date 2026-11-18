@@ -179,10 +179,13 @@ macro_rules! declared {
             check_ids,
             check_ids_full,
             check_ids_full_duplicate,
+            check_ids_report_field,
             check_refs_dangling,
             check_refs_relations_dangling,
             check_locations,
             check_locations_agreement,
+            check_locations_conflicting_unreferenced,
+            check_locations_agreement_disagreeing_absent,
             check_index,
         ];
         ["build-geocode-index"] => cases [build_geocode_index_admin];
@@ -2572,7 +2575,8 @@ fn inspect_report() -> Case {
     )])
 }
 
-/// The full-decode report counts every element of every kind.
+/// The full-decode report counts every element of every kind, and says
+/// whether any element ID is negative.
 fn inspect_extended() -> Case {
     Case::both(
         BOTH,
@@ -2585,13 +2589,17 @@ fn inspect_extended() -> Case {
             let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
             let g = w.base();
             let want = vec![format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 g.nodes.len(),
                 g.ways.len(),
-                g.relations.len()
+                g.relations.len(),
+                base_has_negative(w)
             )];
             let e = &v["elements"];
-            let got = vec![format!("{} {} {}", e["nodes"], e["ways"], e["relations"])];
+            let got = vec![format!(
+                "{} {} {} {}",
+                e["nodes"], e["ways"], e["relations"], v["data"]["has_negative_ids"]
+            )];
             findings.extend(compare("counts", &want, &got, false));
             findings
         },
@@ -2718,11 +2726,6 @@ fn check_on_base(extra: &'static [&'static str]) -> fn(&World, &Path, Framing) -
     }
 }
 
-const CHECK_LOCATIONS_REFUSAL: Sig = Sig::Exit {
-    code: 2,
-    says: "the location check does not check negative IDs",
-};
-
 /// What a completed ID check of the base graph says it read.
 fn scanned(w: &World) -> String {
     let g = w.base();
@@ -2738,16 +2741,6 @@ fn check_default() -> Case {
     Case::both(BOTH, check_on_base(&[]), |w, o| {
         check_verdict(o, 0, &[scanned(w)])
     })
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 2,
-            // Which negative element the parallel phases meet first varies.
-            says: "has a negative ID; the reference check does not check negative IDs",
-        },
-        "check --refs refuses negative IDs",
-    )])
 }
 
 fn check_ids() -> Case {
@@ -2760,28 +2753,6 @@ fn check_ids_full() -> Case {
     Case::both(BOTH, check_on_base(&["--ids", "--full"]), |w, o| {
         check_verdict(o, 0, &[scanned(w)])
     })
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 1,
-            says: "12 violations (showing first 12 of 12):
-  node -1: outside the duplicate-detection ID range
-  node -2: outside the duplicate-detection ID range
-  node -5: outside the duplicate-detection ID range
-  node -7: outside the duplicate-detection ID range
-  node -9: outside the duplicate-detection ID range
-  node -11: outside the duplicate-detection ID range
-  way -1: outside the duplicate-detection ID range
-  way -2: outside the duplicate-detection ID range
-  way -7: outside the duplicate-detection ID range
-  way -9: outside the duplicate-detection ID range
-  relation -1: outside the duplicate-detection ID range
-  relation -7: outside the duplicate-detection ID range
-",
-        },
-        "check --ids --full reports every negative ID as out of range",
-    )])
 }
 
 /// A duplicated `n-7` record, adjacent so the order stays canonical: the
@@ -2817,29 +2788,40 @@ fn check_ids_full_duplicate() -> Case {
             findings
         },
     )
-    .gaps(vec![gap(
-        "violations",
-        None,
-        Sig::Tokens {
-            missing: &["duplicate node -7"],
-            extra: &[
-                "id_out_of_range node -1",
-                "id_out_of_range node -2",
-                "id_out_of_range node -5",
-                "id_out_of_range node -7 x2",
-                "id_out_of_range node -9",
-                "id_out_of_range node -11",
-                "id_out_of_range way -1",
-                "id_out_of_range way -2",
-                "id_out_of_range way -7",
-                "id_out_of_range way -9",
-                "id_out_of_range relation -1",
-                "id_out_of_range relation -7",
-            ],
+}
+
+/// Whether the arm's base graph holds a negative element ID.
+fn base_has_negative(w: &World) -> bool {
+    let g = w.base();
+    g.nodes.iter().map(|n| n.id).any(|id| id < 0)
+        || g.ways.iter().map(|x| x.id).any(|id| id < 0)
+        || g.relations.iter().map(|r| r.id).any(|id| id < 0)
+}
+
+/// `has_negative_ids` in the ID check's JSON, streaming and `--full`: true
+/// on the mixed graph, false on its twin.
+fn check_ids_report_field() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| {
+            vec![
+                base_input(w, dir, f),
+                "--ids".into(),
+                "--full".into(),
+                "--json".into(),
+            ]
         },
-        "check --ids --full reports every negative ID as out of range and so finds \
-         no negative duplicate",
-    )])
+        |w, o| {
+            let mut findings: Vec<Finding> = exit(o, 0).into_iter().collect();
+            if o.code == Some(0) {
+                let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
+                let want = vec![format!("has_negative_ids {}", base_has_negative(w))];
+                let got = vec![format!("has_negative_ids {}", v["ids"]["has_negative_ids"])];
+                findings.extend(compare("field", &want, &got, false));
+            }
+            findings
+        },
+    )
 }
 
 /// Every ID violation in a `check --json` report as `type kind id`.
@@ -2904,15 +2886,6 @@ fn check_refs_dangling() -> Case {
         },
         |w, o| refs_verdict(o, &[format!("n{} in w{}", w.n(-9), w.w(9))]),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 2,
-            says: "w9 references negative ID n-9; the reference check does not check",
-        },
-        "check --refs refuses negative IDs",
-    )])
 }
 
 /// The dangling graph with `w9` complete: the relation member `n-1` of
@@ -2932,15 +2905,6 @@ fn check_refs_relations_dangling() -> Case {
         },
         |w, o| refs_verdict(o, &[format!("n{} in r{}", w.n(-1), w.r(9))]),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        Sig::Exit {
-            code: 2,
-            says: "r9 references negative ID n-1; the reference check does not check",
-        },
-        "check --refs refuses negative IDs",
-    )])
 }
 
 fn locations_input(w: &World, dir: &Path, f: Framing) -> OsString {
@@ -2957,12 +2921,6 @@ fn check_locations() -> Case {
         |w, dir, f| vec![locations_input(w, dir, f), "--locations".into()],
         |_, o| check_verdict(o, 0, &[]),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        CHECK_LOCATIONS_REFUSAL,
-        "check --locations refuses negative way refs",
-    )])
 }
 
 fn check_locations_agreement() -> Case {
@@ -2977,12 +2935,76 @@ fn check_locations_agreement() -> Case {
         },
         |_, o| check_verdict(o, 0, &[]),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        CHECK_LOCATIONS_REFUSAL,
-        "check --locations refuses negative way refs",
-    )])
+}
+
+/// `n-9` with two records that disagree, and `w-9`, its only referrer,
+/// removed: the conflict is reported though no way references the node.
+fn check_locations_conflicting_unreferenced() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| {
+            let mut g = mixed_sign_graph();
+            g.ways.retain(|x| x.id != -9);
+            let at = g.nodes.iter().position(|n| n.id == -9).unwrap();
+            let mut moved = g.nodes[at].clone();
+            moved.lat += 1;
+            g.nodes.insert(at + 1, moved);
+            let layout = Layout {
+                locations: true,
+                ..Layout::plain(f.indexed())
+            };
+            vec![write(dir, IN, &w.graph(g), layout), "--locations".into()]
+        },
+        |w, o| {
+            check_verdict(
+                o,
+                1,
+                &[format!(
+                    "n{}: node records disagree about its coordinate",
+                    w.n(-9)
+                )],
+            )
+        },
+    )
+}
+
+/// `n-9` has no record and `w-9` references it twice with different inline
+/// coordinates: agreement mode reports the absent node.
+fn check_locations_agreement_disagreeing_absent() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| {
+            let mut g = mixed_sign_graph();
+            let (lat, lon) = (g.node(-9).lat, g.node(-9).lon);
+            g.nodes.retain(|n| n.id != -9);
+            for x in &mut g.ways {
+                if x.id == -9 {
+                    x.refs = vec![0, -9, 9, -9];
+                }
+            }
+            let (way, node) = (w.w(-9), w.n(-9));
+            let layout = Layout {
+                locations: true,
+                ..Layout::plain(f.indexed())
+            };
+            let path = dir.join(IN);
+            w.graph(g).write_layout_inline(&path, layout, &|x, p, r| {
+                (x == way && r == node).then_some(if p == 1 { (lat, lon) } else { (lat + 1, lon) })
+            });
+            vec![
+                path.into_os_string(),
+                "--locations".into(),
+                "--agreement".into(),
+            ]
+        },
+        |w, o| {
+            check_verdict(
+                o,
+                1,
+                &[format!("n{}: not in the file, and the ways", w.n(-9))],
+            )
+        },
+    )
 }
 
 fn check_index() -> Case {

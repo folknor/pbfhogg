@@ -733,7 +733,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
 | `--anomalies` | Show blocks outside inspect's per-type median thresholds, plus mixed blocks |
-| `--extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering. Coverage counts objects whose field carries an available value, as `osmium fileinfo -e`: version 1 or more, non-zero timestamp, positive changeset and uid, a user name resolving to a non-empty string; each field is judged on its own value whatever the version, so a present uid 0 or empty user is no uid or user, and a user index past the string table counts as no user. The timestamp range covers non-zero timestamps only. With no objects, "All objects have" is `(none)`. CORRECTNESS.md "Metadata coverage in inspect --extended" lists the boundaries against fileinfo. (`-e` used to be its short; `-e` now refuses here, naming `--extended`.) |
+| `--extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering. Coverage counts objects whose field carries an available value, as `osmium fileinfo -e`: version 1 or more, non-zero timestamp, positive changeset and uid, a user name resolving to a non-empty string; each field is judged on its own value whatever the version, so a present uid 0 or empty user is no uid or user, and a user index past the string table counts as no user. The timestamp range covers non-zero timestamps only. With no objects, "All objects have" is `(none)`. It also reports whether any decoded element ID is negative (`Negative IDs:`, `data.has_negative_ids` in `--json` and as a `--get` key), a property of the input, not a fault. CORRECTNESS.md "Metadata coverage in inspect --extended" lists the boundaries against fileinfo. (`-e` used to be its short; `-e` now refuses here, naming `--extended`.) |
 | `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Data and metadata paths enable extended stats automatically. Not combinable with `--json`, `--blocks` or `--anomalies` (the last two only shape the full report). An unknown key is refused before the input is opened. |
 | `--json` | Machine-readable JSON output. Not combinable with `--nodes` (node stats have no JSON form) or `--get`. |
 | `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123` or `node/123`). Also accepts `w456` / `way/456` and `r789` / `relation/789`, including signed IDs. Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag (`--indexed`, `--nodes`, `-j`, `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `--extended`, `--get`, `--json`, `--force`), which it used to accept and discard. |
@@ -952,7 +952,8 @@ file.
 that one read; `--refs` reads a blob again, once per kind at most, only
 where a way's reference or a relation's node or way member missed in that
 read: its target not yet read, an ID above the range the check sized from
-the file, or a reference missing in fact. A sorted, referentially complete
+the file or a negative one (no sized range covers a negative), or a
+reference missing in fact. A sorted, referentially complete
 file costs about one read of each blob; no file costs more than one read
 per kind. The type-order check of `--ids` judges the decoded elements in
 the order pbfhogg reads them: blobs and their groups in turn, and within a
@@ -968,7 +969,8 @@ The ID check judges monotonicity by canonical OSM order - `0`, then the
 negative IDs by ascending absolute value, then the positives - which is the
 order `sort` produces. On a positive-only file (every production PBF) that is
 plain `i64` order; on a file carrying negative IDs the two differ, and the
-canonical one is the definition.
+canonical one is the definition. `--full` judges duplicates by the same
+signed IDs: `n-7` repeated is a duplicate, and `n-7` beside `n7` is not.
 
 #### Index verification
 
@@ -1081,9 +1083,7 @@ without a node record. The six sum to the reference count.
 
 **Refused (exit 2).** A header without `LocationsOnWays` (no claim to check);
 a header declaring `HistoricalInformation` (several versions of a node
-legitimately disagree); a way referencing a negative node ID (ADR-0002: the
-store is keyed through an `IdSet`, and a skipped comparison cannot be
-certified); any data blob the reader refuses to build
+legitimately disagree); any data blob the reader refuses to build
 a block from - every blob is validated once with the reader's own
 construction, which checks group and element framing, tag, `Info` and
 `DenseInfo` arrays, way geometry and relation member arrays and string table
@@ -1123,7 +1123,7 @@ the result is independent of worker order), then every blob holding ways is
 decoded and each reference the partition owns is compared, streaming one
 reference at a time and scaling a coordinate only for an owned reference.
 The first partition also makes the partition-independent checks (missing
-arrays, out-of-domain inline values, negative references) and validates the
+arrays, out-of-domain inline values) and validates the
 blobs claiming ways, which the up-front pass did not read. Counts come from
 a scan of the final slot states, never from which worker won a race, and the
 retained details are the smallest by file position or node ID, so neither
@@ -1156,14 +1156,19 @@ percent of its nodes and fits one partition; with `--agreement` it needs as
 many as a complete one. The `partitions` and `blob_decodes` fields of the
 JSON report are these cost figures; they follow the host, not the file.
 
-The ref check refuses (exit 2) a file holding a negative ID it would compare
-(ADR-0002): a node, a way under `--check-relations` (the only mode that
-tracks way IDs), a relation, or any checked reference. Under
-`--check-relations` it also
-refuses a relation member of an unknown type, which no set can resolve. A
-positive ID above the range it sized from the file's own indexdata is still
-tracked, inserted from each phase's merge. `--ids --full` reports a negative
-ID as an `id_out_of_range` violation instead. Missing references are counted
+Negative IDs are checked like any other by every check: `--refs` resolves a
+reference to `n-7` against `n-7` only, never its positive twin, and reports
+it missing under its signed ID; `--locations` gives a negative node a slot,
+so its records, its references and (with `--agreement`) the inline copies
+of an absent one are compared; `--ids --full` orders and deduplicates them
+canonically, so an ordered file holding negatives passes. The ID check
+reports whether any element ID of a selected kind is negative
+(`has_negative_ids` in its JSON, `Negative IDs:` in its text); it is a
+property of the input, not a violation. Under `--check-relations` the ref
+check refuses (exit 2) a relation member of an unknown type, which no set
+can resolve. An ID outside the range the ref and full ID checks sized from
+the file's own indexdata (above it, or negative) is still tracked, inserted
+from each phase's merge. Missing references are counted
 into one ID set per category, so their memory follows the range of the
 missing IDs rather than the number of references. Retained `--show-ids`
 details (all of them under `--max-errors 0`) and the deferred

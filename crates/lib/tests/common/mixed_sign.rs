@@ -338,11 +338,25 @@ impl MixedSignGraph {
     /// coordinates from the graph's own node records (a ref the graph has
     /// no record of panics) under a `LocationsOnWays` header. Each element
     /// carries the metadata it holds (the graph's own hold none).
+    pub fn write_layout(&self, path: &Path, layout: Layout) {
+        self.write_layout_inline(path, layout, &|_, _, _| None);
+    }
+
+    /// [`Self::write_layout`], with a locations layout taking way `w`'s
+    /// inline coordinate at ref position `p` (to node `n`) from
+    /// `inline(w, p, n)` where it answers, and from `n`'s record otherwise:
+    /// how a fixture writes a stale or disagreeing copy, or a copy of a node
+    /// the graph has no record of.
     #[expect(
         clippy::too_many_lines,
         reason = "one encoding loop per kind, then the framing, read top to bottom"
     )]
-    pub fn write_layout(&self, path: &Path, layout: Layout) {
+    pub fn write_layout_inline(
+        &self,
+        path: &Path,
+        layout: Layout,
+        inline: &dyn Fn(i64, usize, i64) -> Option<(i32, i32)>,
+    ) {
         let order = |n: usize| -> Vec<usize> {
             if layout.sorted {
                 (0..n).collect()
@@ -392,10 +406,13 @@ impl MixedSignGraph {
                 let locations: Vec<(i32, i32)> = w
                     .refs
                     .iter()
-                    .map(|r| {
-                        *coords
-                            .get(r)
-                            .unwrap_or_else(|| panic!("way {} ref {r}", w.id))
+                    .enumerate()
+                    .map(|(p, r)| {
+                        inline(w.id, p, *r).unwrap_or_else(|| {
+                            *coords
+                                .get(r)
+                                .unwrap_or_else(|| panic!("way {} ref {r}", w.id))
+                        })
                     })
                     .collect();
                 bb.add_way_with_locations(

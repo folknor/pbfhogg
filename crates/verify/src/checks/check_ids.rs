@@ -9,8 +9,8 @@
 //! every data blob claims never decreases, an empty blob's claim included,
 //! since there pbfhogg judges type order from the claims, not the elements
 //! (the header-only [`crate::pbf_frames::framing`]). `--full` adds duplicate
-//! detail, which cannot change the verdict on a file without negative IDs: a
-//! repeat already breaks the strict ascent. Each mode, on each case, must
+//! detail, which cannot change the verdict: a repeat already breaks the
+//! strict ascent, negative IDs included (both sides order them canonically). Each mode, on each case, must
 //! exit as its report says (0 with a pass and no violation, 1 with a failure
 //! and at least one), answer as expected, count every kind as osmium does
 //! (the guard against a reader that skips objects), and say it read
@@ -30,10 +30,14 @@
 //! exists for, read from osmium and the framing, never inferred from how it
 //! was built.
 //!
-//! Domain: no negative ID (pbfhogg rejects negative input IDs project-wide,
-//! and `--full` reports each one as untrackable), and true kind claims: a
-//! blob whose decoded kind contradicts its claim stops pbfhogg's check
-//! without an answer, which is an error here.
+//! Domain: true kind claims: a blob whose decoded kind contradicts its claim
+//! stops pbfhogg's check without an answer, which is an error here. Negative
+//! IDs are in the domain, but a file whose dense delta arithmetic overflows
+//! a signed 64-bit add (a node run `-1` then `i64::MAX`, whose second delta
+//! is `i64::MIN`, or a derived unsorted copy that introduces such a step) is
+//! not a portable osmium oracle: libosmium adds deltas as signed C++
+//! integers, which overflows, where pbfhogg wraps. Such boundary inputs are
+//! covered by pbfhogg's own tests with explicit expectations.
 
 use std::path::{Path, PathBuf};
 
@@ -448,14 +452,6 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
 
     harness.msg("--- check --ids: reading the input ---");
     let input = Case::read(harness, &outdir, "input", pbf)?;
-    if let Some((kind, id)) = input.info.negative_id() {
-        return Err(Error::Failed(format!(
-            "{} holds {} ID {id}: pbfhogg rejects negative input IDs project-wide and check \
-             --ids --full reports each as untrackable, so check --ids cannot be compared on it",
-            pbf.display(),
-            ["node", "way", "relation"][kind]
-        )));
-    }
 
     let mut cases = vec![];
     if input.info.counts.iter().all(|&n| n == 0) {

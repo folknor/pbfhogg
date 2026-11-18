@@ -402,6 +402,7 @@ impl InspectReport {
             "Ordered:  {}",
             if ext.objects_ordered { "yes" } else { "no" }
         )?;
+        writeln!(out, "Negative IDs: {}", yes_no(ext.has_negative_ids))?;
         if ext.has_timestamps() {
             writeln!(
                 out,
@@ -472,6 +473,7 @@ impl InspectReport {
         let ext = self.state.extended.as_ref()?;
         match key {
             InspectGetKeyKind::DataObjectsOrdered => Some(yes_no(ext.objects_ordered)),
+            InspectGetKeyKind::DataHasNegativeIds => Some(yes_no(ext.has_negative_ids)),
             InspectGetKeyKind::DataTimestampFirst => {
                 if ext.has_timestamps() {
                     Some(format_timestamp(ext.min_timestamp))

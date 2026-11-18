@@ -98,8 +98,8 @@ Both within noise: no cost.
 
 ## check --ids --full proves an ordered kind duplicate-free (bygg, 2026-11-08, against `cbdb79f0`)
 
-`--full` now runs the plain order scan first (recording negative IDs as
-`IdOutOfRange`, as before); a kind in strict `osm_id_cmp` order cannot hold
+`--full` now runs the plain order scan first (which, until the 2026-11-18
+entry above, recorded negative IDs as `IdOutOfRange`); a kind in strict `osm_id_cmp` order cannot hold
 a duplicate and is final, and only a kind found out of order is read again
 with its pre-allocated `IdSet`. Planet `planet-20260223-reindexed.osm.pbf`
 (indexed, ordered), interleaved `--bench 1`, base `cbdb79f0` (stored,
@@ -114,6 +114,25 @@ The wall difference (about 3 %, same sign in both pairs) sits at the noise
 line; the nodes phase loses the set's 1.9 GB of page faults (minflt 393k to
 28k). The memory drop is the result. Not measured: an unsorted file, where
 each out-of-order kind costs one extra read at the old peak.
+
+## check handles negative IDs exactly (bygg, 2026-11-18, against `f1fc6f76`)
+
+The ID check's per-element judge gains one sign test (`has_negative_ids`)
+and `--full` drops its out-of-range report: a negative now spills to the
+duplicate pass's side set as an ID above the allocation does. `--refs` and
+`--locations` lose refusal branches only. The cell is the one the change
+reaches on positive input: `id-order --full yes`, denmark `--snapshot
+unsorted` (every kind out of order, so the duplicate pass runs),
+interleaved `--iterations 1` A B B A, base `f1fc6f76` (`--commit`) against
+the uncommitted working tree:
+
+| Arm | Walls |
+|---|---:|
+| base | 369 ms (`629e2a61`, first after the build, cold), 244 ms (`6e7ec2c0`) |
+| working tree | 241 ms (`f3dc6755`), 239 ms (`cd2d04a7`) |
+
+Against the warm base cell the working tree is within noise (-1 to -2 %):
+no cost. No dataset holds a negative ID, so no cell measures one.
 
 ## Payloads validated where they lie (bygg, 2026-11-02, against `7feb4370`)
 

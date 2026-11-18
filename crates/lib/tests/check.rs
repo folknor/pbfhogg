@@ -172,13 +172,38 @@ fn assert_refs_refused(path: &std::path::Path, check_relations: bool, needle: &s
     );
 }
 
-/// Negative IDs are invalid input (ADR-0002) and the tracking sets cannot
-/// hold them, so `check --refs` refuses one wherever it would compare it,
-/// instead of reporting every reference to it as missing. Each fixture has
-/// one negative ID and is otherwise consistent, so a refusal can only come
-/// from that ID.
+/// The per-category missing counts and the `--show-ids` details of a
+/// completed ref check, as `type id in type id` lines.
+fn missing_summary(report: &pbfhogg::check::refs::RefCheckResult) -> (Vec<u64>, Vec<String>) {
+    let mut details: Vec<String> = report
+        .missing_refs
+        .iter()
+        .map(|m| {
+            format!(
+                "{}{} in {}{}",
+                m.missing_type, m.missing_id, m.referencing_type, m.referencing_id
+            )
+        })
+        .collect();
+    details.sort();
+    (
+        vec![
+            report.missing_node_refs,
+            report.missing_way_refs,
+            report.missing_node_members,
+            report.missing_relation_members,
+        ],
+        details,
+    )
+}
+
+/// `check --refs` checks a negative ID like any other, on every path: a
+/// negative element present and referenced resolves, and a reference to an
+/// absent negative is missing under its own signed ID, never resolved by its
+/// positive magnitude twin. The sets hold no pre-allocation for negatives,
+/// so every negative element goes through the phase's side set.
 #[test]
-fn check_refs_refuses_the_negative_ids_it_compares() {
+fn check_refs_checks_negative_ids_like_any_other() {
     let dir = crate::common::test_scratch();
     let write = |name: &str, nodes: &[TestNode], ways: &[TestWay], rels: &[TestRelation]| {
         let path = dir.path().join(name);
@@ -186,54 +211,47 @@ fn check_refs_refuses_the_negative_ids_it_compares() {
         path
     };
 
-    // An element ID the check tracks.
-    let neg_node = write(
-        "neg-node.osm.pbf",
+    // Present negatives of every kind, each referenced: valid.
+    let present = write(
+        "present.osm.pbf",
         &[node(-5), node(1)],
-        &[way(10, &[1])],
-        &[],
+        &[way(-10, &[-5, 1])],
+        &[
+            relation(-3, MemberId::Way(-10)),
+            relation(3, MemberId::Relation(-3)),
+        ],
     );
-    assert_refs_refused(&neg_node, false, "node -5");
-    let neg_way = write("neg-way.osm.pbf", &[node(1)], &[way(-10, &[1])], &[]);
-    assert_refs_refused(&neg_way, true, "way -10");
-    let neg_rel = write(
-        "neg-rel.osm.pbf",
-        &[node(1)],
-        &[],
-        &[relation(-3, MemberId::Node(1))],
-    );
-    assert_refs_refused(&neg_rel, true, "relation -3");
-
-    // A checked reference, on each path: a way ref and node and way members
-    // fail a lookup first, a relation member is deferred without one.
-    let neg_ref = write("neg-ref.osm.pbf", &[node(1)], &[way(10, &[1, -5])], &[]);
-    assert_refs_refused(&neg_ref, false, "w10 references negative ID n-5");
-    for (name, member, needle) in [
-        (
-            "neg-node-member.osm.pbf",
-            MemberId::Node(-5),
-            "r3 references negative ID n-5",
-        ),
-        (
-            "neg-way-member.osm.pbf",
-            MemberId::Way(-6),
-            "r3 references negative ID w-6",
-        ),
-        (
-            "neg-rel-member.osm.pbf",
-            MemberId::Relation(-7),
-            "r3 references negative ID r-7",
-        ),
-    ] {
-        let path = write(name, &[node(1)], &[way(10, &[1])], &[relation(3, member)]);
-        assert_refs_refused(&path, true, needle);
+    for check_relations in [false, true] {
+        let report = run_check_refs(&present, check_relations, Some(0)).expect("checked");
+        assert!(report.is_valid(), "relations {check_relations}");
+        assert_eq!(report.node_count, 2);
     }
 
-    // Passing counterpart: a negative way ID with relations off feeds no
-    // comparison, so it is not refused, and the file is otherwise valid.
-    let report = run_check_refs(&neg_way, false, None).expect("way IDs are not tracked");
-    assert!(report.is_valid());
-    assert_eq!(report.way_count, 1);
+    // A reference to an absent negative on each path, its positive twin
+    // present: missing under the signed ID.
+    let absent = write(
+        "absent.osm.pbf",
+        &[node(1), node(5)],
+        &[way(6, &[1]), way(10, &[1, -5])],
+        &[
+            relation(3, MemberId::Node(-5)),
+            relation(4, MemberId::Way(-6)),
+            relation(7, MemberId::Relation(-7)),
+        ],
+    );
+    let report = run_check_refs(&absent, true, Some(0)).expect("checked");
+    assert_eq!(
+        missing_summary(&report),
+        (
+            vec![1, 1, 1, 1],
+            vec![
+                "n-5 in r3".to_owned(),
+                "n-5 in w10".to_owned(),
+                "r-7 in r7".to_owned(),
+                "w-6 in r4".to_owned(),
+            ]
+        )
+    );
 }
 
 /// A relation member of a type no set can resolve is refused rather than
@@ -494,26 +512,49 @@ fn check_ids_full_proves_an_ordered_kind_duplicate_free_without_its_set() {
     assert_eq!(report.node_count, 3);
 }
 
-/// The order proof does not change what `--ids --full` says about negative
-/// IDs: each one is still an `IdOutOfRange` violation, ordered file or not.
+/// A file in canonical order passes `--ids --full` with its negative IDs,
+/// and says it holds them; its positive-only counterpart says it does not.
 #[test]
-fn check_ids_full_still_reports_negative_ids_on_an_ordered_file() {
+fn check_ids_full_passes_an_ordered_file_with_negative_ids() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("negatives.osm.pbf");
     write_nodes_in_order(&input, &[0, -1, -2, 1, 2]);
+    let report = verify_ids_full(&input, 0, &crate::common::test_host());
+    assert!(report.passed);
+    assert_eq!(report.total_violations, 0);
+    assert!(report.has_negative_ids);
+    assert_eq!(report.to_json_value("f")["has_negative_ids"], true);
+    let streaming = verify_node_ids(&input);
+    assert!(streaming.has_negative_ids);
+
+    let positive = dir.path().join("positive.osm.pbf");
+    write_nodes_in_order(&positive, &[0, 1, 2]);
+    assert!(!verify_ids_full(&positive, 0, &crate::common::test_host()).has_negative_ids);
+    assert!(!verify_node_ids(&positive).has_negative_ids);
+}
+
+/// A negative ID repeated across blobs is a duplicate under its own signed
+/// ID, found through the duplicate pass's side set (no pre-allocation
+/// covers a negative); its positive magnitude twin is not confused with it.
+#[test]
+fn check_ids_full_finds_a_negative_duplicate() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("dup_neg.osm.pbf");
+    let nodes = [node(-2), node(-2), node(2)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
 
     let report = verify_ids_full(&input, 0, &crate::common::test_host());
-    assert!(!report.passed);
+    // -2 -> -2 out of order, the second -2 a duplicate.
     assert_eq!(report.total_violations, 2);
-    let negatives: Vec<i64> = report
+    let duplicates: Vec<i64> = report
         .violations
         .iter()
         .filter_map(|v| match v {
-            pbfhogg::check::verify_ids::IdViolation::IdOutOfRange { id, .. } => Some(*id),
+            pbfhogg::check::verify_ids::IdViolation::Duplicate { id, .. } => Some(*id),
             _ => None,
         })
         .collect();
-    assert_eq!(negatives, [-1, -2]);
+    assert_eq!(duplicates, [-2]);
 }
 
 /// On a kind out of order `--ids --full` reads it again with its set, and
@@ -527,12 +568,12 @@ fn check_ids_full_duplicate_pass_replaces_the_order_pass_findings() {
     crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
 
     let report = verify_ids_full(&input, 0, &crate::common::test_host());
-    // -1 out of range, 5 -> 5 out of order, the second 5 a duplicate.
-    assert_eq!(report.total_violations, 3);
-    assert_eq!(report.violations.len(), 3);
+    // 5 -> 5 out of order, the second 5 a duplicate; -1 is in order.
+    assert_eq!(report.total_violations, 2);
+    assert_eq!(report.violations.len(), 2);
 
     let capped = verify_ids_full(&input, 1, &crate::common::test_host());
-    assert_eq!(capped.total_violations, 3);
+    assert_eq!(capped.total_violations, 2);
     assert_eq!(capped.violations.len(), 1);
 }
 
@@ -1076,39 +1117,44 @@ fn check_refs_judges_an_unindexed_file_as_its_indexed_twin_in_any_order() {
     }
 }
 
-/// The refusals stand wherever the combined pass meets them: a negative ID
-/// it would compare, in any blob order, is refused as on an indexed file.
+/// An unindexed file whose references to negative elements come before
+/// them: the combined pass meets each reference while its target is still
+/// in the side set, so the blob is judged again after the merge and every
+/// reference resolves, in any blob order. An absent negative stays missing
+/// under its signed ID beside its present positive twin.
 #[test]
-fn check_refs_refuses_negative_ids_in_an_unindexed_file_in_any_order() {
+fn check_refs_resolves_negative_ids_in_an_unindexed_file_in_any_order() {
     let dir = crate::common::test_scratch();
-    let nodes = [node(1)];
-    let neg_ref = [way(10, &[99, -5])];
-    let neg_way = [way(-10, &[1])];
-    let neg_member = [relation(3, MemberId::Way(-6))];
-    let cases: [(&str, Vec<Blob<'_>>, bool, &str); 3] = [
-        (
-            "neg-ref",
-            vec![Blob::Ways(&neg_ref), Blob::Nodes(&nodes)],
-            false,
-            "w10 references negative ID n-5",
-        ),
-        (
-            "neg-way",
-            vec![Blob::Ways(&neg_way), Blob::Nodes(&nodes)],
-            true,
-            "way -10",
-        ),
-        (
-            "neg-way-member",
-            vec![Blob::Relations(&neg_member), Blob::Nodes(&nodes)],
-            true,
-            "r3 references negative ID w-6",
-        ),
+    let nodes = [node(-5), node(1), node(6)];
+    let ways = [way(-10, &[-5, 1]), way(11, &[-6])];
+    let rels = [
+        relation(-3, MemberId::Way(-10)),
+        relation(3, MemberId::Relation(-3)),
     ];
-    for (name, blobs, check_relations, needle) in cases {
-        let path = dir.path().join(format!("{name}.osm.pbf"));
-        write_unindexed_blobs(&path, &blobs);
-        assert_refs_refused(&path, check_relations, needle);
+    for order in [
+        vec![
+            Blob::Relations(&rels),
+            Blob::Ways(&ways),
+            Blob::Nodes(&nodes),
+        ],
+        vec![
+            Blob::Nodes(&nodes),
+            Blob::Ways(&ways),
+            Blob::Relations(&rels),
+        ],
+        vec![
+            Blob::Ways(&ways),
+            Blob::Relations(&rels),
+            Blob::Nodes(&nodes),
+        ],
+    ] {
+        let path = dir.path().join("unindexed.osm.pbf");
+        write_unindexed_blobs(&path, &order);
+        let report = run_check_refs(&path, true, Some(0)).expect("checked");
+        assert_eq!(
+            missing_summary(&report),
+            (vec![1, 0, 0, 0], vec!["n-6 in w11".to_owned()])
+        );
     }
 }
 

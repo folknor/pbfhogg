@@ -589,27 +589,6 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   mixed-sign range would silently turn present nodes, positive ones
   included, into missing locations. The error names the sparse index,
   which joins such input. Way and relation blobs may hold negative IDs.
-- `check --locations` - **hard reject** of any way referencing a
-  negative node ID. Its coordinate store gives no negative node a slot,
-  so such a reference could not be compared, and a verifier that
-  skipped it would pass a stale coordinate unseen. Negative node
-  records are still counted and their coordinates domain-checked.
-  osmium has no equivalent check.
-- `check --refs` - **hard reject** of a negative ID the check would
-  compare: a node, a way under `--check-relations` (way IDs are
-  tracked only there), a relation, and every checked way ref and
-  relation member (`crates/lib/src/commands/check/refs.rs`). Its tracking sets
-  are `IdSet`s, so before the reject a negative element was counted
-  as untrackable and every reference to it reported as missing.
-  osmium's `check-refs` keeps a second `IdSetDense` for negatives and
-  checks them. Under `--check-relations` a relation member of an
-  unknown type is refused as well, where osmium skips it.
-- `check --ids --full` - **verdict**, not a refusal: every negative
-  element ID is reported as an `IdOutOfRange` violation and the check
-  exits 1, even in a file whose negatives are in canonical `id_order`
-  (`crates/lib/src/commands/check/verify_ids.rs`). The streaming `check --ids`
-  orders negatives canonically by `osm_id_cmp` and does not fail on
-  them, as libosmium's `CheckOrder` and `osmium fileinfo` do not.
 - `add-locations-to-ways` (both backends) - **silent**, for negative
   relation-member refs, which the relation scan drops before collecting
   relation-member node IDs into the `IdSet` that decides which untagged
@@ -622,6 +601,17 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
 PBF payload, not an ID set passed through `IdSet`.
+
+**check is exact.** `check --refs` (with or without `--check-relations`)
+tracks and resolves negative node, way and relation IDs by their signed
+value, as osmium's `check-refs` does with its second ID set for
+negatives; no difference remains except that osmium stores `0` in that
+second set and pbfhogg in the first, which changes no answer, and that
+osmium cannot represent `abs(i64::MIN)`. `check --ids` and `--ids --full`
+order and deduplicate negatives canonically, as libosmium's `CheckOrder`
+and `osmium fileinfo -e` do, so an ordered file holding negatives passes.
+`check --locations`, which osmium has no equivalent of, gives negative
+nodes slots like any other.
 
 **getid (including `--invert`) and getparents are exact.** They accept a
 negative ID from every source (positional IDs, `--id-file`, `--id-osm-file`;

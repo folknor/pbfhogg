@@ -515,10 +515,11 @@ const KEY_CONFLICTING: u8 = 3;
 const KEY_INVALID_NODE: u8 = 4;
 const KEY_DISAGREEING: u8 = 5;
 
-/// A non-negative ID as a key component.
+/// An ID as a key component, in signed numeric order (the sign bit flipped),
+/// the order the partitions and `finish_partition` walk the keys in.
 #[allow(clippy::cast_sign_loss)]
 fn id_key(id: i64) -> u64 {
-    id.max(0) as u64
+    (id as u64) ^ (1 << 63)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +543,7 @@ impl KeyShards {
         }
     }
 
-    /// Insert and clear a worker's batch. Negative IDs are not keyed.
+    /// Insert and clear a worker's batch.
     fn flush(&self, batch: &mut Vec<i64>) {
         batch.sort_unstable();
         let mut rest = batch.as_slice();
@@ -552,18 +553,16 @@ impl KeyShards {
                 .iter()
                 .position(|&id| IdSet::chunk_of(id) != chunk)
                 .unwrap_or(rest.len());
-            // The key set holds no negative ID: a negative node record gets
-            // no slot. Negatives sort first and share no chunk key with a
-            // non-negative ID, so a run is all one sign.
-            if first >= 0 {
-                let shard = usize::try_from(chunk % self.shards.len() as u64).unwrap_or(0);
-                let mut set = self.shards[shard]
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for &id in &rest[..run] {
-                    set.insert(id);
-                }
+            // A chunk key names one sign family (`IdSet::chunk_of`), so the
+            // shards stay disjoint over both.
+            let shard = usize::try_from(chunk % self.shards.len() as u64).unwrap_or(0);
+            let mut set = self.shards[shard]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for &id in &rest[..run] {
+                set.insert(id);
             }
+            drop(set);
             rest = &rest[run..];
         }
         batch.clear();
@@ -706,8 +705,7 @@ fn route(walk: &Walk) -> (Schedule, Schedule) {
 /// Refuses, rather than reports, a file it cannot check: one whose header
 /// does not declare `LocationsOnWays` (`MissingFeature`) or declares
 /// `HistoricalInformation` (several versions of a node legitimately carry
-/// different coordinates); a way referencing a negative node ID (ADR-0002);
-/// and any data blob the reader refuses to build a block from (every blob
+/// different coordinates); and any data blob the reader refuses to build a block from (every blob
 /// is validated once as the reader validates it).
 ///
 /// A blob whose indexdata claims ways while it holds elements of another
@@ -986,14 +984,6 @@ fn store_budget(opts: &CheckLocationsOptions, available: Option<u64>, key_bytes:
     })
 }
 
-#[cold]
-fn negative_ref_error(way_id: i64, node_id: i64) -> Error {
-    Error::invalid_data(format!(
-        "way {way_id} references negative node ID {node_id}; the location \
-         check does not check negative IDs, which no production PBF carries"
-    ))
-}
-
 /// Slot of `rank` within a partition starting at `first_rank`. Both come
 /// from the plan the store was sized by, so the index is in bounds.
 #[allow(clippy::cast_possible_truncation)]
@@ -1134,7 +1124,7 @@ impl RunCtx<'_> {
                             if ctx.designated {
                                 ctx.structural_ref(
                                     way, position, node_id, event, &mut out, &mut local,
-                                )?;
+                                );
                             }
                             ctx.compare(way, position, node_id, event, &mut out, &mut local);
                         }
@@ -1266,8 +1256,8 @@ impl WayCtx<'_> {
     }
 
     /// The facts about one reference that do not depend on the partition:
-    /// the count, a negative ID, an out-of-domain inline coordinate.
-    /// Designated partition only.
+    /// the count, an out-of-domain inline coordinate. Designated partition
+    /// only.
     fn structural_ref(
         &self,
         (ordinal, way_id): (u64, i64),
@@ -1276,11 +1266,8 @@ impl WayCtx<'_> {
         event: &WayEvent,
         out: &mut WayBlob,
         local: &mut Details,
-    ) -> Result<()> {
+    ) {
         out.refs += 1;
-        if node_id < 0 {
-            return Err(negative_ref_error(way_id, node_id));
-        }
         if let Some(Coord::Invalid { lat_nano, lon_nano }) = event.coord() {
             out.invalid_inline += 1;
             local.push(
@@ -1295,7 +1282,6 @@ impl WayCtx<'_> {
                 },
             );
         }
-        Ok(())
     }
 
     /// Check one reference, if this partition owns it.

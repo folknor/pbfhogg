@@ -1528,6 +1528,8 @@ pbfhogg extract [OPTIONS] <FILE>
 
 Filter elements by tag expressions. Default mode resolves relation members transitively (matched relations pull in member ways, nodes, and nested relations). With `-R`, only directly matched elements are emitted.
 
+Negative IDs are IDs like any other in every mode: a matched `w-7` pulls in exactly the nodes it references, a relation member `n-7` brings `n-7`, and neither brings its positive twin (osmium folds both onto `|id|` when it adds references).
+
 With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes: every delete is kept whatever its tags, with the body its input gave (tags, refs, members, a deleted node's location), and kept elements are written in merge-changes' normal form under the same rules for delete locations and empty metadata attributes (see [merge-changes](#merge-changes)). Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is not a PBF; its framing comes from the output name, see "Output files"), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it. One reader thread frames the OSC document and cuts it into batches; `-j` sizes the workers that filter the batches, and the output is the same at any `-j`.
 
 At least one expression is required, positional or from `-e`; an `-e` file holding none is refused, and so is a malformed expression, before the input is opened.

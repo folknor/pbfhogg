@@ -28,6 +28,12 @@
   dropped. Matching is by the signed ID, where osmium matches by absolute
   value. `parse_ids` and the other library parsers accept negative IDs.
   A bare negative number under `--default-type` needs no `--`.
+- **tags-filter handles negative IDs exactly in its default
+  (reference-including) mode.** A matching negative node, way or
+  relation, and the negative way refs, relation members and nested
+  relations it pulls in, are now written; before, they were silently
+  dropped (`-R` and OSC input were already exact). Selection is by the
+  signed ID, where osmium folds referenced IDs onto their absolute value.
 
 ### Added
 

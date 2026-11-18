@@ -201,13 +201,11 @@ hunter asks for a common refusal policy for conflicting coordinates.
 
 Reported by: altw-sparse, tags, spatial.
 
-`IdSet::set` ignores negative values. Sparse ALTW reference collection and
-coordinate population discard negative IDs although `osm_id.rs` defines signed
-ordering and external's diagnostic implies sparse can join them; tags-filter
-reference inclusion records matches through `IdSet`, so a matching negative-ID
-element survives `-R` but disappears with reference inclusion; extract
-membership (`IdSet` and multi-region membership) discards negatives. Not
-reproduced.
+Sparse ALTW reference collection and coordinate population discard negative
+IDs (explicit sign guards since `IdSet` became signed) although `osm_id.rs`
+defines signed ordering and external's diagnostic implies sparse can join
+them; extract membership (`IdSet` and multi-region membership) discards
+negatives.
 
 Defect hunt 2026-11-17 (extract P1, id-filter-selection P2, cli-binary):
 - Extract: in-region node `1`, out-of-region node `-1`, way `10` referencing

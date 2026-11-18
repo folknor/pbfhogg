@@ -922,29 +922,21 @@ fn tags_filter_two_pass(
                 Ok(result)
             },
             |_seq, cr| {
-                // tags-filter does not select negative IDs: each insertion
-                // below drops one, and nothing else about its element does.
+                // Every set is signed: a negative ID is selected exactly,
+                // never folded onto its magnitude twin as osmium does.
                 for id in cr.matched_nodes {
-                    if id >= 0 {
-                        matched_node_ids.insert(id);
-                    }
+                    matched_node_ids.insert(id);
                 }
                 for (way_id, refs) in cr.matched_ways {
-                    if way_id >= 0 {
-                        direct_way_ids.insert(way_id);
-                    }
+                    direct_way_ids.insert(way_id);
                     has_included_way = true;
                     for r in refs {
-                        if r >= 0 {
-                            way_dep_node_ids.insert(r);
-                        }
+                        way_dep_node_ids.insert(r);
                     }
                 }
                 for id in cr.matched_relations {
-                    if id >= 0 {
-                        direct_relation_ids.insert(id);
-                    }
-                    if id >= 0 && included_relation_ids.insert_if_new(id) {
+                    direct_relation_ids.insert(id);
+                    if included_relation_ids.insert_if_new(id) {
                         has_included_relation = true;
                     }
                 }
@@ -1275,22 +1267,18 @@ fn collect_relation_member_closure(
             if !cr.node_ids.is_empty() || !cr.way_ids.is_empty() || !cr.relation_ids.is_empty() {
                 summary.has_relation = true;
             }
-            // tags-filter does not select negative IDs: each insertion below
-            // drops one.
             for id in cr.node_ids {
-                if id >= 0 {
-                    relation_dep_node_ids.insert(id);
-                }
+                relation_dep_node_ids.insert(id);
             }
             for id in cr.way_ids {
                 // A direct match is already included and its refs already
                 // collected; only a new non-direct way is a member way.
-                if id >= 0 && !direct_way_ids.get(id) && member_way_ids.insert_if_new(id) {
+                if !direct_way_ids.get(id) && member_way_ids.insert_if_new(id) {
                     summary.has_way = true;
                 }
             }
             for id in cr.relation_ids {
-                if id >= 0 && included_relation_ids.insert_if_new(id) {
+                if included_relation_ids.insert_if_new(id) {
                     added_relations += 1;
                 }
             }
@@ -1396,11 +1384,8 @@ fn collect_way_node_dependencies(
             Ok(node_ids)
         },
         |_seq, node_ids| {
-            // tags-filter does not select negative IDs.
             for id in node_ids {
-                if id >= 0 {
-                    relation_dep_node_ids.insert(id);
-                }
+                relation_dep_node_ids.insert(id);
             }
         },
         host,
@@ -1756,6 +1741,124 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A mixed-sign graph whose every negative element has an untagged
+    /// positive magnitude twin, so a fold onto `|id|` shows as an extra twin
+    /// and a drop as a missing negative:
+    ///   nodes -3..=-6 and 3..=6; n-6 `amenity=bench`, n6 untagged
+    ///   way -8 `highway=primary` refs [-4, 6]; way -9 untagged refs [-4, -5];
+    ///   ways 8 and 9 the untagged twins
+    ///   rel -1 `type=route` -> [rel -2]; rel -2 `name=x` -> [rel -1, node -3,
+    ///   way -9]; rels 1 and 2 the twins, untagged
+    /// The route closure reaches n-3 only as a relation member and n-5 only
+    /// through the member way w-9, and closes the r-1/r-2 cycle.
+    fn write_signed_fixture(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(&crate::block_builder::HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let none = std::iter::empty::<(&str, &str)>;
+        let mut block = BlockBuilder::new();
+        for id in [-3_i64, -4, -5] {
+            block.add_node(id, 10, 10, none(), None);
+        }
+        block.add_node(-6, 10, 10, [("amenity", "bench")], None);
+        for id in 3..=6_i64 {
+            block.add_node(id, 10, 10, none(), None);
+        }
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        block.add_way(-8, [("highway", "primary")], &[-4, 6], None);
+        block.add_way(-9, none(), &[-4, -5], None);
+        block.add_way(8, none(), &[4, 6], None);
+        block.add_way(9, none(), &[4, 5], None);
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        for sign in [-1_i64, 1] {
+            let to_partner = [MemberData {
+                id: MemberId::Relation(2 * sign),
+                role: "",
+            }];
+            let back = [
+                MemberData {
+                    id: MemberId::Relation(sign),
+                    role: "",
+                },
+                MemberData {
+                    id: MemberId::Node(3 * sign),
+                    role: "",
+                },
+                MemberData {
+                    id: MemberId::Way(9 * sign),
+                    role: "",
+                },
+            ];
+            if sign < 0 {
+                block.add_relation(sign, [("type", "route")], &to_partner, None);
+                block.add_relation(2 * sign, [("name", "x")], &back, None);
+            } else {
+                block.add_relation(sign, none(), &to_partner, None);
+                block.add_relation(2 * sign, none(), &back, None);
+            }
+        }
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    /// Every set of the two-pass path is signed: a negative direct match,
+    /// way dependency, relation member, member way and nested relation is
+    /// selected exactly, the cycle through negative relations terminates,
+    /// no positive twin is folded in, and the direct and referenced
+    /// counters (which read the direct sets) count the negatives.
+    #[test]
+    fn two_pass_selects_negative_ids_exactly() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("signed.pbf");
+        write_signed_fixture(&input);
+        let route: &[(char, i64)] = &[
+            ('n', -5),
+            ('n', -4),
+            ('n', -3),
+            ('r', -2),
+            ('r', -1),
+            ('w', -9),
+        ];
+        // nodes matched, from ways, from relations; ways matched, from
+        // relations; relations matched, from relations.
+        let route_stats = [0, 0, 3, 0, 1, 1, 1];
+        type Case<'a> = (&'a str, &'a str, &'a [(char, i64)], [u64; 7]);
+        let cases: [Case<'_>; 5] = [
+            ("r/type=route", "two-pass", route, route_stats),
+            ("r/type=route", "remove-tags", route, route_stats),
+            ("r/type=route", "distrust-metadata", route, route_stats),
+            (
+                "w/highway=primary",
+                "two-pass",
+                &[('n', -4), ('n', 6), ('w', -8)],
+                [0, 2, 0, 1, 0, 0, 0],
+            ),
+            (
+                "n/amenity=bench",
+                "two-pass",
+                &[('n', -6)],
+                [1, 0, 0, 0, 0, 0, 0],
+            ),
+        ];
+        for (expression, mode, expected, stats) in cases {
+            let (_, mut elements, got) = run_filter(&input, expression, mode, false).unwrap();
+            elements.sort_unstable();
+            assert_eq!(elements, expected, "{expression}, {mode}");
+            assert_eq!(got, stats, "{expression}, {mode}: counters");
         }
     }
 

@@ -134,8 +134,7 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 11 | check `--locations`, `--agreement` | Refuses negative refs. Unreferenced negative records get no slot, so a coordinate conflict passes clean. | S+. Negative-key ordinals in the same slot store. Cost: 8 + 8.25 bytes per distinct negative key, nothing when there are none **[C:inv]**. | No equivalent. |
 | 12 | check `--index` | Signed, exact. | P | none |
 | 13-19 | getid (positional, `-i`, `-I`, prefilters, `-r`, `--invert`), getparents | Exact and signed since commit 3 **[S]**. | P | Refuses text; abs-folds the rest **[O]** |
-| 20 | tags-filter PBF default | Drops negative matches and dependencies **[S]**. | S+, both passes. | Abs-folds |
-| 21-22 | tags-filter `-R`, OSC | Exact. | P | Direct; OSC unsupported. |
+| 20-22 | tags-filter PBF default, `-R`, OSC | Exact and signed since commit 4 **[S]**. | P | Default abs-folds; `-R` direct; OSC unsupported. |
 | 23-26 | extract simple, complete-ways, smart, `--config` | Drop through `IdSet`/`Membership` **[S]**. | S+. Multi-extract maps the `i64` bits as `u64` into overflow chunk keys `2^38..2^39-1`, carrying region masks **[C:re]**. | Abs-folds **[O]** |
 | 27 | ALTW sparse | Negative way refs filtered (`altw/mod.rs` around 986) **[S]**. | S+. Signed join (section 4.4). | Separate negative index; joins **[O]** |
 | 28 | ALTW external | `check_range` refuses a min < 0; stage 1 skips negative refs **[S]**. | S+. Two bucket families (section 4.5). | Joins |
@@ -176,7 +175,7 @@ What remains of 4.1:
 
 ### 4.2 Membership users
 
-Rows 10, 13-20, 23-26, 30, 31 and 33 use the signed set. The specifics:
+Rows 10, 23-26, 30, 31 and 33 use the signed set. The specifics:
 - prefilter predicates are as in row 16;
 - the `EdgeStore` byte encoding already works for signed children
   **[C:spar]**;
@@ -397,9 +396,10 @@ place with `Status: Superseded by NNNN`, and the new one says
 **DEVIATIONS.md.**
 - Replace the section with "Negative IDs: pbfhogg is exact where osmium
   abs-folds", listing:
-  - getid, its `--invert` (removeid) mode and getparents (their paragraph
-    landed with commit 3; carry it into the new section);
-  - tags-filter and extract;
+  - getid, its `--invert` (removeid) mode and getparents, and tags-filter
+    (their paragraphs landed with commits 3 and 4; carry them into the new
+    section);
+  - extract;
   - ALTW `--keep-member-nodes`-style retention;
   - the apply-changes location join;
   - `check --ids --full` (no difference left);
@@ -447,9 +447,9 @@ Durable text never cites a finding ID.
 
 ## 8. CHANGELOG
 
-- **Negative IDs are now handled like any other ID.** tags-filter and
-  extract select them exactly, where before they dropped them silently
-  (getid and getparents landed their entry with commit 3).
+- **Negative IDs are now handled like any other ID.** extract selects them
+  exactly, where before it dropped them silently (getid and getparents
+  landed their entry with commit 3, tags-filter with commit 4).
 - add-locations-to-ways joins negative node refs in both index types, and
   retains and marks negative relation members. The external index no longer
   refuses node blobs below zero.
@@ -543,7 +543,6 @@ an unreferenced conflicting negative record), `degrade --drop-ids`
 selection (BUG-022), and the `has_negative_ids` report fields, none of
 which the registry asserts yet.
 
-4. tags-filter.
 5. extract, including multi-extract paging.
 6. check: `--ids --full`, `--refs`, `--locations`, and the report fields
    (with inspect's).

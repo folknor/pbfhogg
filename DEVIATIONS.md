@@ -636,17 +636,19 @@ match every other ID, reference and member by its absolute value
 `removeid n7` also removes `n-7`, and `getid -r` follows a reference to
 `-N` as `N`. pbfhogg answers by the signed ID in each case.
 
-**Residual divergence (tags-filter, add-locations-to-ways):**
-Each of these commands drops negative ids before they reach its ID sets
-(`IdSet` in `crates/lib/src/idset.rs` itself holds any signed ID), where osmium's equivalent paths abs-fold via
-`object.positive_id()` to collapse `-N` and `+N` into a single bit.
+**tags-filter is exact.** Default (reference-including) mode selects a
+negative direct match, way ref, relation member, member way and nested
+relation by its exact signed ID. osmium's `tags-filter` records every
+matched and referenced way and relation ID, and every way node ref and
+member ref, by its absolute value (`positive_id`, `positive_ref`), so a
+matched `w-7` also writes `w7` and a ref to `n-7` also writes `n7`; its
+`-R` mode consults no ID set and is exact, like pbfhogg's.
 
-- `tags-filter`'s parallel-classify path silently **drops**
-  negative-id ways from the output, where osmium's `tags-filter`
-  silently **abs-converts** them. Held as a known gap, with the exact
-  elements dropped, by the `tags_filter_way_dependencies` and
-  `tags_filter_relation_closure` cases of the negative-ID registry
-  (`crates/cli/tests/cli_negative_ids.rs`).
+**Residual divergence (add-locations-to-ways):**
+This command drops negative ids before they reach its ID sets
+(`IdSet` in `crates/lib/src/idset.rs` itself holds any signed ID), where osmium's equivalent path abs-folds via
+`positive_ref()` to collapse `-N` and `+N` into a single bit.
+
 - `add-locations-to-ways` silently **omits** relation-member
   retention for any relation member whose id is negative (the member
   id is dropped before the member set is built, so the write pass doesn't know
@@ -655,8 +657,8 @@ Each of these commands drops negative ids before they reach its ID sets
   `member.positive_ref()`, collapsing `-N` and `+N` member refs
   into the same retention decision.
 
-These behaviors are all silent; none matches the project-wide reject
-stance, and none matches osmium's abs-fold. Promoting any of them to
+This behavior is silent; it matches neither the project-wide reject
+stance nor osmium's abs-fold. Promoting it to
 a further hard-reject site is not planned: osmium's own behavior is
 also a silent miscount (just a *different* silent miscount), so
 neither tool offers a clean precedent for forced rejection here. A

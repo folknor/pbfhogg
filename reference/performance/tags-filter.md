@@ -1,5 +1,27 @@
 # Tags Filter
 
+### Signed reference inclusion (bygg, 2026-11-18, against `d4e78733`)
+
+The change: the two-pass path inserts every matched ID, way ref and
+relation member into its signed `IdSet` with no sign guard, so negative
+IDs are selected exactly. On positive input the negative bitmaps are never
+allocated.
+
+Germany (`germany-20260224-seq4704-with-indexdata`), `tag-select --filter
+r/type=route`, `--iterations 1`, baseline built with `--commit d4e78733`,
+variant measured uncommitted. Order A B B A A; the first A ran on a cold
+page cache (4935 ms, `57c5de01`) and is excluded.
+
+| arm | UUID | wall (ms) |
+|---|---|---|
+| baseline | `b20f31ed` | 3692 |
+| baseline | `04e98232` | 3654 |
+| signed | `6f8b9ac3` | 3715 |
+| signed | `dbff80db` | 3715 |
+
+Signed median 3715 ms against 3673 ms, +1.1 %: neutral. Both arms write
+the same 27,326,791 elements with identical counters.
+
 ### tags-filter checks stored tagdata is canonical (bygg, 2026-11-03, against `ebe69342`)
 
 The change: `TagIndex::deserialize`, which runs once per blob header on a

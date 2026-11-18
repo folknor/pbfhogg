@@ -126,6 +126,7 @@ macro_rules! declared {
         ["tags-filter"] => cases [
             tags_filter_way_dependencies,
             tags_filter_relation_closure,
+            tags_filter_direct_nodes,
             tags_filter_omit_referenced,
             tags_filter_osc,
         ];
@@ -1120,18 +1121,6 @@ fn tags_filter_way_dependencies() -> Case {
             pbf_result(o, OUT, &expect(&w.base(), &pick), true)
         },
     )
-    .gaps(vec![gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-7 551000000,123000000 amenity=bench",
-                "w-7 [-7,7] highway=primary",
-            ],
-            extra: &[],
-        },
-        "tags-filter does not select negative IDs",
-    )])
 }
 
 /// `r/type=route` matches `r-1`, `r-7` and `r7`; the closure adds `r1`
@@ -1156,31 +1145,25 @@ fn tags_filter_relation_closure() -> Case {
             pbf_result(o, OUT, &expect(&w.base(), &pick), true)
         },
     )
-    .gaps(vec![gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-1 550100000,120100000 amenity=bench",
-                "n-2 550200000,120000000 ",
-                "n-5 551000000,121000000 ",
-                "n-7 551000000,123000000 amenity=bench",
-                "n1 550100000,120200000 amenity=bench",
-                "n11 566000000,136000000 place=town",
-                "n2 550200000,120300000 ",
-                "n5 553000000,121000000 ",
-                "n7 553000000,123000000 ",
-                "w-1 [-1,-2,-5] highway=residential",
-                "w-2 [1,2] highway=residential",
-                "w7 [5,7,-7,-5,5] ",
-                R_MINUS_1,
-                R_MINUS_7,
-                R_1,
-            ],
-            extra: &[],
+}
+
+/// `n/amenity=bench` matches `n-1`, `n-7` and `n1` directly; the untagged
+/// twin `n7` stays out.
+fn tags_filter_direct_nodes() -> Case {
+    Case::both(
+        BOTH,
+        |w, dir, f| tags_filter_args(w, dir, f, &["n/amenity=bench"]),
+        |w, o| {
+            let nodes: Vec<i64> = [-1, -7, 1].iter().map(|&i| w.n(i)).collect();
+            let pick = Pick {
+                nodes: Some(&nodes),
+                ways: Some(&[]),
+                relations: Some(&[]),
+                locations: false,
+            };
+            pbf_result(o, OUT, &expect(&w.base(), &pick), true)
         },
-        "tags-filter does not select negative IDs",
-    )])
+    )
 }
 
 /// `-R`: the direct match alone.

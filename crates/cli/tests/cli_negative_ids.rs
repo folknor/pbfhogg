@@ -2190,14 +2190,8 @@ fn altw_args(w: &World, dir: &Path, f: Framing, extra: &[&str]) -> Vec<OsString>
     a
 }
 
-/// The mixed graph's ten way refs to negative nodes, every one of them a
-/// node the input holds, refused as unresolvable.
-const SPARSE_REFUSAL: Sig = Sig::Exit {
-    code: 2,
-    says: "10 way node references (each use of a node in each way counted) could not be \
-           resolved to a node location",
-};
-
+/// The mixed graph's ten way refs to negative nodes all resolve: every one
+/// is a node the input holds.
 fn altw_sparse() -> Case {
     Case::both(
         BOTH,
@@ -2208,12 +2202,6 @@ fn altw_sparse() -> Case {
         },
         |w, o| pbf_result(o, OUT, &altw_expected(w), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        SPARSE_REFUSAL,
-        "the sparse index does not join negative node refs",
-    )])
 }
 
 fn altw_external() -> Case {
@@ -2245,12 +2233,6 @@ fn altw_auto_forced() -> Case {
         },
         |w, o| pbf_result(o, OUT, &altw_expected(w), true),
     )
-    .gaps(vec![gap(
-        "exit",
-        None,
-        SPARSE_REFUSAL,
-        "the sparse index does not join negative node refs",
-    )])
 }
 
 /// With `--ignore-missing-nodes` the strict gate cannot hide the join: a
@@ -2270,41 +2252,6 @@ fn altw_retention_and_present_refs() -> Case {
             a
         },
         |w, o| pbf_result(o, OUT, &altw_expected(w), true),
-    )
-    .gaps(vec![altw_placeholder_gap()])
-}
-
-/// The sparse index's answer under `--ignore-missing-nodes` today: every
-/// present negative ref written as the placeholder, and the negative member
-/// nodes `n-2` and `n-11` not retained.
-fn altw_placeholder_gap() -> Gap {
-    gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-2 550200000,120000000 ",
-                "n-11 565000000,135000000 ",
-                "w-1 [-1,-2,-5] @550100000,120100000;550200000,120000000;551000000,121000000 highway=residential",
-                "w-7 [-7,7] @551000000,123000000;553000000,123000000 highway=primary",
-                "w-9 [0,-9,9] @550000000,120000000;550500000,120500000;550600000,120600000 ",
-                "w1 [-1,1] @550100000,120100000;550100000,120200000 highway=residential",
-                "w2 [-11,11] @565000000,135000000;566000000,136000000 building=yes",
-                "w7 [5,7,-7,-5,5] @553000000,121000000;553000000,123000000;551000000,123000000;551000000,121000000;553000000,121000000 ",
-                "w9 [2,9,-2] @550200000,120300000;550600000,120600000;550200000,120000000 highway=service",
-            ],
-            extra: &[
-                "w-1 [-1,-2,-5] @0,0;0,0;0,0 highway=residential",
-                "w-7 [-7,7] @0,0;553000000,123000000 highway=primary",
-                "w-9 [0,-9,9] @550000000,120000000;0,0;550600000,120600000 ",
-                "w1 [-1,1] @0,0;550100000,120200000 highway=residential",
-                "w2 [-11,11] @0,0;566000000,136000000 building=yes",
-                "w7 [5,7,-7,-5,5] @553000000,121000000;553000000,123000000;0,0;0,0;553000000,121000000 ",
-                "w9 [2,9,-2] @550200000,120300000;550600000,120600000;0,0 highway=service",
-            ],
-        },
-        "the sparse index writes the placeholder for present negative refs and drops \
-         negative relation members from retention",
     )
 }
 
@@ -2387,8 +2334,10 @@ fn altw_inject_prepass() -> Case {
                 ));
             }
             let g = w.base();
+            // A closed ring, as the producer reads one: at least four refs,
+            // the last repeating the first. A shorter repeat counts twice.
             let open = |r: &[i64]| -> usize {
-                if r.len() > 1 && r.first() == r.last() {
+                if r.len() >= 4 && r.first() == r.last() {
                     r.len() - 1
                 } else {
                     r.len()
@@ -2415,28 +2364,6 @@ fn altw_inject_prepass() -> Case {
             findings
         },
     )
-    .gaps(vec![
-        altw_placeholder_gap(),
-        gap(
-            "prepass",
-            None,
-            Sig::Tokens {
-                missing: &[
-                    "member w-2",
-                    "pin w-1 @0",
-                    "pin w-1 @1",
-                    "pin w-1 @2",
-                    "pin w-7 @0",
-                    "pin w1 @0",
-                    "pin w7 @2",
-                    "pin w7 @3",
-                    "pin w9 @2",
-                ],
-                extra: &[],
-            },
-            "the prepass drops negative member ways and pins no negative shared node",
-        ),
-    ])
 }
 
 /// The prepass fields of `path`: `member w..` per WayMembers bit, `pin w..

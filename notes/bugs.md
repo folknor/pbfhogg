@@ -197,17 +197,6 @@ Claim named: agreement between index strategies, including the explicit
 requirement in `altw/external/stage2.rs` that domain refusals agree. The
 hunter asks for a common refusal policy for conflicting coordinates.
 
-## BUG-010 - Negative IDs are dropped by IdSet-based paths
-
-Reported by: altw-sparse, tags, spatial.
-
-Sparse ALTW reference collection and coordinate population discard negative
-IDs (explicit sign guards since `IdSet` became signed) although `osm_id.rs`
-defines signed ordering and external's diagnostic implies sparse can join
-them.
-See also DOC-001 in `notes/bugs-docs.md` for the blanket "rejected
-project-wide" wording.
-
 ## BUG-011 - Node-statistics histograms depend on worker scheduling
 
 Reported by: check.

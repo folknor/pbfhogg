@@ -841,9 +841,10 @@ Read this carefully before treating it as a green light:
 - **The equality is structural, not lucky.** Ranks are assigned over
   referenced ids in ascending order, and sorted node blobs cover
   disjoint id ranges, so a blob's referenced nodes *must* occupy one
-  contiguous hole-free rank interval. The counter will read 1.000 on any
-  sorted + indexed input forever; its discriminating power exists only
-  for unsorted input. Do not re-run this to "confirm" it.
+  contiguous hole-free rank interval. The counter reads 1.000 on any
+  sorted + indexed input with non-negative node IDs and no dangling refs;
+  dangling refs, and negative IDs (numeric ranks against canonical file
+  order), leave holes. Do not re-run this to "confirm" it.
 - **Passing the gate removes a disqualifier; it does not make P5 a win.**
   Codex's substantive objections are untouched: buffered pwrite dirties
   the same page cache, the current mmap stores on sorted input are

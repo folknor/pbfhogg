@@ -300,9 +300,14 @@ pub(super) fn build_node_index_sparse(
     // buffered-pwrite pass 1 would pay before it starts (the gate for a
     // per-blob buffered-pwrite pass 1). Ratio near 1.0 = dense intervals;
     // materially above 1.0 = hole-heavy, buffered rewrite disqualified. On
-    // sorted + indexed input it reads exactly 1.000 by construction - ranks
-    // are assigned in ascending id order over disjoint blob id ranges - so it
-    // only discriminates on unsorted input.
+    // sorted + indexed input whose node IDs are non-negative and whose way
+    // refs all resolve it reads exactly 1.000 by construction - ranks are
+    // assigned in ascending id order over disjoint blob id ranges. Referenced
+    // IDs the input lacks leave holes, and so do negative IDs: ranks are
+    // numeric (negatives first, descending by key) while a sorted file holds
+    // them canonically (`0, -1, -2, ...` then positives), so a blob holding
+    // `-2` and `1` spans every rank between. The counter only describes
+    // write locality; the store's correctness rests on the rank bijection.
     let counters = Pass1Counters::new();
 
     let referenced_ref = &referenced;
@@ -327,9 +332,6 @@ pub(super) fn build_node_index_sparse(
             let mut blob_max_rank: u64 = 0;
             for tup in tuples.iter() {
                 walk.observe(tup.id)?;
-                if tup.id < 0 {
-                    continue;
-                }
                 if let Some(rank) = referenced_ref.numeric_rank_if_set(tup.id) {
                     writer_ref.insert(tup.id, rank, tup.lat, tup.lon)?;
                     blob_stored += 1;

@@ -51,6 +51,23 @@
   refused the file (exit 2); `--locations` now reports conflicting
   records and, with `--agreement`, disagreeing inline copies of negative
   nodes.
+- **add-locations-to-ways with the sparse index handles negative IDs
+  exactly.** A way ref to a negative node gets that node's location; it
+  was refused as unresolvable (exit 2), or written as `(0, 0)` under
+  `--ignore-missing-nodes`. An untagged negative relation-member node is
+  kept, and `--inject-prepass` marks negative member ways and pins
+  negative shared nodes; all three were silently dropped. Members are
+  matched by the signed ID, where osmium's `--keep-member-nodes` matches
+  by absolute value. The external index still refuses node blobs below
+  zero.
+- **add-locations-to-ways `--index-type auto` routes on more than the
+  header estimate.** An input whose indexdata the external index would
+  refuse (a negative node blob, node IDs past its encoding limit, ranges
+  out of sorted order) now runs sparse, where auto used to route it to
+  that refusal. When auto runs sparse against a known memory budget, the
+  exact store is judged again after the first pass, counting referenced
+  IDs the file lacks and negative-ID sets, and an over-budget store
+  switches to external with a second `Note:` on stderr.
 
 ### Added
 

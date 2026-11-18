@@ -38,8 +38,6 @@ omission. Sites they named:
   and the writer's index scanner (`blob_meta/scan.rs`), which preserves them;
 - OSC parsing, where sorted-overlay tests require them, and merge-changes;
 - diff's documented exception;
-- ALTW: negative way and relation IDs survive, while negative relation-member
-  node IDs are silently excluded from retention (`altw/mod.rs`);
 - export, which writes a numeric `@id` of -1;
 - `inspect --show`, which deliberately supports signed queries;
 - the geocode builder, which indexes negative-ID address nodes and skips and
@@ -47,7 +45,8 @@ omission. Sites they named:
   lacks.
 extract and id-filter-selection read it the other way: under the stated
 invariant, silent bitmap omission is not rejection, and the selection
-boundaries should refuse (see BUG-010 in `notes/bugs.md`). check-inspect cites
+boundaries should refuse; the commands they named now select negative IDs
+exactly instead. check-inspect cites
 ADR-0002 by a filename different from the one the other hunters used.
 
 ## DOC-002 - truncation-handling.md says partial DenseInfo column sets are rejected

@@ -153,8 +153,11 @@ pub(super) fn scan_blob_metadata(
 }
 
 /// The range checks [`scan_blob_metadata`] documents, for one blob in file
-/// order. Unlocated: the caller locates the error at the blob.
-fn check_range(
+/// order. Unlocated: the caller locates the error at the blob. Auto routing
+/// asks the same question of the same claims through
+/// [`super::HeaderAdmission`], so it never routes here an input these checks
+/// refuse.
+pub(super) fn check_range(
     idx: &crate::blob_meta::BlobIndex,
     order: &mut crate::osm_id::OrderWatermark,
 ) -> Result<()> {

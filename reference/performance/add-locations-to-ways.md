@@ -570,6 +570,29 @@ the ordered pools is not decided by these cells.
 
 ### Add-locations-to-ways
 
+#### Sparse joins negative IDs (baseline `8b260ad2`, bygg, 2026-11-18)
+
+The three sign guards on the sparse path were deleted (pass 0 now pushes
+every ref, pass 1 stores every node tuple, the relation scan emits members
+of either sign) and auto gained the post-pass-0 recheck. Baseline built
+with `--commit 8b260ad2`, variant uncommitted on it, `--iterations 1`
+cells, positive inputs. Baseline cells were front-loaded while the design
+was sparred, then the variant pairs ran followed by one more baseline
+each, so every cell type has three baselines around two variants. No
+trim was run.
+
+| Cell | Baseline | Variant | Verdict |
+|---|---|---|---|
+| Japan `--stop ALTW_PASS0_END`, `altw_pass0_union_ms` over 322,807,555 refs | 745 / 784 / 725 ms (`17872a5a`, `8abf7e9b`, `4a7dd8b2`), median 2.31 ns/ref | 749 / 740 ms (`069e5dcf`, `be633a5b`), median 2.31 ns/ref | neutral |
+| Japan full, prepass off | 5.8 / 5.4 / 5.4 s (`6b3b8742`, `77238189`, `4d6d2283`) | 5.3 / 5.4 s (`092fa9c9`, `7872d91d`) | neutral; store 2,393,252,176 bytes both |
+| Japan full, prepass on | 6.7 / 6.4 / 6.5 s (`dcca04bd`, `6ef4ed9b`, `f5b5a31b`) | 6.4 / 6.9 s (`953381db`, `ecf3e90c`) | neutral; the 6.9 s cell's pass 0 and pass 1 match `f5b5a31b` within 1 %, the difference is in pass 2 |
+| Planet `--stop ALTW_PASS1_END`, pass 0 span | 33.4 / 33.2 / 32.8 s (`3055b71f`, `b5b3a460`, `69f2dcfc`), union 26,269 / 26,310 / 26,395 ms over 11,614,930,354 refs | 33.8 / 33.3 s (`10ae20ae`, `c7ffc41d`), union 26,752 / 26,832 ms | +1.8 % on the union (2.27 against 2.31 ns/ref), under the noise rule |
+| Planet, pass 1 span (82.2 GB store) | 61.8 / 63.8 / 74.8 s | 57.9 / 82.4 s | drive state: the spans climb with each 82 GB store written, in either arm |
+
+Planet ran through pass 1 only: the variant's changes end there (pass 2's
+lookups were already signed), and a full sparse planet on this 30 GB host
+thrashes in pass 2. Verdict: neutral on positive input.
+
 #### Signed `IdSet` (Japan, sparse, baseline `2b4e511c`, bygg, 2026-11-18)
 
 The set became signed (a second, empty bitmap for negative IDs and one

@@ -85,7 +85,11 @@ fn blob_is_passthrough(kind: Option<crate::ElementKind>, keep_untagged_nodes: bo
 ///
 /// Every relation's ID goes to `walk`, memberless ones included, so the
 /// caller can hold the blob's claim to what it holds. The block holds only
-/// relations: both callers refuse a foreign kind first.
+/// relations: both callers refuse a foreign kind first. Members of either
+/// sign are emitted as they are: the sets they go into are signed, so a
+/// negative member node is retained and a negative member way marked like
+/// any other, where osmium's `--keep-member-nodes` folds a member onto its
+/// absolute value.
 ///
 /// A built block on purpose, not a projection on the block validator: it
 /// reads the `type` tag as well as the members, and the scan is not worth
@@ -109,8 +113,8 @@ fn relation_member_ids(
                 .any(|(key, value)| key == "type" && matches!(value, "multipolygon" | "boundary"));
             for member in r.members() {
                 match member.id {
-                    MemberId::Node(id) if want_nodes && id >= 0 => emit(false, id),
-                    MemberId::Way(id) if want_ways && complete && id >= 0 => emit(true, id),
+                    MemberId::Node(id) if want_nodes => emit(false, id),
+                    MemberId::Way(id) if want_ways && complete => emit(true, id),
                     _ => {}
                 }
             }
@@ -152,7 +156,10 @@ pub enum IndexType {
     /// when the estimated sparse store exceeds a fixed share of the
     /// page-cache budget; when the budget is unknown, or the available
     /// memory does not exceed the sparse run's anon allowance, sparse is
-    /// kept and the store estimate is skipped. See `reference/pipeline.md`
+    /// kept and the store estimate is skipped. An input whose indexdata
+    /// the external join would refuse runs sparse; a sparse choice against
+    /// a known budget is judged again on the exact store after the first
+    /// pass, and may switch to external there. See `reference/pipeline.md`
     /// for the routing rule and `reference/performance/add-locations-to-ways.md` for measurements.
     #[default]
     Auto,
@@ -429,27 +436,18 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     // Auto-select: sparse unless the input qualifies for external AND a
     // known page-cache budget is exceeded by the estimated store (see
     // IndexType::Auto).
-    let backend = match options.index_type {
-        IndexType::Sparse => ResolvedBackend::Sparse,
-        IndexType::External => ResolvedBackend::External,
+    // `recheck` is the page-cache budget auto routed sparse on, when it
+    // could have chosen external: the exact store is judged against it
+    // again once pass 0 has counted it.
+    let (backend, recheck) = match options.index_type {
+        IndexType::Sparse => (ResolvedBackend::Sparse, None),
+        IndexType::External => (ResolvedBackend::External, None),
         IndexType::Auto => auto_select_backend(input, &mut front, host)?,
     };
 
     // External join has its own pipeline - dispatch early.
     if backend == ResolvedBackend::External {
-        let stats = external::external_join_in(
-            input,
-            front,
-            output,
-            options.keep_untagged_nodes,
-            &options.write,
-            overrides,
-            options.inject_prepass,
-            host,
-            scratch,
-        )?;
-        enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
-        return Ok(stats);
+        return run_external(input, front, output, options, overrides, host, scratch);
     }
 
     let indexdata_present = front.require_indexdata(
@@ -493,8 +491,16 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     host.invocation.marker("ALTW_PASS0_END");
     // Cheap one-shot count; surfaces the way-ref IdSet size before the index
     // build so the counter survives SIGKILL during pass 1.
+    let referenced_count = referenced.len();
     host.invocation
-        .counter("altw_referenced_node_ids", referenced.len());
+        .counter("altw_referenced_node_ids", referenced_count);
+    if let Some(budget) = recheck
+        && exact_store_exceeds_budget(referenced_count, &referenced, shared.as_ref(), budget, host)
+    {
+        drop((referenced, shared));
+        let front = InputFront::open(input, options.write.direct_reads, host)?;
+        return run_external(input, front, output, options, overrides, host, scratch);
+    }
     host.invocation.counter("altw_index_kind", 1);
 
     host.invocation.marker("ALTW_PASS1_START");
@@ -549,6 +555,91 @@ pub(crate) fn add_locations_to_ways_to<'a>(
     Ok(stats)
 }
 
+/// The external join, chosen up front or by the post-pass-0 recheck, and
+/// the missing-location gate every backend answers to.
+fn run_external(
+    input: &PinnedInput,
+    front: InputFront<'_>,
+    output: &crate::output::BoundOutput,
+    options: &AltwOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Entered<'_>,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<Stats> {
+    let stats = external::external_join_in(
+        input,
+        front,
+        output,
+        options.keep_untagged_nodes,
+        &options.write,
+        overrides,
+        options.inject_prepass,
+        host,
+        scratch,
+    )?;
+    enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
+    Ok(stats)
+}
+
+/// The post-pass-0 recheck: whether the exact sparse store, now that pass 0
+/// has counted it, exceeds the share of the page-cache budget auto routed
+/// sparse on. Emits its note only when it re-routes.
+///
+/// The header estimate counts indexed nodes, so it misses referenced IDs
+/// the input does not hold (each takes a slot all the same) and charges
+/// standalone ones that take none; `referenced_count * 8` is the store
+/// exactly. The negative families of `referenced` (with the rank index
+/// pass 1 builds) and of `shared` are anon memory outside the measured
+/// allowance the budget already subtracts, so they come off the page cache
+/// the store is judged against: external when
+/// `100 * store + PCT * anon > PCT * budget`. Both are zero without a
+/// negative ID. The budget is the one auto routed on, not a fresh probe,
+/// which would charge pass 0's own sets against the allowance a second
+/// time.
+fn exact_store_exceeds_budget(
+    referenced_count: u64,
+    referenced: &IdSet,
+    shared: Option<&IdSet>,
+    budget: u64,
+    host: &crate::host::Entered<'_>,
+) -> bool {
+    let anon = u128::from(referenced.negative_footprint_bytes(true))
+        + u128::from(shared.map_or(0, |s| s.negative_footprint_bytes(false)));
+    let (over, store) = recheck_routes_external(referenced_count, anon, budget);
+    host.invocation.counter(
+        "altw_auto_recheck_store_bytes",
+        u64::try_from(store).unwrap_or(u64::MAX),
+    );
+    host.invocation.counter(
+        "altw_auto_recheck_anon_bytes",
+        u64::try_from(anon).unwrap_or(u64::MAX),
+    );
+    if over {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.auto_recheck",
+            "auto re-routed to index type external: the exact sparse store of \
+             {:.1} GB ({referenced_count} referenced node IDs) plus {:.1} GB of \
+             negative-ID sets exceeds {AUTO_STORE_BUDGET_PCT} % of the {:.1} GB \
+             page-cache budget",
+            store as f64 / 1e9,
+            anon as f64 / 1e9,
+            budget as f64 / 1e9,
+        );
+    }
+    over
+}
+
+/// The recheck's rule, pure: `referenced_count` slots of 8 bytes and
+/// `anon` bytes outside the allowance, against `budget`. Returns the verdict
+/// and the store's bytes. Widened, so no input can wrap it into a verdict.
+fn recheck_routes_external(referenced_count: u64, anon: u128, budget: u64) -> (bool, u128) {
+    let store = u128::from(referenced_count) * 8;
+    let pct = u128::from(AUTO_STORE_BUDGET_PCT);
+    (store * 100 + anon * pct > u128::from(budget) * pct, store)
+}
+
 /// Refuse an output that carries placeholder vertices, unless the caller
 /// explicitly asked for them.
 ///
@@ -595,11 +686,14 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 // extension frame before the data is skipped by both). Selection judges
 // header claims, not blob payloads: a malformed data blob is the business
 // of whichever pass reads it.
+//
+// Returns the backend and, when it is sparse chosen against a known budget
+// on an input external could take, that budget for the post-pass-0 recheck.
 fn auto_select_backend(
     input: &PinnedInput,
     front: &mut InputFront<'_>,
     host: &crate::host::Entered<'_>,
-) -> Result<ResolvedBackend> {
+) -> Result<(ResolvedBackend, Option<u64>)> {
     let sorted = front.is_sorted()?;
     let has_index = front.indexed()?;
 
@@ -612,7 +706,7 @@ fn auto_select_backend(
             "altw.auto_select",
             "auto-selected index type sparse (sorted={sorted}, indexed={has_index})"
         );
-        return Ok(ResolvedBackend::Sparse);
+        return Ok((ResolvedBackend::Sparse, None));
     }
 
     // Both backends can run. The budget is probed first: when it cannot
@@ -639,15 +733,29 @@ fn auto_select_backend(
             "auto-selected index type sparse (sorted=true, indexed=true; {why}, so no \
              page-cache budget can justify the external index)"
         );
-        return Ok(ResolvedBackend::Sparse);
+        return Ok((ResolvedBackend::Sparse, None));
     };
 
     // Route on scale. The walk reads headers the selected backend will also
     // need, so it can warm those pages for the following pass rather than
     // adding another cold header walk.
     host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_START");
-    let store = estimate_sparse_store_bytes(input, host)?;
+    let walk = route_walk(input, host)?;
     host.invocation.marker("ALTW_AUTO_ESTIMATE_WALK_END");
+    let store = walk.store_estimate;
+
+    // An input the external join would refuse on its indexdata runs sparse,
+    // which joins it, and is not rechecked: there is nothing to re-route to.
+    if let Err(refusal) = walk.external {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.auto_select",
+            "auto-selected index type sparse (sorted=true, indexed=true; the external \
+             index cannot take this input: {refusal})"
+        );
+        return Ok((ResolvedBackend::Sparse, None));
+    }
     let chosen = route_sorted_indexed(store, budget);
 
     host.invocation.counter(
@@ -683,7 +791,8 @@ fn auto_select_backend(
              store estimate unavailable)"
         );
     }
-    Ok(chosen)
+    let recheck = (chosen == ResolvedBackend::Sparse).then_some(budget);
+    Ok((chosen, recheck))
 }
 
 /// Pure routing decision for an input both backends can handle (sorted +
@@ -704,25 +813,29 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: u64) -> Resolved
 }
 
 /// Estimate the sparse store size for an indexed input: total node count
-/// from per-blob indexdata, times 8 bytes per rank slot. Total nodes is
-/// an upper bound on referenced nodes (the store is sized by
-/// way-referenced ids only): tight when most nodes are way-referenced,
-/// loose when many are standalone. Overestimating routes toward external,
+/// from per-blob indexdata, times 8 bytes per rank slot. The store is
+/// sized by the way-referenced IDs, so the estimate is close when most
+/// nodes are way-referenced, high when many are standalone, and low by one
+/// slot for each referenced ID the input does not hold. Overestimating routes toward external,
 /// which is not free: a file of mostly standalone nodes can be sent to
 /// external, whose scratch demand (per way reference, see
 /// `reference/pipeline.md`) a tiny real store would never have needed, and
 /// whose scratch check can then refuse a run sparse would complete.
 /// Indexdata counts elements, not references, so no tighter bound is
-/// available without decoding. Returns
-/// `None` when the first OsmData blob lacks indexdata, since the sum would
-/// silently undercount; an input that is indexed on its first OsmData blob
-/// and not on a later one is refused by the walk.
-fn estimate_sparse_store_bytes(
-    input: &PinnedInput,
-    host: &crate::host::Entered<'_>,
-) -> Result<Option<u64>> {
+/// available before pass 0 decodes the ways; the post-pass-0 recheck then
+/// judges the exact store, which also counts the referenced IDs the input
+/// does not hold. The estimate is `None` when the first OsmData blob lacks
+/// indexdata, since the sum would silently undercount; an input that is
+/// indexed on its first OsmData blob and not on a later one is refused by
+/// the walk.
+///
+/// The same walk asks [`external::HeaderAdmission`] whether the external
+/// join would admit the input's indexdata, so auto never routes, up front
+/// or on the recheck, to an engine that then refuses those claims.
+fn route_walk(input: &PinnedInput, host: &crate::host::Entered<'_>) -> Result<RouteWalk> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let mut node_count: u64 = 0;
+    let mut admission = external::HeaderAdmission::new();
     while let Some(meta) = walker.next_header()? {
         if meta.blob_type != crate::blob::BlobKind::OsmData {
             continue;
@@ -732,11 +845,30 @@ fn estimate_sparse_store_bytes(
                 if idx.kind == crate::ElementKind::Node {
                     node_count = node_count.saturating_add(idx.count);
                 }
+                admission.observe(idx);
             }
-            None => return Ok(None),
+            None => {
+                return Ok(RouteWalk {
+                    store_estimate: None,
+                    external: Err(crate::error::new_missing_indexdata(
+                        "an OsmData blob carries no indexdata",
+                    )),
+                });
+            }
         }
     }
-    Ok(Some(node_count.saturating_mul(8)))
+    Ok(RouteWalk {
+        store_estimate: Some(node_count.saturating_mul(8)),
+        external: admission.finish(),
+    })
+}
+
+/// What auto's header walk learned: the store estimate, and whether the
+/// external join would admit the input's indexdata (its refusal if not,
+/// which auto reports and routes around).
+struct RouteWalk {
+    store_estimate: Option<u64>,
+    external: Result<()>,
 }
 
 /// Page-cache budget for the sparse store: the host's available memory
@@ -979,11 +1111,9 @@ fn collect_way_referenced_node_ids(
                     } else {
                         refs
                     };
-                    for &node_id in refs {
-                        if node_id >= 0 {
-                            refs_vec.push(node_id);
-                        }
-                    }
+                    // Every ref, either sign: the set is signed, and the
+                    // store ranks negatives like any other ID.
+                    refs_vec.extend_from_slice(refs);
                 },
             )?;
             // The walker reads only ways, so nodes or relations under a way
@@ -1357,10 +1487,32 @@ fn process_block(
 mod tests {
     use super::{
         AUTO_ANON_HEADROOM_BYTES, AUTO_STORE_BUDGET_PCT, ResolvedBackend, page_cache_budget_bytes,
-        route_sorted_indexed,
+        recheck_routes_external, route_sorted_indexed,
     };
 
     const GB: u64 = 1_000_000_000;
+
+    /// The recheck uses the estimate route's threshold on the exact store,
+    /// and takes extra anon off the budget: `store <= 80 % of (budget -
+    /// anon)` stays sparse.
+    #[test]
+    fn recheck_judges_the_exact_store_and_charges_extra_anon() {
+        let budget = 10 * GB;
+        let threshold_slots = budget * AUTO_STORE_BUDGET_PCT / 100 / 8;
+        assert!(!recheck_routes_external(threshold_slots, 0, budget).0);
+        assert!(recheck_routes_external(threshold_slots + 1, 0, budget).0);
+        // 1 GB of anon off a 10 GB budget leaves 7.2 GB for the store.
+        let anon = u128::from(GB);
+        let fits = 7_200_000_000 / 8;
+        assert!(!recheck_routes_external(fits, anon, budget).0);
+        assert!(recheck_routes_external(fits + 1, anon, budget).0);
+        assert_eq!(recheck_routes_external(3, 0, 1).1, 24);
+        assert!(
+            recheck_routes_external(u64::MAX, u128::from(u64::MAX), u64::MAX).0,
+            "widened arithmetic: the largest store never wraps to sparse"
+        );
+        assert!(!recheck_routes_external(0, 0, 0).0);
+    }
 
     /// The store sizes and budget below are the measured pair the threshold
     /// was chosen between: the smaller store ran linear on sparse, the larger

@@ -190,6 +190,124 @@ fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> u64 {
         })
 }
 
+/// What this backend would refuse in an input's indexdata, judged blob by
+/// blob in the one header walk auto routing already makes, so auto never
+/// routes here an input the join then refuses on those same claims. The
+/// checks are the join's own, not copies: [`blob_meta::check_range`] over
+/// every data blob (reversed and negative node ranges, and canonical order),
+/// [`BucketLayout::new`] over the largest node `max_id`, and the `u32`
+/// way-blob ordinal of `stage1`. Refusals that need the way pass (a slot
+/// bucket's width, scratch space) stay with the join, as does the trust
+/// placed in a false but well-formed claim (`reference/indexdata-trust.md`).
+pub(super) struct HeaderAdmission {
+    order: crate::osm_id::OrderWatermark,
+    max_node_id: u64,
+    way_blobs: usize,
+    refused: Option<crate::Error>,
+}
+
+impl HeaderAdmission {
+    pub(super) fn new() -> Self {
+        Self {
+            order: crate::osm_id::OrderWatermark::default(),
+            max_node_id: 0,
+            way_blobs: 0,
+            refused: None,
+        }
+    }
+
+    /// One data blob's indexdata, in file order. After the first refusal
+    /// the rest are not judged.
+    pub(super) fn observe(&mut self, idx: &crate::blob_meta::BlobIndex) {
+        if self.refused.is_some() {
+            return;
+        }
+        if let Err(e) = blob_meta::check_range(idx, &mut self.order) {
+            self.refused = Some(e);
+            return;
+        }
+        match idx.kind {
+            crate::ElementKind::Node => {
+                // `check_range` refused a negative node range above.
+                self.max_node_id = self.max_node_id.max(u64::try_from(idx.max_id).unwrap_or(0));
+            }
+            crate::ElementKind::Way => self.way_blobs += 1,
+            crate::ElementKind::Relation => {}
+        }
+    }
+
+    /// `Ok` when the join would admit the claims observed, else the
+    /// join's own refusal.
+    pub(super) fn finish(self) -> Result<()> {
+        if let Some(e) = self.refused {
+            return Err(e);
+        }
+        BucketLayout::new(self.max_node_id, NUM_BUCKETS)?;
+        if let Some(last) = self.way_blobs.checked_sub(1) {
+            stage1::way_blob_ordinal(last)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::HeaderAdmission;
+    use crate::ElementKind;
+    use crate::blob_meta::BlobIndex;
+
+    fn idx(kind: ElementKind, min_id: i64, max_id: i64) -> BlobIndex {
+        BlobIndex {
+            kind,
+            min_id,
+            max_id,
+            count: 1,
+            bbox: None,
+        }
+    }
+
+    fn admit(blobs: &[BlobIndex]) -> crate::error::Result<()> {
+        let mut admission = HeaderAdmission::new();
+        for b in blobs {
+            admission.observe(b);
+        }
+        admission.finish()
+    }
+
+    #[test]
+    fn admits_what_the_join_admits() {
+        admit(&[
+            idx(ElementKind::Node, 1, 10),
+            idx(ElementKind::Node, 10, 20),
+            idx(ElementKind::Way, -5, 3),
+            idx(ElementKind::Relation, 1, 1),
+        ])
+        .expect("sorted non-negative nodes");
+        admit(&[]).expect("no data blob");
+        admit(&[idx(ElementKind::Node, 0, 1 << 38)]).expect("2^38 is encodable");
+    }
+
+    #[test]
+    fn refuses_what_the_join_refuses() {
+        for (blobs, says) in [
+            (vec![idx(ElementKind::Node, -2, 0)], "negative node ids"),
+            (
+                vec![idx(ElementKind::Node, 5, 9), idx(ElementKind::Node, 1, 2)],
+                "contradict the sorted header",
+            ),
+            (
+                vec![idx(ElementKind::Way, 1, 2), idx(ElementKind::Node, 1, 2)],
+                "contradict the sorted header",
+            ),
+            (vec![idx(ElementKind::Node, 1, (1 << 38) + 1)], "max_id"),
+            (vec![idx(ElementKind::Node, 1, i64::MAX)], "max_id"),
+        ] {
+            let err = admit(&blobs).expect_err(says);
+            assert!(err.to_string().contains(says), "{says}: {err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod max_node_id_tests {
     use super::{blob_meta::BlobMeta, max_node_id_from_blob_meta};

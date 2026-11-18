@@ -23,8 +23,8 @@ priority is the hunter's own label. Findings that match an existing mechanism
 were added to `notes/bugs.md` instead of being filed here: tag truncation
 (BUG-004), apply-changes base version precedence (BUG-016), plain nodes in
 renumber (BUG-020), degrade drop counting (BUG-022), cat decode counters
-(BUG-023), extract coordinate narrowing (BUG-025) and negative IDs in IdSet
-paths (BUG-010). Entries are in no order of importance.
+(BUG-023) and extract coordinate narrowing (BUG-025). Entries are in no
+order of importance.
 
 ## CMD-001 - apply-changes drops creates for kinds that come before the base's first kind
 
@@ -533,3 +533,18 @@ header decode. A correctly framed `OSMHeader` with the one-byte payload `0x80`
 and no data blobs reaches a successful empty reference report. `--refs`
 promises only referential integrity, so its success does not certify that the
 header is readable.
+
+## CMD-040 - Sparse ALTW carries a false sorted header into its output
+
+Reported by: the negative-ID ALTW item (2026-11-18), while sparring auto's
+external admission gate; not reproduced.
+
+`altw_output_facts` carries the input's order claim, and the sparse index
+does not depend on order, so it never tests that claim. A file stamped
+`Sort.Type_then_ID` whose node blob ranges run `[2]` then `[1]` joins under
+`--index-type sparse` and publishes an output stamped sorted that is not.
+Auto now sees the contradiction in its header walk (the external join's
+order check) and runs sparse instead of routing to external's refusal, so
+it reaches the same output. The fix belongs where the stamp is written, for
+explicit sparse and auto alike: drop the claim, or refuse, when a decoding
+pass proves it false.

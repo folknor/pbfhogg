@@ -229,9 +229,7 @@ fn expected_pins(nodes: &[TestNode], ways: &[TestWay]) -> HashMap<i64, Option<Ve
     let mut count: HashMap<i64, u32> = HashMap::new();
     for w in ways {
         for &id in trimmed_refs(&w.refs) {
-            if id >= 0 {
-                *count.entry(id).or_default() += 1;
-            }
+            *count.entry(id).or_default() += 1;
         }
     }
 
@@ -240,7 +238,7 @@ fn expected_pins(nodes: &[TestNode], ways: &[TestWay]) -> HashMap<i64, Option<Ve
         let mut bits = vec![0u8; w.refs.len().div_ceil(8)];
         let mut any = false;
         for (i, &id) in w.refs.iter().enumerate() {
-            let shared = id >= 0 && count.get(&id).copied().unwrap_or(0) >= 2;
+            let shared = count.get(&id).copied().unwrap_or(0) >= 2;
             let resolved = present.contains(&id);
             if shared && resolved {
                 bits[i / 8] |= 1 << (i % 8);
@@ -260,8 +258,8 @@ fn trimmed_refs(refs: &[i64]) -> &[i64] {
     }
 }
 
-/// A way is a member iff it is a `Way` member (id >= 0) of a `multipolygon` or
-/// `boundary` relation. Returned in fixture file order.
+/// A way is a member iff it is a `Way` member, of either sign, of a
+/// `multipolygon` or `boundary` relation. Returned in fixture file order.
 fn expected_members(ways: &[TestWay], relations: &[TestRelation]) -> Vec<bool> {
     let member_ids: HashSet<i64> = relations
         .iter()
@@ -272,7 +270,7 @@ fn expected_members(ways: &[TestWay], relations: &[TestRelation]) -> Vec<bool> {
         })
         .flat_map(|r| r.members.iter())
         .filter_map(|m| match m.id {
-            MemberId::Way(id) if id >= 0 => Some(id),
+            MemberId::Way(id) => Some(id),
             _ => None,
         })
         .collect();
@@ -388,6 +386,71 @@ fn inject_prepass_oracle_roundtrip() {
             "{backend}: way_member_count == decoded way count"
         );
     }
+}
+
+/// The same contract on negative IDs, held by the same oracle. Sparse only:
+/// the external index does not yet take negative node blobs. Ring `w-12`
+/// closes on `n-2`; `n-2`'s only other use is in `w-10`, so both of the
+/// ring's endpoint bits are set, while ring `w-14` closes on `n-7`, which no
+/// other way uses, so neither endpoint is pinned. `w-13` repeats `n-6`
+/// inside a way too short to be a ring, which counts twice. `n-99` is
+/// shared but absent and pinned nowhere; `w-10` and `w-12` are members of a
+/// multipolygon and a boundary, the route's `w-11` is not.
+#[test]
+fn inject_prepass_oracle_roundtrip_negative_ids() {
+    let nodes: Vec<TestNode> = (1..=11).map(|i| node(-i)).collect();
+    let ways = vec![
+        way(-10, vec![-1, -2, -3, -4]),
+        way(-11, vec![-3, -5]),
+        way(-12, vec![-2, -3, -8, -2]),
+        way(-13, vec![-6, -9, -6]),
+        way(-14, vec![-7, -10, -11, -7]),
+        way(-15, vec![-9, -99]),
+        way(-16, vec![-99, -1]),
+    ];
+    let relations = vec![
+        mp_relation(-20, -10),
+        TestRelation {
+            id: -21,
+            members: vec![TestMember {
+                id: MemberId::Way(-12),
+                role: "outer",
+            }],
+            tags: vec![("type", "boundary")],
+            meta: None,
+        },
+        TestRelation {
+            id: -22,
+            members: vec![TestMember {
+                id: MemberId::Way(-11),
+                role: "",
+            }],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+    ];
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_indexed_pbf(&input, &nodes, &ways, &relations);
+    let want_pins = expected_pins(&nodes, &ways);
+    let want_members = pack_lsb(&expected_members(&ways, &relations));
+    assert_eq!(
+        want_pins.get(&-12),
+        Some(&Some(vec![0b1011])),
+        "oracle: the ring closing on a shared node pins both endpoints"
+    );
+    assert_eq!(want_pins.get(&-14), Some(&None), "oracle: an unshared ring");
+
+    let output = dir.path().join("sparse.osm.pbf");
+    run_inject(&input, &output, "sparse");
+    let (ways_out, members) = read_inject_artifacts(&output);
+    assert_eq!(ways_out.len(), ways.len());
+    for (id, pins) in &ways_out {
+        assert_eq!(pins, want_pins.get(id).expect("known way"), "way {id}");
+    }
+    assert_eq!(members.len(), 1, "single way blob");
+    assert_eq!(members[0].0, want_members, "field-5 membership");
 }
 
 // What each command does with the enrichment declarations on its output (kept

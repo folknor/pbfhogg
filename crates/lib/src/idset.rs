@@ -827,6 +827,47 @@ impl Bitmap {
         directory + self.allocated_chunk_count() as u64 * per_chunk as u64
     }
 
+    /// The bytes this bitmap holds now, and with `ranked` also the rank index
+    /// [`Self::rank_index`] would build for it, priced by what each chunk
+    /// is: a bit array its 4 MiB (and its block prefixes when ranked), an
+    /// array chunk the capacity of its offsets, plus the direct directory
+    /// and an entry per overflow chunk. Unlike
+    /// [`Self::ranked_bytes_upper_bound`], which charges every chunk as a
+    /// bit array, it does not grow a thinly spread set into gigabytes.
+    fn footprint_bytes(&self, ranked: bool) -> u64 {
+        use std::mem::size_of;
+        let rank_entry = if ranked {
+            size_of::<u64>() + size_of::<Option<Vec<u32>>>()
+        } else {
+            0
+        };
+        let direct_entry = size_of::<Option<Chunk>>() + rank_entry;
+        let overflow_entry = size_of::<u64>() + size_of::<Chunk>() + 64 + rank_entry;
+        let chunk_bytes = |chunk: &Chunk| -> u64 {
+            match chunk {
+                Chunk::Dense(_) => {
+                    let prefixes = if ranked {
+                        BLOCKS_PER_CHUNK * size_of::<u32>()
+                    } else {
+                        0
+                    };
+                    (CHUNK_BYTES + prefixes) as u64
+                }
+                Chunk::Sparse(offsets) => (offsets.capacity() * size_of::<u32>()) as u64,
+            }
+        };
+        let directory = (self.chunks.len() + 1) as u64 * direct_entry as u64
+            + self.overflow.len() as u64 * overflow_entry as u64;
+        directory
+            + self
+                .chunks
+                .iter()
+                .flatten()
+                .chain(self.overflow.values())
+                .map(chunk_bytes)
+                .sum::<u64>()
+    }
+
     fn merge_from(&mut self, other: &Bitmap) {
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);
@@ -1321,6 +1362,19 @@ impl IdSet {
             0
         };
         self.nonneg.ranked_bytes_upper_bound() + neg
+    }
+
+    /// The bytes the negative family holds, with `ranked` also the rank
+    /// index [`into_ranked`](Self::into_ranked) would build for it, priced
+    /// by what its chunks are (see the backend's footprint). Zero when the
+    /// set holds no negative ID: an empty family allocates and is charged
+    /// nothing.
+    pub(crate) fn negative_footprint_bytes(&self, ranked: bool) -> u64 {
+        if self.neg.has_any() {
+            self.neg.footprint_bytes(ranked)
+        } else {
+            0
+        }
     }
 
     /// A key naming the backend chunk `id` lives in, over both families
@@ -1966,6 +2020,30 @@ mod tests {
         let mut s = IdSet::new();
         s.insert(-42);
         assert!(s.has_any());
+    }
+
+    /// The negative footprint is zero without a negative member, and prices
+    /// a thinly spread negative family by what it holds: one ID in each of
+    /// 1024 overflow chunks costs kilobytes, not 1024 bit arrays.
+    #[test]
+    fn negative_footprint_prices_what_the_family_holds() {
+        let mut s = IdSet::new();
+        assert_eq!(s.negative_footprint_bytes(true), 0);
+        s.insert(0);
+        s.insert(i64::MAX);
+        assert_eq!(s.negative_footprint_bytes(true), 0);
+        for i in 0..1024_i64 {
+            s.insert(i64::MIN + (i << 30) * 64);
+        }
+        let ranked = s.negative_footprint_bytes(true);
+        assert!(ranked > 0);
+        assert!(ranked < 1 << 20, "{ranked} bytes for 1024 thin chunks");
+        assert!(s.negative_footprint_bytes(false) < ranked);
+        let mut dense = IdSet::new();
+        for id in -2000..0 {
+            dense.insert(id);
+        }
+        assert!(dense.negative_footprint_bytes(false) >= CHUNK_BYTES as u64);
     }
 
     /// An empty negative family costs nothing in the ranked bound, so a set

@@ -1412,6 +1412,114 @@ fn fixed_memory_routes_auto() {
     }
 }
 
+/// Auto's two decisions against one known budget. A way referencing six
+/// node IDs of which the file holds four has a 32-byte header estimate and
+/// a 48-byte exact store: with a 40-byte budget (80 % is 32 bytes) the
+/// estimate routes sparse and the post-pass-0 recheck re-routes external,
+/// whose output then carries the two placeholders asked for. The same
+/// budget on a file holding a negative node blob, which the external index
+/// refuses, keeps sparse up front and says why, and sparse joins it.
+#[test]
+fn auto_rechecks_the_exact_store_and_never_routes_to_a_refusal() {
+    use crate::common::{TestNode, TestWay};
+    let Some(ticket) = crate::common::heavy_ticket(1, "auto_rechecks_the_exact_store") else {
+        return;
+    };
+    let dir = crate::common::test_scratch();
+    let node = |id: i64| TestNode {
+        id,
+        lat: 550_000_000,
+        lon: 120_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    let dangling = dir.path().join("dangling.osm.pbf");
+    crate::common::write_indexed_pbf(
+        &dangling,
+        &[node(1), node(2), node(3), node(4)],
+        &[TestWay {
+            id: 1,
+            refs: vec![1, 2, 3, 4, 5, 6],
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+    );
+    let negative = dir.path().join("negative.osm.pbf");
+    crate::common::write_indexed_pbf(
+        &negative,
+        &[node(0), node(-1), node(1), node(2)],
+        &[TestWay {
+            id: 1,
+            refs: vec![-1, 0, 1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+    );
+    let memory = (3_u64 << 30) + 40;
+    for (input, notes, missing) in [
+        (
+            &dangling,
+            &[
+                (
+                    "altw.auto_select",
+                    "auto-selected index type sparse (store estimate",
+                ),
+                ("altw.auto_recheck", "auto re-routed to index type external"),
+            ][..],
+            2,
+        ),
+        (
+            &negative,
+            &[(
+                "altw.auto_select",
+                "auto-selected index type sparse (sorted=true, indexed=true; the external \
+                 index cannot take this input: altw external: node blob indexdata range",
+            )][..],
+            0,
+        ),
+    ] {
+        let sink = Arc::new(Recording::default());
+        let mut host = crate::common::heavy_host(&ticket);
+        host.diagnostics = pbfhogg::host::Diagnostics::new(
+            Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
+        );
+        host.resources = Arc::new(pbfhogg::host::Fixed {
+            parallelism: std::num::NonZeroUsize::new(4),
+            memory_available: Some(memory),
+        });
+        let opts = pbfhogg::altw::AltwOptions {
+            keep_untagged_nodes: true,
+            write: Default::default(),
+            index_type: pbfhogg::altw::IndexType::Auto,
+            inject_prepass: false,
+            ignore_missing_nodes: true,
+        };
+        let stats = pbfhogg::altw::add_locations_to_ways(
+            input,
+            crate::common::out(input.with_extension("out.pbf")),
+            &opts,
+            &Default::default(),
+            &host,
+            crate::common::scratch_in(dir.path()),
+        )
+        .expect("auto");
+        assert_eq!(stats.missing_locations, missing, "{}", input.display());
+        let seen = sink.0.lock().expect("sink").clone();
+        for (key, prefix) in notes {
+            assert!(
+                seen.iter()
+                    .any(|(k, text)| k == key && text.starts_with(prefix)),
+                "{}: no {key} note starting {prefix:?} in {seen:?}",
+                input.display()
+            );
+        }
+        let rechecked = seen.iter().any(|(k, _)| k == "altw.auto_recheck");
+        assert_eq!(rechecked, notes.len() == 2, "{seen:?}");
+    }
+}
+
 /// Every scratch-producing backend works in the run directory it is handed
 /// and leaves its parent exactly as it found it.
 #[test]

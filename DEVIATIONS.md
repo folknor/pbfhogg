@@ -40,8 +40,12 @@ fraction of the file, filtered via `BlobFilter::only_relations()`).
 
 **Implementation:** A third pass scans relation blobs to collect node IDs
 referenced as members into an `IdSet` bitset. During the write pass,
-untagged nodes are kept if they appear in this set. The pass is skipped entirely
-when `--keep-untagged-nodes` is set (all nodes are kept anyway).
+untagged nodes are kept if they appear in this set. Members are matched by
+their signed ID, so a member `n-7` keeps node `-7` only; osmium's
+`--keep-member-nodes` folds each member onto its absolute value
+(`positive_ref()`), and its man page says the option does not work with
+negative IDs. The pass is skipped when `--keep-untagged-nodes` is set (all
+nodes are kept anyway) unless `--inject-prepass` needs its member ways.
 
 ## add-locations-to-ways: missing nodes are an error (no longer a deviation)
 
@@ -588,16 +592,9 @@ their work-unit planner also cuts by (`crates/lib/src/commands/diff/units.rs`).
   Stage 2 partitions and walks node IDs as unsigned values, so a
   mixed-sign range would silently turn present nodes, positive ones
   included, into missing locations. The error names the sparse index,
-  which joins such input. Way and relation blobs may hold negative IDs.
-- `add-locations-to-ways` (both backends) - **silent**, for negative
-  relation-member refs, which the relation scan drops before collecting
-  relation-member node IDs into the `IdSet` that decides which untagged
-  nodes to keep; the external backend's stage 4 also
-  consults `relation_member_node_ids.any_in_numeric_range(min_id, max_id)` to
-  skip node blobs that contain no relation-referenced nodes (no node
-  blob reaching that check holds a negative ID, given the reject
-  above). That per-id drop (and the matching abs-fold absence on the
-  pbfhogg side) is the residual divergence below.
+  which joins such input, and `--index-type auto` routes such input to
+  sparse rather than to this refusal. Way and relation blobs may hold
+  negative IDs.
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
 PBF payload, not an ID set passed through `IdSet`.
@@ -645,26 +642,16 @@ unfolded in an unsigned set, so a negative one stands for an ID near
 `2^64`; on osmium 1.19.1 a matched way referencing one outside node `n-5`
 makes the run fail "Out of memory".
 
-**Residual divergence (add-locations-to-ways):**
-This command drops negative ids before they reach its ID sets
-(`IdSet` in `crates/lib/src/idset.rs` itself holds any signed ID), where osmium's equivalent path abs-folds via
-`positive_ref()` to collapse `-N` and `+N` into a single bit.
-
-- `add-locations-to-ways` silently **omits** relation-member
-  retention for any relation member whose id is negative (the member
-  id is dropped before the member set is built, so the write pass doesn't know
-  to keep the corresponding untagged node).
-  osmium's `add-locations-to-ways` abs-folds the member ref via
-  `member.positive_ref()`, collapsing `-N` and `+N` member refs
-  into the same retention decision.
-
-This behavior is silent; it matches neither the project-wide reject
-stance nor osmium's abs-fold. Promoting it to
-a further hard-reject site is not planned: osmium's own behavior is
-also a silent miscount (just a *different* silent miscount), so
-neither tool offers a clean precedent for forced rejection here. A
-user who needs deterministic behavior on mixed-sign input must run
-`renumber` first to surface the negatives as a hard error.
+**add-locations-to-ways with the sparse index is exact.** It joins a
+negative node ref to its node, keeps an untagged negative relation-member
+node, and under `--inject-prepass` marks a negative member way and pins a
+negative shared node, each by the exact signed ID, as `--index-type auto`
+does whenever it runs sparse. osmium joins negative refs through a second
+index keyed by absolute value, which is exact for the join; its
+`--keep-member-nodes` retention records members by absolute value
+(`positive_ref()`), so a member `n-7` also keeps an untagged `n7`, and its
+man page says the option does not work with negative IDs. pbfhogg keeps
+only `n-7`.
 
 **Rationale:** `IdSet` is the load-bearing data structure in
 renumber - a bitmap indexed by unsigned id supporting `O(1)`

@@ -66,9 +66,10 @@ It is also used as a reason in places where that reason is false:
 The ADR body itself declines blanket rejection: it turns down alternative (a)
 and chooses (c).
 
-BUG-010 stands on its own merits, through the silent-wrong-answer rule and
-complete-ways' completeness claim **[S][C:inv]**. Under the ruling, its
-remedy is support, not refusal.
+BUG-010 stood on its own merits, through the silent-wrong-answer rule and
+complete-ways' completeness claim **[S][C:inv]**. Under the ruling its
+remedy was support, not refusal; commits 3 to 7 resolved it and it is
+removed from `notes/bugs.md`.
 
 ## 2. The ADR
 
@@ -132,12 +133,10 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 13-19 | getid (positional, `-i`, `-I`, prefilters, `-r`, `--invert`), getparents | Exact and signed since commit 3 **[S]**. | P | Refuses text; abs-folds the rest **[O]** |
 | 20-22 | tags-filter PBF default, `-R`, OSC | Exact and signed since commit 4 **[S]**. | P | Default abs-folds; `-R` direct; OSC unsupported. |
 | 23-26 | extract simple, complete-ways, smart, `--config` | Exact and signed since commit 5 **[S]**. | P | simple abs-folds; complete_ways and smart run out of memory on a negative outside way node **[O]** |
-| 27 | ALTW sparse | Negative way refs filtered (`altw/mod.rs` around 986) **[S]**. | S+. Signed join (section 4.4). | Separate negative index; joins **[O]** |
+| 27 | ALTW sparse | Exact and signed since commit 7 **[S]**. | P | Separate negative index; joins **[O]** |
 | 28 | ALTW external | `check_range` refuses a min < 0; stage 1 skips negative refs **[S]**. | S+. Two bucket families (section 4.5). | Joins |
-| 29 | ALTW auto, `--force` | No sign rule. | P. Post-pass-0 exact-size recheck (section 4.4). | n/a |
-| 30 | ALTW retention | Negative members not kept (`altw/mod.rs` around 112) **[S]**. | S+. Signed node and way member sets. | `--keep-member-nodes` abs-folds and unsupported **[O][C:altw]** |
-| 31 | ALTW `--inject-prepass` | Negative member ways lose their bit (line 113) **[S]**. | S+. Signed membership plus signed shared-node pins. | n/a |
-| 32 | ALTW `--ignore-missing-nodes` | A present `n-1` becomes `(0,0)`. | S+. Only true misses are filled, with the settled `(0,0)` placeholder. | Writes undefined raw location **[C:altw]**; see the doc gap in section 10. |
+| 29 | ALTW auto, `--force` | Header admission gate and post-pass-0 recheck since commit 7 **[S]**. | P. Item 8 deletes the gate's negative clause with `check_range`. | n/a |
+| 30-32 | ALTW retention, `--inject-prepass`, `--ignore-missing-nodes` | Exact and signed since commit 7 **[S]**. | P | `--keep-member-nodes` abs-folds and unsupported **[O][C:altw]**; missing nodes get an undefined raw location **[C:altw]**, see the doc gap in section 10. |
 | 33 | build-geocode-index | pass1 drops negative admin ways **[S]**; pass1_5 skips negative refs. | S+ (section 4.7). | No counterpart. traccar is partial: signed member ways, but a `Dummy` negative location store, so a negative node ref fails **[O][C:rgp]**. |
 | 34 | geocode-query | No ID operand. | P | n/a |
 | 35-37 | diff text and OSC, digest | Canonical and exact **[S]**. | P | Canonical |
@@ -167,33 +166,23 @@ the orphan bijection, lands with commit 10.
 
 ### 4.2 Membership users
 
-Rows 30, 31 and 33 use the signed set. The specifics:
+Row 33 uses the signed set. The specifics:
 - prefilter predicates are as in row 16;
 - the `EdgeStore` byte encoding already works for signed children
   **[C:spar]**.
 
-### 4.4 ALTW sparse join [C:altw]
+### 4.4 ALTW sparse join [landed]
 
-- **Store.** A second ranked set, keyed by `!id`, maps negatives
-  (`-1 -> 0`, `i64::MIN -> i64::MAX`; no signed negation). Both sets share
-  one coordinate mmap of `8 * (neg_distinct + nonneg_distinct)` slots,
-  computed with checked arithmetic. Writer and reader each get pre-sliced
-  regions, so each side ranks from zero.
-- **Pass 0.** The worker's existing sign check splits refs into per-blob
-  vectors. Non-negatives take the unchanged serial `set` loop. Negatives drain
-  separately.
-- **Prepass and pins.** Preserve ref multiplicity until the shared-node
-  decision. A trailing ring closure is excluded from the shared count and
-  takes the first position's pin. A missing ref never gets a pin.
-- **Population.** Parallel workers use signed rank routing and atomic stores.
-  Conflicting duplicate node records need a deterministic winner, shared with
-  external.
-- **Auto routing.** The header estimate stays as a heuristic. After pass 0,
-  recheck the exact slot bytes before allocating, and charge the negative
-  rank directory against the budget. This also fixes an underestimate that
-  exists today, because absent referenced IDs get slots too.
-- **Positive input.** When pass 0 found no negatives, a non-negative-only
-  implementation is selected outside the inner loop.
+Commit 7 deleted the three sparse sign guards; the one signed
+`RankedIdSet` already ranks both families into one store, so no second
+store or positive-only variant was built (measured neutral). Auto holds
+indexdata to external's own header checks (`HeaderAdmission`) and rechecks
+the exact store after pass 0.
+
+What remains for item 8: delete the negative clause of `HeaderAdmission`
+together with `check_range`. Conflicting duplicate node records (a
+deterministic winner shared by both engines) are BUG-009, sign-neutral; a
+negative duplicate is as nondeterministic on sparse as a positive one.
 
 ### 4.5 ALTW external join: two bucket families [C:altw]
 
@@ -273,8 +262,7 @@ implementation.
 
 | Path | What changes on positive input | How it stays free |
 |---|---|---|
-| ALTW sparse pass 0 | The existing worker sign check now splits into two vectors. | The serial non-negative `set` loop is unchanged. The no-negatives implementation is chosen outside the loop. |
-| ALTW sparse population and lookup | A negative region in the store. | The non-negative-only variant is selected when there are no negatives. |
+| ALTW sparse | Landed; measured neutral (commit 7, Japan and planet). | n/a |
 | ALTW external stage 1 | `(family, key)` emit. | The compact positive record path is kept. A family branch per ref is the only addition. |
 | ALTW external stages 2 and 4 | Per-family partition. | Canonical decode only for blobs straddling zero; there are none on positive input. |
 | renumber | Canonical compare and cached offset. | Fast path for two non-negatives. |
@@ -303,14 +291,11 @@ implementation.
   - read the phase split before calling a regression;
   - a regression is a median more than 3 % slower with both pairs agreeing.
 - Cells:
-  - `embed-locations`, Japan, sparse, `--inject-prepass no --stop
-    ALTW_PASS0_END`, compared on ns/ref (`altw_pass0_union_ms /
-    altw_pass0_refs_total`);
-  - Japan sparse, full run, with prepass off and on as separate pairs (store
-    bytes, peak anon, pass 1 and 2 CPU);
+  - (the sparse ALTW cells, Japan pass 0, Japan full with prepass off and on,
+    and the planet pair of pairs, ran with commit 7; recorded in
+    `reference/performance/add-locations-to-ways.md`);
   - Germany external, full run (`s1a_id_emit_ms` per record, shard bytes,
     stage 2 and 4 CPU);
-  - a planet pair of pairs for sparse ALTW;
   - `renumber`, Germany;
   - `tag-select`, Germany, `r/type=route`;
   - `parent-select` and `id-select --add-referenced yes`, Germany;
@@ -500,12 +485,13 @@ lines. It passes `brokkr check` and the relevant Denmark verifies.
 The registry (`crates/cli/tests/cli_negative_ids.rs`) landed with item 2.
 Each commit below flips its own cases' known gaps (each names the check,
 framing and exact wrong observation) and adds the cases its route needs:
-the ALTW auto budget crossover, wide-key and `i64::MIN` boundaries, a
-geocode boundary whose outer way is negative, and `degrade --drop-ids`
-selection (BUG-022), none of which the registry asserts yet.
+wide-key boundaries, a geocode boundary whose outer way is negative, and
+`degrade --drop-ids` selection (BUG-022), none of which the registry
+asserts yet. (The ALTW auto crossover and the sparse `i64::MIN` boundary
+landed with commit 7 as library and CLI tests, `host_contract.rs` and
+`cli_add_locations_to_ways.rs`: the registry's children cannot be given a
+memory budget outside the test-hooks build.)
 
-7. ALTW sparse signed join, signed retention, prepass and pins, and the auto
-   recheck.
 8. ALTW external two-family join, with `check_range` removed.
 9. build-geocode-index.
 10. renumber signed remap and the new orphan mapping, plus the negative
@@ -522,10 +508,6 @@ regression is fixed in the implementation before the policy is recorded.
 
 - The renumber orphan shift collides near `i64::MAX` on positive input
   **[C:rgp]**. This is a bug today.
-- The sparse auto estimate `8 * node_count` underestimates the store, because
-  absent referenced IDs also get slots **[C:altw]**.
-- The ALTW external error recommends sparse, which also cannot join
-  negatives **[C:re]**.
 - The possible add-locations-to-ways fill-value doc gap in section 10.
 - traccar fails on negative node refs: it uses a `Dummy` negative store
   **[O][C:rgp]**.

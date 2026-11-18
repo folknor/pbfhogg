@@ -281,7 +281,7 @@ pub(super) fn build_way_schedule(
 
 /// The `u32` ordinal of the way blob at schedule position `position`, or
 /// the refusal of an input with more way blobs than that can number.
-fn way_blob_ordinal(position: usize) -> Result<u32> {
+pub(super) fn way_blob_ordinal(position: usize) -> Result<u32> {
     u32::try_from(position).map_err(|_| {
         Error::invalid_data(format!(
             "add-locations-to-ways, external index: the input has more than {} way \

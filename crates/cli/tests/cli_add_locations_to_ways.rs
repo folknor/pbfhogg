@@ -1325,6 +1325,67 @@ fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
     );
 }
 
+/// Sparse joins node IDs at both ends of `i64` and on either side of zero,
+/// and keeps an untagged relation member at `i64::MIN`: the negative family
+/// keys `i64::MIN` as `i64::MAX` and ranks it like any other. Auto on the
+/// same sorted, indexed file stays sparse, saying the external index cannot
+/// take a negative node blob, rather than routing to a refusal.
+#[test]
+fn sparse_joins_node_ids_at_both_ends_of_i64() {
+    let at = |id: i64, k: i32| TestNode {
+        id,
+        lat: 550_000_000 + k * 10_000,
+        lon: 120_000_000 + k * 10_000,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![
+        at(0, 0),
+        at(-1, 1),
+        at(i64::MIN, 2),
+        at(1, 3),
+        at(i64::MAX, 4),
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![i64::MIN, i64::MAX, -1, 0, 1, i64::MIN],
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }];
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![TestMember {
+            id: MemberId::Node(i64::MIN),
+            role: "label",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: None,
+    }];
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_indexed_pbf(&input, &nodes, &ways, &relations);
+    let loc = |k: i32| (550_000_000 + k * 10_000, 120_000_000 + k * 10_000);
+    let want = vec![(10, vec![loc(2), loc(4), loc(1), loc(0), loc(3), loc(2)])];
+
+    for backend in [IndexBackend::Sparse, IndexBackend::Auto] {
+        let output = dir
+            .path()
+            .join(format!("{}.osm.pbf", backend.flag().unwrap()));
+        let out = run_altw(&input, &output, false, backend, false);
+        let stderr = out.stderr_str();
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(read_way_locations(&output), want, "{stderr}");
+        assert_eq!(read_node_ids(&output), vec![i64::MIN], "{stderr}");
+        if matches!(backend, IndexBackend::Auto) {
+            assert!(
+                stderr.contains("auto-selected index type sparse (")
+                    && !stderr.contains("re-routed"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
 /// The external backend sizes its id buckets from the node blobs'
 /// indexdata `max_id`, and used to assert (panic) when that exceeded what its
 /// 31-bit bucket-local ids can encode (2^38 with 256 buckets). It is now an

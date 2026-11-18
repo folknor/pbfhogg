@@ -407,7 +407,11 @@ once pass 1 finishes, the store is advised `MADV_RANDOM` so pass 2's
 genuinely-random per-ref lookups stop paying kernel readahead
 speculation. The effect on disk reads and wall time depends on the dataset
 and host; see [performance/add-locations-to-ways.md](performance/add-locations-to-ways.md) for measured results. Its
-working-set limit depends on available page cache.
+working-set limit depends on available page cache. The set is signed and
+its ranks numeric over both families (negative IDs take ranks
+`0..negatives`, non-negative ones follow), so negative refs, relation
+members and prepass pins resolve like any other; a set with no negative ID
+builds no negative rank index.
 
 **External** (`altw/external/`, 4-stage bounded-memory join; requires
 sorted + indexed input):
@@ -487,13 +491,38 @@ The store estimate's header walk refuses a partially indexed input (some
 OsmData blobs indexed, others not) with the missing-indexdata error, so a
 sorted input whose first data blob is indexed always gets an estimate; an
 unavailable estimate would keep sparse. Unsorted or unindexed inputs always
-select sparse, since external cannot run on them. Whether the input is
+select sparse, since external cannot run on them. The same walk holds
+every data blob's indexdata to the external join's own header checks
+(a node range reaching below zero, the canonical order of the ranges,
+the largest node `max_id` its buckets can encode, the `u32` way-blob
+ordinal); an input that fails one runs sparse, which joins it, and the
+note names the refusal. Checks that need the way pass (slot-bucket
+widths, scratch space) and the trust placed in a false but well-formed
+claim stay with external. Whether the input is
 indexed is read from the first data blob's indexdata, the same hint the
 backends' own indexdata check reads, so a header-only file counts as indexed
 and frames before the first data blob are skipped. An unreadable or malformed
 frame header up to there is an input error, not a reason to pick sparse; the
 data blob payloads are not read by the selection. This runtime rule follows the measured
 store-versus-cache behavior documented in [performance/add-locations-to-ways.md](performance/add-locations-to-ways.md).
+
+When the estimate keeps sparse on an input external could take, the
+budget it routed on is kept, and after the first sparse pass (which
+counts the referenced node IDs) the exact store is judged against it
+before the store is allocated: 8 bytes per distinct referenced ID, which
+includes IDs the input does not hold, plus the negative-ID sets (the
+referenced set's negative family with its rank index, and under
+`--inject-prepass` the shared-node set's), priced by what their chunks
+hold and charged as anon memory outside the measured allowance. External
+is chosen when `100 * store + 80 * anon > 80 * budget`; the pass's sets
+are dropped, the input is opened again from its pin, and the join runs
+under the same missing-location gate, after a second note under the
+`altw.auto_recheck` key. Both charges are zero for a file without
+negative IDs, and the budget is the one probed for the estimate rather
+than a fresh probe, which would charge the first pass's own sets twice.
+The recheck can re-route an input whose estimate was zero (no node
+blobs, dangling refs), and never re-routes the other way: an input the
+estimate sent to external is not run through sparse's first pass.
 
 Limits of the rule, both accepted with auto as the default:
 
@@ -509,7 +538,8 @@ Limits of the rule, both accepted with auto as the default:
   external's scratch check (above) can then refuse a run sparse would have
   completed. Indexdata counts elements, not references, so no tighter
   bound is available without decoding; `--index-type sparse` is the
-  remedy.
+  remedy. The opposite error, an estimate below the real store, is caught
+  by the recheck.
 
 ### renumber
 

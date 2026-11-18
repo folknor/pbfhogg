@@ -890,10 +890,11 @@ Reported by: altw-sparse.
 
 Mechanism: the router compares an estimated 8N store with 80 % of available
 memory minus 3 GiB; unknown memory, or available memory at or below the
-allowance, selects sparse. The real store is 8U; 8N is not an upper bound
-with dangling refs (slots are allocated for referenced IDs absent from input);
-lower memory flips back to the random-access engine. Past residency each
-`SparseArrayIndex::get` can be a dependent page fault.
+allowance, selects sparse. An 8N estimate below the real 8U store (dangling
+refs take slots) is now caught by the post-pass-0 recheck, which re-routes
+external; an 8N far above 8U (standalone nodes) still routes external with
+no correction. Lower memory flips back to the random-access engine. Past
+residency each `SparseArrayIndex::get` can be a dependent page fault.
 
 Redesign: regime choice - all-node store fits: actual-node dictionary, skip
 collection; only reference-selected fits: sharded collection and compact store;

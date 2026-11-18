@@ -1477,6 +1477,11 @@ Which elements each strategy writes:
   members, and the parents complete-ways adds, are included as relations but
   not completed.
 
+Negative IDs are IDs like any other in every strategy and in `--config`: a
+way referencing `n-7` is matched only when `n-7` itself is inside, and
+completion pulls in `n-7`, never its positive twin (osmium matches by
+absolute value).
+
 These are osmium extract's `simple`, `complete_ways` and `smart`, element for
 element on a bbox and on a polygon osmium reads the same way, except that osmium's simple decides a relation on its first
 node or way member only and osmium's smart completes `multipolygon` alone

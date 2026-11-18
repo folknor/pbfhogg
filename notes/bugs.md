@@ -204,19 +204,7 @@ Reported by: altw-sparse, tags, spatial.
 Sparse ALTW reference collection and coordinate population discard negative
 IDs (explicit sign guards since `IdSet` became signed) although `osm_id.rs`
 defines signed ordering and external's diagnostic implies sparse can join
-them; extract membership (`IdSet` and multi-region membership) discards
-negatives.
-
-Defect hunt 2026-11-17 (extract P1, id-filter-selection P2, cli-binary):
-- Extract: in-region node `1`, out-of-region node `-1`, way `10` referencing
-  `[1,-1]`; complete-ways selects the way, discards `-1` while collecting
-  dependencies, and publishes the way without a node it references
-  (`extract/smart.rs` dependency collection, `extract/common.rs` membership
-  emission); smart inherits it. Simple is inconsistent: an in-region negative
-  node disappears through filtered emission but survives in a verified
-  raw-copy blob. Claims named: complete-ways completeness and the stated
-  rejection policy; `IdSet` keeps its own contract and extraction fails to
-  enforce its precondition.
+them.
 See also DOC-001 in `notes/bugs-docs.md` for the blanket "rejected
 project-wide" wording.
 

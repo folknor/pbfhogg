@@ -34,6 +34,14 @@
   relations it pulls in, are now written; before, they were silently
   dropped (`-R` and OSC input were already exact). Selection is by the
   signed ID, where osmium folds referenced IDs onto their absolute value.
+- **extract handles negative IDs exactly in every strategy and in
+  `--config`.** Negative nodes inside the region, the ways and relations
+  they match, complete-ways' outside way nodes, smart's member ways and
+  nodes, and parent relations are now written; before, they were silently
+  dropped, so complete-ways could publish a way without a node it
+  references, and `--simple` kept negative nodes only from node blobs it
+  copied raw. Matching is by the signed ID, where osmium matches by
+  absolute value.
 
 ### Added
 

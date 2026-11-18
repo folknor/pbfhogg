@@ -15,6 +15,15 @@ since the shared region membership below, one membership structure per
 kind (the rows in this table predate it and used one `IdSet` per region
 and kind). 5 disjoint longitude strips per configured bench.
 
+### Negative IDs as region members (bygg, 2026-11-18, against `c79e6cfd`)
+
+Membership keys pages by the ID's two's-complement bits, so negatives land
+in the ordered overflow map and positive input takes the same path minus a
+sign check. Japan, 5 strips, simple, `--iterations 1` interleaved: baseline
+1964 ms and 1966 ms against variant 1937, 1930 and 1915 ms, neutral. UUIDs
+and the matching smart cell are in
+[extract.md](extract.md#negative-ids-selected-exactly-bygg-2026-11-18-against-c79e6cfd).
+
 ### Shared region membership (bygg, baseline `4109d1c4`, 2026-11-08)
 
 One `extract/membership.rs` `Membership` per kind (pages of 4096 IDs, a

@@ -55,9 +55,12 @@
 //! O(N^2) region comparisons, and nothing caps N. [`Membership::freeze`]
 //! re-chooses the smaller form for every page left in Incidence form.
 //!
-//! Negative IDs are not members and are dropped before any arithmetic, as
-//! extract drops them before its `IdSet`s
-//! (decisions/0002-negative-ids-rejected-project-wide.md).
+//! A negative ID is a member like any other. Pages are keyed by the ID's
+//! two's-complement bits read as `u64`, so every negative lands on a chunk
+//! id in `2^38..2^39`, above the largest non-negative chunk id `2^38 - 1`
+//! and past the direct index, in the ordered map: no collision with a
+//! non-negative ID, and nothing allocated or probed for negatives when the
+//! input holds none.
 
 // Offsets are masked to 12 bits, page-in-chunk indices to 13, region
 // numbers are below N; every narrowing cast is bounded by construction.
@@ -117,11 +120,12 @@ pub(super) fn regions_of(mask: &[u64]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-/// Split a non-negative ID into (page key, offset in page).
+/// Split an ID into (page key, offset in page), over its two's-complement
+/// bits. See the module docs on negative IDs.
 #[inline]
-fn split(id: i64) -> Option<(u64, u16)> {
-    let id = u64::try_from(id).ok()?;
-    Some((id >> PAGE_SHIFT, (id & (PAGE_IDS as u64 - 1)) as u16))
+fn split(id: i64) -> (u64, u16) {
+    let bits = id.cast_unsigned();
+    (bits >> PAGE_SHIFT, (bits & (PAGE_IDS as u64 - 1)) as u16)
 }
 
 // ---------------------------------------------------------------------------
@@ -646,9 +650,7 @@ impl Membership {
     /// whether `id` is a member of any region.
     #[inline]
     pub(super) fn or_into(&self, id: i64, acc: &mut [u64]) -> bool {
-        let Some((key, off)) = split(id) else {
-            return false;
-        };
+        let (key, off) = split(id);
         let Some(table) = self.table(key >> TABLE_SHIFT) else {
             return false;
         };
@@ -789,12 +791,10 @@ impl BatchBuilder {
         }
     }
 
-    /// Record that `region` holds `id`. Negative IDs are dropped.
+    /// Record that `region` holds `id`.
     #[inline]
     pub(super) fn push(&mut self, id: i64, region: usize) {
-        if id >= 0 {
-            self.pairs.push((id, region as u32));
-        }
+        self.pairs.push((id, region as u32));
     }
 
     /// Record every region of `mask` for `id`.
@@ -807,14 +807,15 @@ impl BatchBuilder {
     /// Encode everything pushed since the last call and clear.
     pub(super) fn finish(&mut self) -> PageBatch {
         let mw = self.mw;
+        // Signed order keeps each page in one run with ascending offsets:
+        // the sign boundary is page-aligned, and within a page signed and
+        // bit order agree.
         self.pairs.sort_unstable();
         let mut batch = Vec::new();
         let mut current: Option<u64> = None;
         self.entries.clear();
         for &(id, region) in &self.pairs {
-            let Some((key, off)) = split(id) else {
-                continue;
-            };
+            let (key, off) = split(id);
             if current != Some(key) {
                 if let Some(done) = current
                     && !self.entries.offsets.is_empty()
@@ -873,9 +874,7 @@ mod tests {
         for blob in blobs {
             for &(id, region) in blob {
                 builder.push(id, region);
-                if id >= 0 {
-                    reference[region].insert(id);
-                }
+                reference[region].insert(id);
             }
             membership.install(builder.finish());
         }
@@ -969,9 +968,77 @@ mod tests {
         check(
             3,
             &blobs,
-            &[-1, i64::MIN, 1, (1 << 25) + 1, i64::MAX - 2],
+            &[
+                -1,
+                i64::MIN,
+                1,
+                (1 << 25) + 1,
+                i64::MAX - 2,
+                -2,
+                i64::MIN + 1,
+            ],
             true,
         );
+    }
+
+    /// Negative IDs are members, distinct from their magnitude twins, across
+    /// the page and chunk boundaries on both sides of zero and at both
+    /// extremes, whatever the arrival order.
+    #[test]
+    fn negative_ids_are_exact_members_across_boundaries() {
+        let edges: Vec<i64> = vec![
+            0,
+            -1,
+            1,
+            -4095,
+            -4096,
+            -4097,
+            4095,
+            4096,
+            4097,
+            -(1 << 25),
+            -(1 << 25) - 1,
+            1 << 25,
+            -(1 << 43),
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MAX,
+        ];
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for &regions in &[1usize, 3, 65] {
+            let mut blobs: Vec<Vec<(i64, usize)>> = vec![
+                edges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &id)| (id, i % regions))
+                    .collect(),
+                // A second visit in reverse, other regions: merges pages.
+                edges
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(i, &id)| (id, (i + 1) % regions))
+                    .collect(),
+            ];
+            // Random negatives and positives near zero, mixed in one blob.
+            for _ in 0..10 {
+                blobs.push(
+                    (0..600)
+                        .map(|_| {
+                            let id = rng.below(20_000) as i64 - 10_000;
+                            (id, rng.below(regions as u64) as usize)
+                        })
+                        .collect(),
+                );
+            }
+            let probes: Vec<i64> = edges
+                .iter()
+                .flat_map(|&id| [id, id.wrapping_neg(), id.wrapping_sub(2)])
+                .chain(-10_010..10_010)
+                .collect();
+            check(regions, &blobs, &probes, false);
+            check(regions, &blobs, &probes, true);
+        }
     }
 
     #[test]

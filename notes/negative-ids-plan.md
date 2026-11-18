@@ -135,7 +135,7 @@ silent drop or a refusal); **V** means the verdict changes. Rows are
 | 12 | check `--index` | Signed, exact. | P | none |
 | 13-19 | getid (positional, `-i`, `-I`, prefilters, `-r`, `--invert`), getparents | Exact and signed since commit 3 **[S]**. | P | Refuses text; abs-folds the rest **[O]** |
 | 20-22 | tags-filter PBF default, `-R`, OSC | Exact and signed since commit 4 **[S]**. | P | Default abs-folds; `-R` direct; OSC unsupported. |
-| 23-26 | extract simple, complete-ways, smart, `--config` | Drop through `IdSet`/`Membership` **[S]**. | S+. Multi-extract maps the `i64` bits as `u64` into overflow chunk keys `2^38..2^39-1`, carrying region masks **[C:re]**. | Abs-folds **[O]** |
+| 23-26 | extract simple, complete-ways, smart, `--config` | Exact and signed since commit 5 **[S]**. | P | simple abs-folds; complete_ways and smart run out of memory on a negative outside way node **[O]** |
 | 27 | ALTW sparse | Negative way refs filtered (`altw/mod.rs` around 986) **[S]**. | S+. Signed join (section 4.4). | Separate negative index; joins **[O]** |
 | 28 | ALTW external | `check_range` refuses a min < 0; stage 1 skips negative refs **[S]**. | S+. Two bucket families (section 4.5). | Joins |
 | 29 | ALTW auto, `--force` | No sign rule. | P. Post-pass-0 exact-size recheck (section 4.4). | n/a |
@@ -175,11 +175,10 @@ What remains of 4.1:
 
 ### 4.2 Membership users
 
-Rows 10, 23-26, 30, 31 and 33 use the signed set. The specifics:
+Rows 10, 30, 31 and 33 use the signed set. The specifics:
 - prefilter predicates are as in row 16;
 - the `EdgeStore` byte encoding already works for signed children
-  **[C:spar]**;
-- multi-extract paging is as in row 26 **[C:re]**.
+  **[C:spar]**.
 
 ### 4.3 check
 
@@ -296,7 +295,7 @@ implementation.
 | ALTW external stages 2 and 4 | Per-family partition. | Canonical decode only for blobs straddling zero; there are none on positive input. |
 | renumber | Canonical compare and cached offset. | Fast path for two non-negatives. |
 | geocode pass1_5 | Collector spill branch. | Positive atomic path unchanged. |
-| getid, getparents, tags-filter, extract | One sign decision per probe. | `min_id >= 0` skips the side store, which is cold. |
+| getid, getparents, tags-filter, extract | Landed; measured neutral (commits 3 to 5). | n/a |
 | check `--refs`, `--locations`, `--ids --full` | Side merge or side Vec. | Empty, so no allocation. |
 
 **Prior evidence [C:perf].**
@@ -330,7 +329,6 @@ implementation.
     stage 2 and 4 CPU);
   - a planet pair of pairs for sparse ALTW;
   - `renumber`, Germany;
-  - `region-extract`, Japan multi simple 5 regions, and Germany single smart;
   - `tag-select`, Germany, `r/type=route`;
   - `parent-select` and `id-select --add-referenced yes`, Germany;
   - `geocode-build`, Germany, `--stop GEOCODE_PASS1_5_END`;
@@ -396,10 +394,9 @@ place with `Status: Superseded by NNNN`, and the new one says
 **DEVIATIONS.md.**
 - Replace the section with "Negative IDs: pbfhogg is exact where osmium
   abs-folds", listing:
-  - getid, its `--invert` (removeid) mode and getparents, and tags-filter
-    (their paragraphs landed with commits 3 and 4; carry them into the new
-    section);
-  - extract;
+  - getid, its `--invert` (removeid) mode and getparents, tags-filter and
+    extract (their paragraphs landed with commits 3 to 5; carry them into
+    the new section);
   - ALTW `--keep-member-nodes`-style retention;
   - the apply-changes location join;
   - `check --ids --full` (no difference left);
@@ -433,7 +430,6 @@ place with `Status: Superseded by NNNN`, and the new one says
 **Doc comments and messages.**
 - `idset.rs`, rewritten with the type.
 - `renumber/mod.rs`, `wire_rewrite.rs` and `relations.rs`.
-- `extract/membership.rs`.
 - `blob_meta/mod.rs` `BlobIndex::deserialize`.
 - `altw/external/blob_meta.rs`: the "use sparse" error disappears.
 - The geocode warning.
@@ -447,9 +443,6 @@ Durable text never cites a finding ID.
 
 ## 8. CHANGELOG
 
-- **Negative IDs are now handled like any other ID.** extract selects them
-  exactly, where before it dropped them silently (getid and getparents
-  landed their entry with commit 3, tags-filter with commit 4).
 - add-locations-to-ways joins negative node refs in both index types, and
   retains and marks negative relation members. The external index no longer
   refuses node blobs below zero.
@@ -543,7 +536,6 @@ an unreferenced conflicting negative record), `degrade --drop-ids`
 selection (BUG-022), and the `has_negative_ids` report fields, none of
 which the registry asserts yet.
 
-5. extract, including multi-extract paging.
 6. check: `--ids --full`, `--refs`, `--locations`, and the report fields
    (with inspect's).
 7. ALTW sparse signed join, signed retention, prepass and pins, and the auto

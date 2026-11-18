@@ -2436,3 +2436,166 @@ fn extract_accepts_honest_kind_claims() {
     assert_eq!(node_ids(&elements), vec![1, 3]);
     assert!(way_ids(&elements).contains(&12));
 }
+
+// ---------------------------------------------------------------------------
+// Negative IDs
+// ---------------------------------------------------------------------------
+
+/// A graph whose negative elements reach every closure route: the outside
+/// node of a matched way (complete-ways), the member way and its outside node
+/// of a matched multipolygon (smart pass 1 extras and pass 2), and a parent
+/// relation of an included relation. Every negative has a magnitude twin
+/// that an absolute-value match would confuse it with: `n2` is inside while
+/// `n-2` is not, so `w10`, which refers only to negatives outside, must stay
+/// out. Canonical order per kind, so the same lists serve the sorted file.
+fn negative_graph() -> (
+    Vec<TestNode<'static>>,
+    Vec<TestWay<'static>>,
+    Vec<TestRelation<'static>>,
+) {
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    let way = |id, refs: &[i64]| TestWay {
+        id,
+        refs: refs.to_vec(),
+        tags: vec![("highway", "path")],
+        meta: None,
+    };
+    let nodes = vec![
+        node(-1, 557_000_000, 125_000_000),
+        node(-2, 540_000_000, 125_000_000),
+        node(-3, 557_000_000, 140_000_000),
+        node(2, 556_500_000, 125_500_000),
+    ];
+    let ways = vec![way(-10, &[-1, -2]), way(-11, &[-2, -3]), way(10, &[-3, -2])];
+    let relations = vec![
+        TestRelation {
+            id: -300,
+            members: vec![
+                TestMember {
+                    id: MemberId::Way(-10),
+                    role: "outer",
+                },
+                TestMember {
+                    id: MemberId::Way(-11),
+                    role: "inner",
+                },
+            ],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        },
+        TestRelation {
+            id: -400,
+            members: vec![TestMember {
+                id: MemberId::Relation(-300),
+                role: "",
+            }],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+        TestRelation {
+            id: 400,
+            members: vec![TestMember {
+                id: MemberId::Way(10),
+                role: "",
+            }],
+            tags: vec![("type", "route")],
+            meta: None,
+        },
+    ];
+    (nodes, ways, relations)
+}
+
+fn sorted_ids(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn negative_ids_are_selected_exactly_by_every_strategy() {
+    let dir = crate::common::test_scratch();
+    let (nodes, ways, relations) = negative_graph();
+    for sorted in [false, true] {
+        let input = dir.path().join(format!("neg-{sorted}.osm.pbf"));
+        if sorted {
+            write_test_pbf_sorted(&input, &nodes, &ways, &relations);
+        } else {
+            write_test_pbf(&input, &nodes, &ways, &relations);
+        }
+        for (name, strategy, want_nodes, want_ways, want_relations) in [
+            (
+                "simple",
+                Strategy::Simple,
+                vec![-1, 2],
+                vec![-10],
+                vec![-300],
+            ),
+            (
+                "complete",
+                Strategy::CompleteWays,
+                vec![-2, -1, 2],
+                vec![-10],
+                vec![-400, -300],
+            ),
+            (
+                "smart",
+                Strategy::Smart,
+                vec![-3, -2, -1, 2],
+                vec![-11, -10],
+                vec![-400, -300],
+            ),
+        ] {
+            let output = dir.path().join(format!("out-{name}-{sorted}.osm.pbf"));
+            run_extract(&input, &output, &RegionArg::Bbox(BBOX_STR), strategy);
+            let c = read_all_elements(&output);
+            let at = format!("{name}, sorted {sorted}");
+            assert_eq!(sorted_ids(node_ids(&c)), want_nodes, "{at}: nodes");
+            assert_eq!(sorted_ids(way_ids(&c)), want_ways, "{at}: ways");
+            assert_eq!(
+                sorted_ids(relation_ids(&c)),
+                want_relations,
+                "{at}: relations"
+            );
+        }
+    }
+}
+
+/// The single-pass multi-extract keys negatives into region membership, so
+/// each region of one `--config` run writes what its own single extract
+/// writes, and the twins stay apart between regions.
+#[test]
+fn multi_extract_selects_negative_ids_as_its_single_extracts_do() {
+    let dir = crate::common::test_scratch();
+    let (nodes, ways, relations) = negative_graph();
+    let input = dir.path().join("neg.osm.pbf");
+    write_test_pbf_sorted(&input, &nodes, &ways, &relations);
+    let south = "12.4,53.9,12.6,54.1";
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"a.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}},{{"output":"b.osm.pbf","bbox":[12.4,53.9,12.6,54.1]}}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    run_extract_multi(&input, &config, Strategy::Simple);
+    for (name, bbox) in [("a", BBOX_STR), ("b", south)] {
+        let single = dir.path().join(format!("single-{name}.osm.pbf"));
+        run_extract(&input, &single, &RegionArg::Bbox(bbox), Strategy::Simple);
+        let s = read_all_elements(&single);
+        let m = read_all_elements(&dir.path().join(format!("{name}.osm.pbf")));
+        assert_eq!(node_ids(&m), node_ids(&s), "{name}: nodes");
+        assert_eq!(way_ids(&m), way_ids(&s), "{name}: ways");
+        assert_eq!(relation_ids(&m), relation_ids(&s), "{name}: relations");
+    }
+    let b = read_all_elements(&dir.path().join("b.osm.pbf"));
+    assert_eq!(node_ids(&b), vec![-2]);
+    assert_eq!(sorted_ids(way_ids(&b)), vec![-11, -10, 10]);
+    assert_eq!(sorted_ids(relation_ids(&b)), vec![-300, 400]);
+}

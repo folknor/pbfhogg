@@ -2053,53 +2053,7 @@ fn extract_simple() -> Case {
             )
         },
     )
-    .gaps(vec![
-        // Indexed, the region-filled node blob `[0, -1, -2]` is copied whole.
-        gap(
-            "elements",
-            Some(Framing::Indexed),
-            Sig::Tokens {
-                missing: &[
-                    "n-9 550500000,120500000 ",
-                    "w-1 [-1,-2,-5] highway=residential",
-                    "w-2 [1,2] highway=residential",
-                    "w-9 [0,-9,9] ",
-                    R_MINUS_1,
-                    R_7,
-                    R_11,
-                ],
-                extra: &[],
-            },
-            EXTRACT_DROPS,
-        ),
-        gap(
-            "elements",
-            Some(Framing::Unindexed),
-            Sig::Tokens {
-                missing: &[
-                    "n-1 550100000,120100000 amenity=bench",
-                    "n-2 550200000,120000000 ",
-                    "n-9 550500000,120500000 ",
-                    "w-1 [-1,-2,-5] highway=residential",
-                    "w-2 [1,2] highway=residential",
-                    "w-9 [0,-9,9] ",
-                    R_MINUS_1,
-                    R_7,
-                    R_11,
-                ],
-                extra: &[],
-            },
-            EXTRACT_DROPS,
-        ),
-    ])
 }
-
-const EXTRACT_DROPS: &str = "extract does not select negative IDs";
-const R_MINUS_1: &str = "r-1 [n1:stop,w-2:,r1:] type=route;route=bus";
-const R_1: &str = "r1 [w7:outer,n11:label,r-1:subarea] type=boundary;boundary=administrative;admin_level=4;name=Mixed";
-const R_7: &str = "r7 [r-7:,w-1:] type=route;route=road";
-const R_11: &str = "r11 [w-2:outer,n-11:label] type=multipolygon;landuse=grass";
-const R_MINUS_7: &str = "r-7 [n-7:stop,w7:] type=route;route=bus";
 
 /// Complete-ways adds `-5`, the outside node of the matched `w-1`, and
 /// `r1`, the parent of the included `r-1`.
@@ -2121,27 +2075,6 @@ fn extract_complete_ways() -> Case {
             )
         },
     )
-    .gaps(vec![gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-1 550100000,120100000 amenity=bench",
-                "n-2 550200000,120000000 ",
-                "n-5 551000000,121000000 ",
-                "n-9 550500000,120500000 ",
-                "w-1 [-1,-2,-5] highway=residential",
-                "w-2 [1,2] highway=residential",
-                "w-9 [0,-9,9] ",
-                R_MINUS_1,
-                R_1,
-                R_7,
-                R_11,
-            ],
-            extra: &[],
-        },
-        EXTRACT_DROPS,
-    )])
 }
 
 /// Smart adds `-11`, the outside label member of the matched multipolygon
@@ -2164,28 +2097,6 @@ fn extract_smart() -> Case {
             )
         },
     )
-    .gaps(vec![gap(
-        "elements",
-        None,
-        Sig::Tokens {
-            missing: &[
-                "n-1 550100000,120100000 amenity=bench",
-                "n-2 550200000,120000000 ",
-                "n-5 551000000,121000000 ",
-                "n-9 550500000,120500000 ",
-                "n-11 565000000,135000000 ",
-                "w-1 [-1,-2,-5] highway=residential",
-                "w-2 [1,2] highway=residential",
-                "w-9 [0,-9,9] ",
-                R_MINUS_1,
-                R_1,
-                R_7,
-                R_11,
-            ],
-            extra: &[],
-        },
-        EXTRACT_DROPS,
-    )])
 }
 
 /// Two regions in one pass whose membership differs between the magnitude
@@ -2245,36 +2156,6 @@ fn extract_config() -> Case {
             findings
         },
     )
-    .gaps(vec![
-        gap(
-            "region b",
-            None,
-            Sig::Tokens {
-                missing: &["w-7 [-7,7] highway=primary", R_MINUS_7],
-                extra: &[],
-            },
-            EXTRACT_DROPS,
-        ),
-        gap(
-            "region a",
-            None,
-            Sig::Tokens {
-                missing: &[
-                    "n-1 550100000,120100000 amenity=bench",
-                    "n-2 550200000,120000000 ",
-                    "n-9 550500000,120500000 ",
-                    "w-1 [-1,-2,-5] highway=residential",
-                    "w-2 [1,2] highway=residential",
-                    "w-9 [0,-9,9] ",
-                    R_MINUS_1,
-                    R_7,
-                    R_11,
-                ],
-                extra: &[],
-            },
-            EXTRACT_DROPS,
-        ),
-    ])
 }
 
 // ---------------------------------------------------------------------------

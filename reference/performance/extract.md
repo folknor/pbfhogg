@@ -41,6 +41,24 @@ scan. Workers pread + decompress + classify in parallel, sending compact
 results back to the consumer. Write passes use pread-from-workers with full
 PrimitiveBlock lifecycle per worker.
 
+### Negative IDs selected exactly (bygg, 2026-11-18, against `c79e6cfd`)
+
+The change that deleted extract's `id >= 0` insertion guards and keyed
+multi-extract's region membership by the ID's two's-complement bits, so
+negatives are members. Positive input reaches no new code: the guards were
+one branch per insertion, and membership's `split` lost its sign check.
+`region-extract`, `--iterations 1`, interleaved, variant uncommitted (dirty)
+against the baseline built with `--commit c79e6cfd`; no trim before the
+suite. Verdict: neutral on both cells.
+
+| Cell | baseline | variant |
+|------|----------|---------|
+| japan, `--mode multi --strategy simple` (5 strips) | 1964 ms (`8fe4daa8`), 1966 ms (`06548c61`); first cell 2352 ms cold (`1d1c3b03`) | 1937 ms (`6629190d`), 1930 ms (`1a888b66`), 1915 ms (`ce916c08`) |
+| germany, single `--strategy smart` | 3951 ms (`856e3f67`), 3929 ms (`133ce870`) | 3955 ms (`ffeefacb`), 3932 ms (`5cc40d31`) |
+
+Japan multi is 1.7 % faster on the medians, under the noise floor; Germany
+smart is unchanged.
+
 ### Parent relations, integer bbox edges and plain nodes (bygg, 2026-11-03, against `4a3ba718`)
 
 The change that brought extract's membership to osmium's: complete-ways and

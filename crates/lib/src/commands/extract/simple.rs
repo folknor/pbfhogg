@@ -74,8 +74,6 @@ fn classify_block_simple(
         return;
     }
 
-    // extract does not select negative IDs: every insertion below drops
-    // one.
     for element in block.elements_skip_metadata() {
         match (phase, &element) {
             (ClassifyPhase::Nodes, Element::DenseNode(dn))
@@ -85,25 +83,18 @@ fn classify_block_simple(
                     dn.decimicro_lon(),
                 ) =>
             {
-                if dn.id() >= 0 {
-                    bbox_node_ids.insert(dn.id());
-                }
+                bbox_node_ids.insert(dn.id());
             }
             (ClassifyPhase::Nodes, Element::Node(n))
                 if region.contains_decimicro(exact_bbox, n.decimicro_lat(), n.decimicro_lon()) =>
             {
-                if n.id() >= 0 {
-                    bbox_node_ids.insert(n.id());
-                }
+                bbox_node_ids.insert(n.id());
             }
             (ClassifyPhase::Ways, Element::Way(w)) if w.refs().any(|r| bbox_node_ids.get(r)) => {
-                if w.id() >= 0 {
-                    matched_way_ids.insert(w.id());
-                }
+                matched_way_ids.insert(w.id());
             }
             (ClassifyPhase::Relations, Element::Relation(r))
-                if r.id() >= 0
-                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids) =>
+                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) =>
             {
                 matched_relation_ids.insert(r.id());
             }
@@ -469,11 +460,8 @@ fn extract_simple_single_pass(
                 Ok((matching, verified))
             },
             |position, (matching_ids, verified): (Vec<i64>, Option<u64>)| {
-                // extract does not select negative IDs.
                 for id in matching_ids {
-                    if id >= 0 {
-                        bbox_node_ids.insert(id);
-                    }
+                    bbox_node_ids.insert(id);
                 }
                 verified_nodes[position] = verified;
             },
@@ -543,11 +531,8 @@ fn extract_simple_single_pass(
                 Ok(matching)
             },
             |_position, matching_ids: Vec<i64>| {
-                // extract does not select negative IDs.
                 for id in matching_ids {
-                    if id >= 0 {
-                        matched_way_ids.insert(id);
-                    }
+                    matched_way_ids.insert(id);
                 }
             },
             host,
@@ -619,7 +604,6 @@ fn extract_simple_single_pass(
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element
                         && relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids)
-                        && r.id() >= 0
                     {
                         ids.insert(r.id());
                     }

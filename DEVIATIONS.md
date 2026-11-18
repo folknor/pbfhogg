@@ -644,6 +644,17 @@ member ref, by its absolute value (`positive_id`, `positive_ref`), so a
 matched `w-7` also writes `w7` and a ref to `n-7` also writes `n7`; its
 `-R` mode consults no ID set and is exact, like pbfhogg's.
 
+**extract is exact.** Every strategy, single and through `--config`,
+selects a negative node inside the region, a way or relation matched
+through one, a matched way's outside nodes, a smart relation's member ways
+and nodes, and a parent relation, by its exact signed ID. osmium's simple
+strategy matches node refs and members by absolute value, so a way whose
+only refs are `n-2` outside the region is written when `n2` is inside.
+osmium's complete_ways and smart record a matched way's outside node refs
+unfolded in an unsigned set, so a negative one stands for an ID near
+`2^64`; on osmium 1.19.1 a matched way referencing one outside node `n-5`
+makes the run fail "Out of memory".
+
 **Residual divergence (add-locations-to-ways):**
 This command drops negative ids before they reach its ID sets
 (`IdSet` in `crates/lib/src/idset.rs` itself holds any signed ID), where osmium's equivalent path abs-folds via

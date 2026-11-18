@@ -478,16 +478,14 @@ pub(crate) const QUEUE_SLOTS_PER_WORKER: usize = 2;
 #[cfg(feature = "linux-io-uring")]
 pub(crate) const NUM_BUFS: u16 = 64;
 
-/// `user_data` packs `buf_idx` into the low 16 bits, but `ud_buf_idx` masks
-/// `0x3F` - six bits. The two disagree for any `NUM_BUFS` above 64, and the
-/// disagreement is silent: a CQE for buffer 64 returns index 0 to the free
-/// list, so two writers end up filling the same registered buffer and the
-/// output is corrupt with nothing reported. Widening the pool means widening
-/// the mask.
+/// The ring writer records which slots the kernel owns in one `u64` bitmask
+/// (`UringState::outstanding`), one bit per buffer, and a completion is only
+/// accepted for a slot whose bit is set. Widening the pool past 64 means
+/// widening that mask.
 #[cfg(feature = "linux-io-uring")]
 const _: () = assert!(
     NUM_BUFS <= 64,
-    "NUM_BUFS exceeds the 6-bit mask in ud_buf_idx; widen the mask first"
+    "NUM_BUFS exceeds the u64 outstanding-slot mask of the io_uring writer; widen it first"
 );
 
 /// Retained per-thread scratch is kept at or below 4 MiB per buffer. Blocks

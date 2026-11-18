@@ -244,7 +244,7 @@ re-encode. Full ruling in CORRECTNESS.md; tests in `crates/cli/tests/cli_sort.rs
 
 At planet the producer does one syscall and the writer does all the wall.
 Buffered: ~116 s of in-kernel ext4 CFR at ~800 MB/s (92 GB / 114.9 s).
-`--io-uring` (`7f6288c0`): ~111 s of ReadFixed+WriteFixed at ~827 MB/s,
+`--io-uring` (`7f6288c0`): ~111 s of userspace range reads into registered buffers plus WriteFixed at ~827 MB/s,
 total 118.1 s (**-4%**) - but reintroduces the `SORT_PASS2_END` page-cache
 thrash (25,478 majflt / 1.65 s) that buffered post-walker eliminated,
 because uring reads payload bytes through the page cache while ext4

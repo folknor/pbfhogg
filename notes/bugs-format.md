@@ -213,34 +213,6 @@ Both hunters say that rationale conflicts with the pre-1.0 premise. The
 proposed fix is a checked compression-level type, or validation at the writer
 boundary before any output is created.
 
-## FMT-014 - A failed io_uring submit leaves a queued request out of in_flight
-
-Reported by: write-backends [P1].
-
-In `write/uring_writer.rs` the SQE is pushed before `submit()`, but `in_flight`
-increments only after a successful submit, so a submit error leaves a queued
-request uncounted. Sequence: request A is counted, request B is queued, B's
-submit fails, and teardown's `submit_and_wait` submits B. If both completions
-are available, `reap_cqes` decrements a count of one twice. That panics under
-overflow checks or wraps in release, and the next drain can then wait forever
-for a completion that does not exist. This breaks the claimed drain accounting
-and complete writer teardown. The hunter's fix is to count a request when it
-enters the SQ, including requests whose submission then fails.
-
-## FMT-015 - io_uring cleanup can free buffers that outstanding writes still use
-
-Reported by: write-backends [P1].
-
-After `NUM_BUFS * 4` failed drain attempts, cleanup in `write/uring_writer.rs`
-proceeds even with `in_flight` nonzero: it skips buffer unregistration and
-drops the ring and the pool. The accompanying comment establishes that closing
-a ring is asynchronous. This violates the submission safety requirement that
-buffers stay valid for the life of their operations. That `WriteFixed` only
-reads the allocation does not make freeing it safe, because an allocator that
-reuses the storage can expose another allocation's contents to an outstanding
-output write. The retry limit needs an ownership fallback: keep the ring and
-allocation until quiescence, or deliberately abandon ownership without freeing.
-
 ## FMT-016 - DirectWriter::flush reports success after a failed finalization
 
 Reported by: write-backends [P2].

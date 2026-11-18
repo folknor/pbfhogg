@@ -317,6 +317,15 @@ pub struct FaultPlan {
     pub uring_panic_at_dispatch: AtomicU64,
     /// Handoff operations the uring writer thread has dispatched.
     pub uring_dispatch_count: AtomicU64,
+    /// The next this-many `io_uring_enter` calls of the ring writer (submit
+    /// or submit-and-wait) fail with an injected error before reaching the
+    /// kernel, leaving every pushed SQE queued. `u64::MAX` fails every one.
+    pub uring_enter_failures: AtomicU64,
+    /// Ring writers whose teardown proved quiescence and freed their pool.
+    pub uring_pools_freed: AtomicU64,
+    /// Ring writers whose teardown could not prove quiescence and kept
+    /// their pool allocated.
+    pub uring_pools_retained: AtomicU64,
 
     // --- pipelined `PbfWriter` framing (`write::writer`) ---
     /// Sequence number whose framing job panics on the executor.
@@ -792,6 +801,9 @@ impl FaultPlan {
             gzip_hook_timed_out: AtomicBool::new(false),
             uring_panic_at_dispatch: AtomicU64::new(u64::MAX),
             uring_dispatch_count: AtomicU64::new(0),
+            uring_enter_failures: AtomicU64::new(0),
+            uring_pools_freed: AtomicU64::new(0),
+            uring_pools_retained: AtomicU64::new(0),
             framing_panic_at: AtomicUsize::new(usize::MAX),
             hold_framing_at: AtomicUsize::new(usize::MAX),
             held_framing_jobs: Watched::<AtomicU64>::new(0),
@@ -1308,6 +1320,33 @@ impl FaultPlan {
         if n == self.uring_panic_at_dispatch.load(Ordering::Relaxed) {
             panic!("test-hooks: uring_writer dispatch #{n} panicking");
         }
+    }
+
+    /// Called by the uring writer before each `io_uring_enter`: the injected
+    /// error while `uring_enter_failures` is armed.
+    #[cfg(feature = "linux-io-uring")]
+    pub(crate) fn on_uring_enter(&self) -> Option<crate::Error> {
+        let armed = self
+            .uring_enter_failures
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| match n {
+                0 => None,
+                u64::MAX => Some(u64::MAX),
+                n => Some(n - 1),
+            })
+            .is_ok();
+        armed.then(|| crate::Error::internal("test-hooks: injected io_uring_enter failure"))
+    }
+
+    /// Called by the uring writer's teardown when it frees its pool.
+    #[cfg(feature = "linux-io-uring")]
+    pub(crate) fn on_uring_pool_freed(&self) {
+        self.uring_pools_freed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Called by the uring writer's teardown when it keeps its pool.
+    #[cfg(feature = "linux-io-uring")]
+    pub(crate) fn on_uring_pool_retained(&self) {
+        self.uring_pools_retained.fetch_add(1, Ordering::Relaxed);
     }
 
     // ---- single-shot selectors -------------------------------------------

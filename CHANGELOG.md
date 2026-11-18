@@ -324,6 +324,14 @@
 
 ### Fixed
 
+- The io_uring writer (`--io-uring`, `PbfWriter::to_path_uring`) no longer
+  mishandles a failed `io_uring_enter` after a write was queued: the write
+  is now counted from the moment it is queued, so teardown waits for it
+  instead of panicking on a miscount or waiting for a completion that never
+  comes, and a teardown that cannot confirm the kernel is done with its
+  buffers keeps them allocated rather than freeing memory a pending write
+  may still copy into the output. An interrupted wait (EINTR) is retried
+  instead of failing the run.
 - `build-geocode-index` stores admin boundary vertices exactly: converting
   a kept vertex back to decimicrodegrees truncated a value like
   550000006.9999999 to the unit below, so even `--admin-tolerance 0`,

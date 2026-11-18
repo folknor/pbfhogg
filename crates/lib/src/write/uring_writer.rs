@@ -25,6 +25,7 @@ use io_uring::types::Fixed;
 use std::alloc::{self, Layout};
 use std::fs::File;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -37,9 +38,11 @@ use crate::direct_io::{alloc_aligned_zeroed, round_up};
 /// Registered file descriptor index for the output file.
 const OUT_FD_IDX: u32 = 0;
 
-/// Extract the buffer index from user_data (bits 0-5).
+/// Extract the buffer index from user_data (bits 0-15). The whole field is
+/// decoded, so an index outside the pool is seen as one rather than aliasing
+/// a valid slot; `reap_cqes` checks it against the outstanding set.
 const fn ud_buf_idx(ud: u64) -> u16 {
-    (ud & 0x3F) as u16
+    (ud & 0xFFFF) as u16
 }
 
 /// Extract the expected length from user_data (bits 16+).
@@ -48,8 +51,8 @@ const fn ud_expected_len(ud: u64) -> u32 {
     (ud >> 16) as u32
 }
 
-// `NUM_BUFS` (in `crate::tunables`) is asserted there to fit the 6-bit mask in
-// [`ud_buf_idx`]; widening the pool means widening that mask.
+// `NUM_BUFS` (in `crate::tunables`) is asserted there to fit the `u64`
+// outstanding-slot mask of `UringState`; widening the pool means widening it.
 
 // ---------------------------------------------------------------------------
 // AlignedBufferPool - contiguous aligned allocation with free-list
@@ -156,7 +159,9 @@ impl Drop for AlignedBufferPool {
 /// as a `WriteFixed` SQE. CQEs are reaped to recycle buffer indices.
 struct UringState {
     ring: IoUring,
-    pool: AlignedBufferPool,
+    /// Freed only by `Drop`, and only once no request can still read it; see
+    /// there. Never dropped implicitly.
+    pool: ManuallyDrop<AlignedBufferPool>,
     /// Index of the buffer currently being filled (`None` = need to acquire).
     current_buf: Option<u16>,
     /// Bytes filled in the current buffer.
@@ -167,8 +172,16 @@ struct UringState {
     /// Updated only by `accept_buffered` after bytes have been copied/read.
     /// Completion errors still abort before `flush_final` can truncate.
     logical_size: u64,
-    /// Number of submitted but not yet completed SQEs.
-    in_flight: u32,
+    /// The slots the kernel owns, one bit per buffer index: set when the
+    /// slot's `WriteFixed` SQE is pushed (published in the SQ, whether or not
+    /// a later `io_uring_enter` succeeds in submitting it), cleared by its
+    /// one terminal CQE. Counting at push rather than at a successful submit
+    /// is what keeps a request queued by a failed submit inside the drain.
+    outstanding: u64,
+    /// A completion arrived for a slot that was not outstanding (or outside
+    /// the pool). The outstanding set no longer proves which requests are
+    /// live, so the pool is never reused or freed after this.
+    poisoned: bool,
     /// The invocation whose writer counters the ring's submits, waits and
     /// fsync record into.
     invocation: crate::host::Permit,
@@ -237,8 +250,11 @@ impl UringState {
 
     /// Submit a registered buffer as a `WriteFixed` SQE.
     ///
-    /// Handles O_DIRECT alignment padding, advances `write_offset` and
-    /// `in_flight`. Releases the buffer immediately if `data_len` is zero.
+    /// Handles O_DIRECT alignment padding. Pushing the SQE is the ownership
+    /// transfer: the slot becomes outstanding and `write_offset` advances
+    /// there, before the fallible submit, so a submit error leaves a request
+    /// the drain still waits for. Releases the buffer immediately if
+    /// `data_len` is zero.
     /// Does **not** update `logical_size`: `accept_buffered` already counted
     /// payload bytes, and alignment padding must never contribute.
     #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by IO_BUF_BYTES/NUM_BUFS
@@ -272,107 +288,137 @@ impl UringState {
         // registered fd (OUT_FD_IDX). The buffer will not be touched until the
         // CQE is reaped (enforced by the free-list protocol).
         self.push_sqe(&sqe)?;
+        self.outstanding |= 1 << buf_idx;
+        self.write_offset += aligned_len as u64;
+
         let t_submit = crate::counters::Stopwatch::start();
-        self.ring
-            .submitter()
-            .submit()
-            .map_err(|e| Error::from(e).context("io_uring submit failed"))?;
+        self.enter(0)
+            .map_err(|e| e.context("io_uring submit failed"))?;
         let metrics = self.metrics();
         metrics.uring_submit_calls.fetch_add(1, Relaxed);
         t_submit.record_ns(&metrics.uring_submit_ns);
 
-        self.write_offset += aligned_len as u64;
-        self.in_flight += 1;
-
         Ok(())
+    }
+
+    /// `io_uring_enter`: submit every queued SQE and, for `want > 0`, wait
+    /// for that many completions. An interrupted call is not a failure: the
+    /// queued entries stay queued and the next enter submits them, so EINTR
+    /// returns `Ok` and the caller's loop decides whether to enter again (the
+    /// teardown drain counts it as one of its rounds).
+    fn enter(&mut self, want: usize) -> Result<()> {
+        #[cfg(pbfhogg_test_hooks)]
+        if let Some(e) = self.invocation.faults().on_uring_enter() {
+            return Err(e);
+        }
+        let submitter = self.ring.submitter();
+        let result = if want == 0 {
+            submitter.submit()
+        } else {
+            submitter.submit_and_wait(want)
+        };
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Acquire a free buffer, reaping CQEs if necessary.
     fn acquire_buffer(&mut self) -> Result<u16> {
-        // Fast path: free buffer available.
-        if let Some(idx) = self.pool.acquire() {
-            return Ok(idx);
-        }
-        // Slow path: all buffers in-flight, wait until a buffer is freed.
         loop {
-            if self.in_flight == 0 {
+            if let Some(idx) = self.pool.acquire() {
+                // Refused before its bytes are exposed for filling: the free
+                // list and the outstanding set must never share a slot.
+                if self.outstanding & (1 << idx) != 0 {
+                    self.poisoned = true;
+                    return Err(Error::internal(
+                        "io_uring free list handed out an outstanding buffer",
+                    ));
+                }
+                return Ok(idx);
+            }
+            // All buffers outstanding: wait until one completes.
+            if self.outstanding == 0 {
                 return Err(Error::internal("no free buffers and nothing in-flight"));
             }
             self.reap_cqes(true)?;
-            if let Some(idx) = self.pool.acquire() {
-                return Ok(idx);
-            }
         }
     }
 
-    /// Push a single SQE to the submission queue, waiting for SQ space if full.
+    /// Push a single SQE to the submission queue. The ring is built with
+    /// `2 * NUM_BUFS` entries and each slot has at most one SQE outstanding,
+    /// so a full SQ is a broken invariant, not a condition to wait out (the
+    /// crate's `squeue_wait` only makes room on an SQPOLL ring, which this
+    /// writer does not build).
     fn push_sqe(&mut self, sqe: &io_uring::squeue::Entry) -> Result<()> {
-        // Safety: SQE references registered buffers/fds, validated by callers.
-        unsafe {
-            if self.ring.submission().push(sqe).is_ok() {
-                return Ok(());
-            }
-        }
-        // SQ full - wait for the kernel to drain entries, then retry.
-        self.ring
-            .submitter()
-            .squeue_wait()
-            .map_err(|e| Error::from(e).context("squeue_wait failed"))?;
-        unsafe {
-            self.ring
-                .submission()
-                .push(sqe)
-                .map_err(|_| Error::internal("io_uring SQ still full after squeue_wait"))?;
-        }
-        Ok(())
+        // Safety: the SQE references a registered buffer and the registered
+        // output fd; the buffer's slot becomes outstanding as soon as this
+        // returns, and the pool outlives every outstanding request (see
+        // `Drop`).
+        unsafe { self.ring.submission().push(sqe) }
+            .map_err(|_| Error::internal("io_uring SQ full with one SQE per registered buffer"))
     }
 
     /// Reap completed CQEs and recycle buffer indices.
     ///
-    /// If `wait` is true, blocks until at least one CQE is available.
+    /// If `wait` is true, enters the ring and blocks until at least one CQE
+    /// is available. Visible completions are harvested even when that enter
+    /// fails, and the whole visible batch is validated before the first
+    /// error (enter, write or protocol) is returned, so a later bad CQE is
+    /// never left for a drain that sees nothing outstanding.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // ud as u16, result as u32: io_uring CQE fields
     fn reap_cqes(&mut self, wait: bool) -> Result<()> {
-        if self.in_flight == 0 {
-            return Ok(());
-        }
-        if wait {
+        let mut first: Option<Error> = None;
+        if wait && self.outstanding != 0 && !self.poisoned {
             let t_wait = crate::counters::Stopwatch::start();
-            self.ring
-                .submitter()
-                .submit_and_wait(1)
-                .map_err(|e| Error::from(e).context("io_uring submit_and_wait failed"))?;
+            if let Err(e) = self.enter(1) {
+                first = Some(e.context("io_uring submit_and_wait failed"));
+            }
             let elapsed = t_wait.elapsed_ns();
             let metrics = self.metrics();
             metrics.uring_submit_and_wait_calls.fetch_add(1, Relaxed);
             metrics.uring_submit_and_wait_ns.fetch_add(elapsed, Relaxed);
         }
-        for cqe in self.ring.completion() {
+        let count = self.pool.count;
+        let mut completion = self.ring.completion();
+        completion.sync();
+        for cqe in &mut completion {
             let ud = cqe.user_data();
             let buf_idx = ud_buf_idx(ud);
             let expected_len = ud_expected_len(ud);
             let result = cqe.result();
-            self.in_flight -= 1;
 
-            // Release the buffer slot on every CQE, success or failure.
-            // Previously only the success path ran release, so a
-            // kernel-level error or short write leaked the slot. The
-            // writer typically tears down on error anyway, but keep the
-            // pool accounting consistent so any code path that tries to
-            // observe `pool.free_count()` or continue past an error
-            // sees a sane state.
+            if buf_idx >= count || self.outstanding & (1 << buf_idx) == 0 {
+                // A completion this writer cannot attribute to a live
+                // request: the outstanding set stops being a proof.
+                self.poisoned = true;
+                first.get_or_insert_with(|| {
+                    Error::internal(format!(
+                        "io_uring completion for buffer {buf_idx}, which was not outstanding"
+                    ))
+                });
+                continue;
+            }
+            // The one terminal CQE retires the slot, success or failure.
+            self.outstanding &= !(1 << buf_idx);
             self.pool.release(buf_idx);
 
             if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result).into());
-            }
-            if result.cast_unsigned() != expected_len {
-                return Err(Error::io_kind(
-                    io::ErrorKind::WriteZero,
-                    format!("io_uring short write: expected {expected_len} bytes, got {result}"),
-                ));
+                first.get_or_insert_with(|| io::Error::from_raw_os_error(-result).into());
+            } else if result.cast_unsigned() != expected_len {
+                first.get_or_insert_with(|| {
+                    Error::io_kind(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "io_uring short write: expected {expected_len} bytes, got {result}"
+                        ),
+                    )
+                });
             }
         }
-        Ok(())
+        drop(completion);
+        first.map_or(Ok(()), Err)
     }
 
     /// The writer counters of this ring's invocation.
@@ -382,40 +428,49 @@ impl UringState {
 
     /// Drain all in-flight SQEs.
     fn drain(&mut self) -> Result<()> {
-        while self.in_flight > 0 {
+        while self.outstanding != 0 {
+            if self.poisoned {
+                return Err(Error::internal(
+                    "io_uring completion accounting lost; cannot drain",
+                ));
+            }
             self.reap_cqes(true)?;
         }
-        Ok(())
+        // A completion visible with nothing outstanding is unattributable;
+        // inspect the CQ once more so it poisons the state rather than
+        // surviving finalization.
+        self.reap_cqes(false)
     }
 
     /// Drain in-flight SQEs on the teardown path, ignoring their outcomes.
     ///
     /// [`drain`](Self::drain) stops at the first failing CQE, which is exactly
-    /// the case teardown has to survive: `reap_cqes` decrements `in_flight`
-    /// before returning the error, so the remaining completions are still
+    /// the case teardown has to survive: the remaining completions are still
     /// pending when the state is dropped. This keeps reaping until the ring is
-    /// quiet.
+    /// quiet, or until the round cap.
     ///
     /// This is best-effort cleanup, not a wall-clock shutdown guarantee.
-    /// The round cap only limits retries after errors: `submit_and_wait(1)`
-    /// itself has no deadline, and a submit error need not consume a CQE.
-    /// Keep the blocking drain here because returning on a timer would not
-    /// establish that registered buffers are no longer in use. The io-uring
-    /// dependency's `IoUring::drop` unmaps the queues and closes the fd; it
-    /// does not expose a timed quiescence handshake. Cancellation is also a
-    /// request whose completion must be observed, not a deadline guarantee.
-    /// A bounded return therefore needs a separate ownership policy for an
-    /// abandoned ring and its allocation (leak them, or transfer them to a
-    /// reaper that may itself wait indefinitely). That changes resource and
-    /// shutdown semantics and is deliberately not hidden in a retry limit.
+    /// The round cap only limits retries after errors and interruptions (an
+    /// EINTR is one round): `submit_and_wait(1)` itself has no deadline, and a
+    /// failed enter need not consume a CQE. A poisoned state stops at once,
+    /// since no wait can restore the proof of which requests are live. If the
+    /// drain stops with requests outstanding, `Drop` keeps their buffers
+    /// alive instead of freeing them; a timed return would not have
+    /// established quiescence either, so the cap is safe only because of that
+    /// ownership fallback.
     fn drain_best_effort(&mut self) {
         let mut rounds = 0_u32;
-        while self.in_flight > 0 && rounds < u32::from(NUM_BUFS) * 4 {
+        while self.outstanding != 0 && !self.poisoned && rounds < u32::from(NUM_BUFS) * 4 {
             rounds += 1;
             if self.reap_cqes(true).is_err() {
-                // A failing CQE consumes one in-flight entry; a submit error
-                // may consume none. Retry either case up to the round cap.
+                // A failing CQE retires its slot; a failed enter may retire
+                // none. Retry either case up to the round cap.
             }
+        }
+        // Inspect what is visible without entering, so an unattributable
+        // completion poisons the state before `Drop` decides on the pool.
+        if self.reap_cqes(false).is_err() {
+            // Recorded in `poisoned` or `outstanding`; nothing to return.
         }
     }
 
@@ -437,42 +492,47 @@ impl UringState {
 /// Quiesce the ring before the registered buffers are deallocated.
 ///
 /// Every error path out of `uring_init_and_run` - a failed `write`, an error
-/// from `uring_main_loop`, a failed `flush_final` - drops `UringState` with
-/// SQEs still in flight. Field order drops `ring` before `pool`, but closing
-/// the ring fd is **not** a synchronous barrier: `io_uring_release` hands the
-/// context to `io_ring_exit_work` on a workqueue, which cancels requests and
-/// only then runs `io_sqe_buffers_unregister` to unpin the registered pages.
-/// Userspace returns from `close(2)` long before that finishes, so `pool`'s
-/// `dealloc` can hand the virtual range back to the allocator while the kernel
-/// still holds pins on it.
+/// from the delivery loop, a failed `flush_final` - drops `UringState` with
+/// SQEs possibly outstanding. Closing the ring fd is **not** a synchronous
+/// barrier: `io_uring_release` hands the context to `io_ring_exit_work` on a
+/// workqueue, which cancels requests and only then unpins the registered
+/// pages. Userspace returns from `close(2)` long before that finishes. Freeing
+/// the pool while a `WriteFixed` is still outstanding would let the allocator
+/// reissue memory the kernel then copies into the output file - another
+/// allocation's contents written to disk - so the pool is freed only on
+/// proof that nothing can read it.
 ///
-/// The consequence today is bounded, and narrower than it first looks: the
-/// only opcode this writer ever submits is `WriteFixed`, which the kernel
-/// *reads* from. A completing SQE therefore cannot scribble into memory the
-/// allocator has re-issued - it can only copy whatever now lives there into an
-/// output file that is being abandoned anyway. That is not memory corruption.
-/// It would become memory corruption the moment any read-side opcode is added
-/// (the `ReadFixed` chain this writer used to submit for `CopyRange` was
-/// exactly that shape), and it is a pin leak either way.
+/// The proof is all three of: the drain retired every outstanding slot, no
+/// completion arrived for a slot that was not outstanding, and
+/// `unregister_buffers` succeeded. Then the pool is freed here, before the
+/// ring drops. Otherwise the allocation is deliberately leaked (at most
+/// `NUM_BUFS * IO_BUF_BYTES`, on a path that needs repeated enter failures or
+/// a broken completion protocol) and the ring still drops normally: its
+/// registered file holds its own kernel reference, and the kernel's exit work
+/// cancels or waits out the requests and unpins the pages on its own
+/// schedule. Leaking the ring as well would only add a leaked descriptor and
+/// a locked-memory charge that never returns.
 ///
-/// A successful drain removes the window. There are at most `NUM_BUFS`
-/// completions outstanding, but no time bound on obtaining them. If repeated
-/// submit errors exhaust the retry cap, cleanup remains best-effort and the
-/// field-order fallback above still applies; this is not guaranteed quiescence.
-///
-/// After the drain the buffers are unregistered explicitly. The same deferred
-/// exit work is what unpins them on close, and until it runs the pages stay
-/// charged against the user's locked memory: writers opened one after another
-/// in one process (or by the same user) then refuse at `register_buffers` with
-/// ENOMEM under a limit that holds one writer comfortably. Unregistering a
-/// quiet ring unpins synchronously. Its error is ignored: on a ring that did
-/// not quiesce it fails or waits on the outstanding requests, and close
-/// remains the fallback.
+/// Unregistering explicitly on the quiet path matters on its own: the same
+/// deferred exit work is what unpins on close, and until it runs the pages
+/// stay charged against the user's locked memory, so writers opened one after
+/// another in one process (or by the same user) would refuse at
+/// `register_buffers` with ENOMEM under a limit that holds one writer
+/// comfortably. Unregistering a quiet ring unpins synchronously.
 impl Drop for UringState {
     fn drop(&mut self) {
         self.drain_best_effort();
-        if self.in_flight == 0 && self.ring.submitter().unregister_buffers().is_err() {
-            // Close unpins them later; see above.
+        let quiet = self.outstanding == 0 && !self.poisoned;
+        if quiet && self.ring.submitter().unregister_buffers().is_ok() {
+            // Safety: no request references the pool (see above), the
+            // registration is gone, and the pool is never touched again.
+            unsafe { ManuallyDrop::drop(&mut self.pool) };
+            #[cfg(pbfhogg_test_hooks)]
+            self.invocation.faults().on_uring_pool_freed();
+        } else {
+            // Retained: never freed. See above.
+            #[cfg(pbfhogg_test_hooks)]
+            self.invocation.faults().on_uring_pool_retained();
         }
     }
 }
@@ -684,10 +744,45 @@ fn uring_init_and_run(
     finish: super::Finish,
     cancel: &crate::host::Recorder,
 ) -> Result<()> {
+    let (mut state, file) = open_ring(path, cancel)?;
+
+    // Step 6: Signal successful init.
+    init_tx
+        .send(Ok(()))
+        .map_err(|_| Error::internal("constructor dropped before init completed"))?;
+
+    // Step 7: Write header, a handoff like any chunk.
+    let metrics = &cancel.metrics().writer;
+    metrics.time_handoff(|| state.write(framed_header))?;
+    metrics.record_accepted(framed_header.len() as u64);
+
+    // Step 8: The shared ordered-delivery loop, into the ring's buffers. It
+    // proves the stream complete before returning `Ok`; finalizing a short
+    // stream here would pad and `set_len` it into a well-formed-looking file.
+    deliver_in_order(
+        rx,
+        &mut UringSink {
+            state: &mut state,
+            cancel,
+            direct: super::copy_range::DirectScratch::default(),
+        },
+        expected,
+        metrics,
+    )?;
+
+    // Step 9: Flush and finalize.
+    state.flush_final(&file, finish)?;
+
+    Ok(())
+}
+
+/// Steps 1-5: build the ring, open the output, register file and pool, and
+/// hand both to a `UringState`.
+fn open_ring(path: &std::path::Path, cancel: &crate::host::Recorder) -> Result<(UringState, File)> {
     // Step 1: Declare the buffer pool. It is allocated in step 3, once the
     // output file has reported its direct I/O alignment, but declared here
-    // so that locals still drop ring first, pool second (as `UringState`'s
-    // field order does) on an error return before the state is built.
+    // so that locals drop ring first, pool second on an error return before
+    // the state is built.
     let pool: AlignedBufferPool;
 
     // Step 2: Create io_uring ring.
@@ -743,9 +838,11 @@ fn uring_init_and_run(
     pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES, align)?;
     let iovecs = pool.iovecs();
     // Safety: iovecs point into the pool allocation, which outlives the
-    // ring's use of it (`UringState` drains and unregisters before the pool
-    // drops, and on an early return `pool`, declared before `ring`, drops
-    // after it).
+    // ring's use of it: `UringState` frees it only after a drain and a
+    // successful unregister. On an early return before the state exists no
+    // SQE was ever pushed, so `pool` (declared before `ring`, so dropped
+    // after it) frees memory no request can read; a failed registration is
+    // rolled back by the kernel.
     unsafe { ring.submitter().register_buffers(&iovecs) }
         .map_err(|e| classify_register_failure(e, memlock_soft_limit()))?;
     cancel
@@ -754,45 +851,20 @@ fn uring_init_and_run(
         .uring_registered_buffers
         .fetch_add(u64::from(NUM_BUFS), Relaxed);
 
-    // Step 6: Signal successful init.
-    init_tx
-        .send(Ok(()))
-        .map_err(|_| Error::internal("constructor dropped before init completed"))?;
-
-    let mut state = UringState {
+    // The state owns ring and pool from here on, before the next fallible
+    // step (the init signal), so every later exit goes through its `Drop`.
+    let state = UringState {
         ring,
-        pool,
+        pool: ManuallyDrop::new(pool),
         current_buf: None,
         current_len: 0,
         write_offset: 0,
         logical_size: 0,
-        in_flight: 0,
+        outstanding: 0,
+        poisoned: false,
         invocation: cancel.permit(),
     };
-
-    // Step 7: Write header, a handoff like any chunk.
-    let metrics = &cancel.metrics().writer;
-    metrics.time_handoff(|| state.write(framed_header))?;
-    metrics.record_accepted(framed_header.len() as u64);
-
-    // Step 8: The shared ordered-delivery loop, into the ring's buffers. It
-    // proves the stream complete before returning `Ok`; finalizing a short
-    // stream here would pad and `set_len` it into a well-formed-looking file.
-    deliver_in_order(
-        rx,
-        &mut UringSink {
-            state: &mut state,
-            cancel,
-            direct: super::copy_range::DirectScratch::default(),
-        },
-        expected,
-        metrics,
-    )?;
-
-    // Step 9: Flush and finalize.
-    state.flush_final(&file, finish)?;
-
-    Ok(())
+    Ok((state, file))
 }
 
 /// The io_uring byte path for [`deliver_in_order`]: copy into the ring's
@@ -1016,6 +1088,115 @@ mod tests {
                 "len={len}"
             );
         }
+    }
+
+    /// A real ring on scratch for the enter-failure cells, or `None` after
+    /// announcing a skip on a platform refusal.
+    #[cfg(pbfhogg_test_hooks)]
+    fn hooked_ring(
+        dir: &std::path::Path,
+        call: &crate::host::Recorder,
+    ) -> Option<(UringState, File)> {
+        match open_ring(&dir.join("uring-enter-fault.bin"), call) {
+            Ok(opened) => Some(opened),
+            Err(e) => {
+                Refusals::Skip.skip_or_panic(&e, &["io-uring", "direct-io"], 0);
+                None
+            }
+        }
+    }
+
+    /// A submit that fails after its SQE was pushed leaves that request
+    /// queued; the next enter submits it. It must be counted outstanding
+    /// from the push, so the drain retires both requests exactly once and
+    /// both buffers land at their offsets. Counting only after a successful
+    /// submit retired two completions against a count of one.
+    #[cfg(pbfhogg_test_hooks)]
+    #[test]
+    fn a_failed_submit_keeps_its_queued_write_outstanding() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "io_uring failed submit",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
+        let dir = crate::path_guard::tests::scratch();
+        let invocation = crate::host::Invocation::new();
+        let call = invocation.call().expect("fresh invocation");
+        let Some((mut state, file)) = hooked_ring(dir.path(), &call) else {
+            return;
+        };
+        let first = vec![7_u8; IO_BUF_BYTES];
+        let second = vec![9_u8; IO_BUF_BYTES];
+        state.write(&first).expect("first buffer submits");
+        call.faults().uring_enter_failures.store(1, Relaxed);
+        let failed = state.write(&second).expect_err("injected submit failure");
+        assert!(
+            failed.report().contains("injected io_uring_enter failure"),
+            "{}",
+            failed.report()
+        );
+        assert_eq!(
+            state.outstanding.count_ones(),
+            2,
+            "the queued write is outstanding before any drain"
+        );
+        state.drain().expect("drain submits the queued write");
+        assert_eq!(state.outstanding, 0);
+        file.set_len(state.logical_size).expect("truncate");
+        drop(state);
+        assert_eq!(call.faults().uring_pools_freed.load(Relaxed), 1);
+        assert_eq!(call.faults().uring_pools_retained.load(Relaxed), 0);
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(
+            std::fs::read(dir.path().join("uring-enter-fault.bin")).expect("read output"),
+            expected
+        );
+    }
+
+    /// A write pushed but never entered (every enter fails) stays
+    /// outstanding through the capped teardown drain, so teardown cannot
+    /// prove the kernel is done with the pool and must keep it allocated
+    /// rather than free memory a request may still read.
+    #[cfg(pbfhogg_test_hooks)]
+    #[test]
+    fn teardown_keeps_the_pool_while_a_write_is_outstanding() {
+        let _bound = pbfhogg_test_scratch::HangBound::arm(
+            crate::tunables::TEST_HANG_BOUND,
+            crate::tunables::TEST_HANG_REPORT_GRACE,
+            "io_uring retained pool",
+        );
+        let _lease = pbfhogg_test_scratch::locked_memory_lease();
+        let dir = crate::path_guard::tests::scratch();
+        let invocation = crate::host::Invocation::new();
+        let call = invocation.call().expect("fresh invocation");
+        let Some((mut state, _file)) = hooked_ring(dir.path(), &call) else {
+            return;
+        };
+        // The write's own submit, then every round of the teardown drain:
+        // a budget that reaches zero proves the drain ran to its cap.
+        let budget = 1 + u64::from(NUM_BUFS) * 4;
+        call.faults().uring_enter_failures.store(budget, Relaxed);
+        state
+            .write(&vec![5_u8; IO_BUF_BYTES])
+            .expect_err("injected submit failure");
+        assert_eq!(state.outstanding.count_ones(), 1);
+        // Teardown keeps a retained pool registered, and the kernel's
+        // deferred unpin on close can outlast the memlock lease, refusing the
+        // next test's registration. Nothing was ever entered (every enter
+        // fails before the syscall), so the kernel holds no request and the
+        // test can unpin synchronously now; teardown's decision rests on the
+        // outstanding slot alone and is unchanged by it.
+        state
+            .ring
+            .submitter()
+            .unregister_buffers()
+            .expect("unregister an idle ring");
+        drop(state);
+        assert_eq!(call.faults().uring_enter_failures.load(Relaxed), 0);
+        assert_eq!(call.faults().uring_pools_retained.load(Relaxed), 1);
+        assert_eq!(call.faults().uring_pools_freed.load(Relaxed), 0);
     }
 
     /// The registration refusal is attributed to the memlock limit only on

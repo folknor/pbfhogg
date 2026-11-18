@@ -47,7 +47,7 @@ use crate::tunables::{
 
 use stage1::stage1_way_pass;
 use stage2::{SlotBuckets, stage2_node_join};
-use stage3::{IntegratedInputs, SlotBucketRef, stage3_slot_reorder};
+use stage3::{IntegratedInputs, stage3_slot_reorder};
 use stage4::stage4_assembly;
 
 /// What this backend would refuse in an input's indexdata, or would not be
@@ -1296,14 +1296,14 @@ pub(crate) fn external_join_in(
     // tripled the summed pread time on europe (see
     // `InputSource::open_random_access`).
     let input_pbf = crate::read::input::InputFile::open(input)?;
-    let resolved_count = stage2_node_join(
+    let (resolved_count, slot_bucket_manifest) = stage2_node_join(
         scratch,
         &id_bucket_counts,
         num_shard_workers,
         stage1_out_format,
         bucket_layout_ref,
         &way_slot_starts,
-        &slot_buckets,
+        slot_buckets,
         slot_bucket_count,
         total_slots,
         &input_pbf,
@@ -1360,25 +1360,15 @@ pub(crate) fn external_join_in(
         })
         .collect::<crate::Result<_>>()?;
 
-    let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
-        .map(|i| {
-            let path = radix::slot_bucket_path(scratch, i)?;
-            Ok(std::fs::metadata(path.as_path())
-                .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
-                .unwrap_or(0))
-        })
-        .collect::<crate::Result<_>>()?;
+    // Stage 3's per-bucket counts are stage 2's committed counts, never the
+    // files' observed lengths (see `SharedSlotBuckets::into_manifest`).
     // Slot-bucket balance twin of the id-bucket counters above; min is
     // over nonempty buckets.
     {
-        let max_entries: u64 = slot_entry_counts.iter().copied().max().unwrap_or(0);
-        let min_entries: u64 = slot_entry_counts
-            .iter()
-            .copied()
-            .filter(|&c| c > 0)
-            .min()
-            .unwrap_or(0);
-        let nonempty = slot_entry_counts.iter().filter(|&&c| c > 0).count();
+        let counts = || slot_bucket_manifest.buckets.iter().map(|&(_, n)| n);
+        let max_entries: u64 = counts().max().unwrap_or(0);
+        let min_entries: u64 = counts().filter(|&c| c > 0).min().unwrap_or(0);
+        let nonempty = counts().filter(|&c| c > 0).count();
         host.invocation
             .counter("extjoin_slot_bucket_max_entries", max_entries);
         host.invocation
@@ -1386,13 +1376,6 @@ pub(crate) fn external_join_in(
         host.invocation
             .counter("extjoin_slot_buckets_nonempty", nonempty);
     }
-    let slot_paths: Vec<crate::scratch::ScratchPath> = (0..slot_bucket_count)
-        .map(|i| radix::slot_bucket_path(scratch, i))
-        .collect::<crate::Result<_>>()?;
-    let slot_bucket_ref = SlotBucketRef {
-        paths: slot_paths,
-        entry_counts: slot_entry_counts,
-    };
 
     // The streaming router: pre-populates `Empty` entries for zero-ref
     // way blobs so stage 4 never waits on a blob that stage 3 would
@@ -1429,7 +1412,7 @@ pub(crate) fn external_join_in(
     let member_way_ids_ref = relation_member_node_ids
         .as_ref()
         .and_then(|scan| scan.member_way_ids.as_ref());
-    let slot_bucket_ref_ref = &slot_bucket_ref;
+    let slot_bucket_ref_ref = &slot_bucket_manifest;
     let inject_metrics = super::inject_metrics::InjectMetrics::default();
     let inject_metrics_ref = &inject_metrics;
 
@@ -1446,7 +1429,6 @@ pub(crate) fn external_join_in(
             };
             let result = stage3_slot_reorder(
                 slot_bucket_ref_ref,
-                slot_bucket_count,
                 total_slots,
                 &integrated,
                 num_workers,

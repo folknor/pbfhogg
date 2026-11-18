@@ -417,9 +417,13 @@ builds no negative rank index.
 sorted + indexed input):
 1. Way pass → emit `(node key, slot_pos)` records into 256 node-key buckets
 2. Node join → per bucket, sort by node key, merge-join against the node
-   stream (pread workers), emit resolved coords into slot buckets
-3. Slot reorder → per bucket, sort by slot_pos, emit blob-ordered
-   delta-varint `coord_payloads`
+   stream (pread workers), emit resolved coords into slot buckets; the
+   per-bucket entry counts stage 2 committed are handed to stage 3 as the
+   bucket manifest, and their sum must equal the resolved count
+3. Slot reorder → per bucket, read exactly the manifest's entries (a file
+   shorter or longer is refused; a zero-count bucket is not opened),
+   scatter them by bucket-local slot, emit blob-ordered delta-varint
+   `coord_payloads`
 4. Assembly → pread workers reframe way blobs, splicing coord payloads
 
 Bounded memory with high scratch-disk demand. See

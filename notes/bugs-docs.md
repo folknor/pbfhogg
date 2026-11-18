@@ -249,3 +249,12 @@ planning four node shards). The negative-ID fallback wording in these files
 is already corrected; the rest needs checking against the planner's actual
 cuts before rewording, since some assertions may depend on how many units a
 fixture is cut into.
+
+## DOC-025 - CORRECTNESS.md describes two frame-check funnels
+
+Reported by: the FMT-001 scout (2026-11-18), not verified by an
+implementer.
+
+The "BlobHeader.datasize cap" section of `CORRECTNESS.md` still describes
+two separate frame-check funnels, while `crates/lib/src/read/frame.rs` has
+had a single frame state machine since `307982d7`.

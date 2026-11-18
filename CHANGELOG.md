@@ -324,6 +324,14 @@
 
 ### Fixed
 
+- `add-locations-to-ways --index-type external` (and Auto when it routes
+  there) no longer publishes ways with vertices at (0, 0) when it cannot
+  read a scratch slot bucket back. A failed `stat` on a bucket used to be
+  read as "empty", so every resolved vertex in that bucket was written as
+  (0, 0) with no missing location reported, even without
+  `--ignore-missing-nodes`. The run now fails (exit 2) with nothing
+  published, as it also does when a bucket file is shorter or longer
+  than what the run wrote to it.
 - `PrimitiveBlock::from_vec` refuses a buffer over 256 MiB with
   `ErrorKind::WireFormat`. A buffer of 4 GiB or more used to wrap the
   block's internal string-table offsets, so string lookups could return

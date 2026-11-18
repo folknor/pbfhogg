@@ -570,6 +570,35 @@ the ordered pools is not decided by these cells.
 
 ### Add-locations-to-ways
 
+#### Slot bucket counts from stage 2's manifest (baseline `ca672c71`, bygg, 2026-11-18)
+
+Stage 3 takes each slot bucket's entry count from stage 2's committed
+counts instead of a `stat` per bucket, reads exactly that many bytes plus
+a one-byte probe, and stage 2's slot writers close before streaming. That
+is per-bucket work, not per-entry work. `embed-locations --dataset planet
+--index-type external`, `--iterations 1`, no trim available; A built with
+`--commit ca672c71`, B the uncommitted variant on it. Wall and the
+`EXTJOIN_STAGE1` and `EXTJOIN_STREAMING` spans (stage 1 is code the change
+does not touch; streaming holds stage 3):
+
+| Cell | UUID | Wall | Stage 1 | Streaming |
+|---|---|---:|---:|---:|
+| A1 | `2476b356` | 312 s | 22.6 s | 129.5 s |
+| B1 | `83af586a` | 342 s | 27.5 s | 142.2 s |
+| A2 | `c8852ded` | 371 s | 58.8 s | 138.5 s |
+| B2 | `dda5f930` | 419 s | 72.4 s | 162.3 s |
+| B3 | `23bc3f11` | 434 s | 78.8 s | 160.8 s |
+| A3 | `ace6cfbb` | 423 s | 77.4 s | 155.9 s |
+| A4 | `64654984` | 430 s | 74.1 s | 159.9 s |
+| B4 | `2e6e0a67` | 435 s | 83.0 s | 158.4 s |
+
+Every cell ran slower than the one before it until about B3. That is drive
+state from back-to-back planet scratch with no trim, and it penalised each
+B that followed an A, in the untouched stage 1 as much as in streaming.
+Once the drift levelled off, the pairs read +2.6 % (B first) and +1.2 %
+(A first) on wall, and B4's streaming span is 1.5 s shorter than A4's.
+Neutral: no cost on the measured path.
+
 #### External joins negative IDs (baseline `69f83b46`, bygg, 2026-11-18)
 
 The external join gained two node-key families, the metadata-scan decode

@@ -170,21 +170,6 @@ pool that uses every reported core. This contradicts the documented rule in
 `docs/cli/commands.md` that `N` caps worker pools at `N`. These are
 compression workers, not the separately exempted reader or drain threads.
 
-## CMD-012 - A scratch stat failure moves resolved vertices to Null Island
-
-Reported by: altw [P1].
-
-The external stage 2 to 3 handoff (`altw/external/mod.rs`) turns every failed
-bucket `stat` into zero entries with `unwrap_or(0)`. Stage 3 then takes its
-empty-bucket branch (`stage3.rs`), skips reading the bucket and generates zero
-coordinates. Missing-location accounting still uses stage 2's earlier resolved
-count, so the ordinary CLI can publish corrupted geometry reporting zero
-missing locations, even without `--ignore-missing-nodes`. This breaks the
-refusal-on-partial-failure contract and the missing-location publication
-guarantee. Stage 2 already keeps authoritative bucket counts, so the handoff
-should carry and verify an explicit bucket manifest instead of filesystem
-observations that suppress errors.
-
 ## CMD-013 - A stage 3 startup failure can deadlock the external ALTW pipeline
 
 Reported by: altw [P1].

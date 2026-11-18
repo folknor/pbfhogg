@@ -336,8 +336,9 @@ impl pbfhogg::debug::InstrumentSink for Counters {
 /// rendezvous holds the four stage 3 workers (the stage's cap) each with a
 /// slot bucket file open, and stage 4 with its shared input and output
 /// writer open, until all have arrived, on top of what earlier stages
-/// still hold (the slot bucket writers, stage 2's input, the payload
-/// files, the pin, the output staging and the scratch lock). The arms are
+/// still hold (stage 2's input, the payload files, the pin, the output
+/// staging and the scratch lock; stage 2's slot bucket writers are closed
+/// before streaming starts). The arms are
 /// External with buffered output, Auto routed to external (memory one byte
 /// above the sparse allowance changes routing, not worker sizing), and
 /// External with O_DIRECT and with io_uring output (the direct writer's

@@ -11,11 +11,7 @@ use super::coord_payloads::{
 };
 use super::{COORD_SLOT_SIZE, RE_OFF_LAT, RE_OFF_LOCAL_SLOT_POS, RE_OFF_LON, RESOLVED_ENTRY_SIZE};
 
-/// Lightweight reference to slot bucket paths + counts for stage 3.
-pub(super) struct SlotBucketRef {
-    pub(super) paths: Vec<crate::scratch::ScratchPath>,
-    pub(super) entry_counts: Vec<u64>,
-}
+use super::stage2::SlotBucketManifest;
 
 /// Inputs needed for the integrated dual-emit path. In the streaming
 /// design (Commit B of #2), stage 3 publishes directly to the
@@ -51,6 +47,57 @@ crate::counters::counter_set! {
         tmp_pwrite_ns => "s3_tmp_pwrite_ms" / 1_000_000,
         tmp_pwrite_calls => "s3_tmp_pwrite_calls",
     }
+}
+
+/// Read slot bucket `path` into `data_buf`, which must come back exactly
+/// `expected_len` bytes long: the length the stage 2 manifest committed.
+/// The manifest, not the file, sizes the read, so a file grown past it
+/// cannot drive the allocation; a short or long file is refused, never
+/// read as fewer or more entries. I/O errors keep their kind.
+///
+/// This holds the file to its length, not its contents. The run's scratch
+/// directory is trusted (ADR-0018): a same-length file whose records were
+/// altered (one slot's entry overwritten with another's, say) is not
+/// detected, because catching it would take a per-entry presence check in
+/// the scatter loop, a hot-path cost that defends only against corrupt
+/// scratch. The guard here is against our own code turning a failure it
+/// observed into an answer, as a failed `stat` read as an empty bucket once
+/// did.
+fn read_slot_bucket(
+    file: &crate::scratch::ScratchFile,
+    path: &crate::scratch::ScratchPath,
+    expected_len: usize,
+    data_buf: &mut Vec<u8>,
+) -> crate::Result<()> {
+    use std::io::Read;
+    let read_error = |e: std::io::Error| {
+        Error::from(e).context(format!("failed to read slot bucket {}", path.display()))
+    };
+    data_buf.clear();
+    data_buf.reserve_exact(expected_len);
+    (&mut &*file)
+        .take(expected_len as u64)
+        .read_to_end(data_buf)
+        .map_err(read_error)?;
+    let mut probe = [0u8; 1];
+    // loop-ends: retries only an interrupted read; any result or other
+    // error leaves.
+    let extra = loop {
+        match (&mut &*file).read(&mut probe) {
+            Ok(n) => break n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(read_error(e)),
+        }
+    };
+    if data_buf.len() != expected_len || extra != 0 {
+        return Err(Error::internal(format!(
+            "slot bucket {} holds {}{} bytes, but stage 2 wrote {expected_len}",
+            path.display(),
+            data_buf.len(),
+            if extra == 0 { "" } else { " or more" },
+        )));
+    }
+    Ok(())
 }
 
 #[hotpath::measure]
@@ -96,14 +143,14 @@ fn scatter_bucket_entries(
     Ok(stores)
 }
 
-/// Pre-allocates the output file to `total_slots * 8` bytes (zero-filled
-/// by the OS). Empty buckets need no explicit zero-write - the file is
-/// already zeroed.
+/// Scatters each slot bucket into a zero-filled buffer and emits the way
+/// blobs it covers to the router. A bucket's entry count comes from the
+/// stage 2 manifest: a zero-count bucket is not opened, and its slots stay
+/// zero.
 #[hotpath::measure]
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub(super) fn stage3_slot_reorder(
-    slot_buckets: &SlotBucketRef,
-    slot_bucket_count: usize,
+    slot_buckets: &SlotBucketManifest,
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
     num_workers: usize,
@@ -115,6 +162,8 @@ pub(super) fn stage3_slot_reorder(
     // sized so that range_size >= max_blob_slots - preserving the
     // 2-piece straddler invariant for small inputs. (See
     // `ResolvedEntry::slot_bucket` for the matching routing logic.)
+    let buckets = slot_buckets.buckets.as_slice();
+    let slot_bucket_count = buckets.len();
     let range_size = total_slots / slot_bucket_count as u64;
 
     // `num_workers` is sized by the caller, which opens exactly that many
@@ -149,8 +198,6 @@ pub(super) fn stage3_slot_reorder(
     let next_ref = &next_idx;
     let c = &counters;
     let err_ref = &s3_error;
-    let entry_counts = &slot_buckets.entry_counts;
-    let paths = &slot_buckets.paths;
 
     let ctx = integrated;
     let router = ctx.router;
@@ -246,7 +293,8 @@ pub(super) fn stage3_slot_reorder(
                     // wrap.
                     let bucket_slots = bucket_end - bucket_start;
 
-                    if entry_counts[bucket_idx] == 0 {
+                    let (bucket_path, bucket_entries) = &buckets[bucket_idx];
+                    if *bucket_entries == 0 {
                         // No resolved entries landed in this bucket, but blobs
                         // can still overlap its slot range (all-zero coords).
                         // Classify intersections and emit matching zero-coord
@@ -287,13 +335,24 @@ pub(super) fn stage3_slot_reorder(
                         scatter_buf.clear();
                         scatter_buf.resize(bucket_bytes, 0);
 
+                        // At most one entry per slot, so a count above the
+                        // span is a stage 2 bug; within it, the byte length
+                        // is representable (`validate_slot_layout`).
+                        let expected_len = (*bucket_entries <= bucket_slots)
+                            .then(|| bucket_entries.checked_mul(RESOLVED_ENTRY_SIZE as u64))
+                            .flatten()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .ok_or_else(|| Error::internal(format!(
+                                "slot bucket {bucket_idx} manifest count {bucket_entries} \
+                                 exceeds its {bucket_slots} slots"
+                            )))?;
                         let t_open = crate::counters::Stopwatch::start();
                         data_buf.clear();
                         let bucket_file =
-                            crate::scratch::open(&paths[bucket_idx]).map_err(|e| {
+                            crate::scratch::open(bucket_path).map_err(|e| {
                                 Error::from(e).context(format!(
                                     "failed to open slot bucket {}",
-                                    paths[bucket_idx].display()
+                                    bucket_path.display()
                                 ))
                             })?;
                         t_open.record_ms(&c.open_ms);
@@ -306,13 +365,8 @@ pub(super) fn stage3_slot_reorder(
                         );
 
                         let t_read = crate::counters::Stopwatch::start();
-                        std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf).map_err(
-                            |e| {
-                                Error::from(e).context(format!(
-                                    "failed to read slot bucket {}",
-                                    paths[bucket_idx].display()
-                                ))
-                            },
+                        read_slot_bucket(
+                            &bucket_file, bucket_path, expected_len, &mut data_buf,
                         )?;
                         if crate::fadvise::evict_scratch(&bucket_file, cancel) {
                             c.fadvise_calls.fetch_add(1, Relaxed);
@@ -542,10 +596,11 @@ fn emit_integrated_intersections(
 
 #[cfg(test)]
 mod tests {
-    use super::{IntegratedInputs, SlotBucketRef, stage3_slot_reorder};
+    use super::{IntegratedInputs, stage3_slot_reorder};
     use crate::commands::altw::external::coord_payloads::{
         ConcurrentBlobLocationRouter, PayloadFile, parse_per_way_refcount_sidecar_bytes,
     };
+    use crate::commands::altw::external::stage2::SlotBucketManifest;
     use std::sync::Arc;
 
     #[test]
@@ -577,14 +632,16 @@ mod tests {
             router: &router,
             inject_prepass: false,
         };
-        let slot_buckets = SlotBucketRef {
-            paths: Vec::new(),
-            entry_counts: vec![0, 0],
+        // Named but never created: a zero-count bucket must not be opened.
+        let slot_buckets = SlotBucketManifest {
+            buckets: vec![
+                (scratch.file("slots-0").expect("name"), 0),
+                (scratch.file("slots-1").expect("name"), 0),
+            ],
         };
 
         let err = stage3_slot_reorder(
             &slot_buckets,
-            2,
             100,
             &integrated,
             1,
@@ -597,5 +654,39 @@ mod tests {
         assert!(router_err.to_string().contains("stage 3 worker 0 error"));
         assert!(router_err.to_string().contains("blob 0 slot range"));
         assert!(!router_err.to_string().contains("panicked"));
+    }
+
+    /// A slot bucket is held to the length stage 2 committed: a file
+    /// shorter or longer than the manifest says is refused, not read as
+    /// fewer or more entries.
+    #[test]
+    fn slot_bucket_read_is_held_to_the_manifest_length() {
+        let temp = crate::path_guard::tests::scratch();
+        let scratch = crate::scratch::RunScratch::create(
+            temp.path(),
+            &crate::host::Host::for_tests().entered(),
+        )
+        .expect("run scratch");
+        let path = scratch.file("slots-0").expect("name");
+        std::fs::write(path.as_path(), [7u8; 24]).expect("write bucket");
+        let read = |expected: usize| {
+            let file = crate::scratch::open(&path).expect("open bucket");
+            let mut buf = Vec::new();
+            super::read_slot_bucket(&file, &path, expected, &mut buf).map(|()| buf)
+        };
+
+        assert_eq!(read(24).expect("exact length"), vec![7u8; 24]);
+        let short = read(36).expect_err("a short file must be refused");
+        assert!(
+            short
+                .to_string()
+                .contains("holds 24 bytes, but stage 2 wrote 36"),
+            "{short}"
+        );
+        let long = read(12).expect_err("a long file must be refused");
+        assert!(
+            long.to_string().contains("holds 12 or more bytes"),
+            "{long}"
+        );
     }
 }

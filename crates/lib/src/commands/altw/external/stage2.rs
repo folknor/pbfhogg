@@ -273,6 +273,34 @@ impl SharedSlotBuckets {
         Error::from(err).context(format!("failed to write slot bucket {path}"))
     }
 
+    /// Close the writers and hand stage 3 the manifest. Only after
+    /// [`Self::finish`] succeeded, so every count is on disk.
+    ///
+    /// The manifest's counts are the ones [`flush_slot_buffer`] advanced
+    /// after each successful `write_all`, so they are what stage 2 committed
+    /// to each file. Stage 3 trusts them, never a filesystem observation: a
+    /// bucket's file length used to be read back by `stat`, and a failed
+    /// `stat` became "empty", which published every vertex of that bucket at
+    /// (0, 0) with no missing location reported.
+    fn into_manifest(self) -> SlotBucketManifest {
+        let Self {
+            writers,
+            entry_counts,
+            paths,
+        } = self;
+        drop(writers);
+        SlotBucketManifest {
+            buckets: paths
+                .into_iter()
+                .zip(
+                    entry_counts
+                        .into_iter()
+                        .map(std::sync::atomic::AtomicU64::into_inner),
+                )
+                .collect(),
+        }
+    }
+
     /// Flush every bucket and, on Linux, write it back and advise it out of
     /// the page cache, counting each advice into `counters`. Runs once, at
     /// the end of [`stage2_node_join`], after its workers have joined.
@@ -330,6 +358,13 @@ impl SharedSlotBuckets {
     }
 }
 
+/// Stage 2's slot bucket files as committed: each bucket's path and the
+/// number of `ResolvedEntry` records stage 2 wrote to it. The only source
+/// of stage 3's per-bucket counts.
+pub(super) struct SlotBucketManifest {
+    pub(super) buckets: Vec<(crate::scratch::ScratchPath, u64)>,
+}
+
 /// Parallel stage 2: N workers each claim id buckets via atomic
 /// dispatch, load + sort the bucket's records, find the contiguous run
 /// of node blobs whose key span in the bucket's family intersects the
@@ -337,7 +372,9 @@ impl SharedSlotBuckets {
 /// node tuples in lockstep, and emit `ResolvedEntry` to per-bucket slot
 /// writers (256 files total, per-bucket mutex). Returns the count of
 /// records that found their node in the key-sorted tuple stream -
-/// presence, not non-zero-ness; see the counting site in [`walk_blob`].
+/// presence, not non-zero-ness; see the counting site in [`walk_blob`] -
+/// and the manifest of what was written to each slot bucket, whose counts
+/// sum to it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stage2_node_join(
     scratch: &RunScratch,
@@ -346,7 +383,7 @@ pub(super) fn stage2_node_join(
     format: ShardFormat,
     layout: &NodeKeyLayout,
     way_slot_starts: &[u64],
-    slot_buckets: &SharedSlotBuckets,
+    slot_buckets: SharedSlotBuckets,
     slot_bucket_count: usize,
     total_slots: u64,
     input_pbf: &crate::read::input::InputFile,
@@ -354,14 +391,14 @@ pub(super) fn stage2_node_join(
     node_spans: &NodeSpans,
     inject_prepass: bool,
     host: &crate::host::Entered<'_>,
-) -> Result<u64> {
+) -> Result<(u64, SlotBucketManifest)> {
     let job = Stage2Job {
         scratch,
         id_bucket_counts,
         num_shard_workers,
         layout,
         way_slot_starts,
-        slot_buckets,
+        slot_buckets: &slot_buckets,
         slot_bucket_count,
         total_slots,
         input_pbf,
@@ -371,10 +408,25 @@ pub(super) fn stage2_node_join(
         host,
     };
     // One dispatch per stage: each record form gets its own join.
-    match format {
+    let resolved_count = match format {
         ShardFormat::Packed(codec) => node_join(codec, &job),
         ShardFormat::Wide(codec) => node_join(codec, &job),
+    }?;
+    let manifest = slot_buckets.into_manifest();
+    // Every resolved record appends exactly one entry, and a successful join
+    // drained every worker buffer, so the two tallies agree. A disagreement
+    // is a lost or doubled flush, and stage 3 would build on it.
+    let written = manifest
+        .buckets
+        .iter()
+        .try_fold(0u64, |acc, (_, n)| acc.checked_add(*n));
+    if written != Some(resolved_count) || resolved_count > total_slots {
+        return Err(Error::internal(format!(
+            "stage 2 wrote {written:?} slot bucket entries for {resolved_count} resolved \
+             references of {total_slots} slots"
+        )));
     }
+    Ok((resolved_count, manifest))
 }
 
 /// Everything stage 2 reads, shared by every worker.

@@ -503,6 +503,16 @@ publication, and is sign-neutral (a large positive start does it too). The
 fix is a split path: cut an oversized rewritten block between elements into
 two output blocks with their own indexes.
 
+## CMD-045 - The OSC parser can block on a FIFO input before refusing it
+
+Reported by: the CMD-044 spar partner (codex, 2026-11-19); not verified.
+
+The OSC parser rewinds its input after sniffing the format, so it requires a
+seekable input. Given a FIFO, the sniffing read can block (no writer, or a
+writer that never sends) before the seek fails and the input is refused. The
+claim to check is that an unseekable OSC input should be refused up front,
+not discovered after a blocking read.
+
 ## CMD-042 - External ALTW stage 4 copies its passthrough prefix after the router aborts
 
 Reported by: the stage 3 startup-deadlock item (2026-11-18), from source

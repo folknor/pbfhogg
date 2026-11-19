@@ -177,7 +177,8 @@ pub struct BuildStats {
     pub admin_polygons: u64,
     /// Relations that produced no polygon because their boundary geometry was
     /// missing, unclosed, or degenerated during simplification, or because
-    /// ring assembly exceeded its search budget (reported as a warning).
+    /// their complete member ways do not determine their rings (reported as a
+    /// warning).
     pub dropped_admin_relations: u64,
     pub fine_cells: u64,
     pub coarse_cells: u64,
@@ -771,14 +772,15 @@ fn build_from_schedules(
             dropped_admin.sample_relation_ids
         );
     }
-    if dropped_admin.over_budget > 0 {
+    if dropped_admin.ambiguous_topology > 0 {
         crate::host::diag!(
             host.diagnostics,
             Warning,
-            "geocode.pass2.admin_ring_budget",
-            "{} admin relations refused: ring assembly exceeded its search budget \
-             (counted among the dropped relations above)",
-            dropped_admin.over_budget
+            "geocode.pass2.admin_ring_topology",
+            "{} admin relations refused: their member ways do not determine their \
+             rings (branching junction, repeated segment, self-touching ring or \
+             nested lobes; counted among the dropped relations above)",
+            dropped_admin.ambiguous_topology
         );
     }
     host.invocation.marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");

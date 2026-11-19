@@ -11,7 +11,7 @@ use super::BuildConfig;
 use super::Result;
 use super::pass1::RawAdminRelation;
 use crate::error::Error;
-use crate::geo::RingSearchBudgetExceeded;
+use crate::geo::{RingMember, RingRefusal};
 
 use super::super::format::*;
 
@@ -23,19 +23,30 @@ pub(super) struct AssembledPolygon {
     pub(super) vertices: Vec<NodeCoord>,
 }
 
-/// Relations that produced no polygon. `over_budget` is the subset refused
-/// because ring assembly exceeded its step budget; it is included in `total`.
+/// Relations that produced no polygon. `ambiguous_topology` is the subset
+/// whose complete member ways do not determine their rings
+/// (`crate::geo::assemble_rings` lists the refusals; a way listed as both
+/// outer and inner is one more); it is included in `total`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct DroppedAdminRelations {
     pub(super) total: usize,
-    pub(super) over_budget: usize,
+    pub(super) ambiguous_topology: usize,
     pub(super) sample_relation_ids: Vec<i64>,
 }
 
-/// One admin member way's geometry: its coordinates when every ref
-/// resolved, `None` when the way is in the file but at least one of its
-/// nodes is not (or it has no refs).
-pub(super) type AdminWayGeometry = Option<Vec<(i32, i32)>>;
+/// A fully located admin member way: its node IDs and their coordinates,
+/// one per ref. Rings are joined by node ID, so two nodes at one coordinate
+/// stay two vertices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AdminWay {
+    pub(super) nodes: Vec<i64>,
+    pub(super) coords: Vec<(i32, i32)>,
+}
+
+/// One admin member way's geometry: the way when every ref resolved,
+/// `None` when the way is in the file but at least one of its nodes is not
+/// (or it has no refs).
+pub(super) type AdminWayGeometry = Option<AdminWay>;
 
 /// Admin member way geometry by way ID, last file occurrence winning. A way
 /// absent from the map is absent from the file.
@@ -82,8 +93,8 @@ pub(super) fn assemble_admin_polygons(
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
     // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores.
-    let per_relation: Vec<std::result::Result<Vec<AssembledPolygon>, RingSearchBudgetExceeded>> =
-        executor.install(|| {
+    let per_relation: Vec<std::result::Result<Vec<AssembledPolygon>, RingRefusal>> = executor
+        .install(|| {
             relations
                 .par_iter()
                 .map(|rel| assemble_one_relation(rel, way_geom, tolerance_m))
@@ -98,9 +109,9 @@ pub(super) fn assemble_admin_polygons(
                 super::sample_id(&mut dropped.sample_relation_ids, rel.id);
             }
             Ok(assembled) => polygons.extend(assembled),
-            Err(RingSearchBudgetExceeded) => {
+            Err(_) => {
                 dropped.total += 1;
-                dropped.over_budget += 1;
+                dropped.ambiguous_topology += 1;
                 super::sample_id(&mut dropped.sample_relation_ids, rel.id);
             }
         }
@@ -164,10 +175,12 @@ fn vertex_e7(lon_deg: f64, lat_deg: f64) -> NodeCoord {
 /// it). Pure function - no shared mutable state, safe to call from
 /// rayon workers.
 ///
-/// Relation geometry is untrusted input, so ring assembly runs under its step
-/// budget. Exceeding it on either the outer or the inner rings refuses the
-/// whole relation: a polygon assembled without its holes, or from a partial
-/// ring set, would be a silently different boundary.
+/// Rings are assembled per role by node topology (`crate::geo::assemble_rings`).
+/// A refusal on either role refuses the whole relation: a polygon assembled
+/// without its holes, or from a partial ring set, would be a silently
+/// different boundary. A way listed more than once in one role is one
+/// boundary and counts once; a way listed as both outer and inner asserts
+/// one boundary as shell and hole, and refuses the relation.
 ///
 /// Every ring is simplified on its own to `tolerance_m` (`geo::simplify_ring`
 /// states the contract). The reader's answer for this polygon is
@@ -184,7 +197,7 @@ fn assemble_one_relation(
     rel: &RawAdminRelation,
     way_geom: &WayGeometryMap,
     tolerance_m: f64,
-) -> std::result::Result<Vec<AssembledPolygon>, RingSearchBudgetExceeded> {
+) -> std::result::Result<Vec<AssembledPolygon>, RingRefusal> {
     // Extracts may contain a relation but omit member ways, or keep a member
     // way while omitting some of its nodes. Such a relation contributes no
     // polygon at all. Assembling around the hole is not safe in any form:
@@ -198,29 +211,22 @@ fn assemble_one_relation(
     //   inner turns its hole into an affirmative match.
     // The builder has no evidence that a missing member cannot affect a
     // given outer, so the relation is withheld and counted as dropped.
-    let member_geometry = |wid: &i64| way_geom.get(wid).and_then(Option::as_deref);
-    let Some(outer_segs) = rel
-        .outer_way_ids
-        .iter()
-        .map(member_geometry)
-        .collect::<Option<Vec<&[(i32, i32)]>>>()
-    else {
+    let Some(outer_members) = role_members(&rel.outer_way_ids, way_geom) else {
         return Ok(Vec::new());
     };
-    let Some(inner_segs) = rel
-        .inner_way_ids
-        .iter()
-        .map(member_geometry)
-        .collect::<Option<Vec<&[(i32, i32)]>>>()
-    else {
+    let Some(inner_members) = role_members(&rel.inner_way_ids, way_geom) else {
         return Ok(Vec::new());
     };
-    let outer_rings = crate::geo::assemble_rings_bounded(&outer_segs)?;
+    let inner_ids: rustc_hash::FxHashSet<i64> = rel.inner_way_ids.iter().copied().collect();
+    if rel.outer_way_ids.iter().any(|id| inner_ids.contains(id)) {
+        return Err(RingRefusal::AmbiguousJunction);
+    }
+    let outer_rings = crate::geo::assemble_rings(&outer_members)?;
     if outer_rings.is_empty() {
         return Ok(Vec::new());
     }
 
-    let inner_rings = crate::geo::assemble_rings_bounded(&inner_segs)?;
+    let inner_rings = crate::geo::assemble_rings(&inner_members)?;
 
     let mut result = Vec::with_capacity(outer_rings.len());
     for outer_ring in &outer_rings {
@@ -282,6 +288,23 @@ fn assemble_one_relation(
         });
     }
     Ok(result)
+}
+
+/// One role's member ways, the first occurrence of each way ID only, or
+/// `None` when any of them lacks complete geometry.
+fn role_members<'a>(way_ids: &[i64], way_geom: &'a WayGeometryMap) -> Option<Vec<RingMember<'a>>> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut members = Vec::with_capacity(way_ids.len());
+    for id in way_ids {
+        let way = way_geom.get(id)?.as_ref()?;
+        if seen.insert(*id) {
+            members.push(RingMember {
+                nodes: &way.nodes,
+                coords: &way.coords,
+            });
+        }
+    }
+    Some(members)
 }
 
 #[hotpath::measure]
@@ -422,6 +445,37 @@ mod tests {
     use crate::geocode_index::builder::BuildConfig;
     use crate::geocode_index::builder::pass1::RawAdminRelation;
 
+    /// A located way whose node IDs are derived from its coordinates, so
+    /// fixtures that share a coordinate share the node.
+    fn located(coords: Vec<(i32, i32)>) -> super::AdminWayGeometry {
+        let nodes = coords
+            .iter()
+            .map(|&(lat, lon)| (i64::from(lat) << 32) | i64::from(lon.cast_unsigned()))
+            .collect();
+        Some(super::AdminWay { nodes, coords })
+    }
+
+    fn relation(id: i64, outer: Vec<i64>, inner: Vec<i64>) -> RawAdminRelation {
+        RawAdminRelation {
+            id,
+            admin_level: 8,
+            name_offset: u32::try_from(id).unwrap(),
+            country_code_offset: 0,
+            outer_way_ids: outer,
+            inner_way_ids: inner,
+        }
+    }
+
+    fn square_e7() -> Vec<(i32, i32)> {
+        vec![
+            (550_000_000, 120_000_000),
+            (550_000_000, 121_000_000),
+            (551_000_000, 121_000_000),
+            (551_000_000, 120_000_000),
+            (550_000_000, 120_000_000),
+        ]
+    }
+
     #[test]
     fn relations_without_assembled_geometry_are_counted() {
         // The MIXED case is what makes this discriminating: an implementation
@@ -430,16 +484,7 @@ mod tests {
         // only shape that pins the count to the relations that actually
         // failed to assemble.
         let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(
-            7,
-            Some(vec![
-                (550_000_000, 120_000_000),
-                (550_000_000, 121_000_000),
-                (551_000_000, 121_000_000),
-                (551_000_000, 120_000_000),
-                (550_000_000, 120_000_000),
-            ]),
-        );
+        way_geom.insert(7, located(square_e7()));
         // In the file, but one of its nodes is not.
         way_geom.insert(8, None);
 
@@ -511,7 +556,7 @@ mod tests {
             dropped,
             DroppedAdminRelations {
                 total: 4,
-                over_budget: 0,
+                ambiguous_topology: 0,
                 sample_relation_ids: vec![1, 2, 4, 5],
             },
             "every relation without complete member geometry is dropped"
@@ -531,7 +576,7 @@ mod tests {
             (550_000_007, 120_000_007),
         ];
         let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(7, Some(ring.clone()));
+        way_geom.insert(7, located(ring.clone()));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 8,
@@ -558,66 +603,67 @@ mod tests {
         assert_eq!(stored, ring);
     }
 
-    /// A relation whose ring search exceeds the budget is refused as a whole
-    /// and counted separately, while an ordinary relation beside it still
-    /// assembles. The over-budget relation also carries a closed ring that an
-    /// unbounded search would have returned; it must not leak out alone.
+    /// Complete member ways whose rings are not determined refuse their
+    /// relation and are counted; determined shapes beside them publish every
+    /// ring, whatever surrounds them.
     #[test]
-    fn over_budget_relations_are_refused_and_counted() {
+    fn ambiguous_topology_is_refused_and_counted() {
         let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        // Leaf way first, so the first search runs through the complete graph.
-        way_geom.insert(1, Some(vec![(-1, -1), (0, 0)]));
+        // A leaf into a complete graph on 12 nodes: a block that is not a
+        // cycle, so its rings could be paired many ways.
+        way_geom.insert(1, located(vec![(-1, -1), (0, 0)]));
         let mut way_id = 2;
         let mut complete_graph = vec![1];
         for a in 0..12 {
             for b in a + 1..12 {
-                way_geom.insert(way_id, Some(vec![(a, a), (b, b)]));
+                way_geom.insert(way_id, located(vec![(a, a), (b, b)]));
                 complete_graph.push(way_id);
                 way_id += 1;
             }
         }
-        let square = vec![
-            (550_000_000, 120_000_000),
-            (550_000_000, 121_000_000),
-            (551_000_000, 121_000_000),
-            (551_000_000, 120_000_000),
-            (550_000_000, 120_000_000),
-        ];
-        way_geom.insert(1_000, Some(square));
+        way_geom.insert(1_000, located(square_e7()));
         complete_graph.push(1_000);
 
+        // A leaf followed by self-closed loops at its end node, beside a
+        // disconnected closed square. The leaf is on no ring; every loop
+        // and the square is one. This once exhausted a search budget and
+        // lost the square too.
+        let mut loops = vec![2_000];
+        way_geom.insert(2_000, located(vec![(-5_000, -5_000), (0, 0)]));
+        for k in 1..=8 {
+            let id = 2_000 + k;
+            let x = i32::try_from(k).unwrap() * 1_000;
+            way_geom.insert(id, located(vec![(0, 0), (x, 100), (x, 200), (0, 0)]));
+            loops.push(id);
+        }
+        loops.push(1_000);
+
         let relations = vec![
-            RawAdminRelation {
-                id: 1,
-                admin_level: 8,
-                name_offset: 1,
-                country_code_offset: 0,
-                outer_way_ids: complete_graph,
-                inner_way_ids: Vec::new(),
-            },
-            RawAdminRelation {
-                id: 2,
-                admin_level: 8,
-                name_offset: 2,
-                country_code_offset: 0,
-                outer_way_ids: vec![1_000],
-                inner_way_ids: Vec::new(),
-            },
+            relation(1, complete_graph, Vec::new()),
+            relation(2, loops, Vec::new()),
+            // One way as both shell and hole.
+            relation(3, vec![1_000], vec![1_000]),
+            // A way listed twice in one role is one boundary.
+            relation(4, vec![1_000, 1_000], Vec::new()),
         ];
+        let config = BuildConfig {
+            admin_tolerance_m: 0.0,
+            ..BuildConfig::default()
+        };
         let (polygons, dropped) = assemble_admin_polygons(
             &relations,
             &way_geom,
-            &BuildConfig::default(),
+            &config,
             &crate::host::Executor::for_tests(),
         );
-        assert_eq!(polygons.len(), 1);
-        assert_eq!(polygons[0].name_offset, 2);
+        let names: Vec<u32> = polygons.iter().map(|p| p.name_offset).collect();
+        assert_eq!(names, [vec![2; 9], vec![4]].concat());
         assert_eq!(
             dropped,
             DroppedAdminRelations {
-                total: 1,
-                over_budget: 1,
-                sample_relation_ids: vec![1],
+                total: 2,
+                ambiguous_topology: 2,
+                sample_relation_ids: vec![1, 3],
             }
         );
     }
@@ -744,7 +790,7 @@ mod tests {
             "the query point is inside the unsimplified boundary"
         );
         let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(1, Some(ring_e7(&outer)));
+        way_geom.insert(1, located(ring_e7(&outer)));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 8,
@@ -787,8 +833,8 @@ mod tests {
         let mainland = rect_lonlat(12.0, 51.3, 12.4, 51.45);
         let exclave = rect_lonlat(12.2, lat0, 12.2 + w_lon, lat0 + w_lat);
         let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(1, Some(ring_e7(&mainland)));
-        way_geom.insert(2, Some(ring_e7(&exclave)));
+        way_geom.insert(1, located(ring_e7(&mainland)));
+        way_geom.insert(2, located(ring_e7(&exclave)));
         let relations = vec![
             RawAdminRelation {
                 id: 1,
@@ -851,8 +897,8 @@ mod tests {
         let outer = wavy(10.0, 0.2, 2_000, 0.03, 1.7);
         let hole = wavy(10.05, 0.05, 500, 0.1, 2.3);
         let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(1, Some(ring_e7(&outer)));
-        way_geom.insert(2, Some(ring_e7(&hole)));
+        way_geom.insert(1, located(ring_e7(&outer)));
+        way_geom.insert(2, located(ring_e7(&hole)));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 4,

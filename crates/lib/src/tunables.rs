@@ -1041,11 +1041,6 @@ pub(crate) const MAX_EXTRACTS: usize = 500;
 /// short, since a query on one is at distance zero.
 pub(crate) const DEGENERATE_SEGMENT_EPSILON: f64 = 1e-30;
 
-/// Headroom, in segment placements, that `ring_search_budget` grants on top
-/// of its quadratic allowance. It is spent only at branching endpoints.
-#[cfg(feature = "commands")]
-pub(crate) const RING_SEARCH_EXTRA_STEPS: u64 = 1 << 20;
-
 // ---------------------------------------------------------------------------
 // getid
 // ---------------------------------------------------------------------------

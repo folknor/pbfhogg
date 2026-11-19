@@ -182,28 +182,58 @@ earlier one, such as the out-of-domain refusal. The build still fails and
 publishes nothing; only the reported cause can be the wrong one. Keep the
 first error (or stop the blob at it).
 
-## GEO-016 - Admin ring assembly pairs complete members ambiguously
+## GEO-017 - Assembled admin rings are not checked against crossing or shared edges
 
-Reported by: the codex spar of the missing-node geometry work.
+Reported by: the ring-assembly rewrite (node-ID biconnected blocks).
 
-On complete input, `geo::assemble_rings_bounded` (used by
-`builder/admin.rs`) joins member ways by endpoint coordinate equality and
-takes the first continuation its search finds. None of these cases needs a
-missing node:
+Rings join by node ID and ring sets must be provably disjoint within one
+connected graph, but two shapes still pass unvalidated. Rings that cross, or
+touch somewhere other than a shared node (a bow-tie built from distinct node
+IDs at crossing segments), are never tested against each other. And an edge
+shared between the outer and inner roles, or between two relations' ways,
+under different way IDs is not detected, because the both-roles refusal keys
+on way ID only. Either can publish a polygon whose even-odd interior is not
+what the relation describes. A segment-intersection pass over the assembled
+rings (or a planar-embedding validation) would close both.
 
-- Four outer ways all running from node L to node R through different
-  midpoints pair by member order; another order pairs them differently and
-  changes which points are inside.
-- A leaf way followed by many self-closed ways at the leaf's end node makes
-  the search try permutations of loops that can never return to the leaf;
-  it exhausts the budget and drops the whole relation, including a
-  disconnected, fully closed ring.
-- A self-closed member met mid-chain is swallowed into a figure-eight ring;
-  oppositely wound equal lobes give a stored area near zero, which wins the
-  reader's least-area ranking.
-- A retrace such as `A B A` passes the closure test as a ring.
-- Joining by coordinate rather than node ID lets two distinct nodes at an
-  equal E7 coordinate close a ring.
+## GEO-018 - Open ways sharing a side between two holes are refused as a theta
 
-A topology-aware assembler (node-ID graph, bridges peeled, cycles chosen by
-an explicit policy, budget per component) would settle all of them.
+Reported by: the ring-assembly rewrite.
+
+Two inner rings built from open ways that share one side form a theta graph:
+a biconnected block with a degree-3 vertex, which the assembler refuses as
+ambiguous, withholding the whole relation. The relation is well formed (two
+adjacent holes), so this is an over-refusal, the same trade as the other
+ambiguous-topology refusals. Face parity on a validated planar embedding
+would publish it; the current design deliberately refuses instead.
+
+## GEO-019 - hole_inside_outer is sensitive to tangency and ring start
+
+Reported by: the ring-assembly rewrite.
+
+The hole-ownership vote (`hole_inside_outer`, 2-2 vote among sampled
+vertices) can lose when a hole vertex lies on the outer ring's edge, and the
+outcome can depend on which vertex the hole ring starts at. Equal rings in a
+different rotation can then be assigned to a different outer or to none. Use
+a vote that excludes boundary vertices or a sample that is rotation
+invariant.
+
+## GEO-020 - Polar admin rings depend on member order through the closing edge
+
+Reported by: the ring-assembly rewrite.
+
+The reader frames a ring that winds around a pole by closing it with an edge
+that depends on where the ring starts, so member order still changes the
+answer for such rings. The assembler now keeps the start deterministic (the
+earliest source edge) but the dependence is in the reader's framing, which
+predates the rewrite. The framing should be start-invariant.
+
+## GEO-021 - The geocode verifier drops absent member ways where the builder withholds the relation
+
+Reported by: scout lateral in the ring-assembly rewrite; not verified.
+
+The verifier's `AdminModel` skips member ways that are absent from the input,
+while the producer withholds the whole relation when any member way or node
+is missing. On an extract the model can therefore expect an area the index
+does not hold. Not confirmed against a real extract; check the model before
+trusting an extract-based verify run.

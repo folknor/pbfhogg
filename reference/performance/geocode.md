@@ -12,6 +12,27 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Admin rings by node topology (bygg, 2026-11-19, variant uncommitted against `9d61febc`)
+
+Admin ring assembly replaced: members join by node ID and each graph is
+cut into biconnected blocks (a cycle block is a ring, any other block or
+a self-touching, degenerate or nested ring refuses the relation), in place
+of the budgeted endpoint-coordinate search. Pass 2b keeps every admin
+way's node IDs. Planet, full build, `--iterations 1`, after
+`sudo fstrim -av`, baseline built with `--commit HEAD`. Walls: base 114 s
+(`98348426`), variant 123 s (`a5b7acf7`, first cut with std hashing),
+variant 122 s (`deac9c4c`, Fx hashing, closed-member fast path), base
+113 s (`fc33a797`). Second pair by phase: `GEOCODE_PASS2_ADMIN_ASSEMBLY`
+1.17 s to 2.29 s, `GEOCODE_PASS2B` 6.45 s to 7.97 s, peak RSS after
+Pass 2 about 2 GB higher. `GEOCODE_PASS2A`, whose code is unchanged,
+ran 19.3 s in both base cells and 25.4 s in both variant cells, reading
+87.8 GB instead of 61.9 GB from disk; not explained by the change and not
+resolved by these cells. Output: 929,216 admin polygons instead of
+929,941, 3,049 relations dropped instead of 2,742, of which 324 are
+topology refusals (the old search refused 3 on budget). Verdict: costs
+more than noise and drops 307 more relations; held uncommitted for the
+maintainer's decision.
+
 ### Missing way nodes never join their neighbours (bygg, 2026-11-19, variant uncommitted against `80774411`)
 
 Pass 2b resolves each way's refs in one loop that records where a run of

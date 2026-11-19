@@ -357,6 +357,9 @@ struct WayWorker {
     /// Indices into `coords` where a run of consecutively resolved refs
     /// ends because the next ref was unresolved. Empty for a complete way.
     run_breaks: Vec<usize>,
+    /// The way's node IDs, filled for admin ways only: ring assembly joins
+    /// members by node identity, never by coordinate.
+    nodes: Vec<i64>,
 }
 
 struct PendingInterp {
@@ -416,6 +419,7 @@ fn resolve_way_into(
         out: state,
         coords,
         run_breaks,
+        nodes,
     } = worker;
     if state.error.is_some() {
         return;
@@ -445,7 +449,11 @@ fn resolve_way_into(
     let mut missing_node_ref_count = 0_u64;
     coords.clear();
     run_breaks.clear();
+    nodes.clear();
     for nid in crate::read::elements::WayRefIter::delta_decoded(way.refs) {
+        if is_admin_way {
+            nodes.push(nid);
+        }
         let coord = match referenced_nodes.numeric_rank_if_set(nid) {
             None => None,
             Some(rank) => {
@@ -484,7 +492,10 @@ fn resolve_way_into(
     // duplicated way ID still decides, and assembly sees why it has no
     // geometry.
     if is_admin_way {
-        let geometry = (complete && !coords.is_empty()).then(|| coords.to_vec());
+        let geometry = (complete && !coords.is_empty()).then(|| super::admin::AdminWay {
+            nodes: nodes.clone(),
+            coords: coords.to_vec(),
+        });
         state.admin_geoms.push((way_id, geometry));
     }
     if coords.is_empty() {

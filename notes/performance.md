@@ -1745,19 +1745,16 @@ Reported by: copy, osc, merge.
   the next limit once comparison work shrinks (not claimed dominant today).
 - tags-count derives its standalone kind filter only for a single kind.
 
-## PERF-062 - Ring assembly backtracks over coordinate copies
+## PERF-062 - Ring assembly allocates a graph per relation
 
 Reported by: spatial.
 
-Mechanism: `assemble_rings_search` (`geo.rs`) backtracks over endpoint
-choices while copying coordinates into speculative rings; the public API is
-unbounded (the geocode caller uses a placement budget).
+Mechanism: `geo::assemble_rings` (node-ID biconnected blocks, `geo/rings.rs`)
+builds a node graph and owned rings for every relation. The old backtracking
+search over coordinate copies is gone, and its pathological worst cases with
+it; what remains is per-relation allocation.
 
-Redesign: search over segment and orientation descriptors, materialize
-coordinates only for the chosen ring, preserving the traversal result where
-promised.
-
-Payoff: removes pathological worst cases; not a current export throughput item.
+Payoff: small; not a current export throughput item.
 
 ## PERF-063 - Geocode Pass 1.5 overflow lists are unbounded per worker
 
@@ -1778,3 +1775,28 @@ Redesign: bounded batches folded into one shared accumulator, or a
 scratch-backed sort and dedupe where the final set also needs a bound.
 
 Payoff: bounded memory on exotic ID layouts; nothing on planet-shaped input.
+
+## PERF-064 - Geocode build retains admin-way node IDs and reads more in Pass 2a
+
+Reported by: the ring-assembly rewrite.
+
+Measured on planet geocode-build at bygg, run `fc33a797` (before
+`9d61febc`) against run `deac9c4c` (the node-ID ring assembly): peak RSS
+(hwm) rose from 22.1 GB to 26.5 GB and peak anonymous memory from 13.0 GB to
+14.2 GB.
+
+Mechanism: about 1.2 GB of the anon rise is the admin-way node IDs Pass 2b
+now keeps so rings can join by node ID. The remaining roughly 3 GB is
+file-backed. It coincides with Pass 2a reading 87.8 GB from disk against
+61.9 GB and running 25.4 s against 19.3 s although Pass 2a's code is
+untouched; two interleaved pairs could not attribute that to the change or
+to cell-order page-cache state.
+
+Follow-up:
+- (a) Settle the Pass 2a and file-backed delta with balanced interleaved
+  cells (same predecessor workload per arm, trim first).
+- (b) Reduce the retained node-ID footprint: drop node IDs once a way's ring
+  topology is resolved, or store them more compactly.
+
+Payoff: about 1.2 GB anon plus whatever part of the file-backed rise the
+change owns; the roughly 2.6 s of assembly and Pass 2b cost is accepted.

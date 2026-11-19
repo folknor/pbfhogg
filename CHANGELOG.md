@@ -102,6 +102,11 @@
   collided for negative orphans and refused an orphan near the largest ID,
   which now renumbers. The old ID can no longer be recovered by
   subtraction.
+- **`geo::assemble_rings` takes ring members and can refuse.** It now takes
+  `&[RingMember]` (each member carries its node IDs as well as its
+  coordinates) and returns `Result<Vec<Ring>, RingRefusal>`, where it took
+  bare coordinate chains and returned rings. Members join by node ID, not
+  by coordinate. The bounded variant and its step budget are gone.
 
 ### Added
 
@@ -175,6 +180,18 @@
 
 ### Changed
 
+- **`build-geocode-index` assembles admin boundary rings by node ID and
+  refuses ambiguous topology.** Member ways join where they share a node,
+  not where two nodes share a coordinate, so a retrace, a figure-eight or
+  four ways between the same two nodes no longer pass as a ring or pair by
+  member order. A relation whose outer or inner ways do not form an
+  unambiguous set of disjoint rings, or that lists one way in both roles,
+  is withheld whole and counted under the new warning
+  `geocode.pass2.admin_ring_topology`, which replaces
+  `geocode.pass2.admin_ring_budget` (the search budget no longer exists).
+  More relations can be withheld than before (on planet, about 300 more of
+  roughly 3,000), and the build is slower and uses more memory (planet
+  wall about 8 s, peak RSS up about 4 GB).
 - **`merge-changes --simplify` writes survivors in canonical OSM order**
   inside each create, modify and delete group: `0`, the negative IDs by
   magnitude, then the positives, as osmium orders objects. It used to write

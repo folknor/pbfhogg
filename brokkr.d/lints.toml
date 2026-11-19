@@ -877,12 +877,9 @@ must_scan = ["crates/harness/src/scenarios/file_assertions.rs", "crates/harness/
 message = "Use bounded file_assertions helpers for dataset-sized scenario observations"
 
 # Test-run hygiene, owned by pbfhogg because the runner clears and checks
-# nothing: the pre-test entry empties data/test-scratch and records a
-# stat manifest of the checkout; the post-test entry fails if the checkout
-# changed or test scratch is not empty after a green test phase. Keep these
-# the last entries of their stages, so no other pre-test check writes after
-# the snapshot. scripts/test_tree.py states what the manifest excludes and
-# cannot see.
+# nothing: the pre-test entry empties data/test-scratch; the post-test entry
+# fails if test scratch is not empty after a green test phase. Only scratch
+# is judged, so working in the tree during a run never trips it.
 [[script_check]]
 name = "test-tree-clear-and-snapshot"
 command = "python3 -B scripts/test_tree.py clear-and-snapshot"

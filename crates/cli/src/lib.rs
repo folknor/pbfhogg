@@ -7,6 +7,16 @@
 // published by the library. clippy.toml lists the path-writing methods this
 // refuses.
 #![deny(clippy::disallowed_methods)]
+// The `Subcommand` derive on `Command` generates one `from_arg_matches` that
+// builds every variant's fields inline, so its unoptimised frame is large. It
+// runs once per process at startup, never recursively. The derive's output
+// carries no attributes of the item, so an item-level expect cannot reach it
+// (verified: it goes unfulfilled), and the crate is the narrowest scope that
+// does. Splitting the command tree only rearranges the derive's output.
+#![expect(
+    clippy::large_unopt_stack_frames,
+    reason = "clap derive output runs once at startup; its frame is only large unoptimised"
+)]
 
 mod command_paths;
 mod exit_code;

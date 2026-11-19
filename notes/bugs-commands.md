@@ -39,18 +39,26 @@ matching files and its explicit protection against successful zero-diff
 mistakes. Metadata failures need to propagate, separately from skipping
 directories.
 
-## CMD-007 - OSC output can contain characters XML forbids
+## CMD-051 - OSC readers accept characters XML 1.0 forbids
 
-Reported by: osc-parsing [P2], diff [P2].
+Reported by: the CMD-007 output fix (spar with codex).
 
-`push_attribute_escaped` (`osc/write.rs`) handles XML punctuation and
-whitespace, but neither it nor quick-xml's writer rejects XML 1.0 forbidden
-code points, and PBF string validation checks UTF-8 only. A PBF tag containing
-NUL or U+0001 reaches `write_checked_tags_xml` and is written literally, from
-diff derive, tags-filter or any other PBF-to-OSC path. These characters cannot
-appear in XML 1.0 even as character references, so conforming readers reject
-the file. This breaks the promise that `--format osc` writes OSC XML. The
-shared writer should refuse unrepresentable strings before publication.
+Every OSC writer now refuses a character outside XML 1.0's `Char` production
+(`osc::write::check_xml_chars`), but no OSC reader does. quick-xml 0.42
+decodes every character reference except `&#0;`, and the reader does not check
+raw scalars either, so `&#1;`, a raw U+0001 or `&#xFFFE;` in an input is
+accepted. libosmium's Expat refuses the whole document. Consequences:
+`apply-changes` writes such a value into the output PBF where osmium would
+refuse the input. The re-emitters' refusal depends on whether the change is
+rendered: today every change is rendered before the keep predicate and the
+simplify dedupe, but moving rendering after selection (PERF-044) would let a
+discarded malformed change pass. A forbidden character in root or section
+attributes (`<osmChange generator="&#1;">`), unknown attributes or ignored
+events is never looked at. The fix belongs at the shared XML boundary
+(`osc/xml_parse.rs`, not only `append_str_attr`): check literal scalars
+wherever they occur and the decoded value of every character reference, while
+keeping `&amp;#1;` legal. Any per-byte cost on the apply and merge read paths
+is measured first.
 
 ## CMD-011 - Unindexed gzip derive ignores the -j worker cap
 

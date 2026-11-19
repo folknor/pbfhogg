@@ -296,6 +296,27 @@ The signs disagree and every delta is under 2 %, so the change has no
 cost. The checks run only on elements that are printed, a small fraction of
 the elements compared.
 
+## XML 1.0 character check on written strings (bygg, 2026-11-19, against `29fd352a`)
+
+Every tag, role and user string `--format osc` writes is scanned once for
+characters XML 1.0 cannot carry, replacing the tab/LF/CR scan the escape
+already did. Same protocol as above: `diff-pair --from base --to 20260411
+--format osc`, `--iterations 1`, after `fstrim`, baseline `--commit HEAD`
+first in each pair.
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `ad1b0707` 2m13s | `9c57083d` 2m13s |
+| 2 | `e54f2cd1` 2m13s | `76a27316` 2m25s |
+| 3 | `48f31ab2` 2m25s | `04b2dc4a` 2m23s |
+
+The host stepped from 2m13s to 2m25s mid-run: baseline 3 on clean HEAD
+shows it too. In pair 2 the whole delta is in the assembly span
+(`DERIVECHANGES_WRITE`, 16.3 s to 22.7 s at under one core, write wait
+doubled), which copies already-formatted bytes and never reaches the check.
+The scan phases that format differ by about 3 %. The signs disagree across
+pairs, so the change has no cost.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

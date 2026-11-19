@@ -374,6 +374,14 @@
 
 ### Fixed
 
+- **OSC output never contains characters XML 1.0 forbids.** A tag,
+  member role, user or metadata value holding NUL, another C0 control
+  besides tab, LF and CR, or U+FFFE / U+FFFF used to be written out raw
+  by `diff --format osc` (from a PBF string) and by `merge-changes` and
+  OSC `tags-filter` (from an input reference such as `&#1;`). The result
+  was a file that conforming XML readers, osmium's among them, reject.
+  These runs now fail with exit 2, naming the element and attribute, and
+  publish nothing.
 - **`apply-changes` no longer refuses changes whose output only needed
   more blocks.** A rewritten block keeps its source block's whole string
   table, and blocks were cut by element count alone. So a large tag value

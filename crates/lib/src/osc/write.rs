@@ -15,39 +15,79 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::{ElementKind, MemberId};
 
+/// Check that a user-text attribute value can be written as XML 1.0, and
+/// say whether it holds a tab, newline or carriage return that must be
+/// written as a character reference.
+///
+/// XML 1.0's `Char` production admits tab, LF, CR, U+0020-U+D7FF,
+/// U+E000-U+FFFD and U+10000-U+10FFFF. A `str` holds no surrogate, so what
+/// it can hold beyond that is the other C0 controls (NUL, U+0001 ...) and
+/// U+FFFE / U+FFFF. Those cannot appear in an XML 1.0 document at all, not
+/// even as character references, so a conforming reader (libosmium's Expat
+/// among them) refuses the whole file. PBF strings are validated as UTF-8
+/// only and quick-xml's attribute normalization admits every reference but
+/// `&#0;`, so both a PBF tag and an OSC input's `&#1;` can carry one here.
+/// Writing it would publish a file that is not XML; dropping or replacing
+/// it would be a silent wrong answer. It is refused.
+///
+/// One pass over the bytes, replacing the whitespace scan the escape needed
+/// anyway: a byte below 0x20 is an ASCII scalar, and in valid UTF-8 `EF BF
+/// BE` / `EF BF BF` are exactly U+FFFE / U+FFFF. The scan continues past a
+/// tab, LF or CR, since a forbidden scalar can follow one.
+fn check_xml_chars(key: &str, value: &str) -> crate::Result<bool> {
+    let bytes = value.as_bytes();
+    let mut needs_refs = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        let forbidden = match b {
+            b'\t' | b'\n' | b'\r' => {
+                needs_refs = true;
+                None
+            }
+            0..0x20 => Some(u32::from(b)),
+            0xEF if bytes.get(i + 1) == Some(&0xBF) => match bytes.get(i + 2) {
+                Some(&0xBE) => Some(0xFFFE),
+                Some(&0xBF) => Some(0xFFFF),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(cp) = forbidden {
+            return Err(crate::Error::invalid_data(format!(
+                "attribute {key} holds U+{cp:04X}, which XML 1.0 cannot carry even as a \
+                 character reference; OSC output refuses it rather than write a file \
+                 XML readers reject"
+            )));
+        }
+    }
+    Ok(needs_refs)
+}
+
+/// Name the element an attribute refusal belongs to, as `node 42`.
+pub(crate) fn in_element(kind: ElementKind, id: i64) -> impl FnOnce(crate::Error) -> crate::Error {
+    move |err| err.context(format!("{} {id}", kind.as_str()))
+}
+
 /// Push an attribute whose value is OSM user data (tag key/value, member
-/// role, user name, and the pass-through metadata text an OSC re-emitter
-/// carries) and may therefore contain control characters.
+/// role, user name) and may therefore contain control characters.
 ///
 /// XML 1.0 attribute-value normalization (spec section 3.3.3) replaces raw
 /// tab, newline, and carriage-return characters in attribute values with
 /// spaces at parse time, so a literal newline inside e.g. a multi-line
-/// `inscription` tag value does not survive a write -> parse roundtrip -
-/// the applied result silently has spaces where the source had newlines.
+/// `inscription` tag value does not survive a write -> parse roundtrip.
 /// Character references (`&#10;` etc.) are the only spec-conforming way to
-/// preserve them; osmium's OSC writer does the same (`&#xA;`).
-/// quick-xml's tuple `push_attribute` escapes only `< > & " '`, so the
-/// control characters must be pre-escaped here and pushed as an
-/// already-escaped `Attribute`.
-fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &str) {
-    if value.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t')) {
-        let escaped = quick_xml::escape::escape(value);
-        let mut out = String::with_capacity(escaped.len() + 8);
-        for ch in escaped.chars() {
-            match ch {
-                '\n' => out.push_str("&#10;"),
-                '\r' => out.push_str("&#13;"),
-                '\t' => out.push_str("&#9;"),
-                _ => out.push(ch),
-            }
-        }
-        elem.push_attribute(quick_xml::events::attributes::Attribute {
-            key: quick_xml::name::QName(key),
-            value: std::borrow::Cow::Owned(out),
-        });
-    } else {
-        elem.push_attribute((key, value));
-    }
+/// preserve them; osmium's OSC writer does the same (`&#xA;`). quick-xml
+/// 0.42's tuple `push_attribute` escapes through `escape_attribute`, which
+/// writes the five markup characters and `&#9;` / `&#10;` / `&#13;`, the
+/// same bytes [`append_attr_escaped`] writes. A character XML cannot carry
+/// is refused ([`check_xml_chars`]).
+fn push_attribute_escaped<'a>(
+    elem: &mut BytesStart<'a>,
+    key: &'a str,
+    value: &str,
+) -> crate::Result<()> {
+    check_xml_chars(key, value)?;
+    elem.push_attribute((key, value));
+    Ok(())
 }
 
 /// Append ` key="value"` to a start tag's content, escaped as
@@ -72,11 +112,18 @@ pub(crate) fn append_int_attr(content: &mut String, key: &str, n: i64) {
 }
 
 /// Append ` key="value"` as [`push_attribute_escaped`] writes it: escaped,
-/// with newline, carriage return and tab as character references.
-pub(crate) fn append_attr_escaped(content: &mut String, key: &str, value: &str) {
-    if !value.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t')) {
+/// with newline, carriage return and tab as character references, and a
+/// character XML cannot carry refused ([`check_xml_chars`]). This is the
+/// OSC re-emitters' one user-text boundary: tags, roles and every metadata
+/// text field.
+pub(crate) fn append_attr_escaped(
+    content: &mut String,
+    key: &str,
+    value: &str,
+) -> crate::Result<()> {
+    if !check_xml_chars(key, value)? {
         append_attr(content, key, value);
-        return;
+        return Ok(());
     }
     content.push(' ');
     content.push_str(key);
@@ -90,6 +137,7 @@ pub(crate) fn append_attr_escaped(content: &mut String, key: &str, value: &str) 
         }
     }
     content.push('"');
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -161,16 +209,20 @@ impl OwnedMetadata {
     /// writes [`Self::append_attrs`]; this stays as the oracle the byte
     /// sinks' differential tests compare with.
     #[cfg(test)]
-    pub(crate) fn push_attrs(&self, elem: &mut quick_xml::events::BytesStart<'_>) {
+    pub(crate) fn push_attrs(
+        &self,
+        elem: &mut quick_xml::events::BytesStart<'_>,
+    ) -> crate::Result<()> {
         if let Some(version) = self.version {
             let v = version.to_string();
             elem.push_attribute(("version", v.as_str()));
         }
         for (bit, key, value) in self.text_fields() {
             if self.has(bit) {
-                push_attribute_escaped(elem, key, value);
+                push_attribute_escaped(elem, key, value)?;
             }
         }
+        Ok(())
     }
 
     /// The text fields in attribute order. Every one is the decoded
@@ -189,15 +241,16 @@ impl OwnedMetadata {
 
     /// The metadata as start tag content text, in the owned writers'
     /// attribute order and escaping (`push_attrs`).
-    pub(crate) fn append_attrs(&self, content: &mut String) {
+    pub(crate) fn append_attrs(&self, content: &mut String) -> crate::Result<()> {
         if let Some(version) = self.version {
             append_int_attr(content, "version", i64::from(version));
         }
         for (bit, key, value) in self.text_fields() {
             if self.has(bit) {
-                append_attr_escaped(content, key, value);
+                append_attr_escaped(content, key, value)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -283,15 +336,16 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
         elem.push_attribute(("lat", lat_str.as_str()));
         elem.push_attribute(("lon", coord_buf.as_str()));
     }
+    let ctx = || in_element(ElementKind::Node, node.id);
     if let Some(meta) = &node.metadata {
-        meta.push_attrs(&mut elem);
+        meta.push_attrs(&mut elem).map_err(ctx())?;
     }
 
     if node.tags.is_empty() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_tags_xml(writer, &node.tags)?;
+        write_tags_xml(writer, &node.tags).map_err(ctx())?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -305,8 +359,9 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
     let mut elem = BytesStart::new(ElementKind::Way.as_str());
     let id_str = way.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
+    let ctx = || in_element(ElementKind::Way, way.id);
     if let Some(meta) = &way.metadata {
-        meta.push_attrs(&mut elem);
+        meta.push_attrs(&mut elem).map_err(ctx())?;
     }
 
     if way.refs.is_empty() && way.tags.is_empty() {
@@ -319,7 +374,7 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
             nd.push_attribute(("ref", r_str.as_str()));
             writer.write_event(Event::Empty(nd))?;
         }
-        write_tags_xml(writer, &way.tags)?;
+        write_tags_xml(writer, &way.tags).map_err(ctx())?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
     }
     Ok(())
@@ -333,8 +388,9 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
     let mut elem = BytesStart::new(ElementKind::Relation.as_str());
     let id_str = rel.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
+    let ctx = || in_element(ElementKind::Relation, rel.id);
     if let Some(meta) = &rel.metadata {
-        meta.push_attrs(&mut elem);
+        meta.push_attrs(&mut elem).map_err(ctx())?;
     }
 
     if rel.members.is_empty() && rel.tags.is_empty() {
@@ -347,10 +403,10 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
-            push_attribute_escaped(&mut member, "role", m.role.as_str());
+            push_attribute_escaped(&mut member, "role", m.role.as_str()).map_err(ctx())?;
             writer.write_event(Event::Empty(member))?;
         }
-        write_tags_xml(writer, &rel.tags)?;
+        write_tags_xml(writer, &rel.tags).map_err(ctx())?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }
     Ok(())
@@ -381,8 +437,8 @@ fn write_checked_tags_xml<'a, W: std::io::Write>(
     for tag in tags {
         let (k, v) = tag?;
         let mut tag = BytesStart::new("tag");
-        push_attribute_escaped(&mut tag, "k", k);
-        push_attribute_escaped(&mut tag, "v", v);
+        push_attribute_escaped(&mut tag, "k", k)?;
+        push_attribute_escaped(&mut tag, "v", v)?;
         writer.write_event(Event::Empty(tag))?;
     }
     Ok(())
@@ -454,7 +510,7 @@ fn push_info_attrs(
     if let Some(u) = user
         && !u.is_empty()
     {
-        push_attribute_escaped(elem, "user", u);
+        push_attribute_escaped(elem, "user", u).map_err(in_element(kind, id))?;
     }
     Ok(())
 }
@@ -578,7 +634,7 @@ fn write_dense_node_xml<W: std::io::Write>(
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_checked_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -627,7 +683,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_checked_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -667,7 +723,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
             nd.push_attribute(("ref", r_str.as_str()));
             writer.write_event(Event::Empty(nd))?;
         }
-        write_checked_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags).map_err(in_element(ElementKind::Way, way.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
     }
     Ok(())
@@ -711,10 +767,12 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
-            push_attribute_escaped(&mut member, "role", m.role()?);
+            let ctx = || in_element(ElementKind::Relation, rel.id());
+            push_attribute_escaped(&mut member, "role", m.role()?).map_err(ctx())?;
             writer.write_event(Event::Empty(member))?;
         }
-        write_checked_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags)
+            .map_err(in_element(ElementKind::Relation, rel.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }
     Ok(())
@@ -1238,6 +1296,51 @@ mod tests {
             write_element_xml(&mut writer, &element, &mut coord_buf)?;
         }
         String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+    }
+
+    /// The dense writer's XML for one node carrying the tag `(k, v)`.
+    fn dense_node_tagged(k: &str, v: &str) -> crate::Result<String> {
+        let mut bb = crate::write::block_builder::BlockBuilder::new();
+        bb.add_node(3, 0, 0, [(k, v)], None);
+        let bytes = bb
+            .take()?
+            .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
+            .to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes)?;
+        let mut writer = Writer::new(Vec::new());
+        let mut coord_buf = String::new();
+        for element in block.elements() {
+            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+        }
+        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+    }
+
+    /// A PBF string is valid UTF-8 but may hold a character XML 1.0 cannot
+    /// carry even as a reference; derive refuses it, naming the element,
+    /// rather than publish a file no XML reader accepts. The scan does not
+    /// stop at a tab that needs a reference.
+    #[test]
+    fn pbf_strings_xml_cannot_carry_are_refused() -> crate::Result<()> {
+        for (k, v) in [
+            ("a\0", "b"),
+            ("a", "\u{1}"),
+            ("a", "x\ty\u{1F}"),
+            ("a", "\u{FFFE}"),
+            ("a", "\u{FFFF}"),
+        ] {
+            let err = dense_node_tagged(k, v).expect_err("forbidden character");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("XML 1.0 cannot carry") && msg.contains("node 3"),
+                "{k:?}={v:?}: {msg}"
+            );
+        }
+        let xml = dense_node_tagged("a", "\u{FFFD}\u{FEFF}\u{FF01}\u{85}\u{10000}\t")?;
+        assert!(
+            xml.contains("v=\"\u{FFFD}\u{FEFF}\u{FF01}\u{85}\u{10000}&#9;\""),
+            "got: {xml}"
+        );
+        Ok(())
     }
 
     /// Derive only writes coordinates the OSC reader takes back: the domain

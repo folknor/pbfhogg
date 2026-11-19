@@ -554,6 +554,21 @@ override is held to the same domain as an invalid argument before either
 input is opened. Deleted elements print only ID, version and the override, so
 their old values are not judged.
 
+Every OSC producer, derive and the re-emitters alike, writes only characters
+XML 1.0's `Char` production admits. PBF strings are validated as UTF-8 only,
+and quick-xml's attribute normalization decodes every character reference but
+`&#0;`, so a tag key or value, member role, user or other metadata text can
+hold a C0 control other than tab, LF and CR, or U+FFFE / U+FFFF. None of
+those can appear in an XML 1.0 document even as a reference. The one
+user-text escape boundary (`osc::write::check_xml_chars`, behind both escape
+helpers) refuses such a value as invalid data, naming the element and
+attribute, before anything is published. Tab, LF and CR are written as
+references. This is an output guarantee, not input validation: the re-emitters
+render every change before filtering or deduplicating, so today a forbidden
+character in a change they would discard also fails the run, but that follows
+from render order and is not promised. Root and section attributes are not
+re-emitted, so a forbidden character there passes without refusal.
+
 The re-emitting OSC paths (`merge-changes`, with or without `--simplify`, and
 `tags-filter --input-kind osc`) deliberately parse version but pass timestamp,
 changeset, uid and visible through as normalized XML attribute text without

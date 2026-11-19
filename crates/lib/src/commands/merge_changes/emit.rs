@@ -25,7 +25,9 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 use super::{Action, OscWriter, action_tag};
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
-use crate::osc::write::{OwnedMetadata, append_attr, append_attr_escaped, append_int_attr};
+use crate::osc::write::{
+    OwnedMetadata, append_attr, append_attr_escaped, append_int_attr, in_element,
+};
 use crate::osc::xml_parse::{
     DeleteChildren, OscSink, append_str_attr, coord_to_decimicro, delete_coords, parse_i64_attr,
     parse_member_into, parse_nd, scan_owned_metadata_into,
@@ -168,7 +170,9 @@ impl ElementBuf {
             append_attr(&mut self.head, "lon", &self.coord);
         }
         if has_meta {
-            self.meta.append_attrs(&mut self.head);
+            self.meta
+                .append_attrs(&mut self.head)
+                .map_err(in_element(kind, id))?;
         }
         self.structural.clear();
         self.structural_ranges.clear();
@@ -182,17 +186,18 @@ impl ElementBuf {
     }
 
     pub(crate) fn tag(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
-        self.open()?;
+        let (kind, id) = (self.open()?, self.id);
+        let ctx = || in_element(kind, id);
         let start = self.tags.len();
         self.tags.push_str("tag");
         // k then v, as `parse_tag` reads them.
         let k = self.tag_text.len();
         append_str_attr(e, "k", &mut self.tag_text)?;
         let v = self.tag_text.len();
-        append_attr_escaped(&mut self.tags, "k", &self.tag_text[k..v]);
+        append_attr_escaped(&mut self.tags, "k", &self.tag_text[k..v]).map_err(ctx())?;
         append_str_attr(e, "v", &mut self.tag_text)?;
         let end = self.tag_text.len();
-        append_attr_escaped(&mut self.tags, "v", &self.tag_text[v..end]);
+        append_attr_escaped(&mut self.tags, "v", &self.tag_text[v..end]).map_err(ctx())?;
         self.tag_ranges.push((start, self.tags.len()));
         self.tag_pairs.push((k, v, end));
         Ok(())
@@ -209,7 +214,8 @@ impl ElementBuf {
     }
 
     pub(crate) fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
-        self.open()?;
+        let (rel_kind, id) = (self.open()?, self.id);
+        let ctx = || in_element(rel_kind, id);
         let mut type_scratch = std::mem::take(&mut self.coord);
         self.scratch.clear();
         let parsed = parse_member_into(e, &mut type_scratch, &mut self.scratch);
@@ -219,7 +225,7 @@ impl ElementBuf {
         self.structural.push_str("member");
         append_attr(&mut self.structural, "type", kind.as_str());
         append_int_attr(&mut self.structural, "ref", ref_id);
-        append_attr_escaped(&mut self.structural, "role", &self.scratch);
+        append_attr_escaped(&mut self.structural, "role", &self.scratch).map_err(ctx())?;
         self.structural_ranges.push((start, self.structural.len()));
         Ok(())
     }
@@ -585,6 +591,52 @@ newline"/>
             );
             assert_same(dir.path(), &xml, case);
         }
+    }
+
+    /// A character XML 1.0 cannot carry, which quick-xml's normalization
+    /// decodes from a reference, is refused by both paths wherever user text
+    /// is written, naming the element; never written out raw. Legal
+    /// neighbours (U+FFFD, U+FEFF, a referenced tab, an escaped `&#1;`)
+    /// still write.
+    #[test]
+    fn refuses_characters_xml_cannot_carry() {
+        let dir = crate::path_guard::tests::scratch();
+        for case in [
+            r#"<node id="5" lat="1" lon="1"><tag k="a&#1;" v="b"/></node>"#,
+            r#"<node id="5" lat="1" lon="1"><tag k="a" v="&#9;&#x1F;"/></node>"#,
+            r#"<node id="5" lat="1" lon="1"><tag k="a" v="&#xFFFE;"/></node>"#,
+            r#"<node id="5" lat="1" lon="1" user="&#xFFFF;"/>"#,
+            r#"<node id="5" lat="1" lon="1" timestamp="&#2;"/>"#,
+            r#"<relation id="5"><member type="way" ref="1" role="&#8;"/></relation>"#,
+        ] {
+            let xml = format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"><modify>{case}</modify></osmChange>"
+            );
+            let recorded = batches(dir.path(), &xml).expect("the reader decodes it");
+            // The byte sink refuses while replaying (so the input path is
+            // named); the owned oracle refuses when it writes. Same words.
+            for batch in &recorded {
+                for owned in [false, true] {
+                    let err = encode(batch, owned).expect_err(case);
+                    assert!(
+                        err.contains("XML 1.0 cannot carry") && err.contains(" 5"),
+                        "{case} owned={owned}: {err}"
+                    );
+                }
+            }
+        }
+        let xml = "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"><modify>\
+                   <node id=\"5\" lat=\"1\" lon=\"1\"><tag k=\"a\" v=\"\u{FFFD}&#xFEFF;&#9;&amp;#1;\"/></node>\
+                   </modify></osmChange>";
+        let recorded = batches(dir.path(), xml).expect("the reader decodes it");
+        let text: String = recorded
+            .iter()
+            .map(|batch| encode(batch, false).expect("legal characters write").0)
+            .collect();
+        assert!(
+            text.contains("v=\"\u{FFFD}\u{FEFF}&#9;&amp;#1;\""),
+            "got:\n{text}"
+        );
     }
 
     /// Every single-byte change of the document: the same bytes or the

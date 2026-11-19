@@ -8,6 +8,13 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### XML 1.0 character check folded into the escape scan (bygg, 2026-11-19, `29fd352a` + change)
+
+Every user-text attribute's existing tab/LF/CR byte scan now also refuses
+characters XML 1.0 cannot carry. `--iterations 1`, A B A B, planet 7-OSC
+default merge (`--osc 4914..4920`): `29fd352a` 3.0, 3.1 s (`4c7fb2d5`,
+`48119317`); variant 2.9, 2.9 s (`436b7bdc`, `543cd61e`). No cost.
+
 ### Decoded typed attributes, whitespace-preserving metadata escape (bygg, 2026-11-19, `ceab35f2` + change)
 
 Typed attribute reads (IDs, refs, coordinates, numeric and timestamp

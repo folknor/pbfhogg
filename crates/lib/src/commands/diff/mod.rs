@@ -192,9 +192,11 @@ pub fn diff<'a, 'b>(
 /// otherwise) and the same input checks. Like `diff -c`, it skips a fresh
 /// pair of byte-equal blobs without decoding it, so `common` counts such a
 /// pair by the blobs' claimed `index.count` and a corrupt blob that is
-/// byte-identical on both sides is not noticed; `created`, `modified` and
-/// `deleted` are exact either way. Only the formatting is skipped, so no
-/// output I/O happens at all.
+/// byte-identical on both sides is not noticed. Every blob it decodes has its
+/// claim checked exact, but a false range on a skipped pair is believed and
+/// can also change how its neighbours pair, so `created`, `modified` and
+/// `deleted` are exact when the skipped pairs' claims are. Only the
+/// formatting is skipped, so no output I/O happens at all.
 ///
 /// The inputs are pinned as in [`diff`], with the same refusals.
 #[hotpath::measure]
@@ -456,9 +458,9 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
             BlockMergeAction::BlobEqual { count, .. } => {
                 self.stats.common += count;
             }
-            // A single-sided run's count is the merge's (claimed or, for a
-            // clipped block, counted); count-only runs skip the element walk
-            // that exists only to format each line.
+            // A single-sided run's count is counted from the decoded block;
+            // count-only runs skip the element walk that exists only to
+            // format each line.
             BlockMergeAction::BlobOldOnly(run) => {
                 if let Some(out) = self.output.as_mut() {
                     for elem in run.elements() {

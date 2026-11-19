@@ -37,10 +37,12 @@
 //!
 //! # Trust
 //!
-//! Membership and clipping trust indexdata ranges, as everywhere in the
-//! block-pair engine (reference/indexdata-trust.md). The element walk of
-//! overlapping blocks can refuse an understated last ID. One-sided runs
-//! trust the range, and work-unit clipping can hide elements beyond it.
+//! Membership is planned from indexdata ranges before any body is decoded
+//! (reference/indexdata-trust.md). Every block a worker decodes is refused
+//! unless its claim is exact and its elements in order, before it is
+//! clipped, so no element can fall outside every unit's window: a carried
+//! frame's last unit is the one its exact claimed last lies in. A
+//! byte-identical pair skipped undecoded is believed.
 //!
 //! # Progress and failures
 //!

@@ -252,6 +252,31 @@ No cost on either form. The OSC variant is faster in both pairs, the first
 pair by more than noise; nothing in the change removes work, so that is
 read as drift, not a win.
 
+## Exact claims on every decoded block (bygg, 2026-11-19, against `1279349a`)
+
+Every block an indexed diff decodes has its indexdata held exact and its
+elements in canonical order before it is clipped: the validator records
+the IDs (dense IDs decoded from their column alone) and one tally per
+block decides the claim. Matched planet A/B, `diff-pair --from base --to
+20260411`, `--iterations 1`, after `fstrim`; baseline cells are `--commit
+HEAD` builds of `1279349a`, variant cells the uncommitted working tree
+(stored as dirty), baseline first in every pair.
+
+| Form | Pair | Baseline | Variant |
+|---|---|---|---|
+| text (`-c`) | 1 | `26677819` 1m46s | `daeb63a7` 1m47s |
+| text (`-c`) | 2 | `c6a4eae2` 1m47s | `31b6f1e6` 1m47s |
+| `--format osc` | 1 | `cc21318e` 2m13s | `8ee3dcbf` 2m16s |
+| `--format osc` | 2 | `2efb6a1f` 2m17s | `920e1437` 2m22s |
+
+No cost on text. The OSC variant is slower in both pairs (medians 2m15s
+against 2m19s, about 3 %), but `brokkr sidecar --compare` puts the
+decoding phases within about 1 % in both pairs (node phase -0 % and +1 %)
+and the difference in the single-threaded write and assembly segment after
+`DERIVECHANGES_WRITE_START` (15.8 s against 17.7 s, 18.8 s against
+21.5 s), which the change does not touch and whose bytes are the same.
+Read as noise in that segment, not a cost of the check.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

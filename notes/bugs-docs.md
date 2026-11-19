@@ -149,15 +149,14 @@ Reported by: osc-parsing.
 locations. The preservation claim in `docs/cli/commands.md` needs narrowing,
 unless preserving those fields is intended.
 
-## DOC-015 - diff count and quiet-mode documentation
+## DOC-015 - diff quiet-mode documentation
 
 Reported by: diff.
 
-`docs/cli/commands.md` says single-sided counts are claimed counts, but the
-implementation counts decoded elements (`osc/merge_join.rs`). It also says
-quiet diff makes the same refusals as text mode without `-c`, but quiet mode
-enables byte-equal skipping and can accept corrupt bodies that the ordinary
-text diff rejects.
+`docs/cli/commands.md` says quiet diff makes the same refusals as text mode
+without `-c`, but quiet mode enables byte-equal skipping and can accept
+corrupt bodies, and believe false claims on a skipped pair, that the
+ordinary text diff rejects.
 
 ## DOC-016 - The indexdata trust table says renumber refuses relation count mismatches
 
@@ -249,19 +248,3 @@ planning four node shards). The negative-ID fallback wording in these files
 is already corrected; the rest needs checking against the planner's actual
 cuts before rewording, since some assertions may depend on how many units a
 fixture is cut into.
-
-## DOC-027 - Decide how indexed diff should refuse understated last IDs in one-sided runs
-
-`crates/lib/src/osc/merge_join.rs::emit_block` trusts the claimed range.
-With old `[2]` and new `[1, 2]` claiming `[1, 1]`, text diff can report
-both a creation and a deletion of node 2. The overlapping-block element
-walk checks its boundary and can refuse an understated last ID. One-sided
-runs have no such check, and work-unit routing and clipping can hide the
-offending element before emission.
-
-Decide how much validation indexed diff should do in passing under
-ADR-0013. Checking the last element of a visible run could catch the
-example on canonically ordered input, but any check after clipping misses
-elements hidden by the planner. Count-only sinks also consume a one-sided
-run without iterating its elements, so adding an element walk changes a
-measured path. The CLI and trust reference describe the current scope.

@@ -262,7 +262,8 @@ fn out_of_order_blob_on_the_old_side_is_rejected_too() {
 /// lands mid-block and the side whose claim was short is dropped along with
 /// every element past the boundary - silently, with no error and no count
 /// anomaly, because the count that would have disagreed comes from the same
-/// lying metadata.
+/// lying metadata. Decoding now holds every decoded block's claim exact, so
+/// the forged claim is refused there.
 ///
 /// `BlockBuilder` derives its index from what it actually wrote and cannot
 /// emit this, which is why the fix pass recorded no test here. It does not
@@ -306,7 +307,7 @@ fn understated_max_id_is_rejected_not_silently_truncated() {
          block; stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("does not match the blob's contents"),
+        stderr.contains("this run places and counts the blob by its claim"),
         "error should say the metadata contradicts the payload; got:\n{stderr}"
     );
 }
@@ -346,7 +347,7 @@ fn understated_max_id_is_rejected_at_every_shard_count() {
         &lying_new,
         &[],
         2,
-        Some("does not match the blob's contents"),
+        Some("this run places and counts the blob by its claim"),
     );
 }
 
@@ -971,10 +972,10 @@ fn surplus_repeats_are_single_sided_in_order() {
     }
 }
 
-/// A block held at a repeated boundary ID still has its claim checked
-/// against what lies behind the repeats: new `[1, 1, 2]` claiming its last
-/// node is 1, against old `[1] | [2]`, is refused rather than trusted to emit
-/// the held tail as created.
+/// A block whose repeats would hold it at the boundary ID still has its claim
+/// checked: new `[1, 1, 2]` claiming its last node is 1, against old
+/// `[1] | [2]`, is refused rather than trusted to emit the held tail as
+/// created.
 #[test]
 fn a_held_repeat_does_not_hide_an_understated_max_id() {
     let dir = crate::common::test_scratch();
@@ -995,7 +996,81 @@ fn a_held_repeat_does_not_hide_an_understated_max_id() {
         &lying,
         &[],
         2,
-        Some("does not match the blob's contents"),
+        Some("this run places and counts the blob by its claim"),
+    );
+}
+
+/// A claim-disjoint blob is emitted whole as one-sided, so its claim decides
+/// which side of its peer its elements land on: new `[1, 2]` claiming
+/// `[1, 1]` against old `[2]` once reported node 2 created and deleted at
+/// once, in text, `-c`, `-q` and OSC alike. Decoding refuses the claim before
+/// the run is emitted.
+#[test]
+fn a_one_sided_blob_with_an_understated_last_id_is_refused() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let honest = dir.path().join("new.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    write_blobs(&old, &[Blob::Nodes(&[2])]);
+    write_blobs(&honest, &[Blob::Nodes(&[1, 2])]);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let forged = crate::common::adversarial::forge_indexdata_range(&bytes, 1, 1, 1, None);
+    std::fs::write(&lying, forged).expect("write forged");
+    assert_both_paths(&old, &honest, &[], 1, None);
+    for args in [&[][..], &["-c"], &["-q"]] {
+        assert_both_paths(
+            &old,
+            &lying,
+            args,
+            2,
+            Some("this run places and counts the blob by its claim"),
+        );
+    }
+}
+
+/// The lower edge of a claim routes a blob as much as its upper one: new
+/// `[1, 2]` claiming `[2, 2]` against old `[1]` is emitted after old's `1`
+/// as one-sided and would report node 1 deleted and created. Refused.
+#[test]
+fn a_one_sided_blob_with_an_overstated_first_id_is_refused() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let honest = dir.path().join("new.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    write_blobs(&old, &[Blob::Nodes(&[1])]);
+    write_blobs(&honest, &[Blob::Nodes(&[1, 2])]);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let forged = crate::common::adversarial::forge_indexdata_range(&bytes, 1, 2, 2, None);
+    std::fs::write(&lying, forged).expect("write forged");
+    assert_both_paths(&old, &honest, &[], 1, None);
+    assert_both_paths(
+        &old,
+        &lying,
+        &[],
+        2,
+        Some("this run places and counts the blob by its claim"),
+    );
+}
+
+/// A mixed-sign claim cannot name its first element, so the header order
+/// check weighs its `min_id` and cannot see the blob start before its
+/// predecessor ends. Old `[-3] | [-2, -4, 1]` has exact claims and blocks in
+/// order, yet `-2` sorts before `-3`; against new `[-2, -3, -4, 1]` the merge
+/// reported `-2` created and deleted. Decoding the mixed-sign blob checks
+/// its actual first element against the preceding blob's last.
+#[test]
+fn a_mixed_sign_blob_starting_before_its_predecessor_is_refused() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    write_blobs(&old, &[Blob::Nodes(&[-3]), Blob::Nodes(&[-2, -4, 1])]);
+    write_blobs(&new, &[Blob::Nodes(&[-2, -3, -4, 1])]);
+    assert_both_paths(
+        &old,
+        &new,
+        &[],
+        2,
+        Some("before the id -3 the blob preceding it in this file reaches"),
     );
 }
 

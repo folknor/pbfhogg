@@ -467,6 +467,12 @@ pub(crate) struct BlobDesc {
     pub(crate) blob_index: u64,
     pub(crate) frame_offset: u64,
     pub(crate) index: crate::blob_meta::BlobIndex,
+    /// The claimed last key of the blob before this one in file order, when
+    /// that blob is of the same kind. A mixed-sign claim cannot name its
+    /// first element, so the header guard cannot see such a blob start
+    /// before its predecessor ends; decoding checks its actual first element
+    /// against this.
+    pub(crate) prev_last: Option<OsmIdKey>,
 }
 
 impl BlobDesc {
@@ -503,10 +509,10 @@ pub(crate) struct Window {
 
 impl Window {
     /// Whether a blob's claimed range reaches outside the window, so its
-    /// decoded block must be clipped. A claim inside stays unclipped, which
-    /// keeps [`check_claimed_max`] able to see a block holding more than
-    /// its claim says. Claim-based, with the conservative key 0 for a
-    /// mixed-sign range: a crossing claim costs a clip, never an element.
+    /// decoded block must be clipped. Claim-based, which decoding has proved
+    /// exact by then ([`hold_decoded_claim`]), with the conservative key 0
+    /// for a mixed-sign range: a crossing claim costs a clip, never an
+    /// element.
     fn crosses(self, desc: &BlobDesc) -> bool {
         self.start.is_some_and(|s| desc.first_key() < s)
             || self.end.is_some_and(|e| desc.last_key() >= e)
@@ -722,6 +728,10 @@ pub(crate) struct BlobCursor {
     /// An observed data header whose payload is still pending in the
     /// reader: the next blob, of the running kind or a later one.
     lookahead: Option<BlobDesc>,
+    /// The kind and claimed last key of the last data blob observed, which
+    /// becomes the next blob's [`BlobDesc::prev_last`] when it is of that
+    /// kind.
+    last_of_kind: Option<(ElementKind, OsmIdKey)>,
 }
 
 impl BlobCursor {
@@ -742,6 +752,7 @@ impl BlobCursor {
             started: false,
             exhausted: false,
             lookahead: None,
+            last_of_kind: None,
         })
     }
 
@@ -791,10 +802,19 @@ impl BlobCursor {
             if let Err(e) = self.order.observe(&index) {
                 return Err(self.locate(blob_index, frame_offset, e));
             }
+            let prev_last = self
+                .last_of_kind
+                .filter(|(kind, _)| *kind == index.kind)
+                .map(|(_, key)| key);
+            self.last_of_kind = Some((
+                index.kind,
+                crate::osm_id::blob_osm_last_key(index.min_id, index.max_id),
+            ));
             self.lookahead = Some(BlobDesc {
                 blob_index,
                 frame_offset,
                 index,
+                prev_last,
             });
             return Ok(());
         }
@@ -882,6 +902,7 @@ pub(crate) struct BlockPairSide<'a> {
     window: Window,
     st: Vec<(u32, u32)>,
     gr: Vec<(u32, u32)>,
+    ids: crate::read::project_ids::IdScratch,
 }
 
 impl<'a> BlockPairSide<'a> {
@@ -901,16 +922,13 @@ impl<'a> BlockPairSide<'a> {
             window,
             st: Vec::new(),
             gr: Vec::new(),
+            ids: crate::read::project_ids::IdScratch::default(),
         }
     }
 
     #[cold]
     fn locate(&self, desc: &BlobDesc, err: crate::Error) -> crate::Error {
-        err.locate(crate::error::Location::new(
-            Some(self.path),
-            Some(desc.blob_index),
-            Some(crate::ByteOffset(desc.frame_offset)),
-        ))
+        locate_in(self.path, desc, err)
     }
 
     /// The next blob of the unit, its body not yet parsed.
@@ -942,8 +960,11 @@ impl<'a> BlockPairSide<'a> {
         crate::blob::raw_blob_payload(self.body()).map_err(|e| self.locate(desc, e))
     }
 
-    /// Decompress and parse the current blob, clipped to the window when its
-    /// claimed range crosses it.
+    /// Decompress and parse the current blob, refuse it unless its claim is
+    /// exact and its elements in order ([`hold_decoded_claim`], before any
+    /// clip can hide an element), and clip it to the window when its claimed
+    /// range crosses it. Every [`BlockState`] is built here, so every block
+    /// the merge reads, emits or residualises has passed that check.
     ///
     /// Each block gets a fresh buffer, as the block-pair workers always
     /// did, and that is kept for now on the default path of a measured
@@ -966,17 +987,29 @@ impl<'a> BlockPairSide<'a> {
         if let Err(e) = crate::blob::decompress_blob_raw(self.body(), &mut decompressed) {
             return Err(self.locate(&desc, e));
         }
-        let block =
-            match PrimitiveBlock::from_vec_with_scratch(decompressed, &mut self.st, &mut self.gr) {
-                Ok(block) => block,
-                Err(e) => return Err(self.locate(&desc, e)),
-            };
         // The planner placed this blob by its claimed kind, so an element of
         // another kind would be merged against the wrong file's blobs of
-        // that kind (spurious created/deleted) or dropped.
-        if let Err(e) = block.refuse_foreign_kind(Some(desc.index.kind)) {
-            return Err(self.locate(&desc, e));
-        }
+        // that kind (spurious created/deleted) or dropped: the claimed kind
+        // is refused by validation itself.
+        let buffer = crate::read::block::BlockBuffer::new(
+            decompressed,
+            None,
+            &mut self.st,
+            &mut self.gr,
+            Some(desc.index.kind),
+        );
+        let path = self.path;
+        let ids = &mut self.ids;
+        let (_, accepted) = match buffer
+            .project(|_, _| crate::read::project_ids::KindIds::of(desc.index.kind, ids))
+        {
+            Ok(projected) => projected,
+            Err(e) => return Err(locate_in(path, &desc, e)),
+        };
+        let block = match hold_decoded_claim(&self.ids, accepted.bytes(), &desc) {
+            Ok(()) => accepted.into_block(),
+            Err(e) => return Err(locate_in(path, &desc, e)),
+        };
         let (skip_count, end, clip_last) = if self.window.crosses(&desc) {
             clip(&block, self.window)
         } else {
@@ -1008,8 +1041,8 @@ impl<'a> BlockPairSide<'a> {
 /// leading elements before the window's start (an earlier unit owns them),
 /// the index of the first element at or past its end (the block's length
 /// when none is), and the ID of the last element inside. Counted from the
-/// elements, so a clipped run's count is exact. Order within the block is
-/// trusted, as everywhere in the engine. It reads only IDs but walks the
+/// elements, so a clipped run's count is exact. The block's order and claim
+/// were checked when it was decoded. It reads only IDs but walks the
 /// built block on purpose: the merge runs over that block next, and only
 /// the blocks a window edge crosses are clipped.
 fn clip(block: &PrimitiveBlock, window: Window) -> (usize, Option<usize>, Option<i64>) {
@@ -1032,6 +1065,100 @@ fn clip(block: &PrimitiveBlock, window: Window) -> (usize, Option<usize>, Option
     (skip.min(len), Some(len), last_inside)
 }
 
+/// `err` located at blob `desc` of the input at `path`.
+#[cold]
+fn locate_in(
+    path: &std::sync::Arc<std::path::Path>,
+    desc: &BlobDesc,
+    err: crate::Error,
+) -> crate::Error {
+    err.locate(crate::error::Location::new(
+        Some(path),
+        Some(desc.blob_index),
+        Some(crate::ByteOffset(desc.frame_offset)),
+    ))
+}
+
+/// The order a decoded block must hold, named in its refusal.
+const DECODED_ORDER: crate::blob_meta::Order =
+    crate::blob_meta::Order::Required("diff pairs each input's elements in canonical order");
+
+/// Refuse a decoded block whose claim is not exact for its elements, whose
+/// elements are out of canonical order, or which starts before the blob
+/// preceding it in its file ends. ADR-0013: a run that decodes a blob
+/// checks the claim it relied on, and every placement this engine makes
+/// rests on the claim being exact. The planner carries a blob only while
+/// its claimed last key reaches the next unit, so an element past an
+/// understated claim would belong to no unit; a claim-disjoint blob is
+/// emitted whole as one-sided, so an element past its claim would appear
+/// created and deleted at once; and the merge boundary is a claimed last,
+/// which decides elements below it single-sided on the strength of the
+/// peer's next blob starting at or past it. Exact claims and in-order
+/// blocks make each of those true. `ids` is the block's IDs of the claimed
+/// kind, recorded by validation in `bytes`, so dense IDs are reconstructed
+/// from their column alone.
+///
+/// A mixed-sign claim proves neither its first element nor, so, that the
+/// blob starts after its predecessor's last: the header guard compares the
+/// claim's present first key, its `min_id`, and the blob's elements may
+/// start at any smaller key. Its actual first element is checked here
+/// instead. A blob of one sign has an exact claimed first, which the guard
+/// already weighed.
+///
+/// A byte-identical pair skipped undecoded is not checked; its claim is
+/// believed (reference/indexdata-trust.md).
+fn hold_decoded_claim(
+    ids: &crate::read::project_ids::IdScratch,
+    bytes: &[u8],
+    desc: &BlobDesc,
+) -> Result<()> {
+    let claim = &desc.index;
+    // Whether the claim names its first element: false only for a
+    // mixed-sign range, whose conservative first key is not one it proves.
+    let names_first = crate::osm_id::blob_osm_first_key(claim.min_id, claim.max_id)
+        == crate::osm_id::blob_osm_present_first_key(claim.min_id, claim.max_id);
+    if names_first {
+        // `hold_claim` decides a non-negative claim from the tally and walks
+        // any other through the canonical replay.
+        let mut tally = crate::blob_meta::AscendingTally::default();
+        ids.each(bytes, |_, id| {
+            tally.add(id);
+            Ok(())
+        })?;
+        return crate::blob_meta::hold_claim(&tally, claim, DECODED_ORDER, || {
+            let mut all = Vec::new();
+            // Already walked once without error; a second walk of the same
+            // accepted bytes yields the same IDs, so this cannot fail. Were
+            // it to, the empty replay still refuses.
+            if ids
+                .each(bytes, |_, id| {
+                    all.push(id);
+                    Ok(())
+                })
+                .is_err()
+            {
+                all.clear();
+            }
+            all
+        });
+    }
+    let mut walk = crate::blob_meta::ClaimWalk::new(Some(claim), DECODED_ORDER);
+    ids.each(bytes, |_, id| walk.observe(id))?;
+    let first = walk.finish()?;
+    if let (Some(first), Some(prev_last)) = (first, desc.prev_last)
+        && crate::osm_id::osm_id_key(first) < prev_last
+    {
+        return Err(crate::error::new_unsorted(format!(
+            "block-pair merge: a {} blob starts at id {first}, before the id {} the blob \
+             preceding it in this file reaches. The input's header claims Sort.Type_then_ID \
+             but its blobs are not in canonical order.",
+            claim.kind.as_str(),
+            crate::osm_id::osm_id_from_key(prev_last),
+        )));
+    }
+    Ok(())
+}
+
 /// Drain the rest of one side's shard as single-sided runs.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn drain_remaining<S: MergeSink>(
@@ -1050,9 +1177,9 @@ fn drain_remaining<S: MergeSink>(
 }
 
 /// Emit a decoded block's remaining run as BlobOldOnly or BlobNewOnly.
-/// The range claim already decided routing. This path emits the run without
-/// the boundary checks in `merge_decoded_pair`, so an understated last ID
-/// can appear as a one-sided change.
+/// The range claim decided routing, and decoding proved it exact
+/// ([`hold_decoded_claim`]), so no element of the run can lie in the
+/// peer's range.
 fn emit_block<S: MergeSink>(
     bs: &BlockState,
     is_old: bool,
@@ -1076,10 +1203,8 @@ fn emit_block<S: MergeSink>(
 }
 
 /// The OSM-order last ID a decoded block can still offer: its claimed last,
-/// or, for a block clipped to the window, the earlier of that and its last
-/// element inside the window. A claim understating the block's contents
-/// stays the answer, so [`check_claimed_max`] still sees the contradiction
-/// for a block whose claim does not cross the window's end.
+/// exact once decoded, or, for a block clipped to the window, the earlier
+/// of that and its last element inside the window.
 fn state_last(bs: &BlockState) -> i64 {
     let last = blob_last(&bs.index);
     match bs.clip_last {
@@ -1123,37 +1248,17 @@ fn merge_decoded_pair<S: MergeSink>(
 
     let outcome = element_merge_pair(&os, &ns, merge_up_to, kind, sink)?;
 
-    check_claimed_max(&os.index, outcome.old_past, merge_up_to, "old")?;
-    check_claimed_max(&ns.index, outcome.new_past, merge_up_to, "new")?;
-
-    // On input in canonical order at most one side keeps a residual: a side
-    // holds elements past the boundary only when its last reaches past the
-    // other's, and a side held at the boundary key is one whose peer ran
-    // out. Both keeping one means a block's elements are out of order
-    // behind truthful-looking claims, and retrying the same pair would never
-    // progress.
+    // Decoding proved both claims exact and both blocks in order
+    // ([`hold_decoded_claim`]), so the side whose last is the boundary ends
+    // there, and only the other keeps elements past it; a side held at the
+    // boundary key is one whose peer ran out. Both keeping one is a broken
+    // engine invariant, and retrying the same pair would never progress.
     if outcome.old_has_more && outcome.new_has_more {
-        return Err(crate::error::new_unsorted(format!(
+        return Err(crate::Error::internal(format!(
             "block-pair merge: both blocks still hold elements after merging up to ID \
-             {merge_up_to}. Their elements are not in canonical order within the block."
+             {merge_up_to}, though both claims were checked exact"
         )));
     }
-
-    // ADR-0013: metadata is trusted by default, but nothing load-bearing may
-    // break when it turns out to be wrong. The residual decision below is
-    // "does this block still hold elements past the boundary", and asking
-    // `index.max_id` is only a proxy for it. When a blob's stored `max_id`
-    // understates its real contents, the proxy says "finished" while the
-    // block still holds elements - and the block is then dropped, taking
-    // them with it, with no error and no infinite loop to notice. Compare
-    // the proxy against what the iterator actually saw, and reject the
-    // mismatch instead of losing elements to it. A block clipped at the
-    // window's end is bounded there, so what it holds past the window is the
-    // next unit's and never counts as "more"; a block whose claim lies
-    // inside the window is not clipped, so its contents stay visible. The
-    // checks above take `*_past`, elements strictly past the boundary: a
-    // side held at the boundary key (see [`element_merge_pair`]) is not
-    // "more" by itself.
 
     if outcome.old_has_more {
         os.skip_count += outcome.old_consumed;
@@ -1176,42 +1281,13 @@ fn blob_last(index: &crate::blob_meta::BlobIndex) -> i64 {
 ///
 /// Uses the `osm_id` blob-range keys rather than raw `max_id < min_id`, so
 /// the non-overlap test agrees with the order the elements are merged in.
-/// Claimed ranges, also for a clipped block: conservative, since a clipped
-/// block's remaining elements lie inside its claim.
+/// Claimed ranges, also for a clipped block: conservative, since a decoded
+/// block's claim is exact ([`hold_decoded_claim`]) and its remaining
+/// elements lie inside it. A fresh blob compared before decoding is decoded
+/// before it is emitted, so the claim it was routed by is checked then.
 fn blob_entirely_before(a: &crate::blob_meta::BlobIndex, b: &crate::blob_meta::BlobIndex) -> bool {
     crate::osm_id::blob_osm_last_key(a.min_id, a.max_id)
         < crate::osm_id::blob_osm_first_key(b.min_id, b.max_id)
-}
-
-/// Verify a blob's stored `max_id` against what the element walk found.
-///
-/// `has_more` true means the block still holds elements past `merge_up_to`
-/// (within its window bound). If the blob's own claimed last ID is at or
-/// before the boundary, the stored metadata contradicts the block's
-/// contents. Erroring here is also what keeps [`merge_decoded_pair`] from
-/// looping: a side is only retained as a residual when it genuinely has
-/// more, and the boundary is the earlier of the two effective lasts, so
-/// both sides retaining would require both claims to be understated - which
-/// this rejects - or both blocks to reach past the window, which their
-/// bound stops.
-fn check_claimed_max(
-    index: &crate::blob_meta::BlobIndex,
-    has_more: bool,
-    merge_up_to: i64,
-    side: &str,
-) -> Result<()> {
-    if !has_more {
-        return Ok(());
-    }
-    let claimed_last = blob_last(index);
-    if crate::osm_id::osm_id_cmp(claimed_last, merge_up_to).is_le() {
-        return Err(crate::error::new_indexdata_mismatch(format!(
-            "block-pair merge: the {side} blob's indexdata claims its last ID is \
-             {claimed_last}, but the block still holds elements past the merge boundary \
-             {merge_up_to}. The stored blob metadata does not match the blob's contents."
-        )));
-    }
-    Ok(())
 }
 
 /// Run the block-pair merge over one work unit of one kind.
@@ -1403,10 +1479,6 @@ fn element_merge_pair<S: MergeSink>(
     // uses it, and for negative IDs the two disagree - a raw boundary test
     // would cut the streams somewhere the merge order does not.
     let in_range = |e: &Element<'_>| crate::osm_id::osm_id_cmp(element_id(e), merge_up_to).is_le();
-    // Whether the side whose block ran out holds the merge pair's repeats of
-    // the boundary ID back from the other side.
-    let mut old_held = false;
-    let mut new_held = false;
 
     loop {
         // Which side's head goes next, from the in-range heads alone; the
@@ -1428,14 +1500,12 @@ fn element_merge_pair<S: MergeSink>(
             (None, None) => break,
             (Some(o_id), None) => {
                 if o_id == merge_up_to && new_iter.peek().is_none() {
-                    old_held = true;
                     break;
                 }
                 std::cmp::Ordering::Less
             }
             (None, Some(n_id)) => {
                 if n_id == merge_up_to && old_iter.peek().is_none() {
-                    new_held = true;
                     break;
                 }
                 std::cmp::Ordering::Greater
@@ -1472,52 +1542,18 @@ fn element_merge_pair<S: MergeSink>(
         }
     }
 
-    let old_has_more = old_iter.peek().is_some();
-    let new_has_more = new_iter.peek().is_some();
-    let old_past = if old_held {
-        held_tail_past(&os.index, old_iter, merge_up_to)
-    } else {
-        old_has_more
-    };
-    let new_past = if new_held {
-        held_tail_past(&ns.index, new_iter, merge_up_to)
-    } else {
-        new_has_more
-    };
     Ok(MergePairOutcome {
         old_consumed,
         new_consumed,
-        old_has_more,
-        new_has_more,
-        old_past,
-        new_past,
+        old_has_more: old_iter.peek().is_some(),
+        new_has_more: new_iter.peek().is_some(),
     })
-}
-
-/// Whether a block held at the boundary ID also holds an element past it,
-/// behind its repeats of that ID: what [`check_claimed_max`] asks of a held
-/// side. `rest` is the held side's iterator, at its first held element, so
-/// the walk covers only what is left. Walked only when the claim does not
-/// already reach past the boundary (the check passes for any answer
-/// otherwise), which needs a repeated ID to happen at all. An element
-/// before the boundary is disorder within the block, which is trusted, not
-/// a claim the check can refute.
-fn held_tail_past<'a>(
-    index: &crate::blob_meta::BlobIndex,
-    mut rest: impl Iterator<Item = Element<'a>>,
-    merge_up_to: i64,
-) -> bool {
-    if crate::osm_id::osm_id_cmp(blob_last(index), merge_up_to).is_gt() {
-        return false;
-    }
-    rest.any(|e| crate::osm_id::osm_id_cmp(element_id(&e), merge_up_to).is_gt())
 }
 
 /// What one [`element_merge_pair`] call did, and what it left behind.
 ///
 /// `*_has_more` is what the bounded iterator actually observed, not what
-/// the blob's indexdata claims. The residual decision is made from these, so
-/// an understated `max_id` cannot silently drop a block's tail.
+/// the blob's indexdata claims; the residual decision is made from these.
 struct MergePairOutcome {
     old_consumed: usize,
     new_consumed: usize,
@@ -1525,8 +1561,4 @@ struct MergePairOutcome {
     /// the boundary ID held for the peer's next blob.
     old_has_more: bool,
     new_has_more: bool,
-    /// The side holds an element strictly past the boundary, the fact
-    /// [`check_claimed_max`] weighs against the claim.
-    old_past: bool,
-    new_past: bool,
 }

@@ -166,37 +166,98 @@ fn repeated_ids_pair_in_order_at_every_cut() {
     }
 }
 
-/// A block whose elements are out of order behind honest claims can leave
-/// both sides of a pair with nothing to merge below the boundary: `[2, 1, 3]`
-/// clipped at a cut at 3 ends at `n1`, so the boundary is 1 and both heads
-/// are `n2`. Both sides keep a residual, and retrying the pair would never
-/// progress; the merge refuses it as unsorted instead.
+/// A block whose elements are out of order behind an exact claim is refused
+/// as unsorted when it is decoded, before any cut clips it: `[2, 1, 3]`
+/// clipped at a cut at 3 would end at `n1`, leaving both sides of the pair
+/// holding `n2` past a boundary of 1, a pair that could never progress.
 #[test]
-fn a_pair_that_cannot_progress_is_refused() {
+fn a_block_out_of_order_is_refused_at_decode() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("disordered.osm.pbf");
     write_ids(&path, &[2, 1, 3, 3], 3);
-    let host = crate::common::test_host();
-    host.invocation
-        .faults()
-        .diff_unit_target_bytes
-        .store(1, Ordering::Relaxed);
-    let options = DiffOptions {
-        suppress_common: false,
-        verbose: false,
-        type_filter: None,
-        parallelism: pbfhogg::Parallelism::from_jobs(1),
-        locations: false,
-    };
-    let mut out = Vec::new();
-    let err = diff(&path, &path, &mut out, &options, false, &host)
-        .expect_err("a pair that cannot progress must be refused");
-    assert!(
-        err.report()
-            .contains("not in canonical order within the block"),
-        "{}",
-        err.report()
-    );
+    for unit_bytes in [1, 0] {
+        let host = crate::common::test_host();
+        host.invocation
+            .faults()
+            .diff_unit_target_bytes
+            .store(unit_bytes, Ordering::Relaxed);
+        let options = DiffOptions {
+            suppress_common: false,
+            verbose: false,
+            type_filter: None,
+            parallelism: pbfhogg::Parallelism::from_jobs(1),
+            locations: false,
+        };
+        let mut out = Vec::new();
+        let err = diff(&path, &path, &mut out, &options, false, &host)
+            .expect_err("a block out of order must be refused");
+        assert!(
+            matches!(err.kind(), pbfhogg::ErrorKind::Unsorted { .. }),
+            "unit {unit_bytes}: {}",
+            err.report()
+        );
+        assert!(
+            err.report()
+                .contains("out of the order its header declares"),
+            "unit {unit_bytes}: {}",
+            err.report()
+        );
+    }
+}
+
+/// A frame is carried into later units only while its claimed last reaches
+/// them, and each unit clips it to its window, so the elements past an
+/// understated claim once belonged to no unit and vanished before any check
+/// saw them. Against old `[1, 2] | [3, 4] | [5, 6]` cut at every blob, a new
+/// blob holding nodes 1 to 6 while claiming 1 to 4 is carried past the cut
+/// at 3 and dropped at the cut at 5, which hid 5 and 6 and reported them
+/// deleted. It is now refused when it is decoded, at every cut.
+#[test]
+fn an_understated_claim_cannot_hide_elements_behind_a_cut() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let honest = dir.path().join("honest.osm.pbf");
+    let lying = dir.path().join("lying.osm.pbf");
+    let ids: Vec<i64> = (1..=6).collect();
+    write_ids(&old, &ids, 2);
+    write_ids(&honest, &ids, 6);
+    let bytes = std::fs::read(&honest).unwrap();
+    // Frames: the header, then the one node blob.
+    std::fs::write(
+        &lying,
+        crate::common::adversarial::forge_indexdata_range(&bytes, 1, 1, 4, None),
+    )
+    .unwrap();
+    for jobs in [1, 3] {
+        for unit_bytes in [1, 200, 0] {
+            let text = diff_text(&old, &honest, jobs, unit_bytes, false);
+            assert_eq!(
+                text.lines().filter(|l| l.starts_with(' ')).count(),
+                6,
+                "jobs {jobs}, unit {unit_bytes}: honest claims compare equal; got:\n{text}"
+            );
+            let host = crate::common::test_host();
+            host.invocation
+                .faults()
+                .diff_unit_target_bytes
+                .store(unit_bytes, Ordering::Relaxed);
+            let options = DiffOptions {
+                suppress_common: false,
+                verbose: false,
+                type_filter: None,
+                parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+                locations: false,
+            };
+            let mut out = Vec::new();
+            let err = diff(&old, &lying, &mut out, &options, false, &host)
+                .expect_err("an understated claim must be refused");
+            assert!(
+                matches!(err.kind(), pbfhogg::ErrorKind::IndexdataMismatch { .. }),
+                "jobs {jobs}, unit {unit_bytes}: {}",
+                err.report()
+            );
+        }
+    }
 }
 
 /// The fault plan's planner and text settings for one run; zero keeps the

@@ -2477,12 +2477,11 @@ fn derive_sequential_and_sharded_output_byte_identical() {
     }
 }
 
-/// A single-sided blob is decoded (its lines are printed from it), yet its
-/// run was counted by the blob's claimed `count`: a new blob claiming 10
-/// nodes while holding 3 reported 10 created. The count now comes from the
-/// decoded block, with and without `-c`, sharded or not.
+/// A single-sided blob is decoded, so its claim is checked: a new blob
+/// claiming 10 nodes while holding 3 once reported 10 created, and is now
+/// refused as a false claim, with and without `-c` and `-q`, sharded or not.
 #[test]
-fn single_sided_runs_count_decoded_elements_not_claimed_ones() {
+fn a_single_sided_blob_with_a_false_count_is_refused() {
     let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     write_multi_block_test_pbf(&old, &generate_nodes(3, 1), &[], &[], 3);
@@ -2496,21 +2495,30 @@ fn single_sided_runs_count_decoded_elements_not_claimed_ones() {
         crate::common::adversarial::forge_indexdata_range(&bytes, 2, 4, 6, Some(10)),
     )
     .unwrap();
-    for suppress_common in [false, true] {
-        for jobs in [Some(1), None] {
-            let (_, stats) = run_diff(
-                &old,
-                &new,
-                DiffOpts {
-                    suppress_common,
-                    jobs,
-                    ..DiffOpts::default()
-                },
-            );
+    for mode in [None, Some("-c"), Some("-q")] {
+        for jobs in ["1", "4"] {
+            let invocation_scratch = pbfhogg_test_scratch::scratch();
+            let mut cli = CliInvoker::new(&invocation_scratch)
+                .arg("diff")
+                .arg(&old)
+                .arg(&new)
+                .arg("-j")
+                .arg(jobs);
+            if let Some(flag) = mode {
+                cli = cli.arg(flag);
+            }
+            let out = cli.run();
             assert_eq!(
-                (stats.created, stats.common),
-                (3, 3),
-                "-c {suppress_common}, -j {jobs:?}"
+                out.status.code(),
+                Some(2),
+                "{mode:?}, -j {jobs}: stderr:\n{}",
+                out.stderr_str()
+            );
+            assert!(
+                out.stderr_str()
+                    .contains("blob indexdata claims 10 node elements with ids 4..=6"),
+                "{mode:?}, -j {jobs}: stderr:\n{}",
+                out.stderr_str()
             );
         }
     }

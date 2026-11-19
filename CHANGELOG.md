@@ -333,6 +333,16 @@
 
 ### Fixed
 
+- Indexed `diff` (text, `-c`, `-q` and `--format osc`) refuses, with exit
+  `2`, every blob it decodes whose indexdata is not exact (a count, least
+  or greatest ID that is not what the blob holds) or whose elements are out
+  of canonical order, and a blob whose range spans negative and positive IDs
+  that starts before the blob preceding it ends. A false range could
+  report one element both created and deleted, hide elements behind a
+  work-unit cut, or pair identical files as different; a false count gave
+  wrong created and deleted totals. Honestly indexed sorted files diff as
+  before. A byte-identical pair skipped without decoding (`-c`, `-q`,
+  `--format osc`) is still believed; `check --index` verifies it.
 - The `build-geocode-index` scratch report makes removal of legacy buckets
   conditional on publication removing the old index directory.
 - `build-geocode-index --overwrite` replaces only a directory whose

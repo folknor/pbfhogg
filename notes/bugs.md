@@ -130,15 +130,6 @@ checked accessors exist. Consumers named:
 The proposed fix is fallible tag iteration carried through owned conversion,
 matching and builder intake.
 
-## BUG-005 - Diff clipping can hide elements beyond a false index range
-
-Reported by: decode, merge.
-
-A carried frame is clipped at successive unit boundaries (`merge_join.rs`
-`clip`) and stops being carried once its claimed last key is passed
-(`diff/units.rs` carry selection). Elements beyond an understated claim belong
-to no unit, and the later claimed-maximum check only sees the clipped run.
-
 ## BUG-006 - Rebuild paths drop inline way locations
 
 Reported by: encoding, sort, spatial.

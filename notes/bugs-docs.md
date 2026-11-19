@@ -259,6 +259,18 @@ The "BlobHeader.datasize cap" section of `CORRECTNESS.md` still describes
 two separate frame-check funnels, while `crates/lib/src/read/frame.rs` has
 had a single frame state machine since `307982d7`.
 
+## DOC-028 - The exit status of a publication-time HoldsInput refusal is undocumented
+
+Reported by: the FMT-023/GEO-001/GEO-002 implementer (2026-11-19), not
+verified.
+
+`build-geocode-index` now refuses at final inspection when replacing the
+index directory would delete the input PBF (`OutputError::HoldsInput`).
+`docs/cli/commands.md` describes the refusal but not its exit status; the
+CLI's mapping of that error kind was not checked. Separately, the
+`IndexScratch` report text still says the old index's buckets are deleted
+with it, without "when replacement succeeds".
+
 ## DOC-026 - apply-changes comments describe a timed receive and a relation-first fixture that is not
 
 Reported by: the CMD-001 scout and implementer (2026-11-18), not verified

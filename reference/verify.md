@@ -621,7 +621,9 @@ entry runs on the suite input (by default `indexed`, which declares no
 `LocationsOnWays`; the PASS line names the gap). The suite's `degrade -l`
 entry runs the whole check on the selected generation's
 `altw-keep-untagged` base, and standalone `degrade --locations-on-ways`
-does the same on the selected input. On a `LocationsOnWays` input the check
+does the same on the selected input. The ordinary and locations entries use
+`checks/degrade/` and `checks/degrade-l/`, respectively. On a
+`LocationsOnWays` input the check
 first compares the reference with way coordinates against the one without
 (both the input, or both the same stable partition): an unmatched object is
 a failure, and no differing record means no way carried a coordinate. In the locations entry an input that declares no

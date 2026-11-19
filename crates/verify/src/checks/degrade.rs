@@ -123,7 +123,8 @@ impl Run<'_> {
 /// Run degrade cross-validation (module doc) on any input; one without
 /// inline way coordinates is a PASS-line gap.
 pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<String>, Error> {
-    run_on(harness, pbf, direct_io, false)
+    let outdir = harness.subdir("degrade")?;
+    run_on(harness, pbf, direct_io, false, &outdir)
 }
 
 /// Run degrade cross-validation on an input that must carry inline way
@@ -134,7 +135,8 @@ pub fn run_locations(
     pbf: &Path,
     direct_io: bool,
 ) -> Result<Option<String>, Error> {
-    run_on(harness, pbf, direct_io, true)
+    let outdir = harness.subdir("degrade-l")?;
+    run_on(harness, pbf, direct_io, true, &outdir)
 }
 
 fn run_on(
@@ -142,10 +144,10 @@ fn run_on(
     pbf: &Path,
     direct_io: bool,
     require_locations: bool,
+    outdir: &Path,
 ) -> Result<Option<String>, Error> {
-    let outdir = harness.subdir("degrade")?;
     harness.msg("--- degrade: reading the input ---");
-    let input = reencode::read_input(harness, &outdir, pbf)?;
+    let input = reencode::read_input(harness, outdir, pbf)?;
     if require_locations && !input.locations {
         return Err(Error::Failed(
             "the input declares no LocationsOnWays, so coordinate stripping cannot be verified \
@@ -153,10 +155,10 @@ fn run_on(
                 .to_owned(),
         ));
     }
-    let mut refs = References::new(&outdir, &input);
+    let mut refs = References::new(outdir, &input);
     let reference = refs.get(harness, false)?;
     let coordinates = if input.locations {
-        observed_coordinates(harness, &outdir, &mut refs, &reference)?
+        observed_coordinates(harness, outdir, &mut refs, &reference)?
     } else {
         false
     };
@@ -169,7 +171,7 @@ fn run_on(
     }
     let mut run = Run {
         harness,
-        outdir: outdir.clone(),
+        outdir: outdir.to_path_buf(),
         input: &input,
         direct_io,
         gaps: Vec::new(),

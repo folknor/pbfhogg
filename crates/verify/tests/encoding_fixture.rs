@@ -58,6 +58,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     // coverage diff finds none; without the requirement that is a gap.
     let low = dir.join("low.pbf");
     write_pbf(&low, false, 3, &["Sort.Type_then_ID"], &["LocationsOnWays"]);
+    judge_degrade_pair(&mut h, exe, &dir, &input, &low);
     for (fault, path, required, passed) in [
         ("", &low, true, true),
         ("no-coords", &low, true, false),
@@ -103,6 +104,28 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             accepted
         );
     }
+}
+
+/// The suite runs both degrade checks under the same run directory.
+fn judge_degrade_pair(h: &mut harness::Harness, exe: &Path, dir: &Path, input: &Path, low: &Path) {
+    std::fs::write(dir.join("fault"), "").unwrap();
+    h.run = run::Run::create(dir, exe, true).unwrap();
+    h.run.watch(input).unwrap();
+    h.run.watch(low).unwrap();
+    let ordinary = super::judge(h, "degrade", |h| checks::degrade::run(h, input, true));
+    assert_eq!(
+        ordinary.status,
+        harness::CheckStatus::Passed,
+        "{ordinary:?}"
+    );
+    let locations = super::judge(h, "degrade -l", |h| {
+        checks::degrade::run_locations(h, low, true)
+    });
+    assert_eq!(
+        locations.status,
+        harness::CheckStatus::Passed,
+        "{locations:?}"
+    );
 }
 
 /// Hold one encoding fault to the comparisons it must fail on every arm

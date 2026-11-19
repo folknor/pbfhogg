@@ -25,18 +25,6 @@ under BUG-016 in `notes/bugs.md`, because it is the other reading of that
 mechanism, and the geocode-query optimizer sink is recorded under BUG-028.
 Entries are in no order of importance.
 
-## TOOL-001 - verify all stops at degrade -l whenever a locations base is configured
-
-Reported by: verify [P1].
-
-The suite (`crates/verify/src/all.rs`) runs ordinary degrade and then
-locations degrade. Both call `run_on`, which always requests `checks/degrade`
-(`checks/degrade.rs`). The second request fails because that directory already
-exists, so the suite prints `ERROR`, exits 2 and never reaches the remaining
-checks. This breaks the binding contract in `reference/verify.md` that both
-entries run when their prerequisites exist. The directory identity needs to
-distinguish the two checks.
-
 ## TOOL-002 - verify extract compares different regions for some bbox spellings
 
 Reported by: verify [P2].

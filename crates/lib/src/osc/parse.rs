@@ -1278,6 +1278,9 @@ mod tests {
             r#"id="1" lat="1.0" lon="2.0" version="1" changeset="not-a-number""#,
             r#"id="1" lat="1.0" lon="2.0" version="1" uid="x""#,
             r#"id="1" lat="1.0" lon="2.0" version="1" timestamp="yesterday""#,
+            // A signed component, literal or referenced, is not a rollover.
+            r#"id="1" lat="1.0" lon="2.0" version="1" timestamp="2026-01-01T-1:00:00Z""#,
+            r#"id="1" lat="1.0" lon="2.0" version="1" timestamp="2026-01-01T&#45;1:00:00Z""#,
         ] {
             let err = parse_single_node("create", attrs)
                 .err()

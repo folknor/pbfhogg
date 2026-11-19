@@ -362,6 +362,15 @@
 
 ### Fixed
 
+- **A sign inside an RFC 3339 timestamp is refused.** The `time-filter`
+  cutoff, the `osmosis_replication_timestamp` header override and OSC
+  `timestamp` attributes read by `apply-changes` accepted a leading `+`
+  or `-` in a component, so `2026-01-01T-1:00:00Z` silently became
+  `2025-12-31T23:00:00Z` (also when spelled `T&#45;1` in OSC). Every
+  component must now be ASCII digits. Signed UNIX seconds are still
+  accepted where they were. A derived OSC element dated before year 0000
+  is now refused by `apply-changes` rather than read back.
+
 - **OSC input reads character references in IDs, refs, coordinates and
   numeric or timestamp metadata.** `id="&#49;"`, `ref="&#50;"`,
   `lat="&#49;"`, `version="&#49;"` and the like were refused as not a

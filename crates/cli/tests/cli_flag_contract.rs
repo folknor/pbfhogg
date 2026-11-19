@@ -504,6 +504,21 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["time-filter", "IN", "-o", "OUT", "yesterday"],
         "UNIX seconds",
     ),
+    (
+        &["time-filter", "IN", "-o", "OUT", "2026-01-01T-1:00:00Z"],
+        "UNIX seconds",
+    ),
+    (
+        &[
+            "sort",
+            "IN",
+            "-o",
+            "OUT",
+            "--output-header",
+            "osmosis_replication_timestamp=2026-01--1T00:00:00Z",
+        ],
+        "osmosis_replication_timestamp",
+    ),
     (&["extract", "IN", "-o", "OUT", "--bbox", "1,2,3"], "bbox"),
     (&["export", "IN", "--bbox", "1,2,3"], "bbox"),
     (&["degrade", "IN", "-o", "OUT", "--drop-ids", "5"], "N:SEED"),

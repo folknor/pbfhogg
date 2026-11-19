@@ -848,8 +848,10 @@ pub(crate) fn probe_to_first_data_blob(frames: &mut Frames<FileReader>) -> Resul
 /// Uses the civil-time algorithm from Howard Hinnant's `chrono`-compatible
 /// date library to convert days since epoch to (year, month, day). Signed:
 /// a timestamp before 1970 formats as its real date (`-1` is
-/// `1969-12-31T23:59:59Z`) and [`parse_rfc3339_utc`] reads it back, for
-/// every year with four digits.
+/// `1969-12-31T23:59:59Z`) and [`parse_rfc3339_utc`] reads it back for
+/// years 0000 to 9999. Outside that range the output is not in the
+/// parser's grammar: a later year has five digits and an earlier one a
+/// sign (`-001-01-01T00:00:00Z`), which the parser refuses.
 pub(crate) fn format_epoch_secs(secs: i64) -> String {
     let day_secs = secs.rem_euclid(86400);
     let days = (secs - day_secs) / 86400;
@@ -891,10 +893,11 @@ impl crate::error::Leaf for TimestampError {}
 /// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, the OSM XML
 /// timestamp format) into Unix epoch seconds.
 ///
-/// Inverse of `format_epoch_secs`. Strict: exactly 20 bytes, `Z` suffix,
-/// no fractional seconds or offsets (OSM planet/OSC files never carry
-/// either). Used by the OSC parser for element `timestamp` attributes and
-/// by the CLI for `time-filter`'s cutoff argument.
+/// Inverse of `format_epoch_secs` for years 0000 to 9999. Strict: exactly
+/// 20 bytes, `Z` suffix, every component ASCII digits (no sign), no
+/// fractional seconds or offsets (OSM planet/OSC files never carry either).
+/// Used by the OSC parser for element `timestamp` attributes and by the CLI
+/// for `time-filter`'s cutoff and the replication-timestamp header override.
 pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, TimestampError> {
     const FORMAT_ERR: TimestampError = TimestampError("timestamp must be YYYY-MM-DDTHH:MM:SSZ");
     if input.len() != 20 {
@@ -912,10 +915,19 @@ pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, TimestampError
         return Err(FORMAT_ERR);
     }
 
+    // Every component is fixed-width ASCII digits. Not `str::parse`, which
+    // takes a leading `+` or `-`: `T-1:00:00Z` would read as hour -1 and
+    // roll the date back, turning a malformed timestamp into a different
+    // valid one. A pre-1970 instant is spelled with an earlier year; the
+    // callers' own integer branches take signed epoch seconds.
     let field = |start: usize, end: usize| -> std::result::Result<i64, TimestampError> {
-        input[start..end]
-            .parse::<i64>()
-            .map_err(|_| TimestampError("invalid numeric timestamp component"))
+        bytes[start..end].iter().try_fold(0_i64, |acc, &b| {
+            if b.is_ascii_digit() {
+                Ok(acc * 10 + i64::from(b - b'0'))
+            } else {
+                Err(TimestampError("invalid numeric timestamp component"))
+            }
+        })
     };
 
     let year = field(0, 4)?;
@@ -995,6 +1007,31 @@ mod tests {
         assert!(parse_rfc3339_utc("2026-02-30T00:00:00Z").is_err()); // Feb 30
         assert!(parse_rfc3339_utc("2026-02-20T24:00:00Z").is_err()); // hour 24
         assert!(parse_rfc3339_utc("not-a-timestamp-at-al").is_err());
+
+        // A sign in any component is malformed, never a rollover.
+        for signed in [
+            "2026-01-01T-1:00:00Z",
+            "2026-01--1T00:00:00Z",
+            "2026--1-01T00:00:00Z",
+            "2026-01-01T00:-1:00Z",
+            "2026-01-01T00:00:-1Z",
+            "-001-01-01T00:00:00Z",
+            "+026-01-01T00:00:00Z",
+            "2026-+1-01T00:00:00Z",
+            "2026-01-+1T00:00:00Z",
+            "2026-01-01T+1:00:00Z",
+            "2026-01-01T00:+1:00Z",
+            "2026-01-01T00:00:+1Z",
+            "2026-01-01T 1:00:00Z",
+        ] {
+            assert_eq!(
+                parse_rfc3339_utc(signed),
+                Err(TimestampError("invalid numeric timestamp component")),
+                "{signed}"
+            );
+        }
+        // The formatter's output below year 0000 is outside the grammar.
+        assert!(parse_rfc3339_utc(&format_epoch_secs(-62_198_755_200)).is_err());
         Ok(())
     }
 }

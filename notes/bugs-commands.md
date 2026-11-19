@@ -26,21 +26,6 @@ renumber (BUG-020), degrade drop counting (BUG-022) and cat decode counters
 (BUG-023). Entries are in no
 order of importance.
 
-## CMD-003 - parse_rfc3339_utc accepts malformed signed components
-
-Reported by: osc-parsing [P2], passthrough-rewrite.
-
-`parse_rfc3339_utc` (`commands/mod.rs`) parses components as signed integers
-and checks only upper bounds for day and time. `2026-01-01T-1:00:00Z` is
-accepted and stored as `2025-12-31T23:00:00Z`, `2026-01--1T00:00:00Z` also
-passes, and leading `+` signs are accepted. The parser feeds header overrides
-and OSC metadata (`osc/xml_parse.rs`), so malformed timestamps silently become
-different valid ones. This breaks the function's documented strict RFC 3339
-contract and the refusal policy for malformed input. Fixed-width components
-need ASCII-digit validation. OSC timestamps are now read after XML
-normalization, so a referenced sign (`T&#45;1:00:00Z`) reaches the same
-acceptance; the digit check closes both spellings.
-
 ## CMD-006 - load_all_diffs silently skips files it cannot stat
 
 Reported by: osc-parsing [P2].
@@ -75,7 +60,9 @@ The borrowed node writers (`osc/write.rs`) format unchecked PBF coordinates,
 so a new node at latitude 91 produces `lat="91"`, which the OSC parser
 refuses. `push_info_attrs` formats timestamps without checking the year, so an
 element dated `10000-01-01` gets a five-digit year, while `parse_rfc3339_utc`
-requires exactly 20 bytes and four year digits. Derive succeeds, but applying
+requires exactly 20 bytes and four year digits. Below year 0000 the formatter
+writes a signed year (`-001-01-01T00:00:00Z`), which the parser refuses since
+it accepts only ASCII digits in every component. Derive succeeds, but applying
 its output fails. The public delete-timestamp parameter has the same problem,
 and values above `i64::MAX` are silently clamped (`diff/derive.rs`). This
 breaks the derive/apply roundtrip documented in `docs/cli/commands.md`, even

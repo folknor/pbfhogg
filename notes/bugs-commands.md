@@ -491,20 +491,3 @@ with the size error instead of renumbering. It fails loudly and before
 publication, and is sign-neutral (a large positive start does it too). The
 fix is a split path: cut an oversized rewritten block between elements into
 two output blocks with their own indexes.
-
-## CMD-048 - An empty numeric OSC attribute is refused applied directly and dropped when re-emitted
-
-Reported by: the CMD-042/043/047 spar partner (codex, 2026-11-19), from
-source; not reproduced.
-
-apply-changes refuses `uid=""`, `changeset=""` and `timestamp=""` as
-unparsable (`arena_meta`, `osc/xml_parse.rs`). merge-changes and OSC
-tags-filter pass those fields as text and omit an empty one on output, so the
-same change fails applied directly and succeeds applied after re-emission
-(a delete with `version="7" uid=""`, say). `version=""` is refused
-everywhere and is not part of this. Either the re-emitters refuse an
-explicit empty numeric or timestamp attribute too, or both routes read it
-as absent; the second lets a malformed attribute pass silently, the first
-changes the re-emitters' acceptance policy. An empty `visible` was settled
-as absent on every route; an empty `user` is a claim (it can name a blank
-user alongside a uid) and is BUG-015's question.

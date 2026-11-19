@@ -244,13 +244,6 @@ and re-emission silently removes the offending tail. Claim named: the
 malformed-role refusal contract in `CORRECTNESS.md`. The parser needs to
 validate the complete child attribute list.
 
-## BUG-015 - OSC re-emission drops explicit empty metadata
-
-Reported by: osc.
-
-`OwnedMetadata::append_attrs` tests string emptiness and parsing keeps no
-presence bits, so an explicit `user=""` is omitted on output.
-
 ## BUG-016 - apply-changes applies older OSC versions over newer base versions
 
 Reported by: apply-core.

@@ -387,10 +387,9 @@ where
             "uid" => MetaField::Uid,
             "user" => MetaField::User,
             // An empty `visible` carries no visibility and is the attribute
-            // absent, for every sink: the re-emitters write an empty
-            // attribute as absent, so treating it as present here made a
-            // directly applied change claim `visible` true in the PBF and the
-            // same change applied after re-emission claim nothing. It is
+            // absent, for every sink, so a change claims the same visibility
+            // applied directly and after re-emission (which, skipping it
+            // here, never writes it). It is
             // judged after the iterator has validated the attribute (a
             // duplicate still fails) and does not count as metadata.
             // libosmium refuses it; pbfhogg does no strict true/false
@@ -1152,6 +1151,7 @@ pub(crate) fn parse_owned_metadata(
         uid: String::new(),
         user: String::new(),
         visible: String::new(),
+        present: 0,
     };
     let present = scan_owned_metadata_into(e, &mut meta)?;
     Ok(if present { Some(meta) } else { None })
@@ -1164,7 +1164,9 @@ pub(crate) fn scan_owned_metadata_into(
     e: &quick_xml::events::BytesStart<'_>,
     meta: &mut crate::osc::write::OwnedMetadata,
 ) -> ParseResult<bool> {
+    use crate::osc::write::OwnedMetadata as M;
     meta.version = None;
+    meta.present = 0;
     for text in [
         &mut meta.timestamp,
         &mut meta.changeset,
@@ -1187,14 +1189,22 @@ pub(crate) fn scan_owned_metadata_into(
         let text = attr
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(xml_err)?;
-        let slot = match field {
-            MetaField::Timestamp => &mut meta.timestamp,
-            MetaField::Changeset => &mut meta.changeset,
-            MetaField::Uid => &mut meta.uid,
-            MetaField::User => &mut meta.user,
-            MetaField::Visible => &mut meta.visible,
+        // Presence is recorded apart from the text: an exactly empty
+        // attribute is present and is re-emitted as written (an empty
+        // `visible` never reaches here; `scan_meta_attrs` reads it as
+        // absent). Applying the re-emitted change then sees what applying
+        // the original saw: `user=""` stays a blank-user claim, and
+        // `uid=""`, `changeset=""` or `timestamp=""` is refused by apply's
+        // native parse either way, as libosmium refuses them on every route.
+        let (slot, bit) = match field {
+            MetaField::Timestamp => (&mut meta.timestamp, M::PRESENT_TIMESTAMP),
+            MetaField::Changeset => (&mut meta.changeset, M::PRESENT_CHANGESET),
+            MetaField::Uid => (&mut meta.uid, M::PRESENT_UID),
+            MetaField::User => (&mut meta.user, M::PRESENT_USER),
+            MetaField::Visible => (&mut meta.visible, M::PRESENT_VISIBLE),
             MetaField::Version => unreachable!("handled above"),
         };
+        meta.present |= bit;
         // A repeated attribute keeps its last value, as the owned scan did.
         slot.clear();
         slot.push_str(&text);

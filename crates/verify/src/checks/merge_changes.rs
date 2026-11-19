@@ -37,8 +37,8 @@
 //!
 //! A delete is held to its input body (tags, coordinates, refs, members)
 //! like any other change, as pbfhogg and osmium write one; a deleted node
-//! with no location is held to none, never 0 0; an empty metadata attribute
-//! is held to be omitted. pbfhogg refuses a deleted node with half a
+//! with no location is held to none, never 0 0; an empty `visible` is held to
+//! be omitted and every other empty metadata attribute to be kept. pbfhogg refuses a deleted node with half a
 //! location or an unusable coordinate: such an input fails the arm on
 //! pbfhogg's exit, and no case here asserts the refusal, which pbfhogg's
 //! own tests cover.
@@ -859,7 +859,7 @@ pub fn run(harness: &mut Harness, oscs: &[PathBuf]) -> Result<Option<String>, Er
         "on the inputs ({} change file{}) and the inputs twice over{}: default mode as its \
          inputs concatenated and --simplify as the last change per object by input position, \
          grouped create, modify, delete in kind then canonical ID order, comparing action labels, metadata \
-         attributes (an empty one held to be omitted) and osmium's decoding record for record, \
+         attributes (an empty visible held to be omitted, any other empty one kept) and osmium's decoding record for record, \
          a delete held to its input body ({} bodied input deletes checked, a deleted node \
          without a location held to none), section boundaries not compared, --jobs 1 as the automatic workers; on fixtures, \
          version regressions refused naming the first by position, unversioned changes \

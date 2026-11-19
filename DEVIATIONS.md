@@ -309,8 +309,21 @@ change that is silently different from its input is the outcome pbfhogg
 refuses. `apply-changes` keeps only a delete's identity and version claim,
 so the location cannot change its answer; it accepts the same file.
 
-Empty metadata attributes are not a deviation: an empty `user=""` is written
-as absent, as osmium's writer omits an empty user.
+## merge-changes and tags-filter OSC: an explicit empty metadata attribute is written back
+
+**osmium behavior:** libosmium holds a user as a plain string with no
+absence, so `user=""` and no `user` read the same, and its XML writer omits an
+empty user. It refuses an empty `uid`, `changeset` or `timestamp` on reading
+(`string_to_ulong`, `parse_timestamp`), so no osmium command re-emits one.
+
+**pbfhogg behavior:** the re-emitters write every metadata attribute a kept
+change carried, empty included (an empty `visible` excepted, which every
+consumer reads as absent). An empty `user=""` is written back, because
+apply-changes records it as a blank-user claim distinct from no user, and
+dropping it would change what the change claims once re-emitted. The
+re-emitters do not validate `uid`, `changeset` or `timestamp`, so an empty one
+passes through as malformed nonempty text does; apply-changes refuses it
+directly and after re-emission alike.
 
 ## OSC input: an empty `visible` is read as absent
 
@@ -320,7 +333,7 @@ as absent, as osmium's writer omits an empty user.
 **pbfhogg behavior:** every OSC consumer reads `visible=""` as the attribute
 absent: no visibility claim, and not on its own metadata. pbfhogg does no
 strict true/false validation of `visible` (only `false` hides), and the
-re-emitters write an empty attribute as absent, so reading it as absent is
+re-emitters never see an empty `visible` as present, so reading it as absent is
 what keeps a change's claims the same applied directly and after
 `merge-changes` or OSC `tags-filter`.
 

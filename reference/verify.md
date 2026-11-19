@@ -642,7 +642,8 @@ fixtures. The suite runs both on its single selected OSC.
 
 Every change listing joins osmium OPL with a strict XML scan by position,
 requiring equal kind, ID, version and length. Comparisons hold action labels,
-metadata attributes (empty expected attributes must be omitted), tags,
+metadata attributes (an empty expected `visible` must be omitted, every
+other empty expected attribute kept), tags,
 coordinates, references and members record for record; deletes retain their
 bodies and an unlocated deleted node remains unlocated. Section boundaries
 are not compared. Automatic `.osc.gz` output must have the same decompressed

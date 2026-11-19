@@ -362,6 +362,13 @@
 
 ### Fixed
 
+- **`merge-changes` and OSC `tags-filter` write back an explicit empty
+  metadata attribute.** They dropped `user=""`, `uid=""`, `changeset=""` and
+  `timestamp=""`, so a blank-user claim `apply-changes` records became no
+  user once re-emitted, and a change `apply-changes` refuses for its empty
+  `uid` (or `changeset`, `timestamp`) applied cleanly after re-emission. Each
+  is now written as read; apply-changes reads the same claim, or refuses the
+  same change, on both routes. osmium omits an empty user (DEVIATIONS.md).
 - **An empty `visible=""` in an OSC is read as absent.** `apply-changes`
   wrote it into the PBF as an explicit `visible` true claim, while
   `merge-changes` and OSC `tags-filter` write it as absent, so the same

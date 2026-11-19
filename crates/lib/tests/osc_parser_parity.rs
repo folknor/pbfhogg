@@ -316,6 +316,74 @@ fn an_empty_visible_is_absent_applied_directly_and_after_re_emission() {
     );
 }
 
+/// An exactly empty `user`, `uid`, `changeset` or `timestamp` is present,
+/// and each re-emitter writes it, so applying the re-emitted change reads
+/// what applying the original reads. The re-emitters used to write an empty
+/// attribute as absent: a blank-user claim became no user, and a change apply
+/// refuses for its `uid=""` (a delete, say) applied cleanly once re-emitted.
+#[test]
+fn explicit_empty_metadata_survives_re_emission() {
+    let dir = crate::common::test_scratch();
+    let tag = r#"<tag k="highway" v="primary"/>"#;
+    let user_input = dir.path().join("user.osc");
+    std::fs::write(
+        &user_input,
+        format!(
+            r#"<osmChange version="0.6"><create>
+<node id="1" lat="1.0" lon="2.0" version="1" uid="7" user="">{tag}</node>
+<node id="2" lat="1.0" lon="2.0" version="1" uid="7">{tag}</node>
+</create></osmChange>"#
+        ),
+    )
+    .unwrap();
+    let users = |path: &Path| -> Vec<Option<String>> {
+        let overlay = pbfhogg::osc::parse_osc_file(path).unwrap();
+        (1..=2)
+            .map(|id| {
+                let node = overlay.get_node(id).unwrap();
+                node.metadata().unwrap().user.map(str::to_owned)
+            })
+            .collect()
+    };
+    let expected = vec![Some(String::new()), None];
+    assert_eq!(users(&user_input), expected, "applied directly");
+    let out = |n: &str| -> PathBuf { dir.path().join(format!("re-{n}.osc.gz")) };
+    type ReEmit<'a> = &'a dyn Fn(&Path, &Path) -> Verdict;
+    let re_emitters: [(&str, ReEmit<'_>); 3] = [
+        ("merge-changes streaming", &merge_verdict),
+        ("merge-changes simplify", &simplify_verdict),
+        ("tags-filter osc", &tags_filter_verdict),
+    ];
+    for (name, run) in re_emitters {
+        let re = out(&format!("user-{}", name.len()));
+        run(&user_input, &re).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(users(&re), expected, "applied after {name}");
+    }
+
+    for field in ["uid", "changeset", "timestamp"] {
+        let input = dir.path().join(format!("{field}.osc"));
+        std::fs::write(
+            &input,
+            format!(
+                r#"<osmChange version="0.6"><delete>
+<way id="1" version="7" {field}=""/>
+</delete></osmChange>"#
+            ),
+        )
+        .unwrap();
+        let needle = format!("'{field}'");
+        let direct = overlay_verdict(&input).expect_err("apply refuses it directly");
+        assert!(direct.contains(&needle), "{field}: {direct}");
+        for (name, run) in re_emitters {
+            let re = out(&format!("{field}-{}", name.len()));
+            run(&input, &re).unwrap_or_else(|e| panic!("{field}: {name}: {e}"));
+            let after = overlay_verdict(&re)
+                .expect_err("apply refuses it after re-emission as it does directly");
+            assert!(after.contains(&needle), "{field} after {name}: {after}");
+        }
+    }
+}
+
 /// The driver tracked one section and one open object, not the hierarchy:
 /// a node nested in a way replaced the sink's current element, a section
 /// nested anywhere overwrote the action, an unknown wrapper's `<nd>` was

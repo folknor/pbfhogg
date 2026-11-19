@@ -23,9 +23,11 @@
 //! so a record is one line and a position is its line number.
 //!
 //! [`compare`] reads the expected side as pbfhogg's OSC writers render an
-//! input change: an empty metadata string is written as no attribute, and
-//! the projection is applied to the expected side only, so the actual output
-//! must carry no empty attribute. Every change keeps its body, a delete's
+//! input change: an empty `visible` is written as no attribute, every other
+//! metadata attribute is written when present, empty included, and the
+//! projection is applied to the expected side only, so the actual output
+//! must carry no empty `visible` and must keep every other empty attribute.
+//! Every change keeps its body, a delete's
 //! included (tags, coordinates, refs, members, as osmium keeps them), and
 //! both sides are osmium's decoding, so pbfhogg's normal form (attribute
 //! order, coordinate spelling, tags written after children) is not compared
@@ -93,14 +95,11 @@ impl Change {
 
     /// This change as pbfhogg's writers render it (see the module docs).
     fn as_pbfhogg_writes(&self) -> Self {
-        let empty_is_absent = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+        // Only an empty `visible` is the attribute absent; every other
+        // metadata attribute keeps its presence, empty included.
         let meta = OscMeta {
-            version: self.meta.version,
-            timestamp: empty_is_absent(&self.meta.timestamp),
-            changeset: empty_is_absent(&self.meta.changeset),
-            uid: empty_is_absent(&self.meta.uid),
-            user: empty_is_absent(&self.meta.user),
-            visible: empty_is_absent(&self.meta.visible),
+            visible: self.meta.visible.clone().filter(|s| !s.is_empty()),
+            ..self.meta.clone()
         };
         Self {
             action: self.action,
@@ -612,7 +611,7 @@ mod tests {
                 changeset: Some(String::new()),
                 uid: None,
                 user: Some("a\tb%c\nd".into()),
-                visible: None,
+                visible: Some(String::new()),
             },
             opl: opl.into(),
         }
@@ -630,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn pbfhogg_writes_a_delete_with_its_body_and_an_empty_string_as_absent() {
+    fn pbfhogg_writes_a_delete_with_its_body_and_only_an_empty_visible_as_absent() {
         let d = change(
             OscAction::Delete,
             "w9 v2 dD c0 t2020-01-01T00:00:00Z i0 u Ta=b Nn1,n2",
@@ -639,7 +638,8 @@ mod tests {
         assert!(d.has_field('N') && !d.has_field('M'));
         let written = d.as_pbfhogg_writes();
         assert_eq!(written.opl, d.opl);
-        assert_eq!(written.meta.changeset, None);
+        assert_eq!(written.meta.changeset, Some(String::new()));
+        assert_eq!(written.meta.visible, None);
         assert_eq!(written.meta.user, d.meta.user);
         let m = change(OscAction::Modify, "n1 v2 dV c0 t i0 u Ta=b x1 y2");
         assert_eq!(m.as_pbfhogg_writes().opl, m.opl);
@@ -672,8 +672,13 @@ mod tests {
         std::fs::write(&actual, b.record()).unwrap();
         assert!(compare(&expected, &actual).unwrap().is_equal());
         // The projection is the expected side's only: an actual empty
-        // attribute differs.
+        // `visible` differs, and so does an actual that dropped an empty
+        // changeset the input carried.
         std::fs::write(&actual, a.record()).unwrap();
+        assert!(!compare(&expected, &actual).unwrap().is_equal());
+        let mut dropped = b.clone();
+        dropped.meta.changeset = None;
+        std::fs::write(&actual, dropped.record()).unwrap();
         assert!(!compare(&expected, &actual).unwrap().is_equal());
         // A delete that lost its body, or a missing location written as
         // 0 0, differs.

@@ -177,7 +177,8 @@ pub fn run(harness: &mut Harness, osc: &Path) -> Result<Option<String>, Error> {
         "for {cases}: every delete kept and each create and modify kept exactly when osmium \
          tags-filter -R keeps it from osmium's reading of the change file, every kept change \
          in input order, comparing action \
-         labels, metadata attributes (an empty one held to be omitted) and osmium's decoding \
+         labels, metadata attributes (an empty visible held to be omitted, any other empty \
+         one kept) and osmium's decoding \
          record for record, a delete held to its input body, section boundaries not compared, \
          --jobs 1 as the automatic workers; over the cases {} creates, {} modifies and {} \
          deletes kept, {} of the deletes matched by osmium's filter and {} bodied deletes \

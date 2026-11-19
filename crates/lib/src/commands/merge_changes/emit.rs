@@ -73,6 +73,7 @@ impl ElementBuf {
                 uid: String::new(),
                 user: String::new(),
                 visible: String::new(),
+                present: 0,
             },
             scratch: String::new(),
             coord: String::new(),
@@ -507,6 +508,34 @@ newline"/>
             r#"<member type="node" ref="3" role="a&amp;b"/>"#,
         ] {
             assert!(delete.contains(needle), "{needle} missing from:\n{delete}");
+        }
+    }
+
+    /// An explicitly empty metadata attribute is present and is written;
+    /// an empty `visible` is absent. The following element carries none of
+    /// them, so a presence bit left set on the reused buffer would show.
+    /// Asserted on the bytes, so two writers that both drop it cannot agree.
+    #[test]
+    fn explicit_empty_metadata_is_written_and_does_not_leak() {
+        let dir = crate::path_guard::tests::scratch();
+        let xml = r#"<?xml version="1.0"?>
+<osmChange version="0.6"><delete>
+<way id="1" version="7" timestamp="" changeset="" uid="" user="" visible=""/>
+<way id="2" version="8"/>
+</delete></osmChange>"#;
+        let recorded = batches(dir.path(), xml).expect("the document reads");
+        let text: String = recorded
+            .iter()
+            .map(|batch| encode(batch, false).expect("the byte sink accepts it").0)
+            .collect();
+        for needle in [
+            r#"<way id="1" version="7" timestamp="" changeset="" uid="" user=""/>"#,
+            r#"<way id="2" version="8"/>"#,
+        ] {
+            assert!(text.contains(needle), "{needle} missing from:\n{text}");
+        }
+        for batch in &recorded {
+            assert_eq!(encode(batch, false), encode(batch, true));
         }
     }
 

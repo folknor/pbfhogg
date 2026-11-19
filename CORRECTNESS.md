@@ -553,9 +553,15 @@ hidden whether a change is applied directly or after re-emission (`False` is
 visible on both routes). An empty `visible=""` is the attribute absent for
 every consumer: it is no visibility claim and does not by itself give an
 element metadata, so a change claims the same thing applied directly and after
-re-emission, which writes an empty attribute as absent. Applying the overlay's
-native metadata validation to the re-emitting paths would reject attribute text
-they currently preserve. Every
+re-emission. Every other metadata attribute a retained change was read with is
+written back when present, empty included: an empty `user=""` stays a
+blank-user claim (apply records it as a user distinct from none), and an empty
+`uid`, `changeset` or `timestamp` is re-emitted, so apply refuses it after
+re-emission exactly as it does directly. Applying the overlay's native metadata
+validation to the re-emitting paths would reject attribute text they currently
+preserve. A change the re-emitters discard (an earlier change simplify replaces,
+a create or modify the filter does not keep) takes its unvalidated attribute
+text with it. Every
 `tag`, `nd` and `member` is read by one parser per child kind, whatever the
 command: a missing role reads as empty, and a malformed role, an unknown member
 type, or a missing `k`, `v` or `ref` is refused. The children of an object in

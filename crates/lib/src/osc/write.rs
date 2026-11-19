@@ -124,9 +124,22 @@ pub(crate) struct OwnedMetadata {
     pub(crate) uid: String,
     pub(crate) user: String,
     pub(crate) visible: String,
+    /// Which of the text fields the source element carried, one
+    /// `PRESENT_*` bit each. Presence, not emptiness, decides what is
+    /// written: an explicit `user=""` names a blank user (apply records it
+    /// as a PBF claim distinct from no user), and an explicit `uid=""` is
+    /// re-emitted so that applying the re-emitted change refuses it exactly
+    /// as applying the original does. A cleared field has its bit cleared.
+    pub(crate) present: u8,
 }
 
 impl OwnedMetadata {
+    pub(crate) const PRESENT_TIMESTAMP: u8 = 1;
+    pub(crate) const PRESENT_CHANGESET: u8 = 1 << 1;
+    pub(crate) const PRESENT_UID: u8 = 1 << 2;
+    pub(crate) const PRESENT_USER: u8 = 1 << 3;
+    pub(crate) const PRESENT_VISIBLE: u8 = 1 << 4;
+
     pub(crate) fn version_only(version: i32) -> Self {
         Self {
             version: Some(version),
@@ -135,7 +148,12 @@ impl OwnedMetadata {
             uid: String::new(),
             user: String::new(),
             visible: String::new(),
+            present: 0,
         }
+    }
+
+    fn has(&self, bit: u8) -> bool {
+        self.present & bit != 0
     }
 
     /// The owned writers' metadata attributes. Production OSC re-emission
@@ -147,19 +165,19 @@ impl OwnedMetadata {
             let v = version.to_string();
             elem.push_attribute(("version", v.as_str()));
         }
-        if !self.timestamp.is_empty() {
+        if self.has(Self::PRESENT_TIMESTAMP) {
             elem.push_attribute(("timestamp", self.timestamp.as_str()));
         }
-        if !self.changeset.is_empty() {
+        if self.has(Self::PRESENT_CHANGESET) {
             elem.push_attribute(("changeset", self.changeset.as_str()));
         }
-        if !self.uid.is_empty() {
+        if self.has(Self::PRESENT_UID) {
             elem.push_attribute(("uid", self.uid.as_str()));
         }
-        if !self.user.is_empty() {
+        if self.has(Self::PRESENT_USER) {
             push_attribute_escaped(elem, "user", self.user.as_str());
         }
-        if !self.visible.is_empty() {
+        if self.has(Self::PRESENT_VISIBLE) {
             elem.push_attribute(("visible", self.visible.as_str()));
         }
     }
@@ -170,19 +188,19 @@ impl OwnedMetadata {
         if let Some(version) = self.version {
             append_int_attr(content, "version", i64::from(version));
         }
-        for (key, value) in [
-            ("timestamp", &self.timestamp),
-            ("changeset", &self.changeset),
-            ("uid", &self.uid),
+        for (bit, key, value) in [
+            (Self::PRESENT_TIMESTAMP, "timestamp", &self.timestamp),
+            (Self::PRESENT_CHANGESET, "changeset", &self.changeset),
+            (Self::PRESENT_UID, "uid", &self.uid),
         ] {
-            if !value.is_empty() {
+            if self.has(bit) {
                 append_attr(content, key, value);
             }
         }
-        if !self.user.is_empty() {
+        if self.has(Self::PRESENT_USER) {
             append_attr_escaped(content, "user", &self.user);
         }
-        if !self.visible.is_empty() {
+        if self.has(Self::PRESENT_VISIBLE) {
             append_attr(content, "visible", &self.visible);
         }
     }

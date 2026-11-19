@@ -25,6 +25,16 @@
   and `check --index` refuse the same blobs. Library: `tags_checked()`,
   `CheckedTagIter` and `CheckedDenseTagIter` are removed; `tags()` now
   always yields every tag of an accepted block.
+- **Blob and HeaderBlock fields are recognised by wire type as well as
+  field number.** A known field number carrying a different wire type is
+  skipped as an unknown field, as protobuf and osmium do, and an invalid
+  wire type is refused (exit 2). Before, a Blob payload tagged with an
+  invalid wire type still decoded, and a wrongly typed header field could
+  become a replication timestamp. A Blob holding a second payload in
+  `lzma_data`, `OBSOLETE_bzip2_data` or `lz4_data` beside its `raw`,
+  `zlib_data` or `zstd_data` is refused instead of decoding the supported
+  one, and a lone payload in one of those codecs now names the
+  unsupported compression instead of reporting an empty blob.
 - `diff --format osc --increment-version` exits 2 without publishing an
   OSC if a deleted element is already at version 2147483647.
 

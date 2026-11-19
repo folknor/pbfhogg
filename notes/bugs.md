@@ -26,31 +26,6 @@ reading or an API hazard rather than a demonstrated wrong result; that label is
 kept. "Reported by" is a fact about the reports. Entries are in no order of
 importance.
 
-## BUG-001 - Blob envelope parsers ignore wire type
-
-Reported by: framing.
-
-`WireBlob::parse` (`blob_wire.rs`) and `parse_raw_envelope` (`decompress.rs`)
-dispatch known fields by number without checking wire type: a wrong-typed
-payload field is read as length-delimited anyway and `raw_size` is read as a
-varint regardless of its tag. Unlike `WireBlobHeader`, these can reinterpret
-malformed envelope bytes instead of rejecting or skipping them.
-
-Defect hunt 2026-11-17 (read-framing, read-block-decoding): rated P1 by
-read-framing. Concrete trigger: an ordinary raw Blob whose payload tag changes
-from `0x0a` to `0x0e` (reserved wire type 6) is still consumed and, if the
-payload is a valid PrimitiveBlock, decodes successfully; other wrong wire types
-can consume bytes across real field boundaries. The framing layer cannot catch
-it because the declared extent stays correct. The same pattern is in
-`WireHeaderBlock::parse` (`block.rs`): appending `87 02 00` (field 32, invalid
-wire type 7) yields replication timestamp 0, and `82 02 00` (empty
-length-delimited field 32) becomes a timestamp instead of being skipped. The
-element parsers already match on field and wire type together. Claim named:
-protobuf decoding and the input-refusal contract. read-framing proposes one
-borrowed Blob-envelope parser shared by owned Blob construction, direct
-decompression and payload comparison, separating structural from
-post-decompression validation.
-
 ## BUG-002 - Missing BlobHeader datasize becomes zero
 
 Reported by: framing.

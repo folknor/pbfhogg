@@ -2,7 +2,6 @@
 //! the zlib thread-local state, and the suite of `decompress_*` entry points
 //! called from pipelined and pread read paths.
 
-use super::wire_schema::blob as blob_fields;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +15,7 @@ use crate::tunables::{
     DECOMPRESS_POOL_MAX_RETAINED_CAPACITY,
 };
 
-use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
+use super::blob_wire::{BlobData, BlobEnvelope, MAX_BLOB_MESSAGE_SIZE, PayloadKind, WireBlob};
 
 thread_local! {
     /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).
@@ -505,11 +504,11 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
 #[hotpath::measure]
 pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     buf.clear();
-    let (payload, raw_size) = parse_raw_envelope(raw_blob)?;
-    let Some((field, slice)) = payload else {
+    let BlobEnvelope { payload, raw_size } = BlobEnvelope::parse(raw_blob)?;
+    let Some((kind, slice)) = payload else {
         return Err(new_blob_error(BlobError::Empty));
     };
-    if field == blob_fields::RAW {
+    if kind == PayloadKind::Raw {
         let size = slice.len() as u64;
         if size > MAX_BLOB_MESSAGE_SIZE {
             return Err(new_blob_error(BlobError::MessageTooBig { size }));
@@ -525,7 +524,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             // hint because `reserve` counts additional bytes from its length.
             buf.reserve_exact(clamp_capacity_hint(rs as usize));
         }
-        if field == blob_fields::ZLIB_DATA {
+        if kind == PayloadKind::Zlib {
             zlib_decompress_into(slice, buf)?;
         } else {
             zstd_decompress_into(slice, buf)?;
@@ -542,54 +541,15 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
 /// [`decompress_blob_raw`], so an envelope one refuses the other refuses, and
 /// borrowed, so a failed comparison costs no copy.
 pub(crate) fn raw_blob_payload(raw_blob: &[u8]) -> Result<Option<(u8, &[u8])>> {
-    let (payload, _) = parse_raw_envelope(raw_blob)?;
-    Ok(payload.map(|(field, slice)| {
-        let kind = match field {
-            blob_fields::RAW => 0,
-            blob_fields::ZLIB_DATA => 1,
-            _ => 2,
+    let envelope = BlobEnvelope::parse(raw_blob)?;
+    Ok(envelope.payload.map(|(kind, slice)| {
+        let kind = match kind {
+            PayloadKind::Raw => 0,
+            PayloadKind::Zlib => 1,
+            PayloadKind::Zstd => 2,
         };
         (kind, slice)
     }))
-}
-
-/// Parse a `Blob` envelope from raw bytes: the payload field and its bytes,
-/// and the declared `raw_size`.
-#[allow(clippy::type_complexity)]
-fn parse_raw_envelope(raw_blob: &[u8]) -> Result<(Option<(u32, &[u8])>, Option<i32>)> {
-    use super::wire::Cursor;
-
-    let mut cursor = Cursor::new(raw_blob);
-    let mut raw_size: Option<i32> = None;
-    // The payload field, recorded rather than acted on: `raw_size` (field 2)
-    // may follow the payload on the wire, and the whole envelope has to be
-    // walked anyway to detect a second payload field. This loop used to
-    // `return` on the first `raw`, which both skipped the multi-field check
-    // and made this parser disagree with `WireBlob::parse` (last-field-wins)
-    // about which payload an adversarial two-field blob carried.
-    let mut payload: Option<(u32, &[u8])> = None;
-
-    while let Some((field, wire_type)) = cursor.read_tag()? {
-        match field {
-            blob_fields::RAW | blob_fields::ZLIB_DATA | blob_fields::ZSTD_DATA => {
-                let slice = cursor.read_len_delimited()?;
-                if payload.is_some() {
-                    return Err(crate::read::blob_wire::multiple_payload_fields());
-                }
-                payload = Some((field, slice));
-            }
-            blob_fields::RAW_SIZE => {
-                // Validate before narrowing so 2^32 + N cannot alias N and
-                // pass the decompressed-length check as an honest size.
-                raw_size = Some(super::wire::read_int32(
-                    &mut cursor,
-                    "Blob.raw_size exceeds int32",
-                )?);
-            }
-            _ => cursor.skip_field(wire_type)?,
-        }
-    }
-    Ok((payload, raw_size))
 }
 
 /// Decompress a parsed WireBlob into an owned `Bytes`.
@@ -930,6 +890,93 @@ mod tests {
         let mut out = Vec::new();
         super::decompress_blob_raw(&single, &mut out).expect("a single-payload blob still decodes");
         assert_eq!(out, b"from-raw");
+    }
+
+    /// Run a serialized Blob through every envelope route: direct
+    /// decompression, the payload comparison helper and the owned parser.
+    /// Returns the direct route's output, or the three verdicts must agree
+    /// on refusal.
+    fn every_route(blob: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let direct = super::decompress_blob_raw(blob, &mut out);
+        let compared = super::raw_blob_payload(blob);
+        let owned = WireBlob::parse_slice(blob).and_then(|b| super::decompress_blob(&b, None));
+        match (&direct, &owned) {
+            (Ok(()), Ok(bytes)) => {
+                assert_eq!(&out[..], &bytes[..], "routes decoded different bytes");
+                assert!(compared.is_ok(), "comparison refused what decode accepts");
+                Some(out)
+            }
+            (Err(_), Err(_)) => None,
+            _ => panic!("routes disagree: direct {direct:?}, owned {owned:?}"),
+        }
+    }
+
+    #[test]
+    fn known_blob_fields_with_another_wire_type_are_unknown_fields() {
+        // Field 1 with reserved wire type 6 (tag 0x0e): used to be read as a
+        // raw payload. Now refused by every route, the comparison included.
+        let mut reserved = encode_blob(&[(1, b"from-raw")]);
+        reserved[0] = 0x0e;
+        assert!(every_route(&reserved).is_none());
+        assert!(super::raw_blob_payload(&reserved).is_err());
+
+        // Field 1 as a varint is not a payload: the envelope is empty.
+        let varint_raw = [0x08, 0x05];
+        let mut out = Vec::new();
+        let err = super::decompress_blob_raw(&varint_raw, &mut out).expect_err("no payload");
+        assert!(
+            matches!(err.kind(), ErrorKind::Blob(BlobError::Empty)),
+            "{err:?}"
+        );
+        assert!(matches!(super::raw_blob_payload(&varint_raw), Ok(None)));
+
+        // ... and beside a real payload it is skipped, not a second payload.
+        let mut beside = vec![0x08, 0x05];
+        beside.extend(encode_blob(&[(1, b"from-raw")]));
+        assert_eq!(every_route(&beside).as_deref(), Some(&b"from-raw"[..]));
+
+        // A length-delimited field 2 is not a raw_size: skipped, so a value
+        // that would have been a lying size no longer refuses the blob.
+        let mut ld_size = encode_blob(&[(1, b"from-raw")]);
+        ld_size.extend(encode_blob(&[(2, &[0x7f])]));
+        assert_eq!(every_route(&ld_size).as_deref(), Some(&b"from-raw"[..]));
+
+        // A varint on the lz4 number is unknown too, not an unsupported payload.
+        let mut varint_lz4 = encode_blob(&[(1, b"from-raw")]);
+        varint_lz4.extend([0x30, 0x01]);
+        assert_eq!(every_route(&varint_lz4).as_deref(), Some(&b"from-raw"[..]));
+    }
+
+    #[test]
+    fn every_payload_alternative_of_the_oneof_counts_as_a_payload() {
+        for field in [4_u32, 5, 6] {
+            // A lone unsupported codec is refused as a wire error, not Empty.
+            let lone = encode_blob(&[(field, b"x")]);
+            let mut out = Vec::new();
+            let err = super::decompress_blob_raw(&lone, &mut out).expect_err("unsupported");
+            assert!(
+                matches!(err.kind(), ErrorKind::WireFormat { .. }),
+                "{err:?}"
+            );
+            assert!(every_route(&lone).is_none());
+            assert!(super::raw_blob_payload(&lone).is_err());
+
+            // Beside raw, in either order and even when empty, it is a
+            // second payload, never silently dropped in favour of raw.
+            for blob in [
+                encode_blob(&[(1, b"from-raw"), (field, b"")]),
+                encode_blob(&[(field, b""), (1, b"from-raw")]),
+            ] {
+                let mut out = Vec::new();
+                let err = super::decompress_blob_raw(&blob, &mut out).expect_err("two payloads");
+                let ErrorKind::WireFormat { msg } = err.kind() else {
+                    panic!("{err:?}");
+                };
+                assert!(msg.contains("more than one"), "{msg}");
+                assert!(every_route(&blob).is_none());
+            }
+        }
     }
 
     /// Pin int32 bounds in both envelope parsers, in either field order.

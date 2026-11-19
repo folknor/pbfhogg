@@ -161,11 +161,15 @@ The other contract sites are:
 - `zlib_decompress_into` / `zstd_decompress_into`
   (`crates/lib/src/read/decompress.rs`) for shape 5 - the actual
   decompressors, reached by every `decompress_*` entry point
-- `WireBlob::parse` (`crates/lib/src/read/blob_wire.rs`) and
-  `decompress_blob_raw` (`crates/lib/src/read/decompress.rs`) - the two Blob
-  envelope parsers. Both reject a blob carrying more than one of
-  `raw` / `zlib_data` / `zstd_data`, and both cross-check a
-  declared `Blob.raw_size` against the payload they produced.
+- `BlobEnvelope::parse` (`crates/lib/src/read/blob_wire.rs`) - the one Blob
+  envelope parser, under `WireBlob::parse`, `decompress_blob_raw` and
+  `raw_blob_payload`. It recognises a field by number and wire type
+  together (a known number with another supported wire type is skipped
+  as unknown, an invalid wire type is refused), rejects a blob carrying
+  more than one of the schema's six payload fields, and refuses a lone
+  `lzma_data`, `OBSOLETE_bzip2_data` or `lz4_data` as unsupported. Both
+  decoding routes cross-check a declared `Blob.raw_size` against the
+  payload they produced.
 - `validate_block` (`crates/lib/src/read/block.rs`) for the
   block-layer contract below. Every `PrimitiveBlock` constructor -
   `from_vec`, `from_vec_with_scratch`,
@@ -555,9 +559,10 @@ Shape 5 is enforced during decompression, not after it:
   so an undersized value fails with `Z_BUF_ERROR` but an oversized
   one succeeds and silently yields a payload zero-padded to the
   declared length.
-- A `Blob` carrying more than one of `raw` / `zlib_data` /
-  `zstd_data` is rejected by both parsers. They are three
-  encodings of one payload, not three payloads. The two parsers
+- A `Blob` carrying more than one of its payload fields (`raw`,
+  `zlib_data`, `lzma_data`, `OBSOLETE_bzip2_data`, `lz4_data`,
+  `zstd_data`, empty or not) is rejected. They are alternative
+  encodings of one payload, not several payloads. Two Blob parsers
   previously disagreed about such a blob - `WireBlob::parse` was
   last-field-wins, `decompress_blob_raw` returned on the first
   `raw` it saw - so one adversarial blob decoded to two different

@@ -115,8 +115,15 @@ pub(crate) struct WireHeaderBlock {
 
 impl WireHeaderBlock {
     /// Parse a HeaderBlock from decompressed protobuf bytes.
+    ///
+    /// Fields are recognised by number and wire type together, as in the
+    /// Blob envelope and element parsers and in libosmium's
+    /// `decode_header_block`: a known number carrying another supported wire
+    /// type is an unknown field and is skipped, so a length-delimited field
+    /// 32 is not a replication timestamp. Invalid wire types are refused by
+    /// `skip_field`.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        use super::wire::Cursor;
+        use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
         let mut cursor = Cursor::new(data);
         let mut bbox: Option<WireHeaderBBox> = None;
         let mut required_features: Vec<String> = Vec::new();
@@ -128,27 +135,27 @@ impl WireHeaderBlock {
         let mut osmosis_replication_base_url: Option<String> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
-            match field {
-                header_block::BBOX => {
+            match (field, wire_type) {
+                (header_block::BBOX, WIRE_LEN) => {
                     // bbox: HeaderBBox submessage
                     let sub_data = cursor.read_len_delimited()?;
                     bbox = Some(WireHeaderBBox::parse(sub_data)?);
                 }
-                header_block::REQUIRED_FEATURES => {
+                (header_block::REQUIRED_FEATURES, WIRE_LEN) => {
                     // required_features: repeated string
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
                         .map_err(|_| new_wire_error("invalid UTF-8 in required_features"))?;
                     required_features.push(s);
                 }
-                header_block::OPTIONAL_FEATURES => {
+                (header_block::OPTIONAL_FEATURES, WIRE_LEN) => {
                     // optional_features: repeated string
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
                         .map_err(|_| new_wire_error("invalid UTF-8 in optional_features"))?;
                     optional_features.push(s);
                 }
-                header_block::WRITING_PROGRAM => {
+                (header_block::WRITING_PROGRAM, WIRE_LEN) => {
                     // writingprogram: string
                     let bytes = cursor.read_len_delimited()?;
                     writingprogram = Some(
@@ -156,7 +163,7 @@ impl WireHeaderBlock {
                             .map_err(|_| new_wire_error("invalid UTF-8 in writingprogram"))?,
                     );
                 }
-                header_block::SOURCE => {
+                (header_block::SOURCE, WIRE_LEN) => {
                     // source: string
                     let bytes = cursor.read_len_delimited()?;
                     source = Some(
@@ -164,15 +171,15 @@ impl WireHeaderBlock {
                             .map_err(|_| new_wire_error("invalid UTF-8 in source"))?,
                     );
                 }
-                header_block::REPLICATION_TIMESTAMP => {
+                (header_block::REPLICATION_TIMESTAMP, WIRE_VARINT) => {
                     // osmosis_replication_timestamp: int64
                     osmosis_replication_timestamp = Some(cursor.read_varint_i64()?);
                 }
-                header_block::REPLICATION_SEQUENCE_NUMBER => {
+                (header_block::REPLICATION_SEQUENCE_NUMBER, WIRE_VARINT) => {
                     // osmosis_replication_sequence_number: int64
                     osmosis_replication_sequence_number = Some(cursor.read_varint_i64()?);
                 }
-                header_block::REPLICATION_BASE_URL => {
+                (header_block::REPLICATION_BASE_URL, WIRE_LEN) => {
                     // osmosis_replication_base_url: string
                     let bytes = cursor.read_len_delimited()?;
                     osmosis_replication_base_url =
@@ -3486,5 +3493,36 @@ mod strict_validation_tests {
             }
             assert_eq!(seen, 1);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod header_wire_type_tests {
+    use super::WireHeaderBlock;
+
+    #[test]
+    fn known_header_fields_with_another_wire_type_are_unknown_fields() {
+        // Field 32 (replication timestamp) length-delimited and empty
+        // (82 02 00): skipped, not read as a timestamp.
+        let h = WireHeaderBlock::parse(&[0x82, 0x02, 0x00]).unwrap();
+        assert_eq!(h.osmosis_replication_timestamp, None);
+
+        // Correctly typed it still reads.
+        let h = WireHeaderBlock::parse(&[0x80, 0x02, 0x07]).unwrap();
+        assert_eq!(h.osmosis_replication_timestamp, Some(7));
+
+        // Field 32 with invalid wire type 7 (87 02 00) is refused, not 0.
+        assert!(WireHeaderBlock::parse(&[0x87, 0x02, 0x00]).is_err());
+
+        // A varint on a string field (writingprogram, 16) and on the bbox
+        // (1) contributes nothing.
+        let h = WireHeaderBlock::parse(&[0x80, 0x01, 0x05, 0x08, 0x01]).unwrap();
+        assert_eq!(h.writingprogram, None);
+        assert!(h.bbox.is_none());
+
+        // A varint on required_features (4) names no feature.
+        let h = WireHeaderBlock::parse(&[0x20, 0x01]).unwrap();
+        assert!(h.required_features.is_empty());
     }
 }

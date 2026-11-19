@@ -1,5 +1,21 @@
 # Read Pipeline
 
+### Blob envelope fields matched by wire type (plantasjen, 2026-11-20, uncommitted against `70cc559a`)
+
+One borrowed Blob envelope parser, matching field number and wire type
+together, now serves the owned, direct and comparison routes. Planet
+`file-info --mode nodes`, `--iterations 1`, interleaved, HEAD via
+`--commit 70cc559a`:
+
+| Pair | HEAD | Variant |
+|---|---|---|
+| 1 | 31.2 s (`7e4cefad`, first cell after the gate) | 24.4 s (`7c33116b`) |
+| 2 | 24.6 s (`d7dccae3`) | 24.2 s (`2e203b49`) |
+
+The first HEAD cell sits in the slow mode of the bimodal walls recorded
+below; in the matched fast mode the arms agree within noise. No cost.
+Kept.
+
 ### Tag string indices resolved at block validation (plantasjen, 2026-11-19, uncommitted against `8ca7880c`)
 
 Block validation now checks every tag key and value string index against

@@ -4,6 +4,10 @@ pub(crate) mod blob {
     pub(crate) const RAW: u32 = 1;
     pub(crate) const RAW_SIZE: u32 = 2;
     pub(crate) const ZLIB_DATA: u32 = 3;
+    /// Payload alternatives in the schema's oneof that pbfhogg cannot decode.
+    pub(crate) const LZMA_DATA: u32 = 4;
+    pub(crate) const OBSOLETE_BZIP2_DATA: u32 = 5;
+    pub(crate) const LZ4_DATA: u32 = 6;
     pub(crate) const ZSTD_DATA: u32 = 7;
 }
 

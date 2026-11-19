@@ -268,7 +268,8 @@ pub(crate) enum BlobData {
 pub(crate) fn multiple_payload_fields() -> crate::error::Error {
     new_wire_error(
         "Blob carries more than one of the mutually exclusive payload fields \
-         raw, zlib_data and zstd_data. The three are alternative encodings of \
+         raw, zlib_data, lzma_data, OBSOLETE_bzip2_data, lz4_data and \
+         zstd_data. They are alternative encodings of \
          one payload, so a blob with two of them has no defined content and is \
          rejected rather than guessed at. Re-fetch or re-encode the file with a \
          conforming writer, and report the bug to whatever produced it.",
@@ -304,10 +305,108 @@ pub(crate) fn check_raw_size(declared: Option<i32>, actual: usize) -> Result<()>
     }
 }
 
+/// The decodable payload encodings of a `Blob`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PayloadKind {
+    Raw,
+    Zlib,
+    Zstd,
+}
+
+/// A `Blob` envelope, borrowed: the payload's encoding and bytes, and the
+/// declared `raw_size`. The one parser of the `Blob` message, shared by the
+/// owned [`WireBlob`], direct decompression and blob payload comparison, so
+/// an envelope one route refuses every route refuses.
+pub(crate) struct BlobEnvelope<'a> {
+    pub payload: Option<(PayloadKind, &'a [u8])>,
+    pub raw_size: Option<i32>,
+}
+
+impl<'a> BlobEnvelope<'a> {
+    /// Parse a serialized `Blob`.
+    ///
+    /// Fields are recognised by number and wire type together. An
+    /// occurrence of a known number with another supported wire type is an
+    /// unknown field and is skipped, as protobuf specifies and as
+    /// libosmium's `decode_blob` does: a varint on field 1 is not a raw
+    /// payload, and a length-delimited field 2 is not a `raw_size`. Reading
+    /// it in the schema's form instead would reinterpret bytes across real
+    /// field boundaries. An invalid wire type (6, 7) or a group (3, 4) is
+    /// refused by `skip_field`.
+    ///
+    /// All six payload fields of the schema's oneof count as payloads,
+    /// empty or not, so two of them are refused as
+    /// [`multiple_payload_fields`] whatever their order. A lone lzma, bzip2
+    /// or lz4 payload is refused as unsupported once the walk is complete,
+    /// so a duplicate gets the duplicate verdict first.
+    pub fn parse(input: &'a [u8]) -> Result<Self> {
+        use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
+        let mut cursor = Cursor::new(input);
+        let mut payload: Option<(u32, &'a [u8])> = None;
+        let mut raw_size: Option<i32> = None;
+
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            match (field, wire_type) {
+                (
+                    blob::RAW
+                    | blob::ZLIB_DATA
+                    | blob::LZMA_DATA
+                    | blob::OBSOLETE_BZIP2_DATA
+                    | blob::LZ4_DATA
+                    | blob::ZSTD_DATA,
+                    WIRE_LEN,
+                ) => {
+                    let slice = cursor.read_len_delimited()?;
+                    if payload.is_some() {
+                        return Err(multiple_payload_fields());
+                    }
+                    payload = Some((field, slice));
+                }
+                (blob::RAW_SIZE, WIRE_VARINT) => {
+                    // Validate before narrowing so 2^32 + N cannot alias N and
+                    // pass the decompressed-length check as an honest size.
+                    raw_size = Some(super::wire::read_int32(
+                        &mut cursor,
+                        "Blob.raw_size exceeds int32",
+                    )?);
+                }
+                _ => cursor.skip_field(wire_type)?,
+            }
+        }
+
+        let payload = match payload {
+            None => None,
+            Some((blob::RAW, s)) => Some((PayloadKind::Raw, s)),
+            Some((blob::ZLIB_DATA, s)) => Some((PayloadKind::Zlib, s)),
+            Some((blob::ZSTD_DATA, s)) => Some((PayloadKind::Zstd, s)),
+            Some((field, _)) => return Err(unsupported_compression(field)),
+        };
+        Ok(BlobEnvelope { payload, raw_size })
+    }
+}
+
+fn unsupported_compression(field: u32) -> crate::error::Error {
+    new_wire_error(match field {
+        blob::LZMA_DATA => {
+            "Blob payload is lzma_data, an unsupported compression; only raw, \
+             zlib_data and zstd_data payloads decode"
+        }
+        blob::OBSOLETE_BZIP2_DATA => {
+            "Blob payload is OBSOLETE_bzip2_data, an unsupported compression; \
+             only raw, zlib_data and zstd_data payloads decode"
+        }
+        _ => {
+            "Blob payload is lz4_data, an unsupported compression; only raw, \
+             zlib_data and zstd_data payloads decode"
+        }
+    })
+}
+
 /// Parsed Blob envelope from protobuf wire format.
 ///
 /// Fields: raw (bytes, field 1), raw_size (int32, field 2),
-/// zlib_data (bytes, field 3), zstd_data (bytes, field 7).
+/// zlib_data (bytes, field 3), zstd_data (bytes, field 7). Parsed by
+/// [`BlobEnvelope::parse`].
 #[derive(Clone, Debug)]
 pub(crate) struct WireBlob {
     pub data: Option<BlobData>,
@@ -320,41 +419,21 @@ impl WireBlob {
     /// The returned `BlobData` variants hold `Bytes` slices of the input, so
     /// decompressors get zero-copy access to the compressed payload.
     pub fn parse(input: &Bytes) -> Result<Self> {
-        use super::wire::Cursor;
-        let mut cursor = Cursor::new(input);
-        let mut data: Option<BlobData> = None;
-        let mut raw_size: Option<i32> = None;
-
-        while let Some((field, wire_type)) = cursor.read_tag()? {
-            match field {
-                blob::RAW | blob::ZLIB_DATA | blob::ZSTD_DATA => {
-                    // raw (1) / zlib_data (3) / zstd_data (7): the three
-                    // mutually exclusive payload encodings.
-                    let slice = cursor.read_len_delimited()?;
-                    let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
-                    let payload = input.slice(offset..offset + slice.len());
-                    if data.is_some() {
-                        return Err(multiple_payload_fields());
-                    }
-                    data = Some(match field {
-                        blob::RAW => BlobData::Raw(payload),
-                        blob::ZLIB_DATA => BlobData::Zlib(payload),
-                        _ => BlobData::Zstd(payload),
-                    });
-                }
-                blob::RAW_SIZE => {
-                    // Validate before narrowing so 2^32 + N cannot alias N and
-                    // pass the decompressed-length check as an honest size.
-                    raw_size = Some(super::wire::read_int32(
-                        &mut cursor,
-                        "Blob.raw_size exceeds int32",
-                    )?);
-                }
-                _ => cursor.skip_field(wire_type)?,
+        let envelope = BlobEnvelope::parse(input)?;
+        // `slice_ref` shares the input's buffer; an empty payload stays
+        // `Some`, so a present empty payload is still distinct from none.
+        let data = envelope.payload.map(|(kind, slice)| {
+            let payload = input.slice_ref(slice);
+            match kind {
+                PayloadKind::Raw => BlobData::Raw(payload),
+                PayloadKind::Zlib => BlobData::Zlib(payload),
+                PayloadKind::Zstd => BlobData::Zstd(payload),
             }
-        }
-
-        Ok(WireBlob { data, raw_size })
+        });
+        Ok(WireBlob {
+            data,
+            raw_size: envelope.raw_size,
+        })
     }
 
     /// Parse a Blob from `&[u8]`, copying the input internally.

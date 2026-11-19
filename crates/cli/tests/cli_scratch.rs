@@ -631,7 +631,10 @@ fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
         .assert_failure()
         .stderr_str();
     assert_eq!(occurrences(&stderr, &buckets), 1, "{stderr}");
-    assert!(stderr.contains("deletes the old index"), "{stderr}");
+    assert!(
+        stderr.contains("only if publishing a replacement index removes the old index directory"),
+        "{stderr}"
+    );
     assert_eq!(occurrences(&stderr, &swap), 1, "{stderr}");
     assert!(stderr.contains("only copy"), "{stderr}");
     assert_eq!(occurrences(&stderr, &staging), 1, "{stderr}");

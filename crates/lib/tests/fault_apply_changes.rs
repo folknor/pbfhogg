@@ -374,7 +374,7 @@ mod apply_changes {
         // relation, and the created way is written at the node-to-relation
         // transition, after publication.
         Shape {
-            name: "relation-first",
+            name: "nodes-then-relation",
             write: |base, osc| {
                 write_low_base(base, &(1..=4).collect::<Vec<_>>(), 2, &[], &[(500, 10)]);
                 write_osc_body(

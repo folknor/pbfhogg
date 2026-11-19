@@ -462,9 +462,9 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   A path that merely passes through the directory (a symlinked directory
   inside it) is not refused; only that link would be lost. The check is
   repeated immediately before publication, so an input moved into the index
-  during the build is refused then, with nothing replaced, and a backup
-  of the replaced index that holds any link to the input is kept, with a
-  warning, rather than removed.
+  during the build is refused then (exit `2`), with nothing replaced.
+  After a successful replacement, a backup that holds any link to the
+  input is kept and the command prints a warning.
 - **A symlink is never an output**, even with `--overwrite`: replacing it
   would turn the link into a regular file. The error names the link and its
   target. An existing directory (or device, FIFO) where a file output is
@@ -611,8 +611,8 @@ once), `diff` also scans the old input's directory (`diff-par-*`; `--format osc`
 older versions sat beside the output, which is scanned anyway), and `build-geocode-index` also
 scans everything inside the existing index directory it is about to replace, at any depth,
 including `.buckets-level*` trees (and the parent for `.geocode-build-*` staging of earlier
-versions). A `.buckets-level*` tree inside an index is deleted along with the old index when
-`--overwrite` replaces it; the report says so. What is inside such a tree is checked like the
+versions). A `.buckets-level*` tree inside an index is deleted when successful
+publication removes the old index; the report says so. What is inside such a tree is checked like the
 rest of the index, so a backup or run directory that ended up in one blocks the replacement.
 That is the only reported entry that
 publication removes: an index that holds anything else pbfhogg leaves behind (a backup, a
@@ -1695,7 +1695,13 @@ With `--format osc`, roundtrips content - applying the derived OSC to the old PB
 
 A comparison whose ID ranges give no point to cut a work unit within 1 GiB of blobs (one ID repeated across that many adjacent blobs) is refused as a resource limit.
 
-**Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, the comparison is one engine at every `-j` and `-t`, and every blob header of both files is checked: it refuses a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). Each header is checked as the input's stream reaches it, and the rest of both files is read before the run succeeds, so a defect late in a file can be refused after earlier text was written. The body of a blob of a kind `-t` excludes is never read. Blob bodies of the selected kinds are decoded where the comparison needs them: a byte-identical blob pair (same claimed range and count, a range not spanning negative and positive IDs, same compression and compressed bytes) is not decoded when the comparison may skip equal blobs (`-c`, `-q`, `--format osc`), so a corrupt body inside such a pair passes there and is refused by a diff that prints common elements. Where a block holds elements past its claimed last ID, the merge refuses the claim when it meets them, unless a work-unit boundary falls inside the block's claimed range: the block is then clipped to each unit's range, and what it holds past its claim is in no unit. Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
+**Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, the comparison is one engine at every `-j` and `-t`, and every blob header of both files is checked: it refuses a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). Each header is checked as the input's stream reaches it, and the rest of both files is read before the run succeeds, so a defect late in a file can be refused after earlier text was written. The body of a blob of a kind `-t` excludes is never read.
+
+With `-c`, `-q` or `--format osc`, the comparison can skip decoding a pair when both blobs are fresh (neither has a partially consumed block), both claimed ranges are wholly inside the work unit, their claimed ranges and counts match, the range does not span negative and positive IDs, and their compression and compressed bytes match. A corrupt payload in a skipped pair can pass undetected. A diff that prints common elements decodes the pair.
+
+The element-by-element merge of overlapping blocks refuses an understated last ID when it sees elements past that claim. It trusts the claimed range when emitting a one-sided run, so an understated last ID can yield spurious changes. Work-unit assignment also trusts the ranges: when a block crosses a work-unit boundary, clipping can hide elements beyond its claim. Use `check --index` to verify claimed ranges.
+
+Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
 
 Indexed diff also trusts claimed element counts: byte-identical pairs add
 the claimed count to the common total, and single-sided runs use it for

@@ -474,9 +474,10 @@ pub(crate) fn merge_to<'a>(
     // what an explicit count may be).
     //
     // A single worker is safe through the barrier and its shutdown: worker
-    // panics are caught and published to FailureSlot, the drain sees them
-    // within one receive timeout, drops its receiver and barrier sender,
-    // and merge joins both producers; a failed worker's pool leaves its
+    // panics are caught and published to FailureSlot, which sends a wake
+    // message to the drain. The drain checks the slot after receiving, drops
+    // its receiver and barrier sender, and merge joins both producers.
+    // A failed worker's pool leaves its
     // scope and drops the candidate receiver, releasing a scanner blocked in
     // send. Barrier progress rests on the scanner's boundary message, the
     // drain's barrier check after each receive, and workers flushing coord

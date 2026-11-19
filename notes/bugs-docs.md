@@ -250,57 +250,18 @@ is already corrected; the rest needs checking against the planner's actual
 cuts before rewording, since some assertions may depend on how many units a
 fixture is cut into.
 
-## DOC-025 - CORRECTNESS.md describes two frame-check funnels
+## DOC-027 - Decide how indexed diff should refuse understated last IDs in one-sided runs
 
-Reported by: the FMT-001 scout (2026-11-18), not verified by an
-implementer.
+`crates/lib/src/osc/merge_join.rs::emit_block` trusts the claimed range.
+With old `[2]` and new `[1, 2]` claiming `[1, 1]`, text diff can report
+both a creation and a deletion of node 2. The overlapping-block element
+walk checks its boundary and can refuse an understated last ID. One-sided
+runs have no such check, and work-unit routing and clipping can hide the
+offending element before emission.
 
-The "BlobHeader.datasize cap" section of `CORRECTNESS.md` still describes
-two separate frame-check funnels, while `crates/lib/src/read/frame.rs` has
-had a single frame state machine since `307982d7`.
-
-## DOC-028 - The exit status of a publication-time HoldsInput refusal is undocumented
-
-Reported by: the FMT-023/GEO-001/GEO-002 implementer (2026-11-19), not
-verified.
-
-`build-geocode-index` now refuses at final inspection when replacing the
-index directory would delete the input PBF (`OutputError::HoldsInput`).
-`docs/cli/commands.md` describes the refusal but not its exit status; the
-CLI's mapping of that error kind was not checked. Separately, the
-`IndexScratch` report text still says the old index's buckets are deleted
-with it, without "when replacement succeeds".
-
-## DOC-026 - apply-changes comments describe a timed receive and a relation-first fixture that is not
-
-Reported by: the CMD-001 scout and implementer (2026-11-18), not verified
-further.
-
-- The single-worker comment in
-  `crates/lib/src/commands/apply_changes/rewrite.rs` still says "within one
-  receive timeout"; the drain now blocks on its channel and is woken by a
-  message.
-- The `relation-first` fault fixture in
-  `crates/lib/tests/fault_apply_changes.rs` contains base nodes, so its name
-  promises a shape it does not build. The relation-only shape is covered by
-  `merge_writes_node_and_way_upserts_before_a_relation_only_base_with_locations`
-  in `crates/cli/tests/cli_apply_changes.rs`.
-
-## DOC-027 - diff input checks promise a claim refusal the one-sided shortcut skips
-
-Reported by: the CMD-010 spar partner (2026-11-19), checked against the
-code by the CMD-010 implementer, not fixed.
-
-- `docs/cli/commands.md` "diff", "Input checks", says that where a block
-  holds elements past its claimed last ID the merge refuses the claim when
-  it meets them. `block_pair_merge_phase` (`osc/merge_join.rs`) emits a
-  block whose claim lies entirely before the peer's as one run without
-  walking it against the claim, so old `[2]` against new `[1, 2]` claiming
-  `[1, 1]` can print `+n2` then `-n2` with no refusal. The refusal holds
-  only where a decoded pair walk meets the contradiction. Either the
-  shortcut checks the run's last element against the claim, or the
-  paragraph says where the check runs.
-- The same paragraph lists the byte-identical skip conditions without the
-  rest: both blobs fresh (no residual on either side) and neither crossing
-  its work unit's window. A pair that matches but misses those is decoded,
-  so the corrupt-body exception is narrower than stated.
+Decide how much validation indexed diff should do in passing under
+ADR-0013. Checking the last element of a visible run could catch the
+example on canonically ordered input, but any check after clipping misses
+elements hidden by the planner. Count-only sinks also consume a one-sided
+run without iterating its elements, so adding an element walk changes a
+measured path. The CLI and trust reference describe the current scope.

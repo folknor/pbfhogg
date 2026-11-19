@@ -400,11 +400,10 @@ few bytes over 32 MiB (protobuf framing plus the `raw_size` hint), so it too is
 rejected by the reference reader - interoperable files cannot carry such a blob.
 `MAX_BLOB_DATASIZE` (declared-datasize cap) and `MAX_BLOB_MESSAGE_SIZE`
 (decompressed-content cap) denote different things but coincide at 32 MiB
-because the reference reader enforces one number on both fields. The check lives
-at two funnels covering every read-side site: inline in
-`BlobReader::read_blob_header` (the `next` / `next_header_skip_blob` spine) and
-in `parse_blob_header_with_index` (the shared parse funnel for `read_raw_frame`,
-`read_blob_header_only`, and `HeaderWalker::next_header`).
+because the reference reader enforces one number on both fields.
+`Frames::read_header` in `crates/lib/src/read/frame.rs` checks the declared
+size once per frame before exposing its payload length. Both `BlobReader`
+and `HeaderWalker` use this state machine for frame reads and skips.
 
 **Impact:** Well-formed files are byte-identical - the guard only trips at the
 cap, which no interoperable blob reaches. The single observable change is a

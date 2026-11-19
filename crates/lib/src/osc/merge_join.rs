@@ -1050,6 +1050,9 @@ fn drain_remaining<S: MergeSink>(
 }
 
 /// Emit a decoded block's remaining run as BlobOldOnly or BlobNewOnly.
+/// The range claim already decided routing. This path emits the run without
+/// the boundary checks in `merge_decoded_pair`, so an understated last ID
+/// can appear as a one-sided change.
 fn emit_block<S: MergeSink>(
     bs: &BlockState,
     is_old: bool,

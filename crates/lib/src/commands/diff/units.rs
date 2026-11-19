@@ -38,10 +38,9 @@
 //! # Trust
 //!
 //! Membership and clipping trust indexdata ranges, as everywhere in the
-//! block-pair engine (reference/indexdata-trust.md). A block holding
-//! elements past its claimed last ID is refused when the merge meets them,
-//! unless a cut hides them: a block whose claim crosses a window's end is
-//! clipped there, and what it holds past its claim is then in no unit.
+//! block-pair engine (reference/indexdata-trust.md). The element walk of
+//! overlapping blocks can refuse an understated last ID. One-sided runs
+//! trust the range, and work-unit clipping can hide elements beyond it.
 //!
 //! # Progress and failures
 //!

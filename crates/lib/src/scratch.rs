@@ -611,9 +611,8 @@ pub enum StaleKind {
     /// the only copy there is. It is reported and never deleted.
     OutputBackup,
     /// Scratch an older geocode builder left inside an index directory
-    /// (`.buckets-level*`). Found by [`find_stale_in_index`]. Replacing the
-    /// index deletes it along with the old index, which is why it is its own
-    /// kind: the other kinds are never deleted by anything.
+    /// (`.buckets-level*`). Found by [`find_stale_in_index`]. Publication
+    /// deletes it when it removes the old index.
     IndexScratch,
 }
 
@@ -732,8 +731,8 @@ impl fmt::Display for StaleScratch {
             StaleKind::IndexScratch => write!(
                 f,
                 "{path} is probably scratch left inside a geocode index by an older pbfhogg run \
-                 that did not finish ({size}; {}). pbfhogg does not remove it, but publishing a \
-                 replacement index deletes the old index directory, and this with it",
+                 that did not finish ({size}; {}). This is removed only if publishing a \
+                 replacement index removes the old index directory",
                 self.observation
             ),
             StaleKind::OutputStaging => write!(
@@ -927,10 +926,10 @@ fn classify_geocode_staging(path: &Path, issues: &mut Vec<ScanIssue>) -> StaleKi
 /// ([`StaleKind::IndexScratch`]). Classified entries are reported whole and
 /// not descended into.
 ///
-/// Replacing an index refuses while any entry other than a `.buckets-level*`
-/// tree is in it (`OutputError::HoldsLeftovers`, live run directories
-/// included); the buckets are deleted with the old index, and the
-/// [`StaleKind::IndexScratch`] wording says so. Nothing is deleted here.
+/// Replacing an index refuses while any other recognized leftover is in it
+/// (`OutputError::HoldsLeftovers`, live run directories included). This scan
+/// only reports. The buckets disappear when publication removes the old
+/// index directory.
 /// `dir` is not followed if it is a symlink, and neither are its entries.
 #[must_use]
 pub fn find_stale_in_index(dir: &Path) -> StaleScan {
@@ -1519,7 +1518,10 @@ mod tests {
         assert_eq!(scan.stale[0].path, index.join(".buckets-level17"));
         assert!(scan.stale[0].observed_bytes >= 300);
         let text = scan.stale[0].to_string();
-        assert!(text.contains("deletes the old index"), "{text}");
+        assert!(
+            text.contains("only if publishing a replacement index removes the old index directory"),
+            "{text}"
+        );
         assert!(index.join(".buckets-level17").join("b").exists());
         assert!(index.join("buckets-level-notes").exists());
 

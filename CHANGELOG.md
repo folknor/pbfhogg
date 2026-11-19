@@ -333,6 +333,8 @@
 
 ### Fixed
 
+- The `build-geocode-index` scratch report makes removal of legacy buckets
+  conditional on publication removing the old index directory.
 - `build-geocode-index --overwrite` replaces only a directory whose
   `geocode_header.bin` really is an index header: a regular file, not a
   symlink, a header long and starting with the format's magic. Any other

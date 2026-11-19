@@ -1,6 +1,6 @@
 //! Iterate over the dense nodes in a `PrimitiveGroup`
 
-use super::block::{get_stringtable_key_value, str_from_stringtable, validated};
+use super::block::{resolved_tag, str_from_stringtable, validated};
 use super::elements::zip_hint;
 use super::wire::{
     Cursor, PackedBoolIter, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, WireBlock,
@@ -100,16 +100,6 @@ impl<'a> DenseNode<'a> {
         DenseTagIter {
             block: self.block,
             cursor: Cursor::new(self.tag_bytes),
-        }
-    }
-
-    /// Like [`tags`](Self::tags), but yields `Err` for a malformed varint or
-    /// an out-of-range string index instead of silently ending the tag list.
-    pub fn tags_checked(&self) -> CheckedDenseTagIter<'a> {
-        CheckedDenseTagIter {
-            block: self.block,
-            cursor: Cursor::new(self.tag_bytes),
-            failed: false,
         }
     }
 
@@ -797,21 +787,12 @@ impl<'a> Iterator for DenseTagIter<'a> {
         }
         // The cursor covers only the complete (key, val) pairs `DenseNodeIter`
         // found in `keys_vals`, which block construction validated
-        // (`validate_dense_keys_vals`), so neither read can fail; a failure is
-        // a broken invariant and panics (see `validated`).
-        // wontfix(type-result-fallible): an out-of-range string index is
-        // different - construction does not resolve indices - and still ends
-        // iteration, because Iterator constrains the return type. See
-        // CORRECTNESS.md "Tag iterators end early on an out-of-range string
-        // index". Emptying the cursor on that branch keeps the end final
-        // (the iterator is fused) at no cost on the success path.
+        // (`validate_dense_keys_vals`), widths and table bounds included, so
+        // neither read nor either lookup can fail; a failure is a broken
+        // invariant and panics (see `validated` and `resolved_tag`).
         let key = validated(self.cursor.read_varint(), "DenseNodes keys_vals key") as usize;
         let val = validated(self.cursor.read_varint(), "DenseNodes keys_vals value") as usize;
-        let pair = get_stringtable_key_value(self.block, Some(key), Some(val));
-        if pair.is_none() {
-            self.cursor = Cursor::new(&[]);
-        }
-        pair
+        Some(resolved_tag(self.block, key, val))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -821,46 +802,6 @@ impl<'a> Iterator for DenseTagIter<'a> {
 }
 
 impl std::iter::FusedIterator for DenseTagIter<'_> {}
-
-/// The fallible sibling of [`DenseTagIter`]: yields `Err` for a malformed
-/// varint or a key or value index past the string table, instead of ending
-/// iteration. After an `Err` the iterator yields nothing more.
-#[derive(Clone)]
-pub struct CheckedDenseTagIter<'a> {
-    block: &'a WireBlock<'static>,
-    cursor: Cursor<'a>,
-    failed: bool,
-}
-
-#[allow(clippy::cast_possible_truncation)]
-impl<'a> Iterator for CheckedDenseTagIter<'a> {
-    type Item = Result<(&'a str, &'a str)>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.failed || self.cursor.is_empty() {
-            return None;
-        }
-        let item = (|| {
-            let key = self.cursor.read_varint()? as usize;
-            let val = self.cursor.read_varint()? as usize;
-            Ok((
-                str_from_stringtable(self.block, key)?,
-                str_from_stringtable(self.block, val)?,
-            ))
-        })();
-        self.failed = item.is_err();
-        Some(item)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.failed {
-            return (0, Some(0));
-        }
-        // Each remaining key/value pair occupies at least two bytes.
-        (0, Some(self.cursor.remaining() / 2))
-    }
-}
 
 /// An iterator over the tags of a dense node as raw index pairs.
 #[derive(Clone)]
@@ -915,45 +856,19 @@ mod tests {
             block: node.block,
             cursor: Cursor::new(&data),
         };
-        let mut checked = CheckedDenseTagIter {
-            block: node.block,
-            cursor: Cursor::new(&data),
-            failed: false,
-        };
         let mut raw = DenseRawTagIter {
             cursor: Cursor::new(&data),
         };
         for upper in [3, 1, 0] {
             assert_eq!(tags.size_hint(), (0, Some(upper)));
-            assert_eq!(checked.size_hint(), (0, Some(upper)));
             assert_eq!(raw.size_hint(), (0, Some(upper)));
             if upper > 0 {
                 assert!(tags.next().is_some());
-                assert!(checked.next().unwrap().is_ok());
                 assert!(raw.next().is_some());
             }
         }
         assert!(tags.next().is_none());
-        assert!(checked.next().is_none());
         assert!(raw.next().is_none());
-
-        let mut tags = DenseTagIter {
-            block: node.block,
-            cursor: Cursor::new(&[127, 0, 0, 0]),
-        };
-        assert!(tags.next().is_none());
-        assert_eq!(tags.size_hint(), (0, Some(0)));
-        for data in [&[127, 0, 0, 0][..], &[0x80, 0x80, 0x80, 0x80][..]] {
-            let mut checked = CheckedDenseTagIter {
-                block: node.block,
-                cursor: Cursor::new(data),
-                failed: false,
-            };
-            assert_eq!(checked.size_hint(), (0, Some(2)));
-            assert!(checked.next().unwrap().is_err());
-            assert_eq!(checked.size_hint(), (0, Some(0)));
-            assert!(checked.next().is_none());
-        }
     }
 
     fn meta(version: i32, timestamp: i64, changeset: i64, uid: i32, user: &str) -> Metadata<'_> {

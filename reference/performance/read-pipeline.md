@@ -1,5 +1,23 @@
 # Read Pipeline
 
+### Tag string indices resolved at block validation (plantasjen, 2026-11-19, uncommitted against `8ca7880c`)
+
+Block validation now checks every tag key and value string index against
+the string table in the same scan that checks their width. Planet
+`file-info --mode nodes`, `--iterations 1`, interleaved, HEAD via
+`--commit 8ca7880c` against the uncommitted tree:
+
+| Pair | HEAD | Variant |
+|---|---|---|
+| 1 | 31.6 s (`30ac0a7e`, cold first cell) | 25.0 s (`965f7512`) |
+| 2 | 24.8 s (`920eb33d`) | 24.7 s (`2b866378`) |
+| 3 | 31.1 s (`2a0765c9`) | 32.1 s (`2860083e`) |
+| 4 | 31.4 s (`5210c14b`) | 31.1 s (`b652483e`) |
+
+Walls are bimodal (about 25 s and 31 s) with another project's builds
+sharing the host between cells; within each mode the arms agree to
+about 1 %. No cost. Kept.
+
 ### DenseInfo columns read per group (bygg, 2026-11-10, `9e098409` against `9a7e719b`)
 
 Column presence is decided once per group and the dense iterator keeps

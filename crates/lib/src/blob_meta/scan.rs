@@ -50,7 +50,9 @@
 //! dense `keys_vals` value indices. None of those can make an
 //! index omit something a successful decode yields - the decoder refuses such
 //! a block outright - so the gap can only cost an index over a block nobody
-//! can read, never a wrong skip.
+//! can read, never a wrong skip. Tag string indices are checked as the
+//! decoder checks them: a key or value index past the string table is an
+//! `Err`, so a blob whose tags no decode reads in full gets no index.
 
 use protohoggr::Cursor;
 
@@ -139,9 +141,10 @@ struct Walk<'a> {
     /// flag vector instead of a hash set: this is set once per tag of every
     /// element of every blob on the indexdata-generating paths.
     key_seen: Vec<bool>,
-    /// Largest key sid referenced anywhere, checked against the string table
-    /// in both modes so the two scanners agree on what is an `Err`.
-    max_key_sid: Option<u64>,
+    /// Largest tag key or value sid referenced anywhere, checked against the
+    /// string table in both modes so this walk refuses the tag index block
+    /// construction refuses.
+    max_tag_sid: Option<u64>,
 }
 
 impl<'a> Walk<'a> {
@@ -163,7 +166,7 @@ impl<'a> Walk<'a> {
             sorted: true,
             extent: None,
             key_seen: Vec::new(),
-            max_key_sid: None,
+            max_tag_sid: None,
         };
 
         let (stringtable, groups) = walk.block_fields(raw)?;
@@ -185,7 +188,7 @@ impl<'a> Walk<'a> {
             walk.group(group)?;
         }
 
-        if let Some(sid) = walk.max_key_sid {
+        if let Some(sid) = walk.max_tag_sid {
             let index = usize::try_from(sid).unwrap_or(usize::MAX);
             if index >= walk.strings.len() {
                 return Err(new_stringtable_index_out_of_bounds(index));
@@ -328,13 +331,19 @@ impl<'a> Walk<'a> {
         }
         let mut cur = Cursor::new(vals);
         while !cur.is_empty() {
-            cur.read_varint_u32()?;
+            let sid = u64::from(cur.read_varint_u32()?);
+            self.value(sid);
         }
         Ok(())
     }
 
+    /// A tag value sid: bounded against the table in `run`, never recorded.
+    fn value(&mut self, sid: u64) {
+        self.max_tag_sid = Some(self.max_tag_sid.map_or(sid, |m| m.max(sid)));
+    }
+
     fn key(&mut self, sid: u64) {
-        self.max_key_sid = Some(self.max_key_sid.map_or(sid, |m| m.max(sid)));
+        self.value(sid);
         // An out-of-range sid has no flag; `run` turns it into an `Err`.
         if self.collect_keys
             && let Ok(i) = usize::try_from(sid)
@@ -420,8 +429,8 @@ impl<'a> Walk<'a> {
     /// may omit its terminator. Zero is a delimiter only in key position - a
     /// value of 0 is a value.
     ///
-    /// Index width is not checked here: a key past the string table is an
-    /// `Err` through `max_key_sid` in `run`, and the decoder's `int32` bound
+    /// Index width is not checked here: a key or value past the string table
+    /// is an `Err` through `max_tag_sid` in `run`, and the decoder's `int32` bound
     /// on values (`validate_dense_keys_vals` in `read/block.rs`) is one of
     /// the decoder-only refusals listed in the module docs.
     fn dense_keys_vals(&mut self, keys_vals: &[u8], nodes: u64) -> Result<()> {
@@ -443,8 +452,9 @@ impl<'a> Walk<'a> {
                     "dense keys_vals ends with a key that has no value",
                 ));
             }
-            kv.read_varint()?;
+            let value = kv.read_varint()?;
             self.key(key);
+            self.value(value);
             in_run = true;
         }
         if in_run {
@@ -1063,6 +1073,29 @@ mod tests {
             try_scan_block_ids_checked(&block).is_err(),
             "both scanners agree"
         );
+    }
+
+    /// A value index past the table is refused as block construction
+    /// refuses it, on plain and dense tags, by both scanners; value index 0
+    /// on a dense node is a value, and resolves.
+    #[test]
+    fn a_value_outside_the_string_table_is_an_error() {
+        let strings: &[&[u8]] = &[b"", b"highway"];
+        let mut plain = Vec::new();
+        write_len_delimited(3, &element_msg(1, &[1], &[7]), &mut plain);
+        let mut dense = Vec::new();
+        write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[1, 7, 0]), &mut dense);
+        for g in [&plain, &dense] {
+            let block = block_with_strings(strings, &[g]);
+            assert!(try_scan_block_tags(&block).is_err());
+            assert!(try_scan_block_ids_checked(&block).is_err());
+            assert!(crate::PrimitiveBlock::from_vec(block).is_err());
+        }
+        let mut zero = Vec::new();
+        write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[1, 0, 0]), &mut zero);
+        let block = block_with_strings(strings, &[&zero]);
+        assert!(try_scan_block_tags(&block).is_ok());
+        assert!(crate::PrimitiveBlock::from_vec(block).is_ok());
     }
 
     #[test]

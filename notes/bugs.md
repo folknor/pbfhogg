@@ -91,45 +91,6 @@ Metadata also goes through whole-second normalization (`owned.rs`). Both
 hunters say the documentation is the wrong side here: "same corpus, different
 encoding" needs explicit precision qualifications.
 
-## BUG-004 - Out-of-range tag SIDs silently shorten tag lists
-
-Reported by: decode, encoding, merge, tags.
-
-`TagIter::next` (`elements.rs`) and `DenseTagIter` end iteration at an
-out-of-range string index, and structural validation does not check SID bounds.
-Rebuild and Owned-conversion paths (filters, extract, sort sweep encoding) use
-`tags()`, so malformed indices can produce successfully written elements with
-fewer tags. Checked iterators exist. The tags hunter describes this end-of-list
-handling as existing behaviour a rewrite must keep; the decode, encoding and
-merge hunters call it a silent wrong answer. Both readings are recorded.
-
-Defect hunt 2026-11-17: reported independently by read-block-decoding (P1),
-write-encoding (P2), apply-merge (P2), id-filter-selection (P1), export (P2),
-passthrough-rewrite and geocode-builder (P2). All of them cite the
-`CORRECTNESS.md` entry that documents the iterator limitation and all call that
-acceptance incompatible with the refusal-over-silent-wrong-answer contract;
-the wrong boundary is each command consuming the infallible iterator while
-checked accessors exist. Consumers named:
-- repack writer and owned paths (`repack/mod.rs`), against repack's explicit
-  tag round-trip promise in `docs/cli/commands.md`;
-- cat cleaning path (`cat/mod.rs`) and degrade rewrites; cat's
-  unclassifiable-block fallback already uses the checked accessors;
-- owned conversions (`owned.rs`), used by blob_merge cursor demotion;
-- blob_merge sweep encoder (`blob_merge/sweep.rs`), affecting sort and
-  cat --dedupe;
-- getid, getparents, time-filter and tags-filter: a way with
-  `highway=primary`, a bad index, then `name=Main` is missed by a `name=Main`
-  filter and written with only its first tag by a `highway=primary` filter;
-- export (`export/mod.rs`): a bad first tag drops a tagged element as
-  untagged; `building=yes`, bad tag, `area=no` becomes a Polygon because
-  classification never reaches the override, breaking "area=no always
-  disqualifies";
-- geocode builder node processing (`pass2.rs`) and relation selection
-  (`pass1.rs`): an address loses postcode or place fields after the bad pair;
-  Pass 1.5 already refuses the same corruption in way tags.
-The proposed fix is fallible tag iteration carried through owned conversion,
-matching and builder intake.
-
 ## BUG-006 - Rebuild paths drop inline way locations
 
 Reported by: encoding, sort, spatial.

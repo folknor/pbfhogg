@@ -256,12 +256,12 @@ pub use read::block::{
     HeaderBBox, HeaderBlock, PrimitiveBlock, PrimitiveGroup,
 };
 pub use read::dense::{
-    CheckedDenseTagIter, DenseColumns, DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter,
-    DenseRawTagIter, DenseTagIter,
+    DenseColumns, DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter, DenseRawTagIter,
+    DenseTagIter,
 };
 pub use read::elements::{
-    CheckedTagIter, Element, Info, MemberId, MemberType, Node, RawTagIter, RelMember,
-    RelMemberIter, Relation, TagIter, Way, WayNodeLocation, WayNodeLocationsIter, WayRefIter,
+    Element, Info, MemberId, MemberType, Node, RawTagIter, RelMember, RelMemberIter, Relation,
+    TagIter, Way, WayNodeLocation, WayNodeLocationsIter, WayRefIter,
 };
 pub use read::reader::{ElementReader, PipelinedBlocks};
 

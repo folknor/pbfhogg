@@ -15,15 +15,11 @@
 //! kinds and values. Only then is anything merged by text, so duplicate
 //! string table entries fold into one row.
 //!
-//! Which tags count is the element walk's rule, the one `TagIter` and
-//! `DenseTagIter` apply: an element's tags are its pairs up to the first one
-//! whose key or value index lies past the string table (CORRECTNESS.md, "Tag
-//! iterators end early on an out-of-range string index"). Counting a key
-//! alone still reads and checks its value index. A plain element stops
-//! there; a dense node stops counting but its pairs are still read up to its
-//! terminator so the next node starts where it should. Index 0 is looked up
-//! like any other index, and a dense `0` is a terminator only in key
-//! position.
+//! Every tag counts: block validation refused any key or value index past
+//! the string table, so on an accepted blob every index resolves, as it does
+//! for `TagIter` and `DenseTagIter`; one that does not is a broken internal
+//! invariant and an error. Index 0 is looked up like any other index, and a
+//! dense `0` is a terminator only in key position.
 
 use rustc_hash::FxHashMap;
 
@@ -319,6 +315,7 @@ fn walk_tags(
         u32::try_from(index)
             .ok()
             .filter(|&i| (i as usize) < strings)
+            .ok_or_else(past_the_table)
     };
     for &run in runs {
         match run {
@@ -326,30 +323,18 @@ fn walk_tags(
                 let keys = PackedUint32Iter::new(keys.in_blob(bytes)?);
                 let vals = PackedUint32Iter::new(vals.in_blob(bytes)?);
                 for (k, v) in keys.zip(vals) {
-                    let (Some(k), Some(v)) = (resolves(k.into()), resolves(v.into())) else {
-                        break;
-                    };
-                    f(kind, k, v);
+                    f(kind, resolves(k.into())?, resolves(v.into())?);
                 }
             }
             TagRun::Dense(span) => {
                 let mut cursor = Cursor::new(span.in_blob(bytes)?);
-                // Whether the current node's tags are still counting.
-                let mut live = true;
                 while !cursor.is_empty() {
                     let key = cursor.read_varint()?;
                     if key == 0 {
-                        live = true;
                         continue;
                     }
                     let value = cursor.read_varint()?;
-                    if !live {
-                        continue;
-                    }
-                    match (resolves(key), resolves(value)) {
-                        (Some(k), Some(v)) => f(ElementKind::Node, k, v),
-                        _ => live = false,
-                    }
+                    f(ElementKind::Node, resolves(key)?, resolves(value)?);
                 }
             }
         }
@@ -358,7 +343,9 @@ fn walk_tags(
 }
 
 fn past_the_table() -> Error {
-    Error::internal("inspect tags: a counted string index lies past its string table")
+    Error::internal(
+        "inspect tags: a tag string index on an accepted block lies past its string table",
+    )
 }
 
 /// The string of an index already found in the table.
@@ -446,13 +433,14 @@ mod tests {
     }
 
     /// Blocks that exercise the tag rules: duplicate string table entries,
-    /// index 0 (holding the empty string, and holding text), an index past
-    /// the table in the middle of an element's tags, dense value index 0, a
-    /// final dense run without its terminator, and tags on every kind.
+    /// index 0 (holding the empty string, and holding text), dense value
+    /// index 0, a final dense run without its terminator, and tags on every
+    /// kind. An index past the table is a construction refusal, which the
+    /// mutation sweep reaches.
     fn tag_fixtures() -> Vec<(&'static str, Vec<u8>)> {
         let mut tagged_way = Vec::new();
         field_varint(&mut tagged_way, 1, 71);
-        field_bytes(&mut tagged_way, 2, &packed([1, 3, 9, 1]));
+        field_bytes(&mut tagged_way, 2, &packed([1, 3, 4, 1]));
         field_bytes(&mut tagged_way, 3, &packed([2, 2, 2, 4]));
         field_bytes(&mut tagged_way, 8, &deltas(&[1, 2]));
         let mut tagged_relation = relation(80, &[(1, 5, 0)]);
@@ -460,7 +448,7 @@ mod tests {
         field_bytes(&mut tagged_relation, 3, &packed([2, 0]));
         vec![
             (
-                "duplicate strings, index 0 and an out-of-range index on every kind",
+                "duplicate strings and index 0 on every kind",
                 block(
                     &["", "k", "v", "k", "e"],
                     &[
@@ -470,14 +458,14 @@ mod tests {
                                     1,
                                     0,
                                     0,
-                                    &[(1, 2), (3, 2), (0, 4), (9, 2), (1, 2)],
+                                    &[(1, 2), (3, 2), (0, 4), (4, 2), (1, 2)],
                                     None,
                                 ),
-                                plain_node(2, 0, 0, &[(2, 9), (1, 2)], None),
+                                plain_node(2, 0, 0, &[(2, 4), (1, 2)], None),
                             ],
                             dense: Some(dense(
                                 &[(3, 0, 0), (4, 0, 0), (5, 0, 0), (6, 0, 0)],
-                                &[1, 2, 9, 2, 1, 2, 0, 3, 0, 0, 0, 1, 2, 3, 2],
+                                &[1, 2, 4, 2, 1, 2, 0, 3, 0, 0, 0, 1, 2, 3, 2],
                             )),
                             ..Group::default()
                         },
@@ -616,22 +604,22 @@ mod tests {
         };
         let key = |k: &str| (k.to_owned(), None);
         let pair = |k: &str, v: &str| (k.to_owned(), Some(v.to_owned()));
-        // Plain node 1: k=v twice (indices 1 and 3), ""=e, then an index past
-        // the table ends its tags. Plain node 2 ends at once, its key "v" not
-        // counted either: the pair's value index is past the table. Dense:
-        // node 3 k=v then ends, node 4 k="" (value index 0), node 5 none,
-        // node 6 (unterminated) k=v twice. Way: k=v twice, then ends.
-        // Relation: e=v and k="".
+        // Plain node 1: k=v twice (indices 1 and 3), ""=e, e=v, k=v. Plain
+        // node 2: v=e, k=v. Dense: node 3 k=v, e=v, k=v; node 4 k="" (value
+        // index 0); node 5 none; node 6 (unterminated) k=v twice. Way: k=v
+        // twice, e=v, k=e. Relation: e=v and k="".
         let pairs: Counts = [
-            (pair("k", "v"), 2 + 1 + 2 + 2),
+            (pair("k", "v"), 3 + 1 + 4 + 2),
             (pair("", "e"), 1),
             (pair("k", ""), 1 + 1),
-            (pair("e", "v"), 1),
+            (pair("e", "v"), 1 + 1 + 1 + 1),
+            (pair("v", "e"), 1),
+            (pair("k", "e"), 1),
         ]
         .into_iter()
         .collect();
         assert_eq!(count(&["*=*"]), pairs);
-        let keys: Counts = [(key("k"), 7 + 2), (key(""), 1), (key("e"), 1)]
+        let keys: Counts = [(key("k"), 13), (key(""), 1), (key("e"), 4), (key("v"), 1)]
             .into_iter()
             .collect();
         // No expression and a bare `*` both count every key.
@@ -639,7 +627,7 @@ mod tests {
         assert_eq!(count(&["*"]), keys);
         // A tag both routes select counts in both rows; the repeated key
         // expression counts once.
-        let both: Counts = [(key("k"), 9), (pair("k", "v"), 7)].into_iter().collect();
+        let both: Counts = [(key("k"), 13), (pair("k", "v"), 10)].into_iter().collect();
         assert_eq!(count(&["k", "k=v", "k"]), both);
     }
 

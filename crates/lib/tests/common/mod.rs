@@ -1126,24 +1126,24 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
         for element in block.elements() {
             match element {
                 Element::DenseNode(dn) => {
-                    let tags = checked_tags(dn.tags_checked(), &format!("dense node {}", dn.id()));
+                    let tags = checked_tags(dn.tags(), &format!("dense node {}", dn.id()));
                     contents
                         .nodes
                         .push((dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags));
                 }
                 Element::Node(n) => {
-                    let tags = checked_tags(n.tags_checked(), &format!("node {}", n.id()));
+                    let tags = checked_tags(n.tags(), &format!("node {}", n.id()));
                     contents
                         .nodes
                         .push((n.id(), n.decimicro_lat(), n.decimicro_lon(), tags));
                 }
                 Element::Way(w) => {
-                    let tags = checked_tags(w.tags_checked(), &format!("way {}", w.id()));
+                    let tags = checked_tags(w.tags(), &format!("way {}", w.id()));
                     contents.ways.push((w.id(), w.refs().collect(), tags));
                 }
                 Element::Relation(r) => {
                     let what = format!("relation {}", r.id());
-                    let tags = checked_tags(r.tags_checked(), &what);
+                    let tags = checked_tags(r.tags(), &what);
                     let members = r
                         .members()
                         .map(|m| {
@@ -1479,15 +1479,11 @@ fn public_view_of_model(decoded: &model::DecodedPbf) -> Vec<PublicView> {
 }
 
 /// Collect a checked tag iterator, failing on an unresolvable index.
-pub fn checked_tags<'a, E: std::fmt::Display>(
-    tags: impl Iterator<Item = Result<(&'a str, &'a str), E>>,
-    what: &str,
+pub fn checked_tags<'a>(
+    tags: impl Iterator<Item = (&'a str, &'a str)>,
+    _what: &str,
 ) -> Vec<(String, String)> {
-    tags.map(|tag| {
-        let (k, v) = tag.unwrap_or_else(|e| panic!("{what}: tag: {e}"));
-        (k.to_owned(), v.to_owned())
-    })
-    .collect()
+    tags.map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
 }
 
 /// A member kind as the public API reports it, unknown values kept.
@@ -1525,7 +1521,7 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                     PublicView::Node {
                         id: n.id(),
                         nano: (n.nano_lat(), n.nano_lon()),
-                        tags: checked_tags(n.tags_checked(), &what),
+                        tags: checked_tags(n.tags(), &what),
                         version,
                         milli_timestamp,
                     }
@@ -1536,7 +1532,7 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                     PublicView::Node {
                         id: n.id(),
                         nano: (n.nano_lat(), n.nano_lon()),
-                        tags: checked_tags(n.tags_checked(), &what),
+                        tags: checked_tags(n.tags(), &what),
                         version: info.claimed_version(),
                         milli_timestamp: info.milli_timestamp(),
                     }
@@ -1551,7 +1547,7 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                         id: w.id(),
                         refs: w.refs().collect(),
                         locations: (!locations.is_empty()).then_some(locations),
-                        tags: checked_tags(w.tags_checked(), &what),
+                        tags: checked_tags(w.tags(), &what),
                         meta: plain_view_of_info(&w.info(), &what),
                     }
                 }
@@ -1569,7 +1565,7 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                                 (member_kind(m.id.member_type()), m.id.id(), role)
                             })
                             .collect(),
-                        tags: checked_tags(r.tags_checked(), &what),
+                        tags: checked_tags(r.tags(), &what),
                         meta: plain_view_of_info(&r.info(), &what),
                     }
                 }

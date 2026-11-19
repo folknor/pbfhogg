@@ -520,12 +520,12 @@ mod tests {
                     &strings,
                     &[
                         (
-                            vec![plain_node(7, 0, 0, &[(9, 2)], Some([1, 0, 0, 0, 4]))],
+                            vec![plain_node(7, 0, 0, &[(4, 2)], Some([1, 0, 0, 0, 4]))],
                             None,
                         ),
                         (vec![], Some(dense(&[(7, 5, 5), (8, 6, 6)], &[]))),
                         (
-                            vec![plain_node(1, 9, 9, &[(1, 99)], None)],
+                            vec![plain_node(1, 9, 9, &[(1, 4)], None)],
                             Some(dense(&[], &[])),
                         ),
                         (vec![], None),
@@ -533,8 +533,8 @@ mod tests {
                 ),
             ),
             (
-                // A first pair past the table is untagged even when a later
-                // pair resolves; an unterminated final run still counts.
+                // A node with several pairs counts once; an empty run is
+                // untagged; an unterminated final run still counts.
                 "dense tag runs",
                 block(
                     &strings,
@@ -542,7 +542,7 @@ mod tests {
                         vec![],
                         Some(dense(
                             &[(1, 0, 0), (2, 0, 0), (3, 0, 0)],
-                            &[9, 2, 1, 2, 0, 0, 1, 2],
+                            &[4, 2, 1, 2, 0, 0, 1, 2],
                         )),
                     )],
                 ),

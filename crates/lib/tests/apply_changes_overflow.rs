@@ -84,20 +84,14 @@ fn node_notes(path: &Path) -> Vec<(i64, String)> {
                 let (id, tags): (i64, Vec<(String, String)>) = match &element {
                     Element::DenseNode(n) => (
                         n.id(),
-                        n.tags_checked()
-                            .map(|t| {
-                                let (k, v) = t.unwrap();
-                                (k.to_owned(), v.to_owned())
-                            })
+                        n.tags()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
                             .collect(),
                     ),
                     Element::Node(n) => (
                         n.id(),
-                        n.tags_checked()
-                            .map(|t| {
-                                let (k, v) = t.unwrap();
-                                (k.to_owned(), v.to_owned())
-                            })
+                        n.tags()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
                             .collect(),
                     ),
                     _ => continue,

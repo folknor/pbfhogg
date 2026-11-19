@@ -21,7 +21,8 @@ hunter per scope reading source at `63d4ec1d`. None was built, run or
 reproduced. "Reported by" names the scope or scopes, and the bracketed
 priority is the hunter's own label. Findings that match an existing mechanism
 were added to `notes/bugs.md` instead of being filed here: builder tag
-truncation (BUG-004), candidate
+truncation (since fixed: block validation refuses a tag string index past
+the table), candidate
 ranking ties (BUG-026) and building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 

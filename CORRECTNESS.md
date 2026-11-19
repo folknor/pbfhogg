@@ -40,92 +40,52 @@ block error contracts, including the byte-level rewriters' handling of
 these forms, are described in
 [reference/truncation-handling.md](reference/truncation-handling.md).
 
-## Tag iterators end early on an out-of-range string index
+## Tag string indices are resolved at block construction
 
-**Status:** Known, accepted for `TagIter` and `DenseTagIter`
-(`wontfix(type-result-fallible)` in source). Fallible siblings exist, and
-`diff`, `diff --format osc` and `digest` use them.
+**Status:** Fixed. A tag key or value string index past the block's string
+table is refused when the block is built.
 
 **Context:** Tags and relation member roles are indices into the block's
-string table. `str_from_stringtable` (`crates/lib/src/read/block.rs`) bounds-checks every
-lookup and returns `StringtableIndexOutOfBounds` on a miss, but the infallible
-tag iterators cannot surface it: `TagIter` (`crates/lib/src/read/elements.rs`) and
-`DenseTagIter` (`crates/lib/src/read/dense.rs`) implement
-`Iterator<Item = (&str, &str)>`, and `get_stringtable_key_value` discards the
-error as `None`. A tag with an out-of-range key or value index therefore ends
-the element's tag list early, silently dropping it and every tag after it.
-Both iterators are fused, so that end is final even for a caller that keeps
-calling `next`, and neither promises a positive `size_hint` lower bound,
-since the early end cannot be predicted without resolving every index.
+string table. `validate_block` (`crates/lib/src/read/block.rs`) bounds every
+plain `keys` / `vals` index and every dense `keys_vals` key and value index
+against the table, in the same scan that checks their width, and refuses one
+past it as `StringtableIndexOutOfBounds`. Every `PrimitiveBlock` and every
+validator projection goes through it, so on an accepted block every tag
+lookup resolves: `TagIter` and `DenseTagIter` treat a failed lookup as a
+broken construction invariant and panic in release, and there is no
+fallible tag iterator. Earlier, an out-of-range index ended the infallible
+iterators' list early, so repack, cat, degrade, sort, the filters, extract,
+export, the geocode builder and ALTW could write an element with fewer tags
+or select on a shortened list; that is now a refusal of the block. The raw
+blob metadata scanner (`crates/lib/src/blob_meta/scan.rs`) applies the same
+key and value bound, so indexdata generation and `check --index` refuse what
+a decode refuses.
 
-`tags_checked()` on `Node`, `Way`, `Relation` and `DenseNode` returns the
-fallible sibling (`CheckedTagIter`, `CheckedDenseTagIter`), which yields an
-`Err` for the bad tag instead. Element content for `diff` and `digest` is
-defined once, in `crates/lib/src/content.rs`, on these checked iterators and on
-`RelMember::role`'s `Result`. A corrupt element there is never silently equal
-to anything: the block-pair paths compare it as unequal ("modified"), the
-streaming path's owned conversion errors, and `digest` refuses the file. The
-one exception is diff's byte-equal blob fast path, which reports two
-byte-identical blobs as common without decoding either.
+The claim covers accepted blocks and validator projections, not every byte
+of a file: a blob copied without decoding (raw passthrough, diff's
+byte-equal blob fast path) is not checked.
 
-Member roles and user names are not covered by this gap. `RelMember::role`
-and the `user` accessors return a `Result`, and every path that writes them
-propagates it: the re-encoding commands (through the public
+Member roles and user names are not resolved at construction.
+`RelMember::role` and the `user` accessors return a `Result`, and every path
+that writes them propagates it: the re-encoding commands (through the public
 `Relation::members_into`, and `element_metadata` and `dense_node_metadata` in
 `crates/lib/src/owned.rs`, which the owned-element conversions share), the
 `bench-write` instrument and the OSC writer refuse a bad role or user index
 with an error naming the element, rather than writing an empty string.
 `inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
-bad role as empty when classifying boundary members.
+bad role as empty when classifying boundary members. Element content for
+`diff` and `digest` (`crates/lib/src/content.rs`) resolves roles through
+that `Result`: a bad role is never silently equal to anything.
 
 `apply-changes` copies the surviving elements of a blob it rewrites with their
 string indices unresolved, into an output block whose string table starts as
-the source block's, so it does not go through these iterators either. It
-checks every index it copies (tag keys and values, member roles, user names)
-against the source block's table and refuses one past it, naming the element,
-the field and the index: such an index would otherwise name one of the
-strings the diff's own elements add behind the copied table. It also refuses
-a rewritten block whose string table does not begin with the empty string.
-Blobs it copies unchanged are not decoded and not checked.
-
-`inspect tags` does not go through these iterators: it reads the raw index
-arrays through a projection on the block validator
-(`crates/lib/src/commands/tags_count/tally.rs`) and counts each element's tags by the
-same rule, up to the first pair whose key or value index lies past the
-table, for key rows (which still check the value index) as for pair rows.
-Its unit tests hold its counts to the element walk's on every fixture and
-mutation, under key, pair and mixed selections, so the two cannot drift
-apart silently.
-
-`validate_block` (`crates/lib/src/read/block.rs`) does not close the gap: it is a
-structural pass that checks array framing and parallel-array lengths without
-resolving any string index, because resolving them would mean decoding every
-packed tag array up front. A tag array that ends mid-varint, or whose keys
-and values disagree in count, is rejected there; a well-formed index that
-points past the string table is not.
-
-**Not a performance trade:** the bounds check runs on every lookup either way.
-Only the error is thrown away. The constraint is the iterator's item type.
-
-**Impact:** Wrong output rather than an error, but only for input whose string
-indices point past the table - a producer bug, not something well-formed PBFs
-contain. Random corruption of a zlib blob fails the stream's checksum at
-decompression before any index is resolved.
-
-**Where it must not apply:** code that has to refuse corrupt input outright
-uses `tags_checked()` and matches on `RelMember::role`'s `Result`, rather than
-going through the infallible tag iterators or `role().unwrap_or("")`. Library
-users who need the same strictness should do likewise, and treat `tags()` as
-best-effort on untrusted input.
-
-**Fix approach for the remaining consumers (if ever needed):** the re-encoding
-paths stream `tags()` straight into `BlockBuilder::add_*`, which takes an
-infallible iterator. A builder input that consumes `tags_checked()` once and
-propagates its error would refuse a bad tag without a second lookup or a
-validation pre-pass; the alternative is to resolve every index in
-`validate_block` behind an opt-in strictness flag. Either touches the
-hottest per-element path of every re-encoding command, so it is a measured
-change.
+the source block's. A tag index past the source table is refused when the
+source block is built; the raw copy checks every role and user index it
+copies against the source block's table and refuses one past it, naming the
+element, the field and the index: such an index would otherwise name one of
+the strings the diff's own elements add behind the copied table. It also
+refuses a rewritten block whose string table does not begin with the empty
+string. Blobs it copies unchanged are not decoded and not checked.
 
 ## Osmosis -1 sentinel for absent metadata
 

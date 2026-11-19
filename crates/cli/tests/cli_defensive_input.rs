@@ -724,7 +724,25 @@ impl RawSid {
         RawSid::RelationUser,
     ];
 
-    /// The refusal's element and field, ahead of the index.
+    /// What the refusal of index `sid` here says. A tag key or value index
+    /// past the source table is refused when the block is built, before the
+    /// rewrite reaches it, by index (the run's error names the base file
+    /// and blob); a user or role index by the raw copy, naming the element
+    /// and field ahead of the index.
+    fn refusal(self, sid: u64) -> String {
+        match self {
+            RawSid::DenseKey
+            | RawSid::DenseVal
+            | RawSid::NodeKey
+            | RawSid::NodeVal
+            | RawSid::WayKey
+            | RawSid::WayVal
+            | RawSid::RelationKey => format!("stringtable index out of bounds: {sid}"),
+            _ => format!("{} {sid}", self.needle()),
+        }
+    }
+
+    /// The raw copy's refusal: element and field, ahead of the index.
     fn needle(self) -> &'static str {
         match self {
             RawSid::DenseKey => "node 2: tag key string index",
@@ -1005,11 +1023,11 @@ fn apply_changes_rewrites_the_valid_raw_rewrite_fixture() {
 }
 
 /// A string index of a copied base element at or past its source block's
-/// table is refused, naming the element, field and index: one inside the
-/// slots the diff's strings take behind the copied table (which used to
-/// name a diff string silently), one past those too (a tag key there used
-/// to panic), and, for a plain node's key, one at or past 2^31 (which the
-/// copy used to carry as a negative dense index).
+/// table is refused: one inside the slots the diff's strings take behind
+/// the copied table (which used to name a diff string silently), one past
+/// those too (a tag key there used to panic), and, for a plain node's key,
+/// one at or past 2^31 (which the copy used to carry as a negative dense
+/// index). See `RawSid::refusal` for which boundary refuses which.
 #[test]
 fn apply_changes_refuses_a_bad_string_index_in_a_rewritten_blob() {
     let dir = crate::common::test_scratch();
@@ -1018,11 +1036,7 @@ fn apply_changes_refuses_a_bad_string_index_in_a_rewritten_blob() {
         for sid in [4, 40] {
             write_raw_rewrite_pbf(&base, Some((which, sid)));
             let out = run_raw_rewrite(dir.path(), &base);
-            assert_refused(
-                &out,
-                &format!("{} {sid}", which.needle()),
-                &format!("{which:?} index {sid}"),
-            );
+            assert_refused(&out, &which.refusal(sid), &format!("{which:?} index {sid}"));
             assert_eq!(out.status.code(), Some(2), "{which:?} index {sid}");
             assert!(
                 !dir.path().join("output.osm.pbf").exists(),
@@ -1034,7 +1048,7 @@ fn apply_changes_refuses_a_bad_string_index_in_a_rewritten_blob() {
     let out = run_raw_rewrite(dir.path(), &base);
     assert_refused(
         &out,
-        &format!("{} {}", RawSid::NodeKey.needle(), 1u64 << 31),
+        &RawSid::NodeKey.refusal(1 << 31),
         "NodeKey index 2^31",
     );
 }

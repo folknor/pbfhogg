@@ -222,7 +222,7 @@ fn materialize(element: &Element<'_>) -> String {
             n.id(),
             n.nano_lat(),
             n.nano_lon(),
-            crate::common::checked_tags(n.tags_checked(), &what),
+            crate::common::checked_tags(n.tags(), &what),
             info_string(&n.info()),
         ),
         Element::DenseNode(dn) => {
@@ -242,7 +242,7 @@ fn materialize(element: &Element<'_>) -> String {
                 dn.id(),
                 dn.nano_lat(),
                 dn.nano_lon(),
-                crate::common::checked_tags(dn.tags_checked(), &what),
+                crate::common::checked_tags(dn.tags(), &what),
             )
         }
         Element::Way(w) => {
@@ -254,7 +254,7 @@ fn materialize(element: &Element<'_>) -> String {
             format!(
                 "way id={} tags={:?} refs={refs:?} locations={locations:?} info=[{}]",
                 w.id(),
-                crate::common::checked_tags(w.tags_checked(), &what),
+                crate::common::checked_tags(w.tags(), &what),
                 info_string(&w.info()),
             )
         }
@@ -269,7 +269,7 @@ fn materialize(element: &Element<'_>) -> String {
             format!(
                 "rel id={} tags={:?} members={members:?} info=[{}]",
                 r.id(),
-                crate::common::checked_tags(r.tags_checked(), &what),
+                crate::common::checked_tags(r.tags(), &what),
                 info_string(&r.info()),
             )
         }

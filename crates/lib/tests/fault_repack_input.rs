@@ -262,7 +262,7 @@ fn write_replacement(path: &Path, route: Route) {
 /// Every element of the file at `path` in file order, and the element count
 /// of each data blob.
 fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
-    type Checked<'a> = dyn Iterator<Item = pbfhogg::Result<(&'a str, &'a str)>> + 'a;
+    type Checked<'a> = dyn Iterator<Item = (&'a str, &'a str)> + 'a;
     let tags =
         |it: &mut Checked<'_>| -> Vec<(String, String)> { crate::common::checked_tags(it, "item") };
     let mut items = Vec::new();
@@ -279,13 +279,13 @@ fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
                     id: n.id(),
                     lat: n.decimicro_lat(),
                     lon: n.decimicro_lon(),
-                    tags: tags(&mut n.tags_checked()),
+                    tags: tags(&mut n.tags()),
                 },
                 Element::Node(n) => Item::Node {
                     id: n.id(),
                     lat: n.decimicro_lat(),
                     lon: n.decimicro_lon(),
-                    tags: tags(&mut n.tags_checked()),
+                    tags: tags(&mut n.tags()),
                 },
                 Element::Way(w) => Item::Way {
                     id: w.id(),
@@ -294,12 +294,12 @@ fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
                         .node_locations()
                         .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
                         .collect(),
-                    tags: tags(&mut w.tags_checked()),
+                    tags: tags(&mut w.tags()),
                 },
                 Element::Relation(r) => Item::Relation {
                     id: r.id(),
                     members: r.members().map(|m| m.id.id()).collect(),
-                    tags: tags(&mut r.tags_checked()),
+                    tags: tags(&mut r.tags()),
                 },
                 _ => continue,
             });

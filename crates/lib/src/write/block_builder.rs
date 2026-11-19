@@ -1353,10 +1353,11 @@ impl BlockBuilder {
     // output: it names one of the diff's strings (a valid file with the wrong
     // tag, role or user), or, past those too, a slot that does not exist (a
     // tag key there would make the tagdata build index past the table).
-    // `PrimitiveBlock` construction checks the index widths but resolves no
-    // index (`validate_block`), so the raw adds check every index they copy
-    // against the seeded length and refuse a bad one with an error naming the
-    // element. A refusal also poisons the builder (already surfaced: the
+    // `PrimitiveBlock` construction (`validate_block`) resolves tag indices
+    // against the source table, but not role or user indices, and a raw
+    // source need not be a constructed block; the builder's boundary is its
+    // own: the raw adds check every index they copy against the seeded
+    // length and refuse a bad one with an error naming the element. A refusal also poisons the builder (already surfaced: the
     // caller has the error), since the block in progress may hold part of
     // the refused element: no later take can emit it. The raw adds are the
     // only way a raw index enters a block, so the bound holds for every block

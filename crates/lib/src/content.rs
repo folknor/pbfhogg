@@ -24,8 +24,9 @@
 //! Never content: metadata of any kind (version, timestamp, changeset, uid,
 //! user, `visible`), header fields, and anything about the encoding.
 //!
-//! Every string is resolved through the fallible string-table lookup, so a
-//! bad index is an `Err` token, never a silently shortened tag list. An
+//! Tag strings always resolve: block construction refuses a tag key or
+//! value index past the string table. Roles are resolved through the
+//! fallible string-table lookup, so a bad role index is an `Err` token. An
 //! `Err` token the comparison reaches compares unequal to everything,
 //! including another `Err`; a comparison that already differs on an
 //! earlier token stops before it.
@@ -33,7 +34,7 @@
 //! Diff and derive validate string indices in exactly three places, the
 //! same on every path:
 //!
-//! - **Comparison** sees only content tokens: a bad tag or role index it
+//! - **Comparison** sees only content tokens: a bad role index it
 //!   reaches makes the pair unequal. Metadata (the user name) is not
 //!   content, so a bad user index never affects equality.
 //! - **Derive's OSC writers** resolve every string they print - tags,
@@ -202,18 +203,18 @@ impl Content for Element<'_> {
 enum ElementTokens<'a> {
     DenseNode {
         coord: Option<Token<'a>>,
-        tags: crate::CheckedDenseTagIter<'a>,
+        tags: crate::DenseTagIter<'a>,
     },
     Node {
         coord: Option<Token<'a>>,
-        tags: crate::CheckedTagIter<'a>,
+        tags: crate::TagIter<'a>,
     },
     Way {
-        tags: crate::CheckedTagIter<'a>,
+        tags: crate::TagIter<'a>,
         refs: crate::WayRefIter<'a>,
     },
     Relation {
-        tags: crate::CheckedTagIter<'a>,
+        tags: crate::TagIter<'a>,
         members: crate::RelMemberIter<'a>,
     },
 }
@@ -226,29 +227,29 @@ impl<'a> ElementTokens<'a> {
                     lat: n.decimicro_lat(),
                     lon: n.decimicro_lon(),
                 }),
-                tags: n.tags_checked(),
+                tags: n.tags(),
             },
             Element::Node(n) => ElementTokens::Node {
                 coord: Some(Token::Coord {
                     lat: n.decimicro_lat(),
                     lon: n.decimicro_lon(),
                 }),
-                tags: n.tags_checked(),
+                tags: n.tags(),
             },
             Element::Way(w) => ElementTokens::Way {
-                tags: w.tags_checked(),
+                tags: w.tags(),
                 refs: w.refs(),
             },
             Element::Relation(r) => ElementTokens::Relation {
-                tags: r.tags_checked(),
+                tags: r.tags(),
                 members: r.members(),
             },
         }
     }
 }
 
-fn tag_token<'a>(tag: Result<(&'a str, &'a str)>) -> Result<Token<'a>> {
-    tag.map(|(k, v)| Token::Tag(k, v))
+fn tag_token<'a>((k, v): (&'a str, &'a str)) -> Result<Token<'a>> {
+    Ok(Token::Tag(k, v))
 }
 
 impl<'a> Iterator for ElementTokens<'a> {
@@ -421,21 +422,21 @@ pub(crate) fn write_full_record(
     let meta = match element {
         Element::DenseNode(n) => {
             write_nano_coord(out, n.nano_lat(), n.nano_lon());
-            for tag in n.tags_checked() {
-                write_tag(out, tag?)?;
+            for tag in n.tags() {
+                write_tag(out, tag)?;
             }
             n.info().and_then(MetaClaims::from_dense)
         }
         Element::Node(n) => {
             write_nano_coord(out, n.nano_lat(), n.nano_lon());
-            for tag in n.tags_checked() {
-                write_tag(out, tag?)?;
+            for tag in n.tags() {
+                write_tag(out, tag)?;
             }
             Some(MetaClaims::from_info(&n.info()))
         }
         Element::Way(w) => {
-            for tag in w.tags_checked() {
-                write_tag(out, tag?)?;
+            for tag in w.tags() {
+                write_tag(out, tag)?;
             }
             let mut refs = 0usize;
             for r in w.refs() {
@@ -458,8 +459,8 @@ pub(crate) fn write_full_record(
             Some(MetaClaims::from_info(&w.info()))
         }
         Element::Relation(r) => {
-            for tag in r.tags_checked() {
-                write_tag(out, tag?)?;
+            for tag in r.tags() {
+                write_tag(out, tag)?;
             }
             for m in r.members() {
                 write_member(out, m.id, m.role()?)?;

@@ -15,6 +15,16 @@
   `&amp;#1;` (escaped text) and references inside comments or CDATA stay
   legal. A `<!DOCTYPE>` with an internal subset (`[...]`) is now refused;
   a bare `<!DOCTYPE osmChange>` or an external identifier is still read.
+- **A tag string index past the block's string table is refused.** Every
+  command that decodes a block now fails (exit 2) on a tag key or value
+  index that names no string, as osmium does. Before, the tag list ended
+  silently at that tag, so repack, cat, degrade, sort, the filters,
+  extract, export, the geocode builder and add-locations-to-ways could
+  write elements with fewer tags or select on a shortened list, and
+  `inspect tags` counted only the tags before it. Indexdata generation
+  and `check --index` refuse the same blobs. Library: `tags_checked()`,
+  `CheckedTagIter` and `CheckedDenseTagIter` are removed; `tags()` now
+  always yields every tag of an accepted block.
 - `diff --format osc --increment-version` exits 2 without publishing an
   OSC if a deleted element is already at version 2147483647.
 

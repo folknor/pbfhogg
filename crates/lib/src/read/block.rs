@@ -886,6 +886,13 @@ fn overlong_varint_err() -> crate::error::Error {
     new_wire_error("packed varint array holds a varint wider than 64 bits")
 }
 
+/// A tag key or value index at or past the block's string table.
+#[cold]
+#[inline(never)]
+fn sid_past_the_table(index: u64) -> crate::error::Error {
+    new_stringtable_index_out_of_bounds(usize::try_from(index).unwrap_or(usize::MAX))
+}
+
 /// [`packed_varint_count`] for a `uint32` string-index array (`keys` / `vals`
 /// on Node, Way and Relation), refusing any value above `u32::MAX` in the
 /// same single byte scan.
@@ -906,12 +913,20 @@ fn overlong_varint_err() -> crate::error::Error {
 /// decoding reader - up to the decoder's own ten-byte limit, past which it
 /// refuses the varint (see [`packed_varint_count`]), so a continuation bit on
 /// the tenth byte is refused here too.
+///
+/// The same scan resolves each index against the block's string table:
+/// `strings` is its entry count, and an index at or past it is refused
+/// (`StringtableIndexOutOfBounds`). That is what lets the infallible tag
+/// iterators treat every lookup on an accepted block as one that resolves.
+/// Only payload bytes 0 to 4 accumulate (the width check above already holds
+/// the later ones at zero).
 #[inline]
-fn packed_uint32_count(data: &[u8]) -> Result<usize> {
+fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
     let mut count = 0usize;
     // Index of the current byte within its varint; never past 9, because the
     // tenth byte either terminates the varint or is refused.
     let mut pos = 0u8;
+    let mut value = 0u64;
     for &b in data {
         let payload = b & 0x7f;
         let too_wide = match pos {
@@ -922,7 +937,14 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
         if too_wide {
             return Err(new_wire_error("tag string index exceeds uint32"));
         }
+        if pos <= 4 {
+            value |= u64::from(payload) << (7 * u32::from(pos));
+        }
         if b & 0x80 == 0 {
+            if value >= strings as u64 {
+                return Err(sid_past_the_table(value));
+            }
+            value = 0;
             count += 1;
             pos = 0;
         } else if pos == 9 {
@@ -1019,19 +1041,22 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// check but one is a byte scan; the exception is `keys_vals`, whose
 /// zero-terminated per-node runs have to be walked varint by varint because
 /// nothing in the encoding states how many nodes an array describes.
-/// No stringtable index is resolved (that is `str_from_stringtable`'s job,
-/// which is already fallible).
+/// Tag string indices are the one kind of string reference this pass
+/// resolves: every plain key and value and every dense key and value must
+/// lie in the string table, in the same scan that checks their width (the
+/// plain arrays' per-byte scan accumulates each varint; the dense walk
+/// already decodes them). A tag index past the table is refused here, so
+/// on an accepted block every tag lookup resolves and the infallible tag
+/// iterators cannot end a tag list early; a failed lookup there is a
+/// broken invariant. The table is the one `scan_block_fields` kept, the
+/// same one every lookup reads.
 ///
-/// Consequently a block accepted here is not a certificate that its string
-/// indices are in table bounds. Enforcing that globally would change when
-/// out-of-range strings fail and require decoding regular-element keys and
-/// values, relation roles and Info/DenseInfo user indices even for readers
-/// that never access those strings (dense `keys_vals` is the one array this
-/// pass already decodes, for its run count and int32 width checks).
-/// Keep structural validation distinct from string resolution. A raw
-/// rewrite, which copies indices without resolving them, checks the ones it
-/// copies itself (`BlockBuilder`'s raw adds, against the table they were
-/// pre-seeded from).
+/// Relation roles and Info/DenseInfo user indices are not resolved here:
+/// their accessors return a `Result`, and resolving them would decode
+/// arrays readers that never touch those strings skip. A raw rewrite,
+/// which copies indices into a table that grows behind them, checks the
+/// ones it copies itself (`BlockBuilder`'s raw adds, against the table they
+/// were pre-seeded from).
 ///
 /// No error raised here carries a byte offset. These sites sit below the
 /// framing layer and cannot know their position in the file; the enclosing
@@ -1071,8 +1096,12 @@ fn validate_block<P: GroupProjection>(
     let slice =
         |&(offset, len): &(u32, u32)| &buffer[offset as usize..offset as usize + len as usize];
     let mut projection = make(&fields, st);
-    let (kinds, element_count) =
-        validate_groups(groups.len(), |i| slice(&groups[i]), &mut projection)?;
+    let (kinds, element_count) = validate_groups(
+        groups.len(),
+        |i| slice(&groups[i]),
+        st.len(),
+        &mut projection,
+    )?;
     validate_stringtable_utf8(st.iter().map(slice))?;
     Ok((
         projection,
@@ -1449,6 +1478,7 @@ impl<P: GroupProjection> GroupProjection for Option<P> {
 fn validate_groups<'a>(
     group_count: usize,
     group: impl Fn(usize) -> &'a [u8],
+    strings: usize,
     projection: &mut impl GroupProjection,
 ) -> Result<(crate::element_kind::ElementKindSet, u64)> {
     use super::wire::Cursor;
@@ -1483,6 +1513,7 @@ fn validate_groups<'a>(
             validate_tag_arrays(
                 node.keys_data,
                 node.vals_data,
+                strings,
                 "node has mismatched keys/vals tag array lengths",
             )?;
             projection.node(&node, info.as_ref());
@@ -1495,6 +1526,7 @@ fn validate_groups<'a>(
             validate_tag_arrays(
                 way.keys_data,
                 way.vals_data,
+                strings,
                 "way has mismatched keys/vals tag array lengths",
             )?;
             validate_way_geometry_arrays(&way)?;
@@ -1508,6 +1540,7 @@ fn validate_groups<'a>(
             validate_tag_arrays(
                 relation.keys_data,
                 relation.vals_data,
+                strings,
                 "relation has mismatched keys/vals tag array lengths",
             )?;
             validate_relation_member_arrays(&relation)?;
@@ -1526,7 +1559,7 @@ fn validate_groups<'a>(
                     "dense group has mismatched id/lat/lon array lengths",
                 ));
             }
-            validate_dense_keys_vals(dense.keys_vals_data, ids)?;
+            validate_dense_keys_vals(dense.keys_vals_data, ids, strings)?;
             let info = match dense.info_data {
                 Some(info_data) => validate_dense_info_arrays(info_data, ids)?,
                 None => None,
@@ -1564,9 +1597,14 @@ fn validate_stringtable_utf8<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Res
 /// carries a `&'static str`, so the caller supplies the message rather than
 /// this function formatting one.
 #[inline]
-fn validate_tag_arrays(keys_data: &[u8], vals_data: &[u8], mismatch: &'static str) -> Result<()> {
-    let keys = packed_uint32_count(keys_data)?;
-    let vals = packed_uint32_count(vals_data)?;
+fn validate_tag_arrays(
+    keys_data: &[u8],
+    vals_data: &[u8],
+    strings: usize,
+    mismatch: &'static str,
+) -> Result<()> {
+    let keys = packed_uint32_count(keys_data, strings)?;
+    let vals = packed_uint32_count(vals_data, strings)?;
     if keys != vals {
         return Err(new_wire_error(mismatch));
     }
@@ -1594,7 +1632,15 @@ fn validate_tag_arrays(keys_data: &[u8], vals_data: &[u8], mismatch: &'static st
 ///
 /// A run whose final key varint has no matching value varint is corruption and
 /// is rejected: `DenseTagIter` would drop that tag with no signal.
-fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<()> {
+///
+/// Every nonzero key and every value (value index 0 included: only a key of
+/// 0 is the run separator) must also lie in the string table of `strings`
+/// entries, as for the plain arrays ([`packed_uint32_count`]).
+fn validate_dense_keys_vals(
+    keys_vals_data: &[u8],
+    node_count: usize,
+    strings: usize,
+) -> Result<()> {
     use super::wire::Cursor;
 
     if keys_vals_data.is_empty() {
@@ -1605,9 +1651,8 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
     let mut runs = 0usize;
     let mut in_run = false;
     // Dense tag iterators narrow to i32. Require nonnegative int32 string
-    // indices here, including values, so high bits cannot alias a valid sid.
-    // This is a width check, not string-table resolution: tags_checked still
-    // reports a fitting index that points beyond the table.
+    // indices here, including values, so high bits cannot alias a valid sid;
+    // then require each fitting index to resolve in the table.
     while !cursor.is_empty() {
         let key = cursor.read_varint()?;
         if key > 0x7fff_ffff {
@@ -1618,13 +1663,20 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
             in_run = false;
             continue;
         }
+        if key >= strings as u64 {
+            return Err(sid_past_the_table(key));
+        }
         if cursor.is_empty() {
             return Err(new_wire_error(
                 "dense keys_vals ends with a key that has no value",
             ));
         }
-        if cursor.read_varint()? > 0x7fff_ffff {
+        let value = cursor.read_varint()?;
+        if value > 0x7fff_ffff {
             return Err(new_wire_error("dense tag string index exceeds int32"));
+        }
+        if value >= strings as u64 {
+            return Err(sid_past_the_table(value));
         }
         in_run = true;
     }
@@ -2189,33 +2241,37 @@ pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -
     }
 }
 
-/// Construct a key-value tuple from key/value indexes, using the stringtable from a block.
+/// The key and value strings of a tag on an accepted block.
 ///
-/// Returns `None` both when either index is absent (end of the tag arrays) and
-/// when either lookup fails: the `StringtableIndexOutOfBounds` error from
-/// [`str_from_stringtable`] is discarded here, not propagated. The tag
-/// iterators that call this therefore end early on a bad index instead of
-/// erroring. See CORRECTNESS.md "Tag iterators end early on an out-of-range
-/// string index"; a caller that must reject such input uses the checked
-/// iterators (`tags_checked()`), which resolve through `str_from_stringtable`
-/// and keep the error.
-pub(crate) fn get_stringtable_key_value<'a>(
+/// Block construction refused any tag key or value index past the string
+/// table (`packed_uint32_count` and `validate_dense_keys_vals`), and every
+/// tag iterator reads the indices of a block that passed it, so both lookups
+/// resolve; a miss is a broken construction invariant and panics, in
+/// release as in debug.
+#[inline]
+#[track_caller]
+pub(crate) fn resolved_tag<'a>(
     block: &'a WireBlock<'_>,
-    key_index: Option<usize>,
-    value_index: Option<usize>,
-) -> Option<(&'a str, &'a str)> {
-    match (key_index, value_index) {
-        (Some(key_index), Some(val_index)) => {
-            let k_res = str_from_stringtable(block, key_index);
-            let v_res = str_from_stringtable(block, val_index);
-            if let (Ok(k), Ok(v)) = (k_res, v_res) {
-                Some((k, v))
-            } else {
-                None
-            }
-        }
-        _ => None,
+    key_index: usize,
+    value_index: usize,
+) -> (&'a str, &'a str) {
+    match (
+        str_from_stringtable(block, key_index),
+        str_from_stringtable(block, value_index),
+    ) {
+        (Ok(k), Ok(v)) => (k, v),
+        _ => tag_index_unresolved(),
     }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn tag_index_unresolved() -> ! {
+    panic!(
+        "a tag string index lies past the string table after PrimitiveBlock construction \
+         resolved it (validate_block in block.rs): construction invariant broken"
+    )
 }
 
 // Tests use `unwrap()`/`expect()` because panicking is the correct failure mode
@@ -2272,8 +2328,17 @@ mod strict_validation_tests {
 
     /// A `PrimitiveBlock` carrying a one-entry (empty string) StringTable and
     /// the given PrimitiveGroup bodies.
+    /// A block of `groups` whose string table holds 63 empty strings (the
+    /// most a single-byte-length table holds), so any fixture tag index
+    /// below 63 resolves (construction refuses one past the table).
     fn block_with_groups(groups: &[Vec<u8>]) -> Vec<u8> {
-        let mut out = len_field(1, &len_field(1, &[]));
+        block_with_table(63, groups)
+    }
+
+    /// A block of `groups` whose string table holds `strings` empty strings.
+    fn block_with_table(strings: usize, groups: &[Vec<u8>]) -> Vec<u8> {
+        let table: Vec<u8> = (0..strings).flat_map(|_| len_field(1, &[])).collect();
+        let mut out = len_field(1, &table);
         for group in groups {
             out.extend_from_slice(&len_field(2, group));
         }
@@ -2500,7 +2565,7 @@ mod strict_validation_tests {
                 "packed_varint_count disagrees with read_varint on {data:02x?}"
             );
             assert_eq!(
-                super::packed_uint32_count(data).ok(),
+                super::packed_uint32_count(data, usize::MAX).ok(),
                 oracle(data, u64::from(u32::MAX)),
                 "packed_uint32_count disagrees with read_varint on {data:02x?}"
             );
@@ -2926,35 +2991,56 @@ mod strict_validation_tests {
     /// the end is final - the tags after the bad one never resume. The
     /// zipped `RawTagIter` hint stays exact on the same arrays.
     #[test]
-    fn tag_iter_hint_and_fusing_on_out_of_range_string_index() {
-        use std::iter::FusedIterator;
-        fn assert_fused<I: FusedIterator>(_: &I) {}
-
-        // The fixture string table has one entry (index 0); key index 1 on
-        // the second tag points past it. Three tags, all one-byte varints.
-        let mut way = vec![0x08u8, 0x01];
-        way.extend_from_slice(&len_field(2, &[0x00, 0x01, 0x00]));
-        way.extend_from_slice(&len_field(3, &[0x00, 0x00, 0x00]));
-        let block = PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &way)]))
-            .expect("bad string indices are not a construction error");
-        let Some(Element::Way(w)) = block.elements().next() else {
-            panic!("expected one way");
+    fn tag_string_indices_past_the_table_are_refused_at_construction() {
+        // The fixture string table has one entry, index 0. A tag index past
+        // it is refused whatever the element kind, key or value position,
+        // and wherever in the list it sits; an overlong encoding of index 0
+        // resolves, as a decoder reads it.
+        let element = |keys: &[u8], vals: &[u8]| {
+            let mut e = vec![0x08u8, 0x01];
+            e.extend_from_slice(&len_field(2, keys));
+            e.extend_from_slice(&len_field(3, vals));
+            e
         };
-
-        let raw = w.raw_tags();
-        assert_eq!(raw.size_hint(), (0, Some(3)));
-        assert_eq!(raw.count(), 3);
-
-        let mut tags = w.tags();
-        assert_fused(&tags);
-        let (lower, upper) = tags.size_hint();
-        assert_eq!(lower, 0);
-        assert_eq!(upper, Some(3));
-        assert_eq!(tags.next(), Some(("", "")));
-        assert_eq!(tags.next(), None);
-        // The third tag is valid; a non-fused iterator would resume with it.
-        assert_eq!(tags.next(), None);
-        assert_eq!(tags.size_hint(), (0, Some(0)));
+        for field in [3u8, 4] {
+            for (keys, vals) in [
+                (&[0x00, 0x01, 0x00][..], &[0x00, 0x00, 0x00][..]),
+                (&[0x00, 0x00][..], &[0x00, 0x01][..]),
+                (&[0x81, 0x80, 0x80, 0x80, 0x00][..], &[0x00][..]),
+            ] {
+                let err = PrimitiveBlock::from_vec(block_with_table(
+                    1,
+                    &[len_field(field, &element(keys, vals))],
+                ))
+                .expect_err("a tag index past the table must be refused");
+                assert!(
+                    matches!(
+                        err.kind(),
+                        crate::error::ErrorKind::StringtableIndexOutOfBounds { index: 1 }
+                    ),
+                    "field {field}, keys {keys:02x?}, vals {vals:02x?}: {err}"
+                );
+            }
+            let block = PrimitiveBlock::from_vec(block_with_table(
+                1,
+                &[len_field(field, &element(&[0x80, 0x80, 0x00], &[0x00]))],
+            ))
+            .expect("an overlong index 0 resolves");
+            let tags: Vec<_> = match block.elements().next() {
+                Some(Element::Way(w)) => w.tags().collect(),
+                Some(Element::Relation(r)) => r.tags().collect(),
+                other => panic!("unexpected element {other:?}"),
+            };
+            assert_eq!(tags, [("", "")]);
+        }
+        // Dense: a nonzero key is a string index (0 is the run separator);
+        // the value position is covered with a larger table in
+        // `blob_meta/scan.rs`.
+        PrimitiveBlock::from_vec(block_with_table(
+            1,
+            &[dense_group_with(1, &[0x01, 0x00], None)],
+        ))
+        .expect_err("a dense key past the table must be refused");
     }
 
     /// A packed array on a regular element that ends mid-varint is rejected
@@ -3342,18 +3428,17 @@ mod strict_validation_tests {
                 tags.extend_from_slice(if as_key { sid } else { &[1] });
                 tags.extend_from_slice(if as_key { &[1] } else { sid });
                 tags.push(0);
-                let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
-                    1, &tags, None,
-                )]))
-                .expect_err("oversized dense string index must fail construction");
+                // An unbounded table, so the width check alone can refuse.
+                let err = validate_dense_keys_vals(&tags, 1, usize::MAX)
+                    .expect_err("oversized dense string index must fail construction");
                 assert!(err.to_string().contains("exceeds int32"));
             }
         }
         let mut tags = max.to_vec();
         tags.extend_from_slice(&max);
         tags.push(0);
-        validate_dense_keys_vals(&tags, 1).expect("int32 maximum fits");
-        validate_dense_keys_vals(&[0x81, 0x80, 0, 1, 0], 1)
+        validate_dense_keys_vals(&tags, 1, usize::MAX).expect("int32 maximum fits");
+        validate_dense_keys_vals(&[0x81, 0x80, 0, 1, 0], 1, usize::MAX)
             .expect("overlong encoding of a small index fits");
     }
 

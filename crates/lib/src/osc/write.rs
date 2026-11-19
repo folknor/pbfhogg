@@ -421,22 +421,14 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
     write_borrowed_tags_xml(writer, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
 
-#[cfg(test)]
+/// The tag event loop. A block's tag strings always resolve (block
+/// construction refuses an index past the string table), so the list is
+/// never shortened.
 fn write_borrowed_tags_xml<'a, W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> crate::Result<()> {
-    write_checked_tags_xml(writer, tags.map(Ok))
-}
-
-/// The tag event loop over checked tags: a tag whose key or value index is
-/// past the block's string table is an error, never a shortened tag list.
-fn write_checked_tags_xml<'a, W: std::io::Write>(
-    writer: &mut Writer<W>,
-    tags: impl Iterator<Item = crate::Result<(&'a str, &'a str)>>,
-) -> crate::Result<()> {
-    for tag in tags {
-        let (k, v) = tag?;
+    for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
         push_attribute_escaped(&mut tag, "k", k)?;
         push_attribute_escaped(&mut tag, "v", v)?;
@@ -630,12 +622,12 @@ fn write_dense_node_xml<W: std::io::Write>(
         )?;
     }
 
-    let mut tags = node.tags_checked().peekable();
+    let mut tags = node.tags().peekable();
     if tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_checked_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
+        write_borrowed_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -679,12 +671,12 @@ fn write_borrowed_node_xml<W: std::io::Write>(
         info.user().transpose()?,
     )?;
 
-    let mut tags = node.tags_checked().peekable();
+    let mut tags = node.tags().peekable();
     if tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_checked_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
+        write_borrowed_tags_xml(writer, tags).map_err(in_element(ElementKind::Node, node.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -713,7 +705,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     )?;
 
     let mut refs = way.refs().peekable();
-    let mut tags = way.tags_checked().peekable();
+    let mut tags = way.tags().peekable();
     if refs.peek().is_none() && tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
@@ -724,7 +716,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
             nd.push_attribute(("ref", r_str.as_str()));
             writer.write_event(Event::Empty(nd))?;
         }
-        write_checked_tags_xml(writer, tags).map_err(in_element(ElementKind::Way, way.id()))?;
+        write_borrowed_tags_xml(writer, tags).map_err(in_element(ElementKind::Way, way.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
     }
     Ok(())
@@ -757,7 +749,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     )?;
 
     let mut members = rel.members().peekable();
-    let mut tags = rel.tags_checked().peekable();
+    let mut tags = rel.tags().peekable();
     if members.peek().is_none() && tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
@@ -772,7 +764,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
             push_attribute_escaped(&mut member, "role", m.role()?).map_err(ctx())?;
             writer.write_event(Event::Empty(member))?;
         }
-        write_checked_tags_xml(writer, tags)
+        write_borrowed_tags_xml(writer, tags)
             .map_err(in_element(ElementKind::Relation, rel.id()))?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }

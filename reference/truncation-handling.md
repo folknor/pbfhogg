@@ -229,7 +229,13 @@ group, in order:
    kinds, `lat` against `lon` against `refs` on ways, and
    `roles_sid` against `memids` against `types` on relations,
 5. the `DenseNodes` sub-message parses, and its packed `id`,
-   `lat` and `lon` arrays are well-formed and of equal length.
+   `lat` and `lon` arrays are well-formed and of equal length,
+6. every tag key and value string index, plain and dense, lies in
+   the block's string table (refused as
+   `StringtableIndexOutOfBounds`). The infallible tag iterators
+   therefore never meet an index that does not resolve, and cannot
+   end a tag list early. Role and user indices are not resolved
+   here; their accessors return a `Result`.
 
 Step 4 matters as much as the rest: parsing an element only
 records the bounds of its packed fields, so a `vals` array one
@@ -247,9 +253,11 @@ early, so running them first would silently examine a prefix.
 This is a structural pass, not a second decode - sub-message
 parsing walks field headers and records slice bounds, and the
 packed-array checks count varints with a byte scan rather than
-decoding their values. The one exception is the dense `keys_vals`
-walk described below, which decodes that array's varints to find
-each node's tag-run terminator. On a matched interleaved A/B over Denmark
+decoding their values. The exceptions are the tag arrays: the
+plain `keys` / `vals` scan accumulates each varint in the same
+pass to bound it against the string table, and the dense
+`keys_vals` walk described below decodes that array's varints to
+find each node's tag-run terminator and to bound each index. On a matched interleaved A/B over Denmark
 (`add-locations-to-ways`, commit `40cbae08`, host `bygg`) the cost
 was at or below run-to-run noise: 2201 ms / 2100 ms / 2100 ms for
 on / off / on.
@@ -369,7 +377,11 @@ checked). The first keeps the element decoder in agreement with
 the raw scanners that read the same indices and refuse oversized
 ones (`blob_meta`'s tag scan, way classification in `scan/way.rs`);
 the second keeps every index representable as the nonnegative
-`i32` that the dense raw-tag iterator narrows it to.
+`i32` that the dense raw-tag iterator narrows it to. On top of the
+width, each tag index must also lie in the string table (step 6
+above): an index that fits its type but names no string would
+otherwise end the infallible tag iterators' list early, a silent
+wrong answer for every command that rebuilds or selects on tags.
 
 ## Which wire forms of a packed field count as present
 

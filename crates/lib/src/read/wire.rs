@@ -1101,15 +1101,22 @@ mod tests {
     /// the raw scanners and so must not walk the tag arrays again.
     #[test]
     fn tag_indices_must_fit_uint32_in_both_wire_forms() {
-        // u32::MAX; u32::MAX + 1, which used to alias string index zero in
-        // PackedUint32Iter; and zero in an overlong six-byte encoding, whose
-        // value fits and is therefore accepted.
-        let cases: [(&[u8], bool); 3] = [
-            (&[0xff, 0xff, 0xff, 0xff, 0x0f], true),
-            (&[0x80, 0x80, 0x80, 0x80, 0x10], false),
-            (&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00], true),
+        // u32::MAX, which fits but lies past the one-entry table; u32::MAX
+        // + 1, which used to alias string index zero in PackedUint32Iter; and
+        // zero in an overlong six-byte encoding, whose value fits and is
+        // therefore accepted.
+        let cases: [(&[u8], Option<&str>); 3] = [
+            (
+                &[0xff, 0xff, 0xff, 0xff, 0x0f],
+                Some("stringtable index out of bounds: 4294967295"),
+            ),
+            (
+                &[0x80, 0x80, 0x80, 0x80, 0x10],
+                Some("tag string index exceeds uint32"),
+            ),
+            (&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00], None),
         ];
-        for (value, valid) in cases {
+        for (value, refusal) in cases {
             for field in [2_u8, 3] {
                 for packed in [false, true] {
                     // One Way carrying `value` in `field` and 0 in the other
@@ -1130,9 +1137,12 @@ mod tests {
                     block.push(u8::try_from(group.len()).unwrap());
                     block.extend_from_slice(&group);
                     let result = crate::PrimitiveBlock::from_vec(block);
-                    assert_eq!(result.is_ok(), valid, "{value:?} in field {field}");
-                    if let Err(err) = result {
-                        assert!(err.to_string().contains("tag string index exceeds uint32"));
+                    match (result, refusal) {
+                        (Ok(_), None) => {}
+                        (Err(err), Some(expected)) => {
+                            assert!(err.to_string().contains(expected), "{err}");
+                        }
+                        (result, _) => panic!("{value:?} in field {field}: {:?}", result.err()),
                     }
                 }
             }

@@ -732,7 +732,6 @@ fn reencode_unclassifiable(
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                check_tags(dn.tags_checked())?;
                 let meta = dense_node_metadata(dn)?;
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
                 bb.add_node_dense(
@@ -744,7 +743,6 @@ fn reencode_unclassifiable(
                 );
             }
             Element::Node(n) => {
-                check_tags(n.tags_checked())?;
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
                 bb.add_node_partial(
@@ -769,7 +767,6 @@ fn reencode_unclassifiable(
                         crate::HeaderBlock::SHARED_NODE_PINS_V1,
                     )));
                 }
-                check_tags(w.tags_checked())?;
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                 ensure_way_capacity_local(&mut bb, &mut output)?;
                 refs_buf.clear();
@@ -792,7 +789,6 @@ fn reencode_unclassifiable(
                 }
             }
             Element::Relation(r) => {
-                check_tags(r.tags_checked())?;
                 let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 ensure_relation_capacity_local(&mut bb, &mut output)?;
                 r.members_into(&mut members_buf)?;
@@ -817,16 +813,6 @@ fn start_node(
         flush_local(bb, output)?;
     }
     *node_run_has_meta = has_meta;
-    Ok(())
-}
-
-/// Resolve every tag string, failing on the first bad string index.
-fn check_tags<'t>(
-    tags: impl Iterator<Item = crate::Result<(&'t str, &'t str)>>,
-) -> crate::Result<()> {
-    for tag in tags {
-        tag?;
-    }
     Ok(())
 }
 

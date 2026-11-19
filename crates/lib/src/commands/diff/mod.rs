@@ -989,7 +989,7 @@ fn write_way_details_borrowed(
     write_seq_edit(output, "ref", "refs", &old_refs, &new_refs, |w, id| {
         write!(w, "n{id}")
     })?;
-    write_tag_diff_iter(output, old.tags_checked(), new.tags_checked())?;
+    write_tag_diff_iter(output, old.tags(), new.tags())?;
     Ok(())
 }
 
@@ -1062,7 +1062,7 @@ fn write_relation_details_borrowed(
     new: &crate::Relation<'_>,
 ) -> Result<()> {
     write_member_diff_borrowed(output, old, new)?;
-    write_tag_diff_iter(output, old.tags_checked(), new.tags_checked())?;
+    write_tag_diff_iter(output, old.tags(), new.tags())?;
     Ok(())
 }
 
@@ -1070,11 +1070,11 @@ fn write_relation_details_borrowed(
 /// key/value data.
 fn write_tag_diff_iter<'a>(
     output: &mut dyn Write,
-    old_tags: impl Iterator<Item = Result<(&'a str, &'a str)>>,
-    new_tags: impl Iterator<Item = Result<(&'a str, &'a str)>>,
+    old_tags: impl Iterator<Item = (&'a str, &'a str)>,
+    new_tags: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Result<()> {
-    let old_vec: Vec<(&str, &str)> = old_tags.collect::<Result<_>>()?;
-    let new_vec: Vec<(&str, &str)> = new_tags.collect::<Result<_>>()?;
+    let old_vec: Vec<(&str, &str)> = old_tags.collect();
+    let new_vec: Vec<(&str, &str)> = new_tags.collect();
     let old_map: HashMap<&str, &str> = old_vec.iter().copied().collect();
     let new_map: HashMap<&str, &str> = new_vec.iter().copied().collect();
 
@@ -1150,17 +1150,15 @@ fn write_tag_diff_borrowed(
 ) -> Result<()> {
     match (old, new) {
         (Element::DenseNode(da), Element::DenseNode(db)) => {
-            write_tag_diff_iter(output, da.tags_checked(), db.tags_checked())
+            write_tag_diff_iter(output, da.tags(), db.tags())
         }
         (Element::DenseNode(da), Element::Node(nb)) => {
-            write_tag_diff_iter(output, da.tags_checked(), nb.tags_checked())
+            write_tag_diff_iter(output, da.tags(), nb.tags())
         }
         (Element::Node(na), Element::DenseNode(db)) => {
-            write_tag_diff_iter(output, na.tags_checked(), db.tags_checked())
+            write_tag_diff_iter(output, na.tags(), db.tags())
         }
-        (Element::Node(na), Element::Node(nb)) => {
-            write_tag_diff_iter(output, na.tags_checked(), nb.tags_checked())
-        }
+        (Element::Node(na), Element::Node(nb)) => write_tag_diff_iter(output, na.tags(), nb.tags()),
         _ => Ok(()),
     }
 }
@@ -1280,12 +1278,7 @@ mod text_unit_sink_tests {
         let new: Vec<(&str, &str)> = keys.iter().map(|k| (k.as_str(), "new")).collect();
         let render = |a: &[(&str, &str)], b: &[(&str, &str)]| {
             let mut out = Vec::new();
-            write_tag_diff_iter(
-                &mut out,
-                a.iter().copied().map(Ok),
-                b.iter().copied().map(Ok),
-            )
-            .unwrap();
+            write_tag_diff_iter(&mut out, a.iter().copied(), b.iter().copied()).unwrap();
             String::from_utf8(out).unwrap()
         };
         assert_eq!(

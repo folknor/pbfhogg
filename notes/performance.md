@@ -1301,7 +1301,8 @@ loses a hash lookup per occurrence.
 
 Risks: expression identity (do not cross-match `amenity=school` and
 `shop=bakery`); element-level OR, empty expressions, type restrictions,
-inversion; preserve out-of-range SID handling and dense boundary finding; key
+inversion; dense boundary finding (tag SIDs are bounded by block
+validation, so a tally needs no out-of-range handling of its own); key
 and pair rows independent, no double counts, duplicate dictionary strings merged
 by text. Medium-confidence: partition-owner counting instead of mutex shards.
 

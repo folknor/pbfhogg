@@ -250,9 +250,7 @@ fn expected_meta(meta: Option<&Meta>) -> Option<(i32, i64, i64, i32, String, boo
     meta.map(|m| (m.0, m.1 * 1000, m.2, m.3, m.4.clone(), m.5))
 }
 
-fn checked<'a, E: std::fmt::Display>(
-    tags: impl Iterator<Item = Result<(&'a str, &'a str), E>>,
-) -> Tags {
+fn checked<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Tags {
     crate::common::checked_tags(tags, "codec case")
 }
 
@@ -383,7 +381,7 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                                 i.visible(),
                             )
                         });
-                        (node.id(), checked(node.tags_checked()), meta)
+                        (node.id(), checked(node.tags()), meta)
                     }
                     Element::Node(node) => {
                         counts[0] += 1;
@@ -391,20 +389,12 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                             (node.decimicro_lat(), node.decimicro_lon()),
                             (case.lat, case.lon)
                         );
-                        (
-                            node.id(),
-                            checked(node.tags_checked()),
-                            info_meta(&node.info()),
-                        )
+                        (node.id(), checked(node.tags()), info_meta(&node.info()))
                     }
                     Element::Way(way) => {
                         counts[1] += 1;
                         assert_eq!(way.refs().collect::<Vec<_>>(), case.refs);
-                        (
-                            way.id(),
-                            checked(way.tags_checked()),
-                            info_meta(&way.info()),
-                        )
+                        (way.id(), checked(way.tags()), info_meta(&way.info()))
                     }
                     Element::Relation(relation) => {
                         counts[2] += 1;
@@ -420,7 +410,7 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                         assert_eq!(members, expected);
                         (
                             relation.id(),
-                            checked(relation.tags_checked()),
+                            checked(relation.tags()),
                             info_meta(&relation.info()),
                         )
                     }

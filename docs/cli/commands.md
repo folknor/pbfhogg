@@ -1114,10 +1114,11 @@ without a node record. The six sum to the reference count.
 a header declaring `HistoricalInformation` (several versions of a node
 legitimately disagree); any data blob the reader refuses to build
 a block from - every blob is validated once with the reader's own
-construction, which checks group and element framing, tag, `Info` and
+construction, which checks group and element framing, tag arrays and
+every tag key and value string-table index against the table, `Info` and
 `DenseInfo` arrays, way geometry and relation member arrays and string table
-UTF-8, but not what the reader only finds when it resolves strings (a tag's
-string-table index past the end of the table passes). A blob whose
+UTF-8, but not what the reader only finds when it resolves other strings (a
+role or user string-table index past the end of the table passes). A blob whose
 indexdata claims ways while it holds elements of another kind is not a
 refusal: the check reads such a blob only in its way passes, so it stops
 there and fails the file (exit 1), as described under
@@ -1725,7 +1726,7 @@ A comparison whose ID ranges give no point to cut a work unit within 1 GiB of bl
 
 With `-c`, `-q` or `--format osc`, the comparison can skip decoding a pair when both blobs are fresh (neither has a partially consumed block), both claimed ranges are wholly inside the work unit, their claimed ranges and counts match, the range does not span negative and positive IDs, and their compression and compressed bytes match. A corrupt payload in a skipped pair can pass undetected, and its indexdata is believed: a false range or count on a skipped pair can change the common total and how the blobs around it pair, so the answer can be wrong without a refusal. A diff that prints common elements decodes the pair. Use `check --index` to verify claimed ranges and counts.
 
-Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
+Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a role or user whose string index is out of range) are not refused there; a tag string index out of range is refused when the block is built, whatever its kind.
 
 Created and deleted totals come from the decoded blocks. Only the common
 total of a byte-identical pair skipped undecoded comes from its claimed
@@ -1980,11 +1981,13 @@ run fails (exit 2) and publishes nothing. See
 refused at decode".
 
 A blob the run rewrites keeps its surviving elements' strings by copying their
-string table indices, and checks each one: a tag key or value, member role or
-user name index that lies past its block's string table, or a block whose
-string table does not begin with the empty string, fails the run (exit 2) and
-publishes nothing, the error naming the element, field and index. Blobs copied
-unchanged are not checked.
+string table indices, and checks each one: a member role or user name index
+that lies past its block's string table, or a block whose string table does
+not begin with the empty string, fails the run (exit 2) and publishes
+nothing, the error naming the element, field and index. A tag key or value
+index past the table fails the run the same way when the block is decoded,
+the error naming the index and the blob. Blobs copied unchanged are not
+checked.
 
 Output blocks are cut at 8000 elements, and also wherever a block would pass
 the 32 MiB PBF payload limit: a rewritten block carries its source block's

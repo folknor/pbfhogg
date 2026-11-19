@@ -666,9 +666,9 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
 
 // The metadata of every owned conversion comes from `element_metadata` /
 // `dense_node_metadata`, so an owned re-encode and a borrowed one write the
-// same metadata and refuse the same bad user name. Tags still go through the
-// infallible tag iterators: see CORRECTNESS.md "Tag iterators end early on an
-// out-of-range string index".
+// same metadata and refuse the same bad user name. Tags go through the
+// infallible tag iterators, which cannot shorten a list: block construction
+// refused any tag string index past the table.
 
 pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> Result<OwnedNode> {
     Ok(OwnedNode {

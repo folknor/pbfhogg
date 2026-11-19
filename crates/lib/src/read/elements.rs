@@ -1,6 +1,6 @@
 //! Nodes, ways and relations
 
-use super::block::{get_stringtable_key_value, str_from_stringtable};
+use super::block::{resolved_tag, str_from_stringtable};
 use super::dense::DenseNode;
 use super::wire::{
     PackedInt32Iter, PackedSint64Iter, PackedUint32Iter, WireBlock, WireInfo, WireNode,
@@ -148,12 +148,6 @@ impl<'a> Node<'a> {
         }
     }
 
-    /// Like [`tags`](Self::tags), but yields `Err` for an out-of-range string
-    /// index instead of silently ending the tag list.
-    pub fn tags_checked(&self) -> CheckedTagIter<'a> {
-        CheckedTagIter::new(self.block, self.node.keys_data, self.node.vals_data)
-    }
-
     /// Returns additional metadata for this element.
     ///
     /// Metadata the element does not carry reads as `None` fields. The bytes
@@ -269,12 +263,6 @@ impl<'a> Way<'a> {
             key_indices: PackedUint32Iter::new(self.way.keys_data),
             val_indices: PackedUint32Iter::new(self.way.vals_data),
         }
-    }
-
-    /// Like [`tags`](Self::tags), but yields `Err` for an out-of-range string
-    /// index instead of silently ending the tag list.
-    pub fn tags_checked(&self) -> CheckedTagIter<'a> {
-        CheckedTagIter::new(self.block, self.way.keys_data, self.way.vals_data)
     }
 
     /// Returns additional metadata for this element.
@@ -394,12 +382,6 @@ impl<'a> Relation<'a> {
             key_indices: PackedUint32Iter::new(self.rel.keys_data),
             val_indices: PackedUint32Iter::new(self.rel.vals_data),
         }
-    }
-
-    /// Like [`tags`](Self::tags), but yields `Err` for an out-of-range string
-    /// index instead of silently ending the tag list.
-    pub fn tags_checked(&self) -> CheckedTagIter<'a> {
-        CheckedTagIter::new(self.block, self.rel.keys_data, self.rel.vals_data)
     }
 
     /// Returns additional metadata for this element.
@@ -819,21 +801,7 @@ impl<'a> Iterator for TagIter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match (self.key_indices.next(), self.val_indices.next()) {
-            (Some(k), Some(v)) => {
-                // wontfix(type-result-fallible): Iterator trait constrains
-                // return type; an out-of-range stringtable index ends
-                // iteration rather than propagating an error. See
-                // CORRECTNESS.md. Emptying both arrays on that branch keeps
-                // the end final (the iterator is fused) at no cost on the
-                // success path.
-                let pair =
-                    get_stringtable_key_value(self.block, Some(k as usize), Some(v as usize));
-                if pair.is_none() {
-                    self.key_indices = PackedUint32Iter::empty();
-                    self.val_indices = PackedUint32Iter::empty();
-                }
-                pair
-            }
+            (Some(k), Some(v)) => Some(resolved_tag(self.block, k as usize, v as usize)),
             (k, v) => {
                 // Construction (`validate_tag_arrays` in `block.rs`) rejects
                 // keys and vals arrays of different lengths.
@@ -843,9 +811,9 @@ impl<'a> Iterator for TagIter<'a> {
         }
     }
 
-    /// The lower bound is 0: a string index past the table ends iteration
-    /// early, and only resolving every remaining index could rule that out.
-    /// The upper bound is the shorter array's.
+    /// The packed arrays' byte-based hint: the arrays are equal in count
+    /// and every pair resolves (block construction), but the count itself
+    /// is not stored.
     fn size_hint(&self) -> (usize, Option<usize>) {
         (
             0,
@@ -855,68 +823,6 @@ impl<'a> Iterator for TagIter<'a> {
 }
 
 impl std::iter::FusedIterator for TagIter<'_> {}
-
-/// The fallible sibling of [`TagIter`]: yields `Err` for a tag whose key or
-/// value index points past the block's string table, instead of ending
-/// iteration as `TagIter` does. Callers that must refuse corrupt input
-/// (rather than see a shortened tag list) use this. After an `Err` the
-/// iterator yields nothing more.
-#[derive(Clone)]
-pub struct CheckedTagIter<'a> {
-    block: &'a WireBlock<'static>,
-    key_indices: PackedUint32Iter<'a>,
-    val_indices: PackedUint32Iter<'a>,
-    failed: bool,
-}
-
-impl<'a> CheckedTagIter<'a> {
-    fn new(block: &'a WireBlock<'static>, keys_data: &'a [u8], vals_data: &'a [u8]) -> Self {
-        CheckedTagIter {
-            block,
-            key_indices: PackedUint32Iter::new(keys_data),
-            val_indices: PackedUint32Iter::new(vals_data),
-            failed: false,
-        }
-    }
-}
-
-impl<'a> Iterator for CheckedTagIter<'a> {
-    type Item = Result<(&'a str, &'a str)>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        let item = match (self.key_indices.next(), self.val_indices.next()) {
-            (None, None) => return None,
-            (Some(k), Some(v)) => str_from_stringtable(self.block, k as usize)
-                .and_then(|key| Ok((key, str_from_stringtable(self.block, v as usize)?))),
-            // Block construction rejects mismatched keys/vals arrays, so this
-            // is unreachable on a constructed block; report it rather than
-            // trusting that.
-            _ => Err(crate::error::new_wire_error(
-                "element has mismatched keys/vals tag array lengths",
-            )),
-        };
-        self.failed = item.is_err();
-        Some(item)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.failed {
-            return (0, Some(0));
-        }
-        // A mismatched tail yields an error past the shorter array.
-        let upper = self
-            .key_indices
-            .size_hint()
-            .1
-            .zip(self.val_indices.size_hint().1)
-            .map(|(keys, vals)| keys.max(vals));
-        (0, upper)
-    }
-}
 
 /// An iterator over the tags of an element as raw index pairs.
 #[derive(Clone)]
@@ -1059,34 +965,6 @@ impl<'a> Info<'a> {
 mod tests {
     use super::*;
     use crate::write::block_builder::{BlockBuilder, MemberData};
-
-    #[test]
-    fn checked_tag_size_hint() {
-        let mut builder = BlockBuilder::new();
-        builder.add_relation(1, [], &[], None);
-        let bytes = builder.take().unwrap().unwrap().to_vec();
-        let block = crate::PrimitiveBlock::from_vec(bytes).unwrap();
-        let Element::Relation(relation) = block.elements().next().unwrap() else {
-            panic!("fixture contains a relation");
-        };
-        for (keys, vals) in [(&[0, 0][..], &[0][..]), (&[0][..], &[0, 0][..])] {
-            let mut tags = CheckedTagIter::new(relation.block, keys, vals);
-            assert_eq!(tags.size_hint(), (0, Some(2)));
-            assert!(tags.next().unwrap().is_ok());
-            assert_eq!(tags.size_hint(), (0, Some(1)));
-            assert!(tags.next().unwrap().is_err());
-            assert_eq!(tags.size_hint(), (0, Some(0)));
-            assert!(tags.next().is_none());
-        }
-        let mut tags = CheckedTagIter::new(relation.block, &[127, 0], &[0, 0]);
-        assert!(tags.next().unwrap().is_err());
-        assert_eq!(tags.size_hint(), (0, Some(0)));
-        let mut tags = CheckedTagIter::new(relation.block, &[0], &[0]);
-        assert_eq!(tags.size_hint(), (0, Some(1)));
-        assert!(tags.next().unwrap().is_ok());
-        assert_eq!(tags.size_hint(), (0, Some(0)));
-        assert!(tags.next().is_none());
-    }
 
     #[test]
     fn way_ref_and_location_accumulators_wrap_at_signed_boundaries() {

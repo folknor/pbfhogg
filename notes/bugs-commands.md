@@ -492,16 +492,6 @@ publication, and is sign-neutral (a large positive start does it too). The
 fix is a split path: cut an oversized rewritten block between elements into
 two output blocks with their own indexes.
 
-## CMD-045 - The OSC parser can block on a FIFO input before refusing it
-
-Reported by: the CMD-044 spar partner (codex, 2026-11-19); not verified.
-
-The OSC parser rewinds its input after sniffing the format, so it requires a
-seekable input. Given a FIFO, the sniffing read can block (no writer, or a
-writer that never sends) before the seek fails and the input is refused. The
-claim to check is that an unseekable OSC input should be refused up front,
-not discovered after a blocking read.
-
 ## CMD-042 - External ALTW stage 4 copies its passthrough prefix after the router aborts
 
 Reported by: the stage 3 startup-deadlock item (2026-11-18), from source
@@ -531,17 +521,16 @@ can therefore sit in the router's readiness wait (stage 3 still making
 progress) for a writer that is already dead. A delay, not a deadlock. Init
 success should wait until the pool's workers are all born.
 
-## CMD-046 - An apply reads `visible` raw where re-emitters decode it
+## CMD-047 - An empty `visible` is a claim when applied and gone when re-emitted
 
-Reported by: the OSC tags-filter ordering spar (2026-11-19), from source;
+Reported by: the CMD-045/046 spar partner (codex, 2026-11-19), from source;
 not reproduced.
 
-`arena_meta` (`osc/xml_parse.rs`) marks an element hidden only when the raw
-attribute bytes are exactly `false`, while the re-emitting sinks
-(merge-changes, OSC tags-filter) normalize the attribute first and write the
-decoded text. A create with `visible="&#102;alse"` is therefore visible when
-the input is applied directly and hidden when it is applied after passing
-through either re-emitter, so the same change stream gives two final states.
-Same class as CMD-004 (native parsing before XML normalization). Either the
-overlay normalizes `visible` before the test, or the policy is recorded as a
-deviation.
+`arena_meta` (`osc/xml_parse.rs`) records `visible=""` as present and not
+hidden, so a direct apply writes an explicit `visible=true` claim into the
+element's `Info`. Both re-emitters (merge-changes, OSC tags-filter) omit an
+empty metadata attribute under the documented empty-attribute rule, so the
+same change applied after re-emission carries no visibility claim. Both read
+as visible; the PBF claims differ. Either re-emission keeps an explicit empty
+`visible`, or apply treats an empty `visible` as absent (or refuses it, as
+libosmium's `set_visible` refuses any value but `true`/`false`).

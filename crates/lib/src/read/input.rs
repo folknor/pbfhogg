@@ -124,11 +124,13 @@ pub(crate) fn open_at(dir: std::os::fd::BorrowedFd<'_>, name: &str, label: &Path
 }
 
 /// Open `path` with exactly the kernel flags `flags` (`O_CLOEXEC` added), by
-/// the raw `openat(2)` syscall. Not an input open: it reads nothing, and
-/// serves `crate::scratch`'s mount-identity probe, which needs
-/// `O_PATH | O_NOFOLLOW` on a symlink. musl's `open` wrapper, which std's
-/// `OpenOptions` reaches, refuses that with `ELOOP` though the kernel
-/// accepts it. It lives here because this module is the one owner of
+/// the raw `openat(2)` syscall. Not a reading open: it serves `O_PATH`
+/// descriptors, which read nothing - `crate::scratch`'s mount-identity probe
+/// (`O_PATH | O_NOFOLLOW` on a symlink) and the input pin's anchor. On musl
+/// targets std's `OpenOptions` cannot ask for `O_PATH`: it masks custom flags
+/// with `O_ACCMODE`, which there includes `O_PATH`, so the flag never reaches
+/// the kernel. The probe then fails with `ELOOP` and the anchor becomes a
+/// read open, which on a FIFO is a reader. `EINTR` is retried, as std does. It lives here because this module is the one owner of
 /// adopting a descriptor `openat` just created.
 #[cfg(target_os = "linux")]
 pub(crate) fn open_raw(path: &Path, flags: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
@@ -136,18 +138,24 @@ pub(crate) fn open_raw(path: &Path, flags: libc::c_int) -> std::io::Result<std::
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: `c_path` is a valid NUL-terminated string for the call.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat,
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            flags | libc::O_CLOEXEC,
-        )
+    let fd = loop {
+        // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                flags | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
     // A nonnegative return is a descriptor, an int the syscall ABI widened.
     #[allow(clippy::cast_possible_truncation)]
     let fd = fd as libc::c_int;
@@ -463,11 +471,18 @@ impl PinnedInput {
     fn pin_with(path: &Path, host: &crate::host::Entered<'_>, force_path: bool) -> Result<Self> {
         #[cfg(not(pbfhogg_test_hooks))]
         let _ = host;
+        // On Linux the anchor is an `O_PATH` descriptor, which is no reader:
+        // judging a FIFO must not become one, or a waiting writer connects
+        // to it and what it writes is dropped when the anchor closes. It is
+        // opened by the raw syscall because on musl std's `OpenOptions`
+        // drops `O_PATH` (see `open_raw`), leaving a plain nonblocking read
+        // open of the FIFO.
         #[cfg(target_os = "linux")]
-        let flags = libc::O_PATH;
+        let anchor = open_raw(path, libc::O_RDONLY | libc::O_NONBLOCK | libc::O_PATH)
+            .map(File::from)
+            .map_err(|e| named("open", path, e))?;
         #[cfg(not(target_os = "linux"))]
-        let flags = 0;
-        let anchor = open_nonblocking(path, flags).map_err(|e| named("open", path, e))?;
+        let anchor = open_nonblocking(path, 0).map_err(|e| named("open", path, e))?;
         let meta = anchor.metadata().map_err(|e| named("stat", path, e))?;
         let kind = meta.file_type();
         if !kind.is_file() {
@@ -620,8 +635,8 @@ impl PinnedInput {
     /// Whether this pin's later opens go through `/proc/self/fd` (a replaced
     /// input does not affect the run) rather than the path (a replaced input
     /// fails the run with `InputReplaced`), so a replacement test can tell
-    /// which outcome this host owes.
-    #[cfg(any(test, pbfhogg_test_hooks))]
+    /// which outcome this host owes, and a caller can tell whether an open
+    /// reads the pinned object without resolving the path again.
     #[must_use]
     pub fn reopens_through_procfs(&self) -> bool {
         #[cfg(unix)]
@@ -946,6 +961,23 @@ mod pin_tests {
             assert!(flags >= 0);
             assert_eq!(flags & libc::O_NONBLOCK, 0);
         }
+    }
+
+    /// The anchor is an `O_PATH` descriptor on every Linux target, so pinning
+    /// a FIFO never opens a reader a waiting writer could connect to. Through
+    /// std's `OpenOptions` musl targets lost the flag (it is masked with
+    /// `O_ACCMODE`, which on musl includes `O_PATH`), leaving a read open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_anchor_is_an_o_path_descriptor() {
+        use std::os::unix::io::AsRawFd as _;
+        let dir = crate::path_guard::tests::scratch();
+        let (input, _) = fixture(dir.path());
+        let pin = PinnedInput::pin_with(&input, &Host::for_tests().entered(), true).unwrap();
+        // SAFETY: the anchor is open for the call.
+        let flags = unsafe { libc::fcntl(pin.0.anchor.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_PATH, libc::O_PATH);
     }
 
     /// An argument spelled exactly as an earlier one shares its pin; any

@@ -547,7 +547,10 @@ changeset, uid and visible through as normalized XML attribute text without
 native-value validation. They do not preserve raw entity spellings or raw
 attribute whitespace, and all of them write the same normalized bytes for the
 same element. The apply-changes overlay retains its native numeric metadata
-parsing and treats only literal `false` as hidden. Applying the overlay's
+parsing and treats only `false` as hidden, compared after the same XML
+attribute normalization the re-emitters apply, so an entity-spelled `false` is
+hidden whether a change is applied directly or after re-emission (`False` is
+visible on both routes). Applying the overlay's
 native metadata validation to the re-emitting paths would reject attribute text
 they currently preserve. Every
 `tag`, `nd` and `member` is read by one parser per child kind, whatever the

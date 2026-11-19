@@ -362,6 +362,21 @@
 
 ### Fixed
 
+- **OSC inputs may be streams.** `apply-changes`, `merge-changes` and
+  `tags-filter --input-kind osc` read an OSC from a FIFO or `/dev/stdin`.
+  Before, the gzip sniff sought back to the start, so a stream was opened,
+  partly read and then refused. `tags-filter` without `--input-kind` no
+  longer reads a stream to sniff its kind, which dropped its first four
+  bytes; it routes a stream by its name. Its content sniff now needs Linux
+  with `/proc`; elsewhere the kind comes from the name.
+- **musl builds: refusing a FIFO input no longer swallows its writer's
+  data.** The check that an input is a regular file opened the path as a
+  reader there, so a waiting writer connected, wrote into it, and lost
+  what it wrote when the refusal closed it.
+- **`visible="&#102;alse"` (any XML-escaped `false`) now hides an element
+  in `apply-changes`,** as it already did once re-emitted by
+  `merge-changes` or OSC `tags-filter`, so both routes give the same
+  result.
 - **Replacing a directory output (`build-geocode-index --overwrite`) no
   longer deletes the contents of a filesystem mounted inside it.** The old
   directory was moved aside with its mounts and then removed recursively,

@@ -541,9 +541,10 @@ fn validate_command(
     command: &Command,
     matches: &clap::ArgMatches,
     quiet: bool,
+    host: &pbfhogg::host::Host,
 ) -> Result<Option<TagsFilterPlan>, Box<dyn std::error::Error>> {
     match command {
-        Command::TagsFilter { .. } => validate_tags_filter(command, matches).map(Some),
+        Command::TagsFilter { .. } => validate_tags_filter(command, matches, host).map(Some),
         Command::Diff { .. } => validate_diff(command, quiet).map(|()| None),
         // `-q` is global, so its conflicts are checked here rather than by
         // clap: a clap conflict on a global flag is not seen when the flag is
@@ -698,6 +699,7 @@ fn tags_filter_options<'a>(
 fn validate_tags_filter(
     command: &Command,
     matches: &clap::ArgMatches,
+    host: &pbfhogg::host::Host,
 ) -> Result<(InputKind, Vec<String>), Box<dyn std::error::Error>> {
     let Command::TagsFilter {
         file,
@@ -742,7 +744,7 @@ fn validate_tags_filter(
             return Err(force_refused(&["tags-filter"]));
         }
     }
-    let kind = input_kind.unwrap_or_else(|| detect_input_kind(file));
+    let kind = input_kind.unwrap_or_else(|| detect_input_kind(file, host));
     if matches!(kind, InputKind::Pbf) {
         return Ok((kind, expressions));
     }
@@ -2481,9 +2483,10 @@ struct GeocodeLevels {
 // Deliberately sniff only four bytes, then use extensions with unknown = PBF.
 // Gzip magic means OSC; no BOM/whitespace skipping or format refusal is added.
 // Stricter sniffing would break accepted inputs and the extension fallback contract.
-fn detect_input_kind(path: &std::path::Path) -> InputKind {
+// Only a regular file is sniffed; a stream goes straight to the extension rule.
+fn detect_input_kind(path: &std::path::Path, host: &pbfhogg::host::Host) -> InputKind {
     // Content sniffing: read first bytes to distinguish PBF from OSC
-    if let Ok(kind) = sniff_input_kind(path) {
+    if let Ok(kind) = sniff_input_kind(path, host) {
         return kind;
     }
     // Fall back to extension
@@ -2495,19 +2498,35 @@ fn detect_input_kind(path: &std::path::Path) -> InputKind {
     }
 }
 
-/// `File::open` of an input this front end reads itself, naming `path` in a
-/// failure (the library's opens do the same): a bare "No such file or
-/// directory" does not say which input it was. The `io::ErrorKind` is kept.
-#[allow(clippy::disallowed_methods)]
-fn open_input(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("failed to open {}: {e}", path.display()))
-    })
-}
-
-fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
+/// The four-byte content sniff, of a regular file only. The input is read
+/// again by the library through its own open, so sniffing a stream would
+/// steal its first bytes, and even a read open that reads nothing counts as
+/// a FIFO reader: a producer can connect to it and lose what it wrote, or
+/// get EPIPE, when the probe closes. The library's input pin judges the type
+/// on Linux without opening a reader and refuses anything but a regular
+/// file, and the sniff reads the pinned object through `/proc/self/fd`. Where
+/// the pin cannot reopen that way (no procfs, or not Linux) its reopen goes
+/// by path, and a path swapped to a FIFO would be connected to before the
+/// identity check refuses it, so there the kind comes from the extension rule
+/// alone. The library still reopens by path afterwards; a replacement in
+/// between is parsed as whatever it is, never with bytes missing. Any
+/// refusal here (a stream, a missing file) leaves the kind to the extension
+/// rule.
+fn sniff_input_kind(
+    path: &std::path::Path,
+    host: &pbfhogg::host::Host,
+) -> std::io::Result<InputKind> {
     use std::io::Read;
-    let mut file = open_input(path)?;
+    if !cfg!(target_os = "linux") {
+        // The pin's anchor itself is a read open there.
+        return Err(std::io::Error::other("no anchored reopen"));
+    }
+    let pin = pbfhogg::read::input::PinnedInput::pin(path, host).map_err(std::io::Error::other)?;
+    if !pin.reopens_through_procfs() {
+        return Err(std::io::Error::other("no anchored reopen"));
+    }
+    let open = pbfhogg::read::input::InputFile::open(&pin).map_err(std::io::Error::other)?;
+    let mut file: &std::fs::File = open.file();
     let mut buf = [0u8; 4];
     match file.read_exact(&mut buf) {
         Ok(()) => {}
@@ -2742,7 +2761,7 @@ pub fn run() -> process::ExitCode {
             // the filesystem. Only tags-filter's autodetected input kind needs a
             // read (the four-byte sniff it always did), so its OSC-mode refusals
             // ride that read.
-            let tags_filter_kind = validate_command(&cli.command, &matches, quiet)?;
+            let tags_filter_kind = validate_command(&cli.command, &matches, quiet, &host)?;
             // The command line's inputs, outputs and scratch location, stated
             // once; the dispatch below moves the command's fields.
             let paths = CommandPaths::of(&cli.command);

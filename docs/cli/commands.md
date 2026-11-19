@@ -477,6 +477,19 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   naming both suffixes, exit `64`. The match is case-sensitive (`.OSC` is
   refused). Every OSC reader here sniffs the gzip magic, so either form is
   read back.
+- **An OSC input may be a stream** (a FIFO, `/dev/stdin`) for
+  `apply-changes`, `merge-changes` and `tags-filter --input-kind osc`: each
+  is read front to back once, and the gzip sniff replays the bytes it took
+  rather than seeking back. The open and every read wait for the stream's
+  writer, and cancellation cannot interrupt a wait the writer never ends. In
+  `merge-changes`, an error in one input can therefore wait for a stream input
+  whose writer has neither written nor closed. Each argument is opened on its
+  own, so naming the same FIFO twice splits its bytes between the two.
+  `tags-filter` without `--input-kind` routes a stream by its name (the
+  extension rule) without reading it, since its content sniff reads regular
+  files only, and only on Linux with `/proc` mounted (elsewhere the kind
+  comes from the name alone); use `--input-kind osc` for a stream with
+  another name.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
   (`.pbfhogg-tmp-<pid>-<n>.<name>`), or in `--staging-dir` when given (see
@@ -1567,7 +1580,7 @@ Filter elements by tag expressions. Default mode resolves relation members trans
 
 Negative IDs are IDs like any other in every mode: a matched `w-7` pulls in exactly the nodes it references, a relation member `n-7` brings `n-7`, and neither brings its positive twin (osmium folds both onto `|id|` when it adds references).
 
-With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes: every delete is kept whatever its tags, with the body its input gave (tags, refs, members, a deleted node's location), and kept elements are written in merge-changes' normal form under the same rules for delete locations and empty metadata attributes (see [merge-changes](#merge-changes)). Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is not a PBF; its framing comes from the output name, see "Output files"), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it. One reader thread frames the OSC document and cuts it into batches; `-j` sizes the workers that filter the batches, and the output is the same at any `-j`.
+With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes: every delete is kept whatever its tags, with the body its input gave (tags, refs, members, a deleted node's location), and kept elements are written in merge-changes' normal form under the same rules for delete locations and empty metadata attributes (see [merge-changes](#merge-changes)). Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is not a PBF; its framing comes from the output name, see "Output files"), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it (of a regular file; a stream is routed by its name, see "Output files"). One reader thread frames the OSC document and cuts it into batches; `-j` sizes the workers that filter the batches, and the output is the same at any `-j`.
 
 The kept changes are written in input order, each under its input action. Every batch becomes its own gzip member (or plain fragment) with its own `<create>`/`<modify>`/`<delete>` sections, so a section can be split into adjacent sections of the same action, as in merge-changes without `--simplify`; the changes and their order are unchanged. Order is part of the answer: apply-changes lets the later of two equal-version changes win, so a delete followed by a re-create of the same object at the same version must stay in that order to leave the object alive. Selection is per change, not per object: a matching `v2` followed by a non-matching `v3` keeps the `v2` and drops the `v3`, so applying a filtered stream can leave an object at an older matching state, and a kept way or relation can refer to a node or member whose create was dropped (which `apply-changes --locations-on-ways` refuses as a missing reference).
 

@@ -172,6 +172,94 @@ fn every_consumer_reads_plain_and_gzipped_osc() {
     assert_all_accept(dir.path(), &lying_gz, "gzip bytes named .osc");
 }
 
+/// Every consumer reads its OSC front to back once, so a stream serves it:
+/// the format sniff replays the bytes it took instead of seeking back over
+/// them, which on a FIFO used to block, consume the head and then fail the
+/// seek. Plain input carries a UTF-8 BOM, which the replayed prefix has to
+/// keep whole for the XML reader.
+#[cfg(unix)]
+#[test]
+fn every_consumer_reads_osc_from_a_fifo() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "an OSC FIFO run or its feeder did not end",
+    );
+    let dir = crate::common::test_scratch();
+    let xml = "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<osmChange version=\"0.6\">
+  <create>
+    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"><tag k=\"highway\" v=\"primary\"/></node>
+  </create>
+</osmChange>";
+    let gz_file = dir.path().join("in.osc.gz");
+    write_gz(&gz_file, xml);
+    let gzip = std::fs::read(&gz_file).unwrap();
+    let out = |n: &str| -> PathBuf { dir.path().join(format!("out-{n}.osc.gz")) };
+    for (form, bytes) in [("plain", xml.as_bytes().to_vec()), ("gzip", gzip)] {
+        type Run<'a> = &'a dyn Fn(&Path) -> Verdict;
+        let runs: [(&str, Run<'_>); 4] = [
+            ("apply-changes overlay", &|p| {
+                let overlay = pbfhogg::osc::parse_osc_file(p).map_err(|e| e.to_string())?;
+                assert!(overlay.get_node(1).is_some(), "{form}: node 1 missing");
+                Ok(())
+            }),
+            ("merge-changes streaming", &|p| merge_verdict(p, &out("m"))),
+            ("merge-changes simplify", &|p| {
+                simplify_verdict(p, &out("s"))
+            }),
+            ("tags-filter osc", &|p| tags_filter_verdict(p, &out("t"))),
+        ];
+        for (i, (name, run)) in runs.into_iter().enumerate() {
+            let fifo = crate::common::make_fifo(dir.path(), &format!("{form}-{i}.fifo"));
+            let feeder = crate::common::FifoFeeder::start(&fifo, bytes.clone());
+            let verdict = run(&fifo);
+            match feeder.finish() {
+                crate::common::Fed::Wrote(written) => {
+                    written.unwrap_or_else(|e| panic!("{form}: {name} left bytes unread: {e}"));
+                }
+                crate::common::Fed::Unfed => panic!("{form}: {name} never opened the FIFO"),
+                crate::common::Fed::OpenFailed(e) => panic!("{form}: feeder open failed: {e}"),
+            }
+            verdict.unwrap_or_else(|e| panic!("{form}: {name} refused a FIFO: {e}"));
+        }
+    }
+}
+
+/// `visible` is compared decoded, as the re-emitters write it: an
+/// entity-spelled `false` is hidden when applied directly and when applied
+/// after passing through merge-changes, rather than visible in one and
+/// hidden in the other.
+#[test]
+fn visibility_survives_re_emission() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osc");
+    std::fs::write(
+        &input,
+        r#"<osmChange version="0.6"><create>
+<node id="1" lat="1.0" lon="2.0" version="1" visible="&#102;alse"/>
+<node id="2" lat="1.0" lon="2.0" version="1" visible="False"/>
+<node id="3" lat="1.0" lon="2.0" version="1" visible="false"/>
+</create></osmChange>"#,
+    )
+    .unwrap();
+    let re_emitted = dir.path().join("re.osc.gz");
+    merge_verdict(&input, &re_emitted).unwrap();
+    let visible = |path: &Path| -> Vec<Option<bool>> {
+        let overlay = pbfhogg::osc::parse_osc_file(path).unwrap();
+        (1..=3)
+            .map(|id| overlay.get_node(id).unwrap().metadata().unwrap().visible)
+            .collect()
+    };
+    let expected = vec![Some(false), Some(true), Some(false)];
+    assert_eq!(visible(&input), expected, "applied directly");
+    assert_eq!(
+        visible(&re_emitted),
+        expected,
+        "applied after merge-changes"
+    );
+}
+
 /// The driver tracked one section and one open object, not the hierarchy:
 /// a node nested in a way replaced the sink's current element, a section
 /// nested anywhere overwrote the action, an unknown wrapper's `<nd>` was

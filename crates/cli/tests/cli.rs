@@ -415,6 +415,45 @@ fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
 }
 
+/// The kind sniff reads only a regular file: a stream is routed by its
+/// name, and the sniff never opens it as a reader, so the OSC filter gets
+/// the stream whole rather than missing the four bytes a sniff took. Linux
+/// only: elsewhere the input pin's anchor is a read open, itself a reader.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_tags_filter_routes_a_stream_by_name_without_reading_it() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "the OSC FIFO run or its feeder did not end",
+    );
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let fifo = crate::common::make_fifo(dir.path(), "changes.osc");
+    let feeder = crate::common::FifoFeeder::start(
+        &fifo,
+        br#"<osmChange version="0.6"><create><node id="7" lat="1.0" lon="2.0" version="1"><tag k="name" v="x"/></node></create></osmChange>"#
+            .to_vec(),
+    );
+    let out = dir.path().join("out.osc");
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("tags-filter")
+        .arg(&fifo)
+        .arg("name")
+        .arg("-o")
+        .arg(&out)
+        .run();
+    let fed = feeder.finish();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(fed, crate::common::Fed::Wrote(Ok(()))));
+    let written = std::fs::read_to_string(&out).expect("read output");
+    assert!(written.contains(r#"id="7""#), "output: {written}");
+}
+
 #[test]
 fn cli_diff_quiet_osc_without_output_retains_error() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();

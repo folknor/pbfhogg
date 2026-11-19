@@ -19,7 +19,7 @@
 //! what an element turns into once the framing has identified it.
 
 use std::cell::Cell;
-use std::io::{self, BufReader, Read, Seek};
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -473,26 +473,32 @@ pub(crate) fn open_osc_reader(
     cancel: &crate::host::Recorder,
 ) -> ParseResult<(OscReader, Rc<Cell<u64>>)> {
     let mut file = crate::read::input::open(path)?;
-    // A file shorter than two bytes cannot be gzip and cannot be XML
-    // either; read what is there and let the XML parser produce the
-    // complaint, rather than failing here with an EOF error that names
-    // nothing.
+    // The input is read front to back exactly once and never rewound, so
+    // it may be a stream (a FIFO, `/dev/stdin`): the sniffed prefix is
+    // replayed ahead of the rest of the file rather than sought back over.
+    // Three bytes, not the two the gzip magic needs, so that plain XML's
+    // first buffer fill still holds a whole UTF-8 BOM for quick-xml.
+    //
+    // A file shorter than that is read as far as it goes and the XML
+    // parser produces the complaint, rather than failing here with an EOF
+    // error that names nothing.
     let read_error =
         |e: io::Error| Error::from(e).context(format!("failed to read {}", path.display()));
-    let mut magic = [0u8; 2];
+    let mut prefix = [0u8; 3];
     let mut got = 0usize;
-    while got < 2 {
-        match file.read(&mut magic[got..]) {
+    while got < prefix.len() {
+        match file.read(&mut prefix[got..]) {
             Ok(0) => break,
             Ok(n) => got += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(read_error(e)),
         }
     }
-    file.seek(io::SeekFrom::Start(0)).map_err(read_error)?;
+    let gzip = got >= 2 && prefix[..2] == [0x1f, 0x8b];
+    let file = io::Cursor::new(prefix).take(got as u64).chain(file);
 
     let total = Rc::new(Cell::new(0_u64));
-    let inner: Box<dyn io::Read> = if got == 2 && magic == [0x1f, 0x8b] {
+    let inner: Box<dyn io::Read> = if gzip {
         Box::new(TimedRead {
             inner: MultiGzDecoder::new(file),
             total: Rc::clone(&total),
@@ -1188,6 +1194,9 @@ pub(crate) fn scan_owned_metadata_into(
 /// Read an element's metadata into the arena representation.
 // Deliberately keep the overlay's native numeric parsing and false-only visible
 // test. Sharing owned-sink validation would change accepted input and its cost.
+// The visible test does compare the decoded value, though: the re-emitters
+// (merge-changes, OSC tags-filter) write the decoded text, so a raw comparison
+// would make `visible="&#102;alse"` visible here and hidden once re-emitted.
 fn arena_meta(
     e: &quick_xml::events::BytesStart<'_>,
     overlay: &mut CompactDiffOverlay,
@@ -1230,7 +1239,10 @@ fn arena_meta(
             }
             MetaField::Visible => {
                 meta.flags |= META_FLAG_HAS_VISIBLE;
-                if attr.value.as_ref() == "false" {
+                let text = attr
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(xml_err)?;
+                if text == "false" {
                     meta.flags |= META_FLAG_HIDDEN;
                 }
             }

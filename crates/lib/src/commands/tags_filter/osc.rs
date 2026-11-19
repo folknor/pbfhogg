@@ -1,12 +1,17 @@
 //! Filter OSC files by tag expressions while preserving all delete actions.
 
+use std::io::Write as _;
 use std::path::Path;
 
+#[cfg(test)]
 use flate2::write::GzEncoder;
+#[cfg(test)]
 use quick_xml::Writer;
+#[cfg(test)]
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 
 use crate::ElementKind;
+use crate::commands::merge_changes;
 use crate::commands::merge_changes::emit::ElementBuf;
 use crate::commands::merge_changes::stream;
 use crate::error::Result;
@@ -15,7 +20,9 @@ use crate::osc::write::{
     OwnedMember, OwnedNode, OwnedRelation, OwnedWay, write_node_xml, write_relation_xml,
     write_way_xml,
 };
-use crate::osc::xml_parse::{DeleteChildren, LexBatch, OscAction, OscSink};
+#[cfg(test)]
+use crate::osc::xml_parse::{DeleteChildren, OscSink};
+use crate::osc::xml_parse::{LexBatch, OscAction};
 #[cfg(test)]
 use crate::osc::xml_parse::{
     coord_to_decimicro, delete_coords, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
@@ -94,44 +101,23 @@ impl CurrentElem {
     }
 }
 
-// Nine action/kind vectors: create/modify/delete then node/way/relation
-// order, encounter order within each group. The byte path keeps the same
-// nine groups as rendered XML.
+/// One kept change of the owned oracle.
 #[cfg(test)]
-struct FilteredOsc {
-    create_nodes: Vec<OwnedNode>,
-    create_ways: Vec<OwnedWay>,
-    create_relations: Vec<OwnedRelation>,
-    modify_nodes: Vec<OwnedNode>,
-    modify_ways: Vec<OwnedWay>,
-    modify_relations: Vec<OwnedRelation>,
-    delete_nodes: Vec<OwnedNode>,
-    delete_ways: Vec<OwnedWay>,
-    delete_relations: Vec<OwnedRelation>,
+enum KeptElement {
+    Node(OwnedNode),
+    Way(OwnedWay),
+    Relation(OwnedRelation),
 }
 
+/// The kept changes in input order, each with its action.
 #[cfg(test)]
-impl FilteredOsc {
-    fn new() -> Self {
-        Self {
-            create_nodes: Vec::new(),
-            create_ways: Vec::new(),
-            create_relations: Vec::new(),
-            modify_nodes: Vec::new(),
-            modify_ways: Vec::new(),
-            modify_relations: Vec::new(),
-            delete_nodes: Vec::new(),
-            delete_ways: Vec::new(),
-            delete_relations: Vec::new(),
-        }
-    }
-}
+type FilteredOsc = Vec<(Section, KeptElement)>;
 
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TagsFilterOscStats {
     pub creates_in: u64,
     pub creates_out: u64,
@@ -141,7 +127,36 @@ pub struct TagsFilterOscStats {
     pub deletes_out: u64,
 }
 
+impl std::ops::AddAssign for TagsFilterOscStats {
+    fn add_assign(&mut self, other: Self) {
+        self.creates_in += other.creates_in;
+        self.creates_out += other.creates_out;
+        self.modifies_in += other.modifies_in;
+        self.modifies_out += other.modifies_out;
+        self.deletes_in += other.deletes_in;
+        self.deletes_out += other.deletes_out;
+    }
+}
+
+impl stream::Tally for TagsFilterOscStats {
+    /// The per-input change count is merge's counter, not the filter's.
+    fn changes_per_osc(&self) -> Option<u64> {
+        None
+    }
+}
+
 impl TagsFilterOscStats {
+    /// Count one checked change of `action`, kept or not.
+    fn record(&mut self, action: Section, kept: bool) {
+        let (seen, out) = match action {
+            Section::Create => (&mut self.creates_in, &mut self.creates_out),
+            Section::Modify => (&mut self.modifies_in, &mut self.modifies_out),
+            Section::Delete => (&mut self.deletes_in, &mut self.deletes_out),
+        };
+        *seen += 1;
+        *out += u64::from(kept);
+    }
+
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         writeln!(
             w,
@@ -196,22 +211,24 @@ pub fn tags_filter_osc(
 
 /// [`tags_filter_osc`] writing to a borrowed output it does not publish.
 ///
-/// The input is read on merge-changes' lexical readers
-/// ([`stream::collect`]): one reader frames and checks the document and cuts
-/// it into batches of whole elements, and pool workers check each batch's
-/// elements with the shared parsers and render the kept ones (every delete,
-/// and each create or modify with a matching tag) into nine byte groups,
-/// one per action and kind. The document is then written once: each
-/// non-empty action's section holds its node, way and relation groups, each
-/// concatenated in input order. That is the order and the bytes the owned
-/// writers produced (a differential test holds it to that), with no owned
-/// element built for any change.
+/// The input runs through merge-changes' streaming path ([`stream::run`]):
+/// one reader frames and checks the document and cuts it into batches of
+/// whole elements, and workers check every element of a batch with the
+/// shared parsers and render the kept ones (every delete, and each create or
+/// modify with a matching tag) in input order, each batch opening and
+/// closing its own action sections and, for `.osc.gz`, deflated as its own
+/// gzip member. The batches are written in order as they finish.
 ///
-/// Memory is the rendered XML of the kept changes plus the readers' bounded
-/// in-flight batches; a match-all filter retains the whole input's rendered
-/// XML. Spooling the groups to scratch would bound that at the cost of a full
-/// write and read of the kept output and a scratch owner this command does
-/// not have.
+/// Input order is the contract, not a layout choice: an apply admits an
+/// equal version and lets the later change win, so a filter that grouped
+/// the kept changes by action would turn a delete followed by a same-version
+/// re-create into a re-create followed by a delete, and a delete followed by
+/// a higher-version create into a version regression. Kept changes keep
+/// their relative order, so every surviving claim reaches an apply as the
+/// unfiltered stream would have delivered it.
+///
+/// Memory is the readers' bounded in-flight batches; nothing of the output
+/// is retained.
 #[hotpath::measure]
 pub(crate) fn tags_filter_osc_to(
     input: &Path,
@@ -234,218 +251,52 @@ pub(crate) fn tags_filter_osc_to(
     let plan = stream::Plan {
         batching,
         inputs: &inputs,
-        is_gz: false,
+        is_gz,
         readers: 1,
         lanes: parallelism.fixed().unwrap_or(usize::MAX),
         executor: host.executor.borrowed(),
         cancel: &host.invocation,
     };
     let expressions = expressions.as_slice();
-    let batches = stream::collect(&plan, &|batch: &LexBatch, path: &Path| {
-        filter_batch(batch, path, expressions)
-    })?;
-    let batches: Vec<FilteredBatch> = batches.into_iter().flatten().collect();
+    let encode = |batch: &LexBatch, path: &Path| filter_batch(batch, path, is_gz, expressions);
+    let mut out = output.writer()?;
+    out.write_all(&merge_changes::build_prelude_bytes(is_gz)?)?;
+    // One input never spills, so the run needs no scratch.
+    let stats = stream::run(&plan, None, &mut out, &encode)?;
     host.invocation.check()?;
-    let mut stats = TagsFilterOscStats::default();
-    for b in &batches {
-        stats.creates_in += b.stats.creates_in;
-        stats.creates_out += b.stats.creates_out;
-        stats.modifies_in += b.stats.modifies_in;
-        stats.modifies_out += b.stats.modifies_out;
-        stats.deletes_in += b.stats.deletes_in;
-        stats.deletes_out += b.stats.deletes_out;
-    }
-    write_groups(output, is_gz, &batches)?;
+    out.write_all(&merge_changes::build_postlude_bytes(is_gz)?)?;
+    out.finish()?;
     host.invocation.marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
 
-/// One batch's kept elements, rendered: groups in (action, kind) order,
-/// create node first, delete relation last.
-struct FilteredBatch {
-    groups: [Vec<u8>; 9],
-    stats: TagsFilterOscStats,
-}
-
-fn group_index(action: Section, kind: ElementKind) -> usize {
-    let a = match action {
-        Section::Create => 0,
-        Section::Modify => 1,
-        Section::Delete => 2,
-    };
-    let k = match kind {
-        ElementKind::Node => 0,
-        ElementKind::Way => 1,
-        ElementKind::Relation => 2,
-    };
-    a * 3 + k
-}
-
-/// A writer whose indent state is the document's inside an action section
-/// (depth 2, line break pending), with nothing written: an element rendered
-/// into it has the bytes it has at that place in the document, whatever
-/// precedes it there.
-fn group_writer() -> Result<Writer<Vec<u8>>> {
-    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
-    writer.write_event(Event::Start(BytesStart::new("osmChange")))?;
-    writer.write_event(Event::Start(BytesStart::new("create")))?;
-    writer.get_mut().clear();
-    Ok(writer)
-}
-
+/// One batch, filtered and rendered in input order: every delete, and each
+/// create or modify with a tag an expression admits for its kind.
 fn filter_batch(
     batch: &LexBatch,
     path: &Path,
-    expressions: &[Expression],
-) -> Result<FilteredBatch> {
-    let mut sink = FilterBytes {
-        element: ElementBuf::new("tags-filter OSC"),
-        groups: Vec::with_capacity(9),
-        stats: TagsFilterOscStats::default(),
-        expressions,
-    };
-    for _ in 0..9 {
-        sink.groups.push(group_writer()?);
-    }
-    batch.replay(&mut sink, path)?;
-    let mut groups: [Vec<u8>; 9] = Default::default();
-    for (slot, writer) in groups.iter_mut().zip(sink.groups) {
-        *slot = writer.into_inner();
-    }
-    Ok(FilteredBatch {
-        groups,
-        stats: sink.stats,
-    })
-}
-
-/// The worker sink: every element checked as the owned sink checks it;
-/// deletes kept unconditionally, creates and modifies when a tag matches.
-struct FilterBytes<'a> {
-    element: ElementBuf,
-    groups: Vec<Writer<Vec<u8>>>,
-    stats: TagsFilterOscStats,
-    expressions: &'a [Expression],
-}
-
-impl OscSink for FilterBytes<'_> {
-    const DELETE_CHILDREN: DeleteChildren = DeleteChildren::Route;
-    const END_ELEMENT_EMITS: bool = true;
-
-    fn begin_element(
-        &mut self,
-        action: Section,
-        kind: ElementKind,
-        e: &BytesStart<'_>,
-    ) -> Result<()> {
-        self.element.begin(action, kind, e)
-    }
-
-    fn tag(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        self.element.tag(e)
-    }
-
-    fn nd(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        self.element.nd(e)
-    }
-
-    fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
-        self.element.member(e)
-    }
-
-    fn end_element(&mut self) -> Result<()> {
-        let Some((action, kind)) = self.element.finish() else {
-            return Ok(());
-        };
-        let keep = match action {
-            Section::Delete => {
-                self.stats.deletes_in += 1;
-                self.stats.deletes_out += 1;
-                true
-            }
-            Section::Create => {
-                self.stats.creates_in += 1;
-                let keep = self.matches(kind);
-                self.stats.creates_out += u64::from(keep);
-                keep
-            }
-            Section::Modify => {
-                self.stats.modifies_in += 1;
-                let keep = self.matches(kind);
-                self.stats.modifies_out += u64::from(keep);
-                keep
-            }
-        };
-        if keep {
-            let writer = self
-                .groups
-                .get_mut(group_index(action, kind))
-                .ok_or_else(|| crate::Error::internal("tags-filter OSC: no group writer"))?;
-            self.element.write(writer, kind)?;
-        }
-        Ok(())
-    }
-}
-
-impl FilterBytes<'_> {
-    /// [`matches_any`] over the element's tags as read.
-    fn matches(&self, kind: ElementKind) -> bool {
-        self.element.tag_pairs().any(|(key, value)| {
-            self.expressions
-                .iter()
-                .any(|expr| expr.type_filter.admits(kind) && tag_matches(&expr.matcher, key, value))
-        })
-    }
-}
-
-fn write_groups(
-    output: &crate::output::BoundOutput,
     is_gz: bool,
-    batches: &[FilteredBatch],
-) -> Result<()> {
-    let out = output.writer()?;
-    let sink = if is_gz {
-        OscByteSink::Gz(Box::new(std::io::BufWriter::with_capacity(
-            crate::tunables::OSC_GZIP_WRITE_BUFFER,
-            GzEncoder::new(out, flate2::Compression::fast()),
-        )))
-    } else {
-        OscByteSink::Plain(out)
+    expressions: &[Expression],
+) -> Result<(Vec<u8>, TagsFilterOscStats)> {
+    let mut stats = TagsFilterOscStats::default();
+    let mut keep = |action: Section, kind: ElementKind, element: &ElementBuf| {
+        let kept = action == Section::Delete || matches(expressions, kind, element);
+        stats.record(action, kept);
+        kept
     };
-    let mut writer = Writer::new_with_indent(sink, b' ', 2);
-    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
-    let mut root = BytesStart::new("osmChange");
-    root.push_attribute(("version", "0.6"));
-    writer.write_event(Event::Start(root))?;
-    for (a, action) in [Section::Create, Section::Modify, Section::Delete]
-        .into_iter()
-        .enumerate()
-    {
-        let range = a * 3..a * 3 + 3;
-        let present = batches
+    let bytes =
+        merge_changes::encode_batch_filtered(batch, path, is_gz, "tags-filter OSC", &mut keep)?;
+    Ok((bytes, stats))
+}
+
+/// Whether any of the element's tags, as read, matches an expression that
+/// admits its kind.
+fn matches(expressions: &[Expression], kind: ElementKind, element: &ElementBuf) -> bool {
+    element.tag_pairs().any(|(key, value)| {
+        expressions
             .iter()
-            .any(|b| b.groups[range.clone()].iter().any(|g| !g.is_empty()));
-        if !present {
-            continue;
-        }
-        writer.write_event(Event::Start(BytesStart::new(action.tag())))?;
-        // Raw bytes: a rendered element leaves the indent state as it found
-        // it, so the closing tag indents as after event-by-event writing.
-        for g in range {
-            for b in batches {
-                std::io::Write::write_all(writer.get_mut(), &b.groups[g])?;
-            }
-        }
-        writer.write_event(Event::End(BytesEnd::new(action.tag())))?;
-    }
-    writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
-    match writer.into_inner() {
-        OscByteSink::Gz(buffered) => buffered
-            .into_inner()
-            .map_err(|e| crate::Error::from(e.into_error()))?
-            .finish()?
-            .finish(),
-        OscByteSink::Plain(out) => out.finish(),
-    }
+            .any(|expr| expr.type_filter.admits(kind) && tag_matches(&expr.matcher, key, value))
+    })
 }
 
 #[cfg(test)]
@@ -505,11 +356,6 @@ impl OscSink for FilterSink<'_> {
         // it. Dropping it here is how this filter used to turn a
         // metadata-bearing change stream into an anonymous one.
         let metadata = parse_owned_metadata(e)?;
-        match action {
-            Section::Create => self.stats.creates_in += 1,
-            Section::Modify => self.stats.modifies_in += 1,
-            Section::Delete => self.stats.deletes_in += 1,
-        }
 
         let mut cur = CurrentElem::new(kind, id, metadata);
         if kind == ElementKind::Node {
@@ -578,103 +424,46 @@ fn finalize_current(
     };
     // Every delete is kept, body and all; a create or modify only when a
     // tag matches.
-    if section == Section::Delete {
-        stats.deletes_out += 1;
-        match cur.kind {
-            ElementKind::Node => filtered.delete_nodes.push(OwnedNode {
-                id: cur.id,
-                location: cur.location,
-                tags: cur.tags,
-                metadata: cur.metadata,
-            }),
-            ElementKind::Way => filtered.delete_ways.push(OwnedWay {
-                id: cur.id,
-                tags: cur.tags,
-                refs: cur.refs,
-                metadata: cur.metadata,
-            }),
-            ElementKind::Relation => filtered.delete_relations.push(OwnedRelation {
-                id: cur.id,
-                tags: cur.tags,
-                members: cur.members,
-                metadata: cur.metadata,
-            }),
-        }
+    let kept = section == Section::Delete || matches_any(expressions, &cur.tags, cur.kind);
+    stats.record(section, kept);
+    if !kept {
         return;
     }
-    if !matches_any(expressions, &cur.tags, cur.kind) {
-        return;
-    }
-
-    match (section, cur.kind) {
-        (Section::Create, ElementKind::Node) => {
-            stats.creates_out += 1;
-            filtered.create_nodes.push(OwnedNode {
-                id: cur.id,
-                location: cur.location,
-                tags: cur.tags,
-                metadata: cur.metadata,
-            });
-        }
-        (Section::Create, ElementKind::Way) => {
-            stats.creates_out += 1;
-            filtered.create_ways.push(OwnedWay {
-                id: cur.id,
-                tags: cur.tags,
-                refs: cur.refs,
-                metadata: cur.metadata,
-            });
-        }
-        (Section::Create, ElementKind::Relation) => {
-            stats.creates_out += 1;
-            filtered.create_relations.push(OwnedRelation {
-                id: cur.id,
-                tags: cur.tags,
-                members: cur.members,
-                metadata: cur.metadata,
-            });
-        }
-        (Section::Modify, ElementKind::Node) => {
-            stats.modifies_out += 1;
-            filtered.modify_nodes.push(OwnedNode {
-                id: cur.id,
-                location: cur.location,
-                tags: cur.tags,
-                metadata: cur.metadata,
-            });
-        }
-        (Section::Modify, ElementKind::Way) => {
-            stats.modifies_out += 1;
-            filtered.modify_ways.push(OwnedWay {
-                id: cur.id,
-                tags: cur.tags,
-                refs: cur.refs,
-                metadata: cur.metadata,
-            });
-        }
-        (Section::Modify, ElementKind::Relation) => {
-            stats.modifies_out += 1;
-            filtered.modify_relations.push(OwnedRelation {
-                id: cur.id,
-                tags: cur.tags,
-                members: cur.members,
-                metadata: cur.metadata,
-            });
-        }
-        _ => {}
-    }
+    let element = match cur.kind {
+        ElementKind::Node => KeptElement::Node(OwnedNode {
+            id: cur.id,
+            location: cur.location,
+            tags: cur.tags,
+            metadata: cur.metadata,
+        }),
+        ElementKind::Way => KeptElement::Way(OwnedWay {
+            id: cur.id,
+            tags: cur.tags,
+            refs: cur.refs,
+            metadata: cur.metadata,
+        }),
+        ElementKind::Relation => KeptElement::Relation(OwnedRelation {
+            id: cur.id,
+            tags: cur.tags,
+            members: cur.members,
+            metadata: cur.metadata,
+        }),
+    };
+    filtered.push((section, element));
 }
 
+/// The owned writer: one document, the kept changes in input order, an
+/// action section opened at each change of action.
 #[cfg(test)]
 fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOsc) -> Result<()> {
     // Framing follows the output name, the rule every OSC producer shares
     // (`crate::osc::output_is_gzip`); the name was vetted before any work.
     let out = output.writer()?;
     let sink = if crate::osc::output_is_gzip(output.destination())? {
-        OscByteSink::Gz(Box::new(std::io::BufWriter::with_capacity(
-            crate::tunables::OSC_GZIP_WRITE_BUFFER,
-            GzEncoder::new(out, flate2::Compression::fast()),
-        )))
+        OscByteSink::Gz(Box::new(std::io::BufWriter::new(GzEncoder::new(
+            out,
+            flate2::Compression::fast(),
+        ))))
     } else {
         OscByteSink::Plain(out)
     };
@@ -685,55 +474,23 @@ fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOs
     root.push_attribute(("version", "0.6"));
     writer.write_event(Event::Start(root))?;
 
-    if !filtered.create_nodes.is_empty()
-        || !filtered.create_ways.is_empty()
-        || !filtered.create_relations.is_empty()
-    {
-        writer.write_event(Event::Start(BytesStart::new("create")))?;
-        for node in &filtered.create_nodes {
-            write_node_xml(&mut writer, node)?;
+    let mut open: Option<Section> = None;
+    for (section, element) in filtered {
+        if open != Some(*section) {
+            if let Some(prev) = open {
+                writer.write_event(Event::End(BytesEnd::new(prev.tag())))?;
+            }
+            writer.write_event(Event::Start(BytesStart::new(section.tag())))?;
+            open = Some(*section);
         }
-        for way in &filtered.create_ways {
-            write_way_xml(&mut writer, way)?;
+        match element {
+            KeptElement::Node(node) => write_node_xml(&mut writer, node)?,
+            KeptElement::Way(way) => write_way_xml(&mut writer, way)?,
+            KeptElement::Relation(rel) => write_relation_xml(&mut writer, rel)?,
         }
-        for rel in &filtered.create_relations {
-            write_relation_xml(&mut writer, rel)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("create")))?;
     }
-
-    if !filtered.modify_nodes.is_empty()
-        || !filtered.modify_ways.is_empty()
-        || !filtered.modify_relations.is_empty()
-    {
-        writer.write_event(Event::Start(BytesStart::new("modify")))?;
-        for node in &filtered.modify_nodes {
-            write_node_xml(&mut writer, node)?;
-        }
-        for way in &filtered.modify_ways {
-            write_way_xml(&mut writer, way)?;
-        }
-        for rel in &filtered.modify_relations {
-            write_relation_xml(&mut writer, rel)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("modify")))?;
-    }
-
-    if !filtered.delete_nodes.is_empty()
-        || !filtered.delete_ways.is_empty()
-        || !filtered.delete_relations.is_empty()
-    {
-        writer.write_event(Event::Start(BytesStart::new("delete")))?;
-        for node in &filtered.delete_nodes {
-            write_node_xml(&mut writer, node)?;
-        }
-        for way in &filtered.delete_ways {
-            write_way_xml(&mut writer, way)?;
-        }
-        for rel in &filtered.delete_relations {
-            write_relation_xml(&mut writer, rel)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("delete")))?;
+    if let Some(prev) = open {
+        writer.write_event(Event::End(BytesEnd::new(prev.tag())))?;
     }
 
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
@@ -749,15 +506,17 @@ fn write_filtered_osc(output: &crate::output::BoundOutput, filtered: &FilteredOs
     }
 }
 
-/// The OSC document's byte sink: gzip-framed or plain, per the output name.
+/// The owned writer's byte sink: gzip-framed or plain, per the output name.
 /// The gzip side is buffered in front of the encoder: the XML writer emits
 /// many tiny writes per element, and deflate run once per write was most of
 /// such a writer's time.
+#[cfg(test)]
 enum OscByteSink {
     Gz(Box<std::io::BufWriter<GzEncoder<crate::output::OutputWriter>>>),
     Plain(crate::output::OutputWriter),
 }
 
+#[cfg(test)]
 impl std::io::Write for OscByteSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
@@ -952,20 +711,167 @@ mod tests {
             vec!["nothing=here".to_string()],
         ] {
             let plain = dir.path().join("out.osc");
-            let a = owned(&input, &plain, &exprs);
+            let (a_plain, a_stats) = owned(&input, &plain, &exprs);
+            let a_xml = normal_form(&String::from_utf8(a_plain).unwrap());
             let gz = dir.path().join("out.osc.gz");
-            let (a_bytes, a_stats) = owned(&input, &gz, &exprs);
+            let (a_gz, _) = owned(&input, &gz, &exprs);
+            assert_eq!(a_xml, normal_form(&decompress(&a_gz)), "{exprs:?}");
+            let mut first: Option<(Vec<u8>, Vec<u8>)> = None;
             for schedule in SCHEDULES {
-                let b = rendered(&input, &plain, &exprs, schedule);
-                assert!(a == b, "{exprs:?} {schedule:?}");
-                let (b_bytes, b_stats) = rendered(&input, &gz, &exprs, schedule);
+                let (b_plain, b_stats) = rendered(&input, &plain, &exprs, schedule);
                 assert_eq!(a_stats, b_stats, "{exprs:?} {schedule:?}");
+                let b_xml = normal_form(&String::from_utf8(b_plain.clone()).unwrap());
+                assert!(a_xml == b_xml, "{exprs:?} {schedule:?}");
+                let (b_gz, _) = rendered(&input, &gz, &exprs, schedule);
                 assert!(
-                    decompress(&a_bytes) == decompress(&b_bytes),
+                    a_xml == normal_form(&decompress(&b_gz)),
                     "{exprs:?} {schedule:?}"
                 );
+                // The bytes, gzip members included, do not depend on the
+                // schedule.
+                match &first {
+                    None => first = Some((b_plain, b_gz)),
+                    Some((p, g)) => {
+                        assert!(*p == b_plain && *g == b_gz, "{exprs:?} {schedule:?}");
+                    }
+                }
             }
         }
+    }
+
+    /// The document with inter-element whitespace removed and each run of
+    /// same-action sections joined into one: what is left is the changes,
+    /// their actions and their order.
+    fn normal_form(xml: &str) -> String {
+        let mut out = String::new();
+        let mut gap = String::new();
+        let mut in_tag = false;
+        for c in xml.chars() {
+            if in_tag {
+                out.push(c);
+                in_tag = c != '>';
+            } else if c == '<' {
+                gap.clear();
+                out.push(c);
+                in_tag = true;
+            } else {
+                gap.push(c);
+                assert!(c.is_whitespace(), "text outside a tag: {gap:?}");
+            }
+        }
+        for action in ["create", "modify", "delete"] {
+            out = out.replace(&format!("</{action}><{action}>"), "");
+        }
+        out
+    }
+
+    /// The ids and actions of a document's changes, in order.
+    fn changes(xml: &str) -> Vec<String> {
+        let xml = normal_form(xml);
+        let mut action = "";
+        let mut out = Vec::new();
+        for piece in xml.split('<').skip(1) {
+            let name = piece.split([' ', '>', '/']).next().unwrap_or("");
+            match name {
+                "create" | "modify" | "delete" => action = name,
+                "node" | "way" | "relation" => {
+                    let id = piece
+                        .split("id=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    let version = piece
+                        .split("version=\"")
+                        .nth(1)
+                        .map_or("-", |v| v.split('"').next().unwrap());
+                    out.push(format!("{action} {name} {id} v{version}"));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A delete followed by a matching re-create of the same object keeps
+    /// that order, at the same version and at a higher one, across batch
+    /// boundaries with a batch that keeps nothing in between, and an
+    /// interleaving of kinds and actions keeps its encounter order.
+    #[test]
+    fn kept_changes_keep_their_input_order() {
+        let dir = crate::path_guard::tests::scratch();
+        let mut body = String::from(
+            "<osmChange version=\"0.6\">\
+             <delete><node id=\"1\" version=\"3\" lat=\"1\" lon=\"2\"/>\
+             <node id=\"2\" version=\"3\" lat=\"1\" lon=\"2\"/></delete>\
+             <create><way id=\"9\" version=\"1\"><nd ref=\"1\"/><tag k=\"highway\" v=\"x\"/></way></create>",
+        );
+        // Enough dropped creates to fill whole batches at the test batching.
+        body.push_str("<create>");
+        for k in 100..200 {
+            body.push_str(&format!(
+                "<node id=\"{k}\" version=\"1\" lat=\"1\" lon=\"2\"><tag k=\"name\" v=\"n\"/></node>"
+            ));
+        }
+        body.push_str("</create>");
+        body.push_str(
+            "<create><node id=\"1\" version=\"3\" lat=\"1\" lon=\"2\"><tag k=\"highway\" v=\"x\"/></node>\
+             <node id=\"2\" version=\"4\" lat=\"1\" lon=\"2\"><tag k=\"highway\" v=\"x\"/></node></create>\
+             <modify><way id=\"9\" version=\"2\"><nd ref=\"1\"/><tag k=\"highway\" v=\"y\"/></way></modify>\
+             <delete><relation id=\"5\" version=\"2\"/></delete>\
+             <modify><node id=\"1\" version=\"4\" lat=\"1\" lon=\"2\"><tag k=\"highway\" v=\"x\"/></node></modify>\
+             </osmChange>",
+        );
+        let input = dir.path().join("in.osc");
+        std::fs::write(&input, body).unwrap();
+        let exprs = ["highway".to_string()];
+        let expected = [
+            "delete node 1 v3",
+            "delete node 2 v3",
+            "create way 9 v1",
+            "create node 1 v3",
+            "create node 2 v4",
+            "modify way 9 v2",
+            "delete relation 5 v2",
+            "modify node 1 v4",
+        ];
+        let plain = dir.path().join("out.osc");
+        let gz = dir.path().join("out.osc.gz");
+        for schedule in SCHEDULES {
+            let stats = filter_with(&input, &plain, &exprs, schedule).unwrap();
+            let xml = String::from_utf8(std::fs::read(&plain).unwrap()).unwrap();
+            assert_eq!(changes(&xml), expected, "{schedule:?}");
+            assert_eq!(
+                (stats.creates_in, stats.creates_out, stats.deletes_in),
+                (103, 3, 3),
+                "{schedule:?}"
+            );
+            filter_with(&input, &gz, &exprs, schedule).unwrap();
+            let xml = decompress(&std::fs::read(&gz).unwrap());
+            assert_eq!(changes(&xml), expected, "{schedule:?}");
+        }
+    }
+
+    /// Applying the filtered stream leaves the re-created object alive, as
+    /// applying the unfiltered one does: the overlay sees the delete first.
+    #[test]
+    fn a_same_version_recreate_survives_the_filter() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("in.osc");
+        std::fs::write(
+            &input,
+            "<osmChange version=\"0.6\">\
+             <delete><node id=\"1\" version=\"3\" lat=\"1\" lon=\"2\"/></delete>\
+             <create><node id=\"1\" version=\"3\" lat=\"1\" lon=\"2\"><tag k=\"highway\" v=\"x\"/></node></create>\
+             </osmChange>",
+        )
+        .unwrap();
+        let out = dir.path().join("out.osc");
+        filter_with(&input, &out, &["highway".to_string()], Schedule::Fixed(2)).unwrap();
+        let diff = crate::osc::parse::parse_osc_file(&out).unwrap();
+        assert!(diff.has_node(1), "the re-created node is live");
+        assert!(!diff.is_deleted(ElementKind::Node, 1), "and not deleted");
     }
 
     /// Many batches of well-formed elements, then `tail`.

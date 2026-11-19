@@ -668,8 +668,8 @@ non-simplifying runs with jobs other than 1.
 OSC tags-filter runs four cases: `highway=primary`, `amenity=restaurant`,
 `w/highway=primary`, and `n/amenity r/type=route`. Osmium filters the input
 OPL with `-R`; the expected listing consumes matches in lockstep, keeping
-matching creates/modifies and every delete. Output groups actions then kinds,
-keeping each kind's input order. PASS counts selected changes and bodied
+matching creates/modifies and every delete. Output keeps the kept changes in
+input order, each under its input action. PASS counts selected changes and bodied
 deletes, without claiming section-boundary identity.
 
 

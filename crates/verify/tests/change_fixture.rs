@@ -23,7 +23,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         false,
         cache,
     );
-    for fault in ["", "", "drop-delete", "serial"] {
+    for fault in ["", "", "drop-delete", "serial", "grouped"] {
         h.run = run::Run::create(&dir, exe, true).unwrap();
         h.run.watch(&input).unwrap();
         std::fs::write(dir.join("fault"), fault).unwrap();
@@ -97,11 +97,14 @@ pub fn tool(args: &[OsString]) -> i32 {
             } else {
                 ""
             };
-            std::fs::write(
-                output,
-                format!("{HEAD}{create}{delete}</osmChange>{suffix}"),
-            )
-            .unwrap();
+            // The input is the delete then the create; a filter that
+            // regroups by action writes them the other way round.
+            let body = if fault == "grouped" {
+                format!("{create}{delete}")
+            } else {
+                format!("{delete}{create}")
+            };
+            std::fs::write(output, format!("{HEAD}{body}</osmChange>{suffix}")).unwrap();
         } else {
             let lines = format!(
                 "{}{}",

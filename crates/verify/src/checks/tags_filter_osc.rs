@@ -12,10 +12,11 @@
 //! create or modify is kept exactly when it is osmium's next line (identical
 //! lines get identical decisions, so taking the first match is exact),
 //! every delete is kept, and osmium's output must be used up. pbfhogg's
-//! output must then be those changes in one create, one modify and one
-//! delete section, each holding its node, way and relation changes in that
-//! order, each kind in input order, compared record for record with a
-//! delete held to its input body, as pbfhogg and osmium write it. The
+//! output must then be those changes in input order, each with its input
+//! action, compared record for record with a delete held to its input body,
+//! as pbfhogg and osmium write it. Order is the claim: an apply lets the
+//! later of two equal-version changes win, so a regrouped stream can change
+//! an object's final state. The
 //! cases are the given change file's, so how many bodied deletes are
 //! checked depends on it. A
 //! `--jobs 1` run must write the same content as the automatic one, which
@@ -53,15 +54,7 @@ struct Kept {
 
 /// Build the expected listing of one case at `dir/expected.changes`.
 fn expected(input: &Path, osmium: &Path, dir: &Path, kept: &mut Kept) -> Result<(), Error> {
-    let mut groups = Vec::new();
-    let mut writers = Vec::new();
-    for action in ["create", "modify", "delete"] {
-        for kind in ["node", "way", "relation"] {
-            let path = dir.join(format!("expected-{action}-{kind}.changes"));
-            writers.push(BufWriter::new(File::create(&path)?));
-            groups.push(path);
-        }
-    }
+    let mut writer = BufWriter::new(File::create(dir.join("expected.changes"))?);
     let mut reader = ListingReader::open(input)?;
     let mut matches = BufReader::new(File::open(osmium)?);
     let mut next = String::new();
@@ -99,12 +92,7 @@ fn expected(input: &Path, osmium: &Path, dir: &Path, kept: &mut Kept) -> Result<
             }
         };
         if keep {
-            let action = match change.action {
-                OscAction::Create => 0,
-                OscAction::Modify => 1,
-                OscAction::Delete => 2,
-            };
-            writers[action * 3 + change.kind.index()].write_all(change.record().as_bytes())?;
+            writer.write_all(change.record().as_bytes())?;
         }
     }
     if !next.is_empty() {
@@ -114,11 +102,8 @@ fn expected(input: &Path, osmium: &Path, dir: &Path, kept: &mut Kept) -> Result<
             next.trim_end()
         )));
     }
-    for mut writer in writers {
-        writer.flush()?;
-    }
-    let groups: Vec<&Path> = groups.iter().map(std::path::PathBuf::as_path).collect();
-    listing::concatenate(&groups, &dir.join("expected.changes"))
+    writer.flush()?;
+    Ok(())
 }
 
 /// Cross-validate `pbfhogg tags-filter --input-kind osc` on the change file
@@ -190,8 +175,8 @@ pub fn run(harness: &mut Harness, osc: &Path) -> Result<Option<String>, Error> {
         .join(", ");
     Ok(Some(format!(
         "for {cases}: every delete kept and each create and modify kept exactly when osmium \
-         tags-filter -R keeps it from osmium's reading of the change file, in create, modify \
-         and delete sections of node, way and relation changes in input order, comparing action \
+         tags-filter -R keeps it from osmium's reading of the change file, every kept change \
+         in input order, comparing action \
          labels, metadata attributes (an empty one held to be omitted) and osmium's decoding \
          record for record, a delete held to its input body, section boundaries not compared, \
          --jobs 1 as the automatic workers; over the cases {} creates, {} modifies and {} \
@@ -209,7 +194,7 @@ mod tests {
     use crate::verify_change_listing::Change;
 
     #[test]
-    fn osc_filter_expected_keeps_deletes_and_groups_selected_changes() {
+    fn osc_filter_expected_keeps_deletes_and_selected_changes_in_input_order() {
         let scratch = pbfhogg_test_scratch::scratch();
         let dir = scratch.path();
         let changes = [
@@ -269,7 +254,7 @@ mod tests {
         let actual = std::fs::read_to_string(dir.join("expected.changes")).unwrap();
         assert_eq!(
             actual,
-            [2, 0, 1, 4]
+            [0, 1, 2, 4]
                 .iter()
                 .map(|i| changes[*i].record())
                 .collect::<String>()

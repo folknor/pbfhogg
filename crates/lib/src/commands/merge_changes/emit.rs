@@ -233,8 +233,13 @@ pub(super) struct ByteSink<'w> {
     /// When set, every written element's identity, version claim and byte
     /// range in the writer's buffer (see [`Element`]).
     index: Option<&'w mut Vec<Element>>,
+    /// When set, decides per checked change whether it is written.
+    keep: Option<KeepFn<'w>>,
     element: ElementBuf,
 }
+
+/// A [`ByteSink`]'s write predicate, given each change after it is checked.
+type KeepFn<'w> = &'w mut dyn FnMut(Action, ElementKind, &ElementBuf) -> bool;
 
 impl<'w> ByteSink<'w> {
     pub(super) fn new(
@@ -247,7 +252,27 @@ impl<'w> ByteSink<'w> {
             open_action,
             count,
             index: None,
+            keep: None,
             element: ElementBuf::new("merge-changes"),
+        }
+    }
+
+    /// A sink that writes only the changes `keep` admits, in input order;
+    /// every change is checked first. `owner` names the command in refusals.
+    pub(super) fn filtered(
+        writer: &'w mut OscWriter,
+        open_action: &'w mut Option<Action>,
+        count: &'w mut u64,
+        owner: &'static str,
+        keep: KeepFn<'w>,
+    ) -> Self {
+        Self {
+            writer,
+            open_action,
+            count,
+            index: None,
+            keep: Some(keep),
+            element: ElementBuf::new(owner),
         }
     }
 
@@ -294,6 +319,11 @@ impl OscSink for ByteSink<'_> {
         let Some((action, kind)) = self.element.finish() else {
             return Ok(());
         };
+        if let Some(keep) = self.keep.as_deref_mut()
+            && !keep(action, kind, &self.element)
+        {
+            return Ok(());
+        }
         if *self.open_action != Some(action) {
             if let Some(prev) = self.open_action.take() {
                 self.writer

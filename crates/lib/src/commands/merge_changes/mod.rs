@@ -623,7 +623,9 @@ fn write_streaming(
     out.write_all(&prelude)?;
     // The ordered drain overlaps this span; DRAIN below is the postlude.
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_START");
-    let count = stream::run(plan, scratch, &mut out)?;
+    let encode =
+        |batch: &crate::osc::xml_parse::LexBatch, path: &Path| encode_batch(batch, path, is_gz);
+    let count: u64 = stream::run(plan, scratch, &mut out, &encode)?;
     cancel.marker("MERGECHANGES_PARALLEL_EMIT_END");
     cancel.marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
@@ -659,11 +661,37 @@ fn encode_batch(
     Ok((bytes, count))
 }
 
+/// [`encode_batch`] writing only the changes `keep` admits, in input order,
+/// each action section opened when a kept change needs it. Every change is
+/// checked whether kept or not. A batch that keeps nothing is empty bytes,
+/// not an empty gzip member. `owner` names the command in refusals.
+pub(crate) fn encode_batch_filtered(
+    batch: &crate::osc::xml_parse::LexBatch,
+    path: &Path,
+    is_gz: bool,
+    owner: &'static str,
+    keep: &mut dyn FnMut(Action, crate::ElementKind, &emit::ElementBuf) -> bool,
+) -> crate::Result<Vec<u8>> {
+    let mut writer = OscWriter::new_buf(is_gz);
+    let mut open_action: Option<Action> = None;
+    let mut count = 0u64;
+    {
+        let mut sink =
+            emit::ByteSink::filtered(&mut writer, &mut open_action, &mut count, owner, keep);
+        batch.replay(&mut sink, path)?;
+    }
+    let Some(prev) = open_action else {
+        return Ok(Vec::new());
+    };
+    writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
+    writer.into_inner()
+}
+
 /// Pre-build the XML prelude (`<?xml ?><osmChange version="0.6">`) as
 /// a self-contained gzip member (or plain bytes if `is_gz` is false).
 /// Used by the N > 1 parallel-drain path so the main thread can write
 /// it directly to the output file before concatenating worker chunks.
-fn build_prelude_bytes(is_gz: bool) -> Result<Vec<u8>> {
+pub(crate) fn build_prelude_bytes(is_gz: bool) -> Result<Vec<u8>> {
     let mut writer = OscWriter::new_buf(is_gz);
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     let mut root = BytesStart::new("osmChange");
@@ -675,7 +703,7 @@ fn build_prelude_bytes(is_gz: bool) -> Result<Vec<u8>> {
 /// Pre-build the XML postlude (`</osmChange>`) as a self-contained
 /// gzip member (or plain bytes if `is_gz` is false). Counterpart to
 /// `build_prelude_bytes`.
-fn build_postlude_bytes(is_gz: bool) -> Result<Vec<u8>> {
+pub(crate) fn build_postlude_bytes(is_gz: bool) -> Result<Vec<u8>> {
     let mut writer = OscWriter::new_buf(is_gz);
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
     writer.into_inner()

@@ -26,17 +26,6 @@ renumber (BUG-020), degrade drop counting (BUG-022) and cat decode counters
 (BUG-023). Entries are in no
 order of importance.
 
-## CMD-002 - OSC tags-filter output can reverse an object's final state
-
-Reported by: osc-parsing [P1].
-
-`write_groups` (`tags_filter/osc.rs`) emits all creates, then all modifies,
-then all deletes, whatever the input order. A delete followed by a matching
-re-create at the same version becomes a create followed by a delete. Both
-changes pass the overlay's version gate, so applying the filtered stream
-deletes the object. This breaks the meaning of filtering a change stream. The
-filter's output ordering is what is wrong.
-
 ## CMD-003 - parse_rfc3339_utc accepts malformed signed components
 
 Reported by: osc-parsing [P2], passthrough-rewrite.
@@ -541,3 +530,18 @@ refusal only at a later write or the final flush. In external ALTW stage 4
 can therefore sit in the router's readiness wait (stage 3 still making
 progress) for a writer that is already dead. A delay, not a deadlock. Init
 success should wait until the pool's workers are all born.
+
+## CMD-046 - An apply reads `visible` raw where re-emitters decode it
+
+Reported by: the OSC tags-filter ordering spar (2026-11-19), from source;
+not reproduced.
+
+`arena_meta` (`osc/xml_parse.rs`) marks an element hidden only when the raw
+attribute bytes are exactly `false`, while the re-emitting sinks
+(merge-changes, OSC tags-filter) normalize the attribute first and write the
+decoded text. A create with `visible="&#102;alse"` is therefore visible when
+the input is applied directly and hidden when it is applied after passing
+through either re-emitter, so the same change stream gives two final states.
+Same class as CMD-004 (native parsing before XML normalization). Either the
+overlay normalizes `visible` before the test, or the policy is recorded as a
+deviation.

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use pbfhogg::tags_filter::osc::tags_filter_osc;
 
@@ -19,9 +19,10 @@ fn write_osc_gz(path: &std::path::Path, xml: &str) {
     enc.finish().expect("finish gz");
 }
 
+/// The output is concatenated gzip members, one per batch.
 fn read_osc_gz(path: &std::path::Path) -> String {
     let file = File::open(path).expect("open osc file");
-    let mut dec = GzDecoder::new(file);
+    let mut dec = MultiGzDecoder::new(file);
     let mut xml = String::new();
     dec.read_to_string(&mut xml).expect("read osc");
     xml

@@ -1,5 +1,30 @@
 # Tags Filter
 
+### OSC tags-filter streams in input order (bygg, 2026-11-19, against `50a00440`)
+
+The change: OSC mode runs on merge-changes' ordered streaming drain
+instead of collecting nine (action, kind) groups and writing them through
+one serial gzip encoder. Kept changes stay in input order, each batch is
+its own gzip member deflated on the workers, and nothing of the output is
+retained.
+
+Planet OSC 4913, `tag-select --input-kind osc --input 4913` (default
+`w/highway=primary`), `--iterations 1`, after `fstrim`. Baseline built with
+`--commit HEAD` at `50a00440`, variant measured uncommitted. Order A B A B A B.
+
+| arm | UUID | wall (ms) |
+|---|---|---|
+| baseline | `79f32ae0` | 1723.7 |
+| streamed | `1f27e1f3` | 1599.0 |
+| baseline | `34d508f8` | 1836.2 |
+| streamed | `25f49e08` | 1722.7 |
+| baseline | `4f28c8df` | 1730.5 |
+| streamed | `5219f691` | 1607.8 |
+
+Streamed median 1607.8 ms against 1730.5 ms, -7 %, faster in every pair.
+Peak RSS in the `TAGSFILTEROSC` span (sidecar compare `4f28c8df` against
+`5219f691`): 161460 kB to 21304 kB.
+
 ### Signed reference inclusion (bygg, 2026-11-18, against `d4e78733`)
 
 The change: the two-pass path inserts every matched ID, way ref and

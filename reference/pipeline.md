@@ -661,12 +661,17 @@ bytes, without building owned elements.
   survivor ranges back, or an index-only pass followed by a re-parse into
   key-range buckets; both add a full payload write and read.
 
-`tags-filter --input-kind osc` runs on the same readers through
-`stream::collect`: workers render kept elements into nine (action, kind)
-groups, concatenated in input order into one document. Its one reader
-frames the document; `Fixed(n)` runs the workers on a pool of `n` built
-for the call and joined before the document is written, `Auto` on the
-host's executor.
+`tags-filter --input-kind osc` is the default streaming merge of one input
+with a keep predicate: `stream::run`'s workers check every element of a
+batch and write the kept ones in input order, each batch its own gzip
+member or plain fragment with its own action sections, drained in order to
+the output as they finish. Input order is required, not incidental: an
+apply lets the later of two equal-version changes win, so regrouping by
+action reverses a delete and a same-version re-create. Memory is the
+readers' in-flight ledger; nothing of the output is retained. Its one
+reader frames the document; the workers run on the host's executor, at
+most `n` at once under `Fixed(n)`, unbounded under `Auto`. One input never
+spills, so the run has no scratch.
 
 ---
 

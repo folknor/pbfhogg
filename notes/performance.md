@@ -1344,24 +1344,20 @@ per-nesting-level rescan and repeated collection of already reached members,
 pointing to `getid` as the existing explicit worklist; it labels this an
 unmeasured optimization, not a correctness finding.
 
-## PERF-044 - tags-filter OSC output collects everything then gzips serially
+## PERF-044 - tags-filter OSC formats every element before deciding to keep it
 
 Reported by: tags, osc.
 
-Mechanism: `tags_filter_osc_to` collects every batch's nine rendered groups
-before writing; `write_groups` runs one `GzEncoder`; `ElementBuf` formats an
-element before `FilterBytes::matches` decides.
+OSC tags-filter now streams on merge-changes' ordered drain with one gzip
+member per batch, so output is neither collected nor deflated serially. What
+remains: `ElementBuf` (`merge_changes/emit.rs`) formats an element's
+attributes and children as it reads them, before the keep predicate given to
+`ByteSink::filtered` decides, so a dropped create or modify pays the
+rendering. Redesign: check every element (validation must not be skipped for
+a dropped one) but render only survivors. Single-member gzip input remains a
+serial inflate.
 
-Redesign: validate and select first, render survivors only (deletes always
-survive); compress group chunks on workers; ordered streams per action and kind
-group, stream the earliest writable group and spool later ones bounded; reuse
-`merge_changes::OscWriter` members and its spill coordinator.
-
-Risks: canonical XML order and escaping, late-input failures, publish only on
-success, compression ratio of independent members, single-member gzip input
-remains a serial inflate.
-
-Kind: high conviction for large output.
+Kind: unmeasured, moderate conviction.
 
 ## PERF-045 - Checks re-decode payload per check
 

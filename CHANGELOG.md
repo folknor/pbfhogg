@@ -4,6 +4,18 @@
 
 ### Breaking
 
+- **`tags-filter --input-kind osc` writes the kept changes in input
+  order.** It used to write every create, then every modify, then every
+  delete, so a delete followed by a re-create of the same object at the
+  same version came out the other way round and applying the filtered
+  file deleted the object; a delete followed by a higher-version create
+  was refused by `apply-changes` as a version regression. Output now
+  matches `merge-changes` without `--simplify`: sections follow the
+  input's actions and may repeat, and a `.osc.gz` output is several
+  concatenated gzip members (one per batch) rather than one; `gzip -d`
+  and osmium read it whole, but a reader that stops after the first
+  member (flate2's `GzDecoder`) sees only the document's start. Memory no
+  longer grows with the kept output.
 - **Geocode index format is now 7; existing indexes must be rebuilt.**
   The last release wrote format 5. Version 6 replaced the admin vertex
   budget with `--admin-tolerance`, and version 7 records the input PBF's

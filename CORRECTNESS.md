@@ -564,6 +564,12 @@ Every OSC producer (`merge-changes`, `tags-filter --input-kind osc`,
 `pbfhogg::osc::output_is_gzip`: `.osc` is plain, `.osc.gz` is gzip, anything
 else is refused before any work. Changing that rule changes the output
 transport contract.
+A re-emitter that keeps a change stream (default `merge-changes`,
+`tags-filter --input-kind osc`) writes the changes it keeps in input order.
+Apply admits an equal version and lets the later change win, so grouping by
+action would put a same-version re-create before the delete it follows and
+leave the object deleted. Only `--simplify`, which keeps one change per
+object, may regroup.
 Integer decimicrodegree conversion for diff text and OSC output deliberately
 divides by `1e7`; multiplication can change rounding and therefore output bytes.
 `diff --format osc -q` without `-o` deliberately errors with

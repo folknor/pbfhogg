@@ -433,8 +433,27 @@ where
     }
 }
 
-/// Run the merge, writing every member in input and batch order to `out`.
-/// Returns the number of changes written.
+/// What one encoded batch reports beside its bytes, summed over the run.
+/// Every accepted batch contributes exactly once, one that wrote nothing
+/// included.
+pub(crate) trait Tally: Default + Copy + Send + std::ops::AddAssign {
+    /// The change count `merge_changes_changes_per_osc` reports per input,
+    /// or `None` for an encoder whose tally is not merge's change count.
+    fn changes_per_osc(&self) -> Option<u64>;
+}
+
+impl Tally for u64 {
+    fn changes_per_osc(&self) -> Option<u64> {
+        Some(*self)
+    }
+}
+
+/// Run the stream, writing every batch's encoded bytes in input and batch
+/// order to `out`. Returns the summed tally of every batch.
+///
+/// `encode` renders one batch into a self-contained piece of the document
+/// (its own action sections, its own gzip member when compressed); an empty
+/// piece is written as nothing.
 ///
 /// `scratch` may be `None` exactly when [`super::stream_writes_scratch`] is
 /// false for this plan: with one input every member goes to the output, and
@@ -442,19 +461,25 @@ where
 /// is drained (a slot is reused only at completion, and the loop advances the
 /// head before it receives again), so no input is ever pending with a member
 /// in hand.
-pub(crate) fn run(
+pub(crate) fn run<T, E>(
     plan: &Plan<'_>,
     scratch: Option<&RunScratch>,
     out: &mut crate::output::OutputWriter,
-) -> crate::Result<u64> {
-    let is_gz = plan.is_gz;
-    let encode = move |batch: &LexBatch, path: &Path| super::encode_batch(batch, path, is_gz);
+    encode: &E,
+) -> crate::Result<T>
+where
+    T: Tally,
+    E: Fn(&LexBatch, &Path) -> crate::Result<(Vec<u8>, T)> + Sync,
+{
     let ledger = Ledger::new(plan.batching.inflight_bytes);
-    let (tx, rx) = std::sync::mpsc::channel::<Msg<(Vec<u8>, u64)>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Msg<(Vec<u8>, T)>>();
     let _wake = ledger.wake_on_cancel(plan.cancel);
     let ledger_ref = &ledger;
-    let encoder = Encoder::new(plan, ledger_ref, &encode);
+    let encoder = Encoder::new(plan, ledger_ref, encode);
     let encoder_ref = &encoder;
+    // The spill-first handshake waits for a later input to spill, which
+    // only a plan with more than one input can do.
+    let spills = plan.inputs.len() > 1;
     let result = plan.executor.scope(move |scope| {
         crate::threads::scope(plan.cancel, |threads| {
             let _stop = StopOnDrop::new(ledger_ref, plan.cancel);
@@ -462,7 +487,7 @@ pub(crate) fn run(
                 let tx = tx.clone();
                 threads
                     .spawn_named(format!("merge-read-{input}"), move || {
-                        read_input(input, plan, scope, encoder_ref, &tx, true);
+                        read_input(input, plan, scope, encoder_ref, &tx, spills);
                     })
                     .map(drop)
                     .map_err(|e| {
@@ -611,8 +636,8 @@ fn collect_results<T>(
 
 /// One reader thread's whole life. Always ends with exactly one terminal
 /// message, sent last, after which it does nothing that can block.
-/// `ordered` is true under [`run`]'s coordinator, the only one the
-/// `test-hooks` spill-first handshake applies to.
+/// `ordered` is true under [`run`]'s coordinator on a plan that can spill,
+/// the only case the `test-hooks` spill-first handshake applies to.
 fn read_input<'s, T, E>(
     input: usize,
     plan: &'s Plan<'s>,
@@ -690,31 +715,34 @@ enum Sink {
     Output,
 }
 
-struct InputState {
+struct InputState<T> {
     /// Finished members waiting for an earlier one of the same input.
-    waiting: BTreeMap<usize, (Vec<u8>, u64, usize)>,
+    waiting: BTreeMap<usize, (Vec<u8>, T, usize)>,
     /// The next sequence number to write.
     next: usize,
     /// The batch count, once the reader has finished.
     batches: Option<usize>,
-    changes: u64,
+    /// The tally of every member drained so far, spilled or written.
+    changes: T,
     sink: Sink,
     /// Reader finished and every member written; its reader slot is free.
     complete: bool,
 }
 
-struct Coordinator<'a, 'p> {
+struct Coordinator<'a, 'p, T> {
     plan: &'a Plan<'p>,
     /// `None` only on a plan that provably never spills; see [`run`].
     scratch: Option<&'a RunScratch>,
     ledger: &'a Ledger,
     out: &'a mut crate::output::OutputWriter,
-    states: Vec<InputState>,
+    states: Vec<InputState<T>>,
     head: usize,
-    total: u64,
+    /// The tallies of the inputs completed so far, each folded in once when
+    /// it stops being the head.
+    total: T,
 }
 
-impl<'a, 'p> Coordinator<'a, 'p> {
+impl<'a, 'p, T: Tally> Coordinator<'a, 'p, T> {
     fn new(
         plan: &'a Plan<'p>,
         scratch: Option<&'a RunScratch>,
@@ -726,7 +754,7 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                 waiting: BTreeMap::new(),
                 next: 0,
                 batches: None,
-                changes: 0,
+                changes: T::default(),
                 sink: if i == 0 { Sink::Output } else { Sink::Pending },
                 complete: false,
             })
@@ -738,15 +766,15 @@ impl<'a, 'p> Coordinator<'a, 'p> {
             out,
             states,
             head: 0,
-            total: 0,
+            total: T::default(),
         }
     }
 
     fn run(
         mut self,
-        rx: &Receiver<Msg<(Vec<u8>, u64)>>,
+        rx: &Receiver<Msg<(Vec<u8>, T)>>,
         spawn_reader: impl Fn(usize) -> crate::Result<()>,
-    ) -> crate::Result<u64> {
+    ) -> crate::Result<T> {
         let n = self.plan.inputs.len();
         let readers = self.plan.readers.clamp(1, n.max(1));
         let mut started = 0;
@@ -870,10 +898,7 @@ impl<'a, 'p> Coordinator<'a, 'p> {
                 state.sink = Sink::Spill(path, io::BufWriter::with_capacity(SPILL_CHUNK, file));
             }
             match &mut state.sink {
-                Sink::Output => {
-                    self.out.write_all(&bytes)?;
-                    self.total += changes;
-                }
+                Sink::Output => self.out.write_all(&bytes)?,
                 Sink::Spill(path, file) => {
                     file.write_all(&bytes).map_err(|e| spill_err(path, e))?;
                     #[cfg(pbfhogg_test_hooks)]
@@ -893,17 +918,20 @@ impl<'a, 'p> Coordinator<'a, 'p> {
     /// The head input is complete: report it, then make the next input the
     /// head, copying whatever it already spilled into the output.
     fn advance_head(&mut self) -> crate::Result<()> {
-        let done = &self.states[self.head];
-        self.plan
-            .cancel
-            .counter("merge_changes_changes_per_osc", done.changes);
+        let done = self.states[self.head].changes;
+        if let Some(changes) = done.changes_per_osc() {
+            self.plan
+                .cancel
+                .counter("merge_changes_changes_per_osc", changes);
+        }
+        // The completed input's whole tally, spilled members included,
+        // counted once here and nowhere else.
+        self.total += done;
         self.head += 1;
         let Some(state) = self.states.get_mut(self.head) else {
             return Ok(());
         };
         let sink = std::mem::replace(&mut state.sink, Sink::Output);
-        // Members already counted while spilling reach the output now.
-        self.total += state.changes;
         #[cfg(pbfhogg_test_hooks)]
         let copied = match &sink {
             Sink::Spill(..) => Some(true),

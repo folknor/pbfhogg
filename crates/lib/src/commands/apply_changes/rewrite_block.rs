@@ -2,6 +2,13 @@
 //! diff overlay element-by-element, interleaves inline upsert creates at
 //! their sorted positions, and frames each output block on the worker as it
 //! completes.
+//!
+//! What the rewrite writes, and in which order, is one iterator ([`Steps`]);
+//! how it is cut into blocks is the consumer's. The split exists so the
+//! output of a block that overflowed the PBF blob limit can be written again
+//! in smaller blocks (`overflow.rs`): the steps are a pure function of the
+//! block, the diff and the inline slice, so a second walk yields the same
+//! operations in the same order.
 
 use std::ops::Range;
 
@@ -10,10 +17,11 @@ use crate::blob_meta::BlobIndex;
 use crate::block_builder::BlockBuilder;
 use crate::osc::sorted::SortedDiff;
 use crate::writer::Compression;
-use crate::{Element, PrimitiveBlock};
+use crate::{BlockElementsIter, Element, PrimitiveBlock};
 
 use crate::commands::{
-    FramedBlocks, ensure_node_capacity_local, ensure_relation_capacity_local, flush_local,
+    BlockSink, FramedBlocks, ensure_node_capacity_local, ensure_relation_capacity_local,
+    flush_local,
 };
 
 use super::Result;
@@ -24,6 +32,7 @@ use super::element_writes::{
     write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
 };
 use super::loc_mode::LocMode;
+use super::overflow::{Replay, RewriteSink};
 use super::refresh::StaleProbe;
 use super::stats::MergeStats;
 
@@ -40,20 +49,158 @@ pub(super) struct RewriteOutput {
     pub(super) refresh: RefreshTally,
 }
 
+/// One element the rewrite writes, in output order.
+#[derive(Clone)]
+pub(super) enum Op<'a> {
+    /// The diff's record `upserts(kind)[i]`: a create, or the replacement
+    /// of a base element.
+    Osc(ElementKind, usize),
+    /// A base element the diff leaves alone.
+    Base(Element<'a>),
+}
+
+/// One step of the rewrite's walk.
+pub(super) enum Step<'a> {
+    /// A base element was reached that inline creates sort before: its ID
+    /// for the blob walk, observed before those creates are written. The
+    /// element itself follows as a [`Step::Element`] whose ID is already
+    /// observed.
+    Observe(i64),
+    /// An inline create.
+    Create(Op<'a>),
+    /// A base element and what the diff does to it: the op to write, or
+    /// `None` where the diff deletes it. Observed here unless a
+    /// [`Step::Observe`] of it came first.
+    Element { id: i64, op: Option<Op<'a>> },
+}
+
+/// The rewrite's steps over one base block: for each base element, the
+/// inline creates sorting before it (behind a [`Step::Observe`] of it when
+/// there are any), then the element with what the diff does to it; then the
+/// trailing creates. An element with no create before it is one step, moved
+/// once: this is the rewrite's per-element hot path, and parking every
+/// element behind its own observe step measured 3 % slower on planet
+/// (`reference/performance/apply-changes.md`, "Overflow recovery").
+///
+/// The `osm_id_cmp` here is coherent with the `osm_id_key` bounds used to
+/// slice `inline` in `streaming::upsert_slice` ONLY if the base block
+/// iterates in canonical OSM order. The header's `is_sorted()` precondition
+/// (`rewrite.rs::build_header_bytes`) claims it and the blob walk refuses
+/// the block where it is false; any future caller that bypasses both must
+/// re-establish the invariant or the cursor may skip past upserts and drop
+/// creates.
+pub(super) struct Steps<'a> {
+    elements: BlockElementsIter<'a>,
+    diff: &'a SortedDiff,
+    kind: ElementKind,
+    /// The inline upserts not yet passed, as indexes into `upserts(kind)`.
+    inline: Range<usize>,
+    // Creates come from `inline` alone; what the diff does to each base
+    // element is found by its own per-kind cursors, so a base element the
+    // upsert cursor has already passed (an ID the block holds twice) is
+    // still replaced.
+    seeks: KindSeeks,
+    /// A base element observed and waiting behind its inline creates.
+    pending: Option<(ElementKind, i64, Element<'a>)>,
+}
+
+impl<'a> Steps<'a> {
+    pub(super) fn new(
+        block: &'a PrimitiveBlock,
+        diff: &'a SortedDiff,
+        kind: ElementKind,
+        inline: Range<usize>,
+    ) -> Self {
+        Self {
+            elements: block.elements(),
+            diff,
+            kind,
+            inline,
+            seeks: KindSeeks::default(),
+            pending: None,
+        }
+    }
+
+    /// Whether an inline create sorts before base element `id`.
+    #[inline]
+    fn create_due(&self, id: i64) -> bool {
+        !self.inline.is_empty()
+            && self
+                .diff
+                .upserts(self.kind)
+                .get(self.inline.start)
+                .is_some_and(|&next| crate::osm_id::osm_id_cmp(next, id).is_lt())
+    }
+
+    #[inline]
+    fn next_create(&mut self) -> Option<Step<'a>> {
+        let i = self.inline.next()?;
+        Some(Step::Create(Op::Osc(self.kind, i)))
+    }
+
+    /// The element's step, once no create sorts before it.
+    #[inline]
+    fn resolve(&mut self, elem_kind: ElementKind, id: i64, element: Element<'a>) -> Step<'a> {
+        // Skip a modification ID (written below as the element's own hit).
+        if !self.inline.is_empty()
+            && self.diff.upserts(self.kind).get(self.inline.start) == Some(&id)
+        {
+            self.inline.next();
+        }
+        let op = match self.seeks.find(self.diff, elem_kind, id) {
+            DiffHit::Deleted => None,
+            DiffHit::Upserted(i) => Some(Op::Osc(elem_kind, i)),
+            DiffHit::None => Some(Op::Base(element)),
+        };
+        Step::Element { id, op }
+    }
+}
+
+impl<'a> Iterator for Steps<'a> {
+    type Item = Step<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Step<'a>> {
+        if let Some((elem_kind, id, element)) = self.pending.take() {
+            if self.create_due(id) {
+                self.pending = Some((elem_kind, id, element));
+                return self.next_create();
+            }
+            return Some(self.resolve(elem_kind, id, element));
+        }
+        let Some(element) = self.elements.next() else {
+            return self.next_create();
+        };
+        let (elem_kind, id) = element_kind_id(&element);
+        if self.create_due(id) {
+            self.pending = Some((elem_kind, id, element));
+            return Some(Step::Observe(id));
+        }
+        Some(self.resolve(elem_kind, id, element))
+    }
+}
+
 // The create dispatch mirrors stream_output, but capacity checks below must
 // flush into this worker's local blocks before stats advance. The shared
 // add_osc_* helpers own only encoding, not ordering or output submission.
 /// Write the diff's record `upserts(kind)[i]` into the local BlockBuilder:
 /// a create, or the replacement of a base element.
-fn write_osc_local(
+fn write_osc_local<O: BlockSink + ?Sized>(
     i: usize,
     kind: ElementKind,
     diff: &SortedDiff,
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     stats: &mut MergeStats,
     loc: LocMode<'_>,
 ) -> Result<()> {
+    // A block whose content is already past the blob limit cannot be
+    // framed whatever comes next: end it here, so the overflow is found
+    // (and recovered) at one limit's worth, not after every remaining OSC
+    // element has been copied in.
+    if bb.content_over_payload_limit() {
+        flush_local(bb, output)?;
+    }
     match kind {
         ElementKind::Node => {
             ensure_node_capacity_local(bb, output)?;
@@ -71,6 +218,53 @@ fn write_osc_local(
         }
     }
     Ok(())
+}
+
+/// What writing one [`Op`] needs besides the builder and the sink.
+pub(super) struct OpContext<'c, 'a> {
+    pub(super) block: &'a PrimitiveBlock,
+    pub(super) diff: &'a SortedDiff,
+    pub(super) loc: LocMode<'a>,
+    pub(super) stats: &'c mut MergeStats,
+    pub(super) base_writes: &'c mut BaseWrites<'a>,
+}
+
+/// Write one op into `bb`, flushing into `output` as capacity and the
+/// source string table require.
+pub(super) fn write_op<O: BlockSink + ?Sized>(
+    op: &Op<'_>,
+    bb: &mut BlockBuilder,
+    output: &mut O,
+    cx: &mut OpContext<'_, '_>,
+) -> Result<()> {
+    let block = cx.block;
+    match op {
+        Op::Osc(kind, i) => write_osc_local(*i, *kind, cx.diff, bb, output, cx.stats, cx.loc),
+        Op::Base(Element::DenseNode(dn)) => {
+            write_base_dense_node_local(bb, output, dn, block)?;
+            cx.stats.base_nodes += 1;
+            Ok(())
+        }
+        Op::Base(Element::Node(n)) => {
+            write_base_node_local(bb, output, n, block)?;
+            cx.stats.base_nodes += 1;
+            Ok(())
+        }
+        Op::Base(Element::Way(w)) => {
+            if cx.loc.for_way(w.id())?.is_some() {
+                write_base_way_local_with_locations(bb, output, w, block, cx.base_writes)?;
+            } else {
+                write_base_way_local(bb, output, w, block, cx.base_writes)?;
+            }
+            cx.stats.base_ways += 1;
+            Ok(())
+        }
+        Op::Base(Element::Relation(r)) => {
+            write_base_relation_local(bb, output, r, block, cx.base_writes)?;
+            cx.stats.base_relations += 1;
+            Ok(())
+        }
+    }
 }
 
 /// Rewrite one decoded base block on a worker, framing each completed output
@@ -98,11 +292,19 @@ fn write_osc_local(
 /// resident all at once and no encode buffer changes hands: a planet input
 /// blob holds some 200k elements and becomes ~27 output blocks, and
 /// accumulating them all before framing held each worker's whole raw output
-/// beside its framed copy. A completed block's framing error therefore
-/// surfaces at the flush that completes it, ahead of whatever fallible work
-/// the element's write helper does after that flush; it promises no other
-/// ordering against the element's errors.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// beside its framed copy.
+///
+/// An output block is the source block's whole string table (survivors keep
+/// their string indices) plus what the OSC elements add, so it can outgrow
+/// the PBF blob limit although the source block and every changed element
+/// fit: a 17 MiB tag value modified to another 17 MiB value. Such a block's
+/// framing refusal is recorded, not returned, and once the walk has ended
+/// its elements are written again in smaller blocks (`overflow.rs`); only a
+/// single element that still overflows, or a recovery past its byte budget,
+/// fails the rewrite, with that framing error. A recorded overflow outranks
+/// any later error of the walk, as it would have had it been returned at
+/// its flush.
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
     block: &PrimitiveBlock,
@@ -117,102 +319,103 @@ pub(super) fn rewrite_block_parallel(
     compression: &Compression,
     metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<RewriteOutput> {
-    let mut walk = blob_walk(claim);
-    let mut output = FramedBlocks::new(*compression, metrics);
+    let mut sink = RewriteSink::new(FramedBlocks::new(*compression, metrics));
     let mut stats = MergeStats::new();
     let mut base_writes = BaseWrites::new(block, probe, scratch);
-    // Creates come from `inline_upserts` alone; what the diff does to each
-    // base element is found by its own per-kind cursors, so a base element
-    // the upsert cursor has already passed (an ID the block holds twice) is
-    // still replaced.
-    let mut seeks = KindSeeks::default();
-    let inline_ids = &diff.upserts(kind)[inline_upserts.clone()];
-    let inline_base = inline_upserts.start;
-    let mut upsert_cursor: usize = 0;
+    let walked = {
+        let mut cx = OpContext {
+            block,
+            diff,
+            loc,
+            stats: &mut stats,
+            base_writes: &mut base_writes,
+        };
+        walk_and_write(
+            block,
+            diff,
+            bb,
+            inline_upserts.clone(),
+            kind,
+            claim,
+            &mut sink,
+            &mut cx,
+        )
+    };
+    // The last use of `base_writes`, which releases `scratch` for a replay.
+    let refresh = base_writes.tally;
+    let RewriteSink {
+        framed, overflows, ..
+    } = sink;
+    let mut frames = framed.frames;
+    let mut frame_ns = framed.frame_ns;
+    if !overflows.is_empty() {
+        let replay = Replay {
+            block,
+            diff,
+            kind,
+            inline: inline_upserts,
+            loc,
+            probe,
+            scratch,
+            compression,
+            metrics,
+        };
+        let (recovered, ns) = replay.run(overflows, frames)?;
+        frames = recovered;
+        frame_ns += ns;
+    }
+    walked?;
+    Ok(RewriteOutput {
+        frames,
+        frame_ns,
+        stats,
+        refresh,
+    })
+}
 
+/// The rewrite's first pass: every step written into `bb`, blocks flushed
+/// into `sink` (which records an overflowing block instead of failing), the
+/// last block flushed, then the walk ended.
+#[allow(clippy::too_many_arguments)]
+fn walk_and_write(
+    block: &PrimitiveBlock,
+    diff: &SortedDiff,
+    bb: &mut BlockBuilder,
+    inline_upserts: Range<usize>,
+    kind: ElementKind,
+    claim: Option<&BlobIndex>,
+    sink: &mut RewriteSink<'_>,
+    cx: &mut OpContext<'_, '_>,
+) -> Result<()> {
+    let mut walk = blob_walk(claim);
     bb.pre_seed_string_table(block)?;
-
-    for element in block.elements() {
-        let (elem_kind, elem_id) = element_kind_id(&element);
-        walk.observe(elem_id)?;
-
-        // Emit creates (upsert IDs not in base block) before this element.
-        // The `osm_id_cmp` here is coherent with the `osm_id_key` bounds used
-        // to slice `inline_upserts` in `streaming::upsert_slice` ONLY if the
-        // base block iterates in canonical OSM order. The header's
-        // `is_sorted()` precondition (`rewrite.rs::build_header_bytes`)
-        // claims it and `walk` refuses the block where it is false; any
-        // future caller that bypasses both must re-establish the invariant
-        // or the cursor may skip past upserts and drop creates.
-        while upsert_cursor < inline_ids.len()
-            && crate::osm_id::osm_id_cmp(inline_ids[upsert_cursor], elem_id).is_lt()
-        {
-            let i = inline_base + upsert_cursor;
-            upsert_cursor += 1;
-            write_osc_local(i, kind, diff, bb, &mut output, &mut stats, loc)?;
-        }
-        // Skip modification IDs (handled below by normal element processing)
-        if upsert_cursor < inline_ids.len() && inline_ids[upsert_cursor] == elem_id {
-            upsert_cursor += 1;
-        }
-
-        match seeks.find(diff, elem_kind, elem_id) {
-            DiffHit::Deleted => {
-                stats.deleted += 1;
-                continue;
+    let mut observed = false;
+    for step in Steps::new(block, diff, kind, inline_upserts) {
+        match step {
+            Step::Observe(id) => {
+                walk.observe(id)?;
+                observed = true;
             }
-            DiffHit::Upserted(i) => {
-                write_osc_local(i, elem_kind, diff, bb, &mut output, &mut stats, loc)?;
-                continue;
+            Step::Create(op) => {
+                write_op(&op, bb, sink, cx)?;
+                sink.op_written();
             }
-            DiffHit::None => {}
-        }
-
-        match &element {
-            Element::DenseNode(dn) => {
-                write_base_dense_node_local(bb, &mut output, dn, block)?;
-                stats.base_nodes += 1;
-            }
-            Element::Node(n) => {
-                write_base_node_local(bb, &mut output, n, block)?;
-                stats.base_nodes += 1;
-            }
-            Element::Way(w) => {
-                let id = w.id();
-                if loc.for_way(id)?.is_some() {
-                    write_base_way_local_with_locations(
-                        bb,
-                        &mut output,
-                        w,
-                        block,
-                        &mut base_writes,
-                    )?;
-                    stats.base_ways += 1;
-                } else {
-                    write_base_way_local(bb, &mut output, w, block, &mut base_writes)?;
-                    stats.base_ways += 1;
+            Step::Element { id, op } => {
+                if !std::mem::take(&mut observed) {
+                    walk.observe(id)?;
+                }
+                match op {
+                    Some(op) => {
+                        write_op(&op, bb, sink, cx)?;
+                        sink.op_written();
+                    }
+                    None => cx.stats.deleted += 1,
                 }
             }
-            Element::Relation(r) => {
-                write_base_relation_local(bb, &mut output, r, block, &mut base_writes)?;
-                stats.base_relations += 1;
-            }
         }
     }
-
-    // Emit remaining upserts after the last element (trailing creates)
-    for i in inline_base + upsert_cursor..inline_upserts.end {
-        write_osc_local(i, kind, diff, bb, &mut output, &mut stats, loc)?;
-    }
-
     // Flush remaining elements in the BlockBuilder, then end the walk.
-    flush_local(bb, &mut output)?;
+    flush_local(bb, sink)?;
     walk.finish()?;
-
-    Ok(RewriteOutput {
-        frames: output.frames,
-        frame_ns: output.frame_ns,
-        stats,
-        refresh: base_writes.tally,
-    })
+    Ok(())
 }

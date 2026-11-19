@@ -630,6 +630,23 @@ pub(crate) const OWNED_PASSTHROUGH_FLUSH_BYTES: usize = 32 << 20;
 pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: std::num::NonZeroUsize =
     std::num::NonZeroUsize::MIN.saturating_add(63);
 
+/// Framed bytes one apply-changes rewrite worker may produce re-encoding the
+/// output blocks of one input blob that overflowed the PBF data blob limit
+/// (`apply_changes/overflow.rs`). The worker holds a blob's frames until its
+/// rewrite ends, and every split block of surviving base elements carries
+/// the source block's whole string table and every split block of OSC
+/// elements the strings they share, so a large table or a large shared
+/// role interleaved with many changed elements could fan out into
+/// gigabytes. The budget also bounds legitimate recovery: one blob's
+/// changed elements needing more than this many bytes of frames between
+/// them are refused.
+/// Past this budget the worker gives up and returns the original oversize
+/// error, the loud refusal before publication that the run gave before
+/// overflow recovery existed. Real data never overflows (blocks are a few
+/// MiB at most), so the value only decides how hostile an input is still
+/// recovered: eight blob limits' worth.
+pub(crate) const APPLY_CHANGES_OVERFLOW_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+
 /// Filter bits per OSC node in the `--locations-on-ways` refresh probe
 /// (`apply_changes/refresh.rs`), before rounding up to a power of two. The
 /// filter is the only state the probe holds beside the sorted diff, and it is

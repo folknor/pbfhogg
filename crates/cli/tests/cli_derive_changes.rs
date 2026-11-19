@@ -361,13 +361,21 @@ fn a_node_outside_the_geographic_domain_is_refused_not_written() {
         meta: None,
     };
     write_test_pbf_sorted(&old, &[node(1, 100_000_000)], &[], &[]);
-    write_test_pbf_sorted(&new, &[node(1, 100_000_000), node(2, 910_000_000)], &[], &[]);
+    write_test_pbf_sorted(
+        &new,
+        &[node(1, 100_000_000), node(2, 910_000_000)],
+        &[],
+        &[],
+    );
     for jobs in [1, 4] {
         let osc = dir.path().join(format!("changes-{jobs}.osc"));
         let out = run_derive(&old, &new, &osc, false, false, Some(jobs));
         let stderr = out.stderr_str();
         assert_eq!(out.status.code(), Some(2), "-j {jobs}; stderr:\n{stderr}");
-        assert!(stderr.contains("geographic domain"), "-j {jobs}; stderr:\n{stderr}");
+        assert!(
+            stderr.contains("geographic domain"),
+            "-j {jobs}; stderr:\n{stderr}"
+        );
         assert!(!osc.exists(), "-j {jobs}: nothing may be published");
     }
 }

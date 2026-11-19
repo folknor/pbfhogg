@@ -79,6 +79,12 @@ impl StringTable {
         self.slots.len()
     }
 
+    /// Bytes of string content the table holds, all slots together (their
+    /// encoded entries add a few bytes each on top).
+    pub(super) fn content_len(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// The bytes of slot `idx`. Panics on an index past [`len`](Self::len),
     /// as indexing the old slot vector did.
     pub(super) fn get(&self, idx: usize) -> &[u8] {

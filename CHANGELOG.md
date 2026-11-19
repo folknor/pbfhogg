@@ -371,6 +371,16 @@
 
 ### Fixed
 
+- **`apply-changes` no longer refuses changes whose output only needed
+  more blocks.** A rewritten block keeps its source block's whole string
+  table, and blocks were cut by element count alone. So a large tag value
+  modified to another large value (two 17 MiB values), or two large
+  creates side by side, made one block past the 32 MiB PBF payload limit,
+  and the run failed (exit 2), although every element fitted on its own.
+  This broke the `diff --format osc` roundtrip. Such output is now written
+  as more blocks. An element that does not fit a block alone, or one base
+  blob whose re-cut output would pass 256 MiB, is still refused before
+  publication.
 - **A sign inside an RFC 3339 timestamp is refused.** The `time-filter`
   cutoff, the `osmosis_replication_timestamp` header override and OSC
   `timestamp` attributes read by `apply-changes` accepted a leading `+`

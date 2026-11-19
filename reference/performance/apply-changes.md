@@ -38,6 +38,22 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### Overflow recovery: the rewrite walk as a step iterator (bygg, 2026-11-19, `3bafe5c0` + change)
+
+The worker's rewrite loop became a step iterator (so an output block over
+the 32 MiB payload limit can be written again from the same operations) with
+an operation counter per written element and one content-length check per
+OSC element. Planet apply-diff of OSC 4913, `--iterations 1`, after
+`fstrim`, baseline `--commit HEAD`, variant uncommitted. Baseline 194, 195,
+196 s (`6fb59924`, `d0f7515e`, `78878a27`).
+
+The first form parked every base element in the iterator behind its own
+observe step, moving each element twice more: 200 and 201 s (`e67aa743`,
+`bec1a5b8`), +3 % in both orders, all of it in the CPU-bound node streaming
+phase (129.3 s to 134.8 s at 29 cores). Not landed. The landed form yields
+an element with no create before it as one step, parking only behind due
+creates: 195, 196 s (`d610315b`, `b0dbda39`). Neutral.
+
 ### Drain blocks on its channel, no receive timeout (bygg, 2026-11-12, `ab647536` + change)
 
 The drain's 25 ms `recv_timeout` became a plain `recv`: a published

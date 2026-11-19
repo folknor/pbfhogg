@@ -69,6 +69,7 @@ mod geocode_reader;
 mod inspect;
 
 mod apply_changes_create_runs;
+mod apply_changes_overflow;
 #[cfg(pbfhogg_test_hooks)]
 mod capabilities;
 mod corrupt_input;

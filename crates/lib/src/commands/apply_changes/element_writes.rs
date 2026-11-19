@@ -1,6 +1,6 @@
 //! Element-write helpers shared between OSC-diff emission and base-PBF
 //! passthrough. The `*_local` helpers flush into the rewrite task's own
-//! [`FramedBlocks`], which frames each block on the worker as it completes;
+//! block sink, which frames each block on the worker as it completes;
 //! the `add_osc_*` encoders add one element and leave capacity to the
 //! caller, as the drain's create runs (`stream_output.rs`) size every block
 //! themselves.
@@ -10,7 +10,7 @@ use crate::block_builder::{BlockBuilder, MemberData};
 use crate::owned::{dense_node_raw_metadata, element_raw_partial_metadata};
 
 use crate::commands::{
-    FramedBlocks, ensure_node_capacity_local, ensure_relation_capacity_local,
+    BlockSink, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local,
 };
 
@@ -77,9 +77,9 @@ pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactR
 // Writing base elements for parallel rewrite (local flush, no PbfWriter)
 // ---------------------------------------------------------------------------
 
-pub(super) fn write_base_dense_node_local(
+pub(super) fn write_base_dense_node_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     dn: &crate::DenseNode<'_>,
     block: &PrimitiveBlock,
 ) -> Result<()> {
@@ -101,9 +101,9 @@ pub(super) fn write_base_dense_node_local(
     )
 }
 
-pub(super) fn write_base_node_local(
+pub(super) fn write_base_node_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
 ) -> Result<()> {
@@ -249,9 +249,9 @@ fn output_info<'b>(
     Ok(Some(buf))
 }
 
-pub(super) fn write_base_way_local(
+pub(super) fn write_base_way_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
     ctx: &mut BaseWrites<'_>,
@@ -281,9 +281,9 @@ pub(super) fn write_base_way_local(
 /// block's framing is the default and nothing changed; otherwise every
 /// coordinate is re-encoded in decimicrodegrees under the default framing the
 /// output block declares, since a raw copy would be read back rescaled.
-pub(super) fn write_base_way_local_with_locations(
+pub(super) fn write_base_way_local_with_locations<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
     ctx: &mut BaseWrites<'_>,
@@ -358,9 +358,9 @@ pub(super) fn write_base_way_local_with_locations(
 }
 
 /// Write an OSC way, with LocationsOnWays coordinates when `loc` requires them.
-pub(super) fn write_osc_way_local(
+pub(super) fn write_osc_way_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     way: &crate::osc::CompactWayRef<'_>,
     loc: LocMode<'_>,
 ) -> Result<()> {
@@ -370,9 +370,9 @@ pub(super) fn write_osc_way_local(
     Ok(())
 }
 
-pub(super) fn write_base_relation_local(
+pub(super) fn write_base_relation_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
-    output: &mut FramedBlocks<'_>,
+    output: &mut O,
     rel: &crate::Relation<'_>,
     block: &PrimitiveBlock,
     ctx: &mut BaseWrites<'_>,

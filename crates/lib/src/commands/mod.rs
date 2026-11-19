@@ -151,12 +151,22 @@ impl<'a> FramedBlocks<'a> {
     }
 }
 
-impl BlockSink for FramedBlocks<'_> {
-    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
-        bb.lend_encoded(|block| {
+impl FramedBlocks<'_> {
+    /// Flush like [`BlockSink::flush`], except that a block too large for a
+    /// PBF data blob ([`is_block_overflow`]) is returned as `Ok(Some(error))`
+    /// rather than failing: no frame is pushed, and the builder is reset and
+    /// ready for the next block all the same (`lend_encoded` encodes and
+    /// resets before lending, and the overflow is the callback's outcome, not
+    /// its error, so the encode buffer's retention rule still runs). For a
+    /// caller that can re-encode the block's elements in smaller pieces.
+    pub(crate) fn flush_or_overflow(
+        &mut self,
+        bb: &mut BlockBuilder,
+    ) -> Result<Option<crate::error::Error>> {
+        let outcome = bb.lend_encoded(|block| {
             let t_frame = crate::counters::Stopwatch::start();
             let indexdata = block.index.serialize();
-            let frame = crate::writer::frame_blob_pipelined(
+            let framed = crate::writer::frame_blob_pipelined(
                 block.bytes,
                 &self.compression,
                 self.keep_indexdata.then_some(indexdata.as_slice()),
@@ -167,12 +177,42 @@ impl BlockSink for FramedBlocks<'_> {
                 },
                 None,
                 self.metrics,
-            )?;
-            self.frames.push((block.index.kind, frame));
-            self.frame_ns += t_frame.elapsed_ns();
-            Ok(())
+            );
+            match framed {
+                Ok(frame) => {
+                    self.frames.push((block.index.kind, frame));
+                    self.frame_ns += t_frame.elapsed_ns();
+                    Ok(None)
+                }
+                Err(error) if is_block_overflow(&error) => Ok(Some(error)),
+                Err(error) => Err(error),
+            }
         })?;
-        Ok(())
+        Ok(outcome.flatten())
+    }
+}
+
+/// Whether `error` is a data block's payload or encoded body over the PBF
+/// blob limits: the one framing failure that cutting the block's elements
+/// into smaller blocks can cure. Header-blob parts, and every other error,
+/// are not.
+pub(crate) fn is_block_overflow(error: &crate::error::Error) -> bool {
+    use crate::error::{ErrorKind, OversizePart};
+    matches!(
+        error.kind(),
+        ErrorKind::BlobTooLarge {
+            part: OversizePart::Payload | OversizePart::Body,
+            ..
+        }
+    )
+}
+
+impl BlockSink for FramedBlocks<'_> {
+    fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
+        match self.flush_or_overflow(bb)? {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 

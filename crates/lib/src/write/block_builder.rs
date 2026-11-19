@@ -658,6 +658,35 @@ impl BlockBuilder {
         self.seeded.is_some()
     }
 
+    /// Whether the block in progress already holds more than the PBF data
+    /// payload limit (string content and serialized element groups; dense
+    /// node columns, a few bytes per node, are not counted), so it cannot be
+    /// framed whatever is added next. O(1). apply-changes asks before adding
+    /// an OSC element, so an attempt that is bound to overflow is cut there
+    /// instead of growing without bound before framing would refuse it.
+    #[inline]
+    pub(crate) fn content_over_payload_limit(&self) -> bool {
+        self.content_len() as u64 > crate::read::blob_wire::MAX_BLOB_MESSAGE_SIZE
+    }
+
+    /// The bytes [`content_over_payload_limit`](Self::content_over_payload_limit)
+    /// counts.
+    #[inline]
+    pub(crate) fn content_len(&self) -> usize {
+        self.string_table
+            .content_len()
+            .saturating_add(self.group_buf.len())
+            .saturating_add(self.node_groups.len())
+            .saturating_add(self.plain_group.len())
+    }
+
+    /// Drop the block in progress without encoding it, as a flush resets
+    /// the builder; for a caller that will write its elements again in
+    /// other blocks. Poison is kept, as by every reset.
+    pub(crate) fn abandon_block(&mut self) {
+        self.reset();
+    }
+
     /// Returns `true` if the block has reached its per-block element cap
     /// (default [`DEFAULT_ELEMENT_CAP`]; configurable via
     /// [`Self::with_element_cap_prealloc`]).

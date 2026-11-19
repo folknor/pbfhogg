@@ -13,6 +13,10 @@
 //! one element and the cuts are those a single builder filling to its cap
 //! would make), encodes and frames each block the way the workers frame
 //! theirs (`frame_blob_pipelined`), and writes the frames raw in order.
+//! A block over the PBF blob limits, which an element count does not bound
+//! (two 17 MiB values side by side), is cut in two and encoded again until
+//! its pieces fit (`settle`); only an element that does not fit a block
+//! alone fails the run.
 //!
 //! A run of one block is encoded on the drain thread. A longer one is
 //! encoded on the invocation's executor, `APPLY_CHANGES_CREATE_BATCH_BLOCKS`
@@ -130,7 +134,8 @@ fn create_batch_blocks(invocation: &crate::host::Invocation) -> NonZeroUsize {
 }
 
 /// Cut `run` into blocks of `DEFAULT_ELEMENT_CAP`, `encode` each and `write`
-/// every frame in block order; returns the elements encoded. `encode` gets an
+/// every frame in block order, a block over the blob limits cut smaller
+/// ([`settle`]); returns the elements encoded. `encode` gets an
 /// empty builder and the block's index range, and returns the block's frame
 /// (`None` for nothing to write) and its element count. A run longer than
 /// one block, with an executor, is encoded on it in batches of
@@ -168,6 +173,7 @@ where
                 let blocks: Vec<Range<usize>> = chunks(batch, cap).collect();
                 let framed: Vec<Result<FramedBlock>> = executor.install(|| {
                     blocks
+                        .clone()
                         .into_par_iter()
                         .map(|chunk| {
                             // A builder per block, not the worker rule's
@@ -186,27 +192,61 @@ where
                         })
                         .collect()
                 });
-                for result in framed {
-                    let (frame, n) = result?;
-                    added += n;
-                    if let Some(frame) = frame {
-                        write(frame)?;
-                    }
+                for (chunk, result) in blocks.into_iter().zip(framed) {
+                    added += settle(result, chunk, bb, invocation, &encode, &mut write)?;
                 }
             }
         }
         _ => {
             for chunk in chunks(run, cap) {
                 invocation.check()?;
-                let (frame, n) = encode(bb, chunk)?;
-                added += n;
-                if let Some(frame) = frame {
-                    write(frame)?;
-                }
+                let result = encode(bb, chunk.clone());
+                added += settle(result, chunk, bb, invocation, &encode, &mut write)?;
             }
         }
     }
     Ok(added)
+}
+
+/// Write one block's encoding of `chunk`, returning its element count. A
+/// block over the PBF blob limits (`commands::is_block_overflow`) is cut in
+/// two and each half encoded again on this thread into `bb`, recursively,
+/// every frame written as it is made, so a chunk whose elements fit only
+/// one or two to a block is never held whole; a single element that
+/// overflows alone is refused with its framing error. Order and the
+/// first-failure rule are those of `write_run`: the halves are written
+/// left to right, and nothing after a failure is.
+fn settle<E, W>(
+    result: Result<FramedBlock>,
+    chunk: Range<usize>,
+    bb: &mut BlockBuilder,
+    invocation: &crate::host::Invocation,
+    encode: &E,
+    write: &mut W,
+) -> Result<u64>
+where
+    E: Fn(&mut BlockBuilder, Range<usize>) -> Result<FramedBlock> + Sync,
+    W: FnMut(Vec<u8>) -> Result<()>,
+{
+    match result {
+        Ok((frame, n)) => {
+            if let Some(frame) = frame {
+                write(frame)?;
+            }
+            Ok(n)
+        }
+        Err(error) if chunk.len() > 1 && crate::commands::is_block_overflow(&error) => {
+            let mid = chunk.start + chunk.len() / 2;
+            let mut added = 0;
+            for half in [chunk.start..mid, mid..chunk.end] {
+                invocation.check()?;
+                let result = encode(bb, half.clone());
+                added += settle(result, half, bb, invocation, encode, write)?;
+            }
+            Ok(added)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// `range` cut into consecutive ranges of `size` elements, the last one
@@ -250,6 +290,18 @@ fn encode_and_frame(
     }
     let added = run.len() as u64;
     for i in run {
+        // Content already past the blob limit: this block cannot be framed,
+        // so stop copying the run into it and let `write_run` cut it
+        // smaller, rather than first building the whole run's worth.
+        if bb.content_over_payload_limit() {
+            let size = bb.content_len() as u64;
+            bb.abandon_block();
+            return Err(crate::error::new_blob_too_large(
+                crate::error::OversizePart::Payload,
+                size,
+                crate::read::blob_wire::MAX_BLOB_MESSAGE_SIZE,
+            ));
+        }
         match kind {
             ElementKind::Node => add_osc_node(bb, &diff.node(i)),
             ElementKind::Way => {
@@ -262,7 +314,8 @@ fn encode_and_frame(
                 // create run, unless `--ignore-missing-nodes` asked for the
                 // `(0, 0)` fallback `add_osc_way` gives. The block failure
                 // input can reach in a create run is the frame's size
-                // refusal below (a block over the PBF blob limit).
+                // refusal below (a block over the PBF blob limit), which
+                // `write_run` answers by cutting the block smaller.
                 let locs = loc.for_way(osc.id())?;
                 add_osc_way(bb, &osc, locs);
             }
@@ -273,16 +326,26 @@ fn encode_and_frame(
         let indexdata = block.index.serialize();
         // No WayMembers, as `take_owned` gives none: the same frame the
         // writer's own framing job made of these blocks.
-        frame_blob_pipelined(
+        // An overflow is the callback's outcome, not its error, so the
+        // builder still releases the oversized encode buffer before
+        // `write_run` encodes the halves.
+        match frame_blob_pipelined(
             block.bytes,
             compression,
             Some(&indexdata),
             block.tagdata,
             None,
             metrics,
-        )
+        ) {
+            Err(error) if crate::commands::is_block_overflow(&error) => Ok(Err(error)),
+            framed => framed.map(Ok),
+        }
     })?;
-    Ok((frame, added))
+    match frame {
+        Some(Err(overflow)) => Err(overflow),
+        Some(Ok(frame)) => Ok((Some(frame), added)),
+        None => Ok((None, added)),
+    }
 }
 
 /// Write every upsert of `kind` from the cursor on and advance the cursor

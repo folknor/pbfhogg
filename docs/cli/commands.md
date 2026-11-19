@@ -1704,7 +1704,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)); `--format osc` only, which keeps its per-action XML there, removed on completion: for a `.osc.gz` output from indexed inputs that XML is already gzip-compressed (about the output's size), otherwise it is plain XML several times larger. Must exist and be writable; checked before any input is read. Default: the output's directory. A text diff writes no scratch and refuses it |
 | `--direct-io` | Use O_DIRECT when reading the PBF inputs; see the [I/O capability matrix](#io-capability-matrix) |
 
-With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)).
+With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)). That holds for elements that fit a PBF block on their own with room to spare, while the changed output of any one base blob stays under 256 MiB. Otherwise `apply-changes` can refuse, loudly and before publishing anything (see [apply-changes](#apply-changes)).
 
 **Only values `apply-changes` reads back.** `--format osc` never writes a value pbfhogg's own OSC reader refuses. A created or modified node outside latitude -90 to 90 or longitude -180 to 180 is refused, and so is one whose coordinate does not fit the PBF representation. An element timestamp outside years 0000 to 9999 is refused too, because `YYYY-MM-DDTHH:MM:SSZ` cannot spell it, and so is one whose scaling overflows. Each refusal exits `2` and publishes nothing. A clock past 9999 under `--update-timestamp` is refused before either input is opened. Deleted elements print only ID, version and the override timestamp, so their old values are never checked.
 
@@ -1976,6 +1976,19 @@ user name index that lies past its block's string table, or a block whose
 string table does not begin with the empty string, fails the run (exit 2) and
 publishes nothing, the error naming the element, field and index. Blobs copied
 unchanged are not checked.
+
+Output blocks are cut at 8000 elements, and also wherever a block would pass
+the 32 MiB PBF payload limit: a rewritten block carries its source block's
+whole string table plus the strings of the changed elements written into it,
+so a large value modified to another large value, or two large creates side by
+side, is written as more blocks rather than refused. An element that does not
+fit a block alone in its output form fails the run (exit 2) with the oversize
+error and publishes nothing. A surviving element's output form is its source
+block's whole string table plus the element, so one that grew past its source
+(refreshed `--locations-on-ways` coordinates, say) can fail beside a table near
+the limit. So does an input blob whose re-cut output would pass 256 MiB of frames, as
+when its changes carry more than 256 MiB of large values between them, or a
+large string is shared by many changed elements that must be cut apart.
 
 The output header declares no bbox (the OSC can place a node outside the
 base's). Of the base's replication state it keeps the base URL and drops the

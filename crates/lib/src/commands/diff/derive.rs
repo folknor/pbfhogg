@@ -61,7 +61,16 @@ impl DeriveChangesStats {
 /// changed elements, not total input size.
 ///
 /// `timestamp` overrides every emitted delete timestamp with the same Unix second.
-/// Pass `None` to omit delete timestamps.
+/// Pass `None` to omit delete timestamps. A value past
+/// `9999-12-31T23:59:59Z` (253402300799) is refused with `InvalidArgument`
+/// before either input is opened: OSC cannot spell it.
+///
+/// Every value written is one pbfhogg's own OSC reader accepts, so the
+/// output always applies: a created or modified node whose coordinate does
+/// not fit `i32` decimicrodegrees (`WireFormat`) or lies outside +-90 /
+/// +-180 degrees (`InvalidData`), an element timestamp outside years 0000
+/// to 9999 (`InvalidData`) or one whose scaling overflows (`WireFormat`)
+/// fails the call, and nothing is published.
 ///
 /// Requires both inputs to declare `Sort.Type_then_ID` - returns an
 /// actionable error if either is unsorted.
@@ -125,6 +134,9 @@ pub(crate) fn derive_changes_to(
     host.invocation.check()?;
     // The name rule every OSC producer shares, applied before any work.
     let gzip = crate::osc::output_is_gzip(output.destination())?;
+    // The delete override must be one OSC can spell, judged once here, before
+    // either input is opened and whether or not any delete is ever written.
+    check_delete_timestamp(timestamp)?;
     let jobs = super::resolve_workers(parallelism, host);
     let [old, new] = super::pin_pair(old, new, host)?;
     let (old_path, new_path) = (old.path(), new.path());
@@ -1209,10 +1221,34 @@ fn write_delete_element<W: Write>(
         elem.push_attribute(("version", v_str.as_str()));
     }
     if let Some(timestamp) = timestamp {
-        let ts = crate::commands::format_epoch_secs(i64::try_from(timestamp).unwrap_or(i64::MAX));
+        let ts = delete_timestamp_text(timestamp)
+            .map_err(|_| crate::Error::internal("delete timestamp reached the writer unchecked"))?;
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
+    Ok(())
+}
+
+/// The OSC spelling of the delete override, or why it has none: an instant
+/// after `9999-12-31T23:59:59Z` has no four-digit year, and pbfhogg's own
+/// OSC parser would refuse the file derive published.
+fn delete_timestamp_text(
+    timestamp: u64,
+) -> std::result::Result<String, crate::commands::TimestampError> {
+    // A u64 above i64::MAX is past year 9999 too; saturate into the refusal.
+    crate::commands::format_rfc3339_utc(i64::try_from(timestamp).unwrap_or(i64::MAX))
+}
+
+/// Refuse a delete override [`delete_timestamp_text`] cannot spell, as an
+/// invalid argument: it is the caller's value, not the inputs'.
+fn check_delete_timestamp(timestamp: Option<u64>) -> Result<()> {
+    if let Some(timestamp) = timestamp {
+        delete_timestamp_text(timestamp).map_err(|err| {
+            crate::Error::invalid_argument_from(err).context(format!(
+                "delete timestamp override {timestamp} (Unix seconds)"
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1230,6 +1266,27 @@ mod scratch_tests {
         }
         let xml = String::from_utf8(writer.into_inner()).expect("XML");
         assert_eq!(xml.matches("timestamp=\"1970-01-01T00:00:00Z\"").count(), 2);
+    }
+
+    /// The override is checked against what OSC can spell: the last second
+    /// of 9999 is written, anything later (u64 values past i64::MAX
+    /// included) is an invalid argument, never clamped into a date.
+    #[test]
+    fn a_delete_timestamp_past_year_9999_is_refused() {
+        super::check_delete_timestamp(None).expect("no override");
+        super::check_delete_timestamp(Some(253_402_300_799)).expect("year 9999");
+        let mut writer = quick_xml::Writer::new(Vec::new());
+        super::write_delete_element(&mut writer, "node", 1, None, false, Some(253_402_300_799))
+            .expect("write delete");
+        let xml = String::from_utf8(writer.into_inner()).expect("XML");
+        assert!(xml.contains("timestamp=\"9999-12-31T23:59:59Z\""), "{xml}");
+        for ts in [253_402_300_800, i64::MAX as u64, u64::MAX] {
+            let err = super::check_delete_timestamp(Some(ts)).expect_err("past 9999");
+            assert!(
+                matches!(err.kind(), crate::ErrorKind::InvalidArgument { .. }),
+                "{ts}: {err:?}"
+            );
+        }
     }
 
     /// A delete carries a version only when the source claimed one: 0 and

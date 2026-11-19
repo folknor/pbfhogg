@@ -989,6 +989,16 @@ impl<'a> Info<'a> {
             .map(|ts| ts.wrapping_mul(i64::from(self.block.date_granularity)))
     }
 
+    /// The time stamp in milliseconds, scaled exactly in `i128` so it never
+    /// wraps. Agrees with [`milli_timestamp`](Self::milli_timestamp)
+    /// whenever it fits `i64`.
+    #[inline]
+    pub fn milli_timestamp_exact(&self) -> Option<i128> {
+        self.info
+            .timestamp
+            .map(|ts| i128::from(ts) * i128::from(self.block.date_granularity))
+    }
+
     /// Returns the changeset id.
     #[inline]
     pub fn changeset(&self) -> Option<i64> {

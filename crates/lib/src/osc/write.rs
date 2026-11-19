@@ -408,14 +408,24 @@ fn write_checked_tags_xml<'a, W: std::io::Write>(
 /// `user` keeps its non-empty test: an empty user name is not
 /// distinguishable from an absent one in the string table, and emitting
 /// `user=""` would assert an anonymous edit that the source never claimed.
+///
+/// **Only what the OSC reader reads back.** A timestamp outside years 0000
+/// to 9999 has no `YYYY-MM-DDTHH:MM:SSZ` spelling (`format_epoch_secs`
+/// would write a five-digit or signed year), and pbfhogg's own OSC parser
+/// refuses it, so derive would publish a file apply cannot read. It is
+/// refused here instead; dropping the attribute would be a silent wrong
+/// answer.
+#[allow(clippy::too_many_arguments)]
 fn push_info_attrs(
     elem: &mut BytesStart<'_>,
+    kind: ElementKind,
+    id: i64,
     version: Option<i32>,
     milli_timestamp: Option<i64>,
     changeset: Option<i64>,
     uid: Option<i32>,
     user: Option<&str>,
-) {
+) -> crate::Result<()> {
     if let Some(version) = version {
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
@@ -423,7 +433,14 @@ fn push_info_attrs(
     if let Some(milli_timestamp) = milli_timestamp {
         // Floor, not truncate, so a pre-1970 millisecond timestamp lands in
         // the right second; export formats the same way.
-        let ts = crate::commands::format_epoch_secs(milli_timestamp.div_euclid(1000));
+        let ts = crate::commands::format_rfc3339_utc(milli_timestamp.div_euclid(1000)).map_err(
+            |err| {
+                crate::Error::invalid_data_from(err).context(format!(
+                    "{} {id}: its timestamp ({milli_timestamp} ms) cannot be written as OSC",
+                    kind.as_str()
+                ))
+            },
+        )?;
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     if let Some(changeset) = changeset {
@@ -439,6 +456,49 @@ fn push_info_attrs(
     {
         push_attribute_escaped(elem, "user", u);
     }
+    Ok(())
+}
+
+/// Refuse a timestamp whose scaling by the block's `date_granularity`
+/// overflows `i64`. The permissive accessors wrap there, and a wrapped
+/// value can read as a plausible date (raw `i64::MAX` at granularity 1000
+/// is -1000 ms, `1969-12-31T23:59:59Z`) or, in a versionless dense slot, as
+/// the zero padding that drops the claim. Once the exact value fits, the
+/// wrapping accessor returns that same value, so every claim rule built on
+/// it is judged correctly.
+fn check_timestamp_scaling(exact: Option<i128>, kind: ElementKind, id: i64) -> crate::Result<()> {
+    match exact {
+        Some(exact) if i64::try_from(exact).is_err() => Err(crate::error::new_wire_error(
+            "timestamp scaled by the block's date_granularity overflows i64 milliseconds; \
+             the blob's timestamp or granularity is corrupt",
+        )
+        .context(format!("{} {id}", kind.as_str()))),
+        _ => Ok(()),
+    }
+}
+
+/// The decimicrodegree coordinates a derived node is printed at, checked
+/// against what the OSC reader accepts. The exact accessors refuse a value
+/// the permissive ones would wrap into some other place (the node scanner's
+/// refusal, shared with extract). The geographic check is `coord_pack`'s on
+/// the very `i32` pair printed: `format_coord(from_decimicro(v))` reads back
+/// as `v` across the whole domain, and the first step past +-90 / +-180
+/// prints past it, so the reader refuses exactly what this refuses.
+fn osc_node_coords(lat: Option<i32>, lon: Option<i32>, id: i64) -> crate::Result<(i32, i32)> {
+    let (Some(lat), Some(lon)) = (lat, lon) else {
+        return Err(
+            crate::scan::node::unrepresentable_coordinate_err().context(format!("node {id}"))
+        );
+    };
+    if !crate::coord_pack::in_domain(lat, lon) {
+        return Err(crate::Error::invalid_data(format!(
+            "node {id} lies outside the geographic domain (lat {}, lon {}); OSC readers, \
+             pbfhogg's included, refuse such a coordinate",
+            crate::coord_fmt::e7_to_deg(f64::from(lat)),
+            crate::coord_fmt::e7_to_deg(f64::from(lon)),
+        )));
+    }
+    Ok((lat, lon))
 }
 
 /// Write a borrowed `Element` as XML. Avoids the owned conversion path
@@ -473,12 +533,26 @@ fn write_dense_node_xml<W: std::io::Write>(
 ) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
-    format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
+    let (lat, lon) = osc_node_coords(
+        node.decimicro_lat_checked(),
+        node.decimicro_lon_checked(),
+        node.id(),
+    )?;
+    format_coord(coord_buf, from_decimicro(lat));
     let lat_str = coord_buf.clone();
-    format_coord(coord_buf, from_decimicro(node.decimicro_lon()));
+    format_coord(coord_buf, from_decimicro(lon));
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
+    // Checked before the claims, which judge a versionless slot's timestamp
+    // by its (wrapping) value: a wrap to zero would drop the claim silently.
+    if let Some(info) = node.info() {
+        check_timestamp_scaling(
+            Some(info.milli_timestamp_exact()),
+            ElementKind::Node,
+            node.id(),
+        )?;
+    }
     // A DenseInfo block decodes every field for every element, so presence
     // is read from the values: `claims` says which fields this slot claims
     // (all of them for a positive version, none for a negative one, and
@@ -489,12 +563,14 @@ fn write_dense_node_xml<W: std::io::Write>(
     {
         push_info_attrs(
             &mut elem,
+            ElementKind::Node,
+            node.id(),
             claims.version,
             claims.milli_timestamp,
             claims.changeset,
             claims.uid,
             claims.user.transpose()?,
-        );
+        )?;
     }
 
     let mut tags = node.tags_checked().peekable();
@@ -515,13 +591,19 @@ fn write_borrowed_node_xml<W: std::io::Write>(
 ) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
-    format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
+    let (lat, lon) = osc_node_coords(
+        node.decimicro_lat_checked(),
+        node.decimicro_lon_checked(),
+        node.id(),
+    )?;
+    format_coord(coord_buf, from_decimicro(lat));
     let lat_str = coord_buf.clone();
-    format_coord(coord_buf, from_decimicro(node.decimicro_lon()));
+    format_coord(coord_buf, from_decimicro(lon));
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
     let info = node.info();
+    check_timestamp_scaling(info.milli_timestamp_exact(), ElementKind::Node, node.id())?;
     // Called unconditionally: every field is independently optional in the
     // wire format, so gating the whole call on `version` being present would
     // discard a timestamp, changeset, uid or user carried by an Info block
@@ -531,12 +613,14 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     // version" inside an Info that carries other fields.
     push_info_attrs(
         &mut elem,
+        ElementKind::Node,
+        node.id(),
         info.claimed_version(),
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
-    );
+    )?;
 
     let mut tags = node.tags_checked().peekable();
     if tags.peek().is_none() {
@@ -557,16 +641,19 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = way.info();
+    check_timestamp_scaling(info.milli_timestamp_exact(), ElementKind::Way, way.id())?;
     // Unconditional for the same reason as the node path above: presence is
     // per field, not gated on `version`.
     push_info_attrs(
         &mut elem,
+        ElementKind::Way,
+        way.id(),
         info.claimed_version(),
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
-    );
+    )?;
 
     let mut refs = way.refs().peekable();
     let mut tags = way.tags_checked().peekable();
@@ -594,16 +681,23 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = rel.info();
+    check_timestamp_scaling(
+        info.milli_timestamp_exact(),
+        ElementKind::Relation,
+        rel.id(),
+    )?;
     // Unconditional for the same reason as the node path above: presence is
     // per field, not gated on `version`.
     push_info_attrs(
         &mut elem,
+        ElementKind::Relation,
+        rel.id(),
         info.claimed_version(),
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
-    );
+    )?;
 
     let mut members = rel.members().peekable();
     let mut tags = rel.tags_checked().peekable();
@@ -1127,5 +1221,93 @@ mod tests {
         assert!(xml.contains("changeset=\"555\""), "got: {xml}");
         assert!(xml.contains("user=\"mapper\""), "got: {xml}");
         Ok(())
+    }
+
+    /// The dense writer's XML for one node at `(lat, lon)` decimicrodegrees.
+    fn dense_node_at(lat: i32, lon: i32) -> crate::Result<String> {
+        let mut bb = crate::write::block_builder::BlockBuilder::new();
+        bb.add_node(1, lat, lon, Vec::<(&str, &str)>::new(), None);
+        let bytes = bb
+            .take()?
+            .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
+            .to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes)?;
+        let mut writer = Writer::new(Vec::new());
+        let mut coord_buf = String::new();
+        for element in block.elements() {
+            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+        }
+        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
+    }
+
+    /// Derive only writes coordinates the OSC reader takes back: the domain
+    /// edges print, one step past any of them is refused, never written as
+    /// `lat="90.0000001"` or `lat="91"` for apply to refuse later.
+    #[test]
+    fn node_coordinates_outside_the_geographic_domain_are_refused() -> crate::Result<()> {
+        let xml = dense_node_at(900_000_000, -1_800_000_000)?;
+        assert!(
+            xml.contains("lat=\"90\"") && xml.contains("lon=\"-180\""),
+            "got: {xml}"
+        );
+        let xml = dense_node_at(-900_000_000, 1_800_000_000)?;
+        assert!(
+            xml.contains("lat=\"-90\"") && xml.contains("lon=\"180\""),
+            "got: {xml}"
+        );
+        for (lat, lon) in [
+            (900_000_001, 0),
+            (-900_000_001, 0),
+            (910_000_000, 0),
+            (0, 1_800_000_001),
+            (0, -1_800_000_001),
+        ] {
+            let err = dense_node_at(lat, lon).expect_err("outside the domain");
+            assert!(
+                err.to_string().contains("geographic domain"),
+                "({lat}, {lon}): {err}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The written instant is one `parse_rfc3339_utc` reads: years 0000 and
+    /// 9999 print, a second beyond either end is refused rather than written
+    /// with a five-digit or signed year.
+    #[test]
+    fn element_timestamps_outside_years_0000_to_9999_are_refused() -> crate::Result<()> {
+        let way_at = |timestamp| {
+            borrowed_way_xml(&crate::write::block_builder::Metadata {
+                timestamp,
+                ..meta(1, 1)
+            })
+        };
+        for (secs, text) in [
+            (253_402_300_799, "9999-12-31T23:59:59Z"),
+            (-62_167_219_200, "0000-01-01T00:00:00Z"),
+        ] {
+            let xml = way_at(secs)?;
+            assert!(xml.contains(&format!("timestamp=\"{text}\"")), "got: {xml}");
+            assert_eq!(crate::commands::parse_rfc3339_utc(text), Ok(secs));
+        }
+        for secs in [253_402_300_800, -62_167_219_201] {
+            let err = way_at(secs).expect_err("outside years 0000 to 9999");
+            assert!(err.to_string().contains("way 7"), "{secs}: {err}");
+        }
+        Ok(())
+    }
+
+    /// A timestamp whose scaling by date_granularity overflows i64 is
+    /// refused, not wrapped: `i64::MAX / 1000 + 1` seconds at the default
+    /// granularity would otherwise print as some unrelated, readable date.
+    #[test]
+    fn a_timestamp_whose_scaling_overflows_is_refused() {
+        let err = handmade_way_xml(Some(1), Some(i64::MAX / 1000 + 1), None, None)
+            .expect_err("scaling overflows");
+        let text = err.to_string();
+        assert!(
+            text.contains("date_granularity") && text.contains("way 7"),
+            "{text}"
+        );
     }
 }

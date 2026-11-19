@@ -4,6 +4,15 @@
 
 ### Breaking
 
+- **`diff --format osc` refuses values its own OSC reader would refuse.**
+  A created or modified node outside latitude -90 to 90 or longitude -180
+  to 180, or with a coordinate that does not fit the PBF representation,
+  and an element timestamp outside years 0000 to 9999 now fail the run
+  (exit 2, nothing published). Before, derive printed `lat="91"`, a
+  five-digit or signed year, or a wrapped coordinate or date, and
+  `apply-changes` then refused the file. The library's delete timestamp
+  override past `9999-12-31T23:59:59Z` is now `InvalidArgument` before
+  any input is opened. Before, it was clamped and written unreadable.
 - **`tags-filter --input-kind osc` writes the kept changes in input
   order.** It used to write every create, then every modify, then every
   delete, so a delete followed by a re-create of the same object at the

@@ -851,7 +851,8 @@ pub(crate) fn probe_to_first_data_blob(frames: &mut Frames<FileReader>) -> Resul
 /// `1969-12-31T23:59:59Z`) and [`parse_rfc3339_utc`] reads it back for
 /// years 0000 to 9999. Outside that range the output is not in the
 /// parser's grammar: a later year has five digits and an earlier one a
-/// sign (`-001-01-01T00:00:00Z`), which the parser refuses.
+/// sign (`-001-01-01T00:00:00Z`), which the parser refuses; an output a
+/// pbfhogg reader must read back formats through [`format_rfc3339_utc`].
 pub(crate) fn format_epoch_secs(secs: i64) -> String {
     let day_secs = secs.rem_euclid(86400);
     let days = (secs - day_secs) / 86400;
@@ -875,8 +876,28 @@ pub(crate) fn format_epoch_secs(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
 }
 
-/// Why a timestamp could not be parsed by [`parse_rfc3339_utc`]. A neutral
-/// leaf: the caller decides whether the bad timestamp is an invalid argument
+/// The earliest instant [`parse_rfc3339_utc`] reads: `0000-01-01T00:00:00Z`.
+pub(crate) const RFC3339_MIN_SECS: i64 = -62_167_219_200;
+/// The latest instant [`parse_rfc3339_utc`] reads: `9999-12-31T23:59:59Z`.
+pub(crate) const RFC3339_MAX_SECS: i64 = 253_402_300_799;
+
+/// Format a Unix second for an output pbfhogg's own readers parse back: the
+/// instant as [`format_epoch_secs`] spells it, or an error when it lies
+/// outside years 0000 to 9999, where that spelling leaves the grammar of
+/// [`parse_rfc3339_utc`]. The range is checked before formatting, so
+/// `i64::MIN` never reaches the civil-date arithmetic.
+pub(crate) fn format_rfc3339_utc(secs: i64) -> std::result::Result<String, TimestampError> {
+    if (RFC3339_MIN_SECS..=RFC3339_MAX_SECS).contains(&secs) {
+        Ok(format_epoch_secs(secs))
+    } else {
+        Err(TimestampError(
+            "timestamp lies outside years 0000 to 9999, which YYYY-MM-DDTHH:MM:SSZ cannot spell",
+        ))
+    }
+}
+
+/// Why a timestamp could not be parsed by [`parse_rfc3339_utc`], or formatted
+/// for an output a pbfhogg reader must read back. A neutral leaf: the caller decides whether the bad timestamp is an invalid argument
 /// (the CLI cutoff) or invalid data (an OSC attribute).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimestampError(&'static str);
@@ -970,6 +991,25 @@ pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, TimestampError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `format_rfc3339_utc`'s domain is exactly the parser's: both ends
+    /// format and read back, one second past either is refused, and the
+    /// extremes of i64 are refused before any calendar arithmetic.
+    #[test]
+    fn rfc3339_format_domain_is_the_parse_domain() -> std::result::Result<(), TimestampError> {
+        for secs in [RFC3339_MIN_SECS, -1, 0, RFC3339_MAX_SECS] {
+            assert_eq!(parse_rfc3339_utc(&format_rfc3339_utc(secs)?)?, secs);
+        }
+        for secs in [
+            RFC3339_MIN_SECS - 1,
+            RFC3339_MAX_SECS + 1,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            assert!(format_rfc3339_utc(secs).is_err(), "{secs}");
+        }
+        Ok(())
+    }
 
     /// `parse_rfc3339_utc` is the exact inverse of `format_epoch_secs` and
     /// rejects malformed input.

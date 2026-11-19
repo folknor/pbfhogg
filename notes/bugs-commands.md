@@ -52,24 +52,6 @@ appear in XML 1.0 even as character references, so conforming readers reject
 the file. This breaks the promise that `--format osc` writes OSC XML. The
 shared writer should refuse unrepresentable strings before publication.
 
-## CMD-008 - Derived OSC can contain values pbfhogg's own OSC reader refuses
-
-Reported by: osc-parsing [P2], diff [P2].
-
-The borrowed node writers (`osc/write.rs`) format unchecked PBF coordinates,
-so a new node at latitude 91 produces `lat="91"`, which the OSC parser
-refuses. `push_info_attrs` formats timestamps without checking the year, so an
-element dated `10000-01-01` gets a five-digit year, while `parse_rfc3339_utc`
-requires exactly 20 bytes and four year digits. Below year 0000 the formatter
-writes a signed year (`-001-01-01T00:00:00Z`), which the parser refuses since
-it accepts only ASCII digits in every component. Derive succeeds, but applying
-its output fails. The public delete-timestamp parameter has the same problem,
-and values above `i64::MAX` are silently clamped (`diff/derive.rs`). This
-breaks the derive/apply roundtrip documented in `docs/cli/commands.md`, even
-though metadata differences are excluded from comparison. The producer should
-refuse values outside the consumer's representable domain, or the consumer
-should accept them.
-
 ## CMD-009 - --increment-version stops incrementing at i32::MAX
 
 Reported by: osc-parsing [P2], diff [P2].
@@ -454,3 +436,20 @@ with the size error instead of renumbering. It fails loudly and before
 publication, and is sign-neutral (a large positive start does it too). The
 fix is a split path: cut an oversized rewritten block between elements into
 two output blocks with their own indexes.
+
+## CMD-049 - apply-changes can grow a rewritten block past the block size cap
+
+Reported by: the derive OSC domain item (2026-11-19), while sparring the
+derive/apply roundtrip; not reproduced.
+
+Apply's block rewrite seeds the output block with the base block's entire
+string table (`rewrite_block.rs`, `pre_seed_string_table`) and then adds
+the strings of the changed elements. When a node's 17 MiB tag value is
+modified to a different 17 MiB value, the old and new blocks each fit the
+32 MiB framing cap and the OSC parser accepts the new value. The rewritten
+block holds both strings and is refused at framing (`write/framing.rs`).
+So a valid derived OSC fails to apply. That breaks the documented
+`diff --format osc` roundtrip in a case that has nothing to do with value
+domains. The failure is loud and comes before publication. The likely fixes
+are seeding only the strings the kept base elements use, or cutting the
+rewritten block in two, as in CMD-041.

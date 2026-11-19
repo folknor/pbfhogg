@@ -345,6 +345,33 @@ fn create_only() {
     assert_derive_stats(&out.stderr_str(), 2, 0, 0);
 }
 
+/// A created node at latitude 91 has no OSC `apply-changes` reads back, so
+/// derive refuses it (exit 2, no output) rather than publishing a diff the
+/// apply half of the documented roundtrip refuses, at every worker count.
+#[test]
+fn a_node_outside_the_geographic_domain_is_refused_not_written() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let node = |id, lat| TestNode {
+        id,
+        lat,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_sorted(&old, &[node(1, 100_000_000)], &[], &[]);
+    write_test_pbf_sorted(&new, &[node(1, 100_000_000), node(2, 910_000_000)], &[], &[]);
+    for jobs in [1, 4] {
+        let osc = dir.path().join(format!("changes-{jobs}.osc"));
+        let out = run_derive(&old, &new, &osc, false, false, Some(jobs));
+        let stderr = out.stderr_str();
+        assert_eq!(out.status.code(), Some(2), "-j {jobs}; stderr:\n{stderr}");
+        assert!(stderr.contains("geographic domain"), "-j {jobs}; stderr:\n{stderr}");
+        assert!(!osc.exists(), "-j {jobs}: nothing may be published");
+    }
+}
+
 #[test]
 fn delete_only() {
     let dir = crate::common::test_scratch();

@@ -531,6 +531,16 @@ impl<'a> DenseNodeInfo<'a> {
         self.timestamp.wrapping_mul(self.date_granularity)
     }
 
+    /// The time stamp in milliseconds, its scaling computed exactly in
+    /// `i128`. The decoded value is the same modular delta sum every reader
+    /// takes (writers produce such sums on purpose); only the scaling is
+    /// exact. Agrees with [`milli_timestamp`](Self::milli_timestamp)
+    /// whenever it fits `i64`.
+    #[inline]
+    pub fn milli_timestamp_exact(&self) -> i128 {
+        i128::from(self.timestamp) * i128::from(self.date_granularity)
+    }
+
     /// Returns the visibility status of an element.
     // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]

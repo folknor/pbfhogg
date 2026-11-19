@@ -541,6 +541,19 @@ root. Anything else is refused, naming the misplaced element. This follows
 libosmium's section and object-child structure; the root-level differences are
 in DEVIATIONS.md. Text and comments are ignored wherever they appear.
 
+The PBF-to-OSC producer (`diff --format osc`) writes only values the overlay's
+native parsing accepts, and refuses an element it cannot write. Node
+coordinates come from the exact accessors. A value that does not fit `i32`
+decimicrodegrees is a wire-format refusal, and one outside +-90 / +-180
+degrees on the very `i32` printed is invalid data. Timestamps are scaled
+exactly, and a scaling that overflows `i64` milliseconds is a wire-format
+refusal. That check comes before the dense claim rules, which would otherwise
+read a wrap to zero as padding. Timestamps print through `format_rfc3339_utc`,
+whose domain is the parser's: years 0000 to 9999. The delete timestamp
+override is held to the same domain as an invalid argument before either
+input is opened. Deleted elements print only ID, version and the override, so
+their old values are not judged.
+
 The re-emitting OSC paths (`merge-changes`, with or without `--simplify`, and
 `tags-filter --input-kind osc`) deliberately parse version but pass timestamp,
 changeset, uid and visible through as normalized XML attribute text without

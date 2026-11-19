@@ -463,11 +463,12 @@ Reported by: the codex spar of the extract and geocode coordinate work.
 Extract and the geocode builder now convert every node coordinate exactly
 (`decimicro_lat_checked` / `decimicro_lon_checked`, the checked columnar
 decode, `nano_lat_exact`) and refuse one that does not fit an `i32`
-decimicrodegree. Every other command that decodes a node and writes it
-again still uses the permissive `decimicro_lat` / `decimicro_lon`, which
-wrap modulo 2^64 and narrow with `as i32`: cat and repack re-encode, sort,
-degrade, tags-filter, time-filter, getid, getparents, the OSC writers,
-apply-changes element writes and altw stage 4 among them. A block with
+decimicrodegree. The OSC node writers derive uses do the same, and also
+refuse a coordinate outside the geographic domain. Every other command that
+decodes a node and writes it again still uses the permissive
+`decimicro_lat` / `decimicro_lon`, which wrap modulo 2^64 and narrow with
+`as i32`: cat and repack re-encode, sort, degrade, tags-filter,
+time-filter, getid, getparents, apply-changes element writes and altw stage 4 among them. A block with
 `lat_offset = 429496729600` and a raw latitude of 0 (429.4967296 degrees)
 is written at latitude 0, a silent wrong answer where a refusal is owed.
 Inline way locations (`WayNodeLocation`) wrap the same way before

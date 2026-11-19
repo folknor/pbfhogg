@@ -277,6 +277,25 @@ and the difference in the single-threaded write and assembly segment after
 21.5 s), which the change does not touch and whose bytes are the same.
 Read as noise in that segment, not a cost of the check.
 
+## OSC values held to the reader's domain (bygg, 2026-11-19, against `211442d5`)
+
+Each created or modified element that `--format osc` writes now goes through
+three checks: exact node coordinates with a geographic range check, exact
+timestamp scaling, and a calendar range check. Matched planet A/B,
+`diff-pair --from base --to 20260411 --format osc`, `--iterations 1`, after
+`fstrim`. The baseline cells are `--commit HEAD` builds of `211442d5` and
+the variant cells are the uncommitted working tree (stored as dirty). The
+baseline ran first in every pair.
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `df869bb4` 2m13s | `a79d17a6` 2m12s |
+| 2 | `8d9c1918` 2m17s | `7a57d7ce` 2m19s |
+
+The signs disagree and every delta is under 2 %, so the change has no
+cost. The checks run only on elements that are printed, a small fraction of
+the elements compared.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

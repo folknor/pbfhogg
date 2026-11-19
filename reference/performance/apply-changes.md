@@ -38,6 +38,14 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### XML 1.0 character check on every OSC input event (bygg, 2026-11-19, `a664c724` + change)
+
+Planet `apply-diff --osc 4913` after `fstrim`, `--iterations 1`:
+`a664c724` 198.29 s (`a8105a31`); variant 200.24 s (`a5760787`). The ingest
+segment the check lands in (before `MERGE_LOOP`) went from 4612 to 4719 ms
+(+107 ms); the rest of the wall delta sits in the drive-bound trailing
+creates drain (684 to 1575 ms), not in parsing. About +1 % of wall, noise.
+
 ### Overflow recovery: the rewrite walk as a step iterator (bygg, 2026-11-19, `3bafe5c0` + change)
 
 The worker's rewrite loop became a step iterator (so an output block over

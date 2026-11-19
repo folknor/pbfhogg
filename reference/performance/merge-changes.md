@@ -8,6 +8,18 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### XML 1.0 character check on every input event (bygg, 2026-11-19, `a664c724` + change)
+
+The shared OSC driver checks each event's bytes for forbidden scalars and
+character references, on the per-input reader thread. After `fstrim`,
+`--iterations 1`, planet 7-OSC default merge (`--osc 4914..4920`):
+`a664c724` 2940, 2946, 2977 ms (`cc997e9a`, `625d253c`, `2bbf14e4`). A first
+variant folding a per-byte predicate over 32-byte chunks cost about 19 %:
+3503, 3485 ms (`ffbb512d`, `b28b2bed`), so the compiler did not vectorize
+it. The landed form tests eight bytes per word (below 0x20, 0xEF, `&`) and
+walks bytes only from the first candidate word: 3014, 3080 ms (`85537dfb`,
+`34841998`), about +2 to 3 %, at the noise band and not chased.
+
 ### XML 1.0 character check folded into the escape scan (bygg, 2026-11-19, `29fd352a` + change)
 
 Every user-text attribute's existing tab/LF/CR byte scan now also refuses

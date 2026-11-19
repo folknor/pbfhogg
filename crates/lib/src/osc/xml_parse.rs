@@ -14,8 +14,10 @@
 //! (root, sections, objects, their children; anything misplaced is
 //! refused), self-closing elements, child routing, and the end-of-document
 //! completeness check. Text, comments and processing instructions are
-//! ignored wherever they appear; this is a hierarchy check, not XML
-//! validation beyond what quick-xml does. An [`OscSink`] owns the *data*:
+//! ignored wherever they appear, except that every event is held to XML
+//! 1.0's `Char` production ([`check_event_chars`]); beyond that this is a
+//! hierarchy check, not XML validation beyond what quick-xml does. An
+//! [`OscSink`] owns the *data*:
 //! what an element turns into once the framing has identified it.
 
 use std::cell::Cell;
@@ -804,6 +806,190 @@ fn handle_close<S: OscSink>(state: &mut DriveState, sink: &mut S, path: &Path) -
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// XML 1.0 Char on input
+// ---------------------------------------------------------------------------
+
+/// Whether `cp` is in XML 1.0's `Char` production: tab, LF, CR,
+/// U+0020-U+D7FF, U+E000-U+FFFD, U+10000-U+10FFFF.
+fn is_xml_char(cp: u32) -> bool {
+    matches!(cp, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x1_0000..=0x10_FFFF)
+}
+
+#[cold]
+fn forbidden_char(cp: u32, how: &str) -> Error {
+    Error::invalid_data(format!(
+        "malformed OSC XML: the document holds U+{cp:04X} {how}, which XML 1.0 forbids \
+         anywhere in a document; refusing it as a conforming XML reader (libosmium's \
+         Expat) does"
+    ))
+}
+
+/// Decode the numeric character reference whose body (between `&#` and
+/// `;`, `x` included) is `body`, and refuse it unless it is a `Char`.
+/// Spelling follows XML 1.0's `CharRef`: decimal digits or lowercase `x`
+/// and hex digits, at least one, any number of leading zeros.
+fn check_char_ref(body: &[u8]) -> ParseResult<()> {
+    let (digits, radix) = match body.split_first() {
+        Some((b'x', rest)) => (rest, 16),
+        _ => (body, 10),
+    };
+    let mut cp: u32 = 0;
+    for &d in digits {
+        let v = char::from(d)
+            .to_digit(radix)
+            .ok_or_else(|| malformed_char_ref(body))?;
+        // Saturate past the Unicode range: still refused, never wrapped.
+        cp = cp.saturating_mul(radix).saturating_add(v).min(0x11_0000);
+    }
+    if digits.is_empty() {
+        return Err(malformed_char_ref(body));
+    }
+    if is_xml_char(cp) {
+        Ok(())
+    } else if cp > 0x10_FFFF {
+        Err(Error::invalid_data(format!(
+            "malformed OSC XML: character reference &#{}; exceeds U+10FFFF",
+            String::from_utf8_lossy(body)
+        )))
+    } else {
+        Err(forbidden_char(cp, "as a character reference"))
+    }
+}
+
+#[cold]
+fn malformed_char_ref(body: &[u8]) -> Error {
+    Error::invalid_data(format!(
+        "malformed OSC XML: malformed character reference &#{};",
+        String::from_utf8_lossy(body)
+    ))
+}
+
+/// Refuse a literal scalar XML 1.0 forbids. `bytes` is valid UTF-8 (every
+/// quick-xml event payload is a `str`), so a byte below 0x20 is an ASCII
+/// scalar and `EF BF BE` / `EF BF BF` are exactly U+FFFE / U+FFFF. When
+/// `refs` is set, every `&#...;` is also decoded and checked: in a start
+/// or empty tag a raw `&` can only begin a reference in a quoted attribute
+/// value, so this covers every attribute, the ones no sink reads included,
+/// while `&amp;#1;` (a `&` followed by `amp;`) stays literal text.
+///
+/// The fast path tests eight bytes at a time for any byte below 0x20, any
+/// 0xEF and (with `refs`) any `&`; only from the first word holding a
+/// candidate on is the event walked byte by byte. A tab, LF or CR is a
+/// candidate the walk then passes, which costs nothing on OSC as written:
+/// its whitespace sits between tags, where quick-xml trims it away.
+fn check_chars(bytes: &[u8], refs: bool) -> ParseResult<()> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    // Exact "some byte is zero" / "some byte is below n" word tests.
+    let has_zero = |v: u64| v.wrapping_sub(LO) & !v & HI;
+    // Without `refs`, repeat the 0xEF test rather than match nothing.
+    let amp = LO * if refs { u64::from(b'&') } else { 0xEF };
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut start = 0;
+    for word in words {
+        let w = u64::from_le_bytes(*word);
+        let below_space = w.wrapping_sub(LO * 0x20) & !w & HI;
+        if below_space | has_zero(w ^ (LO * 0xEF)) | has_zero(w ^ amp) != 0 {
+            return check_chars_slow(bytes, start, refs);
+        }
+        start += 8;
+    }
+    if rest
+        .iter()
+        .any(|&b| b < 0x20 || b == 0xEF || (refs && b == b'&'))
+    {
+        return check_chars_slow(bytes, start, refs);
+    }
+    Ok(())
+}
+
+#[cold]
+fn check_chars_slow(bytes: &[u8], from: usize, refs: bool) -> ParseResult<()> {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b @ 0..0x20 if !matches!(b, b'\t' | b'\n' | b'\r') => {
+                return Err(forbidden_char(u32::from(b), "literally"));
+            }
+            0xEF if bytes.get(i + 1) == Some(&0xBF)
+                && matches!(bytes.get(i + 2), Some(0xBE | 0xBF)) =>
+            {
+                let cp = if bytes[i + 2] == 0xBE { 0xFFFE } else { 0xFFFF };
+                return Err(forbidden_char(cp, "literally"));
+            }
+            b'&' if refs && bytes.get(i + 1) == Some(&b'#') => {
+                let body = &bytes[i + 2..];
+                let end = body
+                    .iter()
+                    .position(|&b| b == b';')
+                    .ok_or_else(|| malformed_char_ref(body))?;
+                check_char_ref(&body[..end])?;
+                i += 2 + end;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Whether a DOCTYPE payload opens an internal subset: a `[` outside the
+/// quoted literals of its external identifier (`SYSTEM "https://[::1]/x"`
+/// is legal and has none).
+fn has_internal_subset(payload: &[u8]) -> bool {
+    let mut quote = None;
+    for &b in payload {
+        match (quote, b) {
+            (None, b'"' | b'\'') => quote = Some(b),
+            (Some(q), _) if b == q => quote = None,
+            (None, b'[') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Hold one event to XML 1.0's `Char` production. The driver ignores most
+/// events, but a document carrying a forbidden character is not XML, and
+/// libosmium's Expat refuses all of it before any OSM interpretation; so
+/// does this, on the reader thread every route shares, before the event is
+/// dispatched - so no filter predicate or simplify dedupe decides whether
+/// the refusal happens. Literal scalars are checked in every event's
+/// payload (quick-xml's payloads omit only delimiters, the BOM and XML
+/// whitespace); character references are decoded where XML gives them
+/// meaning: attribute values and text (`GeneralRef`). Inside comments,
+/// CDATA and processing instructions `&#1;` is legal literal text.
+///
+/// A DOCTYPE with an internal subset is refused outright: its entity
+/// values and attribute defaults would need a second grammar to check,
+/// neither pbfhogg's nor osmium's OSC writers produce one, and libosmium
+/// refuses entity declarations. An
+/// external identifier is inert - nothing loads it.
+fn check_event_chars(ev: &Event<'_>) -> ParseResult<()> {
+    match ev {
+        Event::Start(e) | Event::Empty(e) => check_chars(e.as_bytes(), true),
+        Event::GeneralRef(r) => {
+            let name = r.as_bytes();
+            match name.split_first() {
+                Some((b'#', body)) => check_char_ref(body),
+                _ => check_chars(name, false),
+            }
+        }
+        Event::DocType(d) => {
+            let payload = d.as_bytes();
+            if has_internal_subset(payload) {
+                return Err(Error::invalid_data(
+                    "malformed OSC XML: the document's DOCTYPE carries an internal \
+                     subset; OSC input refuses DTD declarations",
+                ));
+            }
+            check_chars(payload, false)
+        }
+        other => check_chars(other.as_bytes(), false),
+    }
+}
+
 /// Drive one OSC document read from `path` through `reader` into `sink`.
 ///
 /// Every failure of reading or interpreting the input is located with
@@ -822,7 +1008,11 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
     let mut buf = Vec::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        if let Ok(ev) = &event {
+            check_event_chars(ev).map_err(|e| input_fault(path, e))?;
+        }
+        match event {
             Ok(Event::Start(ref e)) => handle_open(e, false, &mut state, sink, path)?,
             Ok(Event::Empty(ref e)) => handle_open(e, true, &mut state, sink, path)?,
             Ok(Event::End(_)) => handle_close(&mut state, sink, path)?,

@@ -39,26 +39,22 @@ matching files and its explicit protection against successful zero-diff
 mistakes. Metadata failures need to propagate, separately from skipping
 directories.
 
-## CMD-051 - OSC readers accept characters XML 1.0 forbids
+## CMD-052 - OSC readers accept undeclared entities and a misplaced DOCTYPE
 
-Reported by: the CMD-007 output fix (spar with codex).
+Reported by: the XML 1.0 input character check (spar with codex).
 
-Every OSC writer now refuses a character outside XML 1.0's `Char` production
-(`osc::write::check_xml_chars`), but no OSC reader does. quick-xml 0.42
-decodes every character reference except `&#0;`, and the reader does not check
-raw scalars either, so `&#1;`, a raw U+0001 or `&#xFFFE;` in an input is
-accepted. libosmium's Expat refuses the whole document. Consequences:
-`apply-changes` writes such a value into the output PBF where osmium would
-refuse the input. The re-emitters' refusal depends on whether the change is
-rendered: today every change is rendered before the keep predicate and the
-simplify dedupe, but moving rendering after selection (PERF-044) would let a
-discarded malformed change pass. A forbidden character in root or section
-attributes (`<osmChange generator="&#1;">`), unknown attributes or ignored
-events is never looked at. The fix belongs at the shared XML boundary
-(`osc/xml_parse.rs`, not only `append_str_attr`): check literal scalars
-wherever they occur and the decoded value of every character reference, while
-keeping `&amp;#1;` legal. Any per-byte cost on the apply and merge read paths
-is measured first.
+The shared driver (`drive_osc`, `osc/xml_parse.rs`) now holds every event to
+XML 1.0 `Char`, but other well-formedness rules still pass where no sink
+looks. An undeclared named entity is refused only in an attribute a sink
+normalizes: `<osmChange x="&x;"/>` (root attributes are never read) and
+`<osmChange>&x;</osmChange>` (a named `GeneralRef` is ignored) are accepted,
+while Expat refuses both. A DOCTYPE after the root (`<osmChange/><!DOCTYPE
+osmChange>`) and a DOCTYPE with a malformed external identifier
+(`<!DOCTYPE osmChange SYSTEM>`) are accepted too; quick-xml does not check
+either. None can put a wrong value into a change, so this is parity, not a
+silent wrong answer. A fix would refuse every non-predefined named
+`GeneralRef`, scan the remaining attributes of each start tag for `&name;`
+outside the five predefined names, and refuse a DOCTYPE outside the prolog.
 
 ## CMD-011 - Unindexed gzip derive ignores the -j worker cap
 

@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **OSC input holding a character XML 1.0 forbids is refused.**
+  `apply-changes`, `merge-changes` (with or without `--simplify`) and
+  `tags-filter --input-kind osc` exit 2 on an OSC document containing a
+  C0 control character other than tab, newline and carriage return, or
+  U+FFFE / U+FFFF, written literally or as a character reference
+  (`&#1;`, `&#xFFFE;`), anywhere in the document - including attributes
+  and text no command reads and changes a filter would drop - as osmium
+  does. Before, `apply-changes` wrote such a value into the output PBF.
+  `&amp;#1;` (escaped text) and references inside comments or CDATA stay
+  legal. A `<!DOCTYPE>` with an internal subset (`[...]`) is now refused;
+  a bare `<!DOCTYPE osmChange>` or an external identifier is still read.
 - `diff --format osc --increment-version` exits 2 without publishing an
   OSC if a deleted element is already at version 2147483647.
 

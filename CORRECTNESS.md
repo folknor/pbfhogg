@@ -539,7 +539,8 @@ sections contain only `node`, `way` and `relation`; an object contains only
 relations, ignored); those children contain no elements; nothing follows the
 root. Anything else is refused, naming the misplaced element. This follows
 libosmium's section and object-child structure; the root-level differences are
-in DEVIATIONS.md. Text and comments are ignored wherever they appear.
+in DEVIATIONS.md. Text and comments are ignored wherever they appear, except
+for the character check below.
 
 The PBF-to-OSC producer (`diff --format osc`) writes only values the overlay's
 native parsing accepts, and refuses an element it cannot write. Node
@@ -556,18 +557,31 @@ their old values are not judged.
 
 Every OSC producer, derive and the re-emitters alike, writes only characters
 XML 1.0's `Char` production admits. PBF strings are validated as UTF-8 only,
-and quick-xml's attribute normalization decodes every character reference but
-`&#0;`, so a tag key or value, member role, user or other metadata text can
+so a tag key or value, member role, user or other metadata text can
 hold a C0 control other than tab, LF and CR, or U+FFFE / U+FFFF. None of
 those can appear in an XML 1.0 document even as a reference. The one
 user-text escape boundary (`osc::write::check_xml_chars`, behind both escape
 helpers) refuses such a value as invalid data, naming the element and
 attribute, before anything is published. Tab, LF and CR are written as
-references. This is an output guarantee, not input validation: the re-emitters
-render every change before filtering or deduplicating, so today a forbidden
-character in a change they would discard also fails the run, but that follows
-from render order and is not promised. Root and section attributes are not
-re-emitted, so a forbidden character there passes without refusal.
+references. For PBF input this is the only check; for OSC input it is not
+reached, because the shared reader refuses first.
+
+Every OSC reader holds the whole input document to XML 1.0's `Char`
+production, as libosmium's Expat does, on the one driver every route shares
+(`check_event_chars` in `osc/xml_parse.rs`), checking each event before it is
+dispatched. Earlier events, earlier parts of the same change included, may
+already have reached a sink; the run still fails and publishes nothing, and no
+filter predicate or simplify dedupe decides whether the refusal happens. A forbidden scalar written literally
+anywhere (attribute, text, comment, CDATA, processing instruction, DOCTYPE),
+or a character reference in an attribute value or text whose decoded value is
+not a `Char`, refuses the document as invalid data. That covers attributes no
+command reads (root, section, unknown) and changes a filter or simplify would
+discard. A malformed numeric reference is refused the same way.
+Reference-looking text that is not a reference stays legal: `&amp;#1;`, and
+`&#1;` inside a comment, CDATA or processing instruction. A DOCTYPE carrying an
+internal subset is refused outright (see DEVIATIONS.md); an external
+identifier is never loaded. Input is decoded as UTF-8 whatever its
+declaration says, and the check is on those scalars.
 
 The re-emitting OSC paths (`merge-changes`, with or without `--simplify`, and
 `tags-filter --input-kind osc`) deliberately parse version but pass timestamp,

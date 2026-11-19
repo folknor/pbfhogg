@@ -594,8 +594,9 @@ newline"/>
     }
 
     /// A character XML 1.0 cannot carry, which quick-xml's normalization
-    /// decodes from a reference, is refused by both paths wherever user text
-    /// is written, naming the element; never written out raw. Legal
+    /// would decode from a reference, is refused by the shared reader in a
+    /// tag key and value, user, timestamp and member role before any batch
+    /// is recorded, so no re-emitter can write it out. Legal
     /// neighbours (U+FFFD, U+FEFF, a referenced tab, an escaped `&#1;`)
     /// still write.
     #[test]
@@ -612,18 +613,13 @@ newline"/>
             let xml = format!(
                 "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"><modify>{case}</modify></osmChange>"
             );
-            let recorded = batches(dir.path(), &xml).expect("the reader decodes it");
-            // The byte sink refuses while replaying (so the input path is
-            // named); the owned oracle refuses when it writes. Same words.
-            for batch in &recorded {
-                for owned in [false, true] {
-                    let err = encode(batch, owned).expect_err(case);
-                    assert!(
-                        err.contains("XML 1.0 cannot carry") && err.contains(" 5"),
-                        "{case} owned={owned}: {err}"
-                    );
-                }
-            }
+            // The shared reader refuses the document before any batch is
+            // recorded, so neither writer ever sees the value; their own
+            // check (`check_xml_chars`) guards PBF-derived output.
+            let Err(err) = batches(dir.path(), &xml) else {
+                panic!("{case}: the reader accepted a character XML 1.0 forbids");
+            };
+            assert!(err.to_string().contains("XML 1.0 forbids"), "{case}: {err}");
         }
         let xml = "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\"><modify>\
                    <node id=\"5\" lat=\"1\" lon=\"1\"><tag k=\"a\" v=\"\u{FFFD}&#xFEFF;&#9;&amp;#1;\"/></node>\

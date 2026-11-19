@@ -477,6 +477,15 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   naming both suffixes, exit `64`. The match is case-sensitive (`.OSC` is
   refused). Every OSC reader here sniffs the gzip magic, so either form is
   read back.
+- **An OSC input must be XML 1.0 in its characters.** `apply-changes`,
+  `merge-changes` and `tags-filter --input-kind osc` refuse (exit `2`) a
+  document holding a C0 control character other than tab, newline and carriage
+  return, or U+FFFE / U+FFFF, anywhere in it - written literally or as a
+  character reference in an attribute or text, including attributes no
+  command reads and changes a filter would drop - as osmium does. `&amp;#1;`
+  and a reference inside a comment or CDATA are ordinary text and pass. A
+  `<!DOCTYPE>` with an internal subset is refused; an external identifier is
+  never loaded.
 - **An OSC input may be a stream** (a FIFO, `/dev/stdin`) for
   `apply-changes`, `merge-changes` and `tags-filter --input-kind osc`: each
   is read front to back once, and the gzip sniff replays the bytes it took
@@ -1704,7 +1713,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)); `--format osc` only, which keeps its per-action XML there, removed on completion: for a `.osc.gz` output from indexed inputs that XML is already gzip-compressed (about the output's size), otherwise it is plain XML several times larger. Must exist and be writable; checked before any input is read. Default: the output's directory. A text diff writes no scratch and refuses it |
 | `--direct-io` | Use O_DIRECT when reading the PBF inputs; see the [I/O capability matrix](#io-capability-matrix) |
 
-With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)). That holds for elements that fit a PBF block on their own with room to spare, while the changed output of any one base blob stays under 256 MiB. Otherwise `apply-changes` can refuse, loudly and before publishing anything (see [apply-changes](#apply-changes)). A string XML 1.0 cannot carry (NUL, another control character besides tab, newline and carriage return, or U+FFFE / U+FFFF), which a PBF may hold, makes the run fail without publishing, naming the element; `merge-changes` and OSC `tags-filter` refuse such a character in their input the same way.
+With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#derive-changes-changes-are-decided-by-content-not-version)). That holds for elements that fit a PBF block on their own with room to spare, while the changed output of any one base blob stays under 256 MiB. Otherwise `apply-changes` can refuse, loudly and before publishing anything (see [apply-changes](#apply-changes)). A string XML 1.0 cannot carry (NUL, another control character besides tab, newline and carriage return, or U+FFFE / U+FFFF), which a PBF may hold, makes the run fail without publishing, naming the element. Every OSC reader (`apply-changes`, `merge-changes`, OSC `tags-filter`) refuses an input document holding such a character anywhere, literally or as a character reference, as osmium does; see [Output files](#output-files).
 
 **Only values `apply-changes` reads back.** `--format osc` never writes a value pbfhogg's own OSC reader refuses. A created or modified node outside latitude -90 to 90 or longitude -180 to 180 is refused, and so is one whose coordinate does not fit the PBF representation. An element timestamp outside years 0000 to 9999 is refused too, because `YYYY-MM-DDTHH:MM:SSZ` cannot spell it, and so is one whose scaling overflows. Each refusal exits `2` and publishes nothing. A clock past 9999 under `--update-timestamp` is refused before either input is opened. Deleted elements print only ID, version and the override timestamp, so their old values are never checked.
 

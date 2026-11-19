@@ -25,8 +25,9 @@ use crate::{ElementKind, MemberId};
 /// U+FFFE / U+FFFF. Those cannot appear in an XML 1.0 document at all, not
 /// even as character references, so a conforming reader (libosmium's Expat
 /// among them) refuses the whole file. PBF strings are validated as UTF-8
-/// only and quick-xml's attribute normalization admits every reference but
-/// `&#0;`, so both a PBF tag and an OSC input's `&#1;` can carry one here.
+/// only, so a PBF tag can carry one here. OSC input cannot: the shared
+/// reader (`check_event_chars` in `osc/xml_parse.rs`) refuses the document
+/// first, so for the re-emitters this is a second line, not the boundary.
 /// Writing it would publish a file that is not XML; dropping or replacing
 /// it would be a silent wrong answer. It is refused.
 ///

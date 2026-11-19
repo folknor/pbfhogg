@@ -337,6 +337,21 @@ re-emitters never see an empty `visible` as present, so reading it as absent is
 what keeps a change's claims the same applied directly and after
 `merge-changes` or OSC `tags-filter`.
 
+## OSC input: a DOCTYPE internal subset is refused
+
+**osmium behavior:** libosmium hands the document to Expat, which parses an
+internal DTD subset; libosmium refuses only entity declarations ("XML
+entities are not supported"), so an internal subset holding only, say, an
+`ATTLIST` declaration is read.
+
+**pbfhogg behavior:** every OSC consumer refuses a `<!DOCTYPE>` that carries
+an internal subset (a `[` outside its quoted literals), whatever it declares.
+pbfhogg applies nothing from a DTD, but a declaration's values (an attribute
+default, an entity value) are part of the document and can hold a character
+reference XML 1.0 forbids; checking them would need a second grammar, for
+input that neither pbfhogg's nor osmium's OSC writers produce. `<!DOCTYPE osmChange>` and an external
+identifier (never loaded) are read as before.
+
 ## derive-changes: changes are decided by content, not version
 
 **osmium behavior:** `osmium derive-changes` walks both inputs in

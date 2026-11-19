@@ -611,6 +611,156 @@ fn every_consumer_refuses_a_truncated_osc() {
     assert_all_refuse(dir.path(), &input, "closing </osmChange>", "truncated");
 }
 
+/// XML 1.0's `Char` production holds for the whole document, as
+/// libosmium's Expat holds it: a forbidden scalar, literal or referenced,
+/// is refused by every route wherever it sits - in an attribute a sink
+/// reads, one nothing reads, text, a comment, or a change the tags-filter
+/// predicate or simplify would discard. Reference-looking text that is not
+/// a reference stays legal.
+#[test]
+fn every_consumer_refuses_a_character_xml_forbids() {
+    let dir = crate::common::test_scratch();
+    let doc = chars_doc;
+    let dropped = chars_dropped;
+    let refused = [
+        (
+            "referenced U+0001 in a tag",
+            doc("", &dropped("&#1;"), ""),
+            "U+0001",
+        ),
+        (
+            "referenced U+FFFE in a tag",
+            doc("", &dropped("&#xFFFE;"), ""),
+            "U+FFFE",
+        ),
+        (
+            "literal U+0001 in a tag",
+            doc("", &dropped("a\u{1}b"), ""),
+            "U+0001",
+        ),
+        (
+            "literal U+FFFF in a tag",
+            doc("", &dropped("\u{FFFF}"), ""),
+            "U+FFFF",
+        ),
+        // Payload offset 16 + 7: the three bytes straddle a word boundary.
+        (
+            "literal U+FFFF across a word",
+            doc("", &dropped("abcdefg\u{FFFF}"), ""),
+            "U+FFFF",
+        ),
+        (
+            "a change simplify supersedes",
+            doc(
+                "",
+                &format!(
+                    "{}<node id=\"2\" lat=\"1.0\" lon=\"2.0\" version=\"2\"/>",
+                    dropped("&#1;")
+                ),
+                "",
+            ),
+            "U+0001",
+        ),
+        (
+            "uppercase X reference",
+            doc("", &dropped("&#X41;"), ""),
+            "malformed character reference",
+        ),
+        (
+            "root attribute",
+            doc(r#" generator="&#1;""#, "", ""),
+            "U+0001",
+        ),
+        (
+            "unread object attribute",
+            doc("", r#"<node id="3" lat="1" lon="2" x="&#x1F;"/>"#, ""),
+            "U+001F",
+        ),
+        ("text reference", doc("", "", "<note>&#2;</note>"), "U+0002"),
+        (
+            "literal in a comment",
+            doc("", "", "<!-- \u{7} -->"),
+            "U+0007",
+        ),
+        (
+            "overflowing reference",
+            doc("", &dropped("&#99999999999;"), ""),
+            "exceeds U+10FFFF",
+        ),
+        (
+            "malformed reference",
+            doc("", &dropped("&#xZZ;"), ""),
+            "malformed character reference",
+        ),
+        (
+            "internal DTD subset",
+            format!(
+                "<!DOCTYPE osmChange [<!ATTLIST osmChange x CDATA \"&#1;\">]>{}",
+                doc("", "", "")
+            ),
+            "internal subset",
+        ),
+    ];
+    for (case, xml, needle) in refused {
+        let input = dir.path().join("chars.osc.gz");
+        write_gz(&input, &xml);
+        assert_all_refuse(dir.path(), &input, needle, case);
+    }
+}
+
+/// A document holding one kept change (so tags-filter keeps something),
+/// optional root attributes, extra root-level content, and `body` in the
+/// same `<create>`.
+fn chars_doc(root_attr: &str, body: &str, extra: &str) -> String {
+    let kept =
+        r#"<node id="1" lat="1.0" lon="2.0" version="1"><tag k="highway" v="primary"/></node>"#;
+    format!(
+        "<osmChange version=\"0.6\"{root_attr}>{extra}\
+         <create>{kept}{body}</create></osmChange>"
+    )
+}
+
+/// A change the tags-filter predicate drops, carrying `v` as a tag value.
+fn chars_dropped(v: &str) -> String {
+    format!(r#"<node id="2" lat="1.0" lon="2.0" version="1"><tag k="name" v="{v}"/></node>"#)
+}
+
+/// The counterpart: what only looks like a forbidden character, and the
+/// legal neighbours of the forbidden ranges, pass every route.
+#[test]
+fn every_consumer_admits_what_xml_allows() {
+    let dir = crate::common::test_scratch();
+    let doc = chars_doc;
+    let dropped = chars_dropped;
+    let accepted = [
+        ("escaped reference text", doc("", &dropped("&amp;#1;"), "")),
+        (
+            "legal neighbours",
+            doc(
+                "",
+                &dropped("&#9;&#xFFFD;&#x10000;&#x10FFFF;\u{FEFF}\u{85}\u{FF01}"),
+                "",
+            ),
+        ),
+        (
+            "references in a comment and CDATA",
+            doc("", "", "<!-- &#1; --><note><![CDATA[&#1;]]></note>"),
+        ),
+        (
+            "external DTD identifier",
+            format!(
+                "<!DOCTYPE osmChange SYSTEM \"https://[::1]/osm.dtd\">{}",
+                doc("", "", "")
+            ),
+        ),
+    ];
+    for (case, xml) in accepted {
+        let input = dir.path().join("chars-ok.osc.gz");
+        write_gz(&input, &xml);
+        assert_all_accept(dir.path(), &input, case);
+    }
+}
+
 /// A created or modified node without usable coordinates. Two copies
 /// did `unwrap_or(0.0)` followed by a saturating `as i32`, which puts
 /// the node at 0/0 - the Gulf of Guinea, a real place - and clamps

@@ -1,28 +1,18 @@
 //! Explicit caller-invoked process policy, and the procfs readers the library,
 //! the CLI and the sidecar instrumentation use. The metric readers return
 //! `Option`: a failed or unavailable sample is reported as absent, never as
-//! zero, and each caller decides what absence means for its output. The one
-//! precondition probe here, `is_mount_point`, returns an I/O error instead,
-//! because its caller refuses work on the answer and must not mistake an
-//! unreadable mount table for "not a mount point".
+//! zero, and each caller decides what absence means for its output.
 
 use crate::tunables::{NOFILE_PROBE_FAILED_ASSUMED_SOFT, NOFILE_SOFT_LIMIT_CLAMP};
 
 /// Read a file the kernel provides (procfs, cgroupfs). Not a caller-named
 /// input, so it bypasses `crate::read::input`: the path is the kernel's, and
 /// each caller decides what a failure means - most fold it into an absent
-/// sample, [`is_mount_point`] returns it with the path as context.
+/// sample, while the deletion walk's mount-identity read in
+/// `crate::scratch` (an `fdinfo` record) refuses on it.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn read_kernel_file(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
     std::fs::read_to_string(path)
-}
-
-/// [`read_kernel_file`] as raw bytes, for a table whose fields need not be
-/// UTF-8 (mountinfo paths).
-#[cfg(target_os = "linux")]
-#[allow(clippy::disallowed_methods)]
-fn read_kernel_bytes(path: &str) -> std::io::Result<Vec<u8>> {
-    std::fs::read(path)
 }
 
 /// Read cumulative minor and major page faults from `/proc/self/stat`.
@@ -110,47 +100,6 @@ fn parse_peak_rss_kb(status: &str) -> Option<u64> {
     let trimmed = rest.trim();
     let kb_str = trimmed.strip_suffix("kB").unwrap_or(trimmed).trim();
     kb_str.parse::<u64>().ok()
-}
-
-/// Whether `path` is exactly a mount point in this process's mount namespace,
-/// read from `/proc/self/mountinfo`.
-///
-/// `path` is canonicalized first, so a symlink is judged by its target; a
-/// caller that cares about the link itself must check for it separately.
-/// Errors from canonicalization or from reading the mount table are returned,
-/// not folded into `false`. Non-Linux targets have no portable mount table
-/// and return `Ok(false)`; there an operation that cannot cross a mount (a
-/// rename) remains the authority.
-#[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "commands"), allow(dead_code))]
-pub(crate) fn is_mount_point(path: &std::path::Path) -> crate::Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let canonical = std::fs::canonicalize(path)?;
-    let mountinfo = read_kernel_bytes("/proc/self/mountinfo")
-        .map_err(|e| crate::Error::from(e).context("cannot read /proc/self/mountinfo"))?;
-    for line in mountinfo.split(|byte| *byte == b'\n') {
-        // Fields: mount ID, parent ID, major:minor, root, mount point, ...
-        // The kernel octal-escapes whitespace inside a path, so splitting
-        // on whitespace cannot cut one.
-        let mut fields = line
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty());
-        let Some(mountpoint) = fields.nth(4) else {
-            continue;
-        };
-        let decoded = decode_mountinfo_path(mountpoint);
-        if std::path::Path::new(std::ffi::OsStr::from_bytes(&decoded)) == canonical.as_path() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-#[cfg_attr(not(feature = "commands"), allow(dead_code))]
-pub(crate) fn is_mount_point(_path: &std::path::Path) -> crate::Result<bool> {
-    Ok(false)
 }
 
 /// Undo the kernel's `\ooo` octal escaping of a mountinfo path field.

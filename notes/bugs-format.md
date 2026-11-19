@@ -320,18 +320,3 @@ serialized Blob through `parse_slice`, even though it already receives
 borrowed bytes and caller-owned output storage. The hunter ties the fix to the
 shared borrowed envelope parser proposed under BUG-001 in `notes/bugs.md`.
 
-## FMT-027 - A mount point inside a replaced directory output is not considered
-
-Reported by: the geocode replacement and deletion-protection work (lateral).
-
-`inspect` (`output.rs`) refuses a directory output that is itself a mount
-point, but nothing looks for a mount point below it. Replacing such a
-directory renames it into the backup container (a rename that carries the
-mounted subtree along) and then removes the backup recursively, which descends
-into the mounted filesystem. The protection walk in `scratch.rs` and the input
-containment walk in `path_guard.rs` both read through mounts, and the latter
-deduplicates directories by identity, so a bind mount over part of the tree
-that exposes different contents in two views can hide one of them from it.
-The likely rule is to refuse replacing, and to keep rather than remove, a tree
-holding any mount point, found by comparing each directory's device with its
-parent's plus the Linux mountinfo check `process::is_mount_point` already does.

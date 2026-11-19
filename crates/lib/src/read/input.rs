@@ -123,6 +123,39 @@ pub(crate) fn open_at(dir: std::os::fd::BorrowedFd<'_>, name: &str, label: &Path
     Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
+/// Open `path` with exactly the kernel flags `flags` (`O_CLOEXEC` added), by
+/// the raw `openat(2)` syscall. Not an input open: it reads nothing, and
+/// serves `crate::scratch`'s mount-identity probe, which needs
+/// `O_PATH | O_NOFOLLOW` on a symlink. musl's `open` wrapper, which std's
+/// `OpenOptions` reaches, refuses that with `ELOOP` though the kernel
+/// accepts it. It lives here because this module is the one owner of
+/// adopting a descriptor `openat` just created.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_raw(path: &Path, flags: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            flags | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A nonnegative return is a descriptor, an int the syscall ABI widened.
+    #[allow(clippy::cast_possible_truncation)]
+    let fd = fd as libc::c_int;
+    // SAFETY: `openat` just returned `fd`, a new descriptor nothing else
+    // owns; wrapping it makes the caller its one owner.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Where an input is opened from: its path, resolved again by every open, or
 /// a [`PinnedInput`] every open is derived from and verified against.
 ///

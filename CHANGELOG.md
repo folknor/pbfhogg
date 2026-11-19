@@ -362,6 +362,18 @@
 
 ### Fixed
 
+- **Replacing a directory output (`build-geocode-index --overwrite`) no
+  longer deletes the contents of a filesystem mounted inside it.** The old
+  directory was moved aside with its mounts and then removed recursively,
+  descending into them. An output directory with any mount point below it,
+  a bind mount over a single file or of the same filesystem included, is
+  now refused before any work with the new `OutputError::HoldsMount` (CLI
+  exit `2`), and a backup or unpublished staging tree found holding a mount
+  at cleanup is kept and reported rather than removed. On Linux the check,
+  and the existing refusal of an output directory that is itself a mount
+  point, read the kernel's mount identity of each entry instead of matching
+  paths against `/proc/self/mountinfo`, so a path spelled differently from
+  the mount table can no longer slip past it.
 - When the OS refuses to create a worker thread (`EAGAIN` under a thread
   or memory limit), every library command and reader returns an
   `ErrorKind::Io` error (CLI exit `2`) instead of panicking, and no longer

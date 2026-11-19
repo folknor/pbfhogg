@@ -1922,7 +1922,10 @@ fn machine_memory_available_with(
         if fs.split_whitespace().next() != Some("cgroup2") {
             continue;
         }
-        let fields: Vec<_> = fields.split_whitespace().collect();
+        // Fields are separated by single spaces. The kernel escapes space,
+        // tab, newline and backslash inside a path, but not a carriage
+        // return or form feed, so splitting on all whitespace could cut one.
+        let fields: Vec<_> = fields.split(' ').collect();
         let (Some(root), Some(mount)) = (fields.get(3), fields.get(4)) else {
             continue;
         };

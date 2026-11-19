@@ -864,34 +864,168 @@ pub(crate) fn is_leftover_name(name: &OsStr) -> bool {
     is_geocode_staging(name) || classify(name).is_some()
 }
 
-/// Every entry under `dir` (not `dir` itself) that no pbfhogg code path may
-/// delete: anything [`is_leftover_name`] recognises, whatever its liveness.
-/// Classified entries are listed whole and not descended into. A
+/// What a recursive removal of a directory tree would reach that pbfhogg
+/// never deletes, as found by [`protected_entries`].
+#[derive(Debug, Default)]
+pub(crate) struct Protected {
+    /// The tree's root is itself a mount point: it is on another mount than
+    /// the directory holding it.
+    pub(crate) root_mounted: bool,
+    /// Entries under the root that a mount covers (a mounted directory, or a
+    /// file or other entry with a bind mount over it), sorted. A recursive
+    /// removal would descend into another filesystem, or another view of
+    /// this one, and delete what it holds there.
+    pub(crate) mounts: Vec<PathBuf>,
+    /// Entries [`is_leftover_name`] recognises, sorted.
+    pub(crate) leftovers: Vec<PathBuf>,
+}
+
+impl Protected {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.root_mounted && self.mounts.is_empty() && self.leftovers.is_empty()
+    }
+
+    /// Every protected path, the root first when it is mounted.
+    pub(crate) fn paths(&self, root: &Path) -> Vec<PathBuf> {
+        let mut all = Vec::new();
+        if self.root_mounted {
+            all.push(root.to_path_buf());
+        }
+        all.extend(self.mounts.iter().cloned());
+        all.extend(self.leftovers.iter().cloned());
+        all
+    }
+}
+
+/// How [`mount_of`] reaches a path.
+#[derive(Clone, Copy)]
+enum Reach {
+    /// The entry itself, its final symlink not followed: the mount covering
+    /// that name, whatever kind of entry it is.
+    Entry,
+    /// A directory opened for reading its entries, final symlink not
+    /// followed. Opening it this way triggers an automount the
+    /// [`Reach::Entry`] lookup may have left untriggered, so it is the mount
+    /// the listing then reads.
+    Listing,
+    /// A directory reached the way a lookup of a name inside it reaches it,
+    /// final symlink followed.
+    Parent,
+}
+
+/// The identity of the mount `path` lies on.
+///
+/// On Linux, the `mnt_id` the kernel reports for a descriptor opened on
+/// `path`, read from `/proc/thread-self/fdinfo` (the calling thread's own
+/// descriptor table, which a caller may have unshared) while the descriptor
+/// is held. That is the mount of the object actually opened, whatever its
+/// spelling, so it tells apart two bind mounts of one device that a device
+/// number cannot, and needs no path matching against the mount table. An
+/// unavailable answer (no procfs, no `mnt_id` line) is an error, never a
+/// guess: the caller is deciding whether a tree may be deleted.
+///
+/// Other platforms have no such report; the device number stands in, which
+/// sees a mount of another filesystem but not a second mount of the same one.
+#[cfg(target_os = "linux")]
+fn mount_of(path: &Path, reach: Reach) -> io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let flags = match reach {
+        Reach::Entry => libc::O_PATH | libc::O_NOFOLLOW,
+        Reach::Listing => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        Reach::Parent => libc::O_PATH | libc::O_DIRECTORY,
+    };
+    // A symlink is an entry whose mount this must read too, which needs the
+    // raw open (see `open_raw`).
+    let fd = crate::read::input::open_raw(path, flags)?;
+    let fdinfo =
+        crate::process::read_kernel_file(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))?;
+    drop(fd);
+    parse_mnt_id(&fdinfo).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the kernel reports no mount id for an open descriptor",
+        )
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_of(path: &Path, reach: Reach) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(match reach {
+        Reach::Entry | Reach::Listing => fs::symlink_metadata(path)?.dev(),
+        Reach::Parent => fs::metadata(path)?.dev(),
+    })
+}
+
+/// The `mnt_id:` field of a `/proc/<pid>/fdinfo/<fd>` record.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_mnt_id(fdinfo: &str) -> Option<u64> {
+    fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Everything in the tree at `dir` that no pbfhogg code path may delete:
+/// `dir` itself when it is a mount point, every mount below it, and every
+/// entry [`is_leftover_name`] recognises, whatever its liveness.
+///
+/// Classified entries and mounts are listed whole and not descended into. A
 /// `.buckets-level*` tree (index scratch) is not itself protected, since
 /// replacing an index may discard it, but it is descended into like any
 /// other directory: being allowed to delete a directory does not exempt
 /// what is inside it, and a backup or run directory found there is
-/// protected. Symlinks are never followed.
+/// protected. Symlinks are never followed, but each entry, symlinks and
+/// leftovers included, is checked for a mount over its own name, and each
+/// directory is opened for reading and checked again before it is listed
+/// (see [`Reach`]; the listing opens the path anew, which ADR-0017's stable
+/// namespace makes the same directory). A leftover is not descended into,
+/// so a mount below one is not seen: a kept tree's warning says to check
+/// for mounts before removing it.
 ///
 /// Used before anything is removed recursively: replacing a directory
 /// output, removing a replaced output's backup, and dropping a directory
-/// output's staging. A walk that cannot be completed is an error, because
-/// what it did not see cannot be shown to be deletable.
-pub(crate) fn protected_entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
+/// output's staging. `remove_dir_all` does not stop at a mount, so a mount
+/// anywhere in the tree would have another filesystem's contents deleted. A
+/// walk that cannot be completed, or a mount identity that cannot be read,
+/// is an error, because what it did not see cannot be shown to be deletable.
+pub(crate) fn protected_entries(dir: &Path) -> io::Result<Protected> {
+    let parent = match dir.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} has no parent directory", dir.display()),
+            ));
+        }
+    };
+    let mut found = Protected::default();
+    let root = mount_of(dir, Reach::Entry)?;
+    if root != mount_of(parent, Reach::Parent)? || root != mount_of(dir, Reach::Listing)? {
+        found.root_mounted = true;
+        return Ok(found);
+    }
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
         for entry in fs::read_dir(&next)? {
             let entry = entry?;
-            let name = entry.file_name();
-            if is_leftover_name(&name) {
-                found.push(entry.path());
+            let path = entry.path();
+            if mount_of(&path, Reach::Entry)? != root {
+                found.mounts.push(path);
+            } else if is_leftover_name(&entry.file_name()) {
+                found.leftovers.push(path);
             } else if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
+                if mount_of(&path, Reach::Listing)? == root {
+                    pending.push(path);
+                } else {
+                    found.mounts.push(path);
+                }
             }
         }
     }
-    found.sort();
+    found.mounts.sort();
+    found.leftovers.sort();
     Ok(found)
 }
 
@@ -1569,11 +1703,33 @@ mod tests {
             ]
         );
         // The protected walk sees the same entries but the buckets.
-        assert_eq!(
-            protected_entries(&index).expect("walk"),
-            [staging, backup.clone()]
-        );
+        let protected = protected_entries(&index).expect("walk");
+        assert_eq!(protected.leftovers, [staging, backup.clone()]);
+        assert!(!protected.root_mounted);
+        assert!(protected.mounts.is_empty(), "{:?}", protected.mounts);
         assert!(backup.exists());
+    }
+
+    #[test]
+    fn the_mount_id_is_read_from_its_fdinfo_line() {
+        let record = "pos:\t0\nflags:\t012100000\nmnt_id:\t31\nino:\t2\n";
+        assert_eq!(parse_mnt_id(record), Some(31));
+        assert_eq!(parse_mnt_id("pos:\t0\nflags:\t0\n"), None);
+        assert_eq!(parse_mnt_id("mnt_id:\tx\n"), None);
+    }
+
+    /// An ordinary tree is one mount, its symlinks included, and the walk
+    /// reads that from the kernel rather than failing closed.
+    #[test]
+    fn an_ordinary_tree_holds_no_mount() {
+        let parent = crate::path_guard::tests::scratch();
+        let root = parent.path().join("tree");
+        fs::create_dir_all(root.join("a/b")).expect("fixture");
+        fs::write(root.join("a/b/file"), b"x").expect("fixture");
+        std::os::unix::fs::symlink("/", root.join("a/up")).expect("fixture");
+        std::os::unix::fs::symlink("missing", root.join("dangling")).expect("fixture");
+        let protected = protected_entries(&root).expect("walk");
+        assert!(protected.is_empty(), "{protected:?}");
     }
 
     /// Names are matched on bytes: a staging or backup name keeps the

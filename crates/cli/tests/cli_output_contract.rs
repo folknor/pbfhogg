@@ -2765,6 +2765,92 @@ fn a_staging_dir_across_a_bind_mount_of_the_same_device_is_refused_before_any_wo
     assert!(names(&source).is_empty(), "{:?}", names(&source));
 }
 
+/// A directory output with a mount point below it is not replaced: the
+/// previous directory would be renamed aside with the mount and then removed
+/// recursively, deleting what the mounted directory holds. The mount is a
+/// bind mount of the same device in a private user and mount namespace of
+/// the child, which only a mount identity (not a device number) tells
+/// apart; a host without user namespaces skips. The same setup with the
+/// bind mount outside the index replaces it, so the refusal is the mount's
+/// position and not the namespace's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_directory_output_with_a_mount_inside_is_not_replaced() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    use crate::invoker::{NAMESPACE_BROKEN, NAMESPACE_DENIED};
+    let root = crate::common::test_scratch();
+    let input = root.path().join("in.osm.pbf");
+    crate::common::write_synthetic_indexed_input(&input);
+    let index = root.path().join("index");
+    let inside = index.join("data");
+    let outside = root.path().join("elsewhere");
+    let source = root.path().join("source");
+    for dir in [&index, &inside, &outside, &source] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let header = crate::common::index_header_placeholder(b"index");
+    std::fs::write(index.join("geocode_header.bin"), &header).unwrap();
+    std::fs::write(source.join("only-copy"), b"kept").unwrap();
+    let build_over = |source: &Path, target: &Path| {
+        CliInvoker::new(&invocation_scratch)
+            .arg("build-geocode-index")
+            .arg(&input)
+            .arg("--output-dir")
+            .arg(&index)
+            .arg("--allow-unindexed")
+            .arg("--overwrite")
+            .bind_mounted(source, target)
+            .run()
+    };
+    let build = |target: &Path| build_over(&source, target);
+
+    let refused = build(&inside);
+    let stderr = refused.stderr_str();
+    match refused.status.code() {
+        Some(code) if (NAMESPACE_DENIED + 1..=NAMESPACE_DENIED + 6).contains(&code) => {
+            crate::common::skip(format!(
+                "the host refuses an unprivileged user and mount namespace (step {})",
+                code - NAMESPACE_DENIED
+            ));
+            return;
+        }
+        Some(code) if (NAMESPACE_BROKEN + 1..=NAMESPACE_BROKEN + 6).contains(&code) => {
+            panic!("namespace setup failed at step {}", code - NAMESPACE_BROKEN);
+        }
+        code => assert_eq!(code, Some(2), "{stderr}"),
+    }
+    assert!(stderr.contains("is a mount point"), "{stderr}");
+    assert!(stderr.contains(&inside.display().to_string()), "{stderr}");
+    assert_eq!(std::fs::read(source.join("only-copy")).unwrap(), b"kept");
+    assert_eq!(
+        std::fs::read(index.join("geocode_header.bin")).unwrap(),
+        header
+    );
+    assert_eq!(
+        names(root.path()),
+        ["elsewhere", "in.osm.pbf", "index", "source"]
+    );
+
+    // A bind mount over a file inside the index is a mount too.
+    let covered = index.join("notes.txt");
+    std::fs::write(&covered, b"covered").unwrap();
+    let refused = build_over(&source.join("only-copy"), &covered);
+    let stderr = refused.stderr_str();
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(&covered.display().to_string()), "{stderr}");
+    assert_eq!(std::fs::read(source.join("only-copy")).unwrap(), b"kept");
+    std::fs::remove_file(&covered).unwrap();
+
+    let replaced = build(&outside);
+    assert!(replaced.status.success(), "{}", replaced.stderr_str());
+    assert_ne!(
+        std::fs::read(index.join("geocode_header.bin")).unwrap(),
+        header
+    );
+    assert!(!inside.exists());
+    assert_eq!(std::fs::read(source.join("only-copy")).unwrap(), b"kept");
+}
+
 /// Every row, a pause at every ordinal of its counting run rather than a
 /// sample: a checkpoint between two tier-1 samples whose exit path leaks (a
 /// receiver kept alive past a scope, a guard moved out of reach) is caught

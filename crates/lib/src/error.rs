@@ -920,6 +920,13 @@ pub enum OutputError {
     /// the file being read, which replacing the directory would delete.
     /// Nothing was installed.
     HoldsInput { path: PathBuf, input: PathBuf },
+    /// A directory output to be replaced has mount points below it
+    /// (`mounts`: a mounted directory, or a bind mount over a file). The
+    /// previous directory is renamed aside with its mounts and then removed
+    /// recursively, which would delete what a mounted directory holds (a
+    /// mounted file the kernel refuses to unlink, but only after the
+    /// removal has begun). Nothing was installed.
+    HoldsMount { path: PathBuf, mounts: Vec<PathBuf> },
     /// Publishing failed and undoing it failed too, or was impossible (a
     /// lone file renamed over its previous output, which no backup holds,
     /// stays published). Each entry says what was left where; nothing it
@@ -1050,6 +1057,7 @@ impl fmt::Display for OutputError {
                 path.display(),
                 input.display()
             ),
+            Self::HoldsMount { path, mounts } => write_holds_mount(f, path, mounts),
             Self::RollbackIncomplete { unresolved, .. } => write!(
                 f,
                 "publishing the output failed and could not be fully undone: {}",
@@ -1113,6 +1121,17 @@ fn join_paths(paths: &[PathBuf]) -> String {
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn write_holds_mount(f: &mut fmt::Formatter, path: &Path, mounts: &[PathBuf]) -> fmt::Result {
+    write!(
+        f,
+        "output directory {} cannot be replaced: {} below it is a mount point, and replacing \
+         the directory would remove it recursively, descending into the mount; unmount it \
+         first",
+        path.display(),
+        join_paths(mounts)
+    )
 }
 
 fn write_unsynced(

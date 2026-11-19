@@ -1125,20 +1125,53 @@ fn refuse_reserved(dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse to replace a directory that holds anything pbfhogg never deletes.
-fn refuse_leftovers_inside(dest: &Path) -> Result<()> {
-    let entries = crate::scratch::protected_entries(dest).map_err(|e| {
+fn joined_paths(paths: &[PathBuf]) -> String {
+    let shown: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    shown.join(", ")
+}
+
+/// The advice a kept tree's warning adds: removing it whole would descend
+/// into a mounted filesystem, and the walk does not look inside the
+/// leftovers it found, so a mount there is not ruled out.
+fn unmount_first(found: &crate::scratch::Protected) -> &'static str {
+    if found.root_mounted || !found.mounts.is_empty() {
+        " (a mount is among them: unmount it before removing anything recursively)"
+    } else {
+        " (and that nothing in it is mounted before removing it recursively)"
+    }
+}
+
+/// Refuse to replace a directory that is a mount point, or holds a mount or
+/// anything else pbfhogg never deletes.
+fn refuse_protected_inside(dest: &Path) -> Result<()> {
+    let found = crate::scratch::protected_entries(dest).map_err(|e| {
         Error::from(e).context(format!(
             "cannot check what replacing output directory {} would delete",
             dest.display()
         ))
     })?;
-    if entries.is_empty() {
+    // Publication renames the directory itself, which a mount point
+    // cannot be.
+    if found.root_mounted {
+        return Err(new_output_error(OutputError::MountPoint {
+            path: dest.to_path_buf(),
+        }));
+    }
+    // The rename would carry a mount below along, and the backup's
+    // recursive removal would then delete what the mounted filesystem
+    // holds.
+    if !found.mounts.is_empty() {
+        return Err(new_output_error(OutputError::HoldsMount {
+            path: dest.to_path_buf(),
+            mounts: found.mounts,
+        }));
+    }
+    if found.leftovers.is_empty() {
         Ok(())
     } else {
         Err(new_output_error(OutputError::HoldsLeftovers {
             path: dest.to_path_buf(),
-            entries,
+            entries: found.leftovers,
         }))
     }
 }
@@ -1181,16 +1214,10 @@ fn inspect(
                     path: dest.to_path_buf(),
                 }));
             }
-            // Publication renames the directory itself, which a mount point
-            // cannot be; refuse before any work rather than at the end.
-            if shape == Shape::Dir && crate::process::is_mount_point(dest)? {
-                return Err(new_output_error(OutputError::MountPoint {
-                    path: dest.to_path_buf(),
-                }));
-            }
             // Replacing a directory deletes the old one whole once the new
-            // one is in place.
+            // one is in place; refuse before any work rather than at the end.
             if shape == Shape::Dir {
+                refuse_protected_inside(dest)?;
                 // Linux checks MAY_WRITE on a directory moved to a new
                 // parent. Our backup container is a new parent even when
                 // it lives beside the destination. Check effective access,
@@ -1202,7 +1229,6 @@ fn inspect(
                         dest.display()
                     ))
                 })?;
-                refuse_leftovers_inside(dest)?;
             }
         }
     }
@@ -2178,20 +2204,21 @@ impl Target {
         match crate::scratch::protected_entries(&backup.container) {
             Ok(found) if found.is_empty() => {}
             Ok(found) => {
-                let found: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
                 self.pending.push(format!(
                     "{} was published; the backup of the previous output at {} is kept because \
-                     it holds {}, which pbfhogg never deletes. Check it, then remove it yourself",
+                     it holds {}, which pbfhogg never deletes. Check it{}, then remove it yourself",
                     self.dest.display(),
                     backup.container.display(),
-                    found.join(", ")
+                    joined_paths(&found.paths(&backup.container)),
+                    unmount_first(&found)
                 ));
                 return;
             }
             Err(e) => {
                 self.pending.push(format!(
                     "{} was published; the backup of the previous output at {} is kept because \
-                     what it holds could not be checked ({e}). Check it, then remove it yourself",
+                     what it holds could not be checked ({e}). Check it, and that nothing in it \
+                     is mounted, then remove it yourself",
                     self.dest.display(),
                     backup.container.display()
                 ));
@@ -2252,13 +2279,13 @@ impl Target {
         match crate::scratch::protected_entries(&self.staging) {
             Ok(found) if found.is_empty() => {}
             Ok(found) => {
-                let found: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
                 self.pending.push(format!(
                     "{} was not published; its staging directory {} is kept because it holds {}, \
-                     which pbfhogg never deletes",
+                     which pbfhogg never deletes. Check it{}",
                     self.dest.display(),
                     self.staging.display(),
-                    found.join(", ")
+                    joined_paths(&found.paths(&self.staging)),
+                    unmount_first(&found)
                 ));
                 return;
             }

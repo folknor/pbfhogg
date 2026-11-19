@@ -30,7 +30,19 @@ output any other way.
   replacing it deletes the old tree; only an index's `.buckets-level*`
   scratch trees may go with it (ADR-0018), and the walk still descends into
   them, since permission to delete a directory does not extend to a backup
-  or run directory found inside it. A caller replacing a directory that may
+  or run directory found inside it. The same walk refuses a tree with a
+  mount on any entry it reaches, a bind mount over a file included
+  (`OutputError::HoldsMount`): the rename aside carries the mount along and
+  the recursive removal of the backup would descend into it (a mounted
+  file the kernel refuses to unlink, but only after the removal has
+  begun). It does not descend into a leftover, which is refused on its
+  own. Mounts are told apart by the kernel's mount identity of
+  each opened entry (Linux `fdinfo` `mnt_id`), not by device number or by
+  matching path text against the mount table, so a bind mount of the same
+  device counts and path spelling does not matter; an unreadable identity
+  refuses. The walks before removing a backup or a dropped staging tree
+  apply the same rule and keep the tree on a mount. Other platforms compare
+  device numbers, which miss a second mount of one filesystem. A caller replacing a directory that may
   hold the run's own input names that input to the output, which then also
   refuses, when the input is named and again at the final inspection, while
   replacement would delete the name the caller gave or the file's last link

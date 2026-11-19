@@ -1213,7 +1213,11 @@ fn write_delete_element<W: Write>(
     // funnels its deletes through this function.
     if let Some(version) = metadata.and_then(|m| m.version).filter(|&v| v >= 1) {
         let version = if increment_version {
-            version.saturating_add(1)
+            version.checked_add(1).ok_or_else(|| {
+                Error::invalid_data(format!(
+                    "cannot increment delete version {version} for {tag_name} {id}"
+                ))
+            })?
         } else {
             version
         };

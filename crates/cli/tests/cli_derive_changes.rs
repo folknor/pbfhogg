@@ -862,6 +862,29 @@ fn increment_version_bumps_delete_versions() {
 }
 
 #[test]
+fn increment_version_refuses_delete_version_overflow() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc = dir.path().join("changes.osc.gz");
+
+    write_versioned_pbf(&old, &[(1, 100_000_000, 200_000_000, i32::MAX)], &[]);
+    write_versioned_pbf(&new, &[], &[]);
+
+    let out = run_derive(&old, &new, &osc, true, false, Some(1));
+    let stderr = out.stderr_str();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("cannot increment delete version 2147483647 for node 1"),
+        "{stderr}"
+    );
+    assert!(!osc.exists());
+
+    run_derive_simple(&old, &new, &osc);
+    assert!(read_osc(&osc).contains(r#"version="2147483647""#));
+}
+
+#[test]
 fn no_increment_version_preserves_delete_versions() {
     let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");

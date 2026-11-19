@@ -4,6 +4,9 @@
 
 ### Breaking
 
+- `diff --format osc --increment-version` exits 2 without publishing an
+  OSC if a deleted element is already at version 2147483647.
+
 - **`diff --format osc` refuses values its own OSC reader would refuse.**
   A created or modified node outside latitude -90 to 90 or longitude -180
   to 180, or with a coordinate that does not fit the PBF representation,

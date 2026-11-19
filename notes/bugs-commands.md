@@ -52,15 +52,6 @@ appear in XML 1.0 even as character references, so conforming readers reject
 the file. This breaks the promise that `--format osc` writes OSC XML. The
 shared writer should refuse unrepresentable strings before publication.
 
-## CMD-009 - --increment-version stops incrementing at i32::MAX
-
-Reported by: osc-parsing [P2], diff [P2].
-
-`write_delete_element` (`diff/derive.rs`) uses `saturating_add(1)`. Deleting
-an element at version 2147483647 with the flag emits the same version and
-reports success, despite the flag's documented promise to bump the version by
-one. An unrepresentable increment should be refused.
-
 ## CMD-011 - Unindexed gzip derive ignores the -j worker cap
 
 Reported by: diff [P2].
@@ -460,3 +451,17 @@ halving misses a partition that exists only because string index widths
 shrink when two elements share a table, and `add_node_partial` writes a
 metadata-less node dense, two bytes larger than plain, so a node at exactly
 the payload limit fails. Both need blocks within bytes of 32 MiB.
+
+## CMD-050 - Re-encoding commands cut blocks only by element count
+
+Reported by: the CMD-049 implementer (2026-11-19); not verified per command.
+
+apply-changes now cuts an output block early when
+`BlockBuilder::content_over_payload_limit()` says its string content plus
+serialized groups would pass the blob payload limit, and recovers an
+overflowing block by replaying it in smaller pieces. The other `BlockBuilder`
+users (cat re-encode, sort, repack, extract) still cut only by element count,
+so two adjacent elements with large tag values can land in one block that the
+writer then refuses as too large. The input is valid; the command fails. The
+helper is available to them; adopting it needs a matched measurement per
+command, since the check runs per added element.

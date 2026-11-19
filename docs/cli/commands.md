@@ -1699,7 +1699,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `--locations` | Also compare inline `LocationsOnWays` way coordinates at 1e-7 degrees; both inputs must declare `LocationsOnWays` (text only, see above) |
 | `-j, --jobs <N>` | Worker threads for the comparison of indexed inputs (see [Worker threads](#worker-threads)). `0` (default) uses one per core. Each input is read once, as one sequential stream, and cut into work units by ID range that the workers merge; the text reaches the output in order as the run goes. The answer is the same at any `-j`. Applies to both text and `--format osc` |
-| `--increment-version` | Bump version of deleted elements by 1 (osc only) |
+| `--increment-version` | Bump versions of deleted elements by 1 (osc only). If a deleted element is already at version 2147483647, exit 2 without publishing an OSC. |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)); `--format osc` only, which keeps its per-action XML there, removed on completion: for a `.osc.gz` output from indexed inputs that XML is already gzip-compressed (about the output's size), otherwise it is plain XML several times larger. Must exist and be writable; checked before any input is read. Default: the output's directory. A text diff writes no scratch and refuses it |
 | `--direct-io` | Use O_DIRECT when reading the PBF inputs; see the [I/O capability matrix](#io-capability-matrix) |

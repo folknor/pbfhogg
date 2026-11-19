@@ -180,6 +180,88 @@ fn a_refused_first_stage3_worker_releases_a_parked_stage4() {
     );
 }
 
+/// A stage 3 failure aborts the router without tripping the token; stage 4,
+/// parked at the first frame of its passthrough prefix (the untagged node
+/// blobs under `keep_untagged_nodes`), must stop there rather than copy the
+/// prefix before the error surfaces.
+#[test]
+fn a_router_abort_stops_the_stage4_passthrough_prefix() {
+    let test = "a_router_abort_stops_the_stage4_passthrough_prefix";
+    let Some(ticket) = crate::common::heavy_ticket(1, test) else {
+        return;
+    };
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        pbfhogg::TEST_HANG_BOUND,
+        pbfhogg::TEST_HANG_REPORT_GRACE,
+        "altw external did not end after a stage 3 spawn refusal",
+    );
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    // Twelve node blobs of five ahead of the way blobs: a prefix of many
+    // passthrough frames before way blob 0.
+    let nodes: Vec<TestNode> = generate_nodes(60, 1);
+    let ways: Vec<TestWay> = generate_ways(10, 10_000, 6, 1);
+    write_multi_block_test_pbf(&input, &nodes, &ways, &[], 5);
+
+    let host = crate::common::heavy_host(&ticket);
+    let faults = host.invocation.faults();
+    faults
+        .altw_stage3_refuse_spawn_at
+        .store(0, Ordering::SeqCst);
+    faults
+        .altw_stage4_hold_passthrough_at
+        .store(0, Ordering::SeqCst);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        add_locations_to_ways(
+            &input,
+            crate::common::out(&output),
+            &AltwOptions {
+                keep_untagged_nodes: true,
+                write: WriteOptions::default(),
+                index_type: IndexType::External,
+                inject_prepass: false,
+                ignore_missing_nodes: true,
+            },
+            &pbfhogg::HeaderOverrides::default(),
+            &host,
+            crate::common::scratch_in(dir.path()),
+        )
+    }));
+    let err = match result {
+        Ok(Err(e)) => e,
+        Ok(Ok(_)) => panic!("altw external with a refused stage 3 spawn must not return Ok"),
+        Err(_) => panic!("altw external must return a spawn refusal as an error, not unwind"),
+    };
+    assert!(
+        faults.altw_stage3_spawn_refused.load(Ordering::SeqCst),
+        "stage 3 never reached the armed worker's spawn; the test proved nothing: {err}"
+    );
+    assert!(
+        !faults.altw_hook_timed_out.load(Ordering::SeqCst),
+        "a bounded altw hook wait expired: {err}"
+    );
+    assert!(
+        faults
+            .altw_stage4_passthrough_saw_abort
+            .load(Ordering::SeqCst),
+        "the held passthrough never saw the router aborted: {err}"
+    );
+    assert_eq!(
+        faults
+            .altw_stage4_passthrough_entries
+            .load(Ordering::SeqCst),
+        1,
+        "stage 4 went on to later passthrough frames after the abort: {err}"
+    );
+    assert_eq!(
+        faults.altw_stage4_passthrough_io.load(Ordering::SeqCst),
+        0,
+        "stage 4 read a passthrough frame after the router aborted: {err}"
+    );
+}
+
 /// Worker 0 is born and holds bucket 0; refusing worker 1 must stop it and
 /// release stage 4 rather than leave worker 0 to the join.
 #[test]

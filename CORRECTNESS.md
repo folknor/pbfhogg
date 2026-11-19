@@ -550,15 +550,19 @@ same element. The apply-changes overlay retains its native numeric metadata
 parsing and treats only `false` as hidden, compared after the same XML
 attribute normalization the re-emitters apply, so an entity-spelled `false` is
 hidden whether a change is applied directly or after re-emission (`False` is
-visible on both routes). Applying the overlay's
+visible on both routes). An empty `visible=""` is the attribute absent for
+every consumer: it is no visibility claim and does not by itself give an
+element metadata, so a change claims the same thing applied directly and after
+re-emission, which writes an empty attribute as absent. Applying the overlay's
 native metadata validation to the re-emitting paths would reject attribute text
 they currently preserve. Every
 `tag`, `nd` and `member` is read by one parser per child kind, whatever the
 command: a missing role reads as empty, and a malformed role, an unknown member
 type, or a missing `k`, `v` or `ref` is refused. The children of an object in
-`<delete>` get that same parse in the driver and are then dropped, so every
-command refuses the same malformed delete and none keeps or emits a deleted
-object's children.
+`<delete>` get that same parse in the driver, so every command refuses the same
+malformed delete; apply-changes then keeps only the delete's identity and
+version, while the re-emitters keep and write the delete's body, as osmium
+does.
 A delete remains pending until a re-create is accepted; a rejected stale
 re-create must not erase it.
 

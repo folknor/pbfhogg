@@ -1660,6 +1660,47 @@ mod tests {
         ));
     }
 
+    /// A refused pwrite pool worker spawn fails the parallel constructor
+    /// itself: the writer does not report itself started before its pool
+    /// exists. Worker 1 is refused, so worker 0 was born and must be joined.
+    #[cfg(pbfhogg_test_hooks)]
+    #[test]
+    fn a_refused_pool_worker_fails_the_parallel_constructor() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("refused.pbf");
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let invocation = crate::host::Call::detached().permit();
+        invocation
+            .faults()
+            .scoped_spawn_refuse_at
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = PbfWriter::to_path_parallel_in(
+            &path,
+            Compression::None,
+            &header,
+            Executor::for_tests(),
+            crate::host::Diagnostics::discard(),
+            crate::write::Finish::Durable,
+            invocation.clone(),
+        );
+        assert!(
+            invocation
+                .faults()
+                .scoped_spawn_refused
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the armed pool worker spawn was never reached"
+        );
+        let Err(err) = result else {
+            panic!("a refused pool worker must fail the constructor");
+        };
+        assert!(matches!(err.kind(), ErrorKind::Io(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("spawn parallel writer pool worker 1"),
+            "{err}"
+        );
+    }
+
     /// A `PbfWriter` whose writer thread has already exited with `outcome`.
     ///
     /// The receiver is dropped before the writer is handed back, so the very

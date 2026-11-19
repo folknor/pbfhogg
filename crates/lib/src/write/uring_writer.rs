@@ -746,15 +746,21 @@ fn uring_init_and_run(
 ) -> Result<()> {
     let (mut state, file) = open_ring(path, cancel)?;
 
-    // Step 6: Signal successful init.
-    init_tx
-        .send(Ok(()))
-        .map_err(|_| Error::internal("constructor dropped before init completed"))?;
-
-    // Step 7: Write header, a handoff like any chunk.
+    // Step 6: Write header, a handoff like any chunk. Before the init
+    // signal, as the pwrite backend writes its header before signalling: a
+    // header large enough to fill a registered buffer submits here, and a
+    // failed submission then fails the constructor rather than a later
+    // write. A failure returns without signalling; the constructor sees the
+    // channel close and recovers this error by joining the thread, after
+    // `state`'s teardown guard has run.
     let metrics = &cancel.metrics().writer;
     metrics.time_handoff(|| state.write(framed_header))?;
     metrics.record_accepted(framed_header.len() as u64);
+
+    // Step 7: Signal successful init.
+    init_tx
+        .send(Ok(()))
+        .map_err(|_| Error::internal("constructor dropped before init completed"))?;
 
     // Step 8: The shared ordered-delivery loop, into the ring's buffers. It
     // proves the stream complete before returning `Ok`; finalizing a short

@@ -260,6 +260,62 @@ fn visibility_survives_re_emission() {
     );
 }
 
+/// An empty `visible` is the attribute absent on both routes: applied
+/// directly it used to claim `visible` true, while merge-changes writes it as
+/// absent, so the re-emitted change claimed nothing. An element whose only
+/// metadata it is has no metadata at all on either route. A duplicate is
+/// still refused.
+#[test]
+fn an_empty_visible_is_absent_applied_directly_and_after_re_emission() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osc");
+    std::fs::write(
+        &input,
+        r#"<osmChange version="0.6"><create>
+<node id="1" lat="1.0" lon="2.0" visible=""/>
+<node id="2" lat="1.0" lon="2.0" version="1" visible=""/>
+<node id="3" lat="1.0" lon="2.0" uid="42" visible=""/>
+</create></osmChange>"#,
+    )
+    .unwrap();
+    let re_emitted = dir.path().join("re.osc.gz");
+    merge_verdict(&input, &re_emitted).unwrap();
+    // Version, uid and visible claims, absent where the element has none.
+    type Claims = Option<(Option<i32>, Option<i32>, Option<bool>)>;
+    let claims = |path: &Path| -> Vec<Claims> {
+        let overlay = pbfhogg::osc::parse_osc_file(path).unwrap();
+        (1..=3)
+            .map(|id| {
+                overlay
+                    .get_node(id)
+                    .unwrap()
+                    .metadata()
+                    .map(|m| (m.version, m.uid, m.visible))
+            })
+            .collect()
+    };
+    let expected = vec![
+        None,
+        Some((Some(1), None, None)),
+        Some((None, Some(42), None)),
+    ];
+    assert_eq!(claims(&input), expected, "applied directly");
+    assert_eq!(claims(&re_emitted), expected, "applied after merge-changes");
+
+    let duplicate = dir.path().join("dup.osc");
+    std::fs::write(
+        &duplicate,
+        r#"<osmChange version="0.6"><create>
+<node id="1" lat="1.0" lon="2.0" visible="" visible="false"/>
+</create></osmChange>"#,
+    )
+    .unwrap();
+    assert!(
+        pbfhogg::osc::parse_osc_file(&duplicate).is_err(),
+        "a duplicated visible attribute must still be refused"
+    );
+}
+
 /// The driver tracked one section and one open object, not the hierarchy:
 /// a node nested in a way replaced the sink's current element, a section
 /// nested anywhere overwrote the action, an unknown wrapper's `<nd>` was

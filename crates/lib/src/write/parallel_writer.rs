@@ -153,13 +153,14 @@ fn parallel_writer_thread_inner(
     }
     metrics.record_accepted(framed_header.len() as u64);
 
-    // Signal init success so the constructor can return.
-    init_tx.send(Ok(())).ok();
-
+    // `run_pool` signals init once every pool worker is born, so a refused
+    // worker spawn fails the constructor instead of a later write.
     let failure = FirstFailure::new();
     let header_len = framed_header.len() as u64;
     crate::threads::scope(cancel, |s| {
-        run_pool(s, &rx, &file, &failure, header_len, expected, cancel);
+        run_pool(
+            s, &rx, &file, &failure, header_len, expected, init_tx, cancel,
+        );
     });
 
     // Every pool thread has been joined; the record is final.
@@ -175,10 +176,17 @@ fn parallel_writer_thread_inner(
     Ok(())
 }
 
-/// Spawn the pool inside `s`, run the dispatcher on this thread, then close
-/// the pool channels and join every worker. Every failure - spawn, dispatch,
-/// dispatcher panic, worker error or panic - lands in `failure`; nothing
-/// returns early past the join loop.
+/// Spawn the pool inside `s`, signal init, run the dispatcher on this
+/// thread, then close the pool channels and join every worker. Every
+/// failure - spawn, dispatch, dispatcher panic, worker error or panic - lands
+/// in `failure`; nothing returns early past the join loop.
+///
+/// Init success is sent only once every worker is born: the constructor's
+/// "the writer started" then means the pool exists. A refused spawn goes to
+/// the constructor as its error instead (and is the thread's result too); no
+/// item can have been sent yet, so the born workers just see their queues
+/// close and are joined.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn run_pool<'w, 'scope, 'env>(
     s: &'w Scope<'w, 'scope, 'env>,
     rx: &Inbox,
@@ -186,6 +194,7 @@ fn run_pool<'w, 'scope, 'env>(
     failure: &'scope FirstFailure,
     header_len: u64,
     expected: &SeqTotal,
+    init_tx: SyncSender<Result<()>>,
     cancel: &'scope crate::host::Recorder,
 ) {
     let mut worker_txs: Vec<SyncSender<WriteOp>> = Vec::with_capacity(POOL_SIZE);
@@ -198,15 +207,17 @@ fn run_pool<'w, 'scope, 'env>(
                 worker_handles.push(handle);
             }
             Err(e) => {
-                failure.record(
-                    Error::from(e).context(format!("spawn parallel writer pool worker {index}")),
-                );
+                let error =
+                    Error::from(e).context(format!("spawn parallel writer pool worker {index}"));
+                init_tx.send(Err(error.clone())).ok();
+                failure.record(error);
                 break;
             }
         }
     }
 
     if !failure.stopped() {
+        init_tx.send(Ok(())).ok();
         // A dispatcher panic is caught so its payload is recorded (and the
         // workers stopped) before the join loop, instead of unwinding past
         // it: `scope` would still join the workers, but only after they had

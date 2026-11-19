@@ -608,6 +608,17 @@ pub struct FaultPlan {
     /// Set by a stage 4 worker just before it waits on the router for way
     /// blob 0.
     pub altw_stage4_way0_entered: Watched<AtomicBool>,
+    /// Schedule position at whose passthrough entry stage 4's consumer
+    /// parks, before any check or I/O, until the router is aborted
+    /// (bounded).
+    pub altw_stage4_hold_passthrough_at: AtomicUsize,
+    /// Set when the held passthrough saw the router aborted before the bound.
+    pub altw_stage4_passthrough_saw_abort: AtomicBool,
+    /// Passthrough entries stage 4's consumer made, held one included.
+    pub altw_stage4_passthrough_entries: AtomicUsize,
+    /// Passthrough frames stage 4's consumer started to read (and so to
+    /// hand to the writer).
+    pub altw_stage4_passthrough_io: AtomicUsize,
     /// A bounded altw hook wait expired: the handshake did not happen, and
     /// a test relying on it proved nothing.
     pub altw_hook_timed_out: AtomicBool,
@@ -908,6 +919,10 @@ impl FaultPlan {
             altw_stage4_panic_consume_at: AtomicUsize::new(usize::MAX),
             altw_stage4_panic_work_at: AtomicUsize::new(usize::MAX),
             altw_stage4_way0_entered: Watched::<AtomicBool>::new(false),
+            altw_stage4_hold_passthrough_at: AtomicUsize::new(usize::MAX),
+            altw_stage4_passthrough_saw_abort: AtomicBool::new(false),
+            altw_stage4_passthrough_entries: AtomicUsize::new(0),
+            altw_stage4_passthrough_io: AtomicUsize::new(0),
             altw_hook_timed_out: AtomicBool::new(false),
             altw_stage1_fleet: Mutex::new(FleetRendezvous::DISARMED),
             altw_stage34_peak: Mutex::new(FleetRendezvous::DISARMED),
@@ -1980,6 +1995,29 @@ impl FaultPlan {
                 && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
         });
         panic!("test-hooks: stage 4 worker panicking at ordinal {ordinal}");
+    }
+
+    /// Called by stage 4's consumer as it enters passthrough schedule
+    /// position `position`, before any check or I/O: counts the entry, and
+    /// at the armed position parks until the router is aborted, recording
+    /// whether it was.
+    pub(crate) fn on_altw_stage4_passthrough(&self, position: usize, aborted: impl Fn() -> bool) {
+        self.altw_stage4_passthrough_entries
+            .fetch_add(1, Ordering::SeqCst);
+        if position != self.altw_stage4_hold_passthrough_at.load(Ordering::SeqCst) {
+            return;
+        }
+        // The router rings the plan after it records an abort.
+        self.wait_until(&self.altw_hook_timed_out, &aborted);
+        self.altw_stage4_passthrough_saw_abort
+            .store(aborted(), Ordering::SeqCst);
+    }
+
+    /// Called by stage 4's consumer just before it reads a passthrough
+    /// frame (which it then hands to the writer).
+    pub(crate) fn on_altw_stage4_passthrough_io(&self) {
+        self.altw_stage4_passthrough_io
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     /// Called as stage 4 starts: fails it, as armed, once the held stage 3

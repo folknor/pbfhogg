@@ -492,45 +492,19 @@ publication, and is sign-neutral (a large positive start does it too). The
 fix is a split path: cut an oversized rewritten block between elements into
 two output blocks with their own indexes.
 
-## CMD-042 - External ALTW stage 4 copies its passthrough prefix after the router aborts
+## CMD-048 - An empty numeric OSC attribute is refused applied directly and dropped when re-emitted
 
-Reported by: the stage 3 startup-deadlock item (2026-11-18), from source
-during the spar; not reproduced.
+Reported by: the CMD-042/043/047 spar partner (codex, 2026-11-19), from
+source; not reproduced.
 
-Before the ordered pool delivers its first result, stage 4's consumer runs
-`before_item(0)` (`altw/external/stage4.rs`), which copies every passthrough
-blob ahead of way blob 0, the whole untagged node prefix under
-`keep_untagged_nodes`. That loop checks only the invocation token. A router
-abort (a stage 3 bucket error, a refused stage 3 spawn) does not trip the
-token, so the call keeps copying, gigabytes at planet scale, before it
-returns the error. Nothing hangs and the error is right, but failure latency
-is a full prefix copy. The fix is to have stage 4 observe `router.is_aborted`
-at its passthrough boundaries, at the same per-blob granularity as the token
-check.
-
-## CMD-043 - The parallel output writer reports startup before its workers exist
-
-Reported by: the stage 3 startup-deadlock item (2026-11-18), from source
-during the spar; not reproduced.
-
-`write/parallel_writer.rs` sends its init success before `run_pool` attempts
-its worker spawns. A refused worker spawn is recorded in `FirstFailure`, but
-the caller has already been told the writer started, and learns of the
-refusal only at a later write or the final flush. In external ALTW stage 4
-can therefore sit in the router's readiness wait (stage 3 still making
-progress) for a writer that is already dead. A delay, not a deadlock. Init
-success should wait until the pool's workers are all born.
-
-## CMD-047 - An empty `visible` is a claim when applied and gone when re-emitted
-
-Reported by: the CMD-045/046 spar partner (codex, 2026-11-19), from source;
-not reproduced.
-
-`arena_meta` (`osc/xml_parse.rs`) records `visible=""` as present and not
-hidden, so a direct apply writes an explicit `visible=true` claim into the
-element's `Info`. Both re-emitters (merge-changes, OSC tags-filter) omit an
-empty metadata attribute under the documented empty-attribute rule, so the
-same change applied after re-emission carries no visibility claim. Both read
-as visible; the PBF claims differ. Either re-emission keeps an explicit empty
-`visible`, or apply treats an empty `visible` as absent (or refuses it, as
-libosmium's `set_visible` refuses any value but `true`/`false`).
+apply-changes refuses `uid=""`, `changeset=""` and `timestamp=""` as
+unparsable (`arena_meta`, `osc/xml_parse.rs`). merge-changes and OSC
+tags-filter pass those fields as text and omit an empty one on output, so the
+same change fails applied directly and succeeds applied after re-emission
+(a delete with `version="7" uid=""`, say). `version=""` is refused
+everywhere and is not part of this. Either the re-emitters refuse an
+explicit empty numeric or timestamp attribute too, or both routes read it
+as absent; the second lets a malformed attribute pass silently, the first
+changes the re-emitters' acceptance policy. An empty `visible` was settled
+as absent on every route; an empty `user` is a claim (it can name a blank
+user alongside a uid) and is BUG-015's question.

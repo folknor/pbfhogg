@@ -362,6 +362,21 @@
 
 ### Fixed
 
+- **An empty `visible=""` in an OSC is read as absent.** `apply-changes`
+  wrote it into the PBF as an explicit `visible` true claim, while
+  `merge-changes` and OSC `tags-filter` write it as absent, so the same
+  change applied after re-emission claimed nothing. Every consumer now reads
+  it as no visibility claim; osmium refuses the file (DEVIATIONS.md).
+- **A parallel or io_uring writer that cannot start fails at construction.**
+  The parallel (pwrite) writer reported itself started before its worker
+  threads existed, so a refused thread spawn surfaced only at a later write
+  or the final flush; the io_uring writer did the same for a header whose
+  submission failed. `PbfWriter::to_path_parallel` and `to_path_uring` now
+  return those errors themselves.
+- **External `add-locations-to-ways` stops promptly when its join fails.**
+  Stage 4 did not watch stage 3's failure while copying passthrough blobs,
+  so under `--keep-untagged-nodes` it copied the whole untagged node prefix
+  (gigabytes at planet scale) before reporting the error.
 - **OSC inputs may be streams.** `apply-changes`, `merge-changes` and
   `tags-filter --input-kind osc` read an OSC from a FIFO or `/dev/stdin`.
   Before, the gzip sniff sought back to the start, so a stream was opened,

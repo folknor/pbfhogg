@@ -387,8 +387,8 @@ impl ConcurrentBlobLocationRouter {
         self.notify_waiters();
     }
 
-    /// Signal a terminal failure. Wakes all waiters; subsequent waits and
-    /// preads observe the recorded error.
+    /// Signal a terminal failure. Wakes all waiters; subsequent waits,
+    /// preads and [`check`](Self::check) calls observe the recorded error.
     pub(super) fn abort(&self, error: Error) {
         {
             let mut guard = self
@@ -410,11 +410,37 @@ impl ConcurrentBlobLocationRouter {
         self.aborted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The recorded abort error once the router is aborted, else `Ok`.
+    ///
+    /// An abort is terminal for stage 4: it does not trip the invocation
+    /// token, so every stage 4 boundary (a passthrough frame, a decoded
+    /// blob's output, a worker's input read, the final flush) calls this as
+    /// well as the token check. Without it a stage 3 failure left stage 4
+    /// copying the whole passthrough prefix, gigabytes at planet scale under
+    /// `keep_untagged_nodes`, before the error surfaced. One SeqCst load per
+    /// blob.
+    pub(super) fn check(&self) -> Result<()> {
+        if !self.is_aborted() {
+            return Ok(());
+        }
+        Err(self.abort_error())
+    }
+
+    fn abort_error(&self) -> Error {
+        self.abort_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Error::internal("router aborted (no message recorded)"))
+    }
+
     /// Block until `blob_idx`'s slot is populated, the router is aborted,
     /// or the producer is done with the slot still empty. Returns `Ok(())`
     /// when the slot is known to be populated; returns `Err` on abort or
-    /// missing-publication.
+    /// missing-publication. An abort wins over a published slot: the
+    /// abort is checked before the fast path.
     pub(super) fn wait_ready(&self, blob_idx: usize) -> Result<()> {
+        self.check()?;
         // Fast path: slot already populated.
         {
             let guard = self.slots[blob_idx]
@@ -444,13 +470,7 @@ impl ConcurrentBlobLocationRouter {
             // notify until wait has atomically released notify_mu and parked.
             if self.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 drop(mu_guard);
-                let err = self
-                    .abort_error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-                    .unwrap_or_else(|| Error::internal("router aborted (no message recorded)"));
-                break Err(err);
+                break Err(self.abort_error());
             }
             {
                 let guard = self.slots[blob_idx]
@@ -1143,6 +1163,24 @@ mod tests {
         encode_blob_payload(&cb, &decoded, &mut from_decoded).expect("encode decoded");
 
         assert_eq!(from_record, from_decoded);
+    }
+
+    /// A published slot does not mask an abort: the readiness wait and the
+    /// boundary check both return the recorded error.
+    #[test]
+    fn an_abort_wins_over_a_published_slot() {
+        let pwr = make_per_way_rcs(&[&[1]]);
+        let router =
+            ConcurrentBlobLocationRouter::new(&pwr, vec![], &crate::host::Call::detached())
+                .expect("router");
+        router.publish_worker(0, 0, 0, 1).expect("worker");
+        router.wait_ready(0).expect("a published slot is ready");
+        router.check().expect("not aborted");
+        router.abort(Error::internal("stage 3 failed"));
+        for result in [router.wait_ready(0), router.check()] {
+            let err = result.expect_err("an aborted router refuses");
+            assert!(err.to_string().contains("stage 3 failed"), "{err}");
+        }
     }
 
     #[test]

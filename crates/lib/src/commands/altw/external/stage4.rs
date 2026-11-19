@@ -209,6 +209,13 @@ impl S4Consumer<'_> {
     /// it verbatim.
     fn passthrough(&mut self, position: usize) -> Result<()> {
         use std::os::unix::fs::FileExt as _;
+        #[cfg(pbfhogg_test_hooks)]
+        self.cancel
+            .faults()
+            .on_altw_stage4_passthrough(position, || self.router.is_aborted());
+        // The router abort as well as the token: a stage 3 failure does not
+        // trip the token, and this loop is the whole passthrough prefix.
+        self.router.check()?;
         self.cancel.check()?;
         let desc = &self.schedule[position];
         let (frame_offset, frame_size) = (desc.frame_offset, desc.frame_size);
@@ -216,6 +223,8 @@ impl S4Consumer<'_> {
         // The frame is handed to the writer whole, so it is read into a
         // buffer of its own and the consumer keeps none between blobs.
         let mut frame = vec![0_u8; frame_size];
+        #[cfg(pbfhogg_test_hooks)]
+        self.cancel.faults().on_altw_stage4_passthrough_io();
         self.file
             .read_exact_at(&mut frame, frame_offset)
             .map_err(|e| {
@@ -270,6 +279,8 @@ impl S4Consumer<'_> {
         let _ = ordinal;
         self.total_stats.merge(&block_stats);
         for block in blocks {
+            // Each output handoff is a boundary for the router abort.
+            self.router.check()?;
             self.bytes_written += block.bytes.len() as u64;
             self.write_calls += 1;
             let t_w = crate::counters::Stopwatch::start();
@@ -622,6 +633,10 @@ pub(super) fn stage4_assembly(
                             c.readiness_wait_blobs.fetch_add(1, Relaxed);
                             record_max(&c.readiness_wait_max_ns, wait_ns);
                         }
+                    } else {
+                        // A non-way blob skips the readiness wait, so it
+                        // observes the router abort here, before its read.
+                        coord_payloads_reader.check()?;
                     }
 
                     let t0 = crate::counters::Stopwatch::start();
@@ -816,6 +831,9 @@ pub(super) fn stage4_assembly(
     // the writer pipeline and only materialises here. Isolating
     // flush makes the channel-vs-writer attribution legible.
     let t_flush = crate::counters::Stopwatch::start();
+    // An abort that landed after the last handoff stops the run before the
+    // flush finalizes an output the run will report as failed.
+    coord_payloads_reader.check()?;
     writer.flush()?;
     let s4_flush_ms: u64 = t_flush.elapsed_ms();
     let s4_output_bytes = std::fs::metadata(output.path())

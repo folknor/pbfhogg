@@ -386,6 +386,17 @@ where
             "changeset" => MetaField::Changeset,
             "uid" => MetaField::Uid,
             "user" => MetaField::User,
+            // An empty `visible` carries no visibility and is the attribute
+            // absent, for every sink: the re-emitters write an empty
+            // attribute as absent, so treating it as present here made a
+            // directly applied change claim `visible` true in the PBF and the
+            // same change applied after re-emission claim nothing. It is
+            // judged after the iterator has validated the attribute (a
+            // duplicate still fails) and does not count as metadata.
+            // libosmium refuses it; pbfhogg does no strict true/false
+            // validation (DEVIATIONS.md). An empty `user` stays a claim: it
+            // can name a blank user alongside a uid.
+            "visible" if attr.value.is_empty() => continue,
             "visible" => MetaField::Visible,
             _ => continue,
         };

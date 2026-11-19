@@ -312,6 +312,18 @@ so the location cannot change its answer; it accepts the same file.
 Empty metadata attributes are not a deviation: an empty `user=""` is written
 as absent, as osmium's writer omits an empty user.
 
+## OSC input: an empty `visible` is read as absent
+
+**osmium behavior:** libosmium's `set_visible` accepts only `true` and
+`false`; `visible=""` throws, so osmium refuses the change file.
+
+**pbfhogg behavior:** every OSC consumer reads `visible=""` as the attribute
+absent: no visibility claim, and not on its own metadata. pbfhogg does no
+strict true/false validation of `visible` (only `false` hides), and the
+re-emitters write an empty attribute as absent, so reading it as absent is
+what keeps a change's claims the same applied directly and after
+`merge-changes` or OSC `tags-filter`.
+
 ## derive-changes: changes are decided by content, not version
 
 **osmium behavior:** `osmium derive-changes` walks both inputs in

@@ -37,33 +37,9 @@ passes, and leading `+` signs are accepted. The parser feeds header overrides
 and OSC metadata (`osc/xml_parse.rs`), so malformed timestamps silently become
 different valid ones. This breaks the function's documented strict RFC 3339
 contract and the refusal policy for malformed input. Fixed-width components
-need ASCII-digit validation.
-
-## CMD-004 - Numeric OSC attributes refuse legal XML character references
-
-Reported by: osc-parsing [P2].
-
-`parse_i64_attr`, `parse_f64_attr` and `meta_int` (`osc/xml_parse.rs`) parse
-the raw attribute text before XML normalization, so `id="&#49;"`,
-`ref="&#50;"`, `lat="&#49;"` and `version="&#49;"` fail instead of reading as
-numbers. Native timestamp parsing has the same problem. This breaks OSC XML
-compatibility with no recorded deviation. String attributes already normalize
-correctly.
-
-## CMD-005 - OSC re-emission changes metadata values that contain referenced whitespace
-
-Reported by: osc-parsing [P2], apply-merge [P2].
-
-`scan_owned_metadata_into` (`osc/xml_parse.rs`) correctly turns
-`timestamp="a&#10;b"` into a string containing a newline. `append_attrs`
-(`osc/write.rs`) then uses ordinary escaping for timestamp, changeset, uid and
-visible, which leaves newline and tab literal, so reading the output
-normalizes them to spaces and the value becomes `a b`. Only `user` gets the
-whitespace-preserving escaping. This affects both merge-changes modes and the
-shared tags-filter OSC emitter. These fields deliberately accept arbitrary
-normalized text for pass-through, so it breaks the preservation contract in
-`CORRECTNESS.md`. The writer should use the existing whitespace-preserving
-escaping for these fields too.
+need ASCII-digit validation. OSC timestamps are now read after XML
+normalization, so a referenced sign (`T&#45;1:00:00Z`) reaches the same
+acceptance; the digit check closes both spellings.
 
 ## CMD-006 - load_all_diffs silently skips files it cannot stat
 

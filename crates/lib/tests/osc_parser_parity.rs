@@ -384,6 +384,123 @@ fn explicit_empty_metadata_survives_re_emission() {
     }
 }
 
+/// A typed attribute is read after XML attribute-value normalization, as
+/// every XML reader (libosmium's expat included) hands it over: a character
+/// reference in an ID, a ref, a coordinate or a numeric or timestamp
+/// metadata value names the digit it spells. These were parsed from the raw
+/// text and refused. An unresolvable reference is malformed XML.
+#[test]
+fn typed_attributes_read_character_references() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osc");
+    std::fs::write(
+        &input,
+        r#"<osmChange version="0.6"><create>
+<node id="&#49;" lat="&#49;.5" lon="&#x32;" version="&#51;" changeset="&#52;" uid="&#53;" timestamp="&#50;026-01-02T03:04:05Z"><tag k="highway" v="primary"/></node>
+<node id="2" lat="1.0" lon="2.0" version="1"/>
+<way id="&#55;" version="1"><nd ref="&#49;"/><nd ref="&#50;"/><tag k="highway" v="primary"/></way>
+<relation id="&#56;" version="1"><member type="way" ref="&#55;" role=""/></relation>
+</create></osmChange>"#,
+    )
+    .unwrap();
+    assert_all_accept(dir.path(), &input, "character references in typed values");
+    let overlay = pbfhogg::osc::parse_osc_file(&input).unwrap();
+    let node = overlay.get_node(1).expect("id=&#49; reads as node 1");
+    assert_eq!(
+        (node.decimicro_lat(), node.decimicro_lon()),
+        (15_000_000, 20_000_000)
+    );
+    let meta = node.metadata().unwrap();
+    assert_eq!(
+        (meta.version, meta.changeset, meta.uid, meta.timestamp),
+        (Some(3), Some(4), Some(5), Some(1_767_323_045))
+    );
+    let way = overlay.get_way(7).expect("id=&#55; reads as way 7");
+    assert_eq!(way.refs().collect::<Vec<_>>(), vec![1, 2]);
+
+    let bogus = dir.path().join("bogus.osc");
+    std::fs::write(
+        &bogus,
+        r#"<osmChange version="0.6"><create>
+<node id="1" lat="1.0" lon="2.0" version="&bogus;"/>
+</create></osmChange>"#,
+    )
+    .unwrap();
+    assert_all_refuse(
+        dir.path(),
+        &bogus,
+        "malformed OSC XML",
+        "unresolvable reference",
+    );
+}
+
+/// The re-emitters carry `timestamp`, `changeset`, `uid` and `visible` as
+/// their decoded text. A referenced newline, carriage return or tab is a
+/// real character in it, and was written back literally, so the next reader
+/// normalized it to a space and the value changed. Each must read back as it
+/// was decoded, as `user` already did.
+#[test]
+fn referenced_whitespace_in_metadata_survives_re_emission() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osc");
+    std::fs::write(
+        &input,
+        r#"<osmChange version="0.6"><modify>
+<node id="1" lat="1.0" lon="2.0" version="1" timestamp="a&#10;b" changeset="c&#13;d" uid="e&#9;f" user="g&#10;h" visible="i&#10;j"><tag k="highway" v="primary"/></node>
+</modify></osmChange>"#,
+    )
+    .unwrap();
+    let expected = [
+        ("timestamp", "a\nb"),
+        ("changeset", "c\rd"),
+        ("uid", "e\tf"),
+        ("user", "g\nh"),
+        ("visible", "i\nj"),
+    ];
+    let decoded = |xml: &str| -> Vec<(String, String)> {
+        let mut reader = quick_xml::Reader::from_str(xml);
+        loop {
+            match reader.read_event().unwrap() {
+                quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e)
+                    if e.name().as_ref() == "node" =>
+                {
+                    return e
+                        .attributes()
+                        .map(|a| {
+                            let a = a.unwrap();
+                            let key = a.key.as_ref().to_owned();
+                            let value = a
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .unwrap()
+                                .into_owned();
+                            (key, value)
+                        })
+                        .filter(|(k, _)| expected.iter().any(|(e, _)| e == k))
+                        .collect();
+                }
+                quick_xml::events::Event::Eof => panic!("no node in {xml}"),
+                _ => {}
+            }
+        }
+    };
+    let want: Vec<(String, String)> = expected
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    let out = |n: &str| -> PathBuf { dir.path().join(format!("re-{n}.osc.gz")) };
+    type ReEmit<'a> = &'a dyn Fn(&Path, &Path) -> Verdict;
+    let re_emitters: [(&str, ReEmit<'_>); 3] = [
+        ("merge-changes streaming", &merge_verdict),
+        ("merge-changes simplify", &simplify_verdict),
+        ("tags-filter osc", &tags_filter_verdict),
+    ];
+    for (i, (name, run)) in re_emitters.into_iter().enumerate() {
+        let re = out(&i.to_string());
+        run(&input, &re).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(decoded(&read_gz(&re)), want, "re-read after {name}");
+    }
+}
+
 /// The driver tracked one section and one open object, not the hierarchy:
 /// a node nested in a way replaced the sink's current element, a section
 /// nested anywhere overwrote the action, an unknown wrapper's `<nd>` was

@@ -8,6 +8,17 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Decoded typed attributes, whitespace-preserving metadata escape (bygg, 2026-11-19, `ceab35f2` + change)
+
+Typed attribute reads (IDs, refs, coordinates, numeric and timestamp
+metadata) normalize and re-parse only after the raw parse fails, and
+`timestamp`, `changeset`, `uid` and `visible` are written with the
+whitespace-preserving escape `user` already used. `--iterations 1`,
+A B A B, planet 7-OSC default merge (`--osc 4914..4920`): `ceab35f2`
+2880, 2842 ms (`dcc17f96`, `c9f9e962`); variant 2933, 2907 ms
+(`32bb910b`, `19afba54`). About +2 % with the same sign in both pairs,
+inside the noise band; not chased.
+
 ### Encode-job wakes, no idle poll (bygg, 2026-11-12, `ab647536` + change)
 
 The coordinator's 1 ms idle `recv_timeout` and the credit wait's 1 ms

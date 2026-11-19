@@ -16,7 +16,8 @@ use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::{ElementKind, MemberId};
 
 /// Push an attribute whose value is OSM user data (tag key/value, member
-/// role, user name) and may therefore contain control characters.
+/// role, user name, and the pass-through metadata text an OSC re-emitter
+/// carries) and may therefore contain control characters.
 ///
 /// XML 1.0 attribute-value normalization (spec section 3.3.3) replaces raw
 /// tab, newline, and carriage-return characters in attribute values with
@@ -165,21 +166,25 @@ impl OwnedMetadata {
             let v = version.to_string();
             elem.push_attribute(("version", v.as_str()));
         }
-        if self.has(Self::PRESENT_TIMESTAMP) {
-            elem.push_attribute(("timestamp", self.timestamp.as_str()));
+        for (bit, key, value) in self.text_fields() {
+            if self.has(bit) {
+                push_attribute_escaped(elem, key, value);
+            }
         }
-        if self.has(Self::PRESENT_CHANGESET) {
-            elem.push_attribute(("changeset", self.changeset.as_str()));
-        }
-        if self.has(Self::PRESENT_UID) {
-            elem.push_attribute(("uid", self.uid.as_str()));
-        }
-        if self.has(Self::PRESENT_USER) {
-            push_attribute_escaped(elem, "user", self.user.as_str());
-        }
-        if self.has(Self::PRESENT_VISIBLE) {
-            elem.push_attribute(("visible", self.visible.as_str()));
-        }
+    }
+
+    /// The text fields in attribute order. Every one is the decoded
+    /// (normalized) value its input carried, so a referenced newline, carriage
+    /// return or tab is a real character in it and must be written back as a
+    /// reference, or the next reader normalizes it to a space.
+    fn text_fields(&self) -> [(u8, &'static str, &str); 5] {
+        [
+            (Self::PRESENT_TIMESTAMP, "timestamp", &self.timestamp),
+            (Self::PRESENT_CHANGESET, "changeset", &self.changeset),
+            (Self::PRESENT_UID, "uid", &self.uid),
+            (Self::PRESENT_USER, "user", &self.user),
+            (Self::PRESENT_VISIBLE, "visible", &self.visible),
+        ]
     }
 
     /// The metadata as start tag content text, in the owned writers'
@@ -188,20 +193,10 @@ impl OwnedMetadata {
         if let Some(version) = self.version {
             append_int_attr(content, "version", i64::from(version));
         }
-        for (bit, key, value) in [
-            (Self::PRESENT_TIMESTAMP, "timestamp", &self.timestamp),
-            (Self::PRESENT_CHANGESET, "changeset", &self.changeset),
-            (Self::PRESENT_UID, "uid", &self.uid),
-        ] {
+        for (bit, key, value) in self.text_fields() {
             if self.has(bit) {
-                append_attr(content, key, value);
+                append_attr_escaped(content, key, value);
             }
-        }
-        if self.has(Self::PRESENT_USER) {
-            append_attr_escaped(content, "user", &self.user);
-        }
-        if self.has(Self::PRESENT_VISIBLE) {
-            append_attr(content, "visible", &self.visible);
         }
     }
 }

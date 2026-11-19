@@ -362,6 +362,15 @@
 
 ### Fixed
 
+- **OSC input reads character references in IDs, refs, coordinates and
+  numeric or timestamp metadata.** `id="&#49;"`, `ref="&#50;"`,
+  `lat="&#49;"`, `version="&#49;"` and the like were refused as not a
+  number by `apply-changes`, `merge-changes` and OSC `tags-filter`; they now
+  read as the value the reference spells, as any XML reader gives it.
+- **`merge-changes` and OSC `tags-filter` keep a referenced newline, carriage
+  return or tab in `timestamp`, `changeset`, `uid` and `visible`.** They
+  wrote it back literally, so the next reader saw a space instead; it is now
+  written as a character reference, as `user` already was.
 - **`merge-changes` and OSC `tags-filter` write back an explicit empty
   metadata attribute.** They dropped `user=""`, `uid=""`, `changeset=""` and
   `timestamp=""`, so a blank-user claim `apply-changes` records became no

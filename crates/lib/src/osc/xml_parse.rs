@@ -141,6 +141,33 @@ fn missing_attr(name: &str) -> Error {
     Error::invalid_data(format!("missing attribute '{name}'"))
 }
 
+/// Parse a typed attribute value as XML defines it: after attribute-value
+/// normalization, so a character reference (`id="&#49;"`) reads as the
+/// character it names. The raw text is tried first and normalized only when
+/// that fails, which keeps normal input at one parse with no normalization
+/// scan. That shortcut is exact only for parsers that refuse `&`, tab, LF and
+/// CR, because XML 1.0 normalization changes nothing else: every `parse`
+/// passed here (`i32`, `i64` and `f64` `FromStr`, `parse_rfc3339_utc`) does.
+/// On failure the error names the normalized text; a reference that does not
+/// resolve is malformed XML.
+fn parse_decoded<T, E>(
+    attr: &Attribute<'_>,
+    parse: impl Fn(&str) -> std::result::Result<T, E>,
+) -> ParseResult<std::result::Result<T, (String, E)>> {
+    let raw = attr.value.as_ref();
+    let err = match parse(raw) {
+        Ok(v) => return Ok(Ok(v)),
+        Err(err) => err,
+    };
+    if !raw.as_bytes().contains(&b'&') {
+        return Ok(Err((raw.to_owned(), err)));
+    }
+    let text = attr
+        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+        .map_err(xml_err)?;
+    Ok(parse(&text).map_err(|err| (text.into_owned(), err)))
+}
+
 pub(crate) fn parse_i64_attr(
     e: &quick_xml::events::BytesStart<'_>,
     name: &str,
@@ -148,8 +175,11 @@ pub(crate) fn parse_i64_attr(
     for attr_result in e.attributes() {
         let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            return attr.value.parse::<i64>().map_err(|err| {
-                Error::invalid_data_with(format!("attribute '{name}' is not a valid integer"), err)
+            return parse_decoded(&attr, str::parse::<i64>)?.map_err(|(text, err)| {
+                Error::invalid_data_with(
+                    format!("attribute '{name}' is not a valid integer: '{text}'"),
+                    err,
+                )
             });
         }
     }
@@ -160,8 +190,11 @@ fn parse_f64_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> ParseRes
     for attr_result in e.attributes() {
         let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            return attr.value.parse::<f64>().map_err(|err| {
-                Error::invalid_data_with(format!("attribute '{name}' is not a valid number"), err)
+            return parse_decoded(&attr, str::parse::<f64>)?.map_err(|(text, err)| {
+                Error::invalid_data_with(
+                    format!("attribute '{name}' is not a valid number: '{text}'"),
+                    err,
+                )
             });
         }
     }
@@ -415,8 +448,7 @@ pub(crate) fn meta_int<T: std::str::FromStr>(
 where
     T::Err: std::error::Error + Send + Sync + 'static,
 {
-    let text = attr.value.as_ref();
-    text.parse::<T>().map_err(|err| {
+    parse_decoded(attr, str::parse::<T>)?.map_err(|(text, err)| {
         Error::invalid_data_with(
             format!(
                 "OSC element metadata attribute '{}' has unparsable value '{text}'; \
@@ -1231,17 +1263,18 @@ fn arena_meta(
                 meta.flags |= META_FLAG_HAS_VERSION;
             }
             MetaField::Timestamp => {
-                let text = attr.value.as_ref();
                 meta.flags |= META_FLAG_HAS_TIMESTAMP;
-                meta.timestamp = crate::commands::parse_rfc3339_utc(text).map_err(|err| {
-                    Error::invalid_data_with(
-                        format!(
-                            "OSC element metadata attribute 'timestamp' has unparsable \
+                meta.timestamp = parse_decoded(attr, crate::commands::parse_rfc3339_utc)?.map_err(
+                    |(text, err)| {
+                        Error::invalid_data_with(
+                            format!(
+                                "OSC element metadata attribute 'timestamp' has unparsable \
                              value '{text}'; refusing to record it as the epoch"
-                        ),
-                        err,
-                    )
-                })?;
+                            ),
+                            err,
+                        )
+                    },
+                )?;
             }
             MetaField::Changeset => {
                 meta.changeset = meta_int::<i64>(field, attr)?;

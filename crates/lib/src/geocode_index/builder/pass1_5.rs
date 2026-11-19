@@ -472,10 +472,10 @@ pub(super) fn run_pass1_5(
         let overflow_lists: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
         let overflow_lists_ref = &overflow_lists;
 
-        crate::threads::scope(|scope| {
+        crate::threads::scope(&host.invocation, |scope| {
             for (worker, store_file) in store_files.into_iter().enumerate() {
                 let file = std::sync::Arc::clone(shared_file);
-                scope.spawn(move || {
+                let spawned = scope.spawn(move || {
                     let mut read_buf = crate::read::read_buf::ReadBuf::default();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut st: Vec<(u32, u32)> = Vec::new();
@@ -584,6 +584,16 @@ pub(super) fn run_pass1_5(
                     }
                     push_overflow_list(overflow_lists_ref, w.overflow_nodes);
                 });
+                // A refusal is recorded in the first-error slot, so the
+                // workers already born stop at their next claim instead of
+                // scanning the rest of the schedule before the join.
+                if let Err(e) = spawned {
+                    store_first_err(
+                        first_err_ref,
+                        Error::from(e).context(format!("spawn geocode pass 1.5 worker {worker}")),
+                    );
+                    break;
+                }
             }
         });
 

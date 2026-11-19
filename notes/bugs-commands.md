@@ -531,20 +531,3 @@ refusal only at a later write or the final flush. In external ALTW stage 4
 can therefore sit in the router's readiness wait (stage 3 still making
 progress) for a writer that is already dead. A delay, not a deadlock. Init
 success should wait until the pool's workers are all born.
-
-## CMD-044 - Most library scopes still spawn with the panicking Scope::spawn
-
-Reported by: the stage 3 startup-deadlock item (2026-11-18).
-
-`threads::Scope::spawn` panics on an OS refusal, and most worker scopes in
-the library use it (stage 1, stage 2, sparse ALTW, the read pipeline,
-classify, apply-changes, diff, geocode and others; the sweep found about
-thirty sites). External ALTW stages 3 and 4 and the ordered pool now use
-`try_spawn` and own a refusal; the others were not analysed. A spawn panic
-inside a scope whose already-born threads wait on a peer that was never
-born, or on a channel the body would have fed, deadlocks the same way the
-stage 3 refusal did. The rest escape the call as a panic rather than a typed
-`Io` error. Each site needs its own wait topology checked, then `try_spawn`
-with the refusal recorded and broadcast before the join. Removing
-`Scope::spawn` once no caller needs it would keep new sites from
-reintroducing it.

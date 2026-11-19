@@ -158,7 +158,9 @@ fn parallel_writer_thread_inner(
 
     let failure = FirstFailure::new();
     let header_len = framed_header.len() as u64;
-    crate::threads::scope(|s| run_pool(s, &rx, &file, &failure, header_len, expected, cancel));
+    crate::threads::scope(cancel, |s| {
+        run_pool(s, &rx, &file, &failure, header_len, expected, cancel);
+    });
 
     // Every pool thread has been joined; the record is final.
     if let Some(e) = failure.take() {
@@ -190,7 +192,7 @@ fn run_pool<'w, 'scope, 'env>(
     let mut worker_handles: Vec<Handle<'w, 'scope, 'env, ()>> = Vec::with_capacity(POOL_SIZE);
     for index in 0..POOL_SIZE {
         let (wtx, wrx) = sync_channel::<WriteOp>(PER_WORKER_CAPACITY);
-        match s.try_spawn(move || pool_worker(index, wrx, file, failure, cancel)) {
+        match s.spawn(move || pool_worker(index, wrx, file, failure, cancel)) {
             Ok(handle) => {
                 worker_txs.push(wtx);
                 worker_handles.push(handle);

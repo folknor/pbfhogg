@@ -336,7 +336,7 @@ pub(super) fn run_workers(
     // blob.
     let source: Arc<Path> = Arc::from(base.path());
 
-    crate::threads::scope(|scope| {
+    crate::threads::scope(&cancel, |scope| {
         for worker_id in 0..worker_count {
             let drain_tx = Arc::clone(&drain_tx);
             let loc = locations.as_ref().map(|l| WorkerLoc {
@@ -352,7 +352,7 @@ pub(super) fn run_workers(
             let diff = &*diff;
             let cancel = &cancel;
 
-            scope.spawn(move || {
+            let spawned = scope.spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker_loop(
                         worker_id,
@@ -377,6 +377,18 @@ pub(super) fn run_workers(
                 }
                 drop(drain_tx);
             });
+            if let Err(e) = spawned {
+                // Published while this function's `drain_tx` is still held,
+                // as the failure protocol requires: the drain wakes, returns
+                // the refusal and drops its endpoints, the scanner then stops
+                // and drops the candidate sender, and the workers already
+                // born leave their receive before this scope joins them.
+                failure.publish(
+                    Error::from(e)
+                        .context(format!("spawn apply-changes streaming worker {worker_id}")),
+                );
+                break;
+            }
         }
     });
 

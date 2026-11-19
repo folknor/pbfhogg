@@ -735,9 +735,14 @@ where
     let scratch_pool = &AtomicU64::new(0);
     // Declared before the scope so it drops after the scope has joined.
     let _emit = EmitOnDrop(metrics, invocation);
-    let result = crate::threads::scope(|scope| {
-        // Stage 1: Sequential I/O reader thread
-        scope.spawn(move || {
+    let result = crate::threads::scope(invocation, |scope| {
+        // Stage 1: Sequential I/O reader thread. Spawned LAST, after the
+        // dispatcher: the reader runs the caller's `Read`, which no drop can
+        // interrupt, so on a refused spawn it must not have started. A
+        // refused dispatcher spawn leaves nothing born; a refused reader
+        // spawn drops this closure and its `raw_tx`, the dispatcher's receive
+        // loop ends, and the scope joins it.
+        let reader = move || {
             for (seq, blob_result) in std::iter::from_fn(|| blob_reader.next_blob()).enumerate() {
                 unindexed.observe(&blob_result, &diagnostics, invocation);
                 let t_send = crate::counters::Stopwatch::start();
@@ -747,7 +752,7 @@ where
                     break; // receiver dropped, pipeline shutting down
                 }
             }
-        });
+        };
 
         // Stage 2: Dispatcher thread - fans out to dedicated pool for parallel decode.
         //
@@ -784,7 +789,7 @@ where
         // cleanly. Do not refactor this into a form where `raw_rx`
         // outlives an error return from this closure: the reader
         // thread will block forever on a full channel.
-        scope.spawn(move || {
+        let dispatcher = scope.spawn(move || {
             let decode_threads = decode_thread_count.unwrap_or_else(|| {
                 crate::host::sized_workers(
                     resources.as_ref().map_or(
@@ -875,6 +880,11 @@ where
             drop(dispatch_tx);
             drop(decode_pool);
         });
+        dispatcher
+            .map_err(|e| crate::Error::from(e).context("spawn the read pipeline dispatcher"))?;
+        scope
+            .spawn(reader)
+            .map_err(|e| crate::Error::from(e).context("spawn the read pipeline reader"))?;
 
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);

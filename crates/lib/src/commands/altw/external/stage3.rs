@@ -202,7 +202,7 @@ pub(super) fn stage3_slot_reorder(
     let ctx = integrated;
     let router = ctx.router;
 
-    crate::threads::scope(|scope| {
+    crate::threads::scope(cancel, |scope| {
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
             // A refused spawn is this stage's failure, recorded and broadcast
@@ -215,7 +215,7 @@ pub(super) fn stage3_slot_reorder(
             let allowed = cancel.faults().on_altw_stage3_spawn(worker_id);
             #[cfg(not(pbfhogg_test_hooks))]
             let allowed: std::io::Result<()> = Ok(());
-            let spawned = allowed.and_then(|()| scope.try_spawn(move || -> crate::Result<()> {
+            let spawned = allowed.and_then(|()| scope.spawn(move || -> crate::Result<()> {
                 use std::sync::atomic::Ordering::Relaxed;
 
                 // Panic-safety: if this closure unwinds before `disarm`,

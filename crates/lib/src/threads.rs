@@ -37,6 +37,10 @@ pub(crate) struct Scope<'w, 'scope, 'env: 'scope> {
     inner: &'scope std::thread::Scope<'scope, 'env>,
     /// Every thread spawned, in spawn order; `None` once joined.
     registry: RefCell<Vec<Option<ScopedJoinHandle<'scope, ()>>>>,
+    /// The invocation the scope's threads run for; hook builds consult its
+    /// fault plan before every spawn.
+    #[cfg(pbfhogg_test_hooks)]
+    invocation: &'env crate::host::Invocation,
     _owner: PhantomData<(&'w (), *const ())>,
 }
 
@@ -50,21 +54,11 @@ pub(crate) struct Handle<'w, 'scope, 'env: 'scope, T> {
 }
 
 impl<'w, 'scope, 'env> Scope<'w, 'scope, 'env> {
-    /// Spawn an unnamed thread. Panics if the OS refuses one, as
-    /// `std::thread::Scope::spawn` does.
-    pub(crate) fn spawn<T, F>(&'w self, f: F) -> Handle<'w, 'scope, 'env, T>
-    where
-        F: FnOnce() -> T + Send + 'scope,
-        T: Send + 'scope,
-    {
-        match self.spawn_with(std::thread::Builder::new(), f) {
-            Ok(handle) => handle,
-            Err(e) => panic!("failed to spawn thread: {e}"),
-        }
-    }
-
-    /// Spawn an unnamed thread, returning the OS refusal.
-    pub(crate) fn try_spawn<T, F>(&'w self, f: F) -> std::io::Result<Handle<'w, 'scope, 'env, T>>
+    /// Spawn an unnamed thread, returning the OS refusal. There is no
+    /// panicking form: a refused spawn is the caller's failure to return, and
+    /// before it returns the caller releases every wait a thread it already
+    /// started could be parked on for a peer that will now never exist.
+    pub(crate) fn spawn<T, F>(&'w self, f: F) -> std::io::Result<Handle<'w, 'scope, 'env, T>>
     where
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
@@ -94,6 +88,8 @@ impl<'w, 'scope, 'env> Scope<'w, 'scope, 'env> {
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
     {
+        #[cfg(pbfhogg_test_hooks)]
+        self.invocation.faults().on_scoped_spawn()?;
         let slot = Arc::new(Mutex::new(None));
         let theirs = Arc::clone(&slot);
         #[allow(
@@ -168,10 +164,14 @@ impl<T> Handle<'_, '_, '_, T> {
 }
 
 /// `std::thread::scope`, with every spawned thread joined before it returns.
-pub(crate) fn scope<'env, F, T>(body: F) -> T
+/// `invocation` is the run the threads work for (hook builds refuse the
+/// spawn its fault plan names).
+pub(crate) fn scope<'env, F, T>(invocation: &'env crate::host::Invocation, body: F) -> T
 where
     F: for<'w, 'scope> FnOnce(&'w Scope<'w, 'scope, 'env>) -> T,
 {
+    #[cfg(not(pbfhogg_test_hooks))]
+    let _ = invocation;
     #[allow(
         clippy::disallowed_methods,
         reason = "the one sanctioned std scope: every thread in it is joined"
@@ -180,6 +180,8 @@ where
         let scope = Scope {
             inner,
             registry: RefCell::new(Vec::new()),
+            #[cfg(pbfhogg_test_hooks)]
+            invocation,
             _owner: PhantomData,
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&scope)));
@@ -260,34 +262,40 @@ mod tests {
     /// no wait, since the body itself joins it.
     #[test]
     fn scope_waits_for_thread_local_destructors() {
+        let inv = crate::host::Invocation::new();
         thread_local! {
             static HELD: Cell<Option<SlowTeardown>> = const { Cell::new(None) };
         }
         let finished = Arc::new(AtomicUsize::new(0));
         let body = Arc::new(BodyEnded::default());
         let borrowed = [1, 2, 3];
-        let total = scope(|s| {
+        let total = scope(&inv, |s| {
             let _end = EndBody(&body);
             let mine = Arc::clone(&finished);
-            let joined = s.spawn(move || {
-                HELD.with(|h| {
-                    *h.borrow_mut() = Some(SlowTeardown {
-                        finished: mine,
-                        body: None,
-                    });
-                });
-                borrowed.iter().sum::<i32>()
-            });
-            for _ in 0..3 {
-                let (mine, body) = (Arc::clone(&finished), Arc::clone(&body));
-                drop(s.spawn(move || {
+            let joined = s
+                .spawn(move || {
                     HELD.with(|h| {
                         *h.borrow_mut() = Some(SlowTeardown {
                             finished: mine,
-                            body: Some(body),
+                            body: None,
                         });
                     });
-                }));
+                    borrowed.iter().sum::<i32>()
+                })
+                .unwrap();
+            for _ in 0..3 {
+                let (mine, body) = (Arc::clone(&finished), Arc::clone(&body));
+                drop(
+                    s.spawn(move || {
+                        HELD.with(|h| {
+                            *h.borrow_mut() = Some(SlowTeardown {
+                                finished: mine,
+                                body: Some(body),
+                            });
+                        });
+                    })
+                    .unwrap(),
+                );
             }
             joined.join().unwrap()
         });
@@ -299,19 +307,25 @@ mod tests {
     /// every thread has exited.
     #[test]
     fn panics_follow_join_ownership() {
-        let caught = scope(|s| s.spawn(|| panic!("joined")).join().is_err());
+        let inv = crate::host::Invocation::new();
+        let caught = scope(&inv, |s| {
+            s.spawn(|| panic!("joined")).unwrap().join().is_err()
+        });
         assert!(caught);
 
         let late = AtomicBool::new(false);
         let body = BodyEnded::default();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scope(|s| {
+            scope(&inv, |s| {
                 let _end = EndBody(&body);
-                drop(s.spawn(|| panic!("unjoined")));
-                drop(s.spawn(|| {
-                    body.wait();
-                    late.store(true, SeqCst);
-                }));
+                drop(s.spawn(|| panic!("unjoined")).unwrap());
+                drop(
+                    s.spawn(|| {
+                        body.wait();
+                        late.store(true, SeqCst);
+                    })
+                    .unwrap(),
+                );
             });
         }));
         assert!(unwound.is_err());
@@ -324,16 +338,20 @@ mod tests {
     /// A panicking body keeps its own payload and still joins every thread.
     #[test]
     fn a_panicking_body_joins_and_keeps_its_panic() {
+        let inv = crate::host::Invocation::new();
         let late = AtomicBool::new(false);
         let body = BodyEnded::default();
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scope(|s| {
+            scope(&inv, |s| {
                 let _end = EndBody(&body);
-                drop(s.spawn(|| panic!("child")));
-                drop(s.spawn(|| {
-                    body.wait();
-                    late.store(true, SeqCst);
-                }));
+                drop(s.spawn(|| panic!("child")).unwrap());
+                drop(
+                    s.spawn(|| {
+                        body.wait();
+                        late.store(true, SeqCst);
+                    })
+                    .unwrap(),
+                );
                 panic!("body");
             })
         }))

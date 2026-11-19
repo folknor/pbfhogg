@@ -439,6 +439,8 @@ impl<R: Read + Send> ElementReader<R> {
     /// # Errors
     /// [`ErrorKind::Sealed`](crate::ErrorKind::Sealed) when the reader's
     /// invocation has been sealed; nothing is started.
+    /// [`ErrorKind::Io`](crate::ErrorKind::Io) when the OS refuses the
+    /// background thread; nothing is started.
     pub fn into_blocks_pipelined(self) -> Result<PipelinedBlocks>
     where
         R: 'static,
@@ -467,7 +469,7 @@ impl<R: Read + Send> ElementReader<R> {
             clippy::disallowed_methods,
             reason = "a session thread: the iterator keeps its handle and joins it in teardown"
         )]
-        let handle = std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().spawn(move || {
             let permit = permit;
             let deliver = |block: PrimitiveBlock| {
                 tx.send(Ok(block))
@@ -492,6 +494,11 @@ impl<R: Read + Send> ElementReader<R> {
             thread_completed.store(true, std::sync::atomic::Ordering::Release);
             drop(permit);
         });
+        // A refusal drops the closure, and with it the permit and the sender:
+        // nothing was started, and the error is returned before an iterator
+        // exists.
+        let handle = spawned
+            .map_err(|e| Error::from(e).context("spawn the pipelined block iterator thread"))?;
 
         Ok(PipelinedBlocks {
             rx: Some(rx),
@@ -652,6 +659,7 @@ where
     let call = blob_iter.cancel_token().call()?;
     let pool = DecompressPool::new(&call);
     drop(call);
+    let invocation = blob_iter.cancel_token().clone();
     // Captured once; every worker borrows it to locate decode failures.
     let source = blob_iter.source().cloned();
     let source = source.as_ref();
@@ -663,23 +671,32 @@ where
     let identity = &identity;
     let reduce_op = &reduce_op;
 
-    crate::threads::scope(|scope| -> Result<T> {
+    crate::threads::scope(&invocation, |scope| -> Result<T> {
         // Installed before the first worker spawns: if the calling thread
-        // unwinds inside this scope - a `scope.spawn` failure, or a panicking
-        // `R::read` inside the pump - this closes the queue and shuts the budget
-        // down so every already-spawned worker wakes and scope-join can finish
-        // the unwind instead of blocking forever on a queue that would never be
-        // closed. Disarmed once the pump returns normally and teardown moves to
-        // the join loop below.
+        // leaves this scope before the pump has returned - a refused spawn,
+        // or a panicking `R::read` inside the pump - this closes the queue and
+        // shuts the budget down so every already-spawned worker wakes and
+        // scope-join can finish instead of blocking forever on a queue that
+        // would never be closed. A born worker runs no caller code before its
+        // first batch (see `run_par_worker`), so nothing it does can wait on
+        // the pump that a refusal keeps from starting. Disarmed once the pump
+        // returns normally and teardown moves to the join loop below.
         let mut cancel = CancelGuard::new(&queue, &budget);
 
         let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
+        for worker in 0..worker_count {
             let (queue, budget) = (&queue, &budget);
             let pool = Arc::clone(&pool);
-            handles.push(scope.spawn(move || -> Result<T> {
+            let spawned = scope.spawn(move || -> Result<T> {
                 run_par_worker(queue, budget, &pool, source, map_op, identity, reduce_op)
-            }));
+            });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(e) => {
+                    return Err(crate::error::Error::from(e)
+                        .context(format!("spawn par_map_reduce worker {worker}")));
+                }
+            }
         }
 
         // Frame pump runs on the calling thread: sequential file I/O with
@@ -940,13 +957,18 @@ where
     let mut cancel = CancelGuard::new(queue, budget);
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut acc = identity();
+    // `identity` runs once per worker, but only once the worker holds a batch
+    // or the queue has closed: never while the pump may not have started. A
+    // refused peer spawn returns before the pump runs, so caller code that
+    // waits on input progress must not be running on a born worker then.
+    let mut acc: Option<T> = None;
     while let Some(batch) = queue.pop() {
         if budget.is_shutdown() {
             // Free storage then release; shutdown is already signaled.
             drop(batch);
             break;
         }
+        let mut folded = acc.take().unwrap_or_else(identity);
         // The batch owns its charge: on normal end, decode error, or a mid-fold
         // panic it frees the compressed storage before returning capacity.
         let mut decode_err: Option<crate::error::Error> = None;
@@ -955,7 +977,7 @@ where
             {
                 Ok(block) => {
                     for element in block.elements() {
-                        acc = reduce_op(acc, map_op(element));
+                        folded = reduce_op(folded, map_op(element));
                     }
                 }
                 Err(e) => {
@@ -974,9 +996,13 @@ where
             drop(batch); // frees storage, then releases budget
             return Err(e);
         }
+        acc = Some(folded);
         // Normal end of batch: it drops here (frees storage, then releases).
     }
     // Clean drain: leave siblings to finish; do not shut the budget down.
+    // A worker that never held a batch makes its identity only now, with the
+    // queue closed. Still armed, so a panic in it cancels as one above would.
+    let acc = acc.unwrap_or_else(identity);
     cancel.disarm();
     Ok(acc)
 }

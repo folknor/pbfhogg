@@ -1110,23 +1110,16 @@ pub(crate) fn external_join_in(
     let blob_meta_ref_parallel = &blob_meta;
     let bucket_layout_ref = &bucket_layout;
     let (stage1_out, relation_member_node_ids) = crate::threads::scope(
+        &host.invocation,
         |scope| -> Result<(
             super::external::stage1::Stage1Output,
             Option<relation_scan::RelationScanOutput>,
         )> {
-            let s1_handle = scope.spawn(|| {
-                stage1_way_pass(
-                    blob_meta_ref_parallel,
-                    input_ref_parallel,
-                    direct_io,
-                    scratch,
-                    bucket_layout_ref,
-                    &ref_count_sidecar,
-                    &per_way_refcount_sidecar,
-                    inject_prepass,
-                    host,
-                )
-            });
+            // Stage 1 runs on this thread and the relation scan, when there
+            // is one, on the scope's only spawned thread, started first. A
+            // refusal of that spawn therefore leaves nothing born and nothing
+            // run, and the no-scan case starts no thread at all.
+            //
             // The scan's span nests inside EXTJOIN_S1_PASS_A and ends well
             // before it. A marker-segmented sidecar view labels the segment
             // that begins at EXTJOIN_RELATION_SCAN_END with that marker, so
@@ -1139,7 +1132,7 @@ pub(crate) fn external_join_in(
                 None
             } else {
                 host.invocation.marker("EXTJOIN_RELATION_SCAN_START");
-                Some(scope.spawn(move || {
+                let spawned = scope.spawn(move || {
                     let t_relscan = crate::counters::Stopwatch::start();
                     let ids = relation_scan::collect_relation_member_ids_indexed(
                         input_ref_parallel,
@@ -1152,22 +1145,33 @@ pub(crate) fn external_join_in(
                         .counter("extjoin_relation_member_collect_ms", t_relscan.elapsed_ms());
                     host.invocation.marker("EXTJOIN_RELATION_SCAN_END");
                     Ok::<_, crate::Error>(ids)
-                }))
+                });
+                Some(spawned.map_err(|e| {
+                    crate::Error::from(e).context("spawn the external relation scan")
+                })?)
             };
 
-            // Error ordering: `s1_handle.join()??` short-circuits before
-            // joining the relation-scan handle, but `thread::scope` still
-            // waits for `rel_handle` to run to completion before the scope
-            // returns. A stage-1 failure while the relation scan is
-            // running therefore delays error reporting until the relation
-            // scan completes. Accepted as diagnostic-quality: stage-1
-            // failures are rare (only fire on adversarial or malformed
-            // input, mostly closed by the defensive-input checks in
-            // ADR-0004). A cancellation is not delayed: both threads
-            // observe the invocation's token, the relation scan per blob.
-            let s1_res = s1_handle.join().map_err(|payload| {
-                crate::error::panic_error("stage 1 thread", payload.as_ref())
-            })??;
+            // Error ordering: a stage-1 failure returns here before the
+            // relation-scan handle is joined, but the scope still waits for
+            // the scan to run to completion before it returns. A stage-1
+            // failure while the relation scan is running therefore delays
+            // error reporting until the relation scan completes. Accepted
+            // as diagnostic-quality: stage-1 failures are rare (only fire on
+            // adversarial or malformed input, mostly closed by the
+            // defensive-input checks in ADR-0004). A cancellation is not
+            // delayed: both threads observe the invocation's token, the
+            // relation scan per blob.
+            let s1_res = stage1_way_pass(
+                blob_meta_ref_parallel,
+                input_ref_parallel,
+                direct_io,
+                scratch,
+                bucket_layout_ref,
+                &ref_count_sidecar,
+                &per_way_refcount_sidecar,
+                inject_prepass,
+                host,
+            )?;
             let rel_res = match rel_handle {
                 Some(handle) => Some(handle.join().map_err(|payload| {
                     crate::error::panic_error("relation scan thread", payload.as_ref())
@@ -1419,14 +1423,14 @@ pub(crate) fn external_join_in(
     // Both stage threads return the typed crate::Error unchanged, so a
     // PlatformUnsupported raised by the output writer in stage 4 keeps its
     // kind (and exit code) across the join.
-    let mut stats = crate::threads::scope(|scope| -> crate::Result<Stats> {
+    let mut stats = crate::threads::scope(&host.invocation, |scope| -> crate::Result<Stats> {
         // Stage 3 is the router's only producer, so its parent owns the
         // router's terminal state for every way it can end: a returned error
         // aborts, success marks the producer done, and an unwind (anything
         // that escapes `stage3_slot_reorder`, which cannot install its
         // workers' guards before they exist) aborts through the guard.
         // Without one of the three a stage 4 readiness wait never ends.
-        let s3_spawned = scope.try_spawn(move || -> crate::Result<()> {
+        let s3_spawned = scope.spawn(move || -> crate::Result<()> {
             let guard = coord_payloads::AbortOnDrop::new(router_ref, "stage 3");
             let integrated = IntegratedInputs {
                 way_slot_starts: way_slot_starts_ref,
@@ -1462,7 +1466,7 @@ pub(crate) fn external_join_in(
         // `S4Consumer` and the worker guards in `stage4_assembly`); this covers everything else (the schedule, the
         // writer, the final flush). An abort already raised keeps its first
         // error.
-        let s4_spawned = scope.try_spawn(move || -> crate::Result<Stats> {
+        let s4_spawned = scope.spawn(move || -> crate::Result<Stats> {
             let guard = coord_payloads::AbortOnDrop::new(router_ref, "stage 4");
             let result = stage4_assembly(
                 input,

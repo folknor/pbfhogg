@@ -492,10 +492,10 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
     let c = &counters;
     let err_ref = &s2_error;
 
-    crate::threads::scope(|scope| {
-        for _ in 0..num_workers {
+    crate::threads::scope(&host.invocation, |scope| {
+        for worker in 0..num_workers {
             let pbf_file = Arc::clone(job.input_pbf.file());
-            scope.spawn(move || {
+            let spawned = scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
 
                 let mut w = WorkerBufs {
@@ -540,6 +540,18 @@ fn node_join<C: ShardCodec>(codec: C, job: &Stage2Job<'_, '_>) -> Result<u64> {
 
                 resolved_ref.fetch_add(w.local_resolved, Relaxed);
             });
+            // A refusal is recorded in the first-error slot (an earlier
+            // failure keeps its place), so the workers already born stop at
+            // their next claim instead of joining the rest of the buckets.
+            if let Err(e) = spawned {
+                err_ref
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert(
+                        Error::from(e).context(format!("spawn stage 2 worker {worker}")),
+                    );
+                break;
+            }
         }
     });
 

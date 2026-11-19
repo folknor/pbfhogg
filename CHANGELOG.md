@@ -333,6 +333,16 @@
 
 ### Fixed
 
+- When the OS refuses to create a worker thread (`EAGAIN` under a thread
+  or memory limit), every library command and reader returns an
+  `ErrorKind::Io` error (CLI exit `2`) instead of panicking, and no longer
+  risks hanging with threads it had already started waiting on the one
+  that never started. This covers `apply-changes`, `diff`,
+  `add-locations-to-ways`, `build-geocode-index`, the classify scans behind
+  `check`, `extract`, `getid`, `tags-count` and the rest, the pipelined
+  readers, `ElementReader::par_map_reduce`, `into_blocks_pipelined` and the
+  pipelined `PbfWriter` constructors. A refused thread is never
+  worked around by running with fewer.
 - Indexed `diff` (text, `-c`, `-q` and `--format osc`) refuses, with exit
   `2`, every blob it decodes whose indexdata is not exact (a count, least
   or greatest ID that is not what the blob holds) or whose elements are out

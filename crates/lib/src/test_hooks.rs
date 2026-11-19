@@ -222,6 +222,18 @@ pub struct FaultPlan {
     decode_gate: Mutex<DecodeGate>,
     decode_gate_cv: Condvar,
 
+    // --- joined scopes (`threads::scope`) ---
+    /// Ordinal, counted from 0 across every `threads::scope` spawn and named
+    /// spawn of the invocation, of the spawn refused as the OS refusing the
+    /// thread would (message [`INJECTED_SCOPED_SPAWN_REFUSAL`]). Concurrent
+    /// scopes share the count, so which logical thread an ordinal names can
+    /// differ between runs; every ordinal still names one refusal.
+    pub scoped_spawn_refuse_at: AtomicUsize,
+    /// Scoped spawns attempted so far, the refused one included.
+    pub scoped_spawns: AtomicUsize,
+    /// Set when the armed scoped spawn refusal was delivered.
+    pub scoped_spawn_refused: AtomicBool,
+
     // --- library-built rayon pools (`joined_pool::JoinedPool`) ---
     /// Index of the pool thread whose spawn fails with an injected I/O error
     /// (message [`INJECTED_POOL_SPAWN_FAILURE`]), so the build fails with the
@@ -708,6 +720,10 @@ pub enum Transport {
 /// test can tell it from a genuine platform refusal.
 pub const INJECTED_BACKEND_REFUSAL: &str = "test-hooks: injected output backend refusal";
 
+/// The message of the injected I/O error behind a refused scoped spawn
+/// ([`FaultPlan::scoped_spawn_refuse_at`]).
+pub const INJECTED_SCOPED_SPAWN_REFUSAL: &str = "test-hooks: injected scoped thread spawn refusal";
+
 /// The message of the injected I/O error behind a failed pool-thread spawn
 /// ([`FaultPlan::built_pool_spawn_fail_at`]).
 pub const INJECTED_POOL_SPAWN_FAILURE: &str = "test-hooks: injected pool thread spawn failure";
@@ -787,6 +803,9 @@ impl FaultPlan {
                 released: false,
             }),
             decode_gate_cv: Condvar::new(),
+            scoped_spawn_refuse_at: AtomicUsize::new(usize::MAX),
+            scoped_spawns: AtomicUsize::new(0),
+            scoped_spawn_refused: AtomicBool::new(false),
             built_pool_spawn_fail_at: AtomicUsize::new(usize::MAX),
             hold_built_pool_threads: AtomicBool::new(false),
             built_pool_threads_held: Watched::<AtomicU64>::new(0),
@@ -1211,6 +1230,23 @@ impl FaultPlan {
     /// stopping, the altw router aborting.
     pub(crate) fn ring(&self) {
         self.bell.ring();
+    }
+
+    // ---- joined scopes ---------------------------------------------------
+
+    /// Called by `threads::Scope` before every spawn; the armed ordinal is
+    /// refused as the OS refusing the thread would.
+    pub(crate) fn on_scoped_spawn(&self) -> std::io::Result<()> {
+        let ordinal = self.scoped_spawns.fetch_add(1, Ordering::SeqCst);
+        if ordinal == self.scoped_spawn_refuse_at.load(Ordering::SeqCst) {
+            self.scoped_spawn_refused.store(true, Ordering::SeqCst);
+            // `WouldBlock`: what `EAGAIN` from `pthread_create` reports.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                INJECTED_SCOPED_SPAWN_REFUSAL,
+            ));
+        }
+        Ok(())
     }
 
     // ---- library-built rayon pools ---------------------------------------

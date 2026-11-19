@@ -799,7 +799,7 @@ impl PbfWriter<FileWriter> {
         let sink = FileOutputSink::new(writer, finish, cancel.clone());
         let pipeline = WritePipeline::spawn(executor, cancel.clone(), move |rx, expected| {
             writer_thread(rx, sink, expected)
-        });
+        })?;
         Ok(Self::from_pipeline(compression, pipeline, cancel))
     }
 }

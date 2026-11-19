@@ -909,8 +909,19 @@ exception, not a tier - should not survive across many PRs.
   public library command module at least one fixture scenario and names
   the modes it leaves out, is checked against the module declarations,
   and each module gets its own sweep tests (tripped before the start,
-  sampled ordinals capped at 64 per scenario, census), so no test's time
-  is the whole registry's. The CLI, built with the hook cfg, reads
+  sampled ordinals capped at 64 per scenario, census, refused thread
+  spawns), so no test's time is the whole registry's. The spawn sweep
+  arms `FaultPlan::scoped_spawn_refuse_at`, consulted by `threads::Scope`
+  before every scoped spawn, at sampled ordinals of the scenario's counting
+  run, and requires each reached refusal to come back as a typed I/O error
+  carrying the injected message, with no unwind, nothing published, no
+  scratch and no capability left; a run that left a born thread parked on
+  a peer the refusal kept from existing hangs and is reported by the
+  watchdog. The ordinal counts every scope of the invocation, concurrent
+  ones included, so it names a position, not a site; the session threads
+  outside `threads::scope` (the pipelined block iterator, the writer
+  thread) and `JoinedPool` builds are outside it, the last covered by
+  `built_pool_spawn_fail_at`. The CLI, built with the hook cfg, reads
   two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
   checkpoint count there at exit, and
   `PBFHOGG_TEST_CANCEL_PAUSE=<k>[:stuck]` parks the thread reaching

@@ -456,7 +456,7 @@ pub(crate) fn run(
     let encoder = Encoder::new(plan, ledger_ref, &encode);
     let encoder_ref = &encoder;
     let result = plan.executor.scope(move |scope| {
-        crate::threads::scope(|threads| {
+        crate::threads::scope(plan.cancel, |threads| {
             let _stop = StopOnDrop::new(ledger_ref, plan.cancel);
             let spawn_reader = |input: usize| -> crate::Result<()> {
                 let tx = tx.clone();
@@ -497,7 +497,7 @@ where
     let encoder = Encoder::new(plan, ledger_ref, encode);
     let encoder_ref = &encoder;
     let result = plan.executor.scope(move |scope| {
-        crate::threads::scope(|threads| {
+        crate::threads::scope(plan.cancel, |threads| {
             let _stop = StopOnDrop::new(ledger_ref, plan.cancel);
             let spawn_reader = |input: usize| -> crate::Result<()> {
                 let tx = tx.clone();

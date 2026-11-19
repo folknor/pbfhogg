@@ -396,12 +396,14 @@ impl WritePipeline {
     }
 
     /// Spawn a writer thread running `body` over a fresh channel and
-    /// end-of-stream handshake, and wrap it in a pipeline.
+    /// end-of-stream handshake, and wrap it in a pipeline. An OS refusal of
+    /// the thread is returned as an I/O error; nothing was started, and the
+    /// dropped `body` releases whatever it held.
     pub(super) fn spawn<F>(
         executor: crate::host::Executor,
         invocation: crate::host::Permit,
         body: F,
-    ) -> Self
+    ) -> Result<Self>
     where
         F: FnOnce(Inbox, &SeqTotal) -> Result<()> + Send + 'static,
     {
@@ -414,14 +416,18 @@ impl WritePipeline {
             clippy::disallowed_methods,
             reason = "a session thread: the writer keeps its handle and joins it at its end"
         )]
-        let handle = std::thread::spawn(move || {
-            // Bound before the body runs and dropped after it returns or
-            // unwinds, so after the body's inbox is gone.
-            #[cfg(pbfhogg_test_hooks)]
-            let _exit = exit;
-            body(inbox, &thread_expected)
-        });
-        Self::new(tx, window_rx, handle, expected, executor, invocation)
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                // Bound before the body runs and dropped after it returns or
+                // unwinds, so after the body's inbox is gone.
+                #[cfg(pbfhogg_test_hooks)]
+                let _exit = exit;
+                body(inbox, &thread_expected)
+            })
+            .map_err(|e| crate::Error::from(e).context("spawn the writer thread"))?;
+        Ok(Self::new(
+            tx, window_rx, handle, expected, executor, invocation,
+        ))
     }
 
     /// The writer counters of this pipeline's invocation.
@@ -449,7 +455,7 @@ impl WritePipeline {
         let (init_tx, init_rx) = sync_channel(1);
         let mut pipeline = Self::spawn(executor, invocation, move |rx, expected| {
             body(rx, init_tx, expected)
-        });
+        })?;
         match init_rx.recv() {
             Ok(Ok(())) => Ok(pipeline),
             Ok(Err(e)) => {

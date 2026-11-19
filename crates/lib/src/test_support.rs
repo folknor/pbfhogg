@@ -95,8 +95,9 @@ pub(crate) fn with_parked_thread<T: Send, R>(
     // The library's scope, not std's: it joins the thread whole, its
     // thread-local destructors included, on an unwind too, so the thread
     // has ended before the bound disarms.
-    crate::threads::scope(|scope| {
-        let handle = scope.spawn(parked);
+    let invocation = crate::host::Invocation::new();
+    crate::threads::scope(&invocation, |scope| {
+        let handle = scope.spawn(parked).expect("spawn the parked test thread");
         let observed = {
             let _release = OnUnwind(Some(release));
             observe()

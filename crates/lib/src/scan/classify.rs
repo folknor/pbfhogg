@@ -1150,31 +1150,36 @@ fn run_unordered_per_blob<L, R: Send>(
     // Declared before the scope, so it emits after the scope has joined the
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, &host.invocation);
-    crate::threads::scope(|scope| -> Result<()> {
-        scope.spawn(move || {
-            for (position, entry) in schedule.iter().enumerate() {
-                willneed.before_dispatch(shared_file, entry);
-                if crate::counters::send_recording_wait_observing(
-                    &desc_tx,
-                    position,
-                    &metrics.dispatch_send_wait_ns,
-                    || tally_block(&metrics.dispatch_send_blocks, &metrics.blocked),
-                    |watch| watch.elapsed_ns(),
-                )
-                .is_err()
-                {
-                    break;
+    crate::threads::scope(&host.invocation, |scope| -> Result<()> {
+        // A refused spawn returns at once: this closure owns `desc_rx` and
+        // `result_rx`, so the return drops them, a born dispatcher's send and
+        // born workers' sends fail, and the join finds every thread leaving.
+        scope
+            .spawn(move || {
+                for (position, entry) in schedule.iter().enumerate() {
+                    willneed.before_dispatch(shared_file, entry);
+                    if crate::counters::send_recording_wait_observing(
+                        &desc_tx,
+                        position,
+                        &metrics.dispatch_send_wait_ns,
+                        || tally_block(&metrics.dispatch_send_blocks, &metrics.blocked),
+                        |watch| watch.elapsed_ns(),
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .map_err(|e| crate::error::Error::from(e).context("spawn classify dispatcher"))?;
 
-        for _ in 0..decode_threads {
+        for worker in 0..decode_threads {
             let rx = std::sync::Arc::clone(&desc_rx);
             let tx = result_tx.clone();
             let file = std::sync::Arc::clone(shared_file);
             let work_ref = &work;
             let local_ref = &local;
-            scope.spawn(move || {
+            let spawned = scope.spawn(move || {
                 let mut read_buf = crate::read::read_buf::ReadBuf::default();
                 let mut state = local_ref();
 
@@ -1202,6 +1207,11 @@ fn run_unordered_per_blob<L, R: Send>(
                     }
                 }
             });
+            if let Err(e) = spawned {
+                return Err(
+                    crate::error::Error::from(e).context(format!("spawn classify worker {worker}"))
+                );
+            }
         }
         drop(desc_rx);
         drop(result_tx);
@@ -1457,10 +1467,12 @@ pub(crate) fn parallel_project_phase_ordered<S, R: Send>(
         edge: std::sync::atomic::AtomicUsize::new(first_edge),
         done: std::sync::atomic::AtomicBool::new(false),
     };
-    crate::threads::scope(|scope| {
+    crate::threads::scope(&host.invocation, |scope| {
         let shared = &shared;
-        let advisor =
-            scope.spawn(move || advise_behind(shared, willneed, schedule, file, first_edge));
+        // The scope's first thread: a refusal leaves nothing born.
+        let advisor = scope
+            .spawn(move || advise_behind(shared, willneed, schedule, file, first_edge))
+            .map_err(|e| crate::error::Error::from(e).context("spawn classify advice worker"))?;
         let thread = advisor.thread().clone();
         let _stop = StopAdvisor {
             shared,
@@ -1745,7 +1757,8 @@ fn run_accumulate_decoded<S: Send>(
 
     let decode_threads = resolve_thread_count(threads, &*host.resources);
     let cancel = &host.invocation;
-    // Raised by the first worker to fail. The consumer drops its receiver on
+    // Raised by the first worker to fail, or by a refused worker spawn
+    // before it returns. The consumer drops its receiver on
     // the first error it sees, but that does not reach the other workers:
     // they only learn of it at their one send, after their whole share of
     // the schedule, and the dispatcher keeps feeding them until then.
@@ -1765,31 +1778,33 @@ fn run_accumulate_decoded<S: Send>(
     // Emits after the scope has joined, so every thread's waits are in; on
     // a failure or an unwind too.
     let _emit = EmitOnDrop(metrics, &host.invocation);
-    crate::threads::scope(|scope| -> Result<()> {
-        scope.spawn(move || {
-            for (position, entry) in schedule.iter().enumerate() {
-                willneed.before_dispatch(shared_file, entry);
-                if crate::counters::send_recording_wait_observing(
-                    &desc_tx,
-                    position,
-                    &metrics.dispatch_send_wait_ns,
-                    || tally_block(&metrics.dispatch_send_blocks, &metrics.blocked),
-                    |watch| watch.elapsed_ns(),
-                )
-                .is_err()
-                {
-                    break;
+    crate::threads::scope(&host.invocation, |scope| -> Result<()> {
+        scope
+            .spawn(move || {
+                for (position, entry) in schedule.iter().enumerate() {
+                    willneed.before_dispatch(shared_file, entry);
+                    if crate::counters::send_recording_wait_observing(
+                        &desc_tx,
+                        position,
+                        &metrics.dispatch_send_wait_ns,
+                        || tally_block(&metrics.dispatch_send_blocks, &metrics.blocked),
+                        |watch| watch.elapsed_ns(),
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .map_err(|e| crate::error::Error::from(e).context("spawn accumulate dispatcher"))?;
 
-        for _ in 0..decode_threads {
+        for worker in 0..decode_threads {
             let rx = std::sync::Arc::clone(&desc_rx);
             let tx = result_tx.clone();
             let file = std::sync::Arc::clone(shared_file);
             let work_ref = &work;
             let worker_init_ref = &worker_init;
-            scope.spawn(move || {
+            let spawned = scope.spawn(move || {
                 let mut read_buf = crate::read::read_buf::ReadBuf::default();
                 let worker_pool = crate::blob::DecompressPool::new(cancel);
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
@@ -1848,6 +1863,12 @@ fn run_accumulate_decoded<S: Send>(
                 }
                 drop(unwind_stops_peers);
             });
+            if let Err(e) = spawned {
+                // Born workers watch only `stop` until their end (see above).
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(crate::error::Error::from(e)
+                    .context(format!("spawn accumulate classify worker {worker}")));
+            }
         }
         drop(desc_rx);
         drop(result_tx);

@@ -191,22 +191,38 @@ impl crate::ordered_pool::OrderedConsumer<(u64, Vec<u32>, Option<i64>)> for Stag
 
 /// Flush every shard's id-shard writers, one thread per shard; the first
 /// failure (in shard order) names its shard file.
-fn flush_shards(shards: &mut [Stage1Shard<'_>], scratch: &RunScratch) -> Result<()> {
-    crate::threads::scope(|scope| {
-        let handles: Vec<_> = shards
-            .iter_mut()
-            .map(|shard| {
-                scope.spawn(move || -> Result<()> {
-                    for (bucket_idx, w) in shard.id_shard_writers.iter_mut().enumerate() {
-                        w.flush().map_err(|e| {
-                            shard_error(e, "flush", scratch, shard.worker_id, bucket_idx)
-                        })?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        let mut first = Ok(());
+///
+/// The flushes share nothing, so a refused spawn stops spawning, lets the
+/// flushes already running finish at the join below, and is the result: it
+/// is the only failure known when the spawning stops.
+fn flush_shards(
+    shards: &mut [Stage1Shard<'_>],
+    scratch: &RunScratch,
+    invocation: &crate::host::Invocation,
+) -> Result<()> {
+    crate::threads::scope(invocation, |scope| {
+        let mut handles = Vec::with_capacity(shards.len());
+        let mut refused = None;
+        for (index, shard) in shards.iter_mut().enumerate() {
+            let spawned = scope.spawn(move || -> Result<()> {
+                for (bucket_idx, w) in shard.id_shard_writers.iter_mut().enumerate() {
+                    w.flush().map_err(|e| {
+                        shard_error(e, "flush", scratch, shard.worker_id, bucket_idx)
+                    })?;
+                }
+                Ok(())
+            });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(e) => {
+                    refused = Some(
+                        crate::Error::from(e).context(format!("spawn stage 1 shard flush {index}")),
+                    );
+                    break;
+                }
+            }
+        }
+        let mut first = refused.map_or(Ok(()), Err);
         for handle in handles {
             let result = handle
                 .join()
@@ -617,7 +633,7 @@ pub(super) fn stage1_pass_a(
     // since Drop would silently swallow a flush error, and in parallel, one
     // thread per shard, as each worker used to flush its own on exit. Also
     // after a pool error; that error wins over a flush failure.
-    let flush_result = flush_shards(&mut shards, scratch_ref);
+    let flush_result = flush_shards(&mut shards, scratch_ref, &host.invocation);
     pool_result?;
     flush_result?;
     let total_refs = consumer.finish()?;

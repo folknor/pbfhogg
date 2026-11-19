@@ -593,24 +593,34 @@ pub(crate) fn merge_to<'a>(
     let cancel_wake = host.invocation.on_cancel(move || wake.wake());
     let scanner_failure = Arc::clone(&failure);
     let scanner_sender_guard = Arc::clone(&streaming_channels.drain_tx);
-    let stats = crate::threads::scope(|scope| -> Result<MergeStats> {
-        let scanner_handle = scope.spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scanner::run_scanner(scanner_cfg, host)
-            }));
-            match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => scanner_failure.publish(e),
-                Err(payload) => scanner_failure.publish_panic("scanner", &*payload),
-            }
-            // Keep the channel connected until publication, even though
-            // run_scanner has already dropped its own channels on return.
-            drop(scanner_sender_guard);
-        });
+    // A refused spawn returns at once. The drain has not run, and this
+    // closure owns its channels and location state, so the return drops the
+    // candidate and drain receivers, the sequence-credit sender and the
+    // barrier sender: a born scanner leaves its send or credit wait, and the
+    // scope joins it. Nothing else can have failed yet that outranks the
+    // refusal (a scanner failure is published, not returned).
+    let stats = crate::threads::scope(&host.invocation, |scope| -> Result<MergeStats> {
+        let scanner_handle = scope
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scanner::run_scanner(scanner_cfg, host)
+                }));
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => scanner_failure.publish(e),
+                    Err(payload) => scanner_failure.publish_panic("scanner", &*payload),
+                }
+                // Keep the channel connected until publication, even though
+                // run_scanner has already dropped its own channels on return.
+                drop(scanner_sender_guard);
+            })
+            .map_err(|e| crate::Error::from(e).context("spawn apply-changes scanner"))?;
         let workers_counters_inner = Arc::clone(&worker_counters);
-        let workers_handle = scope.spawn(move || {
-            streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner);
-        });
+        let workers_handle = scope
+            .spawn(move || {
+                streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner);
+            })
+            .map_err(|e| crate::Error::from(e).context("spawn apply-changes worker pool"))?;
 
         let drain_stats = drain::run_drain(
             drain_cfg,

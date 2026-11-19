@@ -535,9 +535,11 @@ fn build_generation(
     // borrows the pin, so `input` lives until the scope has joined it.
     let digest_file = input_digest::open(input, &host.invocation)?;
     let digest_stop = std::sync::atomic::AtomicBool::new(false);
-    crate::threads::scope(|s| {
-        let worker =
-            s.spawn(|| input_digest::hash(digest_file, input, &digest_stop, &host.invocation));
+    crate::threads::scope(&host.invocation, |s| {
+        // The scope's first thread: a refusal leaves nothing born.
+        let worker = s
+            .spawn(|| input_digest::hash(digest_file, input, &digest_stop, &host.invocation))
+            .map_err(|e| Error::from(e).context("spawn the geocode input digest worker"))?;
         // Dropped unused (the build failed or unwound before its header),
         // this stops the hash before the scope joins it.
         let stop_on_failure = input_digest::StopOnDrop(&digest_stop);

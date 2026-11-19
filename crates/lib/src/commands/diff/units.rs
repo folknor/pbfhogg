@@ -207,17 +207,21 @@ pub(super) fn run<C: UnitConsumer>(
     let workers = jobs.max(1);
     let invocation = &host.invocation;
 
-    crate::threads::scope(|scope| {
+    crate::threads::scope(invocation, |scope| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<PlanMsg>(DIFF_UNIT_QUEUE_DEPTH);
-        let planner = scope.spawn(move || {
-            let mut cursors = [old_cursor, new_cursor];
-            let msg = match plan(&mut cursors, &kinds, cut, &tx, invocation) {
-                Ok(()) => PlanMsg::Done,
-                Err(e) => PlanMsg::Failed(e),
-            };
-            // A refused send means the consumer is gone; nothing to tell.
-            tx.send(msg).ok();
-        });
+        // The planner is the scope's only thread: a refusal leaves nothing
+        // born, and `rx` drops with this closure.
+        let planner = scope
+            .spawn(move || {
+                let mut cursors = [old_cursor, new_cursor];
+                let msg = match plan(&mut cursors, &kinds, cut, &tx, invocation) {
+                    Ok(()) => PlanMsg::Done,
+                    Err(e) => PlanMsg::Failed(e),
+                };
+                // A refused send means the consumer is gone; nothing to tell.
+                tx.send(msg).ok();
+            })
+            .map_err(|e| crate::Error::from(e).context("spawn diff unit planner"))?;
 
         let result = drive::<C>(
             rx,

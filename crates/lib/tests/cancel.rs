@@ -15,6 +15,11 @@
 //! of each scenario, in process, so "mid-run" needs no signal and no timing.
 //! Module completeness is not entry or mode completeness: the registry
 //! names what each module's scenarios leave out.
+//!
+//! The same registry carries the thread-startup contract: a scoped thread
+//! spawn the OS refuses, at sampled spawn ordinals of each scenario, ends the
+//! run (no born thread left parked on a peer that never existed) with that
+//! refusal as a typed I/O error, publishing nothing.
 
 #![allow(clippy::unwrap_used, clippy::unwrap_in_result)]
 
@@ -1014,6 +1019,12 @@ macro_rules! sweeps {
                 fn the_census_is_empty_at_observed_checkpoints() {
                     super::sweep_census(module_path!(), stringify!($module));
                 }
+
+                #[cfg(pbfhogg_test_hooks)]
+                #[test]
+                fn a_refused_thread_spawn_ends_the_run_with_an_io_error() {
+                    super::sweep_spawn_refusals(module_path!(), stringify!($module));
+                }
             }
         )*
     };
@@ -1285,6 +1296,107 @@ fn sweep_census(test: &str, module: &str) {
         }
         failures
     });
+}
+
+/// Refuse sampled scoped thread spawns of every scenario of `module`, one
+/// per run (`FaultPlan::scoped_spawn_refuse_at`), as the OS refusing the
+/// thread would. Each run that reaches its refusal must end - a run left
+/// with a born thread parked on a peer the refusal kept from existing hangs
+/// here, and the watchdog reports it - with the refusal as a typed I/O
+/// error, never a panic, publishing nothing and leaving no scratch and no
+/// capability behind. Ordinals count every scope of the invocation, and
+/// concurrent scopes share the count, so one ordinal can name a different
+/// logical thread from run to run; a target the run did not reach is
+/// tolerated for that reason, but every scenario that spawns must refuse.
+#[cfg(pbfhogg_test_hooks)]
+fn sweep_spawn_refusals(test: &str, module: &str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    sweep(test, module, |name, command, inputs| {
+        let counter = pbfhogg::host::Invocation::new();
+        match run_once(name, command, inputs, counter.clone()) {
+            Ok(false) => {}
+            Ok(true) => return vec![format!("{name}: counting run unexpectedly cancelled")],
+            Err(e) => return vec![e],
+        }
+        let spawns = counter.faults().scoped_spawns.load(SeqCst) as u64;
+        let mut failures = Vec::new();
+        let mut refused = 0_u64;
+        for k in checkpoint_sample(spawns) {
+            let token = pbfhogg::host::Invocation::new();
+            token
+                .faults()
+                .scoped_spawn_refuse_at
+                .store(usize::try_from(k - 1).unwrap(), SeqCst);
+            match run_refused(name, command, inputs, &token) {
+                Ok(true) => refused += 1,
+                Ok(false) => {}
+                Err(e) => failures.push(format!("{e} (refused spawn {k} of {spawns})")),
+            }
+        }
+        if spawns > 0 && refused == 0 {
+            failures.push(format!("{name}: no refused spawn was reached"));
+        }
+        failures
+    });
+}
+
+/// One run of `command` under `token`, whose fault plan arms a scoped spawn
+/// refusal. `Ok(true)` when the refusal was delivered and the run ended as
+/// it must; `Ok(false)` when the run never reached the armed ordinal and
+/// completed.
+#[cfg(pbfhogg_test_hooks)]
+fn run_refused(
+    name: &str,
+    command: Command,
+    inputs: &Inputs,
+    token: &pbfhogg::host::Invocation,
+) -> Result<bool, String> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let out = crate::common::test_scratch();
+    let scratch = crate::common::test_scratch();
+    let host = host_with(token.clone(), inputs);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        command(inputs, out.path(), scratch.path(), &host)
+    }));
+    drop(host);
+    let fired = token.faults().scoped_spawn_refused.load(SeqCst);
+    let rest = token.capabilities();
+    if rest != pbfhogg::host::Capabilities::default() {
+        return Err(format!("{name}: capabilities left at rest: {rest:?}"));
+    }
+    match result {
+        Err(_) => Err(format!(
+            "{name}: a refused spawn unwound instead of returning"
+        )),
+        Ok(Ok(())) if !fired => Ok(false),
+        Ok(Ok(())) => Err(format!("{name}: completed despite a refused spawn")),
+        Ok(Err(e)) => {
+            let report = e.report();
+            if !fired {
+                return Err(format!("{name}: failed without a refusal: {report}"));
+            }
+            if !matches!(e.kind(), pbfhogg::ErrorKind::Io(_))
+                || !report.contains(pbfhogg::test_hooks::INJECTED_SCOPED_SPAWN_REFUSAL)
+            {
+                return Err(format!(
+                    "{name}: expected the refusal as an I/O error, got {:?}: {report}",
+                    e.kind()
+                ));
+            }
+            for (what, dir) in [
+                ("output directory", out.path()),
+                ("scratch parent", scratch.path()),
+            ] {
+                if !entries(dir).is_empty() {
+                    return Err(format!(
+                        "{name}: a refused run left {:?} in the {what}",
+                        entries(dir)
+                    ));
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// A public command reached from inside another (`sort` runs `sort_with`)

@@ -788,7 +788,7 @@ where
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, cancel);
 
-    crate::threads::scope(|scope| -> crate::Result<()> {
+    crate::threads::scope(cancel, |scope| -> crate::Result<()> {
         // A local of this closure, so every return drops it before the scope
         // joins the workers. See the module docs ("Two limits, two jobs") for
         // why it is not as deep as the window.
@@ -810,7 +810,7 @@ where
                 metrics,
             };
             let (work, local) = (&work, &local);
-            let spawned = scope.try_spawn(move || {
+            let spawned = scope.spawn(move || {
                 let _close = CloseOnUnwind(shared.gate);
                 let mut local = local(worker);
                 shared.run(|task| work(shard, &mut local, task));
@@ -1307,7 +1307,7 @@ where
     // workers, on a return or an unwind alike.
     let _emit = EmitOnDrop(metrics, cancel);
 
-    crate::threads::scope(|scope| -> crate::Result<()> {
+    crate::threads::scope(cancel, |scope| -> crate::Result<()> {
         // Every channel end below is a local of this closure, so any return
         // drops it before the scope joins the workers.
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<PayloadJob<P, T, E>>(window.get());
@@ -1345,7 +1345,11 @@ where
         for worker in 0..workers {
             let jobs = std::sync::Arc::clone(&job_rx);
             let (work, local, abandoned) = (&work, &local, &abandoned);
-            scope.spawn(move || {
+            // A refusal is the run's failure, ahead of a source error still
+            // speculative in task order. Returning raises `_abandon` first,
+            // then drops the queue's sender and every task receiver, so the
+            // workers already born stop at their next job or send.
+            let spawned = scope.spawn(move || {
                 // Before any caller code, and dropped after the local state.
                 let _unwind = AbandonOnUnwind(abandoned);
                 let mut local = local(worker);
@@ -1367,6 +1371,9 @@ where
                     }
                 }
             });
+            if let Err(e) = spawned {
+                return Err(Error::from(e).context(format!("spawn streamed pool worker {worker}")));
+            }
         }
         // Workers hold the only job receivers now, so their exit drops any
         // task sender still queued.

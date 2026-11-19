@@ -12,6 +12,19 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Missing way nodes never join their neighbours (bygg, 2026-11-19, variant uncommitted against `80774411`)
+
+Pass 2b resolves each way's refs in one loop that records where a run of
+resolved refs breaks; streets emit one record per run, an incomplete
+building gives no address point, and an incomplete admin way withholds
+its relations. Planet, full build, `--iterations 1`, interleaved A B A B
+after `sudo fstrim -av`, baseline built with `--commit HEAD`. Walls: base
+112.6 s (`752c6de4`), variant 113.1 s (`86946794`), base 111.5 s
+(`6b5c0402`), variant 111.6 s (`329d2309`). `GEOCODE_PASS2B` in the second
+pair: base 5.28 s, variant 5.10 s. Planet has no unresolved way ref, so the
+counters (admin relation drops 2742, missing member geometry 0) and the
+output are unchanged. Verdict: neutral.
+
 ### Pass 2a judges the domain on exact nanodegrees (bygg, 2026-11-19, variant uncommitted against `364e45e6`)
 
 Pass 2a computes every node's exact nanodegree position in `i128` and

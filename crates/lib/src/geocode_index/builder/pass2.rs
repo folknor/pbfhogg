@@ -36,8 +36,6 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustc_hash::FxHashMap;
-
 use crate::Element;
 
 use super::Result;
@@ -287,7 +285,7 @@ struct WayBlobOut {
     street_nodes: Vec<u8>,
     building_addrs: Vec<FlatAddrPoint>,
     interps: Vec<PendingInterp>,
-    admin_geoms: Vec<(i64, Vec<(i32, i32)>)>,
+    admin_geoms: Vec<(i64, super::admin::AdminWayGeometry)>,
     missing_node_ref_count: u64,
     missing_ref_way_ids: Vec<i64>,
     error: Option<Error>,
@@ -356,6 +354,9 @@ struct FlatAddrPoint {
 struct WayWorker {
     out: WayBlobOut,
     coords: Vec<(i32, i32)>,
+    /// Indices into `coords` where a run of consecutively resolved refs
+    /// ends because the next ref was unresolved. Empty for a complete way.
+    run_breaks: Vec<usize>,
 }
 
 struct PendingInterp {
@@ -377,10 +378,26 @@ struct PendingInterp {
 /// (`pass1_5::extract_blob_ways`) and the tag values its roles read.
 ///
 /// Coord resolution reads `coord_slots` (the store Phase 2a populated).
-/// A ref is dropped from the way's geometry when its node was never
-/// collected by Pass 1.5 or its slot was never written - the node is not in
-/// the file. Absence is the `coord_pack` presence flag, not an all-zero
-/// slot, so a node at Null Island (lat 0, lon 0) is kept like any other.
+/// A ref is unresolved when its node was never collected by Pass 1.5 or its
+/// slot was never written - the node is not in the file. Absence is the
+/// `coord_pack` presence flag, not an all-zero slot, so a node at Null
+/// Island (lat 0, lon 0) is kept like any other.
+///
+/// An unresolved ref never lets its neighbours join: the two refs either
+/// side of it are not adjacent in the source, and an edge between them
+/// would be invented geometry. So each consumer reads only what the
+/// resolved refs prove:
+///
+/// - a street is split into its maximal runs of consecutively resolved
+///   refs, one street record per run of two or more coordinates;
+/// - a building address is the mean of its nodes, so an incomplete way
+///   gives no address point;
+/// - an interpolation way is staged with `complete == false` and the
+///   resolver refuses it;
+/// - an admin way that is incomplete is recorded as such (`None`), and
+///   admin assembly withholds every relation that names it
+///   (`admin::assemble_one_relation` says why a partial way cannot be
+///   assembled around).
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn resolve_way_into(
     way: &super::way_store::ExtractedWay<'_>,
@@ -395,7 +412,11 @@ fn resolve_way_into(
         VALUE_INTERPOLATION, VALUE_NAME, VALUE_PLACE, VALUE_POSTCODE, VALUE_STREET,
     };
 
-    let WayWorker { out: state, coords } = worker;
+    let WayWorker {
+        out: state,
+        coords,
+        run_breaks,
+    } = worker;
     if state.error.is_some() {
         return;
     }
@@ -416,53 +437,58 @@ fn resolve_way_into(
         return;
     }
 
-    // Extracts can omit referenced nodes at their clip boundary. Use the
-    // coordinates available in this PBF and shorten the way rather than
-    // inventing a location or rejecting every other usable record. This is a
-    // separate case from a decoded node whose coordinate is outside the legal
-    // geographic domain, which cannot safely participate in the index.
-    let mut rank_outside_store: Option<u64> = None;
+    // Extracts can omit referenced nodes at their clip boundary. Such a ref
+    // is not an error, but it is a gap: what each role keeps of the way is
+    // stated on this function. This is a separate case from a decoded node
+    // whose coordinate is outside the legal geographic domain, which cannot
+    // safely participate in the index.
     let mut missing_node_ref_count = 0_u64;
     coords.clear();
-    coords.extend(
-        crate::read::elements::WayRefIter::delta_decoded(way.refs).filter_map(|nid| {
-            let Some(rank) = referenced_nodes.numeric_rank_if_set(nid) else {
-                missing_node_ref_count = missing_node_ref_count.saturating_add(1);
-                return None;
-            };
-            let Some(slot) = coord_slot(coord_slots, rank) else {
-                rank_outside_store = Some(rank);
-                return None;
-            };
-            let coord = unpack_coord(slot.load(Ordering::Relaxed));
-            if coord.is_none() {
-                missing_node_ref_count = missing_node_ref_count.saturating_add(1);
+    run_breaks.clear();
+    for nid in crate::read::elements::WayRefIter::delta_decoded(way.refs) {
+        let coord = match referenced_nodes.numeric_rank_if_set(nid) {
+            None => None,
+            Some(rank) => {
+                let Some(slot) = coord_slot(coord_slots, rank) else {
+                    state.error = Some(Error::internal(format!(
+                        "internal error: way {way_id} resolves to coordinate rank {rank}, \
+                         outside the {}-slot store built from the same referenced-node set",
+                        coord_slots.len()
+                    )));
+                    return;
+                };
+                unpack_coord(slot.load(Ordering::Relaxed))
             }
-            coord
-        }),
-    );
-    let coords: &[(i32, i32)] = coords;
-    if let Some(rank) = rank_outside_store {
-        state.error = Some(Error::internal(format!(
-            "internal error: way {way_id} resolves to coordinate rank {rank}, outside the \
-             {}-slot store built from the same referenced-node set",
-            coord_slots.len()
-        )));
-        return;
+        };
+        match coord {
+            Some(c) => coords.push(c),
+            None => {
+                missing_node_ref_count = missing_node_ref_count.saturating_add(1);
+                if run_breaks.last() != Some(&coords.len()) {
+                    run_breaks.push(coords.len());
+                }
+            }
+        }
     }
-    if missing_node_ref_count > 0 {
+    let coords: &[(i32, i32)] = coords;
+    let complete = missing_node_ref_count == 0;
+    if !complete {
         state.missing_node_ref_count = state
             .missing_node_ref_count
             .saturating_add(missing_node_ref_count);
         super::sample_id(&mut state.missing_ref_way_ids, way_id);
     }
+
+    // Admin way geometry, owned: it moves into the `way_geom` map. An
+    // incomplete way is recorded too, so the last file occurrence of a
+    // duplicated way ID still decides, and assembly sees why it has no
+    // geometry.
+    if is_admin_way {
+        let geometry = (complete && !coords.is_empty()).then(|| coords.to_vec());
+        state.admin_geoms.push((way_id, geometry));
+    }
     if coords.is_empty() {
         return;
-    }
-
-    // Admin way geometry, owned: it moves into the `way_geom` map.
-    if is_admin_way {
-        state.admin_geoms.push((way_id, coords.to_vec()));
     }
 
     // Interpolation ways - defer file writes to merge, keep slim
@@ -506,7 +532,10 @@ fn resolve_way_into(
     // Building addresses (centroid) - main thread interns + streams.
     // The classifier saw presence; an address whose names are all empty is
     // no address point.
-    let building_names = if is_building_addr {
+    // An incomplete footprint has no "mean of its nodes": the mean of the
+    // survivors can land on a lone surviving node, where interpolation would
+    // then read it as the address on that node.
+    let building_names = if is_building_addr && complete {
         address_names(addr_st, addr_place)
     } else {
         None
@@ -541,24 +570,38 @@ fn resolve_way_into(
     }
 
     // Streets - defer file writes to merge. Same u16 invariant as interp.
-    if is_street && coords.len() >= 2 {
-        let Ok(node_count) = u16::try_from(coords.len()) else {
-            state.error = Some(Error::invalid_data(format!(
-                "street way: {} coords exceeds u16::MAX. OSM ways are capped at \
-                 2000 refs by convention; if this limit ever changes, bump \
-                 `StreetWay.node_count` to u32 and increment FORMAT_VERSION.",
-                coords.len()
-            )));
-            return;
-        };
-        let name = Text::push(&mut state.text, name.unwrap_or(""), base);
-        state.street_nodes.reserve(coords.len() * NodeCoord::SIZE);
-        for &(lat_e7, lon_e7) in coords {
-            state
-                .street_nodes
-                .extend_from_slice(&NodeCoord { lat_e7, lon_e7 }.to_bytes());
+    // One record per run of consecutively resolved refs: a segment only ever
+    // joins two nodes adjacent in the source way.
+    if is_street {
+        let mut start = 0;
+        for end in run_breaks
+            .iter()
+            .copied()
+            .chain(std::iter::once(coords.len()))
+        {
+            let run = &coords[start..end];
+            start = end;
+            if run.len() < 2 {
+                continue;
+            }
+            let Ok(node_count) = u16::try_from(run.len()) else {
+                state.error = Some(Error::invalid_data(format!(
+                    "street way: {} coords exceeds u16::MAX. OSM ways are capped at \
+                     2000 refs by convention; if this limit ever changes, bump \
+                     `StreetWay.node_count` to u32 and increment FORMAT_VERSION.",
+                    run.len()
+                )));
+                return;
+            };
+            let name = Text::push(&mut state.text, name.unwrap_or(""), base);
+            state.street_nodes.reserve(run.len() * NodeCoord::SIZE);
+            for &(lat_e7, lon_e7) in run {
+                state
+                    .street_nodes
+                    .extend_from_slice(&NodeCoord { lat_e7, lon_e7 }.to_bytes());
+            }
+            state.streets.push(FlatStreet { name, node_count });
         }
-        state.streets.push(FlatStreet { name, node_count });
     }
 }
 
@@ -572,7 +615,7 @@ pub(super) struct Pass2Output {
     pub(super) addr_point_count: u32,
     pub(super) street_way_count: u32,
     pub(super) interp_ways: Vec<SlimInterpWay>,
-    pub(super) way_geom: FxHashMap<i64, Vec<(i32, i32)>>,
+    pub(super) way_geom: super::admin::WayGeometryMap,
     pub(super) street_ways: Records<StreetWay>,
     pub(super) street_nodes: Records<NodeCoord>,
     pub(super) addr_points: Records<AddrPoint>,
@@ -631,8 +674,7 @@ pub(super) fn run_pass2(
     // slots when there are no referenced nodes.
     let mut coord_mmap = memmap2::MmapMut::map_anon(coord_array_len.max(1))?;
     let coord_store: &[AtomicU64] = coord_slots(&mut coord_mmap, slot_count)?;
-    let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> =
-        rustc_hash::FxHashMap::default();
+    let mut way_geom: super::admin::WayGeometryMap = rustc_hash::FxHashMap::default();
 
     // Streaming output: write data files directly during the merge instead
     // of accumulating Vecs. Running counters track offsets and record counts.

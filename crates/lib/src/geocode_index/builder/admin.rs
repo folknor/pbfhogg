@@ -32,22 +32,31 @@ pub(super) struct DroppedAdminRelations {
     pub(super) sample_relation_ids: Vec<i64>,
 }
 
+/// One admin member way's geometry: its coordinates when every ref
+/// resolved, `None` when the way is in the file but at least one of its
+/// nodes is not (or it has no refs).
+pub(super) type AdminWayGeometry = Option<Vec<(i32, i32)>>;
+
+/// Admin member way geometry by way ID, last file occurrence winning. A way
+/// absent from the map is absent from the file.
+pub(super) type WayGeometryMap = FxHashMap<i64, AdminWayGeometry>;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct MissingAdminWayGeometry {
     pub(super) member_refs: u64,
     pub(super) sample_way_ids: Vec<i64>,
 }
 
-/// Count relation member references whose way geometry was not collected and
-/// retain a bounded, stable sample of the missing way IDs.
+/// Count relation member references whose way is absent from the file or
+/// not fully located, and retain a bounded, stable sample of their way IDs.
 pub(super) fn missing_admin_way_geometry(
     relations: &[RawAdminRelation],
-    way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
+    way_geom: &WayGeometryMap,
 ) -> MissingAdminWayGeometry {
     let mut missing = MissingAdminWayGeometry::default();
     for relation in relations {
         for &way_id in relation.outer_way_ids.iter().chain(&relation.inner_way_ids) {
-            if !way_geom.contains_key(&way_id) {
+            if !matches!(way_geom.get(&way_id), Some(Some(_))) {
                 missing.member_refs = missing.member_refs.saturating_add(1);
                 super::sample_id(&mut missing.sample_way_ids, way_id);
             }
@@ -59,7 +68,7 @@ pub(super) fn missing_admin_way_geometry(
 #[hotpath::measure]
 pub(super) fn assemble_admin_polygons(
     relations: &[RawAdminRelation],
-    way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
+    way_geom: &WayGeometryMap,
     config: &BuildConfig,
     executor: &crate::host::Executor,
 ) -> (Vec<AssembledPolygon>, DroppedAdminRelations) {
@@ -173,28 +182,44 @@ fn vertex_e7(lon_deg: f64, lat_deg: f64) -> NodeCoord {
 /// original rings.
 fn assemble_one_relation(
     rel: &RawAdminRelation,
-    way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
+    way_geom: &WayGeometryMap,
     tolerance_m: f64,
 ) -> std::result::Result<Vec<AssembledPolygon>, RingSearchBudgetExceeded> {
-    // Extracts may contain a relation but omit one or more member ways. Only
-    // member geometry present in this PBF can close an outer ring; missing
-    // geometry is omitted, and the relation contributes no polygon if no
-    // usable outer ring remains.
-    let outer_segs: Vec<&[(i32, i32)]> = rel
+    // Extracts may contain a relation but omit member ways, or keep a member
+    // way while omitting some of its nodes. Such a relation contributes no
+    // polygon at all. Assembling around the hole is not safe in any form:
+    // - joining a partial way's surviving nodes across the gap invents an
+    //   edge, which can close a smaller ring;
+    // - feeding its runs separately lets an endpoint at an equal coordinate
+    //   on another node close a ring the source never closes;
+    // - dropping a whole member, outer or inner, changes which observed
+    //   edges the endpoint search pairs into rings (several members sharing
+    //   both endpoints pair differently once one is gone), and a missing
+    //   inner turns its hole into an affirmative match.
+    // The builder has no evidence that a missing member cannot affect a
+    // given outer, so the relation is withheld and counted as dropped.
+    let member_geometry = |wid: &i64| way_geom.get(wid).and_then(Option::as_deref);
+    let Some(outer_segs) = rel
         .outer_way_ids
         .iter()
-        .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
-        .collect();
+        .map(member_geometry)
+        .collect::<Option<Vec<&[(i32, i32)]>>>()
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(inner_segs) = rel
+        .inner_way_ids
+        .iter()
+        .map(member_geometry)
+        .collect::<Option<Vec<&[(i32, i32)]>>>()
+    else {
+        return Ok(Vec::new());
+    };
     let outer_rings = crate::geo::assemble_rings_bounded(&outer_segs)?;
     if outer_rings.is_empty() {
         return Ok(Vec::new());
     }
 
-    let inner_segs: Vec<&[(i32, i32)]> = rel
-        .inner_way_ids
-        .iter()
-        .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
-        .collect();
     let inner_rings = crate::geo::assemble_rings_bounded(&inner_segs)?;
 
     let mut result = Vec::with_capacity(outer_rings.len());
@@ -404,17 +429,19 @@ mod tests {
         // would pass an all-dropped or all-kept fixture. One of each is the
         // only shape that pins the count to the relations that actually
         // failed to assemble.
-        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
         way_geom.insert(
             7,
-            vec![
+            Some(vec![
                 (550_000_000, 120_000_000),
                 (550_000_000, 121_000_000),
                 (551_000_000, 121_000_000),
                 (551_000_000, 120_000_000),
                 (550_000_000, 120_000_000),
-            ],
+            ]),
         );
+        // In the file, but one of its nodes is not.
+        way_geom.insert(8, None);
 
         let relations = vec![
             // Names a way that has no geometry: dropped.
@@ -444,12 +471,32 @@ mod tests {
                 outer_way_ids: vec![7],
                 inner_way_ids: Vec::new(),
             },
+            // The same closed outer plus an outer that is not fully located:
+            // dropped whole, the complete ring is not published alone.
+            RawAdminRelation {
+                id: 4,
+                admin_level: 8,
+                name_offset: 4,
+                country_code_offset: 0,
+                outer_way_ids: vec![7, 8],
+                inner_way_ids: Vec::new(),
+            },
+            // The same closed outer with an absent inner: its hole would
+            // become an affirmative match, so dropped whole.
+            RawAdminRelation {
+                id: 5,
+                admin_level: 8,
+                name_offset: 5,
+                country_code_offset: 0,
+                outer_way_ids: vec![7],
+                inner_way_ids: vec![98],
+            },
         ];
         assert_eq!(
             missing_admin_way_geometry(&relations, &way_geom),
             super::MissingAdminWayGeometry {
-                member_refs: 1,
-                sample_way_ids: vec![99],
+                member_refs: 3,
+                sample_way_ids: vec![8, 98, 99],
             }
         );
         let (polygons, dropped) = assemble_admin_polygons(
@@ -463,11 +510,11 @@ mod tests {
         assert_eq!(
             dropped,
             DroppedAdminRelations {
-                total: 2,
+                total: 4,
                 over_budget: 0,
-                sample_relation_ids: vec![1, 2],
+                sample_relation_ids: vec![1, 2, 4, 5],
             },
-            "only the two geometry-less relations are dropped"
+            "every relation without complete member geometry is dropped"
         );
     }
 
@@ -483,8 +530,8 @@ mod tests {
             (551_000_007, 120_000_007),
             (550_000_007, 120_000_007),
         ];
-        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
-        way_geom.insert(7, ring.clone());
+        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
+        way_geom.insert(7, Some(ring.clone()));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 8,
@@ -517,14 +564,14 @@ mod tests {
     /// unbounded search would have returned; it must not leak out alone.
     #[test]
     fn over_budget_relations_are_refused_and_counted() {
-        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
+        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
         // Leaf way first, so the first search runs through the complete graph.
-        way_geom.insert(1, vec![(-1, -1), (0, 0)]);
+        way_geom.insert(1, Some(vec![(-1, -1), (0, 0)]));
         let mut way_id = 2;
         let mut complete_graph = vec![1];
         for a in 0..12 {
             for b in a + 1..12 {
-                way_geom.insert(way_id, vec![(a, a), (b, b)]);
+                way_geom.insert(way_id, Some(vec![(a, a), (b, b)]));
                 complete_graph.push(way_id);
                 way_id += 1;
             }
@@ -536,7 +583,7 @@ mod tests {
             (551_000_000, 120_000_000),
             (550_000_000, 120_000_000),
         ];
-        way_geom.insert(1_000, square);
+        way_geom.insert(1_000, Some(square));
         complete_graph.push(1_000);
 
         let relations = vec![
@@ -696,8 +743,8 @@ mod tests {
             crate::geo::point_in_ring(query.0, query.1, &outer),
             "the query point is inside the unsimplified boundary"
         );
-        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
-        way_geom.insert(1, ring_e7(&outer));
+        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
+        way_geom.insert(1, Some(ring_e7(&outer)));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 8,
@@ -739,9 +786,9 @@ mod tests {
         let (w_lon, w_lat) = (10.0 * d / c, 10.0 * d);
         let mainland = rect_lonlat(12.0, 51.3, 12.4, 51.45);
         let exclave = rect_lonlat(12.2, lat0, 12.2 + w_lon, lat0 + w_lat);
-        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
-        way_geom.insert(1, ring_e7(&mainland));
-        way_geom.insert(2, ring_e7(&exclave));
+        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
+        way_geom.insert(1, Some(ring_e7(&mainland)));
+        way_geom.insert(2, Some(ring_e7(&exclave)));
         let relations = vec![
             RawAdminRelation {
                 id: 1,
@@ -803,9 +850,9 @@ mod tests {
         // vertices go, but not by much, so the bands overlap the wiggles.
         let outer = wavy(10.0, 0.2, 2_000, 0.03, 1.7);
         let hole = wavy(10.05, 0.05, 500, 0.1, 2.3);
-        let mut way_geom: FxHashMap<i64, Vec<(i32, i32)>> = FxHashMap::default();
-        way_geom.insert(1, ring_e7(&outer));
-        way_geom.insert(2, ring_e7(&hole));
+        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
+        way_geom.insert(1, Some(ring_e7(&outer)));
+        way_geom.insert(2, Some(ring_e7(&hole)));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 4,

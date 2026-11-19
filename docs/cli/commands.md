@@ -2114,8 +2114,14 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 A node whose coordinates fall outside the geographic domain fails the whole
 build, judged on the exact nanodegree value before truncation (latitude
 within +-90 degrees, longitude within +-180, inclusive), as `check
---locations` judges it. Node, way and relation IDs of either sign are used alike. Incomplete extracts remain usable: missing way nodes and missing admin
-member ways contribute no geometry; admin boundary candidates with a missing,
+--locations` judges it. Node, way and relation IDs of either sign are used alike. Incomplete extracts remain usable, and a missing node or member never
+contributes geometry: no segment joins the two nodes on either side of a
+missing way node (the street keeps each stretch of consecutive present nodes
+as a street of its own), a `building` way with a missing node gives no
+address point, and an admin boundary whose outer or inner member ways
+(an empty role counts as outer) are not all present with every node present
+contributes no area at all, since the rings and holes of what remains are not
+the boundary's; admin boundary candidates with a missing,
 unparseable, or unsupported level or no name are skipped; relation members
 whose roles do not describe outer or inner rings are ignored (an empty role
 counts as outer). Each closed outer ring is its own area, and an inner
@@ -2151,8 +2157,8 @@ admin polygon under every cell, at the street, coarse and admin levels, that
 such a line passes through (an index built by pbfhogg 0.5.0 or earlier can
 lack a cell the line only clips near its corner; rebuild to gain them).
 
-An address point is a node, or a `building` way (at the mean of its
-nodes), with `addr:housenumber` and a non-empty `addr:street`, a non-empty
+An address point is a node, or a `building` way whose nodes are all
+present (at the mean of its nodes), with `addr:housenumber` and a non-empty `addr:street`, a non-empty
 `addr:place`, or both. `addr:place` is OSM's tag for an address that
 belongs to a place rather than a street; a query answers it in the
 address's `place` field, and `street` stays empty unless the address also

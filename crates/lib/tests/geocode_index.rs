@@ -1153,8 +1153,10 @@ fn understated_node_max_id_is_an_error_not_a_panic() {
 }
 
 /// An all-negative file: the boundary `r-30` over the negative way `w-20`,
-/// whose ring runs over negative nodes and holds a dangling ref `-50` below
-/// every node present. It answers like its positive counterpart, and an
+/// whose ring runs over negative nodes, beside a street `w-21` holding a
+/// dangling ref `-50` below every node present (inside the ring it would
+/// leave the boundary incomplete and withhold the relation). It answers
+/// like its positive counterpart, and an
 /// understated negative `max_id` claim is refused at Pass 2a as a positive
 /// one is (the bound is the numeric maximum, not floored at zero).
 #[test]
@@ -1180,12 +1182,20 @@ fn negative_admin_way_over_negative_nodes_answers_and_bounds_hold() {
     write_test_pbf_sorted(
         &input,
         &nodes,
-        &[TestWay {
-            id: -20,
-            refs: vec![-10, -11, -12, -50, -13, -10],
-            tags: vec![],
-            meta: None,
-        }],
+        &[
+            TestWay {
+                id: -21,
+                refs: vec![-10, -11, -50],
+                tags: vec![("highway", "residential"), ("name", "Negative Road")],
+                meta: None,
+            },
+            TestWay {
+                id: -20,
+                refs: vec![-10, -11, -12, -13, -10],
+                tags: vec![],
+                meta: None,
+            },
+        ],
         &[TestRelation {
             id: -30,
             members: vec![TestMember {
@@ -1268,6 +1278,118 @@ fn dangling_ref_above_every_node_id_is_dropped_not_fatal() {
         2,
         "the street keeps exactly its two present nodes"
     );
+}
+
+/// A node missing from the middle of a way never joins its neighbours:
+/// refs `1, 2, missing, 3, 4` give the street the segments `1-2` and `3-4`,
+/// as two records, and no `2-3` chord a query could land on at zero
+/// distance. A building whose footprint lacks a node has no mean of its
+/// nodes and gives no address point.
+#[test]
+fn a_missing_mid_way_node_splits_the_street_and_refuses_the_building() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    let node = |id, lon| TestNode {
+        id,
+        lat: 557_000_000,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![
+        node(1, 125_000_000),
+        node(2, 125_001_000),
+        node(3, 125_030_000),
+        node(4, 125_031_000),
+    ];
+    write_test_pbf_sorted(
+        &input,
+        &nodes,
+        &[
+            street_way(vec![1, 2, 99, 3, 4]),
+            TestWay {
+                id: 11,
+                refs: vec![1, 2, 99, 1],
+                tags: vec![
+                    ("building", "yes"),
+                    ("addr:housenumber", "7"),
+                    ("addr:street", "Main Street"),
+                ],
+                meta: None,
+            },
+        ],
+        &[],
+    );
+    let stats = build_into(&input, &index_dir, false);
+    assert_eq!(stats.street_ways, 2, "one street record per resolved run");
+    assert_eq!(street_vertex_count(&index_dir), 4);
+    assert_eq!(stats.addr_points, 0, "an incomplete footprint has no mean");
+
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open");
+    // On the would-be chord, about 90 m from node 2 and 940 m from node 3.
+    let result = reader.query(55.7, 12.5015).expect("valid query");
+    let street = result.street.expect("the real segment 1-2 is in range");
+    assert_eq!(street.name, "Main Street");
+    assert!(
+        street.distance_m > 50.0,
+        "no segment may span the missing node: {street:?}"
+    );
+}
+
+/// A boundary ring with a node missing from its middle is not closed over the
+/// gap into a smaller ring: the relation contributes no area, and a query
+/// inside the shortcut ring answers no admin level.
+#[test]
+fn a_boundary_with_a_missing_ring_node_contributes_no_area() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![
+        node(10, 556_990_000, 124_990_000),
+        node(11, 556_990_000, 125_020_000),
+        node(12, 557_010_000, 125_020_000),
+        node(13, 557_010_000, 124_990_000),
+    ];
+    write_test_pbf_sorted(
+        &input,
+        &nodes,
+        &[
+            street_way(vec![10, 11]),
+            TestWay {
+                id: 20,
+                refs: vec![10, 11, 12, 50, 13, 10],
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestRelation {
+            id: 30,
+            members: vec![TestMember {
+                id: MemberId::Way(20),
+                role: "outer",
+            }],
+            tags: vec![
+                ("type", "boundary"),
+                ("boundary", "administrative"),
+                ("admin_level", "2"),
+                ("name", "Shortcutland"),
+            ],
+            meta: None,
+        }],
+    );
+    let stats = build_into(&input, &index_dir, false);
+    assert_eq!(stats.admin_polygons, 0);
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("open");
+    let inside = reader.query(55.7000, 12.5005).expect("valid query");
+    assert!(inside.admin.is_empty(), "{:?}", inside.admin);
 }
 
 /// `--force` on input without indexdata: there is no `max_id` to read, so

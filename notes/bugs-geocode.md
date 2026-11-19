@@ -57,23 +57,6 @@ belongs to the CLI contract, so the hunter flags the library behaviour
 separately rather than claiming that contract covers this API. It is a
 destructive difference between the two entry points.
 
-## GEO-003 - Missing nodes produce invented street segments and admin rings
-
-Reported by: geocode-builder [P1].
-
-`resolve_way_into` (`builder/pass2.rs`) removes unresolved references with
-`filter_map` and treats the remaining coordinates as one continuous way. For
-refs `A, missing-B, C` it writes the segment `A-C`, and a query on that chord
-can return a zero-distance street that does not exist in the source. For an
-admin ring, removing missing vertices can leave a smaller closed polygon,
-which admin assembly (`builder/admin.rs`) accepts. This breaks the
-missing-geometry contract in `docs/cli/commands.md`, because absent nodes
-contribute a newly constructed edge. The reader and cell cover correctly
-process the geometry they are given. The hunter's proposal is to keep gaps
-structurally: streets keep contiguous resolved runs, and admin assembly never
-closes rings across unresolved references. Interpolation already carries
-completeness explicitly.
-
 ## GEO-004 - A corrupt relation member role becomes an outer boundary
 
 Reported by: geocode-builder [P1], read-block-decoding [P2].
@@ -230,3 +213,29 @@ Reported by: the codex spar of the geocode coordinate-domain work.
 earlier one, such as the out-of-domain refusal. The build still fails and
 publishes nothing; only the reported cause can be the wrong one. Keep the
 first error (or stop the blob at it).
+
+## GEO-016 - Admin ring assembly pairs complete members ambiguously
+
+Reported by: the codex spar of the missing-node geometry work.
+
+On complete input, `geo::assemble_rings_bounded` (used by
+`builder/admin.rs`) joins member ways by endpoint coordinate equality and
+takes the first continuation its search finds. None of these cases needs a
+missing node:
+
+- Four outer ways all running from node L to node R through different
+  midpoints pair by member order; another order pairs them differently and
+  changes which points are inside.
+- A leaf way followed by many self-closed ways at the leaf's end node makes
+  the search try permutations of loops that can never return to the leaf;
+  it exhausts the budget and drops the whole relation, including a
+  disconnected, fully closed ring.
+- A self-closed member met mid-chain is swallowed into a figure-eight ring;
+  oppositely wound equal lobes give a stored area near zero, which wins the
+  reader's least-area ranking.
+- A retrace such as `A B A` passes the closure test as a ring.
+- Joining by coordinate rather than node ID lets two distinct nodes at an
+  equal E7 coordinate close a ring.
+
+A topology-aware assembler (node-ID graph, bridges peeled, cycles chosen by
+an explicit policy, budget per component) would settle all of them.

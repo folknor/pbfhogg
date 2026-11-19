@@ -10,6 +10,15 @@
   XXH3-128 and size in the header. `Reader::open` refuses any other
   version with an error telling you to rebuild with
   `build-geocode-index`; there is no in-place upgrade.
+- **`build-geocode-index` no longer joins a way across a missing node.**
+  On an extract that drops some of a way's nodes, a street is split into
+  one street per stretch of consecutive present nodes instead of gaining a
+  straight segment over the gap (which queries could match at zero
+  distance), a `building` way with a missing node gives no address point,
+  and an admin boundary whose outer or inner member ways are not all
+  present with every node contributes no area, where before it could
+  close a smaller ring or lose a hole. Complete input builds the same
+  index as before.
 - **The ID sets in `getid::ElementIds` (`node_ids`, `way_ids`,
   `relation_ids`) are signed and their methods renamed.** They hold any
   `i64`, negative IDs included. `set` / `set_if_new` are now `insert` /

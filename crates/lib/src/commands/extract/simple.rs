@@ -64,29 +64,33 @@ fn classify_block_simple(
     bbox_node_ids: &mut IdSet,
     matched_way_ids: &mut IdSet,
     matched_relation_ids: &mut IdSet,
-) {
+) -> crate::error::Result<()> {
     let phase_kind = match phase {
         ClassifyPhase::Nodes => ElementKind::Node,
         ClassifyPhase::Ways => ElementKind::Way,
         ClassifyPhase::Relations => ElementKind::Relation,
     };
     if !block.element_kinds().has(phase_kind) {
-        return;
+        return Ok(());
     }
 
     for element in block.elements_skip_metadata() {
         match (phase, &element) {
             (ClassifyPhase::Nodes, Element::DenseNode(dn))
-                if region.contains_decimicro(
+                if region.contains_node(
                     exact_bbox,
-                    dn.decimicro_lat(),
-                    dn.decimicro_lon(),
-                ) =>
+                    dn.decimicro_lat_checked(),
+                    dn.decimicro_lon_checked(),
+                )? =>
             {
                 bbox_node_ids.insert(dn.id());
             }
             (ClassifyPhase::Nodes, Element::Node(n))
-                if region.contains_decimicro(exact_bbox, n.decimicro_lat(), n.decimicro_lon()) =>
+                if region.contains_node(
+                    exact_bbox,
+                    n.decimicro_lat_checked(),
+                    n.decimicro_lon_checked(),
+                )? =>
             {
                 bbox_node_ids.insert(n.id());
             }
@@ -101,6 +105,7 @@ fn classify_block_simple(
             _ => {}
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,7 +229,7 @@ fn extract_simple_two_pass(
                 &mut bbox_node_ids,
                 &mut matched_way_ids,
                 &mut matched_relation_ids,
-            );
+            )?;
         }
     }
     host.invocation.marker("SIMPLE_UNSORTED_PASS1_END");

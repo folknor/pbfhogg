@@ -34,6 +34,32 @@ pub(crate) fn in_domain(lat: i32, lon: i32) -> bool {
         && (-LON_LIMIT..=LON_LIMIT).contains(&i64::from(lon))
 }
 
+/// Latitude bound in nanodegrees: 90 degrees.
+const LAT_LIMIT_NANO: i128 = 90_000_000_000;
+/// Longitude bound in nanodegrees: 180 degrees.
+const LON_LIMIT_NANO: i128 = 180_000_000_000;
+
+/// The decimicrodegree coordinate of an exact nanodegree position, or
+/// `None` when the position lies outside the geographic domain (latitude
+/// within +/-90 degrees, longitude within +/-180, both inclusive), judged
+/// on the exact value before it is truncated toward zero. In-domain values
+/// always fit `i32`, so the truncation is safe. This is the rule
+/// `check --locations` judges stored nodes and inline locations by, and the
+/// geocode builder admits every node by; the location joins (altw,
+/// apply-changes `-l`) judge the truncated decimicrodegree with
+/// [`in_domain`] instead.
+pub(crate) fn decimicro_in_domain(lat_nano: i128, lon_nano: i128) -> Option<(i32, i32)> {
+    if (-LAT_LIMIT_NANO..=LAT_LIMIT_NANO).contains(&lat_nano)
+        && (-LON_LIMIT_NANO..=LON_LIMIT_NANO).contains(&lon_nano)
+    {
+        // In domain, so both quotients fit i32 (at most 1.8e9).
+        #[allow(clippy::cast_possible_truncation)]
+        Some(((lat_nano / 100) as i32, (lon_nano / 100) as i32))
+    } else {
+        None
+    }
+}
+
 /// A coordinate outside the geographic range. A neutral leaf: the caller
 /// classifies it, because the same bad number is an invalid argument for a
 /// bounding box and invalid data in an OSC file or a GeoJSON polygon.

@@ -723,10 +723,17 @@ impl PrimitiveBlock {
     /// rejects a block whose dense `id`/`lat`/`lon` arrays disagree in length
     /// or fail to parse, so a re-parse failure is a broken invariant and
     /// panics (see `validated`) rather than dropping the group's nodes.
+    ///
+    /// Unlike the element accessors, the coordinates are checked: a dense
+    /// coordinate whose exact decimicrodegree value does not fit `i32` is
+    /// refused with the node scanner's wire error, as
+    /// [`DenseNodeColumns::decode_append`](super::columnar::DenseNodeColumns::decode_append)
+    /// describes. Every caller decides membership from these columns, so
+    /// a wrapped coordinate must not reach it.
     pub(crate) fn decode_dense_columns(
         &self,
         columns: &mut super::columnar::DenseNodeColumns,
-    ) -> usize {
+    ) -> Result<usize> {
         columns.clear();
         for group in self.groups() {
             if let Some(dense) = validated_dense(&group.group) {
@@ -735,10 +742,10 @@ impl PrimitiveBlock {
                     self.block.granularity,
                     self.block.lat_offset,
                     self.block.lon_offset,
-                );
+                )?;
             }
         }
-        columns.len()
+        Ok(columns.len())
     }
 
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
@@ -977,8 +984,10 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// imposing positivity or checking the scaled values. Delta reconstruction
 /// is modular, and so is the step after it: `offset + granularity * raw` for
 /// coordinates and `raw * date_granularity` for timestamps use wrapping `i64`
-/// arithmetic in every block-API accessor, so debug and release agree and
-/// nothing panics.
+/// arithmetic in every permissive block-API accessor (`nano_lat`,
+/// `decimicro_lat`, `milli_timestamp` and kin; the checked and exact
+/// coordinate accessors are named for what they do instead), so debug and
+/// release agree and nothing panics.
 /// A value whose scaling runs past `i64` is garbage in, garbage out, exactly
 /// like the far larger class of in-range but meaningless values (a latitude
 /// of 10^6 degrees) that no reader refuses, and like the `as i32` narrowing
@@ -989,14 +998,17 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// come from the header alone: modular deltas let an accumulated value be any
 /// `i64`, so every header except granularity 0, or granularity 1 with a
 /// zero offset, admits some overflowing coordinate.
-/// Paths that turn coordinates into output they vouch for (the node scanner
-/// in `scan/node.rs` behind altw and apply-changes `--locations-on-ways`,
-/// and the apply-changes way refresh in `refresh.rs`) do their own exact
-/// scaling and checked `i32` narrowing during the decode they already
-/// perform. They read granularity as this decoder does (any `int32`). The
-/// geographic domain is judged only where a node coordinate is joined into
-/// an output way (the altw stores and the apply-changes kept-node sink), on
-/// the joined nodes, not per decoded node.
+/// Paths that turn coordinates into output they vouch for do their own
+/// exact scaling and checked `i32` narrowing during the decode they already
+/// perform: the node scanner in `scan/node.rs` (altw, apply-changes
+/// `--locations-on-ways`, sorted extract simple), the apply-changes way
+/// refresh in `refresh.rs`, every other extract route through the checked
+/// accessors (`decimicro_lat_checked`) and the checked columnar decode
+/// (`decode_dense_columns`). They read granularity as this decoder does
+/// (any `int32`). The geographic domain is judged where a node coordinate is
+/// joined into an output way (the altw stores and the apply-changes
+/// kept-node sink), on the joined nodes, and by the geocode builder on every
+/// decoded node, on its exact nanodegree value.
 ///
 /// The framing walk comes first deliberately - it is the check that makes the
 /// element iterators used below unable to terminate early, so running the
@@ -2295,43 +2307,50 @@ mod strict_validation_tests {
         PrimitiveBlock::from_vec(buffer).unwrap()
     }
 
-    /// Every dense-node reader puts a node at the same coordinate: the
-    /// columnar decode (extract smart, multi-extract) and the element
-    /// accessors (every other reader) always, and the vouching node scanner
-    /// (altw, apply-changes -l) wherever it accepts the value. That holds on
+    /// The checked readers - the columnar decode (extract smart, complete,
+    /// multi-extract), the checked element accessors (every other extract
+    /// route) and the node scanner (extract simple,
+    /// altw, apply-changes -l) - accept and refuse the same coordinates and
+    /// agree with the permissive accessor wherever they accept. That holds on
     /// the cancelling encoding, whose product overflows `i64` while the
-    /// offset brings it back to 100 nanodegrees, and on a block whose true
-    /// nanodegree value is past `i64`, where columnar and accessors give the
-    /// same wrapped value (the deleted granularity-100 shortcut did not).
+    /// offset brings it back to 100 nanodegrees. On a block whose true
+    /// nanodegree value is past `i64` all three refuse, while the permissive
+    /// accessor still answers with its documented wrapped value.
     #[test]
     fn columnar_accessors_and_scanner_agree_on_coordinates() {
-        let cases: [(i32, i64, i64); 5] = [
+        let cases: [(i32, i64, i64); 6] = [
             (100, 0, 550_000_000),
             (100, -9_223_372_036_854_775_800, 92_233_720_368_547_759),
             (100, 9_223_372_036_854_775_799, -92_233_720_368_547_759),
             (1000, 500, -35),
             // True value 100 * (i64::MAX / 50) is past i64.
             (100, 0, i64::MAX / 50),
+            // Fits i64, not i32: 429.4967296 degrees, wraps to 0 when narrowed.
+            (100, 429_496_729_600, 0),
         ];
         for (granularity, lat_offset, raw_lat) in cases {
+            let case = format!("case {granularity} {lat_offset} {raw_lat}");
             let block = scaled_dense_block(granularity, lat_offset, raw_lat);
             let mut columns = crate::read::columnar::DenseNodeColumns::new();
-            block.decode_dense_columns(&mut columns);
-            let accessor: Vec<i32> = block
+            let columnar = block
+                .decode_dense_columns(&mut columns)
+                .ok()
+                .map(|_| columns.lats);
+            let (checked, permissive): (Vec<Option<i32>>, Vec<i32>) = block
                 .elements()
                 .filter_map(|e| match e {
-                    Element::DenseNode(n) => Some(n.decimicro_lat()),
+                    Element::DenseNode(n) => Some((n.decimicro_lat_checked(), n.decimicro_lat())),
                     _ => None,
                 })
-                .collect();
-            assert_eq!(
-                columns.lats, accessor,
-                "case {granularity} {lat_offset} {raw_lat}"
-            );
-            if let Some(scanned) =
+                .unzip();
+            let checked: Option<Vec<i32>> = checked.into_iter().collect();
+            let scanned =
                 crate::scan::node::scale_to_decimicro(lat_offset, i64::from(granularity), raw_lat)
-            {
-                assert_eq!(accessor, [scanned], "scanner, case {lat_offset} {raw_lat}");
+                    .map(|v| vec![v]);
+            assert_eq!(columnar, scanned, "columnar, {case}");
+            assert_eq!(checked, scanned, "checked accessor, {case}");
+            if let Some(scanned) = scanned {
+                assert_eq!(permissive, scanned, "permissive accessor, {case}");
             }
         }
         // The cancelling encodings scan, at 1 and -1 decimicrodegrees.
@@ -2792,7 +2811,7 @@ mod strict_validation_tests {
                 let block = unvalidated_block(buffer);
                 let msg = panic_message(|| {
                     let mut columns = crate::read::columnar::DenseNodeColumns::new();
-                    block.decode_dense_columns(&mut columns);
+                    let _decoded = block.decode_dense_columns(&mut columns);
                 });
                 assert!(
                     msg.contains(&expected),

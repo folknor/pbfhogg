@@ -108,6 +108,19 @@ impl Region {
         }
     }
 
+    /// [`Self::contains_decimicro`] on a node's checked coordinates
+    /// (`decimicro_lat_checked` / `decimicro_lon_checked`), refusing a node
+    /// whose coordinates do not fit `i32` (see `common::checked_coords`).
+    fn contains_node(
+        &self,
+        exact: &common::BboxInt,
+        lat: Option<i32>,
+        lon: Option<i32>,
+    ) -> crate::error::Result<bool> {
+        let (lat, lon) = common::checked_coords(lat, lon)?;
+        Ok(self.contains_decimicro(exact, lat, lon))
+    }
+
     /// Returns the bounding box of this region.
     pub fn bbox(&self) -> &Bbox {
         match self {

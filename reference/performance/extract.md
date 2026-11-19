@@ -41,6 +41,29 @@ scan. Workers pread + decompress + classify in parallel, sending compact
 results back to the consumer. Write passes use pread-from-workers with full
 PrimitiveBlock lifecycle per worker.
 
+### Coordinates converted exactly on every route (bygg, 2026-11-19, variant uncommitted against `364e45e6`)
+
+The change that made every extract classifier and writer refuse a node
+coordinate that does not fit an `i32` decimicrodegree: the columnar decode
+tracks the minimum and maximum cumulative value of each axis per dense
+group and scales only those two exactly, the element routes and writers
+call the checked accessors. `region-extract --dataset planet --strategy
+smart` (columnar node classify plus every writer), `--iterations 1`,
+interleaved, after `sudo fstrim -av`, baseline built with `--commit HEAD`.
+Verdict: neutral.
+
+| Span | baseline | variant |
+|------|----------|---------|
+| wall | 81.16 s (`db699244`), 74.73 s (`572388d3`) | 75.29 s (`48843705`), 79.06 s (`6f2b0e81`) |
+| `PASS1_NODE_CLASSIFY` | 12.41 s, 12.52 s | 12.60 s, 12.58 s |
+| `SMART_PASS3_WRITE` | 39.50 s, 39.64 s | 39.49 s, 39.57 s |
+
+The wall spread is `SMART_PASS1_SCHEDULE_SCAN` (0.1 to 7.1 s across the four
+cells, header walk under page-cache state), code this change does not touch.
+Node classify is about 1 % slower on the medians, under the noise floor;
+the write pass is unchanged. Multi-extract's all-bbox route runs the same
+columnar decode and was not measured separately.
+
 ### Negative IDs selected exactly (bygg, 2026-11-18, against `c79e6cfd`)
 
 The change that deleted extract's `id >= 0` insertion guards and keyed

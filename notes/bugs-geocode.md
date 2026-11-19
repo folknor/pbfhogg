@@ -21,7 +21,7 @@ hunter per scope reading source at `63d4ec1d`. None was built, run or
 reproduced. "Reported by" names the scope or scopes, and the bracketed
 priority is the hunter's own label. Findings that match an existing mechanism
 were added to `notes/bugs.md` instead of being filed here: builder tag
-truncation (BUG-004), coordinate narrowing in Pass 2 (BUG-025), candidate
+truncation (BUG-004), candidate
 ranking ties (BUG-026) and building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 
@@ -219,3 +219,14 @@ house number computed from generation B's unrelated record at the same index.
 The required provenance relationship is neither encoded nor documented.
 Binding candidates to their originating reader would also keep the polygon
 identity that BUG-026 in `notes/bugs.md` needs.
+
+## GEO-015 - Pass 2a reports the last error of a blob, not the first
+
+Reported by: the codex spar of the geocode coordinate-domain work.
+
+`run_pass2`'s node worker (`builder/pass2.rs`) records a failure in
+`state.error` and continues the blob, so a later failure in the same blob
+(a conflicting duplicate coordinate, an out-of-range rank) overwrites an
+earlier one, such as the out-of-domain refusal. The build still fails and
+publishes nothing; only the reported cause can be the wrong one. Keep the
+first error (or stop the blob at it).

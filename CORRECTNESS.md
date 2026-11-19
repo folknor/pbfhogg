@@ -592,10 +592,20 @@ OSC tags-filter. There are no command-specific replacement counters.
 ## Coordinate domain checks
 
 The general PBF readers and dense-node iterators expose coordinates without
-checking geographic ranges; the node scanner checks only the i32
-representation. Bbox parsing, location joins and `check --locations` have
-separate domain checks. This is a deliberate boundary, not a promise that
-reading a node validates its geographic position.
+checking geographic ranges; their `decimicro_lat` / `decimicro_lon` wrap
+modulo 2^64 and narrow with `as i32`. The node scanner, the checked accessors
+(`decimicro_lat_checked` / `decimicro_lon_checked`) and the columnar decode
+check only the i32 representation, exactly: a coordinate whose exact
+decimicrodegree value does not fit `i32` is refused, never wrapped. Every
+extract strategy classifies and writes nodes through these checked
+conversions, so no strategy places a node at a wrapped coordinate another
+refuses. Bbox parsing, location joins, `check --locations` and the geocode
+builder have separate domain checks. This is a deliberate boundary, not a
+promise that reading a node validates its geographic position.
+
+The geocode builder admits every node by the rule `check --locations` uses:
+the exact nanodegree value, before truncation, within +-90 latitude and
++-180 longitude inclusive; anything else fails the build.
 
 Location joins in add-locations-to-ways and apply-changes judge the
 truncated decimicrodegree value. An input less than 100 nanodegrees beyond

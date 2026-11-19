@@ -282,12 +282,21 @@ Both `Node` and `DenseNode` provide:
 | `decimicro_lon()` | `i32` | Longitude in decimicrodegrees (10^-7) |
 | `nano_lat()` | `i64` | Latitude in nanodegrees (10^-9) |
 | `nano_lon()` | `i64` | Longitude in nanodegrees (10^-9) |
+| `decimicro_lat_checked()` | `Option<i32>` | Exact latitude in decimicrodegrees, `None` if it does not fit `i32` |
+| `decimicro_lon_checked()` | `Option<i32>` | Exact longitude in decimicrodegrees, `None` if it does not fit `i32` |
+| `nano_lat_exact()` | `i128` | Exact latitude in nanodegrees, never wraps |
+| `nano_lon_exact()` | `i128` | Exact longitude in nanodegrees, never wraps |
 
-Coordinates are read as stored, not validated. Scaling by the block's
-granularity and offsets wraps on `i64` overflow, and the decimicrodegree
-accessors narrow to `i32` without a range check, so a corrupt block yields
+Coordinates are read as stored, not validated. In `lat()`, `lon()`,
+`nano_lat()`, `nano_lon()`, `decimicro_lat()` and `decimicro_lon()`,
+scaling by the block's granularity and offsets wraps on `i64` overflow, and
+the two decimicrodegree accessors narrow to `i32` without a range check, so a corrupt block yields
 wrong coordinates rather than an error or a panic. `milli_timestamp()`
-wraps the same way. Range-check the values if your input is untrusted.
+wraps the same way. If your input is untrusted, use the checked and exact
+accessors: they agree with the plain ones wherever the value is
+representable, and say so when it is not. None of them checks the
+geographic domain; judge `nano_lat_exact()` / `nano_lon_exact()` against
++-90 and +-180 degrees for that.
 
 ### Way methods
 

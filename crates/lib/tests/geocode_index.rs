@@ -1329,6 +1329,74 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
     );
 }
 
+/// Pass 2a judges every node's geographic domain on its exact nanodegree
+/// position, before any narrowing or truncation. A latitude whose framing
+/// puts it past the `i32` decimicrodegree range used to wrap to latitude 0
+/// and be indexed there (raw 4_294_967_296 at the default framing, or a
+/// lat_offset of 429_496_729_600 on raw 0), and 90.000000001 degrees used
+/// to truncate into the domain; a scaling past `i64` wrapped the exact
+/// nanodegree value itself. Each is refused, dense or plain; exactly
+/// 90 degrees builds.
+#[test]
+fn out_of_domain_nodes_are_judged_before_narrowing() {
+    let cases: [(&str, i64, Option<i32>, i64, bool); 5] = [
+        ("wraps to zero", 4_294_967_296, None, 0, false),
+        // 4 * 2^62 is 2^64 nanodegrees: the wrapping i64 scaling gives 0.
+        ("scaling wraps to zero", 1 << 62, Some(4), 0, false),
+        ("offset wraps to zero", 0, None, 429_496_729_600, false),
+        (
+            "truncates into the domain",
+            90_000_000_001,
+            Some(1),
+            0,
+            false,
+        ),
+        ("exactly the pole", 90_000_000_000, Some(1), 0, true),
+    ];
+    for (case, raw_lat, granularity, lat_offset, builds) in cases {
+        for plain in [false, true] {
+            let dir = crate::common::test_scratch();
+            let input = dir.path().join("input.osm.pbf");
+            let index_dir = dir.path().join("index");
+            crate::common::groups::write_unindexed_blocks(
+                &input,
+                &[
+                    crate::common::groups::framed_node_block(
+                        4,
+                        plain,
+                        raw_lat,
+                        granularity,
+                        lat_offset,
+                    ),
+                    crate::common::groups::plain_geocode_block(),
+                ],
+            );
+            let result = build_index(
+                &input,
+                &pbfhogg::geocode_index::builder::BuildConfig {
+                    allow_unindexed: true,
+                    ..Default::default()
+                },
+                &index_dir,
+                true,
+                &crate::common::test_host(),
+            );
+            if builds {
+                result.unwrap_or_else(|e| panic!("{case}, plain {plain}: {e}"));
+            } else {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("{case}, plain {plain}: built"));
+                assert!(
+                    err.to_string().contains("outside the geographic domain"),
+                    "{case}, plain {plain}: {err}"
+                );
+                assert!(!index_dir.exists(), "{case}, plain {plain}: published");
+            }
+        }
+    }
+}
+
 #[test]
 fn builder_refuses_a_truly_empty_index() {
     let dir = crate::common::test_scratch();

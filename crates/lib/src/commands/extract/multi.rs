@@ -363,8 +363,9 @@ pub(super) fn try_extract_multi_single_pass(
         // kept (passthrough verification counts them).
         let classify_columns = |block: &PrimitiveBlock,
                                 columns: &mut crate::read::columnar::DenseNodeColumns,
-                                scratch: &mut Vec<Vec<i64>>| {
-            block.decode_dense_columns(columns);
+                                scratch: &mut Vec<Vec<i64>>|
+         -> crate::error::Result<()> {
+            block.decode_dense_columns(columns)?;
             for v in scratch.iter_mut() {
                 v.clear();
             }
@@ -378,8 +379,7 @@ pub(super) fn try_extract_multi_single_pass(
             // only those messages here; keep dense classification batched.
             for group in block.groups() {
                 for node in group.nodes() {
-                    let lat = node.decimicro_lat();
-                    let lon = node.decimicro_lon();
+                    let (lat, lon) = super::common::plain_coords(&node)?;
                     for (region, &(min_lat, max_lat, min_lon, max_lon)) in bboxes.iter().enumerate()
                     {
                         if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon {
@@ -388,6 +388,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             }
+            Ok(())
         };
         let worker_init = || {
             (
@@ -423,7 +424,7 @@ pub(super) fn try_extract_multi_single_pass(
                     None
                 };
                 let block = validated.into_block();
-                classify_columns(&block, columns, scratch);
+                classify_columns(&block, columns, scratch)?;
                 // Occurrence counts, not set sizes: a duplicate id counts
                 // every time it is copied.
                 let observed = columns.len();
@@ -452,14 +453,19 @@ pub(super) fn try_extract_multi_single_pass(
             |block, builder: &mut BatchBuilder| {
                 for element in block.elements_skip_metadata() {
                     let (id, lat, lon) = match &element {
-                        Element::DenseNode(node) => {
-                            (node.id(), node.decimicro_lat(), node.decimicro_lon())
-                        }
-                        Element::Node(node) => {
-                            (node.id(), node.decimicro_lat(), node.decimicro_lon())
-                        }
+                        Element::DenseNode(node) => (
+                            node.id(),
+                            node.decimicro_lat_checked(),
+                            node.decimicro_lon_checked(),
+                        ),
+                        Element::Node(node) => (
+                            node.id(),
+                            node.decimicro_lat_checked(),
+                            node.decimicro_lon_checked(),
+                        ),
                         _ => continue,
                     };
+                    let (lat, lon) = super::common::checked_coords(lat, lon)?;
                     match &grid {
                         Some(grid) => {
                             for &region in grid.candidates(lat, lon) {
@@ -530,31 +536,21 @@ pub(super) fn try_extract_multi_single_pass(
                     // common no-region-matches node.
                     Element::DenseNode(dn) if node_members.mask_into(dn.id(), &mut mask) => {
                         let id = dn.id();
+                        let (lat, lon) = super::common::dense_coords(dn)?;
                         let meta = dense_node_metadata(dn)?;
                         for i in regions_of(&mask) {
                             ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_node_dense(
-                                id,
-                                dn.decimicro_lat(),
-                                dn.decimicro_lon(),
-                                dn.tags(),
-                                meta.as_ref(),
-                            );
+                            bbs[i].add_node_dense(id, lat, lon, dn.tags(), meta.as_ref());
                             counts[i] += 1;
                         }
                     }
                     Element::Node(nd) if node_members.mask_into(nd.id(), &mut mask) => {
                         let id = nd.id();
+                        let (lat, lon) = super::common::plain_coords(nd)?;
                         let meta = element_metadata(ElementKind::Node, id, &nd.info())?;
                         for i in regions_of(&mask) {
                             ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_node_partial(
-                                id,
-                                nd.decimicro_lat(),
-                                nd.decimicro_lon(),
-                                nd.tags(),
-                                meta.as_ref(),
-                            );
+                            bbs[i].add_node_partial(id, lat, lon, nd.tags(), meta.as_ref());
                             counts[i] += 1;
                         }
                     }

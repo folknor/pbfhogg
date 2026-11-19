@@ -678,16 +678,24 @@ pub(super) fn run_pass2(
                                 )));
                                 continue;
                             }
-                            let lat_e7 = node.decimicro_lat();
-                            let lon_e7 = node.decimicro_lon();
-                            let Some(packed) = pack_coord(lat_e7, lon_e7) else {
+                            // The domain is judged on the exact nanodegree
+                            // value, before truncation, as `check --locations`
+                            // judges it. Judging the permissive
+                            // `decimicro_lat` instead let a corrupt framing
+                            // (raw latitude 4_294_967_296 at the default
+                            // granularity) wrap to latitude 0 and be indexed
+                            // there, and let 90.000000099 degrees truncate
+                            // into the domain.
+                            let (lat_nano, lon_nano) = (node.nano_lat_exact(), node.nano_lon_exact());
+                            let in_domain = crate::coord_pack::decimicro_in_domain(lat_nano, lon_nano);
+                            let Some(((lat_e7, lon_e7), packed)) = in_domain.and_then(|c| Some((c, pack_coord(c.0, c.1)?))) else {
                                 // An out-of-domain coordinate is decoded source
                                 // data, not an absent reference at an extract
                                 // edge. Silently skipping it could publish
                                 // plausible but incomplete geometry, so this
                                 // build remains fatal for that condition.
                                 state.error = Some(Error::invalid_data(format!(
-                                    "node {node_id} has coordinates outside the geographic domain (lat {lat_e7}, lon {lon_e7} in decimicrodegrees)"
+                                    "node {node_id} has coordinates outside the geographic domain (lat {lat_nano}, lon {lon_nano} in nanodegrees)"
                                 )));
                                 continue;
                             };

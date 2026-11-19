@@ -43,11 +43,6 @@ use crate::ElementKind;
 use crate::error::{Error, Result, new_wire_error};
 use crate::read::wire::{Cursor, WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireWay};
 
-/// Latitude bound in nanodegrees: 90 degrees.
-const LAT_LIMIT_NANO: i128 = 90_000_000_000;
-/// Longitude bound in nanodegrees: 180 degrees.
-const LON_LIMIT_NANO: i128 = 180_000_000_000;
-
 /// One decoded coordinate.
 ///
 /// `Valid` carries the e7 value the comparison uses; `Invalid` the exact
@@ -75,17 +70,9 @@ impl Framing {
     pub(super) fn coord(self, raw_lat: i64, raw_lon: i64) -> Coord {
         let lat_nano = self.lat_offset + self.granularity * i128::from(raw_lat);
         let lon_nano = self.lon_offset + self.granularity * i128::from(raw_lon);
-        if (-LAT_LIMIT_NANO..=LAT_LIMIT_NANO).contains(&lat_nano)
-            && (-LON_LIMIT_NANO..=LON_LIMIT_NANO).contains(&lon_nano)
-        {
-            // In domain, so both quotients fit i32 (at most 1.8e9).
-            #[allow(clippy::cast_possible_truncation)]
-            Coord::Valid {
-                lat: (lat_nano / 100) as i32,
-                lon: (lon_nano / 100) as i32,
-            }
-        } else {
-            Coord::Invalid { lat_nano, lon_nano }
+        match crate::coord_pack::decimicro_in_domain(lat_nano, lon_nano) {
+            Some((lat, lon)) => Coord::Valid { lat, lon },
+            None => Coord::Invalid { lat_nano, lon_nano },
         }
     }
 }

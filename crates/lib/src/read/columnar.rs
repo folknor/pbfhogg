@@ -21,6 +21,21 @@ pub(crate) fn decimicro(offset: i64, granularity: i64, value: i64) -> i32 {
     (offset.wrapping_add(granularity.wrapping_mul(value)) / 100) as i32
 }
 
+/// Refuse an axis of a dense group unless the cumulative values at both of
+/// its ends scale to an `i32` decimicrodegree; see
+/// [`DenseNodeColumns::decode_append`] for why the ends decide the group.
+#[inline]
+fn representable(offset: i64, granularity: i64, min: i64, max: i64) -> crate::error::Result<()> {
+    use crate::scan::node::{scale_to_decimicro, unrepresentable_coordinate_err};
+    if scale_to_decimicro(offset, granularity, min).is_some()
+        && scale_to_decimicro(offset, granularity, max).is_some()
+    {
+        Ok(())
+    } else {
+        Err(unrepresentable_coordinate_err())
+    }
+}
+
 /// A dense group's coordinates in decimicrodegrees, in node order, decoded
 /// from its validated `lat` and `lon` arrays as [`DenseNodeColumns::decode_append`]
 /// and the dense element iterator decode them. The validator holds the two
@@ -108,13 +123,25 @@ impl DenseNodeColumns {
     /// that a disagreement cannot become an out-of-bounds index downstream,
     /// and `validate_block` in `block.rs` rejects the disagreement
     /// outright at block construction.
+    ///
+    /// The coordinates are checked, exactly as the node scanner's
+    /// `scale_to_decimicro` checks them, and a group holding a coordinate
+    /// whose exact value does not fit an `i32` decimicrodegree is refused
+    /// with the scanner's wire error (the columns are then partial and must
+    /// not be used). The check costs no per-node branch: the loops track the
+    /// minimum and maximum cumulative value of each axis, and only those two
+    /// endpoints are scaled exactly. `offset + granularity * raw` is monotone
+    /// in `raw`, so if both endpoints are representable every node of the
+    /// group is, its exact nanodegree value then fits `i64`, and the wrapping
+    /// arithmetic below already produced it, cancelling intermediates
+    /// included. If an endpoint is not representable, that node is not.
     pub fn decode_append(
         &mut self,
         dense: &WireDenseNodes<'_>,
         granularity: i32,
         lat_offset: i64,
         lon_offset: i64,
-    ) {
+    ) -> crate::error::Result<()> {
         let gran = i64::from(granularity);
 
         // Reconstruct signed deltas modulo 2^64, as the dense iterator and
@@ -128,32 +155,46 @@ impl DenseNodeColumns {
 
         // One scaling for every granularity, the element accessors' own:
         // nanodegrees = offset + granularity * cumulative modulo 2^64, then
-        // / 100 truncating toward zero and narrowed by `as i32`. Scaling and
-        // offsets wrap rather than being validated (see "What is
-        // deliberately not checked" on block construction in `block.rs`),
-        // and because this is the accessors' arithmetic step for step, a
-        // node classifies at the same coordinate here as in every reader
-        // built on the accessors, even when the true value is past `i64`.
+        // / 100 truncating toward zero and narrowed by `as i32`, then the
+        // group is proved representable from its endpoints (doc above), so
+        // every accepted node classifies at the coordinate the exact node
+        // scanner gives it and that the checked accessors give it, and a
+        // group the scanner would refuse is refused here too.
         //
         // There is deliberately no granularity-100 shortcut
         // (`cumulative + offset / 100`, skipping the multiply and divide).
         // One existed; it wrapped at a different point from the accessors,
-        // so on a block whose true nanodegree value overflows `i64` it put
-        // the node somewhere else than a simple extract does, and a matched
+        // so on a block whose true nanodegree value overflows `i64` it
+        // disagreed with the accessors, and a matched
         // planet A/B of extract --strategy smart and multi-extract found
         // its removal inside noise (reference/performance/read-pipeline.md, "Columnar
         // granularity-100 shortcut").
+        let lats_before = self.lats.len();
+        let (mut lat_min, mut lat_max) = (i64::MAX, i64::MIN);
         let mut cumulative_lat: i64 = 0;
         for delta in PackedSint64Iter::new(dense.lat_data) {
             cumulative_lat = cumulative_lat.wrapping_add(delta);
+            lat_min = lat_min.min(cumulative_lat);
+            lat_max = lat_max.max(cumulative_lat);
             self.lats.push(decimicro(lat_offset, gran, cumulative_lat));
         }
+        if self.lats.len() > lats_before {
+            representable(lat_offset, gran, lat_min, lat_max)?;
+        }
 
+        let lons_before = self.lons.len();
+        let (mut lon_min, mut lon_max) = (i64::MAX, i64::MIN);
         let mut cumulative_lon: i64 = 0;
         for delta in PackedSint64Iter::new(dense.lon_data) {
             cumulative_lon = cumulative_lon.wrapping_add(delta);
+            lon_min = lon_min.min(cumulative_lon);
+            lon_max = lon_max.max(cumulative_lon);
             self.lons.push(decimicro(lon_offset, gran, cumulative_lon));
         }
+        if self.lons.len() > lons_before {
+            representable(lon_offset, gran, lon_min, lon_max)?;
+        }
+        Ok(())
     }
 
     /// Classify nodes against N bounding boxes in a single pass, collecting
@@ -267,13 +308,104 @@ mod tests {
             keys_vals_data: &[],
             info_data: None,
         };
-        for granularity in [100, 0] {
-            let mut columns = DenseNodeColumns::new();
-            columns.decode_append(&dense, granularity, 0, 0);
-            assert_eq!(columns.ids, [i64::MIN, i64::MAX]);
-            let coords = if granularity == 100 { [0, -1] } else { [0, 0] };
-            assert_eq!(columns.lats, coords);
-            assert_eq!(columns.lons, coords);
+        // Granularity 0 makes every coordinate the offset, so the wrapped
+        // cumulative values are representable and only the deltas wrap.
+        let mut columns = DenseNodeColumns::new();
+        columns
+            .decode_append(&dense, 0, 0, 0)
+            .expect("granularity 0 is representable");
+        assert_eq!(columns.ids, [i64::MIN, i64::MAX]);
+        assert_eq!(columns.lats, [0, 0]);
+        assert_eq!(columns.lons, [0, 0]);
+        // At granularity 100 the same values are far past i32 and refused,
+        // where the wrapping arithmetic alone gave 0 and -1.
+        let mut columns = DenseNodeColumns::new();
+        assert!(columns.decode_append(&dense, 100, 0, 0).is_err());
+    }
+
+    /// The group check matches `scale_to_decimicro` on every node: an
+    /// unrepresentable value anywhere in the group (first, middle or last,
+    /// either axis, either granularity sign) refuses the group, the last 99
+    /// nanodegrees past each `i32` edge are accepted, and a cancelling
+    /// encoding whose product overflows `i64` is accepted at the scanner's
+    /// value.
+    #[test]
+    fn columnar_coordinates_are_checked_like_the_scanner() {
+        use crate::scan::node::scale_to_decimicro;
+        fn zz(v: i64) -> u64 {
+            ((v << 1) ^ (v >> 63)).cast_unsigned()
+        }
+        fn packed_deltas(values: &[i64]) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut prev = 0_i64;
+            for &v in values {
+                let mut z = zz(v.wrapping_sub(prev));
+                prev = v;
+                while z >= 0x80 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    out.push((z as u8) | 0x80);
+                    z >>= 7;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                out.push(z as u8);
+            }
+            out
+        }
+        let edge_hi = i64::from(i32::MAX) * 100 + 99;
+        let edge_lo = i64::from(i32::MIN) * 100 - 99;
+        let cases: &[(i32, i64, &[i64])] = &[
+            (1, 0, &[0, edge_hi, edge_lo]),
+            (1, 0, &[0, edge_hi + 1]),
+            (1, 0, &[edge_lo - 1, 0]),
+            (100, 0, &[5, 4_294_967_296, 7]),
+            (100, 429_496_729_600, &[0]),
+            (-100, 0, &[3, -2_147_483_648, 2]),
+            (-100, 0, &[3, -2_147_483_647, 2]),
+            (100, -9_223_372_036_854_775_800, &[92_233_720_368_547_759]),
+            (100, 9_223_372_036_854_775_799, &[-92_233_720_368_547_759]),
+            (1000, 500, &[-35, 12, 900_000]),
+        ];
+        for &(granularity, offset, values) in cases {
+            let gran = i64::from(granularity);
+            let expected: Option<Vec<i32>> = values
+                .iter()
+                .map(|&v| scale_to_decimicro(offset, gran, v))
+                .collect();
+            let ids = packed_deltas(
+                &(1..=values.len())
+                    .map(|i| i64::try_from(i).expect("small"))
+                    .collect::<Vec<_>>(),
+            );
+            let coords = packed_deltas(values);
+            let zero = packed_deltas(&vec![0; values.len()]);
+            for (lat_data, lon_data, axis) in [(&coords, &zero, "lat"), (&zero, &coords, "lon")] {
+                let dense = WireDenseNodes {
+                    id_data: &ids,
+                    lat_data,
+                    lon_data,
+                    keys_vals_data: &[],
+                    info_data: None,
+                };
+                let (lat_offset, lon_offset) = if axis == "lat" {
+                    (offset, 0)
+                } else {
+                    (0, offset)
+                };
+                let mut columns = DenseNodeColumns::new();
+                let got = columns.decode_append(&dense, granularity, lat_offset, lon_offset);
+                match &expected {
+                    Some(expected) => {
+                        assert!(got.is_ok(), "{axis} {granularity} {offset} {values:?}");
+                        let column = if axis == "lat" {
+                            &columns.lats
+                        } else {
+                            &columns.lons
+                        };
+                        assert_eq!(column, expected, "{axis} {granularity} {offset} {values:?}");
+                    }
+                    None => assert!(got.is_err(), "{axis} {granularity} {offset} {values:?}"),
+                }
+            }
         }
     }
 
@@ -287,10 +419,17 @@ mod tests {
             keys_vals_data: &[],
             info_data: None,
         };
+        // 100 * i32::MAX + 100 nanodegrees is one decimicrodegree past
+        // i32::MAX: the offset is applied before the narrowing, which refuses
+        // it rather than wrapping it to i32::MIN.
         let mut columns = DenseNodeColumns::new();
-        columns.decode_append(&dense, 100, 100, 100);
-        assert_eq!(columns.lats, [i32::MIN]);
-        assert_eq!(columns.lons, [i32::MIN]);
+        assert!(columns.decode_append(&dense, 100, 100, 100).is_err());
+        let mut columns = DenseNodeColumns::new();
+        columns
+            .decode_append(&dense, 100, 0, 0)
+            .expect("i32::MAX is representable");
+        assert_eq!(columns.lats, [i32::MAX]);
+        assert_eq!(columns.lons, [i32::MAX]);
     }
 
     fn next(state: &mut u64) -> u64 {

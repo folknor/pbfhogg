@@ -22,8 +22,8 @@ reproduced. "Reported by" names the scope or scopes, and the bracketed
 priority is the hunter's own label. Findings that match an existing mechanism
 were added to `notes/bugs.md` instead of being filed here: tag truncation
 (BUG-004), apply-changes base version precedence (BUG-016), plain nodes in
-renumber (BUG-020), degrade drop counting (BUG-022), cat decode counters
-(BUG-023) and extract coordinate narrowing (BUG-025). Entries are in no
+renumber (BUG-020), degrade drop counting (BUG-022) and cat decode counters
+(BUG-023). Entries are in no
 order of importance.
 
 ## CMD-002 - OSC tags-filter output can reverse an object's final state

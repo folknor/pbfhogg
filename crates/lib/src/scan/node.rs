@@ -69,7 +69,13 @@ pub(crate) struct NodeTuple {
 /// output ways (the altw sparse and external stores, and the apply-changes
 /// `--locations-on-ways` kept-node sink in `streaming.rs`), on the referenced
 /// nodes only, so the per-node cost of this scan stays unchanged for every
-/// consumer, extract simple's classify included.
+/// consumer, extract simple's classify included. The geocode builder's
+/// Pass 2a judges the domain on every node, on the exact nanodegree value.
+///
+/// This is also the conversion behind the checked element accessors
+/// (`decimicro_lat_checked` on `Node` and `DenseNode`) and the checked
+/// columnar decode, so every extract strategy accepts and refuses the same
+/// coordinates.
 #[inline]
 pub(crate) fn scale_to_decimicro(offset: i64, granularity: i64, raw: i64) -> Option<i32> {
     match granularity
@@ -86,19 +92,32 @@ pub(crate) fn scale_to_decimicro(offset: i64, granularity: i64, raw: i64) -> Opt
 #[cold]
 #[inline(never)]
 fn scale_to_decimicro_wide(offset: i64, granularity: i64, raw: i64) -> Option<i32> {
-    let nano = i128::from(offset) + i128::from(granularity) * i128::from(raw);
-    i32::try_from(nano / 100).ok()
+    i32::try_from(exact_nano(offset, granularity, raw) / 100).ok()
+}
+
+/// The exact nanodegree value `offset + granularity * raw`, which three
+/// `i64` operands cannot overflow in `i128`.
+#[inline]
+pub(crate) fn exact_nano(offset: i64, granularity: i64, raw: i64) -> i128 {
+    i128::from(offset) + i128::from(granularity) * i128::from(raw)
+}
+
+/// The refusal for a node coordinate [`scale_to_decimicro`] rejects, shared
+/// by this scanner, the checked columnar decode and the extract consumers of
+/// the checked element accessors, so every route words it the same way.
+#[cold]
+#[inline(never)]
+pub(crate) fn unrepresentable_coordinate_err() -> crate::error::Error {
+    crate::error::new_wire_error(
+        "node coordinate does not fit in an i32 decimicrodegree; \
+         the blob's granularity, offset, or deltas are corrupt",
+    )
 }
 
 /// [`scale_to_decimicro`] with this scanner's refusal.
 #[inline]
 fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
-    scale_to_decimicro(offset, granularity, raw).ok_or_else(|| {
-        crate::error::new_wire_error(
-            "node coordinate does not fit in an i32 decimicrodegree; \
-             the blob's granularity, offset, or deltas are corrupt",
-        )
-    })
+    scale_to_decimicro(offset, granularity, raw).ok_or_else(unrepresentable_coordinate_err)
 }
 
 /// Error for a dense `id` array that ends mid-varint or holds a varint wider

@@ -63,6 +63,38 @@ impl<'a> DenseNode<'a> {
 
     crate::impl_coordinate_conversions!();
 
+    /// The latitude in decimicrodegrees (10^-7), computed exactly from the
+    /// group's cumulative value and the block's granularity and offset, or
+    /// `None` when the exact value does not fit `i32`. The cumulative value
+    /// is the same wrapping delta sum every reader takes; only the scaling
+    /// and the narrowing are exact. Agrees with
+    /// [`decimicro_lat`](Self::decimicro_lat) whenever it returns `Some`;
+    /// bounds the `i32` representation only, not the geographic domain.
+    #[inline]
+    pub fn decimicro_lat_checked(&self) -> Option<i32> {
+        crate::scan::node::scale_to_decimicro(self.lat_offset, self.granularity, self.lat)
+    }
+
+    /// The longitude counterpart of
+    /// [`decimicro_lat_checked`](Self::decimicro_lat_checked).
+    #[inline]
+    pub fn decimicro_lon_checked(&self) -> Option<i32> {
+        crate::scan::node::scale_to_decimicro(self.lon_offset, self.granularity, self.lon)
+    }
+
+    /// The exact latitude in nanodegrees (10^-9), computed in `i128` so it
+    /// never wraps.
+    #[inline]
+    pub fn nano_lat_exact(&self) -> i128 {
+        crate::scan::node::exact_nano(self.lat_offset, self.granularity, self.lat)
+    }
+
+    /// The exact longitude in nanodegrees (10^-9), computed in `i128`.
+    #[inline]
+    pub fn nano_lon_exact(&self) -> i128 {
+        crate::scan::node::exact_nano(self.lon_offset, self.granularity, self.lon)
+    }
+
     /// Returns an iterator over the tags of this node.
     pub fn tags(&self) -> DenseTagIter<'a> {
         DenseTagIter {

@@ -19,6 +19,48 @@ use crate::idset::IdSet;
 use super::ExtractStats;
 
 // ---------------------------------------------------------------------------
+// Node coordinates
+// ---------------------------------------------------------------------------
+
+/// A node's decimicrodegree coordinates from its checked accessors
+/// (`decimicro_lat_checked` / `decimicro_lon_checked`), or the node scanner's
+/// refusal when either does not fit `i32`.
+///
+/// Every extract strategy converts node coordinates through this, the
+/// columnar decode or the node scanner, which all share one exact rule, so
+/// no strategy classifies or writes a node at a wrapped coordinate that
+/// another refuses. The permissive `decimicro_lat` / `decimicro_lon` wrap
+/// modulo 2^64 and narrow with `as i32`, so a corrupt offset (lat_offset
+/// 429_496_729_600 on a raw 0 is 4_294_967_296 decimicrodegrees) used to
+/// put the node at 0 and select it into an extract around `(0, 0)`. The
+/// writers check too, not only the classifiers: complete-ways and smart
+/// write way-dependency nodes from blobs classification skipped on a
+/// disjoint bbox claim, and the write must not depend on that claim being
+/// true.
+#[inline]
+pub(super) fn checked_coords(
+    lat: Option<i32>,
+    lon: Option<i32>,
+) -> crate::error::Result<(i32, i32)> {
+    match (lat, lon) {
+        (Some(lat), Some(lon)) => Ok((lat, lon)),
+        _ => Err(crate::scan::node::unrepresentable_coordinate_err()),
+    }
+}
+
+/// [`checked_coords`] of a dense node.
+#[inline]
+pub(super) fn dense_coords(node: &crate::DenseNode<'_>) -> crate::error::Result<(i32, i32)> {
+    checked_coords(node.decimicro_lat_checked(), node.decimicro_lon_checked())
+}
+
+/// [`checked_coords`] of a plain node.
+#[inline]
+pub(super) fn plain_coords(node: &crate::Node<'_>) -> crate::error::Result<(i32, i32)> {
+    checked_coords(node.decimicro_lat_checked(), node.decimicro_lon_checked())
+}
+
+// ---------------------------------------------------------------------------
 // Integer bbox + spatial filter
 // ---------------------------------------------------------------------------
 
@@ -606,14 +648,9 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 let from_way = ids.outside_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
+                    let (lat, lon) = dense_coords(dn)?;
                     let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                    bb.add_node_dense(
-                        dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
-                        dn.tags(),
-                        meta.as_ref(),
-                    );
+                    bb.add_node_dense(dn.id(), lat, lon, dn.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -626,17 +663,12 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
                 let from_way = ids.outside_way_node_ids.get(n.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
+                    let (lat, lon) = plain_coords(n)?;
                     let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Node, n.id(), &n.info())?,
                         clean,
                     );
-                    bb.add_node_partial(
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        n.tags(),
-                        meta.as_ref(),
-                    );
+                    bb.add_node_partial(n.id(), lat, lon, n.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {

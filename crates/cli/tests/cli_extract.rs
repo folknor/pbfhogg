@@ -2599,3 +2599,250 @@ fn multi_extract_selects_negative_ids_as_its_single_extracts_do() {
     assert_eq!(sorted_ids(way_ids(&b)), vec![-11, -10, 10]);
     assert_eq!(sorted_ids(relation_ids(&b)), vec![-300, 400]);
 }
+
+/// A one-node input whose block framing puts the node at a coordinate that
+/// fits `i64` nanodegrees but not an `i32` decimicrodegree:
+/// lat_offset 429_496_729_600 with raw latitude and longitude 0 is
+/// 429.4967296 degrees, 4_294_967_296 decimicrodegrees, which `as i32`
+/// narrows to 0. `offset` 0 is the in-range control. `plain` selects a
+/// plain Node message instead of a dense group. The writer gives the blob
+/// indexdata without a bbox (no box holds the coordinate), so every route
+/// decodes it.
+fn write_unrepresentable_node_pbf(input: &Path, sorted: bool, plain: bool, offset: u64) {
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push(u8::try_from(v & 0x7f).expect("seven bits") | 0x80);
+            v >>= 7;
+        }
+        out.push(u8::try_from(v).expect("below 0x80"));
+    }
+    // id 1 (zigzag 2), lat 0, lon 0.
+    let group: Vec<u8> = if plain {
+        vec![10, 6, 8, 2, 64, 0, 72, 0]
+    } else {
+        vec![18, 9, 10, 1, 2, 66, 1, 0, 74, 1, 0]
+    };
+    let mut block = vec![10, 2, 10, 0, 18];
+    varint(u64::try_from(group.len()).expect("small"), &mut block);
+    block.extend_from_slice(&group);
+    // Field 19, lat_offset.
+    varint(19 << 3, &mut block);
+    varint(offset, &mut block);
+    let header = if sorted {
+        HeaderBuilder::new().sorted()
+    } else {
+        HeaderBuilder::new()
+    };
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(input).expect("create input"),
+        Compression::default(),
+    );
+    writer
+        .write_header(&header.build().expect("header"))
+        .expect("write header");
+    writer.write_primitive_block(&block).expect("write block");
+    writer.flush().expect("flush");
+}
+
+/// The checks are not only at classification. Node 1 at 10,10 sits in its
+/// own blob, whose stored bbox claim stays 10,10 after its payload gains a
+/// lat_offset that puts the node past `i32`: the claim is disjoint from the
+/// region, so classification skips the blob, but way 10 is selected through
+/// node 2 at 0,0, and complete-ways and smart then write node 1 as a way
+/// dependency. That write refuses rather than emitting the wrapped
+/// coordinate. Mutating node 2's blob instead leaves its claim contained in
+/// the region, so multi-extract nominates it for raw copy; verification
+/// must refuse it, not copy it. Offset 0 is the control.
+#[test]
+fn extract_writers_and_raw_copy_refuse_an_unrepresentable_coordinate() {
+    const REFUSAL: &str = "node coordinate does not fit in an i32 decimicrodegree";
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    };
+    crate::common::write_multi_block_test_pbf(
+        &base,
+        &[node(1, 100_000_000, 100_000_000), node(2, 0, 0)],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "residential")],
+            meta: None,
+        }],
+        &[],
+        1,
+    );
+    let pbf = std::fs::read(&base).expect("read base");
+    let mutated = |blob: usize, offset: i64, name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            crate::common::adversarial::mutate_blob_payload(&pbf, blob, |p| {
+                p.extend_from_slice(&[0x98, 0x01]);
+                crate::common::adversarial::write_varint(p, offset.cast_unsigned());
+            }),
+        )
+        .expect("write mutated input");
+        path
+    };
+    for (offset, refused) in [(429_496_729_600_i64, true), (0, false)] {
+        let input = mutated(1, offset, &format!("dependency-{offset}.osm.pbf"));
+        for (name, strategy) in [
+            ("complete", Strategy::CompleteWays),
+            ("smart", Strategy::Smart),
+        ] {
+            let out = dir.path().join(format!("{name}-{offset}.osm.pbf"));
+            let cli = CliInvoker::new(&invocation_scratch)
+                .arg("extract")
+                .arg(&input)
+                .arg("-o")
+                .arg(&out)
+                .arg("--bbox=-1,-1,1,1");
+            let cli = strategy_args(cli, strategy);
+            if refused {
+                cli.assert_failure().assert_stderr_contains(REFUSAL);
+                assert!(!out.exists(), "{name}: nothing is published");
+            } else {
+                cli.assert_success();
+                assert_eq!(node_ids(&read_all_elements(&out)), vec![1, 2], "{name}");
+            }
+        }
+
+        let input = mutated(2, offset, &format!("candidate-{offset}.osm.pbf"));
+        let config = dir.path().join(format!("multi-{offset}.json"));
+        let (a, b) = (format!("a-{offset}.osm.pbf"), format!("b-{offset}.osm.pbf"));
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"directory":"{}","extracts":[{{"output":"{a}","bbox":[-1,-1,1,1]}},{{"output":"{b}","bbox":[-2,-2,2,2]}}]}}"#,
+                dir.path()
+                    .canonicalize()
+                    .expect("absolute directory")
+                    .display(),
+            ),
+        )
+        .expect("config");
+        let cli = CliInvoker::new(&invocation_scratch)
+            .arg("extract")
+            .arg(&input)
+            .arg("--config")
+            .arg(&config)
+            .arg("--simple");
+        if refused {
+            cli.assert_failure().assert_stderr_contains(REFUSAL);
+            assert!(!dir.path().join(&a).exists(), "multi: nothing is published");
+        } else {
+            cli.assert_success();
+            assert_eq!(node_ids(&read_all_elements(&dir.path().join(&a))), vec![2]);
+        }
+    }
+}
+
+/// Every extract route refuses a node whose coordinate does not fit an
+/// `i32` decimicrodegree, as sorted simple's node scanner always did, rather
+/// than wrapping it to `(0, 0)` and selecting and writing it there:
+/// sorted and unsorted input, dense and plain nodes, simple, complete-ways
+/// and smart, bbox and polygon, and the shared multi-extract route. The
+/// same input with offset 0 extracts the node, so the refusal is the
+/// coordinate's.
+#[test]
+fn every_extract_route_refuses_an_unrepresentable_coordinate() {
+    const REFUSAL: &str = "node coordinate does not fit in an i32 decimicrodegree";
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let polygon = dir.path().join("null-island.geojson");
+    std::fs::write(
+        &polygon,
+        r#"{"type":"Polygon","coordinates":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}"#,
+    )
+    .expect("polygon");
+    for sorted in [true, false] {
+        for plain in [false, true] {
+            for (offset, refused) in [(429_496_729_600_u64, true), (0, false)] {
+                let case = format!("sorted {sorted} plain {plain} offset {offset}");
+                let input = dir
+                    .path()
+                    .join(format!("in-{sorted}-{plain}-{offset}.osm.pbf"));
+                write_unrepresentable_node_pbf(&input, sorted, plain, offset);
+                for (name, strategy) in [
+                    ("simple", Strategy::Simple),
+                    ("complete", Strategy::CompleteWays),
+                    ("smart", Strategy::Smart),
+                ] {
+                    for region in [RegionArg::Bbox("-1,-1,1,1"), RegionArg::Polygon(&polygon)] {
+                        let out = dir.path().join(format!("out-{name}.osm.pbf"));
+                        if out.exists() {
+                            std::fs::remove_file(&out).expect("remove previous output");
+                        }
+                        let cli = CliInvoker::new(&invocation_scratch)
+                            .arg("extract")
+                            .arg(&input)
+                            .arg("-o")
+                            .arg(&out);
+                        let cli = match region {
+                            RegionArg::Bbox(b) => cli.arg(format!("--bbox={b}")),
+                            RegionArg::Polygon(p) => cli.arg("--polygon").arg(p),
+                        };
+                        let cli = strategy_args(cli, strategy);
+                        if refused {
+                            cli.assert_failure().assert_stderr_contains(REFUSAL);
+                            assert!(!out.exists(), "{name}, {case}: nothing is published");
+                        } else {
+                            cli.assert_success();
+                            assert_eq!(
+                                node_ids(&read_all_elements(&out)),
+                                vec![1],
+                                "{name}, {case}"
+                            );
+                        }
+                    }
+                }
+                // All-bbox regions take the columnar classifier; one polygon
+                // moves every region onto the element classifier.
+                for second in [
+                    r#""bbox":[-2,-2,2,2]"#,
+                    r#""polygon":{"type":"Polygon","coordinates":[[[-2,-2],[2,-2],[2,2],[-2,2],[-2,-2]]]}"#,
+                ] {
+                    let config = dir.path().join("multi.json");
+                    std::fs::write(
+                        &config,
+                        format!(
+                            r#"{{"directory":"{}","extracts":[{{"output":"a.osm.pbf","bbox":[-1,-1,1,1]}},{{"output":"b.osm.pbf",{second}}}]}}"#,
+                            dir.path().canonicalize().expect("absolute directory").display(),
+                        ),
+                    )
+                    .expect("config");
+                    for name in ["a.osm.pbf", "b.osm.pbf"] {
+                        let path = dir.path().join(name);
+                        if path.exists() {
+                            std::fs::remove_file(&path).expect("remove previous output");
+                        }
+                    }
+                    let cli = CliInvoker::new(&invocation_scratch)
+                        .arg("extract")
+                        .arg(&input)
+                        .arg("--config")
+                        .arg(&config)
+                        .arg("--simple");
+                    if refused {
+                        cli.assert_failure().assert_stderr_contains(REFUSAL);
+                        assert!(!dir.path().join("a.osm.pbf").exists(), "multi, {case}");
+                    } else {
+                        cli.assert_success();
+                        assert_eq!(
+                            node_ids(&read_all_elements(&dir.path().join("b.osm.pbf"))),
+                            vec![1],
+                            "multi {second}, {case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

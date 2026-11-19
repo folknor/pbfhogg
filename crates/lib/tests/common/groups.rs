@@ -164,3 +164,42 @@ pub fn plain_geocode_block() -> Vec<u8> {
     bytes_field(&mut out, 2, &ways);
     out
 }
+
+/// A block holding one node, ID `id`, as a plain `Node` message when `plain`
+/// or a one-node dense group otherwise, at raw latitude `raw_lat` and raw
+/// longitude 0, under the block framing `granularity` (field 17, omitted
+/// when `None`, so the default 100) and `lat_offset` (field 19). For inputs
+/// whose framing puts a node past the `i32` decimicrodegree range or just
+/// outside the geographic domain.
+pub fn framed_node_block(
+    id: i64,
+    plain: bool,
+    raw_lat: i64,
+    granularity: Option<i32>,
+    lat_offset: i64,
+) -> Vec<u8> {
+    let mut group = Vec::new();
+    if plain {
+        let mut node = Vec::new();
+        varint_field(&mut node, 1, zigzag(id));
+        varint_field(&mut node, 8, zigzag(raw_lat));
+        varint_field(&mut node, 9, 0);
+        bytes_field(&mut group, 1, &node);
+    } else {
+        let mut dense = Vec::new();
+        packed_sint(&mut dense, 1, &[id], true);
+        packed_sint(&mut dense, 8, &[raw_lat], true);
+        packed_sint(&mut dense, 9, &[0], true);
+        bytes_field(&mut group, 2, &dense);
+    }
+    let mut out = Vec::new();
+    let mut table = Vec::new();
+    bytes_field(&mut table, 1, b"");
+    bytes_field(&mut out, 1, &table);
+    bytes_field(&mut out, 2, &group);
+    if let Some(granularity) = granularity {
+        varint_field(&mut out, 17, i64::from(granularity).cast_unsigned());
+    }
+    varint_field(&mut out, 19, lat_offset.cast_unsigned());
+    out
+}

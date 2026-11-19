@@ -12,6 +12,19 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Pass 2a judges the domain on exact nanodegrees (bygg, 2026-11-19, variant uncommitted against `364e45e6`)
+
+Pass 2a computes every node's exact nanodegree position in `i128` and
+checks the geographic domain on it before truncating, instead of judging
+the wrapped and narrowed `decimicro_lat`. Planet, full build,
+`--iterations 1`, interleaved A B A B after `sudo fstrim -av`, baseline
+built with `--commit HEAD`. Walls: base 107.7 s (`c98a41fc`), variant
+115.8 s (`410578d9`), base 116.6 s (`047778be`), variant 116.7 s
+(`b48cb68d`); the first cell's lead is `GEOCODE_SCHEDULES` (0.6 s against
+6.5 to 7.1 s in the other three), the header walk this change does not
+touch. `GEOCODE_PASS2A`: base 20.39 s, 19.24 s; variant 19.45 s, 19.51 s.
+Verdict: neutral.
+
 ### Negative node refs spill to the overflow lists (bygg, 2026-11-18, variant uncommitted against `6a823de7`)
 
 Pass 1.5 collects negative admin ways and node refs: a ref the

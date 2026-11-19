@@ -231,20 +231,20 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 for element in block.elements_skip_metadata() {
                     match (phase, &element) {
                         (UnsortedPhase::Nodes, Element::DenseNode(dn))
-                            if region.contains_decimicro(
+                            if region.contains_node(
                                 &exact_bbox,
-                                dn.decimicro_lat(),
-                                dn.decimicro_lon(),
-                            ) =>
+                                dn.decimicro_lat_checked(),
+                                dn.decimicro_lon_checked(),
+                            )? =>
                         {
                             bbox_node_ids.insert(dn.id());
                         }
                         (UnsortedPhase::Nodes, Element::Node(n))
-                            if region.contains_decimicro(
+                            if region.contains_node(
                                 &exact_bbox,
-                                n.decimicro_lat(),
-                                n.decimicro_lon(),
-                            ) =>
+                                n.decimicro_lat_checked(),
+                                n.decimicro_lon_checked(),
+                            )? =>
                         {
                             bbox_node_ids.insert(n.id());
                         }
@@ -410,7 +410,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         |block, (columns, ids)| {
             ids.clear();
             if use_columnar {
-                block.decode_dense_columns(columns);
+                block.decode_dense_columns(columns)?;
                 columns.collect_matching_ids_bbox(
                     exact_bbox.min_lat,
                     exact_bbox.max_lat,
@@ -424,7 +424,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 // was missing from a sorted bbox extract.
                 for group in block.groups() {
                     for node in group.nodes() {
-                        if exact_bbox.contains(node.decimicro_lat(), node.decimicro_lon()) {
+                        let (lat, lon) = super::common::plain_coords(&node)?;
+                        if exact_bbox.contains(lat, lon) {
                             ids.push(node.id());
                         }
                     }
@@ -433,20 +434,20 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 for element in block.elements_skip_metadata() {
                     match &element {
                         Element::DenseNode(dn)
-                            if region.contains_decimicro(
+                            if region.contains_node(
                                 exact_bbox,
-                                dn.decimicro_lat(),
-                                dn.decimicro_lon(),
-                            ) =>
+                                dn.decimicro_lat_checked(),
+                                dn.decimicro_lon_checked(),
+                            )? =>
                         {
                             ids.push(dn.id());
                         }
                         Element::Node(n)
-                            if region.contains_decimicro(
+                            if region.contains_node(
                                 exact_bbox,
-                                n.decimicro_lat(),
-                                n.decimicro_lon(),
-                            ) =>
+                                n.decimicro_lat_checked(),
+                                n.decimicro_lon_checked(),
+                            )? =>
                         {
                             ids.push(n.id());
                         }
@@ -805,14 +806,9 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
+                    let (lat, lon) = super::common::dense_coords(dn)?;
                     let meta = clean_metadata(dense_node_metadata(dn)?, clean);
-                    bb.add_node_dense(
-                        dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
-                        dn.tags(),
-                        meta.as_ref(),
-                    );
+                    bb.add_node_dense(dn.id(), lat, lon, dn.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -829,17 +825,12 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
+                    let (lat, lon) = super::common::plain_coords(n)?;
                     let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Node, n.id(), &n.info())?,
                         clean,
                     );
-                    bb.add_node_partial(
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        n.tags(),
-                        meta.as_ref(),
-                    );
+                    bb.add_node_partial(n.id(), lat, lon, n.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {

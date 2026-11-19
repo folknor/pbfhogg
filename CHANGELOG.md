@@ -324,6 +324,16 @@
 
 ### Fixed
 
+- `extract` no longer moves a node whose block framing puts it beyond an
+  `i32` decimicrodegree. Complete-ways, smart, unsorted simple and the
+  shared multi-extract route wrapped such a coordinate (a latitude offset
+  of 429.4967296 degrees became 0) and could select and write the node at
+  the wrong place, where sorted simple refused it; every strategy now
+  fails with the same error on any such node it classifies or writes. `build-geocode-index` judges each node's
+  geographic domain on the exact nanodegree value before truncation, so a
+  wrapped or just-out-of-range latitude fails the build instead of being
+  indexed. `Node` and `DenseNode` gain `decimicro_lat_checked`,
+  `decimicro_lon_checked`, `nano_lat_exact` and `nano_lon_exact`.
 - `diff` on indexed inputs no longer depends on how a repeated ID falls
   across blobs. Two identical records of one ID, split into two blobs on
   one side and packed into one on the other, were reported as one common,

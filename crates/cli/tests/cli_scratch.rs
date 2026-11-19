@@ -607,7 +607,11 @@ fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
     let buckets = index.join(".buckets-level17");
     std::fs::create_dir_all(&buckets).unwrap();
     std::fs::write(buckets.join("bucket"), vec![9_u8; 256]).unwrap();
-    std::fs::write(index.join("geocode_header.bin"), b"index").unwrap();
+    std::fs::write(
+        index.join("geocode_header.bin"),
+        crate::common::index_header_placeholder(b"index"),
+    )
+    .unwrap();
     // Siblings of the index: the staging of the version before this one
     // (holding the previous index, so a backup), and this version's own
     // staging directory with scratch inside it, which is one entry.
@@ -656,7 +660,11 @@ fn an_index_holding_leftovers_is_not_replaced() {
     crate::common::write_synthetic_indexed_input(&input);
     let index = dir.path().join("index");
     std::fs::create_dir(&index).unwrap();
-    std::fs::write(index.join("geocode_header.bin"), b"index").unwrap();
+    std::fs::write(
+        index.join("geocode_header.bin"),
+        crate::common::index_header_placeholder(b"index"),
+    )
+    .unwrap();
     let backup = index.join(".pbfhogg-backup-999999-0.other.osm.pbf");
     std::fs::create_dir(&backup).unwrap();
     std::fs::write(backup.join("other.osm.pbf"), b"only copy").unwrap();
@@ -680,7 +688,7 @@ fn an_index_holding_leftovers_is_not_replaced() {
     );
     assert_eq!(
         std::fs::read(index.join("geocode_header.bin")).unwrap(),
-        b"index"
+        crate::common::index_header_placeholder(b"index")
     );
     assert!(run.join("id-W0-000").exists());
     let siblings: Vec<_> = names(dir.path())
@@ -700,7 +708,11 @@ fn a_backup_that_cannot_be_removed_is_reported_by_the_cli() {
     let index = dir.path().join("index");
     let locked = index.join("locked");
     std::fs::create_dir_all(&locked).unwrap();
-    std::fs::write(index.join("geocode_header.bin"), b"index").unwrap();
+    std::fs::write(
+        index.join("geocode_header.bin"),
+        crate::common::index_header_placeholder(b"index"),
+    )
+    .unwrap();
     std::fs::write(locked.join("f"), b"x").unwrap();
     let _denial = match dir.deny_write(&locked) {
         Ok(guard) => guard,

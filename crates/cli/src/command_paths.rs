@@ -330,7 +330,7 @@ impl CommandPaths {
                 NamedOutput::File(path) => reject_aliases(&inputs, path)?,
                 NamedOutput::IndexDir(dir) => {
                     for input in &inputs {
-                        if dir_holds(dir, input)? {
+                        if pbfhogg::path_guard::dir_holds(dir, input)? {
                             return Err(format!(
                                 "output '{}' contains input '{}', which replacing it would delete",
                                 dir.display(),
@@ -401,31 +401,6 @@ impl CommandPaths {
             }
         }
     }
-}
-
-/// Whether replacing the directory `dir` would delete `input`: the file it
-/// resolves to lies inside `dir`, or the directory entry that names it does
-/// (a symlink inside `dir` is deleted with it even when its target is not).
-/// An entry further up the input's path, such as a symlinked directory inside
-/// `dir`, only loses that link, not the input or its entry, and is allowed.
-/// A missing input or directory holds nothing; the command's own checks say
-/// what is wrong with it.
-fn dir_holds(dir: &Path, input: &Path) -> std::io::Result<bool> {
-    let resolve = |path: &Path| match std::fs::canonicalize(path) {
-        Ok(path) => Ok(Some(path)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(std::io::Error::new(
-            e.kind(),
-            format!("failed to resolve {}: {e}", path.display()),
-        )),
-    };
-    let (Some(dir), Some(target)) = (resolve(dir)?, resolve(input)?) else {
-        return Ok(false);
-    };
-    if target.starts_with(&dir) {
-        return Ok(true);
-    }
-    Ok(planned_path(input)?.is_some_and(|entry| entry.starts_with(&dir)))
 }
 
 fn paths_alias(input: &Path, output: &Path) -> std::io::Result<bool> {
@@ -537,7 +512,7 @@ impl LeftoverScanner {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
 mod tests {
-    use super::{ScratchSite, TmpDirArg, dir_holds, merge_changes_writes_scratch};
+    use super::{ScratchSite, TmpDirArg, merge_changes_writes_scratch};
     use crate::host;
 
     /// The CLI's host over fixed resources: these tests make scratch and
@@ -639,43 +614,5 @@ mod tests {
             .to_string();
         assert!(err.contains("--tmp-dir"), "{err}");
         assert!(err.contains(&missing.display().to_string()), "{err}");
-    }
-
-    /// Replacing a directory deletes an input inside it, and the entry that
-    /// names an input even when that entry is a symlink or hard link to a
-    /// file outside. A path that only passes through the directory, or
-    /// through a symlinked directory inside it, loses nothing the run reads.
-    #[cfg(unix)]
-    #[test]
-    fn a_directory_holds_an_input_inside_it_or_the_entry_naming_it() {
-        let root = pbfhogg_test_scratch::scratch();
-        let idx = root.path().join("idx");
-        let outside = root.path().join("outside");
-        std::fs::create_dir(&idx).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        let source = outside.join("in.osm.pbf");
-        std::fs::write(&source, b"pbf").unwrap();
-        let inside = idx.join("in.osm.pbf");
-        std::fs::write(&inside, b"pbf").unwrap();
-        let link_in = idx.join("link.osm.pbf");
-        std::os::unix::fs::symlink(&source, &link_in).unwrap();
-        let link_out = outside.join("into-idx.osm.pbf");
-        std::os::unix::fs::symlink(&inside, &link_out).unwrap();
-        let dir_link = idx.join("elsewhere");
-        std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
-        let hard = idx.join("hard.osm.pbf");
-        std::fs::hard_link(&source, &hard).unwrap();
-
-        assert!(dir_holds(&idx, &inside).unwrap());
-        assert!(dir_holds(&idx, &link_in).unwrap());
-        assert!(dir_holds(&idx, &link_out).unwrap());
-        assert!(!dir_holds(&idx, &source).unwrap());
-        assert!(!dir_holds(&idx, &idx.join("..").join("outside").join("in.osm.pbf")).unwrap());
-        assert!(!dir_holds(&idx, &dir_link.join("in.osm.pbf")).unwrap());
-        assert!(!dir_holds(&idx, &outside.join("missing.osm.pbf")).unwrap());
-        assert!(!dir_holds(&root.path().join("no-such-index"), &source).unwrap());
-        // A hard link inside is an entry inside; the outside name for the
-        // same inode (asserted above) is not.
-        assert!(dir_holds(&idx, &hard).unwrap());
     }
 }

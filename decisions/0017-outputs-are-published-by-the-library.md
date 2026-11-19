@@ -28,7 +28,14 @@ output any other way.
   (`OutputError::HoldsLeftovers`, naming the entries) when anything of that
   kind is anywhere inside it, live run directories included, because
   replacing it deletes the old tree; only an index's `.buckets-level*`
-  scratch trees may go with it (ADR-0018). Construction then reserves a hidden
+  scratch trees may go with it (ADR-0018), and the walk still descends into
+  them, since permission to delete a directory does not extend to a backup
+  or run directory found inside it. A caller replacing a directory that may
+  hold the run's own input names that input to the output, which then also
+  refuses, when the input is named and again at the final inspection, while
+  replacement would delete the name the caller gave or the file's last link
+  (judged by directory and file identity, not path prefix), and keeps rather
+  than removes a backup holding any link to it. Construction then reserves a hidden
   staging entry, `.pbfhogg-tmp-<pid>-<n>.<name tail>` (the marker is a
   prefix, so suffix-sniffing writers see the destination's suffix), created
   exclusively. By default it is a sibling of the destination, and creating

@@ -215,9 +215,9 @@ pub fn build_geocode_index<'a>(
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
     let host = &host.enter()?;
-    let output = output.0.bind_unissued(&host.invocation)?;
+    let mut output = output.0.bind_unissued(&host.invocation)?;
     host.invocation.check()?;
-    let stats = build_geocode_index_to(input.into(), config, &output, host, scratch)?;
+    let stats = build_geocode_index_to(input.into(), config, &mut output, host, scratch)?;
     output.publish()?;
     Ok(stats)
 }
@@ -229,26 +229,35 @@ pub fn build_geocode_index<'a>(
 fn build_geocode_index_to(
     input: crate::read::input::InputSource<'_>,
     config: &BuildConfig,
-    output: &crate::output::BoundOutputDir,
+    output: &mut crate::output::BoundOutputDir,
     host: &crate::host::Entered<'_>,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
     config.validate()?;
     refuse_scratch_inside_index(scratch.path(), output.destination())?;
+    // Every failure of the build names the index it was building; a file
+    // the failure is about is named beneath this.
+    let destination = output.destination().to_path_buf();
+    let building =
+        |e: Error| e.context(format!("building geocode index {}", destination.display()));
+    // The input is opened four times (see `build_generation`), every open
+    // derived from this pin, taken before any of them, so an input renamed
+    // over mid-build is never read partly from each file. A path is pinned
+    // here, after the configuration and scratch checks; a caller's pin (one
+    // that composes several steps on the input) is shared as it is.
+    let input = input.pin(host).map_err(building)?;
+    // Publication deletes the replaced index whole, so an input inside it
+    // (`index/source.pbf`) would go with it. Refused now and again in the
+    // output's final inspection, since the input can be moved in meanwhile.
+    output.keep_input(input.clone())?;
     // The generation is built inside the output's staging directory, on
     // inodes of its own: publication swaps the whole directory, so a failed
     // build never truncates the files an already-open Reader has mapped,
     // and the previous index survives every failure. The writer is finished
     // only once the build returned with every file it wrote closed.
     let writer = output.writer()?;
-    // Every failure of the build names the index it was building; a file
-    // the failure is about is named beneath this.
-    let stats = build_generation(input, config, writer.path(), host, &scratch).map_err(|e| {
-        e.context(format!(
-            "building geocode index {}",
-            output.destination().display()
-        ))
-    })?;
+    let stats =
+        build_generation(&input, config, writer.path(), host, &scratch).map_err(building)?;
     writer.finish();
     // The run scratch goes before publication: its removal is the run's
     // cleanup, and publication only syncs and renames the index.
@@ -324,21 +333,87 @@ fn refuse_scratch_inside_index(
 /// directory, an older version's scratch) is refused whatever this says, and
 /// only an index's `.buckets-level*` trees go with it.
 ///
+/// An index is recognised by its header file: a regular file (never followed
+/// through a symlink) at least a header long that starts with the format's
+/// magic. The version after the magic is not read, so an index of any
+/// format, older ones included, can be rebuilt in place; the magic and the
+/// header's length have been the same in every format. The rest of the
+/// index is not checked: a directory with a genuine header and other files
+/// beside it is an index, and those files go with it.
+///
 /// # Errors
 /// An invalid-argument error naming the directory when it holds anything
-/// but an index.
+/// but an index; an I/O error when what it holds cannot be inspected.
 pub fn replaceable_index_dir(destination: &std::path::Path) -> Result<()> {
-    if !destination.is_dir() || destination.join(FILE_HEADER).exists() {
+    // The output layer refuses a destination that is a symlink or not a
+    // directory before this runs, and a missing one has nothing to replace.
+    match std::fs::symlink_metadata(destination) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(inspect_error(destination, e)),
+    }
+    let header = destination.join(FILE_HEADER);
+    if holds_index_header(&header).map_err(|e| inspect_error(&header, e))? {
         return Ok(());
     }
-    if std::fs::read_dir(destination)?.next().is_none() {
-        return Ok(());
+    let mut entries = std::fs::read_dir(destination).map_err(|e| inspect_error(destination, e))?;
+    match entries.next() {
+        None => return Ok(()),
+        Some(Err(e)) => return Err(inspect_error(destination, e)),
+        Some(Ok(_)) => {}
     }
     Err(Error::invalid_argument(format!(
         "output path {} exists and is not a geocode index directory; publication would \
          replace it wholesale. Choose a new or empty directory.",
         destination.display()
     )))
+}
+
+fn inspect_error(path: &std::path::Path, e: std::io::Error) -> Error {
+    Error::from(e).context(format!(
+        "cannot inspect {} to decide whether it is a geocode index",
+        path.display()
+    ))
+}
+
+/// Whether `header` is a geocode index header: a regular file, not reached
+/// through a symlink, of at least [`HEADER_SIZE`] bytes beginning with
+/// [`HEADER_MAGIC`]. Checked by `lstat` before the open, so a device or FIFO
+/// is never opened, and opened with `O_NOFOLLOW | O_NONBLOCK` then checked
+/// again, so one swapped in meanwhile is neither followed nor waited on.
+fn holds_index_header(header: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::symlink_metadata(header) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    // A read of the replaced index's header, to recognise it, not an input
+    // of the build.
+    #[allow(clippy::disallowed_methods)]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(header);
+    let mut file = match file {
+        Ok(file) => file,
+        // ELOOP: a symlink was swapped in after the lstat.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    let mut prefix = [0u8; HEADER_SIZE];
+    match file.read_exact(&mut prefix) {
+        Ok(()) => Ok(prefix[..HEADER_MAGIC.len()] == HEADER_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Check and stage the output for an index at `destination`;
@@ -384,7 +459,7 @@ pub fn index_output_with_staging(
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn build_generation(
-    input: crate::read::input::InputSource<'_>,
+    input: &crate::read::input::PinnedInput,
     config: &BuildConfig,
     output_dir: &std::path::Path,
     host: &crate::host::Entered<'_>,
@@ -395,20 +470,15 @@ fn build_generation(
     // `output_dir` is the output's staging directory, which `OutputDir`
     // created when it was staged; it is not created again here.
 
-    // The input is opened four times: the indexdata probe, the replication
-    // header read, the schedule walk, whose one description the
-    // unindexed classify, pass 1, pass 1.5 and pass 2 then share, and the
-    // whole-file digest's own sequential description.
-    // Every open is derived from this pin, taken before any of them, so an
-    // input renamed over mid-build is never read partly from each file.
-    // A path is pinned here, after the configuration and output checks, so
-    // a failure to pin is named with the index; a caller's pin (one that
-    // composes several steps on the input) is shared as it is.
-    let input = input.pin(host)?;
+    // The input is opened four times, each open derived from the caller's
+    // pin: the indexdata probe, the replication header read, the schedule
+    // walk, whose one description the unindexed classify, pass 1, pass 1.5
+    // and pass 2 then share, and the whole-file digest's own sequential
+    // description.
 
     // Validate input
     crate::commands::require_indexdata(
-        &input,
+        input,
         config.direct_io,
         config.allow_unindexed,
         "input PBF has no blob-level indexdata. Without indexdata, \
@@ -417,7 +487,7 @@ fn build_generation(
     )?;
 
     // Read PBF header
-    let reader = ElementReader::open_in(&input, config.direct_io, host)?;
+    let reader = ElementReader::open_in(input, config.direct_io, host)?;
     let pbf_header = reader.header();
     // The geocode header stores replication sequence in a u32. Missing
     // metadata is represented by zero, but wrapping a present larger value
@@ -454,7 +524,7 @@ fn build_generation(
         max_node_id,
         file: shared_file,
         file_size: walked_size,
-    } = pass1_5::build_schedules(&input, host)?;
+    } = pass1_5::build_schedules(input, host)?;
     host.invocation.marker("GEOCODE_SCHEDULES_END");
     host.invocation.check()?;
 
@@ -463,11 +533,11 @@ fn build_generation(
     // only for the header write (see `input_digest`). Opened here, on the
     // calling thread, so the open is counted with the others. The worker
     // borrows the pin, so `input` lives until the scope has joined it.
-    let digest_file = input_digest::open(&input, &host.invocation)?;
+    let digest_file = input_digest::open(input, &host.invocation)?;
     let digest_stop = std::sync::atomic::AtomicBool::new(false);
     crate::threads::scope(|s| {
         let worker =
-            s.spawn(|| input_digest::hash(digest_file, &input, &digest_stop, &host.invocation));
+            s.spawn(|| input_digest::hash(digest_file, input, &digest_stop, &host.invocation));
         // Dropped unused (the build failed or unwound before its header),
         // this stops the hash before the scope joins it.
         let stop_on_failure = input_digest::StopOnDrop(&digest_stop);
@@ -481,7 +551,7 @@ fn build_generation(
                 Err(payload) => std::panic::resume_unwind(payload),
             }
             .ok_or_else(|| Error::internal("the input digest stopped before the header write"))?;
-            input_digest::check_extent(digest, walked_size, &input)
+            input_digest::check_extent(digest, walked_size, input)
         };
         build_from_schedules(
             pass1_5::Schedules {

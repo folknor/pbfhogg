@@ -140,6 +140,158 @@ pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// `(st_dev, st_ino)`.
+type Identity = (u64, u64);
+
+fn identity_of(meta: &fs::Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+/// What removing a directory tree recursively would take with it, as seen
+/// from one file: the identity of every directory in the tree (the root
+/// included), and every entry, as (parent directory identity, name), that is
+/// a hard link to the file. Symlinks are never followed, so a link inside
+/// pointing out costs only the link. Identities rather than paths, so a bind
+/// mount aliasing the tree or a directory in it is still recognised, and a
+/// directory reached twice is walked once and its entries counted once.
+#[derive(Default)]
+struct Removed {
+    dirs: std::collections::HashSet<Identity>,
+    links: std::collections::HashSet<(Identity, std::ffi::OsString)>,
+}
+
+fn removed_with(dir: &Path, file: Identity) -> std::io::Result<Removed> {
+    let mut removed = Removed::default();
+    let root = match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => meta,
+        Ok(_) => return Ok(removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+        Err(e) => return Err(e),
+    };
+    let root = identity_of(&root);
+    removed.dirs.insert(root);
+    let mut pending = vec![(dir.to_path_buf(), root)];
+    while let Some((next, parent)) = pending.pop() {
+        for entry in fs::read_dir(&next)? {
+            let entry = entry?;
+            // `DirEntry::metadata` does not follow a symlink.
+            let meta = entry.metadata()?;
+            let id = identity_of(&meta);
+            if meta.is_dir() {
+                if removed.dirs.insert(id) {
+                    pending.push((entry.path(), id));
+                }
+            } else if id == file {
+                removed.links.insert((parent, entry.file_name()));
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Whether replacing the directory `dir` wholesale (moved aside, then
+/// removed recursively) would delete the run's input: `file` is the input
+/// file's live metadata and `label` the path the caller named it by.
+///
+/// Refused when the tree holds every remaining link to the file (an outside
+/// hard link survives, so then the file does too), or, while `label` still
+/// resolves to the file, when the entry `label` names, or the file it
+/// resolves to, sits in a directory of the tree (a symlink inside is
+/// deleted with it even when its target is not). A path that merely passes
+/// through a symlinked directory inside `dir` loses only that link and is
+/// allowed. A file with no link at all (an unlinked, pinned input) has
+/// nothing to lose. A label that no longer names the file is not judged by
+/// name; the link rule alone covers a file moved after it was named.
+///
+/// The judgement is of the tree as it is now; a caller rechecks immediately
+/// before the replacement, and namespace changes after that are outside it.
+///
+/// # Errors
+/// Any error walking `dir` or resolving `label` other than not-found: what
+/// the walk did not see cannot be shown to survive.
+pub(crate) fn replacing_dir_deletes(
+    dir: &Path,
+    label: &Path,
+    file: &fs::Metadata,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let id = identity_of(file);
+    let removed = removed_with(dir, id)?;
+    if removed.dirs.is_empty() {
+        return Ok(false);
+    }
+    if !removed.links.is_empty() && removed.links.len() as u64 >= file.nlink() {
+        return Ok(true);
+    }
+    let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match fs::metadata(label) {
+        Ok(meta) if identity_of(&meta) == id => {}
+        Ok(_) => return Ok(false),
+        Err(e) if not_found(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let inside = |path: &Path| match fs::metadata(path) {
+        Ok(meta) => Ok(removed.dirs.contains(&identity_of(&meta))),
+        Err(e) if not_found(&e) => Ok(false),
+        Err(e) => Err(e),
+    };
+    // A bare relative file name's parent is the current directory.
+    let entry_parent = label
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if inside(entry_parent)? {
+        return Ok(true);
+    }
+    match fs::canonicalize(label) {
+        Ok(target) => match target.parent() {
+            Some(parent) => inside(parent),
+            None => Ok(false),
+        },
+        Err(e) if not_found(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a directory tree holds any link to `file` at all, whatever other
+/// links exist: removing a tree that holds one is never done on the strength
+/// of a link count that may have gone stale.
+///
+/// # Errors
+/// Any error walking `dir`.
+pub(crate) fn tree_links_to(dir: &Path, file: &fs::Metadata) -> std::io::Result<bool> {
+    Ok(!removed_with(dir, identity_of(file))?.links.is_empty())
+}
+
+/// Whether replacing the directory `dir` would delete `input`, by the rule
+/// of [`replacing_dir_deletes`]: the CLI's preflight, which refuses before
+/// any work what the library refuses again before publication. A missing
+/// input or directory holds nothing; the command's own checks say what is
+/// wrong with it.
+///
+/// # Errors
+/// Any error but not-found, naming the path.
+#[doc(hidden)]
+pub fn dir_holds(dir: &Path, input: &Path) -> std::io::Result<bool> {
+    let named = |path: &Path, e: std::io::Error| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to check whether {} holds {}: {e}",
+                dir.display(),
+                path.display()
+            ),
+        )
+    };
+    let file = match fs::metadata(input) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(named(input, e)),
+    };
+    replacing_dir_deletes(dir, input, &file).map_err(|e| named(input, e))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -204,5 +356,53 @@ pub(crate) mod tests {
         assert!(!same_file(&base, &other).expect("equal bytes, different file"));
         assert!(!same_file(&base, &absent).expect("absent output"));
         assert!(!same_file(&absent, &base).expect("absent input"));
+    }
+
+    /// Replacing a directory deletes an input inside it, and the entry that
+    /// names an input even when that entry is a symlink to a file outside.
+    /// A path that only passes through the directory, or through a
+    /// symlinked directory inside it, loses nothing the run reads, and a
+    /// file with a hard link outside survives.
+    #[test]
+    fn a_directory_holds_an_input_inside_it_or_the_entry_naming_it() {
+        let root = scratch();
+        let idx = root.path().join("idx");
+        let outside = root.path().join("outside");
+        fs::create_dir(&idx).expect("fixture");
+        fs::create_dir(&outside).expect("fixture");
+        let source = outside.join("in.osm.pbf");
+        fs::write(&source, b"pbf").expect("fixture");
+        let inside = idx.join("in.osm.pbf");
+        fs::write(&inside, b"pbf").expect("fixture");
+        let link_in = idx.join("link.osm.pbf");
+        std::os::unix::fs::symlink(&source, &link_in).expect("fixture");
+        let link_out = outside.join("into-idx.osm.pbf");
+        std::os::unix::fs::symlink(&inside, &link_out).expect("fixture");
+        let dir_link = idx.join("elsewhere");
+        std::os::unix::fs::symlink(&outside, &dir_link).expect("fixture");
+        let buckets = idx.join(".buckets-level9");
+        fs::create_dir(&buckets).expect("fixture");
+        let hard = buckets.join("hard.osm.pbf");
+        fs::hard_link(&source, &hard).expect("fixture");
+
+        assert!(dir_holds(&idx, &inside).expect("fixture"));
+        assert!(dir_holds(&idx, &link_in).expect("fixture"));
+        assert!(dir_holds(&idx, &link_out).expect("fixture"));
+        assert!(!dir_holds(&idx, &source).expect("fixture"));
+        assert!(
+            !dir_holds(&idx, &idx.join("..").join("outside").join("in.osm.pbf")).expect("fixture")
+        );
+        assert!(!dir_holds(&idx, &dir_link.join("in.osm.pbf")).expect("fixture"));
+        assert!(!dir_holds(&idx, &outside.join("missing.osm.pbf")).expect("fixture"));
+        assert!(!dir_holds(&root.path().join("no-such-index"), &source).expect("fixture"));
+        // The name given is inside, though another link survives outside.
+        assert!(dir_holds(&idx, &hard).expect("fixture"));
+        assert!(tree_links_to(&idx, &fs::metadata(&source).expect("fixture")).expect("fixture"));
+
+        // The outside name goes: the link inside is now the last one, and a
+        // label that no longer names the file is judged by links alone.
+        fs::remove_file(&source).expect("fixture");
+        let file = fs::metadata(&hard).expect("fixture");
+        assert!(replacing_dir_deletes(&idx, &source, &file).expect("fixture"));
     }
 }

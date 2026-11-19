@@ -79,6 +79,18 @@ pub fn out_replace(path: impl AsRef<Path>) -> pbfhogg::Output {
     .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
 }
 
+/// The bytes of a placeholder geocode index header carrying `tag`: what the
+/// builder recognises as an index it may replace (`GIDX` and a header's
+/// length, any version), without being a readable index. `tag` lets a test
+/// tell one planted index from another byte for byte.
+#[allow(dead_code)]
+pub fn index_header_placeholder(tag: &[u8]) -> Vec<u8> {
+    let mut bytes = b"GIDX".to_vec();
+    bytes.extend_from_slice(tag);
+    bytes.resize(bytes.len().max(128), 0);
+    bytes
+}
+
 /// A FIFO named `name` in `dir`: the one place integration tests create
 /// FIFOs (input-pinning refusals, and `fifo_capture::FifoCapture`).
 #[cfg(unix)]

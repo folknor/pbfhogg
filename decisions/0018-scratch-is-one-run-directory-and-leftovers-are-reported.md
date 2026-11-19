@@ -100,7 +100,10 @@ directory.
   `IndexScratch` report says publication will delete it. It is the one reported
   kind that anything removes. Every other kind inside a directory output
   blocks its replacement outright (`OutputError::HoldsLeftovers`, ADR-0017),
-  live or not: the scan reports, the output layer refuses.
+  live or not, inside a `.buckets-level*` tree included: the scan reports,
+  the output layer refuses. Recognising an index is the builder's rule: its
+  header file is a regular file, never a symlink, a header long and starting
+  with the format magic, whatever version follows.
   Network filesystems limit what the lock can say, accepted because the
   report is worded as a belief and nothing is deleted: an NFS mount with
   `local_lock=flock` or `local_lock=all` (or an NFSv3 mount with `nolock`)

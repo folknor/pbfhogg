@@ -289,21 +289,6 @@ remaining cleanup. The output layer already handles this exact hazard by
 suppressing cleanup callbacks during unwinding (`emit_cleanup`, `output.rs`).
 Scratch has no equivalent protection.
 
-## FMT-023 - A .buckets-level directory hides a nested backup from deletion protection
-
-Reported by: filesystem-output [P1].
-
-`protected_entries` (`scratch.rs`) skips `.buckets-level*` directories
-entirely. Given an existing tree `index/geocode_header.bin` plus
-`index/.buckets-level9/.pbfhogg-backup-123-0.previous/`, replacement passes
-the protection check, and after publication `output.rs` recursively deletes
-the old tree, nested backup included. No concurrent mutation is needed. This
-breaks ADR-0017's promise to refuse protected entries anywhere inside a
-directory, and the promise that a kept backup is never deleted. The local
-helper's documentation describes the shortcut accurately. The hunter says the
-shortcut is wrong against the stronger contract: allowing removal of the
-bucket directory should not exempt its descendants from inspection.
-
 ## FMT-024 - path_guard same_file stringifies the original I/O error
 
 Reported by: filesystem-output [P2].
@@ -314,7 +299,9 @@ string and builds a replacement `io::Error`. A canonicalization failure with
 errno, and later conversion into `pbfhogg::Error` cannot recover either. This
 breaks the error-provenance contract in `reference/pipeline.md`: typed errors
 keep their causes, and intermediate layers do not stringify them. The original
-error should be kept in a typed path wrapper.
+error should be kept in a typed path wrapper. `path_guard::dir_holds`, the
+containment preflight `build-geocode-index` shares with the library, names
+its errors the same way and should move with it.
 
 ## FMT-025 - ParallelGzipWriter writes nothing for an empty stream
 
@@ -332,3 +319,19 @@ Reported by: read-framing (optimization observation).
 serialized Blob through `parse_slice`, even though it already receives
 borrowed bytes and caller-owned output storage. The hunter ties the fix to the
 shared borrowed envelope parser proposed under BUG-001 in `notes/bugs.md`.
+
+## FMT-027 - A mount point inside a replaced directory output is not considered
+
+Reported by: the geocode replacement and deletion-protection work (lateral).
+
+`inspect` (`output.rs`) refuses a directory output that is itself a mount
+point, but nothing looks for a mount point below it. Replacing such a
+directory renames it into the backup container (a rename that carries the
+mounted subtree along) and then removes the backup recursively, which descends
+into the mounted filesystem. The protection walk in `scratch.rs` and the input
+containment walk in `path_guard.rs` both read through mounts, and the latter
+deduplicates directories by identity, so a bind mount over part of the tree
+that exposes different contents in two views can hide one of them from it.
+The likely rule is to refuse replacing, and to keep rather than remove, a tree
+holding any mount point, found by comparing each directory's device with its
+parent's plus the Linux mountinfo check `process::is_mount_point` already does.

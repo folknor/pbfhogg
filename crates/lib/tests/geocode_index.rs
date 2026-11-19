@@ -1846,6 +1846,118 @@ fn overwrite_and_allow_unindexed_are_independent_permissions() {
     assert_eq!(stats.street_ways, 1);
 }
 
+/// Overwrite replaces an index, recognised by its header file: a regular
+/// file, never a symlink, a header long and starting with the format magic,
+/// whatever version follows it. A directory with anything else under the
+/// header's name is not an index, and is left as it was.
+#[cfg(unix)]
+#[test]
+fn replacement_recognises_an_index_by_its_header() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_synthetic_indexed_input(&input);
+    let config = pbfhogg::geocode_index::builder::BuildConfig::default();
+    let host = crate::common::test_host();
+    let real = dir.path().join("real");
+    build_index(&input, &config, &real, false, &host).expect("initial build");
+    let index_dir = dir.path().join("index");
+    let header = index_dir.join("geocode_header.bin");
+    let as_dir = || std::fs::create_dir(&header).expect("plant");
+    let empty = || std::fs::write(&header, b"").expect("plant");
+    let short = || std::fs::write(&header, b"GIDX").expect("plant");
+    let other = || std::fs::write(&header, [7_u8; 128]).expect("plant");
+    let symlink = || {
+        std::os::unix::fs::symlink(real.join("geocode_header.bin"), &header).expect("plant");
+    };
+    let plant: [(&str, &dyn Fn()); 5] = [
+        ("a directory", &as_dir),
+        ("an empty file", &empty),
+        ("a short GIDX file", &short),
+        ("other bytes", &other),
+        ("a symlink to a real header", &symlink),
+    ];
+    for (what, plant) in &plant {
+        std::fs::create_dir(&index_dir).expect("index dir");
+        plant();
+        std::fs::write(index_dir.join("keep.txt"), b"mine").expect("plant");
+        let err = build_index(&input, &config, &index_dir, true, &host)
+            .expect_err("not an index, so not replaced");
+        assert!(
+            err.to_string().contains("not a geocode index directory"),
+            "{what}: {err}"
+        );
+        assert_eq!(
+            std::fs::read(index_dir.join("keep.txt")).expect("kept"),
+            b"mine",
+            "{what}"
+        );
+        std::fs::remove_dir_all(&index_dir).expect("reset");
+    }
+
+    // An index of an older format, recognised by its magic alone.
+    std::fs::create_dir(&index_dir).expect("index dir");
+    let mut old = crate::common::index_header_placeholder(b"");
+    old[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    std::fs::write(&header, old).expect("plant");
+    std::fs::write(index_dir.join("geo_cells.bin"), b"old").expect("plant");
+    build_index(&input, &config, &index_dir, true, &host).expect("an older index is replaced");
+    assert_ne!(
+        std::fs::read(index_dir.join("geo_cells.bin")).expect("rebuilt"),
+        b"old"
+    );
+}
+
+/// Publication deletes the index it replaces, so an input inside it would
+/// go too: the library refuses that itself, not only the CLI. A hard link
+/// inside to an input named outside costs only that link, so the rebuild
+/// proceeds, and the backup holding the link is kept rather than removed.
+#[cfg(unix)]
+#[test]
+fn an_input_inside_the_replaced_index_is_never_deleted() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_synthetic_indexed_input(&input);
+    let config = pbfhogg::geocode_index::builder::BuildConfig::default();
+    let host = crate::common::test_host();
+    let index_dir = dir.path().join("index");
+    build_index(&input, &config, &index_dir, false, &host).expect("initial build");
+
+    let inside = index_dir.join("source.osm.pbf");
+    std::fs::copy(&input, &inside).expect("copy input inside");
+    let err = build_index(&inside, &config, &index_dir, true, &host)
+        .expect_err("an input inside the index is refused");
+    assert!(
+        matches!(
+            err.kind(),
+            pbfhogg::ErrorKind::Output(pbfhogg::OutputError::HoldsInput { .. })
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&inside).expect("input survives"),
+        std::fs::read(&input).expect("read")
+    );
+    std::fs::remove_file(&inside).expect("reset");
+
+    let hard = index_dir.join("hard.osm.pbf");
+    std::fs::hard_link(&input, &hard).expect("hard link");
+    build_index(&input, &config, &index_dir, true, &host).expect("outside name survives");
+    assert!(input.exists());
+    let kept: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("list")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".pbfhogg-backup-"))
+        })
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "the backup holding the link is kept: {kept:?}"
+    );
+}
+
 /// Publication renames the output path itself, so a symlinked output
 /// directory would be replaced by a real directory. It is refused before any
 /// input is read, and the link and its target are left alone.

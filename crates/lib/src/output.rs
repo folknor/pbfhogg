@@ -1408,6 +1408,11 @@ struct Target {
     backup_dir: Option<PathBuf>,
     overwrite: Overwrite,
     validator: Option<Validator>,
+    /// The run's input, when it is read while a directory output that may
+    /// hold it is replaced ([`BoundOutputDir::keep_input`]): replacement
+    /// is refused while it would delete the input, and a backup holding any
+    /// link to it is kept.
+    input: Option<crate::read::input::PinnedInput>,
     state: State,
     /// Published by `link(2)`: the staging name is a second link to the
     /// output until it is unlinked.
@@ -1564,6 +1569,7 @@ impl Target {
             backup_dir,
             overwrite,
             validator,
+            input: None,
             state: State::Staged,
             linked: false,
             session,
@@ -1626,7 +1632,42 @@ impl Target {
     }
 
     fn recheck(&self) -> Result<()> {
-        inspect(&self.dest, self.shape, self.overwrite, self.validator)
+        inspect(&self.dest, self.shape, self.overwrite, self.validator)?;
+        self.refuse_holding_input()
+    }
+
+    /// Refuse while replacing the destination would delete the run's input
+    /// (see [`crate::path_guard::replacing_dir_deletes`]).
+    fn refuse_holding_input(&self) -> Result<()> {
+        let Some(input) = &self.input else {
+            return Ok(());
+        };
+        let file = input.metadata()?;
+        let deletes = crate::path_guard::replacing_dir_deletes(&self.dest, input.path(), &file)
+            .map_err(|e| {
+                Error::from(e).context(format!(
+                    "cannot check whether output {} holds the input {}",
+                    self.dest.display(),
+                    input.path().display()
+                ))
+            })?;
+        if deletes {
+            return Err(new_output_error(OutputError::HoldsInput {
+                path: self.dest.clone(),
+                input: input.path().to_path_buf(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Whether `tree` holds a link to the run's input, so it is never
+    /// removed; the caller keeps the tree when this cannot be answered.
+    fn links_to_input(&self, tree: &Path) -> Result<bool> {
+        let Some(input) = &self.input else {
+            return Ok(false);
+        };
+        let file = input.metadata()?;
+        Ok(crate::path_guard::tree_links_to(tree, &file)?)
     }
 
     fn identity(&self) -> Option<Identity> {
@@ -2151,6 +2192,30 @@ impl Target {
                 self.pending.push(format!(
                     "{} was published; the backup of the previous output at {} is kept because \
                      what it holds could not be checked ({e}). Check it, then remove it yourself",
+                    self.dest.display(),
+                    backup.container.display()
+                ));
+                return;
+            }
+        }
+        // The input's other links were checked before the swap, but a link
+        // count can go stale; a backup holding any link to it is kept.
+        match self.links_to_input(&backup.container) {
+            Ok(false) => {}
+            Ok(true) => {
+                self.pending.push(format!(
+                    "{} was published; the backup of the previous output at {} is kept because \
+                     it holds a link to the run's input. Check it, then remove it yourself",
+                    self.dest.display(),
+                    backup.container.display()
+                ));
+                return;
+            }
+            Err(e) => {
+                self.pending.push(format!(
+                    "{} was published; the backup of the previous output at {} is kept because \
+                     whether it holds the run's input could not be checked ({e}). Check it, \
+                     then remove it yourself",
                     self.dest.display(),
                     backup.container.display()
                 ));
@@ -3363,6 +3428,19 @@ impl BoundOutputDir {
         &self.invocation
     }
 
+    /// Guard `input`, which the run reads, against this output's
+    /// replacement: refused now, and again in the final inspection before
+    /// publication, while replacing the destination would delete the name
+    /// the caller gave or the file's last link (a hard link outside
+    /// survives; a symlink inside does not), and a backup holding any link
+    /// to it is kept rather than removed. The rule is
+    /// [`crate::path_guard::replacing_dir_deletes`].
+    pub(crate) fn keep_input(&mut self, input: crate::read::input::PinnedInput) -> Result<()> {
+        let target = &mut self.dir.target;
+        target.input = Some(input);
+        target.refuse_holding_input()
+    }
+
     /// Open the output's single writing session: the staging directory to
     /// fill, and the [`DirWriter::finish`] that lets it be published.
     ///
@@ -4248,10 +4326,20 @@ mod tests {
         let index = dir.path().join("index");
         fs::create_dir_all(index.join("sub")).unwrap();
         fs::write(index.join("header"), b"index").unwrap();
-        // Index scratch may go with it.
-        fs::create_dir_all(index.join(".buckets-level17").join(".pbfhogg-run-1-ab")).unwrap();
+        // Index scratch may go with it, but not what is inside it.
+        let buckets = index.join(".buckets-level17");
+        fs::create_dir_all(&buckets).unwrap();
+        fs::write(buckets.join("000"), b"bucket").unwrap();
         let out = OutputDir::new(&index, Overwrite::Replace, None, &discard()).unwrap();
         drop(out);
+        let nested = buckets.join(".pbfhogg-backup-123-0.previous");
+        fs::create_dir(&nested).unwrap();
+        let err = OutputDir::new(&index, Overwrite::Replace, None, &discard()).unwrap_err();
+        let OutputError::HoldsLeftovers { entries, .. } = output_error(&err) else {
+            panic!("expected a leftover refusal, got {err}");
+        };
+        assert_eq!(entries, std::slice::from_ref(&nested));
+        fs::remove_dir(&nested).unwrap();
         // A backup deep inside, with a name that is not UTF-8.
         let mut name = b".pbfhogg-backup-1-0.".to_vec();
         name.push(0xff);

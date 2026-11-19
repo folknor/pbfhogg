@@ -867,9 +867,12 @@ pub(crate) fn is_leftover_name(name: &OsStr) -> bool {
 
 /// Every entry under `dir` (not `dir` itself) that no pbfhogg code path may
 /// delete: anything [`is_leftover_name`] recognises, whatever its liveness.
-/// Classified entries are listed whole and not descended into, nor are
-/// `.buckets-level*` trees (index scratch, which replacing an index may
-/// discard). Symlinks are never followed.
+/// Classified entries are listed whole and not descended into. A
+/// `.buckets-level*` tree (index scratch) is not itself protected, since
+/// replacing an index may discard it, but it is descended into like any
+/// other directory: being allowed to delete a directory does not exempt
+/// what is inside it, and a backup or run directory found there is
+/// protected. Symlinks are never followed.
 ///
 /// Used before anything is removed recursively: replacing a directory
 /// output, removing a replaced output's backup, and dropping a directory
@@ -884,11 +887,7 @@ pub(crate) fn protected_entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
             let name = entry.file_name();
             if is_leftover_name(&name) {
                 found.push(entry.path());
-            } else if !name
-                .as_bytes()
-                .starts_with(LEGACY_BUCKETS_PREFIX.as_bytes())
-                && entry.file_type()?.is_dir()
-            {
+            } else if entry.file_type()?.is_dir() {
                 pending.push(entry.path());
             }
         }

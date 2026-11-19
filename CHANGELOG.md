@@ -333,6 +333,21 @@
 
 ### Fixed
 
+- `build-geocode-index --overwrite` replaces only a directory whose
+  `geocode_header.bin` really is an index header: a regular file, not a
+  symlink, a header long and starting with the format's magic. Any other
+  entry of that name (an empty or unrelated file, a directory, a symlink)
+  no longer authorises deleting the directory. Indexes of every earlier
+  format are still recognised and can be rebuilt in place.
+- Replacing a directory output no longer deletes a backup, staging entry or
+  run directory that sits inside an index's `.buckets-level*` scratch tree;
+  the replacement is refused naming it, as anywhere else in the directory.
+- The library's `build_geocode_index` now refuses to replace an index that
+  holds its own input (the path given, or the input file's last link), as
+  the CLI already did, with the new `OutputError::HoldsInput`. The check is
+  repeated just before publication and compares directories by identity,
+  so an input moved into the index mid-build or reached through a bind
+  mount is caught; a backup holding any link to the input is kept.
 - `extract` no longer moves a node whose block framing puts it beyond an
   `i32` decimicrodegree. Complete-ways, smart, unsorted simple and the
   shared multi-extract route wrapped such a coordinate (a latitude offset

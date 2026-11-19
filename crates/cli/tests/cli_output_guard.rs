@@ -145,7 +145,11 @@ fn a_geocode_index_directory_holding_an_input_is_refused() {
     let idx = dir.path().join("idx");
     std::fs::create_dir(&idx).unwrap();
     // An index, as far as replacement is concerned.
-    std::fs::write(idx.join("geocode_header.bin"), b"").unwrap();
+    std::fs::write(
+        idx.join("geocode_header.bin"),
+        crate::common::index_header_placeholder(b""),
+    )
+    .unwrap();
     let inside = idx.join("in.osm.pbf");
     write_fixture(&inside);
     let outside = dir.path().join("source.osm.pbf");

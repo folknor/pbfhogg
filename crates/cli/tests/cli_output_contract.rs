@@ -2234,8 +2234,9 @@ mod in_publication {
         ROWS.iter().find(|row| row.label == label).unwrap()
     }
 
-    /// The header file name that makes a directory one the index builder
-    /// agrees to replace (it refuses any other non-empty directory).
+    /// The header file that makes a directory one the index builder agrees
+    /// to replace (it refuses any other non-empty directory), when it holds
+    /// a header-shaped placeholder.
     const INDEX_HEADER: &str = "geocode_header.bin";
 
     /// Plant a previous output with bytes of its own: a file holding
@@ -2246,7 +2247,11 @@ mod in_publication {
             Kind::File => std::fs::write(path, USER_DATA).unwrap(),
             Kind::Dir => {
                 std::fs::create_dir(path).unwrap();
-                std::fs::write(path.join(INDEX_HEADER), USER_DATA).unwrap();
+                std::fs::write(
+                    path.join(INDEX_HEADER),
+                    crate::common::index_header_placeholder(USER_DATA),
+                )
+                .unwrap();
             }
         }
     }
@@ -2258,7 +2263,8 @@ mod in_publication {
             Kind::Dir => {
                 path.is_dir()
                     && names(path) == [INDEX_HEADER]
-                    && std::fs::read(path.join(INDEX_HEADER)).is_ok_and(|b| b == USER_DATA)
+                    && std::fs::read(path.join(INDEX_HEADER))
+                        .is_ok_and(|b| b == crate::common::index_header_placeholder(USER_DATA))
             }
         }
     }

@@ -915,6 +915,11 @@ pub enum OutputError {
         path: PathBuf,
         entries: Vec<PathBuf>,
     },
+    /// A directory output to be replaced holds the run's own input: the
+    /// name `input` that the caller supplied, or the last remaining link to
+    /// the file being read, which replacing the directory would delete.
+    /// Nothing was installed.
+    HoldsInput { path: PathBuf, input: PathBuf },
     /// Publishing failed and undoing it failed too, or was impossible (a
     /// lone file renamed over its previous output, which no backup holds,
     /// stays published). Each entry says what was left where; nothing it
@@ -1037,6 +1042,13 @@ impl fmt::Display for OutputError {
                  first",
                 path.display(),
                 join_paths(entries)
+            ),
+            Self::HoldsInput { path, input } => write!(
+                f,
+                "output directory {} cannot be replaced: it holds the input {} (or its last \
+                 remaining link), which replacing it would delete; move the input out first",
+                path.display(),
+                input.display()
             ),
             Self::RollbackIncomplete { unresolved, .. } => write!(
                 f,

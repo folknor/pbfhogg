@@ -146,6 +146,8 @@ pbfhogg build-geocode-index denmark.osm.pbf --output-dir geocode-index/
 
 This runs a 4-pass pipeline: admin boundary relations, referenced node collection, node+way fused scan, and bucketed S2 cell assignment. The output is a set of memory-mappable binary files for fast reverse geocoding queries.
 
+From Rust, `geocode_index::builder::build_geocode_index` refuses, as the CLI does, to replace an index directory that holds its own input: the name it was given, or the input file's last link, inside the directory (`OutputError::HoldsInput`). It checks once the input is pinned and again immediately before publication, and keeps rather than removes a backup of the replaced index that holds any link to the input.
+
 Build time and memory use depend on the input and host. See [reference/performance/geocode.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/geocode.md) for measurements.
 
 The index can be queried from Rust using the `geocode-reader` feature:

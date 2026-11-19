@@ -25,38 +25,6 @@ truncation (BUG-004), candidate
 ranking ties (BUG-026) and building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 
-## GEO-001 - The index overwrite check accepts any directory containing geocode_header.bin
-
-Reported by: geocode-builder [P1], filesystem-output [P2].
-
-`replaceable_index_dir` (`geocode_index/builder/mod.rs`) accepts a nonempty
-directory whenever an entry named `geocode_header.bin` exists. That entry can
-be an empty file, an unrelated file, a symlink or even a directory. No header
-contents or index structure are checked before publication replaces the whole
-destination and deletes its backup. For example, an unrelated directory
-holding an empty subdirectory called `geocode_header.bin` passes
-`index_output(..., Replace, ...)`, and a successful build replaces it and
-deletes its contents. This breaks the function's promise that overwrite
-replaces an index or an empty directory, never an arbitrary one, and the
-index-or-empty restriction in `docs/cli/commands.md`. `OutputDir` faithfully
-carries out the authorization it is given, so the eligibility check is the
-wrong end. The check should establish that the destination is an index, while
-still allowing replacement of older formats.
-
-## GEO-002 - The library index builder can delete its own input PBF
-
-Reported by: filesystem-output (flagged as a boundary hazard).
-
-`build_geocode_index_to` (`geocode_index/builder/mod.rs`) checks whether
-scratch lies inside the destination, but not whether the input does. A library
-caller can rebuild an existing index from `index/source.pbf` with scratch
-outside the index. The build reads the input, and publication then replaces
-the index directory and deletes `source.pbf` along with the old generation.
-The CLI prevents this with its containment preflight. The documented refusal
-belongs to the CLI contract, so the hunter flags the library behaviour
-separately rather than claiming that contract covers this API. It is a
-destructive difference between the two entry points.
-
 ## GEO-004 - A corrupt relation member role becomes an outer boundary
 
 Reported by: geocode-builder [P1], read-block-decoding [P2].

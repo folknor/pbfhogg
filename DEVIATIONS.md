@@ -292,6 +292,20 @@ three things libosmium's XML reader accepts at the root level:
   silently discard structured content. A childless `<changeset/>` or
   `<bounds/>` is accepted and ignored.
 
+## OSC input: coordinates with an exponent round from their exact value
+
+pbfhogg's OSC reader stores a node coordinate as its exact decimal value
+rounded half away from zero to decimicrodegrees. For a plain decimal that is
+libosmium's answer too (`39.00704275` is `390070428` in both). With an
+exponent the two differ: libosmium keeps at most eight fraction digits of the
+mantissa and then applies the exponent, so `0.000000001e2` reads as 0 there
+and as 1 in pbfhogg. The accepted spellings also differ: pbfhogg takes what
+Rust's `f64` parser takes (a leading `+`, an exponent `+`, any digit count),
+which libosmium refuses in part. The geographic range check is made on the
+`f64` reading of the text, so a token long enough to defeat that parser's
+exponent handling (hundreds of kilobytes) can be refused although its exact
+value is in range.
+
 ## cat --dedupe: which copy survives, and repeats inside one input
 
 `cat --dedupe` stands in for `osmium merge`, but they choose differently

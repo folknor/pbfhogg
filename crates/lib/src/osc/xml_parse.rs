@@ -188,11 +188,43 @@ pub(crate) fn parse_i64_attr(
     Err(missing_attr(name))
 }
 
-fn parse_f64_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> ParseResult<f64> {
+/// The longest coordinate token the `f64` path decides alone. Up to this
+/// length a nonzero mantissa shifts the decimal order by at most 31 places,
+/// so Rust's exponent-accumulation cap can only bite where both the true and
+/// the parsed value overflow or underflow alike; every other such token
+/// parses correctly rounded. Real coordinates are under 16 bytes.
+const COORD_FAST_MAX_LEN: usize = 32;
+
+/// Read a coordinate attribute: its `f64` degrees (which the geographic check
+/// judges, as before) and, where the `f64` product cannot be trusted to round
+/// like the decimal text, the exact decimicrodegree value of that text.
+///
+/// libosmium rounds the decimal digits themselves, half away from zero, so
+/// `39.00704275` is `390070428`, while `39.00704275 * 1e7` in `f64` is
+/// `390070427.49999994`. A correctly rounded parse of `|deg| <= 180` and the
+/// multiply together err by under `2.7e-7` units, and rounding only changes
+/// at half-units, so outside a `1e-6` window around `.5` the `f64` answer is
+/// the exact one; seven-decimal input never enters it. The inner `Option`
+/// is `None` when the exact value does not fit.
+#[allow(clippy::type_complexity)]
+fn parse_coord_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    name: &str,
+) -> ParseResult<(f64, Option<Option<i64>>)> {
+    let parse = |s: &str| {
+        let deg = s.parse::<f64>()?;
+        let frac = deg_to_e7(deg).abs().fract();
+        let exact = if s.len() > COORD_FAST_MAX_LEN || (frac - 0.5).abs() <= 1e-6 {
+            Some(exact_decimal_e7(s))
+        } else {
+            None
+        };
+        Ok::<_, std::num::ParseFloatError>((deg, exact))
+    };
     for attr_result in e.attributes() {
         let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            return parse_decoded(&attr, str::parse::<f64>)?.map_err(|(text, err)| {
+            return parse_decoded(&attr, parse)?.map_err(|(text, err)| {
                 Error::invalid_data_with(
                     format!("attribute '{name}' is not a valid number: '{text}'"),
                     err,
@@ -201,6 +233,91 @@ fn parse_f64_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> ParseRes
         }
     }
     Err(missing_attr(name))
+}
+
+/// The decimicrodegree value of a decimal spelling `f64` `FromStr` accepted
+/// (sign, digits with an optional point, optional exponent), rounded half
+/// away from zero on the exact decimal value. `None` if the magnitude reaches
+/// `1e11` units or the text is not such a spelling (`inf`, `nan`). Only the
+/// retained digits and the first dropped one are read; exponent arithmetic
+/// saturates, so an arbitrarily long token is still read exactly.
+#[cold]
+fn exact_decimal_e7(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let (neg, body) = match b.first() {
+        Some(b'-') => (true, &b[1..]),
+        Some(b'+') => (false, &b[1..]),
+        _ => (false, b),
+    };
+    let mant_end = body
+        .iter()
+        .position(|c| *c == b'e' || *c == b'E')
+        .unwrap_or(body.len());
+    let (mant, exp_part) = body.split_at(mant_end);
+    let exp: i64 = match exp_part.split_first() {
+        None => 0,
+        Some((_, rest)) => {
+            let (eneg, digits) = match rest.first() {
+                Some(b'-') => (true, &rest[1..]),
+                Some(b'+') => (false, &rest[1..]),
+                _ => (false, rest),
+            };
+            if digits.is_empty() {
+                return None;
+            }
+            let mut v: i64 = 0;
+            for c in digits {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                v = v.saturating_mul(10).saturating_add(i64::from(c - b'0'));
+            }
+            if eneg { -v } else { v }
+        }
+    };
+    let int_digits = mant.iter().position(|c| *c == b'.').unwrap_or(mant.len());
+    // Decimal position of the first mantissa digit after scaling by 1e7.
+    let mut pos = i64::try_from(int_digits)
+        .unwrap_or(i64::MAX)
+        .saturating_add(exp)
+        .saturating_add(6);
+    let mut acc: i64 = 0;
+    let mut round_up = false;
+    let mut any_digit = false;
+    for c in mant {
+        if *c == b'.' {
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        any_digit = true;
+        let d = i64::from(c - b'0');
+        if pos >= 0 {
+            if d != 0 {
+                if pos > 10 {
+                    return None;
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let unit = 10_i64.pow(pos as u32);
+                acc = acc.checked_add(d * unit)?;
+            }
+        } else if pos == -1 {
+            round_up = d >= 5;
+            break;
+        } else {
+            break;
+        }
+        pos = pos.saturating_sub(1);
+    }
+    if !any_digit {
+        return None;
+    }
+    if acc >= 100_000_000_000 {
+        return None;
+    }
+    let v = acc + i64::from(round_up);
+    Some(if neg { -v } else { v })
 }
 
 pub(crate) fn parse_str_attr(
@@ -1263,7 +1380,7 @@ pub(crate) fn coord_to_decimicro(
     name: &str,
     id: i64,
 ) -> ParseResult<i32> {
-    let degrees = parse_f64_attr(e, name).map_err(|err| {
+    let (degrees, exact) = parse_coord_attr(e, name).map_err(|err| {
         err.context(format!(
             "OSC node {id}: {name} attribute is missing or unparsable (a created or \
              modified node must carry usable coordinates; storing it at 0/0 would silently \
@@ -1284,6 +1401,23 @@ pub(crate) fn coord_to_decimicro(
     };
     validate(name, degrees)
         .map_err(|err| Error::invalid_data_from(err).context(format!("OSC node {id}")))?;
+    if let Some(exact) = exact {
+        let limit: i64 = if name == "lat" {
+            900_000_000
+        } else {
+            1_800_000_000
+        };
+        return match exact {
+            Some(v) if v.abs() <= limit => {
+                // Bounded by the geographic limit just checked, so it fits.
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(v as i32)
+            }
+            _ => Err(Error::invalid_data(format!(
+                "OSC node {id}: {name} value is outside the geographic range once read exactly"
+            ))),
+        };
+    }
     let scaled = deg_to_e7(degrees);
     if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
         return Err(Error::invalid_data(format!(
@@ -1701,6 +1835,45 @@ impl OscSink for CompactSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coord(attrs: &str, name: &str) -> crate::Result<i32> {
+        let element = quick_xml::events::BytesStart::from_content(format!("node {attrs}"), 4);
+        coord_to_decimicro(&element, name, 1)
+    }
+
+    #[test]
+    fn coordinates_round_the_decimal_text_like_libosmium() -> crate::Result<()> {
+        // f64 gives 390070427.49999994; the decimal is an exact tie.
+        assert_eq!(coord("lat=\"39.00704275\"", "lat")?, 390_070_428);
+        assert_eq!(coord("lat=\"-39.00704275\"", "lat")?, -390_070_428);
+        assert_eq!(coord("lat=\"39.007042749999\"", "lat")?, 390_070_427);
+        assert_eq!(coord("lat=\"&#51;9.00704275\"", "lat")?, 390_070_428);
+        assert_eq!(coord("lon=\"12.3456789\"", "lon")?, 123_456_789);
+        assert_eq!(coord("lon=\"0.000000001e2\"", "lon")?, 1);
+        assert_eq!(coord("lon=\"-0.00000005\"", "lon")?, -1);
+        // Long tokens are read exactly, including against the f64 exponent cap.
+        let long = format!("lat=\"0.{}1e5\"", "0".repeat(40));
+        assert_eq!(coord(&long, "lat")?, 0);
+        let long = format!("lat=\"90.{}1\"", "0".repeat(40));
+        assert_eq!(coord(&long, "lat")?, 900_000_000);
+        let smuggled = format!("lat=\"0.{}1e1000000\"", "0".repeat(999_999));
+        assert!(coord(&smuggled, "lat").is_ok_and(|v| v == 10_000_000));
+        let smuggled = format!("lat=\"0.{}1e1000002\"", "0".repeat(999_999));
+        assert!(coord(&smuggled, "lat").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_decimal_rounds_half_away_from_zero() {
+        assert_eq!(exact_decimal_e7("1.00000005"), Some(10_000_001));
+        assert_eq!(exact_decimal_e7("1.00000004999"), Some(10_000_000));
+        assert_eq!(exact_decimal_e7("+.5e-7"), Some(1));
+        assert_eq!(exact_decimal_e7("180."), Some(1_800_000_000));
+        assert_eq!(exact_decimal_e7("1e5"), None);
+        assert_eq!(exact_decimal_e7("inf"), None);
+        assert_eq!(exact_decimal_e7("1e-99999999999999999999"), Some(0));
+    }
+
     #[test]
     fn owned_sinks_pass_metadata_without_native_validation() -> crate::Result<()> {
         for attributes in [

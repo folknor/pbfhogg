@@ -119,22 +119,6 @@ in `merge_changes/mod.rs`) and `tags-filter --input-kind osc`
 through them first. Fix: accept an absent coordinate on an explicitly hidden
 node there too, keeping its section and visibility on re-emission.
 
-## CMD-054 - OSC coordinates round through f64, unlike libosmium
-
-Reported by: the TOOL-029 spar partner (2026-11-20), from source; not run.
-
-The OSC readers parse `lat`/`lon` as `f64`, multiply by 1e7 and round
-(`crates/lib/src/osc/xml_parse.rs`, `coord_fmt.rs`), while libosmium rounds
-the decimal digits directly (`osmium/osm/location.hpp`). The two can land on
-different decimicrodegrees for an input both accept: `lat="39.00704275"`
-gives a product of `390070427.49999994`, so pbfhogg writes 39.0070427 and
-osmium 39.0070428. DEVIATIONS.md does not record it, and the apply-changes
-verifier (which compares osmium's decoding of the OSC, and osmium's apply
-output, with pbfhogg's output) would fail such a node as a content
-difference. Either parse decimally (exact half-up on the digits) or record
-the deviation. Whether a seven-decimal coordinate, as replication diffs
-carry, can ever round differently is unchecked.
-
 ## CMD-053 - renumber's group policy for non-element fields differs by kind
 
 Reported by: the renumber representation item (2026-11-20), while sparring

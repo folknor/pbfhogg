@@ -384,7 +384,9 @@ unsupported domain, an upsert with a `visible` attribute other than
 touched identity twice, and an object whose occurrences at one version mix
 an invalid timestamp with two distinct valid ones (osmium's sort then has
 no defined result). The comparison is osmium's decoding on both sides: a
-coordinate both tools accept but round differently fails it.
+coordinate both tools accept but round differently fails it. Both round a
+plain decimal exactly; only an exponent spelling can differ (DEVIATIONS.md),
+and replication diffs carry none.
 In locations mode pbfhogg's output must pass `check --locations`;
 osmium's location report is informational, with its stale count shown even
 on PASS. The element comparison does not read inline coordinates in that

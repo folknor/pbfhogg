@@ -457,6 +457,14 @@
 
 ### Fixed
 
+- **OSC coordinates round from their decimal text, as osmium does.**
+  `apply-changes`, `merge-changes`, `tags-filter --input-kind osc` and the
+  library OSC overlay read a coordinate with eight or more fraction digits
+  that sits on a half-unit tie, such as `39.00704275`, as its exact decimal
+  rounded half away from zero (`39.0070428`); before, floating-point scaling
+  could round it down. Seven-digit coordinates were never affected. An
+  exponent spelling is rounded from its exact value, which can differ from
+  osmium (see DEVIATIONS.md).
 - **Header rewrites keep same-number unknown fields.** `degrade`'s
   header-only path (`--strip-bbox`, `--strip-indexdata`, `--strip-tagdata`,
   `--generator`, `--output-header`) and the reframes of `cat --reindex`,

@@ -8,6 +8,14 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Exact decimal coordinate rounding (plantasjen, 2026-11-20, `a36f263e` + change)
+
+OSC coordinates keep the `f64` reading and fall back to an exact decimal
+rounder only near a half-unit tie or for tokens over 32 bytes. Planet
+7-OSC default merge (`--osc 4914..4920`), `--iterations 1`, `--commit HEAD`
+baseline interleaved: baseline 6052, 6034 ms (`7074ce29`, `8bdea66a`),
+variant 6018, 6025 ms (`ed8b723c`, `acbbbf7e`). No cost.
+
 ### XML 1.0 character check on every input event (bygg, 2026-11-19, `a664c724` + change)
 
 The shared OSC driver checks each event's bytes for forbidden scalars and

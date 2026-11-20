@@ -709,6 +709,15 @@ is decided by a tool other than pbfhogg. All three roundtrips are compared
 with new, and the two own-tool roundtrips with each other, by content-only
 element equality (no metadata, visibility or inline coordinates: pbfhogg's
 OSC is content-based by design, and the domain is a non-history snapshot).
+Osmium's derive writes no delete for an old-only object when the next new
+object in object order has its ID under a later kind (DEVIATIONS.md
+"derive-changes"). When osmium's roundtrip differs from new, the verifier models that omission from the OPL of old and new: if it
+retains any old object, osmium's roundtrip must instead equal new plus
+exactly those old records, unchanged, and pbfhogg's roundtrip against
+osmium's passes only when that holds and pbfhogg's equals new. The residue
+is reported as consistent with the omission (the snapshots cannot tell an
+omitted delete from an ignored one). Every other difference, the
+same-version content change osmium's derive misses included, still fails.
 New and pbfhogg's roundtrip must be strictly ordered. The unindexed
 pair must produce the indexed OSC's exact decompressed bytes, including
 metadata; gzip framing is excluded. The roundtrips do not establish

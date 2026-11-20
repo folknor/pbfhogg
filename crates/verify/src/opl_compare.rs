@@ -271,6 +271,98 @@ pub(crate) fn order(
     Ok((ordered, counts))
 }
 
+/// What `osmium derive-changes` from `old` to `new` gives once applied back
+/// to `old`, under [`Policy::CONTENT`], written to `expected` as OPL: new's
+/// records plus every old record osmium writes no delete for. Its merge
+/// (`command_derive_changes.cpp`) skips the delete of an old-only object
+/// when the new stream's current object has the same ID, comparing IDs
+/// without kinds, so an old-only identity is retained, unchanged, exactly
+/// when the next new identity in object order (paired or new-only, none at
+/// the end of new) has its ID and a later kind. Every old-only identity
+/// before that new one is tested on its own: old `n7 n8 w7` against a next
+/// new `r7` retains `n7` and `w7` and deletes `n8`. Version and timestamp
+/// cannot move the cursor for an old-only identity, since every new identity
+/// below it is consumed first and every one above sorts after it whatever
+/// its version. Returns how many records were retained; both decodings are
+/// removed.
+pub(crate) fn osmium_derive_roundtrip(
+    harness: &mut Harness,
+    old: &Path,
+    new: &Path,
+    expected: &Path,
+) -> Result<u64, Error> {
+    let a = expected.with_extension("old.opl");
+    let b = expected.with_extension("new.opl");
+    decode(harness, old, &a, Policy::CONTENT)?;
+    decode(harness, new, &b, Policy::CONTENT)?;
+    let retained = retained_by_osmium_derive(&a, &b, expected)?;
+    for opl in [&a, &b] {
+        std::fs::remove_file(opl)?;
+    }
+    Ok(retained)
+}
+
+/// The walk of [`osmium_derive_roundtrip`] over two strictly ordered OPL
+/// files.
+fn retained_by_osmium_derive(old: &Path, new: &Path, expected: &Path) -> Result<u64, Error> {
+    let mut a = Stream::open(old)?;
+    let mut b = Stream::open(new)?;
+    let mut out = BufWriter::new(File::create(expected)?);
+    // An old-only record is decided by the new record current beside it,
+    // the next new one in object order, which is written after it.
+    let mut retained = 0;
+    let mut ka = a.next()?;
+    let mut kb = b.next()?;
+    loop {
+        match (ka, kb) {
+            (None, None) => break,
+            (Some(x), y) if y.is_none_or(|y| rank(x) < rank(y)) => {
+                if y.is_some_and(|y| y.1 == x.1) {
+                    out.write_all(&a.line)?;
+                    out.write_all(b"\n")?;
+                    retained += 1;
+                }
+                ka = a.next()?;
+            }
+            (_, Some(y)) => {
+                out.write_all(&b.line)?;
+                out.write_all(b"\n")?;
+                if ka == Some(y) {
+                    ka = a.next()?;
+                }
+                kb = b.next()?;
+            }
+            (Some(_), None) => return Err(Error::tool("derive model lost its key")),
+        }
+    }
+    out.flush()?;
+    Ok(retained)
+}
+
+/// [`compare`] of `pbf`, decoded under `policy`, with an OPL file already
+/// written (`expected`); the decoding is removed once merged.
+pub(crate) fn compare_with_opl(
+    harness: &mut Harness,
+    pbf: &Path,
+    expected: &Path,
+    listing: &Path,
+    policy: Policy,
+) -> Result<Merged, Error> {
+    let a = listing.with_extension("first.opl");
+    decode(harness, pbf, &a, policy)?;
+    let merged = merge(&a, expected, listing, true, |_| {}, |_| {})?;
+    harness.msg(&format!(
+        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
+        listing.display(),
+        merged.same,
+        merged.first_only,
+        merged.second_only,
+        merged.differs
+    ));
+    std::fs::remove_file(&a)?;
+    Ok(merged)
+}
+
 /// One OPL stream: its current record and the key it last held.
 struct Stream {
     path: PathBuf,
@@ -574,6 +666,45 @@ mod tests {
         // A shifted tag boundary differs here too.
         let (merged, _, _) = walk_test("n1 v1 Ta=bc\n", "n1 v1 Tab=c\n", false).unwrap();
         assert_eq!(merged.differs, 1);
+    }
+
+    fn derive_model(old: &str, new: &str) -> (u64, String) {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (pa, pb, pe) = (dir.join("a.opl"), dir.join("b.opl"), dir.join("e.opl"));
+        std::fs::write(&pa, old).unwrap();
+        std::fs::write(&pb, new).unwrap();
+        let retained = retained_by_osmium_derive(&pa, &pb, &pe).unwrap();
+        (retained, std::fs::read_to_string(&pe).unwrap())
+    }
+
+    #[test]
+    fn osmium_derive_retains_an_old_only_object_whose_id_the_next_new_object_holds() {
+        // The kind-change pair itself.
+        assert_eq!(
+            derive_model("n1 x1\nn7 x2\n", "n1 x1\nw7 Nn1\n"),
+            (1, "n1 x1\nn7 x2\nw7 Nn1\n".into())
+        );
+        // Every old-only record before the cursor is tested on its own.
+        assert_eq!(
+            derive_model("n7 x1\nn8 x1\nw7 N\n", "r7 M\n"),
+            (2, "n7 x1\nw7 N\nr7 M\n".into())
+        );
+        // A different next ID, a paired cursor of another ID, or the end of
+        // new: deleted.
+        assert_eq!(
+            derive_model("n5 x1\nn7 x1\n", "n7 x2\nw9 N\n"),
+            (0, "n7 x2\nw9 N\n".into())
+        );
+        assert_eq!(
+            derive_model("n1 x1\nw7 N\n", "n1 x1\n"),
+            (0, "n1 x1\n".into())
+        );
+        // A paired cursor with the old-only ID also retains it.
+        assert_eq!(
+            derive_model("n7 x1\nw7 N\n", "w7 Nn1\n"),
+            (1, "n7 x1\nw7 Nn1\n".into())
+        );
     }
 
     #[test]

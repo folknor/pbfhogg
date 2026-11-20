@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::opl_compare::Policy;
+use crate::opl_compare::{self, Policy};
 use crate::osc;
 use crate::reference::ToolRun;
 use crate::verify_input_order;
@@ -155,6 +155,7 @@ pub fn run(
     // Content only: pbfhogg's OSC is content-based by design (metadata and
     // inline way coordinates are not content), so an object whose version
     // moved without a content change is not in it.
+    let mut verdicts = Vec::with_capacity(4);
     for (label, listing, a, b) in [
         (
             "pbfhogg roundtrip vs new",
@@ -193,7 +194,25 @@ pub fn run(
         } else {
             harness.msg("  FAIL (differences found)");
         }
-        harness.record(&format!("diff {label}"), diff);
+        verdicts.push((label, diff));
+    }
+    // The two comparisons with osmium's own roundtrip judge osmium's derive
+    // too, which omits some deletes (`opl_compare::osmium_derive_roundtrip`).
+    // Only when osmium's roundtrip differs from new, it is held instead to
+    // new plus exactly the old records that omission retains, unchanged;
+    // pbfhogg's roundtrip against it then passes only where pbfhogg's equals
+    // new. An osmium roundtrip equal to new is never re-judged.
+    if !verdicts[2].1.is_pass() {
+        let pbfhogg_ok = verdicts[0].1.is_pass();
+        if let Some(osmium_ok) =
+            osmium_omission_explains(harness, &outdir, pbf, &new_pbf, &rt_osmium)?
+        {
+            verdicts[2].1 = Verdict::from_pass(osmium_ok);
+            verdicts[3].1 = Verdict::from_pass(osmium_ok && pbfhogg_ok);
+        }
+    }
+    for (label, verdict) in verdicts {
+        harness.record(&format!("diff {label}"), verdict);
     }
 
     let parity = unindexed_osc_matches(harness, &outdir, pbf, &new_pbf, &pbfhogg_osc, direct_io)?;
@@ -204,6 +223,48 @@ pub fn run(
     harness.record("roundtrip-pbfhogg order", order);
 
     Ok(Some("element-content roundtrips against new and osmium, pbfhogg's OSC applied by both tools; indexed/unindexed OSC decompressed bytes identical; metadata, visibility and inline coordinates not judged".into()))
+}
+
+/// Whether osmium's roundtrip is new plus the old records its derive keeps
+/// by comparing IDs without kinds, each unchanged; `None` when that model
+/// retains nothing, so the failure stands as found. A pass is reported as a
+/// residue consistent with the omission: the snapshots alone cannot tell an
+/// omitted delete from an ignored one.
+fn osmium_omission_explains(
+    harness: &mut Harness,
+    outdir: &Path,
+    old: &Path,
+    new: &Path,
+    rt_osmium: &Path,
+) -> Result<Option<bool>, Error> {
+    harness.msg("=== osmium derive-changes same-ID omission model ===");
+    let expected = outdir.join("osmium-derive-model.opl");
+    let retained = opl_compare::osmium_derive_roundtrip(harness, old, new, &expected)?;
+    if retained == 0 {
+        harness.msg("  the model retains no old object: the failures stand");
+        std::fs::remove_file(&expected)?;
+        return Ok(None);
+    }
+    let merged = opl_compare::compare_with_opl(
+        harness,
+        rt_osmium,
+        &expected,
+        &outdir.join("roundtrip-osmium-vs-model.diff.txt"),
+        Policy::CONTENT,
+    )?;
+    std::fs::remove_file(&expected)?;
+    let ok = merged.identical();
+    if ok {
+        harness.msg(&format!(
+            "  osmium roundtrip is new plus {retained} unchanged old object(s) osmium writes no \
+             delete for (an old-only object whose ID the next new object holds under a later \
+             kind; DEVIATIONS.md derive-changes): attributed to osmium"
+        ));
+    } else {
+        harness.msg("  FAIL: osmium roundtrip is not new plus the retained old objects");
+        harness.replay_listing(&outdir.join("roundtrip-osmium-vs-model.diff.txt"))?;
+    }
+    Ok(Some(ok))
 }
 
 /// The check on input whose header lacks `Sort.Type_then_ID` among its

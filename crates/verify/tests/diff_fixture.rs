@@ -65,6 +65,25 @@ fn text_opl(new: Option<&str>) -> String {
     )
 }
 
+/// The OPL the fake osmium decodes the derive check's kind-change pair to:
+/// OLD holds n1, n5 and n7, NEW n1 and w7, so osmium's derive, comparing
+/// IDs without kinds, deletes n5 but keeps n7. Its roundtrip under fault
+/// `kind-change` is NEW plus n7 as it was; `kind-change-extra` also keeps
+/// n5, `kind-change-altered` keeps n7 with another coordinate.
+fn derive_opl(side: &str) -> String {
+    let node = |id: u32, x: u32| format!("n{id} v1 dV c1 t2020-01-01T00:00:00Z i1 ua T x{x} y1\n");
+    let way = "w7 v1 dV c1 t2020-01-01T00:00:00Z i1 ua T Nn1\n";
+    match side {
+        "old" => [node(1, 1), node(5, 1), node(7, 1)].concat(),
+        "new" => [node(1, 1), way.into()].concat(),
+        "osmium-kind-change" => [node(1, 1), node(7, 1), way.into()].concat(),
+        "osmium-kind-change-extra" => [node(1, 1), node(5, 1), node(7, 1), way.into()].concat(),
+        "osmium-kind-change-pbfhogg" => [node(1, 1), node(7, 1), way.into()].concat(),
+        "osmium-kind-change-altered" => [node(1, 1), node(7, 2), way.into()].concat(),
+        _ => panic!("no derive decoding {side}"),
+    }
+}
+
 pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("diff-fixture");
     std::fs::create_dir(&dir).unwrap();
@@ -109,6 +128,10 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "roundtrip",
                 "roundtrip-metadata",
                 "raw-osc",
+                "kind-change",
+                "kind-change-extra",
+                "kind-change-altered",
+                "kind-change-pbfhogg",
                 "unsorted",
                 "publish",
             ],
@@ -136,6 +159,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             } else if check == "text" {
                 // The text pair's decodings key on content alone.
                 fake_pbf::write_with(&input, &[SORTED], &[SORTED], "text-old");
+            } else if fault.starts_with("kind-change") {
+                fake_pbf::write_with(&input, &[SORTED], &[SORTED], "derive-old");
             } else {
                 fake_pbf::write_with(&input, &[SORTED], &[SORTED], "sorted");
             }
@@ -158,6 +183,7 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
         "",
         "unsorted",
         "roundtrip-metadata",
+        "kind-change",
         "metadata-only",
         "coords",
     ];
@@ -195,10 +221,23 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
         ("osc", _) => {
             assert_eq!(judged.error, None, "{judged:?}");
             match fault {
-                "roundtrip" => assert_eq!(
+                // pbfhogg's roundtrip equal to osmium's attributed one is
+                // still held to new.
+                "roundtrip" | "kind-change-pbfhogg" => assert_eq!(
                     judged.failed,
                     [
                         "diff pbfhogg roundtrip vs new",
+                        "diff pbfhogg roundtrip vs osmium roundtrip"
+                    ],
+                    "{judged:?}"
+                ),
+                // osmium keeping more than its same-ID omission explains,
+                // or keeping it changed, fails both arms judging osmium's
+                // roundtrip.
+                "kind-change-extra" | "kind-change-altered" => assert_eq!(
+                    judged.failed,
+                    [
+                        "diff osmium roundtrip vs new",
                         "diff pbfhogg roundtrip vs osmium roundtrip"
                     ],
                     "{judged:?}"
@@ -245,6 +284,8 @@ pub fn tool(args: &[OsString]) -> i32 {
             Some(text_opl(None))
         } else if let Some(written_under) = marker.strip_prefix("text-new-") {
             Some(text_opl(Some(written_under)))
+        } else if let Some(side) = marker.strip_prefix("derive-") {
+            Some(derive_opl(side))
         } else if let Some(rest) = marker.strip_prefix("renumber-") {
             let (side, written_under) = rest.split_once('-').unwrap();
             Some(renumber_opl(written_under, side == "pbfhogg"))
@@ -296,6 +337,23 @@ pub fn tool(args: &[OsString]) -> i32 {
                     ("renumber", true) => format!("renumber-pbfhogg-{fault}"),
                     ("renumber", false) => format!("renumber-osmium-{fault}"),
                     ("apply-changes", _) if check == "text" => format!("text-new-{fault}"),
+                    ("apply-changes", false)
+                        if fault.starts_with("kind-change")
+                            && output.ends_with("roundtrip-osmium.osm.pbf") =>
+                    {
+                        format!("derive-osmium-{fault}")
+                    }
+                    // pbfhogg's own roundtrip keeping n7 as osmium's does:
+                    // identical to osmium's, still not new.
+                    ("apply-changes", _)
+                        if fault == "kind-change-pbfhogg"
+                            && output.ends_with("roundtrip-pbfhogg.osm.pbf") =>
+                    {
+                        "derive-osmium-kind-change".to_owned()
+                    }
+                    ("apply-changes", _) if fault.starts_with("kind-change") => {
+                        "derive-new".to_owned()
+                    }
                     _ if broken => "wrong".to_owned(),
                     _ if versioned => "sorted @v2".to_owned(),
                     _ => "sorted".to_owned(),

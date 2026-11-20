@@ -27,6 +27,17 @@ characters XML 1.0 cannot carry. `--iterations 1`, A B A B, planet 7-OSC
 default merge (`--osc 4914..4920`): `29fd352a` 3.0, 3.1 s (`4c7fb2d5`,
 `48119317`); variant 2.9, 2.9 s (`436b7bdc`, `543cd61e`). No cost.
 
+Re-measured when the change was ported to the line after `c7417dc6`
+(plantasjen, 2026-11-20, same workload, `--commit HEAD` baseline
+interleaved). The single exact scan cost about 3 % with a consistent sign:
+baseline 5832, 5844, 5683, 5682 ms (`59d6003f`, `aceefd07`, `78558e95`,
+`c052e26f`), variant 5967, 6028, 5862, 5896 ms (`cf31b6af`, `dde6a36b`,
+`49436a71`, `479e38b6`). Adding a plain fast-path scan for any byte below
+0x20 or 0xEF, with the exact scan only behind it, brings it within noise:
+baseline 5843, 5519, 5670 ms (`ecd3fcdf`, `918e4683`, `bd33a9ed`),
+variant 5856, 5714, 5680 ms (`1779f6b0`, `93888103`, `938dc75f`), medians
++0.8 %. That variant landed.
+
 ### Decoded typed attributes, whitespace-preserving metadata escape (bygg, 2026-11-19, `ceab35f2` + change)
 
 Typed attribute reads (IDs, refs, coordinates, numeric and timestamp

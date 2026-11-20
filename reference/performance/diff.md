@@ -311,11 +311,17 @@ first in each pair.
 | 3 | `48f31ab2` 2m25s | `04b2dc4a` 2m23s |
 
 The host stepped from 2m13s to 2m25s mid-run: baseline 3 on clean HEAD
-shows it too. In pair 2 the whole delta is in the assembly span
-(`DERIVECHANGES_WRITE`, 16.3 s to 22.7 s at under one core, write wait
-doubled), which copies already-formatted bytes and never reaches the check.
-The scan phases that format differ by about 3 %. The signs disagree across
+shows it too. In pair 2 about 6.4 s of the 11.8 s delta is in the
+assembly span (`DERIVECHANGES_WRITE`, 16.3 s to 22.7 s at under one core,
+write wait doubled), which copies already-formatted bytes and never reaches
+the check; the rest is in the scan, matching the host step baseline 3 shows. The signs disagree across
 pairs, so the change has no cost.
+
+Re-measured when ported to the line after `c7417dc6` (plantasjen,
+2026-11-20, same workload, `--commit HEAD` baseline first in each pair):
+baseline 4m51s, 4m41s (`2cfba709`, `a0bacafd`), variant 4m38s, 4m36s
+(`f7a2f2d5`, `7903553f`). No cost. These cells ran the single exact scan;
+the landed fast-path pre-scan (see merge-changes.md) only removes work.
 
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 

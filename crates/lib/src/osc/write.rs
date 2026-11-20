@@ -37,6 +37,12 @@ use crate::{ElementKind, MemberId};
 /// tab, LF or CR, since a forbidden scalar can follow one.
 fn check_xml_chars(key: &str, value: &str) -> crate::Result<bool> {
     let bytes = value.as_bytes();
+    // Fast path: almost every value has no byte below 0x20 and no 0xEF lead
+    // byte, and this plain scan costs what the old whitespace-only scan did.
+    // The exact scan below runs only when one is present.
+    if !bytes.iter().any(|&b| b < 0x20 || b == 0xEF) {
+        return Ok(false);
+    }
     let mut needs_refs = false;
     for (i, &b) in bytes.iter().enumerate() {
         let forbidden = match b {

@@ -243,3 +243,26 @@ fn snapshot_sequence_insert_never_replaces_or_creates_a_pbf() {
         Some(10)
     );
 }
+
+#[test]
+fn replace_file_refuses_an_existing_staging_path_without_touching_it() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let root = std::fs::canonicalize(scratch.path()).unwrap();
+    let target = root.join("brokkr.toml");
+    std::fs::write(&target, "old").unwrap();
+    let registered = root.join("data.bin");
+    std::fs::write(&registered, "registered bytes").unwrap();
+    let staging = root.join(".brokkr.toml.tmp");
+    std::fs::write(&staging, "stale or registered").unwrap();
+    assert!(crate::replace_file(&target, b"new").is_err());
+    assert_eq!(std::fs::read(&staging).unwrap(), b"stale or registered");
+    std::fs::remove_file(&staging).unwrap();
+    std::os::unix::fs::symlink(&registered, &staging).unwrap();
+    assert!(crate::replace_file(&target, b"new").is_err());
+    assert_eq!(std::fs::read(&registered).unwrap(), b"registered bytes");
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    std::fs::remove_file(&staging).unwrap();
+    crate::replace_file(&target, b"new").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    assert!(!staging.exists());
+}

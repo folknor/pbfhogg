@@ -494,7 +494,10 @@ fn min_table_position(item: &toml_edit::Item) -> Option<isize> {
 
 /// Replace `path` with `bytes` durably: write a sibling temp file, fsync it,
 /// rename it over `path`, fsync the directory. A failure leaves `path` as it
-/// was; a stale temp from a killed run is overwritten by the next one.
+/// was. The temp is opened create-new, so an existing entry at the temp name
+/// (a registered data file that happens to carry it, a symlink, or a stale
+/// temp from a killed run) is refused and left untouched rather than
+/// truncated; a stale temp must be removed by hand.
 pub fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let at = |e: std::io::Error| Error::message(format!("{}: {e}", path.display()));
     let dir = path
@@ -508,10 +511,26 @@ pub fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     tmp_name.push(name);
     tmp_name.push(".tmp");
     let tmp = dir.join(tmp_name);
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(Error::message(format!(
+                "{}: staging path {} already exists; refusing to overwrite it \
+                 (remove it if it is a stale temp from an interrupted run)",
+                path.display(),
+                tmp.display()
+            )));
+        }
+        Err(e) => return Err(at(e)),
+    };
     let result = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
         if let Ok(meta) = std::fs::metadata(path) {
             std::fs::set_permissions(&tmp, meta.permissions())?;
         }

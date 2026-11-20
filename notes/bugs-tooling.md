@@ -139,19 +139,6 @@ host-wide check examines final destinations only. This breaks preservation of
 registered files, including on failure: a later transfer error leaves the old
 registry pointing at deleted data.
 
-## TOOL-011 - The registry writer can truncate registered data through its temp path
-
-Reported by: datasets-devkit [P1].
-
-`replace_file` (`crates/devkit/src/registry.rs`) uses `File::create` on the
-fixed `.CONFIG.tmp` name, with no ownership check and no symlink refusal. With
-host `data = "."`, acquisition accepts a registered raw file named
-`.brokkr.toml.tmp`. The next registry commit truncates that file, writes TOML
-into it and then moves it away. A pre-existing temporary symlink likewise
-makes `File::create` truncate its target. This violates registered-file
-preservation and the writer's claim that failures before commit preserve
-existing bytes.
-
 ## TOOL-012 - The alias resolver does not follow dangling symlinks
 
 Reported by: datasets-devkit [P2].

@@ -111,13 +111,53 @@ pub struct InterpolationCandidate<'a> {
     pub distance_m: f64,
 }
 
-/// Invalid coordinate supplied to [`Reader::query`] or [`Reader::candidates`].
+/// Why [`Reader::query`] or [`Reader::candidates`] failed: an invalid query
+/// coordinate, or a corrupt index entry the lookup reached.
+///
+/// Open certifies list framing but not every entry's reference (walking every
+/// entry would make each open read every entry file), so a dangling entry is
+/// refused when a lookup reads it, rather than skipped: skipping it would
+/// answer with fewer or farther results as if they were the whole answer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryError {
     NonFiniteLatitude(f64),
     NonFiniteLongitude(f64),
     LatitudeOutOfRange(f64),
     LongitudeOutOfRange(f64),
+    /// A cell entry names record `index` of a file holding `count` records.
+    DanglingReference {
+        reference: IndexReference,
+        index: u32,
+        count: u32,
+    },
+    /// A segment entry names segment `segment_index` of way `way_index`,
+    /// which has no second endpoint among the way's `node_count` nodes.
+    DanglingSegment {
+        reference: IndexReference,
+        way_index: u32,
+        segment_index: u16,
+        node_count: u16,
+    },
+}
+
+/// The record file a corrupt cell entry refers into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexReference {
+    AddressPoint,
+    StreetWay,
+    InterpolationWay,
+    AdminPolygon,
+}
+
+impl IndexReference {
+    fn file(self) -> &'static str {
+        match self {
+            Self::AddressPoint => format::FILE_ADDR_POINTS,
+            Self::StreetWay => format::FILE_STREET_WAYS,
+            Self::InterpolationWay => format::FILE_INTERP_WAYS,
+            Self::AdminPolygon => format::FILE_ADMIN_POLYGONS,
+        }
+    }
 }
 
 impl fmt::Display for QueryError {
@@ -134,6 +174,27 @@ impl fmt::Display for QueryError {
             Self::LongitudeOutOfRange(value) => write!(
                 f,
                 "query longitude ({value}) must be within -180 and 180 degrees"
+            ),
+            Self::DanglingReference {
+                reference,
+                index,
+                count,
+            } => write!(
+                f,
+                "corrupt geocode index: an entry names record {index} of {}, which holds \
+                 {count}",
+                reference.file()
+            ),
+            Self::DanglingSegment {
+                reference,
+                way_index,
+                segment_index,
+                node_count,
+            } => write!(
+                f,
+                "corrupt geocode index: an entry names segment {segment_index} of {} record \
+                 {way_index}, which has no second endpoint among its {node_count} nodes",
+                reference.file()
             ),
         }
     }
@@ -354,8 +415,13 @@ impl Reader {
     /// The string checks read each referenced string's length prefix and
     /// bytes.
     /// This touches file-backed mmap pages and can fault them into memory.
+    /// It also checks that cell IDs are strictly ascending, that the string
+    /// pool begins with its empty-string sentinel, and each admin polygon's
+    /// area and level.
     /// Coordinate payloads and individual cell-entry references are not
-    /// scanned; the latter are bounds-checked when queries use them. The
+    /// scanned; a query that reads an entry naming a record past its file
+    /// fails with [`QueryError::DanglingReference`] or
+    /// [`QueryError::DanglingSegment`] rather than skipping it. The
     /// builder's smoke test calls this same open path, so its validation pass
     /// is also part of build time. There is no unvalidated open: a caller that
     /// reopens an index it has just built or checksummed pays this pass again
@@ -490,10 +556,15 @@ impl Reader {
     // every open and again in the builder smoke test. Open is already
     // O(index size); growing it further belongs after a trusted-open path
     // exists, not before. The builder derives every entry from an in-range
-    // index and fails the build on missing producer data, and every
-    // query-time consumer bounds-checks the entry it reads - the
-    // segment checks against the owning way's node_count, not the shared
-    // node file length, so an entry can never borrow the next way's nodes.
+    // index and fails the build on missing producer data, and a query
+    // refuses (QueryError) any entry it reads that names a record past its
+    // file - the segment checked against the owning way's node_count, not
+    // the shared node file length, so an entry can never borrow the next
+    // way's nodes. Refusing at the read, not skipping, is what keeps a
+    // dangling entry from shortening an answer without the sweep; it costs
+    // nothing on a valid index, since the bound was checked anyway. Per-record
+    // fields that open already walks (admin cell order, polygon area and
+    // level, the string sentinel) are checked here instead.
     // To revisit: Reader::open wall and majflt on a cold planet index, with
     // and without the sweep.
     fn validate_structure(&self) -> Result<()> {
@@ -562,6 +633,7 @@ impl Reader {
             &self.street_entries,
             &self.addr_entries,
             &self.interp_entries,
+            &self.header,
         )?;
         Self::validate_geo_tree(
             format::FILE_COARSE_GEO_CELLS,
@@ -569,13 +641,21 @@ impl Reader {
             &self.coarse_street_entries,
             &self.coarse_addr_entries,
             &self.coarse_interp_entries,
+            &self.header,
         )?;
         self.validate_admin_tree()?;
         // Offset 0 is the empty string of every absent optional field, so the
-        // pool's length-zero sentinel is checked even when no record names a
-        // string at all.
-        validate_string_offset(0, &self.strings, "empty-string sentinel")
-            .map_err(|e| e.context(format::FILE_STRINGS))?;
+        // pool must begin with the length-zero sentinel entry, checked even
+        // when no record names a string at all. Decoding alone is not enough:
+        // a pool beginning with a well-framed nonempty entry would turn every
+        // absent name into that string.
+        if format::read_pool_string(&self.strings, 0) != Some("") {
+            return Err(corrupt(
+                "invalid geocode index: the pool does not begin with its empty-string \
+                 sentinel",
+            )
+            .context(format::FILE_STRINGS));
+        }
         self.validate_way_geometry()?;
         Ok(())
     }
@@ -586,10 +666,27 @@ impl Reader {
     /// `admin_entries.bin` opens successfully and then silently returns
     /// incomplete admin results: a query reads a malformed list as empty, so
     /// the caller cannot tell a broken list from a genuinely empty one.
+    ///
+    /// Both admin searches binary-search the cells, as the geo searches do,
+    /// so cells out of order or repeated would read as missing ones: the
+    /// same strict ascending check as [`Self::validate_geo_tree`].
     fn validate_admin_tree(&self) -> Result<()> {
+        let mut previous = None;
         for (index, cell) in self.admin_cells.table().iter().enumerate() {
-            validate_list(&self.admin_entries, cell.entries_offset, "admin entry")
-                .map_err(|e| in_record(e, format::FILE_ADMIN_CELLS, index))?;
+            (|| -> Result<()> {
+                if previous.is_some_and(|previous| previous >= cell.cell_id) {
+                    return Err(corrupt("cell IDs are not strictly ascending"));
+                }
+                previous = Some(cell.cell_id);
+                validate_list(&self.admin_entries, cell.entries_offset, "admin entry")?;
+                no_targets(
+                    &self.admin_entries,
+                    cell.entries_offset,
+                    self.header.admin_polygon_count,
+                    "admin entry",
+                )
+            })()
+            .map_err(|e| in_record(e, format::FILE_ADMIN_CELLS, index))?;
         }
         Ok(())
     }
@@ -673,6 +770,25 @@ impl Reader {
                     u64::from(poly.vertex_count),
                     "admin polygon vertex",
                 )?;
+                // Ranking compares areas and indexes a slot by level, so a
+                // value outside what the builder writes would silently drop
+                // or misrank the polygon: an area is the absolute value of a
+                // finite sum (never NaN, infinite or -0.0), a level one of
+                // the format's.
+                if !(poly.area.is_finite() && poly.area.is_sign_positive()) {
+                    return Err(corrupt(format!(
+                        "invalid geocode index: admin polygon area {} is not a finite \
+                         nonnegative number",
+                        poly.area
+                    )));
+                }
+                if !format::is_admin_polygon_level(poly.admin_level) {
+                    return Err(corrupt(format!(
+                        "invalid geocode index: admin polygon level {} is not an \
+                         administrative level or the postal level",
+                        poly.admin_level
+                    )));
+                }
                 validate_string_offset(poly.name_offset, &self.strings, "admin polygon name")?;
                 validate_string_offset(
                     poly.country_code_offset,
@@ -720,6 +836,7 @@ impl Reader {
         streets: &Lists<SegmentRef>,
         addrs: &Lists<AddrEntry>,
         interps: &Lists<SegmentRef>,
+        header: &Header,
     ) -> Result<()> {
         // Queries binary-search the cells and test ID ranges against them,
         // so out-of-order cells would read as missing ones.
@@ -732,7 +849,25 @@ impl Reader {
                 previous = Some(cell.cell_id);
                 validate_list(addrs, cell.addr_offset, "address entry")?;
                 validate_list(streets, cell.street_offset, "street entry")?;
-                validate_list(interps, cell.interp_offset, "interpolation entry")
+                validate_list(interps, cell.interp_offset, "interpolation entry")?;
+                no_targets(
+                    addrs,
+                    cell.addr_offset,
+                    header.addr_point_count,
+                    "address entry",
+                )?;
+                no_targets(
+                    streets,
+                    cell.street_offset,
+                    header.street_way_count,
+                    "street entry",
+                )?;
+                no_targets(
+                    interps,
+                    cell.interp_offset,
+                    header.interp_way_count,
+                    "interpolation entry",
+                )
             })()
             .map_err(|e| in_record(e, cells_file, index))?;
         }
@@ -768,7 +903,7 @@ impl Reader {
             self.coarse_max_dist_sq >= self.fine_max_dist_sq,
             false,
             &mut best,
-        );
+        )?;
 
         // Coarse fallback
         let missing = self.coarse_missing(
@@ -792,45 +927,37 @@ impl Reader {
                 false,
                 true,
                 &mut best,
-            );
+            )?;
         }
 
         // Admin lookup (collapsed to one per level)
-        let admin = self.search_admin_ranked(&ctx);
+        let admin = self.search_admin_ranked(&ctx)?;
 
         // Assemble
-        let address = best.addr.and_then(|(idx, dist_sq)| {
-            let pt = self.read_addr_point(idx)?;
-            AddressMatch {
-                lat_e7: pt.lat_e7,
-                lon_e7: pt.lon_e7,
-                house_number: self.read_string(pt.housenumber_offset),
-                street: self.pool_name(pt.street_offset),
-                place: self.pool_name(pt.place_offset),
-                postcode: nonzero_string(self, pt.postcode_offset),
-                distance_m: radians_sq_to_meters(dist_sq),
-            }
-            .into()
+        let address = best.addr.map(|(pt, dist_sq)| AddressMatch {
+            lat_e7: pt.lat_e7,
+            lon_e7: pt.lon_e7,
+            house_number: self.read_string(pt.housenumber_offset),
+            street: self.pool_name(pt.street_offset),
+            place: self.pool_name(pt.place_offset),
+            postcode: nonzero_string(self, pt.postcode_offset),
+            distance_m: radians_sq_to_meters(dist_sq),
         });
 
         let street = best
             .street
-            .and_then(|(way_idx, snap_lat, snap_lon, dist_sq)| {
-                let way = self.read_street_way(way_idx)?;
-                StreetMatch {
-                    name: self.read_string(way.name_offset),
-                    snap_lat_e7: snap_lat,
-                    snap_lon_e7: snap_lon,
-                    distance_m: radians_sq_to_meters(dist_sq),
-                }
-                .into()
+            .map(|(way, snap_lat, snap_lon, dist_sq)| StreetMatch {
+                name: self.read_string(way.name_offset),
+                snap_lat_e7: snap_lat,
+                snap_lon_e7: snap_lon,
+                distance_m: radians_sq_to_meters(dist_sq),
             });
 
-        let interpolation = best.interp.and_then(
-            |(way_idx, seg_idx, snap_lat, snap_lon, dist_sq, total_len)| {
-                self.resolve_interpolation(way_idx, seg_idx, snap_lat, snap_lon, dist_sq, total_len)
-            },
-        );
+        let interpolation =
+            best.interp
+                .and_then(|(way, seg_idx, snap_lat, snap_lon, dist_sq, total_len)| {
+                    self.resolve_interpolation(way, seg_idx, snap_lat, snap_lon, dist_sq, total_len)
+                });
 
         Ok(ReverseResult {
             address,
@@ -865,7 +992,7 @@ impl Reader {
             false,
             false,
             &mut cands,
-        );
+        )?;
 
         let missing = self.coarse_missing(
             &ctx,
@@ -888,11 +1015,11 @@ impl Reader {
                 false,
                 true,
                 &mut cands,
-            );
+            )?;
         }
 
         // Admin: return ALL containing polygons, not collapsed
-        let admin = self.search_admin_all(&ctx);
+        let admin = self.search_admin_all(&ctx)?;
 
         Ok(Candidates {
             addresses: cands.addresses,
@@ -1084,11 +1211,13 @@ impl QueryContext {
 }
 
 /// Tracks nearest candidate of each type for `query()` (allocation-free).
+/// The nearest hit of each class so far. Each keeps the record the search
+/// resolved, so assembling the answer reads nothing that could be missing.
 struct BestTracker {
-    addr: Option<(u32, f64)>,             // (index, dist_sq)
-    street: Option<(u32, i32, i32, f64)>, // (way_idx, snap_lat, snap_lon, dist_sq)
-    // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq, total way length)
-    interp: Option<(u32, u16, i32, i32, f64, f64)>,
+    addr: Option<(AddrPoint, f64)>,             // (point, dist_sq)
+    street: Option<(StreetWay, i32, i32, f64)>, // (way, snap_lat, snap_lon, dist_sq)
+    // (way, seg_idx, snap_lat, snap_lon, dist_sq, total way length)
+    interp: Option<(InterpWay, u16, i32, i32, f64, f64)>,
 }
 
 impl BestTracker {
@@ -1128,11 +1257,14 @@ trait SearchSink<'a> {
     fn bounds(&self) -> ClassBounds;
     /// The classes this sink holds a candidate of.
     fn found(&self) -> SearchKinds;
-    fn address(&mut self, reader: &'a Reader, index: u32, point: AddrPoint, dist_sq: f64);
+    // Each hit arrives with the record its entry names, already resolved by
+    // the search: a sink never re-reads, so it has no missing record to
+    // handle.
+    fn address(&mut self, reader: &'a Reader, point: AddrPoint, dist_sq: f64);
     fn street(
         &mut self,
         reader: &'a Reader,
-        segment: SegmentRef,
+        way: StreetWay,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
@@ -1140,6 +1272,7 @@ trait SearchSink<'a> {
     fn interpolation(
         &mut self,
         reader: &'a Reader,
+        way: InterpWay,
         segment: SegmentRef,
         snap_lat: i32,
         snap_lon: i32,
@@ -1169,43 +1302,35 @@ impl SearchSink<'_> for BestTracker {
         }
     }
 
-    fn address(&mut self, reader: &Reader, index: u32, _point: AddrPoint, dist_sq: f64) {
-        if reader.read_addr_point(index).is_none() {
-            return;
-        }
+    fn address(&mut self, _reader: &Reader, point: AddrPoint, dist_sq: f64) {
         if dist_sq < self.addr.map_or(f64::MAX, |best| best.1) {
-            self.addr = Some((index, dist_sq));
+            self.addr = Some((point, dist_sq));
         }
     }
 
     fn street(
         &mut self,
-        reader: &Reader,
-        segment: SegmentRef,
+        _reader: &Reader,
+        way: StreetWay,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        if reader.read_street_way(segment.way_index).is_none() {
-            return;
-        }
         if dist_sq < self.street.map_or(f64::MAX, |best| best.3) {
-            self.street = Some((segment.way_index, snap_lat, snap_lon, dist_sq));
+            self.street = Some((way, snap_lat, snap_lon, dist_sq));
         }
     }
 
     fn interpolation(
         &mut self,
         reader: &Reader,
+        way: InterpWay,
         segment: SegmentRef,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
     ) {
         if dist_sq < self.interp.map_or(f64::MAX, |best| best.4) {
-            let Some(way) = reader.read_interp_way(segment.way_index) else {
-                return;
-            };
             // Only candidates that can improve the current result need a full
             // way-length scan. Retain the winner's length to avoid scanning it
             // again while assembling the final house number.
@@ -1213,7 +1338,7 @@ impl SearchSink<'_> for BestTracker {
                 return;
             };
             self.interp = Some((
-                segment.way_index,
+                way,
                 segment.segment_index,
                 snap_lat,
                 snap_lon,
@@ -1241,7 +1366,7 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
         }
     }
 
-    fn address(&mut self, reader: &'a Reader, _index: u32, point: AddrPoint, dist_sq: f64) {
+    fn address(&mut self, reader: &'a Reader, point: AddrPoint, dist_sq: f64) {
         self.addresses.push(AddressMatch {
             lat_e7: point.lat_e7,
             lon_e7: point.lon_e7,
@@ -1256,14 +1381,11 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
     fn street(
         &mut self,
         reader: &'a Reader,
-        segment: SegmentRef,
+        way: StreetWay,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        let Some(way) = reader.read_street_way(segment.way_index) else {
-            return;
-        };
         self.streets.push(StreetMatch {
             name: reader.read_string(way.name_offset),
             snap_lat_e7: snap_lat,
@@ -1275,14 +1397,12 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
     fn interpolation(
         &mut self,
         reader: &'a Reader,
+        way: InterpWay,
         segment: SegmentRef,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        let Some(way) = reader.read_interp_way(segment.way_index) else {
-            return;
-        };
         // This API returns every viable segment hit, so validate each one
         // before it can make the fine-level candidate list nonempty.
         if reader.interpolation_total_length(way).is_none() {
@@ -1683,16 +1803,15 @@ impl Reader {
         hand_off: bool,
         presence: bool,
         sink: &mut S,
-    ) {
+    ) -> std::result::Result<(), QueryError> {
         let geo_cells = geo_cells.table();
         let start = ctx.cell(level);
         let (block, block_len) = cell_neighborhood(start, level);
 
-        // An entry naming a record that does not exist is skipped, not
-        // reported: open certifies list spans but not entry contents (see
-        // validate_structure for why), and only a corrupt or hand-edited
-        // index can carry one. The segment distance helpers return f64::MAX
-        // for the same case, which never passes the radius test.
+        // An entry naming a record that does not exist is refused when it is
+        // read (search_cell): open certifies list spans but not entry
+        // contents (see validate_structure for why), so only a lookup can
+        // meet one, and skipping it would answer as if the rest were whole.
         for &id in &block[..block_len] {
             if let Some(gc) = geo_cells.find_by_key(id, |cell| cell.cell_id) {
                 self.search_cell(
@@ -1704,7 +1823,7 @@ impl Reader {
                     max_dist_sq,
                     kinds,
                     sink,
-                );
+                )?;
             }
         }
 
@@ -1730,7 +1849,7 @@ impl Reader {
             }
         };
         if bounds_for(kinds, sink).reach() <= reach_sq {
-            return;
+            return Ok(());
         }
         let kinds = if presence {
             self.possibly_within(ctx, kinds, bounds_for(kinds, sink), true)
@@ -1739,7 +1858,7 @@ impl Reader {
         };
         let bounds = |sink: &S| bounds_for(kinds, sink);
         if bounds(sink).reach() <= reach_sq {
-            return;
+            return Ok(());
         }
 
         let mut walk = CellWalk::new();
@@ -1775,7 +1894,7 @@ impl Reader {
                         interp: cell.lower_bound < wanted.interp,
                     },
                     sink,
-                );
+                )?;
             }
             if cell.lower_bound >= bounds(sink).reach() {
                 continue;
@@ -1790,6 +1909,7 @@ impl Reader {
                 }
             }
         }
+        Ok(())
     }
 
     /// The candidates of one cell, for the classes `kinds` names.
@@ -1804,13 +1924,10 @@ impl Reader {
         max_dist_sq: f64,
         kinds: SearchKinds,
         sink: &mut S,
-    ) {
+    ) -> std::result::Result<(), QueryError> {
         if kinds.addr {
             for entry in addr_entries.entries(gc.addr_offset).iter() {
-                let idx = entry.addr_index;
-                let Some(pt) = self.read_addr_point(idx) else {
-                    continue;
-                };
+                let pt = self.addr_point_entry(entry.addr_index)?;
                 let dist_sq = geo::approx_distance_sq(
                     ctx.lat_rad,
                     ctx.lon_rad,
@@ -1819,26 +1936,43 @@ impl Reader {
                     ctx.cos_lat,
                 );
                 if dist_sq < max_dist_sq {
-                    sink.address(self, idx, pt, dist_sq);
+                    sink.address(self, pt, dist_sq);
                 }
             }
         }
         if kinds.street {
             for seg_ref in street_entries.entries(gc.street_offset).iter() {
-                let (snap_lat, snap_lon, dist_sq) = self.street_segment_distance(ctx, &seg_ref);
+                let way = self.street_way_entry(seg_ref.way_index)?;
+                let ends = segment_endpoints(
+                    &self.street_nodes,
+                    IndexReference::StreetWay,
+                    seg_ref,
+                    way.node_offset,
+                    way.node_count,
+                )?;
+                let (snap_lat, snap_lon, dist_sq) = segment_distance(ctx, ends);
                 if dist_sq < max_dist_sq {
-                    sink.street(self, seg_ref, snap_lat, snap_lon, dist_sq);
+                    sink.street(self, way, snap_lat, snap_lon, dist_sq);
                 }
             }
         }
         if kinds.interp {
             for seg_ref in interp_entries.entries(gc.interp_offset).iter() {
-                let (snap_lat, snap_lon, dist_sq) = self.interp_segment_distance(ctx, &seg_ref);
+                let way = self.interp_way_entry(seg_ref.way_index)?;
+                let ends = segment_endpoints(
+                    &self.interp_nodes,
+                    IndexReference::InterpolationWay,
+                    seg_ref,
+                    way.node_offset,
+                    way.node_count,
+                )?;
+                let (snap_lat, snap_lon, dist_sq) = segment_distance(ctx, ends);
                 if dist_sq < max_dist_sq {
-                    sink.interpolation(self, seg_ref, snap_lat, snap_lon, dist_sq);
+                    sink.interpolation(self, way, seg_ref, snap_lat, snap_lon, dist_sq);
                 }
             }
         }
+        Ok(())
     }
 
     // -- Admin search --------------------------------------------------------
@@ -1847,11 +1981,16 @@ impl Reader {
     /// index ([`admin_ranks_before`]). The interior high bit is
     /// read but ignored as a PIP bypass; every candidate still runs
     /// admin_polygon_contains (see the comment below).
-    fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
+    fn search_admin_ranked<'a>(
+        &'a self,
+        ctx: &QueryContext,
+    ) -> std::result::Result<Vec<AdminMatch<'a>>, QueryError> {
         let level = self.header.admin_cell_level;
         let (cells, count) = cell_neighborhood(ctx.cell(level), level);
         let admin_cells = self.admin_cells.table();
-        let mut best_by_level: [(Option<u32>, f32); ADMIN_LEVEL_SLOTS] =
+        // The winner per level keeps its polygon, so assembly re-reads
+        // nothing, and its index, the tie-break on an equal area.
+        let mut best_by_level: [(Option<(u32, AdminPolygon)>, f32); ADMIN_LEVEL_SLOTS] =
             [(None, f32::MAX); ADMIN_LEVEL_SLOTS];
 
         for &cell_id in &cells[..count] {
@@ -1860,16 +1999,12 @@ impl Reader {
             };
             for entry in self.admin_entries.entries(ac.entries_offset).iter() {
                 let poly_idx = entry.polygon_index();
-                // Out-of-range entry: skipped, as in search_level.
-                let Some(poly) = self.read_admin_polygon(poly_idx) else {
-                    continue;
-                };
-                let level = poly.admin_level as usize;
-                if level >= ADMIN_LEVEL_SLOTS {
-                    continue;
-                }
-                let (best_idx, best_area) = best_by_level[level];
-                if !admin_ranks_before(poly.area, poly_idx, best_area, best_idx) {
+                let poly = self.admin_polygon_entry(poly_idx)?;
+                // Open refused a level outside the format's domain, so every
+                // polygon has a slot.
+                let level = usize::from(poly.admin_level);
+                let (best, best_area) = best_by_level[level];
+                if !admin_ranks_before(poly.area, poly_idx, best_area, best.map(|(i, _)| i)) {
                     continue;
                 }
                 // The interior high bit is only a hint: the reader still runs the
@@ -1883,30 +2018,28 @@ impl Reader {
                 // apart. A false flag here only costs wasted work, never a wrong
                 // answer.
                 if self.admin_polygon_contains(ctx, &poly) {
-                    best_by_level[level] = (Some(poly_idx), poly.area);
+                    best_by_level[level] = (Some((poly_idx, poly)), poly.area);
                 }
             }
         }
 
-        let mut result = Vec::new();
-        for &(maybe_idx, _) in &best_by_level {
-            if let Some(poly_idx) = maybe_idx {
-                let Some(poly) = self.read_admin_polygon(poly_idx) else {
-                    continue;
-                };
-                result.push(AdminMatch {
-                    admin_level: poly.admin_level,
-                    name: self.read_string(poly.name_offset),
-                    country_code: nonzero_string(self, poly.country_code_offset),
-                    area: poly.area,
-                });
-            }
-        }
-        result
+        Ok(best_by_level
+            .iter()
+            .filter_map(|&(best, _)| best)
+            .map(|(_, poly)| AdminMatch {
+                admin_level: poly.admin_level,
+                name: self.read_string(poly.name_offset),
+                country_code: nonzero_string(self, poly.country_code_offset),
+                area: poly.area,
+            })
+            .collect())
     }
 
     /// All admin polygons containing the point (for candidates API).
-    fn search_admin_all<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
+    fn search_admin_all<'a>(
+        &'a self,
+        ctx: &QueryContext,
+    ) -> std::result::Result<Vec<AdminMatch<'a>>, QueryError> {
         let level = self.header.admin_cell_level;
         let (cells, count) = cell_neighborhood(ctx.cell(level), level);
         let admin_cells = self.admin_cells.table();
@@ -1925,10 +2058,7 @@ impl Reader {
                 if !first_admin_attempt(&mut seen, poly_idx) {
                     continue;
                 }
-                // Out-of-range entry: skipped, as in search_level.
-                let Some(poly) = self.read_admin_polygon(poly_idx) else {
-                    continue;
-                };
+                let poly = self.admin_polygon_entry(poly_idx)?;
                 // Interior high bit is a hint only; always run the PIP test, for
                 // the reasons in `search_admin_ranked`: the flag is about its own
                 // cell, not the neighbour cells' queries, and older indexes carry
@@ -1943,7 +2073,7 @@ impl Reader {
                 }
             }
         }
-        result
+        Ok(result)
     }
 
     fn admin_polygon_contains(&self, ctx: &QueryContext, poly: &AdminPolygon) -> bool {
@@ -1972,32 +2102,47 @@ impl Reader {
         geo::point_in_polygon(ctx.lon, ctx.lat, exterior, &holes)
     }
 
-    // -- Segment distance ----------------------------------------------------
+    // -- Entry dereference ---------------------------------------------------
+    //
+    // The one place each kind of cell entry is resolved to its record. Open
+    // does not certify entry contents, so a reference past its file is
+    // refused here, the first time a lookup reads it; everything downstream
+    // receives the resolved record and cannot meet a missing one.
 
-    fn street_segment_distance(&self, ctx: &QueryContext, seg_ref: &SegmentRef) -> (i32, i32, f64) {
-        let Some(way) = self.read_street_way(seg_ref.way_index) else {
-            return SEGMENT_MISS;
-        };
-        segment_distance(
-            ctx,
-            &self.street_nodes,
-            way.node_offset,
-            way.node_count,
-            seg_ref.segment_index,
-        )
+    fn addr_point_entry(&self, index: u32) -> std::result::Result<AddrPoint, QueryError> {
+        self.read_addr_point(index)
+            .ok_or(QueryError::DanglingReference {
+                reference: IndexReference::AddressPoint,
+                index,
+                count: self.header.addr_point_count,
+            })
     }
 
-    fn interp_segment_distance(&self, ctx: &QueryContext, seg_ref: &SegmentRef) -> (i32, i32, f64) {
-        let Some(way) = self.read_interp_way(seg_ref.way_index) else {
-            return SEGMENT_MISS;
-        };
-        segment_distance(
-            ctx,
-            &self.interp_nodes,
-            way.node_offset,
-            way.node_count,
-            seg_ref.segment_index,
-        )
+    fn street_way_entry(&self, index: u32) -> std::result::Result<StreetWay, QueryError> {
+        self.read_street_way(index)
+            .ok_or(QueryError::DanglingReference {
+                reference: IndexReference::StreetWay,
+                index,
+                count: self.header.street_way_count,
+            })
+    }
+
+    fn interp_way_entry(&self, index: u32) -> std::result::Result<InterpWay, QueryError> {
+        self.read_interp_way(index)
+            .ok_or(QueryError::DanglingReference {
+                reference: IndexReference::InterpolationWay,
+                index,
+                count: self.header.interp_way_count,
+            })
+    }
+
+    fn admin_polygon_entry(&self, index: u32) -> std::result::Result<AdminPolygon, QueryError> {
+        self.read_admin_polygon(index)
+            .ok_or(QueryError::DanglingReference {
+                reference: IndexReference::AdminPolygon,
+                index,
+                count: self.header.admin_polygon_count,
+            })
     }
 
     // -- Record readers ------------------------------------------------------
@@ -2057,14 +2202,13 @@ impl Reader {
 
     fn resolve_interpolation(
         &self,
-        way_idx: u32,
+        iw: InterpWay,
         seg_idx: u16,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
         total_len: f64,
     ) -> Option<InterpolationMatch<'_>> {
-        let iw = self.read_interp_way(way_idx)?;
         let house_number =
             self.interpolated_number_at_length(iw, seg_idx, snap_lat, snap_lon, total_len)?;
         let (street, place) = self.interp_parent(iw);
@@ -2132,32 +2276,62 @@ impl Reader {
 // Free functions
 // ---------------------------------------------------------------------------
 
-/// `(snap_lat, snap_lon, dist_sq)` for an entry that names no usable
-/// segment: the distance never passes a radius test.
-const SEGMENT_MISS: (i32, i32, f64) = (0, 0, f64::MAX);
-
-/// Distance from the query to segment `segment` of the way whose nodes are
-/// the `node_count` records at `node_offset` in `nodes`. Both nodes are read
+/// The two endpoints of the segment `seg_ref` names in its way, whose nodes
+/// are the `node_count` records at `node_offset` in `nodes`. Both are read
 /// from the way's own span: a node that is in the file but past this way's
-/// count belongs to the next way.
-fn segment_distance(
-    ctx: &QueryContext,
+/// count belongs to the next way, so a segment index without a second
+/// endpoint in the span is a corrupt entry, refused.
+fn segment_endpoints(
+    nodes: &Records<NodeCoord>,
+    reference: IndexReference,
+    seg_ref: SegmentRef,
+    node_offset: u64,
+    node_count: u16,
+) -> std::result::Result<[NodeCoord; 2], QueryError> {
+    let segment = seg_ref.segment_index;
+    // Widened before the +1, and fails for node_count 0 and 1.
+    if u32::from(segment) + 1 >= u32::from(node_count) {
+        return Err(QueryError::DanglingSegment {
+            reference,
+            way_index: seg_ref.way_index,
+            segment_index: segment,
+            node_count,
+        });
+    }
+    Ok(segment_endpoints_in_span(
+        nodes,
+        node_offset,
+        node_count,
+        segment,
+    ))
+}
+
+/// The endpoints of `segment`, which the caller has checked has a second
+/// endpoint among the way's `node_count` nodes.
+#[expect(
+    clippy::expect_used,
+    reason = "Reader::open validated every way's node span, and the caller's segment \
+              check puts both endpoints inside it"
+)]
+fn segment_endpoints_in_span(
     nodes: &Records<NodeCoord>,
     node_offset: u64,
     node_count: u16,
     segment: u16,
-) -> (i32, i32, f64) {
-    // Widened before the +1, and fails for node_count 0 and 1.
-    if u32::from(segment) + 1 >= u32::from(node_count) {
-        return SEGMENT_MISS;
-    }
-    let Ok(way_nodes) = nodes.span(node_offset, u64::from(node_count)) else {
-        return SEGMENT_MISS;
-    };
+) -> [NodeCoord; 2] {
+    let way_nodes = nodes
+        .span(node_offset, u64::from(node_count))
+        .expect("Reader::open validated the way's node span");
     let first = usize::from(segment);
-    let (Some(a), Some(b)) = (way_nodes.get(first), way_nodes.get(first + 1)) else {
-        return SEGMENT_MISS;
-    };
+    let pair = way_nodes
+        .get(first)
+        .zip(way_nodes.get(first + 1))
+        .expect("both endpoints lie inside the way's span");
+    [pair.0, pair.1]
+}
+
+/// Distance from the query to the segment `a` -> `b`, with the snap point.
+fn segment_distance(ctx: &QueryContext, [a, b]: [NodeCoord; 2]) -> (i32, i32, f64) {
     let (t, dist_sq) = geo::point_to_segment_distance_sq(
         ctx.lon_rad,
         ctx.lat_rad,
@@ -2221,6 +2395,19 @@ fn validate_list<T: Record>(lists: &Lists<T>, offset: u64, kind: &str) -> Result
     })
 }
 
+/// Refuse a nonempty list whose entries name a file of zero records: every
+/// entry in it dangles, and a query would never see it, since a class with no
+/// records is not searched at all. The list itself was validated first.
+fn no_targets<T: Record>(lists: &Lists<T>, offset: u64, targets: u32, kind: &str) -> Result<()> {
+    if targets == 0 && !lists.entries(offset).is_empty() {
+        return Err(corrupt(format!(
+            "invalid geocode index: {kind} list at {offset} names records of a file that \
+             holds none"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a fixed-count run of records at `offset`. Unlike
 /// [`validate_list`] the count comes from the referring record rather than
 /// from a length prefix in the target file.
@@ -2247,8 +2434,9 @@ fn validate_span<T: Record>(
     })
 }
 
-/// Validate a string-pool offset. Offset 0 is the "no string" sentinel that
-/// [`format::read_pool_string`] reads as empty.
+/// Validate a string-pool offset: it frames a whole UTF-8 entry. Offset 0,
+/// the "no string" sentinel, passes like any other offset; open checks
+/// separately that it holds the empty string.
 fn validate_string_offset(offset: u32, strings: &[u8], kind: &str) -> Result<()> {
     format::read_pool_string(strings, offset)
         .map(|_| ())

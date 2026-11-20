@@ -1772,27 +1772,3 @@ Redesign: bounded batches folded into one shared accumulator, or a
 scratch-backed sort and dedupe where the final set also needs a bound.
 
 Payoff: bounded memory on exotic ID layouts; nothing on planet-shaped input.
-
-## PERF-064 - Geocode build Pass 2a reads more after the ring-assembly rewrite
-
-Reported by: the ring-assembly rewrite.
-
-Measured on planet geocode-build at bygg, run `fc33a797` (before
-`9d61febc`) against run `deac9c4c` (the node-ID ring assembly): peak RSS
-(hwm) rose from 22.1 GB to 26.5 GB and peak anonymous memory from 13.0 GB to
-14.2 GB.
-
-The anon half is resolved: admin way geometry now lives in two flat
-anonymous mappings, and from admin assembly on the build holds about 2 GB
-less anon than before the ring rewrite's per-way vectors
-(`reference/performance/geocode.md`, "Admin way geometry in two flat
-mappings"). The peak RSS was always set by the smoke test mapping the
-finished index (about 21 GB file-backed in both bygg runs).
-
-What remains: Pass 2a reading 87.8 GB from disk against 61.9 GB and
-running 25.4 s against 19.3 s on bygg, although Pass 2a's code is
-untouched. Two interleaved pairs could not attribute that to the change or
-to cell-order page-cache state. On plantasjen both arms of a pair that
-each carry the rewrite read 65 to 67 GB. Settle it with balanced
-interleaved cells on bygg (same predecessor workload per arm, trim
-first), the base before `9d61febc` against the current tree.

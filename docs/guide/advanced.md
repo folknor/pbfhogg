@@ -159,7 +159,10 @@ pbfhogg = { version = "0.6", default-features = false, features = ["geocode-read
 
 `Reader::query` and `Reader::candidates` return a `Result`: a non-finite or
 out-of-range latitude or longitude is a typed `QueryError` rather than a
-silently wrong cell lookup.
+silently wrong cell lookup. So is a corrupt index entry the lookup reads
+(`QueryError::DanglingReference` or `DanglingSegment`: an entry naming a
+record past its file), which `Reader::open` does not scan every entry for;
+the lookup refuses rather than answering without it.
 
 `Reader::query` answers each class (address, street, interpolation) with the
 nearest record closer than the index's fine search radius, and for a class

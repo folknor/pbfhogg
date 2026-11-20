@@ -3461,7 +3461,10 @@ fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
 /// declared geometry ends before it. Exercise both fine/coarse query consumers.
 #[test]
 fn segment_distance_respects_the_owning_way_node_count() {
-    use pbfhogg::geocode_index::{builder, reader::Reader};
+    use pbfhogg::geocode_index::{
+        builder,
+        reader::{QueryError, Reader},
+    };
 
     for interpolation in [false, true] {
         let dir = crate::common::test_scratch();
@@ -3535,16 +3538,27 @@ fn segment_distance_respects_the_owning_way_node_count() {
             }
             std::fs::write(entries_path, entries).expect("set last-node segment");
         }
+        // Open certifies spans, not entry contents, so the corrupt entries
+        // are refused by the lookups that read them, never skipped into a
+        // shorter answer nor answered from the next way's nodes.
         let reader = Reader::open(&index_dir).expect("spans remain in bounds");
-        let candidates = reader.candidates(55.7, lon).expect("valid query");
-        assert!(
-            if interpolation {
-                candidates.interpolations.is_empty()
-            } else {
-                candidates.streets.is_empty()
-            },
-            "a segment cannot use nodes outside its owning way"
-        );
+        let dangling = |err: QueryError| {
+            matches!(
+                err,
+                QueryError::DanglingSegment { segment_index, node_count, .. }
+                    if segment_index == count - 1 && node_count == count
+            )
+        };
+        let err = reader
+            .candidates(55.7, lon)
+            .map(drop)
+            .expect_err("candidates refuses the entry");
+        assert!(dangling(err), "{err}");
+        let err = reader
+            .query(55.7, lon)
+            .map(drop)
+            .expect_err("query refuses the entry");
+        assert!(dangling(err), "{err}");
     }
 }
 

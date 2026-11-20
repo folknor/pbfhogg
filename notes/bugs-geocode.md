@@ -102,50 +102,6 @@ the function's own requirement to interpolate in the distance calculation's
 frame. Projection should return the actual closest point, or both calculations
 should share one longitude-frame representation.
 
-## GEO-011 - Corrupt index entry references give successful, incomplete answers
-
-Reported by: geocode-reader [P1].
-
-Open deliberately leaves entry contents unchecked. During lookup
-(`reader.rs`), an invalid address index is skipped, invalid street or
-interpolation references become `SEGMENT_MISS`, and invalid admin indices are
-also skipped. Changing a list's only address index to `addr_point_count` keeps
-every validated file length and list span intact. Open succeeds, the query
-returns `Ok` with no address or with a farther one, and the CLI prints that
-answer as a success. Invalid polygon metadata gets through the same gap: a
-positive NaN `area` passes open and is silently excluded by ranked lookup, and
-an unsupported `admin_level` can appear in raw candidates while ranked lookup
-drops it. This breaks the input-fault refusal contract and ADR-0004, because
-these are detectable invalid references, not legitimate absence.
-`QueryError` currently represents only bad query coordinates, so the fix needs
-either complete validation at open or an index-error path through searches
-and sinks.
-
-## GEO-012 - Admin cells are binary-searched without validating their order
-
-Reported by: geocode-reader [P2].
-
-`validate_admin_tree` (`reader.rs`) validates list spans but never checks cell
-ordering or duplicate keys, and both admin query paths binary-search the
-table. The fine and coarse geo tables do check strict ordering. If three
-distinct admin-cell records are reversed with offsets and lengths preserved,
-open still succeeds, and binary search can miss existing cells and return no
-containing area. This breaks the format's sorted-table contract and the
-promise to refuse input faults rather than return shortened answers.
-
-## GEO-013 - The empty-string sentinel check accepts a nonempty string
-
-Reported by: geocode-reader [P2].
-
-`reader.rs` claims to validate the sentinel by checking that offset zero
-decodes, but never checks that it decodes to an empty string. A pool beginning
-with the bytes `01 78` decodes offset zero as `"x"` and passes. Optional
-address names go through `pool_name`, so an absent street stored at offset
-zero can become `Some("x")`, and an address with both name offsets zero can
-even pass the requirement that it names a street or place. This breaks
-ADR-0025 and the format's requirement that offset zero hold the one-byte zero
-sentinel.
-
 ## GEO-014 - Candidates carry no binding to the reader that produced them
 
 Reported by: geocode-reader (flagged as an API hazard).

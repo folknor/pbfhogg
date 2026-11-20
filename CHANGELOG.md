@@ -4,6 +4,18 @@
 
 ### Breaking
 
+- **The geocode reader refuses corrupt index content it used to answer
+  around.** `Reader::query` and `Reader::candidates` fail with the new
+  `QueryError::DanglingReference` or `QueryError::DanglingSegment` when a
+  cell entry they read names a record past its file; before, the entry was
+  skipped and the query answered with no result or a farther one.
+  `geocode-query` exits 2 naming the points line. `Reader::open` now also
+  refuses admin cells out of order or repeated, an admin polygon area that
+  is NaN, infinite or negative, an admin level outside 2 to 10 and the
+  postal level, a nonempty entry list over an empty record file, and a
+  string pool whose first entry is not the empty string. Indexes built by
+  pbfhogg are unaffected. `QueryError` gains variants, so an exhaustive
+  match on it must add arms.
 - **apply-changes refuses a history base, and applies a hidden change as a
   delete.** A base PBF declaring `HistoricalInformation` exits 2 before the
   OSC is parsed; before, every version of a changed object was overwritten

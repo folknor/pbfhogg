@@ -2399,7 +2399,9 @@ index is opened, and a blank line, a third field, a value that is not a
 finite number, or a latitude outside -90 to 90 or longitude outside -180 to
 180 refuses the run (exit 2) naming the line, before any answer is printed.
 An index the reader refuses (wrong format version, a corrupt file) is
-exit 2 as well, as is a query the reader fails on, naming its line.
+exit 2 as well, as is a query the reader fails on, naming its line (a
+corrupt index entry the query reaches, which open does not scan for, is
+such a failure).
 Every answer is computed before anything is printed, so an interrupted run
 prints nothing and a successful run prints exactly one line per input line
 (an empty `POINTS` file prints nothing).

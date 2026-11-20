@@ -1312,10 +1312,6 @@ pub(crate) const GEOCODE_EXCLUDED_HIGHWAYS: [&[u8]; 9] = [
     b"construction",
 ];
 
-/// Lowest `admin_level` accepted for an admin boundary relation (the highest
-/// is `format::MAX_ADMIN_LEVEL`, fixed by the index layout).
-pub(crate) const GEOCODE_ADMIN_LEVEL_MIN: u8 = 2;
-
 /// The `admin_level` whose boundaries carry the country code.
 pub(crate) const GEOCODE_COUNTRY_ADMIN_LEVEL: u8 = 2;
 

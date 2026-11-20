@@ -271,3 +271,149 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
         );
     }
 }
+
+/// An entry naming a record past its file keeps every validated length and
+/// span intact, so it opens; the lookup that reads it refuses instead of
+/// answering with no address as if none were there.
+#[test]
+fn a_dangling_address_entry_fails_the_query() {
+    use pbfhogg::geocode_index::reader::{IndexReference, QueryError, Reader};
+
+    let dir = crate::common::test_scratch();
+    let index_dir = dir.path().join("index");
+    write_index(&index_dir);
+    std::fs::write(
+        index_dir.join(format::FILE_ADDR_ENTRIES),
+        [1, 0, 1, 0, 0, 0],
+    )
+    .expect("name address point 1 of 1");
+    let reader = Reader::open(&index_dir).expect("entry contents are not checked at open");
+    let expected = QueryError::DanglingReference {
+        reference: IndexReference::AddressPoint,
+        index: 1,
+        count: 1,
+    };
+    assert_eq!(reader.query(55.7, 12.5).err(), Some(expected));
+    assert_eq!(reader.candidates(55.7, 12.5).err(), Some(expected));
+}
+
+/// The admin searches binary-search their cells, so open refuses admin
+/// cells out of order or repeated, as it does geo cells.
+#[test]
+fn reader_rejects_admin_cells_out_of_order() {
+    for ids in [[2u64, 1], [1, 1]] {
+        let dir = crate::common::test_scratch();
+        let index_dir = dir.path().join("index");
+        write_index(&index_dir);
+        let header_path = index_dir.join(format::FILE_HEADER);
+        let bytes: [u8; format::HEADER_SIZE] = std::fs::read(&header_path)
+            .expect("read header")
+            .try_into()
+            .expect("header size");
+        let mut header = Header::from_bytes(&bytes).expect("decode header");
+        header.admin_cell_count = 2;
+        std::fs::write(&header_path, header.to_bytes()).expect("write header");
+        let mut cells = Vec::new();
+        for cell_id in ids {
+            cells.extend_from_slice(
+                &format::AdminCell {
+                    cell_id,
+                    entries_offset: 0,
+                }
+                .to_bytes(),
+            );
+        }
+        std::fs::write(index_dir.join(format::FILE_ADMIN_CELLS), cells).expect("admin cells");
+        let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+            .err()
+            .expect("unordered admin cells must fail open");
+        assert!(
+            err.report().contains("cell IDs are not strictly ascending"),
+            "{ids:?}: unexpected error: {err}"
+        );
+    }
+}
+
+/// Offset 0 must hold the empty string, not merely decode: a pool whose
+/// first entry is a one-byte string would turn every absent name into it.
+#[test]
+fn reader_rejects_a_nonempty_string_sentinel() {
+    let dir = crate::common::test_scratch();
+    let index_dir = dir.path().join("index");
+    write_index(&index_dir);
+    let path = index_dir.join(format::FILE_STRINGS);
+    let mut strings = std::fs::read(&path).expect("read strings");
+    // Offset 0 now frames the one-byte entry holding the next length byte;
+    // every other entry still decodes where it did.
+    strings[0] = 1;
+    std::fs::write(&path, strings).expect("write strings");
+    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .err()
+        .expect("a nonempty sentinel must fail open");
+    assert!(
+        err.report().contains("empty-string sentinel"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Ranked lookup compares areas and slots polygons by level, so an area or
+/// level the builder cannot write is refused at open rather than silently
+/// excluding or misranking the polygon.
+#[test]
+fn reader_rejects_admin_polygon_area_and_level_outside_the_format() {
+    let base = format::AdminPolygon {
+        area: 1.0,
+        vertex_offset: 0,
+        vertex_count: 1,
+        name_offset: 4,
+        country_code_offset: 0,
+        admin_level: 6,
+    };
+    let mut cases = Vec::new();
+    for area in [f32::NAN, -f32::NAN, f32::INFINITY, -1.0, -0.0] {
+        cases.push((format::AdminPolygon { area, ..base }, "area"));
+    }
+    for admin_level in [0, 1, 12, 255] {
+        cases.push((
+            format::AdminPolygon {
+                admin_level,
+                ..base
+            },
+            "level",
+        ));
+    }
+    for (polygon, expected) in cases {
+        let dir = crate::common::test_scratch();
+        let index_dir = dir.path().join("index");
+        write_index(&index_dir);
+        std::fs::write(
+            index_dir.join(format::FILE_ADMIN_POLYGONS),
+            polygon.to_bytes(),
+        )
+        .expect("write polygon");
+        let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+            .err()
+            .unwrap_or_else(|| panic!("{polygon:?} must fail open"));
+        assert!(
+            err.report().contains(expected),
+            "{polygon:?}: unexpected error: {err}"
+        );
+    }
+    for (area, admin_level) in [(0.0, 2), (1.0, 10), (1.0, format::POSTAL_BOUNDARY_LEVEL)] {
+        let dir = crate::common::test_scratch();
+        let index_dir = dir.path().join("index");
+        write_index(&index_dir);
+        std::fs::write(
+            index_dir.join(format::FILE_ADMIN_POLYGONS),
+            format::AdminPolygon {
+                area,
+                admin_level,
+                ..base
+            }
+            .to_bytes(),
+        )
+        .expect("write polygon");
+        pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+            .unwrap_or_else(|e| panic!("area {area} level {admin_level} must open: {e}"));
+    }
+}

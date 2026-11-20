@@ -29,6 +29,17 @@ at 3.0 GB against 4.8 GB. Output identical: 929,216 admin polygons,
 3,049 relations dropped, 324 topology refusals. Verdict: kept; the wall
 delta is inside the band of one unbalanced pair.
 
+Bygg, 2026-11-20, committed as `3db3087d` against its parent
+`8766940a`, one pair, no trim: variant `3ed58022` 118 s, base
+`e2f56dbc` 129 s (`--commit`, second). Anon from admin assembly to the
+end 2.6 to 3.0 GB against 4.8 to 5.4 GB, stage B fine 9.7 GB against
+12.8 GB, smoke test 2.7 GB against 5.3 GB, Pass 2b 13.9 GB against
+14.2 GB. The pair also settles the Pass 2a question left by the
+node-topology entry below: Pass 2a's code is the same in both arms, yet
+the base read 100 GB in 27.7 s and the variant 72 GB in 23.0 s. Pass
+2a's read volume follows page-cache state, not code, so the 61.9 GB
+against 87.8 GB there was not the ring rewrite's.
+
 ### Admin rings by node topology (bygg, 2026-11-19, variant uncommitted against `9d61febc`)
 
 Admin ring assembly replaced: members join by node ID and each graph is
@@ -493,6 +504,27 @@ traccar's index is more compact (18 GB planet) because it uses f32 coords,
 u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
+
+### Corrupt entries refused at the read (plantasjen, 2026-11-20, variant uncommitted against `3db3087d`)
+
+Lookups now fail on a cell entry naming a record past its file instead of
+skipping it, sinks take the record the search already resolved instead of
+re-reading it, and open additionally checks admin cell order, polygon area
+and level, a nonempty list over an empty target file, and the empty-string
+sentinel. geocode-query, germany, country bbox `5.9,47.3,15.0,55.0`, 100k
+points, 3 rounds, interleaved `--iterations 1` cells (base, variant, base,
+variant):
+
+| Cell | us per query (best) | open_ms |
+|---|---:|---:|
+| base `8e049cf3` | 129.31 | 1088 |
+| variant `dfbb0430` | 122.33 | 1030 |
+| base `ee856753` | 129.05 | 987 |
+| variant `64afe2f4` | 122.28 | 1009 |
+
+Queries about 5 % faster in both pairs, same sign (the dropped re-reads in
+the sinks and assembly are the likely cause; not attributed further). Open
+moves within noise: the new checks ride walks open already made.
 
 ### Where the walk still costs (bygg, 2026-11-10, at `7dcabbcc`)
 

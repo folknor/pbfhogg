@@ -102,9 +102,7 @@ fn select_candidate(rel: &crate::read::elements::Relation<'_>) -> Option<Pending
 
     let admin_level = if is_admin {
         let l = level_str?.parse::<u8>().ok()?;
-        if !(crate::tunables::GEOCODE_ADMIN_LEVEL_MIN..=super::super::format::MAX_ADMIN_LEVEL)
-            .contains(&l)
-        {
+        if !super::super::format::is_administrative_level(l) {
             return None;
         }
         l

@@ -39,8 +39,23 @@ pub const S2_MAX_LEVEL: u8 = 30;
 /// a distinct boundary kind and a format migration, not reuse of this slot.
 pub const POSTAL_BOUNDARY_LEVEL: u8 = 11;
 pub const MAX_ADMIN_LEVEL: u8 = 10;
+/// Lowest administrative level the format records.
+pub const MIN_ADMIN_LEVEL: u8 = 2;
 pub const ADMIN_LEVEL_SLOTS: usize = POSTAL_BOUNDARY_LEVEL as usize + 1;
+const _: () = assert!(MIN_ADMIN_LEVEL <= MAX_ADMIN_LEVEL);
 const _: () = assert!(MAX_ADMIN_LEVEL < POSTAL_BOUNDARY_LEVEL);
+
+/// Whether `level` is an administrative level (`boundary=administrative`)
+/// the format records. The postal slot is not one.
+pub const fn is_administrative_level(level: u8) -> bool {
+    MIN_ADMIN_LEVEL <= level && level <= MAX_ADMIN_LEVEL
+}
+
+/// Whether `level` is a value [`AdminPolygon::admin_level`] may hold: an
+/// administrative level or [`POSTAL_BOUNDARY_LEVEL`].
+pub const fn is_admin_polygon_level(level: u8) -> bool {
+    is_administrative_level(level) || level == POSTAL_BOUNDARY_LEVEL
+}
 
 /// A numeric `addr:interpolation` step from 2 to 9; the step 1 is
 /// [`InterpolationType::All`].
@@ -983,8 +998,9 @@ pub(crate) fn push_pool_string(pool: &mut Vec<u8>, s: &str, len: u32) {
 /// Returns `None` for an offset past the pool, a length prefix that is
 /// truncated, overlong (not canonical) or above `u32`, an entry running past
 /// the pool, or bytes that are not UTF-8, so corruption cannot collapse to
-/// the same value as a real string. Offset 0 reads as `""` only when the pool
-/// begins with its length-zero sentinel.
+/// the same value as a real string. Offset 0 is not special here: it reads
+/// whatever entry begins the pool, so it reads as `""` only when the pool
+/// begins with its length-zero sentinel (which `Reader::open` requires).
 pub fn read_pool_string(data: &[u8], offset: u32) -> Option<&str> {
     std::str::from_utf8(pool_entry_bytes(data, offset)?).ok()
 }

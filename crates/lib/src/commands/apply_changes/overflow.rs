@@ -151,11 +151,12 @@ impl Replay<'_, '_> {
         // the same order; only the writing is replayed (no walk, no stats).
         let ops: Vec<Op<'_>> = Steps::new(self.block, self.diff, self.kind, self.inline.clone())
             .filter_map(|step| match step {
-                Step::Create(op) | Step::Element { op: Some(op), .. } => Some(op),
-                Step::Observe(_) | Step::Element { op: None, .. } => None,
+                Ok(Step::Create(op) | Step::Element { op: Some(op), .. }) => Some(Ok(op)),
+                Ok(Step::Observe(_) | Step::Element { op: None, .. }) => None,
+                Err(e) => Some(Err(e)),
             })
             .take(end)
-            .collect();
+            .collect::<Result<_>>()?;
         if ops.len() < end {
             return Err(Error::internal(format!(
                 "apply-changes overflow replay found {} operations where the rewrite wrote {end}",

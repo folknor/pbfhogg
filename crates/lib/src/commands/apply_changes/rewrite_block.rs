@@ -133,14 +133,22 @@ impl<'a> Steps<'a> {
     }
 
     #[inline]
-    fn next_create(&mut self) -> Option<Step<'a>> {
+    fn next_create(&mut self) -> Option<Result<Step<'a>>> {
         let i = self.inline.next()?;
-        Some(Step::Create(Op::Osc(self.kind, i)))
+        Some(Ok(Step::Create(Op::Osc(self.kind, i))))
     }
 
-    /// The element's step, once no create sorts before it.
+    /// The element's step, once no create sorts before it. Refused where
+    /// the diff would replace or delete a base element holding a higher
+    /// version than the changes claimed for it
+    /// ([`SortedDiff::check_base_version`]).
     #[inline]
-    fn resolve(&mut self, elem_kind: ElementKind, id: i64, element: Element<'a>) -> Step<'a> {
+    fn resolve(
+        &mut self,
+        elem_kind: ElementKind,
+        id: i64,
+        element: Element<'a>,
+    ) -> Result<Step<'a>> {
         // Skip a modification ID (written below as the element's own hit).
         if !self.inline.is_empty()
             && self.diff.upserts(self.kind).get(self.inline.start) == Some(&id)
@@ -148,19 +156,39 @@ impl<'a> Steps<'a> {
             self.inline.next();
         }
         let op = match self.seeks.find(self.diff, elem_kind, id) {
-            DiffHit::Deleted => None,
-            DiffHit::Upserted(i) => Some(Op::Osc(elem_kind, i)),
+            DiffHit::Deleted(i) => {
+                self.diff
+                    .check_base_version(elem_kind, id, Err(i), base_claim(&element))?;
+                None
+            }
+            DiffHit::Upserted(i) => {
+                self.diff
+                    .check_base_version(elem_kind, id, Ok(i), base_claim(&element))?;
+                Some(Op::Osc(elem_kind, i))
+            }
             DiffHit::None => Some(Op::Base(element)),
         };
-        Step::Element { id, op }
+        Ok(Step::Element { id, op })
+    }
+}
+
+/// The version a base element claims (`claimed_version`: 0 and the
+/// Osmosis -1 sentinel are none).
+#[inline]
+fn base_claim(element: &Element<'_>) -> Option<i32> {
+    match element {
+        Element::DenseNode(dn) => dn.info().and_then(crate::DenseNodeInfo::claimed_version),
+        Element::Node(n) => n.info().claimed_version(),
+        Element::Way(w) => w.info().claimed_version(),
+        Element::Relation(r) => r.info().claimed_version(),
     }
 }
 
 impl<'a> Iterator for Steps<'a> {
-    type Item = Step<'a>;
+    type Item = Result<Step<'a>>;
 
     #[inline]
-    fn next(&mut self) -> Option<Step<'a>> {
+    fn next(&mut self) -> Option<Result<Step<'a>>> {
         if let Some((elem_kind, id, element)) = self.pending.take() {
             if self.create_due(id) {
                 self.pending = Some((elem_kind, id, element));
@@ -174,7 +202,7 @@ impl<'a> Iterator for Steps<'a> {
         let (elem_kind, id) = element_kind_id(&element);
         if self.create_due(id) {
             self.pending = Some((elem_kind, id, element));
-            return Some(Step::Observe(id));
+            return Some(Ok(Step::Observe(id)));
         }
         Some(self.resolve(elem_kind, id, element))
     }
@@ -391,7 +419,7 @@ fn walk_and_write(
     bb.pre_seed_string_table(block)?;
     let mut observed = false;
     for step in Steps::new(block, diff, kind, inline_upserts) {
-        match step {
+        match step? {
             Step::Observe(id) => {
                 walk.observe(id)?;
                 observed = true;

@@ -236,12 +236,26 @@ position rather than refused, and inputs listed backwards across a pair of
 diffs that differ only in equal-version changes (`delete v12` then
 `modify v12`) are not detected; a real backwards listing is still refused by
 every object whose version advanced between the two diffs.
+`apply-changes` also holds the changes to the base it rewrites: where a
+change replaces or deletes a base element that claims a version, the
+highest version the changes claimed for that object (deletes included,
+so `modify v9` then an unversioned delete still claims 9) must not be
+lower than the base element's, else the run is a hard error naming both;
+osmium keeps the base element silently. The check is on the collapsed
+change set, not each change in turn: base v10 with changes v9 then v11
+applies v11. Equal versions apply (the change wins, where osmium compares
+timestamps), and either side claiming no version passes. A final change
+below the base arises only when, for that object, the change set lies
+wholly before the base - stale diffs, or a content-derived patch back to
+an older snapshot, which needs the opt-out below. `merge-changes
+--simplify` emits final records only, so a simplified change set can no
+longer show a claim its final record does not carry.
 The default `merge-changes` mode is untouched - it preserves the full
 change stream in input order by design and resolves nothing, so there is
 nothing to regress.
 
 Opt into a purely positional rule (the last change seen wins, whatever
-version it claims; osmium has no such mode) with
+version it or the base claims; osmium has no such mode) with
 `apply-changes --allow-version-regression`,
 `merge-changes --simplify --allow-version-regression` (the flag requires
 `--simplify`, the only merge-changes mode that compares versions), or

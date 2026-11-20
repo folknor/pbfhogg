@@ -101,8 +101,8 @@ pub(super) fn element_kind_id(element: &Element<'_>) -> (ElementKind, i64) {
 pub(super) enum DiffHit {
     /// Untouched by the diff.
     None,
-    /// Deleted by the diff.
-    Deleted,
+    /// Deleted by the diff, at this index into the kind's deletes.
+    Deleted(usize),
     /// Replaced by the diff's record at this index into the kind's upserts.
     Upserted(usize),
 }
@@ -127,8 +127,8 @@ impl KindSeeks {
     pub(super) fn find(&mut self, diff: &SortedDiff, kind: ElementKind, id: i64) -> DiffHit {
         let k = usize::from(kind.ordinal());
         let table = diff.kind(kind);
-        if self.deleted[k].find(table.deleted(), id).is_some() {
-            DiffHit::Deleted
+        if let Some(i) = self.deleted[k].find(table.deleted(), id) {
+            DiffHit::Deleted(i)
         } else if let Some(i) = self.upserts[k].find(table.upserts(), id) {
             DiffHit::Upserted(i)
         } else {

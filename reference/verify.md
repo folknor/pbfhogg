@@ -361,8 +361,10 @@ strictly. No finally deleted identity may appear in pbfhogg's output, even
 where osmium's output holds it too. The element diff tolerates only
 osmium-only identities that are finally deleted, since osmium resolves a
 delete by version order against the base, keeping a base element whose
-version is above the delete's, while pbfhogg applies the last change
-whatever the base's version. All other differences fail. Both outputs must
+version is above the delete's. pbfhogg refuses a change set whose
+highest claim for an object is below the base's version, so the
+exception is reached only where one side claims no version (an
+unversioned delete against a versioned base). All other differences fail. Both outputs must
 be in strict order for the element comparison to be made.
 In locations mode pbfhogg's output must pass `check --locations`;
 osmium's location report is informational, with its stale count shown even

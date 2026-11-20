@@ -171,6 +171,16 @@ pub(super) const WAY_META_OFF: usize = 8 + 4 + 4;
 /// Header: `id:i64, member_count:u32, tag_count:u32`.
 pub(super) const RELATION_META_OFF: usize = 8 + 4 + 4;
 
+/// Byte offset of the metadata block inside a record of `kind`.
+#[inline]
+pub(super) fn meta_off(kind: crate::ElementKind) -> usize {
+    match kind {
+        crate::ElementKind::Node => NODE_META_OFF,
+        crate::ElementKind::Way => WAY_META_OFF,
+        crate::ElementKind::Relation => RELATION_META_OFF,
+    }
+}
+
 /// Read the version an arena record claims, or `None` when the source
 /// element carried no `version` attribute.
 pub(super) fn version_at(data: &[u8], record_offset: usize, meta_off: usize) -> Option<i32> {

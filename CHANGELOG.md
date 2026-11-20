@@ -15,6 +15,17 @@
   `&amp;#1;` (escaped text) and references inside comments or CDATA stay
   legal. A `<!DOCTYPE>` with an internal subset (`[...]`) is now refused;
   a bare `<!DOCTYPE osmChange>` or an external identifier is still read.
+- **apply-changes refuses changes older than the base.** Where a change
+  replaces or deletes a base element, and the highest version the changes
+  claim for that object (deletes included) is below the base element's
+  version, the run fails with the same version-regression error the
+  changes' own ordering check gives, naming both versions. Before, the change
+  was applied regardless, so a stale diff silently downgraded or deleted
+  newer objects; osmium keeps the base element instead. Equal versions,
+  and elements or changes without a version, still apply.
+  `--allow-version-regression` restores last-change-wins, and is needed
+  to apply a content-derived patch back to an older snapshot. Library:
+  `ErrorKind::VersionRegression` gains an `in_base` field.
 - **A tag string index past the block's string table is refused.** Every
   command that decodes a block now fails (exit 2) on a tag key or value
   index that names no string, as osmium does. Before, the tag list ended

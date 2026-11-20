@@ -180,40 +180,6 @@ and re-emission silently removes the offending tail. Claim named: the
 malformed-role refusal contract in `CORRECTNESS.md`. The parser needs to
 validate the complete child attribute list.
 
-## BUG-016 - apply-changes applies older OSC versions over newer base versions
-
-Reported by: apply-core.
-
-By inspection, a base node at version 10 with one OSC modify at version 9 is
-replaced by version 9, and an older delete removes it: `KindSeeks`
-(`classify.rs`) matches by ID only and the rewrite applies the action without
-comparing base metadata; the ingest regression gate compares changes within the
-overlay only. The vendored osmium `command_apply_changes.cpp` merges by
-descending version and keeps the first per ID, retaining version 10. The sorted
-delete representation has already discarded the metadata needed.
-
-Defect hunt 2026-11-17: the hunters disagree on which side is wrong.
-- apply-merge (P1): base node 1 at version 9 plus a single OSC modify at
-  version 8 outputs version 8; a version-8 delete removes the version-9
-  object. Rewrite dispatch (`rewrite_block.rs`) replaces or deletes by
-  identity; version checks run during OSC accumulation only; `SortedDiff`
-  (`osc/sorted.rs`) stores deletes as IDs alone. Claim named: the
-  `--allow-version-regression` contract in `docs/cli/commands.md`, since a
-  downgrade succeeds with the flag off. The finished overlay must keep version
-  information, including tombstones, for the base merge.
-- osc-parsing and diff (both flagged out of scope): the implementation matches
-  its overlay-specific API documentation; the CLI wording overstates the
-  protection and should limit it to ordering within the change stream.
-- verify (P2): reads the overlay-only gate as pbfhogg's documented rule
-  (`DEVIATIONS.md`) and reports that `pbfhogg-verify` apply-changes
-  (`checks/apply_changes.rs`) fails that correct result, because it tolerates
-  only osmium-only objects finally deleted by the OSC; equal-version changes
-  with differing timestamps fail the same way. It calls the delete-only
-  exception in `reference/verify.md` wrong against `DEVIATIONS.md`, says the
-  same assumption affects the osmium roundtrips in
-  `checks/derive_changes.rs`, and asks for an independent precedence model
-  instead of unconditional equality with osmium.
-
 ## BUG-017 - apply-changes direct reads do not reach the bulk reads
 
 Reported by: apply-core.
@@ -391,3 +357,18 @@ negatives took the same path they do too. Fix: give duplicates a fixed place
 in report order and pick their examples by canonical ID, or settle every
 occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
 redesign of the same per-blob retention.
+
+## BUG-033 - apply-changes accepts a history base
+
+Reported by: the codex spar of the apply-changes base version gate.
+
+Header admission for apply-changes (`rewrite.rs`) checks the sort claim but
+not `HistoricalInformation`. On a history file the base holds several
+versions of one ID, and the rewrite replaces or deletes every occurrence
+(`rewrite_block.rs`, repeated IDs are matched each time), which is wrong
+for history even when every version check passes; osmium has a separate
+history branch for it. Unverified by a run. Fix: refuse a base declaring
+`HistoricalInformation` and point at producing a snapshot first, or
+implement history application. Related: an OSC upsert carrying
+`visible="false"` is stored as a visibility field, not a delete, and no
+contract says what apply-changes should make of it.

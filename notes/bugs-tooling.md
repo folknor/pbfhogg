@@ -20,9 +20,8 @@ Defects from the 2026-11-17 defect hunt in the dev-only crates:
 with `pbfhogg-harness`, and `pbfhogg-bench` with its Lua scripts. Every
 finding was made by one codex hunter per scope reading source at `63d4ec1d`.
 None was built, run or reproduced, and the bracketed priority is the hunter's
-own label. The verify hunter's apply-changes precedence finding is recorded
-under BUG-016 in `notes/bugs.md`, because it is the other reading of that
-mechanism, and the geocode-query optimizer sink is recorded under BUG-028.
+own label. The verify hunter's apply-changes precedence finding is TOOL-029,
+and the geocode-query optimizer sink is recorded under BUG-028.
 Entries are in no order of importance.
 
 ## TOOL-002 - verify extract compares different regions for some bbox spellings
@@ -365,3 +364,24 @@ indexdata probe. Raw variants complete successfully through the sequential
 fallback (`diff/mod.rs`), so the measurement does not exercise the documented
 workload. The benchmark should establish its indexed-input precondition, as
 diff-unindexed establishes the opposite one.
+
+## TOOL-029 - verify apply-changes judges precedence by equality with osmium
+
+Reported by: verify (2026-11-17 hunt), narrowed 2026-11-20.
+
+apply-changes now refuses a change set whose highest claim for an object is
+below the base element's version, so the stale-delete case the hunter named
+no longer yields a pbfhogg output to compare. What remains: the verifier
+(`crates/verify/src/checks/apply_changes.rs`) requires element equality with
+osmium except for osmium-only identities finally deleted by the OSC. The two
+tools still choose differently where the documented rules differ
+(`DEVIATIONS.md`, "Change stream"): an equal-version conflict, base or
+change, is won by position in pbfhogg and by the later valid timestamp in
+osmium; a change or delete claiming no version against a versioned base
+applies in pbfhogg and loses in osmium. The first fails the check through
+metadata alone. The verifier should judge pbfhogg's admission and final
+action against an independent model of the supplied OSC and base, and
+assert osmium parity only where the precedence rules agree. The derive
+roundtrips (`checks/derive_changes.rs`) compare content, so only content
+or membership differences reach them; whether the same assumption affects
+them is unchecked.

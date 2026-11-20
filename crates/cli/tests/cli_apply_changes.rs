@@ -34,7 +34,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::common::{
-    TestMember, TestNode, TestRelation, TestWay, node_ids_with_coords as node_ids,
+    TestMember, TestMeta, TestNode, TestRelation, TestWay, node_ids_with_coords as node_ids,
     read_all_elements_with_coords as read_all_elements, relation_ids_with_coords as relation_ids,
     way_ids_with_coords as way_ids, write_test_pbf_sorted,
 };
@@ -3190,6 +3190,108 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
 </osmChange>"#,
     );
     run_apply_ok(&base, &forward, &output);
+}
+
+/// The version gate holds against the base as well as within the changes:
+/// a change set whose highest claim for an object is below the base
+/// element's version is refused, whether it modifies or deletes it, and
+/// a claimless final change does not hide the claim made before it. An
+/// equal version, a claimless change set and an unversioned base element
+/// all apply; `--allow-version-regression` restores last-change-wins.
+#[test]
+fn merge_refuses_changes_older_than_the_base_version() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let versioned = |version| {
+        Some(TestMeta {
+            version,
+            ..TestMeta::default()
+        })
+    };
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: versioned(10),
+            },
+            TestNode {
+                id: 2,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+    let refused = [
+        r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>"#,
+        r#"<delete><node id="1" version="9"/></delete>"#,
+        r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>
+  <delete><node id="1"/></delete>"#,
+        r#"<delete><node id="1" version="9"/></delete>
+  <create><node id="1" lat="8.0" lon="8.0"/></create>"#,
+    ];
+    for (n, body) in refused.iter().enumerate() {
+        let osc = dir.path().join(format!("stale{n}.osc.gz"));
+        write_osc(
+            &osc,
+            &format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  {body}\n</osmChange>"
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+        assert!(
+            !out.status.success(),
+            "case {n}: a change older than the base must be refused"
+        );
+        assert!(
+            out.stderr_str().contains("is at version 10 in the base")
+                && out.stderr_str().contains("--allow-version-regression"),
+            "case {n}: error must name the base version and the opt-out; stderr:\n{}",
+            out.stderr_str()
+        );
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("apply-changes")
+            .arg(&base)
+            .arg(&osc)
+            .arg("-o")
+            .arg(&output)
+            .arg("--overwrite")
+            .arg("--allow-version-regression")
+            .arg("--force")
+            .run();
+        assert!(
+            out.status.success(),
+            "case {n}: --allow-version-regression must accept it; stderr:\n{}",
+            out.stderr_str()
+        );
+    }
+    let admitted = [
+        r#"<modify><node id="1" lat="8.0" lon="8.0" version="10"/></modify>"#,
+        r#"<delete><node id="1" version="10"/></delete>"#,
+        r#"<modify><node id="1" lat="8.0" lon="8.0"/></modify>"#,
+        r#"<modify><node id="2" lat="8.0" lon="8.0" version="1"/></modify>"#,
+        r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>
+  <modify><node id="1" lat="8.0" lon="8.0" version="11"/></modify>"#,
+    ];
+    for (n, body) in admitted.iter().enumerate() {
+        let osc = dir.path().join(format!("fresh{n}.osc.gz"));
+        write_osc(
+            &osc,
+            &format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  {body}\n</osmChange>"
+            ),
+        );
+        run_apply_ok(&base, &osc, &output);
+    }
 }
 
 /// Two overlapping diffs, concatenated by `merge-changes` in its default

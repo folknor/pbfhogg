@@ -61,8 +61,13 @@ pub struct MergeOptions {
     /// worker (the barrier fault tests run at one worker too).
     pub parallelism: crate::host::Parallelism,
     /// Accept a change whose `version` is lower than the version already
-    /// held for that object in the overlay. Off by default; see
-    /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
+    /// held for that object, earlier in the changes or in the base. Off by
+    /// default: a change set whose highest claim for an object is below
+    /// the base element's version is refused at the base merge
+    /// ([`ErrorKind::VersionRegression`](crate::ErrorKind::VersionRegression)
+    /// with `in_base`), and the changes themselves are gated as
+    /// [`crate::osc::CompactDiffOverlay::allow_version_regression`]
+    /// describes.
     pub allow_version_regression: bool,
 }
 

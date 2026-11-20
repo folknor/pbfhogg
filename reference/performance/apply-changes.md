@@ -46,6 +46,17 @@ segment the check lands in (before `MERGE_LOOP`) went from 4612 to 4719 ms
 (+107 ms); the rest of the wall delta sits in the drive-bound trailing
 creates drain (684 to 1575 ms), not in parsing. About +1 % of wall, noise.
 
+### Base version check on matched elements (plantasjen, 2026-11-20, `ec250124` + change)
+
+The rewrite compares each matched base element's version with the highest
+version the changes claimed for it, refusing a change set older than the
+base; the step iterator now yields results. Planet apply-diff of OSC 4913,
+`--iterations 1`, baseline `--commit HEAD` then variant uncommitted:
+386 s (`2084e27b`) against 387 s (`40c2ff67`). Streaming phase 257.5 s
+against 258.9 s at 21.8 cores in both, node transition creates 118.3 s
+against 118.0 s. Neutral; one pair, as the difference sits far below the
+noise band.
+
 ### Overflow recovery: the rewrite walk as a step iterator (bygg, 2026-11-19, `3bafe5c0` + change)
 
 The worker's rewrite loop became a step iterator (so an output block over

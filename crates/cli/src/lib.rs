@@ -2190,10 +2190,10 @@ enum Command {
         #[arg(long, requires = "locations_on_ways")]
         ignore_missing_nodes: bool,
         /// Accept a change whose version is lower than the one already
-        /// held for that object. Off by default: an out-of-order diff
-        /// otherwise downgrades objects to an older state and reports
-        /// success. An equal version is always accepted; the later
-        /// change wins.
+        /// held for that object, by an earlier change or by the base.
+        /// Off by default: an out-of-order or stale diff otherwise
+        /// downgrades objects to an older state and reports success. An
+        /// equal version is always accepted; the later change wins.
         #[arg(long)]
         allow_version_regression: bool,
         // Auto keeps the `nproc - 2` heuristic (two cores left for the

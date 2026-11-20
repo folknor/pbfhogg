@@ -348,17 +348,39 @@ impl CompactDiffOverlay {
     /// and parses nothing more (apply-changes). Keeps the arenas and the
     /// interned strings; drops the hash indexes, deleted sets, version
     /// floors and the interner's lookup map, which only parsing reads.
+    ///
+    /// While the version gate is on, the floors are first reduced to what
+    /// the base merge compares against a base element's version: each
+    /// delete's highest claim, and the few upserts whose highest claim is
+    /// above their final record's own (`SortedDiff::check_base_version`).
+    /// With the gate off the floors are incomplete and the base merge
+    /// compares nothing, so none are kept.
     pub(crate) fn into_sorted(self) -> super::sorted::SortedDiff {
+        use super::compact::{NODE_META_OFF, RELATION_META_OFF, WAY_META_OFF};
         use super::sorted::{KindTable, SortedDiff};
+        let gate = !self.allow_version_regression;
+        let floors = |map, off| gate.then_some((map, off));
         SortedDiff::new(
-            KindTable::build(self.node_arena, self.node_index, self.deleted_nodes),
-            KindTable::build(self.way_arena, self.way_index, self.deleted_ways),
+            KindTable::build(
+                self.node_arena,
+                self.node_index,
+                self.deleted_nodes,
+                floors(&self.node_version_floors, NODE_META_OFF),
+            ),
+            KindTable::build(
+                self.way_arena,
+                self.way_index,
+                self.deleted_ways,
+                floors(&self.way_version_floors, WAY_META_OFF),
+            ),
             KindTable::build(
                 self.relation_arena,
                 self.relation_index,
                 self.deleted_relations,
+                floors(&self.relation_version_floors, RELATION_META_OFF),
             ),
             self.interner.into_strings(),
+            gate,
         )
     }
 

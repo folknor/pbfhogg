@@ -180,6 +180,26 @@ pub(crate) fn new_version_regression(
         id,
         version,
         held,
+        in_base: false,
+    })
+}
+
+/// A change set whose highest claim `version` for an object is below the
+/// base element's `held`; see [`ErrorKind::VersionRegression`].
+#[cold]
+pub(crate) fn new_base_version_regression(
+    kind: crate::ElementKind,
+    id: i64,
+    version: i32,
+    held: i32,
+) -> Error {
+    new_error(ErrorKind::VersionRegression {
+        consumer: "apply-changes base merge",
+        kind,
+        id,
+        version,
+        held,
+        in_base: true,
     })
 }
 
@@ -191,6 +211,38 @@ pub(crate) fn new_stringtable_utf8(err: Utf8Error, index: usize) -> Error {
 #[cold]
 pub(crate) fn new_stringtable_index_out_of_bounds(index: usize) -> Error {
     new_error(ErrorKind::StringtableIndexOutOfBounds { index })
+}
+
+/// The text of a [`ErrorKind::VersionRegression`].
+fn fmt_version_regression(
+    f: &mut fmt::Formatter<'_>,
+    consumer: &str,
+    kind: crate::ElementKind,
+    id: i64,
+    (version, held): (i32, i32),
+    in_base: bool,
+) -> fmt::Result {
+    if !in_base {
+        return write!(
+            f,
+            "{consumer}: {} {id} carries version {version}, which is lower than version \
+             {held} already claimed for it in the changes read so far (deletes included). \
+             Accepting it would let an older version replace a newer one and report \
+             success. The OSC inputs may be listed out of sequence order, or come from \
+             inconsistent diff series. Check their order and provenance, or allow \
+             lower-version changes",
+            kind.as_str()
+        );
+    }
+    write!(
+        f,
+        "{consumer}: {} {id} is at version {held} in the base, and the changes \
+         claim at most version {version} for it (deletes included). Applying them \
+         would let an older version replace a newer one and report success. The \
+         changes may predate the base, or come from another diff series. Check \
+         their provenance, or allow lower-version changes",
+        kind.as_str()
+    )
 }
 
 /// A type alias for `Result<T, pbfhogg::Error>`.
@@ -714,15 +766,20 @@ pub enum ErrorKind {
         size: u64,
         limit: u64,
     },
-    /// A change claims `version` for an object a change read earlier already
-    /// claimed `held` for, and lower-version changes were not allowed.
-    /// `consumer` names the operation that refused it.
+    /// A change claims `version` for an object already held at the higher
+    /// version `held`, and lower-version changes were not allowed.
+    /// `consumer` names the operation that refused it. With `in_base`
+    /// false, `held` was claimed by a change read earlier in the same
+    /// run; with `in_base` true, `held` is the base PBF element's version
+    /// and `version` the highest version the run's changes claimed for
+    /// the object (apply-changes, against the base it rewrites).
     VersionRegression {
         consumer: &'static str,
         kind: crate::ElementKind,
         id: i64,
         version: i32,
         held: i32,
+        in_base: bool,
     },
     /// The caller's request is invalid: arguments, configuration, or call
     /// order (such as writing after a writer completed).
@@ -1352,16 +1409,8 @@ impl fmt::Display for Message<'_> {
                 id,
                 version,
                 held,
-            } => write!(
-                f,
-                "{consumer}: {} {id} carries version {version}, which is lower than version \
-                 {held} already claimed for it in the changes read so far (deletes included). \
-                 Accepting it would let an older version replace a newer one and report \
-                 success. The OSC inputs may be listed out of sequence order, or come from \
-                 inconsistent diff series. Check their order and provenance, or allow \
-                 lower-version changes",
-                kind.as_str()
-            ),
+                in_base,
+            } => fmt_version_regression(f, consumer, kind, id, (version, held), in_base),
             ErrorKind::Output(ref output) => fmt::Display::fmt(output, f),
             ErrorKind::StringtableUtf8 { index, .. } => {
                 write!(f, "invalid UTF-8 at string table index {index}")

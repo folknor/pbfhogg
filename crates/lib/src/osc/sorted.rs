@@ -48,29 +48,78 @@ pub(crate) struct KindTable {
     offsets: Vec<usize>,
     /// Deleted IDs, sorted by `osm_id_cmp`.
     deleted: Vec<i64>,
+    /// `deleted_claims[i]` is the highest version the changes claimed for
+    /// `deleted[i]`, the delete's own claim included. Empty when the base
+    /// gate is off (see [`SortedDiff::base_gate`]).
+    deleted_claims: Vec<Option<i32>>,
+    /// Upserted IDs whose highest claimed version is above what their
+    /// final record claims (a claimless final change after a claimed one),
+    /// with that version, sorted by `osm_id_cmp`. Every other upsert's
+    /// highest claim is its record's own: with the stream gate on, a
+    /// claimed record is never below the floor it was admitted against.
+    /// Empty when the base gate is off.
+    upsert_floors: Vec<(i64, i32)>,
 }
 
 impl KindTable {
     /// From the overlay's final state for one kind. Built from the live
     /// index and the deleted set, never from the arena: the arena also holds
     /// superseded and deleted records, and the index is where the parse
-    /// already resolved which record wins.
+    /// already resolved which record wins. `floors` is the overlay's
+    /// version floor map, or `None` when the base gate is off.
     pub(super) fn build(
         arena: Vec<u8>,
         index: FxHashMap<i64, usize>,
         deleted: HashSet<i64>,
+        floors: Option<(&FxHashMap<i64, i32>, usize)>,
     ) -> Self {
         let mut pairs: Vec<(i64, usize)> = index.into_iter().collect();
         pairs.sort_unstable_by(|a, b| osm_id_cmp(a.0, b.0));
-        let (ids, offsets): (Vec<i64>, Vec<usize>) = pairs.into_iter().unzip();
+        let mut upsert_floors = Vec::new();
         let mut deleted: Vec<i64> = deleted.into_iter().collect();
         deleted.sort_unstable_by(|a, b| osm_id_cmp(*a, *b));
+        let mut deleted_claims = Vec::new();
+        if let Some((floors, meta_off)) = floors {
+            for &(id, offset) in &pairs {
+                if let Some(&floor) = floors.get(&id) {
+                    let own = super::compact::version_at(&arena, offset, meta_off);
+                    if own.is_none_or(|own| floor > own) {
+                        upsert_floors.push((id, floor));
+                    }
+                }
+            }
+            // A delete folds its own claim and every earlier one into the
+            // floor, so the floor is the delete's highest claim.
+            deleted_claims = deleted.iter().map(|id| floors.get(id).copied()).collect();
+        }
+        let (ids, offsets): (Vec<i64>, Vec<usize>) = pairs.into_iter().unzip();
         Self {
             arena,
             ids,
             offsets,
             deleted,
+            deleted_claims,
+            upsert_floors,
         }
+    }
+
+    /// The highest version the changes claimed for `deleted()[i]`.
+    #[inline]
+    fn deleted_claim(&self, i: usize) -> Option<i32> {
+        self.deleted_claims.get(i).copied().flatten()
+    }
+
+    /// The highest version the changes claimed for `upserts()[i]`, whose
+    /// record sits at `meta_off`-shaped `arena[offsets[i]..]`.
+    #[inline]
+    fn upsert_claim(&self, i: usize, meta_off: usize) -> Option<i32> {
+        let id = self.ids[i];
+        let floor = self
+            .upsert_floors
+            .binary_search_by(|&(x, _)| osm_id_cmp(x, id))
+            .ok() // ok-deliberate: most upserts have no floor above their own claim
+            .map(|j| self.upsert_floors[j].1);
+        floor.or_else(|| super::compact::version_at(&self.arena, self.offsets[i], meta_off))
     }
 
     /// The upserted IDs, sorted.
@@ -108,6 +157,8 @@ impl KindTable {
             + self.ids.capacity() * size_of::<i64>()
             + self.offsets.capacity() * size_of::<usize>()
             + self.deleted.capacity() * size_of::<i64>()
+            + self.deleted_claims.capacity() * size_of::<Option<i32>>()
+            + self.upsert_floors.capacity() * size_of::<(i64, i32)>()
     }
 }
 
@@ -117,6 +168,9 @@ pub(crate) struct SortedDiff {
     ways: KindTable,
     relations: KindTable,
     strings: StringTable,
+    /// Whether a change is refused against a base element holding a
+    /// higher version: on exactly when the overlay's version gate was.
+    base_gate: bool,
 }
 
 impl SortedDiff {
@@ -125,12 +179,51 @@ impl SortedDiff {
         ways: KindTable,
         relations: KindTable,
         strings: StringTable,
+        base_gate: bool,
     ) -> Self {
         Self {
             nodes,
             ways,
             relations,
             strings,
+            base_gate,
+        }
+    }
+
+    /// Refuse applying the diff's final change to a base element that
+    /// holds a higher version than the changes ever claimed for it: the
+    /// change of `kind` at `upserts(kind)[i]` (`Ok(i)`) or `deleted(kind)[i]`
+    /// (`Err(i)`), against the base element's `base` claim.
+    ///
+    /// The change side is the highest version claimed for the object
+    /// anywhere in the changes, deletes included, not the final record's
+    /// own: `modify v9` then a claimless delete still says the changes
+    /// reached only version 9. Either side claiming nothing passes, and so
+    /// does an equal version (the change wins, as within the changes).
+    /// Only called on a match, so an element the diff leaves alone never
+    /// reaches it.
+    #[inline]
+    pub(crate) fn check_base_version(
+        &self,
+        kind: ElementKind,
+        id: i64,
+        hit: Result<usize, usize>,
+        base: Option<i32>,
+    ) -> crate::Result<()> {
+        if !self.base_gate {
+            return Ok(());
+        }
+        let Some(base) = base else { return Ok(()) };
+        let table = self.kind(kind);
+        let claim = match hit {
+            Ok(i) => table.upsert_claim(i, super::compact::meta_off(kind)),
+            Err(i) => table.deleted_claim(i),
+        };
+        match claim {
+            Some(claim) if claim < base => Err(crate::error::new_base_version_regression(
+                kind, id, claim, base,
+            )),
+            _ => Ok(()),
         }
     }
 

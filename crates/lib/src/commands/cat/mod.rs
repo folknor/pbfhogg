@@ -644,8 +644,9 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
 /// change of kind and at the builder's element cap; a block with no elements
 /// yields nothing. Adjacent groups of one kind share a block.
 ///
-/// Content is what the builder normally writes, the same normalisation
-/// `cat --type` and `--clean` apply. Kept: ids, the decoded decimicrodegree
+/// Content is what the builder normally writes, the node and metadata
+/// normalisation `cat --type` and `--clean` also apply, except that this
+/// rebuild keeps inline way locations and theirs drops them. Kept: ids, the decoded decimicrodegree
 /// coordinates of nodes and of inline way locations, tags, refs, members
 /// and roles, element order as above, and the presence of retained metadata
 /// (no metadata is backfilled onto a node that had none).
@@ -671,9 +672,10 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
 /// - A node run is also split where metadata presence flips. One builder
 ///   block holding nodes with and without metadata would backfill zeroed
 ///   metadata onto the ones that had none.
-/// - Tags, relation roles and the user of re-encoded metadata are resolved
-///   through the fallible accessors. The lossy ones would turn a bad string
-///   index into a missing tag or an empty string.
+/// - Relation roles and the user of re-encoded metadata are resolved through
+///   the fallible accessors, so a bad string index is refused rather than
+///   read as an empty string. Tags need no check here: their string indices
+///   were validated when the block was constructed.
 /// - Inline way locations (`LocationsOnWays`) are carried whenever a way has
 ///   them; the decoder has already checked they match its refs one for one.
 /// - The builder cannot write field 20, so a way carrying pins under a
@@ -693,7 +695,8 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
 /// command is the indexing recipe every indexdata refusal points at, so a
 /// refusal here loops the advice. Refusing only when the re-encode would
 /// change a value was also rejected: plain `cat` would then disagree with
-/// `--type` and `--clean`, which normalise the same way.
+/// `--type` and `--clean`, which re-encode every block and so apply the node
+/// and metadata normalisation above to all of them.
 ///
 /// A split that keeps more is possible without the builder, and is worth
 /// building only if a producer writing these shapes turns up and the

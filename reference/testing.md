@@ -664,9 +664,10 @@ test of what a writer encodes (a dense -1 written as 0), which claims cannot
 show. A test reading output through pbfhogg's own accessors is one whose
 subject is those accessors (decode-path parity, a codec roundtrip), and it
 reads them losslessly. The `test-oracles-no-error-to-empty` text rule is a
-tripwire over every test tree for three spellings of an error read as empty
-(`unwrap_or("")`, `Result::ok`, the infallible `.tags()`); it is not this
-rule, which it cannot see whole.
+tripwire over every test tree for spellings of an error read as empty
+(`unwrap_or("")`, `Result::ok`); it is not this rule, which it cannot see
+whole. Tag accessors are not among them: tag string indices are refused at
+block construction, so `.tags()` cannot read a bad index as empty.
 
 `mod serial` is an orthogonal config overlay, not a tier. Same for `#[ignore = "external"]` (escape hatch for in-tree
 osmium checks).
@@ -1201,23 +1202,20 @@ exception, not a tier - should not survive across many PRs.
   `brokkr check` script checks in `brokkr.d/lints.toml`. Before the test
   phase it empties `data/test-scratch/` (never following symlinks, and
   restoring owner permissions on directories a failed permission test left
-  read-only) and records a stat manifest of the checkout. After a green
-  test phase it fails if the checkout changed or the scratch base is not
+  read-only). After a green test phase it fails if the scratch base is not
   empty: a passing test that retains a tree removes it itself. A failing
   run's kept trees therefore survive until the next check's pre-test stage.
-  The script's header lists what the manifest excludes and what it cannot
-  see: undone writes, writes through symlinks, `brokkr test` runs, and runs
-  whose test phase failed. An edit made by hand during a check fails it.
-  The tree check compares stat metadata, not `git status` or content
-  hashes, on purpose: git status misses writes inside existing ignored
-  directories, skip-worktree files and mode-only changes (and `.gitignore`
-  has unanchored `target`, `data` and `proptest-regressions` patterns),
-  while a content digest would read the planet-sized inputs in `data/`. A
-  post-test allowlist with no baseline was rejected because it fails on any
-  dirty development tree, and an age-based sweep inside the test binary
-  because it would delete trees the process did not create. Any new writer
-  that runs before the test phase must run before `clear-and-snapshot`, and
-  a background-stage writer would overlap it.
+  Only test scratch is judged, not the checkout as a whole: editors, agents
+  and other tools write to the checkout during a run, so a whole-tree
+  comparison cannot tell a test's write from theirs. Writes outside scratch
+  are kept out by construction instead (this crate owns every test's
+  scratch, and the lints below seal the spellings). The script's header
+  lists what it does not cover: `brokkr test` runs, and runs whose test
+  phase or coverage audit failed. An age-based sweep inside the test binary
+  was rejected because it would delete trees the process did not create.
+  Any new writer into test scratch that runs before the test phase must run
+  before `clear-and-snapshot`, and a background-stage writer would overlap
+  it.
   Scratch constructor spellings are sealed outside the leaf by
   `test-scratch-via-test-scratch-crate` in `brokkr.d/lints.toml`.
   Companion rules seal manifest-directory discovery to the leaf and named

@@ -87,7 +87,7 @@ impl WireBlobHeader {
         parse_indexdata: bool,
         parse_waymembers: bool,
     ) -> Result<Self> {
-        use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
+        use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
@@ -99,15 +99,10 @@ impl WireBlobHeader {
         let mut waymembers: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
-            let expected = match field {
-                blob_header::DATASIZE => Some(WIRE_VARINT),
-                blob_header::TYPE
-                | blob_header::INDEXDATA
-                | blob_header::TAGDATA
-                | blob_header::WAYMEMBERS => Some(WIRE_LEN),
-                _ => None,
-            };
-            if expected.is_some_and(|w| w != wire_type) {
+            // The schema table is shared with the verbatim header strippers
+            // (`write/framing.rs`), so a strip removes exactly the
+            // occurrences this parser reads as the field.
+            if blob_header::wire_type(field).is_some_and(|w| w != wire_type) {
                 // Deliberate asymmetry, ruled 2026-10-26. `type` and
                 // `datasize` are what frame the blob; without them the next
                 // frame boundary is unknowable, so a wrong wire type there

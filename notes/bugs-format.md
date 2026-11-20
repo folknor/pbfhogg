@@ -270,21 +270,6 @@ borrowed bytes and caller-owned output storage. The shared borrowed parser
 `BlobEnvelope::parse` (`read/blob_wire.rs`) now exists, and
 `decompress_blob_raw` already decodes from it without a copy.
 
-## FMT-027 - Header field strippers match field numbers, not wire types
-
-Reported by: BUG-001 resolution (spar lateral, 2026-11-19).
-
-The readers now recognise Blob and HeaderBlock fields by number and wire type,
-skipping a known number with another wire type as unknown. The verbatim
-output-header strippers (`strip_header_block_fields` in `write/framing.rs`,
-used by `output_header::verbatim`) still delete every occurrence of a field
-number. Overriding the replication timestamp therefore also deletes an
-unrelated length-delimited field 32 that the reader treated as unknown. The
-written header is semantically correct; the loss is an unknown field the
-verbatim path otherwise preserves. Matching the stripper on the same
-(number, wire type) pairs as the reader would close it, with a test carrying a
-varint timestamp and an opaque length-delimited field 32.
-
 ## FMT-028 - inspect --indexed answers without decoding the header
 
 Reported by: FMT-003 resolution (spar lateral, 2026-11-20).

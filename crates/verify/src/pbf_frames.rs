@@ -912,7 +912,11 @@ fn parse_blob_header(bytes: &[u8]) -> Result<BlobHeader, String> {
                 }
             }
             (3, Value::Varint(v)) => datasize = Some(int32(v)?),
-            (1..=3, _) => return Err("blob header field has the wrong wire type".into()),
+            // type and datasize frame the blob, so a wrong wire type there is
+            // refused, as pbfhogg does. Indexdata is optional: another wire
+            // type on field 2 is an unknown field, skipped by pbfhogg and
+            // libosmium alike and kept by pbfhogg's header strippers.
+            (1 | 3, _) => return Err("blob header field has the wrong wire type".into()),
             _ => {}
         }
     }
@@ -1191,6 +1195,36 @@ mod tests {
         out.extend_from_slice(&(header.len() as u32).to_be_bytes());
         out.extend_from_slice(&header);
         out.extend_from_slice(payload);
+    }
+
+    /// A varint field 2 is an unknown field beside the indexdata bytes, as
+    /// in pbfhogg and libosmium; a wrong-typed type or datasize is refused,
+    /// and two non-empty indexdata occurrences still conflict.
+    #[test]
+    fn blob_header_varint_field_2_is_unknown() {
+        use super::{Indexdata, parse_blob_header};
+        let idx = index(2, 0, 1, 2, 3);
+        let mut header = Vec::new();
+        bytes_field(1, b"OSMData", &mut header);
+        varint(2 << 3, &mut header);
+        varint(7, &mut header);
+        bytes_field(2, &idx, &mut header);
+        varint(3 << 3, &mut header);
+        varint(10, &mut header);
+        let parsed = parse_blob_header(&header).unwrap();
+        assert!(matches!(parsed.indexdata, Indexdata::Present(ref v) if *v == idx));
+
+        let mut twice = header.clone();
+        bytes_field(2, &idx, &mut twice);
+        assert!(matches!(
+            parse_blob_header(&twice).unwrap().indexdata,
+            Indexdata::Conflicting
+        ));
+
+        let mut bad_size = Vec::new();
+        bytes_field(1, b"OSMData", &mut bad_size);
+        bytes_field(3, b"x", &mut bad_size);
+        assert!(parse_blob_header(&bad_size).is_err());
     }
 
     fn header_payload(features: &[&str], zlib: bool) -> Vec<u8> {

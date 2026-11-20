@@ -20,7 +20,7 @@ use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_M
 use crate::write::metrics::WriterMetrics;
 use std::sync::atomic::Ordering::Relaxed;
 
-use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_header};
+use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, Tag, blob, blob_header};
 
 use super::compression::Compression;
 
@@ -716,8 +716,10 @@ fn encode_blob_header_fields(
 }
 
 /// Re-emit a `BlobHeader` protobuf message, copying every field through
-/// verbatim except the field numbers listed in `strip_fields`, which are
-/// dropped.
+/// verbatim except the occurrences of the fields listed in `strip_fields`,
+/// which are dropped. A field is matched by number and wire type together,
+/// as `WireBlobHeader::parse` recognises it: an occurrence of a targeted
+/// number with another wire type is an unknown field and is kept.
 ///
 /// Untargeted fields are copied at the byte level - tag and value together -
 /// straight from the original message, so nothing pbfhogg does not model is
@@ -727,8 +729,8 @@ fn encode_blob_header_fields(
 /// round-trip would produce, and an index that fails to deserialize is kept
 /// instead of dropped. It equally preserves `tagdata` (field 4), the
 /// `pbfhogg.WayMembers-v1` payload (field 5), and any unknown/extension
-/// fields whose wire type this can skip. Only the targeted field number(s)
-/// are removed.
+/// fields whose wire type this can skip. Only the targeted fields are
+/// removed.
 ///
 /// Wire-type coverage: fields using varint (0), 64-bit (1), length-delimited
 /// (2), or 32-bit (5) wire types are copied verbatim regardless of field
@@ -750,15 +752,18 @@ pub(crate) fn strip_blob_header_fields(
 ) -> Result<()> {
     strip_message_fields(
         header_bytes,
-        |field| strip_fields.iter().any(|f| *f as u32 == field),
+        |tag| strip_fields.iter().any(|f| f.tag() == tag),
         out,
         "BlobHeader",
     )
 }
 
 /// Re-emit a `HeaderBlock` protobuf message (the decompressed OSMHeader
-/// payload), copying every field through verbatim except the field numbers
-/// listed in `strip_fields`, which are dropped.
+/// payload), copying every field through verbatim except the occurrences of
+/// the fields listed in `strip_fields`, matched by number and wire type as
+/// `WireHeaderBlock::parse` recognises them, which are dropped. A
+/// length-delimited field 32 is therefore kept when the varint replication
+/// timestamp is overridden.
 ///
 /// The counterpart of [`strip_blob_header_fields`] for the file-level
 /// `HeaderBlock`. Used by `degrade`'s header-only passthrough so
@@ -781,18 +786,21 @@ pub(crate) fn strip_header_block_fields(
 ) -> Result<()> {
     strip_message_fields(
         header_block_bytes,
-        |field| strip_fields.iter().any(|f| *f as u32 == field),
+        |tag| strip_fields.iter().any(|f| f.tag() == tag),
         out,
         "HeaderBlock",
     )
 }
 
 /// Shared protobuf field-copy core for the two strippers above. Copies every
-/// top-level field's tag+value bytes verbatim except the field numbers in
-/// `strip_fields`. `ctx` names the message in parse errors.
+/// top-level field's tag+value bytes verbatim except the occurrences whose
+/// (number, wire type) pair `strip_field` selects. Matching the pair, not the
+/// number, is what keeps a same-number occurrence of another wire type (an
+/// unknown field to the reader) in the output. `ctx` names the message in
+/// parse errors.
 fn strip_message_fields(
     msg_bytes: &[u8],
-    strip_field: impl Fn(u32) -> bool,
+    strip_field: impl Fn(Tag) -> bool,
     out: &mut Vec<u8>,
     ctx: &str,
 ) -> Result<()> {
@@ -811,7 +819,7 @@ fn strip_message_fields(
             .skip_field(wire_type)
             .map_err(|e| Error::from(e).context(format!("{ctx} parse")))?;
         let field_end = cursor.position();
-        if !strip_field(field) {
+        if !strip_field((field, wire_type)) {
             out.extend_from_slice(&msg_bytes[field_start..field_end]);
         }
     }
@@ -1434,6 +1442,59 @@ mod tests {
         assert_eq!(
             parsed.osmosis_replication_base_url(),
             Some("https://example.org/repl")
+        );
+    }
+
+    /// The strippers match a field by number and wire type, as the readers
+    /// recognise it. A same-number occurrence of another wire type is an
+    /// unknown field to the reader, so it survives byte for byte on either
+    /// side of the stripped occurrence: overriding the varint replication
+    /// timestamp keeps a length-delimited field 32, and stripping bytes
+    /// indexdata keeps a varint field 2.
+    #[test]
+    fn strip_keeps_a_same_number_field_of_another_wire_type() {
+        use protohoggr::encode_varint_field;
+        use protohoggr::{encode_bytes_field, encode_int32_field, encode_int64_field};
+
+        let mut header = Vec::new();
+        encode_bytes_field(&mut header, 32, b"opaque-before");
+        encode_int64_field(&mut header, 32, 1_700_000_000);
+        encode_bytes_field(&mut header, 32, b"opaque-after");
+        let mut expect = Vec::new();
+        encode_bytes_field(&mut expect, 32, b"opaque-before");
+        encode_bytes_field(&mut expect, 32, b"opaque-after");
+        let mut out = Vec::new();
+        strip_header_block_fields(&header, &[HeaderBlockField::ReplicationTimestamp], &mut out)
+            .expect("strip timestamp");
+        assert_eq!(out, expect, "only the varint field 32 is the timestamp");
+        // The opaque occurrences are unknown to the reader: no timestamp.
+        let parsed = crate::read::block::HeaderBlock::parse_from_bytes(&out).expect("parse");
+        assert_eq!(parsed.osmosis_replication_timestamp(), None);
+        // A replacement appended after the kept fields reads back.
+        encode_int64_field(&mut out, 32, 1_800_000_000);
+        let parsed = crate::read::block::HeaderBlock::parse_from_bytes(&out).expect("parse");
+        assert_eq!(parsed.osmosis_replication_timestamp(), Some(1_800_000_000));
+
+        let index = [0xABu8; 26];
+        let mut blob_header = Vec::new();
+        encode_bytes_field(&mut blob_header, 1, b"OSMData");
+        encode_varint_field(&mut blob_header, 2, 7);
+        encode_bytes_field(&mut blob_header, 2, &index);
+        encode_int32_field(&mut blob_header, 3, 4242);
+        encode_varint_field(&mut blob_header, 2, 9);
+        let mut expect = Vec::new();
+        encode_bytes_field(&mut expect, 1, b"OSMData");
+        encode_varint_field(&mut expect, 2, 7);
+        encode_int32_field(&mut expect, 3, 4242);
+        encode_varint_field(&mut expect, 2, 9);
+        let mut out = Vec::new();
+        strip_blob_header_fields(&blob_header, &[BlobHeaderField::Indexdata], &mut out)
+            .expect("strip indexdata");
+        assert_eq!(out, expect, "only the bytes field 2 is indexdata");
+        let parsed = WireBlobHeader::parse(&out, true, true, true).expect("parse");
+        assert!(
+            !parsed.indexdata_present,
+            "varint field 2 is not an index claim"
         );
     }
 

@@ -19,6 +19,20 @@ Findings are as reported by the hunters and have not been verified. Hunters read
 source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
+
+## VER-146 - Verifier frame readers refuse wrong-typed fields pbfhogg skips
+
+Reported by: FMT-027 resolution (scout lateral, 2026-11-20).
+
+pbfhogg's readers treat a known Blob or HeaderBlock field number carrying
+another supported wire type as an unknown field and skip it (libosmium does
+the same). The independent readers in `crates/verify/src/pbf_frames.rs` still
+refuse such an occurrence in two places: `blob_content` on Blob fields 1 to 7,
+and `header_features` on HeaderBlock fields 4 and 5. A file pbfhogg and
+osmium both read, or one a pbfhogg verbatim rewrite produced from such an
+input, then fails a verifier framing walk. The BlobHeader reader there was
+aligned (refuses only type and datasize); the other two should follow, keeping
+their literals independent of the library.
 ## VER-144 - Source-policy rules re-parse every file with syn, in debug
 
 Measured 2026-11-18 on bygg (debug `brokkr test`): the single real-tree

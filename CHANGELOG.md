@@ -448,6 +448,14 @@
 
 ### Fixed
 
+- **Header rewrites keep same-number unknown fields.** `degrade`'s
+  header-only path (`--strip-bbox`, `--strip-indexdata`, `--strip-tagdata`,
+  `--generator`, `--output-header`) and the reframes of `cat --reindex`,
+  `cat --repair`, `sort` and `cat --dedupe` removed every occurrence of the
+  field number they replace. They now remove only the occurrences pbfhogg
+  reads as that field (same number and wire type); one with another wire
+  type, which readers skip as unknown, is copied through like any other
+  unknown field.
 - **inspect --blocks takes a huge limit.** A text-mode `--blocks N` whose
   doubling overflows (for example `9223372036854775808`) panicked; it now
   lists every block, as the JSON output already did.

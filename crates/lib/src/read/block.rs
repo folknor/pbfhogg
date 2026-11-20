@@ -138,7 +138,7 @@ impl WireHeaderBlock {
     /// 32 is not a replication timestamp. Invalid wire types are refused by
     /// `skip_field`.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
+        use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
         let mut bbox: Option<WireHeaderBBox> = None;
         let mut required_features: Vec<String> = Vec::new();
@@ -151,12 +151,12 @@ impl WireHeaderBlock {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
-                (header_block::BBOX, WIRE_LEN) => {
+                header_block::BBOX_TAG => {
                     // bbox: HeaderBBox submessage
                     let sub_data = cursor.read_len_delimited()?;
                     bbox = Some(WireHeaderBBox::parse(sub_data)?);
                 }
-                (header_block::REQUIRED_FEATURES, WIRE_LEN) => {
+                header_block::REQUIRED_FEATURES_TAG => {
                     // required_features: repeated string
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
@@ -166,14 +166,14 @@ impl WireHeaderBlock {
                     }
                     required_features.push(s);
                 }
-                (header_block::OPTIONAL_FEATURES, WIRE_LEN) => {
+                header_block::OPTIONAL_FEATURES_TAG => {
                     // optional_features: repeated string
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
                         .map_err(|_| new_wire_error("invalid UTF-8 in optional_features"))?;
                     optional_features.push(s);
                 }
-                (header_block::WRITING_PROGRAM, WIRE_LEN) => {
+                header_block::WRITING_PROGRAM_TAG => {
                     // writingprogram: string
                     let bytes = cursor.read_len_delimited()?;
                     writingprogram = Some(
@@ -181,7 +181,7 @@ impl WireHeaderBlock {
                             .map_err(|_| new_wire_error("invalid UTF-8 in writingprogram"))?,
                     );
                 }
-                (header_block::SOURCE, WIRE_LEN) => {
+                header_block::SOURCE_TAG => {
                     // source: string
                     let bytes = cursor.read_len_delimited()?;
                     source = Some(
@@ -189,15 +189,15 @@ impl WireHeaderBlock {
                             .map_err(|_| new_wire_error("invalid UTF-8 in source"))?,
                     );
                 }
-                (header_block::REPLICATION_TIMESTAMP, WIRE_VARINT) => {
+                header_block::REPLICATION_TIMESTAMP_TAG => {
                     // osmosis_replication_timestamp: int64
                     osmosis_replication_timestamp = Some(cursor.read_varint_i64()?);
                 }
-                (header_block::REPLICATION_SEQUENCE_NUMBER, WIRE_VARINT) => {
+                header_block::REPLICATION_SEQUENCE_NUMBER_TAG => {
                     // osmosis_replication_sequence_number: int64
                     osmosis_replication_sequence_number = Some(cursor.read_varint_i64()?);
                 }
-                (header_block::REPLICATION_BASE_URL, WIRE_LEN) => {
+                header_block::REPLICATION_BASE_URL_TAG => {
                     // osmosis_replication_base_url: string
                     let bytes = cursor.read_len_delimited()?;
                     osmosis_replication_base_url =

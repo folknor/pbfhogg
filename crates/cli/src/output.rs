@@ -10,14 +10,18 @@
 //! value, and every write site propagates it with `?` so the command stops
 //! producing output it can no longer deliver.
 //!
-//! The reader going away is recorded here, process-wide, so `run` can tell
-//! "stdout's reader left" apart from a failure and end the run silently with
-//! success - the convention of `head`-friendly tools, and the same choice
-//! `run` already makes for clap's `--help` / `--version` output, whose write
-//! result it discards. The record is a flag rather than an inspection of the
-//! returned error because the error crosses library boundaries that may wrap
-//! or re-type it on the way up; the flag is set at the one place the `EPIPE`
-//! is certainly still an `io::Error` from stdout.
+//! The reader going away is marked on the error itself: a `BrokenPipe` from
+//! stdout comes back as a `BrokenPipe` carrying a private [`StdoutGone`]
+//! payload, so `run` can tell "the command stopped because stdout's reader
+//! left" apart from a failure and end that run silently with success - the
+//! convention of `head`-friendly tools. Only the error the command returned
+//! is classified ([`crate::exit_code::is_stdout_gone`]), never the fact that
+//! some stdout write failed at some point: a command that detects a truncated
+//! input and then drops a buffered stdout writer flushes into the closed pipe
+//! on the way out, and that cleanup failure must not erase the input error
+//! the command actually stopped on. The marker survives the library's error
+//! boundaries: `pbfhogg::Error` keeps a foreign `io::Error` whole in
+//! `ErrorKind::Io`, and context does not change the kind.
 //!
 //! Any other stdout failure (a full disk behind `> file`, say) is not
 //! swallowed: it propagates like any error and fails the command.
@@ -31,28 +35,51 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set once a stdout write has failed with `BrokenPipe`. Never cleared: the
-/// reader does not come back.
+/// reader does not come back. Only the fast path reads it; whether a run
+/// ended because the reader left is decided on the returned error's
+/// [`StdoutGone`] marker, not on this flag.
 static READER_GONE: AtomicBool = AtomicBool::new(false);
+
+/// The payload of every `BrokenPipe` a stdout write returns: the proof that
+/// this broken pipe is stdout's, not an input FIFO's or a child's.
+#[derive(Debug)]
+pub(crate) struct StdoutGone;
+
+impl std::fmt::Display for StdoutGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout's reader went away")
+    }
+}
+
+impl std::error::Error for StdoutGone {}
+
+/// Whether `err` is a stdout write failing because its reader went away.
+pub(crate) fn is_marked_gone(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::BrokenPipe
+        && err.get_ref().is_some_and(<dyn std::error::Error + Send + Sync>::is::<StdoutGone>)
+}
 
 /// A stdout handle that reports a write failure instead of panicking, and
 /// records the reader going away. Unbuffered; use [`buffered`].
 pub(crate) struct PipeSafeStdout;
 
 impl PipeSafeStdout {
-    /// Pass `result` through, recording a broken pipe on the way.
+    /// Pass `result` through, recording a broken pipe and marking its error
+    /// as stdout's.
     fn observe<T>(result: io::Result<T>) -> io::Result<T> {
-        if let Err(ref err) = result
-            && err.kind() == io::ErrorKind::BrokenPipe
-        {
-            READER_GONE.store(true, Ordering::Relaxed);
+        match result {
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                READER_GONE.store(true, Ordering::Relaxed);
+                Err(Self::gone_error())
+            }
+            other => other,
         }
-        result
     }
 
-    /// Once the reader is gone every further write fails the same way, so
-    /// answer without another syscall.
+    /// The marked error; once the reader is gone every further write fails
+    /// this way without another syscall.
     fn gone_error() -> io::Error {
-        io::Error::from(io::ErrorKind::BrokenPipe)
+        io::Error::new(io::ErrorKind::BrokenPipe, StdoutGone)
     }
 }
 
@@ -90,15 +117,17 @@ pub(crate) fn buffered() -> io::BufWriter<PipeSafeStdout> {
     io::BufWriter::new(PipeSafeStdout)
 }
 
-/// Whether a stdout write has failed because the reader went away.
-pub(crate) fn reader_gone() -> bool {
+fn reader_gone() -> bool {
     READER_GONE.load(Ordering::Relaxed)
 }
 
 /// For a command whose answer is decided before its output is written
-/// (`check`, `inspect --indexed`): a reader that stopped reading early must
-/// not erase the exit status that answer carries, so the output step's
-/// failure is dropped when, and only when, it was the reader going away.
+/// (`check`, `inspect --indexed`, the final flush of a stdout `diff`): a
+/// reader that stopped reading early must not erase the exit status that
+/// answer carries, so the output step's failure is dropped when, and only
+/// when, the error it returned is the reader going away. Any other error -
+/// a value the report could not produce, with a buffered line flushed into
+/// the closed pipe as the buffer dropped - keeps failing the command.
 ///
 /// A streaming command cannot do this. `diff` writes as it compares, so when
 /// the reader leaves there is no verdict yet, and the run ends with exit 0 -
@@ -107,9 +136,11 @@ pub(crate) fn reader_gone() -> bool {
 /// nowhere to learn the verdict, which at planet scale holds `| head` open
 /// for minutes. Pipe to a file, or use the exit status of an unpiped run,
 /// when the verdict matters.
-pub(crate) fn tolerate_reader_gone<E>(result: Result<(), E>) -> Result<(), E> {
-    match result {
-        Err(_) if reader_gone() => Ok(()),
+pub(crate) fn tolerate_reader_gone<E: Into<Box<dyn std::error::Error>>>(
+    result: Result<(), E>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match result.map_err(Into::into) {
+        Err(err) if crate::exit_code::is_stdout_gone(err.as_ref()) => Ok(()),
         other => other,
     }
 }

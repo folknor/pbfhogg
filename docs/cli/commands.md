@@ -83,6 +83,18 @@ interruptions, following the shell's `128 + signal` convention.
 | `130` | Interrupted by SIGINT (Ctrl-C). See [Interruption](#interruption). |
 | `143` | Interrupted by SIGTERM. See [Interruption](#interruption). |
 
+A stdout whose reader has gone away (`pbfhogg ... | head`) is not a
+failure. The status is taken from the error the command returned, not from
+whether any stdout write failed. When the command stopped because a stdout
+write met the closed pipe, the run ends with `0` and no `Error:` line. A
+verdict decided before that write keeps its status: `check`,
+`inspect --indexed`, and a `diff` whose whole report was buffered until the
+final flush. A streaming `diff` that meets the closed pipe mid-comparison
+has no verdict yet and ends with `0`. Any other returned error keeps its
+status, even if stdout also failed while the command cleaned up. For
+example, an `export` that finds a truncated input exits `2`. Usage errors,
+platform refusals and interruptions keep their own statuses.
+
 ### Interruption
 
 Every command handles SIGINT and SIGTERM the same way. The first one prints

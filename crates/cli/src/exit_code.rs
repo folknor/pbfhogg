@@ -51,6 +51,33 @@ pub fn is_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// Whether `err` is a stdout write that failed because stdout's reader went
+/// away: the error itself, seen through the same transparent carriers as
+/// [`is_cancelled`] (a [`Hinted`] wrapper, a `pbfhogg::Error` holding the
+/// `io::Error` in `ErrorKind::Io`, an `io::Error` holding a
+/// `pbfhogg::Error`), carrying the marker [`crate::output`] attaches. Never a
+/// cause further down another error's chain, and never any `BrokenPipe`: one
+/// from an input FIFO or a child is a failure.
+pub fn is_stdout_gone(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(hinted) = err.downcast_ref::<Hinted>() {
+        return is_stdout_gone(&*hinted.source);
+    }
+    if let Some(error) = err.downcast_ref::<pbfhogg::Error>() {
+        return match error.kind() {
+            pbfhogg::ErrorKind::Io(io) => is_stdout_gone(io),
+            _ => false,
+        };
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        return crate::output::is_marked_gone(io)
+            || io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<pbfhogg::Error>())
+                .is_some_and(|error| is_stdout_gone(error));
+    }
+    false
+}
+
 /// A library error with advice that only this front end can give (it names a
 /// CLI flag). The typed error stays reachable through `source()` until the
 /// final print, so exit-code and chain inspection still see it; only
@@ -444,6 +471,37 @@ mod tests {
         assert!(!is_cancelled(&platform()));
         assert!(!is_platform_unsupported(&pbfhogg::Error::from(
             io::Error::other("x")
+        )));
+    }
+
+    /// Stdout's reader going away ends a run quietly only as the error
+    /// itself, seen through the transparent carriers, and only with the
+    /// marker stdout attaches; a bare broken pipe (an input FIFO, a child)
+    /// or one buried as another failure's cause is a failure.
+    #[test]
+    fn stdout_gone_is_classified_only_as_the_marked_authoritative_cause() {
+        use super::is_stdout_gone;
+        let gone = || io::Error::new(io::ErrorKind::BrokenPipe, crate::output::StdoutGone);
+        assert!(is_stdout_gone(&gone()));
+        let library = pbfhogg::Error::from(gone());
+        assert!(is_stdout_gone(&library));
+        assert!(is_stdout_gone(
+            &pbfhogg::Error::from(gone()).context("writing")
+        ));
+        assert!(is_stdout_gone(&io::Error::from(pbfhogg::Error::from(
+            gone()
+        ))));
+        assert!(is_stdout_gone(&Hinted::new(library, "; advice")));
+        let boxed: Box<dyn std::error::Error> = Box::new(gone());
+        assert!(is_stdout_gone(boxed.as_ref()));
+
+        let bare = || io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(!is_stdout_gone(&bare()));
+        assert!(!is_stdout_gone(&pbfhogg::Error::from(bare())));
+        assert!(!is_stdout_gone(&pbfhogg::Error::external(gone())));
+        assert!(!is_stdout_gone(&io::Error::other(gone())));
+        assert!(!is_stdout_gone(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
         )));
     }
 }

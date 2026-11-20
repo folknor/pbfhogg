@@ -22,20 +22,6 @@ findings from the same scope are filed with their library mechanism in
 `notes/bugs-commands.md`: `inspect --show` visibility (CMD-028) and the
 header-only indexed verdict (CMD-033). Entries are in no order of importance.
 
-## CLI-001 - A broken stdout pipe can turn a detected input error into success
-
-Reported by: cli-binary [P2].
-
-`crates/cli/src/lib.rs` converts any ordinary error into success once the
-global `reader_gone` flag is set. Example: export a PBF with a valid header
-followed by a truncated data frame using `--format geojson --type node`, with
-stdout's reader closed. Export buffers the FeatureCollection prefix, detects
-the truncated input, and drops its writer. That drop flushes the prefix, gets
-`EPIPE` and sets the flag, so the CLI suppresses the original corruption error
-and exits 0. This breaks the documented exit-2 contract for malformed input.
-Pipe tolerance must classify the authoritative error, not any failure that
-happens during cleanup.
-
 ## CLI-002 - Stderr I/O failures panic instead of failing the command
 
 Reported by: cli-binary [P2].

@@ -389,3 +389,62 @@ fn file_output_is_guarded_against_input_aliases() {
         "a failing export destroyed a pre-existing file of the output name"
     );
 }
+
+/// `pbfhogg export ... | head` once `head` has gone: only an error that is
+/// itself the stdout write ends the run quietly with success. The truncated
+/// input is the case that used to pass for success: the FeatureCollection
+/// prefix sat in the stdout buffer when the truncation was detected, and the
+/// buffer's drop-time flush hit the closed pipe on the way out.
+#[test]
+fn closed_stdout_keeps_an_input_error_and_ends_a_good_run_quietly() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let temp = crate::common::test_scratch();
+    let input = temp.path().join("input.pbf");
+    write_fixture(&input, false);
+
+    let good = CliInvoker::new(&invocation_scratch)
+        .stdout_closed()
+        .arg("export")
+        .arg(input.as_os_str())
+        .arg("--format")
+        .arg("geojson")
+        .arg("--type")
+        .arg("node")
+        .run();
+    assert_eq!(
+        good.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        good.stderr_str()
+    );
+    assert!(
+        !good.stderr_str().contains("Error:"),
+        "{}",
+        good.stderr_str()
+    );
+
+    let corrupt = temp.path().join("corrupt.pbf");
+    let mut bytes = std::fs::read(&input).unwrap();
+    bytes.truncate(bytes.len() - 5);
+    std::fs::write(&corrupt, bytes).unwrap();
+    let failed = CliInvoker::new(&invocation_scratch)
+        .stdout_closed()
+        .arg("export")
+        .arg(corrupt.as_os_str())
+        .arg("--format")
+        .arg("geojson")
+        .arg("--type")
+        .arg("node")
+        .run();
+    assert_eq!(
+        failed.status.code(),
+        Some(crate::invoker::EXIT_FAILED),
+        "a truncated input is a failure whatever stdout does; stderr:\n{}",
+        failed.stderr_str(),
+    );
+    assert!(
+        failed.stderr_str().contains("Error:"),
+        "{}",
+        failed.stderr_str()
+    );
+}

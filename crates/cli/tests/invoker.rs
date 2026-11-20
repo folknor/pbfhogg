@@ -82,6 +82,7 @@ pub const CHILD_MEMORY: u64 = 8 << 30;
 pub struct CliInvoker<'a> {
     scratch: &'a TestScratch,
     cmd: Command,
+    stdout_closed: bool,
     stderr_closed: bool,
     /// The read end of the announcement pipe, once a pause hook is armed.
     announcements: Option<std::os::fd::OwnedFd>,
@@ -128,6 +129,7 @@ impl<'a> CliInvoker<'a> {
         Self {
             scratch,
             cmd,
+            stdout_closed: false,
             stderr_closed: false,
             announcements: None,
         }
@@ -342,6 +344,17 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
+    /// Give stdout a pipe whose reader has already gone away, as
+    /// `pbfhogg ... | head` does once `head` has what it wants. The
+    /// captured stdout is then empty.
+    pub fn stdout_closed(mut self) -> Self {
+        let (reader, writer) = std::io::pipe().expect("stdout pipe");
+        drop(reader);
+        self.cmd.stdout(writer);
+        self.stdout_closed = true;
+        self
+    }
+
     /// Cap the size of any file the child writes at `bytes` (`RLIMIT_FSIZE`),
     /// with `SIGXFSZ` ignored, so a write that would extend a file past it
     /// fails with `EFBIG` ("File too large") instead of killing the child: a
@@ -524,7 +537,9 @@ impl<'a> CliInvoker<'a> {
     /// budget, a failed `exec`) instead of panicking on it. Preparation,
     /// the guard's included, still panics.
     pub fn try_spawn(mut self) -> std::io::Result<RunningCli<'a>> {
-        self.cmd.stdout(Stdio::piped());
+        if !self.stdout_closed {
+            self.cmd.stdout(Stdio::piped());
+        }
         if !self.stderr_closed {
             self.cmd.stderr(Stdio::piped());
         }

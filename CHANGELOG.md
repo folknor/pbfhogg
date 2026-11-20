@@ -450,6 +450,17 @@
   was a file that conforming XML readers, osmium's among them, reject.
   These runs now fail with exit 2, naming the element and attribute, and
   publish nothing.
+- **A closed stdout no longer hides a real failure.** Any failed command
+  used to exit 0 silently once a stdout write had met a closed pipe
+  (`pbfhogg ... | head`), even when the closed pipe was only met while
+  cleaning up after another error. For example, `export --format geojson`
+  on a truncated input exited 0 when its buffered FeatureCollection opening
+  was flushed into the closed pipe. The status now comes from the error the
+  command returned. Only a run that stopped because of the stdout write
+  ends quietly with 0. Other errors keep exit 2 and print their `Error:`
+  line. `inspect --get` now fails on a key with no value before it writes
+  anything. A `diff` that already found differences before its final stdout
+  flush now keeps exit 1.
 - **A PBF requiring a feature pbfhogg does not implement is refused.** A
   header `required_features` entry other than `OsmSchema-V0.6`,
   `DenseNodes` or `HistoricalInformation` used to be ignored: the file was

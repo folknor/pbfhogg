@@ -161,6 +161,33 @@ fn a_closed_stderr_keeps_the_differences_status() {
     assert_eq!(code(&out), EXIT_ANSWER_NEGATIVE);
 }
 
+/// A verdict reached before the last stdout write survives a stdout reader
+/// that already left: the whole report fits in the stdout buffer, so the
+/// closed pipe is met at the final flush, after the differences were found.
+#[test]
+fn a_closed_stdout_keeps_a_decided_differences_status() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let c = dir.path().join("c.osm.pbf");
+    write_two_nodes(&a, 110_000_000);
+    write_two_nodes(&c, 999_000_000);
+
+    let out = CliInvoker::new(&invocation_scratch)
+        .stdout_closed()
+        .arg("diff")
+        .arg(a.as_os_str())
+        .arg(c.as_os_str())
+        .run();
+    assert_eq!(
+        code(&out),
+        EXIT_ANSWER_NEGATIVE,
+        "stderr:\n{}",
+        out.stderr_str()
+    );
+    assert!(!out.stderr_str().contains("Error:"), "{}", out.stderr_str());
+}
+
 /// A failure is still a failure when nobody can read its message.
 #[test]
 fn a_closed_stderr_keeps_the_failure_status() {

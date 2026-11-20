@@ -3622,12 +3622,14 @@ pub fn run() -> process::ExitCode {
             None => process::ExitCode::from(ExitStatus::Usage.code()),
         },
         Err(e) => {
-            if output::reader_gone() {
-                // Stdout's reader went away (`pbfhogg ... | head`) and the
-                // command stopped writing. Nobody is left to read a report
-                // and nothing failed, so end quietly with success - see
-                // `output` for why this is keyed on the recorded event
-                // rather than on the shape of `e`.
+            if exit_code::is_stdout_gone(e.as_ref()) {
+                // The command stopped because stdout's reader went away
+                // (`pbfhogg ... | head`). Nobody is left to read a report
+                // and nothing failed, so end quietly with success. Keyed on
+                // the returned error, not on whether stdout ever failed: a
+                // buffered writer dropped after an input error flushes into
+                // the closed pipe too, and that must not erase the input
+                // error (see `output`).
                 process::ExitCode::SUCCESS
             } else {
                 output::cli_eprintln!(
@@ -4524,7 +4526,9 @@ fn run_diff(
         // differences status `run` cannot know.
         let mut out = output::buffered();
         let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
-        out.flush()?;
+        // Past the comparison the verdict exists: a reader met only at the
+        // final flush must not cost it.
+        output::tolerate_reader_gone(out.flush())?;
         stats
     };
     if !quiet {
@@ -5242,6 +5246,15 @@ fn run_inspect(
 
     // Everything is computed; only output remains. `--indexed` makes the
     // exit status an answer, and a reader that left early must not cost it.
+    // The requested value is resolved before anything is written, so a key
+    // without a value fails the command whatever stdout does.
+    let got = match get {
+        Some(key) => match report.get_value(key) {
+            Some(val) => Some(val),
+            None => return Err(format!("unknown key: {key}").into()),
+        },
+        None => None,
+    };
     let printed = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut out = output::buffered();
         if let Some(has_index) = has_index
@@ -5252,11 +5265,8 @@ fn run_inspect(
         if let Some(ref node_report) = node_report {
             node_report.write_report(&mut out)?;
         }
-        if let Some(key) = get {
-            match report.get_value(key) {
-                Some(val) => writeln!(out, "{val}")?,
-                None => return Err(format!("unknown key: {key}").into()),
-            }
+        if let Some(val) = got.as_ref() {
+            writeln!(out, "{val}")?;
         } else if json {
             let mut value = report.to_json_filtered(block_limit, anomalies);
             if indexed && let serde_json::Value::Object(ref mut map) = value {

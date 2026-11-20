@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **A caught worker panic is `ErrorKind::Panicked` and exits 101.** A
+  panic on a worker, writer or decode thread that pbfhogg catches at its
+  join used to come back as `ErrorKind::Internal` and exit 2, the same
+  status as a refusal of the input. It is now the new kind
+  `ErrorKind::Panicked { who, payload }`, `Error::is_panic` finds one
+  under any wrapping, and the CLI exits 101 for it, as for an uncaught
+  panic, ahead of every other status. `Internal` now means a broken
+  internal invariant only. Either is a defect worth reporting; a script
+  that treated 2 as "pbfhogg refused this input" no longer sees panics
+  there. The library harness reports such a call's outcome kind as
+  `panicked`.
 - **Geocode index format 9; admin lookup about five times faster.** The
   reader now looks up admin boundaries in the query point's own admin cell
   only, and accepts a boundary that cell marks as containing all of its

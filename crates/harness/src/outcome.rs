@@ -26,6 +26,7 @@ fn kind_id(kind: &ErrorKind) -> &'static str {
         ErrorKind::InvalidArgument { .. } => "invalid_argument",
         ErrorKind::InvalidData { .. } => "invalid_data",
         ErrorKind::Internal { .. } => "internal",
+        ErrorKind::Panicked { .. } => "panicked",
         ErrorKind::External { .. } => "external",
         ErrorKind::Output(_) => "output",
         ErrorKind::Cancelled => "cancelled",
@@ -46,8 +47,15 @@ impl CallOutcome {
         match result {
             Ok(_) => Self::Ok,
             Err(error) if error.is_cancelled() => Self::Cancelled,
+            // A caught panic anywhere in the chain is reported as one,
+            // whatever kind wraps it: it is a defect, never the refusal the
+            // outer kind would name.
             Err(error) => Self::Error {
-                kind: kind_id(error.kind()),
+                kind: if error.is_panic() {
+                    "panicked"
+                } else {
+                    kind_id(error.kind())
+                },
                 message: crate::protocol::one_line(&error.report(), crate::protocol::MESSAGE_MAX),
             },
         }
@@ -93,5 +101,22 @@ mod tests {
         assert_eq!(outcome["kind"], "invalid_argument");
         let message = outcome["message"].as_str().expect("a string");
         assert!(!message.is_empty() && !message.chars().any(char::is_control));
+    }
+
+    /// A caught panic is reported as `panicked` whatever kind wraps it, so
+    /// a planned refusal can never be satisfied by one.
+    #[test]
+    fn a_caught_panic_reports_panicked_under_any_wrapper() {
+        let panic = || pbfhogg::Error::panicked("writer thread", "boom".to_owned());
+        for error in [
+            panic(),
+            panic().context("publishing"),
+            pbfhogg::Error::external(panic()),
+            pbfhogg::Error::from(std::io::Error::other(std::io::Error::from(panic()))),
+        ] {
+            let outcome = CallOutcome::of::<()>(&Err(error)).to_json();
+            assert_eq!(outcome["status"], "error");
+            assert_eq!(outcome["kind"], "panicked", "{outcome}");
+        }
     }
 }

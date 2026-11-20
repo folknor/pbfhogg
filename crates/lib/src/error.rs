@@ -23,13 +23,18 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
-/// `"<who> panicked: <payload>"` as an `Internal` error: the one wording
-/// every join and `catch_unwind` site uses to surface a caught panic as a
-/// failure. The payload text is the one place a message is extracted from a
-/// foreign value, because a panic payload is not an error.
+/// A caught panic as an [`ErrorKind::Panicked`] error, displayed
+/// `"<who> panicked: <payload>"`: the one constructor every join and
+/// `catch_unwind` site uses to surface a caught panic as a failure. The
+/// payload text is the one place a message is extracted from a foreign
+/// value, because a panic payload is not an error.
+///
+/// A kind of its own rather than `Internal` so that a caught panic can never
+/// pass for a refusal: a test that names the refusal it expects fails on a
+/// panic, and the CLI exits 101 for one as it does for an uncaught panic.
 #[cold]
 pub(crate) fn panic_error(who: &str, payload: &(dyn std::any::Any + Send)) -> Error {
-    Error::internal(format!("{who} panicked: {}", panic_message(payload)))
+    Error::panicked(who.to_owned(), panic_message(payload).to_owned())
 }
 
 // Error data structures are modeled on the `csv` crate by BurntSushi.
@@ -413,7 +418,8 @@ impl Error {
         Error::invalid_data(leaf.to_string())
     }
 
-    /// A broken internal invariant or a caught panic.
+    /// A broken internal invariant. A caught panic is
+    /// [`ErrorKind::Panicked`] instead (see `panic_error`).
     #[cold]
     #[must_use]
     pub(crate) fn internal(msg: impl Into<Cow<'static, str>>) -> Error {
@@ -462,6 +468,21 @@ impl Error {
         new_error(ErrorKind::External {
             msg: Cow::Borrowed("callback error"),
             source: Some(Arc::new(source)),
+        })
+    }
+
+    /// A caught panic of `who` whose payload text is `payload`; see
+    /// [`ErrorKind::Panicked`]. Library code reaches it through
+    /// `panic_error`, which extracts the payload text. Doc-hidden and
+    /// public for tests of exit-code and outcome handling, which cannot
+    /// otherwise construct one from outside the crate.
+    #[doc(hidden)]
+    #[cold]
+    #[must_use]
+    pub fn panicked(who: impl Into<Cow<'static, str>>, payload: String) -> Error {
+        new_error(ErrorKind::Panicked {
+            who: who.into(),
+            payload,
         })
     }
 
@@ -563,8 +584,23 @@ impl Error {
             | ErrorKind::BlobTooLarge { .. }
             | ErrorKind::VersionRegression { .. }
             | ErrorKind::Cancelled
-            | ErrorKind::Sealed => None,
+            | ErrorKind::Sealed
+            | ErrorKind::Panicked { .. } => None,
         }
+    }
+
+    /// Whether this error is, or was caused by, a caught panic
+    /// ([`ErrorKind::Panicked`]): walks the whole chain, through context,
+    /// `io::Error` carriers and every cause, including foreign errors in
+    /// between. Unlike [`is_cancelled`](Self::is_cancelled), a panic buried
+    /// as a cause still counts: a failure a panic caused is a defect however
+    /// it is wrapped. It identifies a caught unwind in this error's chain,
+    /// not who is to blame (a caller's callback can panic inside a library
+    /// pool), and says nothing of panics elsewhere in the run whose errors
+    /// lost the first-failure ranking.
+    #[must_use]
+    pub fn is_panic(&self) -> bool {
+        chain_has_panic(self)
     }
 
     /// Whether this error is a cancellation: the run stopped because its
@@ -792,10 +828,22 @@ pub enum ErrorKind {
         msg: Cow<'static, str>,
         source: Option<Arc<dyn StdError + Send + Sync>>,
     },
-    /// A broken internal invariant or a caught panic.
+    /// A broken internal invariant.
     Internal {
         msg: Cow<'static, str>,
         source: Option<Arc<dyn StdError + Send + Sync>>,
+    },
+    /// A panic on a thread the run owns (a worker, a writer thread, a
+    /// decode task), caught at its join or `catch_unwind` and returned as
+    /// this run's failure. Never a refusal of the input: it is a defect.
+    /// See [`Error::is_panic`] for finding one under wrapping.
+    Panicked {
+        /// Which thread or task panicked (`"writer thread"`,
+        /// `"decode task"`, ...).
+        who: Cow<'static, str>,
+        /// The panic payload's text, or a placeholder for a payload that is
+        /// not a string.
+        payload: String,
     },
     /// An error returned by a caller-supplied callback; see
     /// [`Error::external`].
@@ -1333,6 +1381,28 @@ pub(crate) fn io_carries_cancellation(err: &io::Error) -> bool {
     carried_error(err).is_some_and(Error::is_cancelled)
 }
 
+/// Whether `err`'s chain holds an [`ErrorKind::Panicked`]: every
+/// `pbfhogg::Error` link by kind, every `io::Error` through its payload
+/// (whose `source()` skips the payload itself), anything else through
+/// `source()`.
+fn chain_has_panic(err: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(link) = current {
+        current = if let Some(error) = link.downcast_ref::<Error>() {
+            match error.kind() {
+                ErrorKind::Panicked { .. } => return true,
+                ErrorKind::Io(io) => io.get_ref().map(|inner| inner as &(dyn StdError + 'static)),
+                _ => error.structural_source(),
+            }
+        } else if let Some(io) = link.downcast_ref::<io::Error>() {
+            io.get_ref().map(|inner| inner as &(dyn StdError + 'static))
+        } else {
+            link.source()
+        };
+    }
+    false
+}
+
 fn carried_error(err: &io::Error) -> Option<&Error> {
     let mut payload: &(dyn StdError + 'static) = err.get_ref()?;
     loop {
@@ -1389,6 +1459,10 @@ impl fmt::Display for Message<'_> {
             | ErrorKind::InvalidData { ref msg, .. }
             | ErrorKind::Internal { ref msg, .. }
             | ErrorKind::External { ref msg, .. } => f.write_str(msg),
+            ErrorKind::Panicked {
+                ref who,
+                ref payload,
+            } => write!(f, "{who} panicked: {payload}"),
             // These name no command and no flag: how to index, sort or
             // check a file, and which switch grants what, is the front end's
             // advice to give (the CLI maps each kind to its own).
@@ -1644,6 +1718,34 @@ mod tests {
         let from_utf8 = String::from_utf8(vec![0xff]).unwrap_err();
         assert!(from_utf8.utf8_error().source().is_none());
         assert!(from_utf8.source().is_none());
+    }
+
+    /// A caught panic is its own kind, reads `<who> panicked: <payload>`,
+    /// and is found however it is wrapped: context, `io::Error` carriers
+    /// nested any depth, and as the cause of another kind, through a
+    /// foreign error in between. Nothing else is a panic, an `Internal`
+    /// error included.
+    #[test]
+    fn a_caught_panic_is_found_under_every_wrapping() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom 7");
+        let panic = panic_error("writer thread", payload.as_ref());
+        assert!(matches!(
+            panic.kind(),
+            ErrorKind::Panicked { who, payload } if who == "writer thread" && payload == "boom 7"
+        ));
+        assert_eq!(panic.to_string(), "writer thread panicked: boom 7");
+        assert!(panic.is_panic());
+        assert!(panic.clone().context("stage 3").is_panic());
+        let nested = Error::from(io::Error::other(io::Error::from(panic.clone())));
+        assert!(matches!(nested.kind(), ErrorKind::Io(_)));
+        assert!(nested.is_panic());
+        assert!(Error::external(io::Error::from(panic.clone())).is_panic());
+        assert!(Error::invalid_data_with("bad block", panic).is_panic());
+
+        assert!(!Error::internal("broken invariant").is_panic());
+        assert!(!invalid_data("x").is_panic());
+        assert!(!Error::from(io::Error::other("plain")).is_panic());
+        assert!(!Error::external(io::Error::other("plain")).is_panic());
     }
 
     fn invalid_data(msg: &'static str) -> Error {

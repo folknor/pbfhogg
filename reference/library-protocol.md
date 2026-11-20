@@ -278,7 +278,9 @@ are held to their range only, since no call reading anchors them.
   obligation.
 - `outcome`: `{"status": "ok"}`, `{"status": "cancelled"}`, or
   `{"status": "error", "kind": ID, "message": ONE_LINE}` (an identifier,
-  and 0 to 1000 bytes). Reported; the harness's assertions judge it.
+  and 0 to 1000 bytes). Reported; the harness's assertions judge it. An
+  error whose chain holds a caught panic (`pbfhogg::Error::is_panic`) has
+  `kind` `panicked`, whatever kind wraps it.
 - `publications`: every publication the call decided, in order, each
   `{"ordinal", "decision", "members"}`: ordinals 1, 2, ... without gaps;
   `decision` `authorized`, `refused_cancelled` or `refused_error`;
@@ -540,7 +542,8 @@ This section is the harness's own convention, not something the driver
 reads. Every call's plan entry carries `expect`: `{"status": "ok"}`,
 `{"status": "cancelled"}`, or `{"status": "error", "kind": ID}`, in the
 classes of the call document's `outcome` (a cancelled error is
-`cancelled`, never an error of kind `cancelled`; `other` is never planned).
+`cancelled`, never an error of kind `cancelled`; `other` and `panicked` are
+never planned).
 Every scenario carries the scenario-level assertion
 `calls-ended-as-planned`, which fails naming each call whose outcome is not
 its `expect`. A verification therefore holds the same rule a bench does,

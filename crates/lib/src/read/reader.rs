@@ -1442,14 +1442,14 @@ impl Iterator for PipelinedBlocks {
                 if self.completed.load(std::sync::atomic::Ordering::Acquire) {
                     None
                 } else {
-                    let message = match self.handle.take().map(JoinHandle::join) {
-                        Some(Err(payload)) => format!(
-                            "pipeline thread terminated without completing (panicked): {}",
-                            crate::error::panic_message(payload.as_ref()),
-                        ),
-                        _ => "pipeline thread terminated without completing".to_owned(),
-                    };
-                    Some(Err(Error::internal(message)))
+                    // A panic is `Panicked`; a thread that ended unpanicked
+                    // without completing is a broken invariant.
+                    Some(Err(match self.handle.take().map(JoinHandle::join) {
+                        Some(Err(payload)) => {
+                            crate::error::panic_error("pipeline thread", payload.as_ref())
+                        }
+                        _ => Error::internal("pipeline thread terminated without completing"),
+                    }))
                 }
             }
         }
@@ -2032,8 +2032,12 @@ mod tests {
             .expect("a dead pipeline must yield an item, not end-of-iteration")
             .expect_err("and that item must be an error");
         assert!(
-            format!("{err}").contains("panicked): pipeline thread died"),
-            "expected the pipeline-death error, got: {err}"
+            matches!(
+                err.kind(),
+                crate::ErrorKind::Panicked { who, payload }
+                    if who == "pipeline thread" && payload.contains("pipeline thread died")
+            ),
+            "expected the pipeline-death panic, got: {err}"
         );
         assert!(
             crashed.next().is_none(),

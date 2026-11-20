@@ -506,7 +506,7 @@ mod tests {
 
         handle
             .join()
-            .map_err(|_| Error::internal("writer thread panicked"))??;
+            .map_err(|payload| crate::error::panic_error("writer thread", payload.as_ref()))??;
 
         let mut actual = Vec::new();
         std::fs::File::open(&out)?.read_to_end(&mut actual)?;

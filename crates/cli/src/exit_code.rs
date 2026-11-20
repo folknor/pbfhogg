@@ -27,6 +27,27 @@ pub fn is_platform_unsupported(err: &(dyn std::error::Error + 'static)) -> bool 
     false
 }
 
+/// Whether `err`'s chain holds a caught panic anywhere: walked like
+/// [`is_platform_unsupported`], each `pbfhogg::Error` judged by
+/// `pbfhogg::Error::is_panic`, which walks its own chain. A failure a panic
+/// caused is a defect however it is wrapped, so unlike [`is_cancelled`] a
+/// buried panic counts, and it outranks a cancellation the run also saw.
+pub fn is_panic(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<pbfhogg::Error>() {
+            return error.is_panic();
+        }
+        current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            io.get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
+        } else {
+            error.source()
+        };
+    }
+    false
+}
+
 /// Whether `err` is a cancellation: the run stopped because its token was
 /// tripped. Only the authoritative cause counts - the error itself, seen
 /// through the transparent carriers this front end and the library put
@@ -472,6 +493,32 @@ mod tests {
         assert!(!is_platform_unsupported(&pbfhogg::Error::from(
             io::Error::other("x")
         )));
+    }
+
+    /// A caught panic earns exit 101 however it is wrapped - bare, under
+    /// context, inside `io::Error` carriers, under a [`Hinted`] wrapper, as
+    /// the cause of another kind, boxed - and nothing else does, a platform
+    /// refusal and a cancellation included.
+    #[test]
+    fn a_caught_panic_is_classified_anywhere_in_the_chain() {
+        use super::is_panic;
+        let panic = || pbfhogg::Error::panicked("diff unit worker", "overflow".to_owned());
+        assert!(is_panic(&panic()));
+        assert!(is_panic(&panic().context("comparing")));
+        assert!(is_panic(&io::Error::from(panic())));
+        assert!(is_panic(&io::Error::other(io::Error::from(panic()))));
+        assert!(is_panic(&Hinted::new(panic(), "; advice")));
+        assert!(is_panic(&pbfhogg::Error::external(panic())));
+        let boxed: Box<dyn std::error::Error> = Box::new(panic());
+        assert!(is_panic(boxed.as_ref()));
+        assert_eq!(
+            error_report(&panic()),
+            "diff unit worker panicked: overflow"
+        );
+
+        assert!(!is_panic(&platform()));
+        assert!(!is_panic(&io::Error::other("x")));
+        assert!(!is_panic(&pbfhogg::Error::from(io::Error::other("x"))));
     }
 
     /// Stdout's reader going away ends a run quietly only as the error

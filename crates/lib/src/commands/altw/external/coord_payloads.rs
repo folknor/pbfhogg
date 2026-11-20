@@ -617,10 +617,22 @@ impl<'a> AbortOnDrop<'a> {
 impl Drop for AbortOnDrop<'_> {
     fn drop(&mut self) {
         if self.armed.get() {
-            self.router.abort(Error::internal(format!(
-                "{} panicked (AbortOnDrop guard fired)",
-                self.label
-            )));
+            // Unwinding: the holder panicked, and the guard has no payload
+            // (the join that later collects the unwind holds it). Not
+            // unwinding: the holder returned without disarming, a broken
+            // invariant rather than a panic.
+            let error = if std::thread::panicking() {
+                Error::panicked(
+                    self.label,
+                    "payload held by the join (AbortOnDrop guard fired)".to_owned(),
+                )
+            } else {
+                Error::internal(format!(
+                    "{} returned without disarming its AbortOnDrop guard",
+                    self.label
+                ))
+            };
+            self.router.abort(error);
         }
     }
 }

@@ -376,15 +376,12 @@ registry writers now refuse entries they do not own; the lock open does not.
 
 Reported by: the release-sweep retirement (commit `e716ad49`).
 
-Worker pools turn a panic into an `Internal` error (the diff unit worker is
-one), so a test that asserts only `is_err()` on a refusal passes when the
-code panics instead of refusing. With the release sweep gone, dev builds
-are the only test builds, and an arithmetic overflow there panics where a
-release build would wrap: a test that accepts any error can hide that
-difference entirely. The retirement tightened one test
-(`an_identical_corrupt_pair_is_skipped_wherever_equal_blobs_may_be` in
-`crates/lib/tests/roundtrip_invariants.rs`) to name its error kind and
-blob. Nothing finds or forbids the others: neither a sweep of the suite for
-`is_err()` and `.is_err_and(...)`-style refusal assertions that do not
-name a kind, nor a rule (text rule or source-policy audit) that keeps new
-ones out.
+A caught worker panic is now `ErrorKind::Panicked` and exits 101, so a
+test naming its refusal kind, or a CLI test requiring exit 2, fails on one.
+What remains: tests that accept any error still pass on a panic (dev
+overflow checks panic where release wraps). `CliInvoker::assert_failure`
+and about 26 direct `!status.success()` sites accept 101; library and unit
+tests holding bare `is_err()`, discarded `unwrap_err`/`expect_err`, or
+`Err(_)` patterns accept `Panicked`; and no source-policy rule keeps new
+ones out. The settled rulings and the remaining links (CLI refusal bar,
+source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.

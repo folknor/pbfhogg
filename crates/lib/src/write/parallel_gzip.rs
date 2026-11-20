@@ -894,6 +894,16 @@ mod fault_tests {
                         && msg.contains("test-hooks: parallel_gzip pool op #2"),
                     "finish() must report the first failure with its panic payload, got: {msg}"
                 );
+                // The io::Error carries the typed panic, never a refusal kind.
+                let typed = crate::Error::from(e);
+                assert!(
+                    matches!(
+                        typed.kind(),
+                        crate::ErrorKind::Panicked { who, .. } if who == "parallel gzip worker"
+                    ),
+                    "{typed}"
+                );
+                assert!(typed.is_panic());
             }
             Err(_) => panic!("a compress-worker panic must not unwind into the caller"),
         }

@@ -1028,7 +1028,8 @@ executor in sequence order with the raw frames around it.
 
 Every fallible library function returns `pbfhogg::Result`. An error is an
 `ErrorKind` (`Io`, `PlatformUnsupported`, `InvalidArgument`, `InvalidData`,
-`Internal`, `External`, plus the PBF-structure kinds), optional context text,
+`Internal`, `Panicked`, `External`, plus the PBF-structure kinds; a caught
+worker panic is `Panicked`, never `Internal`), optional context text,
 an optional `Location` (file, blob ordinal, byte offset) and, where the cause
 has a type of its own, that cause as `source()`. `Error` is `Clone`, so a
 first-failure slot or a cross-thread channel carries the error itself.

@@ -460,9 +460,11 @@ Every tested sweep builds dev; no suite runs the shipped release profile
 was retired as too costly for what it alone caught. What covers its ground:
 dev's overflow checks panic where release would wrap, wherever a fixture
 reaches the operation and the test does not accept the panic as an
-outcome (a unit worker's panic comes back as an `Internal` error, so a
-refusal test should name the refusal it expects rather than `is_err()`;
-the suite does not enforce that); the `no-debug-only-invariants` textlint
+outcome (a worker's caught panic comes back as an `ErrorKind::Panicked`
+error, and the CLI exits 101 for one, so a test that names the refusal
+kind it expects, or a CLI test that requires exit 2, fails on a panic; a
+test that asserts only `is_err()` or a non-zero exit still passes on one,
+and the suite does not yet forbid that shape); the `no-debug-only-invariants` textlint
 enforces ADR-0021, so a production debug-only check exists only on a line
 carrying its `debug-only-measured:` record, which review polices; and every
 bench and verify run is a release build on real data. Not covered by any

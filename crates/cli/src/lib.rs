@@ -29,7 +29,9 @@ mod output;
 mod signals;
 
 use command_paths::{CommandPaths, LeftoverScanner, parent_of, reject_aliases};
-use exit_code::{Hinted, error_report, is_cancelled, is_platform_unsupported, output_hint};
+use exit_code::{
+    Hinted, error_report, is_cancelled, is_panic, is_platform_unsupported, output_hint,
+};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -68,9 +70,14 @@ use pbfhogg::{HeaderOverrides, TypeFilter};
 /// satisfied by a typo in its argv. What the command itself refuses - a
 /// library `InvalidArgument` included, such as the geocode S2 level bounds -
 /// is `2`: by then the CLI has handed the request over.
+///
+/// `101` is a panic: one on the main thread, which the runtime reports, or
+/// one a worker raised that the library caught and returned. It is kept
+/// apart from `2` so a caller expecting a refusal is never satisfied by a
+/// defect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitStatus {
-    /// `2` - the command failed. Every error path but the two below lands
+    /// `2` - the command failed. Every error path but the three below lands
     /// here.
     Failed,
     /// `3` - the command failed because a requested platform I/O feature
@@ -80,6 +87,11 @@ enum ExitStatus {
     /// `64` - the command line was refused, printed by clap on stderr
     /// (see [`clap_exit`]).
     Usage,
+    /// `101` - the command failed because a thread it ran panicked and the
+    /// panic was caught and returned (`pbfhogg::ErrorKind::Panicked`
+    /// anywhere in the error's chain): a defect, never a refusal. The same
+    /// status an uncaught panic on the main thread gets from the runtime.
+    Panicked,
 }
 
 impl ExitStatus {
@@ -88,6 +100,7 @@ impl ExitStatus {
             Self::Failed => 2,
             Self::PlatformUnsupported => 3,
             Self::Usage => 64,
+            Self::Panicked => 101,
         }
     }
 }
@@ -3604,6 +3617,13 @@ pub fn run() -> process::ExitCode {
                 );
             }
             process::ExitCode::from(outcome.code())
+        }
+        // A caught panic outranks everything else the run reports, a signal
+        // that also arrived included: it is a defect, and no refusal or
+        // interruption status may stand in for it.
+        Err(e) if is_panic(e.as_ref()) => {
+            output::cli_eprintln!("Error: {}", error_report(e.as_ref()));
+            process::ExitCode::from(ExitStatus::Panicked.code())
         }
         // Decided before the reader-gone override: an interrupted run whose
         // stdout reader also left must not report success.

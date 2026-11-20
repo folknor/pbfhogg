@@ -131,18 +131,6 @@ answer for such rings. The assembler now keeps the start deterministic (the
 earliest source edge) but the dependence is in the reader's framing, which
 predates the rewrite. The framing should be start-invariant.
 
-## GEO-022 - The coarse-level dangling-reference refusal has no test
-
-Reported by: the reader corrupt-entry refusal work (commit `8d473cc3`).
-
-Lookup now refuses a dangling entry reference with a `QueryError` at the
-first read. The existing fixture damages fine and coarse entries together,
-and both lookups fail at the first bad fine entry, so the refusal on the
-coarse level (`reader.rs`, the coarse `search_level` path) is never
-exercised. A test needs a query point with no fine hit whose coarse list
-holds a dangling reference; the synthetic builder inputs do not give one
-easily.
-
 ## GEO-023 - A tangent exclave drawn by open ways withholds the relation
 
 Reported by: the crossing-ring review (spar with codex).

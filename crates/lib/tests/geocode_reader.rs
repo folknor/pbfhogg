@@ -296,6 +296,63 @@ fn a_dangling_address_entry_fails_the_query() {
     assert_eq!(reader.candidates(55.7, 12.5).err(), Some(expected));
 }
 
+#[test]
+fn a_dangling_coarse_address_entry_fails_the_query() {
+    use pbfhogg::geocode_index::reader::{IndexReference, QueryError, Reader};
+
+    let dir = crate::common::test_scratch();
+    let index_dir = dir.path().join("index");
+    write_index(&index_dir);
+
+    // The address at 55.7 is about 15 m away, between the fixture's fine
+    // and coarse radii. The fine list stays valid throughout the test.
+    let (lat, lon) = (55.700_135, 12.5);
+    let header_path = index_dir.join(format::FILE_HEADER);
+    let bytes: [u8; format::HEADER_SIZE] = std::fs::read(&header_path)
+        .expect("read header")
+        .try_into()
+        .expect("header size");
+    let mut header = Header::from_bytes(&bytes).expect("decode header");
+    header.coarse_cell_count = 1;
+    std::fs::write(header_path, header.to_bytes()).expect("write header");
+    let cell_id = s2::cellid::CellID::from(s2::latlng::LatLng::from_degrees(lat, lon))
+        .parent(u64::from(header.coarse_cell_level))
+        .0;
+    std::fs::write(
+        index_dir.join(format::FILE_COARSE_GEO_CELLS),
+        GeoCell {
+            cell_id,
+            street_offset: 0,
+            addr_offset: 0,
+            interp_offset: 0,
+        }
+        .to_bytes(),
+    )
+    .expect("coarse cell");
+
+    let entries_path = index_dir.join(format::FILE_COARSE_ADDR_ENTRIES);
+    std::fs::write(&entries_path, [1, 0, 0, 0, 0, 0]).expect("valid coarse address index");
+    {
+        let reader = Reader::open(&index_dir).expect("open valid index");
+        let result = reader.query(lat, lon).expect("query valid index");
+        let address = result.address.expect("coarse address hit");
+        assert!(address.distance_m > f64::from(header.fine_search_radius_m));
+        assert!(address.distance_m < f64::from(header.coarse_search_radius_m));
+        let candidates = reader.candidates(lat, lon).expect("read valid candidates");
+        assert_eq!(candidates.addresses.len(), 1);
+    }
+
+    std::fs::write(entries_path, [1, 0, 1, 0, 0, 0]).expect("name address point 1 of 1");
+    let reader = Reader::open(&index_dir).expect("entry contents are not checked at open");
+    let expected = QueryError::DanglingReference {
+        reference: IndexReference::AddressPoint,
+        index: 1,
+        count: 1,
+    };
+    assert_eq!(reader.query(lat, lon).err(), Some(expected));
+    assert_eq!(reader.candidates(lat, lon).err(), Some(expected));
+}
+
 /// The admin searches binary-search their cells, so open refuses admin
 /// cells out of order or repeated, as it does geo cells.
 #[test]

@@ -1530,6 +1530,37 @@ fn out_of_domain_nodes_are_judged_before_narrowing() {
 }
 
 #[test]
+fn geocode_reports_first_node_error_in_blob() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    let nodes = [1, 2].map(|id| TestNode {
+        id,
+        lat: 900_000_001,
+        lon: 0,
+        tags: vec![],
+        meta: None,
+    });
+    // The fixture writer puts both invalid nodes in one dense node blob.
+    write_test_pbf_sorted(&input, &nodes, &[], &[]);
+    let error = build_index(
+        &input,
+        &Default::default(),
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect_err("invalid nodes must fail the build");
+    assert!(
+        error
+            .to_string()
+            .contains("node 1 has coordinates outside the geographic domain"),
+        "{error}"
+    );
+    assert!(!index_dir.exists());
+}
+
+#[test]
 fn builder_refuses_a_truly_empty_index() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");

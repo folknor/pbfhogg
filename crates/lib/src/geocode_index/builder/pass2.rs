@@ -101,7 +101,6 @@ pub(super) struct SlimInterpWay {
 struct NodeBlobOut {
     text: String,
     addr_points: Vec<FlatAddrPoint>,
-    error: Option<Error>,
 }
 
 /// The names an address carries, as `(street, place)`: an empty value is
@@ -714,6 +713,8 @@ pub(super) fn run_pass2(
             std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS),
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> Result<NodeBlobOut> {
+                // Return the first node error in blob order to the pool,
+                // which adds the blob location.
                 for element in block.elements_skip_metadata() {
                     macro_rules! process_node {
                         ($node:expr) => {{
@@ -725,13 +726,12 @@ pub(super) fn run_pass2(
                             // every decoded node - before any other test can
                             // skip it - rather than trust the claim.
                             if node_id > max_node_id {
-                                state.error = Some(crate::error::new_indexdata_mismatch(format!(
+                                return Err(crate::error::new_indexdata_mismatch(format!(
                                     "node {node_id} exceeds the node-ID bound {max_node_id} derived \
                                      from the blob metadata (the largest indexdata max_id over node \
                                      blobs, widened by any blob without indexdata). Some blob's \
                                      indexdata understates its ID range."
                                 )));
-                                continue;
                             }
                             // The domain is judged on the exact nanodegree
                             // value, before truncation, as `check --locations`
@@ -749,26 +749,23 @@ pub(super) fn run_pass2(
                                 // edge. Silently skipping it could publish
                                 // plausible but incomplete geometry, so this
                                 // build remains fatal for that condition.
-                                state.error = Some(Error::invalid_data(format!(
+                                return Err(Error::invalid_data(format!(
                                     "node {node_id} has coordinates outside the geographic domain (lat {lat_nano}, lon {lon_nano} in nanodegrees)"
                                 )));
-                                continue;
                             };
                             if let Some(rank) = referenced_ref.numeric_rank_if_set(node_id) {
                                 let Some(slot) = coord_slot(coord_store, rank) else {
-                                    state.error = Some(Error::internal(format!(
+                                    return Err(Error::internal(format!(
                                         "internal error: node {node_id} has coordinate rank {rank}, \
                                          outside the {}-slot store built from the same \
                                          referenced-node set",
                                         coord_store.len()
                                     )));
-                                    continue;
                                 };
                                 if !install_coord(slot, packed) {
-                                    state.error = Some(Error::invalid_data(format!(
+                                    return Err(Error::invalid_data(format!(
                                         "node {node_id} has conflicting coordinates across occurrences"
                                     )));
-                                    continue;
                                 }
                             }
                             let mut hn: Option<&str> = None;
@@ -810,13 +807,7 @@ pub(super) fn run_pass2(
                         _ => {}
                     }
                 }
-                // A failure found in this blob ends the pool, located with
-                // the blob it was found in.
-                let mut out = std::mem::take(state);
-                match out.error.take() {
-                    Some(error) => Err(error),
-                    None => Ok(out),
-                }
+                Ok(std::mem::take(state))
             },
             |_seq, out| {
                 write_addr_points(

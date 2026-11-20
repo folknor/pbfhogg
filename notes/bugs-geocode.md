@@ -113,17 +113,6 @@ The required provenance relationship is neither encoded nor documented.
 Binding candidates to their originating reader would also keep the polygon
 identity that BUG-026 in `notes/bugs.md` needs.
 
-## GEO-015 - Pass 2a reports the last error of a blob, not the first
-
-Reported by: the codex spar of the geocode coordinate-domain work.
-
-`run_pass2`'s node worker (`builder/pass2.rs`) records a failure in
-`state.error` and continues the blob, so a later failure in the same blob
-(a conflicting duplicate coordinate, an out-of-range rank) overwrites an
-earlier one, such as the out-of-domain refusal. The build still fails and
-publishes nothing; only the reported cause can be the wrong one. Keep the
-first error (or stop the blob at it).
-
 ## GEO-018 - Open ways sharing a side between two holes are refused as a theta
 
 Reported by: the ring-assembly rewrite.

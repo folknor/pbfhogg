@@ -12,6 +12,18 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Pass 2a returns the first node error (plantasjen, 2026-11-20, variant uncommitted against `e2387c31`)
+
+Germany, one baseline and one variant cell with `--iterations 1` and
+`--stop GEOCODE_PASS2A_END`. Trim was unavailable in the sandbox. The
+`--commit HEAD` attempt (`005e5a6b`) stopped before measurement because
+Git could not create a worktree, so the baseline ran from the working
+tree before the production code edit. Baseline `c1bd30f7` ran in 5.90 s
+with 1.86 s in Pass 2a. Variant `36218575` ran in 4.00 s with 1.72 s
+in Pass 2a. The schedule and Pass 1.5 phases read less from disk in the
+second cell. Verdict: no measured cost in Pass 2a. The pair's cache
+conditions differ, so it gives no speedup estimate.
+
 ### Admin way geometry in two flat mappings (plantasjen, 2026-11-20, variant uncommitted against `8766940a`)
 
 Pass 2b staged every admin way as two heap vectors, node IDs and

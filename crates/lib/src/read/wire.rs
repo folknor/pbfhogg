@@ -113,6 +113,18 @@ fn take_message<'a>(
     dup_msg: &'static str,
 ) -> Result<()> {
     let bytes = cursor.read_len_delimited()?;
+    take_message_body(bytes, slot, dup_msg)
+}
+
+/// [`take_message`]'s rule on a body already read: an empty body is ignored
+/// once the slot holds one (a lone one is kept as present), a second
+/// non-empty body is refused with `dup_msg`.
+#[inline]
+fn take_message_body<'a>(
+    bytes: &'a [u8],
+    slot: &mut Option<&'a [u8]>,
+    dup_msg: &'static str,
+) -> Result<()> {
     match slot {
         Some(existing) if !existing.is_empty() => {
             if bytes.is_empty() {
@@ -126,6 +138,43 @@ fn take_message<'a>(
             Ok(())
         }
     }
+}
+
+/// Refusal of a `PrimitiveBlock` carrying more than one non-empty
+/// `StringTable` body. See [`take_string_table`].
+pub(crate) const DUP_STRING_TABLE: &str =
+    "PrimitiveBlock.stringtable appears twice with data; message merge is unsupported";
+
+/// Take one `PrimitiveBlock.stringtable` occurrence into `slot`, under the
+/// rule [`take_message`] applies to `Info` and `DenseInfo`. Shared by every
+/// walk that selects a block's table: the decoder ([`scan_block_fields`]),
+/// the indexdata scanner (`blob_meta::scan`), both add-locations-to-ways way
+/// reframers (`commands/altw/reframe.rs`) and renumber's wire splice, so all
+/// of them treat repeated occurrences alike (the rewriters additionally
+/// require the field to be present; the decoder reads an absent table as
+/// empty).
+///
+/// Protobuf merges repeated occurrences of this singular message, and its
+/// repeated `s` entries concatenate in occurrence order. The decoder, the
+/// scanner and the reframers used to keep the last occurrence (renumber
+/// refused any second one, empty included), which silently resolved every tag against the
+/// wrong strings (`["", "name", "original"]` then `["", "name",
+/// "replacement"]` read `name=replacement`), let an empty final occurrence
+/// erase the table, and let earlier entries escape UTF-8 validation. A merge
+/// would need every rewriter that re-emits the table as one borrowed slice to
+/// concatenate bodies, for a shape no known writer produces; so, as for
+/// `Info`, a second occurrence with a non-empty body is a refusal, and an
+/// empty body (which merges to nothing) is ignored in either position. Every
+/// accepted block therefore reads exactly as its protobuf merge. "Non-empty"
+/// is the body's byte length: a body holding only unknown fields counts as
+/// data-bearing, and one holding a single empty `s` entry does too, since it
+/// consumes an index. libosmium differs at the edges (it refuses a further
+/// occurrence once its table holds any entry, so it refuses
+/// `[populated, empty]` and accepts `[unknown-fields-only, populated]`);
+/// DEVIATIONS.md records this.
+#[inline]
+pub(crate) fn take_string_table<'a>(bytes: &'a [u8], slot: &mut Option<&'a [u8]>) -> Result<()> {
+    take_message_body(bytes, slot, DUP_STRING_TABLE)
 }
 
 /// Refusal of a `PrimitiveGroup` carrying more than one `DenseNodes` message.
@@ -320,8 +369,8 @@ const _: () = {
     assert!((MAX_BLOCK_BYTES as u64) * 5 <= i32::MAX as u64);
 };
 
-/// Scan a `PrimitiveBlock`'s top-level fields: every field framed, the last
-/// string table's entries into `st_entries` and every group's range into
+/// Scan a `PrimitiveBlock`'s top-level fields: every field framed, the one
+/// data-bearing string table's entries ([`take_string_table`]) into `st_entries` and every group's range into
 /// `group_entries` (both buffer-relative `(offset, length)`, cleared first),
 /// and the final value of each scalar parameter. The whole top level is
 /// framed before the string table's own entries are, so a late top-level
@@ -345,16 +394,13 @@ pub(crate) fn scan_block_fields(
     let mut lat_offset: i64 = 0;
     let mut lon_offset: i64 = 0;
     let mut date_granularity: i32 = 1000;
-    let mut stringtable_offset: usize = 0;
-    let mut stringtable_len: usize = 0;
+    let mut stringtable: Option<&[u8]> = None;
 
     let mut cursor = Cursor::new(buffer);
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
             (super::wire_schema::primitive_block::STRING_TABLE, WIRE_LEN) => {
-                let data = cursor.read_len_delimited()?;
-                stringtable_offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                stringtable_len = data.len();
+                take_string_table(cursor.read_len_delimited()?, &mut stringtable)?;
             }
             (2, WIRE_LEN) => {
                 let data = cursor.read_len_delimited()?;
@@ -379,12 +425,7 @@ pub(crate) fn scan_block_fields(
     }
 
     // Scan string table entries from the stringtable submessage.
-    let st_data = if stringtable_len > 0 {
-        &buffer[stringtable_offset..stringtable_offset + stringtable_len]
-    } else {
-        &[]
-    };
-    WireStringTable::scan_entries(st_data, buffer, st_entries)?;
+    WireStringTable::scan_entries(stringtable.unwrap_or(&[]), buffer, st_entries)?;
     Ok(BlockFields {
         granularity,
         lat_offset,

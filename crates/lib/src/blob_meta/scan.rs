@@ -116,8 +116,8 @@ struct RawExtent {
 /// One pass over a whole block, accumulating everything both scanners need.
 struct Walk<'a> {
     collect_keys: bool,
-    /// Entries of the last `StringTable` occurrence (the decoder keeps the
-    /// last one too).
+    /// Entries of the block's one data-bearing `StringTable` occurrence,
+    /// selected by the decoder's rule.
     strings: Vec<&'a [u8]>,
     granularity: i32,
     lat_offset: i64,
@@ -197,16 +197,22 @@ impl<'a> Walk<'a> {
         Ok(walk)
     }
 
-    /// Read the block-level fields, returning the last StringTable and every
+    /// Read the block-level fields, returning the one data-bearing StringTable
+    /// (`take_string_table`, the decoder's rule) and every
     /// group in order. Groups are walked only afterwards because granularity
     /// and the offsets may follow them on the wire.
     fn block_fields(&mut self, raw: &'a [u8]) -> Result<(&'a [u8], Vec<&'a [u8]>)> {
-        let mut stringtable: &[u8] = &[];
+        let mut stringtable: Option<&[u8]> = None;
         let mut groups: Vec<&[u8]> = Vec::new();
         let mut cur = Cursor::new(raw);
         while let Some((field, wire_type)) = cur.read_tag()? {
             match (field, wire_type) {
-                (1, WIRE_LEN) => stringtable = cur.read_len_delimited()?,
+                (1, WIRE_LEN) => {
+                    crate::read::wire::take_string_table(
+                        cur.read_len_delimited()?,
+                        &mut stringtable,
+                    )?;
+                }
                 (2, WIRE_LEN) => groups.push(cur.read_len_delimited()?),
                 (17, WIRE_VARINT) => {
                     self.granularity =
@@ -222,7 +228,7 @@ impl<'a> Walk<'a> {
                 _ => cur.skip_field(wire_type)?,
             }
         }
-        Ok((stringtable, groups))
+        Ok((stringtable.unwrap_or(&[]), groups))
     }
 
     /// Walk one `PrimitiveGroup`, every field of it.
@@ -1099,15 +1105,51 @@ mod tests {
     }
 
     #[test]
-    fn the_last_string_table_wins() {
+    fn a_second_populated_string_table_is_refused_like_the_decoder() {
         let mut g = Vec::new();
         write_len_delimited(3, &element_msg(1, &[1], &[1]), &mut g);
         let mut block = Vec::new();
-        write_len_delimited(1, &stringtable(&[b"", b"stale"]), &mut block);
+        write_len_delimited(1, &stringtable(&[b"", b"original"]), &mut block);
         write_len_delimited(2, &g, &mut block);
-        write_len_delimited(1, &stringtable(&[b"", b"amenity"]), &mut block);
-        let ti = scan_block_tags(&block).unwrap();
-        assert_eq!(ti.keys(), &[Box::<[u8]>::from(&b"amenity"[..])]);
+        write_len_delimited(1, &stringtable(&[b"", b"replacement"]), &mut block);
+        let err = try_scan_block_tags(&block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::read::wire::DUP_STRING_TABLE),
+            "{err}"
+        );
+        let err = crate::PrimitiveBlock::from_vec(block)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains(crate::read::wire::DUP_STRING_TABLE)),
+            "{err:?}"
+        );
+    }
+
+    /// An empty occurrence merges to nothing in either position, so the
+    /// populated table is the one every index resolves against.
+    #[test]
+    fn an_empty_string_table_occurrence_is_ignored_in_either_position() {
+        let mut g = Vec::new();
+        write_len_delimited(3, &element_msg(1, &[1], &[1]), &mut g);
+        for empty_first in [true, false] {
+            let mut block = Vec::new();
+            if empty_first {
+                write_len_delimited(1, &[], &mut block);
+            }
+            write_len_delimited(1, &stringtable(&[b"", b"amenity"]), &mut block);
+            write_len_delimited(2, &g, &mut block);
+            if !empty_first {
+                write_len_delimited(1, &[], &mut block);
+            }
+            let ti = scan_block_tags(&block).unwrap();
+            assert_eq!(ti.keys(), &[Box::<[u8]>::from(&b"amenity"[..])]);
+            let pb = crate::PrimitiveBlock::from_vec(block).unwrap();
+            assert_eq!(pb.string_table_len(), 2);
+            assert_eq!(pb.string_table_entry(1), Some("amenity"));
+        }
     }
 
     /// The decoder yields empty-string keys, so the scanned index lists one;

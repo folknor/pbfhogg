@@ -35,6 +35,17 @@
   `zlib_data` or `zstd_data` is refused instead of decoding the supported
   one, and a lone payload in one of those codecs now names the
   unsupported compression instead of reporting an empty blob.
+- **A block with two non-empty string tables is refused.** Every command
+  that decodes a block, indexdata generation, `check --index`, renumber
+  and add-locations-to-ways' way rewriting now fail (exit 2) on a
+  `PrimitiveBlock` carrying a second string table with data. Before, the
+  last table silently replaced the earlier one, so tags could resolve to
+  the wrong strings. Blobs copied through without decoding (already
+  indexed blobs in `cat`, relation blobs in add-locations-to-ways) are not
+  inspected. An extra empty table is ignored, now by renumber too, which
+  used to refuse it.
+  add-locations-to-ways also no longer drops an empty string table from
+  its output, which had made that output unreadable to a second run.
 - `diff --format osc --increment-version` exits 2 without publishing an
   OSC if a deleted element is already at version 2147483647.
 

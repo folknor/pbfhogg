@@ -72,7 +72,8 @@ pub(super) fn reframe_way_blob_with_locations(
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     output.clear();
-    encode_bytes_field(output, 1, stringtable_bytes);
+    // `_always`: the field is required, so an empty table stays present.
+    protohoggr::encode_bytes_field_always(output, 1, stringtable_bytes);
 
     let mut stats = WayReframeStats {
         min_way_id: i64::MAX,
@@ -127,7 +128,10 @@ fn parse_block_top(
 /// fields 17 to 20 re-encoded into `scalar_fields` after
 /// [`check_default_coord_framing`] has refused any that is not the PBF
 /// default. Both buffers are cleared first. A block without a StringTable is
-/// refused.
+/// refused, and so is one with two data-bearing StringTable occurrences
+/// (`read::wire::take_string_table`, the decoder's rule): the way's string
+/// indices are copied through against the one table this returns, so it must
+/// be the table the decoder would resolve them against.
 ///
 /// Only the block level is shared. Below it the two differ by design: this
 /// path resolves each ref against a random-access `NodeIndex` and encodes
@@ -141,7 +145,7 @@ pub(super) fn parse_way_block_top(
 ) -> crate::Result<(usize, usize)> {
     group_ranges.clear();
     scalar_fields.clear();
-    let mut stringtable_range: Option<(usize, usize)> = None;
+    let mut stringtable: Option<&[u8]> = None;
 
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor
@@ -153,8 +157,7 @@ pub(super) fn parse_way_block_top(
                 let data = cursor
                     .read_len_delimited()
                     .map_err(|e| crate::Error::from(e).context("reframe st"))?;
-                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                stringtable_range = Some((offset, data.len()));
+                crate::read::wire::take_string_table(data, &mut stringtable)?;
             }
             (2, WIRE_LEN) => {
                 let data = cursor
@@ -177,7 +180,13 @@ pub(super) fn parse_way_block_top(
         }
     }
 
-    stringtable_range
+    stringtable
+        .map(|data| {
+            (
+                data.as_ptr() as usize - decompressed.as_ptr() as usize,
+                data.len(),
+            )
+        })
         .ok_or_else(|| crate::Error::invalid_data("reframe: no StringTable in PrimitiveBlock"))
 }
 
@@ -559,6 +568,45 @@ mod tests {
 
     fn run(block: &[u8]) -> (Vec<u8>, u64, u64) {
         try_run(block).expect("reframe must succeed")
+    }
+
+    /// The table is a required field: an empty but present one stays present
+    /// in the output (it used to be dropped, so a second run refused its own
+    /// output as having no StringTable).
+    #[test]
+    fn an_empty_string_table_stays_present_and_the_output_reframes_again() {
+        let (out, _, _) = run(&way_block(42, &[7], true));
+        assert_eq!(&out[..2], &[0x0a, 0x00]);
+        assert!(try_run(&out).is_ok());
+    }
+
+    /// The way's string indices are copied through against one table, so a
+    /// second data-bearing table is refused as the decoder refuses it, while
+    /// an extra empty occurrence is ignored.
+    #[test]
+    fn a_second_populated_string_table_is_refused() {
+        let mut table = Vec::new();
+        len_delimited(1, b"", &mut table);
+        len_delimited(1, b"k", &mut table);
+        let mut twice = Vec::new();
+        len_delimited(1, &table, &mut twice);
+        len_delimited(1, &table, &mut twice);
+        twice.extend_from_slice(&way_block(42, &[7], true));
+        let err = try_run(&twice).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::read::wire::DUP_STRING_TABLE),
+            "{err}"
+        );
+
+        let mut once = Vec::new();
+        len_delimited(1, &table, &mut once);
+        once.extend_from_slice(&way_block(42, &[7], true));
+        let (out, ways, _) = run(&once);
+        assert_eq!(ways, 1);
+        let mut expected = Vec::new();
+        len_delimited(1, &table, &mut expected);
+        assert_eq!(&out[..expected.len()], &expected[..]);
     }
 
     /// The silent-output bug. `refs` written in the unpacked wire form fell to

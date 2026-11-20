@@ -16,6 +16,20 @@ The first HEAD cell sits in the slow mode of the bimodal walls recorded
 below; in the matched fast mode the arms agree within noise. No cost.
 Kept.
 
+### Repeated StringTable refused in the block scan (plantasjen, 2026-11-20, uncommitted against `e89eb1b8`)
+
+`scan_block_fields` tracks the string table occurrence through the
+shared one-data-bearing-occurrence rule instead of keeping the last one;
+one branch per block. Planet `file-info --mode nodes`, `--iterations 1`,
+interleaved, HEAD via `--commit e89eb1b8`:
+
+| Pair | HEAD | Variant |
+|---|---|---|
+| 1 | 32.0 s (`ecc43bb2`) | 30.8 s (`5a0c4445`) |
+| 2 | 31.7 s (`762dd8a7`) | 30.6 s (`6f02f367`) |
+
+All four in the slow mode; the variant is not slower. No cost. Kept.
+
 ### Tag string indices resolved at block validation (plantasjen, 2026-11-19, uncommitted against `8ca7880c`)
 
 Block validation now checks every tag key and value string index against

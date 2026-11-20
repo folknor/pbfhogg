@@ -29,8 +29,13 @@ occurrences. Protobuf merges repeated occurrences of a singular message, which
 one borrowed slice cannot express; keeping the last occurrence, as the parsers
 once did, dropped fields only the earlier one set and let a malformed earlier
 `Info` pass block validation unseen. A second data-bearing occurrence is
-therefore a hard error naming the field. The `PrimitiveGroup.dense` message
-itself is stricter and refuses any repeat (`WireGroup::dense`).
+therefore a hard error naming the field. A block's `PrimitiveBlock.stringtable`
+takes the same rule (`take_string_table`), shared by the decoder, the
+indexdata scanner (`blob_meta::scan`), renumber's wire splice and both
+add-locations-to-ways way reframers, so every walk that selects a table
+selects the same one; keeping the last table had resolved tags against the
+wrong strings. The `PrimitiveGroup.dense` message itself is stricter and
+refuses any repeat (`WireGroup::dense`).
 
 **Remaining compatibility limit:** Legal protobuf messages that split an
 array across data-bearing occurrences, or a metadata message across

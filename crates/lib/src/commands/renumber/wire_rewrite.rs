@@ -98,8 +98,10 @@ fn repeated_field_error(message: &str, field: &str) -> Error {
 /// Error text for a message that repeats a field the rewriter must read as
 /// one value. An element's second `id` would be copied through verbatim
 /// beside the patched one (protobuf takes the last, so which ID the output
-/// "has" depends on the reader), and a second `DenseNodes` or `StringTable`
-/// would be merged by protobuf but read here as just one of the two.
+/// "has" depends on the reader), and a second `DenseNodes` would be merged
+/// by protobuf but read here as just one of the two. A repeated
+/// `StringTable` is refused by the decoder's shared rule instead
+/// (`read::wire::take_string_table`).
 fn repeated_message_field_error(message: &str, field: &str) -> Error {
     Error::invalid_data(format!(
         "renumber: {message} carries {field} more than once. Protobuf merges or \
@@ -348,13 +350,12 @@ fn split_block<'a>(
     while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
         match (field, wire_type) {
             (1, WIRE_LEN) => {
+                // The decoder's rule: an empty body is ignored, a second
+                // data-bearing one refused, so this splice accepts exactly
+                // the blocks the reader decodes and copies the one table
+                // their indices resolve against.
                 let data = cursor.read_len_delimited().map_err(wire_err)?;
-                if stringtable.replace(data).is_some() {
-                    return Err(repeated_message_field_error(
-                        "PrimitiveBlock",
-                        "StringTable",
-                    ));
-                }
+                crate::read::wire::take_string_table(data, &mut stringtable)?;
             }
             (2, WIRE_LEN) => cursor.skip_field(wire_type).map_err(wire_err)?,
             (17..=20, WIRE_VARINT) => copy_field(&mut cursor, field, wire_type, scalars)?,
@@ -1056,6 +1057,31 @@ mod tests {
         };
         let mut out = Vec::new();
         reframe_relations_with_new_ids(block, &ids, &mut out, &mut Scratch::default())
+    }
+
+    /// The splice copies one table, so it takes the decoder's rule: a second
+    /// data-bearing table is refused, an extra empty occurrence is ignored.
+    #[test]
+    fn string_table_occurrences_follow_the_decoder_rule() {
+        let mut table = Vec::new();
+        len_delimited(1, b"", &mut table);
+        let mut prefix = Vec::new();
+        len_delimited(1, &table, &mut prefix);
+        let mut accepted = prefix.clone();
+        accepted.extend_from_slice(&relation_block(5, 7, true));
+        let mut scalars = Vec::new();
+        let selected = split_block(&accepted, true, &mut scalars, "test").unwrap();
+        assert_eq!(selected, &table[..]);
+        assert!(run(&accepted).is_ok());
+
+        let mut refused = prefix.clone();
+        refused.extend_from_slice(&prefix);
+        refused.extend_from_slice(&relation_block(5, 7, true));
+        let err = run(&refused)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains(crate::read::wire::DUP_STRING_TABLE), "{err}");
     }
 
     /// PrimitiveBlock whose single Relation writes its members across

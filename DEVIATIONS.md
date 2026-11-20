@@ -955,6 +955,24 @@ longer than their group are refused. libosmium merges differently and is not
 the reference here: its `Info` user comes from the last occurrence alone, and
 each `DenseInfo` column from its last segment.
 
+## PBF decoding: a repeated StringTable is refused, not merged
+
+`PrimitiveBlock.stringtable` follows the same rule. Protobuf would merge two
+occurrences by concatenating their `s` entries. pbfhogg refuses a second
+occurrence whose body is non-empty, and ignores an empty body in either
+position, in the decoder, the indexdata scanner (indexdata generation,
+`cat --reindex`, `check --index`), renumber's wire splice and both
+add-locations-to-ways way reframers. Blobs copied through without being
+read (an indexed blob in plain `cat`, a relation blob in
+add-locations-to-ways) are not inspected. Every block accepted therefore reads as
+its protobuf merge. Earlier pbfhogg kept the last occurrence, which resolved
+tags against the wrong strings with no diagnostic. libosmium refuses a further
+occurrence once its table holds any entry, so the two differ at the edges: a
+populated table followed by an empty one is accepted here and refused by
+libosmium, and an occurrence carrying only unknown fields (non-empty body, no
+entries) followed by a populated one is refused here and accepted by
+libosmium. `cat --repair` has no rewrite for this shape.
+
 ## PBF decoding: required features are matched exactly
 
 Like libosmium, pbfhogg refuses a HeaderBlock declaring a required feature

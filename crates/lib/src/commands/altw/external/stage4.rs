@@ -1093,7 +1093,8 @@ fn reframe_way_blob_with_locations(
     let mut sidecar_way_idx: usize = 0;
 
     output.clear();
-    protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
+    // `_always`: the field is required, so an empty table stays present.
+    protohoggr::encode_bytes_field_always(output, 1, stringtable_bytes);
 
     let mut total_ways: u64 = 0;
     let mut min_way_id: i64 = i64::MAX;

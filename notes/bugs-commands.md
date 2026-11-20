@@ -82,19 +82,6 @@ deliberate protobuf restriction is missing from `DEVIATIONS.md`. The refusal
 does prevent wrong coordinates. The hunter says to either convert the framing
 or document the refusal.
 
-## CMD-015 - The ALTW way reframers drop an empty but present StringTable
-
-Reported by: altw [P2].
-
-The sparse reframer (`altw/reframe.rs`) and the external one
-(`altw/external/stage4.rs`) both write the table with `encode_bytes_field`,
-which omits empty payloads. An empty but present StringTable, with a tagless
-way and honest indexdata, passes and is published without the required
-`PrimitiveBlock.stringtable` field. A later ALTW run then fails its own
-missing-StringTable check in `reframe.rs`. This breaks the PBF output
-contract. Whether empty tables should be accepted or refused, turning presence
-into absence and publishing is wrong.
-
 ## CMD-016 - External ALTW statistics leave out whole dropped node blobs
 
 Reported by: altw [P2].

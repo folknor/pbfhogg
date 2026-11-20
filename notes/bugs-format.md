@@ -23,23 +23,6 @@ the scope or scopes, and the bracketed priority is the hunter's own label.
 Findings that match an existing mechanism were added to `notes/bugs.md`
 instead of being filed here. Entries are in no order of importance.
 
-## FMT-002 - A repeated PrimitiveBlock stringtable silently replaces the earlier one
-
-Reported by: read-block-decoding [P1].
-
-`scan_block_fields` (`read/wire.rs`) keeps only the last
-`PrimitiveBlock.stringtable` occurrence. With two occurrences
-`["", "name", "original"]` then `["", "name", "replacement"]`, an element with
-key index 1 and value index 2 should resolve to `name=original` under
-protobuf's embedded-message merge (the repeated strings concatenate). The
-decoder returns `name=replacement`. Every index stays valid, so
-`tags_checked()` also succeeds. An empty final occurrence erases the earlier
-table, and earlier occurrences escape string-table validation. libosmium
-refuses multiple populated string tables. The hunter says merging and refusing
-both satisfy the correctness stance, but keeping the last does not. The
-independent metadata scanner (`blob_meta/scan.rs`) applies the same policy, so
-both ends need fixing.
-
 ## FMT-004 - Repeated header bbox occurrences overwrite instead of merging
 
 Reported by: read-block-decoding [P2].

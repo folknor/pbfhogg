@@ -1506,6 +1506,68 @@ fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
     assert!(resolved_dir.join("anchored.osm.pbf").exists());
 }
 
+/// Under `-d`, a relative `--config` still anchors the configured output
+/// directory, so an absolute output below it keeps its subdirectory (the
+/// configured directory itself need not exist), and an output that would
+/// leave the override is refused before anything is written.
+#[test]
+fn multi_extract_directory_override_keeps_subpaths_and_refuses_escapes() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let root = dir.path().canonicalize().expect("absolute scratch");
+    std::fs::create_dir(root.join("cfg")).expect("create config directory");
+    let override_dir = root.join("new");
+    std::fs::create_dir_all(override_dir.join("part")).expect("create override");
+    let input = root.join("input.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let nested = root.join("cfg/out/part/a.osm.pbf");
+    std::fs::write(
+        root.join("cfg/extract.json"),
+        format!(
+            r#"{{"directory":"out","extracts":[{{"output":"{}","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            nested.display()
+        ),
+    )
+    .expect("write config");
+    CliInvoker::new(&invocation_scratch)
+        .current_dir(&root)
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg("cfg/extract.json")
+        .arg("--directory")
+        .arg(&override_dir)
+        .arg("--simple")
+        .assert_success();
+    assert!(override_dir.join("part/a.osm.pbf").exists());
+    assert!(!override_dir.join("a.osm.pbf").exists());
+
+    std::fs::write(
+        root.join("cfg/escape.json"),
+        r#"{"extracts":[{"output":"../escaped.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}]}"#,
+    )
+    .expect("write escaping config");
+    let result = CliInvoker::new(&invocation_scratch)
+        .current_dir(&root)
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg("cfg/escape.json")
+        .arg("--directory")
+        .arg(&override_dir)
+        .arg("--simple")
+        .assert_failure();
+    assert!(
+        result
+            .stderr_str()
+            .contains("would leave the output directory"),
+        "stderr:\n{}",
+        result.stderr_str()
+    );
+    assert!(!root.join("escaped.osm.pbf").exists());
+}
+
 /// `-b` and `--config` quantize a 17-digit edge to the same column.
 /// "12.639999999999999" names 126399999.99999999 decimicrodegrees, which
 /// rounds to column 126400000, so node 1 on that column is inside under

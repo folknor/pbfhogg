@@ -450,6 +450,16 @@
   was a file that conforming XML readers, osmium's among them, reject.
   These runs now fail with exit 2, naming the element and attribute, and
   publish nothing.
+- **`extract --config -d DIR` keeps every output under `DIR`.** A
+  configured output such as `../x.pbf`, or an absolute output below the
+  configured directory whose rest holds `..`, used to be written outside
+  the override; an empty output could name the override itself. These are
+  now refused before any work. With a relative `--config`, absolute
+  outputs below the configured directory used to lose their
+  subdirectories (and could collide); they now keep them. Library:
+  `parse_extract_config_with_output_directory` refuses an absolute output
+  when given a relative config path.
+
 - **A closed stdout no longer hides a real failure.** Any failed command
   used to exit 0 silently once a stdout write had met a closed pipe
   (`pbfhogg ... | head`), even when the closed pipe was only met while

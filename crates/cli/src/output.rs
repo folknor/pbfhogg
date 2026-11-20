@@ -56,7 +56,9 @@ impl std::error::Error for StdoutGone {}
 /// Whether `err` is a stdout write failing because its reader went away.
 pub(crate) fn is_marked_gone(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::BrokenPipe
-        && err.get_ref().is_some_and(<dyn std::error::Error + Send + Sync>::is::<StdoutGone>)
+        && err
+            .get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<StdoutGone>)
 }
 
 /// A stdout handle that reports a write failure instead of panicking, and

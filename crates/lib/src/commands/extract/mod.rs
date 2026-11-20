@@ -319,6 +319,14 @@ pub fn parse_extract_config(
 /// Parse a multi-extract config, optionally rebasing its outputs under a CLI
 /// output-directory override.
 ///
+/// Under an override, every output must land below it: an output whose kept
+/// subpath holds `..` or names no file is refused. An absolute output is
+/// compared with the configured output directory, which is derived from
+/// `config_path`; when that directory is relative (a relative `config_path`)
+/// an absolute output is refused, because only the caller knows the working
+/// directory that anchors it. Pass an absolute `config_path` to rebase
+/// absolute outputs.
+///
 /// A failure names the file it is about: the config itself, or the polygon
 /// file an entry names.
 pub fn parse_extract_config_with_output_directory(
@@ -391,7 +399,7 @@ fn parse_extract_config_text(
 
         let output_name_path = Path::new(output_name);
         let output_path = if directory_override.is_some() {
-            rebase_config_output(output_name_path, default_output_dir, resolve_dir)
+            rebase_config_output(i, output_name_path, default_output_dir, resolve_dir)?
         } else {
             resolve_dir.join(output_name_path)
         };
@@ -418,26 +426,67 @@ fn parse_extract_config_text(
     Ok((directory, slots))
 }
 
-fn rebase_config_output(output: &Path, old_root: &Path, new_root: &Path) -> PathBuf {
-    // osmium extract concatenates its output-directory string and configured
-    // output string, including when the latter is absolute. Under pbfhogg's
-    // -d override, absolute paths below the configured root keep their
-    // relative suffix, while paths outside that root are reduced to their
-    // filename so the result stays under the override directory.
-    let relative = if output.is_absolute() {
-        output
-            .strip_prefix(old_root)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| {
-                output
-                    .file_name()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| output.to_path_buf())
-            })
+/// Place one configured output under the `-d` override, or say why it cannot
+/// be placed there.
+///
+/// osmium extract concatenates its output-directory string and configured
+/// output string, including when the latter is absolute. Under pbfhogg's -d
+/// override, absolute paths below the configured root keep their relative
+/// suffix, while paths outside that root are reduced to their filename. The
+/// comparison is lexical, by whole components, with `..` in the root kept as
+/// spelled. The suffix kept must name a file below the override: it may hold
+/// only ordinary components (`.` is dropped), so `..` or an empty suffix is
+/// refused rather than allowed to leave the override or name it. A symlinked
+/// directory inside the override is followed; containment is lexical.
+fn rebase_config_output(
+    index: usize,
+    output: &Path,
+    old_root: &Path,
+    new_root: &Path,
+) -> Result<PathBuf> {
+    use std::path::Component;
+    let suffix: &Path = if output.is_absolute() {
+        if !old_root.is_absolute() {
+            // Comparing an absolute output with a relative root always fails
+            // and would silently drop the output's subdirectories. Anchoring
+            // the root needs the working directory, which is the caller's
+            // (ADR-0016): the caller passes an absolute config path.
+            return Err(Error::invalid_data(format!(
+                "extract[{index}] output {} is absolute but the configured output directory {} is relative; \
+                 give the config as an absolute path",
+                output.display(),
+                old_root.display()
+            )));
+        }
+        match output.strip_prefix(old_root) {
+            Ok(rest) => rest,
+            Err(_) => output.file_name().map_or(Path::new(""), Path::new),
+        }
     } else {
-        output.to_path_buf()
+        output
     };
-    new_root.join(relative)
+    let mut kept = PathBuf::new();
+    for component in suffix.components() {
+        match component {
+            Component::Normal(part) => kept.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::invalid_data(format!(
+                    "extract[{index}] output {} would leave the output directory {}",
+                    output.display(),
+                    new_root.display()
+                )));
+            }
+        }
+    }
+    if kept.as_os_str().is_empty() {
+        return Err(Error::invalid_data(format!(
+            "extract[{index}] output '{}' names no file below the output directory {}",
+            output.display(),
+            new_root.display()
+        )));
+    }
+    Ok(new_root.join(kept))
 }
 
 /// The raw text of `key` in the JSON object `text`, or `None` when `text` is
@@ -1599,6 +1648,51 @@ mod tests {
         }"#;
         let path = write_temp_json(&dir, "config.json", json);
         assert!(parse_extract_config(&path).is_err());
+    }
+
+    #[test]
+    fn rebased_outputs_stay_below_the_override() {
+        let old = Path::new("/work/cfg/out");
+        let new = Path::new("/new");
+        let ok = |o: &str| rebase_config_output(0, Path::new(o), old, new);
+        let is = |o: &str, want: &str| assert_eq!(ok(o).ok(), Some(PathBuf::from(want)), "{o}");
+        is("part/a.pbf", "/new/part/a.pbf");
+        is("./part/./a.pbf", "/new/part/a.pbf");
+        is("/work/cfg/out/part/a.pbf", "/new/part/a.pbf");
+        is("/elsewhere/b.pbf", "/new/b.pbf");
+        // Escapes and outputs naming no file below the override are refused;
+        // a matched suffix holding `..` is not retried as a basename.
+        for bad in [
+            "../escaped.pbf",
+            "part/../../escaped.pbf",
+            "part/../a.pbf",
+            "/work/cfg/out/../x.pbf",
+            "",
+            ".",
+            "/work/cfg/out",
+            "/",
+            "/elsewhere/..",
+        ] {
+            assert!(ok(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_absolute_output_against_a_relative_root_is_refused() {
+        let r = rebase_config_output(
+            0,
+            Path::new("/work/cfg/out/part/a.pbf"),
+            Path::new("cfg/out"),
+            Path::new("/new"),
+        );
+        assert!(r.is_err());
+        let rel = rebase_config_output(
+            0,
+            Path::new("a.pbf"),
+            Path::new("cfg/out"),
+            Path::new("/new"),
+        );
+        assert_eq!(rel.ok(), Some(PathBuf::from("/new/a.pbf")));
     }
 
     #[test]

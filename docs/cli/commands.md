@@ -1571,7 +1571,10 @@ Relative `directory` and `polygon_file` values resolve from the config file's
 directory. Relative `output` paths resolve from `directory`, or from the config
 file's directory when it is omitted. `-d` rebases configured outputs under its
 directory, preserving paths below the configured output directory; an absolute
-output outside that root keeps only its filename.
+output outside that root keeps only its filename. Under `-d` an output whose
+kept path contains `..` or names no file (an empty `output`, `.`, or the
+configured directory itself) is refused with exit 2 before any work. The
+containment is lexical; a symlinked directory inside the override is followed.
 These rules intentionally differ from `osmium extract`: relative `directory`
 values use the config file's location here, and `-d` rebases absolute outputs
 under the override instead of concatenating the two path strings.

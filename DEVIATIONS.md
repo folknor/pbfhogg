@@ -538,7 +538,16 @@ process working directory. `--directory` is prepended to each configured
 config file's directory. With `-d`, relative outputs keep their configured
 subpaths. An absolute output under the configured directory keeps its relative
 subpath under the override; an absolute output outside that root is reduced to
-its filename under the override.
+its filename under the override. "Under" is a lexical comparison by whole
+path components, with any `..` in the configured directory's spelling kept as
+written; the CLI makes a relative `--config` absolute first, so the comparison
+is never between an absolute output and a relative root. The kept subpath must
+name a file below the override: one holding `..`, or one that is empty (an
+empty `output`, `.`, or the configured directory itself), is refused before
+any work. Containment is lexical: a symlinked directory inside the override is
+followed. A library caller of `parse_extract_config_with_output_directory`
+passing a relative config path has an absolute output refused, since only the
+caller knows the working directory.
 
 **Impact:** The same config can write to different locations under the two
 tools. In pbfhogg, `-d` keeps absolute outputs below the override directory

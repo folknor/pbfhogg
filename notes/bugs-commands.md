@@ -167,31 +167,6 @@ passes `time-filter` at cutoff 250 and emits the node as predating the cutoff.
 The documented claim is that elements without timestamps are refused rather
 than treated as zero. The accessor needs per-slot presence semantics.
 
-## CMD-022 - extract --directory can publish outside the override root
-
-Reported by: extract [P2].
-
-Rebasing (`extract/mod.rs`) keeps relative paths verbatim and joins them under
-the override. With `-d /work/results`, an output named `../escaped.pbf`
-becomes `/work/results/../escaped.pbf` and is written to `/work/escaped.pbf`.
-Absolute paths under the old root can also keep escaping `..` suffixes. This
-contradicts the explicit guarantee in `DEVIATIONS.md` that every configured
-output stays under the override root. Normal output validation does not catch
-this, and with overwrite enabled it can replace a file outside the root.
-
-## CMD-023 - Absolute extract outputs lose subdirectories when the config path is relative
-
-Reported by: extract [P2].
-
-The configured root (`extract/mod.rs`) stays relative when the config argument
-is relative, so rebasing compares an absolute output against a relative root
-with `strip_prefix`, which always fails. From `/work`, a config
-`cfg/extract.json` with `"directory":"out"` and output
-`/work/cfg/out/part/a.pbf`, rebased under `/new`, produces `/new/a.pbf`
-instead of the documented `/new/part/a.pbf`. This violates the promised
-preservation of subpaths. It can also turn distinct destinations into
-duplicate filenames and cause an otherwise valid config to be refused.
-
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 
 Reported by: extract (flagged as a surprising policy, not counted as a defect).

@@ -4884,8 +4884,20 @@ fn run_extract_config(
     host: &pbfhogg::host::Host,
     leftovers: &mut LeftoverScanner,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Under -d an absolute configured output is compared with the configured
+    // output directory, which the library derives from the config path. A
+    // relative config path would leave that directory relative and the
+    // comparison could never match, so the working directory is applied here,
+    // where process state belongs.
+    let anchored_config;
+    let parse_path = if directory_override.is_some() && config_path.is_relative() {
+        anchored_config = std::path::absolute(config_path)?;
+        anchored_config.as_path()
+    } else {
+        config_path
+    };
     let (_, slots) = pbfhogg::extract::parse_extract_config_with_output_directory(
-        config_path,
+        parse_path,
         directory_override,
     )?;
 

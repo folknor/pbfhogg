@@ -287,6 +287,11 @@
 
 ### Changed
 
+- **`build-geocode-index` holds about 2 GB less memory after Pass 2 at
+  planet.** Admin boundary way geometry is kept in two flat buffers that
+  go back to the OS when assembly ends, instead of millions of small
+  allocations the heap kept resident for the rest of the build. The
+  index is unchanged.
 - **`build-geocode-index` assembles admin boundary rings by node ID and
   refuses ambiguous topology.** Member ways join where they share a node,
   not where two nodes share a coordinate, so a retrace, a figure-eight or

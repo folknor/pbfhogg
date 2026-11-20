@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Result;
 use crate::error::Error;
@@ -281,6 +281,19 @@ struct ExtractShared<'a> {
     needed_admin_ways: &'a crate::idset::IdSet,
     prealloc_max: i64,
     max_node_id: i64,
+    /// Running [`AdminWayTotals`] over every admin way occurrence.
+    admin_ref_bytes: AtomicU64,
+    admin_refs: AtomicU64,
+}
+
+/// What every admin member way occurrence in the way store holds, summed:
+/// its packed ref bytes and its refs. Phase 2b stores at most this much
+/// admin way geometry (only fully located occurrences, superseded ones
+/// included), so `admin::WayGeometryMap` is sized from it once.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AdminWayTotals {
+    pub(super) ref_bytes: u64,
+    pub(super) refs: u64,
 }
 
 /// Classify every way of an accepted blob, record the refs of the relevant
@@ -375,6 +388,14 @@ fn extract_blob_ways(
             shared.max_node_id,
             &w.refs_buf,
         );
+        if roles & ROLE_ADMIN != 0 {
+            shared
+                .admin_ref_bytes
+                .fetch_add(refs.len() as u64, Ordering::Relaxed);
+            shared
+                .admin_refs
+                .fetch_add(w.refs_buf.len() as u64, Ordering::Relaxed);
+        }
         let mut values: [Option<&[u8]>; VALUE_SLOTS] = [None; VALUE_SLOTS];
         for (value, slot) in values.iter_mut().zip(slots) {
             if let Some(index) = slot {
@@ -398,7 +419,11 @@ pub(super) fn run_pass1_5(
     needed_admin_ways: &crate::idset::IdSet,
     scratch: &crate::scratch::RunScratch,
     host: &crate::host::Entered<'_>,
-) -> Result<(crate::idset::IdSet, super::way_store::WayStore)> {
+) -> Result<(
+    crate::idset::IdSet,
+    super::way_store::WayStore,
+    AdminWayTotals,
+)> {
     let shared_file = input.file();
     let file_len = shared_file.metadata()?.len();
     let prealloc_max =
@@ -439,12 +464,15 @@ pub(super) fn run_pass1_5(
     }
     let segments: Mutex<Vec<Option<super::way_store::Segment>>> =
         Mutex::new(vec![None; way_schedule.len()]);
+    let admin_totals;
     {
         let shared = ExtractShared {
             referenced: &referenced_nodes,
             needed_admin_ways,
             prealloc_max,
             max_node_id,
+            admin_ref_bytes: AtomicU64::new(0),
+            admin_refs: AtomicU64::new(0),
         };
         let shared_ref = &shared;
         let segments_ref = &segments;
@@ -603,6 +631,10 @@ pub(super) fn run_pass1_5(
         {
             return Err(e);
         }
+        admin_totals = AdminWayTotals {
+            ref_bytes: shared.admin_ref_bytes.load(Ordering::Relaxed),
+            refs: shared.admin_refs.load(Ordering::Relaxed),
+        };
 
         insert_overflow_nodes(
             &mut referenced_nodes,
@@ -620,7 +652,7 @@ pub(super) fn run_pass1_5(
     )?;
     host.invocation
         .counter("geocode_way_store_bytes", store.bytes());
-    Ok((referenced_nodes, store))
+    Ok((referenced_nodes, store, admin_totals))
 }
 
 /// Single header pass that produces everything Pass 1, Pass 1.5 and Pass 2a
@@ -871,6 +903,8 @@ mod tests {
             needed_admin_ways: admin,
             prealloc_max: 1000,
             max_node_id: 1000,
+            admin_ref_bytes: std::sync::atomic::AtomicU64::new(0),
+            admin_refs: std::sync::atomic::AtomicU64::new(0),
         };
         super::extract_blob_ways(
             blob,

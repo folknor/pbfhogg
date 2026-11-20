@@ -203,8 +203,8 @@ xxhash = "e7f431ab422a0ccdb75d270528ac3e2e"
 seq = 4912
 
 [plantasjen.datasets.planet.pbf.altw]
-file = "planet-20260223-altw.osm.pbf"
-xxhash = "e83b43b8b1883efcc252e47b5c275535"
+file = "planet-20260223-altw-reindexed.osm.pbf"
+xxhash = "ba84918280f56f697d8f41c5b2bfb13d"
 seq = 4912
 
 [plantasjen.datasets.planet.pbf.raw]
@@ -352,8 +352,8 @@ xxhash = "a46218737b7046299ff2e2fce77e8591"
 download_date = "2026-07-10"
 
 [plantasjen.datasets.planet.snapshot.8k.pbf.indexed]
-file = "planet-8k-with-indexdata.osm.pbf"
-xxhash = "0725049652040e1d361f8a2471a6739f"
+file = "planet-8k-reindexed.osm.pbf"
+xxhash = "8055a8ce2618e9762c4798c8e26e7278"
 
 [plantasjen.datasets.denmark.snapshot.1k]
 download_date = "2026-07-10"

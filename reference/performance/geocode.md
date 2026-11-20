@@ -12,6 +12,23 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Admin way geometry in two flat mappings (plantasjen, 2026-11-20, variant uncommitted against `8766940a`)
+
+Pass 2b staged every admin way as two heap vectors, node IDs and
+coordinates; the variant copies the way's packed delta refs and its
+coordinates into two anonymous mappings sized once from Pass 1.5's
+admin totals, and assembly decodes the refs per relation. Planet, full
+build, `--iterations 1`, one pair, no trim: variant `61256a0c` (after a
+long unrelated corpus run), base `f380b1bb` (`--commit HEAD`, right
+after). Walls 210 s and 203 s. Peak anon in Pass 2b 13.6 GB against
+14.2 GB. From admin assembly to the end of the run the base holds 4.6
+to 5.0 GB anon and the variant 2.4 to 3.2 GB: the heap kept the freed
+per-way vectors resident, and the mappings return to the OS on drop.
+Pass 3 stage B fine peaks at 8.8 GB anon against 11.6 GB, the smoke test
+at 3.0 GB against 4.8 GB. Output identical: 929,216 admin polygons,
+3,049 relations dropped, 324 topology refusals. Verdict: kept; the wall
+delta is inside the band of one unbalanced pair.
+
 ### Admin rings by node topology (bygg, 2026-11-19, variant uncommitted against `9d61febc`)
 
 Admin ring assembly replaced: members join by node ID and each graph is

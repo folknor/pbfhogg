@@ -655,7 +655,7 @@ fn build_from_schedules(
         "Pass 1.5: Way extraction..."
     );
 
-    let (referenced_nodes, way_store) = pass1_5::run_pass1_5(
+    let (referenced_nodes, way_store, admin_totals) = pass1_5::run_pass1_5(
         &way_schedule,
         max_node_id,
         &shared_file,
@@ -706,6 +706,7 @@ fn build_from_schedules(
         &shared_file,
         max_node_id,
         referenced_nodes,
+        admin_totals,
         &mut strings,
         host,
     )?;
@@ -730,7 +731,7 @@ fn build_from_schedules(
     // untripped check costs nothing.
     host.invocation.marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
     let (admin_polygons, dropped_admin) =
-        admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);
+        admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor)?;
     let missing_admin_geometry = admin::missing_admin_way_geometry(&admin_relations, &way_geom);
     let dropped_admin_relations = dropped_admin.total;
     host.invocation

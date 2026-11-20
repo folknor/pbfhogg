@@ -285,7 +285,13 @@ struct WayBlobOut {
     street_nodes: Vec<u8>,
     building_addrs: Vec<FlatAddrPoint>,
     interps: Vec<PendingInterp>,
-    admin_geoms: Vec<(i64, super::admin::AdminWayGeometry)>,
+    /// Admin way occurrences in file order: the way ID and, for a fully
+    /// located way, the ends of its packed refs in `admin_refs` and of its
+    /// coordinates in `admin_coords` (each starting where the previous
+    /// located way's ended).
+    admin_geoms: Vec<(i64, Option<(usize, usize)>)>,
+    admin_refs: Vec<u8>,
+    admin_coords: Vec<(i32, i32)>,
     missing_node_ref_count: u64,
     missing_ref_way_ids: Vec<i64>,
     error: Option<Error>,
@@ -357,9 +363,6 @@ struct WayWorker {
     /// Indices into `coords` where a run of consecutively resolved refs
     /// ends because the next ref was unresolved. Empty for a complete way.
     run_breaks: Vec<usize>,
-    /// The way's node IDs, filled for admin ways only: ring assembly joins
-    /// members by node identity, never by coordinate.
-    nodes: Vec<i64>,
 }
 
 struct PendingInterp {
@@ -419,7 +422,6 @@ fn resolve_way_into(
         out: state,
         coords,
         run_breaks,
-        nodes,
     } = worker;
     if state.error.is_some() {
         return;
@@ -449,11 +451,7 @@ fn resolve_way_into(
     let mut missing_node_ref_count = 0_u64;
     coords.clear();
     run_breaks.clear();
-    nodes.clear();
     for nid in crate::read::elements::WayRefIter::delta_decoded(way.refs) {
-        if is_admin_way {
-            nodes.push(nid);
-        }
         let coord = match referenced_nodes.numeric_rank_if_set(nid) {
             None => None,
             Some(rank) => {
@@ -487,14 +485,16 @@ fn resolve_way_into(
         super::sample_id(&mut state.missing_ref_way_ids, way_id);
     }
 
-    // Admin way geometry, owned: it moves into the `way_geom` map. An
-    // incomplete way is recorded too, so the last file occurrence of a
-    // duplicated way ID still decides, and assembly sees why it has no
-    // geometry.
+    // Admin way geometry, staged in the blob's flat buffers for the merge
+    // to copy into the `way_geom` store: the packed refs as the source has
+    // them, and the coordinates. An incomplete way is recorded too, so the
+    // last file occurrence of a duplicated way ID still decides, and
+    // assembly sees why it has no geometry.
     if is_admin_way {
-        let geometry = (complete && !coords.is_empty()).then(|| super::admin::AdminWay {
-            nodes: nodes.clone(),
-            coords: coords.to_vec(),
+        let geometry = (complete && !coords.is_empty()).then(|| {
+            state.admin_refs.extend_from_slice(way.refs);
+            state.admin_coords.extend_from_slice(coords);
+            (state.admin_refs.len(), state.admin_coords.len())
         });
         state.admin_geoms.push((way_id, geometry));
     }
@@ -647,6 +647,7 @@ pub(super) fn run_pass2(
     shared_file: &crate::read::input::InputFile,
     max_node_id: i64,
     referenced_nodes: crate::idset::IdSet,
+    admin_totals: super::pass1_5::AdminWayTotals,
     strings: &mut StringPool,
     host: &crate::host::Entered<'_>,
 ) -> Result<Pass2Output> {
@@ -685,7 +686,8 @@ pub(super) fn run_pass2(
     // slots when there are no referenced nodes.
     let mut coord_mmap = memmap2::MmapMut::map_anon(coord_array_len.max(1))?;
     let coord_store: &[AtomicU64] = coord_slots(&mut coord_mmap, slot_count)?;
-    let mut way_geom: super::admin::WayGeometryMap = rustc_hash::FxHashMap::default();
+    let mut way_geom =
+        super::admin::WayGeometryMap::with_capacity(admin_totals.ref_bytes, admin_totals.refs)?;
 
     // Streaming output: write data files directly during the merge instead
     // of accumulating Vecs. Running counters track offsets and record counts.
@@ -901,9 +903,26 @@ pub(super) fn run_pass2(
                     super::sample_id(&mut missing_ref_way_ids, way_id);
                 }
 
-                // Admin way geometries
-                for (way_id, coords) in out.admin_geoms {
-                    way_geom.insert(way_id, coords);
+                // Admin way geometries, in file order.
+                let (mut refs_start, mut coords_start) = (0, 0);
+                for (way_id, ends) in out.admin_geoms {
+                    let geometry = match ends {
+                        None => None,
+                        Some((refs_end, coords_end)) => {
+                            let refs = out.admin_refs.get(refs_start..refs_end);
+                            let coords = out.admin_coords.get(coords_start..coords_end);
+                            (refs_start, coords_start) = (refs_end, coords_end);
+                            match (refs, coords) {
+                                (Some(r), Some(c)) => Some((r, c)),
+                                _ => {
+                                    return Err(Error::internal(format!(
+                                        "phase 2b admin way {way_id} lies outside its blob's buffers"
+                                    )));
+                                }
+                            }
+                        }
+                    };
+                    way_geom.insert(way_id, geometry)?;
                 }
 
                 // Interpolation ways: push SlimInterpWay + stream node coords.

@@ -34,23 +34,170 @@ pub(super) struct DroppedAdminRelations {
     pub(super) sample_relation_ids: Vec<i64>,
 }
 
-/// A fully located admin member way: its node IDs and their coordinates,
-/// one per ref. Rings are joined by node ID, so two nodes at one coordinate
-/// stay two vertices.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AdminWay {
-    pub(super) nodes: Vec<i64>,
-    pub(super) coords: Vec<(i32, i32)>,
+/// Where one fully located admin member way lives in [`WayGeometryMap`]:
+/// its refs as the source's packed `sint64` delta bytes, and one
+/// `(lat_e7, lon_e7)` coordinate per ref. Rings are joined by node ID, so
+/// two nodes at one coordinate stay two vertices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AdminWaySpan {
+    refs: (usize, usize),
+    coords: (usize, usize),
 }
 
 /// One admin member way's geometry: the way when every ref resolved,
 /// `None` when the way is in the file but at least one of its nodes is not
 /// (or it has no refs).
-pub(super) type AdminWayGeometry = Option<AdminWay>;
+pub(super) type AdminWayGeometry = Option<AdminWaySpan>;
 
 /// Admin member way geometry by way ID, last file occurrence winning. A way
 /// absent from the map is absent from the file.
-pub(super) type WayGeometryMap = FxHashMap<i64, AdminWayGeometry>;
+///
+/// The payload sits in two flat anonymous mappings sized once from the
+/// Pass 1.5 totals, never in per-way heap allocations. Millions of small
+/// per-way vectors (node IDs and coordinates) once fragmented the heap:
+/// at planet the arena kept about 1.6 GB resident from the end of Pass 2
+/// to the end of the run, after the map itself was dropped. A mapping is
+/// returned to the OS when it drops. An occurrence superseded by a later
+/// one keeps its bytes until then; the totals count every occurrence, so
+/// the store still fits.
+pub(super) struct WayGeometryMap {
+    spans: FxHashMap<i64, AdminWayGeometry>,
+    refs: memmap2::MmapMut,
+    refs_len: usize,
+    refs_cap: usize,
+    coords: memmap2::MmapMut,
+    coords_len: usize,
+    coords_cap: usize,
+}
+
+/// A fully located way as Phase 2b hands it over: packed delta refs and
+/// one coordinate per ref.
+pub(super) type LocatedWay<'a> = (&'a [u8], &'a [(i32, i32)]);
+
+/// Bytes per stored coordinate: `lat_e7` then `lon_e7`, little-endian.
+const COORD_BYTES: usize = 8;
+
+impl WayGeometryMap {
+    /// A store for at most `ref_bytes` packed ref bytes and `coords`
+    /// coordinates over all admin way occurrences.
+    pub(super) fn with_capacity(ref_bytes: u64, coords: u64) -> Result<Self> {
+        let refs_cap = usize::try_from(ref_bytes).map_err(|_| {
+            Error::invalid_data(format!("{ref_bytes} admin ref bytes exceed usize"))
+        })?;
+        let coords_cap = usize::try_from(coords).map_err(|_| {
+            Error::invalid_data(format!("{coords} admin way coordinates exceed usize"))
+        })?;
+        let coord_bytes = coords_cap.checked_mul(COORD_BYTES).ok_or_else(|| {
+            Error::invalid_data(format!("{coords} admin way coordinates overflow usize"))
+        })?;
+        // `map_anon` rejects a zero length.
+        Ok(Self {
+            spans: FxHashMap::default(),
+            refs: memmap2::MmapMut::map_anon(refs_cap.max(1))?,
+            refs_len: 0,
+            refs_cap,
+            coords: memmap2::MmapMut::map_anon(coord_bytes.max(1))?,
+            coords_len: 0,
+            coords_cap,
+        })
+    }
+
+    /// Record the next file occurrence of `way_id`: `Some((refs, coords))`
+    /// for a fully located way (`refs` its packed delta bytes, one coordinate
+    /// per ref), `None` for one that is not. A later occurrence replaces an
+    /// earlier one, `None` included.
+    pub(super) fn insert(&mut self, way_id: i64, geometry: Option<LocatedWay<'_>>) -> Result<()> {
+        let span = match geometry {
+            None => None,
+            Some((refs, coords)) => {
+                let refs_end = self
+                    .refs_len
+                    .checked_add(refs.len())
+                    .filter(|&end| end <= self.refs_cap)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "admin way {way_id} overflows the {}-byte ref store sized by pass 1.5",
+                            self.refs_cap
+                        ))
+                    })?;
+                let coords_end = self
+                    .coords_len
+                    .checked_add(coords.len())
+                    .filter(|&end| end <= self.coords_cap)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "admin way {way_id} overflows the {}-coordinate store sized by pass 1.5",
+                            self.coords_cap
+                        ))
+                    })?;
+                self.refs[self.refs_len..refs_end].copy_from_slice(refs);
+                let out = &mut self.coords[self.coords_len * COORD_BYTES..coords_end * COORD_BYTES];
+                for (chunk, &(lat, lon)) in
+                    out.as_chunks_mut::<COORD_BYTES>().0.iter_mut().zip(coords)
+                {
+                    chunk[..4].copy_from_slice(&lat.to_le_bytes());
+                    chunk[4..].copy_from_slice(&lon.to_le_bytes());
+                }
+                let span = AdminWaySpan {
+                    refs: (self.refs_len, refs_end),
+                    coords: (self.coords_len, coords_end),
+                };
+                self.refs_len = refs_end;
+                self.coords_len = coords_end;
+                Some(span)
+            }
+        };
+        self.spans.insert(way_id, span);
+        Ok(())
+    }
+
+    /// The last occurrence of `way_id`: `None` when absent from the file,
+    /// `Some(None)` when present but not fully located.
+    pub(super) fn get(&self, way_id: i64) -> Option<AdminWayGeometry> {
+        self.spans.get(&way_id).copied()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Append the node IDs and coordinates of `span` to `nodes` and
+    /// `coords`. A decoded ref count that differs from the coordinate count
+    /// is an internal error: the two were written together.
+    fn decode_into(
+        &self,
+        way_id: i64,
+        span: AdminWaySpan,
+        nodes: &mut Vec<i64>,
+        coords: &mut Vec<(i32, i32)>,
+    ) -> Result<()> {
+        let refs = self.refs.get(span.refs.0..span.refs.1);
+        let stored = self
+            .coords
+            .get(span.coords.0 * COORD_BYTES..span.coords.1 * COORD_BYTES);
+        let (Some(refs), Some(stored)) = (refs, stored) else {
+            return Err(Error::internal(format!(
+                "admin way {way_id} has a span outside its store"
+            )));
+        };
+        let start = nodes.len();
+        nodes.extend(crate::read::elements::WayRefIter::delta_decoded(refs));
+        let decoded = nodes.len() - start;
+        let expected = span.coords.1 - span.coords.0;
+        if decoded != expected {
+            return Err(Error::internal(format!(
+                "admin way {way_id} decodes {decoded} refs for {expected} stored coordinates"
+            )));
+        }
+        coords.extend(stored.as_chunks::<COORD_BYTES>().0.iter().map(|c| {
+            (
+                i32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                i32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            )
+        }));
+        Ok(())
+    }
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct MissingAdminWayGeometry {
@@ -67,7 +214,7 @@ pub(super) fn missing_admin_way_geometry(
     let mut missing = MissingAdminWayGeometry::default();
     for relation in relations {
         for &way_id in relation.outer_way_ids.iter().chain(&relation.inner_way_ids) {
-            if !matches!(way_geom.get(&way_id), Some(Some(_))) {
+            if !matches!(way_geom.get(way_id), Some(Some(_))) {
                 missing.member_refs = missing.member_refs.saturating_add(1);
                 super::sample_id(&mut missing.sample_way_ids, way_id);
             }
@@ -82,7 +229,7 @@ pub(super) fn assemble_admin_polygons(
     way_geom: &WayGeometryMap,
     config: &BuildConfig,
     executor: &crate::host::Executor,
-) -> (Vec<AssembledPolygon>, DroppedAdminRelations) {
+) -> Result<(Vec<AssembledPolygon>, DroppedAdminRelations)> {
     use rayon::prelude::*;
 
     let tolerance_m = f64::from(config.admin_tolerance_m);
@@ -93,8 +240,11 @@ pub(super) fn assemble_admin_polygons(
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
     // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores.
-    let per_relation: Vec<std::result::Result<Vec<AssembledPolygon>, RingRefusal>> = executor
-        .install(|| {
+    // A store fault (`Err` outside) fails the build; a ring refusal
+    // (`Err` inside) drops only its relation.
+    #[allow(clippy::type_complexity)]
+    let per_relation: Vec<Result<std::result::Result<Vec<AssembledPolygon>, RingRefusal>>> =
+        executor.install(|| {
             relations
                 .par_iter()
                 .map(|rel| assemble_one_relation(rel, way_geom, tolerance_m))
@@ -103,7 +253,7 @@ pub(super) fn assemble_admin_polygons(
     let mut dropped = DroppedAdminRelations::default();
     let mut polygons = Vec::new();
     for (rel, relation) in relations.iter().zip(per_relation) {
-        match relation {
+        match relation? {
             Ok(assembled) if assembled.is_empty() => {
                 dropped.total += 1;
                 super::sample_id(&mut dropped.sample_relation_ids, rel.id);
@@ -116,7 +266,7 @@ pub(super) fn assemble_admin_polygons(
             }
         }
     }
-    (polygons, dropped)
+    Ok((polygons, dropped))
 }
 
 /// Decide whether `hole` belongs to the outer ring `outer_f64`.
@@ -197,6 +347,28 @@ fn assemble_one_relation(
     rel: &RawAdminRelation,
     way_geom: &WayGeometryMap,
     tolerance_m: f64,
+) -> Result<std::result::Result<Vec<AssembledPolygon>, RingRefusal>> {
+    let Some(outer) = RoleScratch::decode(&rel.outer_way_ids, way_geom)? else {
+        return Ok(Ok(Vec::new()));
+    };
+    let Some(inner) = RoleScratch::decode(&rel.inner_way_ids, way_geom)? else {
+        return Ok(Ok(Vec::new()));
+    };
+    Ok(assemble_decoded(
+        rel,
+        &outer.members(),
+        &inner.members(),
+        tolerance_m,
+    ))
+}
+
+/// Assemble a relation from its decoded member ways, outer and inner
+/// each in first-occurrence order.
+fn assemble_decoded(
+    rel: &RawAdminRelation,
+    outer_members: &[RingMember<'_>],
+    inner_members: &[RingMember<'_>],
+    tolerance_m: f64,
 ) -> std::result::Result<Vec<AssembledPolygon>, RingRefusal> {
     // Extracts may contain a relation but omit member ways, or keep a member
     // way while omitting some of its nodes. Such a relation contributes no
@@ -210,23 +382,18 @@ fn assemble_one_relation(
     //   both endpoints pair differently once one is gone), and a missing
     //   inner turns its hole into an affirmative match.
     // The builder has no evidence that a missing member cannot affect a
-    // given outer, so the relation is withheld and counted as dropped.
-    let Some(outer_members) = role_members(&rel.outer_way_ids, way_geom) else {
-        return Ok(Vec::new());
-    };
-    let Some(inner_members) = role_members(&rel.inner_way_ids, way_geom) else {
-        return Ok(Vec::new());
-    };
+    // given outer, so the relation is withheld and counted as dropped
+    // (`RoleScratch::decode` answers `None` for it).
     let inner_ids: rustc_hash::FxHashSet<i64> = rel.inner_way_ids.iter().copied().collect();
     if rel.outer_way_ids.iter().any(|id| inner_ids.contains(id)) {
         return Err(RingRefusal::AmbiguousJunction);
     }
-    let outer_rings = crate::geo::assemble_rings(&outer_members)?;
+    let outer_rings = crate::geo::assemble_rings(outer_members)?;
     if outer_rings.is_empty() {
         return Ok(Vec::new());
     }
 
-    let inner_rings = crate::geo::assemble_rings(&inner_members)?;
+    let inner_rings = crate::geo::assemble_rings(inner_members)?;
 
     let mut result = Vec::with_capacity(outer_rings.len());
     for outer_ring in &outer_rings {
@@ -290,21 +457,50 @@ fn assemble_one_relation(
     Ok(result)
 }
 
-/// One role's member ways, the first occurrence of each way ID only, or
-/// `None` when any of them lacks complete geometry.
-fn role_members<'a>(way_ids: &[i64], way_geom: &'a WayGeometryMap) -> Option<Vec<RingMember<'a>>> {
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut members = Vec::with_capacity(way_ids.len());
-    for id in way_ids {
-        let way = way_geom.get(id)?.as_ref()?;
-        if seen.insert(*id) {
-            members.push(RingMember {
-                nodes: &way.nodes,
-                coords: &way.coords,
-            });
+/// One role's member ways decoded into relation-local buffers, the first
+/// occurrence of each way ID only.
+struct RoleScratch {
+    nodes: Vec<i64>,
+    coords: Vec<(i32, i32)>,
+    /// Each member's end in `nodes` and `coords` (the two run in lockstep).
+    ends: Vec<usize>,
+}
+
+impl RoleScratch {
+    /// `Ok(None)` when any member lacks complete geometry.
+    fn decode(way_ids: &[i64], way_geom: &WayGeometryMap) -> Result<Option<Self>> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut role = Self {
+            nodes: Vec::new(),
+            coords: Vec::new(),
+            ends: Vec::with_capacity(way_ids.len()),
+        };
+        for &id in way_ids {
+            let Some(Some(span)) = way_geom.get(id) else {
+                return Ok(None);
+            };
+            if seen.insert(id) {
+                way_geom.decode_into(id, span, &mut role.nodes, &mut role.coords)?;
+                role.ends.push(role.nodes.len());
+            }
         }
+        Ok(Some(role))
     }
-    Some(members)
+
+    fn members(&self) -> Vec<RingMember<'_>> {
+        let mut start = 0;
+        self.ends
+            .iter()
+            .map(|&end| {
+                let member = RingMember {
+                    nodes: &self.nodes[start..end],
+                    coords: &self.coords[start..end],
+                };
+                start = end;
+                member
+            })
+            .collect()
+    }
 }
 
 #[hotpath::measure]
@@ -436,7 +632,6 @@ pub(super) fn write_admin_index(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::coord_fmt::deg_to_e7;
-    use rustc_hash::FxHashMap;
 
     use super::{
         DroppedAdminRelations, assemble_admin_polygons, hole_inside_outer,
@@ -446,13 +641,97 @@ mod tests {
     use crate::geocode_index::builder::pass1::RawAdminRelation;
 
     /// A located way whose node IDs are derived from its coordinates, so
-    /// fixtures that share a coordinate share the node.
-    fn located(coords: Vec<(i32, i32)>) -> super::AdminWayGeometry {
-        let nodes = coords
+    /// fixtures that share a coordinate share the node: its packed delta
+    /// refs and its coordinates.
+    type OwnedWay = Option<(Vec<u8>, Vec<(i32, i32)>)>;
+
+    fn located(coords: Vec<(i32, i32)>) -> OwnedWay {
+        let nodes: Vec<i64> = coords
             .iter()
             .map(|&(lat, lon)| (i64::from(lat) << 32) | i64::from(lon.cast_unsigned()))
             .collect();
-        Some(super::AdminWay { nodes, coords })
+        Some((crate::read::wire_fixtures::deltas(&nodes), coords))
+    }
+
+    fn assemble(
+        relations: &[RawAdminRelation],
+        way_geom: &super::WayGeometryMap,
+        config: &BuildConfig,
+        executor: &crate::host::Executor,
+    ) -> (Vec<super::AssembledPolygon>, DroppedAdminRelations) {
+        assemble_admin_polygons(relations, way_geom, config, executor).unwrap()
+    }
+
+    impl super::WayGeometryMap {
+        fn for_tests() -> Self {
+            Self::with_capacity(1 << 20, 1 << 17).unwrap()
+        }
+
+        #[allow(clippy::needless_pass_by_value)]
+        fn insert_test(&mut self, way_id: i64, way: OwnedWay) {
+            self.insert(
+                way_id,
+                way.as_ref().map(|(r, c)| (r.as_slice(), c.as_slice())),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Delta-decoded refs survive the store whole: wrapping deltas across
+    /// the i64 extremes, a repeated closing node, and a later occurrence
+    /// replacing an earlier one, a `None` occurrence included.
+    #[test]
+    fn the_store_returns_each_ways_last_occurrence_exactly() {
+        let mut store = super::WayGeometryMap::for_tests();
+        let nodes = [i64::MAX, i64::MIN, -1, i64::MAX];
+        let coords = vec![(1, 2), (3, 4), (5, 6), (1, 2)];
+        let refs = crate::read::wire_fixtures::deltas(&nodes);
+        store.insert_test(1, Some((refs.clone(), coords.clone())));
+        store.insert_test(2, Some((refs.clone(), coords.clone())));
+        store.insert_test(2, None);
+        store.insert_test(3, None);
+        store.insert_test(3, Some((refs, coords.clone())));
+
+        let decode = |id| {
+            let span = store.get(id).unwrap().unwrap();
+            let (mut n, mut c) = (Vec::new(), Vec::new());
+            store.decode_into(id, span, &mut n, &mut c).unwrap();
+            (n, c)
+        };
+        assert_eq!(decode(1), (nodes.to_vec(), coords.clone()));
+        assert_eq!(store.get(2), Some(None));
+        assert_eq!(decode(3), (nodes.to_vec(), coords));
+        assert_eq!(store.get(4), None);
+    }
+
+    /// A store sized below what is written refuses instead of truncating.
+    #[test]
+    fn the_store_refuses_more_than_its_capacity() {
+        let mut store = super::WayGeometryMap::with_capacity(2, 2).unwrap();
+        let refs = crate::read::wire_fixtures::deltas(&[1, 2, 3]);
+        assert!(
+            store
+                .insert(1, Some((&refs, &[(0, 0), (1, 1), (2, 2)])))
+                .is_err()
+        );
+    }
+
+    /// Refs that decode to a count other than the coordinates written
+    /// beside them fail the build rather than drop the relation.
+    #[test]
+    fn a_ref_count_mismatch_is_an_error_not_a_dropped_relation() {
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        let refs = crate::read::wire_fixtures::deltas(&[1, 2, 3, 1]);
+        way_geom
+            .insert(7, Some((&refs, &[(0, 0), (0, 10), (10, 0)])))
+            .unwrap();
+        let result = super::assemble_admin_polygons(
+            &[relation(1, vec![7], Vec::new())],
+            &way_geom,
+            &BuildConfig::default(),
+            &crate::host::Executor::for_tests(),
+        );
+        assert!(result.is_err());
     }
 
     fn relation(id: i64, outer: Vec<i64>, inner: Vec<i64>) -> RawAdminRelation {
@@ -483,10 +762,10 @@ mod tests {
         // would pass an all-dropped or all-kept fixture. One of each is the
         // only shape that pins the count to the relations that actually
         // failed to assemble.
-        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(7, located(square_e7()));
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(7, located(square_e7()));
         // In the file, but one of its nodes is not.
-        way_geom.insert(8, None);
+        way_geom.insert_test(8, None);
 
         let relations = vec![
             // Names a way that has no geometry: dropped.
@@ -544,7 +823,7 @@ mod tests {
                 sample_way_ids: vec![8, 98, 99],
             }
         );
-        let (polygons, dropped) = assemble_admin_polygons(
+        let (polygons, dropped) = assemble(
             &relations,
             &way_geom,
             &BuildConfig::default(),
@@ -575,8 +854,8 @@ mod tests {
             (551_000_007, 120_000_007),
             (550_000_007, 120_000_007),
         ];
-        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(7, located(ring.clone()));
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(7, located(ring.clone()));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 8,
@@ -589,7 +868,7 @@ mod tests {
             admin_tolerance_m: 0.0,
             ..BuildConfig::default()
         };
-        let (polygons, _) = assemble_admin_polygons(
+        let (polygons, _) = assemble(
             &relations,
             &way_geom,
             &config,
@@ -608,20 +887,20 @@ mod tests {
     /// ring, whatever surrounds them.
     #[test]
     fn ambiguous_topology_is_refused_and_counted() {
-        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
+        let mut way_geom = super::WayGeometryMap::for_tests();
         // A leaf into a complete graph on 12 nodes: a block that is not a
         // cycle, so its rings could be paired many ways.
-        way_geom.insert(1, located(vec![(-1, -1), (0, 0)]));
+        way_geom.insert_test(1, located(vec![(-1, -1), (0, 0)]));
         let mut way_id = 2;
         let mut complete_graph = vec![1];
         for a in 0..12 {
             for b in a + 1..12 {
-                way_geom.insert(way_id, located(vec![(a, a), (b, b)]));
+                way_geom.insert_test(way_id, located(vec![(a, a), (b, b)]));
                 complete_graph.push(way_id);
                 way_id += 1;
             }
         }
-        way_geom.insert(1_000, located(square_e7()));
+        way_geom.insert_test(1_000, located(square_e7()));
         complete_graph.push(1_000);
 
         // A leaf followed by self-closed loops at its end node, beside a
@@ -629,11 +908,11 @@ mod tests {
         // and the square is one. This once exhausted a search budget and
         // lost the square too.
         let mut loops = vec![2_000];
-        way_geom.insert(2_000, located(vec![(-5_000, -5_000), (0, 0)]));
+        way_geom.insert_test(2_000, located(vec![(-5_000, -5_000), (0, 0)]));
         for k in 1..=8 {
             let id = 2_000 + k;
             let x = i32::try_from(k).unwrap() * 1_000;
-            way_geom.insert(id, located(vec![(0, 0), (x, 100), (x, 200), (0, 0)]));
+            way_geom.insert_test(id, located(vec![(0, 0), (x, 100), (x, 200), (0, 0)]));
             loops.push(id);
         }
         loops.push(1_000);
@@ -650,7 +929,7 @@ mod tests {
             admin_tolerance_m: 0.0,
             ..BuildConfig::default()
         };
-        let (polygons, dropped) = assemble_admin_polygons(
+        let (polygons, dropped) = assemble(
             &relations,
             &way_geom,
             &config,
@@ -789,8 +1068,8 @@ mod tests {
             crate::geo::point_in_ring(query.0, query.1, &outer),
             "the query point is inside the unsimplified boundary"
         );
-        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(1, located(ring_e7(&outer)));
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(1, located(ring_e7(&outer)));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 8,
@@ -804,7 +1083,7 @@ mod tests {
                 admin_tolerance_m,
                 ..BuildConfig::default()
             };
-            let (polygons, _) = assemble_admin_polygons(
+            let (polygons, _) = assemble(
                 &relations,
                 &way_geom,
                 &config,
@@ -832,9 +1111,9 @@ mod tests {
         let (w_lon, w_lat) = (10.0 * d / c, 10.0 * d);
         let mainland = rect_lonlat(12.0, 51.3, 12.4, 51.45);
         let exclave = rect_lonlat(12.2, lat0, 12.2 + w_lon, lat0 + w_lat);
-        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(1, located(ring_e7(&mainland)));
-        way_geom.insert(2, located(ring_e7(&exclave)));
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(1, located(ring_e7(&mainland)));
+        way_geom.insert_test(2, located(ring_e7(&exclave)));
         let relations = vec![
             RawAdminRelation {
                 id: 1,
@@ -853,7 +1132,7 @@ mod tests {
                 inner_way_ids: Vec::new(),
             },
         ];
-        let (polygons, _) = assemble_admin_polygons(
+        let (polygons, _) = assemble(
             &relations,
             &way_geom,
             &BuildConfig::default(),
@@ -896,9 +1175,9 @@ mod tests {
         // vertices go, but not by much, so the bands overlap the wiggles.
         let outer = wavy(10.0, 0.2, 2_000, 0.03, 1.7);
         let hole = wavy(10.05, 0.05, 500, 0.1, 2.3);
-        let mut way_geom: super::WayGeometryMap = FxHashMap::default();
-        way_geom.insert(1, located(ring_e7(&outer)));
-        way_geom.insert(2, located(ring_e7(&hole)));
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(1, located(ring_e7(&outer)));
+        way_geom.insert_test(2, located(ring_e7(&hole)));
         let relations = vec![RawAdminRelation {
             id: 1,
             admin_level: 4,
@@ -912,7 +1191,7 @@ mod tests {
             admin_tolerance_m: tolerance,
             ..BuildConfig::default()
         };
-        let (polygons, _) = assemble_admin_polygons(
+        let (polygons, _) = assemble(
             &relations,
             &way_geom,
             &config,

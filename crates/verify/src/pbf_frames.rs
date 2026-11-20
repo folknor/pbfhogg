@@ -963,7 +963,9 @@ fn blob_content(bytes: &[u8]) -> Result<Vec<u8>, String> {
                     return Err("blob has more than one payload field".into());
                 }
             }
-            (1..=7, _) => return Err("blob field has the wrong wire type".into()),
+            // A known number with another supported wire type is an unknown
+            // field, skipped as pbfhogg and libosmium do: it never becomes a
+            // payload or a raw_size.
             _ => {}
         }
     }
@@ -1016,7 +1018,8 @@ fn header_features(block: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
         match field? {
             (4, Value::Bytes(v)) => required.push(String::from_utf8_lossy(v).into_owned()),
             (5, Value::Bytes(v)) => optional.push(String::from_utf8_lossy(v).into_owned()),
-            (4 | 5, _) => return Err("a header feature has the wrong wire type".into()),
+            // Another wire type on field 4 or 5 is an unknown field, skipped
+            // as pbfhogg and libosmium do.
             _ => {}
         }
     }
@@ -1226,6 +1229,30 @@ mod tests {
         bytes_field(1, b"OSMData", &mut bad_size);
         bytes_field(3, b"x", &mut bad_size);
         assert!(parse_blob_header(&bad_size).is_err());
+    }
+
+    #[test]
+    fn wrong_typed_blob_and_feature_fields_are_unknown() {
+        use super::{blob_content, header_features};
+        let mut block = Vec::new();
+        varint(4 << 3, &mut block);
+        varint(1, &mut block);
+        bytes_field(4, b"OsmSchema-V0.6", &mut block);
+        varint((5 << 3) | 5, &mut block);
+        block.extend_from_slice(&[0; 4]);
+        bytes_field(5, b"Sort.Type_then_ID", &mut block);
+        let (required, optional) = header_features(&block).unwrap();
+        assert_eq!(required, ["OsmSchema-V0.6"]);
+        assert_eq!(optional, ["Sort.Type_then_ID"]);
+
+        let mut blob = Vec::new();
+        varint(1 << 3, &mut blob);
+        varint(9, &mut blob);
+        bytes_field(2, b"zz", &mut blob);
+        varint((3 << 3) | 1, &mut blob);
+        blob.extend_from_slice(&[0; 8]);
+        bytes_field(1, &block, &mut blob);
+        assert_eq!(blob_content(&blob).unwrap(), block);
     }
 
     fn header_payload(features: &[&str], zlib: bool) -> Vec<u8> {

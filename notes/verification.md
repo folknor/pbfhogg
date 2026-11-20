@@ -20,19 +20,24 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-146 - Verifier frame readers refuse wrong-typed fields pbfhogg skips
+## VER-147 - Verifier frame readers still differ from pbfhogg in acceptance
 
-Reported by: FMT-027 resolution (scout lateral, 2026-11-20).
+Reported by: wrong-wire-type alignment of the verifier readers (spar, 2026-11-20).
 
-pbfhogg's readers treat a known Blob or HeaderBlock field number carrying
-another supported wire type as an unknown field and skip it (libosmium does
-the same). The independent readers in `crates/verify/src/pbf_frames.rs` still
-refuse such an occurrence in two places: `blob_content` on Blob fields 1 to 7,
-and `header_features` on HeaderBlock fields 4 and 5. A file pbfhogg and
-osmium both read, or one a pbfhogg verbatim rewrite produced from such an
-input, then fails a verifier framing walk. The BlobHeader reader there was
-aligned (refuses only type and datasize); the other two should follow, keeping
-their literals independent of the library.
+With field dispatch now on number and wire type in every reader in
+`crates/verify/src/pbf_frames.rs`, other acceptance rules still differ from
+pbfhogg's: `blob_content` refuses a zlib blob without `raw_size` (pbfhogg
+decodes it), refuses zstd, and refuses the first negative `raw_size` even when
+a later valid one wins in pbfhogg; `header_features` reads feature strings
+lossily and records required features pbfhogg refuses, where pbfhogg refuses
+invalid UTF-8; `Fields` decodes a skipped varint fully and refuses a 64-bit
+overflow that pbfhogg's skip only scans past. The module and `index_truth`
+docs claim broader parity (and "every data blob") than the code delivers. The
+verifier ID walk (`block_ids`, `group_ids`, `message_id`, `dense_ids`) still
+refuses wrong-typed known fields, unaudited against the library decoder.
+Each is a file one side reads and the other refuses; none changes a value
+both accept.
+
 ## VER-144 - Source-policy rules re-parse every file with syn, in debug
 
 Measured 2026-11-18 on bygg (debug `brokkr test`): the single real-tree

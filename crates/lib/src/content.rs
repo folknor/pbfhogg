@@ -119,7 +119,11 @@ pub(crate) enum Token<'a> {
 /// decoded blocks.
 pub(crate) trait Content {
     fn content_kind(&self) -> ElementKind;
-    fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>>;
+    /// The element's tokens. The outer error is a node coordinate that does
+    /// not fit an `i32` decimicrodegree: the element has no comparable
+    /// content and every consumer refuses it. An inner error (a bad role
+    /// string index) is read lazily, as before.
+    fn content_tokens(&self) -> Result<impl Iterator<Item = Result<Token<'_>>>>;
 }
 
 /// Which equality a comparison decides "common" by.
@@ -145,41 +149,73 @@ pub(crate) enum Relation {
 
 impl Relation {
     /// Whether `a` and `b` are "common" under this relation.
+    ///
+    /// An error is a coordinate on either side that its normalization cannot
+    /// hold (see [`Content::content_tokens`] and [`way_locations`]): such a
+    /// pair is refused, never judged equal or modified on a wrapped value.
     #[inline]
-    pub(crate) fn equal(self, a: &Element<'_>, b: &Element<'_>) -> bool {
-        content_equal(a, b)
-            && match (self, a, b) {
-                (Relation::ContentLocations, Element::Way(a), Element::Way(b)) => {
-                    way_locations(a).eq(way_locations(b))
+    pub(crate) fn equal(self, a: &Element<'_>, b: &Element<'_>) -> Result<bool> {
+        let content = content_equal(a, b)?;
+        match (self, a, b) {
+            (Relation::ContentLocations, Element::Way(a), Element::Way(b)) => {
+                // Both lists are read to the end, whatever an earlier entry
+                // decided, so compact and verbose diff refuse the same pairs.
+                let mut equal = content;
+                let mut a_locs = way_locations(a);
+                let mut b_locs = way_locations(b);
+                loop {
+                    match (a_locs.next().transpose()?, b_locs.next().transpose()?) {
+                        (None, None) => return Ok(equal),
+                        (Some(x), Some(y)) => equal &= x == y,
+                        (Some(_), None) => {
+                            for loc in a_locs.by_ref() {
+                                loc?;
+                            }
+                            return Ok(false);
+                        }
+                        (None, Some(_)) => {
+                            for loc in b_locs.by_ref() {
+                                loc?;
+                            }
+                            return Ok(false);
+                        }
+                    }
                 }
-                _ => true,
             }
+            _ => Ok(content),
+        }
     }
 }
 
 /// A way's inline locations as (lat, lon) in decimicrodegrees, `i64`,
 /// truncated toward zero: the one normalization [`Relation::ContentLocations`]
-/// and its digest record use.
-pub(crate) fn way_locations<'a>(w: &crate::Way<'a>) -> impl Iterator<Item = (i64, i64)> + use<'a> {
+/// and its digest record use. The nanodegree value is scaled exactly; one
+/// that does not fit `i64` is an error, never a wrapped value. Wherever it
+/// fits, the result is the value the former wrapping scale gave.
+pub(crate) fn way_locations<'a>(
+    w: &crate::Way<'a>,
+) -> impl Iterator<Item = Result<(i64, i64)>> + use<'a> {
     w.node_locations()
-        .map(|l| (l.nano_lat() / 100, l.nano_lon() / 100))
+        .map(|l| Ok((l.nano_lat()? / 100, l.nano_lon()? / 100)))
 }
 
 /// Content equality, the relation `diff` reports as "common".
 ///
-/// Elements of different kinds are never equal. A lookup failure on either
-/// side makes the pair unequal; it never makes corrupt input look identical.
-pub(crate) fn content_equal(a: &impl Content, b: &impl Content) -> bool {
+/// Elements of different kinds are never equal. A node coordinate that does
+/// not fit an `i32` decimicrodegree on either side is an error. A string
+/// lookup failure on either side makes the pair unequal; it never makes
+/// corrupt input look identical.
+pub(crate) fn content_equal(a: &impl Content, b: &impl Content) -> Result<bool> {
     if a.content_kind() != b.content_kind() {
-        return false;
+        return Ok(false);
     }
-    let mut a_tokens = a.content_tokens();
-    let mut b_tokens = b.content_tokens();
+    let mut a_tokens = a.content_tokens()?;
+    let mut b_tokens = b.content_tokens()?;
     loop {
         match (a_tokens.next(), b_tokens.next()) {
-            (None, None) => return true,
+            (None, None) => return Ok(true),
             (Some(Ok(x)), Some(Ok(y))) if x == y => {}
-            _ => return false,
+            _ => return Ok(false),
         }
     }
 }
@@ -193,7 +229,7 @@ impl Content for Element<'_> {
         }
     }
 
-    fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
+    fn content_tokens(&self) -> Result<impl Iterator<Item = Result<Token<'_>>>> {
         ElementTokens::new(self)
     }
 }
@@ -220,19 +256,19 @@ enum ElementTokens<'a> {
 }
 
 impl<'a> ElementTokens<'a> {
-    fn new(element: &Element<'a>) -> Self {
-        match element {
+    fn new(element: &Element<'a>) -> Result<Self> {
+        Ok(match element {
             Element::DenseNode(n) => ElementTokens::DenseNode {
                 coord: Some(Token::Coord {
-                    lat: n.decimicro_lat(),
-                    lon: n.decimicro_lon(),
+                    lat: n.decimicro_lat()?,
+                    lon: n.decimicro_lon()?,
                 }),
                 tags: n.tags(),
             },
             Element::Node(n) => ElementTokens::Node {
                 coord: Some(Token::Coord {
-                    lat: n.decimicro_lat(),
-                    lon: n.decimicro_lon(),
+                    lat: n.decimicro_lat()?,
+                    lon: n.decimicro_lon()?,
                 }),
                 tags: n.tags(),
             },
@@ -244,7 +280,7 @@ impl<'a> ElementTokens<'a> {
                 tags: r.tags(),
                 members: r.members(),
             },
-        }
+        })
     }
 }
 
@@ -331,7 +367,7 @@ pub(crate) fn write_record(
         ElementKind::Relation => KIND_RELATION,
     });
     out.extend_from_slice(&id.to_le_bytes());
-    for token in element.content_tokens() {
+    for token in element.content_tokens()? {
         match token? {
             Token::Coord { lat, lon } => {
                 out.push(TOKEN_COORD);
@@ -351,7 +387,8 @@ pub(crate) fn write_record(
         let count_at = out.len();
         out.extend_from_slice(&0u64.to_le_bytes());
         let mut count: u64 = 0;
-        for (lat, lon) in way_locations(w) {
+        for loc in way_locations(w) {
+            let (lat, lon) = loc?;
             out.extend_from_slice(&lat.to_le_bytes());
             out.extend_from_slice(&lon.to_le_bytes());
             count += 1;
@@ -421,14 +458,14 @@ pub(crate) fn write_full_record(
     out.extend_from_slice(&id.to_le_bytes());
     let meta = match element {
         Element::DenseNode(n) => {
-            write_nano_coord(out, n.nano_lat(), n.nano_lon());
+            write_nano_coord(out, n.nano_lat()?, n.nano_lon()?);
             for tag in n.tags() {
                 write_tag(out, tag)?;
             }
             n.info().and_then(MetaClaims::from_dense)
         }
         Element::Node(n) => {
-            write_nano_coord(out, n.nano_lat(), n.nano_lon());
+            write_nano_coord(out, n.nano_lat()?, n.nano_lon()?);
             for tag in n.tags() {
                 write_tag(out, tag)?;
             }
@@ -446,8 +483,8 @@ pub(crate) fn write_full_record(
             }
             for loc in w.node_locations() {
                 out.push(TOKEN_LOCATION);
-                out.extend_from_slice(&loc.nano_lat().to_le_bytes());
-                out.extend_from_slice(&loc.nano_lon().to_le_bytes());
+                out.extend_from_slice(&loc.nano_lat()?.to_le_bytes());
+                out.extend_from_slice(&loc.nano_lon()?.to_le_bytes());
             }
             if prepass.pins {
                 write_pins(out, w.shared_node_pins(), refs)?;

@@ -348,7 +348,7 @@ pub(crate) fn stream_merge_phase(
                     old_head = Some(o);
                 }
                 std::cmp::Ordering::Equal => {
-                    if relation.equal(&o, &n) {
+                    if relation.equal(&o, &n)? {
                         on_action(BlockMergeAction::ElementEqual(&o))?;
                     } else {
                         on_action(BlockMergeAction::ElementModified { old: &o, new: &n })?;
@@ -1529,7 +1529,7 @@ fn element_merge_pair<S: MergeSink>(
                 if let (Some(o), Some(n)) = (old_iter.next(), new_iter.next()) {
                     old_consumed += 1;
                     new_consumed += 1;
-                    if sink.relation().equal(&o, &n) {
+                    if sink.relation().equal(&o, &n)? {
                         sink.record(kind, &BlockMergeAction::ElementEqual(&o))?;
                     } else {
                         sink.record(

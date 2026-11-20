@@ -515,8 +515,10 @@ mod tests {
         block
             .elements_skip_metadata()
             .filter_map(|el| match &el {
-                Element::DenseNode(dn) => Some((dn.decimicro_lat(), dn.decimicro_lon())),
-                Element::Node(n) => Some((n.decimicro_lat(), n.decimicro_lon())),
+                Element::DenseNode(dn) => {
+                    Some((dn.decimicro_lat_wrapping(), dn.decimicro_lon_wrapping()))
+                }
+                Element::Node(n) => Some((n.decimicro_lat_wrapping(), n.decimicro_lon_wrapping())),
                 _ => None,
             })
             .collect()

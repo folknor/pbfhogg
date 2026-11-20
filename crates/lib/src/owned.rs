@@ -673,8 +673,8 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
 pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> Result<OwnedNode> {
     Ok(OwnedNode {
         id: dn.id(),
-        decimicro_lat: dn.decimicro_lat(),
-        decimicro_lon: dn.decimicro_lon(),
+        decimicro_lat: dn.decimicro_lat()?,
+        decimicro_lon: dn.decimicro_lon()?,
         tags: dn
             .tags()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -691,8 +691,8 @@ pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> Result<OwnedNode> {
 pub(crate) fn read_node(n: &crate::Node<'_>) -> Result<OwnedNode> {
     Ok(OwnedNode {
         id: n.id(),
-        decimicro_lat: n.decimicro_lat(),
-        decimicro_lon: n.decimicro_lon(),
+        decimicro_lat: n.decimicro_lat()?,
+        decimicro_lon: n.decimicro_lon()?,
         tags: n
             .tags()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -726,8 +726,8 @@ pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> Result<OwnedWay> {
     let mut way = read_way(w)?;
     way.locations = w
         .node_locations()
-        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
-        .collect();
+        .map(|loc| Ok((loc.decimicro_lat()?, loc.decimicro_lon()?)))
+        .collect::<Result<_>>()?;
     Ok(way)
 }
 
@@ -892,8 +892,8 @@ mod tests {
                                 .unwrap();
                         borrowed.add_node_partial(
                             n.id(),
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
+                            n.decimicro_lat().unwrap(),
+                            n.decimicro_lon().unwrap(),
                             n.tags(),
                             meta.as_ref(),
                         );

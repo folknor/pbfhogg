@@ -400,15 +400,26 @@ fn apply_changes_output_passes_after_a_node_move() {
             for element in block.elements() {
                 match element {
                     pbfhogg::Element::DenseNode(n) if n.id() == 3 => {
-                        node3 = Some((n.decimicro_lat(), n.decimicro_lon()));
+                        node3 = Some((
+                            n.decimicro_lat().expect("representable coordinate"),
+                            n.decimicro_lon().expect("representable coordinate"),
+                        ));
                     }
                     pbfhogg::Element::Node(n) if n.id() == 3 => {
-                        node3 = Some((n.decimicro_lat(), n.decimicro_lon()));
+                        node3 = Some((
+                            n.decimicro_lat().expect("representable coordinate"),
+                            n.decimicro_lon().expect("representable coordinate"),
+                        ));
                     }
                     pbfhogg::Element::Way(w) if w.id() == 20 => {
                         way20 = Some(
                             w.node_locations()
-                                .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                                .map(|l| {
+                                    (
+                                        l.decimicro_lat().expect("representable coordinate"),
+                                        l.decimicro_lon().expect("representable coordinate"),
+                                    )
+                                })
                                 .collect::<Vec<_>>(),
                         );
                     }

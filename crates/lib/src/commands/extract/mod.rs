@@ -109,7 +109,7 @@ impl Region {
     }
 
     /// [`Self::contains_decimicro`] on a node's checked coordinates
-    /// (`decimicro_lat_checked` / `decimicro_lon_checked`), refusing a node
+    /// (`decimicro_lat().ok()` / `decimicro_lon().ok()`), refusing a node
     /// whose coordinates do not fit `i32` (see `common::checked_coords`).
     fn contains_node(
         &self,

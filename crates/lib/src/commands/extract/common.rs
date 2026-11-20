@@ -22,17 +22,16 @@ use super::ExtractStats;
 // Node coordinates
 // ---------------------------------------------------------------------------
 
-/// A node's decimicrodegree coordinates from its checked accessors
-/// (`decimicro_lat_checked` / `decimicro_lon_checked`), or the node scanner's
+/// A node's decimicrodegree coordinates from its exact accessors
+/// (`decimicro_lat().ok()` / `decimicro_lon().ok()`), or the node scanner's
 /// refusal when either does not fit `i32`.
 ///
 /// Every extract strategy converts node coordinates through this, the
 /// columnar decode or the node scanner, which all share one exact rule, so
 /// no strategy classifies or writes a node at a wrapped coordinate that
-/// another refuses. The permissive `decimicro_lat` / `decimicro_lon` wrap
-/// modulo 2^64 and narrow with `as i32`, so a corrupt offset (lat_offset
-/// 429_496_729_600 on a raw 0 is 4_294_967_296 decimicrodegrees) used to
-/// put the node at 0 and select it into an extract around `(0, 0)`. The
+/// another refuses. A wrapping conversion would put a node with a corrupt
+/// offset (lat_offset 429_496_729_600 on a raw 0 is 4_294_967_296
+/// decimicrodegrees) at 0 and select it into an extract around `(0, 0)`. The
 /// writers check too, not only the classifiers: complete-ways and smart
 /// write way-dependency nodes from blobs classification skipped on a
 /// disjoint bbox claim, and the write must not depend on that claim being
@@ -51,13 +50,13 @@ pub(super) fn checked_coords(
 /// [`checked_coords`] of a dense node.
 #[inline]
 pub(super) fn dense_coords(node: &crate::DenseNode<'_>) -> crate::error::Result<(i32, i32)> {
-    checked_coords(node.decimicro_lat_checked(), node.decimicro_lon_checked())
+    Ok((node.decimicro_lat()?, node.decimicro_lon()?))
 }
 
 /// [`checked_coords`] of a plain node.
 #[inline]
 pub(super) fn plain_coords(node: &crate::Node<'_>) -> crate::error::Result<(i32, i32)> {
-    checked_coords(node.decimicro_lat_checked(), node.decimicro_lon_checked())
+    Ok((node.decimicro_lat()?, node.decimicro_lon()?))
 }
 
 // ---------------------------------------------------------------------------

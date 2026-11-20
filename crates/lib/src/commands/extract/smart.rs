@@ -233,8 +233,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                         (UnsortedPhase::Nodes, Element::DenseNode(dn))
                             if region.contains_node(
                                 &exact_bbox,
-                                dn.decimicro_lat_checked(),
-                                dn.decimicro_lon_checked(),
+                                dn.decimicro_lat().ok(),
+                                dn.decimicro_lon().ok(),
                             )? =>
                         {
                             bbox_node_ids.insert(dn.id());
@@ -242,8 +242,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                         (UnsortedPhase::Nodes, Element::Node(n))
                             if region.contains_node(
                                 &exact_bbox,
-                                n.decimicro_lat_checked(),
-                                n.decimicro_lon_checked(),
+                                n.decimicro_lat().ok(),
+                                n.decimicro_lon().ok(),
                             )? =>
                         {
                             bbox_node_ids.insert(n.id());
@@ -436,8 +436,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                         Element::DenseNode(dn)
                             if region.contains_node(
                                 exact_bbox,
-                                dn.decimicro_lat_checked(),
-                                dn.decimicro_lon_checked(),
+                                dn.decimicro_lat().ok(),
+                                dn.decimicro_lon().ok(),
                             )? =>
                         {
                             ids.push(dn.id());
@@ -445,8 +445,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                         Element::Node(n)
                             if region.contains_node(
                                 exact_bbox,
-                                n.decimicro_lat_checked(),
-                                n.decimicro_lon_checked(),
+                                n.decimicro_lat().ok(),
+                                n.decimicro_lon().ok(),
                             )? =>
                         {
                             ids.push(n.id());

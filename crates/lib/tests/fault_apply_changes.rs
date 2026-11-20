@@ -259,7 +259,7 @@ mod apply_changes {
                 if let pbfhogg::Element::Way(w) = element {
                     let locs = w
                         .node_locations()
-                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                        .map(|l| (l.decimicro_lat().unwrap(), l.decimicro_lon().unwrap()))
                         .collect();
                     ways.push((w.id(), locs));
                 }

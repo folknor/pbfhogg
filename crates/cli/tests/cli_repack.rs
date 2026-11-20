@@ -758,7 +758,12 @@ fn way_locations_in_output(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
                 if let Element::Way(w) = element {
                     let locs: Vec<(i32, i32)> = w
                         .node_locations()
-                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                        .map(|l| {
+                            (
+                                l.decimicro_lat().expect("representable coordinate"),
+                                l.decimicro_lon().expect("representable coordinate"),
+                            )
+                        })
                         .collect();
                     out.push((w.id(), locs));
                 }

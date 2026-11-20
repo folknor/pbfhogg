@@ -38,6 +38,22 @@ the wall is the exact comparison, and `CAT_FILTERED_*` the exact ordered-pass
 total (it excludes the schedule walk and the final flush). Runs from
 `8da26b23` until that change carry no per-kind rows.
 
+### Exact node coordinate accessors cost nothing on cat --clean (plantasjen, 2026-11-20, against `5cd381d2`)
+
+The re-encoders' node coordinate conversion became exact and fallible
+(checked `i64` scaling and checked `i32` narrowing, refusing a wrapped
+value) in the commit after `5cd381d2`. `copy-pbf --dataset planet --clean
+yes`, `--iterations 1`, interleaved A B A B, A at `5cd381d2` via
+`--commit`, B the uncommitted change:
+
+| A, `5cd381d2` | B, exact accessors |
+|---|---|
+| 284 s (`dbffbc8f`), 285 s (`161e83ab`) | 284 s (`46a98815`), 286 s (`6921c5de`) |
+
+Neutral. Every other re-encoder runs the same per-node conversion, and the
+extract and geocode cells of the same checked conversion (see extract.md
+and geocode.md) were neutral too, so no further cells were run.
+
 ### cat --repair leaves the hot paths alone (bygg, 2026-11-10, `9bb34208` against `1d982110`)
 
 Guard cells for the repair route: plain and clean cat must not move.

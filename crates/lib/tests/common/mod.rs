@@ -1127,15 +1127,21 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
             match element {
                 Element::DenseNode(dn) => {
                     let tags = checked_tags(dn.tags(), &format!("dense node {}", dn.id()));
-                    contents
-                        .nodes
-                        .push((dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags));
+                    contents.nodes.push((
+                        dn.id(),
+                        dn.decimicro_lat().expect("representable coordinate"),
+                        dn.decimicro_lon().expect("representable coordinate"),
+                        tags,
+                    ));
                 }
                 Element::Node(n) => {
                     let tags = checked_tags(n.tags(), &format!("node {}", n.id()));
-                    contents
-                        .nodes
-                        .push((n.id(), n.decimicro_lat(), n.decimicro_lon(), tags));
+                    contents.nodes.push((
+                        n.id(),
+                        n.decimicro_lat().expect("representable coordinate"),
+                        n.decimicro_lon().expect("representable coordinate"),
+                        tags,
+                    ));
                 }
                 Element::Way(w) => {
                     let tags = checked_tags(w.tags(), &format!("way {}", w.id()));
@@ -1520,7 +1526,10 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                     });
                     PublicView::Node {
                         id: n.id(),
-                        nano: (n.nano_lat(), n.nano_lon()),
+                        nano: (
+                            n.nano_lat().expect("representable coordinate"),
+                            n.nano_lon().expect("representable coordinate"),
+                        ),
                         tags: checked_tags(n.tags(), &what),
                         version,
                         milli_timestamp,
@@ -1531,7 +1540,10 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                     let info = n.info();
                     PublicView::Node {
                         id: n.id(),
-                        nano: (n.nano_lat(), n.nano_lon()),
+                        nano: (
+                            n.nano_lat().expect("representable coordinate"),
+                            n.nano_lon().expect("representable coordinate"),
+                        ),
                         tags: checked_tags(n.tags(), &what),
                         version: info.claimed_version(),
                         milli_timestamp: info.milli_timestamp(),
@@ -1541,7 +1553,12 @@ fn public_view_of_reader(path: &Path) -> Vec<PublicView> {
                     let what = format!("way {}", w.id());
                     let locations: Vec<(i64, i64)> = w
                         .node_locations()
-                        .map(|l| (l.nano_lat(), l.nano_lon()))
+                        .map(|l| {
+                            (
+                                l.nano_lat().expect("representable coordinate"),
+                                l.nano_lon().expect("representable coordinate"),
+                            )
+                        })
                         .collect();
                     PublicView::Way {
                         id: w.id(),

@@ -230,6 +230,29 @@ Reported by: check-inspect.
 `reference/osmium-parity.md` recommends `inspect -e`. That flag now refuses
 and names `--extended` instead.
 
+## DOC-025 - testing.md still lists infallible tags() as a forbidden test spelling
+
+Reported by: the scout of the repeated-string-table item (2026-11-20); not
+re-read since.
+
+`reference/testing.md` names infallible `.tags()` among the spellings tests
+must not use in place of a checked accessor. Since tag string indices are
+validated at block construction, `tags()` is the only tag accessor and the
+test-oracle lint in `brokkr.d/lints.toml` no longer matches it, so the page
+describes a rule that no longer exists.
+
+## DOC-026 - cat's unclassifiable-block rebuild doc says it normalises like --type and --clean
+
+Reported by: the BUG-032 scout (2026-11-20); not re-read since.
+
+The doc comment on `reencode_unclassifiable` in
+`crates/lib/src/commands/cat/mod.rs` says its content is "the same
+normalisation `cat --type` and `--clean` apply", but it keeps inline way
+locations (`add_way_with_locations_partial`) while the type/clean rebuild
+in `process_block` writes ways with `add_way_partial` and drops them. The
+scout also reported the same comment still describing tags as fallible;
+check that against the current text before rewording.
+
 ## DOC-024 - diff test comments still describe a header walk and ID-range shards
 
 Reported by: the negative-ID documents commit's spar (codex).

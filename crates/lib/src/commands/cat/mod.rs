@@ -736,8 +736,8 @@ fn reencode_unclassifiable(
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
                 bb.add_node_dense(
                     dn.id(),
-                    dn.decimicro_lat(),
-                    dn.decimicro_lon(),
+                    dn.decimicro_lat()?,
+                    dn.decimicro_lon()?,
                     dn.tags(),
                     meta.as_ref(),
                 );
@@ -747,8 +747,8 @@ fn reencode_unclassifiable(
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
                 bb.add_node_partial(
                     n.id(),
-                    n.decimicro_lat(),
-                    n.decimicro_lon(),
+                    n.decimicro_lat()?,
+                    n.decimicro_lon()?,
                     n.tags(),
                     meta.as_ref(),
                 );
@@ -772,10 +772,9 @@ fn reencode_unclassifiable(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
-                locations_buf.extend(
-                    w.node_locations()
-                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon())),
-                );
+                for loc in w.node_locations() {
+                    locations_buf.push((loc.decimicro_lat()?, loc.decimicro_lon()?));
+                }
                 if locations_buf.is_empty() {
                     bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
                 } else {
@@ -975,8 +974,8 @@ fn process_block(
                 let meta = clean_metadata(dense_meta(dn, clean)?, clean);
                 bb.add_node_dense(
                     dn.id(),
-                    dn.decimicro_lat(),
-                    dn.decimicro_lon(),
+                    dn.decimicro_lat()?,
+                    dn.decimicro_lon()?,
                     dn.tags(),
                     meta.as_ref(),
                 );
@@ -990,8 +989,8 @@ fn process_block(
                 );
                 bb.add_node_partial(
                     n.id(),
-                    n.decimicro_lat(),
-                    n.decimicro_lon(),
+                    n.decimicro_lat()?,
+                    n.decimicro_lon()?,
                     n.tags(),
                     meta.as_ref(),
                 );

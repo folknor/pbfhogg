@@ -916,11 +916,17 @@ fn read_contents(path: &Path) -> Contents {
                 }
                 Element::Node(n) => {
                     c.node_ids.insert(n.id());
-                    c.nodes.push((n.nano_lon(), n.nano_lat()));
+                    c.nodes.push((
+                        n.nano_lon().expect("representable coordinate"),
+                        n.nano_lat().expect("representable coordinate"),
+                    ));
                 }
                 Element::DenseNode(n) => {
                     c.node_ids.insert(n.id());
-                    c.nodes.push((n.nano_lon(), n.nano_lat()));
+                    c.nodes.push((
+                        n.nano_lon().expect("representable coordinate"),
+                        n.nano_lat().expect("representable coordinate"),
+                    ));
                 }
                 Element::Relation(r) => {
                     let area = r

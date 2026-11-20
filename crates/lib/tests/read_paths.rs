@@ -220,8 +220,8 @@ fn materialize(element: &Element<'_>) -> String {
         Element::Node(n) => format!(
             "node id={} nlat={} nlon={} tags={:?} info=[{}]",
             n.id(),
-            n.nano_lat(),
-            n.nano_lon(),
+            n.nano_lat().unwrap(),
+            n.nano_lon().unwrap(),
             crate::common::checked_tags(n.tags(), &what),
             info_string(&n.info()),
         ),
@@ -240,8 +240,8 @@ fn materialize(element: &Element<'_>) -> String {
             format!(
                 "node id={} nlat={} nlon={} tags={:?} info=[{info:?}]",
                 dn.id(),
-                dn.nano_lat(),
-                dn.nano_lon(),
+                dn.nano_lat().unwrap(),
+                dn.nano_lon().unwrap(),
                 crate::common::checked_tags(dn.tags(), &what),
             )
         }
@@ -249,7 +249,7 @@ fn materialize(element: &Element<'_>) -> String {
             let refs: Vec<i64> = w.refs().collect();
             let locations: Vec<(i64, i64)> = w
                 .node_locations()
-                .map(|l| (l.nano_lat(), l.nano_lon()))
+                .map(|l| (l.nano_lat().unwrap(), l.nano_lon().unwrap()))
                 .collect();
             format!(
                 "way id={} tags={:?} refs={refs:?} locations={locations:?} info=[{}]",

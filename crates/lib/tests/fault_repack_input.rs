@@ -277,14 +277,14 @@ fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
             items.push(match element {
                 Element::DenseNode(n) => Item::Node {
                     id: n.id(),
-                    lat: n.decimicro_lat(),
-                    lon: n.decimicro_lon(),
+                    lat: n.decimicro_lat().expect("representable coordinate"),
+                    lon: n.decimicro_lon().expect("representable coordinate"),
                     tags: tags(&mut n.tags()),
                 },
                 Element::Node(n) => Item::Node {
                     id: n.id(),
-                    lat: n.decimicro_lat(),
-                    lon: n.decimicro_lon(),
+                    lat: n.decimicro_lat().expect("representable coordinate"),
+                    lon: n.decimicro_lon().expect("representable coordinate"),
                     tags: tags(&mut n.tags()),
                 },
                 Element::Way(w) => Item::Way {
@@ -292,7 +292,12 @@ fn read_items(path: &Path) -> (Vec<Item>, Vec<usize>) {
                     refs: w.refs().collect(),
                     locations: w
                         .node_locations()
-                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                        .map(|l| {
+                            (
+                                l.decimicro_lat().expect("representable coordinate"),
+                                l.decimicro_lon().expect("representable coordinate"),
+                            )
+                        })
                         .collect(),
                     tags: tags(&mut w.tags()),
                 },

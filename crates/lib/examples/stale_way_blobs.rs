@@ -590,7 +590,12 @@ fn scan_way(
     refs.clear();
     refs.extend(way.refs());
     locs.clear();
-    locs.extend(way.node_locations().map(|l| (l.nano_lat(), l.nano_lon())));
+    // Saturated exact values: one past i64 still reads as out of range.
+    let sat = |v: i128| i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX });
+    locs.extend(
+        way.node_locations()
+            .map(|l| (sat(l.nano_lat_exact()), sat(l.nano_lon_exact()))),
+    );
     scan.ways[c] += 1;
     scan.refs[c] += refs.len() as u64;
     if refs.is_empty() {

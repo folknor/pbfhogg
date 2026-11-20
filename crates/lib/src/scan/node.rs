@@ -72,10 +72,10 @@ pub(crate) struct NodeTuple {
 /// consumer, extract simple's classify included. The geocode builder's
 /// Pass 2a judges the domain on every node, on the exact nanodegree value.
 ///
-/// This is also the conversion behind the checked element accessors
-/// (`decimicro_lat_checked` on `Node` and `DenseNode`) and the checked
-/// columnar decode, so every extract strategy accepts and refuses the same
-/// coordinates.
+/// This is also the conversion behind the element accessors
+/// (`decimicro_lat` on `Node`, `DenseNode` and `WayNodeLocation`) and the
+/// checked columnar decode, so every reading and re-encoding route accepts
+/// and refuses the same coordinates.
 #[inline]
 pub(crate) fn scale_to_decimicro(offset: i64, granularity: i64, raw: i64) -> Option<i32> {
     match granularity
@@ -102,14 +102,78 @@ pub(crate) fn exact_nano(offset: i64, granularity: i64, raw: i64) -> i128 {
     i128::from(offset) + i128::from(granularity) * i128::from(raw)
 }
 
+/// The exact nanodegree value as `i64`, or `None` when it does not fit.
+/// Checked fast path with the exact `i128` fallback for a product that only
+/// an offset brings back in range.
+#[inline]
+pub(crate) fn scale_to_nano(offset: i64, granularity: i64, raw: i64) -> Option<i64> {
+    match granularity
+        .checked_mul(raw)
+        .and_then(|scaled| offset.checked_add(scaled))
+    {
+        Some(nano) => Some(nano),
+        None => scale_to_nano_wide(offset, granularity, raw),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn scale_to_nano_wide(offset: i64, granularity: i64, raw: i64) -> Option<i64> {
+    i64::try_from(exact_nano(offset, granularity, raw)).ok()
+}
+
+/// Degrees from `(offset, granularity, raw)`, never wrapping: the `i64`
+/// nanodegree value where it fits (the same `f64` the old accessor gave),
+/// else the exact `i128`.
+#[inline]
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn nano_to_degrees((offset, granularity, raw): (i64, i64, i64)) -> f64 {
+    match scale_to_nano(offset, granularity, raw) {
+        Some(nano) => 1e-9 * nano as f64,
+        None => 1e-9 * exact_nano(offset, granularity, raw) as f64,
+    }
+}
+
 /// The refusal for a node coordinate [`scale_to_decimicro`] rejects, shared
-/// by this scanner, the checked columnar decode and the extract consumers of
-/// the checked element accessors, so every route words it the same way.
+/// by this scanner, the checked columnar decode and the node coordinate
+/// accessors every re-encoder uses, so every route words it the same way.
 #[cold]
 #[inline(never)]
 pub(crate) fn unrepresentable_coordinate_err() -> crate::error::Error {
     crate::error::new_wire_error(
         "node coordinate does not fit in an i32 decimicrodegree; \
+         the blob's granularity, offset, or deltas are corrupt",
+    )
+}
+
+/// The refusal for a node coordinate whose nanodegree value does not fit `i64`.
+#[cold]
+#[inline(never)]
+pub(crate) fn unrepresentable_nano_err() -> crate::error::Error {
+    crate::error::new_wire_error(
+        "node coordinate does not fit in an i64 nanodegree; \
+         the blob's granularity, offset, or deltas are corrupt",
+    )
+}
+
+/// The refusal for an inline way location (LocationsOnWays) that does not
+/// fit an `i32` decimicrodegree.
+#[cold]
+#[inline(never)]
+pub(crate) fn unrepresentable_location_err() -> crate::error::Error {
+    crate::error::new_wire_error(
+        "way node location does not fit in an i32 decimicrodegree; \
+         the blob's granularity, offset, or deltas are corrupt",
+    )
+}
+
+/// The refusal for an inline way location that does not fit an `i64`
+/// nanodegree.
+#[cold]
+#[inline(never)]
+pub(crate) fn unrepresentable_location_nano_err() -> crate::error::Error {
+    crate::error::new_wire_error(
+        "way node location does not fit in an i64 nanodegree; \
          the blob's granularity, offset, or deltas are corrupt",
     )
 }

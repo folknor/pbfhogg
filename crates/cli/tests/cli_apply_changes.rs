@@ -1401,7 +1401,12 @@ fn read_way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
                 if let Element::Way(w) = element {
                     let locs: Vec<(i32, i32)> = w
                         .node_locations()
-                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .map(|loc| {
+                            (
+                                loc.decimicro_lat().expect("representable coordinate"),
+                                loc.decimicro_lon().expect("representable coordinate"),
+                            )
+                        })
                         .collect();
                     result.push((w.id(), locs));
                 }

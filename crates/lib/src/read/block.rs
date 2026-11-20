@@ -1031,29 +1031,28 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// Coordinate and timestamp *values*. The block header scan in `wire.rs`
 /// checks that both scales fit their declared signed int32 type, without
 /// imposing positivity or checking the scaled values. Delta reconstruction
-/// is modular, and so is the step after it: `offset + granularity * raw` for
-/// coordinates and `raw * date_granularity` for timestamps use wrapping `i64`
-/// arithmetic in every permissive block-API accessor (`nano_lat`,
-/// `decimicro_lat`, `milli_timestamp` and kin; the checked and exact
-/// coordinate accessors are named for what they do instead), so debug and
-/// release agree and nothing panics.
-/// A value whose scaling runs past `i64` is garbage in, garbage out, exactly
-/// like the far larger class of in-range but meaningless values (a latitude
-/// of 10^6 degrees) that no reader refuses, and like the `as i32` narrowing
-/// of the decimicrodegree accessors. Refusing overflow here would mean
-/// decoding every `lat` / `lon` array at construction instead of the byte
-/// count scan below - a second decode of the bulk of every file, on every
-/// read - to reject only the narrowest slice of nonsense. Nor can a bound
-/// come from the header alone: modular deltas let an accumulated value be any
-/// `i64`, so every header except granularity 0, or granularity 1 with a
-/// zero offset, admits some overflowing coordinate.
-/// Paths that turn coordinates into output they vouch for do their own
-/// exact scaling and checked `i32` narrowing during the decode they already
+/// is modular. Timestamp scaling (`raw * date_granularity`) also wraps in
+/// `milli_timestamp` and kin, so debug and release agree and nothing panics.
+/// Coordinate scaling does not wrap: `offset + granularity * raw` is
+/// computed exactly by the coordinate accessors of `Node`, `DenseNode` and
+/// `WayNodeLocation`, which refuse (`nano_lat`, `decimicro_lat` and kin
+/// return `Result`) a value their type cannot hold, at the access, so a
+/// consumer that never reads a coordinate never pays for the check.
+/// Refusing at construction instead would mean decoding every `lat` / `lon`
+/// array here rather than the byte count scan below - a second decode of
+/// the bulk of every file, on every read. Nor can a bound come from the
+/// header alone: modular deltas let an accumulated value be any `i64`, so
+/// every header except granularity 0, or granularity 1 with a zero offset,
+/// admits some overflowing coordinate. In-range but meaningless values (a
+/// latitude of 10^6 degrees) are returned as stored, as every reader
+/// returns them.
+/// Paths that decode coordinates without the accessors do the same exact
+/// scaling and checked `i32` narrowing during the decode they already
 /// perform: the node scanner in `scan/node.rs` (altw, apply-changes
 /// `--locations-on-ways`, sorted extract simple), the apply-changes way
-/// refresh in `refresh.rs`, every other extract route through the checked
-/// accessors (`decimicro_lat_checked`) and the checked columnar decode
-/// (`decode_dense_columns`). They read granularity as this decoder does
+/// refresh in `refresh.rs` and the checked columnar decode
+/// (`decode_dense_columns`). `inspect --nodes` alone keeps the wrapping
+/// conversion, as a report of what the old walk read. They read granularity as this decoder does
 /// (any `int32`). The geographic domain is judged where a node coordinate is
 /// joined into an output way (the altw stores and the apply-changes
 /// kept-node sink), on the joined nodes, and by the geocode builder on every
@@ -2400,14 +2399,15 @@ mod strict_validation_tests {
     }
 
     /// The checked readers - the columnar decode (extract smart, complete,
-    /// multi-extract), the checked element accessors (every other extract
-    /// route) and the node scanner (extract simple,
+    /// multi-extract), the element accessors (every re-encoder and the other
+    /// extract routes) and the node scanner (extract simple,
     /// altw, apply-changes -l) - accept and refuse the same coordinates and
-    /// agree with the permissive accessor wherever they accept. That holds on
+    /// agree with the wrapping conversion `inspect --nodes` keeps wherever
+    /// they accept. That holds on
     /// the cancelling encoding, whose product overflows `i64` while the
     /// offset brings it back to 100 nanodegrees. On a block whose true
-    /// nanodegree value is past `i64` all three refuse, while the permissive
-    /// accessor still answers with its documented wrapped value.
+    /// nanodegree value is past `i64` all three refuse, while the wrapping
+    /// conversion still answers with its wrapped value.
     #[test]
     fn columnar_accessors_and_scanner_agree_on_coordinates() {
         let cases: [(i32, i64, i64); 6] = [
@@ -2431,7 +2431,9 @@ mod strict_validation_tests {
             let (checked, permissive): (Vec<Option<i32>>, Vec<i32>) = block
                 .elements()
                 .filter_map(|e| match e {
-                    Element::DenseNode(n) => Some((n.decimicro_lat_checked(), n.decimicro_lat())),
+                    Element::DenseNode(n) => {
+                        Some((n.decimicro_lat().ok(), n.decimicro_lat_wrapping()))
+                    }
                     _ => None,
                 })
                 .unzip();
@@ -3470,11 +3472,12 @@ mod strict_validation_tests {
     }
 
     #[test]
-    fn coordinate_scaling_overflow_wraps_instead_of_panicking() {
+    fn coordinate_scaling_overflow_is_refused_at_the_accessor() {
         // Each encoding carries raw latitude 1. With default granularity 100
         // and lat_offset i64::MAX the scaled value runs past i64; the block
-        // still constructs (values are not validated, by policy) and every
-        // accessor wraps, so debug and release agree.
+        // still constructs (values are not validated there, by policy), the
+        // checked accessors of all three coordinate carriers refuse, and the
+        // exact and wrapping forms answer without panicking.
         let mut dense = len_field(1, &[2]);
         dense.extend(len_field(8, &[2]));
         dense.extend(len_field(9, &[0]));
@@ -3497,18 +3500,35 @@ mod strict_validation_tests {
                 .expect("coordinate values are not validated at construction");
             let wrapped = i64::MAX.wrapping_add(100);
             let mut seen = 0;
+            let exact = i128::from(i64::MAX) + 100;
             for element in block.elements() {
-                let nano_lat = match element {
-                    super::Element::Node(node) => node.nano_lat(),
-                    super::Element::DenseNode(node) => node.nano_lat(),
-                    super::Element::Way(way) => way
-                        .node_locations()
-                        .next()
-                        .expect("one way location")
-                        .nano_lat(),
+                let (checked, e7, exact_lat, wrapping) = match element {
+                    super::Element::Node(node) => (
+                        node.nano_lat().is_err(),
+                        node.decimicro_lat().is_err(),
+                        node.nano_lat_exact(),
+                        node.nano_lat_wrapping(),
+                    ),
+                    super::Element::DenseNode(node) => (
+                        node.nano_lat().is_err(),
+                        node.decimicro_lat().is_err(),
+                        node.nano_lat_exact(),
+                        node.nano_lat_wrapping(),
+                    ),
+                    super::Element::Way(way) => {
+                        let loc = way.node_locations().next().expect("one way location");
+                        (
+                            loc.nano_lat().is_err(),
+                            loc.decimicro_lat().is_err(),
+                            loc.nano_lat_exact(),
+                            loc.nano_lat_wrapping(),
+                        )
+                    }
                     super::Element::Relation(_) => continue,
                 };
-                assert_eq!(nano_lat, wrapped);
+                assert!(checked && e7, "the checked accessors refuse");
+                assert_eq!(exact_lat, exact);
+                assert_eq!(wrapping, wrapped);
                 seen += 1;
             }
             assert_eq!(seen, 1);

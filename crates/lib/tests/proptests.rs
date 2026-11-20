@@ -368,7 +368,10 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                     Element::DenseNode(node) => {
                         counts[0] += 1;
                         assert_eq!(
-                            (node.decimicro_lat(), node.decimicro_lon()),
+                            (
+                                node.decimicro_lat().expect("representable coordinate"),
+                                node.decimicro_lon().expect("representable coordinate")
+                            ),
                             (case.lat, case.lon)
                         );
                         let meta = node.info().map(|i| {
@@ -386,7 +389,10 @@ fn assert_roundtrip(cases: &[CodecCase], bytes: &[u8]) {
                     Element::Node(node) => {
                         counts[0] += 1;
                         assert_eq!(
-                            (node.decimicro_lat(), node.decimicro_lon()),
+                            (
+                                node.decimicro_lat().expect("representable coordinate"),
+                                node.decimicro_lon().expect("representable coordinate")
+                            ),
                             (case.lat, case.lon)
                         );
                         (node.id(), checked(node.tags()), info_meta(&node.info()))

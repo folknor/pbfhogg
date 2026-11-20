@@ -952,13 +952,13 @@ fn write_node_details_borrowed(
     new: &Element<'_>,
 ) -> Result<()> {
     let (o_lat, o_lon) = match old {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
+        Element::DenseNode(dn) => (dn.decimicro_lat()?, dn.decimicro_lon()?),
+        Element::Node(n) => (n.decimicro_lat()?, n.decimicro_lon()?),
         _ => return Ok(()),
     };
     let (n_lat, n_lon) = match new {
-        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
+        Element::DenseNode(dn) => (dn.decimicro_lat()?, dn.decimicro_lon()?),
+        Element::Node(n) => (n.decimicro_lat()?, n.decimicro_lon()?),
         _ => return Ok(()),
     };
     if o_lat != n_lat || o_lon != n_lon {
@@ -1005,8 +1005,8 @@ fn write_way_location_details(
 ) -> Result<()> {
     let old_refs: Vec<i64> = old.refs().collect();
     let new_refs: Vec<i64> = new.refs().collect();
-    let old_locs: Vec<(i64, i64)> = crate::content::way_locations(old).collect();
-    let new_locs: Vec<(i64, i64)> = crate::content::way_locations(new).collect();
+    let old_locs: Vec<(i64, i64)> = crate::content::way_locations(old).collect::<Result<_>>()?;
+    let new_locs: Vec<(i64, i64)> = crate::content::way_locations(new).collect::<Result<_>>()?;
     let positions = old_refs
         .len()
         .max(new_refs.len())

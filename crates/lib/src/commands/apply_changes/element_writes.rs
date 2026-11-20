@@ -93,8 +93,8 @@ pub(super) fn write_base_dense_node_local<O: BlockSink + ?Sized>(
     // cast is the identity.
     bb.add_node_raw(
         dn.id(),
-        dn.decimicro_lat(),
-        dn.decimicro_lon(),
+        dn.decimicro_lat()?,
+        dn.decimicro_lon()?,
         dn.raw_tags()
             .map(|(k, v)| (k.cast_unsigned(), v.cast_unsigned())),
         meta.as_ref(),
@@ -107,13 +107,10 @@ pub(super) fn write_base_node_local<O: BlockSink + ?Sized>(
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
 ) -> Result<()> {
-    // Preserve the block API's documented wrapping coordinate scaling and
-    // narrowing, just as write_base_dense_node_local does. This rewrite
-    // helper is not a coordinate validator. Under --locations-on-ways the
-    // worker's node_coords extractor checks scaling before rewriting a blob
-    // routed as Node; outside that mode base-node rewrites retain the block
-    // API policy. Adding checked scaling here alone would make plain nodes
-    // differ from dense nodes and would not validate passthrough blobs.
+    // The coordinate accessors scale exactly and refuse a value that does
+    // not fit an i32 decimicrodegree, as write_base_dense_node_local does: a
+    // re-encoded base node is never written at a wrapped position. A blob
+    // spliced through untouched is not decoded and so not judged here.
     ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
@@ -124,8 +121,8 @@ pub(super) fn write_base_node_local<O: BlockSink + ?Sized>(
     let meta = element_raw_partial_metadata(&node.info());
     bb.add_node_raw_partial(
         node.id(),
-        node.decimicro_lat(),
-        node.decimicro_lon(),
+        node.decimicro_lat()?,
+        node.decimicro_lon()?,
         node.raw_tags(),
         meta.as_ref(),
     )

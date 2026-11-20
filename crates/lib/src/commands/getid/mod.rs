@@ -1726,8 +1726,8 @@ fn process_block(
                 let meta = dense_node_metadata(dn)?;
                 bb.add_node_dense(
                     dn.id(),
-                    dn.decimicro_lat(),
-                    dn.decimicro_lon(),
+                    dn.decimicro_lat()?,
+                    dn.decimicro_lon()?,
                     dn.tags().take(keep_tags),
                     meta.as_ref(),
                 );
@@ -1738,8 +1738,8 @@ fn process_block(
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 bb.add_node_partial(
                     n.id(),
-                    n.decimicro_lat(),
-                    n.decimicro_lon(),
+                    n.decimicro_lat()?,
+                    n.decimicro_lon()?,
                     n.tags().take(keep_tags),
                     meta.as_ref(),
                 );

@@ -79,8 +79,8 @@ fn classify_block_simple(
             (ClassifyPhase::Nodes, Element::DenseNode(dn))
                 if region.contains_node(
                     exact_bbox,
-                    dn.decimicro_lat_checked(),
-                    dn.decimicro_lon_checked(),
+                    dn.decimicro_lat().ok(),
+                    dn.decimicro_lon().ok(),
                 )? =>
             {
                 bbox_node_ids.insert(dn.id());
@@ -88,8 +88,8 @@ fn classify_block_simple(
             (ClassifyPhase::Nodes, Element::Node(n))
                 if region.contains_node(
                     exact_bbox,
-                    n.decimicro_lat_checked(),
-                    n.decimicro_lon_checked(),
+                    n.decimicro_lat().ok(),
+                    n.decimicro_lon().ok(),
                 )? =>
             {
                 bbox_node_ids.insert(n.id());

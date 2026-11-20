@@ -272,31 +272,29 @@ reader.for_each(|element| {
 
 ### Coordinate methods
 
-Both `Node` and `DenseNode` provide:
+`Node`, `DenseNode` and the `WayNodeLocation` items of
+`Way::node_locations()` provide:
 
 | Method | Return type | Description |
 |--------|-------------|-------------|
-| `lat()` | `f64` | Latitude in degrees |
-| `lon()` | `f64` | Longitude in degrees |
-| `decimicro_lat()` | `i32` | Latitude in decimicrodegrees (10^-7) |
-| `decimicro_lon()` | `i32` | Longitude in decimicrodegrees (10^-7) |
-| `nano_lat()` | `i64` | Latitude in nanodegrees (10^-9) |
-| `nano_lon()` | `i64` | Longitude in nanodegrees (10^-9) |
-| `decimicro_lat_checked()` | `Option<i32>` | Exact latitude in decimicrodegrees, `None` if it does not fit `i32` |
-| `decimicro_lon_checked()` | `Option<i32>` | Exact longitude in decimicrodegrees, `None` if it does not fit `i32` |
-| `nano_lat_exact()` | `i128` | Exact latitude in nanodegrees, never wraps |
-| `nano_lon_exact()` | `i128` | Exact longitude in nanodegrees, never wraps |
+| `lat()` | `f64` | Latitude in degrees, from the exact value |
+| `lon()` | `f64` | Longitude in degrees, from the exact value |
+| `decimicro_lat()` | `Result<i32>` | Latitude in decimicrodegrees (10^-7), truncated toward zero; an error if it does not fit `i32` |
+| `decimicro_lon()` | `Result<i32>` | Longitude in decimicrodegrees (10^-7); an error if it does not fit `i32` |
+| `nano_lat()` | `Result<i64>` | Latitude in nanodegrees (10^-9); an error if it does not fit `i64` |
+| `nano_lon()` | `Result<i64>` | Longitude in nanodegrees (10^-9); an error if it does not fit `i64` |
+| `nano_lat_exact()` | `i128` | Exact latitude in nanodegrees, never fails |
+| `nano_lon_exact()` | `i128` | Exact longitude in nanodegrees, never fails |
 
-Coordinates are read as stored, not validated. In `lat()`, `lon()`,
-`nano_lat()`, `nano_lon()`, `decimicro_lat()` and `decimicro_lon()`,
-scaling by the block's granularity and offsets wraps on `i64` overflow, and
-the two decimicrodegree accessors narrow to `i32` without a range check, so a corrupt block yields
-wrong coordinates rather than an error or a panic. `milli_timestamp()`
-wraps the same way. If your input is untrusted, use the checked and exact
-accessors: they agree with the plain ones wherever the value is
-representable, and say so when it is not. None of them checks the
-geographic domain; judge `nano_lat_exact()` / `nano_lon_exact()` against
-+-90 and +-180 degrees for that.
+The stored value (for dense nodes and way locations, the delta sum, which
+wraps modulo 2^64 as in every reader) is scaled by the block's granularity
+and offsets exactly. A result the return type cannot hold is an error, never
+a wrapped value somewhere else on Earth; the `lat()` / `lon()` degrees never
+wrap and never fail. The check is made at the accessor, so code that never
+reads a coordinate never pays for it. `milli_timestamp()` still wraps on
+overflow; `milli_timestamp_exact()` does not. None of the coordinate
+accessors checks the geographic domain; judge `nano_lat_exact()` /
+`nano_lon_exact()` against +-90 and +-180 degrees for that.
 
 ### Way methods
 

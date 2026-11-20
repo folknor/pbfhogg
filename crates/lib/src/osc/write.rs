@@ -528,17 +528,20 @@ fn check_timestamp_scaling(exact: Option<i128>, kind: ElementKind, id: i64) -> c
 
 /// The decimicrodegree coordinates a derived node is printed at, checked
 /// against what the OSC reader accepts. The exact accessors refuse a value
-/// the permissive ones would wrap into some other place (the node scanner's
-/// refusal, shared with extract). The geographic check is `coord_pack`'s on
+/// a wrapping conversion would put in some other place (the node scanner's
+/// refusal, shared with extract); the error gains the node's id. The
+/// geographic check is `coord_pack`'s on
 /// the very `i32` pair printed: `format_coord(from_decimicro(v))` reads back
 /// as `v` across the whole domain, and the first step past +-90 / +-180
 /// prints past it, so the reader refuses exactly what this refuses.
-fn osc_node_coords(lat: Option<i32>, lon: Option<i32>, id: i64) -> crate::Result<(i32, i32)> {
-    let (Some(lat), Some(lon)) = (lat, lon) else {
-        return Err(
-            crate::scan::node::unrepresentable_coordinate_err().context(format!("node {id}"))
-        );
-    };
+fn osc_node_coords(
+    lat: crate::Result<i32>,
+    lon: crate::Result<i32>,
+    id: i64,
+) -> crate::Result<(i32, i32)> {
+    let (lat, lon) = lat
+        .and_then(|lat| Ok((lat, lon?)))
+        .map_err(|e| e.context(format!("node {id}")))?;
     if !crate::coord_pack::in_domain(lat, lon) {
         return Err(crate::Error::invalid_data(format!(
             "node {id} lies outside the geographic domain (lat {}, lon {}); OSC readers, \
@@ -582,11 +585,7 @@ fn write_dense_node_xml<W: std::io::Write>(
 ) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
-    let (lat, lon) = osc_node_coords(
-        node.decimicro_lat_checked(),
-        node.decimicro_lon_checked(),
-        node.id(),
-    )?;
+    let (lat, lon) = osc_node_coords(node.decimicro_lat(), node.decimicro_lon(), node.id())?;
     format_coord(coord_buf, from_decimicro(lat));
     let lat_str = coord_buf.clone();
     format_coord(coord_buf, from_decimicro(lon));
@@ -640,11 +639,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
 ) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
-    let (lat, lon) = osc_node_coords(
-        node.decimicro_lat_checked(),
-        node.decimicro_lon_checked(),
-        node.id(),
-    )?;
+    let (lat, lon) = osc_node_coords(node.decimicro_lat(), node.decimicro_lon(), node.id())?;
     format_coord(coord_buf, from_decimicro(lat));
     let lat_str = coord_buf.clone();
     format_coord(coord_buf, from_decimicro(lon));

@@ -438,8 +438,8 @@ fn filter_block_parallel(
                     let meta = dense_node_metadata(dn)?;
                     bb.add_node_dense(
                         dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
+                        dn.decimicro_lat()?,
+                        dn.decimicro_lon()?,
                         tags_buf.iter().copied(),
                         meta.as_ref(),
                     );
@@ -454,8 +454,8 @@ fn filter_block_parallel(
                     let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node_partial(
                         n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
+                        n.decimicro_lat()?,
+                        n.decimicro_lon()?,
                         tags_buf.iter().copied(),
                         meta.as_ref(),
                     );
@@ -625,8 +625,8 @@ fn filter_block_pass2(
                     let meta = dense_node_metadata(dn)?;
                     bb.add_node_dense(
                         dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
+                        dn.decimicro_lat()?,
+                        dn.decimicro_lon()?,
                         tags_buf.iter().copied(),
                         meta.as_ref(),
                     );
@@ -652,8 +652,8 @@ fn filter_block_pass2(
                     let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node_partial(
                         n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
+                        n.decimicro_lat()?,
+                        n.decimicro_lon()?,
                         tags_buf.iter().copied(),
                         meta.as_ref(),
                     );

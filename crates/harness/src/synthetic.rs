@@ -269,7 +269,13 @@ fn encode_elements<W: Write>(
                     {
                         out.write_primitive_block(bytes)?;
                     }
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), None);
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat()?,
+                        n.decimicro_lon()?,
+                        n.tags(),
+                        None,
+                    );
                 }
                 Element::Node(n) => {
                     if !bb.can_add_node()
@@ -277,7 +283,13 @@ fn encode_elements<W: Write>(
                     {
                         out.write_primitive_block(bytes)?;
                     }
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), None);
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat()?,
+                        n.decimicro_lon()?,
+                        n.tags(),
+                        None,
+                    );
                 }
                 Element::Way(w) => {
                     if !bb.can_add_way()
@@ -464,8 +476,8 @@ mod tests {
                     seen.node_metadata |= n.info().is_some();
                     out.push(Kept::Node(
                         n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
+                        n.decimicro_lat().expect("representable coordinate"),
+                        n.decimicro_lon().expect("representable coordinate"),
                         tags(&mut n.tags()),
                     ));
                 }
@@ -473,8 +485,8 @@ mod tests {
                     seen.node_metadata |= n.info().version().is_some();
                     out.push(Kept::Node(
                         n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
+                        n.decimicro_lat().expect("representable coordinate"),
+                        n.decimicro_lon().expect("representable coordinate"),
                         tags(&mut n.tags()),
                     ));
                 }

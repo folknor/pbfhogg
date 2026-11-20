@@ -656,11 +656,13 @@ pub(super) fn update_extended_for_element(
     ext.metadata.total += 1;
     match *element {
         Element::DenseNode(ref dn) => {
-            ext.data_bbox.update(dn.nano_lat(), dn.nano_lon());
+            ext.data_bbox
+                .update(dn.nano_lat_wrapping(), dn.nano_lon_wrapping());
             update_extended_dense_node(ext, dn, users);
         }
         Element::Node(ref n) => {
-            ext.data_bbox.update(n.nano_lat(), n.nano_lon());
+            ext.data_bbox
+                .update(n.nano_lat_wrapping(), n.nano_lon_wrapping());
             update_extended_info(ext, &n.info(), users);
         }
         Element::Way(ref w) => update_extended_info(ext, &w.info(), users),

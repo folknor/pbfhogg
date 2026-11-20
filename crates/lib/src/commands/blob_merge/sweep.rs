@@ -466,8 +466,8 @@ impl Output<'_> {
                     let meta = dense_node_metadata(dn)?;
                     self.bb.add_node_dense(
                         dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
+                        dn.decimicro_lat()?,
+                        dn.decimicro_lon()?,
                         dn.tags(),
                         meta.as_ref(),
                     );
@@ -477,8 +477,8 @@ impl Output<'_> {
                     let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     self.bb.add_node_partial(
                         n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
+                        n.decimicro_lat()?,
+                        n.decimicro_lon()?,
                         n.tags(),
                         meta.as_ref(),
                     );

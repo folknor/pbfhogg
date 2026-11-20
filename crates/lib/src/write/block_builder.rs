@@ -2672,8 +2672,8 @@ mod tests {
             let meta = crate::owned::element_raw_partial_metadata(&n.info());
             bb.add_node_raw_partial(
                 n.id(),
-                n.decimicro_lat(),
-                n.decimicro_lon(),
+                n.decimicro_lat()?,
+                n.decimicro_lon()?,
                 n.raw_tags(),
                 meta.as_ref(),
             )?;
@@ -2705,7 +2705,7 @@ mod tests {
             } else {
                 ((30, 40), vec![])
             };
-            assert_eq!((n.decimicro_lat(), n.decimicro_lon()), coords);
+            assert_eq!((n.decimicro_lat()?, n.decimicro_lon()?), coords);
             assert_eq!(n.tags().collect::<Vec<_>>(), tags);
         }
         Ok(())
@@ -2813,7 +2813,7 @@ mod tests {
                         };
                         assert_eq!(n.info().expect("info").columns(), columns, "{meta:?}");
                         assert_eq!(n.tags().collect::<Vec<_>>(), [("k", "v")]);
-                        assert_eq!((n.decimicro_lat(), n.decimicro_lon()), (10, 20));
+                        assert_eq!((n.decimicro_lat()?, n.decimicro_lon()?), (10, 20));
                     }
                     assert!(smaller, "{meta:?}");
                     // A dense re-encode keeps the columns and the claims.

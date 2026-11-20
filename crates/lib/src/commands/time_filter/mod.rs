@@ -544,8 +544,8 @@ fn filter_block_snapshot(
                 let meta = dense_node_metadata(dn)?;
                 bb.add_node_dense(
                     dn.id(),
-                    dn.decimicro_lat(),
-                    dn.decimicro_lon(),
+                    dn.decimicro_lat()?,
+                    dn.decimicro_lon()?,
                     tags_buf.iter().copied(),
                     meta.as_ref(),
                 );
@@ -568,8 +568,8 @@ fn filter_block_snapshot(
                 let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 bb.add_node_partial(
                     n.id(),
-                    n.decimicro_lat(),
-                    n.decimicro_lon(),
+                    n.decimicro_lat()?,
+                    n.decimicro_lon()?,
                     tags_buf.iter().copied(),
                     meta.as_ref(),
                 );

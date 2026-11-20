@@ -617,16 +617,21 @@ OSC tags-filter. There are no command-specific replacement counters.
 ## Coordinate domain checks
 
 The general PBF readers and dense-node iterators expose coordinates without
-checking geographic ranges; their `decimicro_lat` / `decimicro_lon` wrap
-modulo 2^64 and narrow with `as i32`. The node scanner, the checked accessors
-(`decimicro_lat_checked` / `decimicro_lon_checked`) and the columnar decode
-check only the i32 representation, exactly: a coordinate whose exact
-decimicrodegree value does not fit `i32` is refused, never wrapped. Every
-extract strategy classifies and writes nodes through these checked
-conversions, so no strategy places a node at a wrapped coordinate another
-refuses. Bbox parsing, location joins, `check --locations` and the geocode
-builder have separate domain checks. This is a deliberate boundary, not a
-promise that reading a node validates its geographic position.
+checking geographic ranges. Their coordinate accessors (`decimicro_lat`,
+`nano_lat` and kin on `Node`, `DenseNode` and inline way locations), the
+node scanner and the columnar decode check only the representation,
+exactly: a coordinate whose exact value does not fit the accessor's type
+(`i32` decimicrodegrees, `i64` nanodegrees) is an error, never wrapped.
+Every command that writes, compares or digests a decoded node goes through
+these checked conversions (extract, cat, repack, sort and `cat --dedupe`,
+degrade, tags-filter, time-filter, getid, getparents, apply-changes,
+add-locations-to-ways, diff, digest and derived OSC), so none places or
+compares a node at a wrapped coordinate. A blob copied without decoding is
+not judged. `inspect --nodes` and its extended bbox alone keep the wrapping
+conversion, as a report of what the stored values wrap to. Bbox parsing,
+location joins, `check --locations` and the geocode builder have separate
+domain checks. This is a deliberate boundary, not a promise that reading a
+node validates its geographic position.
 
 The geocode builder admits every node by the rule `check --locations` uses:
 the exact nanodegree value, before truncation, within +-90 latitude and

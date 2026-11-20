@@ -132,8 +132,8 @@ fn roundtrip_dense_nodes_with_metadata() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 1001);
-            assert_eq!(dn.decimicro_lat(), 556_789_000);
-            assert_eq!(dn.decimicro_lon(), 126_543_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), 556_789_000);
+            assert_eq!(dn.decimicro_lon().unwrap(), 126_543_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags.len(), 2);
             assert_eq!(tags[0], ("name", "TestNode"));
@@ -150,8 +150,8 @@ fn roundtrip_dense_nodes_with_metadata() {
     match &elements[1] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 2002);
-            assert_eq!(dn.decimicro_lat(), 570_000_000);
-            assert_eq!(dn.decimicro_lon(), 100_000_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), 570_000_000);
+            assert_eq!(dn.decimicro_lon().unwrap(), 100_000_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags.len(), 0);
             let info = dn.info().unwrap();
@@ -165,8 +165,8 @@ fn roundtrip_dense_nodes_with_metadata() {
     match &elements[2] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 3003);
-            assert_eq!(dn.decimicro_lat(), -335_000_000);
-            assert_eq!(dn.decimicro_lon(), -580_000_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), -335_000_000);
+            assert_eq!(dn.decimicro_lon().unwrap(), -580_000_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags.len(), 1);
             assert_eq!(tags[0], ("natural", "tree"));
@@ -215,8 +215,8 @@ fn roundtrip_dense_nodes_no_metadata() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 1);
-            assert_eq!(dn.decimicro_lat(), 100_000_000);
-            assert_eq!(dn.decimicro_lon(), 200_000_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), 100_000_000);
+            assert_eq!(dn.decimicro_lon().unwrap(), 200_000_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags[0], ("k", "v"));
         }
@@ -226,8 +226,8 @@ fn roundtrip_dense_nodes_no_metadata() {
     match &elements[1] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 2);
-            assert_eq!(dn.decimicro_lat(), -100_000_000);
-            assert_eq!(dn.decimicro_lon(), -200_000_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), -100_000_000);
+            assert_eq!(dn.decimicro_lon().unwrap(), -200_000_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags.len(), 0);
         }
@@ -535,7 +535,7 @@ fn roundtrip_way_with_locations() {
             assert_eq!(refs, vec![1, 2, 3]);
             let locs: Vec<(i32, i32)> = w
                 .node_locations()
-                .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                .map(|loc| (loc.decimicro_lat().unwrap(), loc.decimicro_lon().unwrap()))
                 .collect();
             assert_eq!(
                 locs,
@@ -579,8 +579,8 @@ fn roundtrip_uncompressed() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 42);
-            assert_eq!(dn.decimicro_lat(), 123_456_789);
-            assert_eq!(dn.decimicro_lon(), -987_654_321);
+            assert_eq!(dn.decimicro_lat().unwrap(), 123_456_789);
+            assert_eq!(dn.decimicro_lon().unwrap(), -987_654_321);
         }
         _ => panic!("expected DenseNode"),
     }
@@ -657,7 +657,7 @@ fn roundtrip_direct_io() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 1);
-            assert_eq!(dn.decimicro_lat(), 100_000_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), 100_000_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags[0], ("k", "v"));
         }
@@ -855,8 +855,8 @@ fn roundtrip_uring_tiny_output() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 42);
-            assert_eq!(dn.decimicro_lat(), 123_456_789);
-            assert_eq!(dn.decimicro_lon(), -987_654_321);
+            assert_eq!(dn.decimicro_lat().unwrap(), 123_456_789);
+            assert_eq!(dn.decimicro_lon().unwrap(), -987_654_321);
         }
         _ => panic!("expected DenseNode"),
     }
@@ -984,7 +984,7 @@ fn roundtrip_zstd() {
     match &elements[0] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 100);
-            assert_eq!(dn.decimicro_lat(), 556_789_000);
+            assert_eq!(dn.decimicro_lat().unwrap(), 556_789_000);
             let tags: Vec<_> = dn.tags().collect();
             assert_eq!(tags, vec![("name", "ZstdNode")]);
         }

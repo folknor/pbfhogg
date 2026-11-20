@@ -455,13 +455,13 @@ pub(super) fn try_extract_multi_single_pass(
                     let (id, lat, lon) = match &element {
                         Element::DenseNode(node) => (
                             node.id(),
-                            node.decimicro_lat_checked(),
-                            node.decimicro_lon_checked(),
+                            node.decimicro_lat().ok(),
+                            node.decimicro_lon().ok(),
                         ),
                         Element::Node(node) => (
                             node.id(),
-                            node.decimicro_lat_checked(),
-                            node.decimicro_lon_checked(),
+                            node.decimicro_lat().ok(),
+                            node.decimicro_lon().ok(),
                         ),
                         _ => continue,
                     };

@@ -46,6 +46,21 @@
   used to refuse it.
   add-locations-to-ways also no longer drops an empty string table from
   its output, which had made that output unreadable to a second run.
+- **A node coordinate the PBF framing puts outside the representable range
+  is refused, not wrapped.** cat, repack, sort, `cat --dedupe`, degrade,
+  tags-filter, time-filter, getid, getparents, apply-changes and
+  add-locations-to-ways now fail (exit 2) on a decoded node whose
+  granularity, offset and raw value scale past an `i32` decimicrodegree,
+  and on an inline way location they re-encode that does so. Before, a
+  block with `lat_offset` 429496729600 wrote its node at latitude 0.
+  diff and digest refuse such a compared node instead of matching it
+  against one at the wrapped position; export prints the true value.
+  Blobs copied without decoding are not judged. Library: on `Node`,
+  `DenseNode` and `WayNodeLocation`, `decimicro_lat()` / `decimicro_lon()`
+  now return `Result<i32>` and `nano_lat()` / `nano_lon()` `Result<i64>`,
+  scaled exactly; `lat()` / `lon()` never wrap; `decimicro_lat_checked()`
+  and `decimicro_lon_checked()` are removed (use `.ok()`);
+  `WayNodeLocation` no longer implements `PartialEq`.
 - `diff --format osc --increment-version` exits 2 without publishing an
   OSC if a deleted element is already at version 2147483647.
 

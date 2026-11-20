@@ -3238,3 +3238,104 @@ fn repair_refuses_what_the_merge_cannot_make_valid() {
         );
     }
 }
+
+/// A sorted one-node input (node 1, raw lat and lon 0) whose block carries
+/// `lat_offset`. 429_496_729_600 puts the node at 429.4967296 degrees,
+/// 4_294_967_296 decimicrodegrees, which a wrapping `as i32` narrows to 0;
+/// 0 is the in-range control at (0, 0). `plain` writes a plain Node message
+/// instead of a dense group.
+fn write_offset_node_pbf(path: &Path, plain: bool, lat_offset: u64) {
+    use pbfhogg::block_builder::HeaderBuilder;
+    use pbfhogg::writer::{Compression, PbfWriter};
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push(u8::try_from(v & 0x7f).unwrap() | 0x80);
+            v >>= 7;
+        }
+        out.push(u8::try_from(v).unwrap());
+    }
+    let group: Vec<u8> = if plain {
+        vec![10, 6, 8, 2, 64, 0, 72, 0]
+    } else {
+        vec![18, 9, 10, 1, 2, 66, 1, 0, 74, 1, 0]
+    };
+    let mut block = vec![10, 2, 10, 0, 18];
+    varint(u64::try_from(group.len()).unwrap(), &mut block);
+    block.extend_from_slice(&group);
+    varint(19 << 3, &mut block);
+    varint(lat_offset, &mut block);
+    let mut writer = PbfWriter::new(std::fs::File::create(path).unwrap(), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().sorted().build().unwrap())
+        .unwrap();
+    writer.write_primitive_block(&block).unwrap();
+    writer.flush().unwrap();
+}
+
+/// Re-encoding and comparing commands refuse a node whose coordinate does
+/// not fit an `i32` decimicrodegree instead of writing or comparing it at
+/// the wrapped (0, 0): cat's clean re-encode and getid write nothing, and
+/// diff against the control at (0, 0) and the content digest refuse rather
+/// than call the two files identical. The control passes every command.
+#[test]
+fn reencoders_and_comparisons_refuse_an_unrepresentable_coordinate() {
+    const REFUSAL: &str = "node coordinate does not fit in an i32 decimicrodegree";
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    for plain in [false, true] {
+        let control = dir.path().join(format!("control-{plain}.osm.pbf"));
+        write_offset_node_pbf(&control, plain, 0);
+        let corrupt = dir.path().join(format!("corrupt-{plain}.osm.pbf"));
+        write_offset_node_pbf(&corrupt, plain, 429_496_729_600);
+        for (input, refused) in [(&control, false), (&corrupt, true)] {
+            let case = format!("plain {plain} refused {refused}");
+            let out = dir.path().join(format!("cat-{plain}-{refused}.osm.pbf"));
+            let cat = CliInvoker::new(&invocation_scratch)
+                .arg("cat")
+                .arg(input)
+                .arg("-o")
+                .arg(&out)
+                .arg("--clean")
+                .arg("version");
+            let got = dir.path().join(format!("getid-{plain}-{refused}.osm.pbf"));
+            let getid = CliInvoker::new(&invocation_scratch)
+                .arg("getid")
+                .arg(input)
+                .arg("n1")
+                .arg("-o")
+                .arg(&got);
+            let digest = CliInvoker::new(&invocation_scratch)
+                .arg("digest")
+                .arg("--form")
+                .arg("content")
+                .arg(input);
+            if refused {
+                cat.assert_failure().assert_stderr_contains(REFUSAL);
+                assert!(!out.exists(), "cat publishes nothing, {case}");
+                getid.assert_failure().assert_stderr_contains(REFUSAL);
+                assert!(!got.exists(), "getid publishes nothing, {case}");
+                digest.assert_failure().assert_stderr_contains(REFUSAL);
+            } else {
+                let nodes = |p: &Path| -> Vec<(i64, i32, i32)> {
+                    read_all_elements_with_coords(p)
+                        .nodes
+                        .iter()
+                        .map(|(id, lat, lon, _)| (*id, *lat, *lon))
+                        .collect()
+                };
+                cat.assert_success();
+                assert_eq!(nodes(&out), vec![(1, 0, 0)], "{case}");
+                getid.assert_success();
+                assert_eq!(nodes(&got), vec![(1, 0, 0)], "{case}");
+                digest.assert_success();
+            }
+        }
+        CliInvoker::new(&invocation_scratch)
+            .arg("diff")
+            .arg("-c")
+            .arg(&control)
+            .arg(&corrupt)
+            .assert_failure()
+            .assert_stderr_contains(REFUSAL);
+    }
+}

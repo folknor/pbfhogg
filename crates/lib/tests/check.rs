@@ -1420,3 +1420,85 @@ fn check_ids_type_order_is_reported_first_and_counted_past_the_limit() {
         }
     }
 }
+
+/// A header-only PBF whose HeaderBlock requires `feature` beside the schema.
+fn write_header_requiring(path: &std::path::Path, feature: &str) {
+    let mut header_block = vec![0x22, 14];
+    header_block.extend_from_slice(b"OsmSchema-V0.6");
+    header_block.push(0x22);
+    header_block.push(u8::try_from(feature.len()).expect("short"));
+    header_block.extend_from_slice(feature.as_bytes());
+    // Blob { raw = header_block }.
+    let mut blob = vec![0x0a, u8::try_from(header_block.len()).expect("short")];
+    blob.extend_from_slice(&header_block);
+    // BlobHeader { type = "OSMHeader", datasize }.
+    let mut blob_header = vec![0x0a, 9];
+    blob_header.extend_from_slice(b"OSMHeader");
+    blob_header.extend_from_slice(&[0x18, u8::try_from(blob.len()).expect("short")]);
+    let mut frame = u32::try_from(blob_header.len())
+        .expect("short")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&blob_header);
+    frame.extend_from_slice(&blob);
+    std::fs::write(path, frame).expect("write");
+}
+
+fn is_unsupported(result: Result<(), pbfhogg::Error>, what: &str) {
+    let err = result.err().unwrap_or_else(|| panic!("{what}: admitted"));
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::UnsupportedRequiredFeature(f) if f == "UnsupportedExtension"),
+        "{what}: {err}"
+    );
+}
+
+/// A header requiring a feature pbfhogg does not implement is refused by
+/// every reader: the element reader, the header-walk schedule (which never
+/// needed the header otherwise), the index verifier and inspect. A
+/// supported requirement still reads.
+#[test]
+fn an_unsupported_required_feature_refuses_every_reader() {
+    let dir = crate::common::test_scratch();
+    let ok = dir.path().join("ok.osm.pbf");
+    write_header_requiring(&ok, "DenseNodes");
+    pbfhogg::ElementReader::from_path(&ok).expect("a supported requirement reads");
+    run_check_refs(&ok, false, None).expect("a supported requirement checks");
+
+    let bad = dir.path().join("bad.osm.pbf");
+    write_header_requiring(&bad, "UnsupportedExtension");
+    is_unsupported(
+        pbfhogg::ElementReader::from_path(&bad).map(drop),
+        "element reader",
+    );
+    is_unsupported(run_check_refs(&bad, false, None).map(drop), "check refs");
+    let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        max_errors: 0,
+        direct_io: false,
+        full: false,
+        type_filter: None,
+    };
+    is_unsupported(
+        pbfhogg::check::verify_ids::verify_ids(&bad, &opts, &crate::common::test_host()).map(drop),
+        "check ids",
+    );
+    let opts = pbfhogg::check::index::CheckIndexOptions {
+        max_errors: 0,
+        direct_io: false,
+    };
+    is_unsupported(
+        pbfhogg::check::index::check_index(&bad, &opts, &crate::common::test_host()).map(drop),
+        "check index",
+    );
+    let opts = pbfhogg::inspect::InspectOptions {
+        show_blocks: false,
+        show_id_ranges: false,
+        show_locations: false,
+        extended: false,
+        distrust_metadata: false,
+        direct_io: false,
+    };
+    is_unsupported(
+        pbfhogg::inspect::inspect(&bad, &opts, &crate::common::test_host()).map(drop),
+        "inspect",
+    );
+}

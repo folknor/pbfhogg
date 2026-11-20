@@ -40,25 +40,6 @@ both satisfy the correctness stance, but keeping the last does not. The
 independent metadata scanner (`blob_meta/scan.rs`) applies the same policy, so
 both ends need fixing.
 
-## FMT-003 - Unknown required features are accepted and can be erased on rewrite
-
-Reported by: read-framing [P1], read-block-decoding [P1], read-pipeline [P1].
-
-Header parsing (`read/block.rs`) collects arbitrary `required_features`
-strings, and `read_header_blob` (`read/reader.rs`) returns the header without
-checking support. None of the three hunters found enforcement later on. A file
-declaring `UnsupportedRequiredFeature` (or `UnsupportedExtension`) is decoded
-normally by sequential, parallel and pipelined element reading. A rewriting
-command can then build a fresh header through `output_header::build`
-(`commands/output_header.rs`) that keeps the recognized history declaration but
-drops the unsupported requirement. This breaks the meaning documented on
-`HeaderBlock::required_features`, which says these are features the parser
-needs to implement to interpret later blocks. It also breaks osmium parity:
-libosmium's `pbf_decoder.hpp` refuses unknown requirements, and no recorded
-deviation allows this. All three hunters agree that keeping the strings for
-inspection is fine. The wrong boundary is admitting the file to semantic
-consumption without checking them.
-
 ## FMT-004 - Repeated header bbox occurrences overwrite instead of merging
 
 Reported by: read-block-decoding [P2].
@@ -335,4 +316,16 @@ written header is semantically correct; the loss is an unknown field the
 verbatim path otherwise preserves. Matching the stripper on the same
 (number, wire type) pairs as the reader would close it, with a test carrying a
 varint timestamp and an opaque length-delimited field 32.
+
+## FMT-028 - inspect --indexed answers without decoding the header
+
+Reported by: FMT-003 resolution (spar lateral, 2026-11-20).
+
+Every header decode now refuses a required feature pbfhogg does not
+implement, and `inspect` refuses such a file in its report modes. The
+standalone `inspect --indexed` probe (the CLI branch calling the indexdata
+probe in `commands/mod.rs`) reads only frame types and the first data
+frame's BlobHeader, so it still answers for such a file. Harmless as a pure
+framing question, but it is the one `inspect` mode with a different
+admission rule; decoding the leading header there would make them one.
 

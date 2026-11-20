@@ -91,6 +91,11 @@ pub(crate) fn new_missing_feature(feature: &'static str) -> Error {
 }
 
 #[cold]
+pub(crate) fn new_unsupported_required_feature(feature: String) -> Error {
+    new_error(ErrorKind::UnsupportedRequiredFeature(feature))
+}
+
+#[cold]
 pub(crate) fn new_missing_indexdata(reason: &str) -> Error {
     new_error(ErrorKind::MissingIndexdata {
         reason: Cow::Owned(reason.to_owned()),
@@ -497,6 +502,7 @@ impl Error {
             | ErrorKind::WireFormat { .. }
             | ErrorKind::MissingHeader
             | ErrorKind::MissingFeature(_)
+            | ErrorKind::UnsupportedRequiredFeature(_)
             | ErrorKind::MissingIndexdata { .. }
             | ErrorKind::Unsorted { .. }
             | ErrorKind::IndexdataMismatch { .. }
@@ -655,6 +661,10 @@ pub enum ErrorKind {
     MissingHeader,
     /// The input header does not declare a feature required by the operation.
     MissingFeature(&'static str),
+    /// The input header declares a required feature pbfhogg does not
+    /// implement, so its blocks cannot be interpreted. Carries the feature
+    /// string as declared.
+    UnsupportedRequiredFeature(String),
     /// The input has no blob-level indexdata and the operation refuses to
     /// run without it. `reason` is a complete sentence saying why it
     /// matters. Whether the caller can grant a slower fallback, and how, is
@@ -1390,6 +1400,9 @@ impl fmt::Display for Message<'_> {
             }
             ErrorKind::MissingHeader => {
                 write!(f, "PBF file does not start with an OsmHeader blob")
+            }
+            ErrorKind::UnsupportedRequiredFeature(ref feature) => {
+                write!(f, "input PBF requires a feature not supported: {feature:?}")
             }
             ErrorKind::Cancelled => {
                 write!(

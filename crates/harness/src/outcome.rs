@@ -15,6 +15,7 @@ fn kind_id(kind: &ErrorKind) -> &'static str {
         ErrorKind::WireFormat { .. } => "wire_format",
         ErrorKind::MissingHeader => "missing_header",
         ErrorKind::MissingFeature(_) => "missing_feature",
+        ErrorKind::UnsupportedRequiredFeature(_) => "unsupported_required_feature",
         ErrorKind::MissingIndexdata { .. } => "missing_indexdata",
         ErrorKind::Unsorted { .. } => "unsorted",
         ErrorKind::IndexdataMismatch { .. } => "indexdata_mismatch",

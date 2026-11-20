@@ -413,6 +413,18 @@
   was a file that conforming XML readers, osmium's among them, reject.
   These runs now fail with exit 2, naming the element and attribute, and
   publish nothing.
+- **A PBF requiring a feature pbfhogg does not implement is refused.** A
+  header `required_features` entry other than `OsmSchema-V0.6`,
+  `DenseNodes` or `HistoricalInformation` used to be ignored: the file was
+  read as if it were plain, and a rewriting command wrote a header without
+  the requirement. Every library header decode, and so every command that
+  reads elements, now fails with the new
+  `ErrorKind::UnsupportedRequiredFeature`, naming the feature, as osmium
+  does (`inspect` included). Matching is exact, so prefixes osmium happens
+  to accept are refused. `degrade`'s header-only passthrough, which decodes
+  no block, still runs and keeps the requirement in its output header, and
+  `inspect --indexed` still answers from the blob framing alone.
+
 - **`apply-changes` no longer refuses changes whose output only needed
   more blocks.** A rewritten block keeps its source block's whole string
   table, and blocks were cut by element count alone. So a large tag value

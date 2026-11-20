@@ -616,9 +616,13 @@ fn check_index_inner(
     host.invocation.marker("CHECK_INDEX_START");
     // The header comes first or the file is not a PBF: a zero-byte or
     // header-less file gets the one missing-header error, not a clean report
-    // over data blobs it cannot place. Its payload is not decoded.
+    // over data blobs it cannot place. It is decoded only to refuse a file
+    // whose required features say its payloads cannot be read.
     match frames.next_raw()? {
-        Some(frame) if matches!(frame.blob_type, BlobKind::OsmHeader) => {}
+        Some(frame) if matches!(frame.blob_type, BlobKind::OsmHeader) => {
+            crate::blob::decode_blob_to_headerblock(frame.blob_bytes())
+                .map_err(|e| frames.locate(frame.id, e))?;
+        }
         _ => return Err(crate::error::new_missing_header(path)),
     }
 

@@ -526,7 +526,11 @@ pub(crate) fn build_classify_schedule_with_claims<'a>(
     Ok((schedule, indexes, file))
 }
 
-/// Read the first frame of `input` and require it to be the OSMHeader.
+/// Read the first frame of `input`, require it to be the OSMHeader, and
+/// decode it. The decoded header is discarded: decoding is the admission
+/// check (an unsupported required feature is refused there), and every
+/// schedule user reads data blobs on the strength of it, some without any
+/// other header read.
 fn consume_leading_header(
     walker: &mut crate::read::header_walker::HeaderWalker,
     input: &std::path::Path,
@@ -537,6 +541,11 @@ fn consume_leading_header(
     if first.blob_type != crate::blob::BlobKind::OsmHeader {
         return Err(crate::error::new_missing_header(input));
     }
+    let mut buf = crate::read::read_buf::ReadBuf::default();
+    let data = walker
+        .pread_data(first.data_offset, first.data_size, &mut buf)
+        .map_err(|e| walker.locate_meta(&first, e))?;
+    crate::blob::decode_blob_to_headerblock(data).map_err(|e| walker.locate_meta(&first, e))?;
     Ok(())
 }
 

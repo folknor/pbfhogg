@@ -955,6 +955,23 @@ longer than their group are refused. libosmium merges differently and is not
 the reference here: its `Info` user comes from the last occurrence alone, and
 each `DenseInfo` column from its last segment.
 
+## PBF decoding: required features are matched exactly
+
+Like libosmium, pbfhogg refuses a HeaderBlock declaring a required feature
+other than `OsmSchema-V0.6`, `DenseNodes` and `HistoricalInformation`, and
+the refusal names the feature. libosmium compares with
+`strncmp(known, feature, feature.size())`, which admits any proper prefix of
+a known name (`Dense`, the empty string) and a known name followed by a NUL
+and further bytes. pbfhogg compares exactly and refuses those. Unknown
+optional feature names are accepted. Every HeaderBlock decode refuses, and
+every command that reads elements or derives metadata from data blobs
+decodes the header first, `inspect` included, as `osmium fileinfo` does.
+Paths that never decode a `PrimitiveBlock` do not decode the header either:
+`degrade`'s header-only passthrough copies the OSMData payload bytes and
+keeps the required-feature declarations in the header it forwards, and the
+framing-only indexdata and tagdata probes (`inspect --indexed`) answer from
+BlobHeaders alone.
+
 ## PBF decoding: a group holding several element fields is read in kind order
 
 The PBF format puts one kind of element in each `PrimitiveGroup`, but nothing

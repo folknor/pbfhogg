@@ -101,6 +101,10 @@ fn reindex_to(
     let mut header_block = Vec::new();
     decompress_blob_data_into(header.blob_bytes(), &mut header_block)
         .map_err(|e| frames.locate(header.id, e))?;
+    // The header is forwarded, but the indexes are derived from payloads it
+    // may declare unreadable: an unsupported required feature is refused.
+    crate::read::blob::admit_header_bytes(&header_block)
+        .map_err(|e| frames.locate(header.id, e))?;
     let mut writer = super::super::writer_from_header_bytes(
         output,
         write.compression,

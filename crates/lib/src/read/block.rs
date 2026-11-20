@@ -100,6 +100,15 @@ impl WireHeaderBBox {
     }
 }
 
+/// The required features this parser implements. A header naming any other
+/// is refused at parse: its blocks may mean something pbfhogg cannot read,
+/// and a rewrite would rebuild the header without the requirement.
+pub(crate) const SUPPORTED_REQUIRED_FEATURES: [&str; 3] = [
+    Feature::OSM_SCHEMA_V06.as_str(),
+    Feature::DENSE_NODES.as_str(),
+    Feature::HISTORICAL_INFORMATION.as_str(),
+];
+
 /// Parsed HeaderBlock from protobuf wire format.
 #[derive(Clone, Debug)]
 pub(crate) struct WireHeaderBlock {
@@ -115,6 +124,12 @@ pub(crate) struct WireHeaderBlock {
 
 impl WireHeaderBlock {
     /// Parse a HeaderBlock from decompressed protobuf bytes.
+    ///
+    /// A required feature outside [`SUPPORTED_REQUIRED_FEATURES`] is refused
+    /// here, so no decode of any kind admits a file whose blocks need a
+    /// parser pbfhogg is not, as libosmium's `decode_header_block` refuses
+    /// one. The match is exact; see DEVIATIONS.md "PBF decoding: required
+    /// features are matched exactly".
     ///
     /// Fields are recognised by number and wire type together, as in the
     /// Blob envelope and element parsers and in libosmium's
@@ -146,6 +161,9 @@ impl WireHeaderBlock {
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
                         .map_err(|_| new_wire_error("invalid UTF-8 in required_features"))?;
+                    if !SUPPORTED_REQUIRED_FEATURES.contains(&s.as_str()) {
+                        return Err(crate::error::new_unsupported_required_feature(s));
+                    }
                     required_features.push(s);
                 }
                 (header_block::OPTIONAL_FEATURES, WIRE_LEN) => {
@@ -241,7 +259,9 @@ impl HeaderBlock {
     }
 
     /// Returns a list of required features that a parser needs to implement to parse the following
-    /// [`PrimitiveBlock`]s.
+    /// [`PrimitiveBlock`]s. Every entry is one pbfhogg implements: a header
+    /// naming any other fails to decode with
+    /// [`ErrorKind::UnsupportedRequiredFeature`](crate::ErrorKind::UnsupportedRequiredFeature).
     pub fn required_features(&self) -> &[String] {
         self.header.required_features.as_slice()
     }
@@ -3524,5 +3544,44 @@ mod header_wire_type_tests {
         // A varint on required_features (4) names no feature.
         let h = WireHeaderBlock::parse(&[0x20, 0x01]).unwrap();
         assert!(h.required_features.is_empty());
+    }
+
+    /// A HeaderBlock carrying each of `features` as a required feature.
+    fn with_required(features: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for f in features {
+            out.push(0x22);
+            out.push(u8::try_from(f.len()).unwrap());
+            out.extend_from_slice(f.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn supported_required_features_are_admitted() {
+        let h =
+            WireHeaderBlock::parse(&with_required(&super::SUPPORTED_REQUIRED_FEATURES)).unwrap();
+        assert_eq!(h.required_features, super::SUPPORTED_REQUIRED_FEATURES);
+    }
+
+    #[test]
+    fn an_unsupported_required_feature_is_refused_and_named() {
+        // libosmium's prefix comparison would admit "Dense" and ""; the
+        // exact match refuses them.
+        for bad in ["UnsupportedExtension", "Dense", "", "DenseNodes\0x"] {
+            let err = WireHeaderBlock::parse(&with_required(&["OsmSchema-V0.6", bad])).unwrap_err();
+            match err.kind() {
+                crate::ErrorKind::UnsupportedRequiredFeature(f) => assert_eq!(f, bad),
+                other => panic!("{bad:?}: wrong kind {other:?}"),
+            }
+            assert!(err.to_string().contains(&format!("{bad:?}")));
+        }
+    }
+
+    #[test]
+    fn an_unsupported_optional_feature_is_admitted() {
+        // optional_features, field 5.
+        let h = WireHeaderBlock::parse(&[0x2a, 0x03, b'a', b'b', b'c']).unwrap();
+        assert_eq!(h.optional_features, ["abc"]);
     }
 }

@@ -1211,6 +1211,13 @@ pub(crate) fn decode_blob_to_headerblock_from_bytes(
     crate::HeaderBlock::parse_from_bytes(&raw)
 }
 
+/// Admit decompressed `HeaderBlock` bytes that a caller forwards rather
+/// than decodes: parse them only for the refusals parsing applies (an
+/// unsupported required feature among them), and discard the result.
+pub(crate) fn admit_header_bytes(raw: &[u8]) -> Result<()> {
+    super::block::WireHeaderBlock::parse(raw).map(drop)
+}
+
 /// Decompress and parse a blob's data as a HeaderBlock.
 ///
 /// Used for the OsmHeader blob path where the decompressed bytes need to be

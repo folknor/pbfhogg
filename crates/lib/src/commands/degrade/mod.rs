@@ -610,6 +610,11 @@ pub(crate) fn degrade_to(
 /// `--generator` / `--output-header` override replaces only the field it
 /// names, so adding `--generator` no longer changes the declared features.
 ///
+/// The header is deliberately not decoded, so a required feature pbfhogg
+/// does not implement is forwarded rather than refused: no `PrimitiveBlock`
+/// is decoded, and the requirement travels with the OSMData payloads it
+/// governs.
+///
 /// Reads the first frame from `frames`, so the caller goes on to the data
 /// frames through the same walk.
 fn passthrough_header_bytes(

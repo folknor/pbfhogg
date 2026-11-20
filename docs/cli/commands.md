@@ -398,7 +398,10 @@ header follows from them.
   when any input declares it.
 - **Writing program**: `pbfhogg/<version>`, the library's package version.
 - Optional features pbfhogg does not know are not carried: nothing can vouch
-  for them after a rewrite.
+  for them after a rewrite. A required feature pbfhogg does not know never
+  reaches a rewrite: every command that reads elements refuses such an
+  input when it decodes the header (`inspect` included, as
+  `osmium fileinfo` does), naming the feature.
 - **`--generator` / `--output-header`** apply last, and each replaces only
   the field it names; a later `--output-header` for the same key replaces an
   earlier one. An empty `--output-header` value omits the field, whatever the
@@ -411,8 +414,8 @@ header follows from them.
 The exception is degrade's header-only passthrough (`--strip-indexdata`,
 `--strip-tagdata`, `--strip-bbox`, `--corrupt-*`), which copies every blob
 payload and every other blob-header field, and so forwards the input header
-field for field - writing program, custom features and unknown fields
-included - with the bbox removed under `--strip-bbox` and each override
+field for field - writing program, custom features, unknown required
+features and unknown fields included - with the bbox removed under `--strip-bbox` and each override
 replacing only its own field.
 
 A command that copies blobs raw decides its header from the first data blob's

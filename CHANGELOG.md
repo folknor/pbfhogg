@@ -448,6 +448,9 @@
 
 ### Fixed
 
+- **inspect --blocks takes a huge limit.** A text-mode `--blocks N` whose
+  doubling overflows (for example `9223372036854775808`) panicked; it now
+  lists every block, as the JSON output already did.
 - **renumber takes plain nodes and ways without node refs.** A node block
   holding plain (non-dense) node groups, which pbfhogg itself writes for
   nodes whose metadata a dense block cannot carry exactly (for example

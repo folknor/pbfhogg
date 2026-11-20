@@ -206,17 +206,6 @@ because it checks only `previous.max >= next.min`, which counts descending
 disjoint ranges as overlapping. The command does create disorder, but the
 advertised benchmark shape and its test are wrong at cap 1.
 
-## CMD-027 - A large inspect --blocks limit panics
-
-Reported by: check-inspect [P1].
-
-`inspect/report.rs` computes `limit * 2` without an overflow check. In a
-64-bit release build, `--blocks 9223372036854775808` makes the product zero,
-so with any data block present truncation is selected and the following huge
-slice panics. With overflow checks on, the multiplication itself panics. This
-breaks the flag's limiting behaviour and the refusal contract. The JSON
-renderer already uses an overflow-safe comparison.
-
 ## CMD-028 - inspect --show drops present zero metadata and never prints visibility
 
 Reported by: check-inspect [P2], cli-binary [P2].

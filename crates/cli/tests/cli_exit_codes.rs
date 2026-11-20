@@ -579,3 +579,30 @@ fn inspect_force_and_jobs_require_nodes() {
         .arg("2")
         .assert_success();
 }
+
+/// A `--blocks` limit whose doubling overflows usize must list every block,
+/// not wrap to a zero product and panic slicing past the block list.
+#[test]
+fn inspect_huge_blocks_limit_lists_all_blocks() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_two_nodes(&input, 110_000_000);
+
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("inspect")
+        .arg(input.as_os_str())
+        .arg("--blocks")
+        .arg("9223372036854775808")
+        .run();
+    assert!(
+        out.status.success(),
+        "inspect --blocks with a huge limit must succeed; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        !out.stdout_str().contains("blocks omitted"),
+        "a limit past the block count must not truncate; stdout:\n{}",
+        out.stdout_str(),
+    );
+}

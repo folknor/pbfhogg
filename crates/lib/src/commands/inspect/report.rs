@@ -290,7 +290,8 @@ impl InspectReport {
         limit: usize,
     ) -> io::Result<()> {
         let has_raw = infos.iter().any(|i| i.raw.is_some());
-        let truncate = limit > 0 && limit * 2 < infos.len();
+        // Same as `limit * 2 < len`, without the overflow a huge --blocks hits.
+        let truncate = limit > 0 && limit < infos.len().div_ceil(2);
 
         if has_raw {
             writeln!(
@@ -300,7 +301,7 @@ impl InspectReport {
             )?;
             if truncate {
                 write_block_rows_raw(out, &infos[..limit])?;
-                let omitted = infos.len() - limit * 2;
+                let omitted = infos.len() - limit - limit;
                 writeln!(out, "   ...  ({omitted} blocks omitted)")?;
                 write_block_rows_raw(out, &infos[infos.len() - limit..])?;
             } else {
@@ -314,7 +315,7 @@ impl InspectReport {
             )?;
             if truncate {
                 write_block_rows_compressed(out, &infos[..limit])?;
-                let omitted = infos.len() - limit * 2;
+                let omitted = infos.len() - limit - limit;
                 writeln!(out, "   ...  ({omitted} blocks omitted)")?;
                 write_block_rows_compressed(out, &infos[infos.len() - limit..])?;
             } else {

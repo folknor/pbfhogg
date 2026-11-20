@@ -202,12 +202,12 @@ fn assert_index_of(index_dir: &Path, fixture: &Fixture, identity: (u128, u64), c
     );
     assert_eq!(
         reader.replication_sequence(),
-        u32::try_from(fixture.sequence).expect("small sequence"),
+        Some(fixture.sequence),
         "{cell}"
     );
     assert_eq!(
         reader.replication_timestamp(),
-        u64::try_from(fixture.timestamp).expect("positive timestamp"),
+        Some(fixture.timestamp),
         "{cell}"
     );
     let lat = 55.700_05 + f64::from(fixture.lat_shift) * 1e-7;
@@ -427,6 +427,33 @@ fn direct_build_reads_only_the_pinned_input() {
             direct: true,
         },
         |e| crate::common::direct_io_unavailable(e),
+    );
+}
+
+/// The index carries the input header's replication values verbatim: a
+/// negative timestamp stays negative instead of wrapping to a huge unsigned
+/// one, and a sequence beyond u32 is kept rather than refused.
+#[test]
+fn replication_values_outside_unsigned_ranges_are_kept_verbatim() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let fixture = Fixture {
+        sequence: 5_000_000_000,
+        timestamp: -1,
+        ..INPUT
+    };
+    write_fixture(&input, &fixture, true);
+    let index_dir = dir.path().join("index");
+    let route = Route {
+        indexdata: true,
+        direct: false,
+    };
+    run(route, &input, &index_dir, &crate::common::test_host()).expect("build");
+    assert_index_of(
+        &index_dir,
+        &fixture,
+        identity_of(&input),
+        "signed replication",
     );
 }
 

@@ -50,18 +50,6 @@ Admin lookup still works, so refusing the pair at option validation would also
 reject useful admin-only builds. Policy question: refuse the pair, refuse it
 only when the output has no admin polygons, or document it.
 
-## GEO-006 - A negative replication timestamp wraps to an enormous positive one
-
-Reported by: geocode-builder [P2], geocode-reader [P2].
-
-`build_generation` (`builder/mod.rs`) casts the header's signed timestamp
-straight to `u64`. A timestamp of -1 becomes `18446744073709551615`, is
-published, and is returned unchanged by `Reader::replication_timestamp()`.
-This breaks the claim in `docs/guide/advanced.md` that this metadata describes
-the input header. The builder checks representability for the neighbouring
-replication sequence but not for the timestamp. Either keep signed timestamps
-(a format change) or refuse values the format cannot represent.
-
 ## GEO-007 - Public geometry calls can hang while unwrapping longitudes
 
 Reported by: geocode-builder [P2].

@@ -1107,11 +1107,18 @@ impl Reader {
 
     // -- Header accessors ----------------------------------------------------
 
-    pub fn replication_sequence(&self) -> u32 {
+    /// The input PBF header's `osmosis_replication_sequence_number`, exactly
+    /// as the header held it: `None` when it had none, otherwise the signed
+    /// value (zero is a value, not an absence). Descriptive only, no proof
+    /// of origin; [`Self::input_xxh3_128`] is.
+    pub fn replication_sequence(&self) -> Option<i64> {
         self.header.replication_sequence
     }
 
-    pub fn replication_timestamp(&self) -> u64 {
+    /// The input PBF header's `osmosis_replication_timestamp` in seconds
+    /// since the UNIX epoch, exactly as the header held it: `None` when
+    /// absent, otherwise the signed value, negative included.
+    pub fn replication_timestamp(&self) -> Option<i64> {
         self.header.replication_timestamp
     }
 
@@ -2683,15 +2690,14 @@ mod tests {
             #[cfg(pbfhogg_test_hooks)]
             admin_pip_calls: std::sync::atomic::AtomicUsize::new(0),
             header: Header {
-                format_version: format::FORMAT_VERSION,
                 street_cell_level: crate::tunables::GEOCODE_DEFAULT_STREET_LEVEL,
                 coarse_cell_level: crate::tunables::GEOCODE_DEFAULT_COARSE_LEVEL,
                 admin_cell_level: crate::tunables::GEOCODE_DEFAULT_ADMIN_LEVEL,
                 admin_tolerance_m: crate::tunables::GEOCODE_DEFAULT_ADMIN_TOLERANCE_M,
                 fine_search_radius_m: crate::tunables::GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M,
                 coarse_search_radius_m: crate::tunables::GEOCODE_DEFAULT_COARSE_SEARCH_RADIUS_M,
-                replication_sequence: 0,
-                replication_timestamp: 0,
+                replication_sequence: None,
+                replication_timestamp: None,
                 addr_point_count: 0,
                 street_way_count: 0,
                 interp_way_count: 0,

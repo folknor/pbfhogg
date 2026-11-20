@@ -6,15 +6,14 @@ use std::path::Path;
 fn write_index(dir: &Path) {
     std::fs::create_dir(dir).expect("create index");
     let header = Header {
-        format_version: format::FORMAT_VERSION,
         street_cell_level: 16,
         coarse_cell_level: 14,
         admin_cell_level: 10,
         admin_tolerance_m: 0.0,
         fine_search_radius_m: 10.0,
         coarse_search_radius_m: 20.0,
-        replication_sequence: 0,
-        replication_timestamp: 0,
+        replication_sequence: None,
+        replication_timestamp: None,
         addr_point_count: 1,
         street_way_count: 1,
         interp_way_count: 1,

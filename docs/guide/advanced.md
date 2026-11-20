@@ -186,8 +186,10 @@ hex any whole-file XXH3-128 of that PBF gives, so a caller that hashed its
 PBF compares the two to know the index came from those bytes. It identifies
 the input, provided the input was not changed during the build; it does not
 check that the index files are intact. The replication sequence and
-timestamp beside it describe the input's header and are no proof of origin:
-two extracts of one replication state share them.
+timestamp beside it (`Reader::replication_sequence` and
+`Reader::replication_timestamp`, each `Option<i64>`, `None` where the input
+header had none) are the input header's values verbatim and are no proof of
+origin: two extracts of one replication state share them.
 
 Every string an answer carries (names, house numbers, streets, postcodes,
 country codes) is the tag value whole: a value holding a NUL byte, which PBF

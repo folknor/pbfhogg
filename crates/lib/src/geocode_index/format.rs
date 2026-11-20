@@ -27,9 +27,13 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// records the input PBF's whole-file XXH3-128 and size in header bytes
 /// 64..88, so every index a reader accepts carries its input's identity (a
 /// version 6 index's zero bytes there would be indistinguishable from a
-/// recorded digest). Readers deliberately reject other versions: existing
+/// recorded digest); version 8 stores the input header's replication
+/// sequence and timestamp verbatim as signed i64 values with a presence flag
+/// each (header bytes 88..112), where version 7 kept a u32 sequence and a u64
+/// timestamp at bytes 24..36 that could not say "absent" and wrapped a
+/// negative timestamp. Readers deliberately reject other versions: existing
 /// indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -248,9 +252,17 @@ pub const INTERIOR_FLAG: u32 = 0x8000_0000;
 /// Mask to extract the polygon index from an interior-flagged entry.
 pub const INDEX_MASK: u32 = 0x7FFF_FFFF;
 
-/// Header size on disk (128 bytes: 88 used + 40 reserved, written zero and
-/// not read).
+/// Header size on disk (128 bytes). Byte 11, bytes 24..36, 89..96 and
+/// 112..128 are reserved: written zero and not read.
 pub const HEADER_SIZE: usize = 128;
+
+/// Header byte 88 bit: the replication sequence is present.
+const REPLICATION_SEQUENCE_PRESENT: u8 = 0b01;
+/// Header byte 88 bit: the replication timestamp is present.
+const REPLICATION_TIMESTAMP_PRESENT: u8 = 0b10;
+const REPLICATION_FLAGS_AT: usize = 88;
+const REPLICATION_SEQUENCE_AT: usize = 96;
+const REPLICATION_TIMESTAMP_AT: usize = 104;
 
 // ---------------------------------------------------------------------------
 // Header (128 bytes)
@@ -259,7 +271,6 @@ pub const HEADER_SIZE: usize = 128;
 /// Index header. Fixed-size, read once at `Reader::open`.
 #[derive(Debug, Clone)]
 pub struct Header {
-    pub format_version: u32,
     pub street_cell_level: u8,
     pub coarse_cell_level: u8,
     pub admin_cell_level: u8,
@@ -270,8 +281,15 @@ pub struct Header {
     pub admin_tolerance_m: f32,
     pub fine_search_radius_m: f32,
     pub coarse_search_radius_m: f32,
-    pub replication_sequence: u32,
-    pub replication_timestamp: u64,
+    /// The input PBF header's `osmosis_replication_sequence_number`, verbatim:
+    /// `None` when the header has none, any `i64` otherwise (zero included).
+    /// Stored at bytes 96..104 under presence bit 0 of byte 88.
+    pub replication_sequence: Option<i64>,
+    /// The input PBF header's `osmosis_replication_timestamp` (seconds since
+    /// the UNIX epoch), verbatim: `None` when absent, any `i64` otherwise,
+    /// negative values included. Stored at bytes 104..112 under presence
+    /// bit 1 of byte 88.
+    pub replication_timestamp: Option<i64>,
     pub addr_point_count: u32,
     pub street_way_count: u32,
     pub interp_way_count: u32,
@@ -297,11 +315,34 @@ fn field<const N: usize>(buf: &[u8; HEADER_SIZE], at: usize) -> [u8; N] {
     out
 }
 
+/// One replication field: its i64 at `at` when `bit` is set in `flags`.
+/// An absent field's payload must be zero, so `None` has one encoding and a
+/// value written without its presence bit is refused rather than read as
+/// absent.
+fn replication_field(
+    buf: &[u8; HEADER_SIZE],
+    flags: u8,
+    bit: u8,
+    at: usize,
+    name: &str,
+) -> Result<Option<i64>, FormatError> {
+    let value = i64::from_le_bytes(field(buf, at));
+    if flags & bit != 0 {
+        Ok(Some(value))
+    } else if value == 0 {
+        Ok(None)
+    } else {
+        Err(FormatError::InvalidMetadata(format!(
+            "replication {name} is marked absent but its payload is {value}"
+        )))
+    }
+}
+
 impl Header {
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..4].copy_from_slice(&HEADER_MAGIC);
-        buf[4..8].copy_from_slice(&self.format_version.to_le_bytes());
+        buf[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         buf[8] = self.street_cell_level;
         buf[9] = self.coarse_cell_level;
         buf[10] = self.admin_cell_level;
@@ -309,8 +350,7 @@ impl Header {
         buf[12..16].copy_from_slice(&self.admin_tolerance_m.to_le_bytes());
         buf[16..20].copy_from_slice(&self.fine_search_radius_m.to_le_bytes());
         buf[20..24].copy_from_slice(&self.coarse_search_radius_m.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.replication_sequence.to_le_bytes());
-        buf[28..36].copy_from_slice(&self.replication_timestamp.to_le_bytes());
+        // buf[24..36] reserved
         buf[36..40].copy_from_slice(&self.addr_point_count.to_le_bytes());
         buf[40..44].copy_from_slice(&self.street_way_count.to_le_bytes());
         buf[44..48].copy_from_slice(&self.interp_way_count.to_le_bytes());
@@ -320,7 +360,19 @@ impl Header {
         buf[60..64].copy_from_slice(&self.admin_cell_count.to_le_bytes());
         buf[64..80].copy_from_slice(&self.input_xxh3_128.to_be_bytes());
         buf[80..88].copy_from_slice(&self.input_bytes.to_le_bytes());
-        // buf[88..128] reserved (already zero)
+        let mut flags = 0u8;
+        if let Some(seq) = self.replication_sequence {
+            flags |= REPLICATION_SEQUENCE_PRESENT;
+            buf[REPLICATION_SEQUENCE_AT..REPLICATION_SEQUENCE_AT + 8]
+                .copy_from_slice(&seq.to_le_bytes());
+        }
+        if let Some(ts) = self.replication_timestamp {
+            flags |= REPLICATION_TIMESTAMP_PRESENT;
+            buf[REPLICATION_TIMESTAMP_AT..REPLICATION_TIMESTAMP_AT + 8]
+                .copy_from_slice(&ts.to_le_bytes());
+        }
+        buf[REPLICATION_FLAGS_AT] = flags;
+        // buf[89..96] and buf[112..128] reserved (already zero)
         buf
     }
 
@@ -359,18 +411,35 @@ impl Header {
         let admin_tolerance_m = f32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         validate_admin_tolerance(admin_tolerance_m)
             .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
+        let flags = buf[REPLICATION_FLAGS_AT];
+        if flags & !(REPLICATION_SEQUENCE_PRESENT | REPLICATION_TIMESTAMP_PRESENT) != 0 {
+            return Err(FormatError::InvalidMetadata(format!(
+                "unknown replication presence flags {flags:#04x}"
+            )));
+        }
+        let replication_sequence = replication_field(
+            buf,
+            flags,
+            REPLICATION_SEQUENCE_PRESENT,
+            REPLICATION_SEQUENCE_AT,
+            "sequence",
+        )?;
+        let replication_timestamp = replication_field(
+            buf,
+            flags,
+            REPLICATION_TIMESTAMP_PRESENT,
+            REPLICATION_TIMESTAMP_AT,
+            "timestamp",
+        )?;
         Ok(Self {
-            format_version: version,
             street_cell_level: street,
             coarse_cell_level: coarse,
             admin_cell_level: admin,
             admin_tolerance_m,
             fine_search_radius_m,
             coarse_search_radius_m,
-            replication_sequence: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
-            replication_timestamp: u64::from_le_bytes([
-                buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34], buf[35],
-            ]),
+            replication_sequence,
+            replication_timestamp,
             addr_point_count: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
             street_way_count: u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
             interp_way_count: u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
@@ -1312,15 +1381,14 @@ mod tests {
 
     fn valid_header_bytes() -> [u8; HEADER_SIZE] {
         Header {
-            format_version: FORMAT_VERSION,
             street_cell_level: 17,
             coarse_cell_level: 14,
             admin_cell_level: 10,
             admin_tolerance_m: 20.0,
             fine_search_radius_m: 75.0,
             coarse_search_radius_m: 1000.0,
-            replication_sequence: 0,
-            replication_timestamp: 0,
+            replication_sequence: None,
+            replication_timestamp: None,
             addr_point_count: 0,
             street_way_count: 0,
             interp_way_count: 0,
@@ -1350,6 +1418,81 @@ mod tests {
         let parsed = Header::from_bytes(&bytes).expect("valid header");
         assert_eq!(parsed.input_xxh3_128, header.input_xxh3_128);
         assert_eq!(parsed.input_bytes, header.input_bytes);
+    }
+
+    /// The replication fields sit at their offsets under their own presence
+    /// bits: a sequence beyond u32 and a negative timestamp with distinct
+    /// bytes, so a decoder that swapped fields, byte order or bits fails.
+    #[test]
+    fn header_replication_is_at_its_format_offsets() {
+        let mut header = Header::from_bytes(&valid_header_bytes()).expect("valid header");
+        let seq = 0x0102_0304_0506_0708_i64;
+        let ts = -0x0011_2233_4455_6677_i64;
+        header.replication_sequence = Some(seq);
+        header.replication_timestamp = Some(ts);
+        let bytes = header.to_bytes();
+        assert_eq!(bytes[88], 0b11);
+        assert_eq!(bytes[96..104], seq.to_le_bytes());
+        assert_eq!(bytes[104..112], ts.to_le_bytes());
+        assert!(bytes[24..36].iter().all(|&b| b == 0));
+        assert!(bytes[89..96].iter().all(|&b| b == 0));
+        assert!(bytes[112..].iter().all(|&b| b == 0));
+        let parsed = Header::from_bytes(&bytes).expect("valid header");
+        assert_eq!(parsed.replication_sequence, Some(seq));
+        assert_eq!(parsed.replication_timestamp, Some(ts));
+    }
+
+    /// Absent and present zero are distinct, and each field's presence is
+    /// its own: every combination of the two round-trips.
+    #[test]
+    fn header_replication_presence_is_per_field() {
+        let cases = [
+            (None, None, 0b00),
+            (Some(0), None, 0b01),
+            (None, Some(0), 0b10),
+            (Some(0), Some(-1), 0b11),
+            (None, Some(-1), 0b10),
+        ];
+        for (seq, ts, flags) in cases {
+            let mut header = Header::from_bytes(&valid_header_bytes()).expect("valid header");
+            header.replication_sequence = seq;
+            header.replication_timestamp = ts;
+            let bytes = header.to_bytes();
+            assert_eq!(bytes[88], flags, "{seq:?} {ts:?}");
+            let parsed = Header::from_bytes(&bytes).expect("valid header");
+            assert_eq!(parsed.replication_sequence, seq);
+            assert_eq!(parsed.replication_timestamp, ts);
+        }
+    }
+
+    /// A payload under a clear presence bit is refused, each field checked
+    /// on its own with the other present and valid, and so are unknown bits.
+    #[test]
+    fn header_rejects_inconsistent_replication_presence() {
+        let mut header = Header::from_bytes(&valid_header_bytes()).expect("valid header");
+        header.replication_timestamp = Some(5);
+        let mut bytes = header.to_bytes();
+        bytes[96..104].copy_from_slice(&7i64.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(FormatError::InvalidMetadata(m)) if m.contains("sequence")
+        ));
+
+        let mut header = Header::from_bytes(&valid_header_bytes()).expect("valid header");
+        header.replication_sequence = Some(5);
+        let mut bytes = header.to_bytes();
+        bytes[104..112].copy_from_slice(&(-1i64).to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(FormatError::InvalidMetadata(m)) if m.contains("timestamp")
+        ));
+
+        let mut bytes = valid_header_bytes();
+        bytes[88] = 0b100;
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(FormatError::InvalidMetadata(m)) if m.contains("flags")
+        ));
     }
 
     /// Every level field, not just the street level. A test that pokes one of
@@ -1451,15 +1594,14 @@ mod tests {
     #[test]
     fn header_roundtrip() {
         let header = Header {
-            format_version: FORMAT_VERSION,
             street_cell_level: 17,
             coarse_cell_level: 14,
             admin_cell_level: 10,
             admin_tolerance_m: 20.0,
             fine_search_radius_m: 75.0,
             coarse_search_radius_m: 1000.0,
-            replication_sequence: 4704,
-            replication_timestamp: 1_700_000_000,
+            replication_sequence: Some(4704),
+            replication_timestamp: Some(1_700_000_000),
             addr_point_count: 3_000_000,
             street_way_count: 1_800_000,
             interp_way_count: 100_000,
@@ -1473,15 +1615,15 @@ mod tests {
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), HEADER_SIZE);
         let parsed = Header::from_bytes(&bytes).expect("valid header");
-        assert_eq!(parsed.format_version, FORMAT_VERSION);
+        assert_eq!(bytes[4..8], FORMAT_VERSION.to_le_bytes());
         assert_eq!(parsed.street_cell_level, 17);
         assert_eq!(parsed.coarse_cell_level, 14);
         assert_eq!(parsed.admin_cell_level, 10);
         assert_eq!(parsed.admin_tolerance_m.to_bits(), 20.0_f32.to_bits());
         assert!((parsed.fine_search_radius_m - 75.0).abs() < f32::EPSILON);
         assert!((parsed.coarse_search_radius_m - 1000.0).abs() < f32::EPSILON);
-        assert_eq!(parsed.replication_sequence, 4704);
-        assert_eq!(parsed.replication_timestamp, 1_700_000_000);
+        assert_eq!(parsed.replication_sequence, Some(4704));
+        assert_eq!(parsed.replication_timestamp, Some(1_700_000_000));
         assert_eq!(parsed.addr_point_count, 3_000_000);
         assert_eq!(parsed.street_way_count, 1_800_000);
         assert_eq!(parsed.interp_way_count, 100_000);

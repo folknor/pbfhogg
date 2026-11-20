@@ -2225,10 +2225,12 @@ geometry: inside a ring is decided by even-odd crossing parity, so a ring
 that crosses itself keeps the regions it encloses an odd number of times;
 outer rings of one relation that overlap are separate areas whose union
 matches; and a hole subtracts from each outer ring that owns it, wherever it
-touches or crosses that ring. The PBF replication sequence is stored as a u32 in the
-geocode header. A missing value is stored as zero, and a present value outside
-the u32 range fails the build rather than being wrapped to a different source
-version. The header also records the input PBF's whole-file XXH3-128 (seed
+touches or crosses that ring. The PBF header's replication sequence and
+timestamp are stored in the geocode header exactly as the input holds them:
+each as a signed 64-bit value with its own presence, so a missing value stays
+missing, a zero stays zero and a negative timestamp stays negative; no value
+fails the build. The library reader returns them as `Option<i64>` from
+`Reader::replication_sequence` and `Reader::replication_timestamp`. The header also records the input PBF's whole-file XXH3-128 (seed
 zero, over every byte of the file) and its size, so a consumer that hashed its
 PBF can tell whether an index was built from it; the library reader exposes
 them as `Reader::input_xxh3_128` (formatted `{:032x}`, the same 32-digit hex
@@ -2239,9 +2241,9 @@ rewrite is not detected. Names, house numbers, streets, postcodes and country co
 stored and answered whole, bytes and all: a PBF tag value holding a NUL byte
 is not cut at it.
 
-The index carries an on-disk format version, currently 7. A reader accepts
-only its own version: an index of any other version (6 and earlier, such as
-one built before the input digest was recorded) is refused with an error
+The index carries an on-disk format version. A reader accepts only its own
+version: an index of any other version (such as one built before the input
+digest or the signed replication fields were recorded) is refused with an error
 telling you to rebuild it with `build-geocode-index`, and there is no
 in-place upgrade. Rebuild existing indexes after upgrading.
 

@@ -490,21 +490,11 @@ fn build_generation(
     // Read PBF header
     let reader = ElementReader::open_in(input, config.direct_io, host)?;
     let pbf_header = reader.header();
-    // The geocode header stores replication sequence in a u32. Missing
-    // metadata is represented by zero, but wrapping a present larger value
-    // would publish a plausible, incorrect source version, so refuse it.
-    let repl_seq = u32::try_from(
-        pbf_header
-            .osmosis_replication_sequence_number()
-            .unwrap_or(0),
-    )
-    .map_err(|_| {
-        Error::invalid_data(
-            "replication sequence exceeds the geocode header u32 range; bump FORMAT_VERSION",
-        )
-    })?;
-    #[allow(clippy::cast_sign_loss)]
-    let repl_ts = pbf_header.osmosis_replication_timestamp().unwrap_or(0) as u64;
+    // The geocode header stores the PBF header's replication sequence and
+    // timestamp verbatim: signed, with their presence. Nothing here reads
+    // them, so there is no value to refuse and none to narrow.
+    let repl_seq = pbf_header.osmosis_replication_sequence_number();
+    let repl_ts = pbf_header.osmosis_replication_timestamp();
     drop(reader);
 
     // -----------------------------------------------------------------------
@@ -587,7 +577,7 @@ fn build_generation(
 fn build_from_schedules(
     schedules: pass1_5::Schedules,
     finish_digest: impl FnOnce() -> Result<input_digest::InputDigest>,
-    (repl_seq, repl_ts): (u32, u64),
+    (repl_seq, repl_ts): (Option<i64>, Option<i64>),
     start_time: std::time::Instant,
     config: &BuildConfig,
     output_dir: &std::path::Path,
@@ -978,7 +968,6 @@ fn build_from_schedules(
     let digest = finish_digest()?;
     host.invocation.check()?;
     let header = Header {
-        format_version: FORMAT_VERSION,
         street_cell_level: config.street_level,
         coarse_cell_level: config.coarse_level,
         admin_cell_level: config.admin_level,

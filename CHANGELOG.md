@@ -128,12 +128,21 @@
   and osmium read it whole, but a reader that stops after the first
   member (flate2's `GzDecoder`) sees only the document's start. Memory no
   longer grows with the kept output.
-- **Geocode index format is now 7; existing indexes must be rebuilt.**
+- **Geocode index format is now 8; existing indexes must be rebuilt.**
   The last release wrote format 5. Version 6 replaced the admin vertex
-  budget with `--admin-tolerance`, and version 7 records the input PBF's
-  XXH3-128 and size in the header. `Reader::open` refuses any other
-  version with an error telling you to rebuild with
-  `build-geocode-index`; there is no in-place upgrade.
+  budget with `--admin-tolerance`, version 7 records the input PBF's
+  XXH3-128 and size in the header, and version 8 stores the input
+  header's replication sequence and timestamp verbatim, signed and with
+  their presence. `Reader::open` refuses any other version with an error
+  telling you to rebuild with `build-geocode-index`; there is no in-place
+  upgrade.
+- **`Reader::replication_sequence` and `Reader::replication_timestamp`
+  return `Option<i64>`** (were `u32` and `u64`). `None` means the input
+  header had no value, where both used to read as 0. A negative input
+  timestamp used to come back wrapped to a huge positive number, and a
+  sequence outside the u32 range failed the build; both are now kept as
+  the input holds them. `format::Header` loses its `format_version`
+  field: `to_bytes` always writes the current version.
 - **`build-geocode-index` no longer joins a way across a missing node.**
   On an extract that drops some of a way's nodes, a street is split into
   one street per stretch of consecutive present nodes instead of gaining a

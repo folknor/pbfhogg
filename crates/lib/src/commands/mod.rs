@@ -864,10 +864,15 @@ pub(crate) fn leading_header_frame(frames: &mut Frames<FileReader>, path: &Path)
 
 /// Continue a front-of-file read from the frame after the header to the
 /// first OsmData frame's header, returning its `(indexdata, tagdata)`
-/// presence. Frames in between are skipped, not read, and the data frame's
-/// payload is left unread.
+/// presence. Every frame up to and including that data frame is skipped, not
+/// read: the deciding frame's payload is skipped too, before it answers, so a
+/// first data frame cut short is the located shape-4 truncation
+/// (`reference/truncation-handling.md`) rather than a verdict drawn from a
+/// header whose payload is not there. A truncated unindexed first frame is
+/// therefore the truncation, never the missing-indexdata refusal.
 pub(crate) fn probe_to_first_data_blob(frames: &mut Frames<FileReader>) -> Result<(bool, bool)> {
     while let Some(header) = frames.next_header()? {
+        frames.skip_payload()?;
         if matches!(header.header.blob_type, BlobKind::OsmData) {
             let indexed = header
                 .header
@@ -875,7 +880,6 @@ pub(crate) fn probe_to_first_data_blob(frames: &mut Frames<FileReader>) -> Resul
                 .is_some_and(|data| crate::blob_meta::BlobIndex::deserialize(&data).is_some());
             return Ok((indexed, header.header.tagdata.is_some()));
         }
-        frames.skip_payload()?;
     }
     // No data blob: nothing lacks indexdata, so the file counts as indexed.
     // It carries no tagdata, which is a statement about presence, not a

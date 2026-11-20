@@ -213,7 +213,9 @@ should stay that way:
 - `inspect --tags` - `parallel_project_accumulate` (pread workers, a
   projection on the block validator; each worker merges its blobs into a
   sharded count table)
-- `inspect` default / `inspect --indexed` - `HeaderWalker`
+- `inspect` default - `HeaderWalker`
+- `inspect --indexed` alone - the first-data-blob probe (`Frames` over a
+  `FileReader`, stopping after the first data frame)
   (pread-only header walk)
 - `check --ids` (streaming and `--full`) and `check --refs` -
   `parallel_project_phase` (pread workers, a projection on the block

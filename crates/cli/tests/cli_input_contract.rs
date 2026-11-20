@@ -2000,7 +2000,10 @@ fn a_second_header_is_refused_by_the_commands_that_walk_frames_themselves() {
 /// where they stop. `reference/truncation-handling.md` allows an early stop;
 /// what it forbids is reading a short payload as though it were whole.
 const STOPS_BEFORE_LAST_PAYLOAD: &[(&str, &str)] = &[
-    ("inspect --indexed", "stops at the first data blob's header"),
+    (
+        "inspect --indexed",
+        "stops after the first data blob, payload skipped",
+    ),
     ("inspect --get", "stops after the file header"),
     (
         "inspect --show",
@@ -2359,6 +2362,58 @@ fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
     assert_eq!(out.status.code(), Some(2), "stdout:\n{}", out.stdout_str());
     assert!(out.stderr_str().contains(MISSING_HEADER));
     assert!(!out.stdout_str().contains("Indexed"));
+}
+
+/// The first-data-blob probe completes the frame it answers from: a file
+/// whose first data payload runs past EOF is the located truncation (exit 2,
+/// no verdict), whether or not that blob's header claims indexdata.
+#[test]
+fn inspect_indexed_refuses_a_first_data_payload_cut_short() {
+    /// One frame `[len][BlobHeader]`, `[Blob{raw}]` declared at its full
+    /// size; `indexdata` is a field-5 value of any bytes (the probe answers
+    /// no for one that does not deserialize, which is enough here).
+    fn frame(kind: &str, payload: &[u8], indexdata: Option<&[u8]>) -> Vec<u8> {
+        let mut blob = vec![0x0A, u8::try_from(payload.len()).unwrap()];
+        blob.extend_from_slice(payload);
+        let mut header = vec![0x0A, u8::try_from(kind.len()).unwrap()];
+        header.extend_from_slice(kind.as_bytes());
+        if let Some(data) = indexdata {
+            header.extend_from_slice(&[0x2A, u8::try_from(data.len()).unwrap()]);
+            header.extend_from_slice(data);
+        }
+        header.extend_from_slice(&[0x18, u8::try_from(blob.len()).unwrap()]);
+        let mut out = u32::try_from(header.len()).unwrap().to_be_bytes().to_vec();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&blob);
+        out
+    }
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    for indexdata in [None, Some(&[0x01u8, 0x02][..])] {
+        let mut bytes = frame("OSMHeader", &[], None);
+        bytes.extend_from_slice(&frame("OSMData", &[0x01, 0x02, 0x03, 0x04], indexdata));
+        bytes.truncate(bytes.len() - 1);
+        let path = dir.path().join("cut.osm.pbf");
+        std::fs::write(&path, bytes).unwrap();
+        let out = CliInvoker::new(&invocation_scratch)
+            .args(["inspect", "--indexed"])
+            .arg(&path)
+            .run();
+        let stderr = out.stderr_str();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "indexdata {indexdata:?}; stdout:\n{}\nstderr:\n{stderr}",
+            out.stdout_str()
+        );
+        assert!(
+            !out.stdout_str().contains("Indexed"),
+            "{}",
+            out.stdout_str()
+        );
+        assert!(stderr.contains("cut.osm.pbf"), "{stderr}");
+        assert!(stderr.contains("blob 1"), "{stderr}");
+    }
 }
 
 #[test]

@@ -57,21 +57,6 @@ Its documentation (`read/decompress.rs`) promises the same refusals as
 decompressor rejects for size mismatch. Diff's documented byte-equality
 shortcut explains why. The hunter says the helper's promise is what is wrong.
 
-## FMT-007 - The first-data-blob probe accepts a truncated payload
-
-Reported by: read-pipeline [P1].
-
-`probe_to_first_data_blob` (`commands/mod.rs`) returns right after reading the
-first OSMData BlobHeader and never calls `skip_payload` for that frame. Take a
-complete OSMHeader followed by an indexed OSMData BlobHeader that declares a
-nonempty payload, with the file ending right after it: the probe returns
-`Ok(true)`, and `inspect --indexed` (`crates/cli/src/lib.rs`) reports success.
-This breaks the shape-4 truncation contract in
-`reference/truncation-handling.md`, which explicitly includes these probes.
-The command-side probe is wrong, because `FileReader::skip` cannot enforce a
-check its caller omits. The conformance test (`read/frame_conformance_tests.rs`)
-misses it because its substitute walk calls `skip_payload` on every frame.
-
 ## FMT-008 - PipelinedBlocks returns queued blocks after cancellation
 
 Reported by: read-pipeline [P2], concurrency-host [P2].

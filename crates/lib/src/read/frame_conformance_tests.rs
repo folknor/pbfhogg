@@ -45,7 +45,11 @@ enum Source {
     /// `Frames::next_raw` over a buffered `FileReader`.
     Raw,
     /// `Frames::next_header` then `skip_payload` over a buffered
-    /// `FileReader`, as the front probes walk.
+    /// `FileReader`, the step the front probes take on every frame they
+    /// pass, the deciding data frame included. The probes themselves stop
+    /// at the first data frame, so their early return is pinned beside
+    /// them (`commands::input_front` tests and the CLI input contract), not
+    /// by this whole-file walk.
     HeaderThenSkip,
     /// `HeaderWalker::next_header`: pread, payload extent checked against the
     /// file size taken at open.

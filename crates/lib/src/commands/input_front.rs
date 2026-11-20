@@ -204,6 +204,43 @@ mod tests {
         assert!(forced.header().is_err());
     }
 
+    /// A first data frame whose payload is cut short is the located
+    /// truncation for both front probes, never an indexdata answer, and
+    /// comes ahead of the missing-indexdata refusal (this fixture carries no
+    /// indexdata), forced or not.
+    #[test]
+    fn a_truncated_first_data_payload_is_the_truncation() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("cut.osm.pbf");
+        let mut bytes = frame("OSMHeader", &[]);
+        let header_len = bytes.len();
+        bytes.extend_from_slice(&frame("OSMData", &[0x01, 0x02, 0x03, 0x04]));
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(&path, bytes).unwrap();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let is_cut = |err: &crate::Error| {
+            matches!(err.kind(), ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+                && err.blob_index() == Some(1)
+                && err.byte_offset().map(|o| o.0) == Some(u64::try_from(header_len).unwrap())
+        };
+
+        let err = InputFront::open(&path, false, &host)
+            .unwrap()
+            .indexed()
+            .unwrap_err();
+        assert!(is_cut(&err), "{err:?}");
+        for force in [false, true] {
+            let err = InputFront::open(&path, false, &host)
+                .unwrap()
+                .require_indexdata(force, "test reason", &host)
+                .unwrap_err();
+            assert!(is_cut(&err), "force {force}: {err:?}");
+        }
+        let err = super::super::has_indexdata(&path, false, &host.diagnostics).unwrap_err();
+        assert!(is_cut(&err), "{err:?}");
+    }
+
     /// A header-only file is indexed to the front, as to `has_indexdata`;
     /// a file opening with a data blob is the missing-header error.
     #[test]

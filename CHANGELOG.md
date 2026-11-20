@@ -448,6 +448,13 @@
 
 ### Fixed
 
+- **A first data blob cut short is refused by the indexdata probe.**
+  `inspect --indexed`, `has_indexdata` and every command's indexdata
+  precondition answered from the first data blob's header without
+  checking its payload was there, so a file ending inside that payload
+  got a yes or no verdict. It is now the located truncation error (exit
+  2), ahead of the missing-indexdata refusal even under `--force`.
+
 - **OSC output never contains characters XML 1.0 forbids.** A tag,
   member role, user or metadata value holding NUL, another C0 control
   besides tab, LF and CR, or U+FFFE / U+FFFF used to be written out raw

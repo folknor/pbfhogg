@@ -124,7 +124,10 @@ there is no per-command relaxation. The contract sites are:
   `HeaderWalker` (pread), the raw-frame walks of the passthrough and
   full-scan commands (`Frames::next_raw` over a `FileReader`), and
   the input-front probes (`has_indexdata`, `InputFront`), which read
-  headers and skip payloads over a `FileReader`. `cat --dedupe`'s
+  headers and skip payloads over a `FileReader`. A probe stops early,
+  at the first data frame, but only after skipping that frame's payload
+  too: the frame it answers from is a complete one, so a first data
+  frame cut short is the shape-4 refusal, not an indexdata answer. `cat --dedupe`'s
   pass 1 walks with `HeaderWalker`, as `sort`'s does.
 
 Shape 4 is detected by whatever the source can do, and reported the
@@ -697,7 +700,11 @@ Initial alignment landed in commit `436998b` (covering
 `BlobReader::next`, its payload skip, and `HeaderWalker::next_header`);
 the caller-side `FileReader::skip` that followed the front probe's
 header-only read landed in commit `12699db` after a post-pass review
-surfaced it as a silent shape-4 hole. The raw-frame read was already
+surfaced it as a silent shape-4 hole. That skip covered only the frames
+the probe passed over: the probe still answered from the first data
+frame's header without skipping its payload, so a cut first data
+payload was answered rather than refused, until the probe was made to
+skip the deciding frame before answering. The raw-frame read was already
 aligned by its end-to-end `read_exact` pattern.
 
 On 2026-10-26 the three frame decoders that remained (`BlobReader`'s

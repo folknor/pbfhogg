@@ -1007,11 +1007,15 @@ and further bytes. pbfhogg compares exactly and refuses those. Unknown
 optional feature names are accepted. Every HeaderBlock decode refuses, and
 every command that reads elements or derives metadata from data blobs
 decodes the header first, `inspect` included, as `osmium fileinfo` does.
-Paths that never decode a `PrimitiveBlock` do not decode the header either:
-`degrade`'s header-only passthrough copies the OSMData payload bytes and
-keeps the required-feature declarations in the header it forwards, and the
-framing-only indexdata and tagdata probes (`inspect --indexed`) answer from
-BlobHeaders alone.
+The public indexdata and tagdata probes (`has_indexdata`,
+`has_indexdata_in`, `has_tagdata`, and so `inspect --indexed`) decode the
+header too, though they read no data payload, so no `inspect` mode answers
+for a file the readers refuse. The one path that never decodes the header is
+`degrade`'s header-only passthrough: it copies the OSMData payload bytes and
+keeps the required-feature declarations in the header it forwards. A
+command's internal indexdata precondition reads only framing and leaves the
+header to the command's own reader, so a command may refuse missing
+indexdata before it reaches the header refusal.
 
 ## PBF decoding: a group holding several element fields is read in kind order
 

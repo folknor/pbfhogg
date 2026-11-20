@@ -513,8 +513,10 @@
   `ErrorKind::UnsupportedRequiredFeature`, naming the feature, as osmium
   does (`inspect` included). Matching is exact, so prefixes osmium happens
   to accept are refused. `degrade`'s header-only passthrough, which decodes
-  no block, still runs and keeps the requirement in its output header, and
-  `inspect --indexed` still answers from the blob framing alone.
+  no block, still runs and keeps the requirement in its output header. The
+  public `has_indexdata`, `has_indexdata_in` and `has_tagdata` probes, and
+  so `inspect --indexed`, refuse such a file too (exit 2) rather than
+  answering from the blob framing.
 
 - **`apply-changes` no longer refuses changes whose output only needed
   more blocks.** A rewritten block keeps its source block's whole string

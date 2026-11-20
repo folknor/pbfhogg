@@ -2370,15 +2370,16 @@ fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
 #[test]
 fn inspect_indexed_refuses_a_first_data_payload_cut_short() {
     /// One frame `[len][BlobHeader]`, `[Blob{raw}]` declared at its full
-    /// size; `indexdata` is a field-5 value of any bytes (the probe answers
-    /// no for one that does not deserialize, which is enough here).
+    /// size; `indexdata` is a field-2 (indexdata) value of any bytes (the
+    /// probe answers no for one that does not deserialize, which is enough
+    /// here).
     fn frame(kind: &str, payload: &[u8], indexdata: Option<&[u8]>) -> Vec<u8> {
         let mut blob = vec![0x0A, u8::try_from(payload.len()).unwrap()];
         blob.extend_from_slice(payload);
         let mut header = vec![0x0A, u8::try_from(kind.len()).unwrap()];
         header.extend_from_slice(kind.as_bytes());
         if let Some(data) = indexdata {
-            header.extend_from_slice(&[0x2A, u8::try_from(data.len()).unwrap()]);
+            header.extend_from_slice(&[0x12, u8::try_from(data.len()).unwrap()]);
             header.extend_from_slice(data);
         }
         header.extend_from_slice(&[0x18, u8::try_from(blob.len()).unwrap()]);
@@ -2413,6 +2414,52 @@ fn inspect_indexed_refuses_a_first_data_payload_cut_short() {
         );
         assert!(stderr.contains("cut.osm.pbf"), "{stderr}");
         assert!(stderr.contains("blob 1"), "{stderr}");
+    }
+}
+
+/// `inspect --indexed` admits the header like every other inspect mode: a
+/// required feature pbfhogg does not implement is a runtime refusal naming
+/// it, never a yes or no; a supported one still answers.
+#[test]
+fn inspect_indexed_refuses_an_unsupported_required_feature() {
+    /// A header-only file whose HeaderBlock requires `feature` (field 4).
+    fn header_requiring(feature: &str) -> Vec<u8> {
+        let mut block = vec![0x22, u8::try_from(feature.len()).unwrap()];
+        block.extend_from_slice(feature.as_bytes());
+        let mut blob = vec![0x0A, u8::try_from(block.len()).unwrap()];
+        blob.extend_from_slice(&block);
+        let mut header = vec![0x0A, 9];
+        header.extend_from_slice(b"OSMHeader");
+        header.extend_from_slice(&[0x18, u8::try_from(blob.len()).unwrap()]);
+        let mut out = u32::try_from(header.len()).unwrap().to_be_bytes().to_vec();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&blob);
+        out
+    }
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    for (feature, code) in [("DenseNodes", 0), ("NotAFeatureWeKnow", 2)] {
+        let path = dir.path().join("feature.osm.pbf");
+        std::fs::write(&path, header_requiring(feature)).unwrap();
+        let out = CliInvoker::new(&invocation_scratch)
+            .args(["inspect", "--indexed"])
+            .arg(&path)
+            .run();
+        let stderr = out.stderr_str();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{feature}; stdout:\n{}\nstderr:\n{stderr}",
+            out.stdout_str()
+        );
+        if code == 2 {
+            assert!(
+                !out.stdout_str().contains("Indexed"),
+                "{}",
+                out.stdout_str()
+            );
+            assert!(stderr.contains(feature), "{stderr}");
+        }
     }
 }
 

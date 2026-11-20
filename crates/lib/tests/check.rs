@@ -1501,4 +1501,23 @@ fn an_unsupported_required_feature_refuses_every_reader() {
         pbfhogg::inspect::inspect(&bad, &opts, &crate::common::test_host()).map(drop),
         "inspect",
     );
+
+    // The public first-data-blob probes decode the header too: they answer
+    // for a supported requirement and refuse an unsupported one.
+    let host = crate::common::test_host();
+    let diagnostics = pbfhogg::host::Diagnostics::discard();
+    assert!(pbfhogg::has_indexdata(&ok, false, &diagnostics).expect("ok probes"));
+    assert!(!pbfhogg::has_tagdata(&ok, false, &diagnostics).expect("ok probes"));
+    is_unsupported(
+        pbfhogg::has_indexdata(&bad, false, &diagnostics).map(drop),
+        "has_indexdata",
+    );
+    is_unsupported(
+        pbfhogg::has_indexdata_in(&bad, false, &host).map(drop),
+        "has_indexdata_in",
+    );
+    is_unsupported(
+        pbfhogg::has_tagdata(&bad, false, &diagnostics).map(drop),
+        "has_tagdata",
+    );
 }

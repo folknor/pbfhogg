@@ -670,8 +670,16 @@ pub(crate) fn require_indexdata<'a>(
     host: &crate::host::Entered<'_>,
 ) -> Result<bool> {
     let source = input.into();
-    let (present, _) =
-        probe_first_data_blob(source, direct_io, &host.diagnostics, &host.invocation)?;
+    // Hint only: the command decodes its own header afterwards, so the
+    // refusal order matches `InputFront::require_indexdata` (indexdata
+    // question first, header admission when the command reads the header).
+    let (present, _) = probe_first_data_blob(
+        source,
+        direct_io,
+        HeaderAdmission::Skip,
+        &host.diagnostics,
+        &host.invocation,
+    )?;
     indexdata_policy(present, source.path(), force, reason, host)
 }
 
@@ -756,8 +764,12 @@ pub(crate) fn dispatch_scan_arm<'a>(
 
 /// Check if the first OsmData blob in a PBF has indexdata.
 ///
-/// O(1) header-only probe: reads blob headers until the first OsmData
-/// blob and returns whether it carries indexdata. A file with a header and
+/// Decodes the leading OsmHeader first, so a file no pbfhogg reader admits
+/// (an undecodable header, or a required feature pbfhogg does not implement,
+/// [`crate::ErrorKind::UnsupportedRequiredFeature`]) is that error located at blob 0,
+/// byte 0, not an answer. Then reads blob headers until the first OsmData
+/// blob, skipping every payload, and returns whether it carries indexdata.
+/// A file with a header and
 /// no data blobs is vacuously indexed (no blob lacks indexdata), so it
 /// returns true. A file with no leading OsmHeader blob, a zero-byte file
 /// included, is the missing-header error naming it. Trusts the first blob
@@ -776,7 +788,14 @@ pub fn has_indexdata<'a>(
 ) -> Result<bool> {
     // A library probe with no run to observe: it is never cancelled.
     let cancel = crate::host::Call::detached();
-    Ok(probe_first_data_blob(input, direct_io, diagnostics, &cancel)?.0)
+    Ok(probe_first_data_blob(
+        input,
+        direct_io,
+        HeaderAdmission::Decode,
+        diagnostics,
+        &cancel,
+    )?
+    .0)
 }
 
 /// [`has_indexdata`] for a run under `host`: the same probe, reporting to the
@@ -789,7 +808,14 @@ pub fn has_indexdata_in<'a>(
     host: &crate::host::Host,
 ) -> Result<bool> {
     let host = &host.enter()?;
-    Ok(probe_first_data_blob(input, direct_io, &host.diagnostics, &host.invocation)?.0)
+    Ok(probe_first_data_blob(
+        input,
+        direct_io,
+        HeaderAdmission::Decode,
+        &host.diagnostics,
+        &host.invocation,
+    )?
+    .0)
 }
 
 /// Check if the first OsmData blob in a PBF has tagdata (`BlobHeader`
@@ -798,15 +824,34 @@ pub fn has_indexdata_in<'a>(
 /// O(1) header-only probe, the tagdata sibling of [`has_indexdata`]: reads
 /// blob headers until the first OsmData blob and returns whether it carries
 /// tagdata. Returns false if the file has no data blobs, and the
-/// missing-header error for a file without a leading OsmHeader blob. Trusts
-/// the first blob to be representative.
+/// missing-header error for a file without a leading OsmHeader blob. Decodes
+/// the leading header first and refuses what it refuses, as
+/// [`has_indexdata`] does. Trusts the first blob to be representative.
 pub fn has_tagdata(
     path: &Path,
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
     let cancel = crate::host::Call::detached();
-    Ok(probe_first_data_blob(path, direct_io, diagnostics, &cancel)?.1)
+    Ok(probe_first_data_blob(
+        path,
+        direct_io,
+        HeaderAdmission::Decode,
+        diagnostics,
+        &cancel,
+    )?
+    .1)
+}
+
+/// What the first-data-blob probe does with the leading OsmHeader payload.
+#[derive(Clone, Copy)]
+enum HeaderAdmission {
+    /// Read and decode it, refusing what every reader refuses: the public
+    /// probes, which answer about a whole file.
+    Decode,
+    /// Skip it: a command precondition whose command decodes the header
+    /// itself, after the indexdata question.
+    Skip,
 }
 
 // This is a first-data-blob hint, not validation of every blob. Keep the
@@ -817,6 +862,7 @@ pub fn has_tagdata(
 fn probe_first_data_blob<'a>(
     input: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
+    admission: HeaderAdmission,
     diagnostics: &crate::host::Diagnostics,
     cancel: &crate::host::Invocation,
 ) -> Result<(bool, bool)> {
@@ -830,9 +876,22 @@ fn probe_first_data_blob<'a>(
     );
     // The header comes first or the file is not a PBF: a zero-byte or
     // header-less file gets the one missing-header error here, ahead of any
-    // question about indexdata. Its payload is skipped, not read.
+    // question about indexdata.
     leading_header_frame(&mut frames, path)?;
-    frames.skip_payload()?;
+    match admission {
+        HeaderAdmission::Decode => {
+            let mut payload = Vec::new();
+            frames.read_payload(&mut payload)?;
+            crate::blob::decode_blob_to_headerblock(&payload).map_err(|e| {
+                e.locate(crate::error::Location::new(
+                    Some(&std::sync::Arc::from(path)),
+                    Some(0),
+                    Some(crate::ByteOffset(0)),
+                ))
+            })?;
+        }
+        HeaderAdmission::Skip => frames.skip_payload()?,
+    }
     probe_to_first_data_blob(&mut frames)
 }
 

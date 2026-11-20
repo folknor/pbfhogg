@@ -270,15 +270,3 @@ borrowed bytes and caller-owned output storage. The shared borrowed parser
 `BlobEnvelope::parse` (`read/blob_wire.rs`) now exists, and
 `decompress_blob_raw` already decodes from it without a copy.
 
-## FMT-028 - inspect --indexed answers without decoding the header
-
-Reported by: FMT-003 resolution (spar lateral, 2026-11-20).
-
-Every header decode now refuses a required feature pbfhogg does not
-implement, and `inspect` refuses such a file in its report modes. The
-standalone `inspect --indexed` probe (the CLI branch calling the indexdata
-probe in `commands/mod.rs`) reads only frame types and the first data
-frame's BlobHeader, so it still answers for such a file. Harmless as a pure
-framing question, but it is the one `inspect` mode with a different
-admission rule; decoding the leading header there would make them one.
-

@@ -442,7 +442,8 @@ impl Claims {
 
 /// Whether `path`'s first data blob carries indexdata: the probe pbfhogg's
 /// raw-copying `cat` paths decide their way handling from. A file without
-/// a data blob answers false, as pbfhogg's probe does.
+/// a data blob answers false here, where pbfhogg's probe answers true
+/// (vacuously indexed); such a file has no ways for the answer to govern.
 pub(crate) fn first_data_blob_indexed(path: &Path) -> Result<bool, Error> {
     Ok(Claims::open(path)?
         .next_blob()?

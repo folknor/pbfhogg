@@ -24,7 +24,8 @@ were added to `notes/bugs.md` instead of being filed here: tag truncation
 (since fixed: block validation refuses a tag string index past the table),
 apply-changes base version precedence (since fixed: a change set older
 than the base element is refused), plain nodes in
-renumber (BUG-020), degrade drop counting (BUG-022) and cat decode counters
+renumber (since fixed: renumber rewrites plain node groups), degrade drop
+counting (BUG-022) and cat decode counters
 (BUG-023). Entries are in no
 order of importance.
 
@@ -105,18 +106,19 @@ emits a wait span without blocking. The nanosecond stall counter is correctly
 gated, but the marker span is not. The repository's convention is to emit
 `WAIT_*` pairs only on genuine blocks.
 
-## CMD-018 - renumber rejects empty ways its own builder writes
+## CMD-053 - renumber's group policy for non-element fields differs by kind
 
-Reported by: sort-renumber [P2].
+Reported by: the renumber representation item (2026-11-20), while sparring
+plain-node support; not reproduced.
 
-`encode_way` (`write/encode.rs`) omits field 8 when `refs` is empty, but
-`reframe_way` (`renumber/wire_rewrite.rs`) requires the field and returns
-`reframe_ways: no refs field`. A sorted, indexed file produced with
-`add_way(..., &[], ...)` cannot be renumbered. renumber is also inconsistent
-with itself: it accepts an explicitly present empty refs field, its
-replacement encoder then omits the field, and so its successful output fails a
-second renumber. An absent repeated field must mean an empty list, as the
-producer already assumes.
+`renumber/wire_rewrite.rs` rebuilds node groups (dense and plain) and
+relation groups from their element messages only, silently dropping every
+other `PrimitiveGroup` field, including field 5 (`changesets`, a known
+message the index scanner ignores), while way groups copy such fields
+through verbatim. No producer pbfhogg reads writes them, but the three
+rewriters disagree on one input shape. Pick one rule (refuse a `changesets`
+field in any data blob, or keep unknown fields everywhere) and apply it to
+all three.
 
 ## CMD-019 - sort orders history versions only when blob layout forces a rewrite
 
@@ -389,7 +391,7 @@ Renumber writes exactly one output block per input block (`pool.rs`
 `run_rewrite_stage`), and the writer refuses a block over the raw size cap
 (`write/framing.rs`). The rewrite can grow a block: a way or relation ID of
 1 is a one-byte varint, a large start (`2^40`) or a negative one (`-1` is
-ten bytes) widens every ID, and a way alternating between a live node and an
+ten bytes) widens every ID, plain node messages included, and a way alternating between a live node and an
 orphan can widen its ref deltas. An input block close to the cap then fails
 with the size error instead of renumbering. It fails loudly and before
 publication, and is sign-neutral (a large positive start does it too). The

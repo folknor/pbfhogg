@@ -608,6 +608,17 @@ headers, parse key lists, or bounds-check copied key string indices. Corrupt
 indices pass through as on the read side. Adding those operations changes the
 historical output or adds per-blob or per-tag work to the measured hot path.
 
+The byte rewrite takes every element representation the library writes. A
+node group is one `DenseNodes` or plain `Node` messages (written where a
+dense slot cannot keep the metadata fields present); each is renumbered in
+its own form, so plain stays plain, and both share the blob's order check
+and numbering. A plain node's `id` must be one varint, as for ways and
+relations. A group with no element field is zero nodes. A group holding
+both plain and dense nodes is refused: it carries no indexdata, and `cat`
+rebuilds it. A way with no `refs` field has an empty list, as the encoders
+write it, and an explicitly empty `refs` comes out in that same form, so
+renumber output renumbers again.
+
 ## Sidecar comparison contracts
 
 The historical names `merge_scanner_to_drain_bytes_high_water` and

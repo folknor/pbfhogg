@@ -203,23 +203,6 @@ Reported by: apply-core.
 Samples are inserted only in the two passthrough arms; rewritten and create
 frames never contribute, though `stats.rs` labels the result blob sizes.
 
-## BUG-020 - renumber rejects plain node encoding
-
-Reported by: sort.
-
-`single_dense` (`wire_rewrite.rs`) requires `DenseNodes`, rejecting plain
-nodes, including valid sorted output the library's partial-metadata encoding
-produces.
-
-Defect hunt 2026-11-17 (sort-renumber, P2): a sorted, honestly indexed block
-with one plain node fails renumber, and the error wrongly calls the
-single-kind group mixed. `BlockBuilder::add_node_partial` deliberately writes
-plain nodes when dense encoding cannot preserve metadata presence, for example
-metadata with an explicit UID of zero and no version. Claim named: renumber
-renumbers all element IDs with no dense-only restriction. The hunter's
-structural note: renumber's rewrite layer needs to cover every element
-representation the library produces.
-
 ## BUG-021 - renumber turns explicit zlib:6 into zlib:1
 
 Reported by: sort.

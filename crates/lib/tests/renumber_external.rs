@@ -650,6 +650,73 @@ fn renumber_nodes_and_ways_end_to_end() {
     assert_eq!(way_300.tag("barrier"), Some("gate"));
 }
 
+/// The builder writes a node whose metadata a dense slot cannot carry as a
+/// plain `Node` group, and a way with no refs without its `refs` field.
+/// Renumber took neither. Both now renumber, plain stays plain with its
+/// metadata claims intact, and the output renumbers again.
+#[test]
+fn plain_nodes_and_zero_ref_ways_renumber_as_the_builder_writes_them() {
+    use pbfhogg::block_builder::{BlockBuilder, PartialMetadata};
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let again = dir.path().join("again.osm.pbf");
+
+    // Version 0 with explicit zero uid and changeset: written plain.
+    let plain_meta = PartialMetadata {
+        version: Some(0),
+        timestamp: Some(1_600_000_000),
+        changeset: Some(0),
+        uid: Some(0),
+        user: Some(""),
+        visible: None,
+    };
+    let mut bb = BlockBuilder::new();
+    bb.add_node(10, 1, 2, [("a", "b")], None);
+    bb.add_node_partial(20, 3, 4, [("c", "d")], Some(&plain_meta));
+    bb.add_node(30, 5, 6, [("e", "f")], None);
+    let nodes = bb.take().expect("take").expect("node block").to_vec();
+    bb.add_way(100, [("highway", "x")], &[10, 20, 30], None);
+    bb.add_way(200, [("empty", "yes")], &[], None);
+    bb.add_way(300, [("g", "h")], &[20], None);
+    let ways = bb.take().expect("take").expect("way block").to_vec();
+    crate::common::frame_fixture_blocks(
+        &input,
+        &[nodes, ways],
+        crate::common::FixtureFraming::INDEXED,
+    );
+
+    let stats = run_renumber(&input, &output, &default_opts()).expect("renumber");
+    assert_eq!(stats.nodes_written, 3);
+    assert_eq!(stats.ways_written, 3);
+    assert_sorted_file(&output);
+
+    let before = read_normalized(&input);
+    let after = read_normalized(&output);
+    let ids: Vec<i64> = after.nodes.iter().map(|n| n.id).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+    for (old, new) in before.nodes.iter().zip(&after.nodes) {
+        assert_eq!(
+            (old.nano_lat, old.nano_lon, &old.tags, &old.meta),
+            (new.nano_lat, new.nano_lon, &new.tags, &new.meta),
+            "node {} keeps everything but its id",
+            old.id
+        );
+    }
+    assert!(
+        after.nodes[1].meta.is_some(),
+        "the plain node's claims survive"
+    );
+    let refs: Vec<(i64, Vec<i64>)> = after.ways.iter().map(|w| (w.id, w.refs.clone())).collect();
+    assert_eq!(refs, vec![(1, vec![1, 2, 3]), (2, vec![]), (3, vec![2])]);
+
+    run_renumber(&output, &again, &default_opts()).expect("the output renumbers again");
+    let twice = read_normalized(&again);
+    assert_eq!(twice.nodes, after.nodes);
+    assert_eq!(twice.ways, after.ways);
+}
+
 #[test]
 fn renumber_custom_start_ids() {
     let dir = crate::common::test_scratch();

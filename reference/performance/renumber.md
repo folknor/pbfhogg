@@ -4,7 +4,7 @@
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces
 the original 256-bucket radix partition). Wire-format splice rewriters
-for all three element types - pass 1 (DenseNodes), stage 2d (ways),
+for all three element types - pass 1 (dense and plain nodes), stage 2d (ways),
 and R2d (relations) - patch only the ID/ref fields and copy everything
 else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
 construction. Pass 1: 4 work-stealing workers. Stage 2d: 6 workers.
@@ -44,6 +44,37 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 ## History
 
 ### Renumber
+
+#### Plain node groups and ways without refs (planet, baseline `19f32e61`, plantasjen, 2026-11-20)
+
+Pass 1 classifies each node group (dense, plain, or no elements) and
+rewrites plain `Node` messages by a one-range id splice; stage 2d takes a
+way with no `refs` field as an empty list. Matched `id-remap`
+`--iterations 1` cells, baseline built with `--commit 19f32e61`, variants
+uncommitted on it, no fstrim, other projects' checks running between
+cells. The walls moved with the input reads (`pass1_pread_ns` 102 to
+213 s across cells of either arm, drifting upward through the session),
+so the verdicts are read from the rewrite counters, which do not depend
+on the drive.
+
+- Baseline: 174.8 / 187.9 / 195.7 s (UUIDs `58a66045`, `1744d7a1`,
+  `ba539b69`); `pass1_reframe_ns` 54.5 / 55.0 / 53.7 s,
+  `stage2d_reframe_ns` 252.4 / 250.2 / 250.7 s.
+- First form, a refusal arm for a non-packed, non-varint `refs` in the
+  way splice's per-field loop: 208.4 / 180.1 s (`257410d0`, `13531e3c`),
+  `stage2d_reframe_ns` 273.2 / 272.0 s, about 9 % over the baseline in
+  both cells; pass 1 unchanged (54.9 / 53.5 s). The same with that
+  refusal built as a cold out-of-line function and the absent case as an
+  empty splice range: 182.2 s (`022a49bc`), stage 2d 275.3 s. With the
+  original way splice restored (isolation build, `14bd921f`) stage 2d
+  read 249.4 s, so the cost followed the way-loop change.
+- The loop as before and the stray-field check moved into the
+  absent-refs path: 177.3 / 212.6 s (`c10a910f`, `c1b1fb00`; the second
+  cell's pass 1 read took 180 s), `pass1_reframe_ns` 54.3 / 53.7 s,
+  `stage2d_reframe_ns` 250.1 / 250.3 s.
+- Landed form, the same check run for every way with no refs (absent or
+  one empty segment): 181.6 s (`cfdce1c1`), `pass1_reframe_ns` 52.4 s,
+  `stage2d_reframe_ns` 248.9 s. Verdict: neutral.
 
 #### Signed remap and orphan bijection (Germany, baseline `b974262f`, bygg, 2026-11-18)
 

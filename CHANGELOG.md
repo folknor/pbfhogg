@@ -448,6 +448,15 @@
 
 ### Fixed
 
+- **renumber takes plain nodes and ways without node refs.** A node block
+  holding plain (non-dense) node groups, which pbfhogg itself writes for
+  nodes whose metadata a dense block cannot carry exactly (for example
+  version 0 with an explicit uid 0), failed with an error calling the
+  group mixed; a way with no node refs, which the writer encodes without
+  a refs field, failed with `no refs field`, so renumber's own output with
+  such a way could not be renumbered again. Both now renumber; plain nodes
+  stay plain with their metadata intact.
+
 - **A first data blob cut short is refused by the indexdata probe.**
   `inspect --indexed`, `has_indexdata` and every command's indexdata
   precondition answered from the first data blob's header without

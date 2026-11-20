@@ -1,4 +1,11 @@
-//! Wire-format rewriters for DenseNodes, Ways, and Relations.
+//! Wire-format rewriters for nodes (dense and plain), Ways, and Relations.
+//!
+//! Each rewriter takes every element representation the library writes:
+//! plain `Node` groups beside dense ones, and ways with no `refs` field
+//! (the encoders omit an empty list). Payload bytes the rewrite does not
+//! interpret (tags, metadata, inline way locations) are copied, not
+//! validated, so a block the index scanner accepts but the full reader
+//! refuses is carried through as it came.
 //!
 //! These are the renumber-specific fast path: renumber only changes IDs,
 //! so we avoid the full decode -> BlockBuilder -> re-encode cycle.
@@ -401,11 +408,28 @@ fn for_each_group<'a>(
 // DenseNodes wire-format rewriter for pass 1
 // ---------------------------------------------------------------------------
 
-/// The one DenseNodes message of a node group. Refuses a second one (protobuf
-/// would merge the two, concatenating their packed arrays, where taking
-/// either alone silently drops nodes) and any other element kind.
-fn single_dense(group: &[u8]) -> crate::Result<&[u8]> {
+/// How a node group holds its nodes. The library writes both forms:
+/// `BlockBuilder::add_node_partial` writes plain `Node` messages where a
+/// dense slot cannot keep the metadata fields present, in groups of their
+/// own, and the index scanner indexes such blocks.
+enum NodeGroup<'a> {
+    /// One DenseNodes message.
+    Dense(&'a [u8]),
+    /// One or more plain `Node` messages, walked again by the rewrite.
+    Plain,
+    /// No element field at all: zero nodes, as every reader takes it.
+    Empty,
+}
+
+/// Classify a node group. Refuses a second DenseNodes (protobuf would merge
+/// the two, concatenating their packed arrays, where taking either alone
+/// silently drops nodes), plain and dense nodes in one group (the index
+/// scanner withholds indexdata for that shape, and the reader orders it by
+/// kind, not by wire), any other element kind, and an element field that is
+/// not length-delimited.
+fn node_group(group: &[u8]) -> crate::Result<NodeGroup<'_>> {
     let mut dense: Option<&[u8]> = None;
+    let mut plain = false;
     let mut cursor = Cursor::new(group);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
         match (field, wire_type) {
@@ -415,16 +439,145 @@ fn single_dense(group: &[u8]) -> crate::Result<&[u8]> {
                     return Err(repeated_message_field_error("PrimitiveGroup", "DenseNodes"));
                 }
             }
-            (1 | 3 | 4, _) => return Err(foreign_kind_error("node", field)),
+            (1, WIRE_LEN) => {
+                cursor.skip_field(wire_type).map_err(wire_err)?;
+                plain = true;
+            }
+            (1 | 2, _) => return Err(malformed_element_field(field)),
+            (3 | 4, _) => return Err(foreign_kind_error("node", field)),
             _ => cursor.skip_field(wire_type).map_err(wire_err)?,
         }
     }
-    dense.ok_or_else(|| Error::invalid_data("reframe: no DenseNodes in PrimitiveGroup"))
+    match (dense, plain) {
+        (Some(_), true) => Err(Error::invalid_data(
+            "renumber: a node blob's PrimitiveGroup carries both plain Node and \
+             DenseNodes elements. A group must hold one node encoding; such a \
+             block carries no indexdata, and `cat` rebuilds it into single-kind \
+             groups.",
+        )),
+        (Some(d), false) => Ok(NodeGroup::Dense(d)),
+        (None, true) => Ok(NodeGroup::Plain),
+        (None, false) => Ok(NodeGroup::Empty),
+    }
 }
 
-/// Reframe a decompressed PrimitiveBlock by replacing only the DenseNodes
-/// ID deltas while copying everything else (string table, lat/lon, tags,
-/// metadata) verbatim at the byte level.
+/// Error text for a PrimitiveGroup element field whose wire type is not
+/// length-delimited.
+fn malformed_element_field(field: u32) -> Error {
+    let name = match field {
+        1 => "nodes",
+        2 => "dense",
+        3 => "ways",
+        _ => "relations",
+    };
+    Error::invalid_data(format!(
+        "renumber: PrimitiveGroup.{name} is not a length-delimited message"
+    ))
+}
+
+/// The DenseNodes of a group the caller knows is dense (test re-reads).
+#[cfg(test)]
+fn single_dense(group: &[u8]) -> crate::Result<&[u8]> {
+    match node_group(group)? {
+        NodeGroup::Dense(d) => Ok(d),
+        _ => Err(Error::invalid_data(
+            "reframe: no DenseNodes in PrimitiveGroup",
+        )),
+    }
+}
+
+/// Where one node group's rewrite reads its shared per-blob state.
+struct NodeSink<'s> {
+    base_new_id: i64,
+    assigned: u64,
+    span: Span,
+    id_set: &'s IdSet,
+    overflow: &'s mut Vec<i64>,
+}
+
+impl NodeSink<'_> {
+    /// Record one input node: order, ID set, count. Returns its new ID.
+    #[inline]
+    fn push(&mut self, old_id: i64) -> crate::Result<i64> {
+        self.span.push("node", old_id)?;
+        if !self.id_set.try_insert_atomic(old_id) {
+            self.overflow.push(old_id);
+        }
+        let new_id = offset_id(self.base_new_id, self.assigned)?;
+        self.assigned = inc(self.assigned)?;
+        Ok(new_id)
+    }
+}
+
+/// Rewrite a group of plain `Node` messages into `out` as a plain group:
+/// each node's `id` replaced, every other byte of the message copied.
+/// Non-element group fields are dropped, as the dense rewrite drops them.
+fn rewrite_plain_group(
+    group: &[u8],
+    sink: &mut NodeSink<'_>,
+    element: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> crate::Result<()> {
+    out.clear();
+    let mut cursor = Cursor::new(group);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
+        if (field, wire_type) == (1, WIRE_LEN) {
+            let node = cursor.read_len_delimited().map_err(wire_err)?;
+            reframe_plain_node(node, sink, element)?;
+            protohoggr::encode_bytes_field_always(out, 1, element);
+        } else {
+            cursor.skip_field(wire_type).map_err(wire_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite one plain `Node` into `out` with its id replaced. The id must be
+/// one varint field 1, the rule renumber applies to way and relation ids
+/// (the reader defaults an absent id to 0 and keeps the last of several,
+/// which a splice would leave beside the patched one).
+fn reframe_plain_node(
+    node: &[u8],
+    sink: &mut NodeSink<'_>,
+    out: &mut Vec<u8>,
+) -> crate::Result<()> {
+    let mut id: Option<(i64, (usize, usize))> = None;
+    let mut cursor = Cursor::new(node);
+    loop {
+        let tag_start = cursor.position();
+        let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? else {
+            break;
+        };
+        match (field, wire_type) {
+            (1, WIRE_VARINT) => {
+                let v = cursor.read_sint64().map_err(wire_err)?;
+                if id.replace((v, (tag_start, cursor.position()))).is_some() {
+                    return Err(repeated_message_field_error("Node", "id"));
+                }
+            }
+            (1, _) => {
+                return Err(Error::invalid_data("renumber: Node.id is not a varint"));
+            }
+            _ => {
+                cursor.read_raw_field(wire_type).map_err(wire_err)?;
+            }
+        }
+    }
+    let (old_id, (start, end)) =
+        id.ok_or_else(|| Error::invalid_data("reframe: plain Node without an id field"))?;
+    let new_id = sink.push(old_id)?;
+    out.clear();
+    out.extend_from_slice(&node[..start]);
+    protohoggr::encode_tag(out, 1, WIRE_VARINT);
+    protohoggr::encode_varint(out, protohoggr::zigzag_encode_64(new_id));
+    out.extend_from_slice(&node[end..]);
+    Ok(())
+}
+
+/// Reframe a decompressed node PrimitiveBlock by replacing only the node
+/// IDs (DenseNodes ID deltas, or each plain Node's id) while copying
+/// everything else (string table, lat/lon, tags, metadata) verbatim at the
+/// byte level. Plain groups stay plain, so metadata presence survives.
 ///
 /// Records each old node ID in `id_set` through the atomic setter. An ID
 /// whose chunk `id_set` does not cover - the pre-allocation is bounded by the
@@ -442,10 +595,31 @@ pub(super) fn reframe_dense_with_new_ids(
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
 
-    let mut assigned: u64 = 0;
-    let mut span = Span::default();
+    let mut sink = NodeSink {
+        base_new_id,
+        assigned: 0,
+        span: Span::default(),
+        id_set,
+        overflow,
+    };
     let groups = for_each_group(decompressed, |group| {
-        let dense_bytes = single_dense(group)?;
+        let dense_bytes = match node_group(group)? {
+            NodeGroup::Dense(d) => d,
+            NodeGroup::Plain => {
+                rewrite_plain_group(group, &mut sink, &mut s.element, &mut s.group)?;
+                protohoggr::encode_bytes_field(output, 2, &s.group);
+                return Ok(());
+            }
+            NodeGroup::Empty => return Ok(()),
+        };
+        let NodeSink {
+            base_new_id,
+            assigned,
+            span,
+            id_set,
+            overflow,
+        } = &mut sink;
+        let base_new_id = *base_new_id;
 
         // `id_field` holds only a data-bearing occurrence; `saw_id_field`
         // records that field 1 was present at all, so a DenseNodes carrying
@@ -498,7 +672,7 @@ pub(super) fn reframe_dense_with_new_ids(
         // duplicates the next group's first.
         s.packed.clear();
         if group_count > 0 {
-            let first_new = offset_id(base_new_id, assigned)?;
+            let first_new = offset_id(base_new_id, *assigned)?;
             protohoggr::encode_varint(&mut s.packed, protohoggr::zigzag_encode_64(first_new));
             let n = usize::try_from(group_count)
                 .map_err(|_| Error::invalid_data("group node count > usize"))?;
@@ -506,7 +680,7 @@ pub(super) fn reframe_dense_with_new_ids(
             s.packed
                 .extend(std::iter::repeat_n(step, n.saturating_sub(1)));
         }
-        assigned = assigned
+        *assigned = assigned
             .checked_add(group_count)
             .ok_or_else(|| Error::invalid_data("renumber: node count overflow"))?;
 
@@ -529,9 +703,9 @@ pub(super) fn reframe_dense_with_new_ids(
     output.extend_from_slice(&s.scalars);
 
     Ok(Outcome {
-        count: assigned,
+        count: sink.assigned,
         orphans: 0,
-        span: span.get(),
+        span: sink.span.get(),
         new_range: None,
     })
 }
@@ -682,7 +856,13 @@ fn reframe_way(
         prev_new_ref = new_ref;
     }
 
-    let refs_r = refs_range.ok_or_else(|| Error::invalid_data("reframe_ways: no refs field"))?;
+    // An empty present segment is replaced by nothing, the encoders' form,
+    // so renumber output renumbers again; an absent one is an empty list.
+    let refs_r = if old_refs_data.is_empty() {
+        zero_refs_range(way_bytes, id_r, refs_range)?
+    } else {
+        refs_range.unwrap_or((id_r.1, id_r.1))
+    };
     splice_two(
         way_bytes,
         id_r,
@@ -692,6 +872,34 @@ fn reframe_way(
         out,
     );
     Ok(orphans)
+}
+
+/// The splice range of a way with no refs: its one empty packed segment,
+/// or with none the empty range just past its id. Either way the empty
+/// `refs_out` writes nothing there, the encoders' form for an empty list,
+/// which every reader takes an absent `refs` to be. A field 8 that is not
+/// packed is refused rather than copied through as an unknown field: beside
+/// an empty list it would be the output's only `refs`, which the next
+/// renumber refuses. The check lives in this rare path, not in the
+/// per-field loop: as an extra arm there it measured about 9 % more stage
+/// 2d rewrite time on planet (reference/performance/renumber.md).
+#[cold]
+#[inline(never)]
+fn zero_refs_range(
+    way_bytes: &[u8],
+    id_r: (usize, usize),
+    present: Option<(usize, usize)>,
+) -> crate::Result<(usize, usize)> {
+    let mut cursor = Cursor::new(way_bytes);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
+        if field == 8 && wire_type != WIRE_LEN {
+            return Err(Error::invalid_data(
+                "renumber: Way.refs is neither packed nor a varint",
+            ));
+        }
+        cursor.skip_field(wire_type).map_err(wire_err)?;
+    }
+    Ok(present.unwrap_or((id_r.1, id_r.1)))
 }
 
 /// Emit `bytes` into `out` with the two non-overlapping ranges `a` and `b`
@@ -1724,5 +1932,213 @@ mod tests {
             outcome.orphans, 0,
             "node 7 is present, so its ref is not an orphan"
         );
+    }
+
+    /// A plain `Node` message: id, then whatever `rest` holds verbatim.
+    fn plain_node_message(id: i64, rest: &[u8]) -> Vec<u8> {
+        let mut node = vec![0x08];
+        varint(zz(id), &mut node);
+        node.extend_from_slice(rest);
+        node
+    }
+
+    fn plain_group(nodes: &[Vec<u8>]) -> Vec<u8> {
+        let mut group = Vec::new();
+        for n in nodes {
+            len_delimited(1, n, &mut group);
+        }
+        group
+    }
+
+    fn dense_group(ids: &[i64]) -> Vec<u8> {
+        let block = dense_groups(&[ids]);
+        let mut groups = Vec::new();
+        for_each_group(&block, |g| {
+            groups.push(g.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        groups.pop().unwrap()
+    }
+
+    /// Every node of a rewritten block in order, each with whether it is
+    /// plain, and the bytes after a plain node's id.
+    fn node_ids(block: &[u8]) -> Vec<(i64, bool, Vec<u8>)> {
+        let mut seen = Vec::new();
+        for_each_group(block, |group| {
+            let mut c = Cursor::new(group);
+            while let Some((f, _)) = c.read_tag().map_err(wire_err)? {
+                let body = c.read_len_delimited().map_err(wire_err)?;
+                let mut m = Cursor::new(body);
+                if f == 1 {
+                    assert_eq!(m.read_tag().map_err(wire_err)?, Some((1, WIRE_VARINT)));
+                    let id = m.read_sint64().map_err(wire_err)?;
+                    seen.push((id, true, body[m.position()..].to_vec()));
+                } else {
+                    assert_eq!(f, 2);
+                    while let Some((df, dw)) = m.read_tag().map_err(wire_err)? {
+                        if df == 1 {
+                            let mut ids = Cursor::new(m.read_len_delimited().map_err(wire_err)?);
+                            let mut id = 0_i64;
+                            while ids.remaining() > 0 {
+                                id = id.wrapping_add(ids.read_sint64().map_err(wire_err)?);
+                                seen.push((id, false, Vec::new()));
+                            }
+                        } else {
+                            m.skip_field(dw).map_err(wire_err)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        seen
+    }
+
+    /// `BlockBuilder::add_node_partial` writes plain groups beside dense
+    /// ones; the dense-only rewriter refused them as a "mixed" group. They
+    /// share the blob's order check and numbering, stay plain, and keep
+    /// every byte but the id (here a tag pair and an Info), and the output
+    /// renumbers again.
+    #[test]
+    fn plain_node_groups_renumber_beside_dense_ones() {
+        let mut rest = Vec::new();
+        len_delimited(2, &[0x01], &mut rest); // keys
+        len_delimited(3, &[0x02], &mut rest); // vals
+        len_delimited(4, &[0x18, 0x00], &mut rest); // Info { uid: 0 }
+        rest.extend_from_slice(&[0x40, 0x02, 0x48, 0x04]); // lat, lon
+        let block = block_of(&[
+            dense_group(&[10]),
+            plain_group(&[plain_node_message(20, &rest), plain_node_message(30, &[])]),
+            dense_group(&[40]),
+        ]);
+        let mut out = Vec::new();
+        let (outcome, _) = run_dense_into(&block, &mut out).expect("rewrite");
+        assert_eq!(outcome.count, 4);
+        assert_eq!(outcome.span, Some((10, 40)));
+        assert_eq!(
+            node_ids(&out),
+            vec![
+                (1, false, Vec::new()),
+                (2, true, rest.clone()),
+                (3, true, Vec::new()),
+                (4, false, Vec::new()),
+            ]
+        );
+        let again = run_dense(&out).expect("the output renumbers again");
+        assert_eq!(again.span, Some((1, 4)));
+
+        // The plain run takes part in the order check.
+        let err = run_dense(&block_of(&[
+            dense_group(&[10]),
+            plain_group(&[plain_node_message(5, &[])]),
+        ]))
+        .err()
+        .expect("a step back into a plain group");
+        assert!(err.to_string().contains("strictly increase"), "got: {err}");
+    }
+
+    #[test]
+    fn a_plain_node_id_must_be_one_varint() {
+        let refused = |node: Vec<u8>, text: &str| {
+            let err = run_dense(&block_of(&[plain_group(&[node])]))
+                .err()
+                .expect("refused");
+            assert!(err.to_string().contains(text), "{text}: got {err}");
+        };
+        refused(Vec::new(), "plain Node without an id field");
+        refused(vec![0x40, 0x02], "plain Node without an id field");
+        let mut twice = plain_node_message(20, &[]);
+        twice.extend_from_slice(&plain_node_message(21, &[]));
+        refused(twice, "Node carries id more than once");
+        let mut wrong = plain_node_message(20, &[]);
+        len_delimited(1, &[0x02], &mut wrong);
+        refused(wrong, "Node.id is not a varint");
+    }
+
+    #[test]
+    fn a_group_with_plain_and_dense_nodes_is_refused() {
+        let mut group = dense_group(&[10]);
+        group.extend_from_slice(&plain_group(&[plain_node_message(20, &[])]));
+        let err = run_dense(&block_of(&[group])).err().expect("refused");
+        assert!(
+            err.to_string().contains("both plain Node and DenseNodes"),
+            "got: {err}"
+        );
+        // A non-message element field is not taken for an empty group.
+        let err = run_dense(&block_of(&[vec![0x10, 0x01]]))
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains("PrimitiveGroup.dense is not"),
+            "got: {err}"
+        );
+    }
+
+    /// A group with no element field holds zero nodes, as the reader takes
+    /// it: no ID is consumed and nothing is written for it.
+    #[test]
+    fn a_group_with_no_elements_is_zero_nodes() {
+        let mut out = Vec::new();
+        let (outcome, _) = run_dense_into(&block_of(&[Vec::new(), dense_group(&[10])]), &mut out)
+            .expect("rewrite");
+        assert_eq!(outcome.count, 1);
+        assert_eq!(node_ids(&out), vec![(1, false, Vec::new())]);
+    }
+
+    fn run_ways_into(block: &[u8], out: &mut Vec<u8>) -> crate::Result<Outcome> {
+        let mut node_ids = IdSet::new();
+        node_ids.insert(7);
+        let node_ids = node_ids.into_ranked();
+        reframe_ways_with_new_ids(
+            block,
+            1_000,
+            &IdSpace::new(&node_ids, 100),
+            &mut IdSet::new(),
+            out,
+            &mut Scratch::default(),
+        )
+    }
+
+    /// The encoders omit an empty `refs` list, so a zero-ref way has no
+    /// field 8; it renumbers, and so does the rewrite of an explicitly empty
+    /// segment, whose output takes the encoders' form.
+    #[test]
+    fn a_way_without_refs_renumbers_and_renumbers_again() {
+        let absent = way_message(3, &[], 1);
+        let mut empty = absent.clone();
+        len_delimited(8, &[], &mut empty);
+        for way in [absent, empty] {
+            let mut group = Vec::new();
+            len_delimited(3, &way, &mut group);
+            let mut out = Vec::new();
+            let outcome = run_ways_into(&block_of(&[group]), &mut out).expect("rewrite");
+            assert_eq!(outcome.count, 1);
+            assert_eq!(outcome.span, Some((3, 3)));
+            let mut again = Vec::new();
+            let outcome = run_ways_into(&out, &mut again).expect("the output renumbers again");
+            assert_eq!(outcome.span, Some((1_000, 1_000)));
+            assert_eq!(again, out, "the second rewrite is a fixed point");
+        }
+
+        // A field 8 of another wire type is not taken for an absent list,
+        // nor kept beside an empty one, where it would be the output's only
+        // `refs` and the next renumber would refuse it.
+        let stray = [0x45, 0, 0, 0, 0]; // field 8, fixed32
+        let mut alone = way_message(3, &[], 1);
+        alone.extend_from_slice(&stray);
+        let mut beside_empty = way_message(3, &[], 1);
+        len_delimited(8, &[], &mut beside_empty);
+        beside_empty.extend_from_slice(&stray);
+        for way in [alone, beside_empty] {
+            let mut group = Vec::new();
+            len_delimited(3, &way, &mut group);
+            let err = run_ways(&block_of(&[group])).err().expect("refused");
+            assert!(
+                err.to_string().contains("Way.refs is neither packed"),
+                "got: {err}"
+            );
+        }
     }
 }

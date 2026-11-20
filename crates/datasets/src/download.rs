@@ -16,7 +16,7 @@ use pbfhogg_devkit::{Config, DatasetView, FileEntry, Generation, file_digest};
 
 use crate::date::CivilDate;
 use crate::layout::{
-    clear, indexed_pbf_filename, osc_filename, partial, publication_path, publish, raw_pbf_filename,
+    indexed_pbf_filename, osc_filename, publication_path, publish, raw_pbf_filename, stage,
 };
 use crate::lock::DatasetLock;
 use crate::output::note;
@@ -132,8 +132,7 @@ fn acquire_raw(
         ));
     } else {
         let url = resolved.source.pbf_url();
-        let staged = partial(&dest);
-        clear(&staged)?;
+        let staged = stage(req.config, req.host, data_dir, key, &dest, &[])?;
         note(&format!("  GET: {url} -> {}", dest.display()));
         req.tools.fetch(&url, &staged, lock)?;
         publish(&staged, &dest)?;
@@ -158,8 +157,7 @@ fn generate_indexed(
         ));
     }
     let dest = data_dir.join(&name);
-    let staged = partial(&dest);
-    clear(&staged)?;
+    let staged = stage(req.config, req.host, data_dir, key, &dest, &[raw])?;
     note(&format!(
         "  generating indexed PBF via pbfhogg cat -> {}",
         dest.display()
@@ -307,8 +305,7 @@ fn acquire_osc(
                 dest.display()
             ));
         } else {
-            let staged = partial(&dest);
-            clear(&staged)?;
+            let staged = stage(req.config, req.host, dir, &resolved.key, &dest, &[raw])?;
             let url = resolved.source.osc_url(seq);
             note(&format!("  GET: {url} -> {}", dest.display()));
             req.tools.fetch(&url, &staged, lock)?;
@@ -1024,6 +1021,61 @@ mod tests {
         assert_eq!(tools.fetches.get(), 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert_eq!(std::fs::read(dir.join("other")).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn staging_never_unlinks_a_registered_entry() {
+        use std::os::unix::fs::symlink;
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = std::fs::canonicalize(scratch.path()).unwrap();
+        let path = dir.join("brokkr.toml");
+        let staged = dir.join(".partial.denmark.denmark-new.osm.pbf");
+        std::fs::create_dir(dir.join("store")).unwrap();
+        std::fs::write(dir.join("store/raw"), b"protected").unwrap();
+        let head = format!(
+            "[h]\ndata = {:?}\n[h.datasets.denmark]\norigin = \"download.geofabrik.de/europe/denmark\"\n",
+            dir.to_str().unwrap()
+        );
+        // The staging name registered as a file, and traversed as a
+        // symlinked directory by another dataset's registration.
+        for (file, setup) in [
+            (".partial.denmark.denmark-new.osm.pbf", false),
+            (".partial.denmark.denmark-new.osm.pbf/raw", true),
+        ] {
+            if staged.symlink_metadata().is_ok() {
+                std::fs::remove_file(&staged).unwrap();
+            }
+            if setup {
+                symlink(dir.join("store"), &staged).unwrap();
+            } else {
+                std::fs::write(&staged, b"protected").unwrap();
+            }
+            let before = format!("{head}[h.datasets.other.pbf.raw]\nfile = {file:?}\n");
+            std::fs::write(&path, &before).unwrap();
+            let config = Config::load(&path, None).unwrap();
+            let tools = SnapshotPrograms {
+                fail_cat: std::cell::Cell::new(false),
+                fetches: std::cell::Cell::new(0),
+            };
+            let req = Request {
+                config: &config,
+                host: "h",
+                region: "denmark",
+                refresh: false,
+                force: false,
+                snapshot: None,
+                as_snapshot: Some("new"),
+                osc_seq: None,
+                indexed: false,
+                tools: &tools,
+                today: CivilDate::parse_yyyymmdd("20260411").unwrap(),
+            };
+            let err = run(&req).unwrap_err();
+            assert!(err.contains("registered by 'other'"), "{err}");
+            assert_eq!(tools.fetches.get(), 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(std::fs::read(dir.join(file)).unwrap(), b"protected");
+        }
     }
 
     #[test]

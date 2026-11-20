@@ -126,8 +126,15 @@ stdin open until exit.
 The lock's content records the source identity of potentially unregistered
 acquisition files. Raw and OSC adoption requires an already matching
 identity; a torn record matches nothing. Identity is rewritten only when
-nothing is adoptable. Stale staged files are removed under the lock before
-their writer starts. Registered shared diffs do not require a recovery
+nothing is adoptable. The staged sibling of `NAME` is `.partial.KEY.NAME`;
+dataset keys never contain `.`, so two datasets, which hold different
+locks, never share a staging name. Stale staged files are removed under the
+lock before their writer starts, except that the removal refuses when
+resolving any file registered on the host (or the input being promoted)
+would look up that staging entry, whether the registration names it
+directly or traverses it through a symlink; directories compare by device
+and inode, so a bind-mounted alias is seen through. Leftovers from the
+older `.partial-NAME` spelling are never removed by the tool. Registered shared diffs do not require a recovery
 identity. Retry preserves registered pins and can recover completed,
 unregistered publication safely.
 

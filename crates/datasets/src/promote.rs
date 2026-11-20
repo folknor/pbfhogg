@@ -113,34 +113,21 @@ fn publish_output(req: &Request<'_>, dir: &Path, dest: &Path, digest: &str) -> R
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let staged = layout::partial(dest);
-            let staged_path = layout::publication_path(&staged)?;
-            if staged_path == std::fs::canonicalize(req.file).map_err(|e| e.to_string())? {
-                return Err("output is the promotion staging file; move it elsewhere first".into());
-            }
-            // Even an unusual manually configured staging name belongs to
-            // the registry. Recovery must not unlink it or fill an absent
-            // registered destination with a different pin.
+            // Recovery must not fill an absent registered destination with
+            // a different pin.
             let dest_path = layout::publication_path(dest)?;
-            for view in req
-                .config
-                .dataset_views(req.host)
-                .map_err(|e| e.to_string())?
-                .values()
-            {
-                for generation in std::iter::once(&view.primary).chain(view.snapshots.values()) {
-                    for entry in generation.pbf.values().chain(generation.osc.values()) {
-                        let named = layout::publication_path(&dir.join(&entry.file))?;
-                        if named == staged_path || named == dest_path {
-                            return Err(format!(
-                                "publication path {} is already registered",
-                                named.display()
-                            ));
-                        }
-                    }
+            for (_, path) in layout::registered_paths(req.config, req.host, dir)? {
+                let named = layout::publication_path(&path)?;
+                if named == dest_path {
+                    return Err(format!(
+                        "publication path {} is already registered",
+                        named.display()
+                    ));
                 }
             }
-            layout::clear(&staged)?;
+            // Even an unusual manually configured staging name belongs to
+            // the registry, and the output must survive its staging.
+            let staged = layout::stage(req.config, req.host, dir, req.dataset, dest, &[req.file])?;
             std::fs::copy(req.file, &staged).map_err(|e| format!("copy output: {e}"))?;
             // Hash both names after copying: concurrent input changes must
             // never turn the registered pin into a claim about other bytes.
@@ -293,7 +280,7 @@ mod tests {
         std::fs::write(&input, b"generated").unwrap();
         let digest = file_digest(&input).unwrap();
         let dest = dir.join(format!("tiny-named-indexed-{digest}.osm.pbf"));
-        let staged = layout::partial(&dest);
+        let staged = layout::partial("tiny", &dest);
         std::fs::rename(&input, &staged).unwrap();
         let config = Config::load(&path, None).unwrap();
         let mut req = Request {
@@ -306,7 +293,7 @@ mod tests {
             producer: Producer::Degrade,
             strip_indexdata: false,
         };
-        assert!(run(&req).unwrap_err().contains("staging file"));
+        assert!(run(&req).unwrap_err().contains("staging name"));
         assert_eq!(std::fs::read(&staged).unwrap(), b"generated");
         std::fs::rename(&staged, &input).unwrap();
         req.file = &input;
@@ -325,8 +312,9 @@ mod tests {
         edit.commit().unwrap();
         let config = Config::load(&path, None).unwrap();
         req.config = &config;
-        // A dangling alias cannot be canonicalized to its future target;
-        // with a real staging file, the registered alias must protect it.
+        // Resolving the alias looks up the staging entry, so the staging
+        // name is protected whether or not a file sits there yet.
+        assert!(run(&req).unwrap_err().contains("already registered"));
         std::fs::write(&staged, b"registered bytes").unwrap();
         assert!(run(&req).unwrap_err().contains("already registered"));
         assert_eq!(std::fs::read(&staged).unwrap(), b"registered bytes");

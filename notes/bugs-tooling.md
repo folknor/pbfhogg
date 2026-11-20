@@ -127,17 +127,15 @@ check. This violates registered-file preservation and the promise that
 acquiring a snapshot leaves existing generations unchanged. Every acquisition
 path needs the same ownership checks.
 
-## TOOL-010 - Download staging cleanup can delete registered data
-
-Reported by: datasets-devkit [P1].
-
-`acquire_raw`, `generate_indexed` (`download.rs`) and OSC acquisition call
-`clear()` on predictable staging names without checking registry ownership. A
-registered snapshot can legitimately be named `.partial-denmark-new.osm.pbf`,
-and acquiring snapshot `new` unlinks it before starting its writer. Refresh's
-host-wide check examines final destinations only. This breaks preservation of
-registered files, including on failure: a later transfer error leaves the old
-registry pointing at deleted data.
+The final-name checks that do exist (refresh, OSC, promotion) compare
+canonical endpoints, which is the wrong question for a rename: `rename`
+replaces the destination entry, so a registration that traverses the final
+name as a symlinked directory is broken while the endpoints differ. The
+staging removal already asks the right question (`layout::stage`, does
+resolving a registration look up this entry); publication should share it.
+Final names also coincide across datasets (`foo-bar` snapshot `baz` and
+`foo` snapshot `bar-baz` both publish `foo-bar-baz.osm.pbf`) under
+different dataset locks, so only Brokkr's machine lock serialises them.
 
 ## TOOL-012 - The alias resolver does not follow dangling symlinks
 

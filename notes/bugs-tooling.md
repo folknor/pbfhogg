@@ -20,8 +20,7 @@ Defects from the 2026-11-17 defect hunt in the dev-only crates:
 with `pbfhogg-harness`, and `pbfhogg-bench` with its Lua scripts. Every
 finding was made by one codex hunter per scope reading source at `63d4ec1d`.
 None was built, run or reproduced, and the bracketed priority is the hunter's
-own label. The verify hunter's apply-changes precedence finding is TOOL-029,
-and the geocode-query optimizer sink is recorded under BUG-028.
+own label. The geocode-query optimizer sink is recorded under BUG-028.
 Entries are in no order of importance.
 
 ## TOOL-002 - verify extract compares different regions for some bbox spellings
@@ -350,26 +349,18 @@ fallback (`diff/mod.rs`), so the measurement does not exercise the documented
 workload. The benchmark should establish its indexed-input precondition, as
 diff-unindexed establishes the opposite one.
 
-## TOOL-029 - verify apply-changes judges precedence by equality with osmium
+## TOOL-029 - verify derive roundtrips assume osmium apply precedence matches
 
 Reported by: verify (2026-11-17 hunt), narrowed 2026-11-20.
 
-apply-changes now refuses a change set whose highest claim for an object is
-below the base element's version, so the stale-delete case the hunter named
-no longer yields a pbfhogg output to compare. What remains: the verifier
-(`crates/verify/src/checks/apply_changes.rs`) requires element equality with
-osmium except for osmium-only identities finally deleted by the OSC. The two
-tools still choose differently where the documented rules differ
-(`DEVIATIONS.md`, "Change stream"): an equal-version conflict, base or
-change, is won by position in pbfhogg and by the later valid timestamp in
-osmium; a change or delete claiming no version against a versioned base
-applies in pbfhogg and loses in osmium. The first fails the check through
-metadata alone. The verifier should judge pbfhogg's admission and final
-action against an independent model of the supplied OSC and base, and
-assert osmium parity only where the precedence rules agree. The derive
-roundtrips (`checks/derive_changes.rs`) compare content, so only content
-or membership differences reach them; whether the same assumption affects
-them is unchecked.
+The apply-changes check now judges pbfhogg against its own change model.
+The derive roundtrips (`crates/verify/src/checks/derive_changes.rs`) still
+apply derived OSCs with osmium and compare with `new` under `CONTENT`. A
+derived upsert whose version equals the base's with an earlier valid
+timestamp, or a claimless one, would be dropped by osmium's apply
+precedence and surface as a content difference blamed on pbfhogg. Traced
+from source only; derive emits new's versions, so whether real derives
+reach it is unchecked.
 
 ## TOOL-030 - The dataset lock file is opened following symlinks
 

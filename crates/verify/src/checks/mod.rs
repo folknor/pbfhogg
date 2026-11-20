@@ -2,6 +2,7 @@
 //! of the run, records every comparison on the harness and returns its
 //! claim.
 pub(crate) mod apply_changes;
+pub(crate) mod apply_model;
 pub(crate) mod sort;
 
 pub(crate) mod add_locations;

@@ -57,7 +57,8 @@ impl Policy {
         locations: false,
     };
 
-    fn format(self) -> String {
+    /// The `osmium cat -f` value that decodes under this policy.
+    pub(crate) fn format(self) -> String {
         let mut format = String::from("opl");
         if !self.metadata {
             format.push_str(",add_metadata=false");
@@ -348,9 +349,21 @@ pub(crate) fn compare_with_opl(
     listing: &Path,
     policy: Policy,
 ) -> Result<Merged, Error> {
+    compare_with_opl_each(harness, pbf, expected, listing, policy, |_| {})
+}
+
+/// [`compare_with_opl`], handing every [`Group`] to `each` in object order.
+pub(crate) fn compare_with_opl_each(
+    harness: &mut Harness,
+    pbf: &Path,
+    expected: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+) -> Result<Merged, Error> {
     let a = listing.with_extension("first.opl");
     decode(harness, pbf, &a, policy)?;
-    let merged = merge(&a, expected, listing, true, |_| {}, |_| {})?;
+    let merged = merge(&a, expected, listing, true, each, |_| {})?;
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -443,12 +456,12 @@ impl Stream {
 
 /// osmium's object order of a kind and ID: kind, then ID zero, the
 /// negative IDs by magnitude, the positive IDs by magnitude.
-fn rank((kind, id): (usize, i64)) -> (usize, bool, u64) {
+pub(crate) fn rank((kind, id): (usize, i64)) -> (usize, bool, u64) {
     (kind, id > 0, id.unsigned_abs())
 }
 
 /// The kind and signed ID an OPL object line opens with.
-fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
+pub(crate) fn parse_key(line: &[u8]) -> Result<(usize, i64), &'static str> {
     let (&letter, rest) = line.split_first().ok_or("an empty line")?;
     let kind = match letter {
         b'n' => 0,

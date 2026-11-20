@@ -1,53 +1,67 @@
-//! Verify: apply-changes - strict pbfhogg/osmium comparison, with deletion
-//! held to the input OSC's final deletes.
+//! Verify: apply-changes - pbfhogg held to the verifier's own model of the
+//! input OSC and base for every identity the OSC touches, and to osmium's
+//! output for every other identity.
+//!
+//! The two tools resolve a touched identity by different documented rules
+//! (DEVIATIONS.md, "Change stream"): pbfhogg by the last change in file
+//! order, osmium by version, then valid timestamp, against the base too. So
+//! osmium is no oracle for a touched identity; [`super::apply_model`] predicts
+//! both tools' answers from the inputs, pbfhogg is judged against its
+//! prediction, and osmium against its own where the model defines it. The
+//! model also predicts pbfhogg's version-regression refusal, which the check
+//! then holds pbfhogg to. An identity the OSC leaves alone is copied from the
+//! base by both tools, so there osmium's output is the reference.
 //!
 //! osmosis is not run, on purpose. It deletes regardless of version, which
 //! once made it the independent witness for deletion, but its output only
 //! ever fed a printed element-count line, and equal counts prove no element
-//! identity. Deletion is now enforced directly from the input OSC, so the
-//! run (about 37 s of a 58 s uncached denmark check on 2026-11-15) and the
-//! osmosis and JDK provisioning behind it bought no verdict and were
-//! removed. A future deletion check built on osmosis would have to pin its
-//! semantics first and count a missing or failed run as not completing.
+//! identity. Deletion is now judged from the input model, so the run (about
+//! 37 s of a 58 s uncached denmark check on 2026-11-15) and the osmosis and
+//! JDK provisioning behind it bought no verdict and were removed.
 //!
 //! osmconvert is not a reference here, on purpose. Run for real on
 //! 2026-11-15 (bygg, upstream osmconvert 0.8.10), it cannot read a PBF whose
 //! BlobHeaders carry indexdata: its reader accepts only an 11..17 byte
 //! BlobHeader, so every PBF pbfhogg writes is refused ("format blob header
 //! 880"), and some refusals exit 0 with an empty output. The check runs on
-//! the indexed variant, so osmconvert never produced anything to look at. On
-//! the raw Geofabrik denmark seq4704 base with the seq4705 change it gave the
-//! same node, way and relation counts as pbfhogg and osmosis did; counts alone
-//! prove no element identity, and it only ever fed a printed fileinfo line.
+//! the indexed variant, so osmconvert never produced anything to look at.
 
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+use super::apply_model::{Key, Model, OsmiumExpect};
 use crate::argv::PbfArgv;
 use crate::error::Error;
-use crate::harness::Harness;
 use crate::harness::WayLocations::{Dropped, Kept};
-use crate::opl_compare::Policy;
-use crate::osc::{self, OscAction, OscKind};
+use crate::harness::{Harness, Verdict};
+use crate::opl_compare::{self, Class, Group, Policy, parse_key, rank};
+use crate::osc::{self, OscKind};
 use crate::output;
 use crate::reference::ToolRun;
-use crate::verify_element_diff::{self as element_diff, PerType};
+use crate::verify_element_diff::PerType;
 use crate::verify_input_order;
 
 /// The header feature `--locations-on-ways` requires of its base.
 const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
 
-/// Cross-validate `pbfhogg apply-changes` against osmium.
+/// The fields every comparison here reads. Inline way coordinates are left
+/// out in both modes: plain mode drops them with the declaration
+/// (`Harness::judge_way_locations` holds that), and in locations mode
+/// osmium's are known stale and the OSC's ways carry none, so
+/// `pbfhogg check --locations` judges them instead.
+const POLICY: Policy = Policy::NO_LOCATIONS;
+
+/// Cross-validate `pbfhogg apply-changes` against the change model and
+/// osmium.
 ///
 /// With `locations_on_ways`, both tools run with `--locations-on-ways` and
-/// pbfhogg's output must pass `pbfhogg check --locations`. The element diff
-/// leaves inline coordinates out in this mode (osmium's are no reference,
-/// below), so that check, pbfhogg's own and the one same-project comparator
-/// left in this check, is the only one that catches a stale coordinate - a
-/// way the diff leaves untouched under a node it moves. No osmium command
-/// holds inline coordinates to node records.
-/// osmium's output is checked the same way but only reported: its location
-/// index can itself write stale coordinates (several versions of one node,
-/// unsorted lookups), so it is not the oracle.
+/// pbfhogg's output must pass `pbfhogg check --locations`, the only check
+/// that catches a stale coordinate - a way the diff leaves untouched under a
+/// node it moves. osmium's output is checked the same way but only
+/// reported: its location index can itself write stale coordinates (several
+/// versions of one node, unsorted lookups), so it is not the oracle.
 ///
 /// On a base whose header lacks `Sort.Type_then_ID` among its optional
 /// features, apply-changes is held to its documented refusal instead and no
@@ -72,7 +86,6 @@ pub fn run(
         harness.msg("  mode: --locations-on-ways");
     }
 
-    // --- pbfhogg apply-changes ---
     let pbfhogg_out = outdir.join("pbfhogg.osm.pbf");
     let pbfhogg_args = PbfArgv::new("apply-changes")
         .input(pbf)
@@ -94,6 +107,11 @@ pub fn run(
             direct_io,
             locations_on_ways,
         );
+    }
+
+    let model = read_model(harness, pbf, osc, &outdir)?;
+    if let Some(why) = model.refusal() {
+        return expect_version_refusal(harness, pbfhogg_args, &pbfhogg_out, &why);
     }
 
     harness.msg("--- pbfhogg apply-changes ---");
@@ -129,8 +147,8 @@ pub fn run(
     harness.record("pbfhogg apply-changes output order", order);
 
     // --- Inline locations (-l only) ---
-    // Before the element diff, which reports its failure as an `Err` and so
-    // would otherwise keep this verdict from being recorded.
+    // Before the element judgment, which reports its failure as an `Err` and
+    // so would otherwise keep this verdict from being recorded.
     if locations_on_ways {
         harness.msg("=== inline locations (pbfhogg check --locations) ===");
         let (pbfhogg_verdict, _) = harness.check_locations("pbfhogg", &pbfhogg_out, false)?;
@@ -156,32 +174,19 @@ pub fn run(
         ));
     }
 
-    // --- Strict pbfhogg-vs-osmium element diff, held to the final deletes ---
-    //
-    // Cross-validation needs more than equal element counts. We diff
-    // the two outputs element-by-element and exempt the one
-    // legitimate semantic difference: osmium resolves a delete by version
-    // order against the base, while pbfhogg applies the last change to an
-    // identity whatever the base's version, so osmium-only elements the
-    // input OSC finally deletes aren't bugs. Because that exemption leaves
-    // osmium no oracle for deletion, the deletion itself is enforced from
-    // the input: an identity the OSC finally deletes fails wherever
-    // pbfhogg's output holds it, even where osmium agrees. Anything else (osmium-only identities not finally
-    // deleted, pbfhogg-only elements, or content-level `<modify>`
-    // differences) fails verify.
-    // Inline coordinates are left out in locations mode: osmium's own are
-    // known stale there (above), so they are no reference.
-    let policy = if locations_on_ways {
-        Policy::NO_LOCATIONS
-    } else {
-        Policy::between(&pbfhogg_out, &osmium_out)?
-    };
-    verify_pbfhogg_vs_osmium(harness, osc, &pbfhogg_out, &osmium_out, &outdir, policy)?;
+    judge_elements(
+        harness,
+        &model,
+        &pbfhogg_out,
+        &osmium_out,
+        &outdir,
+        locations_on_ways,
+    )?;
 
     Ok(Some(if locations_on_ways {
-        "strict element content with final-delete tolerance; final deletes absent; output strictly ordered; inline locations pass pbfhogg check --locations; osmium locations informational"
+        "touched identities as the change model predicts; untouched identities equal to osmium; osmium held to its precedence model where cursor-independent; output strictly ordered; inline locations pass pbfhogg check --locations; osmium locations informational"
     } else {
-        "strict element content with final-delete tolerance; final deletes absent; output strictly ordered"
+        "touched identities as the change model predicts; untouched identities equal to osmium; osmium held to its precedence model; output strictly ordered"
     }.into()))
 }
 
@@ -225,6 +230,99 @@ fn refused(
     )))
 }
 
+/// The change model of `osc` over `pbf`: the verifier's OSC scan joined with
+/// osmium's decoding of the same file, and the base records of the touched
+/// identities (`osmium getid -H -I`, which takes its IDs from the OSC).
+fn read_model(
+    harness: &mut Harness,
+    pbf: &Path,
+    osc: &Path,
+    outdir: &Path,
+) -> Result<Model, Error> {
+    harness.msg("=== change model ===");
+    let mut changes = Vec::new();
+    osc::scan_osc_changes(osc, |change| changes.push(change))?;
+    let osc_opl = outdir.join("input-osc.opl");
+    opl_compare::decode(harness, osc, &osc_opl, POLICY)?;
+    let mut model = Model::build(&changes, opl_lines(&osc_opl)?)?;
+    std::fs::remove_file(&osc_opl)?;
+    let occurrences = changes.len();
+    drop(changes);
+    if occurrences > 0 {
+        let base_opl = outdir.join("base-touched.opl");
+        let getid = ToolRun::osmium("apply-changes-base.1")
+            .arg("getid")
+            .input(pbf)
+            .args(&["-H", "-I"])
+            .input(osc)
+            .args(&["-f", &POLICY.format(), "-o"])
+            .output(&base_opl)
+            .arg("--overwrite");
+        let captured = harness.reference(&getid, &outdir.join("base-touched.stdout"))?;
+        harness.require_success(&captured, "osmium getid -H")?;
+        for line in opl_lines(&base_opl)? {
+            model.add_base(line?)?;
+        }
+    }
+    harness.msg(&format!(
+        "  {occurrences} OSC occurrences over {} identities, {} held by the base",
+        model.identities(),
+        model.base_records()
+    ));
+    Ok(model)
+}
+
+/// The lines of an OPL file, newlines stripped.
+fn opl_lines(path: &Path) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>>, Error> {
+    let file = File::open(path)
+        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
+    Ok(BufReader::new(file)
+        .split(b'\n')
+        .map(|line| line.map_err(Error::from)))
+}
+
+/// Hold `args` to the version-regression refusal the model predicts: exit 2
+/// with the regression's `--allow-version-regression` advice, and nothing
+/// published at `out`. No reference runs.
+fn expect_version_refusal(
+    harness: &mut Harness,
+    args: PbfArgv,
+    out: &Path,
+    why: &str,
+) -> Result<Option<String>, Error> {
+    harness.msg(&format!(
+        "--- pbfhogg apply-changes (expected to refuse: {why}) ---"
+    ));
+    let captured = harness.pbfhogg_discard(args)?;
+    if std::fs::exists(out)? {
+        harness.msg(&format!("  published {} FAIL", out.display()));
+        harness.fail(format!(
+            "pbfhogg apply-changes published {} on a version regression",
+            out.display()
+        ));
+    }
+    let refused = captured.code() == Some(2)
+        && captured
+            .stderr_text()
+            .contains("--allow-version-regression");
+    harness.msg(&format!(
+        "  exit {:?}: {}",
+        captured.code(),
+        if refused {
+            "refused the regression PASS"
+        } else {
+            "did not refuse the regression FAIL"
+        }
+    ));
+    harness.record(
+        "pbfhogg apply-changes refuses the version regression",
+        Verdict::from_pass(refused),
+    );
+    Ok(Some(format!(
+        "version regression refused with its advice and nothing published ({why})"
+    )))
+}
+
 /// `STALE (563 mismatched (538 nodes))`: the verdict with the report's
 /// mismatch count, echoed from its "Refs with a node record" line when it has
 /// one, so a change in the stale set shows in the summary line itself.
@@ -240,196 +338,224 @@ fn stale_summary(report: &str) -> String {
     }
 }
 
-/// Diff `(pbfhogg_out, osmium_out)` as osmium decodes them
-/// (`element_diff::scan_element_diff`), then categorise each differing
-/// identity, and every identity pbfhogg holds, against the input OSC's final
-/// deletes ([`FinalDeletes`]). Returns
-/// `Err(Error::Failed(...))` if any unexplained difference remains.
-fn verify_pbfhogg_vs_osmium(
+/// Judge pbfhogg's output, as osmium decodes it, against the expected
+/// stream: osmium's output for the untouched identities with the model's
+/// records for the touched ones. Then judge osmium's touched records
+/// against its own model. `Err(Error::Failed(...))` if pbfhogg differs; an
+/// osmium departure from its model is recorded as a failed comparison.
+fn judge_elements(
     harness: &mut Harness,
-    input_osc: &Path,
+    model: &Model,
     pbfhogg_out: &Path,
     osmium_out: &Path,
     outdir: &Path,
-    policy: Policy,
+    locations_on_ways: bool,
 ) -> Result<(), Error> {
-    harness.msg("=== pbfhogg vs osmium element diff ===");
+    harness.msg("=== pbfhogg vs the change model and osmium ===");
+    let expectations = model.expectations(locations_on_ways);
+    let osmium_opl = outdir.join("osmium.opl");
+    opl_compare::decode(harness, osmium_out, &osmium_opl, POLICY)?;
+    let expected = outdir.join("expected.opl");
+    let osmium_touched = write_expected(&osmium_opl, &expected, model, &expectations)?;
+    std::fs::remove_file(&osmium_opl)?;
 
-    let applied = FinalDeletes::read(input_osc)?;
-    harness.msg(&format!(
-        "  input OSC final deletes: {} nodes, {} ways, {} relations",
-        applied.ids[0].len(),
-        applied.ids[1].len(),
-        applied.ids[2].len(),
-    ));
+    let mut report = Report::default();
+    let listing = outdir.join("pbfhogg-vs-expected.diff.txt");
+    opl_compare::compare_with_opl_each(harness, pbfhogg_out, &expected, &listing, POLICY, |g| {
+        report.classify(g, model.touches((g.kind, g.id)));
+    })?;
+    std::fs::remove_file(&expected)?;
+    report.judge_osmium(&expectations, &osmium_touched);
 
-    let diff_path = outdir.join("pbfhogg-vs-osmium.diff.txt");
-
-    // The element diff old new: delete = old-only, create = new-only,
-    // modify = same id, different record. We pass pbfhogg as `old` and
-    // osmium as `new` so:
-    //   diff.created_* = osmium-only (carve-out candidates)
-    //   diff.deleted_* = pbfhogg-only (always failures)
-    //   diff.modified_* = content mismatches (always failures)
-    // Classified as it streams: only counters and bounded samples are kept,
-    // so a regression the size of the planet costs no more than a pass. The
-    // verdict waits for the scan to return, which proves both sides read
-    // whole and in strict order.
-    //
-    // Every identity pbfhogg holds is also held to the change's final
-    // deletes, so an element both tools wrongly keep fails here even though
-    // the two outputs agree on it.
-    let mut report = MergeDiffReport::default();
-    let mut retained = PerType::default();
-    element_diff::scan_element_diff_held(
-        harness,
-        pbfhogg_out,
-        osmium_out,
-        &diff_path,
-        policy,
-        |action, kind, id| report.classify(action, kind, id, &applied),
-        |kind, id| {
-            if applied.contains(kind, id) {
-                retained.add(kind, id);
-            }
-        },
-    )?;
-    report.retained_deleted = retained;
-    drop(applied);
-    if report.is_empty() {
-        harness.msg("  pbfhogg and osmium outputs are element-identical PASS");
-        return Ok(());
-    }
     report.print(harness);
-
-    if report.is_failure() {
+    if report.osmium_off_model.total() > 0 {
+        harness.fail(format!(
+            "osmium apply-changes departs from the verifier's precedence model on {} \
+             identities",
+            report.osmium_off_model.total()
+        ));
+    }
+    let failures = report.pbfhogg_failures();
+    if failures > 0 {
         return Err(Error::Failed(format!(
-            "pbfhogg vs osmium: {} unexplained difference entries \
-             (see element diff above)",
-            report.total_failures()
+            "pbfhogg apply-changes: {failures} unexplained difference entries (see element \
+             diff above)"
         )));
     }
+    harness.msg("  pbfhogg output is as expected PASS");
     Ok(())
 }
 
-/// The identities, a kind and an ID, whose last entry in the input OSC in
-/// file order is a delete, per kind (node, way, relation), sorted for binary
-/// search. The change's own answer: apply-changes resolves an identity by
-/// its last change in file order (a later create or modify re-enters a
-/// deleted identity, a later delete removes it), whatever version the base
-/// holds, so none of these may survive in its output. The verifier reads it
-/// from the input itself, so it is evidence independent of both tools.
-///
-/// Held in memory, O(distinct identities in the input change) while it is
-/// read, then O(final deletes). That is the one input-sized structure here,
-/// and the step before it dominates it: osmium apply-changes, which must
-/// have succeeded first, holds every change in the file as a full object.
-/// Nothing sized by the PBF or by the difference is retained.
-struct FinalDeletes {
-    ids: [Vec<i64>; 3],
+/// Write the expected pbfhogg stream to `expected`: `osmium_opl`'s untouched
+/// records, held to strict object order, merged with the model's live
+/// touched records. Every osmium record of a touched identity is returned
+/// instead, read in any order and any multiplicity, for the osmium judgment.
+fn write_expected(
+    osmium_opl: &Path,
+    expected: &Path,
+    model: &Model,
+    expectations: &[(Key, Option<&[u8]>, OsmiumExpect)],
+) -> Result<HashMap<Key, Vec<Vec<u8>>>, Error> {
+    let mut out = BufWriter::new(File::create(expected)?);
+    let mut live = expectations
+        .iter()
+        .filter_map(|&(key, pbfhogg, _)| pbfhogg.map(|line| (key, line)))
+        .peekable();
+    let mut touched: HashMap<Key, Vec<Vec<u8>>> = HashMap::new();
+    let mut last: Option<Key> = None;
+    for line in opl_lines(osmium_opl)? {
+        let line = line?;
+        let key = parse_key(&line)
+            .map_err(|why| Error::Failed(format!("osmium apply-changes output: {why}")))?;
+        if model.touches(key) {
+            touched.entry(key).or_default().push(line);
+            continue;
+        }
+        if last.is_some_and(|last| rank(key) <= rank(last)) {
+            return Err(Error::Failed(
+                "osmium apply-changes output: an untouched object at or below the previous \
+                 one: not in strict kind and ID order"
+                    .into(),
+            ));
+        }
+        last = Some(key);
+        while let Some(&(k, record)) = live.peek() {
+            if rank(k) >= rank(key) {
+                break;
+            }
+            out.write_all(record)?;
+            out.write_all(b"\n")?;
+            live.next();
+        }
+        out.write_all(&line)?;
+        out.write_all(b"\n")?;
+    }
+    for (_, record) in live {
+        out.write_all(record)?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
+    Ok(touched)
 }
 
-impl FinalDeletes {
-    /// Read strictly: an entry the scanner cannot account for refuses the
-    /// document, so no delete drops out of the expectation unseen.
-    fn read(osc_path: &Path) -> Result<Self, Error> {
-        let mut last: [std::collections::HashMap<i64, bool>; 3] = Default::default();
-        osc::scan_osc_file_strict(osc_path, |action, kind, id| {
-            last[kind.index()].insert(id, action == OscAction::Delete);
-        })?;
-        Ok(Self::from_last(last))
-    }
+const KINDS: [OscKind; 3] = [OscKind::Node, OscKind::Way, OscKind::Relation];
 
-    fn from_last(last: [std::collections::HashMap<i64, bool>; 3]) -> Self {
-        let ids = last.map(|kind| {
-            let mut ids: Vec<i64> = kind
-                .into_iter()
-                .filter_map(|(id, deleted)| deleted.then_some(id))
-                .collect();
-            ids.sort_unstable();
-            ids
-        });
-        Self { ids }
-    }
-
-    fn contains(&self, kind: OscKind, id: i64) -> bool {
-        self.ids[kind.index()].binary_search(&id).is_ok()
-    }
-}
-
-/// Outcome classes for the per-element diff, each a count of diff entries
-/// per kind plus the smallest few distinct IDs
-/// ([`element_diff::MAX_REPORTED_IDS`]), so the
-/// report is bounded and deterministic whatever the diff's size or order.
+/// Outcome classes, each a count per kind with bounded ID samples.
 #[derive(Default)]
-struct MergeDiffReport {
-    /// osmium-only identities the input OSC finally deletes. These are
-    /// *expected* differences: osmium resolves a delete by version order
-    /// against the base, so a delete below the base's version leaves the
-    /// base element, while pbfhogg applies the last change regardless.
-    osmium_only_explained: PerType,
-    /// osmium-only identities the input OSC does not finally delete. These
-    /// are pbfhogg dropping elements it shouldn't have.
-    osmium_only_unexplained: PerType,
-    /// Identities the input OSC finally deletes that pbfhogg's output still
-    /// holds, whether osmium holds them too or not (one osmium dropped also
-    /// counts in `pbfhogg_only`).
-    retained_deleted: PerType,
-    /// pbfhogg-only IDs (osmium dropped, pbfhogg kept). Always a
-    /// failure - means osmium did something pbfhogg didn't.
+struct Report {
+    /// Touched: pbfhogg holds a record where the model expects none (a
+    /// final delete it kept).
+    held_removed: PerType,
+    /// Touched: pbfhogg lacks the change's final record.
+    missing_final: PerType,
+    /// Touched: pbfhogg's record is not the change's final record.
+    not_final: PerType,
+    /// Untouched: only pbfhogg holds it.
     pbfhogg_only: PerType,
-    /// IDs present in both outputs but with different content.
+    /// Untouched: only osmium holds it.
+    osmium_only: PerType,
+    /// Untouched: both hold it, unequal.
     content_mismatch: PerType,
+    /// Touched: osmium wrote something other than its model's answer.
+    osmium_off_model: PerType,
+    /// Touched, informational: the two models disagree and osmium wrote its
+    /// own answer.
+    precedence_differs: PerType,
+    /// Touched, informational: the model does not decide osmium's answer.
+    osmium_undecided: PerType,
 }
 
-impl MergeDiffReport {
-    /// Bucket one diff entry. pbfhogg is the diff's old side and osmium its
-    /// new side, so `<create>` is osmium-only (exempt when the input deleted
-    /// it), `<delete>` pbfhogg-only and `<modify>` a content mismatch.
-    fn classify(&mut self, action: OscAction, kind: OscKind, id: i64, applied: &FinalDeletes) {
-        let class = match action {
-            OscAction::Create if applied.contains(kind, id) => &mut self.osmium_only_explained,
-            OscAction::Create => &mut self.osmium_only_unexplained,
-            OscAction::Delete => &mut self.pbfhogg_only,
-            OscAction::Modify => &mut self.content_mismatch,
+impl Report {
+    fn classify(&mut self, group: Group, touched: bool) {
+        let class = match (group.class, touched) {
+            (Class::FirstOnly, true) => &mut self.held_removed,
+            (Class::SecondOnly, true) => &mut self.missing_final,
+            (Class::Differs, true) => &mut self.not_final,
+            (Class::FirstOnly, false) => &mut self.pbfhogg_only,
+            (Class::SecondOnly, false) => &mut self.osmium_only,
+            (Class::Differs, false) => &mut self.content_mismatch,
         };
-        class.add(kind, id);
+        class.add(KINDS[group.kind], group.id);
     }
 
-    fn is_empty(&self) -> bool {
-        self.osmium_only_explained.total() == 0 && self.total_failures() == 0
+    /// Hold osmium's touched records (`seen`) to its model: no record where
+    /// it is expected to write none, exactly one equal record where it is.
+    fn judge_osmium(
+        &mut self,
+        expectations: &[(Key, Option<&[u8]>, OsmiumExpect)],
+        seen: &HashMap<Key, Vec<Vec<u8>>>,
+    ) {
+        for (key, pbfhogg, osmium) in expectations {
+            let kind = KINDS[key.0];
+            let records = seen.get(key).map_or(&[][..], Vec::as_slice);
+            let (matches, agrees) = match osmium {
+                OsmiumExpect::Undefined => {
+                    self.osmium_undecided.add(kind, key.1);
+                    continue;
+                }
+                OsmiumExpect::Absent => (records.is_empty(), pbfhogg.is_none()),
+                OsmiumExpect::Record(line) => (
+                    matches!(records, [one] if one == line),
+                    *pbfhogg == Some(line.as_slice()),
+                ),
+            };
+            if !matches {
+                self.osmium_off_model.add(kind, key.1);
+            } else if !agrees {
+                self.precedence_differs.add(kind, key.1);
+            }
+        }
     }
 
-    fn total_failures(&self) -> u64 {
-        self.osmium_only_unexplained.total()
-            + self.retained_deleted.total()
-            + self.pbfhogg_only.total()
-            + self.content_mismatch.total()
-    }
-
-    fn is_failure(&self) -> bool {
-        self.total_failures() > 0
+    fn pbfhogg_failures(&self) -> u64 {
+        [
+            &self.held_removed,
+            &self.missing_final,
+            &self.not_final,
+            &self.pbfhogg_only,
+            &self.osmium_only,
+            &self.content_mismatch,
+        ]
+        .iter()
+        .map(|class| class.total())
+        .sum()
     }
 
     fn print(&self, harness: &mut Harness) {
-        if self.osmium_only_explained.total() > 0 {
-            harness.msg(&format!(
-                "  osmium-only explained by final deletes: {} OK",
-                self.osmium_only_explained.counts_line()
-            ));
-        }
+        let mut note = |label: &str, class: &PerType| {
+            if class.total() > 0 {
+                harness.msg(&format!(
+                    "  {label}: {} (informational)",
+                    class.counts_line()
+                ));
+            }
+        };
+        note(
+            "osmium answers by its own precedence where pbfhogg's differs",
+            &self.precedence_differs,
+        );
+        note(
+            "osmium's answer left undecided (--locations-on-ways cursor)",
+            &self.osmium_undecided,
+        );
         let mut fail =
             |label: &str, class: &PerType| class.print("FAIL ", label, |line| harness.msg(line));
         fail(
-            "osmium-only NOT finally deleted",
-            &self.osmium_only_unexplained,
+            "touched, held where the change removes it",
+            &self.held_removed,
         );
         fail(
-            "finally deleted but held by pbfhogg",
-            &self.retained_deleted,
+            "touched, the change's final record missing",
+            &self.missing_final,
         );
-        fail("pbfhogg-only (osmium dropped)", &self.pbfhogg_only);
-        fail("content differs", &self.content_mismatch);
+        fail("touched, not the change's final record", &self.not_final);
+        fail("untouched, pbfhogg-only", &self.pbfhogg_only);
+        fail("untouched, osmium-only", &self.osmium_only);
+        fail("untouched, content differs", &self.content_mismatch);
+        fail(
+            "touched, osmium departs from its precedence model",
+            &self.osmium_off_model,
+        );
     }
 }
 
@@ -438,156 +564,58 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    fn from_entries(entries: &[(OscAction, OscKind, i64)]) -> FinalDeletes {
-        let mut last: [std::collections::HashMap<i64, bool>; 3] = Default::default();
-        for &(action, kind, id) in entries {
-            last[kind.index()].insert(id, action == Delete);
-        }
-        FinalDeletes::from_last(last)
-    }
-
-    fn deletes(nodes: &[i64], ways: &[i64], relations: &[i64]) -> FinalDeletes {
-        let mut entries = Vec::new();
-        for (kind, ids) in [(Node, nodes), (Way, ways), (Relation, relations)] {
-            entries.extend(ids.iter().map(|&id| (Delete, kind, id)));
-        }
-        from_entries(&entries)
-    }
-
-    fn classify_all(
-        entries: &[(OscAction, OscKind, i64)],
-        applied: &FinalDeletes,
-    ) -> MergeDiffReport {
-        let mut report = MergeDiffReport::default();
-        for &(action, kind, id) in entries {
-            report.classify(action, kind, id, applied);
-        }
-        report
-    }
-
-    use OscAction::{Create, Delete, Modify};
-    use OscKind::{Node, Relation, Way};
-
-    #[test]
-    fn final_deletes_are_sorted_deduplicated_and_searchable() {
-        let set = deletes(&[9, 1, 9, 4, -3], &[], &[7]);
-        assert_eq!(set.ids[0], vec![-3, 1, 4, 9]);
-        assert!(set.contains(Node, 4));
-        assert!(set.contains(Node, -3));
-        assert!(!set.contains(Way, 4));
-        assert!(set.contains(Relation, 7));
+    fn group(class: Class, id: i64) -> Group {
+        Group { class, kind: 0, id }
     }
 
     #[test]
-    fn the_last_entry_in_file_order_decides() {
-        let set = from_entries(&[
-            // Deleted, then re-entered: live.
-            (Delete, Node, 1),
-            (Create, Node, 1),
-            // Modified, then deleted: deleted.
-            (Modify, Node, 2),
-            (Delete, Node, 2),
-            // Equal-version transitions are positional too.
-            (Delete, Node, 3),
-            (Modify, Node, 3),
-            (Delete, Node, 3),
-            // Kinds are separate identities.
-            (Delete, Way, 4),
-            (Create, Relation, 4),
+    fn touched_and_untouched_differences_land_in_their_own_classes() {
+        let mut report = Report::default();
+        report.classify(group(Class::FirstOnly, 1), true);
+        report.classify(group(Class::SecondOnly, 2), true);
+        report.classify(group(Class::Differs, 3), true);
+        report.classify(group(Class::FirstOnly, 4), false);
+        report.classify(group(Class::SecondOnly, 5), false);
+        report.classify(group(Class::Differs, 6), false);
+        for (class, id) in [
+            (&report.held_removed, 1),
+            (&report.missing_final, 2),
+            (&report.not_final, 3),
+            (&report.pbfhogg_only, 4),
+            (&report.osmium_only, 5),
+            (&report.content_mismatch, 6),
+        ] {
+            assert_eq!(class.kinds[0].ids(), vec![id]);
+        }
+        assert_eq!(report.pbfhogg_failures(), 6);
+    }
+
+    #[test]
+    fn osmium_is_held_to_its_model_by_multiplicity() {
+        let base = b"n1 v5".to_vec();
+        let expectations = vec![
+            // Agreeing absence, osmium writes nothing.
+            ((0, 1), None, OsmiumExpect::Absent),
+            // Precedence differs, osmium writes its own answer.
+            ((0, 2), None, OsmiumExpect::Record(base.clone())),
+            // osmium writes the record twice.
+            ((0, 3), None, OsmiumExpect::Record(base.clone())),
+            // Undecided.
+            ((0, 4), None, OsmiumExpect::Undefined),
+            // osmium writes something where it should write nothing.
+            ((0, 5), None, OsmiumExpect::Absent),
+        ];
+        let seen = HashMap::from([
+            ((0, 2), vec![base.clone()]),
+            ((0, 3), vec![base.clone(), base.clone()]),
+            ((0, 5), vec![base.clone()]),
         ]);
-        assert!(!set.contains(Node, 1));
-        assert!(set.contains(Node, 2));
-        assert!(set.contains(Node, 3));
-        assert!(set.contains(Way, 4));
-        assert!(!set.contains(Relation, 4));
-        assert!(!set.contains(Node, 4));
-    }
-
-    #[test]
-    fn an_earlier_delete_does_not_excuse_an_osmium_only_reentry() {
-        let applied = from_entries(&[(Delete, Node, 5), (Create, Node, 5)]);
-        let report = classify_all(&[(Create, Node, 5)], &applied);
-        assert_eq!(report.osmium_only_unexplained.kinds[0].ids(), vec![5]);
-        assert!(report.is_failure());
-    }
-
-    #[test]
-    fn a_finally_deleted_identity_pbfhogg_holds_fails() {
-        let mut report = MergeDiffReport::default();
-        report.retained_deleted.add(Node, 7);
-        assert!(report.is_failure());
-        assert!(!report.is_empty());
-    }
-
-    #[test]
-    fn classify_buckets_each_action() {
-        let applied = deletes(&[10], &[], &[]);
-        let report = classify_all(
-            &[
-                (Create, Node, 10),
-                (Create, Node, 20),
-                (Create, Way, 30),
-                (Modify, Node, 40),
-                (Delete, Way, 50),
-            ],
-            &applied,
-        );
-        assert_eq!(report.osmium_only_explained.kinds[0].ids(), vec![10]);
-        assert_eq!(report.osmium_only_unexplained.kinds[0].ids(), vec![20]);
-        assert_eq!(report.osmium_only_unexplained.kinds[1].ids(), vec![30]);
-        assert_eq!(report.content_mismatch.kinds[0].ids(), vec![40]);
-        assert_eq!(report.pbfhogg_only.kinds[1].ids(), vec![50]);
-        assert!(report.is_failure());
-        assert_eq!(report.total_failures(), 4);
-    }
-
-    #[test]
-    fn classify_clean_when_all_explained() {
-        let applied = deletes(&[1, 2, 3], &[10], &[100]);
-        let report = classify_all(
-            &[
-                (Create, Node, 1),
-                (Create, Node, 2),
-                (Create, Node, 3),
-                (Create, Way, 10),
-                (Create, Relation, 100),
-            ],
-            &applied,
-        );
-        assert!(!report.is_failure());
-        assert!(!report.is_empty());
-        assert_eq!(report.osmium_only_explained.kinds[0].ids(), vec![1, 2, 3]);
-        assert_eq!(report.osmium_only_explained.total(), 5);
-    }
-
-    #[test]
-    fn pbfhogg_only_and_modify_always_fail() {
-        // pbfhogg-only entries fail even when the input requested the delete:
-        // osmium deleted them too, so pbfhogg should not be holding them.
-        let applied = deletes(&[7, 8], &[], &[]);
-        let report = classify_all(
-            &[(Delete, Node, 7), (Delete, Node, 8), (Modify, Node, 42)],
-            &applied,
-        );
-        assert_eq!(report.pbfhogg_only.kinds[0].ids(), vec![7, 8]);
-        assert_eq!(report.content_mismatch.kinds[0].ids(), vec![42]);
-        assert_eq!(report.total_failures(), 3);
-    }
-
-    #[test]
-    fn a_huge_regression_keeps_exact_counts_and_bounded_samples() {
-        // The bug: every differing ID was copied into report vectors, so the
-        // failure path held a planet-sized regression in memory.
-        let applied = deletes(&[], &[], &[]);
-        let mut report = MergeDiffReport::default();
-        for id in (0..100_000).rev() {
-            report.classify(Create, Node, id, &applied);
-        }
-        let sampled = &report.osmium_only_unexplained.kinds[0];
-        assert_eq!(sampled.count, 100_000);
-        assert_eq!(sampled.ids(), (0..10).collect::<Vec<i64>>());
-        assert_eq!(element_diff::MAX_REPORTED_IDS, 10);
-        assert_eq!(report.total_failures(), 100_000);
+        let mut report = Report::default();
+        report.judge_osmium(&expectations, &seen);
+        assert_eq!(report.precedence_differs.kinds[0].ids(), vec![2]);
+        assert_eq!(report.osmium_off_model.kinds[0].ids(), vec![3, 5]);
+        assert_eq!(report.osmium_undecided.kinds[0].ids(), vec![4]);
+        assert_eq!(report.pbfhogg_failures(), 0);
     }
 
     #[test]
@@ -596,10 +624,5 @@ mod tests {
                       Refs with a node record: 60836196 verified, 563 mismatched (538 nodes)\n";
         assert_eq!(stale_summary(report), "STALE (563 mismatched (538 nodes))");
         assert_eq!(stale_summary("something else\n"), "STALE");
-    }
-
-    #[test]
-    fn an_empty_report_is_identical() {
-        assert!(MergeDiffReport::default().is_empty());
     }
 }

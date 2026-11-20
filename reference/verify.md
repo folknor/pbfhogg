@@ -41,7 +41,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   lengths, so `a=bc` and `ab=c` collide there; no check judges with osmium
   diff). Metadata is compared everywhere except the `diff --format osc`
   roundtrips; inline way coordinates are compared when both files declare
-  `LocationsOnWays`, except in apply-changes locations mode. Where
+  `LocationsOnWays`, except in apply-changes, which never reads them (its
+  declaration and `check --locations` verdicts judge them). Where
   coordinates are the command's promise (add-locations-to-ways), the check
   requires both declarations. Where pbfhogg keeps the input's declaration
   (cat, `getid --invert`, sort), the osmium reference is written with
@@ -75,7 +76,7 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   extract, multi-extract, cat, tags-filter, repack, degrade and
   apply-changes (both modes) and passes the derive-changes roundtrip; an
   inline-coordinate-only change fails repack and degrade and passes
-  apply-changes in locations mode. In the text diff, a version change
+  apply-changes in both modes. In the text diff, a version change
   pbfhogg's header omits fails, and a version-only or
   inline-coordinate-only change passes as common (the listing judges
   content, which excludes coordinates, so reading them would not change
@@ -342,7 +343,7 @@ suite because a later comparison cannot make that run complete.
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
 | `repack` | osmium OPL decodings, walked in file order | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
 | `degrade` | osmium OPL decodings, walked in file order | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on a `LocationsOnWays` input (`--locations-on-ways`, suite `degrade -l`) |
-| `apply-changes` | `osmium apply-changes` | strict output order and element equality, tolerating only osmium-only identities the input OSC finally deletes, and no finally deleted identity in pbfhogg's output; optional inline-location consistency |
+| `apply-changes` | verifier-owned change model over the OSC scan, `osmium cat` of the OSC and `osmium getid -H` base records; `osmium apply-changes` | predicted version-regression refusals; every identity the OSC touches holds its last change in file order or nothing after a final delete; untouched identities equal to osmium; osmium held to its own precedence model; strict output order; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
 | `diff` | osmium OPL decodings of both inputs, merged | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
@@ -354,18 +355,36 @@ Apply-changes accepts `--osc-seq` or a fixture `--osc`, and
 optional sort feature is held to exit 2 with the exact Unsorted advice and
 no published output; references do not run. In locations mode that base
 must still declare LocationsOnWays, so the refusal has only one cause.
-On sorted input, pbfhogg's output must be strictly ordered. An identity
-(kind and ID) is finally deleted when its last entry in the input OSC, in
-file order, is a delete; the verifier reads that from the input itself,
-strictly. No finally deleted identity may appear in pbfhogg's output, even
-where osmium's output holds it too. The element diff tolerates only
-osmium-only identities that are finally deleted, since osmium resolves a
-delete by version order against the base, keeping a base element whose
-version is above the delete's. pbfhogg refuses a change set whose
-highest claim for an object is below the base's version, so the
-exception is reached only where one side claims no version (an
-unversioned delete against a versioned base). All other differences fail. Both outputs must
-be in strict order for the element comparison to be made.
+On sorted input the check first builds its own model of the change set.
+The verifier's OSC scanner gives each occurrence's action and version
+claim (present or absent), osmium's OPL decoding of the same OSC gives its
+record, joined occurrence by occurrence with keys and count checked, and
+`osmium getid -H -I` gives the base records of the touched identities (kind
+and signed ID; history mode keeps both signs of a magnitude). The model
+predicts pbfhogg's version gates: an explicit claim below an earlier claim
+for the object, or a highest explicit claim (deletes included) below the
+base element's version of 1 or more, is a refusal, and pbfhogg is then held
+to exit 2 with the `--allow-version-regression` advice and no published
+output, with no reference run. Otherwise pbfhogg must succeed, and its
+output must be strictly ordered and equal, under the no-inline-coordinates
+OPL projection, to an expected stream: for each touched identity its last
+OSC occurrence in file order, or nothing when that is a delete; for every
+other identity osmium's output, which copies the base. osmium resolves a
+touched identity by its own rules (highest version, then later valid
+timestamp, then later occurrence; the base wins only by strictly beating
+that candidate; written only if visible), so it is held to that model
+instead: no record where it predicts none, exactly one equal record where
+it predicts one. Where the two models disagree (an equal version with a
+later base timestamp, a claimless change against a versioned base) the
+count is printed as information. In locations mode osmium's answer for a
+touched identity whose base record does not strictly lose depends on its
+merge cursor, so it is not judged there. The check refuses to judge, as an
+unsupported domain, an upsert with a `visible` attribute other than
+`true`, an explicit version outside `0..=i32::MAX`, a base holding a
+touched identity twice, and an object whose occurrences at one version mix
+an invalid timestamp with two distinct valid ones (osmium's sort then has
+no defined result). The comparison is osmium's decoding on both sides: a
+coordinate both tools accept but round differently fails it.
 In locations mode pbfhogg's output must pass `check --locations`;
 osmium's location report is informational, with its stale count shown even
 on PASS. The element comparison does not read inline coordinates in that

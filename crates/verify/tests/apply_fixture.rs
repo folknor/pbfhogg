@@ -10,25 +10,85 @@ const LOSS_WARNING: &str = "Warning: the input declares LocationsOnWays, which t
                             not declare: this command does not keep it on every way it writes, \
                             or cannot vouch for it in the output";
 
-/// The OPL the fake osmium decodes each output to, by fault: the element
-/// differences the apply check classifies.
-fn opl(fault: &str, pbfhogg: bool) -> &'static str {
-    match (fault, pbfhogg) {
-        ("explained", false) => "n1 v1\nn7 v1\n",
-        ("unexplained", false) => "n1 v1\nn8 v1\n",
-        ("modified", true) => "n1 v1\nn7 v1 Ta=1\n",
-        ("modified", false) => "n1 v1\nn7 v1 Ta=2\n",
-        ("deleted", true) => "n1 v1\nn7 v1\n",
-        // Both tools keep the node the change deletes: the outputs agree,
-        // and only the final-delete rule can fail it.
-        ("both-retain", _) => "n1 v1\nn7 v1\n",
-        // One field class differs on a surviving object: a version, read
-        // in both modes; an inline coordinate, read in neither (plain mode
-        // drops the declaration, locations mode leaves coordinates out).
-        ("metadata", true) => "n1 v2\n",
-        ("coords", true) => "n1 v1\nw1 v1 Nn1x2y1\n",
-        ("coords", false) => "n1 v1\nw1 v1 Nn1x1y1\n",
-        _ => "n1 v1\n",
+const T1: &str = "2020-01-01T00:00:00Z";
+const T2: &str = "2020-01-02T00:00:00Z";
+
+/// A node record as osmium's OPL writer spells it with metadata.
+fn node(id: i64, version: i64, timestamp: &str, tags: &str) -> String {
+    format!("n{id} v{version} dV c1 t{timestamp} i1 u T{tags} x1 y1\n")
+}
+
+/// One fault's inputs and tool outputs: the OSC, osmium's OPL decoding of
+/// it, the base records osmium getid finds for its identities, and the OPL
+/// each tool's output decodes to.
+struct Case {
+    osc: &'static str,
+    osc_opl: String,
+    base: String,
+    pbfhogg: String,
+    osmium: String,
+}
+
+/// The default change: a claimless delete of `n7` over a base holding `n1`
+/// and `n7` v1. pbfhogg deletes it; plain osmium keeps the base, whose
+/// version beats the claimless delete.
+fn case(fault: &str) -> Case {
+    let n1 = node(1, 1, T1, "");
+    let n7 = node(7, 1, T1, "");
+    let delete = Case {
+        osc: r#"<osmChange version="0.6"><delete><node id="7"/></delete></osmChange>"#,
+        osc_opl: "n7 v0 dD c0 t i0 u T x y\n".to_owned(),
+        base: format!("{n1}{n7}"),
+        pbfhogg: n1.clone(),
+        osmium: format!("{n1}{n7}"),
+    };
+    let modify = |version: u8| Case {
+        osc: if version == 0 {
+            r#"<osmChange version="0.6"><modify><node id="7" version="0" timestamp="2020-01-01T00:00:00Z" lat="1" lon="1"/></modify></osmChange>"#
+        } else {
+            r#"<osmChange version="0.6"><modify><node id="7" version="1" timestamp="2020-01-01T00:00:00Z" lat="1" lon="1"/></modify></osmChange>"#
+        },
+        osc_opl: node(7, version.into(), T1, ""),
+        // The base's equal version carries a later timestamp.
+        base: format!("{n1}{}", node(7, 1, T2, "")),
+        pbfhogg: format!("{n1}{}", node(7, version.into(), T1, "")),
+        osmium: format!("{n1}{}", node(7, 1, T2, "")),
+    };
+    match fault {
+        "unexplained" => Case {
+            osmium: format!("{n1}{n7}{}", node(8, 1, T1, "")),
+            ..delete
+        },
+        "modified" => Case {
+            pbfhogg: node(1, 1, T1, "a=1"),
+            osmium: format!("{}{n7}", node(1, 1, T1, "a=2")),
+            ..delete
+        },
+        "deleted" => Case {
+            pbfhogg: format!("{n1}{n7}"),
+            ..delete
+        },
+        "osmium-off-model" => Case {
+            osmium: n1.clone(),
+            ..delete
+        },
+        "metadata" => Case {
+            pbfhogg: node(1, 2, T1, ""),
+            osmium: format!("{}{n7}", node(1, 1, T1, "")),
+            ..delete
+        },
+        "coords" => Case {
+            pbfhogg: format!("{n1}w1 v1 dV c1 t{T1} i1 u T Nn1x2y1\n"),
+            osmium: format!("{n1}{n7}w1 v1 dV c1 t{T1} i1 u T Nn1x1y1\n"),
+            ..delete
+        },
+        "precedence" => modify(1),
+        "precedence-wrong" => Case {
+            pbfhogg: format!("{n1}{}", node(7, 1, T2, "")),
+            ..modify(1)
+        },
+        "regression" | "regression-accepted" => modify(0),
+        _ => delete,
     }
 }
 
@@ -37,11 +97,6 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     std::fs::create_dir(&dir).unwrap();
     let input = dir.join("input.pbf");
     let osc = dir.join("input.osc");
-    std::fs::write(
-        &osc,
-        r#"<osmChange version="0.6"><delete><node id="7"/></delete></osmChange>"#,
-    )
-    .unwrap();
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(&dir, "apply".into(), false).unwrap();
     let mut h = harness::Harness::new(
@@ -53,11 +108,10 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     );
     for (fault, expected) in [
         ("", true),
-        ("explained", true),
         ("unexplained", false),
         ("modified", false),
         ("deleted", false),
-        ("both-retain", false),
+        ("osmium-off-model", false),
         ("stale", false),
         ("osmium-stale", true),
         ("unsorted", true),
@@ -65,8 +119,13 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         ("silent-drop", false),
         ("metadata", false),
         ("coords", true),
+        ("precedence", true),
+        ("precedence-wrong", false),
+        ("regression", true),
+        ("regression-accepted", false),
     ] {
         std::fs::write(dir.join("fault"), fault).unwrap();
+        std::fs::write(&osc, case(fault).osc).unwrap();
         if fault == "unsorted" || fault == "publish" {
             fake_pbf::write(&input, &[LOW], "unsorted");
         } else {
@@ -81,7 +140,11 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             let judged = super::judge(&mut h, "apply", |h| {
                 checks::apply_changes::run(h, &input, &osc, true, locations)
             });
-            let pass = expected || (fault == "stale" && !locations);
+            // Under -l osmium keeps or drops a base that does not lose by
+            // its cursor, so the model leaves it undecided there.
+            let pass = expected
+                || (fault == "stale" && !locations)
+                || (fault == "osmium-off-model" && locations);
             assert_apply(fault, locations, &judged);
             assert_eq!(
                 judged.status,
@@ -97,20 +160,19 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
 }
 
 /// Hold one apply fault to the comparison it fails by name, or to the
-/// element diff's error: an element difference, the metadata fault among
-/// them, must be the unexplained-entries error in both modes, never a
+/// element judgment's error: an element difference, the metadata fault
+/// among them, must be the unexplained-entries error in both modes, never a
 /// pass the coordinate or declaration arms could mask.
 fn assert_apply(fault: &str, locations: bool, judged: &super::Judged) {
     let case = format!("fault={fault}, locations={locations}: {judged:?}");
     let unexplained = match fault {
-        "unexplained" | "both-retain" | "metadata" => Some(1),
-        "modified" | "deleted" => Some(2),
+        "unexplained" | "modified" | "deleted" | "metadata" | "precedence-wrong" => Some(1),
         _ => None,
     };
     assert_eq!(
         judged.error,
         unexplained.map(|n| format!(
-            "pbfhogg vs osmium: {n} unexplained difference entries (see element diff above)"
+            "pbfhogg apply-changes: {n} unexplained difference entries (see element diff above)"
         )),
         "{case}"
     );
@@ -123,6 +185,22 @@ fn assert_apply(fault: &str, locations: bool, judged: &super::Judged) {
         "silent-drop" => assert_eq!(
             judged.failed,
             ["pbfhogg apply-changes output declares LocationsOnWays as its command documents"],
+            "{case}"
+        ),
+        "osmium-off-model" if !locations => assert_eq!(
+            judged.failed,
+            ["osmium apply-changes departs from the verifier's precedence model on 1 identities"],
+            "{case}"
+        ),
+        "regression-accepted" => assert!(
+            judged
+                .failed
+                .iter()
+                .any(|f| f == "pbfhogg apply-changes refuses the version regression")
+                && judged
+                    .failed
+                    .iter()
+                    .any(|f| f.starts_with("pbfhogg apply-changes published ")),
             "{case}"
         ),
         // The published path is per run: hold the one entry by its frame.
@@ -146,18 +224,32 @@ pub fn tool(args: &[OsString]) -> i32 {
         .find(|p| p.file_name().is_some_and(|n| n == "apply-fixture"))
         .unwrap();
     let fault = std::fs::read_to_string(root.join("fault")).unwrap();
+    let case = case(&fault);
     let value = |flag| args[args.iter().position(|s| *s == flag).unwrap() + 1];
+    if fake_pbf::is_opl_cat(&args) && args[1].ends_with(".osc") {
+        std::fs::write(value("-o"), fake_pbf::project(&args, &case.osc_opl)).unwrap();
+        return 0;
+    }
     if fake_pbf::is_opl_cat(&args) {
         // Keyed on content alone, as the reference cache keys the decode:
         // the marker names the side and the fault that wrote it.
         let marker = fake_pbf::marker(Path::new(args[1]));
         let (side, written_under) = marker.split_once('-').unwrap();
-        let opl = opl(written_under, side == "pbfhogg");
-        std::fs::write(value("-o"), fake_pbf::project(&args, opl)).unwrap();
+        let written = self::case(written_under);
+        let opl = if side == "pbfhogg" {
+            written.pbfhogg
+        } else {
+            written.osmium
+        };
+        std::fs::write(value("-o"), fake_pbf::project(&args, &opl)).unwrap();
         return 0;
     }
     match args[0] {
         "fileinfo" => print!("{}", fake_pbf::fileinfo(1, 1, 0)),
+        "getid" => {
+            assert!(args.contains(&"-H") && args.contains(&"-I"));
+            std::fs::write(value("-o"), fake_pbf::project(&args, &case.base)).unwrap();
+        }
         "apply-changes" => {
             let ours = args.contains(&"--output");
             let output = value(if ours { "--output" } else { "-o" });
@@ -174,6 +266,14 @@ pub fn tool(args: &[OsString]) -> i32 {
                 eprintln!(
                     "Error: apply-changes requires a sorted base PBF (Sort.Type_then_ID). (in {})\n\nSort the input first, decoding every blob rather than believing the header's sort claim and the blobs' indexdata:\n\n  pbfhogg sort --distrust-metadata {} -o sorted.osm.pbf",
                     args[1], args[1]
+                );
+                return 2;
+            }
+            if fault == "regression" {
+                assert!(ours, "references must not run on a predicted refusal");
+                eprintln!(
+                    "Error: apply-changes base merge: node 7 ...; pass --allow-version-regression \
+                     to permit lower-version changes"
                 );
                 return 2;
             }

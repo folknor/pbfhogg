@@ -340,18 +340,3 @@ negatives took the same path they do too. Fix: give duplicates a fixed place
 in report order and pick their examples by canonical ID, or settle every
 occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
 redesign of the same per-blob retention.
-
-## BUG-033 - apply-changes accepts a history base
-
-Reported by: the codex spar of the apply-changes base version gate.
-
-Header admission for apply-changes (`rewrite.rs`) checks the sort claim but
-not `HistoricalInformation`. On a history file the base holds several
-versions of one ID, and the rewrite replaces or deletes every occurrence
-(`rewrite_block.rs`, repeated IDs are matched each time), which is wrong
-for history even when every version check passes; osmium has a separate
-history branch for it. Unverified by a run. Fix: refuse a base declaring
-`HistoricalInformation` and point at producing a snapshot first, or
-implement history application. Related: an OSC upsert carrying
-`visible="false"` is stored as a visibility field, not a delete, and no
-contract says what apply-changes should make of it.

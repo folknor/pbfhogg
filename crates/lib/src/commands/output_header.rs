@@ -149,6 +149,18 @@ pub(crate) enum Replication {
     Drop,
 }
 
+/// Whether the output may hold several versions of one object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum History {
+    /// The output holds the inputs' records (all of them or a subset): it
+    /// declares `HistoricalInformation` when any input does.
+    Carry,
+    /// time-filter: the output holds at most one version of each object, as
+    /// of its cutoff, whatever the input held, so it never declares
+    /// `HistoricalInformation`.
+    Snapshot,
+}
+
 /// The facts a command states about its output.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OutputFacts {
@@ -156,16 +168,19 @@ pub(crate) struct OutputFacts {
     pub(crate) ways: Ways,
     pub(crate) bbox: Bbox,
     pub(crate) replication: Replication,
+    pub(crate) history: History,
 }
 
 impl OutputFacts {
-    /// Input order, input bbox and replication state, with `ways`.
+    /// Input order, input bbox, replication state and history declaration,
+    /// with `ways`.
     pub(crate) fn carry(ways: Ways) -> Self {
         Self {
             order: Order::AsInput,
             ways,
             bbox: Bbox::Carry,
             replication: Replication::Carry,
+            history: History::Carry,
         }
     }
 
@@ -316,7 +331,8 @@ pub(crate) fn build(
     if let Some(source) = agreed(inputs, HeaderBlock::source) {
         hb = hb.source(source);
     }
-    if inputs.iter().any(HeaderBlock::has_historical_information) {
+    if facts.history == History::Carry && inputs.iter().any(HeaderBlock::has_historical_information)
+    {
         hb = hb.historical();
     }
 

@@ -106,6 +106,19 @@ emits a wait span without blocking. The nanosecond stall counter is correctly
 gated, but the marker span is not. The repository's convention is to emit
 `WAIT_*` pairs only on genuine blocks.
 
+## CMD-055 - OSC re-emitters require coordinates on a hidden node
+
+Reported by: the BUG-033 spar partner (2026-11-20), from source; not run.
+
+apply-changes reads a `<create>`/`<modify>` node with `visible="false"` as a
+delete and needs no `lat`/`lon` on it (OSM's deleted versions carry none).
+`merge-changes` (both renderers, `merge_changes/emit.rs` and the owned parser
+in `merge_changes/mod.rs`) and `tags-filter --input-kind osc`
+(`tags_filter/osc.rs`) still require coordinates on every node outside
+`<delete>`, so such a change applies directly but is refused when routed
+through them first. Fix: accept an absent coordinate on an explicitly hidden
+node there too, keeping its section and visibility on re-emission.
+
 ## CMD-054 - OSC coordinates round through f64, unlike libosmium
 
 Reported by: the TOOL-029 spar partner (2026-11-20), from source; not run.

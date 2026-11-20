@@ -561,7 +561,12 @@ same element. The apply-changes overlay retains its native numeric metadata
 parsing and treats only `false` as hidden, compared after the same XML
 attribute normalization the re-emitters apply, so an entity-spelled `false` is
 hidden whether a change is applied directly or after re-emission (`False` is
-visible on both routes). An empty `visible=""` is the attribute absent for
+visible on both routes). apply-changes writes a snapshot, so a hidden create
+or modify is recorded as a versioned delete of its object (its version claim
+reaches the version gates like any delete's; a hidden node needs no
+coordinates); the public overlay parser still stages it as a hidden upsert.
+osmium apply-changes in snapshot mode likewise writes the winning record only
+when it is visible. An empty `visible=""` is the attribute absent for
 every consumer: it is no visibility claim and does not by itself give an
 element metadata, so a change claims the same thing applied directly and after
 re-emission. Every other metadata attribute a retained change was read with is

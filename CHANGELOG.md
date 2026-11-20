@@ -4,6 +4,15 @@
 
 ### Breaking
 
+- **apply-changes refuses a history base, and applies a hidden change as a
+  delete.** A base PBF declaring `HistoricalInformation` exits 2 before the
+  OSC is parsed; before, every version of a changed object was overwritten
+  with the new state. Make a snapshot with `time-filter` first. A `<create>`
+  or `<modify>` with `visible="false"` now removes the object (as osmium
+  does) instead of writing an element marked invisible into the snapshot.
+- **time-filter output no longer declares `HistoricalInformation`.** It
+  holds one version of each object; before, a history input's declaration
+  was carried, so the snapshot read as a history file.
 - **OSC input holding a character XML 1.0 forbids is refused.**
   `apply-changes`, `merge-changes` (with or without `--simplify`) and
   `tags-filter --input-kind osc` exit 2 on an OSC document containing a

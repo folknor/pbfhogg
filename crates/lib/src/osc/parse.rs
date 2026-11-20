@@ -18,6 +18,7 @@ use super::compact::{
 };
 use super::interner::StringInterner;
 use super::version_floor::VersionFloor;
+pub(crate) use super::xml_parse::HiddenUpserts;
 use super::xml_parse::{CompactSink, parse_osc_path};
 
 pub use super::compact::{
@@ -597,17 +598,24 @@ impl Default for CompactDiffOverlay {
 /// conflicts, but only when they do not move the object backwards: see
 /// [`CompactDiffOverlay::allow_version_regression`].
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
-    parse_osc_file_into_until(path, overlay, &crate::host::Call::detached())
+    parse_osc_file_into_until(
+        path,
+        overlay,
+        HiddenUpserts::Keep,
+        &crate::host::Call::detached(),
+    )
 }
 
 /// [`parse_osc_file_into`] that stops at the next read of the input once
-/// `cancel` is tripped (`ErrorKind::Cancelled`).
+/// `cancel` is tripped (`ErrorKind::Cancelled`), with `hidden` saying what a
+/// `visible="false"` create or modify becomes.
 pub(crate) fn parse_osc_file_into_until(
     path: &Path,
     overlay: &mut CompactDiffOverlay,
+    hidden: HiddenUpserts,
     cancel: &crate::host::Recorder,
 ) -> ParseResult<()> {
-    let mut sink = CompactSink::new(overlay);
+    let mut sink = CompactSink::new(overlay, hidden);
     // Deliberately use the shared historical per-file decompression counter.
     // Command-specific names or accumulation would break brokkr comparisons.
     parse_osc_path(path, &mut sink, cancel)

@@ -117,6 +117,64 @@ fn output_header_replication_timestamp_is_cutoff() {
     assert!(header.is_sorted(), "sorted flag should be preserved");
 }
 
+/// apply-changes refuses a history base (it would replace every version of a
+/// changed object), and time-filter is the way to a base it takes: its output
+/// is a snapshot and does not declare `HistoricalInformation`. On that
+/// snapshot a hidden `<modify>` removes its object, and the hidden node needs
+/// no coordinates.
+#[test]
+fn a_time_filter_snapshot_of_a_history_file_is_an_apply_changes_base() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let history = dir.path().join("history.osm.pbf");
+    let snapshot = dir.path().join("snapshot.osm.pbf");
+    let osc = dir.path().join("hide.osc");
+    let output = dir.path().join("applied.osm.pbf");
+    write_history_input(&history);
+    std::fs::write(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" version="2" visible="false"><tag k="a" v="b"/></node>
+  </modify>
+</osmChange>"#,
+    )
+    .expect("write osc");
+    let apply = |base: &Path| {
+        CliInvoker::new(&invocation_scratch)
+            .arg("apply-changes")
+            .arg(base)
+            .arg(&osc)
+            .arg("-o")
+            .arg(&output)
+            .run()
+    };
+
+    let refused = apply(&history);
+    assert_eq!(refused.status.code(), Some(2), "{}", refused.stderr_str());
+    assert!(
+        refused.stderr_str().contains("HistoricalInformation"),
+        "{}",
+        refused.stderr_str()
+    );
+    assert!(!output.exists(), "a refused apply-changes published output");
+
+    run_time_filter(&history, &snapshot, 250);
+    assert!(!read_header(&snapshot).has_historical_information());
+
+    let applied = apply(&snapshot);
+    assert!(applied.status.success(), "{}", applied.stderr_str());
+    assert_eq!(
+        read_nodes_with_metadata(&output),
+        vec![NodeSnapshot {
+            id: 1,
+            version: 2,
+            milli_timestamp: 200_000
+        }]
+    );
+}
+
 #[test]
 fn snapshot_path_filters_non_history_input() {
     let dir = crate::common::test_scratch();

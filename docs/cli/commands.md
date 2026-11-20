@@ -407,7 +407,8 @@ header follows from them.
   three: its new IDs are not the feed's, so the feed's diffs would address
   other objects.
 - **`source`** is kept when every input agrees; **`HistoricalInformation`**
-  when any input declares it.
+  when any input declares it, except from time-filter, whose output holds one
+  version of each object and never declares it.
 - **Writing program**: `pbfhogg/<version>`, the library's package version.
 - Optional features pbfhogg does not know are not carried: nothing can vouch
   for them after a rewrite. A required feature pbfhogg does not know never
@@ -1953,6 +1954,9 @@ indexdata is read, so a wholly unindexed input is filtered as an indexed one
 is; a partially indexed input (indexdata on some data blobs and not others)
 is refused once a read has met both kinds of data blob.
 
+The output holds at most one version of each object and never declares
+`HistoricalInformation`, so it can serve as an apply-changes base.
+
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
@@ -1988,6 +1992,18 @@ element order inside every blob it decodes (below), where an element that
 also falls outside its blob's claimed range is refused as false indexdata
 instead. Disorder confined to a blob copied without being decoded can pass
 undetected.
+
+**Snapshots only.** A base whose header declares `HistoricalInformation` is
+refused from the header (exit 2, nothing published), after the sort check and
+before the OSC is parsed: the run replaces or deletes every record of a
+changed ID, which on a history file would overwrite every past version. Make a
+snapshot with `time-filter` at the point the changes start from and apply to
+that. A base without the declaration that repeats an ID has every copy
+replaced or deleted. The output is a snapshot too, so a `<create>` or
+`<modify>` element with `visible="false"` is the object's deleted state: it is
+applied as a delete carrying that element's version claim, the object is
+absent if that change wins, and a hidden node needs no coordinates (osmium
+applies it the same way).
 
 Which blobs are unmodified is decided from each blob's indexdata ID range,
 and a passed-through blob's element count in the statistics is its indexdata

@@ -153,8 +153,12 @@ pub(crate) fn time_filter_to(
         output,
         compression,
         reader.header(),
+        // Both paths write at most one version of each object, the one at
+        // the cutoff, so a history input's declaration is not carried: the
+        // output is a snapshot, which is what apply-changes takes as a base.
         &super::output_header::OutputFacts {
             replication: super::output_header::Replication::AsOf(cutoff_timestamp),
+            history: super::output_header::History::Snapshot,
             ..super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded)
         },
         overrides,

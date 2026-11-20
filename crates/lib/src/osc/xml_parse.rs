@@ -1503,13 +1503,36 @@ fn arena_meta(
     Ok(meta)
 }
 
+/// What a [`CompactSink`] makes of a `<create>` or `<modify>` element that
+/// says `visible="false"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HiddenUpserts {
+    /// Stage it as an upsert carrying the hidden bit: the public overlay
+    /// reports what the file says.
+    Keep,
+    /// Record it as a versioned delete: apply-changes writes a snapshot, and
+    /// in OSM a record whose visibility is false is the deleted state of its
+    /// object, so the object is absent if this change wins. osmium
+    /// apply-changes does the same in its snapshot mode (it writes the
+    /// winning record only when it is visible). The version claim goes
+    /// through the delete path, so the stream and base version gates still
+    /// see it. The body is parsed like an upsert's and dropped; a node's
+    /// coordinates are not required.
+    AsDelete,
+}
+
 /// Sink that appends into a [`CompactDiffOverlay`].
 pub(crate) struct CompactSink<'a> {
     overlay: &'a mut CompactDiffOverlay,
+    hidden: HiddenUpserts,
     /// `None` while no create/modify element is being staged - which is
     /// also the state during a `<delete>` element, whose children the
-    /// driver checks and drops (`DeleteChildren::CheckAndDrop`).
+    /// driver checks and drops (`DeleteChildren::CheckAndDrop`), and during
+    /// a hidden upsert recorded as a delete (`dropping`).
     staging: Option<Staging>,
+    /// A hidden create or modify recorded as a delete is open: the driver
+    /// still routes its children, which are parsed and dropped.
+    dropping: bool,
 }
 
 struct Staging {
@@ -1525,10 +1548,21 @@ struct Staging {
 }
 
 impl<'a> CompactSink<'a> {
-    pub(crate) fn new(overlay: &'a mut CompactDiffOverlay) -> Self {
+    pub(crate) fn new(overlay: &'a mut CompactDiffOverlay, hidden: HiddenUpserts) -> Self {
         Self {
             overlay,
+            hidden,
             staging: None,
+            dropping: false,
+        }
+    }
+
+    /// Record a versioned delete of `kind` `id` with `meta`'s claim.
+    fn delete(&mut self, kind: ElementKind, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
+        match kind {
+            ElementKind::Node => self.overlay.delete_node(id, meta),
+            ElementKind::Way => self.overlay.delete_way(id, meta),
+            ElementKind::Relation => self.overlay.delete_relation(id, meta),
         }
     }
 
@@ -1567,18 +1601,22 @@ impl OscSink for CompactSink<'_> {
             // seq 4913, bygg) the strings only deletes interned were 48 of
             // 13,692, 537 bytes.
             let meta = arena_meta(e, self.overlay)?;
-            match kind {
-                ElementKind::Node => self.overlay.delete_node(id, &meta)?,
-                ElementKind::Way => self.overlay.delete_way(id, &meta)?,
-                ElementKind::Relation => self.overlay.delete_relation(id, &meta)?,
-            }
+            self.delete(kind, id, &meta)?;
             self.staging = None;
+            self.dropping = false;
             return Ok(());
         }
 
         // Deliberately leave the delete pending until insertion succeeds. Clearing it
         // here would let a rejected stale re-create erase the accepted deletion.
         let meta = arena_meta(e, self.overlay)?;
+        if self.hidden == HiddenUpserts::AsDelete && meta.flags & META_FLAG_HIDDEN != 0 {
+            self.delete(kind, id, &meta)?;
+            self.staging = None;
+            self.dropping = true;
+            return Ok(());
+        }
+        self.dropping = false;
         let (lat, lon) = if kind == ElementKind::Node {
             (
                 coord_to_decimicro(e, "lat", id)?,
@@ -1604,6 +1642,9 @@ impl OscSink for CompactSink<'_> {
 
     fn tag(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
         let (k, v) = parse_tag(e)?;
+        if self.dropping {
+            return Ok(());
+        }
         let key_id = self.overlay.intern(&k)?;
         let st = self.staged()?;
         st.tag_keys.push(key_id);
@@ -1613,6 +1654,9 @@ impl OscSink for CompactSink<'_> {
 
     fn nd(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
         let ref_id = parse_nd(e)?;
+        if self.dropping {
+            return Ok(());
+        }
         self.staged()?.refs.push(ref_id);
         Ok(())
     }
@@ -1620,6 +1664,9 @@ impl OscSink for CompactSink<'_> {
     fn member(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
         let member = parse_member(e)?;
         let type_byte = member_type_to_byte(member.member_type())?;
+        if self.dropping {
+            return Ok(());
+        }
         let role_id = self.overlay.intern(&member.role)?;
         self.staged()?
             .members
@@ -1628,6 +1675,7 @@ impl OscSink for CompactSink<'_> {
     }
 
     fn end_element(&mut self) -> ParseResult<()> {
+        self.dropping = false;
         let Some(st) = self.staging.take() else {
             return Ok(());
         };
@@ -1707,7 +1755,7 @@ mod tests {
         let mut overlay = CompactDiffOverlay::new();
         let deletion =
             quick_xml::events::BytesStart::from_content("node id=\"7\" version=\"5\"", 4);
-        CompactSink::new(&mut overlay).begin_element(
+        CompactSink::new(&mut overlay, HiddenUpserts::Keep).begin_element(
             OscAction::Delete,
             ElementKind::Node,
             &deletion,
@@ -1716,7 +1764,7 @@ mod tests {
             "node id=\"7\" version=\"4\" lat=\"1\" lon=\"2\"",
             4,
         );
-        let mut sink = CompactSink::new(&mut overlay);
+        let mut sink = CompactSink::new(&mut overlay, HiddenUpserts::Keep);
         sink.begin_element(OscAction::Create, ElementKind::Node, &stale)?;
         assert!(sink.end_element().is_err());
         assert!(overlay.is_deleted(ElementKind::Node, 7));
@@ -1725,11 +1773,37 @@ mod tests {
             "node id=\"7\" version=\"6\" lat=\"1\" lon=\"2\"",
             4,
         );
-        let mut sink = CompactSink::new(&mut overlay);
+        let mut sink = CompactSink::new(&mut overlay, HiddenUpserts::Keep);
         sink.begin_element(OscAction::Create, ElementKind::Node, &current)?;
         sink.end_element()?;
         assert!(!overlay.is_deleted(ElementKind::Node, 7));
         assert!(overlay.has_node(7));
+        Ok(())
+    }
+
+    #[test]
+    fn a_hidden_upsert_is_a_delete_only_for_apply() -> crate::Result<()> {
+        // No coordinates: a hidden node recorded as a delete does not need them.
+        let hidden = quick_xml::events::BytesStart::from_content(
+            "node id=\"7\" version=\"5\" visible=\"false\"",
+            4,
+        );
+        let tag = quick_xml::events::BytesStart::from_content("tag k=\"a\" v=\"b\"", 3);
+        let mut overlay = CompactDiffOverlay::new();
+        let mut sink = CompactSink::new(&mut overlay, HiddenUpserts::AsDelete);
+        sink.begin_element(OscAction::Modify, ElementKind::Node, &hidden)?;
+        sink.tag(&tag)?;
+        sink.end_element()?;
+        assert!(overlay.is_deleted(ElementKind::Node, 7));
+        assert!(!overlay.has_node(7));
+
+        let mut overlay = CompactDiffOverlay::new();
+        let mut sink = CompactSink::new(&mut overlay, HiddenUpserts::Keep);
+        assert!(
+            sink.begin_element(OscAction::Modify, ElementKind::Node, &hidden)
+                .is_err(),
+            "the public overlay still stages a hidden node, which needs coordinates"
+        );
         Ok(())
     }
 }

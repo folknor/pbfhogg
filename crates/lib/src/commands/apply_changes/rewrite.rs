@@ -119,6 +119,21 @@ fn build_header_bytes(
              must be ordered by ID.",
         ));
     }
+    // A history file holds several versions of one object, and the rewrite
+    // replaces or deletes every record of a changed ID (it keys on kind and
+    // ID, which is right for a snapshot's undeclared repeats): applied to a
+    // history base it would overwrite every past version with the new state.
+    // Applying changes to history is a different operation (a union ordered
+    // by version, as osmium's history mode does) that this pipeline does not
+    // implement.
+    if header.has_historical_information() {
+        return Err(crate::Error::invalid_data(
+            "apply-changes applies changes to a snapshot, and the base PBF declares \
+             HistoricalInformation: every version of a changed object would be replaced. \
+             Make a snapshot first (time-filter at the point the changes start from) \
+             and apply the changes to that.",
+        ));
+    }
     if locations_on_ways && !header.has_locations_on_ways() {
         return Err(crate::Error::invalid_data(
             "apply-changes with locations_on_ways requires the base PBF to have LocationsOnWays. \
@@ -329,7 +344,7 @@ pub(crate) fn merge_to<'a>(
         host,
     )?;
 
-    // The base header's refusals (unsorted base, `-l` without
+    // The base header's refusals (unsorted base, history base, `-l` without
     // LocationsOnWays) come before the OSC is parsed: the header read
     // happens either way, so ordering it first costs nothing and keeps a
     // multi-minute OSC parse from preceding a refusal it cannot change.
@@ -353,7 +368,15 @@ pub(crate) fn merge_to<'a>(
         // file: input-reader time (file reads, plus decompression for gzip),
         // not the full parse wall measured by osc_start here. Its owner,
         // TimedRead in osc/xml_parse.rs, documents the attribution.
-        crate::osc::parse::parse_osc_file_into_until(osc_file, &mut overlay, &host.invocation)?;
+        // The output is a snapshot, so a `visible="false"` create or modify
+        // is the object's deleted state: it is recorded as a versioned delete
+        // (`HiddenUpserts::AsDelete` says why).
+        crate::osc::parse::parse_osc_file_into_until(
+            osc_file,
+            &mut overlay,
+            crate::osc::parse::HiddenUpserts::AsDelete,
+            &host.invocation,
+        )?;
         overlay
     };
     let osc_parse_ms = osc_start.elapsed_ms();

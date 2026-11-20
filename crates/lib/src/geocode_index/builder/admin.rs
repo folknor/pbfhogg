@@ -330,7 +330,12 @@ fn vertex_e7(lon_deg: f64, lat_deg: f64) -> NodeCoord {
 /// without its holes, or from a partial ring set, would be a silently
 /// different boundary. A way listed more than once in one role is one
 /// boundary and counts once; a way listed as both outer and inner asserts
-/// one boundary as shell and hole, and refuses the relation.
+/// one boundary as shell and hole, and refuses the relation. The same edge
+/// under two different way IDs, one per role, is not refused: the reader
+/// answers `in outer and not in hole`, so a shared edge is a notch in the
+/// set difference, not a different area. Nor are edges shared with other
+/// relations, which are answered independently; neighbouring boundaries
+/// share edges as a rule.
 ///
 /// Every ring is simplified on its own to `tolerance_m` (`geo::simplify_ring`
 /// states the contract). The reader's answer for this polygon is

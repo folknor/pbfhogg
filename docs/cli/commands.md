@@ -2219,7 +2219,13 @@ ring is a hole of every outer ring whose interior contains the inner
 ring's boundary;
 where an inner ring touches or crosses an outer ring, which outer it
 belongs to is not promised. A point is in the area when it is inside the
-outer ring and inside none of its holes. The PBF replication sequence is stored as a u32 in the
+outer ring and inside none of its holes. Relations refused during ring
+assembly contribute no admin area. Rings are not otherwise validated as
+geometry: inside a ring is decided by even-odd crossing parity, so a ring
+that crosses itself keeps the regions it encloses an odd number of times;
+outer rings of one relation that overlap are separate areas whose union
+matches; and a hole subtracts from each outer ring that owns it, wherever it
+touches or crosses that ring. The PBF replication sequence is stored as a u32 in the
 geocode header. A missing value is stored as zero, and a present value outside
 the u32 range fails the build rather than being wrapped to a different source
 version. The header also records the input PBF's whole-file XXH3-128 (seed

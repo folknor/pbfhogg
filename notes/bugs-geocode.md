@@ -125,20 +125,6 @@ earlier one, such as the out-of-domain refusal. The build still fails and
 publishes nothing; only the reported cause can be the wrong one. Keep the
 first error (or stop the blob at it).
 
-## GEO-017 - Assembled admin rings are not checked against crossing or shared edges
-
-Reported by: the ring-assembly rewrite (node-ID biconnected blocks).
-
-Rings join by node ID and ring sets must be provably disjoint within one
-connected graph, but two shapes still pass unvalidated. Rings that cross, or
-touch somewhere other than a shared node (a bow-tie built from distinct node
-IDs at crossing segments), are never tested against each other. And an edge
-shared between the outer and inner roles, or between two relations' ways,
-under different way IDs is not detected, because the both-roles refusal keys
-on way ID only. Either can publish a polygon whose even-odd interior is not
-what the relation describes. A segment-intersection pass over the assembled
-rings (or a planar-embedding validation) would close both.
-
 ## GEO-018 - Open ways sharing a side between two holes are refused as a theta
 
 Reported by: the ring-assembly rewrite.
@@ -192,3 +178,44 @@ coarse level (`reader.rs`, the coarse `search_level` path) is never
 exercised. A test needs a query point with no fine hit whose coarse list
 holds a dangling reference; the synthetic builder inputs do not give one
 easily.
+
+## GEO-023 - A tangent exclave drawn by open ways withholds the relation
+
+Reported by: the crossing-ring review (spar with codex).
+
+Open outer ways share one graph, and `NestedRings` runs per role before any
+inner exists. A valid mainland whose enclave hole holds an exclave, all
+three rings meeting at one shared node, is withheld when the outers are
+split into open ways: the exclave cycle sits inside the mainland cycle of
+the same graph. Drawn as closed ways the same rings are never compared and
+publish correctly, so coverage depends on where the mapper split a way.
+Over-refusal, not a wrong answer. Closing it needs nesting judged across
+roles (a containment forest with alternating outer and inner roles), not
+per role.
+
+## GEO-024 - Invalid admin ring topology is published under even-odd, not refused
+
+Reported by: the crossing-ring review (spar with codex).
+
+A self-crossing ring, overlapping outers of one relation, or a hole that
+crosses its shell is published with a defined answer (even-odd parity per
+ring, union of outers, owned holes subtracted; `docs/cli/commands.md`
+states it), where libosmium refuses the area. Overlapping outers also rank
+by each record's own area. Refusing instead is a policy change to the CLI
+contract and needs, per the `geo/rings.rs` module doc: a containment
+forest with alternating roles, cyclic edge order at shared nodes, seam
+normalisation for touching holes, a periodic frame for seam contacts and a
+subquadratic sweep, measured against the admin assembly phase. Maintainer's
+call. Valid topology already answers correctly apart from the ownership
+vote (GEO-019).
+
+## GEO-025 - Holes sharing an edge can both miss a point at roundoff scale
+
+Reported by: the crossing-ring review (spar with codex).
+
+Two closed inner rings that split one hole along a shared edge, wound the
+same way, traverse that edge in opposite directions, and the reader's f64
+ray intercept differs between the two directions. A point strictly inside
+one hole, within about one ulp of the seam, can miss both, so the shell
+matches. Within the tolerance contract but not exact; an exact or
+direction-normalised edge intercept would close it.

@@ -371,3 +371,20 @@ re-read since.
 which follows a symlink at that name. A symlink planted at the lock path can
 make the lock open, and possibly create, a file elsewhere. The staging and
 registry writers now refuse entries they do not own; the lock open does not.
+
+## TOOL-032 - Refusal tests that accept any error can pass on a panic
+
+Reported by: the release-sweep retirement (commit `e716ad49`).
+
+Worker pools turn a panic into an `Internal` error (the diff unit worker is
+one), so a test that asserts only `is_err()` on a refusal passes when the
+code panics instead of refusing. With the release sweep gone, dev builds
+are the only test builds, and an arithmetic overflow there panics where a
+release build would wrap: a test that accepts any error can hide that
+difference entirely. The retirement tightened one test
+(`an_identical_corrupt_pair_is_skipped_wherever_equal_blobs_may_be` in
+`crates/lib/tests/roundtrip_invariants.rs`) to name its error kind and
+blob. Nothing finds or forbids the others: neither a sweep of the suite for
+`is_err()` and `.is_err_and(...)`-style refusal assertions that do not
+name a kind, nor a rule (text rule or source-policy audit) that keeps new
+ones out.

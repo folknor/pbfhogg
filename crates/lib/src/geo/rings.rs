@@ -24,7 +24,19 @@
 //! into an area of its own).
 //!
 //! Geometric validity beyond that is not checked: rings that cross, or touch
-//! other than at a shared node, are returned as walked.
+//! other than at a shared node, are returned as walked, and rings of
+//! different graphs (separate closed members) are never compared. That is a
+//! policy, not an oversight. For valid topology the published answer is
+//! already right: each outer is its own polygon, holes subtract, and
+//! neighbouring relations sharing edges are independent. What a crossing
+//! changes is only the answer for invalid topology, which even-odd parity
+//! still defines. Refusing it the way libosmium does would need more than a
+//! segment-intersection pass: a containment forest with alternating roles
+//! (an exclave inside an enclave inside a mainland is valid), the cyclic
+//! order of incident edges at shared nodes (two rings sharing two nodes can
+//! cross with every edge midpoint outside the other), seam normalisation
+//! for touching holes, a periodic frame for seam contacts, and a sweep that
+//! stays subquadratic on long rings.
 //!
 //! The work is linear in the member refs, apart from the pairwise
 //! disjointness check between rings of one connected graph.

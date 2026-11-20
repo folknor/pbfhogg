@@ -77,8 +77,12 @@ that writes them propagates it: the re-encoding commands (through the public
 `crates/lib/src/owned.rs`, which the owned-element conversions share), the
 `bench-write` instrument and the OSC writer refuse a bad role or user index
 with an error naming the element, rather than writing an empty string.
-`inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
-bad role as empty when classifying boundary members. Element content for
+`inspect` shows a bad role as `<invalid>`. `build-geocode-index` refuses a bad
+role on a way member of a boundary candidate, since the role decides whether
+that way is an outer ring, a hole or auxiliary; it does not read roles of node
+or relation members or of relations it does not select, so a bad index there
+passes. The check is on the decoded index, after the documented signed-32
+narrowing of the varint. Element content for
 `diff` and `digest` (`crates/lib/src/content.rs`) resolves roles through
 that `Result`: a bad role is never silently equal to anything.
 

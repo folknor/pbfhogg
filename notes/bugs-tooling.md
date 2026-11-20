@@ -370,3 +370,13 @@ assert osmium parity only where the precedence rules agree. The derive
 roundtrips (`checks/derive_changes.rs`) compare content, so only content
 or membership differences reach them; whether the same assumption affects
 them is unchecked.
+
+## TOOL-030 - The dataset lock file is opened following symlinks
+
+Reported by: the scout of the download staging item (2026-11-20); not
+re-read since.
+
+`pbfhogg-datasets` opens its per-dataset lock file with an ordinary open,
+which follows a symlink at that name. A symlink planted at the lock path can
+make the lock open, and possibly create, a file elsewhere. The staging and
+registry writers now refuse entries they do not own; the lock open does not.

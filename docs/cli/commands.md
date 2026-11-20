@@ -2196,7 +2196,9 @@ contributes no area at all, since the rings and holes of what remains are not
 the boundary's; admin boundary candidates with a missing,
 unparseable, or unsupported level or no name are skipped; relation members
 whose roles do not describe outer or inner rings are ignored (an empty role
-counts as outer). Each closed outer ring is its own area, and an inner
+counts as outer), while a way member of a boundary candidate whose role string
+index names no string in its block fails the build (exit 2), naming the
+relation, member position and index. Each closed outer ring is its own area, and an inner
 ring is a hole of every outer ring whose interior contains the inner
 ring's boundary;
 where an inner ring touches or crosses an outer ring, which outer it

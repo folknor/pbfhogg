@@ -26,20 +26,6 @@ the table), candidate
 ranking ties (BUG-026) and building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 
-## GEO-004 - A corrupt relation member role becomes an outer boundary
-
-Reported by: geocode-builder [P1], read-block-decoding [P2].
-
-`select_relation` (`builder/pass1.rs`) uses `m.role().unwrap_or("")`, and an
-empty role means outer. Take an ordinary boundary relation with an outer ring
-and an enclosed ring whose role index is out of bounds. The enclosed ring
-becomes another outer polygon instead of causing a refusal, so queries inside
-it can return the administrative area where a hole should have excluded it.
-`CORRECTNESS.md` acknowledges this exact fallback. Both hunters say it
-conflicts with the refusal contract: the decoder returns an error correctly,
-the consumer discards it, and a failed lookup is not an empty role. The fix is
-to propagate the role error.
-
 ## GEO-005 - The builder can publish an index with nothing queryable
 
 Reported by: geocode-builder [P2].

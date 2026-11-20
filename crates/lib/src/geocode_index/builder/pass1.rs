@@ -47,7 +47,32 @@ struct PendingRelation {
 }
 
 /// The boundary relation `rel` contributes, or `None` when it is not one.
-fn select_relation(rel: &crate::read::elements::Relation<'_>) -> Option<PendingRelation> {
+///
+/// A way member's role decides whether the way is an outer ring, a hole or
+/// auxiliary, so an eligible relation whose way member has a role string
+/// index that resolves to no string (negative, or past the block's table) is
+/// refused rather than read as an empty role: read as empty it would turn a
+/// hole into another outer area. Roles of node and relation members, and of
+/// relations that are not candidates, are never read and so not checked.
+fn select_relation(rel: &crate::read::elements::Relation<'_>) -> Result<Option<PendingRelation>> {
+    let Some(mut selected) = select_candidate(rel) else {
+        return Ok(None);
+    };
+    for (position, m) in rel.members().enumerate() {
+        if let MemberId::Way(wid) = m.id {
+            match boundary_role(rel.member_role(position, &m)?) {
+                BoundaryRole::Inner => selected.inner_way_ids.push(wid),
+                BoundaryRole::Outer => selected.outer_way_ids.push(wid),
+                BoundaryRole::Ignore => {}
+            }
+        }
+    }
+    Ok(Some(selected))
+}
+
+/// `rel` with no member ways yet when its tags make it a boundary
+/// candidate.
+fn select_candidate(rel: &crate::read::elements::Relation<'_>) -> Option<PendingRelation> {
     let mut boundary: Option<&str> = None;
     let mut level_str: Option<&str> = None;
     let mut rel_name: Option<&str> = None;
@@ -97,27 +122,13 @@ fn select_relation(rel: &crate::read::elements::Relation<'_>) -> Option<PendingR
     } else {
         None
     };
-
-    let mut outer_way_ids = Vec::new();
-    let mut inner_way_ids = Vec::new();
-    for m in rel.members() {
-        if let MemberId::Way(wid) = m.id {
-            let role = m.role().unwrap_or("");
-            match boundary_role(role) {
-                BoundaryRole::Inner => inner_way_ids.push(wid),
-                BoundaryRole::Outer => outer_way_ids.push(wid),
-                BoundaryRole::Ignore => {}
-            }
-        }
-    }
-
     Some(PendingRelation {
         id: rel.id(),
         admin_level,
         name: name.into(),
         country_code,
-        outer_way_ids,
-        inner_way_ids,
+        outer_way_ids: Vec::new(),
+        inner_way_ids: Vec::new(),
     })
 }
 
@@ -146,13 +157,15 @@ pub(super) fn run_pass1(
         std::num::NonZeroUsize::new(crate::tunables::GEOCODE_MERGE_WINDOW_BLOBS),
         || (),
         |block, _: &mut ()| -> Result<Vec<PendingRelation>> {
-            Ok(block
-                .elements_skip_metadata()
-                .filter_map(|element| match element {
-                    Element::Relation(rel) => select_relation(&rel),
-                    _ => None,
-                })
-                .collect())
+            let mut pending = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(rel) = element
+                    && let Some(selected) = select_relation(&rel)?
+                {
+                    pending.push(selected);
+                }
+            }
+            Ok(pending)
         },
         |_position, pending: Vec<PendingRelation>| {
             for rel in pending {
@@ -186,6 +199,7 @@ pub(super) fn run_pass1(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -197,5 +211,81 @@ mod tests {
         for role in ["subarea", "label", "admin_centre", "stop"] {
             assert!(matches!(boundary_role(role), BoundaryRole::Ignore));
         }
+    }
+
+    /// A way member role whose string index names no string is refused for
+    /// a boundary candidate, naming the relation, the member's position in
+    /// the full member list and the index; an unresolvable role on a node
+    /// member, or on a relation that is not a candidate, is never read.
+    #[test]
+    fn an_unresolvable_way_role_of_a_boundary_is_refused() {
+        use crate::read::wire_fixtures::{Group, block, field_bytes, packed, relation};
+
+        // Strings: 0 "", 1 outer, 2 inner, 3 boundary, 4 administrative,
+        // 5 admin_level, 6 8, 7 name, 8 X.
+        let strings = [
+            "",
+            "outer",
+            "inner",
+            "boundary",
+            "administrative",
+            "admin_level",
+            "8",
+            "name",
+            "X",
+        ];
+        let negative = u64::from_ne_bytes((-1i64).to_ne_bytes());
+        let tagged = |mut r: Vec<u8>, tags: &[(u64, u64)]| {
+            field_bytes(&mut r, 2, &packed(tags.iter().map(|t| t.0)));
+            field_bytes(&mut r, 3, &packed(tags.iter().map(|t| t.1)));
+            r
+        };
+        let boundary = [(3, 4), (5, 6), (7, 8)];
+        let bytes = block(
+            &strings,
+            &[Group {
+                relations: vec![
+                    // Node member with a bad role, then valid ways.
+                    tagged(
+                        relation(1, &[(99, 5, 0), (1, 10, 1), (2, 11, 1)]),
+                        &boundary,
+                    ),
+                    // Valid outer, then a way past the table at position 2.
+                    tagged(
+                        relation(2, &[(1, 10, 1), (0, 5, 0), (99, 11, 1)]),
+                        &boundary,
+                    ),
+                    // A negative role index on a way.
+                    tagged(relation(3, &[(negative, 10, 1)]), &boundary),
+                    // Not a candidate: no name.
+                    tagged(relation(4, &[(99, 10, 1)]), &boundary[..2]),
+                ],
+                ..Group::default()
+            }],
+        );
+        let block = crate::PrimitiveBlock::from_vec(bytes).unwrap();
+        let relations: Vec<_> = block
+            .elements()
+            .map(|element| match element {
+                Element::Relation(relation) => relation,
+                _ => panic!("fixture contains only relations"),
+            })
+            .collect();
+
+        let first = select_relation(&relations[0]).unwrap().unwrap();
+        assert_eq!(first.outer_way_ids, [10]);
+        assert_eq!(first.inner_way_ids, [11]);
+
+        let err = select_relation(&relations[1]).err().unwrap().to_string();
+        assert!(
+            err.contains("relation 2 member 2: role string index 99"),
+            "{err}"
+        );
+        let err = select_relation(&relations[2]).err().unwrap().to_string();
+        assert!(
+            err.contains("relation 3 member 0: role string index -1"),
+            "{err}"
+        );
+        assert!(select_relation(&relations[3]).unwrap().is_none());
     }
 }

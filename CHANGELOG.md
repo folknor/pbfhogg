@@ -26,6 +26,12 @@
   `--allow-version-regression` restores last-change-wins, and is needed
   to apply a content-derived patch back to an older snapshot. Library:
   `ErrorKind::VersionRegression` gains an `in_base` field.
+- **build-geocode-index refuses an unresolvable boundary member role.** A
+  way member of an admin or postal boundary relation whose role string
+  index is negative or past the block's string table now fails the build
+  (exit 2), naming the relation, member position and index, and leaves any
+  existing index in place. Before, the role read as empty and so as outer,
+  turning a would-be hole into another area of the boundary.
 - **A tag string index past the block's string table is refused.** Every
   command that decodes a block now fails (exit 2) on a tag key or value
   index that names no string, as osmium does. Before, the tag list ended

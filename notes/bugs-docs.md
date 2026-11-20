@@ -253,6 +253,16 @@ in `process_block` writes ways with `add_way_partial` and drops them. The
 scout also reported the same comment still describing tags as fallible;
 check that against the current text before rewording.
 
+## DOC-027 - testing.md test-scratch prose is stale
+
+Reported by: the scout of the download staging item (2026-11-20); not
+re-read since.
+
+The "Test scratch" prose in `reference/testing.md` no longer matches how
+test scratch is cleared and checked: `scripts/test_tree.py` now only
+empties `data/test-scratch` before the test phase and requires it empty
+after, with no whole-checkout snapshot.
+
 ## DOC-024 - diff test comments still describe a header walk and ID-range shards
 
 Reported by: the negative-ID documents commit's spar (codex).

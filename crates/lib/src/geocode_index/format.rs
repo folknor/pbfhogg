@@ -31,9 +31,12 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 /// sequence and timestamp verbatim as signed i64 values with a presence flag
 /// each (header bytes 88..112), where version 7 kept a u32 sequence and a u64
 /// timestamp at bytes 24..36 that could not say "absent" and wrapped a
-/// negative timestamp. Readers deliberately reject other versions: existing
-/// indexes must be rebuilt.
-pub const FORMAT_VERSION: u32 = 8;
+/// negative timestamp; version 9 makes the admin cell lists a binding cover
+/// (see [`AdminEntry`]): the reader consults only the query's own admin cell
+/// and accepts an interior-flagged entry without a point-in-polygon test,
+/// where version 8 and earlier only carried the flag as a hint. Readers
+/// deliberately reject other versions: existing indexes must be rebuilt.
+pub const FORMAT_VERSION: u32 = 9;
 
 /// S2's on-disk cell level limit, independent of build sampling budgets.
 pub const S2_MAX_LEVEL: u8 = 30;
@@ -246,7 +249,7 @@ impl TryFrom<u8> for ParentKind {
 /// they never use this sentinel.
 pub const NO_DATA_U64: u64 = u64::MAX;
 
-/// Interior cell hint flag (high bit on a u32 polygon index).
+/// Interior cell flag (high bit on a u32 polygon index); see [`AdminEntry`].
 pub const INTERIOR_FLAG: u32 = 0x8000_0000;
 
 /// Mask to extract the polygon index from an interior-flagged entry.
@@ -699,8 +702,30 @@ pub const RING_SENTINEL: NodeCoord = NodeCoord {
 };
 
 /// The item of admin_entries.bin lists: a polygon index with the interior
-/// hint packed into its high bit ([`INTERIOR_FLAG`]). Hand-written rather
+/// flag packed into its high bit ([`INTERIOR_FLAG`]). Hand-written rather
 /// than a `record!` because its two values share one u32.
+///
+/// The admin lists are a cover the reader relies on, stated over the cell
+/// the reader assigns a query to (S2's point-to-cell mapping of the query's
+/// coordinates at `admin_cell_level`), not over a cell's geometric
+/// footprint, since rounding can assign a point just outside a footprint to
+/// it. A producer guarantees, for every valid query:
+///
+/// - every admin polygon whose point-in-polygon test (as
+///   `geo::point_in_polygon` decides it over the stored rings) holds for the
+///   query is listed under the query's assigned cell;
+/// - a polygon index occurs at most once in one cell's list;
+/// - a set interior flag means the test holds for every valid query
+///   assigned to that cell, including every accepted longitude spelling at
+///   the antimeridian and the poles. A clear flag only says "test it".
+///
+/// Extra, unflagged entries are allowed: the cover may be conservative. The
+/// reader reads only the query's own cell, accepts a flagged entry without a
+/// test and tests the rest, so an index breaking these rules answers wrongly
+/// rather than refusing. Open cannot certify them without recomputing the
+/// cover, and does not: like the vertex coordinates themselves, they are the
+/// producer's to get right. pbfhogg's builder meets them with the padded
+/// edge cover and flood fill of `builder::pass3` (ADR-0022, ADR-0029).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminEntry {
     raw: u32,
@@ -712,11 +737,11 @@ impl AdminEntry {
 
     /// `None` when `polygon_index` reaches into the flag bit: masking it
     /// would silently name a different polygon.
-    pub fn new(polygon_index: u32, interior_hint: bool) -> Option<Self> {
+    pub fn new(polygon_index: u32, interior: bool) -> Option<Self> {
         if polygon_index & INTERIOR_FLAG != 0 {
             return None;
         }
-        let flag = if interior_hint { INTERIOR_FLAG } else { 0 };
+        let flag = if interior { INTERIOR_FLAG } else { 0 };
         Some(Self {
             raw: polygon_index | flag,
         })
@@ -727,9 +752,10 @@ impl AdminEntry {
         self.raw & INDEX_MASK
     }
 
-    /// A hint only: the reader still runs the point-in-polygon test.
+    /// Whether the polygon contains every query assigned to this entry's
+    /// cell, so the reader skips its point-in-polygon test.
     #[inline]
-    pub fn interior_hint(self) -> bool {
+    pub fn interior(self) -> bool {
         self.raw & INTERIOR_FLAG != 0
     }
 
@@ -2213,15 +2239,15 @@ mod tests {
     }
 
     #[test]
-    fn admin_entry_packs_the_interior_hint_into_the_high_bit() {
+    fn admin_entry_packs_the_interior_flag_into_the_high_bit() {
         let plain = AdminEntry::new(7, false).expect("small index");
         let interior = AdminEntry::new(7, true).expect("small index");
         assert_eq!(plain.to_bytes(), 7u32.to_le_bytes());
         assert_eq!(interior.to_bytes(), (7u32 | 0x8000_0000).to_le_bytes());
         let parsed = AdminEntry::from_bytes(&interior.to_bytes());
         assert_eq!(parsed.polygon_index(), 7);
-        assert!(parsed.interior_hint());
-        assert!(!plain.interior_hint());
+        assert!(parsed.interior());
+        assert!(!plain.interior());
         assert_eq!(
             AdminEntry::new(INDEX_MASK, false).map(AdminEntry::polygon_index),
             Some(INDEX_MASK)

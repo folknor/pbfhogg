@@ -328,10 +328,10 @@ fn write_synthetic_admin_with_hole_input(path: &Path) {
 
 /// A single admin polygon large enough to span many admin S2 cells, so the
 /// builder's pass-3 centroid flood-fill flags genuinely-interior cells (their
-/// centers lie strictly inside the polygon). Used to pin the reader-side
-/// invariant that the interior high bit is only a hint, never a
-/// point-in-polygon bypass: a query just outside the boundary must not be
-/// attributed to the polygon via an adjacent interior-flagged cell.
+/// centers lie strictly inside the polygon). Used to pin that the interior
+/// flag decides containment only in its own cell: a query just outside the
+/// boundary must not be attributed to the polygon via an adjacent
+/// interior-flagged cell.
 ///
 /// Axis-aligned square: latitude 54.0..57.0, longitude 10.0..13.0 (each side
 /// ~3 degrees, hundreds of km - far wider than one ~8 km level-10 admin cell).
@@ -2468,7 +2468,7 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
 /// (see `crates/lib/src/geocode_index/format.rs`): admin_cells.bin is fixed 16-byte
 /// records (cell_id u64, entries_offset u64); admin_entries.bin holds, at
 /// each cell's entries_offset, a u16 count followed by that many u32 entries
-/// whose top bit (`INTERIOR_FLAG`) marks an interior hint. Keyed by cell id
+/// whose top bit (`INTERIOR_FLAG`) marks an interior entry. Keyed by cell id
 /// (rather than a single yes/anywhere bool) so callers can ask "is *this*
 /// cell interior-flagged" instead of "is some cell somewhere interior
 /// flagged" - the latter proves nothing about any particular query.
@@ -2521,8 +2521,8 @@ fn admin_cell_interior_flags(index_dir: &Path) -> std::collections::HashMap<u64,
 
 /// Returns a query point's own admin S2 cell id and its neighbor cell ids at
 /// `level`, mirroring the reader's private `cell_neighborhood` helper (the
-/// point's cell plus up to 8 S2 neighbors) so a test can reason about
-/// exactly the same per-query cell set the reader's admin search visits.
+/// point's cell plus up to 8 S2 neighbors), the block the street searches
+/// read first; admin search reads only the own cell.
 fn admin_cell_neighborhood(lat: f64, lon: f64, level: u8) -> (u64, Vec<u64>) {
     let cell =
         s2::cellid::CellID::from(s2::latlng::LatLng::from_degrees(lat, lon)).parent(level as u64);
@@ -2534,17 +2534,16 @@ fn admin_cell_neighborhood(lat: f64, lon: f64, level: u8) -> (u64, Vec<u64>) {
     (cell.0, neighbors)
 }
 
-/// Regression: the admin interior high bit is a hint only, never a
-/// point-in-polygon bypass. Before the fix at both reader call sites
-/// (`search_admin_ranked` / `search_admin_all`), `is_interior || contains(...)`
-/// accepted a candidate whenever ANY cell in the query's 9-cell neighborhood
-/// carried an interior-flagged entry for the polygon - even if the query point
-/// itself lay outside the polygon. pbfhogg's builder does not make that skip
-/// sound (no interior erosion, cell-center sampling), so a point just outside
-/// the boundary but adjacent to a genuinely-interior cell was wrongly attributed
-/// to the polygon. The fix always runs the PIP test; this pins that behavior.
+/// The admin interior flag decides containment only for queries in the cell
+/// it is stored on. An earlier reader read the query's 9-cell neighborhood
+/// and accepted a candidate whenever ANY of those cells carried an
+/// interior-flagged entry for the polygon, so a point just outside the
+/// boundary but adjacent to a genuinely interior cell was attributed to the
+/// polygon. The reader now reads only the query's own cell, where a flag
+/// holds for every query the cell is assigned (format `AdminEntry`), and
+/// skips the point-in-polygon test there; this pins both halves.
 #[test]
-fn admin_interior_hint_does_not_bypass_point_in_polygon() {
+fn admin_interior_flag_decides_only_its_own_cell() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
@@ -2578,13 +2577,39 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
         .find(|admin| admin.admin_level == 2)
         .expect("query inside the polygon should return the boundary");
     assert_eq!(inside_admin.name, "Bigland");
+    // That point's own cell is interior-flagged, so the flag answers it
+    // without a containment test.
+    let (inside_cell, _) = admin_cell_neighborhood(55.5, 11.5, admin_level);
+    assert_eq!(
+        interior_flags.get(&inside_cell).copied(),
+        Some(true),
+        "fixture must put the inside point in an interior-flagged cell"
+    );
+    #[cfg(pbfhogg_test_hooks)]
+    {
+        reader.reset_admin_pip_calls();
+        let raw = reader.candidates(55.5, 11.5).expect("valid query");
+        assert!(raw.admin.iter().any(|admin| admin.name == "Bigland"));
+        assert_eq!(
+            reader.admin_pip_calls(),
+            0,
+            "an interior-flagged own cell answers without a containment test"
+        );
+        let ranked = reader.query(55.5, 11.5).expect("valid query");
+        assert!(ranked.admin.iter().any(|admin| admin.name == "Bigland"));
+        assert_eq!(
+            reader.admin_pip_calls(),
+            0,
+            "the ranked path also answers a flagged own cell without a test"
+        );
+    }
 
     // Regression: several points just NORTH of the top edge (latitude 57.0).
     // Every point is unambiguously outside (latitude > 57.0), yet each sits
     // within one admin-cell width of the boundary, so its 9-cell neighborhood
     // may include interior-flagged cells one step inside. Pre-fix, the
-    // interior bypass attributed these to "Bigland"; post-fix, the
-    // unconditional PIP test rejects them. Both the ranked query() and the
+    // interior bypass attributed these to "Bigland"; now the reader reads
+    // only the own cell, unflagged, and tests it. Both the ranked query() and the
     // raw candidates() paths must reject.
     //
     // Non-vacuity guard, made query-local (not "some cell somewhere is
@@ -2632,7 +2657,7 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
         #[cfg(pbfhogg_test_hooks)]
         assert!(
             reader.admin_pip_calls() <= 1,
-            "one polygon shared by neighboring cells must be containment-tested at most once"
+            "only the query's own cell is read, and it lists a polygon at most once"
         );
         assert!(
             raw.admin.iter().all(|admin| admin.name != "Bigland"),
@@ -2644,7 +2669,7 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
         exercised_neighbor_bypass,
         "none of the tested outside queries had an interior-flagged neighbor \
          cell for Bigland (with their own cell unflagged); the fixture/level \
-         no longer exercises the interior-hint neighbor-cell bypass this test \
+         no longer exercises the neighbor-cell flag this test \
          guards against, so the assertions above would pass vacuously"
     );
 }

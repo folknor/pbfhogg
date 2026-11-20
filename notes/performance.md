@@ -1541,23 +1541,26 @@ Kind: high conviction.
 
 Reported by: geocode.
 
-Mechanism: the reader searches nine cells, ignores the builder's interior flags
-and, per containment test, allocates and rebuilds all rings from mmap
-coordinates (plus an unwrapped copy at the antimeridian); ranked lookup lacks the
-raw path's attempted-polygon deduplication. Build-side flood fill (`pass3.rs`)
-runs full containment for seeds and visited cells, one task per polygon.
+Already landed (format 9, ADR-0029): the reader reads only the query's own
+admin cell and trusts its interior flag, about 130 to 26 us per query on the
+germany box; the dedupe question dissolved (one list repeats no polygon).
 
-Redesign: a versioned hierarchical admin index - constant-membership regions
-carry containing polygon IDs and the smallest-area winner per level; boundary
-regions carry membership plus a prepared edge index; queries use their own
-region and evaluate only relevant edges with the existing crossing expression;
-build prepares rings once, refines boundary cells, keeps uniform subtrees,
-proceeds per completed relation. Local: dedupe failed admin attempts now.
+Residue, query: a containment test on a boundary (unflagged) entry still
+allocates and rebuilds all of the polygon's rings from mmap coordinates (plus
+an unwrapped copy at the antimeridian) and scans every vertex. A prepared
+per-cell edge index (the edges of each polygon that cross the cell, evaluated
+with the existing crossing expression) would make that cost proportional to
+the cell's edges, a format change from 9. It needs more than the cell's
+edges: the query's ray also crosses edges outside the cell, so each cell
+entry would carry a base parity per ring and per longitude retry.
+
+Residue, build: the flood fill (`pass3.rs` `admin_cells_for_polygon`) runs
+full containment for seeds and visited cells, one task per polygon; preparing
+rings once, refining boundary cells and keeping uniform subtrees would cut it.
 
 Risks: holes, even-odd self-intersections, implicit closing edges, antimeridian
-retries, simplification, stored f32 area, polygon-index ties; today's flags on
-neighbouring cells say nothing about the query point and format 7 cannot express
-the stronger invariant.
+retries, simplification, stored f32 area, polygon-index ties; any change must
+keep the format 9 cover rules at `AdminEntry`.
 
 Kind: highest-conviction query rewrite.
 

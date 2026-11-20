@@ -517,6 +517,29 @@ u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
 
+### Admin lookup reads the own cell and trusts its flag, format 9 (plantasjen, 2026-11-20, variant uncommitted against `a7946048`)
+
+The reader reads only the query's own admin cell instead of nine and accepts
+an interior-flagged entry without a point-in-polygon test (ADR-0029).
+geocode-query, germany, country bbox `5.9,47.3,15.0,55.0`, 100k points, 3
+rounds, interleaved `--iterations 1` cells (base, variant, base, variant):
+
+| Cell | us per query (best) | open_ms | index build (child 0) |
+|---|---:|---:|---:|
+| base `15de9fd0` | 131.82 | 1120 | 13.3 s |
+| variant `caa66d3a` | 26.48 | 1111 | 12.4 s |
+| base `5eed0a30` | 127.92 | 1127 | 13.4 s |
+| variant `17b4381f` | 26.08 | 1072 | 13.3 s |
+
+About 4.9 times faster in both pairs. The bench discards answers; the
+answer evidence is `pbfhogg-verify geocode --dataset germany` passing on
+the variant. The build adds one frame pass per admin polygon (the bound
+check) and builds the same cover; its wall moved within noise. What is
+left of the query cost is the containment test on unflagged entries, which
+still rebuilds the polygon's rings. The variant measured here dropped
+unbounded polygons in pass 3; the landed shape drops them after ring
+assembly, the same work moved earlier.
+
 ### Corrupt entries refused at the read (plantasjen, 2026-11-20, variant uncommitted against `3db3087d`)
 
 Lookups now fail on a cell entry naming a record past its file instead of

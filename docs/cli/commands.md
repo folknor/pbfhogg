@@ -2225,7 +2225,11 @@ geometry: inside a ring is decided by even-odd crossing parity, so a ring
 that crosses itself keeps the regions it encloses an odd number of times;
 outer rings of one relation that overlap are separate areas whose union
 matches; and a hole subtracts from each outer ring that owns it, wherever it
-touches or crosses that ring. The PBF header's replication sequence and
+touches or crosses that ring. One geometry is dropped with a warning: an
+area with a ring (outer or hole) whose longitudes, unwrapped across the
+antimeridian, pass 100,000 degrees (it winds round a pole hundreds of
+times) is left out of the index, so that area answers no query; the
+relation's other areas are kept. The PBF header's replication sequence and
 timestamp are stored in the geocode header exactly as the input holds them:
 each as a signed 64-bit value with its own presence, so a missing value stays
 missing, a zero stays zero and a negative timestamp stays negative; no value
@@ -2243,7 +2247,8 @@ is not cut at it.
 
 The index carries an on-disk format version. A reader accepts only its own
 version: an index of any other version (such as one built before the input
-digest or the signed replication fields were recorded) is refused with an error
+digest or the signed replication fields were recorded, or before the admin
+cells became the cover admin lookup relies on) is refused with an error
 telling you to rebuild it with `build-geocode-index`, and there is no
 in-place upgrade. Rebuild existing indexes after upgrading.
 
@@ -2253,7 +2258,11 @@ its distance to. An admin boundary edge is the edge the query's
 point-in-polygon test uses. The index lists a street, interpolation way or
 admin polygon under every cell, at the street, coarse and admin levels, that
 such a line passes through (an index built by pbfhogg 0.5.0 or earlier can
-lack a cell the line only clips near its corner; rebuild to gain them).
+lack a cell the line only clips near its corner; rebuild to gain them). Admin
+lookup reads only the admin cell holding the query point: the index lists
+there every admin polygon that can contain it, and marks one that contains
+every query point the cell is assigned, so it is accepted without a
+point-in-polygon test.
 
 An address point is a node, or a `building` way whose nodes are all
 present (at the mean of its nodes), with `addr:housenumber` and a non-empty `addr:street`, a non-empty

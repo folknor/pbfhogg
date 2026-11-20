@@ -213,9 +213,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   Geocode admin edge cells are a conservative cover of the reader's
   point-in-polygon boundary (planar ring edges in its frame, the closing
   edge, the antimeridian for unwrapped rings), so an interior-flagged cell
-  is wholly inside; the reader still tests every candidate, because the
-  flag is per cell, the query reads nine, and older indexes carry unsound
-  flags. Supersedes ADR-0015.
+  is wholly inside. Its reader half (test every candidate of nine cells,
+  since older indexes carried unsound flags) is amended by ADR-0029, which
+  trusts the flag on the query's own cell. Supersedes ADR-0015.
 - [ADR-0023](0023-geocode-search-radii-are-searched-in-full.md) - A geocode
   search radius is a promise: the reader answers the nearest record closer
   than it, wherever it lies, by reading the 3x3 block, proving how far that
@@ -252,3 +252,9 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   keeps the signed identity where osmium folds IDs onto their magnitude; a
   drop, misplacement or refusal for an ID's sign is a bug. Supersedes
   ADR-0002.
+- [ADR-0029](0029-the-reader-trusts-the-admin-cover-of-the-query-cell.md) -
+  Geocode format 9 makes the admin cell lists a binding cover over the
+  cell a query is assigned (every containing polygon listed, once; a flag
+  means every query assigned the cell is inside), so the reader reads only
+  the query's own cell and skips the test for flagged entries; a polygon
+  with a ring unwrapped past 1e5 degrees is dropped. Amends ADR-0022.

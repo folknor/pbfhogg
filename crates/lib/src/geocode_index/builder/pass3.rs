@@ -1045,6 +1045,24 @@ fn run_stage_b(
     Ok(total_cells)
 }
 
+/// Whether every ring of `poly` stays, in its point-in-polygon frame
+/// (`geo::pip_ring_frame`), within `ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG`, the
+/// range the cover's rounding is proven inside `PATH_COVER_UV_SLACK` for.
+/// The reader trusts the admin cover (format `AdminEntry`), so the builder
+/// drops a polygon failing this before it writes any admin record: a record
+/// left without its cells would break the cover rules.
+pub(super) fn admin_frame_within_bound(poly: &AssembledPolygon) -> bool {
+    let (ext, holes) = parse_polygon_rings(poly.vertices.iter().copied());
+    let max_lon = crate::tunables::ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG;
+    std::iter::once(&ext).chain(holes.iter()).all(|ring| {
+        crate::geo::pip_ring_frame(ring)
+            .iter()
+            .all(|&(lon, _)| lon.abs() <= max_lon)
+    })
+}
+
+/// Every polygon's admin cells. The caller has dropped the polygons that
+/// fail `admin_frame_within_bound`.
 #[hotpath::measure]
 pub(super) fn assign_admin_cells(
     polygons: &[AssembledPolygon],
@@ -1749,5 +1767,45 @@ mod tests {
             "the east lobe must have interior cells - a single seed reaches only one \
              lobe (west {west}, east {east})"
         );
+    }
+
+    /// The frame bound the builder drops polygons by: a ring whose unwrapped
+    /// frame passes the longitude the cover's rounding is proven for fails
+    /// it, a ring winding round the pole once passes. Ring assembly refuses
+    /// the repeated coordinates of this fixture, so it tests the predicate
+    /// alone, not a build.
+    #[test]
+    fn admin_frame_bound_separates_hundreds_of_windings_from_one() {
+        // 120-degree steps at latitude 80: three vertices per turn round the
+        // north pole, unwrapped one turn (360 degrees) further each time.
+        let winding = |turns: usize| {
+            let lons = [0, 1_200_000_000, -1_200_000_000];
+            let mut vertices: Vec<NodeCoord> = (0..turns * 3)
+                .map(|i| NodeCoord {
+                    lat_e7: 800_000_000,
+                    lon_e7: lons[i % 3],
+                })
+                .collect();
+            vertices.push(NodeCoord {
+                lat_e7: 700_000_000,
+                lon_e7: 0,
+            });
+            vertices.push(vertices[0]);
+            AssembledPolygon {
+                admin_level: 8,
+                name_offset: 0,
+                country_code_offset: 0,
+                area: 1.0,
+                vertices,
+            }
+        };
+        let turns_past: u32 = 300;
+        assert!(
+            f64::from(turns_past) * 360.0
+                > crate::tunables::ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG + 360.0,
+            "the fixture must wind past the bound"
+        );
+        assert!(!admin_frame_within_bound(&winding(turns_past as usize)));
+        assert!(admin_frame_within_bound(&winding(1)));
     }
 }

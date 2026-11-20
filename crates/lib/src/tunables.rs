@@ -1257,6 +1257,18 @@ pub(crate) const PATH_COVER_TOLERANCE_WIDTH_FRACTION: f64 = 1.0 / 1024.0;
 /// about 6 mm on the ground.
 pub(crate) const PATH_COVER_UV_SLACK: f64 = 1e-9;
 
+/// Largest absolute longitude, in degrees, an admin ring may reach in its
+/// point-in-polygon frame (`geo::pip_ring_frame`, which unwraps a ring
+/// across the antimeridian and so can leave [-180, 180]) for the builder to
+/// cover it. The reader trusts the admin cover (format `AdminEntry`), and
+/// the cover's rounding grows with the frame's longitudes: interpolating and
+/// projecting a chord from endpoints of magnitude M errs by about
+/// 12 * 2^-53 * M degrees, which at 1e5 is some 5e-11 in face units against
+/// `PATH_COVER_UV_SLACK`'s 1e-9. A ring past it winds round a pole hundreds
+/// of times, which no boundary does; the builder leaves such a polygon out
+/// of the cover and reports it.
+pub(crate) const ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG: f64 = 1e5;
+
 /// Longest piece, in radians of the path's own (lat, lon) parameter
 /// (`sqrt(dlat^2 + dlon^2)`), the path cover turns into one chord. It keeps
 /// every chord far from antipodal and short enough that the cube faces it can

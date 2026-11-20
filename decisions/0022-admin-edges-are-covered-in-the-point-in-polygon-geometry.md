@@ -1,7 +1,8 @@
 # ADR-0022: Cover admin edges in the point-in-polygon geometry; keep the reader's interior bypass off
 
 Date: 2026-11-03
-Status: Accepted
+Status: Accepted; the reader half amended by 0029 (format 9 trusts the
+flag on the query's own cell)
 Supersedes 0015
 
 ## Decision

@@ -1984,49 +1984,55 @@ impl Reader {
 
     // -- Admin search --------------------------------------------------------
 
+    /// The entries of the query's own admin cell, empty where the cell lists
+    /// none. Under the format's cover contract ([`format::AdminEntry`]) this
+    /// one list names every polygon that can contain the query, so neither
+    /// search reads the neighbour cells, and each polygon is met at most
+    /// once, so neither keeps an attempted-polygon set.
+    fn own_admin_entries(&self, ctx: &QueryContext) -> Table<'_, format::AdminEntry> {
+        let level = self.header.admin_cell_level;
+        let cell_id = ctx.cell(level).0;
+        self.admin_cells
+            .table()
+            .find_by_key(cell_id, |cell| cell.cell_id)
+            .map(|ac| self.admin_entries.entries(ac.entries_offset))
+            .unwrap_or_default()
+    }
+
+    /// Whether `poly` contains the query: an interior-flagged entry does by
+    /// the format's contract, anything else is tested.
+    fn admin_entry_contains(
+        &self,
+        ctx: &QueryContext,
+        entry: format::AdminEntry,
+        poly: &AdminPolygon,
+    ) -> bool {
+        entry.interior() || self.admin_polygon_contains(ctx, poly)
+    }
+
     /// Ranked admin: one per level, smallest area, ties to the lower polygon
-    /// index ([`admin_ranks_before`]). The interior high bit is
-    /// read but ignored as a PIP bypass; every candidate still runs
-    /// admin_polygon_contains (see the comment below).
+    /// index ([`admin_ranks_before`]), over the query's own admin cell.
     fn search_admin_ranked<'a>(
         &'a self,
         ctx: &QueryContext,
     ) -> std::result::Result<Vec<AdminMatch<'a>>, QueryError> {
-        let level = self.header.admin_cell_level;
-        let (cells, count) = cell_neighborhood(ctx.cell(level), level);
-        let admin_cells = self.admin_cells.table();
         // The winner per level keeps its polygon, so assembly re-reads
         // nothing, and its index, the tie-break on an equal area.
         let mut best_by_level: [(Option<(u32, AdminPolygon)>, f32); ADMIN_LEVEL_SLOTS] =
             [(None, f32::MAX); ADMIN_LEVEL_SLOTS];
 
-        for &cell_id in &cells[..count] {
-            let Some(ac) = admin_cells.find_by_key(cell_id, |cell| cell.cell_id) else {
+        for entry in self.own_admin_entries(ctx).iter() {
+            let poly_idx = entry.polygon_index();
+            let poly = self.admin_polygon_entry(poly_idx)?;
+            // Open refused a level outside the format's domain, so every
+            // polygon has a slot.
+            let level = usize::from(poly.admin_level);
+            let (best, best_area) = best_by_level[level];
+            if !admin_ranks_before(poly.area, poly_idx, best_area, best.map(|(i, _)| i)) {
                 continue;
-            };
-            for entry in self.admin_entries.entries(ac.entries_offset).iter() {
-                let poly_idx = entry.polygon_index();
-                let poly = self.admin_polygon_entry(poly_idx)?;
-                // Open refused a level outside the format's domain, so every
-                // polygon has a slot.
-                let level = usize::from(poly.admin_level);
-                let (best, best_area) = best_by_level[level];
-                if !admin_ranks_before(poly.area, poly_idx, best_area, best.map(|(i, _)| i)) {
-                    continue;
-                }
-                // The interior high bit is only a hint: the reader still runs the
-                // point-in-polygon test unconditionally (ADR-0022). The current
-                // builder flags a cell only when the whole cell is inside, but the
-                // flag still cannot bypass the test: it describes the cell it is
-                // stored on, while this loop applies the entries of all nine
-                // neighbourhood cells to the query, and an index built before the
-                // builder covered polygon edges exactly carries flags on cells the
-                // boundary runs through, with nothing in the file telling the two
-                // apart. A false flag here only costs wasted work, never a wrong
-                // answer.
-                if self.admin_polygon_contains(ctx, &poly) {
-                    best_by_level[level] = (Some((poly_idx, poly)), poly.area);
-                }
+            }
+            if self.admin_entry_contains(ctx, entry, &poly) {
+                best_by_level[level] = (Some((poly_idx, poly)), poly.area);
             }
         }
 
@@ -2042,42 +2048,22 @@ impl Reader {
             .collect())
     }
 
-    /// All admin polygons containing the point (for candidates API).
+    /// All admin polygons containing the point (for candidates API), in the
+    /// order the query's own admin cell lists them.
     fn search_admin_all<'a>(
         &'a self,
         ctx: &QueryContext,
     ) -> std::result::Result<Vec<AdminMatch<'a>>, QueryError> {
-        let level = self.header.admin_cell_level;
-        let (cells, count) = cell_neighborhood(ctx.cell(level), level);
-        let admin_cells = self.admin_cells.table();
         let mut result = Vec::new();
-        let mut seen: FxHashSet<u32> = FxHashSet::default();
-
-        for &cell_id in &cells[..count] {
-            let Some(ac) = admin_cells.find_by_key(cell_id, |cell| cell.cell_id) else {
-                continue;
-            };
-            for entry in self.admin_entries.entries(ac.entries_offset).iter() {
-                let poly_idx = entry.polygon_index();
-                // Record every attempted polygon, not only successful PIP
-                // matches, so a non-containing polygon shared by neighboring
-                // cells is fetched and tested exactly once.
-                if !first_admin_attempt(&mut seen, poly_idx) {
-                    continue;
-                }
-                let poly = self.admin_polygon_entry(poly_idx)?;
-                // Interior high bit is a hint only; always run the PIP test, for
-                // the reasons in `search_admin_ranked`: the flag is about its own
-                // cell, not the neighbour cells' queries, and older indexes carry
-                // unsound flags.
-                if self.admin_polygon_contains(ctx, &poly) {
-                    result.push(AdminMatch {
-                        admin_level: poly.admin_level,
-                        name: self.read_string(poly.name_offset),
-                        country_code: nonzero_string(self, poly.country_code_offset),
-                        area: poly.area,
-                    });
-                }
+        for entry in self.own_admin_entries(ctx).iter() {
+            let poly = self.admin_polygon_entry(entry.polygon_index())?;
+            if self.admin_entry_contains(ctx, entry, &poly) {
+                result.push(AdminMatch {
+                    admin_level: poly.admin_level,
+                    name: self.read_string(poly.name_offset),
+                    country_code: nonzero_string(self, poly.country_code_offset),
+                    area: poly.area,
+                });
             }
         }
         Ok(result)
@@ -2467,15 +2453,11 @@ fn nonzero_string(reader: &Reader, offset: u32) -> Option<&str> {
     }
 }
 
-fn first_admin_attempt(seen: &mut FxHashSet<u32>, polygon_index: u32) -> bool {
-    seen.insert(polygon_index)
-}
-
 /// Whether a candidate ranks ahead of the level's current best: smaller
 /// stored area, and on an equal area the lower polygon index. A total order,
-/// so the winner among containing polygons does not depend on which of the
-/// nine neighbourhood cells, or which entry within one, presented a
-/// candidate first; with area alone, two equal-area polygons swapped places
+/// so the winner among containing polygons does not depend on the order the
+/// query's admin cell lists them in; with area alone, two equal-area
+/// polygons swapped places
 /// whenever a rebuild changed the cell cover, far from either boundary.
 /// `best_idx` is `None` while the level has no winner yet.
 fn admin_ranks_before(
@@ -2769,15 +2751,6 @@ mod tests {
         check_records!(street_ways, StreetWay, read_street_way);
         check_records!(interp_ways, InterpWay, read_interp_way);
         check_records!(admin_polygons, AdminPolygon, read_admin_polygon);
-    }
-
-    #[test]
-    fn failed_admin_containment_candidates_are_still_deduplicated() {
-        let mut seen = FxHashSet::default();
-        assert!(first_admin_attempt(&mut seen, 17));
-        // This helper is called before polygon fetch and containment. A failed
-        // PIP therefore cannot make the same polygon eligible in a neighbor.
-        assert!(!first_admin_attempt(&mut seen, 17));
     }
 
     #[test]

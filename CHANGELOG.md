@@ -4,6 +4,19 @@
 
 ### Breaking
 
+- **Geocode index format 9; admin lookup about five times faster.** The
+  reader now looks up admin boundaries in the query point's own admin cell
+  only, and accepts a boundary that cell marks as containing all of its
+  queries without a point-in-polygon test, where it used to test every
+  candidate of the nine surrounding cells. On the Germany box (100,000
+  points) a query went from about 130 us to about 26 us; admin answers
+  are unchanged except for points exactly on a boundary. Format 9 makes
+  the admin cell lists a binding cover, so the reader refuses format 8
+  and earlier: rebuild existing indexes. A producer other than pbfhogg
+  must meet the cover rules stated at `AdminEntry` in the format module.
+  An admin area with a ring whose antimeridian-unwrapped longitudes pass
+  100,000 degrees (one winding round a pole hundreds of times) is dropped
+  with a warning and answers no query.
 - **`build-geocode-index` refuses an index whose only content is
   interpolation ways.** With no address points, streets or admin polygons,
   no interpolation way can resolve a number, yet such a build used to

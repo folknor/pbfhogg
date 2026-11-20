@@ -741,6 +741,25 @@ fn build_from_schedules(
         );
     }
     drop(way_geom);
+    // The reader trusts the admin cover, which is exact only while a ring's
+    // unwrapped frame stays within the bound; a polygon past it is dropped
+    // here, before the empty-index gate and before any admin record is
+    // written, so no published record lacks its cells.
+    let mut admin_polygons = admin_polygons;
+    let before_bound = admin_polygons.len();
+    admin_polygons.retain(pass3::admin_frame_within_bound);
+    let unbounded_admin = before_bound - admin_polygons.len();
+    if unbounded_admin > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.admin_unbounded_frame",
+            "{unbounded_admin} admin polygons dropped: a ring winds round a pole so often \
+             that its longitudes, unwrapped across the antimeridian, pass {} degrees, \
+             beyond what the admin cell cover is exact for",
+            crate::tunables::ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG
+        );
+    }
     crate::host::diag!(
         host.diagnostics,
         Progress,

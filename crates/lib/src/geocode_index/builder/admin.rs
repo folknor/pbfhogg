@@ -604,7 +604,7 @@ pub(super) fn write_admin_index(
         })?;
         entries_out.write_all(&count.to_le_bytes())?;
         for e in &entries[start..i] {
-            // The interior hint ORs into the high bit of poly_index. If
+            // The interior flag ORs into the high bit of poly_index. If
             // `poly_index >= 0x8000_0000` (>2.1 B admin polygons) the OR
             // would silently collide with existing bits and the decoded
             // poly_index would be wrong, so `AdminEntry::new` refuses it.

@@ -377,22 +377,6 @@ Remaining open findings from the closed hunt.
 
 ### Geocode index
 
-- [ ] **Admin interior flags are sound; the reader cannot use them yet.** Since
-  2026-11-03 ([ADR-0022](../decisions/0022-admin-edges-are-covered-in-the-point-in-polygon-geometry.md),
-  superseding ADR-0015) the edge cells are a conservative cover of the
-  reader's own point-in-polygon boundary (`crates/lib/src/geocode_index/builder/cover.rs`),
-  so a flagged cell is wholly inside its polygon. Re-enabling a PIP skip
-  needs two things the index does not have: a header signal that its flags
-  come from that builder (older indexes carry flags on boundary cells), and a
-  reader that trusts only the query's own cell's flag, not the eight
-  neighbours'. A format change; measure the PIP cost it would save first.
-  The level cap (19) stays either way: an exact cover's work still doubles
-  per level, now bounded by a proved cell count rather than a sample count.
-  The PIP cost is the query cost: admin point-in-polygon dominates every row
-  of the query latency table in `reference/performance/geocode.md`. The query's own admin cell
-  already lists every polygon containing it under an exact cover, so the
-  eight neighbours' entries are pure extra PIP work; the same header signal
-  would let the reader drop them.
 - [ ] **Geocode walk per-cell overhead, only if a coastal-heavy workload
   appears.** Each expanded cell pays `edge_neighbors` plus four
   `Cell::rect_bound`. Open sea no longer walks: the presence test answers it

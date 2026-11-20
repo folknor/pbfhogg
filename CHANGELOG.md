@@ -488,6 +488,15 @@
 
 ### Fixed
 
+- **`geo` ring functions always return, and the E7 longitude helpers no
+  longer overflow.** `geo::point_in_ring_with_antimeridian`,
+  `point_in_polygon` and `simplify_ring` looped forever on a ring with an
+  infinite or huge longitude; they now document finite WGS84 degrees as their
+  domain, with unspecified answers outside it, and always terminate. Answers
+  for in-domain rings are unchanged. `geo::wrapped_longitude_delta_e7` and
+  `normalize_longitude_e7` are total over `i64`; before, values near
+  `i64::MAX` panicked or returned a wrong longitude.
+
 - **OSC coordinates round from their decimal text, as osmium does.**
   `apply-changes`, `merge-changes`, `tags-filter --input-kind osc` and the
   library OSC overlay read a coordinate with eight or more fraction digits

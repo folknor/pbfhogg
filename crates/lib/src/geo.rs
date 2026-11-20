@@ -373,6 +373,10 @@ pub fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
 /// together with the antimeridian itself for an unwrapped ring: the three
 /// retries are not periodic, so the answer can change across +/-180 where no
 /// edge runs. The geocode builder covers exactly that boundary.
+///
+/// Coordinates are expected to be finite degrees in the WGS84 domain. Outside
+/// it the answer is unspecified, but the call always returns; the same holds
+/// for [`point_in_polygon`] and [`simplify_ring`].
 pub fn point_in_ring_with_antimeridian(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
     match pip_ring_frame(ring) {
         std::borrow::Cow::Borrowed(raw) => point_in_ring(px, py, raw),
@@ -400,7 +404,8 @@ pub(crate) fn pip_ring_frame(ring: &[(f64, f64)]) -> std::borrow::Cow<'_, [(f64,
 ///
 /// `exterior` is the outer ring (must contain the point).
 /// `holes` are inner rings (must NOT contain the point).
-/// Coordinates are `(longitude, latitude)` in degrees.
+/// Coordinates are `(longitude, latitude)` in degrees, finite and in the
+/// WGS84 domain; outside it the answer is unspecified but the call returns.
 pub fn point_in_polygon(
     px: f64,
     py: f64,
@@ -438,25 +443,64 @@ pub fn ring_crosses_antimeridian(ring: &[(f64, f64)]) -> bool {
         || (ring[ring.len() - 1].0 - ring[0].0).abs() > 180.0
 }
 
+/// Largest absolute longitude, in degrees, for which a ring is unwrapped by
+/// the shift-by-a-turn loops. It covers every longitude an `i32`
+/// decimicrodegree value can spell (about 214.75 degrees), so every ring a
+/// geocode index stores, corrupt ones included, keeps the exact frame it has
+/// always had: the builder's cover was computed in that frame (ADR-0022).
+const UNWRAP_LOOP_LON_LIMIT_DEG: f64 = 215.0;
+
 /// Unwrap longitudes into a continuous sequence to avoid the ±180° discontinuity.
+///
+/// Two paths, chosen per ring. When every longitude is within
+/// [`UNWRAP_LOOP_LON_LIMIT_DEG`] the loops below shift each vertex a turn at
+/// a time, re-testing the rounded difference after every shift. That exact
+/// rounding sequence is the frame stored indexes were built against, and a
+/// closed form does not reproduce it (a difference that rounds to exactly
+/// -540 takes one closed-form turn but two loop turns), so it is kept
+/// verbatim. It terminates: with the first longitude in range every shift
+/// below 2^62 makes strict progress and none can step past it. Work is
+/// proportional to how far the ring winds, as it always was.
+///
+/// Any other ring (a non-finite or far out-of-range longitude, reachable only
+/// through the public `geo` functions, whose results are unspecified there)
+/// takes a closed-form turn count instead. The loops would never finish on it:
+/// subtracting 360 leaves infinity, or `1e308`, unchanged.
 fn unwrap_ring_longitudes(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let mut out = Vec::with_capacity(ring.len());
     if ring.is_empty() {
         return out;
     }
+    let looped = ring
+        .iter()
+        .all(|&(lon, _)| lon.abs() <= UNWRAP_LOOP_LON_LIMIT_DEG);
 
     let (first_lon, first_lat) = ring[0];
     out.push((first_lon, first_lat));
     let mut prev_unwrapped_lon = first_lon;
 
     for &(lon, lat) in &ring[1..] {
-        let mut adjusted = lon;
-        while adjusted - prev_unwrapped_lon > 180.0 {
-            adjusted -= 360.0;
-        }
-        while adjusted - prev_unwrapped_lon < -180.0 {
-            adjusted += 360.0;
-        }
+        let adjusted = if looped {
+            let mut adjusted = lon;
+            while adjusted - prev_unwrapped_lon > 180.0 {
+                adjusted -= 360.0;
+            }
+            while adjusted - prev_unwrapped_lon < -180.0 {
+                adjusted += 360.0;
+            }
+            adjusted
+        } else {
+            // Bounded arithmetic; NaN differences fail both tests and keep
+            // the raw longitude, as the loops' comparisons did.
+            let d = lon - prev_unwrapped_lon;
+            if d > 180.0 {
+                lon - 360.0 * ((d - 180.0) / 360.0).ceil()
+            } else if d < -180.0 {
+                lon + 360.0 * ((-180.0 - d) / 360.0).ceil()
+            } else {
+                lon
+            }
+        };
         out.push((adjusted, lat));
         prev_unwrapped_lon = adjusted;
     }
@@ -504,8 +548,16 @@ pub const LON_FULL_TURN_E7: i64 = 3_600_000_000;
 /// must unwrap with this first, otherwise a segment spanning ±180° is
 /// interpolated the long way around the globe.
 #[inline]
+///
+/// Total over `i64`, in `[-180°, +180°)`: the delta is reduced modulo a
+/// turn before any half turn is subtracted, so no step can overflow.
 pub fn wrapped_longitude_delta_e7(delta_e7: i64) -> i64 {
-    (delta_e7 + LON_FULL_TURN_E7 / 2).rem_euclid(LON_FULL_TURN_E7) - LON_FULL_TURN_E7 / 2
+    let r = delta_e7.rem_euclid(LON_FULL_TURN_E7);
+    if r >= LON_FULL_TURN_E7 / 2 {
+        r - LON_FULL_TURN_E7
+    } else {
+        r
+    }
 }
 
 /// Fold an unwrapped longitude in decimicrodegrees back into (-180°, +180°].
@@ -637,7 +689,8 @@ fn project_on_segment(
 /// Douglas-Peucker keeps when every removed vertex must lie within
 /// `tolerance_m` of the edge that replaces it. `tolerance_m <= 0` (or NaN)
 /// returns the ring unchanged. Coordinates are `(x, y)` (longitude, latitude)
-/// in degrees.
+/// in degrees, finite and in the WGS84 domain; outside it the result is
+/// unspecified but the call returns.
 ///
 /// **No ring vanishes.** A ring that fits inside the tolerance as a whole
 /// would come back as a point or a line, which answers nothing. When the
@@ -1048,6 +1101,39 @@ mod tests {
     /// They exist because `point_to_segment_distance_sq` returns a `t` in an
     /// unwrapped frame, and any caller interpolating raw E7 coordinates with
     /// that `t` silently takes the long way around the globe.
+    /// Out-of-domain longitudes have unspecified answers, but the calls
+    /// return: shifting by a turn never moves infinity or `1e308`, so the
+    /// unwrap must not loop on them.
+    #[test]
+    fn non_finite_and_huge_longitudes_terminate() {
+        for bad in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e308,
+            -1e308,
+            1e12,
+            f64::NAN,
+        ] {
+            let ring = [(0.0, 0.0), (bad, 0.0), (0.0, 1.0)];
+            let _ = point_in_ring_with_antimeridian(0.1, 0.1, &ring);
+            let _ = point_in_polygon(0.1, 0.1, &ring, &[&ring]);
+            let first = [(bad, 0.0), (10.0, 0.0), (190.0, 1.0), (0.0, 1.0)];
+            let _ = point_in_ring_with_antimeridian(0.1, 0.1, &first);
+            let wide = [
+                (0.0, 0.0),
+                (bad, 0.0),
+                (1.0, 1.0),
+                (179.0, 2.0),
+                (-179.0, 3.0),
+            ];
+            let _ = simplify_ring(&wide, 1.0);
+        }
+        // Huge but finite with a small first difference.
+        let a = 2f64.powi(63);
+        let ring = [(a, 0.0), (a + 2048.0, 0.0), (a, 1.0), (a, 0.0)];
+        let _ = point_in_ring_with_antimeridian(0.0, 0.5, &ring);
+    }
+
     #[test]
     fn e7_longitude_helpers_take_the_short_arc() {
         // 179.9E to 179.9W is 0.2 degrees east, not 359.8 west.
@@ -1072,6 +1158,17 @@ mod tests {
         // Legal longitudes are fixed points.
         assert_eq!(normalize_longitude_e7(125_000_000), 125_000_000);
         assert_eq!(normalize_longitude_e7(-1_799_000_000), -1_799_000_000);
+
+        // Total over i64: reduced before the half turn, so nothing overflows.
+        // i64::MAX is 54_775_807 past a whole number of turns.
+        assert_eq!(wrapped_longitude_delta_e7(i64::MAX), 54_775_807);
+        assert_eq!(wrapped_longitude_delta_e7(i64::MIN), -54_775_808);
+        assert_eq!(
+            wrapped_longitude_delta_e7(i64::MAX - 54_775_807 - LON_FULL_TURN_E7 + 1_800_000_000),
+            -1_800_000_000
+        );
+        assert_eq!(wrapped_longitude_delta_e7(1_800_000_000), -1_800_000_000);
+        assert_eq!(normalize_longitude_e7(i64::MAX), 54_775_807);
     }
 
     #[test]

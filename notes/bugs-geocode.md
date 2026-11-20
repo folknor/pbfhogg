@@ -50,31 +50,17 @@ Admin lookup still works, so refusing the pair at option validation would also
 reject useful admin-only builds. Policy question: refuse the pair, refuse it
 only when the output has no admin polygons, or document it.
 
-## GEO-007 - Public geometry calls can hang while unwrapping longitudes
+## GEO-028 - Unwrapping a winding ring is quadratic in its winding
 
-Reported by: geocode-builder [P2].
+Reported by: spar on the longitude-unwrap termination fix (lateral).
 
-`unwrap_ring_longitudes` (`geo.rs`) repeatedly adds or subtracts 360. With an
-infinite longitude subtraction never changes the value, and a large finite
-longitude such as `1e308` behaves the same because subtracting 360 rounds back
-to itself. `point_in_ring_with_antimeridian` with the ring
-`[(0,0), (INFINITY,0), (0,1)]` never returns, and `point_in_polygon` and
-`simplify_ring` reach the same code. These public signatures document no
-finite-coordinate precondition and no nontermination. The builder's own
-coordinates cannot reach this, so it is a public API fault. Fix: validate the
-domain or use bounded normalization.
-
-## GEO-008 - Integer longitude normalization overflows on its accepted type
-
-Reported by: geocode-builder [P2].
-
-`wrapped_longitude_delta_e7` (`geo.rs`) adds half a turn before reducing
-modulo a turn. `i64::MAX` overflows that addition: with overflow checks it
-panics, and without them it returns the wrong longitude, because wrapping
-modulo `2^64` changes the later remainder. `normalize_longitude_e7` inherits
-the problem, and its documented job is folding an unwrapped `i64` longitude
-with no narrower precondition. Fix: reduce modulo the full turn before adding
-the half turn. Current builder callers stay within a safe range.
+`unwrap_ring_longitudes` (`geo.rs`) keeps its shift-a-turn-at-a-time loops
+for in-range rings, because stored indexes were covered in exactly that
+rounding sequence (a closed-form turn count differs at rounding boundaries).
+Each vertex costs one iteration per turn the ring has drifted, so a legal ring
+repeating `[120, -120, 0]` 100,000 times costs about 15 billion shifts. Only
+reachable with an admin ring winding the pole thousands of times; a fix must
+keep the legacy frame bit-identical or bump the index format and rebuild covers.
 
 ## GEO-009 - Admin ranking area and containment use different longitude frames
 

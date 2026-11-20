@@ -787,18 +787,22 @@ fn build_from_schedules(
     host.invocation.marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
     host.invocation.check()?;
     // Deliberately a conjunction, not a disjunction. An admin-only index (a
-    // boundaries extract with no addressable content) and an
-    // interpolation-only index are both legitimate; only an index with
-    // nothing queryable at all is a build that should have failed. The
-    // admin-only direction is pinned by the five admin query tests, which all
-    // build from inputs with zero address points and zero streets.
-    if addr_point_count == 0
-        && street_way_count == 0
-        && interp_ways.is_empty()
-        && admin_polygons.is_empty()
-    {
+    // boundaries extract with no addressable content) is legitimate; only an
+    // index with nothing queryable at all is a build that should have failed.
+    // The admin-only direction is pinned by the five admin query tests, which
+    // all build from inputs with zero address points and zero streets.
+    //
+    // Staged interpolation ways are not a term, and the gate can therefore
+    // run before resolution. An interpolation record takes its numbers only
+    // from indexed address points on its own end nodes, so with no address
+    // points every way resolves to the zero sentinel and none can answer;
+    // with address points the gate already passes on them. Counting staged
+    // interpolation ways here once let an input whose only content was an
+    // unresolvable `addr:interpolation` way publish an index that answers
+    // nothing.
+    if addr_point_count == 0 && street_way_count == 0 && admin_polygons.is_empty() {
         return Err(Error::invalid_data(
-            "geocode build found zero address points, streets, interpolation ways, and admin polygons; refusing to publish an empty index",
+            "geocode build found zero address points, streets and admin polygons; refusing to publish an empty index",
         ));
     }
 

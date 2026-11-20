@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- **`build-geocode-index` refuses an index whose only content is
+  interpolation ways.** With no address points, streets or admin polygons,
+  no interpolation way can resolve a number, yet such a build used to
+  publish an index that answers nothing. It now fails with the empty-index
+  error, exit 2.
 - **The geocode reader refuses corrupt index content it used to answer
   around.** `Reader::query` and `Reader::candidates` fail with the new
   `QueryError::DanglingReference` or `QueryError::DanglingSegment` when a

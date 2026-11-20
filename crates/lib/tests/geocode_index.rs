@@ -726,7 +726,10 @@ fn write_interp_cell_overflow_input(path: &Path) {
     // not, so these ways reach the per-cell cap without resolving (the end
     // nodes carry no addr:street, so they are not address points). Should
     // the builder ever stop listing unresolved ways, this fixture needs
-    // resolvable ones to keep exercising the cap.
+    // resolvable ones to keep exercising the cap. Node 3 is one unrelated
+    // address point: an index whose only content is unresolved
+    // interpolation is refused as empty, so without it the build would stop
+    // at that gate and never reach Pass 3.
     let nodes = vec![
         TestNode {
             id: 1,
@@ -740,6 +743,13 @@ fn write_interp_cell_overflow_input(path: &Path) {
             lat: 557_000_010,
             lon: 125_000_010,
             tags: vec![("addr:housenumber", "3")],
+            meta: None,
+        },
+        TestNode {
+            id: 3,
+            lat: 557_100_000,
+            lon: 125_100_000,
+            tags: vec![("addr:housenumber", "9"), ("addr:street", "Elsewhere")],
             meta: None,
         },
     ];
@@ -1551,6 +1561,55 @@ fn builder_refuses_a_truly_empty_index() {
             .contains("refusing to publish an empty index"),
         "unexpected error: {err}"
     );
+}
+
+/// An input whose only content is an `addr:interpolation` way between two
+/// untagged nodes stages an interpolation way, but with no address points
+/// it can only resolve to the zero sentinel and never answer. The build is
+/// refused as empty and publishes nothing.
+#[test]
+fn builder_refuses_an_index_whose_only_content_is_unresolvable_interpolation() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    let node = |id, lat| TestNode {
+        id,
+        lat,
+        lon: 125_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_sorted(
+        &input,
+        &[node(1, 557_000_000), node(2, 557_001_000)],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("addr:interpolation", "all")],
+            meta: None,
+        }],
+        &[],
+    );
+    let err = build_index(
+        &input,
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect_err("an index with only unresolvable interpolation must be refused");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::InvalidData { .. }),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("refusing to publish an empty index"),
+        "unexpected error: {err}"
+    );
+    assert!(!index_dir.exists(), "an empty index was published");
 }
 
 /// One input that populates every record kind at once: address points,

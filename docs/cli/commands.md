@@ -2377,10 +2377,11 @@ guarantee above further needs a new generation to replace the whole directory:
 a file replaced inside a published directory can be read beside the other
 files of the old one. On Unix the reader refuses an index file that is a symlink.
 
-A build that finds nothing queryable at all - no address points, no streets, no
-interpolation ways and no admin polygons - fails rather than publishing an empty
-index. Indexes containing only some of those kinds, such as an admin-boundaries
-extract, are legitimate and still build.
+A build that indexes no address points, no streets and no admin polygons fails
+rather than publishing an empty index. Interpolation ways do not count: they
+take their numbers from the address points on their end nodes, so without
+address points none can answer. Indexes containing only some of those kinds,
+such as an admin-boundaries extract, are legitimate and still build.
 
 Outputs a set of binary files. See [performance/geocode.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/geocode.md) for measured build times, index size, and peak memory.
 

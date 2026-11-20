@@ -26,18 +26,29 @@ the table), candidate
 ranking ties (BUG-026) and building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 
-## GEO-005 - The builder can publish an index with nothing queryable
+## GEO-026 - A collinear admin outer ring publishes and never contains a point
 
-Reported by: geocode-builder [P2].
+Reported by: spar on the empty-index gate (source inspection, not run).
 
-The empty-index gate (`builder/mod.rs`) counts interpolation source records
-before resolution. Use two untagged nodes and one way tagged only
-`addr:interpolation=all`, with no streets, addresses or admin polygons. The
-interpolation record passes the gate, resolution keeps it with zero endpoints
-(`builder/interp.rs`), the reader correctly refuses to answer from it, and the
-build succeeds anyway. This contradicts the gate's own comment and the promise
-in `docs/cli/commands.md` to refuse an index with nothing queryable. The gate
-should judge usable output after resolution.
+A named admin relation with one closed outer way `A-B-C-A` whose three nodes
+share latitude 0 at distinct longitudes, built with `--admin-tolerance 0`,
+passes ring assembly (`geo/rings.rs`) and admin assembly (`builder/admin.rs`),
+and the reader accepts its zero area. Every edge is horizontal, so the
+containment test never toggles: the polygon counts toward the empty-index
+gate and is listed in cells, yet answers no query. A plain zero-signed-area
+filter is not the fix, since an accepted self-crossing ring whose lobes cancel
+also has zero signed area but queryable lobes.
+
+## GEO-027 - Zero search radii disable every distance match
+
+Reported by: spar on the empty-index gate (source inspection, not run).
+
+`--search-radius 0 --coarse-search-radius 0` is accepted (`format.rs` radius
+validation), but the reader's strict distance comparison then rejects even an
+exact hit, so an address- or street-only index publishes and can never answer.
+Admin lookup still works, so refusing the pair at option validation would also
+reject useful admin-only builds. Policy question: refuse the pair, refuse it
+only when the output has no admin polygons, or document it.
 
 ## GEO-006 - A negative replication timestamp wraps to an enormous positive one
 

@@ -455,16 +455,24 @@ musl coverage. Brokkr refuses configured target runners and prints a
 planning line for a test lane whose target differs from the compiler
 host; it does not refuse such a lane before building.
 
-Three further tested sweeps run in the gate only. `release` runs the
-library and CLI suites in the shipped release profile (fat LTO, debug
-assertions and overflow checks off), default features, no hook cfg, so a
-`#[should_panic]` invariant test whose panic came from a debug-only check,
-or a path whose arithmetic wraps only in release, fails there; every other
-tested sweep builds dev. It builds both platform backends in, the shape
-brokkr benches, so the O_DIRECT and io_uring tests run with release
-semantics under the gate's backend requirement; the feature-off refusals
-run in dev only (consumer, musl). `harness-hotpath`,
-`harness-hotpath-alloc`, `cli-hotpath` and `cli-hotpath-alloc` are the
+Every tested sweep builds dev; no suite runs the shipped release profile
+(fat LTO, debug assertions and overflow checks off). A gate sweep that did
+was retired as too costly for what it alone caught. What covers its ground:
+dev's overflow checks panic where release would wrap, wherever a fixture
+reaches the operation and the test does not accept the panic as an
+outcome (a unit worker's panic comes back as an `Internal` error, so a
+refusal test should name the refusal it expects rather than `is_err()`;
+the suite does not enforce that); the `no-debug-only-invariants` textlint
+enforces ADR-0021, so a production debug-only check exists only on a line
+carrying its `debug-only-measured:` record, which review polices; and every
+bench and verify run is a release build on real data. Not covered by any
+suite: a miscompile or undefined behaviour that only opt-level 3 exposes,
+and timing-sensitive behaviour of the exact shipped shape (both backends,
+no hook cfg, no profiling feature).
+
+The profiling sweeps run in the gate only. `harness-hotpath`,
+`harness-hotpath-alloc`, `cli-hotpath`, `cli-hotpath-alloc`,
+`bench-hotpath` and `bench-hotpath-alloc` are the
 profiling lane (`brokkr check --profile profiling` runs it alone; operator
 profiling uses `brokkr bench --hotpath library-scenario --scenario hotpath-cat
 --dataset denmark`): the
@@ -1072,7 +1080,7 @@ exception, not a tier - should not survive across many PRs.
   `MachineProbe`, and `RAYON_NUM_THREADS=<cores>`, which bounds the CLI's
   ambient executor in any build. These are fixed sizing and routing inputs,
   not a thread cap (`-j` and concurrent stage threads can exceed them). A
-  child built without the hook cfg (the `consumer`, `musl` and `release`
+  child built without the hook cfg (the `consumer`, `musl` and profiling
   sweeps; `musl-all` sets it) ignores the resource variable and still sizes
   its pools, routes altw's auto backend and sets `check --locations`' store
   budget from the runner's machine. A shipped build has no private override

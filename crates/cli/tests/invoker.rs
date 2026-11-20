@@ -182,7 +182,7 @@ impl<'a> CliInvoker<'a> {
     /// for unknown) for memory-routed choices such as altw's auto backend.
     /// The resource override is a hook (`PBFHOGG_TEST_RESOURCES`, honoured
     /// under the `pbfhogg_test_hooks` cfg); a build without the cfg (the
-    /// consumer, musl and release sweeps) ignores it and sizes and routes
+    /// consumer, musl and profiling sweeps) ignores it and sizes and routes
     /// from the machine, so no assertion those builds compile may depend on
     /// the machine. Fixed sizing inputs, not a thread
     /// cap: `-j` and concurrent stage threads can exceed `cores`.

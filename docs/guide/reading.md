@@ -66,7 +66,7 @@ if let Some(bbox) = reader.header().bbox() {
 # Ok::<(), std::io::Error>(())
 ```
 
-`header().is_sorted()` returns `true` when the PBF declares `Sort.Type_then_ID`. In debug builds, `for_each` and `for_each_pipelined` assert that node IDs are monotonically increasing when the sorted flag is set.
+`header().is_sorted()` returns `true` when the PBF declares `Sort.Type_then_ID`. The readers do not check the claim: elements are delivered in file order whatever the flag says.
 
 ## Read modes
 

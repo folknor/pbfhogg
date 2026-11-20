@@ -712,9 +712,16 @@ fn an_identical_corrupt_pair_is_skipped_wherever_equal_blobs_may_be() {
             (40, 0, 0, 0),
             "-j {jobs} -c"
         );
+        // A decode refusal, not merely an error: a unit worker's panic also
+        // comes back as an `Internal` error, and a panic that dev's overflow
+        // checks raise where release would wrap must not pass for one.
+        let refusal = run_diff(false).err().unwrap_or_else(|| {
+            panic!("-j {jobs}: printing every common element decodes the corrupt pair")
+        });
         assert!(
-            run_diff(false).is_err(),
-            "-j {jobs}: printing every common element decodes the corrupt pair"
+            matches!(refusal.kind(), pbfhogg::ErrorKind::WireFormat { .. })
+                && refusal.blob_index() == Some(4),
+            "-j {jobs}: the corrupt blob 4 must be refused as bad wire format, got {refusal}"
         );
 
         let osc = dir.path().join(format!("j{jobs}.osc.gz"));

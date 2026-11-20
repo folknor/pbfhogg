@@ -160,26 +160,6 @@ rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "{host_arch}-unknown-linux-musl"
 parallel = {}
 
-# The shipped build profile: opt-level 3, fat LTO, one codegen unit, so
-# debug_assertions and overflow checks off. Every other tested sweep builds
-# dev, where an overflow panics; here the whole library and CLI suite runs
-# with release semantics, so a #[should_panic] invariant test whose panic
-# came from a debug-only check, or a path whose arithmetic wraps in release,
-# fails. ADR-0021 requires invariants to hold in release; this is where the
-# suite says so. Both platform backends on, without the hook cfg: the shape
-# brokkr builds every bench in, so O_DIRECT and io_uring run with release
-# semantics and the gate's backend requirement applies. The feature-off
-# branches (the feature_missing refusals) run in consumer and musl, dev
-# only; a second fat-LTO suite for them was judged not to pay.
-# CLI children here size on the real machine, as in consumer and musl.
-# Gate only: the LTO link of every test binary is too slow for tier1.
-[[check]]
-name = "release"
-packages = ["pbfhogg", "pbfhogg-cli"]
-features = ["linux-direct-io", "linux-io-uring"]
-profile = "release"
-parallel = {}
-
 # The profiling lane: the harness, CLI and bench-instrument suites built with
 # each profiling feature. The executables profile only when
 # HOTPATH_OUTPUT_PATH asks, so every unprofiled test checks an instrumented
@@ -426,7 +406,7 @@ skip = ["serial::"]
 # reference/testing.md "Platform-dependent tests").
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "release", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc", "bench-hotpath", "bench-hotpath-alloc"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl", "musl-all", "harness-hotpath", "harness-hotpath-alloc", "cli-hotpath", "cli-hotpath-alloc", "bench-hotpath", "bench-hotpath-alloc"]
 env = {PBFHOGG_TEST_REQUIRE = "direct-io,promise-guard" }
 
 # The profiling lane alone, for work on the harness or the instrumentation.

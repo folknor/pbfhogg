@@ -180,3 +180,15 @@ while the producer withholds the whole relation when any member way or node
 is missing. On an extract the model can therefore expect an area the index
 does not hold. Not confirmed against a real extract; check the model before
 trusting an extract-based verify run.
+
+## GEO-022 - The coarse-level dangling-reference refusal has no test
+
+Reported by: the reader corrupt-entry refusal work (commit `8d473cc3`).
+
+Lookup now refuses a dangling entry reference with a `QueryError` at the
+first read. The existing fixture damages fine and coarse entries together,
+and both lookups fail at the first bad fine entry, so the refusal on the
+coarse level (`reader.rs`, the coarse `search_level` path) is never
+exercised. A test needs a query point with no fine hit whose coarse list
+holds a dangling reference; the synthetic builder inputs do not give one
+easily.

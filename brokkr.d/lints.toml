@@ -190,6 +190,32 @@ must_scan = [
 ]
 message = "A .ok() on validated read-side data swallows a broken invariant; panic through the module's invariant helper, return the error, or mark a deliberate absent answer with // ok-deliberate: <reason>"
 
+# ADR-0021: an internal invariant is checked in release, never only in a
+# debug build. No suite runs the shipped release profile, so this is the one
+# mechanical check of that rule: production code names neither a debug
+# assertion macro nor the debug_assertions cfg, bare words so an import
+# alias is caught too. Test code is skipped, which keeps the writers'
+# test-only Drop checks of a forgotten flush, an API-discipline check the
+# ADR keeps test-only. The ADR's one exception, a site whose release check
+# a matched planet A/B measured as costing more than noise, carries
+# `// debug-only-measured: <where the measurement is recorded>` on the line.
+# The waiver is line-level text, so review polices it: a marker on an import
+# alias waives every use of that alias.
+[[textlint]]
+require_live_paths = true
+name = "no-debug-only-invariants"
+pattern = '\b(?:debug_assert(?:_eq|_ne)?|debug_assertions)\b'
+paths = ["crates/*/src/**/*.rs"]
+except = ['//\s*debug-only-measured:\s*\S']
+region = "code"
+test_code = "skip"
+must_scan = [
+    "crates/lib/src/write/writer.rs",
+    "crates/lib/src/write/parallel_gzip.rs",
+    "crates/lib/src/write/direct_writer.rs",
+]
+message = "ADR-0021: check an internal invariant in release (the type, Error::internal, or a release panic outside Drop); a debug-only check needs a recorded planet A/B and // debug-only-measured: <record>"
+
 # The exact spelling the OSC arena used to turn a bad intern id or bad UTF-8
 # into an empty tag key, role, value or user name. Matched on the raw line
 # (`region = "code"` would blank the literal), so comment lines are exempt.

@@ -806,7 +806,7 @@ fn roundtrip_uring_tiny_output() {
     writer.write_primitive_block(bytes).unwrap();
 
     writer.flush().unwrap();
-    // In every build, the release sweep's included: the ring was set up
+    // In every build, release included: the ring was set up
     // (its fixed pool registered, its output opened O_DIRECT). That is
     // setup, not proof the block went through it.
     let mut registered = None;

@@ -131,16 +131,6 @@ answer for such rings. The assembler now keeps the start deterministic (the
 earliest source edge) but the dependence is in the reader's framing, which
 predates the rewrite. The framing should be start-invariant.
 
-## GEO-021 - The geocode verifier drops absent member ways where the builder withholds the relation
-
-Reported by: scout lateral in the ring-assembly rewrite; not verified.
-
-The verifier's `AdminModel` skips member ways that are absent from the input,
-while the producer withholds the whole relation when any member way or node
-is missing. On an extract the model can therefore expect an area the index
-does not hold. Not confirmed against a real extract; check the model before
-trusting an extract-based verify run.
-
 ## GEO-022 - The coarse-level dangling-reference refusal has no test
 
 Reported by: the reader corrupt-entry refusal work (commit `8d473cc3`).

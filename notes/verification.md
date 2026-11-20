@@ -95,14 +95,16 @@ open (reference/testing.md "Platform-dependent tests"). Residue:
 `pbfhogg-verify geocode` judges all four answer classes; on the configured datasets two
 paths stay out of reach:
 
-- A relation whose outer or inner ways do not assemble uniquely (an endpoint shared by three
-  or more member ends) leaves its whole member box unjudged at its level. On germany that is
-  r16239 and r17511 at level 2 and r52343 at level 4 (southern Bavaria, the run prints them).
-  Localising to the branching group's box is sound for containment, but the builder refuses
-  the whole relation when its ring-search budget runs out, which only a branching group can
-  cause. A conservative placement bound over the group's member count (about 531,804
-  placements for seven members, under the 2^20 extra allowance) could certify small groups
-  safe and localise them; whether these relations' groups are small enough is not yet known.
+- The admin model assembles rings by walking member endpoints by node id and leaves a
+  relation unmodelled (its whole member box unjudged at its level) wherever the builder's
+  node-id assembly could differ: an endpoint shared by three or more member ends, a one-node
+  member, a way listed twice in a role, an interior node shared within a role, a coordinate
+  revisit or a ring of fewer than three coordinates. The builder withholds a relation whole on
+  any topology refusal, so localising a mask to one group's box is not sound. On germany the
+  branching masks were r16239 and r17511 at level 2 and r52343 at level 4 (southern Bavaria,
+  before the guards widened; the run prints the current list). Closing it needs an
+  independent oracle of the builder's node-id topology rules (bridges dropped, lobes split at
+  shared nodes, its refusal classes), so these shapes are judged instead of masked.
 - The model refuses data near the antimeridian; unwrapping longitude would let an
   antimeridian dataset (the Fiji entry in notes/todo.md) be judged. No eligible dataset
   crosses it (the verify dataset list is denmark and germany).

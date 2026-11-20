@@ -8,18 +8,29 @@
 //! counts); its country code (`ISO3166-1:alpha2`, empty meaning none) is
 //! kept at level 2 only. The last occurrence of a key counts. Its way
 //! members with role `outer` or an empty role are outer, `inner` inner,
-//! any other role ignored; a member way absent from the decoding is
-//! omitted.
+//! any other role ignored.
 //!
-//! Rings are assembled with no search: each member occurrence is an edge
-//! between its first and last node. A connected group of edges in which
-//! every endpoint is shared by exactly two edge ends forms exactly one
-//! closed walk whatever order it is followed in, and that walk is the ring
-//! (kept when it has more than two coordinates); a group that is an open
-//! path forms none. Any other group (an endpoint shared three or more ways,
-//! a one-node way), or a member way with a node osmium could not locate,
-//! leaves the relation unmodelled: the model does not know which rings the
-//! builder's search picks.
+//! Withheld, as the builder withholds it, and judged as contributing no
+//! area: a relation with an outer or inner member way absent from the
+//! decoding, present with no nodes, or referring to a node the decoding
+//! holds no record of, and a relation listing one way in both roles. The
+//! decoding is `tags-filter` without `-R`, which copies every member way
+//! and every node of one, so absence there is absence in the input.
+//!
+//! Rings are assembled with no search, by node id: each member occurrence
+//! is an edge between its first and last node. A connected group of edges
+//! in which every endpoint is shared by exactly two edge ends forms exactly
+//! one closed walk whatever order it is followed in, and that walk is the
+//! ring; a group that is an
+//! open path forms none. The builder assembles over every node, not only
+//! endpoints, and refuses topology this walk cannot see, so a relation is
+//! left unmodelled where the two could differ: a group of any other shape
+//! (an endpoint shared by three or more member ends, a one-node way), a way
+//! listed twice in one role, a node of a member at an interior position
+//! that also occurs elsewhere among the role's members, a ring revisiting
+//! a coordinate, or a ring of fewer than three coordinates. A member node whose record carries no location leaves the
+//! relation's whole level unjudged, since its known coordinates do not
+//! bound where the builder's rings run.
 //!
 //! Each outer ring is a polygon. An inner ring belongs to every outer ring
 //! whose trace contains its trace: that is decided only where the two
@@ -45,11 +56,10 @@
 //! level, which could hold any answer, or inside the box of an undecided
 //! hole of that level.
 //!
-//! An unassemblable group is not localised the same way, though any ring
-//! the builder makes of it lies inside the group's box: the builder's ring
-//! search refuses the whole relation when its step budget runs out, which
-//! only a branching group can cause, so the relation's other polygons may
-//! vanish and its whole box stays unjudged.
+//! An unmodelled group is not localised the same way, though any ring the
+//! builder makes of it lies inside the group's box: the builder withholds a
+//! relation whole when it refuses any of its topology, so the relation's
+//! other polygons may vanish and its whole box stays unjudged.
 
 use std::collections::HashMap;
 
@@ -65,6 +75,73 @@ const OWNERSHIP_CLEARANCE_E7: f64 = 1.0;
 const EDGE_GRID_E7: i32 = 500_000;
 
 type Pt = (i32, i32);
+
+/// A located member node: its id and coordinates.
+type Node = (i64, Pt);
+
+/// One way record of the decoding.
+pub(super) struct Way {
+    /// Node ids, signed.
+    pub(super) refs: Vec<i64>,
+    /// osmium's location of each ref, `None` where it had none.
+    pub(super) nodes: Vec<Option<Pt>>,
+}
+
+/// Every node record of the decoding: its location, `None` when the record
+/// carries none.
+pub(super) type NodeRecords = HashMap<i64, Option<Pt>>;
+
+/// What one member way of a relation resolves to.
+enum Resolved {
+    /// Every node located.
+    Located(Vec<Node>),
+    /// Every node has a record, and some record has no location; the
+    /// located coordinates.
+    Locationless(Vec<Pt>),
+}
+
+/// A member way's nodes, or `None` when the builder withholds the relation
+/// for it: no refs, or a ref with no node record.
+fn resolve(way: &Way, records: &NodeRecords) -> Result<Option<Resolved>, String> {
+    if way.refs.len() != way.nodes.len() {
+        return Err("a way's refs and locations differ in count".to_owned());
+    }
+    if way.refs.is_empty() {
+        return Ok(None);
+    }
+    let mut located = Vec::with_capacity(way.refs.len());
+    let mut locationless = false;
+    for (&id, &at) in way.refs.iter().zip(&way.nodes) {
+        match at.or_else(|| records.get(&id).copied().flatten()) {
+            Some(p) => located.push((id, p)),
+            None if records.contains_key(&id) => locationless = true,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(if locationless {
+        Resolved::Locationless(located.into_iter().map(|(_, p)| p).collect())
+    } else {
+        Resolved::Located(located)
+    }))
+}
+
+/// Whether one role's members hold a shape the endpoint walk cannot judge
+/// against the builder's node-id assembly: a way listed twice, or a node at
+/// an interior position of a member that occurs anywhere else among them.
+fn needs_full_topology(ids: &[i64], ways: &[Vec<Node>]) -> bool {
+    let mut listed = std::collections::HashSet::new();
+    if !ids.iter().all(|id| listed.insert(*id)) {
+        return true;
+    }
+    let mut count: HashMap<i64, usize> = HashMap::new();
+    for w in ways {
+        for &(id, _) in w {
+            *count.entry(id).or_default() += 1;
+        }
+    }
+    ways.iter()
+        .any(|w| w.len() > 2 && w[1..w.len() - 1].iter().any(|(id, _)| count[id] > 1))
+}
 
 /// One polygon the model holds.
 pub(super) struct Polygon {
@@ -88,6 +165,8 @@ pub(super) struct AdminModel {
     /// The id, level and why of each `unmodelled` box, for the run's account.
     pub(super) unmodelled_why: Vec<(String, u8, Unmodelled)>,
     pub(super) relations: usize,
+    /// Selected relations the builder withholds whole, judged as no area.
+    pub(super) withheld: usize,
     /// Every ring edge, `(polygon, a, b)`, and the grid over them.
     edges: Vec<(u32, Pt, Pt)>,
     edge_cells: HashMap<(i32, i32), Vec<u32>>,
@@ -96,10 +175,13 @@ pub(super) struct AdminModel {
 /// Why a relation is not modelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Unmodelled {
-    /// A member way has a node osmium could not locate.
+    /// A member node's record carries no location; its whole level is
+    /// unjudged.
     Unlocated,
-    /// Its outer or inner ways do not assemble uniquely: an endpoint
-    /// shared by three or more member ends, or a one-node member.
+    /// Its outer or inner ways hold a shape the endpoint walk cannot judge:
+    /// an endpoint shared by three or more member ends, a one-node member,
+    /// a way listed twice in a role, a shared interior node, or a ring
+    /// revisiting a coordinate.
     Junction,
     /// A hole comes within the clearance of an outer it may belong to; the
     /// relation is modelled and only the hole's box is unjudged.
@@ -169,14 +251,14 @@ fn bbox_of<'p>(points: impl Iterator<Item = &'p Pt>) -> Option<(i32, i32, i32, i
 
 /// The rings of one role's member ways, or `None` when they are not
 /// uniquely assembled.
-fn rings(ways: &[&[Pt]]) -> Option<Vec<Vec<Pt>>> {
-    let mut ends: HashMap<Pt, Vec<usize>> = HashMap::new();
+fn rings(ways: &[&[Node]]) -> Option<Vec<Vec<Pt>>> {
+    let mut ends: HashMap<i64, Vec<usize>> = HashMap::new();
     for (i, w) in ways.iter().enumerate() {
         if w.len() < 2 {
             return None;
         }
-        ends.entry(w[0]).or_default().push(i);
-        ends.entry(w[w.len() - 1]).or_default().push(i);
+        ends.entry(w[0].0).or_default().push(i);
+        ends.entry(w[w.len() - 1].0).or_default().push(i);
     }
     let mut seen = vec![false; ways.len()];
     let mut out = Vec::new();
@@ -190,7 +272,7 @@ fn rings(ways: &[&[Pt]]) -> Option<Vec<Vec<Pt>>> {
         let mut k = 0;
         while k < group.len() {
             let w = ways[group[k]];
-            for end in [w[0], w[w.len() - 1]] {
+            for end in [w[0].0, w[w.len() - 1].0] {
                 for &j in &ends[&end] {
                     if !seen[j] {
                         seen[j] = true;
@@ -202,11 +284,19 @@ fn rings(ways: &[&[Pt]]) -> Option<Vec<Vec<Pt>>> {
         }
         let degrees: Vec<usize> = group
             .iter()
-            .flat_map(|&i| [ways[i][0], ways[i][ways[i].len() - 1]])
+            .flat_map(|&i| [ways[i][0].0, ways[i][ways[i].len() - 1].0])
             .map(|e| ends[&e].len())
             .collect();
         if degrees.iter().all(|&d| d == 2) {
-            out.extend(walk(ways, &group, &ends));
+            let ring = walk(ways, &group, &ends)?;
+            // A coordinate visited twice, by distinct nodes, is a revisit
+            // the builder may refuse or keep apart, and a closed walk of
+            // fewer than three coordinates is one it refuses whole.
+            let mut at = std::collections::HashSet::new();
+            if ring.len() < 4 || !ring[..ring.len() - 1].iter().all(|p| at.insert(*p)) {
+                return None;
+            }
+            out.push(ring);
         } else if degrees.iter().filter(|&&d| d == 1).count() == 2
             && degrees.iter().all(|&d| d <= 2)
         {
@@ -219,23 +309,23 @@ fn rings(ways: &[&[Pt]]) -> Option<Vec<Vec<Pt>>> {
 }
 
 /// The closed walk of a group whose every endpoint has degree two.
-fn walk(ways: &[&[Pt]], group: &[usize], ends: &HashMap<Pt, Vec<usize>>) -> Option<Vec<Pt>> {
+fn walk(ways: &[&[Node]], group: &[usize], ends: &HashMap<i64, Vec<usize>>) -> Option<Vec<Pt>> {
     let mut used = std::collections::HashSet::new();
     let first = group[0];
     used.insert(first);
-    let mut ring: Vec<Pt> = ways[first].to_vec();
+    let mut ring: Vec<Node> = ways[first].to_vec();
     while used.len() < group.len() {
-        let end = ring[ring.len() - 1];
+        let end = ring[ring.len() - 1].0;
         let &next = ends[&end].iter().find(|j| !used.contains(*j))?;
         used.insert(next);
         let w = ways[next];
-        if w[0] == end {
+        if w[0].0 == end {
             ring.extend_from_slice(&w[1..]);
         } else {
             ring.extend(w[..w.len() - 1].iter().rev());
         }
     }
-    (ring.len() > 2).then_some(ring)
+    Some(ring.into_iter().map(|(_, p)| p).collect())
 }
 
 /// Even-odd containment of `(y, x)` in decimicrodegrees.
@@ -380,7 +470,8 @@ impl AdminModel {
     /// The model of the decoded relations and their member ways.
     pub(super) fn build(
         relations: &[Record],
-        ways: &HashMap<i64, Vec<Option<Pt>>>,
+        ways: &HashMap<i64, Way>,
+        records: &NodeRecords,
     ) -> Result<Self, String> {
         let mut model = Self::default();
         for r in relations {
@@ -388,30 +479,49 @@ impl AdminModel {
                 continue;
             };
             model.relations += 1;
+            if b.outer.iter().any(|id| b.inner.contains(id)) {
+                model.withheld += 1;
+                continue;
+            }
             let mut members: Vec<Vec<Pt>> = Vec::new();
             let mut located = true;
-            let collect = |ids: &[i64], members: &mut Vec<Vec<Pt>>, located: &mut bool| {
+            let mut complete = true;
+            let mut collect = |ids: &[i64], members: &mut Vec<Vec<Pt>>| -> Result<_, String> {
                 let mut out = Vec::new();
                 for id in ids {
-                    let Some(nodes) = ways.get(id) else {
-                        continue;
+                    let resolved = match ways.get(id) {
+                        Some(way) => resolve(way, records).map_err(|e| format!("w{id}: {e}"))?,
+                        None => None,
                     };
-                    match nodes.iter().copied().collect::<Option<Vec<Pt>>>() {
-                        Some(coords) if !coords.is_empty() => {
-                            members.push(coords.clone());
-                            out.push(coords);
+                    match resolved {
+                        Some(Resolved::Located(nodes)) => {
+                            members.push(nodes.iter().map(|&(_, p)| p).collect());
+                            out.push(nodes);
                         }
-                        Some(_) => {}
-                        None => {
-                            *located = false;
-                            members.push(nodes.iter().flatten().copied().collect());
+                        Some(Resolved::Locationless(coords)) => {
+                            located = false;
+                            members.push(coords);
                         }
+                        None => complete = false,
                     }
                 }
-                out
+                Ok(out)
             };
-            let outer_ways = collect(&b.outer, &mut members, &mut located);
-            let inner_ways = collect(&b.inner, &mut members, &mut located);
+            let outer_ways = collect(&b.outer, &mut members)?;
+            let inner_ways = collect(&b.inner, &mut members)?;
+            if !complete {
+                model.withheld += 1;
+                continue;
+            }
+            if !located {
+                // The known coordinates do not bound the builder's rings.
+                let world = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+                model.unmodelled.push((b.level, world));
+                model
+                    .unmodelled_why
+                    .push((r.id.clone(), b.level, Unmodelled::Unlocated));
+                continue;
+            }
             let Some(member_box) = bbox_of(members.iter().flatten()) else {
                 continue;
             };
@@ -439,22 +549,21 @@ impl AdminModel {
                     ));
                 }
             }
-            fn as_slices(v: &[Vec<Pt>]) -> Vec<&[Pt]> {
+            fn as_slices(v: &[Vec<Node>]) -> Vec<&[Node]> {
                 v.iter().map(Vec::as_slice).collect()
             }
-            let assembled = if located {
-                rings(&as_slices(&outer_ways)).zip(rings(&as_slices(&inner_ways)))
-            } else {
+            let assembled = if needs_full_topology(&b.outer, &outer_ways)
+                || needs_full_topology(&b.inner, &inner_ways)
+            {
                 None
+            } else {
+                rings(&as_slices(&outer_ways)).zip(rings(&as_slices(&inner_ways)))
             };
             let Some((outers, inners)) = assembled else {
                 model.unmodelled.push((b.level, member_box));
-                let why = if located {
-                    Unmodelled::Junction
-                } else {
-                    Unmodelled::Unlocated
-                };
-                model.unmodelled_why.push((r.id.clone(), b.level, why));
+                model
+                    .unmodelled_why
+                    .push((r.id.clone(), b.level, Unmodelled::Junction));
                 continue;
             };
             model.add_polygons(&r.id, &b, outers, &inners);
@@ -795,23 +904,141 @@ mod tests {
         ]
     }
 
+    /// Nodes `first..` over `pts`, a closing point taking the first id.
+    fn ids(first: i64, pts: &[Pt]) -> Vec<Node> {
+        let mut out: Vec<Node> = Vec::new();
+        for (i, &p) in pts.iter().enumerate() {
+            let closing = i > 0 && i + 1 == pts.len() && p == pts[0];
+            #[allow(clippy::cast_possible_wrap)]
+            let id = if closing { first } else { first + i as i64 };
+            out.push((id, p));
+        }
+        out
+    }
+
+    fn way(nodes: &[Node]) -> Way {
+        Way {
+            refs: nodes.iter().map(|n| n.0).collect(),
+            nodes: nodes.iter().map(|n| Some(n.1)).collect(),
+        }
+    }
+
     #[test]
     fn degree_two_groups_close_and_others_are_unmodelled() {
-        let s = square(0, 0, 10);
+        let s = ids(1, &square(0, 0, 10));
         let (a, b) = (s[..3].to_vec(), s[2..].to_vec());
         let r = rings(&[&a[..], &b[..]]).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].len(), 5);
         // A reversed member joins as well.
-        let rev: Vec<Pt> = b.iter().rev().copied().collect();
+        let rev: Vec<Node> = b.iter().rev().copied().collect();
         assert_eq!(rings(&[&a[..], &rev[..]]).unwrap()[0].len(), 5);
         // An open path forms nothing.
         assert!(rings(&[&a[..]]).unwrap().is_empty());
-        // Three ends at one point: not modelled.
-        let spur = [s[0], (-5, -5)];
+        // Three ends at one node: not modelled.
+        let spur = [s[0], (99, (-5, -5))];
         assert!(rings(&[&a[..], &b[..], &spur[..]]).is_none());
         // A one-node way: not modelled.
         assert!(rings(&[&s[..], &[s[0]][..]]).is_none());
+        // Distinct nodes at the first coordinate close nothing by id.
+        let mut open = s.clone();
+        open[4].0 = 50;
+        assert!(rings(&[&open[..]]).unwrap().is_empty());
+        // A ring revisiting a coordinate through distinct nodes: not modelled.
+        let revisit = [
+            (1, (0, 0)),
+            (2, (0, 10)),
+            (3, (0, 0)),
+            (4, (10, 0)),
+            (1, (0, 0)),
+        ];
+        assert!(rings(&[&revisit[..]]).is_none());
+    }
+
+    #[test]
+    fn repeated_and_shared_interior_members_need_full_topology() {
+        let s = ids(1, &square(0, 0, 10));
+        assert!(needs_full_topology(&[7, 7], &[s.clone(), s.clone()]));
+        assert!(!needs_full_topology(&[7], std::slice::from_ref(&s)));
+        // A bridge leaving the triangle at its corner node 1: A B C A D.
+        let bridged = vec![s[0], s[1], s[2], s[0], (9, (-5, -5))];
+        assert!(needs_full_topology(&[7], &[bridged]));
+    }
+
+    fn relation(members: &str) -> Record {
+        super::super::parse_record(&format!(
+            "r1 v1 Tboundary=administrative,admin_level=2,name=C,ISO3166-1:alpha2=CC M{members}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_incomplete_relation_is_withheld_and_judged_as_no_area() {
+        let shell = ids(1, &square(0, 0, 1_000_000));
+        let mut ways = HashMap::new();
+        ways.insert(1, way(&shell));
+        let records = NodeRecords::new();
+        // A missing inner way, an empty way and a missing node each withhold.
+        let mut empty = HashMap::new();
+        empty.insert(1, way(&shell));
+        empty.insert(
+            2,
+            Way {
+                refs: Vec::new(),
+                nodes: Vec::new(),
+            },
+        );
+        let mut unresolved = HashMap::new();
+        let mut half = way(&shell);
+        half.nodes[1] = None;
+        unresolved.insert(1, half);
+        for (members, ways) in [
+            ("w1@outer,w2@inner", &ways),
+            ("w1@outer,w2@outer", &empty),
+            ("w1@outer", &unresolved),
+            ("w1@outer,w1@inner", &ways),
+        ] {
+            let model = AdminModel::build(&[relation(members)], ways, &records).unwrap();
+            assert_eq!((model.relations, model.withheld), (1, 1), "{members}");
+            assert!(model.polygons.is_empty() && model.unmodelled.is_empty());
+            assert!(matches!(
+                model.expect(0.05, 0.05, 1.0).levels[2],
+                Level::None { .. }
+            ));
+        }
+        // A same-level relation that is complete still answers.
+        let other = super::super::parse_record(
+            "r2 v1 Tboundary=administrative,admin_level=2,name=D Mw1@outer",
+        )
+        .unwrap();
+        let model =
+            AdminModel::build(&[relation("w1@outer,w2@inner"), other], &ways, &records).unwrap();
+        assert_eq!((model.relations, model.withheld), (2, 1));
+        let Level::Some { candidates, .. } = model.expect(0.05, 0.05, 1.0).levels[2].clone() else {
+            panic!("the complete relation answers");
+        };
+        assert_eq!(model.polygons[candidates[0]].name, "D");
+    }
+
+    #[test]
+    fn a_late_node_resolves_and_a_locationless_one_unjudges_the_level() {
+        let shell = ids(1, &square(0, 0, 1_000_000));
+        let mut late = way(&shell);
+        let apex = late.nodes[2].take().unwrap();
+        let mut ways = HashMap::new();
+        ways.insert(1, late);
+        let mut records = NodeRecords::new();
+        records.insert(3, Some(apex));
+        let model = AdminModel::build(&[relation("w1@outer")], &ways, &records).unwrap();
+        assert_eq!(model.polygons.len(), 1);
+        records.insert(3, None);
+        let model = AdminModel::build(&[relation("w1@outer")], &ways, &records).unwrap();
+        assert!(model.polygons.is_empty());
+        assert_eq!(model.unmodelled_why[0].2, Unmodelled::Unlocated);
+        assert!(matches!(
+            model.expect(50.0, 50.0, 1.0).levels[2],
+            Level::Unjudged
+        ));
     }
 
     #[test]
@@ -833,9 +1060,9 @@ mod tests {
              Mw1@outer,w2@inner",
         );
         let mut ways = HashMap::new();
-        ways.insert(1, square(0, 0, 1_000_000).into_iter().map(Some).collect());
-        ways.insert(2, square(0, 0, 100_000).into_iter().map(Some).collect());
-        let model = AdminModel::build(&[relation], &ways).unwrap();
+        ways.insert(1, way(&ids(1, &square(0, 0, 1_000_000))));
+        ways.insert(2, way(&ids(11, &square(0, 0, 100_000))));
+        let model = AdminModel::build(&[relation], &ways, &NodeRecords::new()).unwrap();
         assert_eq!(model.polygons.len(), 1);
         assert!(model.polygons[0].holes.is_empty());
         assert_eq!(model.unmodelled.len(), 1);

@@ -45,7 +45,8 @@
 //! `w/addr:interpolation`). On an input with no answering range only
 //! absence is judged, and the run says so. Admin answers come from a
 //! second decoding, `osmium tags-filter r/boundary=administrative,postal_code`
-//! (members and their nodes come along), modelled by `admin`, and are
+//! (members and their nodes come along, untagged node records kept),
+//! modelled by `admin`, and are
 //! judged on two builds: at `--admin-tolerance 0`, and at a non-zero
 //! tolerance outside its band. Address, street and interpolation are judged
 //! on the non-zero build alone; the admin tolerance does not reach them.
@@ -56,9 +57,13 @@
 //! coordinate within 10 degrees of the antimeridian or beyond 85 degrees of
 //! latitude, and a street segment spanning half a turn of longitude or more
 //! (the model does not unwrap longitude; the reader takes the shorter way). libosmium cuts a string
-//! at a NUL byte where pbfhogg answers it whole, so a tag value holding one
+//! at a NUL byte where pbfhogg answers it whole, so a tag value or a
+//! member role holding one
 //! is outside what this comparison can see; a FAIL naming such a value is
-//! that limit, not a pbfhogg defect.
+//! that limit, not a pbfhogg defect. So is a way whose refs are split
+//! across packed fields with an empty one last: libosmium keeps only the
+//! last segment, so the decoding shows a way pbfhogg reads with nodes as
+//! one with none, and a boundary listing it is withheld by the model only.
 //!
 //! Queries are drawn from a fixed seed: uniform points over the extent of
 //! the modelled data, and witness points placed near modelled records,
@@ -391,6 +396,8 @@ struct Record {
     location: Option<(i32, i32)>,
     /// A way's node locations, `None` where osmium had none.
     nodes: Vec<Option<(i32, i32)>>,
+    /// A way's node ids, signed, one per entry of `nodes`.
+    refs: Vec<i64>,
     /// A relation's members: type letter, id and role.
     members: Vec<(u8, i64, String)>,
     id: String,
@@ -401,7 +408,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
     let first = fields.next().unwrap_or_default();
     let kind = *first.as_bytes().first().ok_or("empty record")?;
     let (mut tags, mut x, mut y, mut nodes) = (Vec::new(), None, None, Vec::new());
-    let mut members = Vec::new();
+    let (mut members, mut refs) = (Vec::new(), Vec::new());
     let coordinate = |text: &str| {
         parse_decimicro(text)
             .and_then(|v| i32::try_from(v).ok())
@@ -422,10 +429,23 @@ fn parse_record(line: &str) -> Result<Record, String> {
             "y" if !value.is_empty() => y = Some(coordinate(value)?),
             "N" if !value.is_empty() => {
                 for token in value.split(',') {
-                    let location = token.split_once('x').and_then(|(_, at)| {
-                        let (lon, lat) = at.split_once('y')?;
-                        (!lon.is_empty() && !lat.is_empty()).then_some((lat, lon))
-                    });
+                    let id = token
+                        .strip_prefix('n')
+                        .map(|t| t.split_once('x').map_or(t, |(id, _)| id))
+                        .and_then(|id| id.parse::<i64>().ok())
+                        .ok_or_else(|| format!("{first}: node ref {token:?}"))?;
+                    refs.push(id);
+                    // A bare ref, `xy`, or a complete pair; nothing else.
+                    let location = match token.split_once('x') {
+                        None => None,
+                        Some((_, at)) => match at.split_once('y') {
+                            Some(("", "")) => None,
+                            Some((lon, lat)) if !lon.is_empty() && !lat.is_empty() => {
+                                Some((lat, lon))
+                            }
+                            _ => return Err(format!("{first}: node ref {token:?}")),
+                        },
+                    };
                     nodes.push(match location {
                         Some((lat, lon)) => Some((coordinate(lat)?, coordinate(lon)?)),
                         None => None,
@@ -452,6 +472,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
         tags,
         location: x.zip(y).map(|(lon, lat)| (lat, lon)),
         nodes,
+        refs,
         members,
         id: first.to_owned(),
     })
@@ -743,13 +764,15 @@ fn tally(filled: &mut [[usize; 3]; 3], q: &Query) {
 }
 
 /// osmium's `tags-filter` of `pbf` by `filters` (keeping referenced
-/// objects), then `add-locations-to-ways` as OPL.
+/// objects), then `add-locations-to-ways` as OPL; `keep_nodes` keeps the
+/// untagged node records too.
 fn located_opl(
     harness: &mut Harness,
     pbf: &Path,
     outdir: &Path,
     stem: &str,
     filters: &[&str],
+    keep_nodes: bool,
 ) -> Result<std::path::PathBuf, Error> {
     let filtered = outdir.join(format!("{stem}-filtered.osm.pbf"));
     let ended = harness.reference(
@@ -767,6 +790,11 @@ fn located_opl(
     let ended = harness.reference(
         &ToolRun::osmium(format!("{stem}-locations.1"))
             .args(&["add-locations-to-ways", "--ignore-missing-nodes"])
+            .args(if keep_nodes {
+                &["--keep-untagged-nodes"][..]
+            } else {
+                &[]
+            })
             .input(&filtered)
             .args(&["-f", "opl", "-o"])
             .output(&opl)
@@ -778,10 +806,18 @@ fn located_opl(
 }
 
 /// The admin model of osmium's decoding of the input's boundary relations.
+///
+/// The decoding keeps every node record (`located_opl` with `keep_nodes`):
+/// osmium locates a way's refs as it passes the way, so a node stored after
+/// the way is left unlocated though the input holds it, while the builder
+/// resolves refs after its whole node pass. Each node record is therefore
+/// recorded, and the model tells a ref the input lacks (no record) from
+/// one whose record carries no location.
 fn admin_model(path: &Path) -> Result<admin::AdminModel, Error> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-    let mut ways: HashMap<i64, Vec<Option<(i32, i32)>>> = HashMap::new();
+    let mut ways: HashMap<i64, admin::Way> = HashMap::new();
+    let mut node_records: admin::NodeRecords = HashMap::new();
     let mut relations = Vec::new();
     for (n, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
@@ -792,13 +828,25 @@ fn admin_model(path: &Path) -> Result<admin::AdminModel, Error> {
                 let id = record.id[1..]
                     .parse()
                     .map_err(|_| at(format!("way id {}", record.id)))?;
-                ways.insert(id, record.nodes);
+                ways.insert(
+                    id,
+                    admin::Way {
+                        refs: record.refs,
+                        nodes: record.nodes,
+                    },
+                );
+            }
+            b'n' => {
+                let id = record.id[1..]
+                    .parse()
+                    .map_err(|_| at(format!("node id {}", record.id)))?;
+                node_records.insert(id, record.location);
             }
             b'r' => relations.push(record),
             _ => {}
         }
     }
-    admin::AdminModel::build(&relations, &ways).map_err(Error::Tool)
+    admin::AdminModel::build(&relations, &ways, &node_records).map_err(Error::Tool)
 }
 
 /// Build an index of `pbf` at `admin_tolerance` meters into `index`.
@@ -951,7 +999,10 @@ fn judge_admin(
     for why in wrong.iter().take(SHOWN_MISMATCHES) {
         harness.msg(&format!("    {why}"));
     }
-    if admin.relations > 0 && tally.containing == 0 && wrong.is_empty() {
+    // A withheld relation is judged as absent, so an input whose every
+    // boundary is withheld covers the absence path only; one the model
+    // leaves unmodelled covers nothing.
+    if admin.relations > admin.withheld && tally.containing == 0 && wrong.is_empty() {
         return Err(Error::tool(format!(
             "no admin answer {label} was judged containing; the check cannot cover that path"
         )));
@@ -978,6 +1029,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         &outdir,
         "geocode",
         &["nw/addr:housenumber", "w/highway", "w/addr:interpolation"],
+        false,
     )?)?;
     let admin = admin_model(&located_opl(
         harness,
@@ -985,11 +1037,13 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         &outdir,
         "geocode-admin",
         &["r/boundary=administrative,postal_code"],
+        true,
     )?)?;
     harness.msg(&format!(
         "  model: {} address points, {} street segments, {} interpolation ranges from {} \
          resolved ways ({} refused), {} admin polygons from {} boundary relations ({} \
-         unjudged boxes of unmodelled relations and undecided holes)",
+         withheld as incomplete or listing a way in both roles, {} unjudged boxes of \
+         unmodelled relations and undecided holes)",
         model.addresses.len(),
         model.segments.len(),
         model.interp.sections.len(),
@@ -997,6 +1051,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         model.interp.refused_ways,
         admin.polygons.len(),
         admin.relations,
+        admin.withheld,
         admin.unmodelled.len(),
     ));
     // Every unmodelled relation makes its level unjudged across its box, so

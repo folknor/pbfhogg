@@ -550,6 +550,10 @@
 
 ### Fixed
 
+- **`export` skips degenerate Polygons.** An area way whose ring has zero
+  area as written - collinear positions, or distinct positions that
+  rounding to seven decimals collapses - was emitted as a Polygon. It is
+  now skipped and counted among the invalid ways.
 - **`export` winds every Polygon exterior ring counterclockwise.** The
   orientation was judged with a floating-point area over absolute
   coordinates, which cancels to zero for small rings away from the

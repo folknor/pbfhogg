@@ -93,18 +93,6 @@ fn emitted_twice_area(scratch: &mut String, coords: &[(f64, f64)]) -> Option<i12
     Some(twice_area)
 }
 
-fn has_three_distinct_positions(coords: &[(f64, f64)]) -> bool {
-    let Some(&first) = coords.first() else {
-        return false;
-    };
-    let Some(second) = coords.iter().copied().find(|coord| *coord != first) else {
-        return false;
-    };
-    coords
-        .iter()
-        .any(|coord| *coord != first && *coord != second)
-}
-
 fn push_positions<'a, I>(
     buf: &mut String,
     scratch: &mut String,
@@ -133,17 +121,21 @@ pub(super) fn write_way_geometry(
     }
 
     let closed = coords.first() == coords.last();
-    if is_area {
-        let output_len = coords.len() + usize::from(!closed);
-        if output_len < 4 || !has_three_distinct_positions(coords) {
-            return WayGeom::Invalid;
-        }
-    }
+    // An area ring is judged by one rule, on the coordinates it emits: a
+    // non-zero exact emitted twice-area. That rejects rings that are
+    // collinear or that rounding to seven decimals collapses, which a
+    // check on the unrounded input passes. It also implies every older
+    // guard: a non-zero determinant names two emitted positions distinct
+    // from the first and not collinear with it, so the ring has three
+    // distinct positions and, closed or with its closing position
+    // appended, at least four. A self-intersecting ring whose lobes cancel
+    // to exactly zero net area is rejected too; self-intersection is not
+    // otherwise checked.
     let reverse = if is_area {
-        let Some(twice_area) = emitted_twice_area(scratch, coords) else {
-            return WayGeom::Invalid;
-        };
-        twice_area < 0
+        match emitted_twice_area(scratch, coords) {
+            None | Some(0) => return WayGeom::Invalid,
+            Some(twice_area) => twice_area < 0,
+        }
     } else {
         false
     };
@@ -319,6 +311,45 @@ mod tests {
             buf,
             "{\"type\":\"Polygon\",\"coordinates\":[[[-0.000005,0.0000083],\
              [0.0000012,0.0000154],[-0.0000019,0.0000119],[-0.000005,0.0000083]]]}"
+        );
+    }
+
+    #[test]
+    fn zero_emitted_area_is_invalid() {
+        let mut buf = String::new();
+        let mut scratch = String::new();
+        let collinear = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (0.0, 0.0)];
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &collinear, true),
+            WayGeom::Invalid
+        );
+        // Three distinct input positions that all round to [0,0].
+        let collapsed = [(0.0, 0.0), (0.0, 1e-9), (1e-9, 0.0), (0.0, 0.0)];
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &collapsed, true),
+            WayGeom::Invalid
+        );
+        // Distinct input that rounds to two distinct positions.
+        let flattened = [(0.0, 0.0), (1e-9, 1.0), (0.0, 1.0), (0.0, 0.0)];
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &flattened, true),
+            WayGeom::Invalid
+        );
+        // Lobes of a bowtie cancel to zero net area.
+        let bowtie = [(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &bowtie, true),
+            WayGeom::Invalid
+        );
+        // An open ring needs no fourth input position.
+        assert_eq!(
+            write_way_geometry(
+                &mut buf,
+                &mut scratch,
+                &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                true
+            ),
+            WayGeom::Written
         );
     }
 

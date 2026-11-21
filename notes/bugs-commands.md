@@ -293,18 +293,16 @@ side. Separately, the extended text renderer (`inspect/report.rs`) omits
 metadata coverage entirely when there are no objects, although the
 documentation promises `All objects have: (none)`.
 
-## CMD-035 - Export accepts degenerate polygons, including ones made by rounding
+## CMD-058 - Export writes LineStrings whose emitted positions all coincide
 
-Reported by: export [P2].
+Reported by: export polygon-degeneracy work [P3].
 
-`write_way_geometry` (`export/geometry.rs`) checks the position count and that
-there are three distinct unrounded positions, but never rejects zero area. A
-closed area-tagged way `[(0,0),(1,1),(2,2),(0,0)]` passes and is counted as an
-exported Polygon. A valid granularity-1 triangle
-`[(0,0),(0,1e-9),(1e-9,0),(0,0)]` passes the distinct-position check, and then
-seven-decimal formatting (`coord_fmt.rs`) collapses every output position to
-`[0,0]`. Both break the promise that invalid way geometry is skipped and
-counted. Validation needs to judge the coordinates actually emitted.
+`write_way_geometry` (`export/geometry.rs`) rejects a LineString only below two
+input positions. A way `[(0,0),(0,0)]`, or one whose distinct positions all
+round to one seven-decimal position, is written and counted as exported.
+RFC 7946 asks for two or more positions, which such a line has, so whether it
+is invalid is a policy question; libosmium's `use_nodes::unique` would
+collapse it and refuse it. Polygons are already judged on emitted area.
 
 ## CMD-036 - Export emits coordinates outside the GeoJSON domain
 

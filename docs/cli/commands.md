@@ -1703,7 +1703,9 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC
 strings. Tags that collide with emitted reserved property names are omitted.
 Polygon exterior rings are closed and counterclockwise. Ways with invalid
-geometry are skipped and reported in the stderr summary.
+geometry are skipped and reported in the stderr summary; an area way is
+invalid when its ring has zero signed area at the emitted seven-decimal
+precision (collinear, or collapsed by rounding).
 
 ### diff
 

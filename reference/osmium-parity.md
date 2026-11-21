@@ -42,12 +42,15 @@ pbfhogg's `export` has no config file - the rules are fixed:
   presence of any of `building`, `landuse`, `natural`, `leisure`,
   `amenity`, `boundary`, `waterway` (`AREA_KEYS`) qualifies. Every other
   way (open, or closed but untagged for area) becomes a `LineString`.
-  Polygon exterior rings are re-wound counterclockwise
-  (`write_way_geometry`'s signed-area check) and always explicitly
-  closed in the output, regardless of whether the source way repeats
-  its first node ID. A closed way with fewer than 3 geometrically
-  distinct positions is rejected as invalid geometry, not silently
-  emitted as a degenerate polygon.
+  Area classification is by node refs; the serialized ring is closed
+  geometrically, gaining a closing position when the first and last
+  node locations differ. Polygon exterior rings are re-wound
+  counterclockwise (`write_way_geometry`'s signed-area check, computed
+  exactly on the emitted seven-decimal coordinates). A ring whose
+  signed area at emitted precision is zero (collinear, collapsed by
+  rounding, or a self-intersecting ring whose lobes cancel exactly) is
+  skipped and counted as an invalid way, not emitted as a degenerate
+  polygon. Self-intersection is not otherwise checked.
 - **Property model** (`crates/lib/src/commands/export/properties.rs::write_properties`):
   every feature gets `@id` and `@type`. `--metadata` adds `@version`,
   `@timestamp` (RFC 3339 UTC), `@changeset`, `@uid`, `@user`, `@visible`

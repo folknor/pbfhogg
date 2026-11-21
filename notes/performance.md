@@ -1818,48 +1818,41 @@ repack, cat, cat-dedupe, renumber, merge-changes, field-policies), other
 (geocode, extract, multi-extract, check-ids, check-refs, getid, getparents,
 diff, derive-changes, tags-filter, inspect-tags).
 
-## PERF-064 - Every comparison materializes fresh OPL decodings and reuses none
+## PERF-064 - OPL decodings are reused within a run, but still serial, file-materialized and per policy
 
 Reported by: all eight (orchestration, engine, heavy and other, both models).
 
-Mechanism: every element judgment goes through `opl_compare::decode`/`walk`.
-Each decode runs `osmium cat -f opl... -o FILE` (marked `.uncached()`) to
-completion. On denmark that is several GB of text, which engine-opus puts at
-about 80-100 bytes per object and heavy-opus at about 7-8 GB at FULL. The
-second side is decoded only after the first, then both files are merged on one
-thread through 8 KiB `BufReader`s and deleted. The API is pairwise and takes
-paths, so the decode is hidden inside each call. Order (`check_sorted`,
-`order`), counts (`osmium_counts`) and equality (`same_elements`) are separate
-calls, and each pays its own full decode. `opl_compare::decode` says so: "A file
-decoded twice in one check gets a fresh decoding each time."
+Landed: a run-owned decoding store (`opl_compare::Decodings`, owned by
+`run::Run`, files in `RUN/decodings/`) keyed by the file's identity stamp
+(dev, ino, size, mtime) plus its name from the first dot, and the policy.
+Every comparison, order scan, counts call, reencode reference and
+apply-changes model read takes its decoding from it; order and counts are
+recorded per source once any decoding of it was read whole for its keys.
+Idle decodings are bounded by `DECODING_BUDGET` with LRU eviction; failed
+calls keep theirs. reference/verify.md "Decoding reuse" is the contract.
+Measured once on plantasjen, denmark `verify cat-dedupe` PASS: 11 osmium cat
+runs (the hunt counted 13-16 at e3782a4f), wall 3m5s; no matched baseline
+on this host.
 
-Census of full-size decodes in one `verify all`:
+What remains:
 
-- orchestration-opus: about 90, of which about 40 are distinct (content,
-  policy) pairs, about 35 distinct files, and about ten denmark-equivalents of
-  unique blob payload. The input alone is decoded to OPL more than 20 times.
-- engine-opus: about 70-80, of which 30-40 are distinct.
-- heavy-opus: about 77 in its checks alone.
+- Decodes are still serial, written to files and read back, never streamed
+  (`-o -`) or run concurrently; that needs the multi-child lifecycle of
+  PERF-066.
+- No reuse across runs (PERF-065).
+- One decoding per policy: NO_LOCATIONS and CONTENT are never projected
+  from FULL, since no field-policies control holds such a projection. A
+  file compared under two policies decodes twice; cat --dedupe's input is
+  decoded under CONTENT for its order scan and again under the merge
+  policy. Ordering the order scan after, or decoding it at the merge
+  policy, would save that decode.
+- Byte-identical files at distinct inodes decode apart (the stamp key was
+  chosen over a content digest: the encoding fixture's fake osmium answers
+  by name over byte-identical PBFs, and no fresh output is hashed).
+- The budget bounds retained idle bytes, not scratch headroom for the decode
+  in flight or for producers.
 
-Per check, as the hunters read it:
-
-- sort: 3.
-- cat: 12 partial decodes, 4 per `compare_outputs`.
-- cat --dedupe: 13-16, with the input decoded 7 times.
-- add-locations all: 10.
-- repack: 8, with the input decoded 4 times.
-- degrade: 14 (16 with -l), with the input decoded 5 times and drop-a 3 times.
-- apply-changes: 3, plus the rewrites `osmium.opl` and `expected.opl`.
-- diff --format osc: 10 (13 on the omission path), with `new` decoded 4 times.
-- getid-removeid: 9 full-size and 13 small.
-- extract: 16 per region over 6 files.
-- getparents: 32 small.
-- tags-filter: 12 small.
-- multi-extract: 3 per region per pass.
-
-Each full pairwise comparison writes and rereads about 15 GB (heavy-opus).
-
-Redesigns:
+Redesigns (as filed, for the residue):
 
 - orchestration-opus: a run-wide, single-flight `Decodings` service keyed by
   osmium identity, policy and content. It streams `osmium cat -o -`, derives

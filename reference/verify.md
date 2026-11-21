@@ -21,7 +21,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
 
 - **Element equality** is the verifier's merge of osmium's decodings
   (`opl_compare`): `osmium cat -f opl[,add_metadata=false][,locations_on_ways=true]`
-  of each side to a file in the check's directory, then a streaming merge
+  of each side to a file in the run's decoding store (`RUN/decodings/`,
+  below), then a streaming merge
   keyed by kind and ID in osmium's object order (kind node, way, relation;
   then ID zero, negative IDs by magnitude, positive IDs by magnitude) that
   requires each side strictly ascending, so it also certifies, as osmium
@@ -32,9 +33,33 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   two record sequences are equal element by element, in any order; that is
   their claim, not identity under a sort. Differing identities are
   classified first-only, second-only or differing and written to a listing
-  beside the outputs, both sides' records included; the OPL pair is removed
-  once merged and kept when the merge fails; when the second side's decode
-  fails, the first side's decoding remains as well. This is equality of osmium-decoded records under a field
+  beside the outputs, both sides' records included. When the merge fails,
+  or a side's decode fails, each decoding already made is kept in the
+  store, never evicted or removed, so the path an error names survives in
+  the kept run directory.
+
+  **Decoding reuse.** Within one run a decoding is made once per source and
+  policy and reused by every later comparison, order scan and model read,
+  across checks: the source is the file's identity stamp (device, inode,
+  size, mtime, the same stamp input identity uses) plus its name from the
+  first dot, since osmium chooses its reader from the name. Cache-placed
+  reference artifacts, hard links of one inode, meet across checks;
+  byte-identical files at distinct inodes do not. A reuse is still an
+  observation: the file is watched, every input revalidated and the
+  lifecycle checkpointed. Order and counts are recorded per source once a
+  decoding was read whole for its keys (an order scan, a completed strict
+  merge, a judged walk's drain), under any policy, since every policy
+  writes the kind and ID alike; record bytes are never projected from one
+  policy to another. A call pins its retained operands before it makes any
+  missing one. Idle decodings are evicted least recently used down to
+  `DECODING_BUDGET` (`crates/verify/src/tunables.rs`) after each use, one
+  larger than the budget first, and before each new decode down to the
+  budget less an estimate of it; a germany-scale estimate alone exceeds the
+  budget and sheds them all. The budget bounds retained idle bytes, not the
+  filesystem's headroom for the decode in flight. At the run's end the
+  store is removed, kept run or not, except decodings kept as evidence.
+
+  This is equality of osmium-decoded records under a field
   policy, not of wire fields: absent metadata becomes libosmium's defaults on
   both sides, timestamps are whole seconds, coordinates are at 1e-7 degrees
   and a string is cut at an embedded NUL. OPL escapes its separators, so tag
@@ -286,8 +311,9 @@ is unsupported.
 Completed reference executions are stored at
 `SCRATCH/tools/verify-reference/` (format 2). No pbfhogg output, observation,
 or verdict is cached: every comparison runs again. The element comparison's
-OPL decodings are not cached either: each is as large as its input, read
-once and removed, and publishing them filled a germany run's scratch. A hit is shown as
+OPL decodings are not cached across runs either: each is as large as its
+input, and publishing them filled a germany run's scratch; within a run
+they are reused under a budget ("Decoding reuse" above). A hit is shown as
 `osmium sort cached 1.2s` in the check's steps, timed like a run (probes,
 digests, validation and placement); `--verbose` also shows the hit in detail.
 

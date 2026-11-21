@@ -410,11 +410,12 @@ impl<'a> References<'a> {
                 ""
             }
         ));
-        let decoding = self.outdir.join(format!("{stem}.input.opl"));
-        opl_compare::decode(harness, &self.input.path, &decoding, Policy::FULL)?;
         let path = self.outdir.join(format!("{stem}.opl"));
-        let coordinate_ways = partition(&decoding, &path, strip)?;
-        std::fs::remove_file(&decoding)?;
+        // Both strip variants read the run's one FULL decoding of the input.
+        let coordinate_ways =
+            opl_compare::decoded(harness, &self.input.path, Policy::FULL, |_, opl| {
+                partition(opl, &path, strip)
+            })?;
         harness.msg(&format!(
             "  {coordinate_ways} ways carry a defined coordinate in osmium's decoding"
         ));

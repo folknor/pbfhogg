@@ -245,10 +245,9 @@ fn read_model(
     harness.msg("=== change model ===");
     let mut changes = Vec::new();
     osc::scan_osc_changes(osc, |change| changes.push(change))?;
-    let osc_opl = outdir.join("input-osc.opl");
-    opl_compare::decode(harness, osc, &osc_opl, POLICY)?;
-    let mut model = Model::build(&changes, opl_lines(&osc_opl)?)?;
-    std::fs::remove_file(&osc_opl)?;
+    let mut model = opl_compare::decoded(harness, osc, POLICY, |_, opl| {
+        Model::build(&changes, opl_lines(opl)?)
+    })?;
     let occurrences = changes.len();
     drop(changes);
     if occurrences > 0 {
@@ -389,11 +388,10 @@ fn judge_elements(
 ) -> Result<(), Error> {
     harness.msg("=== pbfhogg vs the change model and osmium ===");
     let expectations = model.expectations(locations_on_ways);
-    let osmium_opl = outdir.join("osmium.opl");
-    opl_compare::decode(harness, osmium_out, &osmium_opl, POLICY)?;
     let expected = outdir.join("expected.opl");
-    let osmium_touched = write_expected(&osmium_opl, &expected, model, &expectations)?;
-    std::fs::remove_file(&osmium_opl)?;
+    let osmium_touched = opl_compare::decoded(harness, osmium_out, POLICY, |_, opl| {
+        write_expected(opl, &expected, model, &expectations)
+    })?;
 
     let mut report = Report::default();
     let listing = outdir.join("pbfhogg-vs-expected.diff.txt");

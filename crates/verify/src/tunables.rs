@@ -47,6 +47,18 @@ pub(crate) const TEST_REPORT_GRACE: Duration = Duration::from_millis(100);
 /// Keep up to 20 GiB of completed reference artifacts by default.
 pub(crate) const REFERENCE_BUDGET: u64 = 20 * 1024 * 1024 * 1024;
 
+/// Idle OPL decodings a run retains for reuse, in bytes, after each
+/// release (`opl_compare::Decodings`). Sized to hold a few denmark-scale
+/// decodings, so an input compared again and again is decoded once, while a
+/// germany-scale decoding, whose estimate alone exceeds it, sheds every idle
+/// one before it is made: retaining germany decodings once filled scratch.
+pub(crate) const DECODING_BUDGET: u64 = 16 * 1024 * 1024 * 1024;
+
+/// OPL bytes estimated per input byte before a decode, to make room ahead
+/// of it. An eviction hint only: actual sizes are accounted once written.
+/// With metadata, OPL text runs to roughly ten to twenty times its PBF.
+pub(crate) const OPL_EXPANSION: u64 = 16;
+
 /// Records buffered by the bounded external sorter before spilling.
 pub(crate) const SORT_CHUNK: usize = 1 << 20;
 /// Maximum run files opened by one merge pass.

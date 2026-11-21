@@ -421,6 +421,8 @@ fn execute(args: &Args, mut life: process::Lifecycle) -> Result<ExitCode, Error>
     let ending = ending.and_then(|ending| h.checkpoint().map(|()| ending));
     if ending.is_ok() {
         h.retain_references(args.reference_budget)?;
+        // Kept failure evidence is a link of its own; the store's copies go.
+        h.run.decodings.discard();
     }
     h.run.finish(passed && ending.is_ok());
     Ok(match ending? {

@@ -523,7 +523,7 @@ impl Harness {
         label: &str,
         pbf: &Path,
     ) -> Result<(Verdict, crate::counts::Counts), Error> {
-        let (ordered, counts) = opl_compare::order(self, pbf, &pbf.with_extension("order.opl"))?;
+        let (ordered, counts) = opl_compare::order(self, pbf)?;
         let scan = opl_compare::Scan { ordered, counts };
         Ok((self.report_order(label, pbf, scan), counts_of(scan.counts)))
     }

@@ -87,7 +87,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         )));
     }
 
-    let (ordered, _) = opl_compare::order(harness, pbf, &outdir.join("input.order.opl"))?;
+    let (ordered, _) = opl_compare::order(harness, pbf)?;
     if !ordered {
         return Err(Error::tool(
             "the input claims Sort.Type_then_ID but osmium does not decode it in strict kind and \
@@ -285,8 +285,7 @@ fn derive(
         crate::checks::sort::osmium_sort(harness, &filtered, &sorted, &dir.join("osmium.sink"))?;
         sorted
     };
-    let (ordered, counts) =
-        opl_compare::order(harness, &operand, &operand.with_extension("order.opl"))?;
+    let (ordered, counts) = opl_compare::order(harness, &operand)?;
     harness.msg(&format!(
         "  {name}: {} nodes, {} ways, {} relations",
         counts[0], counts[1], counts[2]

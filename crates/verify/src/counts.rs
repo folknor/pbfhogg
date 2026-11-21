@@ -13,8 +13,7 @@ pub(crate) struct Counts {
 /// osmium's object counts of `pbf`, read from its OPL decoding
 /// (`crate::opl_compare::order`).
 pub(crate) fn osmium_counts(h: &mut Harness, pbf: &Path) -> Result<Counts, Error> {
-    let (_, [nodes, ways, relations]) =
-        crate::opl_compare::order(h, pbf, &pbf.with_extension("counts.opl"))?;
+    let (_, [nodes, ways, relations]) = crate::opl_compare::order(h, pbf)?;
     Ok(Counts {
         nodes,
         ways,

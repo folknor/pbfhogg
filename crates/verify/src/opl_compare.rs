@@ -138,45 +138,339 @@ impl Merged {
 /// The step label of every merge walk, timed apart from the decodes it reads.
 const MERGE_STEP: &str = "opl merge";
 
-/// `osmium cat` of `pbf` to OPL under `policy`, into `opl`.
-pub(crate) fn decode(
-    harness: &mut Harness,
-    pbf: &Path,
-    opl: &Path,
+/// What one decoding was made from: the file's identity stamp (device,
+/// inode, size, mtime, the run's trusted input identity) and its name's
+/// format text. osmium picks its reader from the name, so the same inode
+/// under `x.osc` and `x.osc.gz`, or `pbf` and `data`, is not one source:
+/// the text is everything from the first dot, or the whole name when it has
+/// none. Keyed by stamp, not content digest: no fresh output is hashed, and
+/// cache-placed reference artifacts, hard links of one inode in several
+/// checks, still meet. Byte-identical files at distinct inodes decode apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Source {
+    stamp: (u64, u64, u64, i64, i64),
+    format: std::ffi::OsString,
+}
+
+impl Source {
+    fn of(pbf: &Path) -> Result<Self, Error> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(pbf)
+            .map_err(|e| Error::Environment(format!("{}: {e}", pbf.display())))?;
+        let name = pbf.file_name().unwrap_or_default().as_bytes();
+        let format = name
+            .iter()
+            .position(|&b| b == b'.')
+            .map_or(name, |i| &name[i..]);
+        Ok(Self {
+            stamp: (
+                meta.dev(),
+                meta.ino(),
+                meta.size(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+            ),
+            format: std::ffi::OsStr::from_bytes(format).to_os_string(),
+        })
+    }
+}
+
+struct Entry {
+    source: Source,
     policy: Policy,
-) -> Result<(), Error> {
-    let format = policy.format();
-    // A file decoded twice in one check gets a fresh decoding each time:
-    // reference placement links into an absent name and refuses an existing
-    // one, so a repeated decode to the same path needs the old pair gone.
-    // Deliberately kept over fresh per-call paths: the verifier never
-    // retries, the first decoding of a path is merged and removed before any
-    // second one, and fresh paths would only leave more scratch behind. The
-    // delete of an absent file costs one unlink.
-    for stale in [opl.to_path_buf(), opl.with_extension("stdout")] {
-        match std::fs::remove_file(&stale) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+    path: PathBuf,
+    bytes: u64,
+    /// Calls currently reading it; a pinned entry is never evicted.
+    pins: u32,
+    used: u64,
+    /// Read by a call that failed: the error names this file, so it is
+    /// never evicted or discarded and stays in the kept run directory.
+    kept: bool,
+}
+
+impl Entry {
+    fn idle(&self) -> bool {
+        self.pins == 0 && !self.kept
+    }
+}
+
+/// The run's OPL decodings, reused across calls and checks while their
+/// source's stamp holds, plus each source's order and counts once some
+/// decoding of it was read whole for its keys. Every policy writes the
+/// object key (kind and ID) the same, so a scan read under one policy
+/// answers order and counts under any; record bytes are never projected
+/// across policies. Retention is bounded: idle (unpinned) decodings are
+/// evicted least recently used down to `tunables::DECODING_BUDGET` bytes
+/// after every release, and before every new decode down to the budget less
+/// that decode's estimate (all idle ones when the estimate alone exceeds
+/// it). The budget bounds retained idle bytes, not the filesystem's
+/// headroom for the decode in flight or for other work.
+#[derive(Default)]
+pub(crate) struct Decodings {
+    entries: Vec<Entry>,
+    scans: Vec<(Source, Scan)>,
+    tick: u64,
+    made: u64,
+}
+
+impl Decodings {
+    fn idle_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|e| e.idle())
+            .map(|e| e.bytes)
+            .sum()
+    }
+
+    /// Evict idle entries, least recently used first, until the idle bytes
+    /// are at most `limit`.
+    fn trim(&mut self, limit: u64) -> Result<(), Error> {
+        while self.idle_bytes() > limit {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.idle())
+                .min_by_key(|(_, e)| e.used)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            self.evict(oldest)?;
+        }
+        Ok(())
+    }
+
+    fn evict(&mut self, index: usize) -> Result<(), Error> {
+        // Unlinked first: an entry whose file stays is still accounted.
+        std::fs::remove_file(&self.entries[index].path)?;
+        self.entries.swap_remove(index);
+        Ok(())
+    }
+
+    /// Unpin `paths`, marking them kept when `keep`. An entry larger than
+    /// the budget goes as soon as it is idle, before the least recently used
+    /// trim, so it never flushes smaller entries only to be evicted itself.
+    fn release(&mut self, paths: &[PathBuf], keep: bool) -> Result<(), Error> {
+        for path in paths {
+            if let Some(e) = self.entries.iter_mut().find(|e| &e.path == path) {
+                e.pins = e.pins.saturating_sub(1);
+                e.kept |= keep;
+            }
+        }
+        while let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.idle() && e.bytes > crate::tunables::DECODING_BUDGET)
+        {
+            self.evict(i)?;
+        }
+        self.trim(crate::tunables::DECODING_BUDGET)
+    }
+
+    /// Record `scan` as the order and counts of the source `path` decodes.
+    fn publish(&mut self, path: &Path, scan: Scan) {
+        let Some(source) = self
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.source.clone())
+        else {
+            return;
+        };
+        if !self.scans.iter().any(|(s, _)| *s == source) {
+            self.scans.push((source, scan));
         }
     }
+
+    /// Remove every retained decoding at the end of the run, except those a
+    /// failed call kept as evidence.
+    pub(crate) fn discard(&mut self) {
+        for entry in self.entries.drain(..).filter(|e| !e.kept) {
+            if let Err(e) = std::fs::remove_file(&entry.path) {
+                crate::output::error(&format!(
+                    "cannot remove the decoding {}: {e}",
+                    entry.path.display()
+                ));
+            }
+        }
+    }
+}
+
+/// `osmium cat` of `pbf` to OPL under `policy`, as a pinned store entry:
+/// the run's retained decoding of the same source and policy when there is
+/// one, else a fresh decode. A reuse is still an observation of `pbf`: it
+/// is watched, every watched input revalidated and the lifecycle
+/// checkpointed, as a launch would.
+/// The pinned retained decoding of `pbf` under `policy`, if any. The input
+/// is validated before the pin is taken, so a failed validation leaves no
+/// pin behind.
+fn acquire_hit(
+    harness: &mut Harness,
+    pbf: &Path,
+    policy: Policy,
+) -> Result<Option<PathBuf>, Error> {
+    let source = Source::of(pbf)?;
+    let Some(path) = harness
+        .run
+        .decodings
+        .entries
+        .iter()
+        .find(|e| e.source == source && e.policy == policy)
+        .map(|e| e.path.clone())
+    else {
+        return Ok(None);
+    };
+    harness.run.watch(pbf)?;
+    harness.run.revalidate()?;
+    harness.checkpoint()?;
+    harness.run.decodings.tick += 1;
+    let tick = harness.run.decodings.tick;
+    if let Some(e) = harness
+        .run
+        .decodings
+        .entries
+        .iter_mut()
+        .find(|e| e.path == path)
+    {
+        e.pins += 1;
+        e.used = tick;
+    }
+    harness.msg(&format!(
+        "  {}: reusing the run's OPL decoding {}",
+        pbf.display(),
+        path.display()
+    ));
+    Ok(Some(path))
+}
+
+fn acquire(harness: &mut Harness, pbf: &Path, policy: Policy) -> Result<PathBuf, Error> {
+    if let Some(path) = acquire_hit(harness, pbf, policy)? {
+        return Ok(path);
+    }
+    let source = Source::of(pbf)?;
+    harness.run.decodings.tick += 1;
+    let tick = harness.run.decodings.tick;
+    let estimate = source
+        .stamp
+        .2
+        .saturating_mul(crate::tunables::OPL_EXPANSION);
+    harness
+        .run
+        .decodings
+        .trim(crate::tunables::DECODING_BUDGET.saturating_sub(estimate))?;
+    let dir = harness.run.dir.join("decodings");
+    std::fs::create_dir_all(&dir)?;
+    harness.run.decodings.made += 1;
+    let opl = dir.join(format!("{}.opl", harness.run.decodings.made));
     let captured = harness.reference(
         &ToolRun::osmium("opl-compare.1")
             .arg("cat")
             .input(pbf)
-            .args(&["-f", &format, "-o"])
-            .output(opl)
+            .args(&["-f", &policy.format(), "-o"])
+            .output(&opl)
             .arg("--overwrite")
             .uncached(),
         &opl.with_extension("stdout"),
     )?;
-    harness.require_success(&captured, "osmium cat to OPL")
+    harness.require_success(&captured, "osmium cat to OPL")?;
+    // A successful decode's stdout is no evidence; a failed one's stays.
+    std::fs::remove_file(opl.with_extension("stdout"))?;
+    // The stamp the decode was keyed under must still be the file's.
+    if Source::of(pbf)? != source {
+        return Err(Error::Environment(format!(
+            "{} changed while osmium decoded it",
+            pbf.display()
+        )));
+    }
+    let bytes = std::fs::metadata(&opl)?.len();
+    harness.run.decodings.entries.push(Entry {
+        source,
+        policy,
+        path: opl.clone(),
+        bytes,
+        pins: 1,
+        used: tick,
+        kept: false,
+    });
+    Ok(opl)
+}
+
+/// Run `work` over pinned decodings of `sides` (each a file and its
+/// policy), in side order, releasing them after. Retained decodings are
+/// pinned first and only then are the missing ones made, so no operand is
+/// evicted to make room for another. When an acquire or `work` fails, each
+/// decoding acquired is kept: never evicted or discarded, so the path an
+/// error names stays in the kept run directory, and the failure stays the
+/// one raised. `work` returns whether its outcome, though `Ok`, is a failure
+/// whose decodings are kept too.
+fn with_decodings<T>(
+    harness: &mut Harness,
+    sides: &[(&Path, Policy)],
+    work: impl FnOnce(&mut Harness, &[PathBuf]) -> Result<(T, bool), Error>,
+) -> Result<T, Error> {
+    let mut slots: Vec<Option<PathBuf>> = vec![None; sides.len()];
+    let mut outcome = Ok(None);
+    'acquire: for hits in [true, false] {
+        for ((pbf, policy), slot) in sides.iter().zip(&mut slots) {
+            if slot.is_some() {
+                continue;
+            }
+            let got = if hits {
+                acquire_hit(harness, pbf, *policy)
+            } else {
+                acquire(harness, pbf, *policy).map(Some)
+            };
+            match got {
+                Ok(path) => *slot = path,
+                Err(e) => {
+                    outcome = Err(e);
+                    break 'acquire;
+                }
+            }
+        }
+    }
+    let held: Vec<PathBuf> = slots.iter().flatten().cloned().collect();
+    if outcome.is_ok() {
+        outcome = work(harness, &held).map(Some);
+    }
+    let keep = match &outcome {
+        Ok(Some((_, failed))) => *failed,
+        _ => true,
+    };
+    if keep {
+        for path in &held {
+            harness.msg(&format!("  decoding kept: {}", path.display()));
+        }
+    }
+    let released = harness.run.decodings.release(&held, keep);
+    if let (Err(cleanup), Err(_) | Ok(Some((_, true)))) = (&released, &outcome) {
+        // The comparison's failure stays the one raised.
+        harness.msg(&format!("  decoding cleanup failed: {cleanup}"));
+    }
+    let (value, _) = outcome?.ok_or_else(|| Error::tool("decodings lost their outcome"))?;
+    released?;
+    Ok(value)
+}
+
+/// `read` over the OPL decoding of `pbf` under `policy`, from the run's
+/// store; kept on failure.
+pub(crate) fn decoded<T>(
+    harness: &mut Harness,
+    pbf: &Path,
+    policy: Policy,
+    read: impl FnOnce(&mut Harness, &Path) -> Result<T, Error>,
+) -> Result<T, Error> {
+    with_decodings(harness, &[(pbf, policy)], |h, held| {
+        Ok((read(h, &held[0])?, false))
+    })
 }
 
 /// Compare `first` with `second` under `policy`: both decoded to OPL beside
 /// `listing`, merged, every [`Group`] handed to `each` in object order and
-/// written to `listing`. The OPL pair is removed once merged; on an error it
-/// stays for diagnosis. A stream out of strict order, an ID that is not a
+/// written to `listing`. The decodings are the run's ([`Decodings`]); on an
+/// error both are kept in the run's store for diagnosis. A stream out of strict order, an ID that is not a
 /// signed 64-bit decimal or a line that is not an object is an error naming
 /// the file.
 pub(crate) fn compare(
@@ -276,25 +570,32 @@ pub(crate) fn compare_judged(
     policy: Policy,
     each: impl FnMut(Group),
 ) -> Result<Walked, Error> {
-    let a = listing.with_extension("first.opl");
-    let b = listing.with_extension("second.opl");
-    decode(harness, first, &a, policy)?;
-    decode(harness, second, &b, policy)?;
-    let walked = harness.timed(MERGE_STEP, || merge_judged(&a, &b, listing, each))?;
-    if let Ok(merged) = &walked.merged {
-        harness.msg(&format!(
-            "  OPL merge {}: same={} first-only={} second-only={} differs={}",
-            listing.display(),
-            merged.same,
-            merged.first_only,
-            merged.second_only,
-            merged.differs
-        ));
-        for opl in [&a, &b] {
-            std::fs::remove_file(opl)?;
+    let sides = [(first, policy), (second, policy)];
+    with_decodings(harness, &sides, |harness, held| {
+        let (a, b) = (&held[0], &held[1]);
+        let walked = harness.timed(MERGE_STEP, || merge_judged(a, b, listing, each))?;
+        for (path, scan) in [a, b].into_iter().zip(&walked.scans) {
+            if let Ok(scan) = scan {
+                harness.run.decodings.publish(path, *scan);
+            }
         }
-    }
-    Ok(walked)
+        if let Ok(merged) = &walked.merged {
+            log_merge(harness, listing, merged);
+        }
+        let failed = walked.merged.is_err();
+        Ok((walked, failed))
+    })
+}
+
+fn log_merge(harness: &mut Harness, listing: &Path, merged: &Merged) {
+    harness.msg(&format!(
+        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
+        listing.display(),
+        merged.same,
+        merged.first_only,
+        merged.second_only,
+        merged.differs
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,42 +609,72 @@ fn walk(
     each: impl FnMut(Group),
     paired: impl FnMut(Pair<'_>),
 ) -> Result<Merged, Error> {
-    let a = listing.with_extension("first.opl");
-    let b = listing.with_extension("second.opl");
-    decode(harness, first, &a, policy)?;
-    decode(harness, second, &b, policy)?;
-    let merged = harness.timed(MERGE_STEP, || merge(&a, &b, listing, strict, each, paired))?;
-    harness.msg(&format!(
-        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
-        listing.display(),
-        merged.same,
-        merged.first_only,
-        merged.second_only,
-        merged.differs
-    ));
-    // The listing holds every differing record from both sides, so the
-    // decodings, each as large as its input, are not kept even then.
-    for opl in [&a, &b] {
-        std::fs::remove_file(opl)?;
-    }
-    Ok(merged)
+    let sides = [(first, policy), (second, policy)];
+    // The listing holds every differing record from both sides, so a
+    // completed merge keeps no decoding beside it, even when they differ.
+    with_decodings(harness, &sides, |harness, held| {
+        let (a, b) = (&held[0], &held[1]);
+        let merged = harness.timed(MERGE_STEP, || merge(a, b, listing, strict, each, paired))?;
+        if strict {
+            // A completed strict merge read both sides whole, ascending.
+            for (path, counts) in [(a, merged.first), (b, merged.second)] {
+                harness.run.decodings.publish(
+                    path,
+                    Scan {
+                        ordered: true,
+                        counts,
+                    },
+                );
+            }
+        }
+        log_merge(harness, listing, &merged);
+        Ok((merged, false))
+    })
 }
 
 /// Whether `pbf`'s objects strictly ascend in osmium's object order as
-/// osmium decodes them, and its object count per kind: an OPL decoding
-/// (no metadata, no inline coordinates) beside `opl`, scanned for its keys
-/// and removed. `osmium fileinfo -e` cannot stand in: it refuses a file
-/// whose ways lack their nodes (an invalid-location geometry error), which
-/// every way-only or filtered output is.
-pub(crate) fn order(
-    harness: &mut Harness,
-    pbf: &Path,
-    opl: &Path,
-) -> Result<(bool, [u64; 3]), Error> {
-    decode(harness, pbf, opl, Policy::CONTENT)?;
-    let scanned = harness.timed("opl order scan", || scan_order(opl))?;
-    std::fs::remove_file(opl)?;
-    Ok(scanned)
+/// osmium decodes them, and its object count per kind: the run's recorded
+/// scan of `pbf` when some decoding of it was already read whole for its
+/// keys (under any policy, since every policy writes the key alike), else a
+/// key scan of a retained decoding under any policy, else of a new one with
+/// no metadata and no inline coordinates; on failure that decoding is kept.
+/// `osmium fileinfo -e` cannot stand in: it refuses a file whose ways lack
+/// their nodes (an invalid-location geometry error), which every way-only or
+/// filtered output is.
+pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]), Error> {
+    let source = Source::of(pbf)?;
+    if let Some(scan) = harness
+        .run
+        .decodings
+        .scans
+        .iter()
+        .find(|(s, _)| *s == source)
+        .map(|(_, scan)| *scan)
+    {
+        harness.run.watch(pbf)?;
+        harness.run.revalidate()?;
+        harness.checkpoint()?;
+        harness.msg(&format!(
+            "  {}: order and counts from the run's earlier reading of its decoding",
+            pbf.display()
+        ));
+        return Ok((scan.ordered, scan.counts));
+    }
+    let policy = harness
+        .run
+        .decodings
+        .entries
+        .iter()
+        .find(|e| e.source == source)
+        .map_or(Policy::CONTENT, |e| e.policy);
+    decoded(harness, pbf, policy, |harness, path| {
+        let (ordered, counts) = harness.timed("opl order scan", || scan_order(path))?;
+        harness
+            .run
+            .decodings
+            .publish(path, Scan { ordered, counts });
+        Ok((ordered, counts))
+    })
 }
 
 /// The key scan of [`order`] over one OPL file.
@@ -372,25 +703,21 @@ fn scan_order(opl: &Path) -> Result<(bool, [u64; 3]), Error> {
 /// new `r7` retains `n7` and `w7` and deletes `n8`. Version and timestamp
 /// cannot move the cursor for an old-only identity, since every new identity
 /// below it is consumed first and every one above sorts after it whatever
-/// its version. Returns how many records were retained; both decodings are
-/// removed.
+/// its version. Returns how many records were retained; the decodings come
+/// from the run's store and are kept there on failure.
 pub(crate) fn osmium_derive_roundtrip(
     harness: &mut Harness,
     old: &Path,
     new: &Path,
     expected: &Path,
 ) -> Result<u64, Error> {
-    let a = expected.with_extension("old.opl");
-    let b = expected.with_extension("new.opl");
-    decode(harness, old, &a, Policy::CONTENT)?;
-    decode(harness, new, &b, Policy::CONTENT)?;
-    let retained = harness.timed("opl derive model", || {
-        retained_by_osmium_derive(&a, &b, expected)
-    })?;
-    for opl in [&a, &b] {
-        std::fs::remove_file(opl)?;
-    }
-    Ok(retained)
+    let sides = [(old, Policy::CONTENT), (new, Policy::CONTENT)];
+    with_decodings(harness, &sides, |harness, held| {
+        let retained = harness.timed("opl derive model", || {
+            retained_by_osmium_derive(&held[0], &held[1], expected)
+        })?;
+        Ok((retained, false))
+    })
 }
 
 /// The walk of [`osmium_derive_roundtrip`] over two strictly ordered OPL
@@ -431,7 +758,7 @@ fn retained_by_osmium_derive(old: &Path, new: &Path, expected: &Path) -> Result<
 }
 
 /// [`compare`] of `pbf`, decoded under `policy`, with an OPL file already
-/// written (`expected`); the decoding is removed once merged.
+/// written (`expected`); the decoding is the run's, kept on failure.
 pub(crate) fn compare_with_opl(
     harness: &mut Harness,
     pbf: &Path,
@@ -451,26 +778,25 @@ pub(crate) fn compare_with_opl_each(
     policy: Policy,
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
-    let a = listing.with_extension("first.opl");
-    decode(harness, pbf, &a, policy)?;
-    let merged = harness.timed(MERGE_STEP, || {
-        merge(&a, expected, listing, true, each, |_| {})
-    })?;
-    harness.msg(&format!(
-        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
-        listing.display(),
-        merged.same,
-        merged.first_only,
-        merged.second_only,
-        merged.differs
-    ));
-    std::fs::remove_file(&a)?;
-    Ok(merged)
+    decoded(harness, pbf, policy, |harness, a| {
+        let merged = harness.timed(MERGE_STEP, || {
+            merge(a, expected, listing, true, each, |_| {})
+        })?;
+        harness.run.decodings.publish(
+            a,
+            Scan {
+                ordered: true,
+                counts: merged.first,
+            },
+        );
+        log_merge(harness, listing, &merged);
+        Ok(merged)
+    })
 }
 
 /// [`compare_sequence`] with the first side an OPL file already written
 /// (`expected`) and the second `pbf` decoded under `policy`; the decoding is
-/// removed once merged, `expected` is kept.
+/// the run's, kept on failure, and `expected` is kept.
 pub(crate) fn compare_sequence_with_opl(
     harness: &mut Harness,
     expected: &Path,
@@ -478,21 +804,13 @@ pub(crate) fn compare_sequence_with_opl(
     listing: &Path,
     policy: Policy,
 ) -> Result<Merged, Error> {
-    let b = listing.with_extension("second.opl");
-    decode(harness, pbf, &b, policy)?;
-    let merged = harness.timed(MERGE_STEP, || {
-        merge(expected, &b, listing, false, |_| {}, |_| {})
-    })?;
-    harness.msg(&format!(
-        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
-        listing.display(),
-        merged.same,
-        merged.first_only,
-        merged.second_only,
-        merged.differs
-    ));
-    std::fs::remove_file(&b)?;
-    Ok(merged)
+    decoded(harness, pbf, policy, |harness, b| {
+        let merged = harness.timed(MERGE_STEP, || {
+            merge(expected, b, listing, false, |_| {}, |_| {})
+        })?;
+        log_merge(harness, listing, &merged);
+        Ok(merged)
+    })
 }
 
 /// One OPL stream: its current record and the key it last held.

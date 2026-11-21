@@ -63,6 +63,9 @@ pub(crate) struct Run {
     /// the same dataset input, tool and libraries on every call; without
     /// this each call reread them in full.
     digests: std::collections::HashMap<PathBuf, (Stamp, String)>,
+    /// The run's retained OPL decodings, in `RUN/decodings/`: owned by the
+    /// run, so no other run ever reads them.
+    pub(crate) decodings: crate::opl_compare::Decodings,
     keep: bool,
 }
 
@@ -86,6 +89,7 @@ impl Run {
             pbfhogg_digest,
             inputs: Vec::new(),
             digests: std::collections::HashMap::new(),
+            decodings: crate::opl_compare::Decodings::default(),
             keep,
         })
     }

@@ -270,13 +270,15 @@ entries only).
 
 `brokkr run` holds the machine lock for the verifier's whole life, which
 keeps every cooperating writer (the dataset tool, benches, another
-verifier) away. Each input's identity (device, inode, size, mtime, ctime) is
+verifier) away. Each input's identity (device, inode, size, mtime; not
+ctime, which cache placement and eviction move on a shared inode) is
 recorded when resolved; every pass compares every watched input with that
 first stamp, after every reference run (and at the cache's own points inside
 one) and every check, and a change makes the check ENVIRONMENT. These are
 sequential metadata observations, not a guarantee that no input moved
 between them. That detects ordinary external
-replacement; concurrent namespace manipulation by a process outside the lock
+replacement; a same-size rewrite that leaves mtime equal is not detected,
+the local single-user tool's accepted gap; concurrent namespace manipulation by a process outside the lock
 is unsupported.
 
 ## Reference cache
@@ -301,7 +303,7 @@ placed earlier on the search path, or an `/etc/ld.so.preload`, moves no
 file the probe named and is not detected: the verifier is a local
 single-user tool and does not defend against it. File digests of inputs, the executable and
 its libraries are taken once per run and reused while the file's stamp
-(device, inode, size, mtime, ctime) is unchanged; a first digest reads
+(device, inode, size, mtime) is unchanged; a first digest reads
 through one handle whose stamp must hold before and after, and a file seen
 changing meanwhile is ENVIRONMENT.
 When identity cannot be established, the reference runs uncached. Utilities
@@ -324,11 +326,12 @@ mtime; not ctime, which placement moves) equals the one its manifest
 recorded, without reading it, and hashes it in full only when the stamp
 moved; a rewrite in place with mtime set back is not detected. Publication fsyncs artifacts, manifest and
 directories. Checks receive
-private hard links (copies across filesystems), so eviction cannot remove a
-live check's files. When a run-local reference artifact becomes an input,
-its hard link is detached into a private copy before stamping: later cache links or eviction
-must not change a watched inode's ctime. Checks must never modify reference
-artifacts in place.
+their own hard links of the read-only cache inode (copies across
+filesystems), so eviction cannot remove a live check's files. A reference
+artifact that becomes an input is watched on that shared inode without a
+copy. Checks must never modify reference artifacts in place; a write moves
+the stamp, so the watching check is ENVIRONMENT and the entry's next lookup
+rehashes and drops it.
 
 `--fresh-reference` bypasses hits and replaces completed entries.
 `--reference-budget BYTES` sets the maximum retained logical artifact bytes

@@ -279,8 +279,8 @@ impl ReferenceCache {
                 // The recorded stamp (device, inode, size, mtime) stands in
                 // for the bytes: published artifacts are read-only and
                 // nothing in a local single-user run rewrites them in place
-                // and sets mtime back. Placement links and input detachment
-                // move only nlink and ctime, which the stamp leaves out. A
+                // and sets mtime back. Placement links and evictions move
+                // only nlink and ctime, which the stamp leaves out. A
                 // moved stamp (a remount, say) falls back to the full digest.
                 if Stamp::of(&meta) != artifact.stamp
                     && digest(&path).map_err(|e| e.to_string())? != artifact.xxh128

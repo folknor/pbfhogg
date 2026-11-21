@@ -2093,33 +2093,6 @@ ranking caps scratch during one.
 
 Kind: local, medium.
 
-## PERF-068 - Run::watch copies every cache-placed artifact before it is read
-
-Reported by: orchestration-opus, engine-opus, other-opus, orchestration-codex.
-
-Mechanism: the cache places artifacts by hard link. When such a link later
-becomes an input, `Run::watch` sees `nlink > 1` and calls `private_input_copy`
-to copy the whole file, because a later link or eviction would move the shared
-inode's ctime. Nearly every osmium output that is then decoded gets copied in
-full first: sort, cat, extract, apply-changes, add-locations, renumber, the
-derive roundtrips, and getid's two denmark-sized removeid outputs. That is
-probably several GB of writes per run, on the critical path.
-
-Redesigns:
-
-- orchestration-opus: stamp such files without ctime, since the cache itself
-  identifies artifacts by dev, ino, size and mtime; or use a reflink; or copy
-  at placement for artifacts known to be re-read.
-- other-opus: `copy_file_range`, or verify the artifact's digest at use.
-- codex-orchestration: owner-held immutable artifacts serving every reader
-  from one stable path for the run.
-- From the reference cache work: on a hit whose artifact will become an
-  input, hash while copying into the private file and compare with the
-  manifest, so the lookup's full digest read and this copy's full read become
-  one, and the digest binds the bytes the consumer actually gets.
-
-Kind: local, medium.
-
 ## PERF-069 - Checks rebuild the same fixtures independently
 
 Reported by: orchestration-opus, orchestration-codex, heavy-codex, other-opus,

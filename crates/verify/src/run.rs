@@ -20,13 +20,19 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::tunables;
 
+/// An input's identity: device, inode, size and mtime. ctime is left out on
+/// purpose. Reference artifacts reach checks as hard links of the cache's
+/// inode, and every later placement or eviction of that inode moves its
+/// ctime without touching its bytes; keeping ctime here forced a full private
+/// copy of each such artifact before it could be watched. The verifier is a
+/// local single-user tool, so a same-size rewrite that leaves mtime equal is
+/// outside what it defends against, the same stamp policy cache lookups use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     dev: u64,
     ino: u64,
     size: u64,
     mtime: (i64, i64),
-    ctime: (i64, i64),
 }
 
 fn stamp(path: &Path) -> Result<Stamp, Error> {
@@ -42,39 +48,8 @@ impl Stamp {
             ino: meta.ino(),
             size: meta.size(),
             mtime: (meta.mtime(), meta.mtime_nsec()),
-            ctime: (meta.ctime(), meta.ctime_nsec()),
         }
     }
-}
-
-/// Detach a run-local hard link before taking its first input stamp.
-fn private_input_copy(path: &Path) -> Result<(), Error> {
-    let before = stamp(path)?;
-    let tmp = path.with_file_name(format!(
-        ".{}.watch-copy",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let mut dest = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    let copied = (|| -> Result<(), Error> {
-        let mut source = std::fs::File::open(path)?;
-        std::io::copy(&mut source, &mut dest)?;
-        dest.set_permissions(source.metadata()?.permissions())?;
-        if stamp(path)? != before {
-            return Err(Error::Environment(format!(
-                "input {} changed while isolating its reference link",
-                path.display()
-            )));
-        }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if copied.is_err() {
-        drop(std::fs::remove_file(&tmp));
-    }
-    copied
 }
 
 pub(crate) struct Run {
@@ -118,20 +93,16 @@ impl Run {
     /// Watch `path` for the rest of the run.
     pub(crate) fn watch(&mut self, path: &Path) -> Result<(), Error> {
         if !self.inputs.iter().any(|(p, _)| p == path) {
-            // Cache placement uses hard links. Once a reference artifact is
-            // itself an input, isolate its inode: a later hit or eviction
-            // changes the shared inode's ctime without changing these bytes.
-            // Keep ctime in the input identity rather than masking mutations.
-            if path.starts_with(&self.dir) && std::fs::metadata(path)?.nlink() > 1 {
-                private_input_copy(path)?;
-            }
+            // A cache-placed reference artifact is watched on the cache's
+            // own inode, uncopied: the stamp leaves out the ctime that later
+            // placements and evictions move (see `Stamp`).
             self.inputs.push((path.to_path_buf(), stamp(path)?));
         }
         Ok(())
     }
 
     /// XXH3-128 of `path`, reused while the path's stamp (device, inode,
-    /// size, mtime, ctime) is the one it was hashed under. A first hash reads
+    /// size, mtime) is the one it was hashed under. A first hash reads
     /// through one handle whose stamp must equal the path's before and after
     /// the read, so the memo never holds one file's digest under another's
     /// stamp; a file seen changing meanwhile is ENVIRONMENT. This is an
@@ -339,7 +310,8 @@ mod tests {
         let input = run.check_dir("first").unwrap().join("reference.pbf");
         std::fs::hard_link(&artifact, &input).unwrap();
         run.watch(&input).unwrap();
-        assert_ne!(
+        // Watched in place: no private copy is made.
+        assert_eq!(
             std::fs::metadata(&input).unwrap().ino(),
             std::fs::metadata(&artifact).unwrap().ino()
         );
@@ -347,8 +319,9 @@ mod tests {
         std::fs::hard_link(&artifact, &hit).unwrap();
         std::fs::remove_file(&artifact).unwrap();
         run.revalidate().unwrap();
-        // A real change of the private input still fails identity checks.
-        std::fs::write(&input, b"changed").unwrap();
+        // A write through another link of the shared inode still fails
+        // identity checks.
+        std::fs::write(&hit, b"changed").unwrap();
         assert!(matches!(run.revalidate(), Err(Error::Environment(_))));
     }
 

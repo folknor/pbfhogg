@@ -373,8 +373,8 @@ suite because a later comparison cannot make that run complete.
 | `apply-changes` | verifier-owned change model over the OSC scan, `osmium cat` of the OSC and `osmium getid -H` base records; `osmium apply-changes` | predicted version-regression refusals; every identity the OSC touches holds its last change in file order or nothing after a final delete; untouched identities equal to osmium; osmium held to its own precedence model; strict output order; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
-| `diff` | osmium OPL decodings of both inputs, merged | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity |
-| `diff --format osc` | osmium derive-changes and apply-changes | content-only element equality of roundtrips, pbfhogg's OSC applied by both tools, and indexed/unindexed decompressed OSC parity |
+| `diff` | osmium OPL decodings of both inputs, merged | every text record and detail, four summaries/exits, indexed/unindexed and plain/verbose parity, each run's sequential-fallback note as its inputs predict |
+| `diff --format osc` | osmium derive-changes and apply-changes | content-only element equality of roundtrips, pbfhogg's OSC applied by both tools, indexed/unindexed decompressed OSC parity, each derive's sequential-fallback note as its inputs predict |
 | `renumber` | osmium renumber | every object paired at its renumbered ID; every difference is an orphan reference named outside the live range on both sides, one to one |
 
 Apply-changes accepts `--osc-seq` or a fixture `--osc`, and
@@ -756,6 +756,16 @@ reaches only the diff under test. Without the optional sort feature, both
 formats must refuse the input as OLD and as NEW against an osmium-sorted
 copy: exit 2, advice naming the input and no publication or text listing.
 No content comparison runs on that route.
+
+Both formats compare the original pair and the pair stripped of indexdata,
+and the outputs match whichever engine ran, so parity cannot show the
+route. Every diff under test passes `--jobs 2`: pbfhogg prints its
+fallback note only above one worker, and an automatic count is one on a
+one-core host, while the engine is chosen by indexdata alone. Each
+stripped run's stderr must carry the whole line `Note: Using sequential
+comparison: missing indexdata` and each indexed run's must not. This
+confirms the indexdata predicate that selects the engine, not entry into
+the engine; PASS says so. A reworded note fails the stripped runs.
 
 Text diff runs plain and verbose on the original pair and the pair stripped
 of indexdata. Osmium decodes both inputs to OPL with metadata and the

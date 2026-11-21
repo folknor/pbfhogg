@@ -156,6 +156,9 @@ pub(crate) fn derive_changes_to(
         "Streaming diff merge-walks both inputs in id order.",
     )?;
     let both_indexed = old_indexed && new_indexed;
+    // pbfhogg-verify's derive-changes check matches this note's rendered
+    // line exactly to judge each run's route (at a fixed `--jobs 2`); a
+    // reword fails that check closed, so change its matcher with the text.
     if jobs > 1 && !both_indexed {
         let reason = "missing indexdata";
         crate::host::diag!(

@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::argv::PbfArgv;
+use crate::diff_summary;
 use crate::error::Error;
 use crate::harness::{Harness, Role, Verdict};
 use crate::opl_compare::{self, Policy};
@@ -12,11 +13,15 @@ use crate::verify_input_order;
 
 /// `pbfhogg diff --format osc OLD NEW -o OUT`, which writes run scratch on
 /// every path, kept in the check's own directory. pbfhogg takes
-/// `--direct-io` on indexed and unindexed inputs alike.
+/// `--direct-io` on indexed and unindexed inputs alike. A fixed worker count
+/// makes the fallback note mean the same on every host
+/// ([`diff_summary::JOBS`]).
 fn osc_diff(old: &Path, new: &Path, out: &Path, direct_io: bool) -> PbfArgv {
     PbfArgv::new("diff")
         .arg("--format")
         .arg("osc")
+        .arg("--jobs")
+        .arg(diff_summary::JOBS)
         .input(old)
         .input(new)
         .output(out)
@@ -79,6 +84,14 @@ pub fn run(
     // Like a text diff, it exits 1 when the inputs differ - the normal case
     // here - and still writes its OSC; 2 and above are real failures.
     harness.require_codes(&captured, "pbfhogg diff --format osc", &[0, 1])?;
+    // The unindexed rerun below matches this OSC whichever engine either run
+    // took, so each run's route is judged from its own diagnostics.
+    diff_summary::record_fallback_note(
+        harness,
+        "indexed derive",
+        false,
+        diff_summary::fallback_note(&captured.stderr_text()),
+    );
 
     let osmium_osc = outdir.join("osmium.osc.gz");
 
@@ -238,7 +251,7 @@ pub fn run(
     let parity = unindexed_osc_matches(harness, &outdir, pbf, &new_pbf, &pbfhogg_osc, direct_io)?;
     harness.record("unindexed OSC vs indexed OSC", parity);
 
-    Ok(Some("element-content roundtrips against new and osmium, pbfhogg's OSC applied by both tools; indexed/unindexed OSC decompressed bytes identical; metadata, visibility and inline coordinates not judged".into()))
+    Ok(Some("element-content roundtrips against new and osmium, pbfhogg's OSC applied by both tools; indexed/unindexed OSC decompressed bytes identical; the fallback note confirms which engine the indexdata predicate selects, not engine entry; metadata, visibility and inline coordinates not judged".into()))
 }
 
 /// Whether osmium's roundtrip is new plus the old records its derive keeps
@@ -350,6 +363,12 @@ fn unindexed_osc_matches(
         "pbfhogg diff --format osc (unindexed inputs)",
         &[0, 1],
     )?;
+    diff_summary::record_fallback_note(
+        harness,
+        "unindexed derive",
+        true,
+        diff_summary::fallback_note(&captured.stderr_text()),
+    );
 
     harness.msg("=== diff: unindexed OSC vs indexed OSC ===");
     match osc::first_content_difference(&raw_osc, indexed_osc)? {

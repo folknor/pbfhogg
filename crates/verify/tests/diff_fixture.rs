@@ -117,6 +117,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "version",
                 "metadata-only",
                 "coords",
+                "route",
                 "unsorted",
                 "publish",
             ],
@@ -132,6 +133,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "kind-change-extra",
                 "kind-change-altered",
                 "kind-change-pbfhogg",
+                "route",
                 "unsorted",
                 "publish",
             ],
@@ -207,6 +209,21 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
             );
             assert_eq!(judged.error, None);
         }
+        // The note swapped between the pairs, outputs unchanged: each run
+        // fails on its own note and nothing else does.
+        ("text", "route") => {
+            assert_eq!(
+                judged.failed,
+                [
+                    "indexed verbose fallback note present where its inputs predict it absent",
+                    "indexed plain fallback note present where its inputs predict it absent",
+                    "unindexed verbose fallback note absent where its inputs predict it present",
+                    "unindexed plain fallback note absent where its inputs predict it present",
+                ],
+                "{judged:?}"
+            );
+            assert_eq!(judged.error, None);
+        }
         ("renumber", "metadata") => {
             assert!(judged.failed.is_empty(), "{judged:?}");
             assert!(
@@ -239,6 +256,14 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
                     [
                         "diff osmium roundtrip vs new",
                         "diff pbfhogg roundtrip vs osmium roundtrip"
+                    ],
+                    "{judged:?}"
+                ),
+                "route" => assert_eq!(
+                    judged.failed,
+                    [
+                        "indexed derive fallback note present where its inputs predict it absent",
+                        "unindexed derive fallback note absent where its inputs predict it present",
                     ],
                     "{judged:?}"
                 ),
@@ -400,8 +425,21 @@ fn diff_tool(args: &[&str], fault: &str, check: &str) -> i32 {
         assert!(!args.contains(&"--staging-dir"));
         assert!(!args.contains(&"--tmp-dir"));
     }
+    // Every judged run fixes the worker count, so the fallback note means
+    // the same on every host.
+    let jobs = args
+        .iter()
+        .position(|a| *a == "--jobs")
+        .map(|i| args[i + 1]);
+    assert_eq!(jobs, Some("2"), "{args:?}");
     if refuse(args, fault, output) {
         return 2;
+    }
+    // pbfhogg's note on an unindexed pair at more than one worker; the route
+    // fault prints it on the indexed pair instead, outputs unchanged.
+    let raw = args.iter().any(|a| a.contains("unindexed.osm.pbf"));
+    if raw != (fault == "route") {
+        eprintln!("Note: Using sequential comparison: missing indexdata");
     }
     if osc {
         std::fs::write(
@@ -417,7 +455,6 @@ fn diff_tool(args: &[&str], fault: &str, check: &str) -> i32 {
     }
     assert!(args.contains(&"--direct-io"));
     let verbose = args.contains(&"--verbose");
-    let raw = args.iter().any(|a| a.contains("unindexed.osm.pbf"));
     if fault == "summary" {
         eprintln!("Files are identical (1 common elements)");
     } else {

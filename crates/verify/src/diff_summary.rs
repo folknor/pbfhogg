@@ -1,4 +1,56 @@
-//! A strict reader for pbfhogg's diff summary counts.
+//! A strict reader for pbfhogg's diff summary counts, and the fallback note
+//! both diff formats print on stderr.
+
+/// The worker count every judged diff and `diff --format osc` run passes.
+/// pbfhogg prints its sequential-fallback note only when more than one
+/// worker was asked for, and an automatic count resolves to one on a
+/// one-core host, so a fixed count above one makes the note's presence or
+/// absence mean the same on every host. The engine is chosen by indexdata
+/// alone, never by the worker count, so no engine goes unexercised.
+pub(crate) const JOBS: &str = "2";
+
+/// The line pbfhogg prints, at `-j` above one, when an input lacking
+/// indexdata sends a diff or derive to its sequential element stream
+/// (`crates/lib/src/commands/diff/mod.rs` `compare`, `derive.rs`
+/// `derive_changes_to`). Both formats print the same line.
+const FALLBACK_NOTE: &str = "Note: Using sequential comparison: missing indexdata";
+
+/// Whether a run's stderr carries the sequential-fallback note, as a whole
+/// line. This confirms the indexdata predicate that selects the engine, not
+/// entry into the engine itself. A reworded note fails a run that must carry
+/// it rather than passing; a path holding a newline could only add a line.
+pub(crate) fn fallback_note(stderr: &str) -> bool {
+    stderr.lines().any(|l| l == FALLBACK_NOTE)
+}
+
+/// Record whether a run's fallback note is as its inputs predict: present
+/// on a pair stripped of indexdata, absent on an indexed pair. Output
+/// parity between the two pairs holds whichever engine ran, so it cannot
+/// show the stripped run took the fallback or the indexed run did not.
+pub(crate) fn record_fallback_note(
+    harness: &mut crate::harness::Harness,
+    label: &str,
+    stripped: bool,
+    note: bool,
+) {
+    let ok = note == stripped;
+    let say = |present: bool| if present { "present" } else { "absent" };
+    harness.msg(&format!(
+        "  {label}: fallback note {} (expected {}) {}",
+        say(note),
+        say(stripped),
+        if ok { "PASS" } else { "FAIL" }
+    ));
+    harness.record(
+        &format!(
+            "{label} fallback note {} where its inputs predict it {}",
+            say(note),
+            say(stripped)
+        ),
+        crate::harness::Verdict::from_pass(ok),
+    );
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Counts {
     pub created: u64,
@@ -85,6 +137,23 @@ mod tests {
             "",
         ] {
             assert_eq!(parse_pbfhogg_summary(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_note_is_one_exact_line() {
+        assert!(fallback_note(&format!(
+            "{FALLBACK_NOTE}\n1 differences: x\n"
+        )));
+        assert!(fallback_note(&format!("a\n{FALLBACK_NOTE}")));
+        for text in [
+            "",
+            "Note: Using sequential comparison",
+            "Note: Using sequential comparison: missing indexdata (old)",
+            " Note: Using sequential comparison: missing indexdata",
+            "Using sequential comparison: missing indexdata",
+        ] {
+            assert!(!fallback_note(text), "{text}");
         }
     }
 }

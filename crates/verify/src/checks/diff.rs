@@ -8,7 +8,11 @@
 //! by record against osmium's content; the stripped verbose listing must
 //! equal it byte for byte; each plain listing must equal its header lines;
 //! every run's summary must carry the expected class and common counts and
-//! its exit status must say whether anything differs.
+//! its exit status must say whether anything differs. Every run passes a
+//! fixed worker count above one, and the stripped runs' stderr must carry
+//! pbfhogg's sequential-fallback note and the indexed runs' must not
+//! ([`crate::diff_summary::fallback_note`]): the listings match whichever
+//! engine ran, so parity alone cannot show which did.
 //!
 //! The expected listing comes from osmium, never from pbfhogg: osmium decodes
 //! OLD and NEW to OPL with metadata, and the verifier merges the two
@@ -31,7 +35,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::argv::PbfArgv;
-use crate::diff_summary::{Counts, parse_pbfhogg_summary};
+use crate::diff_summary::{
+    Counts, JOBS, fallback_note, parse_pbfhogg_summary, record_fallback_note,
+};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::opl_compare::{self, Policy};
@@ -46,23 +52,28 @@ use crate::tunables::DIFF_SHOWN_MISMATCHES as SHOWN_MISMATCHES;
 
 /// `pbfhogg diff -c OLD NEW [-v]`, a text diff to stdout. It writes no
 /// scratch, and pbfhogg refuses `--tmp-dir` on it. pbfhogg takes
-/// `--direct-io` on indexed and unindexed inputs alike.
+/// `--direct-io` on indexed and unindexed inputs alike. A fixed worker count
+/// makes the fallback note mean the same on every host ([`JOBS`]).
 fn text_diff(old: &Path, new: &Path, verbose: bool, direct_io: bool) -> PbfArgv {
     PbfArgv::new("diff")
         .arg("--suppress-common")
         .arg_if(verbose, "--verbose")
+        .arg("--jobs")
+        .arg(JOBS)
         .input(old)
         .input(new)
         .arg_if(direct_io, "--direct-io")
 }
 
-/// One pbfhogg diff run: where its listing went, its exit code and the
-/// summary its stderr carried.
+/// One pbfhogg diff run: where its listing went, its exit code, the
+/// summary its stderr carried and whether that stderr carried the
+/// sequential-fallback note.
 struct DiffRun {
     label: &'static str,
     listing: PathBuf,
     code: Option<i32>,
     summary: Option<Counts>,
+    fallback_note: bool,
 }
 
 /// Cross-validate `pbfhogg diff` against osmium's reading of the same pair.
@@ -234,6 +245,14 @@ impl DiffRuns {
                 Verdict::from_pass(ok),
             );
         }
+        for (run, stripped) in [
+            (&self.indexed_verbose, false),
+            (&self.indexed_plain, false),
+            (&self.unindexed_verbose, true),
+            (&self.unindexed_plain, true),
+        ] {
+            record_fallback_note(harness, run.label, stripped, run.fallback_note);
+        }
 
         harness.msg("=== listings across modes ===");
         let verbose = &self.indexed_verbose.listing;
@@ -265,9 +284,13 @@ impl DiffRuns {
 }
 
 /// The findings with a claim naming what the judged records did not
-/// exercise and the qualifications the judgement accepted.
+/// exercise, the qualifications the judgement accepted and what the
+/// fallback note does not establish.
 fn with_claim(coverage: &Coverage) -> Option<String> {
-    let mut claim = Vec::new();
+    let mut claim = vec![
+        "the fallback note confirms which engine the indexdata predicate selects, not engine entry"
+            .to_owned(),
+    ];
     let missing = coverage.missing();
     if !missing.is_empty() {
         claim.push(format!("not exercised: {}", missing.join(", ")));
@@ -286,11 +309,7 @@ fn with_claim(coverage: &Coverage) -> Option<String> {
                 .to_owned(),
         );
     }
-    if claim.is_empty() {
-        None
-    } else {
-        Some(claim.join("; "))
-    }
+    Some(claim.join("; "))
 }
 
 /// What the judgement against osmium established.
@@ -403,6 +422,7 @@ fn pbfhogg_diff(
         listing,
         code: captured.code(),
         summary: parse_pbfhogg_summary(&stderr),
+        fallback_note: fallback_note(&stderr),
     })
 }
 

@@ -410,16 +410,6 @@ The comment describes selection without metadata or header checks.
 path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
 keep those checks when batching requests.
 
-## TOOL-043 - verify diff and derive-changes never confirm their route
-
-Reported by: the multi-extract route fix.
-
-`diff` and `derive-changes` emit `Note:` lines on their sequential fallback
-(`diff.sequential_fallback`, `derive_changes.sequential_fallback`), and their
-checks never read stderr for them, so parity passes whichever route ran.
-multi-extract now judges its route from the config run's stderr
-(`checks/multi_extract.rs` `Route`); the same shape would fit here.
-
 ## TOOL-044 - degrade and repack pick the coordinate reference from the header flag
 
 Reported by: the degrade coordinate witness fix.

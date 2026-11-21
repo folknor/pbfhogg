@@ -58,6 +58,27 @@ interleaved `--bench 1`:
 
 -33 % wall. Every decoding inspect mode runs the same scan.
 
+## Inspect --extended: exact timestamp scaling in the census (plantasjen, 2026-11-21, against `53f2888d`)
+
+The census scales each timestamp with `checked_mul` instead of
+`wrapping_mul` and refuses an overflow. Planet `brokkr bench --iterations 1
+file-info --mode extended`, interleaved; baselines `--commit HEAD` at
+`53f2888d`, variants dirty-tree cells of that tree plus the change:
+
+| UUID | Cell | Wall |
+|---|---|---:|
+| `3b139a3b` | variant, first after build | 54.0 s |
+| `d04891db` | baseline, first after worktree build | 49.0 s |
+| `8b9c9925` | variant | 48.8 s |
+| `8551c212` | baseline | 49.1 s |
+| `d2b12f80` | variant | 48.6 s |
+| `6c9c0c05` | baseline | 49.1 s |
+
+Within noise (-0.5 % to -1 % over the two settled pairs; the first variant
+cell ran cold after its build). Phase split identical (22.3 vs 22.4 avg
+cores, same peak anon). It landed. The walls are plantasjen's and not
+comparable with the bygg cells above.
+
 ## inspect --nodes reads through a projection (bygg, 2026-11-02, against `5ec5eefc`)
 
 `inspect --nodes` reads each node blob through a projection on the block

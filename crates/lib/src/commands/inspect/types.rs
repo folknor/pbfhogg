@@ -579,7 +579,8 @@ impl ScanState {
 // `detect_available_metadata` - not field presence and not the claims model
 // that governs printing. Each field is judged on its own value, for plain
 // `Info` and every dense slot alike, whatever the version: version >= 1,
-// timestamp non-zero in milliseconds, changeset and uid positive, a user name
+// timestamp non-zero in milliseconds (scaled exactly: an overflowing scaling
+// refuses the blob, see `project.rs`), changeset and uid positive, a user name
 // that resolves to a non-empty string. Padding (all zeros) and the Osmosis -1
 // sentinel fail every test by value, so neither needs a branch of its own; a
 // -1 slot's real timestamp, uid or user still counts, as in libosmium. A user
@@ -652,54 +653,65 @@ pub(super) fn update_extended_for_element(
     ext: &mut ExtendedStats,
     element: &Element<'_>,
     users: &UserNames,
-) {
+) -> crate::Result<()> {
     ext.metadata.total += 1;
     match *element {
         Element::DenseNode(ref dn) => {
             ext.data_bbox
                 .update(dn.nano_lat_wrapping(), dn.nano_lon_wrapping());
-            update_extended_dense_node(ext, dn, users);
+            update_extended_dense_node(ext, dn, users)
         }
         Element::Node(ref n) => {
             ext.data_bbox
                 .update(n.nano_lat_wrapping(), n.nano_lon_wrapping());
-            update_extended_info(ext, &n.info(), users);
+            update_extended_info(ext, &n.info(), users)
         }
         Element::Way(ref w) => update_extended_info(ext, &w.info(), users),
         Element::Relation(ref r) => update_extended_info(ext, &r.info(), users),
     }
 }
 
+/// The oracle reads timestamps through the exact claims layer: a claim
+/// whose scaling overflows refuses, one not claimed (absent, or a
+/// versionless dense zero) counts as 0, which the census never counts.
 #[cfg(test)]
 fn update_extended_dense_node(
     ext: &mut ExtendedStats,
     dn: &crate::DenseNode<'_>,
     users: &UserNames,
-) {
+) -> crate::Result<()> {
     if let Some(info) = dn.info() {
         let user = users.names(info.raw_user_sid());
+        let millis = info.claimed_milli_timestamp().transpose()?.unwrap_or(0);
         count_metadata(
             ext,
             info.version(),
-            info.milli_timestamp(),
+            millis,
             info.changeset(),
             info.uid(),
             user,
         );
     }
+    Ok(())
 }
 
 #[cfg(test)]
-fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>, users: &UserNames) {
+fn update_extended_info(
+    ext: &mut ExtendedStats,
+    info: &crate::Info<'_>,
+    users: &UserNames,
+) -> crate::Result<()> {
     let user = info.raw_user_sid().is_some_and(|sid| users.names(sid));
+    let millis = info.claimed_milli_timestamp().transpose()?.unwrap_or(0);
     count_metadata(
         ext,
         info.version().unwrap_or(0),
-        info.milli_timestamp().unwrap_or(0),
+        millis,
         info.changeset().unwrap_or(0),
         info.uid().unwrap_or(0),
         user,
     );
+    Ok(())
 }
 
 pub(super) fn count_metadata(
@@ -844,6 +856,7 @@ fn median_elements_for_kind(infos: &[BlockInfo], kind: BlockKind) -> Option<u64>
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod census_tests {
     use super::{ExtendedStats, UserNames, update_extended_for_element};
     use crate::block_builder::{BlockBuilder, Metadata};
@@ -904,7 +917,7 @@ mod census_tests {
                     assert_eq!(info.user().expect("user").expect("resolves"), "");
                 }
             }
-            update_extended_for_element(&mut ext, &element, &users);
+            update_extended_for_element(&mut ext, &element, &users).unwrap();
         }
         assert_eq!(counts(&ext), (2, 1, 1, 1, 1, 1));
         assert_eq!((ext.min_timestamp, ext.max_timestamp), (5000, 5000));
@@ -931,7 +944,7 @@ mod census_tests {
             // own without DenseInfo, so it has no slot at all.
             let Some(info) = dn.info() else {
                 assert_eq!(dn.id(), 2, "only node 2 lacks metadata");
-                update_extended_for_element(&mut ext, &element, &users);
+                update_extended_for_element(&mut ext, &element, &users).unwrap();
                 continue;
             };
             match dn.id() {
@@ -945,7 +958,7 @@ mod census_tests {
                 }
                 _ => {}
             }
-            update_extended_for_element(&mut ext, &element, &users);
+            update_extended_for_element(&mut ext, &element, &users).unwrap();
         }
         assert_eq!(counts(&ext), (3, 1, 1, 1, 1, 1));
         assert_eq!((ext.min_timestamp, ext.max_timestamp), (11_000, 11_000));
@@ -969,7 +982,7 @@ mod census_tests {
             if dn.id() == 2 {
                 dn.set_test_user_sid(i32::MAX);
             }
-            update_extended_for_element(&mut ext, &Element::DenseNode(dn), &users);
+            update_extended_for_element(&mut ext, &Element::DenseNode(dn), &users).unwrap();
         }
         let m = &ext.metadata;
         assert_eq!(m.has_user, 1);

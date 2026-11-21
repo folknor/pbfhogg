@@ -7,14 +7,21 @@
 //! which construction runs with an empty projection), so a blob is refused
 //! here exactly when building its block would refuse it. Each statistic is a function of one validated column or
 //! one validated element, decoded with the readers' own decoders and
-//! arithmetic (wrapping delta sums, `offset + granularity * raw` and
-//! `timestamp * date_granularity` wrapping, the packed iterators' narrowing),
-//! so it is the value the element walk gives. Element order matters only to
+//! arithmetic (wrapping delta sums, `offset + granularity * raw` wrapping,
+//! the packed iterators' narrowing), so it is the value the element walk
+//! gives. One check goes beyond block construction: under `--extended` each
+//! reconstructed timestamp is scaled by `date_granularity` exactly
+//! (`read::claims::scale_milli_timestamp`), and a scaling that overflows
+//! refuses the blob after its validation succeeds, as every other output
+//! that judges a claimed timestamp refuses it. A wrapped product would
+//! drop the timestamp from the coverage (a wrap to 0) or put an arbitrary
+//! date into the range. Element order matters only to
 //! the ID ranges, and the validator hands a group's plain nodes over before
 //! its dense message, so each group keeps the two apart and joins them dense
 //! first, as the element iterator yields them.
 
 use crate::read::block::{BlockBuffer, GroupProjection};
+use crate::read::claims::scale_milli_timestamp;
 use crate::read::wire::{
     BlockFields, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, PackedUint32Iter,
     WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation, WireWay,
@@ -37,7 +44,7 @@ pub(super) fn scan_block_buffer(
     show_locations: bool,
     extended: bool,
 ) -> Result<(ScanState, BlockKind, u64)> {
-    let (projection, accepted) = buffer.project(|fields, st| {
+    let (mut projection, accepted) = buffer.project(|fields, st| {
         let state = ScanState::new(show_id_ranges, show_locations, extended);
         let users = state
             .extended
@@ -50,8 +57,13 @@ pub(super) fn scan_block_buffer(
             users,
             dense_ids: TypeIdRange::new(),
             plain_ids: TypeIdRange::new(),
+            timestamp_error: None,
         }
     })?;
+    // Construction's refusals come first; the census's own refusal after.
+    if let Some(e) = projection.timestamp_error.take() {
+        return Err(e);
+    }
     let scan = *accepted.scan();
     let kinds = scan.kinds;
     let kind = classify_block(
@@ -71,6 +83,10 @@ struct InspectProjection {
     /// The current group's dense and plain node IDs, joined dense first.
     dense_ids: TypeIdRange,
     plain_ids: TypeIdRange,
+    /// The first census timestamp whose millisecond scaling overflowed;
+    /// the projection hooks cannot fail, so the scan returns it after
+    /// validation.
+    timestamp_error: Option<crate::Error>,
 }
 
 impl InspectProjection {
@@ -104,17 +120,29 @@ impl InspectProjection {
         };
         ext.metadata.total += 1;
         let date_granularity = i64::from(self.fields.date_granularity);
-        let (version, millis, changeset, uid, user) = info.map_or((0, 0, 0, 0, false), |i| {
-            (
-                i.version.unwrap_or(0),
-                i.timestamp
-                    .map_or(0, |ts| ts.wrapping_mul(date_granularity)),
-                i.changeset.unwrap_or(0),
-                i.uid.unwrap_or(0),
-                i.user_sid.is_some_and(|sid| users.names(sid)),
-            )
-        });
-        count_metadata(ext, version, millis, changeset, uid, user);
+        let Some(i) = info else {
+            count_metadata(ext, 0, 0, 0, 0, false);
+            return;
+        };
+        let millis = match i
+            .timestamp
+            .map(|ts| scale_milli_timestamp(ts, date_granularity))
+        {
+            None => 0,
+            Some(Ok(ms)) => ms,
+            Some(Err(e)) => {
+                self.timestamp_error.get_or_insert(e);
+                0
+            }
+        };
+        count_metadata(
+            ext,
+            i.version.unwrap_or(0),
+            millis,
+            i.changeset.unwrap_or(0),
+            i.uid.unwrap_or(0),
+            i.user_sid.is_some_and(|sid| users.names(sid)),
+        );
     }
 
     /// The dense nodes' tagged count: a node is tagged when the first pair
@@ -170,9 +198,17 @@ impl InspectProjection {
         }
         let date_granularity = i64::from(self.fields.date_granularity);
         let mut timestamp: i64 = 0;
+        // The delta sum wraps, as every reader reconstructs it (the writer
+        // encodes with `wrapping_sub`); only the scaling of each
+        // reconstructed value is checked.
         for delta in PackedSint64Iter::new(info.timestamp_data).take(ids) {
             timestamp = timestamp.wrapping_add(delta);
-            let millis = timestamp.wrapping_mul(date_granularity);
+            let Some(millis) = timestamp.checked_mul(date_granularity) else {
+                if self.timestamp_error.is_none() {
+                    self.timestamp_error = scale_milli_timestamp(timestamp, date_granularity).err();
+                }
+                continue;
+            };
             if millis != 0 {
                 ext.metadata.has_timestamp += 1;
                 ext.update_timestamp(millis);
@@ -369,10 +405,11 @@ mod tests {
     }
 
     /// The projection scan's answer for `bytes` against building the block
-    /// and walking its elements: the same refusal message, or the same
-    /// statistics in every mode.
+    /// and walking its elements (whose census refuses an overflowing
+    /// timestamp scaling, under `--extended` only): the same refusal
+    /// message, or the same statistics in every mode.
     fn assert_same(bytes: &[u8], what: &str) {
-        let oracle = PrimitiveBlock::from_vec(bytes.to_vec());
+        let block = PrimitiveBlock::from_vec(bytes.to_vec());
         for (ids, locs, ext) in [
             (false, false, false),
             (true, false, false),
@@ -381,11 +418,18 @@ mod tests {
         ] {
             let (mut st, mut gr) = (Vec::new(), Vec::new());
             let scanned = scan_block_bytes(bytes, &mut st, &mut gr, ids, locs, ext);
-            match (&oracle, scanned) {
-                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{what}"),
-                (Ok(block), Ok(((state, kind, elements), _))) => {
-                    let mut expected = ScanState::new(ids, locs, ext);
-                    let (ekind, eelements) = scan_block(block, &mut expected);
+            let mut expected = ScanState::new(ids, locs, ext);
+            // Construction's refusal, else the walk's census refusal.
+            let oracle: Result<(BlockKind, u64), String> = match &block {
+                Ok(b) => match scan_block(b, &mut expected) {
+                    Ok(walked) => Ok(walked),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            match (oracle, scanned) {
+                (Err(a), Err(b)) => assert_eq!(a, b.to_string(), "{what}"),
+                (Ok((ekind, eelements)), Ok(((state, kind, elements), _))) => {
                     assert_eq!(
                         fingerprint(&state, kind, elements),
                         fingerprint(&expected, ekind, eelements),
@@ -562,6 +606,80 @@ mod tests {
         }
     }
 
+    /// The extended census scan of `bytes`: its refusal message, or its
+    /// timestamp coverage and range.
+    fn census(bytes: &[u8]) -> Result<(u64, i64, i64), String> {
+        let (mut st, mut gr) = (Vec::new(), Vec::new());
+        match scan_block_bytes(bytes, &mut st, &mut gr, false, false, true) {
+            Ok(((state, _, _), ())) => {
+                let e = state.extended.unwrap();
+                Ok((e.metadata.has_timestamp, e.min_timestamp, e.max_timestamp))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// A timestamp whose millisecond scaling overflows refuses the census,
+    /// plain or dense, including a versionless dense slot whose wrapped
+    /// product is exactly 0 (raw 2^61 at granularity 1000), which the
+    /// wrapping census silently left out of the coverage. Without
+    /// `--extended` nothing reads the timestamp and the blob is accepted.
+    #[test]
+    fn overflowing_timestamp_scaling_refuses_the_census() {
+        let plain = block(
+            &["", "alice"],
+            &[(
+                vec![plain_node(
+                    1,
+                    0,
+                    0,
+                    &[],
+                    Some([1, i64::MAX / 1000 + 1, 1, 1, 1]),
+                )],
+                None,
+            )],
+        );
+        let mut builder = BlockBuilder::new();
+        for (id, version, timestamp) in [(1_i64, 0, 1_i64 << 61), (2, 1, 5)] {
+            let meta = Metadata {
+                version,
+                timestamp,
+                changeset: 1,
+                uid: 1,
+                user: "alice",
+                visible: true,
+            };
+            builder.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), Some(&meta));
+        }
+        let dense = builder.take().unwrap().unwrap().to_vec();
+        for (what, bytes) in [("plain", plain), ("dense versionless wrap to 0", dense)] {
+            let refusal = census(&bytes).expect_err(what);
+            assert!(
+                refusal.contains("overflows i64 milliseconds"),
+                "{what}: {refusal}"
+            );
+            let (mut st, mut gr) = (Vec::new(), Vec::new());
+            assert!(scan_block_bytes(&bytes, &mut st, &mut gr, true, true, false).is_ok());
+            assert_same(&bytes, what);
+        }
+    }
+
+    /// The largest representable product is a timestamp like any other:
+    /// raw `i64::MAX` at `date_granularity` 1 is counted and is the range.
+    #[test]
+    fn largest_exact_timestamp_is_counted() {
+        let mut bytes = block(
+            &["", "alice"],
+            &[(
+                vec![plain_node(1, 0, 0, &[], Some([1, i64::MAX, 1, 1, 1]))],
+                None,
+            )],
+        );
+        crate::read::wire_fixtures::field_varint(&mut bytes, 18, 1);
+        assert_eq!(census(&bytes), Ok((1, i64::MAX, i64::MAX)));
+        assert_same(&bytes, "i64::MAX at granularity 1");
+    }
+
     /// Successive blobs joined by `ScanState::append` give one serial
     /// scan's ID ranges, the projection's boundaries included.
     #[test]
@@ -573,7 +691,7 @@ mod tests {
             let ((part, _, _), _) =
                 scan_block_bytes(&bytes, &mut st, &mut gr, true, false, false).unwrap();
             joined.append(part);
-            scan_block(&PrimitiveBlock::from_vec(bytes).unwrap(), &mut serial);
+            scan_block(&PrimitiveBlock::from_vec(bytes).unwrap(), &mut serial).unwrap();
         }
         assert_eq!(
             fingerprint(&joined, BlockKind::Nodes, 0),

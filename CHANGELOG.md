@@ -558,7 +558,9 @@
   comparison, or exactly 0, which on a versionless dense node read as
   padding. Each now refuses it as invalid data naming the element, as
   `diff --format osc` already did; `inspect --show` prints
-  `timestamp: <invalid>`. time-filter now judges timestamps in whole
+  `timestamp: <invalid>`. `inspect --extended` refuses the blob holding
+  one, where its metadata coverage used to drop the timestamp or its
+  timestamp range to show an arbitrary date. time-filter now judges timestamps in whole
   seconds rounded down, so a pre-1970 sub-second timestamp belongs to the
   second before it rather than the one after. Re-encoding commands copy a
   timestamp at the default `date_granularity` verbatim, so such a value

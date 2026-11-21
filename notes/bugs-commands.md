@@ -133,20 +133,6 @@ rewriters disagree on one input shape. Pick one rule (refuse a `changesets`
 field in any data blob, or keep unknown fields everywhere) and apply it to
 all three.
 
-## CMD-059 - inspect --extended census reads wrapped timestamps
-
-Reported by: the timestamp-claim scaling fix (spar review).
-
-The metadata census in `inspect/project.rs` (plain and dense projections)
-scales raw timestamps with `wrapping_mul` and then applies its
-`millis != 0` availability test and timestamp range to the result. It does
-not go through the exact claim readings (`claimed_milli_timestamp`) the
-other metadata outputs now share, and it has its own documented availability
-rule, so it was left alone. An overflowing scaling that wraps to 0 silently
-drops a timestamp from the coverage counts; one that wraps to a non-zero
-value poisons the reported timestamp range with an arbitrary date. Refuse,
-or count it as a separate invalid class, rather than wrap.
-
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 
 Reported by: extract (flagged as a surprising policy, not counted as a defect).

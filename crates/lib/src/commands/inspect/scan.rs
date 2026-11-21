@@ -529,7 +529,7 @@ impl crate::read::pipeline::DecodeTransform for SummarizeBlob {
 pub(super) fn scan_block(
     block: &crate::block::PrimitiveBlock,
     state: &mut ScanState,
-) -> (BlockKind, u64) {
+) -> crate::Result<(BlockKind, u64)> {
     let mut has_nodes = false;
     let mut has_ways = false;
     let mut has_relations = false;
@@ -545,7 +545,7 @@ pub(super) fn scan_block(
             has_ways |= w;
             has_relations |= r;
             if let Some(ref mut ext) = state.extended {
-                update_extended_for_element(ext, &element, &users);
+                update_extended_for_element(ext, &element, &users)?;
             }
         }
     } else {
@@ -558,8 +558,8 @@ pub(super) fn scan_block(
         }
     }
 
-    (
+    Ok((
         classify_block(has_nodes, has_ways, has_relations),
         block_elements,
-    )
+    ))
 }

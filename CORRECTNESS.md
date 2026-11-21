@@ -201,6 +201,11 @@ no uid or user here, although the printing outputs above show them. The Osmosis
 `-1` slot is not skipped: its version fails the test by value, and a real
 timestamp, changeset, uid or user it carries still counts, as in libosmium.
 The data timestamp range is fed by every non-zero timestamp the census counts.
+Each timestamp is scaled to milliseconds exactly: one whose scaling by the
+block's `date_granularity` overflows `i64` refuses the blob, as every output
+judging a claimed timestamp refuses it, rather than wrapping to 0 (left out
+of the coverage) or to an arbitrary date in the range. Dense delta sums still
+wrap, as every reader reconstructs them; only the scaling is checked.
 
 Boundaries against `fileinfo`, all deliberate:
 

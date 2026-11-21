@@ -791,6 +791,113 @@ fn sort_preserves_historical_information_feature() {
     );
 }
 
+/// Write an unclaimed, unindexed file of way blobs, each a list of
+/// `(id, version, name)` records in stored order; `name` tells apart records
+/// of one ID and version.
+fn write_way_history_blobs(path: &Path, blobs: &[&[(i64, i32, &str)]]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = HeaderBuilder::new()
+        .historical()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for blob in blobs {
+        for &(id, version, name) in *blob {
+            bb.add_way(
+                id,
+                [("name", name)],
+                &[1, 2],
+                Some(&Metadata {
+                    version,
+                    timestamp: 1_700_000_000,
+                    changeset: 1,
+                    uid: 1,
+                    user: "u",
+                    visible: true,
+                }),
+            );
+        }
+        let bytes = bb.take().expect("take").expect("a nonempty blob");
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// `(id, version, name)` of every way of `path`, in file order.
+fn ways_in_file_order(path: &Path) -> Vec<(i64, Option<i32>, String)> {
+    crate::common::read_in_file_order(path)
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::common::NormalizedElement::Way(w) => Some((
+                w.id,
+                w.meta.as_ref().and_then(|m| m.version),
+                w.tag("name").unwrap_or_default().to_owned(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run sort on `blobs`, returning the output's ways and the run's stderr.
+fn sort_way_history(blobs: &[&[(i64, i32, &str)]]) -> (Vec<(i64, Option<i32>, String)>, String) {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("history.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+    write_way_history_blobs(&input, blobs);
+    assert_non_indexed(&input);
+    let run = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .assert_success();
+    (ways_in_file_order(&output), run.stderr_str())
+}
+
+/// Sort orders the records of one ID by ascending version, as osmium sort
+/// does, whether the records share an isolated blob or sit in overlapping
+/// ones: the answer does not depend on blob layout. Records of one ID and
+/// version keep their stored order (file, then position) on both routes.
+/// A blob whose versions already ascend still passes through.
+#[test]
+fn sort_orders_versions_of_one_id_whatever_the_blob_layout() {
+    let ordered = vec![
+        (7, Some(1), "b".to_owned()),
+        (7, Some(1), "c".to_owned()),
+        (7, Some(2), "a".to_owned()),
+    ];
+
+    let (isolated, stderr) = sort_way_history(&[&[(7, 2, "a"), (7, 1, "b"), (7, 1, "c")]]);
+    assert_eq!(
+        isolated, ordered,
+        "an isolated blob is rewritten in version order"
+    );
+    assert!(
+        stderr.contains("internally unsorted"),
+        "a descending version routes the blob to rewrite: {stderr}"
+    );
+
+    let (overlapping, _) = sort_way_history(&[&[(7, 2, "a")], &[(7, 1, "b"), (7, 1, "c")]]);
+    assert_eq!(
+        overlapping, ordered,
+        "overlapping blobs merge in version order"
+    );
+
+    let (ascending, stderr) = sort_way_history(&[&[(7, 1, "b"), (7, 1, "c"), (7, 2, "a")]]);
+    assert_eq!(ascending, ordered);
+    assert!(
+        !stderr.contains("internally unsorted"),
+        "a blob whose versions ascend passes through: {stderr}"
+    );
+}
+
 /// A non-indexed blob that is internally unsorted but whose ID range does
 /// not overlap its neighbours must be repaired, not passed through.
 ///

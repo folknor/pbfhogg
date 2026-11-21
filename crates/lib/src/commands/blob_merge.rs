@@ -34,8 +34,8 @@ use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
 use crate::blob_meta::{
-    BboxClaim, BlobIndex, TagIndex, try_scan_block_ids_and_tags, try_scan_block_ids_checked,
-    try_scan_block_tags,
+    BboxClaim, BlobIndex, IdOrder, TagIndex, try_scan_block_ids_and_tags,
+    try_scan_block_ids_checked, try_scan_block_tags, versions_ascend,
 };
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
@@ -157,6 +157,20 @@ pub(crate) struct IndexPolicy {
     /// refused as unsorted, which a plain sort under the file's sorted claim
     /// would copy unchanged.
     pub(crate) distrust_metadata: bool,
+    /// Rewrite a scanned blob whose versions of one ID descend, so its
+    /// output is in (type, ID, version) order whether or not the blob
+    /// overlaps another (`sort`, as osmium sort orders). `cat --dedupe`
+    /// leaves it off: it passes a lone ID-monotone blob through as stored.
+    /// Read only for a blob with a repeated ID
+    /// (`blob_meta::versions_ascend`), so input without one pays nothing.
+    pub(crate) order_versions: bool,
+}
+
+/// The per-blob part of an [`IndexPolicy`], carried to the scan workers.
+#[derive(Clone, Copy)]
+struct ScanRules {
+    distrust: bool,
+    order_versions: bool,
 }
 
 /// Pass 1: walk every input, in order, and index its OSMData blobs.
@@ -321,7 +335,10 @@ fn index_over<P: PayloadRead>(
             Ok(work(
                 scratch,
                 task,
-                policy.distrust_metadata,
+                ScanRules {
+                    distrust: policy.distrust_metadata,
+                    order_versions: policy.order_versions,
+                },
                 cancel,
                 recorder,
             ))
@@ -621,7 +638,7 @@ struct Scratch {
 fn work(
     scratch: &mut Scratch,
     task: Task,
-    distrust: bool,
+    rules: ScanRules,
     cancel: &crate::host::Invocation,
     recorder: &crate::host::Recorder,
 ) -> Done {
@@ -647,7 +664,7 @@ fn work(
             payload,
             claimed,
             carried_tags.as_deref(),
-            distrust,
+            rules,
             cancel,
             recorder,
         )
@@ -679,7 +696,7 @@ fn scan_blob(
     payload: Payload,
     claimed: Option<BlobIndex>,
     carried_tags: Option<&[u8]>,
-    distrust: bool,
+    rules: ScanRules,
     cancel: &crate::host::Invocation,
     recorder: &crate::host::Recorder,
 ) -> Result<Outcome> {
@@ -697,8 +714,7 @@ fn scan_blob(
             read.and_then(|data| decompress_blob_data_into(&data, &mut scratch.decompress_buf))
         }
     };
-    let outcome =
-        decompressed.and_then(|()| decide(scratch, claimed, carried_tags, distrust, cancel));
+    let outcome = decompressed.and_then(|()| decide(scratch, claimed, carried_tags, rules, cancel));
     crate::blob::release_decode_outlier(&mut scratch.decompress_buf, recorder);
     outcome
 }
@@ -709,18 +725,28 @@ fn decide(
     scratch: &mut Scratch,
     claimed: Option<BlobIndex>,
     carried_tags: Option<&[u8]>,
-    distrust: bool,
+    rules: ScanRules,
     cancel: &crate::host::Invocation,
 ) -> Result<Outcome> {
+    let distrust = rules.distrust;
     let with_tags = claimed.is_none() || distrust;
     let (index, tags) = if with_tags {
         try_scan_block_ids_and_tags(&scratch.decompress_buf)?
     } else {
         (try_scan_block_ids_checked(&scratch.decompress_buf)?, None)
     };
-    let Some((index, sorted)) = index else {
+    let Some((index, order)) = index else {
         return kind_indexes(std::mem::take(&mut scratch.decompress_buf), cancel)
             .map(Outcome::Kinds);
+    };
+    // Sorted as a passthrough copies it: IDs monotone, and under
+    // `order_versions` the versions of a repeated ID too, which the sweep
+    // would order (`sweep::emit_group`), so the answer never depends on
+    // whether the blob overlaps another.
+    let sorted = match order {
+        IdOrder::Ascending => true,
+        IdOrder::Descends => false,
+        IdOrder::Repeated => !rules.order_versions || versions_ascend(&scratch.decompress_buf),
     };
     let tagdata = tags.as_ref().and_then(serialize_tags);
     let tags_hold = !distrust || carried_tags_hold(carried_tags, tagdata.as_deref());

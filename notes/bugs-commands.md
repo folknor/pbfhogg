@@ -133,24 +133,6 @@ rewriters disagree on one input shape. Pick one rule (refuse a `changesets`
 field in any data blob, or keep unknown fields everywhere) and apply it to
 all three.
 
-## CMD-019 - sort orders history versions only when blob layout forces a rewrite
-
-Reported by: sort-renumber [P2].
-
-`sort/mod.rs` and the parity table claim equivalence with osmium sort, and the
-vendored `osmium-sort.md` orders equal IDs by ascending version. Take one
-isolated history blob holding `way 7/version 2` then `way 7/version 1`, under
-a header without the sorted claim. Pass 1 compares only IDs
-(`blob_meta/scan.rs`), finds no descent and leaves the blob eligible for
-passthrough, so sort succeeds with the versions still descending.
-`--distrust-metadata` does not fix this. If the records sit in overlapping
-blobs, or an unrelated ID inversion forces a rewrite, the sweep
-(`blob_merge.rs`, `blob_merge/sweep.rs`) emits version 1 before version 2. The
-result depends on blob boundaries and unrelated disorder, because
-classification uses a weaker ordering than the rewrite path. The statement in
-`reference/indexdata-trust.md` that sort does not reorder versions is also
-wrong, since it sometimes does.
-
 ## CMD-057 - time-filter compares a wrapped dense timestamp against the cutoff
 
 Reported by: the time-filter padding-slot fix (spar review).

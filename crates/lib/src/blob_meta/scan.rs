@@ -59,25 +59,146 @@ use protohoggr::Cursor;
 use super::{BlobBbox, BlobIndex, ElementKind, TagIndex};
 use crate::error::{Result, new_stringtable_index_out_of_bounds, new_wire_error};
 use crate::read::wire::{
-    WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireRelation, WireWay, read_int32,
+    WIRE_LEN, WIRE_VARINT, WireDenseInfo, WireDenseNodes, WireInfo, WireNode, WireRelation,
+    WireWay, read_int32,
 };
 
-/// Scan a PrimitiveBlock for its [`BlobIndex`] and whether its elements are
-/// internally sorted in canonical OSM ID order.
-///
-/// The flag is `true` iff every element, in wire order across all groups, is
-/// `>=` its predecessor under `osm_id_cmp`. This is what a blob-level
-/// permutation sort's passthrough fast path implicitly assumes; `sort` uses it
-/// to route an internally unsorted blob into decode + re-encode.
+/// The order of a block's element IDs, in wire order across all groups,
+/// under `osm_id_cmp`. IDs only: versions are not read by the walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdOrder {
+    /// Every ID above its predecessor.
+    Ascending,
+    /// No ID below its predecessor, and at least one equal to it: the
+    /// block holds several records of one object (a history file, or
+    /// duplicates), whose versions the walk has not looked at. Only an
+    /// ID-monotone block reports this; a descent anywhere is [`Descends`].
+    ///
+    /// [`Descends`]: IdOrder::Descends
+    Repeated,
+    /// Some ID below its predecessor.
+    Descends,
+}
+
+/// Scan a PrimitiveBlock for its [`BlobIndex`] and the [`IdOrder`] of its
+/// elements. `sort` routes a [`IdOrder::Descends`] blob into decode +
+/// re-encode, and a [`IdOrder::Repeated`] one too when
+/// [`versions_ascend`] fails on it; `cat --dedupe` routes only the first.
 ///
 /// See the module docs for what `Err` and `Ok(None)` mean.
 #[hotpath::measure]
-pub(crate) fn try_scan_block_ids_checked(raw: &[u8]) -> Result<Option<(BlobIndex, bool)>> {
+pub(crate) fn try_scan_block_ids_checked(raw: &[u8]) -> Result<Option<(BlobIndex, IdOrder)>> {
     Ok(Walk::run(raw, false)?.index())
 }
 
-/// The index with its sortedness flag, and the tag key set, of one block.
-pub(crate) type BlockScan = (Option<(BlobIndex, bool)>, Option<TagIndex>);
+/// The index with its ID order, and the tag key set, of one block.
+pub(crate) type BlockScan = (Option<(BlobIndex, IdOrder)>, Option<TagIndex>);
+
+/// Whether, in a block whose IDs are monotone ([`IdOrder::Repeated`]),
+/// every record of one ID carries a version at or above its predecessor's:
+/// the block is then in `sort`'s canonical (type, ID, version) order and
+/// passes through as the sweep would have written it, records of one
+/// (ID, version) keeping their stored order there as here.
+///
+/// Versions are read as the sweep keys them: an absent `Info`, an absent
+/// version and the `-1` sentinel are 0, a dense slot without a version
+/// column or with `-1` is 0, and any other value compares signed.
+///
+/// `false` is also the answer for anything this walk cannot read exactly -
+/// an `Info` that does not parse, a dense version column that is present but
+/// not one value per ID, a malformed varint - so such a block is routed to the
+/// rewrite, whose decoder refuses or reads it, and never passes on a prefix.
+/// `true` attests version order only; the other metadata columns are unread.
+///
+/// Cold: run only for a block with a repeated ID, so input without one never
+/// pays it.
+#[cold]
+pub(crate) fn versions_ascend(raw: &[u8]) -> bool {
+    versions_walk(raw).unwrap_or(false)
+}
+
+fn versions_walk(raw: &[u8]) -> Result<bool> {
+    let mut groups: Vec<&[u8]> = Vec::new();
+    let mut cur = Cursor::new(raw);
+    while let Some((field, wire_type)) = cur.read_tag()? {
+        if (field, wire_type) == (2, WIRE_LEN) {
+            groups.push(cur.read_len_delimited()?);
+        } else {
+            cur.skip_field(wire_type)?;
+        }
+    }
+    let mut prev: Option<(i64, i32)> = None;
+    let mut ascend = |id: i64, version: i32| -> bool {
+        let holds = prev.is_none_or(|(pid, pv)| pid != id || version >= pv);
+        prev = Some((id, version));
+        holds
+    };
+    let plain = |info: Option<&[u8]>| -> Result<i32> {
+        Ok(match info {
+            Some(data) => WireInfo::parse(data)?.version.unwrap_or(0),
+            None => 0,
+        })
+    };
+    for group in groups {
+        let mut cur = Cursor::new(group);
+        while let Some((field, wire_type)) = cur.read_tag()? {
+            let holds = match (field, wire_type) {
+                (1, WIRE_LEN) => {
+                    let node = WireNode::parse(cur.read_len_delimited()?)?;
+                    ascend(node.id, plain(node.info_data)?)
+                }
+                (3, WIRE_LEN) => {
+                    let way = WireWay::parse(cur.read_len_delimited()?)?;
+                    ascend(way.id, plain(way.info_data)?)
+                }
+                (4, WIRE_LEN) => {
+                    let rel = WireRelation::parse(cur.read_len_delimited()?)?;
+                    ascend(rel.id, plain(rel.info_data)?)
+                }
+                (2, WIRE_LEN) => {
+                    let dense = WireDenseNodes::parse(cur.read_len_delimited()?)?;
+                    let versions = match dense.info_data {
+                        Some(data) => WireDenseInfo::parse(data)?.version_data,
+                        None => &[],
+                    };
+                    let mut ids = Cursor::new(dense.id_data);
+                    let mut vs = Cursor::new(versions);
+                    let mut id: i64 = 0;
+                    let mut holds = true;
+                    while !ids.is_empty() {
+                        id = id.wrapping_add(ids.read_sint64()?);
+                        let version = if versions.is_empty() {
+                            0
+                        } else if vs.is_empty() {
+                            return Ok(false);
+                        } else {
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "protobuf int32: a negative value is sign-extended \
+                                          to 64 bits, and narrowing is how the decoder reads it"
+                            )]
+                            let v = vs.read_varint()? as i32;
+                            if v == -1 { 0 } else { v }
+                        };
+                        holds &= ascend(id, version);
+                    }
+                    if !vs.is_empty() {
+                        return Ok(false);
+                    }
+                    holds
+                }
+                _ => {
+                    cur.skip_field(wire_type)?;
+                    true
+                }
+            };
+            if !holds {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
 
 /// Both scans from one walk: the [`BlobIndex`] with its sortedness flag, and
 /// the tag key set. Equal to calling [`try_scan_block_ids_checked`] and
@@ -131,7 +252,7 @@ struct Walk<'a> {
     min_id: i64,
     max_id: i64,
     prev_id: Option<i64>,
-    sorted: bool,
+    order: IdOrder,
 
     /// `None` until the first node.
     extent: Option<RawExtent>,
@@ -163,7 +284,7 @@ impl<'a> Walk<'a> {
             min_id: i64::MAX,
             max_id: i64::MIN,
             prev_id: None,
-            sorted: true,
+            order: IdOrder::Ascending,
             extent: None,
             key_seen: Vec::new(),
             max_tag_sid: None,
@@ -293,10 +414,15 @@ impl<'a> Walk<'a> {
             Some(k) if k != kind => self.kinds_differ = true,
             Some(_) => {}
         }
-        if let Some(prev) = self.prev_id
-            && crate::osm_id::osm_id_cmp(id, prev).is_lt()
-        {
-            self.sorted = false;
+        if let Some(prev) = self.prev_id {
+            match crate::osm_id::osm_id_cmp(id, prev) {
+                std::cmp::Ordering::Less => self.order = IdOrder::Descends,
+                // A descent stays a descent whatever follows it.
+                std::cmp::Ordering::Equal if self.order == IdOrder::Ascending => {
+                    self.order = IdOrder::Repeated;
+                }
+                _ => {}
+            }
         }
         self.prev_id = Some(id);
         self.min_id = self.min_id.min(id);
@@ -359,9 +485,9 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// The blob's index and sortedness flag, or `None` when no single index
+    /// The blob's index and ID order, or `None` when no single index
     /// describes it.
-    fn index(&self) -> Option<(BlobIndex, bool)> {
+    fn index(&self) -> Option<(BlobIndex, IdOrder)> {
         if self.unsupported_group || self.kinds_differ {
             return None;
         }
@@ -374,7 +500,7 @@ impl<'a> Walk<'a> {
                 count: self.count,
                 bbox: self.bbox(kind),
             },
-            self.sorted,
+            self.order,
         ))
     }
 
@@ -705,7 +831,11 @@ mod tests {
         let b = dense_group_body(&[3, 4]);
         let block = block_from_groups(&[&a, &b]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(sorted, "two ascending same-kind groups must be sorted");
+        assert_eq!(
+            sorted,
+            IdOrder::Ascending,
+            "two ascending same-kind groups must be sorted"
+        );
         assert_eq!(index.kind, ElementKind::Node);
         assert_eq!(index.min_id, 1);
         assert_eq!(index.max_id, 4);
@@ -721,7 +851,7 @@ mod tests {
         let block = block_from_groups(&[&a, &b]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(
-            !sorted,
+            sorted == IdOrder::Descends,
             "an inversion across two same-kind groups must be detected"
         );
         assert_eq!(index.min_id, 10);
@@ -735,7 +865,7 @@ mod tests {
         let block = block_from_groups(&[&g]);
         let (_, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(
-            !sorted,
+            sorted == IdOrder::Descends,
             "a within-group DenseNodes inversion must be detected"
         );
     }
@@ -746,7 +876,11 @@ mod tests {
         let g = dense_group_body(&[-1, -2, -3]);
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(sorted, "canonical -1,-2,-3 order must not be flagged");
+        assert_eq!(
+            sorted,
+            IdOrder::Ascending,
+            "canonical -1,-2,-3 order must not be flagged"
+        );
         assert_eq!(index.min_id, -3);
         assert_eq!(index.max_id, -1);
         assert_eq!(index.count, 3);
@@ -757,7 +891,10 @@ mod tests {
         let g = dense_group_body(&[-2, -1, -3]);
         let block = block_from_groups(&[&g]);
         let (_, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(!sorted, "a negative-ID inversion must be detected");
+        assert!(
+            sorted == IdOrder::Descends,
+            "a negative-ID inversion must be detected"
+        );
     }
 
     #[test]
@@ -767,7 +904,7 @@ mod tests {
         let block = block_from_groups(&[&a, &b]);
         let (_, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(
-            !sorted,
+            sorted == IdOrder::Descends,
             "a negative cross-group seam inversion must be detected"
         );
     }
@@ -779,7 +916,7 @@ mod tests {
         let g = repeated_group_body(3, &[1, 2, 3]);
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(sorted);
+        assert_eq!(sorted, IdOrder::Ascending);
         assert_eq!(index.kind, ElementKind::Way);
         assert_eq!((index.min_id, index.max_id, index.count), (1, 3, 3));
         assert!(index.bbox.is_none(), "ways carry no bbox");
@@ -790,7 +927,7 @@ mod tests {
         let g = repeated_group_body(3, &[1, 3, 2]);
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(!sorted);
+        assert!(sorted == IdOrder::Descends);
         assert_eq!(index.kind, ElementKind::Way);
     }
 
@@ -799,7 +936,7 @@ mod tests {
         let g = repeated_group_body(4, &[5, 4]);
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(!sorted);
+        assert!(sorted == IdOrder::Descends);
         assert_eq!(index.kind, ElementKind::Relation);
     }
 
@@ -808,8 +945,101 @@ mod tests {
         let g = node_group_body(&[2, 1]);
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
-        assert!(!sorted);
+        assert!(sorted == IdOrder::Descends);
         assert_eq!(index.kind, ElementKind::Node);
+    }
+
+    // --- Repeated IDs and their versions --------------------------------
+
+    /// A Way message with `Info { version }`, or no `Info` for `None`.
+    fn way_with_version(id: i64, version: Option<i32>) -> Vec<u8> {
+        let mut msg = element_msg(id, &[], &[]);
+        if let Some(v) = version {
+            let mut info = Vec::new();
+            write_tag(1, 0, &mut info);
+            encode_varint(i64::from(v) as u64, &mut info);
+            write_len_delimited(4, &info, &mut msg);
+        }
+        msg
+    }
+
+    fn ways_block(records: &[(i64, Option<i32>)]) -> Vec<u8> {
+        let mut g = Vec::new();
+        for &(id, v) in records {
+            write_len_delimited(3, &way_with_version(id, v), &mut g);
+        }
+        block_from_groups(&[&g])
+    }
+
+    /// A dense group whose `DenseInfo` carries exactly `versions` (packed,
+    /// not delta coded), or no `DenseInfo` for `None`.
+    fn dense_versions_block(ids: &[i64], versions: Option<&[i32]>) -> Vec<u8> {
+        let coords: Vec<(i64, i64)> = ids.iter().map(|&i| (i, i)).collect();
+        let mut dense = dense_msg(ids, &coords, &[]);
+        if let Some(vs) = versions {
+            let packed: Vec<u64> = vs.iter().map(|&v| i64::from(v) as u64).collect();
+            let mut info = Vec::new();
+            write_len_delimited(1, &packed_uint(&packed), &mut info);
+            write_len_delimited(5, &info, &mut dense);
+        }
+        let mut g = Vec::new();
+        write_len_delimited(2, &dense, &mut g);
+        block_from_groups(&[&g])
+    }
+
+    #[test]
+    fn an_equal_id_is_repeated_and_a_descent_stays_a_descent() {
+        let (_, order) = scan_block_ids_checked(&ways_block(&[(7, None), (7, None)])).unwrap();
+        assert_eq!(order, IdOrder::Repeated);
+        let (_, order) =
+            scan_block_ids_checked(&ways_block(&[(8, None), (7, None), (7, None)])).unwrap();
+        assert_eq!(order, IdOrder::Descends);
+    }
+
+    #[test]
+    fn plain_versions_must_not_descend_within_an_id() {
+        assert!(!versions_ascend(&ways_block(&[(7, Some(2)), (7, Some(1))])));
+        assert!(versions_ascend(&ways_block(&[
+            (7, Some(1)),
+            (7, Some(2)),
+            (8, Some(1))
+        ])));
+        // Equal versions keep their stored order on both routes.
+        assert!(versions_ascend(&ways_block(&[(7, Some(2)), (7, Some(2))])));
+        // Absent Info and the -1 sentinel are 0, as the sweep keys them.
+        assert!(versions_ascend(&ways_block(&[(7, None), (7, Some(1))])));
+        assert!(!versions_ascend(&ways_block(&[
+            (7, Some(1)),
+            (7, Some(-1))
+        ])));
+        // A version drop across IDs is not a descent.
+        assert!(versions_ascend(&ways_block(&[(7, Some(5)), (8, Some(1))])));
+    }
+
+    #[test]
+    fn dense_versions_must_not_descend_within_an_id() {
+        assert!(!versions_ascend(&dense_versions_block(
+            &[3, 3],
+            Some(&[2, 1])
+        )));
+        assert!(versions_ascend(&dense_versions_block(
+            &[3, 3, 4],
+            Some(&[1, 2, 1])
+        )));
+        assert!(versions_ascend(&dense_versions_block(&[3, 3], None)));
+        assert!(!versions_ascend(&dense_versions_block(
+            &[3, 3],
+            Some(&[1, -1])
+        )));
+    }
+
+    #[test]
+    fn a_dense_version_column_not_one_per_id_is_rerouted() {
+        assert!(!versions_ascend(&dense_versions_block(&[3, 3], Some(&[1]))));
+        assert!(!versions_ascend(&dense_versions_block(
+            &[3, 3],
+            Some(&[1, 2, 3])
+        )));
     }
 
     /// `Node.id` is `sint64`, so its wire value is zigzag-encoded. The old
@@ -926,7 +1156,7 @@ mod tests {
         let block = block_from_groups(&[&a, &b]);
         let (index, sorted) = scan_block_ids_checked(&block)
             .expect("two single-kind way groups must still be indexable");
-        assert!(sorted);
+        assert_eq!(sorted, IdOrder::Ascending);
         assert_eq!((index.kind, index.count), (ElementKind::Way, 4));
     }
 

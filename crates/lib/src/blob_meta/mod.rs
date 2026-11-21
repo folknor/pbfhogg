@@ -25,7 +25,8 @@ mod tag_index;
 mod tally;
 
 pub(crate) use scan::{
-    try_scan_block_ids_and_tags, try_scan_block_ids_checked, try_scan_block_tags,
+    IdOrder, try_scan_block_ids_and_tags, try_scan_block_ids_checked, try_scan_block_tags,
+    versions_ascend,
 };
 pub(crate) use tag_index::{TagIndex, encode_tag_index};
 pub(crate) use tally::{AscendingTally, ClaimWalk, IdTally, Order, hold_claim};
@@ -49,12 +50,12 @@ pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
     scan_block_ids_checked(raw).map(|(index, _sorted)| index)
 }
 
-/// A decompressed PrimitiveBlock's [`BlobIndex`] and whether its elements
-/// are in canonical ID order, or `None`. `None` collapses
+/// A decompressed PrimitiveBlock's [`BlobIndex`] and the [`IdOrder`] of its
+/// elements, or `None`. `None` collapses
 /// malformed bytes into "no index", which no production caller wants: they
 /// use [`try_scan_block_ids_checked`] and treat its `Err` as an error.
 #[cfg(test)]
-pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
+pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, IdOrder)> {
     try_scan_block_ids_checked(raw).ok().flatten() // ok-deliberate: advisory, see doc
 }
 

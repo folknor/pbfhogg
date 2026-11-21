@@ -141,6 +141,25 @@ retain a pool teardown cannot prove idle. `sort-pbf --dataset planet
 - Pair 1's 20 s gap is run history, not code: its baseline cell was the
   first after a worktree build and ran cold.
 
+## Version order of repeated IDs in pass 1 (plantasjen, 2026-11-21)
+
+Pass 1's ID walk now also marks a blob whose IDs repeat, and only then
+reads its versions. `sort-pbf --dataset denmark --snapshot unsorted`
+(unclaimed header, every payload scanned, no repeated ID), `--iterations 1`
+cells alternated, baseline `5e8003d3` through `--commit`, variant the
+uncommitted change on that base.
+
+| Pair | `5e8003d3` | variant |
+|---|---|---|
+| 1 | 741 ms (`44fa8bac`, first after a worktree build) | 587 ms (`c4b08f27`) |
+| 2 | 584 ms (`e712720f`) | 576 ms (`de379c9e`) |
+| 3 | 571 ms (`ca14292d`) | 580 ms (`8e1f2e2c`) |
+
+- Verdict: no cost. Pairs 2 and 3 differ by under 2 % with opposite
+  signs; SORT_INDEX_BUILD is 196 ms in both arms of pair 3.
+- No planet cell: the planet input claims `Sort.Type_then_ID` and is
+  indexed, so pass 1 takes the header-only path and never runs the walk.
+
 ## History
 
 ### Sort

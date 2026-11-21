@@ -483,6 +483,21 @@ inference only uses it for range queries - stripping or gating it in
 `cat`/`PbfWriter` would punish those consumers to protect an inference sort
 no longer makes.
 
+**Versions of one ID.** `sort` orders records of one ID by ascending version,
+as osmium sort does (records of one ID and version keep input order; osmium
+also orders those by timestamp, DEVIATIONS.md). The sweep writes every group
+in that order, so a scanned blob must be held to the same order or the
+answer would depend on whether the blob overlaps another: pass 1's ID walk
+marks a blob whose IDs repeat without descending, and only for such a blob
+`sort` reads the versions (`blob_meta::versions_ascend`) and rewrites the
+blob when one descends. Input without a repeated ID pays one more branch
+per element and nothing else. A version column pass 1 cannot read exactly
+routes the blob to the rewrite, whose decoder decides. `cat --dedupe` does
+not ask: it passes a lone ID-monotone blob through as stored. A believed blob
+under the header claim is not decoded, so `sort` takes its versions to
+ascend; the claim's name does not say so, and `--distrust-metadata` checks
+it.
+
 ## Blob sidecar metadata: `indexdata` and `tagdata` are a trust boundary
 
 **Status:** Documented and verifiable. Consumers believe these fields by

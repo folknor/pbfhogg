@@ -551,6 +551,16 @@
 
 ### Fixed
 
+- **`sort` orders the versions of one object whatever the blob layout.**
+  A blob holding `way 7` version 2 before version 1 that overlapped no
+  other blob was copied through with its versions descending, while the
+  same records split across overlapping blobs came out ascending. Every
+  blob `sort` decodes in pass 1 (an input without the
+  `Sort.Type_then_ID` claim, or any input under `--distrust-metadata`)
+  is now rewritten when its versions of one ID descend, so history input
+  comes out in osmium sort's (type, ID, version) order. Under the claim,
+  the default fast path still trusts each blob's version order.
+
 - **`inspect --show` prints every metadata field the element carries.**
   A present timestamp, changeset or uid of 0 and an empty user name were
   dropped, so they read like absent fields, and visibility was never

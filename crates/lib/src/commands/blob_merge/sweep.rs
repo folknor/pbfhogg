@@ -62,8 +62,9 @@
 //!
 //! The group is held whole, uncharged and unbounded: every copy of one ID
 //! is gathered before any is written, because a cursor delivers an ID's
-//! copies in whatever version order its block holds them (`sort` accepts a
-//! blob whose versions of one ID descend), so ordering by version needs
+//! copies in whatever version order its block holds them (pass 1 checks
+//! version order only for a blob `sort` scans; a believed blob, and every
+//! `cat --dedupe` blob, is opened as stored), so ordering by version needs
 //! them all. Demotion cannot free a group member. Ordinary groups are a
 //! few elements; only adversarial input (`sort` of many copies of one ID)
 //! or an object of very many versions grows one. Removing the hold would

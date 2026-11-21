@@ -121,7 +121,10 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   no single index describes; otherwise it must be kept. The domain is true
   believed claims; a decoded blob the verifier's decoder refuses (a repeated
   or absent scalar ID, a wrapping dense delta, compression other than raw or
-  zlib) is a verifier error. The rest must drop it with the loss warning. The warning is read from pbfhogg's stderr as the CLI renders
+  zlib) is a verifier error. The domain also holds each `(kind, id)` once:
+  sort also rewrites a decoded blob whose versions of a repeated ID descend,
+  which the prediction does not read, and the sort check's comparison and
+  strict order check refuse a repeated ID regardless. The rest must drop it with the loss warning. The warning is read from pbfhogg's stderr as the CLI renders
   `header.way_metadata_loss` (`Warning: the input declares ..., which the
   output does not declare`, `LocationsOnWays` a member of the list).
 - **Order and counts** of an output come from its osmium OPL decoding

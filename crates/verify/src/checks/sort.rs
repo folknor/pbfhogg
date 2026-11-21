@@ -146,8 +146,12 @@ fn range_keys(min: i64, max: i64) -> ((u8, u64), (u8, u64)) {
 /// The domain: believed claims are true, as nothing decodes them. A scanned
 /// blob the verifier's decoder refuses (a repeated or absent scalar ID, a
 /// dense ID delta that wraps, compression other than raw or zlib) is a
-/// verifier error, though pbfhogg accepts it. Within the domain the verdict
-/// is exact, so there is no keep-or-drop middle.
+/// verifier error, though pbfhogg accepts it. Each `(kind, id)` occurs once:
+/// pbfhogg also rewrites a scanned blob whose versions of a repeated ID
+/// descend, which this model does not read, and the check's element
+/// comparison and order check refuse a repeated ID before this verdict could
+/// matter. Within the domain the verdict is exact, so there is no
+/// keep-or-drop middle.
 pub(crate) fn sort_way_locations(
     blobs: impl IntoIterator<Item = SortBlob>,
 ) -> crate::harness::WayLocations {

@@ -218,6 +218,7 @@ pub(crate) fn sort_to<'a>(
             require_sorted: None,
             accept_partial_index: false,
             distrust_metadata,
+            order_versions: true,
         },
         direct_io,
         host,

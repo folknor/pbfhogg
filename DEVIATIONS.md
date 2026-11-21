@@ -351,6 +351,18 @@ in an overlap run and passes it through elsewhere. Where every copy of an
 object is identical, the two answers agree; osmium merge is not an oracle
 for anything else.
 
+## sort: records of one ID and version keep input order
+
+osmium sort orders by type, ID, version and then timestamp when both
+records carry a valid one, with a stable sort, and pbfhogg's `sort` orders by
+type, ID and version alone: of two records of one ID and version it keeps
+the order they came in (earlier blob first, then earlier position), never
+reading the timestamp. The two agree wherever no ID repeats a version, which
+is every snapshot and every well-formed history file. libosmium's comparison
+is not a strict weak order there either (a record without a timestamp ties
+with two that differ), so its own result for such records depends on the
+input order.
+
 ## merge-changes and tags-filter OSC: a deleted node's location is both coordinates or neither
 
 Both commands keep a delete's body as osmium does: tags, way node refs,

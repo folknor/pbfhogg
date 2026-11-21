@@ -1371,7 +1371,7 @@ agreed fields is a deliberate deviation (DEVIATIONS.md).
 
 ### sort
 
-Sort PBF into standard order (nodes, ways, relations, each by ascending ID). For already-sorted inputs with indexdata, blobs pass through as raw bytes.
+Sort PBF into standard order (nodes, ways, relations, each by ascending ID; records of one ID, as in a history file, by ascending version, and records of one ID and version in input order). Every record is kept. For already-sorted inputs with indexdata, blobs pass through as raw bytes; under a header claiming `Sort.Type_then_ID` that includes trusting each blob's versions of one ID to ascend, which `--distrust-metadata` checks.
 
 ```
 pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
@@ -1392,7 +1392,8 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 
 An input whose header does not claim `Sort.Type_then_ID` (or any input,
 under `--distrust-metadata`) has every blob decoded in pass 1 to check its
-order. An indexed blob whose indexdata that scan contradicts is copied under
+order; a blob whose IDs descend, or whose versions of one ID descend, is
+rewritten. An indexed blob whose indexdata that scan contradicts is copied under
 indexdata and tag keys scanned from its payload rather than with the false
 claim, and a `Note:` line counts them; the rebuilt `BlobHeader` keeps every
 other field, the way-members field 5 included, as `cat --reindex` keeps it,
@@ -1971,7 +1972,9 @@ as it reads: an element sorting below the one before it is refused as
 unsorted (exit 2; the advice is `sort --distrust-metadata`). A history input
 (`HistoricalInformation`) must also carry each object's versions strictly
 ascending, and an input without that feature must hold each object once;
-either broken is refused as invalid data, which `sort` cannot repair. No
+either broken is refused as invalid data. `sort --distrust-metadata` puts
+descending versions in order; a repeated version or object survives `sort`,
+which keeps every record. No
 indexdata is read, so a wholly unindexed input is filtered as an indexed one
 is; a partially indexed input (indexdata on some data blobs and not others)
 is refused once a read has met both kinds of data blob.

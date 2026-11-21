@@ -25,7 +25,9 @@
 //! reads, one key compare per element: an element sorting below its
 //! predecessor is `Unsorted`, on both paths. The history path also needs
 //! each object's versions strictly ascending, and the snapshot path each
-//! object once; either broken is `InvalidData`, which `sort` cannot repair.
+//! object once; either broken is `InvalidData`. `sort --distrust-metadata`
+//! orders descending versions; a repeated version or object survives `sort`,
+//! which keeps every record.
 
 use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,

@@ -200,6 +200,7 @@ fn plan_merge(
             ),
             accept_partial_index: true,
             distrust_metadata: false,
+            order_versions: false,
         },
         opts.direct_reads,
         host,

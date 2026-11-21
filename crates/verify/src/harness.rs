@@ -371,7 +371,9 @@ impl Harness {
             .execute(&mut self.life, &mut self.run, &self.tools, run, sink)?;
         if matches!(settled, Settled::Complete { cached: true, .. }) {
             self.msg(&format!("  {label}: cached reference"));
-            self.step(&format!("{label} cached"), Duration::ZERO);
+            // A hit is timed like a run: its identity probes, key digests,
+            // artifact validation and placement are real work.
+            self.step(&format!("{label} cached"), started.elapsed());
         } else {
             self.step(&label, started.elapsed());
         }
@@ -672,11 +674,7 @@ impl Harness {
                 } else {
                     String::new()
                 };
-                if label.ends_with(" cached") {
-                    format!("{label}{runs}")
-                } else {
-                    format!("{label} {}{runs}", output::duration(*took))
-                }
+                format!("{label} {}{runs}", output::duration(*took))
             })
             .collect();
         if rendered.is_empty() {

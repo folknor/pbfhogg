@@ -2069,47 +2069,28 @@ summed time rather than wall.
 
 Kind: high-conviction rewrite.
 
-## PERF-067 - The reference cache re-proves identity on every call
+## PERF-067 - Reference cache retention is by recency, not recompute cost
 
-Reported by: orchestration-opus, orchestration-codex, engine-opus, heavy-opus,
-other-opus.
+Reported by: orchestration-opus, other-opus.
 
-Mechanism:
+Residue after the per-run digest memo and real hit timing landed (tool,
+library and input digests are now taken once per run and reused while the
+file stamp holds; the `ldd`/`--version` probes, the digest on lookup and the
+publication fsync stay, with reasons at their code sites).
 
-- `cache_key` runs `osmium --version` and `ldd`, then digests osmium and every
-  linked library, and `identity_text_again` repeats all of it after a miss.
-- `key_text` digests every input in full on every call, so the denmark input
-  is re-hashed by each cached reference that reads it, dozens of times per run.
-- `lookup` re-digests every artifact on a hit, ignoring the manifest `Stamp`.
-- `publish` calls `sync_all` on multi-GB artifacts and directories.
-- Dataset resolution already computes an observed digest, which the verifier
-  drops (codex-orchestration).
-- A hit is recorded as zero time in the step breakdown, so none of this shows
-  up (codex-orchestration).
-- `retain` keeps entries by recency within the byte budget, so a cheap large
-  `osmium cat -t` output can evict an expensive `osmium sort`. other-opus calls
-  LRU loss of geocode's four osmium artifacts the likely cause of that check's
-  2.5-4.4 minute spread.
+`retain` keeps the most recently used entries that fit the byte budget
+(default 20 GiB). Denmark's working set (about 4-5 GB) fits; germany's (about
+40-45 GB) never does, and a germany run pushes older denmark entries out. A
+cost-only order pins stale entries forever; GreedyDual-Size (priority = an
+aging floor plus recompute wall per byte, wall recorded in the manifest) is
+the candidate shape. other-opus attributes geocode's 2.5-4.4 minute denmark
+spread to LRU loss of its four osmium artifacts; nothing recorded supports
+or refutes that.
 
-Redesigns:
-
-- Compute the tool identity once per run, rechecking stamps before publish.
-- Memoize input digests by watched stamp, sharing one digest between the cache
-  key, the engine identity and `Run::watch`.
-- orchestration-opus: trust a matching stamp on read-only cache files and
-  fall back to the digest otherwise, which deliberately weakens tamper
-  evidence. Keep the fsync, or verify by digest only the entries published
-  before the current boot.
-- codex-orchestration: one immutable handle and one validation result per
-  artifact per run, validating content during the consumer's read.
-- Retention by recompute cost per byte, with wall time recorded in the
-  manifest (orchestration-opus), or a retention priority for geocode's
-  artifacts (other-opus).
-
-Payoff: heavy-opus estimates seconds per run, not minutes. The retention
-change is what decides whether a warm run is actually warm.
-
-Risks: weakened tamper evidence if stamps are trusted.
+Blocked on measurement: deciding needs a germany run and a repeated denmark
+`verify all` with the per-step hit times now printed, neither of which this
+session's rulings allow. Note that `retain` caps bytes only after a run; no
+ranking caps scratch during one.
 
 Kind: local, medium.
 
@@ -2133,6 +2114,10 @@ Redesigns:
 - other-opus: `copy_file_range`, or verify the artifact's digest at use.
 - codex-orchestration: owner-held immutable artifacts serving every reader
   from one stable path for the run.
+- From the reference cache work: on a hit whose artifact will become an
+  input, hash while copying into the private file and compare with the
+  manifest, so the lookup's full digest read and this copy's full read become
+  one, and the digest binds the bytes the consumer actually gets.
 
 Kind: local, medium.
 

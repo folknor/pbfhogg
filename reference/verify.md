@@ -286,13 +286,20 @@ Completed reference executions are stored at
 or verdict is cached: every comparison runs again. The element comparison's
 OPL decodings are not cached either: each is as large as its input, read
 once and removed, and publishing them filled a germany run's scratch. A hit is shown as
-`osmium sort cached` in the check's steps; `--verbose` also shows the hit in
-detail.
+`osmium sort cached 1.2s` in the check's steps, timed like a run (probes,
+digests, validation and placement); `--verbose` also shows the hit in detail.
 
 The key includes the declared run ID, literal arguments, input content and
 filename suffixes, output artifact names, controlled environment, executable
 bytes and version, and the shared-library closure resolved by `ldd`.
 Identity probes use the same lifecycle and private environment as tool runs.
+The `--version` and `ldd` probes run at every key observation, since a
+library newly placed earlier on the search path changes the closure without
+moving any file already named. File digests of inputs, the executable and
+its libraries are taken once per run and reused while the file's stamp
+(device, inode, size, mtime, ctime) is unchanged; a first digest reads
+through one handle whose stamp must hold before and after, and a file seen
+changing meanwhile is ENVIRONMENT.
 When identity cannot be established, the reference runs uncached. Utilities
 started by launcher scripts and libraries loaded outside the `ldd` closure
 are outside that identity.
@@ -308,7 +315,10 @@ is ENVIRONMENT. After all children settle, cancellation and input identity
 are checked immediately before the completed staging tree is renamed into
 place. Staging paths include RUNID; sweeps exclude the current run's staging
 and removals never follow symlinks. Published artifacts and manifests are
-immutable. Lookups hash every artifact to check integrity. Checks receive
+immutable. Lookups hash every artifact to check integrity; the manifest's
+artifact stamps are not trusted in its place, because mtime can be set back
+and placement moves ctime. Publication fsyncs artifacts, manifest and
+directories. Checks receive
 private hard links (copies across filesystems), so eviction cannot remove a
 live check's files. When a run-local reference artifact becomes an input,
 its hard link is detached into a private copy before stamping: later cache links or eviction
@@ -332,7 +342,7 @@ Each check prints one line on stdout: `NAME: PASS (time; steps)`, optionally
 with the claim a PASS establishes, or `FAIL`, `ENVIRONMENT`, `INTERRUPTED`.
 The steps are wall times summed per label, slowest first: each pbfhogg and
 reference launch (a reference's time includes the cache's handling of its
-artifacts), and the verifier's own reading of the OPL decodings: `opl merge`
+artifacts, and a cached reference is listed with its own time), and the verifier's own reading of the OPL decodings: `opl merge`
 for every comparison walk (including the check's per-record work and the
 listing writes it does inside the walk), `opl order scan` for a standalone
 order check, `opl derive model` for the derive-changes model. Decodes and

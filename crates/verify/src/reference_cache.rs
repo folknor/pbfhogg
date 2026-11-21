@@ -81,7 +81,11 @@ impl ReferenceCache {
     /// be read is invalid, which lookup would remove, and goes. Each eviction
     /// renames the entry to its trash name first, so one cut short is swept
     /// with the other leftovers by the next verify; a failure is a warning,
-    /// never the verify's result.
+    /// never the verify's result. The order is recency alone, not recompute
+    /// cost per byte: a cost-only order would pin entries of a stale input
+    /// for good, and a cost-aware order with aging (GreedyDual-Size) changes
+    /// only which misses recur when a dataset's working set exceeds the
+    /// budget, a payoff no recorded run has measured yet.
     pub(crate) fn retain(&self, budget: Option<u64>) {
         let Some(budget) = budget else {
             return;
@@ -218,7 +222,10 @@ impl ReferenceCache {
                     return Err(format!("{} no longer matches its digest", artifact.name));
                 }
             }
-            // Read only once its stamp or digest held above.
+            // Read only once its digest held above. The manifest stamp is
+            // not trusted in place of the digest: mtime can be set back, and
+            // hard-link placement moves ctime, so a stamp check would admit a
+            // rewritten artifact that this full read refuses.
             if run.conditional(manifest.exit_code) {
                 let stderr = fs::read(entry.join(ARTIFACTS).join(STDERR))
                     .map_err(|e| format!("{STDERR}: {e}"))?;
@@ -265,6 +272,9 @@ fn publish(
         if !meta.is_file() {
             return Err(Error::tool(format!("{name} is not a regular file")));
         }
+        // Kept: paid only on a miss, after a full tool run, and it makes a
+        // published entry whole across a crash rather than a torn file the
+        // next lookup would have to drop and run again.
         fs::File::open(&path)?.sync_all()?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
         let xxh128 = digest(&path)?;
@@ -523,7 +533,7 @@ impl ReferenceCache {
         let key = if run.uncached {
             None
         } else {
-            cache_key(life, tools, &staging, run)?
+            cache_key(life, watched, tools, &staging, run)?
         };
         watched.revalidate()?;
         if !self.fresh
@@ -560,7 +570,7 @@ impl ReferenceCache {
         fs::write(staging.join(ARTIFACTS).join(STDERR), &ended.stderr)?;
         let mut source = staging.join(ARTIFACTS);
         if let Some(key) = key {
-            let now = identity_text_again(life, tools, &staging, run)?;
+            let now = identity_text_again(life, watched, tools, &staging, run)?;
             watched.revalidate()?;
             if now.as_ref().is_some_and(|now| now.hex == key.hex) {
                 life.checkpoint()?;
@@ -606,11 +616,12 @@ impl ReferenceCache {
 
 fn cache_key(
     life: &mut crate::process::Lifecycle,
+    watched: &mut crate::run::Run,
     tools: &crate::reference::Tools,
     staging: &Path,
     run: &ToolRun,
 ) -> Result<Option<Key>, Error> {
-    let identity = match identity(life, &tools.osmium, staging) {
+    let identity = match identity(life, watched, &tools.osmium, staging) {
         Ok(identity) => identity,
         Err(e @ (Error::Interrupted | Error::Unsettled(_) | Error::Environment(_))) => {
             return Err(e);
@@ -625,7 +636,10 @@ fn cache_key(
     if identity.is_none() {
         output::note("reference identity unavailable; running uncached");
     }
-    identity.as_deref().map(|id| key_text(run, id)).transpose()
+    identity
+        .as_deref()
+        .map(|id| key_text(run, id, &mut |p| watched.digest_of(p)))
+        .transpose()
 }
 
 fn staged_args(run: &ToolRun, staging: &Path) -> Vec<std::ffi::OsString> {
@@ -646,19 +660,30 @@ fn staged_args(run: &ToolRun, staging: &Path) -> Vec<std::ffi::OsString> {
         .collect()
 }
 
+/// The key observed again after a fresh run. The `ldd` and `--version`
+/// probes run again deliberately: a library newly placed earlier on the
+/// executable's search path, or an `/etc/ld.so.preload`, changes the
+/// resolved closure without moving any file the first probe named, so no
+/// stamp of those files can stand in for re-resolving it. Only the file
+/// digests come from the run's stamp-checked memo.
 fn identity_text_again(
     life: &mut crate::process::Lifecycle,
+    watched: &mut crate::run::Run,
     tools: &crate::reference::Tools,
     staging: &Path,
     run: &ToolRun,
 ) -> Result<Option<Key>, Error> {
-    identity(life, &tools.osmium, staging)?
+    identity(life, watched, &tools.osmium, staging)?
         .as_deref()
-        .map(|id| key_text(run, id))
+        .map(|id| key_text(run, id, &mut |p| watched.digest_of(p)))
         .transpose()
 }
 
-fn key_text(run: &ToolRun, identity: &str) -> Result<Key, Error> {
+fn key_text(
+    run: &ToolRun,
+    identity: &str,
+    digest: &mut dyn FnMut(&Path) -> Result<String, Error>,
+) -> Result<Key, Error> {
     let mut text = format!(
         "pbfhogg-verify-reference {FORMAT}\nrun {}\n{identity}",
         run.id
@@ -690,6 +715,7 @@ fn extension(path: &Path) -> String {
 
 fn identity(
     life: &mut crate::process::Lifecycle,
+    watched: &mut crate::run::Run,
     program: &Path,
     private: &Path,
 ) -> Result<Option<String>, Error> {
@@ -718,10 +744,14 @@ fn identity(
     let mut text = format!(
         "tool {} {}\nversion {version:?}\n",
         program.display(),
-        digest(program)?
+        watched.digest_of(program)?
     );
     for path in paths {
-        text.push_str(&format!("lib {} {}\n", path.display(), digest(&path)?));
+        text.push_str(&format!(
+            "lib {} {}\n",
+            path.display(),
+            watched.digest_of(&path)?
+        ));
     }
     Ok(Some(text))
 }
@@ -935,25 +965,28 @@ mod tests {
                 .arg("-o")
                 .output(&root.join("a").join(out))
         };
-        let a = key_text(&run(&input, "osmium.osm.pbf"), "tool x\n").unwrap();
+        let a = key_text(&run(&input, "osmium.osm.pbf"), "tool x\n", &mut digest).unwrap();
         // Another check directory, same artifact name: the same key.
         let moved = ToolRun::osmium("sort.1")
             .arg("sort")
             .input(&input)
             .arg("-o")
             .output(&root.join("b").join("osmium.osm.pbf"));
-        assert_eq!(a.hex, key_text(&moved, "tool x\n").unwrap().hex);
+        assert_eq!(
+            a.hex,
+            key_text(&moved, "tool x\n", &mut digest).unwrap().hex
+        );
         // Another tool identity, another artifact name or other input bytes:
         // another key.
         assert_ne!(
             a.hex,
-            key_text(&run(&input, "osmium.osm.pbf"), "tool y\n")
+            key_text(&run(&input, "osmium.osm.pbf"), "tool y\n", &mut digest)
                 .unwrap()
                 .hex
         );
         assert_ne!(
             a.hex,
-            key_text(&run(&input, "other.osm.pbf"), "tool x\n")
+            key_text(&run(&input, "other.osm.pbf"), "tool x\n", &mut digest)
                 .unwrap()
                 .hex
         );
@@ -961,7 +994,7 @@ mod tests {
         fs::write(&other, b"two").unwrap();
         assert_ne!(
             a.hex,
-            key_text(&run(&other, "osmium.osm.pbf"), "tool x\n")
+            key_text(&run(&other, "osmium.osm.pbf"), "tool x\n", &mut digest)
                 .unwrap()
                 .hex
         );

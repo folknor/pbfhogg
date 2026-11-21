@@ -348,6 +348,10 @@ fn eligible(dataset: &str) -> Result<(), Error> {
 }
 
 /// The input PBF: a fixture named with `--input`, or an eligible dataset.
+/// The resolver's observed digest is dropped on purpose: no stamp brackets
+/// it against the one `Run::watch` takes later, so it could describe an
+/// earlier version of the file, and the run's stamp-checked digest memo
+/// already hashes the input only once.
 fn resolve_input(b: &Boundary, source: &Source) -> Result<PathBuf, Error> {
     if let Some(path) = &source.input {
         return selection::fixture(&b.config, path);

@@ -32,13 +32,19 @@ struct Stamp {
 fn stamp(path: &Path) -> Result<Stamp, Error> {
     let meta = std::fs::metadata(path)
         .map_err(|e| Error::Environment(format!("{}: {e}", path.display())))?;
-    Ok(Stamp {
-        dev: meta.dev(),
-        ino: meta.ino(),
-        size: meta.size(),
-        mtime: (meta.mtime(), meta.mtime_nsec()),
-        ctime: (meta.ctime(), meta.ctime_nsec()),
-    })
+    Ok(Stamp::of(&meta))
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
 }
 
 /// Detach a run-local hard link before taking its first input stamp.
@@ -77,6 +83,11 @@ pub(crate) struct Run {
     pub(crate) pbfhogg: PathBuf,
     pub(crate) pbfhogg_digest: String,
     inputs: Vec<(PathBuf, Stamp)>,
+    /// Content digests by path, each valid only while the path's stamp
+    /// still equals the one it was hashed under. Reference cache keys name
+    /// the same dataset input, tool and libraries on every call; without
+    /// this each call reread them in full.
+    digests: std::collections::HashMap<PathBuf, (Stamp, String)>,
     keep: bool,
 }
 
@@ -99,6 +110,7 @@ impl Run {
             pbfhogg,
             pbfhogg_digest,
             inputs: Vec::new(),
+            digests: std::collections::HashMap::new(),
             keep,
         })
     }
@@ -116,6 +128,39 @@ impl Run {
             self.inputs.push((path.to_path_buf(), stamp(path)?));
         }
         Ok(())
+    }
+
+    /// XXH3-128 of `path`, reused while the path's stamp (device, inode,
+    /// size, mtime, ctime) is the one it was hashed under. A first hash reads
+    /// through one handle whose stamp must equal the path's before and after
+    /// the read, so the memo never holds one file's digest under another's
+    /// stamp; a file seen changing meanwhile is ENVIRONMENT. This is an
+    /// observation under the input identity contract, not a snapshot: it
+    /// neither replaces nor refreshes the watched stamps `revalidate` checks.
+    pub(crate) fn digest_of(&mut self, path: &Path) -> Result<String, Error> {
+        let now = stamp(path)?;
+        if let Some((then, hex)) = self.digests.get(path)
+            && *then == now
+        {
+            return Ok(hex.clone());
+        }
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| Error::tool(format!("{}: {e}", path.display())))?;
+        let changed = || {
+            Error::Environment(format!(
+                "{} changed while its digest was taken",
+                path.display()
+            ))
+        };
+        if Stamp::of(&file.metadata()?) != now {
+            return Err(changed());
+        }
+        let hex = digest_reader(&mut file)?;
+        if Stamp::of(&file.metadata()?) != now || stamp(path)? != now {
+            return Err(changed());
+        }
+        self.digests.insert(path.to_path_buf(), (now, hex.clone()));
+        Ok(hex)
     }
 
     /// `Err(Environment)` when a watched input moved since it was resolved.
@@ -198,6 +243,10 @@ fn run_id() -> Result<String, Error> {
 pub(crate) fn digest(path: &Path) -> Result<String, Error> {
     let mut file =
         std::fs::File::open(path).map_err(|e| Error::tool(format!("{}: {e}", path.display())))?;
+    digest_reader(&mut file)
+}
+
+fn digest_reader(file: &mut std::fs::File) -> Result<String, Error> {
     let mut hash = xxhash_rust::xxh3::Xxh3::new();
     let mut buf = vec![0; tunables::DIGEST_BUFFER];
     // loop-ends: end of file.
@@ -261,6 +310,24 @@ mod tests {
         std::fs::write(&staged, b"two").unwrap();
         std::fs::rename(&staged, &input).unwrap();
         assert!(matches!(run.revalidate(), Err(Error::Environment(_))));
+    }
+
+    #[test]
+    fn a_digest_is_reused_only_while_its_stamp_holds() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let mut run = Run::create(scratch.path(), &fake_exe(scratch.path()), false).unwrap();
+        let input = scratch.path().join("in.pbf");
+        std::fs::write(&input, b"one").unwrap();
+        let first = run.digest_of(&input).unwrap();
+        assert_eq!(first, digest(&input).unwrap());
+        assert_eq!(run.digest_of(&input).unwrap(), first);
+        // A replacement moves the stamp, so the content is hashed again.
+        let staged = scratch.path().join("staged");
+        std::fs::write(&staged, b"two").unwrap();
+        std::fs::rename(&staged, &input).unwrap();
+        let second = run.digest_of(&input).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second, digest(&input).unwrap());
     }
 
     #[test]

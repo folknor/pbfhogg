@@ -1702,10 +1702,14 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 
 Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC
 strings. Tags that collide with emitted reserved property names are omitted.
-Polygon exterior rings are closed and counterclockwise. Ways with invalid
-geometry are skipped and reported in the stderr summary; an area way is
-invalid when its ring has zero signed area at the emitted seven-decimal
-precision (collinear, or collapsed by rounding).
+Polygon exterior rings are closed and counterclockwise. Nodes and ways with
+invalid geometry are skipped and reported in the stderr summary, after
+`--bbox`, expression and type selection. A node or way is invalid when any
+position it would emit lies outside longitude -180 to 180 or latitude -90 to
+90, judged inclusively on the emitted seven-decimal value (so a position that
+rounds onto a pole is valid, and libosmium's undefined location, `214.7483647`
+on both axes, is not). An area way is also invalid when its ring has zero
+signed area at the emitted precision (collinear, or collapsed by rounding).
 
 ### diff
 

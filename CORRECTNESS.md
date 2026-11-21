@@ -652,8 +652,10 @@ add-locations-to-ways, diff, digest and derived OSC), so none places or
 compares a node at a wrapped coordinate. A blob copied without decoding is
 not judged. `inspect --nodes` and its extended bbox alone keep the wrapping
 conversion, as a report of what the stored values wrap to. Bbox parsing,
-location joins, `check --locations` and the geocode builder have separate
-domain checks. This is a deliberate boundary, not a promise that reading a
+location joins, `check --locations`, the geocode builder and export have
+separate domain checks; export judges each position on the seven-decimal
+text it writes and skips and counts a node or way with one outside the
+domain. This is a deliberate boundary, not a promise that reading a
 node validates its geographic position.
 
 The geocode builder admits every node by the rule `check --locations` uses:

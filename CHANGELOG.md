@@ -159,7 +159,8 @@
   and on an inline way location they re-encode that does so. Before, a
   block with `lat_offset` 429496729600 wrote its node at latitude 0.
   diff and digest refuse such a compared node instead of matching it
-  against one at the wrapped position; export prints the true value.
+  against one at the wrapped position; export skips it as outside the
+  geographic domain.
   Blobs copied without decoding are not judged. Library: on `Node`,
   `DenseNode` and `WayNodeLocation`, `decimicro_lat()` / `decimicro_lon()`
   now return `Result<i32>` and `nano_lat()` / `nano_lon()` `Result<i64>`,
@@ -550,6 +551,13 @@
 
 ### Fixed
 
+- **`export` writes only positions inside the GeoJSON coordinate range.**
+  A tagged node at latitude 100, or a way carrying libosmium's undefined
+  location (`214.7483647` on both axes), was written as is. A node or way
+  with any emitted position outside longitude -180 to 180 or latitude -90
+  to 90 is now skipped and counted; the stderr summary gains an
+  `N invalid nodes` count before the invalid ways, and the library's
+  `ExportStats` gains `skipped_invalid_nodes`.
 - **`export` skips degenerate Polygons.** An area way whose ring has zero
   area as written - collinear positions, or distinct positions that
   rounding to seven decimals collapses - was emitted as a Polygon. It is

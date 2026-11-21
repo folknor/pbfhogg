@@ -13,7 +13,7 @@ use crate::owned::TypeFilter;
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{Element, ElementReader};
 
-use geometry::{WayGeom, collect_coords, is_area_way, write_point, write_way_geometry};
+use geometry::{Geom, collect_coords, is_area_way, write_point, write_way_geometry};
 use properties::{MetaClaims, write_properties};
 use writer::FeatureWriter;
 
@@ -69,6 +69,7 @@ pub struct ExportStats {
     pub features: u64,
     pub skipped_untagged_nodes: u64,
     pub skipped_untagged_ways: u64,
+    pub skipped_invalid_nodes: u64,
     pub skipped_invalid_ways: u64,
 }
 
@@ -76,12 +77,13 @@ impl ExportStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         writeln!(
             w,
-            "Exported {} features ({} nodes, {} ways); skipped {} untagged nodes, {} untagged ways, and {} invalid ways",
+            "Exported {} features ({} nodes, {} ways); skipped {} untagged nodes, {} untagged ways, {} invalid nodes, and {} invalid ways",
             self.features,
             self.nodes,
             self.ways,
             self.skipped_untagged_nodes,
             self.skipped_untagged_ways,
+            self.skipped_invalid_nodes,
             self.skipped_invalid_ways
         )?;
 
@@ -188,7 +190,12 @@ pub fn export<W: Write>(
                 {
                     return;
                 }
-                write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
+                if write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat())
+                    == Geom::Invalid
+                {
+                    stats.skipped_invalid_nodes += 1;
+                    return;
+                }
                 let info = node.info();
                 let meta = MetaClaims::from_info(&info);
                 write_properties(&mut properties, node.id(), "node", tags, Some(&meta), opts)
@@ -213,7 +220,12 @@ pub fn export<W: Write>(
                 {
                     return;
                 }
-                write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
+                if write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat())
+                    == Geom::Invalid
+                {
+                    stats.skipped_invalid_nodes += 1;
+                    return;
+                }
                 let meta = node.info().and_then(MetaClaims::from_dense);
                 write_properties(
                     &mut properties,
@@ -249,7 +261,7 @@ pub fn export<W: Write>(
                     return;
                 }
                 if write_way_geometry(&mut geometry, &mut coord_scratch, &coords, is_area)
-                    == WayGeom::Invalid
+                    == Geom::Invalid
                 {
                     stats.skipped_invalid_ways += 1;
                     return;

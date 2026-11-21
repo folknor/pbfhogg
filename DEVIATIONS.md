@@ -15,9 +15,13 @@ fixed area-key list and `area=yes` or `area=no` overrides defined by
 [ADR-0010](decisions/0010-geojson-export-format-and-area-heuristic.md).
 
 **Impact:** Feature classification and property sets are intentionally not
-byte-identical to `osmium export`. Coordinate order and GeoJSON validity still
-follow RFC 7946, but osmium output is not a golden byte-level oracle for this
-command.
+byte-identical to `osmium export`. Positions follow RFC 7946's longitude,
+latitude order and lie in its WGS 84 range (a node or way with an emitted
+position outside it is skipped and counted, as osmium skips and counts an
+invalid location), and Polygon rings are closed, counterclockwise and of
+non-zero area. Full RFC 7946 geometry validity, such as freedom from
+self-intersection, is not checked. osmium output is not a golden byte-level
+oracle for this command.
 
 **Rationale:** Stable identity properties and a compact, documented area rule
 make the initial streaming format predictable without importing osmium's

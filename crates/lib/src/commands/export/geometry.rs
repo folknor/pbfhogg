@@ -6,7 +6,7 @@ pub(super) const AREA_KEYS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WayGeom {
+pub(super) enum Geom {
     Written,
     Invalid,
 }
@@ -21,11 +21,17 @@ fn push_position(buf: &mut String, scratch: &mut String, lon: f64, lat: f64) {
     buf.push(']');
 }
 
-pub(super) fn write_point(buf: &mut String, scratch: &mut String, lon: f64, lat: f64) {
+/// Writes a Point, or returns `Invalid` when its emitted position is outside
+/// the geographic domain (see [`emitted_position`]).
+pub(super) fn write_point(buf: &mut String, scratch: &mut String, lon: f64, lat: f64) -> Geom {
+    if emitted_position(scratch, lon, lat).is_none() {
+        return Geom::Invalid;
+    }
     buf.clear();
     buf.push_str("{\"type\":\"Point\",\"coordinates\":");
     push_position(buf, scratch, lon, lat);
     buf.push('}');
+    Geom::Written
 }
 
 pub(super) fn collect_coords(way: &Way<'_>, coords: &mut Vec<(f64, f64)>) {
@@ -62,6 +68,27 @@ fn emitted_e7(scratch: &mut String, deg: f64) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
+/// Emitted latitude bound, in 10^-7 degrees, inclusive.
+const MAX_LAT_E7: i128 = 900_000_000;
+/// Emitted longitude bound, in 10^-7 degrees, inclusive.
+const MAX_LON_E7: i128 = 1_800_000_000;
+
+/// The position export writes for `(lon, lat)`, as exact 10^-7 degree
+/// counts parsed from the very text `format_coord` produces, or `None` when
+/// that text is not a plain decimal or lies outside -180..=180 longitude or
+/// -90..=90 latitude. RFC 7946 positions are WGS 84 degrees, so the domain
+/// is judged on what is printed: a value just past a pole that rounds to
+/// `90` is valid output, and libosmium's undefined location (`2147483647`
+/// on both axes, printed as `214.7483647`) is not. The readers do not check
+/// the geographic domain, so export enforces it at its own output. Points
+/// and LineStrings format each ordinate once more than writing does; export
+/// has no bench, and that was judged not worth a format-once restructure.
+fn emitted_position(scratch: &mut String, lon: f64, lat: f64) -> Option<(i128, i128)> {
+    let lon = emitted_e7(scratch, lon).filter(|v| v.abs() <= MAX_LON_E7)?;
+    let lat = emitted_e7(scratch, lat).filter(|v| v.abs() <= MAX_LAT_E7)?;
+    Some((lon, lat))
+}
+
 /// Twice the signed area of the ring export emits, in squared 10^-7 degrees,
 /// computed exactly. The orientation is judged on the emitted text, not on
 /// the input: an `f64` shoelace over absolute coordinates loses the sign to
@@ -71,18 +98,17 @@ fn emitted_e7(scratch: &mut String, deg: f64) -> Option<i128> {
 /// multiples of 100. Vertices are taken relative to the first, so the
 /// closing edge of an open ring contributes zero and needs no term. `None`
 /// when a coordinate does not format to a parseable decimal or the checked
-/// `i128` arithmetic overflows, which no geographically valid ring reaches.
+/// `i128` arithmetic overflows, which no geographically valid ring reaches,
+/// or when any emitted position is outside the geographic domain.
 fn emitted_twice_area(scratch: &mut String, coords: &[(f64, f64)]) -> Option<i128> {
     let mut points = coords.iter();
     let &(lon0, lat0) = points.next()?;
-    let origin = (emitted_e7(scratch, lon0)?, emitted_e7(scratch, lat0)?);
+    let origin = emitted_position(scratch, lon0, lat0)?;
     let mut prev = (0_i128, 0_i128);
     let mut twice_area: i128 = 0;
     for &(lon, lat) in points {
-        let cur = (
-            emitted_e7(scratch, lon)?.checked_sub(origin.0)?,
-            emitted_e7(scratch, lat)?.checked_sub(origin.1)?,
-        );
+        let (lon, lat) = emitted_position(scratch, lon, lat)?;
+        let cur = (lon.checked_sub(origin.0)?, lat.checked_sub(origin.1)?);
         let det = prev
             .0
             .checked_mul(cur.1)?
@@ -115,9 +141,18 @@ pub(super) fn write_way_geometry(
     scratch: &mut String,
     coords: &[(f64, f64)],
     is_area: bool,
-) -> WayGeom {
+) -> Geom {
     if !is_area && coords.len() < 2 {
-        return WayGeom::Invalid;
+        return Geom::Invalid;
+    }
+    // Every emitted position must lie in the geographic domain; an area
+    // ring is held to it by `emitted_twice_area` below.
+    if !is_area
+        && coords
+            .iter()
+            .any(|&(lon, lat)| emitted_position(scratch, lon, lat).is_none())
+    {
+        return Geom::Invalid;
     }
 
     let closed = coords.first() == coords.last();
@@ -133,7 +168,7 @@ pub(super) fn write_way_geometry(
     // otherwise checked.
     let reverse = if is_area {
         match emitted_twice_area(scratch, coords) {
-            None | Some(0) => return WayGeom::Invalid,
+            None | Some(0) => return Geom::Invalid,
             Some(twice_area) => twice_area < 0,
         }
     } else {
@@ -165,7 +200,7 @@ pub(super) fn write_way_geometry(
     } else {
         buf.push_str("]}");
     }
-    WayGeom::Written
+    Geom::Written
 }
 
 fn is_area_tags<'a, T>(tags: T) -> bool
@@ -218,14 +253,17 @@ mod tests {
     fn point_and_line_format() {
         let mut buf = String::new();
         let mut scratch = String::new();
-        write_point(&mut buf, &mut scratch, 12.5, 55.123_456_7);
+        assert_eq!(
+            write_point(&mut buf, &mut scratch, 12.5, 55.123_456_7),
+            Geom::Written
+        );
         assert_eq!(
             buf,
             "{\"type\":\"Point\",\"coordinates\":[12.5,55.1234567]}"
         );
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &[(1.0, 2.0), (3.0, 4.0)], false),
-            WayGeom::Written
+            Geom::Written
         );
         assert_eq!(
             buf,
@@ -244,7 +282,7 @@ mod tests {
                 &[(0.0, 0.0), (0.0, 1.0), (1.0, 0.0)],
                 true
             ),
-            WayGeom::Written
+            Geom::Written
         );
         assert_eq!(
             buf,
@@ -252,11 +290,11 @@ mod tests {
         );
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &[(0.0, 0.0)], false),
-            WayGeom::Invalid
+            Geom::Invalid
         );
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &[(0.0, 0.0)], true),
-            WayGeom::Invalid
+            Geom::Invalid
         );
         assert_eq!(
             write_way_geometry(
@@ -265,7 +303,7 @@ mod tests {
                 &[(0.0, 0.0), (0.0, 0.0), (1.0, 1.0)],
                 true
             ),
-            WayGeom::Invalid
+            Geom::Invalid
         );
     }
 
@@ -281,7 +319,7 @@ mod tests {
         ];
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &ring, true),
-            WayGeom::Written
+            Geom::Written
         );
         assert_eq!(
             buf,
@@ -305,7 +343,7 @@ mod tests {
         ];
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &ring, true),
-            WayGeom::Written
+            Geom::Written
         );
         assert_eq!(
             buf,
@@ -321,25 +359,25 @@ mod tests {
         let collinear = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (0.0, 0.0)];
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &collinear, true),
-            WayGeom::Invalid
+            Geom::Invalid
         );
         // Three distinct input positions that all round to [0,0].
         let collapsed = [(0.0, 0.0), (0.0, 1e-9), (1e-9, 0.0), (0.0, 0.0)];
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &collapsed, true),
-            WayGeom::Invalid
+            Geom::Invalid
         );
         // Distinct input that rounds to two distinct positions.
         let flattened = [(0.0, 0.0), (1e-9, 1.0), (0.0, 1.0), (0.0, 0.0)];
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &flattened, true),
-            WayGeom::Invalid
+            Geom::Invalid
         );
         // Lobes of a bowtie cancel to zero net area.
         let bowtie = [(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
         assert_eq!(
             write_way_geometry(&mut buf, &mut scratch, &bowtie, true),
-            WayGeom::Invalid
+            Geom::Invalid
         );
         // An open ring needs no fourth input position.
         assert_eq!(
@@ -349,7 +387,7 @@ mod tests {
                 &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
                 true
             ),
-            WayGeom::Written
+            Geom::Written
         );
     }
 
@@ -364,7 +402,51 @@ mod tests {
                 &[(0.0, 0.0), (f64::NAN, 1.0), (1.0, 0.0), (0.0, 0.0)],
                 true
             ),
-            WayGeom::Invalid
+            Geom::Invalid
+        );
+    }
+
+    #[test]
+    fn positions_outside_the_geographic_domain_are_invalid() {
+        let mut buf = String::new();
+        let mut scratch = String::new();
+        assert_eq!(
+            write_point(&mut buf, &mut scratch, 0.0, 100.0),
+            Geom::Invalid
+        );
+        assert_eq!(
+            write_point(&mut buf, &mut scratch, -180.000_000_1, 0.0),
+            Geom::Invalid
+        );
+        // Edges are inclusive, and a value that rounds onto a pole is valid.
+        assert_eq!(
+            write_point(&mut buf, &mut scratch, -180.0, 90.000_000_04),
+            Geom::Written
+        );
+        assert_eq!(buf, "{\"type\":\"Point\",\"coordinates\":[-180,90]}");
+        // libosmium's undefined location.
+        let undefined = 214.748_364_7;
+        assert_eq!(
+            write_way_geometry(
+                &mut buf,
+                &mut scratch,
+                &[(1.0, 2.0), (undefined, undefined)],
+                false
+            ),
+            Geom::Invalid
+        );
+        assert_eq!(
+            write_way_geometry(
+                &mut buf,
+                &mut scratch,
+                &[(0.0, 0.0), (1.0, 0.0), (1.0, 90.000_000_1), (0.0, 0.0)],
+                true
+            ),
+            Geom::Invalid
+        );
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &[(0.0, 0.0), (0.0, 1e300)], false),
+            Geom::Invalid
         );
     }
 

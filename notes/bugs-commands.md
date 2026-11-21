@@ -304,18 +304,6 @@ RFC 7946 asks for two or more positions, which such a line has, so whether it
 is invalid is a policy question; libosmium's `use_nodes::unique` would
 collapse it and refuse it. Polygons are already judged on emitted area.
 
-## CMD-036 - Export emits coordinates outside the GeoJSON domain
-
-Reported by: export [P2].
-
-Point serialization (`export/geometry.rs`) does no coordinate validation, and
-way validation checks no geographic bounds. A tagged node at latitude 100 is
-exported, and a way containing libosmium's undefined-location values
-(214.7483647 on both axes) can be emitted and counted as valid.
-`DEVIATIONS.md` promises RFC 7946 coordinate order and validity. The general
-reader leaves coordinate values unchecked, so the validation belongs at
-export's output boundary.
-
 ## CMD-037 - export --metadata can emit timestamps that are not RFC 3339
 
 Reported by: export [P2].

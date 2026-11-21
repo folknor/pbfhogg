@@ -169,6 +169,49 @@ fn way_geometry_and_area_heuristic() {
 }
 
 #[test]
+fn positions_outside_the_geographic_domain_are_skipped_and_counted() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let temp = crate::common::test_scratch();
+    let input = temp.path().join("input.pbf");
+    let file = std::fs::File::create(&input).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(
+            &HeaderBuilder::new()
+                .optional_feature("LocationsOnWays")
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    let mut builder = BlockBuilder::new();
+    builder.add_node(1, 1_000_000_000, 0, [("name", "lat 100")], None);
+    builder.add_node(2, 900_000_000, -1_800_000_000, [("name", "corner")], None);
+    write_block(&mut writer, &mut builder);
+    // libosmium's undefined location on both axes.
+    builder.add_way_with_locations(
+        10,
+        [("highway", "primary")],
+        &[1, 2],
+        &[(0, 0), (i32::MAX, i32::MAX)],
+        None,
+    );
+    write_block(&mut writer, &mut builder);
+    writer.flush().unwrap();
+
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(input.as_os_str())
+        .assert_success();
+    let values = features(&output.stdout);
+    assert_eq!(values.len(), 1);
+    assert_eq!(
+        values[0]["geometry"]["coordinates"],
+        serde_json::json!([-180, 90])
+    );
+    output.assert_stderr_contains("1 invalid nodes, and 1 invalid ways");
+}
+
+#[test]
 fn filters_properties_bbox_and_collection_compose() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();

@@ -51,6 +51,14 @@ pbfhogg's `export` has no config file - the rules are fixed:
   rounding, or a self-intersecting ring whose lobes cancel exactly) is
   skipped and counted as an invalid way, not emitted as a degenerate
   polygon. Self-intersection is not otherwise checked.
+- **Coordinate domain** (`geometry.rs::emitted_position`): a node or way
+  with any emitted position outside longitude -180..=180 or latitude
+  -90..=90 is skipped and counted (invalid nodes, invalid ways), judged on
+  the seven-decimal text written. osmium likewise drops and counts an
+  element whose `Location::lon()`/`lat()` throws `invalid_location`;
+  osmium judges the stored int32 decimicrodegree, pbfhogg the emitted
+  rounding of the exact value, which agree except within half a
+  decimicrodegree of an edge.
 - **Property model** (`crates/lib/src/commands/export/properties.rs::write_properties`):
   every feature gets `@id` and `@type`. `--metadata` adds `@version`,
   `@timestamp` (RFC 3339 UTC), `@changeset`, `@uid`, `@user`, `@visible`

@@ -309,7 +309,8 @@ up front if way export is requested and the header lacks
 assembly and area/winding classification → property serialization →
 streamed to a `FeatureWriter` (`geojsonseq`: one Feature per line;
 `geojson`: buffered into one FeatureCollection). Untagged nodes/ways and
-ways with invalid geometry are skipped and counted, not errored.
+nodes/ways with invalid geometry (including any emitted position outside
+the geographic domain) are skipped and counted, not errored.
 
 ### apply-changes (merge)
 

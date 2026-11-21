@@ -15,8 +15,9 @@ A closed way is a Polygon only when it has at least four references, is not
 tagged `area=no`, and is tagged either `area=yes` or with one of these keys:
 `building`, `landuse`, `natural`, `leisure`, `amenity`, `boundary`, or
 `waterway`. Polygon geometry must contain a closed exterior ring of at least
-four positions and is emitted counterclockwise. Invalid way geometry is
-skipped and counted. These rules intentionally do not claim osmium parity,
+four positions and is emitted counterclockwise. Every emitted position lies
+within longitude -180 to 180 and latitude -90 to 90. Invalid node or way
+geometry is skipped and counted. These rules intentionally do not claim osmium parity,
 as recorded in `DEVIATIONS.md`.
 
 ## Alternatives considered

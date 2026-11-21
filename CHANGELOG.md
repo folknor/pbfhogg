@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **`altw::external::external_join` is removed.** It published `(0, 0)`
+  placeholders for unresolvable way node references with no way to
+  refuse them, and skipped `AltwOptions::validate`. Call
+  `altw::add_locations_to_ways` with `index_type: IndexType::External`
+  instead; it takes the same settings in `AltwOptions` (with
+  `write.force` off, which the external index refuses) and refuses
+  missing nodes unless `ignore_missing_nodes` is set. The external index
+  now refuses missing nodes as soon as its node join has counted them,
+  before encoding and writing the output, so a refused run ends earlier.
+
 - **A caught worker panic is `ErrorKind::Panicked` and exits 101.** A
   panic on a worker, writer or decode thread that pbfhogg catches at its
   join used to come back as `ErrorKind::Internal` and exit 2, the same

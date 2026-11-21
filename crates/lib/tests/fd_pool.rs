@@ -14,6 +14,29 @@ use pbfhogg::host::{Host, Invocation};
 use crate::common::fd_gate::{TestPool, pool};
 use pbfhogg::write::WriteOptions;
 
+/// add-locations-to-ways on the external backend, keeping untagged nodes.
+fn external_join(
+    input: &Path,
+    output: &Path,
+    host: &Host,
+    scratch: pbfhogg::scratch::RunScratch,
+) -> pbfhogg::Result<pbfhogg::altw::Stats> {
+    pbfhogg::altw::add_locations_to_ways(
+        input,
+        crate::common::out(output),
+        &pbfhogg::altw::AltwOptions {
+            keep_untagged_nodes: true,
+            write: WriteOptions::default(),
+            index_type: pbfhogg::altw::IndexType::External,
+            inject_prepass: false,
+            ignore_missing_nodes: false,
+        },
+        &Default::default(),
+        host,
+        scratch,
+    )
+}
+
 /// Records the pool's free count at each named marker, and every counter
 /// sample.
 struct Watch {
@@ -191,13 +214,9 @@ fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
     let budget = 64 + 256 + 100;
     let shared = Arc::new(pool(budget, Some(&ticket)));
     let (host, watch) = watched(&shared, &["EXTJOIN_STAGE1_END", "EXTJOIN_STAGE2_START"]);
-    pbfhogg::altw::external::external_join(
+    external_join(
         &input,
-        crate::common::out(&output),
-        true,
-        &Default::default(),
-        &Default::default(),
-        false,
+        &output,
         &host,
         crate::common::scratch_in(dir.path()),
     )
@@ -233,13 +252,9 @@ fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
     let small = Arc::new(pool(64 + 256 - 1, Some(&ticket)));
     let (host, _) = watched(&small, &[]);
     let refused = dir.path().join("refused.osm.pbf");
-    let err = pbfhogg::altw::external::external_join(
+    let err = external_join(
         &input,
-        crate::common::out(&refused),
-        true,
-        &Default::default(),
-        &Default::default(),
-        false,
+        &refused,
         &host,
         crate::common::scratch_in(dir.path()),
     )

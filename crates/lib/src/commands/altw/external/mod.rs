@@ -20,8 +20,6 @@
 //! input; see `reference/performance/add-locations-to-ways.md` for measurements. This path does not
 //! build a random-access node index.
 
-use crate::write::WriteOptions;
-
 use super::Stats;
 use crate::commands::HeaderOverrides;
 use crate::commands::input_front::InputFront;
@@ -813,7 +811,7 @@ impl ResolvedEntry {
     /// the remainder (and is wider than the others) instead of being
     /// truncated. This keeps every bucket's width ≥ `range_size`, which
     /// (together with the `slot_bucket_count = total_slots / max_blob_slots`
-    /// floor in `external_join`) preserves the 2-piece straddler
+    /// floor in `external_join_in`) preserves the 2-piece straddler
     /// invariant for all input sizes. Out-of-range high slot_pos values
     /// (that would land past the nominal last bucket because the last
     /// is wider) get clamped to `slot_bucket_count - 1`.
@@ -841,52 +839,6 @@ pub(super) fn slot_bucket_bounds(
         ((bucket_idx as u64 + 1) * range_size).min(total_slots)
     };
     (bucket_start, bucket_end)
-}
-
-/// Run the full external join pipeline for add-locations-to-ways.
-///
-/// Bounded working memory and sequential I/O. Temporary-disk demand depends
-/// on the input; see `reference/performance/add-locations-to-ways.md` for measured resource use and
-/// the module docs for the algorithm.
-///
-/// The input is read in several passes, so it must be a regular file
-/// (`InvalidArgument` otherwise), and is pinned for the run
-/// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
-/// open cannot reach the pinned file, an input replaced mid-run fails with
-/// `InputReplaced`. A path is pinned here; a caller's pin is shared as it
-/// is (see [`InputSource::pin`](crate::read::input::InputSource::pin)).
-#[allow(clippy::too_many_arguments)]
-pub fn external_join<'a>(
-    input: impl Into<crate::read::input::InputSource<'a>>,
-    output: impl crate::output::BindOutput,
-    keep_untagged_nodes: bool,
-    write: &WriteOptions,
-    overrides: &HeaderOverrides,
-    inject_prepass: bool,
-    host: &crate::host::Host,
-    scratch: crate::scratch::RunScratch,
-) -> Result<Stats> {
-    let host = &host.enter()?;
-    let output = crate::output::bind_unissued(output, &host.invocation)?;
-    host.invocation.check()?;
-    // Every stage's open of the input derives from this pin; see
-    // `add_locations_to_ways_to`, which pins the same way.
-    let pin = input.into().pin(host)?;
-    let front = InputFront::open(&pin, write.direct_reads, host)?;
-    let result = external_join_in(
-        &pin,
-        front,
-        &output,
-        keep_untagged_nodes,
-        write,
-        overrides,
-        inject_prepass,
-        host,
-        &scratch,
-    )?;
-    drop(scratch);
-    output.publish()?;
-    Ok(result)
 }
 
 /// Validate before stage 2 writes slot buckets. Each nonempty blob is no
@@ -1012,21 +964,40 @@ mod slot_layout_tests {
     }
 }
 
-/// [`external_join`] writing to a borrowed output it does not publish, in
-/// scratch the caller owns.
+/// The external join for add-locations-to-ways, writing to a borrowed output
+/// it does not publish, in scratch the caller owns.
+///
+/// Bounded working memory and sequential I/O. Temporary-disk demand depends
+/// on the input; see `reference/performance/add-locations-to-ways.md` for
+/// measured resource use and the module docs for the algorithm.
+///
+/// There is deliberately no public entry point of its own: the external
+/// backend is reached only through
+/// [`add_locations_to_ways`](super::add_locations_to_ways) with
+/// [`IndexType::External`](super::IndexType::External) (or `Auto`), so
+/// backend selection, option validation and the missing-location policy
+/// have one owner and no route can publish `(0, 0)` placeholders the caller
+/// did not ask for. The policy is applied here, right after stage 2: the
+/// missing count is `total_slots - resolved_count`, and stages 3 and 4 only
+/// scatter and encode the entries stage 2 resolved, so neither can change
+/// it. Refusing there skips the coordinate encoding, way assembly and
+/// output write a refused run would otherwise finish and throw away.
 #[hotpath::measure]
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn external_join_in(
     input: &PinnedInput,
     mut front: InputFront<'_>,
     output: &crate::output::BoundOutput,
-    keep_untagged_nodes: bool,
-    write: &WriteOptions,
+    options: &super::AltwOptions,
     overrides: &HeaderOverrides,
-    inject_prepass: bool,
     host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
+    let (keep_untagged_nodes, write, inject_prepass) = (
+        options.keep_untagged_nodes,
+        &options.write,
+        options.inject_prepass,
+    );
     let (direct_io, force) = (write.direct_reads, write.force);
     // `front` is the caller's one read of the input's preconditions; it
     // answers the indexdata and sortedness refusals here and supplies the
@@ -1334,6 +1305,17 @@ pub(crate) fn external_join_in(
     );
     host.invocation.marker("EXTJOIN_STAGE2_END");
 
+    // `resolved_count` counts slots whose node was found in the id-sorted
+    // tuple stream - presence, not a non-zero coordinate. It used to count
+    // `!= (0, 0)`, which reported every genuine node at Null Island as
+    // missing and so made this backend disagree with the sparse one about
+    // the same input. Absence is not zero; see the counting site in
+    // `stage2.rs`. Final here: stage 2 checked it against its manifest, and
+    // the later stages resolve nothing.
+    let missing_locations = total_slots.saturating_sub(resolved_count);
+    host.invocation.check()?;
+    super::enforce_missing_locations_policy(missing_locations, options.ignore_missing_nodes)?;
+
     // Free the per-blob mapping - it was a stage 2 input only.
     drop(node_blob_mapping);
 
@@ -1578,13 +1560,7 @@ pub(crate) fn external_join_in(
         );
     }
 
-    // `resolved_count` counts slots whose node was found in the id-sorted
-    // tuple stream - presence, not a non-zero coordinate. It used to count
-    // `!= (0, 0)`, which reported every genuine node at Null Island as
-    // missing and so made this backend disagree with the sparse one about
-    // the same input. Absence is not zero; see the counting site in
-    // `stage2.rs`.
-    stats.missing_locations = total_slots.saturating_sub(resolved_count);
+    stats.missing_locations = missing_locations;
 
     if inject_prepass {
         let member_ways = member_way_ids_ref.map_or(0, crate::idset::IdSet::len);

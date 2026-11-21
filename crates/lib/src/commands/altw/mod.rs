@@ -551,12 +551,12 @@ pub(crate) fn add_locations_to_ways_to<'a>(
         let member_ways = relation_scan.1.as_ref().map_or(0, IdSet::len);
         inject_metrics.emit(member_ways, &host.invocation);
     }
-    enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
+    enforce_missing_locations_policy(stats.missing_locations, options.ignore_missing_nodes)?;
     Ok(stats)
 }
 
-/// The external join, chosen up front or by the post-pass-0 recheck, and
-/// the missing-location gate every backend answers to.
+/// The external join, chosen up front or by the post-pass-0 recheck. It
+/// applies the missing-location gate itself, as soon as stage 2 has counted.
 fn run_external(
     input: &PinnedInput,
     front: InputFront<'_>,
@@ -566,19 +566,7 @@ fn run_external(
     host: &crate::host::Entered<'_>,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    let stats = external::external_join_in(
-        input,
-        front,
-        output,
-        options.keep_untagged_nodes,
-        &options.write,
-        overrides,
-        options.inject_prepass,
-        host,
-        scratch,
-    )?;
-    enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
-    Ok(stats)
+    external::external_join_in(input, front, output, options, overrides, host, scratch)
 }
 
 /// The post-pass-0 recheck: whether the exact sparse store, now that pass 0
@@ -650,26 +638,31 @@ fn recheck_routes_external(referenced_count: u64, anon: u128, budget: u64) -> (b
 /// well-formed, the numbers are plausible, and no reader can tell. Absence
 /// has to be reported as absence, so the run fails.
 ///
-/// The check runs after the write rather than mid-stream because the
-/// external backend only learns its resolved count when its final stage
-/// completes; a single post-pass gate is the one place that provably covers
-/// all three backends. The output written in the meantime is never published:
-/// it sits at the [`Output`](crate::output::Output)'s staging path, and
-/// [`add_locations_to_ways`] publishes only after this gate passes, so no
-/// caller is left holding a file of fabricated coordinates.
+/// Each backend calls it as soon as its count is final. The sparse paths
+/// (indexed passthrough and the decode-all fallback) count while they write,
+/// so they call it after the write; the external join knows its count when
+/// stage 2 returns and calls it there, before stages 3 and 4 encode and
+/// write anything. Output written before a refusal is never published: it
+/// sits at the [`Output`](crate::output::Output)'s staging path, and
+/// [`add_locations_to_ways`] (the only public route to every backend)
+/// publishes only after the run returns, so no caller is left holding a
+/// file of fabricated coordinates.
 ///
 /// The message deliberately does not name the output path: nothing is
 /// published, so there is no output to point at. The error is the typed
 /// [`ErrorKind::MissingNodeLocations`](crate::ErrorKind::MissingNodeLocations);
 /// how to allow the placeholders is the front end's advice.
-fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -> Result<()> {
-    if stats.missing_locations == 0 || ignore_missing_nodes {
+fn enforce_missing_locations_policy(
+    missing_locations: u64,
+    ignore_missing_nodes: bool,
+) -> Result<()> {
+    if missing_locations == 0 || ignore_missing_nodes {
         return Ok(());
     }
     // Every backend counts per reference: each unresolved position in each
     // way, so a node used twice counts twice.
     Err(crate::error::new_missing_node_locations(
-        stats.missing_locations,
+        missing_locations,
         crate::error::Unresolved::WayNodeReferences,
     ))
 }

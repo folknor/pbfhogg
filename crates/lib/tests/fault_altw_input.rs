@@ -36,8 +36,6 @@ enum Route {
     /// Forced sparse on an unindexed input: the pass 2 walk is replaced by
     /// the decode-all reader.
     DecodeAll,
-    /// The public `external_join`, given the cell's pin.
-    PublicExternal,
 }
 
 /// Write the run's input: 60 nodes, ways over the first six, relations over
@@ -85,23 +83,9 @@ fn run<'a>(
 ) -> pbfhogg::Result<()> {
     let input = input.into();
     let scratch = pbfhogg::scratch::RunScratch::create(scratch_dir, host)?;
-    if let Route::PublicExternal = route {
-        return pbfhogg::altw::external::external_join(
-            input,
-            crate::common::out(output),
-            false,
-            &WriteOptions::default(),
-            &pbfhogg::HeaderOverrides::default(),
-            false,
-            host,
-            scratch,
-        )
-        .map(drop);
-    }
     let (index_type, force) = match route {
         Route::Indexed(index_type) => (index_type, false),
         Route::DecodeAll => (IndexType::Sparse, true),
-        Route::PublicExternal => unreachable!("handled above"),
     };
     add_locations_to_ways(
         input,
@@ -247,11 +231,6 @@ fn external_reads_only_the_pinned_input() {
         6,
         Some(2),
     );
-}
-
-#[test]
-fn public_external_join_reads_only_the_pinned_input() {
-    check_route(Route::PublicExternal, Some(8 << 30), 6, Some(2));
 }
 
 #[test]

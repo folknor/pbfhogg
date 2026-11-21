@@ -177,7 +177,7 @@ pub(super) fn stage3_slot_reorder(
     // the handles join, and the router's abort error (raised here, and by
     // `AbortOnDrop` on a panic) wakes stage 4's readiness waits. A stage 4
     // failure aborts the router and stops these workers without becoming a
-    // stage 3 error, and `external_join` prefers a stage 3 error when both
+    // stage 3 error, and `external_join_in` prefers a stage 3 error when both
     // fail; so "first error" means first recorded, not lowest bucket, and the
     // two stores can name different concurrent causes. Work in flight
     // finishes after another worker fails.

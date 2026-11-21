@@ -70,13 +70,9 @@ fn process_actions_fire_once_at_each_hook_site() {
     // cat asks for one descriptor per pinned input before pinning them.
     assert_eq!(actions.fd.load(Relaxed), 1);
     actions.fd.store(0, Relaxed);
-    pbfhogg::altw::external::external_join(
+    external_join(
         &base,
-        crate::common::out(dir.path().join("external.pbf")),
-        true,
-        &Default::default(),
-        &overrides,
-        false,
+        &dir.path().join("external.pbf"),
         &host,
         crate::common::scratch_in(dir.path()),
     )
@@ -1148,18 +1144,32 @@ fn run_external_join(
     host: &pbfhogg::host::Host,
     scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), String> {
-    pbfhogg::altw::external::external_join(
+    external_join(input, output, host, scratch)
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+/// add-locations-to-ways on the external backend, keeping untagged nodes.
+fn external_join(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    host: &pbfhogg::host::Host,
+    scratch: pbfhogg::scratch::RunScratch,
+) -> pbfhogg::Result<pbfhogg::altw::Stats> {
+    pbfhogg::altw::add_locations_to_ways(
         input,
         crate::common::out(output),
-        true,
+        &pbfhogg::altw::AltwOptions {
+            keep_untagged_nodes: true,
+            write: Default::default(),
+            index_type: pbfhogg::altw::IndexType::External,
+            inject_prepass: false,
+            ignore_missing_nodes: false,
+        },
         &Default::default(),
-        &Default::default(),
-        false,
         host,
         scratch,
     )
-    .map(drop)
-    .map_err(|e| e.to_string())
 }
 /// altw external builds its output writer in stage 4, on a scoped thread of
 /// its own. A backend setup refusal there must reach the caller as the typed
@@ -1184,16 +1194,8 @@ fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
     let faults = host.invocation.faults();
     faults.refuse_output_backend.store(true, Relaxed);
     let output = dir.path().join("refused.pbf");
-    let Err(err) = pbfhogg::altw::external::external_join(
-        &base,
-        crate::common::out(&output),
-        true,
-        &Default::default(),
-        &Default::default(),
-        false,
-        &host,
-        crate::common::scratch_in(dir.path()),
-    ) else {
+    let Err(err) = external_join(&base, &output, &host, crate::common::scratch_in(dir.path()))
+    else {
         panic!("an injected backend refusal must fail the run");
     };
     match err.kind() {

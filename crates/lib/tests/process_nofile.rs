@@ -119,13 +119,17 @@ fn external_join_keeping(
     output: &std::path::Path,
     keep_untagged_nodes: bool,
 ) -> Result<(), String> {
-    pbfhogg::altw::external::external_join(
+    pbfhogg::altw::add_locations_to_ways(
         input,
         crate::common::out(output),
-        keep_untagged_nodes,
+        &pbfhogg::altw::AltwOptions {
+            keep_untagged_nodes,
+            write: Default::default(),
+            index_type: pbfhogg::altw::IndexType::External,
+            inject_prepass: false,
+            ignore_missing_nodes: false,
+        },
         &Default::default(),
-        &Default::default(),
-        false,
         host,
         // Made from the test's own host, whose provider is the one under test.
         pbfhogg::scratch::RunScratch::create(

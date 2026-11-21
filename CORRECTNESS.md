@@ -263,7 +263,10 @@ than a silent `(0, 0)` fill; pass `--ignore-missing-nodes` to accept the
 placeholders (only under that flag does the placeholder ambiguity
 reappear, now opt-in). That filler is opt-in, counted, and gated by a
 check that refuses before anything is published (add-locations-to-ways
-after its write, counting references; apply-changes at its node-to-way
+counting references, the sparse index after its write and the external
+join right after its node join, before it encodes any way; the library
+reaches either backend only through `add_locations_to_ways`, so no entry
+point skips the check; apply-changes at its node-to-way
 barrier, counting distinct nodes), so it is a deliberate output rather than
 an ambiguous sentinel. The first withdrew a documented osmium deviation
 and the second added one - see `DEVIATIONS.md`.

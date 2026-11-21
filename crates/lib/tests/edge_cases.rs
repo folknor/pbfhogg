@@ -384,9 +384,8 @@ fn altw_options() -> pbfhogg::altw::AltwOptions {
 
 /// The library entry point, not the CLI.
 ///
-/// The missing-locations gate can only run after a complete output exists -
-/// the external backend does not know its resolved count until its last
-/// stage - so the write happens before the refusal. A library caller used
+/// The sparse backend counts missing locations while it writes, so its gate
+/// runs after a complete output exists. A library caller used
 /// to be handed an error together with a well-formed PBF at the path it
 /// named, full of fabricated `(0, 0)` vertices that no reader can tell from
 /// genuine data. The output's staging file is what keeps it out now: the
@@ -435,6 +434,17 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
     assert!(output.exists(), "an accepted run must publish its output");
 }
 
+/// Every marker name an invocation emits, in emission order.
+#[derive(Default)]
+struct MarkerLog(std::sync::Mutex<Vec<String>>);
+
+impl pbfhogg::debug::InstrumentSink for MarkerLog {
+    fn marker(&self, name: &str) {
+        self.0.lock().expect("markers").push(name.to_owned());
+    }
+    fn counter(&self, _: &str, _: i64) {}
+}
+
 /// add-locations-to-ways counts unresolved references, not nodes: one absent
 /// node used three times across two ways is three, on both index types,
 /// and the refusal says so.
@@ -478,16 +488,31 @@ fn altw_refusal_counts_each_unresolved_reference() {
         opts.index_type = index_type;
         // External takes indexed input only and refuses `force`.
         opts.write.force = matches!(index_type, pbfhogg::altw::IndexType::Sparse);
+        let markers = std::sync::Arc::new(MarkerLog::default());
+        let mut host = crate::common::heavy_host(&ticket);
+        host.invocation =
+            pbfhogg::host::Invocation::with_sink(std::sync::Arc::clone(&markers)
+                as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>);
         let Err(err) = pbfhogg::altw::add_locations_to_ways(
             &input,
             crate::common::out(&output),
             &opts,
             &pbfhogg::HeaderOverrides::default(),
-            &crate::common::heavy_host(&ticket),
+            &host,
             crate::common::scratch_in(dir.path()),
         ) else {
             panic!("{index_type:?}: an unresolvable way ref must fail the default policy");
         };
+        if index_type == pbfhogg::altw::IndexType::External {
+            // The external join's count is final when stage 2 returns, and it
+            // refuses there: stages 3 and 4 never start.
+            let seen = markers.0.lock().expect("markers").clone();
+            assert!(
+                seen.iter().any(|m| m == "EXTJOIN_STAGE2_END")
+                    && !seen.iter().any(|m| m == "EXTJOIN_STREAMING_START"),
+                "external must refuse right after stage 2: {seen:?}"
+            );
+        }
         assert!(
             matches!(
                 err.kind(),

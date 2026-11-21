@@ -85,24 +85,6 @@ Reported by: encoding.
 locations vector disagrees with refs; the direct builder location API refuses
 the mismatch. The fallback can hide an internal transformation error.
 
-## BUG-008 - Public external_join bypasses missing-node enforcement
-
-Reported by: altw-sparse, altw-external.
-
-`external_join` (`altw/external/mod.rs`) publishes after `external_join_in`
-without the command's missing-location policy and has no `ignore_missing_nodes`
-parameter, so library callers can publish zero placeholders the default command
-rejects. Separately, the command knows the resolved count when stage 2 returns
-but enforces the strict policy only after encoding, assembly, compression and
-writing; passing the policy into orchestration would fail right after the join.
-
-Defect hunt 2026-11-17 (altw, P1): a sorted, indexed input with a way
-referencing an absent node returns success through this public API and
-publishes `(0, 0)`, with no signature option authorizing placeholders; the
-enforcing path is `add_locations_to_ways_to` (`altw/mod.rs`). Claim named: the
-publication guarantee in `CORRECTNESS.md`. The hunter says backend selection
-and publication policy should have one owner.
-
 ## BUG-009 - Duplicate node IDs resolve to scheduling-dependent coordinates
 
 Reported by: altw-sparse, altw-external, apply-locations.

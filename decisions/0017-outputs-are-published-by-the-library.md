@@ -115,7 +115,7 @@ output any other way.
   `sort(input, output, ...)` writes through a borrowing engine
   (`sort_to(input, &output, ...)`, which takes `&BoundOutput`) and calls
   `output.publish()` as its last step, after every post-write gate (the altw
-  missing-locations check runs before publication). Engines that dispatch to
+  missing-locations check on the sparse index runs before publication). Engines that dispatch to
   other engines (`extract_multi` to `extract_to`, altw to the external join,
   derive to its parallel driver) pass the borrow; publication authority
   cannot be borrowed because `publish` takes `self`. Every PBF backend -
@@ -227,7 +227,7 @@ output any other way.
   until publication or drop, which matters only to an `extract --config`
   with very many regions under a tight descriptor limit.
   The wrappers that own run scratch and publish (`add_locations_to_ways`,
-  `external_join`, `derive_changes`, `build_geocode_index`) drop it, removing possibly
+  `derive_changes`, `build_geocode_index`) drop it, removing possibly
   hundreds of GB, before `publish`, so that removal precedes the output's
   `fsync` and rename. That order is deliberate: the scratch is the run's to
   clean up as soon as the work is done, publication then syncs only the
@@ -368,7 +368,7 @@ in its `.pbfhogg-backup-*` entry, possibly partly removed.
   answered by the caller constructing the `Output`: run-owned scratch never
   goes through it.
 - **Publication inside `PbfWriter` (rename on `flush`).** Gates that run
-  after the write (altw's missing-locations check) would publish a file the
+  after the write (altw's missing-locations check on the sparse index) would publish a file the
   run then refuses, and the non-PBF writers would need a second mechanism.
 - **Entry points take `&Path` plus an overwrite flag and check on entry.**
   Nothing would stop an entry from forgetting the check or writing to the

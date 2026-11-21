@@ -1045,7 +1045,8 @@ impl WayReframeScratch {
 /// zigzag-decoding or re-encoding.
 ///
 /// The whole-pipeline missing-location count is computed once in
-/// `external_join` from the total and resolved slot counts. Stage 3 has
+/// `external_join_in`, after stage 2, from the total and resolved slot
+/// counts, and a strict run is refused there before this stage starts. Stage 3 has
 /// already replaced absent slots with zero coordinates in this payload;
 /// those bytes cannot distinguish missing nodes from real Null Island nodes.
 /// Do not derive a per-blob missing count here.

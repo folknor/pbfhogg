@@ -36,17 +36,61 @@ pub(super) fn collect_coords(way: &Way<'_>, coords: &mut Vec<(f64, f64)>) {
     );
 }
 
-fn signed_area(coords: &[(f64, f64)], closed: bool) -> f64 {
-    let mut twice_area = coords
-        .windows(2)
-        .map(|pair| pair[0].0 * pair[1].1 - pair[1].0 * pair[0].1)
-        .sum::<f64>();
-    if !closed {
-        let first = coords[0];
-        let last = coords[coords.len() - 1];
-        twice_area += last.0 * first.1 - first.0 * last.1;
+/// The coordinate `format_coord` writes for `deg`, as an exact count of
+/// 10^-7 degrees, parsed back from that same text. `None` for text that is
+/// not a plain decimal (`NaN`, `inf`) or does not fit.
+fn emitted_e7(scratch: &mut String, deg: f64) -> Option<i128> {
+    format_coord(scratch, deg);
+    let (negative, digits) = match scratch.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, scratch.as_str()),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() || frac_part.len() > 7 {
+        return None;
     }
-    twice_area / 2.0
+    let mut value: i128 = 0;
+    let padded = frac_part.bytes().chain(std::iter::repeat(b'0')).take(7);
+    for byte in int_part.bytes().chain(padded) {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(i128::from(byte - b'0'))?;
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// Twice the signed area of the ring export emits, in squared 10^-7 degrees,
+/// computed exactly. The orientation is judged on the emitted text, not on
+/// the input: an `f64` shoelace over absolute coordinates loses the sign to
+/// cancellation (a small clockwise ring near `(128, 64)` sums products near
+/// 8192 to recover a twice-area near `1e-14`), and exact input nanodegrees
+/// can disagree in sign with the rounded output when block offsets are not
+/// multiples of 100. Vertices are taken relative to the first, so the
+/// closing edge of an open ring contributes zero and needs no term. `None`
+/// when a coordinate does not format to a parseable decimal or the checked
+/// `i128` arithmetic overflows, which no geographically valid ring reaches.
+fn emitted_twice_area(scratch: &mut String, coords: &[(f64, f64)]) -> Option<i128> {
+    let mut points = coords.iter();
+    let &(lon0, lat0) = points.next()?;
+    let origin = (emitted_e7(scratch, lon0)?, emitted_e7(scratch, lat0)?);
+    let mut prev = (0_i128, 0_i128);
+    let mut twice_area: i128 = 0;
+    for &(lon, lat) in points {
+        let cur = (
+            emitted_e7(scratch, lon)?.checked_sub(origin.0)?,
+            emitted_e7(scratch, lat)?.checked_sub(origin.1)?,
+        );
+        let det = prev
+            .0
+            .checked_mul(cur.1)?
+            .checked_sub(cur.0.checked_mul(prev.1)?)?;
+        twice_area = twice_area.checked_add(det)?;
+        prev = cur;
+    }
+    Some(twice_area)
 }
 
 fn has_three_distinct_positions(coords: &[(f64, f64)]) -> bool {
@@ -95,7 +139,14 @@ pub(super) fn write_way_geometry(
             return WayGeom::Invalid;
         }
     }
-    let reverse = is_area && signed_area(coords, closed) < 0.0;
+    let reverse = if is_area {
+        let Some(twice_area) = emitted_twice_area(scratch, coords) else {
+            return WayGeom::Invalid;
+        };
+        twice_area < 0
+    } else {
+        false
+    };
 
     buf.clear();
     if is_area {
@@ -224,6 +275,75 @@ mod tests {
             ),
             WayGeom::Invalid
         );
+    }
+
+    #[test]
+    fn clockwise_ring_far_from_origin_is_reoriented() {
+        let mut buf = String::new();
+        let mut scratch = String::new();
+        let ring = [
+            (128.0, 64.0),
+            (128.0, 64.000_000_1),
+            (128.000_000_1, 64.0),
+            (128.0, 64.0),
+        ];
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &ring, true),
+            WayGeom::Written
+        );
+        assert_eq!(
+            buf,
+            "{\"type\":\"Polygon\",\"coordinates\":[[[128,64],[128.0000001,64],\
+             [128,64.0000001],[128,64]]]}"
+        );
+    }
+
+    #[test]
+    fn orientation_follows_emitted_coordinates() {
+        // Exact nanodegrees (offset 50) wind counterclockwise, but the
+        // seven-decimal output winds clockwise; the output is what must be
+        // counterclockwise.
+        let mut buf = String::new();
+        let mut scratch = String::new();
+        let ring = [
+            (-5050e-9, 8350e-9),
+            (-1950e-9, 11850e-9),
+            (1150e-9, 15450e-9),
+            (-5050e-9, 8350e-9),
+        ];
+        assert_eq!(
+            write_way_geometry(&mut buf, &mut scratch, &ring, true),
+            WayGeom::Written
+        );
+        assert_eq!(
+            buf,
+            "{\"type\":\"Polygon\",\"coordinates\":[[[-0.000005,0.0000083],\
+             [0.0000012,0.0000154],[-0.0000019,0.0000119],[-0.000005,0.0000083]]]}"
+        );
+    }
+
+    #[test]
+    fn unformattable_area_coordinate_is_invalid() {
+        let mut buf = String::new();
+        let mut scratch = String::new();
+        assert_eq!(
+            write_way_geometry(
+                &mut buf,
+                &mut scratch,
+                &[(0.0, 0.0), (f64::NAN, 1.0), (1.0, 0.0), (0.0, 0.0)],
+                true
+            ),
+            WayGeom::Invalid
+        );
+    }
+
+    #[test]
+    fn emitted_e7_parses_formatted_text() {
+        let mut scratch = String::new();
+        assert_eq!(emitted_e7(&mut scratch, -0.000_000_01), Some(0));
+        assert_eq!(emitted_e7(&mut scratch, -0.000_000_1), Some(-1));
+        assert_eq!(emitted_e7(&mut scratch, 12.5), Some(125_000_000));
+        assert_eq!(emitted_e7(&mut scratch, f64::INFINITY), None);
     }
 
     #[test]

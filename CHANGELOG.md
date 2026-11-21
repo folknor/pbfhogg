@@ -550,6 +550,14 @@
 
 ### Fixed
 
+- **`export` winds every Polygon exterior ring counterclockwise.** The
+  orientation was judged with a floating-point area over absolute
+  coordinates, which cancels to zero for small rings away from the
+  origin, so such a ring could be written clockwise. It is now judged
+  exactly on the coordinates as written. An area way with a coordinate
+  that does not format as a decimal number is skipped and counted as
+  invalid geometry.
+
 - **`degrade --drop-ids N:SEED` counts N in distinct IDs.** On input that
   repeats a `(kind, id)`, such as a history file with one record per
   version, selection used to count records, so N could select fewer than

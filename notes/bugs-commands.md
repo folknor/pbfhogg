@@ -293,20 +293,6 @@ side. Separately, the extended text renderer (`inspect/report.rs`) omits
 metadata coverage entirely when there are no objects, although the
 documentation promises `All objects have: (none)`.
 
-## CMD-034 - Export can leave a clockwise ring clockwise through cancellation
-
-Reported by: export [P2].
-
-`export/geometry.rs` computes the shoelace area from absolute longitude and
-latitude products. For the clockwise ring `(128, 64)`, `(128, 64.0000001)`,
-`(128.0000001, 64)`, `(128, 64)` (lon, lat; ordinary decimicrodegree values),
-the calculation subtracts products around 8192 to recover a twice-area around
-`1e-14`, which rounds away. The area becomes zero, `reverse` stays false and
-the ring stays clockwise. This breaks ADR-0010's unconditional
-counterclockwise exterior-ring promise. The shared `geo::signed_area`
-(`geo.rs`) already avoids this with a local origin, and export duplicates the
-vulnerable calculation.
-
 ## CMD-035 - Export accepts degenerate polygons, including ones made by rounding
 
 Reported by: export [P2].

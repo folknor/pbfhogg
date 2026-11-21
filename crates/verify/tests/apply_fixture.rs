@@ -92,7 +92,58 @@ fn case(fault: &str) -> Case {
     }
 }
 
-pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
+/// Every apply fault, one row each: the test's name, the fault's name in
+/// the fixture, and whether the check passes on it outside the
+/// mode-dependent exceptions in `driver`. A callback macro, so the one table
+/// generates both the fault lookup here and one test per fault in
+/// `process.rs`: each fault gets its own child and its own hang bound, and
+/// a fault added here gets its test without a second list to keep in step.
+/// One test holding the whole sweep outgrew its bound under the gate's
+/// parallel load.
+macro_rules! apply_faults {
+    ($callback:ident) => {
+        $callback! {
+            verifier_apply_baseline "" true,
+            verifier_apply_unexplained "unexplained" false,
+            verifier_apply_modified "modified" false,
+            verifier_apply_deleted "deleted" false,
+            verifier_apply_osmium_off_model "osmium-off-model" false,
+            verifier_apply_stale "stale" false,
+            verifier_apply_osmium_stale "osmium-stale" true,
+            verifier_apply_unsorted "unsorted" true,
+            verifier_apply_publish "publish" false,
+            verifier_apply_silent_drop "silent-drop" false,
+            verifier_apply_metadata "metadata" false,
+            verifier_apply_coords "coords" true,
+            verifier_apply_precedence "precedence" true,
+            verifier_apply_precedence_wrong "precedence-wrong" false,
+            verifier_apply_regression "regression" true,
+            verifier_apply_regression_accepted "regression-accepted" false,
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use apply_faults;
+
+macro_rules! expected_lookup {
+    ($($test:ident $fault:literal $expected:literal,)*) => {
+        /// The table's expected outcome for `fault`; an unknown name fails
+        /// rather than passing on an empty sweep.
+        fn expected(fault: &str) -> bool {
+            match fault {
+                $($fault => $expected,)*
+                other => panic!("unknown apply fault {other:?}"),
+            }
+        }
+    };
+}
+apply_faults!(expected_lookup);
+
+/// Run one fault in both location modes. Both modes share this process's
+/// reference cache, so the getid reference run keyed on the same base and
+/// OSC is served from it in the second mode.
+pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path, fault: &str) {
+    let expected = expected(fault);
     let dir = dir.join("apply-fixture");
     std::fs::create_dir(&dir).unwrap();
     let input = dir.join("input.pbf");
@@ -106,56 +157,35 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         false,
         cache,
     );
-    for (fault, expected) in [
-        ("", true),
-        ("unexplained", false),
-        ("modified", false),
-        ("deleted", false),
-        ("osmium-off-model", false),
-        ("stale", false),
-        ("osmium-stale", true),
-        ("unsorted", true),
-        ("publish", false),
-        ("silent-drop", false),
-        ("metadata", false),
-        ("coords", true),
-        ("precedence", true),
-        ("precedence-wrong", false),
-        ("regression", true),
-        ("regression-accepted", false),
-    ] {
-        std::fs::write(dir.join("fault"), fault).unwrap();
-        std::fs::write(&osc, case(fault).osc).unwrap();
-        if fault == "unsorted" || fault == "publish" {
-            fake_pbf::write(&input, &[LOW], "unsorted");
-        } else {
-            // The fault rides in the input's content, so no reference run is
-            // served from the cache entry of another fault.
-            fake_pbf::write(&input, &[SORTED, LOW], &format!("sorted {fault}"));
-        }
-        for locations in [false, true] {
-            h.run = run::Run::create(&dir, exe, true).unwrap();
-            h.run.watch(&input).unwrap();
-            h.run.watch(&osc).unwrap();
-            let judged = super::judge(&mut h, "apply", |h| {
-                checks::apply_changes::run(h, &input, &osc, true, locations)
-            });
-            // Under -l osmium keeps or drops a base that does not lose by
-            // its cursor, so the model leaves it undecided there.
-            let pass = expected
-                || (fault == "stale" && !locations)
-                || (fault == "osmium-off-model" && locations);
-            assert_apply(fault, locations, &judged);
-            assert_eq!(
-                judged.status,
-                if pass {
-                    harness::CheckStatus::Passed
-                } else {
-                    harness::CheckStatus::Failed
-                },
-                "fault={fault}, locations={locations}"
-            );
-        }
+    std::fs::write(dir.join("fault"), fault).unwrap();
+    std::fs::write(&osc, case(fault).osc).unwrap();
+    if fault == "unsorted" || fault == "publish" {
+        fake_pbf::write(&input, &[LOW], "unsorted");
+    } else {
+        fake_pbf::write(&input, &[SORTED, LOW], &format!("sorted {fault}"));
+    }
+    for locations in [false, true] {
+        h.run = run::Run::create(&dir, exe, true).unwrap();
+        h.run.watch(&input).unwrap();
+        h.run.watch(&osc).unwrap();
+        let judged = super::judge(&mut h, "apply", |h| {
+            checks::apply_changes::run(h, &input, &osc, true, locations)
+        });
+        // Under -l osmium keeps or drops a base that does not lose by
+        // its cursor, so the model leaves it undecided there.
+        let pass = expected
+            || (fault == "stale" && !locations)
+            || (fault == "osmium-off-model" && locations);
+        assert_apply(fault, locations, &judged);
+        assert_eq!(
+            judged.status,
+            if pass {
+                harness::CheckStatus::Passed
+            } else {
+                harness::CheckStatus::Failed
+            },
+            "fault={fault}, locations={locations}"
+        );
     }
 }
 

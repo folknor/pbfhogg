@@ -151,19 +151,20 @@ classification uses a weaker ordering than the rewrite path. The statement in
 `reference/indexdata-trust.md` that sort does not reorder versions is also
 wrong, since it sometimes does.
 
-## CMD-021 - time-filter treats an absent dense timestamp as the epoch
+## CMD-057 - time-filter compares a wrapped dense timestamp against the cutoff
 
-Reported by: id-filter-selection [P2].
+Reported by: the time-filter padding-slot fix (spar review).
 
-`dense_timestamp` (`time_filter/mod.rs`) checks whether the group has a
-timestamp column and then returns the slot's value, without checking whether
-that node claims a timestamp. A dense node with an absent or sentinel version
-and timestamp zero is unclaimed padding under the metadata rules in
-`CORRECTNESS.md`, and `DenseNodeInfo::claims` (`read/dense.rs`) correctly
-reports no timestamp for it. Even so, a sorted snapshot containing that slot
-passes `time-filter` at cutoff 250 and emits the node as predating the cutoff.
-The documented claim is that elements without timestamps are refused rather
-than treated as zero. The accessor needs per-slot presence semantics.
+`DenseNodeInfo::milli_timestamp` scales by `date_granularity` with wrapping
+multiplication, and time-filter's dense accessor (through
+`claimed_milli_timestamp`) compares that value with the cutoff. A decoded
+timestamp far enough out to overflow wraps to an arbitrary value: it can wrap
+to a plausible time and be kept or dropped by the wrong comparison, or wrap to
+exactly 0 on a versionless slot and be refused as padding. The OSC writer
+already uses `milli_timestamp_exact` for this ambiguity (CORRECTNESS.md, OSC
+scaling). A cutoff decision on an overflowing timestamp should refuse, not
+wrap. Separately, the integer division by 1000 truncates a negative sub-second
+timestamp toward zero, so it compares as a later second than it is.
 
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 

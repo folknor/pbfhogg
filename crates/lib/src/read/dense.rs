@@ -523,6 +523,22 @@ impl<'a> DenseNodeInfo<'a> {
         (self.version >= 1).then_some(self.version)
     }
 
+    /// The timestamp in milliseconds this slot claims, or `None` when it
+    /// claims none: its group lacks the timestamp column, or the slot claims
+    /// no version and its timestamp is 0, which on the wire is the padding a
+    /// writer stores for a node without metadata. A versioned slot claims a
+    /// present column's value, 0 included. The rule [`claims`](Self::claims)
+    /// applies to the timestamp, without its other fields' cost; the zero
+    /// test is on milliseconds, so a sub-second timestamp is a claim.
+    #[inline]
+    pub(crate) fn claimed_milli_timestamp(&self) -> Option<i64> {
+        if !self.columns.timestamp() {
+            return None;
+        }
+        let milli = self.milli_timestamp();
+        (self.version >= 1 || milli != 0).then_some(milli)
+    }
+
     /// The metadata fields this slot claims, for outputs that print them;
     /// `None` when it claims nothing.
     ///
@@ -573,7 +589,7 @@ impl<'a> DenseNodeInfo<'a> {
             return Some(DenseClaims {
                 // An absent version column reads 0, so this one is present.
                 version: Some(self.version),
-                milli_timestamp: columns.timestamp().then(|| self.milli_timestamp()),
+                milli_timestamp: self.claimed_milli_timestamp(),
                 // libosmium reads the Osmosis -1 as 0, and the re-encoding
                 // conversions write it so.
                 changeset: columns.changeset().then_some(if self.changeset == -1 {
@@ -586,7 +602,6 @@ impl<'a> DenseNodeInfo<'a> {
                 visible: Some(self.visible),
             });
         }
-        let milli_timestamp = self.milli_timestamp();
         let user = match self.user_sid {
             0 => None,
             _ => match self.user() {
@@ -596,7 +611,7 @@ impl<'a> DenseNodeInfo<'a> {
         };
         Some(DenseClaims {
             version: None,
-            milli_timestamp: (milli_timestamp != 0).then_some(milli_timestamp),
+            milli_timestamp: self.claimed_milli_timestamp(),
             changeset: (self.changeset > 0).then_some(self.changeset),
             uid: (self.uid > 0).then_some(self.uid),
             user,

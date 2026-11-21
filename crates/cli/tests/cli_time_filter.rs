@@ -401,6 +401,77 @@ fn time_filter_refuses_metadata_stripped_input() {
     );
 }
 
+/// A dense node added without metadata to a block whose other nodes carry
+/// it is stored as an all-zero slot: no version, timestamp 0. The group
+/// has a timestamp column, but this node claims no timestamp, and it is
+/// refused like a stripped input rather than kept as the epoch - on the
+/// snapshot and the history path alike.
+#[test]
+fn time_filter_refuses_a_dense_padding_slot() {
+    let dir = crate::common::test_scratch();
+    for history in [false, true] {
+        let input = dir.path().join(format!("padding-{history}.osm.pbf"));
+        let file = std::fs::File::create(&input).expect("create file");
+        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        let mut header = HeaderBuilder::new().sorted();
+        if history {
+            header = header.historical();
+        }
+        writer
+            .write_header(&header.build().expect("build header"))
+            .expect("write header");
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 10, 10, [], Some(&snapshot_meta(1, 100, true)));
+        bb.add_node(2, 20, 20, [], None);
+        let bytes = bb.take().expect("take").expect("block");
+        writer.write_primitive_block(bytes).expect("write block");
+        writer.flush().expect("flush");
+        let output = dir.path().join(format!("padding-{history}.out.osm.pbf"));
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("time-filter")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("250")
+            .assert_failure();
+        let stderr = out.stderr_str();
+        assert!(
+            stderr.contains("node 2 carries no timestamp"),
+            "the refusal names the padding node; stderr:\n{stderr}"
+        );
+        assert!(!output.exists(), "a refused run publishes nothing");
+    }
+}
+
+/// The padding rule refuses only the zero of a versionless slot: a
+/// versioned node at the epoch and a versionless node with a non-zero
+/// timestamp both claim their timestamps and are kept below the cutoff.
+#[test]
+fn dense_timestamps_claimed_by_value_or_version_are_kept() {
+    let dir = crate::common::test_scratch();
+    for history in [false, true] {
+        let input = dir.path().join(format!("claimed-{history}.osm.pbf"));
+        let output = dir.path().join(format!("claimed-{history}.out.osm.pbf"));
+        write_node_blocks(&input, history, true, &[&[(1, 1, 0), (2, 0, 100)]]);
+        run_time_filter(&input, &output, 250);
+        let kept: Vec<(i64, Option<i64>)> = crate::common::read_in_file_order(&output)
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::common::NormalizedElement::Node(n) => {
+                    Some((n.id, n.meta.as_ref().and_then(|m| m.milli_timestamp)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(1, Some(0)), (2, Some(100_000))],
+            "history={history}"
+        );
+    }
+}
+
 fn snapshot_meta(version: i32, timestamp: i64, visible: bool) -> Metadata<'static> {
     Metadata {
         version,

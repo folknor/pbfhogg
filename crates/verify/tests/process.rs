@@ -113,16 +113,29 @@ fn verifier_encoding_checks() {
     run_worker("encoding", scratch.path());
 }
 
-#[test]
-fn verifier_apply_changes() {
+/// One apply fault in both location modes, in a child and a scratch of its
+/// own under its own bound.
+fn apply_fault(fault: &str) {
     let _bound = pbfhogg_test_scratch::HangBound::arm(
         tunables::TEST_HANG_BOUND,
         tunables::TEST_REPORT_GRACE,
-        "apply verifier",
+        &format!("apply verifier, fault {fault:?}"),
     );
     let scratch = pbfhogg_test_scratch::scratch();
-    run_worker("apply", scratch.path());
+    run_worker(&format!("apply={fault}"), scratch.path());
 }
+
+macro_rules! apply_tests {
+    ($($test:ident $fault:literal $expected:literal,)*) => {
+        $(
+            #[test]
+            fn $test() {
+                apply_fault($fault);
+            }
+        )*
+    };
+}
+worker::apply_fixture::apply_faults!(apply_tests);
 
 #[test]
 fn verifier_change_checks() {

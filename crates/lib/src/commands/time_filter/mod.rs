@@ -818,13 +818,15 @@ fn version_violation(
 /// `None` means the element carries no timestamp at all.
 fn dense_timestamp(dn: &DenseNode<'_>) -> Option<i64> {
     // A timestamp column, when the group carries one, has a value for every
-    // node. Absence is `info()` returning None (a metadata-stripped dense
-    // block) or a DenseInfo without the timestamp column (libosmium writes
-    // any subset of columns), which reads 0 and must not pass as the epoch.
-    let info = dn.info()?;
-    info.columns()
-        .timestamp()
-        .then_some(info.milli_timestamp() / 1000)
+    // node, so the column alone does not say this node has a timestamp.
+    // Absence is `info()` returning None (a metadata-stripped dense block),
+    // a DenseInfo without the timestamp column (libosmium writes any subset
+    // of columns), or a slot that claims no version and holds timestamp 0:
+    // the padding BlockBuilder and libosmium store for a node added without
+    // metadata among nodes that carry it. Each reads 0 and must not pass as
+    // the epoch; `claimed_milli_timestamp` is the slot rule every metadata
+    // output shares.
+    Some(dn.info()?.claimed_milli_timestamp()? / 1000)
 }
 
 fn node_timestamp(n: &Node<'_>) -> Option<i64> {
@@ -846,9 +848,11 @@ fn require_timestamp(ts: Option<i64>, kind: &str, id: i64) -> crate::Result<i64>
             "time-filter: {kind} {id} carries no timestamp. Filtering by time needs one, and \
              treating an absent timestamp as the Unix epoch would place every such element at \
              or below any cutoff - so the command would keep the entire input, write it out \
-             unchanged, and report success having filtered nothing. The input has had its \
-             metadata stripped (osmium --drop-metadata and several pbfhogg write paths do \
-             this); re-run time-filter against an input that still carries element metadata."
+             unchanged, and report success having filtered nothing. Either the input has had \
+             its metadata stripped (osmium --drop-metadata and several pbfhogg write paths do \
+             this), or the element is a dense node with no version and timestamp 0, which the \
+             format cannot tell apart from a node written without metadata; re-run \
+             time-filter against an input whose elements carry their timestamps."
         ))
     })
 }

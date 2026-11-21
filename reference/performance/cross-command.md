@@ -654,6 +654,25 @@ sides: pbfhogg 2.4, 2.4, 2.5 s (`cf923912`, `17377af1`, `d4566fdf`),
 osmium 7.2, 7.2, 7.1 s (`900e5298`, `31503713`, `3672b775`), about 2.9
 times faster.
 
+## time-filter dense timestamp claim (plantasjen, 2026-11-21, against `c5d88ef9`)
+
+The snapshot path's dense timestamp reads the slot's claim
+(`DenseNodeInfo::claimed_milli_timestamp`: a versionless slot's zero is
+padding, not the epoch) in place of the column test, one more compare
+per dense node. `time-snapshot --dataset planet`, `--iterations 1`,
+interleaved baseline (clean `c5d88ef9` via `--commit HEAD`) and variant
+(the change, uncommitted):
+
+| Order | Arm | Wall | Run |
+|---|---|---|---|
+| 1 | baseline | 241 s | `21825f10` |
+| 2 | variant | 251 s | `18d6a93b` |
+| 3 | baseline | 252 s | `f179cc44` |
+| 4 | variant | 241 s | `f23c8f54` |
+
+Medians are equal (246.5 s each) and the sign flips between pairs: no
+measurable cost. The ~10 s band is drift between cells, not the change.
+
 ## Changes with no cell of their own (2026-10-24 to 2026-10-30)
 
 Each was argued neutral or below noise and never measured alone. Listed

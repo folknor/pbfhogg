@@ -56,7 +56,7 @@ use std::io::Write;
 use std::path::Path;
 
 #[path = "apply_fixture.rs"]
-mod apply_fixture;
+pub(crate) mod apply_fixture;
 #[path = "encoding_fixture.rs"]
 mod encoding_fixture;
 
@@ -207,8 +207,8 @@ fn driver(role: &str, dir: &Path) {
         no_children();
         return;
     }
-    if role == "apply" {
-        apply_fixture::driver(lifecycle, &exe, dir);
+    if let Some(fault) = role.strip_prefix("apply=") {
+        apply_fixture::driver(lifecycle, &exe, dir, fault);
         no_children();
         return;
     } else if role == "encoding" {
@@ -479,6 +479,23 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .count();
     assert_eq!(entries, 1);
+    // A later run that rewrote the same input path between runs misses:
+    // the key holds the input's content, not its path.
+    std::fs::write(&input, b"rewritten").unwrap();
+    let mut later = run::Run::create(dir, exe, true).unwrap();
+    let target = dir.join("rewritten");
+    std::fs::create_dir(&target).unwrap();
+    let output = target.join("out.pbf");
+    let declared = reference::ToolRun::osmium("copy.1")
+        .arg("cache-copy")
+        .input(&input)
+        .output(&output);
+    let (ended, cached) = cache
+        .execute(life, &mut later, &tools, &declared, &target.join("stdout"))
+        .unwrap();
+    assert!(ended.status.success());
+    assert!(!cached);
+    assert_eq!(std::fs::read(output).unwrap(), b"rewritten");
 }
 
 #[path = "../src/counts.rs"]

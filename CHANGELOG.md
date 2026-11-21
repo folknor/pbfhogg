@@ -4,6 +4,14 @@
 
 ### Breaking
 
+- **`time-filter` refuses a dense node whose timestamp is padding.** A
+  dense node with no version (0 or the Osmosis -1) and timestamp 0, which
+  is what a writer stores for a node without metadata in a block whose
+  other nodes carry it, used to pass as the Unix epoch and be kept below
+  every cutoff. It is now refused as a node that carries no timestamp,
+  like metadata-stripped input. A versioned node at the epoch
+  and a versionless node with a non-zero timestamp are still filtered.
+
 - **Default `tags-filter` refuses history input.** Without `-R` it
   selects objects by ID, so on a file holding several versions of one
   object it wrote every version of a matched ID as a match, kept a

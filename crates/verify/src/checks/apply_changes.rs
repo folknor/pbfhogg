@@ -275,13 +275,46 @@ fn read_model(
     Ok(model)
 }
 
-/// The lines of an OPL file, newlines stripped.
+/// The lines of an OPL file, each without its one terminating LF. A last
+/// line without its LF is refused as truncation, as every other verifier OPL
+/// reader refuses it: osmium's own OPL parser accepts one, so a cut-short
+/// file would otherwise read as complete, and `write_expected` would even
+/// re-terminate it. The iterator ends after its first error.
 fn opl_lines(path: &Path) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>>, Error> {
     let file = File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-    Ok(BufReader::new(file)
-        .split(b'\n')
-        .map(|line| line.map_err(Error::from)))
+    let mut reader = BufReader::new(file);
+    let path = path.to_path_buf();
+    let mut number = 0u64;
+    let mut done = false;
+    Ok(std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
+            Err(e) => {
+                done = true;
+                Some(Err(Error::from(e)))
+            }
+            Ok(0) => {
+                done = true;
+                None
+            }
+            Ok(_) => {
+                number += 1;
+                if line.pop() == Some(b'\n') {
+                    Some(Ok(line))
+                } else {
+                    done = true;
+                    Some(Err(Error::Failed(format!(
+                        "OPL {} line {number}: no terminating newline (truncated?)",
+                        path.display()
+                    ))))
+                }
+            }
+        }
+    }))
 }
 
 /// Hold `args` to the version-regression refusal the model predicts: exit 2
@@ -566,6 +599,29 @@ impl Report {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn opl_lines_refuse_a_last_line_without_its_newline() {
+        let dir = pbfhogg_test_scratch::scratch();
+        let path = dir.path().join("lines.opl");
+        std::fs::write(&path, "n1 v1\n\nn2 v1\r\n").unwrap();
+        let lines: Vec<Vec<u8>> = opl_lines(&path).unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            lines,
+            vec![b"n1 v1".to_vec(), Vec::new(), b"n2 v1\r".to_vec()]
+        );
+
+        std::fs::write(&path, "n1 v1\nn2 v1").unwrap();
+        let mut lines = opl_lines(&path).unwrap();
+        assert_eq!(lines.next().unwrap().unwrap(), b"n1 v1");
+        let err = lines.next().unwrap().unwrap_err().to_string();
+        assert!(err.contains("line 2: no terminating newline"), "{err}");
+        assert!(err.contains("lines.opl"), "{err}");
+        assert!(lines.next().is_none());
+
+        std::fs::write(&path, "").unwrap();
+        assert!(opl_lines(&path).unwrap().next().is_none());
+    }
 
     fn group(class: Class, id: i64) -> Group {
         Group { class, kind: 0, id }

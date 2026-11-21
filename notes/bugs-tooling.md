@@ -392,16 +392,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-035 - apply_changes::opl_lines accepts a truncated final line
-
-Reported by: engine-opus.
-
-`opl_lines` reads OPL with `BufRead::split(b'\n')`, which yields a final line
-that has no newline. Every other OPL reader (`opl_compare::Stream`,
-`verify_opl`, `verify_diff_opl::Lines`) refuses that as truncation. A
-truncated `base-touched.opl` would be read as complete. Unlikely, since osmium
-exited 0, but it breaks the engine's stated rule.
-
 ## TOOL-036 - check-refs compares counts that measure different things
 
 Reported by: other-codex.

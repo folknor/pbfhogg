@@ -69,6 +69,19 @@ too_many_lines = "deny"
 # at module level.
 disallowed_methods = "allow"
 
+# Test builds (every brokkr check sweep, brokkr test) compile the workspace's
+# own crates at opt-level 1: the suites spend their time in pbfhogg's codec,
+# geometry and source-audit code and in the debug pbfhogg binary the CLI
+# tests spawn. Third-party crates stay at 0 so a dependency bump does not
+# cost an optimized rebuild. Debug assertions and overflow checks stay on.
+# On `test`, not `dev`, so `cargo build` and rust-analyzer keep dev's
+# settings.
+[profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 0
+
 [profile.release]
 opt-level = 3
 lto = "fat"

@@ -1,7 +1,7 @@
 """Recording brokkr stub for scripts/vs-osmium.sh; no datasets or scratch files.
 
 brokkr's bench_tests directory runs Lua contract tests only, so this shell
-driver test is a pre-clippy script check like the other Python self-tests.
+driver test is a background script check like the other Python self-tests.
 """
 import os
 from pathlib import Path

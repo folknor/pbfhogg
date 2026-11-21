@@ -6,24 +6,26 @@
 # AGENTS.md's document-folder rule, enforced rather than trusted: nothing
 # durable (reference/, docs/, code comments) may cite notes/, and durable
 # docs must not point at files that no longer exist. Reads tracked files
-# only, so data/ and research/ never count. pre-clippy: text only, no build.
+# only, so data/ and research/ never count. Background: it reads text and
+# writes nothing, so it need not hold clippy up, and still fails the run.
 [[script_check]]
 name = "doc-links"
 command = "python3 -B scripts/check_doc_links.py"
 expect = "document conventions ok"
 match = "last-line"
-stage = "pre-clippy"
+stage = "background"
 
 # In-memory fixtures for the document checker's supported Markdown subset.
-# Each checker's in-memory self-test is a pre-clippy script check like this
+# Each checker's in-memory self-test is a background script check like this
 # one, run with -B and printing one "... ok" last line; a self-test with no
-# script check never runs.
+# script check never runs. Background is right only while the script writes
+# nothing a convention phase, clippy or the build reads.
 [[script_check]]
 name = "doc-links-fixtures"
 command = "python3 -B scripts/test_check_doc_links.py"
 expect = "document checker fixtures ok"
 match = "last-line"
-stage = "pre-clippy"
+stage = "background"
 
 # The real renderer as the document checker's oracle: builds the site with
 # the pinned VitePress into the gitignored docs/.vitepress/dist and checks
@@ -868,13 +870,14 @@ message = "emit_read_counters is the once-per-invocation exit hook; only the CLI
 # all sweep over one tokenized corpus, not script checks.
 
 # scripts/vs-osmium.sh against a recording brokkr stub; brokkr's bench
-# contract tests are Lua, so the shell driver's test lives here.
+# contract tests are Lua, so the shell driver's test lives here. Background:
+# its stub only prints, so it writes nothing clippy or the build reads.
 [[script_check]]
 name = "vs-osmium-driver-fixtures"
 command = "python3 -B scripts/test_vs_osmium_driver.py"
 expect = "vs-osmium driver fixtures ok"
 match = "last-line"
-stage = "pre-clippy"
+stage = "background"
 
 # Counter tests assert fixed totals or synchronize on observed slow paths.
 # The identifier tripwire also catches importing sleep under an alias; it

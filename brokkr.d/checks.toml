@@ -59,19 +59,22 @@ name = "all"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-source-policy", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
-# `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
-# binaries executed directly, budget = tests in flight, defaulting to the L3
-# cache domain (the right default for a compute-bound suite). Until 2026-09-02
-# every profile here ran libtest's serial default, so this is the first
-# parallelism the suite has seen; the per-test 20s watchdog is kept. Two-run
-# ritual to judge it: the first run weights by test count (always the slow
-# one), and `claims 1-1` on the second means the budget needs raising (see
-# brokkr man config parallel). Since the test fold (autotests = false) the
+# `parallel` runs the sweep's test binaries concurrently - prebuilt
+# binaries executed directly, budget = tests in flight; the per-test 20s
+# watchdog is kept. Every parallel entry here sets `budget = "cores"`, every
+# physical core the process may use, not the unset default of one L3 cache
+# domain: under the default a two-CCD part ran its longest lanes at
+# `claims 1-1`, the arithmetic floor `brokkr man sweeps` describes, with
+# most cores idle (reference/testing.md "Check wall time" has the numbers).
+# A fixed count would suit one host and not the others. Judge a budget
+# change over two runs: the first weights binaries by test count, and
+# `claims 1-1` on the second means the budget is starving the pole. Since
+# the test fold (autotests = false) the
 # sweep's binaries are each package's lib unit tests and `all` binary, and
 # the process_nofile target; the fan-out therefore parallelizes mostly
 # inside the two `all` binaries, and shared scratch between concurrent
 # cli_* modules is the class to suspect first if a test flakes.
-parallel = {}
+parallel = { budget = "cores" }
 
 # Same build shape as all, without binary fan-out. The serial profile needs
 # both sequential binaries and test_threads = 1; either alone is insufficient.
@@ -93,7 +96,7 @@ name = "consumer"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 no_default_features = true
 features = ["commands"]
-parallel = {}
+parallel = { budget = "cores" }
 
 # "minimal" = the configuration the crate advertises but never built.
 # `consumer` sets no_default_features and then re-enables `commands`, so
@@ -118,7 +121,7 @@ name = "minimal"
 packages = ["pbfhogg"]
 no_default_features = true
 features = []
-parallel = {}
+parallel = { budget = "cores" }
 
 # Library-only geocode reader configuration, without the builder or CLI.
 [[check]]
@@ -126,7 +129,7 @@ name = "geocode-reader"
 packages = ["pbfhogg"]
 no_default_features = true
 features = ["geocode-reader"]
-parallel = {}
+parallel = { budget = "cores" }
 
 # The glibc-only allocator calls (mallopt, mallinfo2, malloc_trim) are gated
 # on target_env = "gnu"; this sweep builds, lints and runs the suite against
@@ -142,7 +145,7 @@ parallel = {}
 name = "musl"
 packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness", "pbfhogg-test-scratch", "pbfhogg-devkit", "pbfhogg-library", "pbfhogg-datasets", "pbfhogg-verify", "pbfhogg-bench"]
 target = "{host_arch}-unknown-linux-musl"
-parallel = {}
+parallel = { budget = "cores" }
 
 # The `all` feature shape on musl. The default-feature `musl` sweep above
 # never compiles code behind the hook cfg, linux-direct-io or linux-io-uring,
@@ -158,7 +161,7 @@ packages = ["pbfhogg", "pbfhogg-cli", "pbfhogg-harness"]
 features = ["linux-direct-io", "linux-io-uring"]
 rustflags = ["--cfg", "pbfhogg_test_hooks"]
 target = "{host_arch}-unknown-linux-musl"
-parallel = {}
+parallel = { budget = "cores" }
 
 # The profiling lane: the harness, CLI and bench-instrument suites built with
 # each profiling feature. The executables profile only when
@@ -172,37 +175,37 @@ parallel = {}
 name = "harness-hotpath"
 packages = ["pbfhogg-harness"]
 features = ["hotpath", "linux-direct-io", "linux-io-uring"]
-parallel = {}
+parallel = { budget = "cores" }
 
 [[check]]
 name = "harness-hotpath-alloc"
 packages = ["pbfhogg-harness"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
-parallel = {}
+parallel = { budget = "cores" }
 
 [[check]]
 name = "cli-hotpath"
 packages = ["pbfhogg-cli"]
 features = ["hotpath", "linux-direct-io", "linux-io-uring"]
-parallel = {}
+parallel = { budget = "cores" }
 
 [[check]]
 name = "cli-hotpath-alloc"
 packages = ["pbfhogg-cli"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
-parallel = {}
+parallel = { budget = "cores" }
 
 [[check]]
 name = "bench-hotpath"
 packages = ["pbfhogg-bench"]
 features = ["hotpath", "linux-direct-io", "linux-io-uring"]
-parallel = {}
+parallel = { budget = "cores" }
 
 [[check]]
 name = "bench-hotpath-alloc"
 packages = ["pbfhogg-bench"]
 features = ["hotpath-alloc", "linux-direct-io", "linux-io-uring"]
-parallel = {}
+parallel = { budget = "cores" }
 
 # Compile and lint-only shapes the tested sweeps cannot carry, run by the
 # gate. The profiling features over every package, so the CLI's instrumented

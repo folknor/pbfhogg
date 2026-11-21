@@ -455,8 +455,12 @@ musl coverage. Brokkr refuses configured target runners and prints a
 planning line for a test lane whose target differs from the compiler
 host; it does not refuse such a lane before building.
 
-Every tested sweep builds dev; no suite runs the shipped release profile
-(fat LTO, debug assertions and overflow checks off). A gate sweep that did
+Every tested sweep's test build uses cargo's `test` profile (no sweep sets
+a `profile` of its own): dev, except that the
+workspace's own crates compile at opt-level 1 (third-party crates stay at
+0), with debug assertions and overflow checks on; see "Check wall time".
+No suite runs the shipped release profile (fat LTO, debug assertions and
+overflow checks off). A gate sweep that did
 was retired as too costly for what it alone caught. What covers its ground:
 dev's overflow checks panic where release would wrap, wherever a fixture
 reaches the operation and the test does not accept the panic as an
@@ -797,6 +801,62 @@ the rule.
   faults ride on the invocation's cancellation token, so they are
   ordinary modules of the `all` binaries and run with
   `brokkr test <name>` like any other test.
+
+### Check wall time
+
+A warm `brokkr check` (tier1) spends nearly all its time in the test
+phase, and the six tested sweeps run one after another, each ending on
+its slowest binary. Three settings keep it short; each was measured on
+plantasjen (Ryzen 9 5900X, 12 cores in two 6-core CCDs) on 2026-11-21 at
+3d2f64bc, one warm run per cell:
+
+| Setting | Warm check | Lane walls (all, consumer, minimal, geocode-reader, musl, musl-all) |
+|---|---|---|
+| neither (default budget, dev) | 5m18s | 87, 45, 20, 21, 54, 77 s |
+| `budget = "cores"` | 2m44s | 45, 21, 10, 10, 35, 32 s |
+| plus opt-level 1 test builds | 2m27s | 45, 18, 7, 7, 29, 27 s |
+
+A check after a one-line library edit took 3m27s end to end at opt-level
+0 and 3m04s at opt-level 1, one sample each: in those samples the faster
+tests outweighed the optimized rebuild. A focused `brokkr test` of
+`geo::tests::far_points_keep_containment_on_a_jagged_ring` ran in 2.4s at
+opt-level 1 against 8.1s at 0.
+
+- **Every parallel entry sets `budget = "cores"`** (`brokkr.d/checks.toml`).
+  The unset default is the physical cores of one L3 cache domain, 6 on
+  plantasjen, and under it the `all` and `musl-all` lanes ran at
+  `claims 1-1`: the pole's share of the budget floors to one slot
+  (`brokkr man sweeps`, the arithmetic floor), so its tests run end to
+  end while most cores idle. The CLI binary's tests mostly wait on the
+  `pbfhogg` children they spawn, so it sat near a tenth of a core for
+  most of its run. `"cores"` is every physical core the process may use,
+  capped by a cgroup CPU quota, and falls back to the logical CPU count
+  where sysfs topology is unreadable. Never a fixed count: one number
+  fits one host.
+- **Test builds compile the workspace at opt-level 1** (`[profile.test]`
+  in the root `Cargo.toml`, third-party crates held at 0). The suites'
+  CPU is pbfhogg's own codec, geometry and source-audit code, in the test
+  process and in the debug `pbfhogg` children the CLI tests spawn. It is
+  on `test`, not `dev`, so a plain `cargo build` keeps dev's settings.
+- **Read-only script checks run in the background stage**
+  (`brokkr.d/lints.toml`), beside clippy rather than ahead of it; a
+  background check still fails the run. A script check that writes
+  anything clippy or the build reads stays `pre-clippy`.
+
+No build script exists in the workspace. One that reruns whenever a
+per-commit or per-run value changes (it watches that value through
+`rerun-if-changed` or `rerun-if-env-changed`, or reruns on every build)
+and prints it as `cargo:rustc-env` rebuilds every target of its package
+in every sweep shape, since cargo has no early cutoff; build identity
+belongs in `option_env!` at an executable's entry point, never in a
+library.
+
+A lane cannot finish before its slowest binary, and after these changes
+that is usually the library's unit-test binary (`pbfhogg/pbfhogg`, about
+43 s in `all`), which no target split can reach: its slowest tests are
+private-surface unit tests in `geo` and `commands::extract`. The tier1
+sweeps cannot fold into one `feature_unification = "package"` entry: they
+are different feature sets over the same packages, not one package each.
 
 ## External cross-validation
 

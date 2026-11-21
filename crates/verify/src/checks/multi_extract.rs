@@ -1,7 +1,8 @@
 //! Verify: multi-extract - compare single-pass multi-extract against
 //! N sequential single-region extracts.
 //!
-//! Generates N non-overlapping longitude strips from the dataset bbox,
+//! Generates N adjacent longitude strips from the dataset bbox (neighbours
+//! share an inclusive edge, so a node on it belongs to both),
 //! runs `pbfhogg extract --config <json> --simple` (single-pass), then
 //! runs one `pbfhogg extract --simple` per region (the sequential
 //! reference). Per region, the multi output must hold the same elements as
@@ -29,9 +30,16 @@
 //!
 //! Only the simple strategy is checked: it is the one with a single-pass
 //! implementation, while complete-ways and smart under `--config` run the
-//! per-region path, which would be compared with itself. Nothing here proves
-//! the single-pass path ran rather than pbfhogg's per-region fallback. The
-//! strips are adjacent, and polygons overlap them only where the dataset's
+//! per-region path, which would be compared with itself.
+//!
+//! Route. The fallback's outputs equal the sequential reference by
+//! construction, so parity alone cannot show the single pass ran. Each config
+//! run's stderr must carry the route the header predicts: the single-pass
+//! banner on sorted input, the sequential-fallback note on unsorted input,
+//! and not the other. Which single-pass classifier ran (the all-bbox one or
+//! the polygon one of a mixed config) has no diagnostic and is not confirmed.
+//!
+//! The strips are adjacent, and polygons overlap them only where the dataset's
 //! polygons happen to; identical regions with distinct outputs and a
 //! deliberately empty region are never constructed (an element can still
 //! fall in several regions, and a region can still come out empty). osmium's
@@ -66,14 +74,15 @@ fn claim(input_sorted: bool, polygons: &[PolygonInput]) -> String {
     };
     if input_sorted {
         format!(
-            "per region, the simple multi-extract output is in strict order and element-content \
+            "the config runs report the single pass, and per region the simple multi-extract \
+             output is in strict order and element-content \
              identical, as osmium decodes both, to a sequential pbfhogg extract, {configs}; \
              osmium's extract membership is not consulted"
         )
     } else {
         format!(
             "on unsorted input, where pbfhogg declines its single pass so no single-pass route is \
-             exercised: per region neither output claims {SORT_TYPE_THEN_ID}, and the multi \
+             exercised and the config runs report the fallback: per region neither output claims {SORT_TYPE_THEN_ID}, and the multi \
              output, through an osmium-sorted copy, repeats no ID and is element-content \
              identical, as osmium decodes both, to a sequential pbfhogg extract, {configs}; \
              osmium's extract membership is not consulted"
@@ -191,6 +200,30 @@ pub fn run(
         let captured = harness.pbfhogg_discard(multi_args.arg_if(direct_io, "--direct-io"))?;
         harness.require_success(&captured, &format!("pbfhogg {label_prefix}"))?;
 
+        // Fallback outputs equal the sequential reference by construction, so
+        // parity alone cannot show the single pass ran: the route is judged
+        // from the run's own diagnostics.
+        let route = Route::from_stderr(&captured.stderr_text());
+        let expected = if input_sorted {
+            Route::SinglePass
+        } else {
+            Route::Fallback
+        };
+        harness.msg(&format!(
+            "  {label_prefix}: route {} (expected {}) {}",
+            route.name(),
+            expected.name(),
+            if route == expected { "PASS" } else { "FAIL" }
+        ));
+        harness.record(
+            &format!(
+                "{label_prefix} took route {} where the input header predicts {}",
+                route.name(),
+                expected.name()
+            ),
+            Verdict::from_pass(route == expected),
+        );
+
         // Counts alone let a region with substituted IDs or changed content
         // pass, so each region is diffed against its sequential extract; the
         // counts are printed as context. The diff refuses a side out of
@@ -250,6 +283,44 @@ pub fn run(
     Ok(Some(claim))
 }
 
+/// Which route a config run reports having taken, from its stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// The single-pass banner alone.
+    SinglePass,
+    /// The sequential-fallback note alone.
+    Fallback,
+    /// Neither line, or both: no route is established. Requiring positive
+    /// evidence makes a reworded diagnostic fail rather than pass. A path
+    /// holding a newline could counterfeit a line, but only add one, so the
+    /// genuine line of the route actually taken still vetoes a wrong verdict.
+    Unknown,
+}
+
+impl Route {
+    fn from_stderr(stderr: &str) -> Self {
+        let single = stderr
+            .lines()
+            .any(|l| l.starts_with("[multi-extract] single-pass: "));
+        let fallback = stderr
+            .lines()
+            .any(|l| l.starts_with("Note: Multi-extract single-pass probe declined the input"));
+        match (single, fallback) {
+            (true, false) => Self::SinglePass,
+            (false, true) => Self::Fallback,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::SinglePass => "single-pass",
+            Self::Fallback => "sequential fallback",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// On unsorted input, `output` must not claim the sort flag.
 fn record_no_sort_claim(harness: &mut Harness, label: &str, output: &Path) -> Result<(), Error> {
     let claims = harness.has_sort_flag(output)?;
@@ -291,7 +362,7 @@ mod tests {
     fn the_claim_names_the_configs_and_what_unsorted_input_leaves_out() {
         let sorted = claim(true, &[]);
         assert!(sorted.contains("no mixed strip and polygon config is run"));
-        assert!(sorted.starts_with("per region"));
+        assert!(sorted.starts_with("the config runs report the single pass"));
         let polygon = PolygonInput {
             name: "city".into(),
             path: PathBuf::from("/d/city.geojson"),
@@ -299,5 +370,23 @@ mod tests {
         let mixed = claim(false, &[polygon]);
         assert!(mixed.contains("strips and polygons city"));
         assert!(mixed.contains("no single-pass route is exercised"));
+    }
+
+    #[test]
+    fn the_route_needs_its_own_line_and_not_the_other() {
+        let single = "[multi-extract] single-pass: 5 regions, simple strategy\n";
+        let fallback = "Note: Multi-extract single-pass probe declined the input; using one \
+                        full pass per region\n[1/5] Extracting to a.osm.pbf\n";
+        assert_eq!(Route::from_stderr(single), Route::SinglePass);
+        assert_eq!(Route::from_stderr(fallback), Route::Fallback);
+        assert_eq!(Route::from_stderr(""), Route::Unknown);
+        assert_eq!(
+            Route::from_stderr(&format!("{single}{fallback}")),
+            Route::Unknown
+        );
+        assert_eq!(
+            Route::from_stderr("Note: Region grid declined\n"),
+            Route::Unknown
+        );
     }
 }

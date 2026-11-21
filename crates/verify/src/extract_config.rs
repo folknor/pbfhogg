@@ -163,6 +163,10 @@ fn utf8(path: &Path) -> Result<&str, Error> {
     path.to_str()
         .ok_or_else(|| Error::tool(format!("non-UTF-8 path {}", path.display())))
 }
+/// `regions` adjacent longitude strips across `bbox`. Neighbours share their
+/// edge exactly, and bbox containment is inclusive (as osmium's
+/// `Box::contains`), so a node on a seam belongs to both strips; any
+/// classifier serving several regions at once must keep that.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn strips(bbox: &Bbox, regions: usize) -> Result<Vec<Bbox>, Error> {
     if regions == 0 {

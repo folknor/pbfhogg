@@ -751,6 +751,8 @@ fn extract_multi_to(
         // The single-pass probe declines unsorted, empty or missing-header
         // input and a first-blob read error. Keep the fallback visible; the
         // probe reports a swallowed read error under its own event first.
+        // pbfhogg-verify's multi-extract check reads this line and the
+        // probe's single-pass banner to judge the route; keep their openings.
         crate::host::diag!(
             host.diagnostics,
             Note,

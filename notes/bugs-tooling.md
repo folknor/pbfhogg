@@ -392,17 +392,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-037 - multi-extract parity passes after the single-pass route falls back
-
-Reported by: other-codex.
-
-The verifier checks the outputs and headers, but pbfhogg emits a distinct
-diagnostic when the single-pass probe declines (`commands/extract/mod.rs`),
-and the check never looks for it. So parity passes on the fallback route
-without exercising the single pass. Related point: the generated strips share
-endpoints and bbox containment is inclusive, so a node on the seam can
-legitimately appear in two strips. A batched classifier must keep that.
-
 ## TOOL-038 - degrade never judges drop-a-again beyond its elements
 
 Reported by: heavy-opus.
@@ -448,3 +437,13 @@ The comment describes selection without metadata or header checks.
 `compare_outputs` compares metadata and checks sort features on the sorted
 path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
 keep those checks when batching requests.
+
+## TOOL-043 - verify diff and derive-changes never confirm their route
+
+Reported by: the multi-extract route fix.
+
+`diff` and `derive-changes` emit `Note:` lines on their sequential fallback
+(`diff.sequential_fallback`, `derive_changes.sequential_fallback`), and their
+checks never read stderr for them, so parity passes whichever route ran.
+multi-extract now judges its route from the config run's stderr
+(`checks/multi_extract.rs` `Route`); the same shape would fit here.

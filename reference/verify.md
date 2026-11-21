@@ -360,7 +360,7 @@ suite because a later comparison cannot make that run complete.
 | `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
 | `getid-removeid` (alias `getid`) | `osmium getid`, `removeid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert element equality with and without way IDs (inline coordinates on a `LocationsOnWays` input without them) and count complement, recursive referenced content and tag removal, with absent witnesses named |
 | `extract` | `osmium extract` | strict order, element content and per-strategy membership on the bbox and every configured polygon; simple relations follow the any-direct-node-or-way rule judged against complete_ways |
-| `multi-extract` | sequential pbfhogg extracts | simple config output per region has strict order and element equality with its sequential extract (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
+| `multi-extract` | sequential pbfhogg extracts | each config run reports the route the input header predicts; simple config output per region has strict order and element equality with its sequential extract (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
 | `geocode` | a verifier-owned model of the documented query rules over `osmium tags-filter` and `osmium add-locations-to-ways` OPL (one decoding of address, highway and interpolation objects, one of boundary relations) | `geocode-query` over two `build-geocode-index` builds of the input, at `--admin-tolerance 20` and `0`, on seeded uniform and witness queries aiming at a quota per class within the fine radius, between the radii and beyond both (at least one each is enforced for every class the model holds), plus witnesses near boundary vertices: every judged address, street and interpolation answer is one of the nearest candidates (tied within 0.1 mm) with equal text and address coordinates, distance within 0.1 mm, a street's nearest point within two decimicrodegrees and an interpolation number one the documented range rules give within the reach of the nearest point's truncation, or none beyond the coarse radius, every answer key present; an input with no answering range judges interpolation absence only and says so. Every judged admin level is a containing area of least stored area (the area within a float error bound of the exact outer-ring shoelace, and no larger than any other containing area's bound), or none; a relation the builder withholds (an outer or inner member way absent from the input, without nodes or referring to an absent node, or one way in both roles) is judged as contributing no area, and a node located only after its way is joined against its record; a level is not judged within 1 mm (tolerance 0) or 21.2 m (tolerance 20) of a boundary of that level, inside the box of a relation the model leaves unmodelled (a member endpoint shared by three or more member ends, a one-node member, a way listed twice in one role, an interior member node shared with another member of the role, a ring revisiting a coordinate or of fewer than three), anywhere at the level of a relation with a member node whose record carries no location, or inside the box of a hole nearer than a decimicrodegree to an outer it may belong to (the relation is otherwise modelled, since that ownership decides answers only inside the hole); witness anchors are drawn class first, uniformly over the classes the model holds, then within the class; at least one containing answer per build is enforced. Queries within 0.1 mm of the coarse radius are not judged; a modelled way with an unlocated node, data beyond 85 degrees of latitude or near the antimeridian, or a segment spanning half a turn of longitude is a verifier error; a tag value or member role holding a NUL is outside the comparison (libosmium cuts it), and so is a way whose refs end in an empty packed field (libosmium keeps only the last segment) |
 | `check-refs` | `osmium check-refs` | missing counts per class in ways-only and relation modes, each exit held to its complete report |
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
@@ -535,11 +535,17 @@ and membership differences, including the simple relation deviation.
 Multi-extract needs a bbox and accepts `--regions` (default five, positive)
 for adjacent longitude strips. Its sequential simple extracts run buffered;
 `--direct-io` reaches config runs only. With polygons it also runs a mixed
-strip/polygon config. This establishes neither osmium membership nor that
-the single-pass path ran. Without the optional sort feature pbfhogg uses
-its sequential fallback: neither output may claim sorted, and comparisons
-use sorted copies with strict order checks. The PASS line states that no
-single-pass route was exercised. Config outputs receive private staging;
+strip/polygon config. Adjacent strips share an inclusive edge, so a node on
+it belongs to both. This does not establish osmium membership. Fallback
+outputs equal the sequential reference by construction, so each config
+run's stderr must report the route the input header predicts: the
+`[multi-extract] single-pass:` banner on sorted input, the
+`Note: Multi-extract single-pass probe declined the input` line on unsorted
+input, and not the other; neither or both fails. Which single-pass
+classifier ran is not confirmed. Without the optional sort feature pbfhogg
+uses its sequential fallback: neither output may claim sorted, and
+comparisons use sorted copies with strict order checks. The PASS line
+states that no single-pass route was exercised. Config outputs receive private staging;
 config and polygon paths are declared reads, and selected polygon files
 are watched like PBF inputs.
 

@@ -39,7 +39,10 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         (true, "content", harness::CheckStatus::Failed),
         // Only the version differs: both checks compare metadata.
         (true, "metadata", harness::CheckStatus::Failed),
+        // The outputs are right but the config run took the fallback.
+        (true, "route", harness::CheckStatus::Failed),
     ] {
+        std::fs::write(dir.join("sorted"), if sorted { "yes" } else { "no" }).unwrap();
         if sorted {
             fake_pbf::write(&input, &[SORTED], "sorted");
         } else {
@@ -58,15 +61,22 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 }
             });
             let case = format!("multi={multi}, sorted={sorted}, fault={fault}: {judged:?}");
+            // The route fault touches only the config run, which extract never makes.
+            let expected = if fault == "route" && !multi {
+                harness::CheckStatus::Passed
+            } else {
+                expected
+            };
             assert_eq!(judged.status, expected, "{case}");
             assert_eq!(judged.error, None, "{case}");
             // Each fault alters one field class of every pbfhogg output, so
             // every arm must fail by name: an arm on a policy blind to it
             // shows as a missing name.
-            let failed: &[&str] = match (fault.is_empty(), multi) {
-                (true, _) => &[],
-                (false, false) => &EXTRACT_ARMS,
-                (false, true) => &MULTI_ARMS,
+            let failed: &[&str] = match (fault, multi) {
+                ("" | "route", false) | ("", true) => &[],
+                ("route", true) => &ROUTE_ARMS,
+                (_, false) => &EXTRACT_ARMS,
+                (_, true) => &MULTI_ARMS,
             };
             assert_eq!(judged.failed, failed, "{case}");
         }
@@ -97,6 +107,12 @@ const MULTI_ARMS: [&str; 5] = [
     "multi-extract mixed strip-0 element content differs from the sequential extract",
     "multi-extract mixed strip-1 element content differs from the sequential extract",
     "multi-extract mixed polygon-city element content differs from the sequential extract",
+];
+
+/// The multi-extract verdicts the route fault fails, in order.
+const ROUTE_ARMS: [&str; 2] = [
+    "multi-extract took route sequential fallback where the input header predicts single-pass",
+    "multi-extract mixed took route sequential fallback where the input header predicts single-pass",
 ];
 
 pub fn tool(args: &[OsString]) -> i32 {
@@ -141,6 +157,18 @@ pub fn tool(args: &[OsString]) -> i32 {
                 assert!(!args.contains(&"--tmp-dir"));
                 let doc: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(value("--config")).unwrap()).unwrap();
+                // The route line pbfhogg prints: the one the input's sort
+                // claim selects, or under the route fault the fallback on a
+                // sorted input, as a probe that declines it would.
+                let sorted = std::fs::read_to_string(root.join("sorted")).unwrap() == "yes";
+                if sorted && fault != "route" {
+                    eprintln!("[multi-extract] single-pass: 2 regions, simple strategy");
+                } else {
+                    eprintln!(
+                        "Note: Multi-extract single-pass probe declined the input; using one \
+                         full pass per region"
+                    );
+                }
                 for region in doc["extracts"].as_array().unwrap() {
                     let output = Path::new(doc["directory"].as_str().unwrap())
                         .join(region["output"].as_str().unwrap());

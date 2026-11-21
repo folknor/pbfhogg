@@ -177,6 +177,22 @@ fn way_node(item: &str) -> Result<(&str, &str), String> {
     })
 }
 
+/// Whether a parsed record is a way with at least one inline way-node
+/// coordinate. libosmium writes an undefined location as a bare `xy`
+/// suffix under its locations option, so that is no coordinate.
+fn has_inline_coordinates(record: &Record<'_>) -> Result<bool, String> {
+    let Some((_, value)) = record.fields.iter().find(|(l, _)| *l == b'N') else {
+        return Ok(false);
+    };
+    for item in items(value) {
+        let suffix = way_node(item)?.1;
+        if !suffix.is_empty() && suffix != "xy" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A member item `<type><id>@<role>`: type letter, ID and role.
 fn member(item: &str) -> Result<(&str, &str, &str), String> {
     let at = item
@@ -757,7 +773,7 @@ fn judge_policies(
         let ok = if reads {
             sees_only(&compared, kind, id)
         } else {
-            compared.merged.identical()
+            compared.merged.identical() && compared.groups.is_empty()
         };
         let expect = if reads {
             format!("{token} alone differs")
@@ -777,6 +793,83 @@ fn judge_policies(
         }
     }
     Ok(true)
+}
+
+/// The between pair's independent witness: the identities whose records
+/// differ in inline coordinates only (module doc), failing every record
+/// that does not fit. `None` when any record failed, after failing each.
+fn coordinate_witness(
+    harness: &mut Harness,
+    declared_full: &[String],
+    undeclared_full: &[String],
+) -> Option<BTreeSet<(usize, i64)>> {
+    // The identities classified as differing in inline coordinates only;
+    // the FULL comparison must report exactly these, not merely as many.
+    // Every identity of the decoding is checked for uniqueness, so a
+    // comparator that silently coalesced duplicate rows could not pass on a
+    // witness that collapsed them too. The witness is independent of the
+    // classification: a way the declared decoding gives inline coordinates
+    // must lose all of them in the undeclared one, so a copy that kept some
+    // cannot shrink or empty the expected set.
+    let mut seen: BTreeSet<(usize, i64)> = BTreeSet::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut located: BTreeSet<(usize, i64)> = BTreeSet::new();
+    for (a, b) in declared_full.iter().zip(undeclared_full) {
+        let witness = parse(a).and_then(|ra| {
+            let rb = parse(b)?;
+            let id = ra
+                .id
+                .parse::<i64>()
+                .map_err(|e| format!("id {:?}: {e}", ra.id))?;
+            Ok((
+                (ra.kind, id),
+                has_inline_coordinates(&ra)?,
+                has_inline_coordinates(&rb)?,
+            ))
+        });
+        let (key, declared_located) = match witness {
+            Ok((_, _, true)) => {
+                failures.push(format!(
+                    "{} keeps inline coordinates in the undeclared copy",
+                    identity(a)
+                ));
+                continue;
+            }
+            Ok((key, declared_located, false)) => (key, declared_located),
+            Err(why) => {
+                failures.push(format!("{}: {why}", identity(a)));
+                continue;
+            }
+        };
+        if !seen.insert(key) {
+            failures.push(format!(
+                "{} appears twice in the declared decoding",
+                identity(a)
+            ));
+        }
+        if declared_located {
+            located.insert(key);
+        }
+        match classify(a, b) {
+            Ok(found) if found.is_empty() && !declared_located => {}
+            Ok(found) if found == BTreeSet::from([Field::WayLocations]) && declared_located => {}
+            Ok(found) => {
+                failures.push(format!(
+                    "{} differs in {found:?} without its declaration, not in inline \
+                     coordinates only",
+                    identity(a)
+                ));
+            }
+            Err(why) => failures.push(format!("{}: {why}", identity(a))),
+        }
+    }
+    if failures.is_empty() {
+        return Some(located);
+    }
+    for failure in failures {
+        harness.fail(failure);
+    }
+    None
 }
 
 /// [`Policy::between`] by declaration, and on a pair that differs in
@@ -823,22 +916,11 @@ fn run_between(
         harness.fail("the undeclared copy holds a different number of records");
         return Ok(true);
     }
-    let mut located = 0u64;
-    for (a, b) in declared_full.iter().zip(&undeclared_full) {
-        match classify(a, b) {
-            Ok(found) if found.is_empty() => {}
-            Ok(found) if found == BTreeSet::from([Field::WayLocations]) => located += 1,
-            Ok(found) => {
-                harness.fail(format!(
-                    "{} differs in {found:?} without its declaration, not in inline \
-                     coordinates only",
-                    identity(a)
-                ));
-            }
-            Err(why) => harness.fail(format!("{}: {why}", identity(a))),
-        }
-    }
-    if located == 0 {
+    // An invalid witness has already failed the check; it is no skip.
+    let Some(located) = coordinate_witness(harness, declared_full, &undeclared_full) else {
+        return Ok(true);
+    };
+    if located.is_empty() {
         harness.msg("  between: no way has a located node on this input");
         return Ok(false);
     }
@@ -849,16 +931,27 @@ fn run_between(
         &outdir.join("between-full.txt"),
         Policy::FULL,
     )?;
-    let ok = full.merged.differs == located
+    let reported: BTreeSet<(usize, i64)> = full
+        .groups
+        .iter()
+        .filter(|g| g.class == Class::Differs)
+        .map(|g| (g.kind, g.id))
+        .collect();
+    let ok = full.merged.differs == located.len() as u64
         && full.merged.first_only == 0
-        && full.merged.second_only == 0;
+        && full.merged.second_only == 0
+        && full.groups.len() == located.len()
+        && reported == located;
     harness.msg(&format!(
-        "  between: {located} way(s) differ in inline coordinates only under full {}",
+        "  between: {} way(s) differ in inline coordinates only under full {}",
+        located.len(),
         if ok { "PASS" } else { "FAIL" }
     ));
     if !ok {
-        harness
-            .fail("the declared and undeclared copies differ under full in more than coordinates");
+        harness.fail(
+            "the declared and undeclared copies do not differ under full in exactly the \
+             ways classified as differing in inline coordinates",
+        );
     }
     for (label, a, b) in [
         ("between", declared, undeclared),
@@ -872,7 +965,7 @@ fn run_between(
         ] {
             let listing = outdir.join(format!("{label}-{name}.txt"));
             let compared = compare(harness, a, b, &listing, policy)?;
-            let ok = compared.merged.identical();
+            let ok = compared.merged.identical() && compared.groups.is_empty();
             harness.msg(&format!(
                 "  {label} under {name}: identical {}",
                 if ok { "PASS" } else { "FAIL" }
@@ -960,7 +1053,7 @@ fn controls(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> 
         &outdir.join("roundtrip.txt"),
         Policy::FULL,
     )?;
-    let lossless = roundtrip.merged.identical();
+    let lossless = roundtrip.merged.identical() && roundtrip.groups.is_empty();
     harness.msg(&format!(
         "  osmium OPL roundtrip of the slice is lossless under full {}",
         if lossless { "PASS" } else { "FAIL" }

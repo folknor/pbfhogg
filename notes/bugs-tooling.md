@@ -401,15 +401,6 @@ elements, so an unknown unclosed tag can escape the scan. osmium's reading
 gives a separate XML check in the listing path today. Keep that protection if
 the two-file join is removed.
 
-## TOOL-041 - field-policies' FULL control checks the count of differing ways, not which
-
-Reported by: heavy-codex.
-
-`run_between` checks the number of differing ways and that there are no
-one-sided records, but never that the differing IDs match the independently
-classified ways. A comparator that reports the right count on the wrong ways
-clears that part of the control.
-
 ## TOOL-042 - getparents' module comment understates its claim
 
 Reported by: other-codex.

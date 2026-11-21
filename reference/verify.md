@@ -65,7 +65,11 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   decoding over the whole record, not from the comparator under test, and
   every other record must be unchanged. `between` is held to all four
   declaration combinations and to a pair differing only in inline
-  coordinates. Visibility is not controlled: libosmium writes it only to
+  coordinates: every identity is unique, the undeclared copy keeps no
+  inline coordinate, the expected set is the ways the declared decoding
+  locates, and when that set is not empty FULL must report exactly one difference for each affected
+  way identity and nothing one-sided, and the ignoring policies must
+  report no difference by count or by identity. Visibility is not controlled: libosmium writes it only to
   history files. A class with no candidate record is named in the PASS
   line; any control that fails or cannot be built is a verifier error
   (`ERROR`, exit 2), which stops a suite, since every later element verdict

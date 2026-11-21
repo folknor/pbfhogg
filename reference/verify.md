@@ -416,8 +416,26 @@ streams with the same keys could pass. That is accepted under the same
 assumption the reference cache already makes when an input digest selects
 a stored osmium output, for a local single-user tool with no adversary.
 An order scan (`order`) answers from a stored summary under any policy.
-Paired walks (renumber), sequence walks (repack, degrade), the derive
-model and field-policies, whose subject is the merge itself, always merge.
+Repack's and degrade's sequence walk against their verifier-written
+expected file (`compare_sequence_with_opl`) is decided without decoding
+the output when the input decoding the file was projected from carries a
+summary key, that key is observed again with the output's in one tool
+binding, and the output's stored summary has the counts and XXH3-128 the
+verifier computed for the expected file as it wrote it: byte-identical
+streams pair every record equal in any order, so the listing is written
+empty. Any other outcome decodes the output and merges. Every case takes
+this path; it pays where the sequences must be identical
+(`--strip-locations` and every repack case), while an output that differs
+from the expected sequence, as a drop or firing unsort output does by
+design, falls back to the merge, which publishes the summary a later run
+reads. The case's judge reads the decided counts as it would a merge's. Degrade's
+comparison of the two drop seeds is decided from their removal listings
+when both passed their removals: each output is the expected sequence,
+whose identities are unique, less the records its listing names in walk
+order, so the outputs are equal exactly when the listings are
+byte-equal; otherwise the two outputs are merged. Paired walks
+(renumber), the other sequence walks, the derive model and
+field-policies, whose subject is the merge itself, always merge.
 
 Summaries are neither read nor written under `--fresh-reference`; every
 fixture test runs in that mode, since its fake osmium answers by file name,

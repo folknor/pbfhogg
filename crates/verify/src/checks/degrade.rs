@@ -286,6 +286,9 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
     }
     let mut removed_per_kind = [0u64; 3];
     let mut listing_a = None;
+    // Each seed's listing when its removals passed: the original drop-a
+    // (index 0) and drop-b (index 2) only.
+    let mut passed: [Option<PathBuf>; 3] = [None, None, None];
     // A refused first run leaves the second, if written, judged in its place.
     let (first, first_stem, first_suffix) = if outputs[0].is_some() {
         (0, "drop-a", "")
@@ -301,7 +304,10 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
         };
         let label = format!("degrade --drop-ids {n}:{seed}{suffix}");
         let compared = reencode::compare(run.harness, &run.outdir, stem, reference, out)?;
-        let per_kind = judge_drop(run, &label, &compared, n, total)?;
+        let (per_kind, ok) = judge_drop(run, &label, &compared, n, total)?;
+        if ok {
+            passed[index] = Some(compared.listing.clone());
+        }
         for (most, removed) in removed_per_kind.iter_mut().zip(per_kind) {
             *most = (*most).max(removed);
         }
@@ -323,8 +329,24 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
         listing_a.as_deref(),
     )?;
     if let (Some(a), Some(b)) = (&outputs[0], &outputs[2]) {
-        let seeds = reencode::compare_outputs(run.harness, &run.outdir, "drop-a-vs-b", a, b)?;
-        if seeds.identical() {
+        // Both passed: each is the expected sequence, whose identities are
+        // unique (the input is strictly ordered), less exactly the records
+        // its listing names, written in the reference's walk order. Two such
+        // sequences are equal exactly when their listings are byte-equal, so
+        // no decode or merge is needed. Otherwise the outputs are merged.
+        let same = if let (Some(la), Some(lb)) = (&passed[0], &passed[2]) {
+            let same = same_bytes(la, lb)?;
+            run.harness.msg(&format!(
+                "  --drop-ids seeds {} and {}: removal listings {}",
+                SEEDS[0],
+                SEEDS[1],
+                if same { "byte-equal" } else { "differ" }
+            ));
+            same
+        } else {
+            reencode::compare_outputs(run.harness, &run.outdir, "drop-a-vs-b", a, b)?.identical()
+        };
+        if same {
             run.gaps.push(format!(
                 "--drop-ids seeds {} and {} removed the same set",
                 SEEDS[0], SEEDS[1]
@@ -450,14 +472,14 @@ fn same_bytes(a: &Path, b: &Path) -> Result<bool, Error> {
 }
 
 /// Hold one drop's diff to exactly `n` removed objects and nothing else;
-/// returns the removed count per kind.
+/// returns the removed count per kind and whether the removals passed.
 fn judge_drop(
     run: &mut Run<'_>,
     label: &str,
     compared: &Compared,
     n: u64,
     total: u64,
-) -> Result<[u64; 3], Error> {
+) -> Result<([u64; 3], bool), Error> {
     let s = compared.merged;
     let ok = s.first_only == n && s.second_only == 0 && s.differs == 0 && s.same + n == total;
     if !ok {
@@ -492,7 +514,7 @@ fn judge_drop(
     ));
     run.harness
         .record(&format!("{label} removals"), Verdict::from_pass(ok));
-    Ok(per_kind)
+    Ok((per_kind, ok))
 }
 
 /// Compare a drop output's blobs with each input blob re-encoded alone with

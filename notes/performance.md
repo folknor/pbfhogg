@@ -2116,46 +2116,35 @@ other.
 
 Kind: structural, medium-large; high confidence (codex-orchestration).
 
-## PERF-070 - degrade and repack decode the reference once per case
+## PERF-070 - degrade and repack still decode and merge on cold runs and in drop and unsort cases
 
-Reported by: heavy-opus, heavy-codex, engine-codex.
+Reported by: heavy-opus, heavy-codex, engine-codex. Narrowed 2026-11-21.
 
-Mechanism: `reencode::compare` re-decodes the reference for every case, 5
-times in degrade, 6 in degrade -l (counting `observed_coordinates`) and 4 in
-repack. degrade's `drop-a` is decoded three times. The five audited degrade
-outputs, and repack's four, each also get an ID decode, `check --index`, a
-claims walk and layout work, and repack's layout predictor walks the original
-claims once per kind per case. On a locations base, degrade also writes a
-coordinate-free reference PBF.
+Landed: the input is decoded once per check into one verifier-written
+expected file, whose XXH3-128 and counts are computed as it is written. A
+case whose output has a stored decoding summary under the same osmium
+binding and digest is decided with no decode and no merge
+(`--strip-locations`, every repack case), and degrade's two drop seeds are
+compared by their removal listings. Denmark on plantasjen, matched V B V
+(variant, HEAD 0e07dcd6, variant), warm: repack 43.4s / 1m39s / 44.6s,
+degrade 1m50s / 2m14s / 1m48s.
 
-Redesigns:
+Residue:
 
-- heavy-opus (local, exact):
-  - Keep one reference decoding per check and compare every output against
-    it, which needs a sequence-walk `compare_with_opl_each`.
-  - `drop-a` against `drop-a-again`: byte equality implies identical
-    decodings.
-  - `drop-a` against `drop-b`: once both pass `judge_drop`, they are equal
-    exactly when the two listings are byte-equal.
-  - Together these take degrade from 14 decodes to 6.
-- heavy-codex (rewrite): make the input a reusable source of ordered records
-  plus per-blob facts and judge each output as it is read.
-  - Derive the coordinate-free expectation on the reference side, and read
-    outputs with coordinates on.
-  - Count removals per span in the walk; check unsort against the predicted
-    swap.
-  - Feed cap, kind order, overlap and layout checks from one frame
-    observation.
-  - Keep the independently executed same-seed repeat. Removal lists settle
-    whether the two seeds match.
-  - On failure, use the retained streams for today's diagnostics.
-  - The seam is the decompressed frame. The same facts serve degrade, repack
-    and parts of cat-dedupe.
-
-Risks: diagnostic parity; the alternate locations base needs its own facts.
-
-Kind: high-conviction rewrite (heavy-codex, "first rewrite"); local removals
-(heavy-opus).
+- A cold run, or an output whose bytes changed, still decodes and merges
+  every case. A cheaper cold path (hash-scan the output decoding, merge
+  only on mismatch) is unmeasured.
+- Drop and unsort cases need their listing, so each still decodes its
+  output and merges against the expected file (4 merges, 5 decodes in
+  degrade).
+- `partition` reads the input decoding three times (once per kind) and
+  rewrites it whole even when the input is already grouped, and repack and
+  degrade each build the same stripped expected file in their own check.
+- Each audited output still gets `index_truth`, `check --index`, a claims
+  walk and layout work, and the layout predictors walk the input claims
+  once per kind per case (the frame-reader half is PERF-077).
+- No test reaches the summary-decided sequence walk: fixtures run with
+  `--fresh-reference`, whose fake osmium answers by file name.
 
 ## PERF-071 - add-locations-to-ways --mode all decodes ten times for three files
 

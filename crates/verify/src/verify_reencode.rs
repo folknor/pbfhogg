@@ -353,6 +353,9 @@ pub(super) struct Expected {
     /// The input's ways with at least one defined inline coordinate, as
     /// osmium decodes them (whatever the header declares).
     pub coordinate_ways: u64,
+    /// The file's source, binding, counts and digest, when the input's
+    /// decoding was sealed under a summary key.
+    pub basis: Option<opl_compare::Basis>,
 }
 
 /// The expected sequences the arms compare an output's elements with, each
@@ -412,16 +415,29 @@ impl<'a> References<'a> {
         ));
         let path = self.outdir.join(format!("{stem}.opl"));
         // Both strip variants read the run's one FULL decoding of the input.
-        let coordinate_ways =
-            opl_compare::decoded(harness, &self.input.path, Policy::FULL, |_, opl| {
-                partition(opl, &path, strip)
+        let (written, key) =
+            opl_compare::decoded(harness, &self.input.path, Policy::FULL, |h, opl| {
+                Ok((
+                    partition(opl, &path, strip)?,
+                    opl_compare::decoding_key(h, opl),
+                ))
             })?;
+        let coordinate_ways = written.coordinate_ways;
         harness.msg(&format!(
             "  {coordinate_ways} ways carry a defined coordinate in osmium's decoding"
         ));
+        // A decoding sealed under a summary key lets an output's stored
+        // summary decide its comparison; one with no key never does.
+        let basis = key.map(|key| opl_compare::Basis {
+            source: self.input.path.clone(),
+            key,
+            counts: written.counts,
+            digest: written.digest,
+        });
         let expected = Expected {
             path,
             coordinate_ways,
+            basis,
         };
         if strip {
             self.stripped = Some(expected.clone());
@@ -432,13 +448,47 @@ impl<'a> References<'a> {
     }
 }
 
+/// What [`partition`] wrote.
+struct Partitioned {
+    /// Ways of the decoding with at least one defined coordinate.
+    coordinate_ways: u64,
+    /// Objects written per kind.
+    counts: [u64; 3],
+    /// XXH3-128 of every byte written, newlines included, spelled as a
+    /// decoding summary's digest is.
+    digest: String,
+}
+
+/// The expected file's writer, digesting every byte it is handed.
+struct HashingWriter {
+    file: File,
+    hasher: xxhash_rust::xxh3::Xxh3,
+}
+
+impl std::io::Write for HashingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// Write `decoding`'s records to `out` kind by kind (one read per kind, each
 /// kind in file order), each way's coordinates stripped when `strip`;
-/// returns how many ways defined a coordinate. A line that is not an object
+/// returns how many ways defined a coordinate, with the written file's
+/// counts and digest once it is flushed. A line that is not an object
 /// record, or a last line without its newline, is an error.
-fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<u64, Error> {
+fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<Partitioned, Error> {
     use std::io::Write;
-    let mut writer = std::io::BufWriter::new(File::create(out)?);
+    let mut writer = std::io::BufWriter::new(HashingWriter {
+        file: File::create(out)?,
+        hasher: xxhash_rust::xxh3::Xxh3::new(),
+    });
+    let mut counts = [0u64; 3];
     let mut coordinate_ways = 0;
     let mut line = Vec::new();
     for kind in 0..KINDS.len() {
@@ -461,6 +511,7 @@ fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<u64, Error> {
             if k != kind {
                 continue;
             }
+            counts[k] += 1;
             if kind == 1 {
                 let (projected, defined) = strip_way_coordinates(body);
                 coordinate_ways += u64::from(defined > 0);
@@ -471,8 +522,14 @@ fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<u64, Error> {
             writer.write_all(b"\n")?;
         }
     }
-    writer.flush()?;
-    Ok(coordinate_ways)
+    let hashing = writer
+        .into_inner()
+        .map_err(|e| Error::Failed(format!("cannot write {}: {}", out.display(), e.error())))?;
+    Ok(Partitioned {
+        coordinate_ways,
+        counts,
+        digest: format!("{:032x}", hashing.hasher.digest128()),
+    })
 }
 
 /// An OPL way line (osmium's writer with `locations_on_ways=true`) with every
@@ -547,6 +604,7 @@ pub(super) fn compare(
     let merged = opl_compare::compare_sequence_with_opl(
         harness,
         &expected.path,
+        expected.basis.as_ref(),
         output,
         &listing,
         Policy::FULL,
@@ -1129,12 +1187,23 @@ mod tests {
             "w5 v1 Nn1x1y1\nn2 v1\nr1 v1 M\nn1 v1\nw3 v1 Nn2xy\n",
         )
         .unwrap();
-        assert_eq!(partition(&decoding, &out, true).unwrap(), 1);
+        let stripped = partition(&decoding, &out, true).unwrap();
+        assert_eq!(stripped.coordinate_ways, 1);
+        assert_eq!(stripped.counts, [2, 2, 1]);
+        let written = std::fs::read(&out).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&out).unwrap(),
-            "n2 v1\nn1 v1\nw5 v1 Nn1xy\nw3 v1 Nn2xy\nr1 v1 M\n"
+            written,
+            b"n2 v1\nn1 v1\nw5 v1 Nn1xy\nw3 v1 Nn2xy\nr1 v1 M\n"
         );
-        assert_eq!(partition(&decoding, &out, false).unwrap(), 1);
+        // The digest is of the bytes written, as a decoding summary's is.
+        assert_eq!(
+            stripped.digest,
+            format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&written))
+        );
+        assert_eq!(
+            partition(&decoding, &out, false).unwrap().coordinate_ways,
+            1
+        );
         assert!(
             std::fs::read_to_string(&out)
                 .unwrap()

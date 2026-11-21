@@ -1091,16 +1091,100 @@ pub(crate) fn compare_with_opl_each(
     })
 }
 
+/// The persistent summary key the run's retained decoding at `path` was
+/// sealed under, if it has one.
+pub(crate) fn decoding_key(harness: &Harness, path: &Path) -> Option<Key> {
+    harness.run.decodings.key_of(path)
+}
+
+/// What a verifier-written expected OPL file was made from and holds: the
+/// PBF whose decoding it projects, that decoding's sealed summary key (so
+/// one tool binding names both sides of a summary decision), and the
+/// written file's object counts per kind and XXH3-128 of its whole byte
+/// stream, newlines included.
+#[derive(Debug, Clone)]
+pub(crate) struct Basis {
+    pub source: PathBuf,
+    pub key: Key,
+    pub counts: [u64; 3],
+    pub digest: String,
+}
+
+/// A sequence walk of the expected file `basis` describes against `pbf`
+/// decided from `pbf`'s stored decoding summary, with no decode and no
+/// merge: the source's key, observed again with the output's in one tool
+/// binding, must still be the one the expected file was made under, and
+/// the output's stored counts and digest must equal the expected file's.
+/// Byte-identical OPL streams pair every record equal in the walk, in any
+/// order, so the walk would find them identical; XXH3-128 equality stands
+/// for byte equality under the same accepted assumption as [`by_summaries`].
+/// Any other outcome is `None` and the caller decodes and merges.
+fn sequence_by_summary(
+    harness: &mut Harness,
+    basis: &Basis,
+    pbf: &Path,
+    listing: &Path,
+    policy: Policy,
+) -> Result<Option<Merged>, Error> {
+    harness.run.watch(&basis.source)?;
+    harness.run.watch(pbf)?;
+    let runs = [key_run(&basis.source, policy), key_run(pbf, policy)];
+    let Some(keys) = harness.summary_keys(&runs, true)? else {
+        return Ok(None);
+    };
+    if keys[0] != basis.key {
+        return Ok(None);
+    }
+    let Some(out) = harness.summary(&keys[1]) else {
+        return Ok(None);
+    };
+    if out.counts != basis.counts || out.digest != basis.digest {
+        return Ok(None);
+    }
+    harness.run.revalidate()?;
+    harness.checkpoint()?;
+    File::create(listing)?;
+    harness.run.decodings.record(
+        Source::of(pbf)?,
+        Scan {
+            ordered: out.ordered,
+            counts: out.counts,
+        },
+    );
+    let merged = Merged {
+        first: basis.counts,
+        second: out.counts,
+        same: out.counts.iter().sum(),
+        ..Merged::default()
+    };
+    harness.msg(&format!(
+        "  OPL comparison {}: decided by the expected file's digest and the output's stored \
+         decoding summary (xxh3-128 {}), same={}",
+        listing.display(),
+        out.digest,
+        merged.same
+    ));
+    Ok(Some(merged))
+}
+
 /// [`compare_sequence`] with the first side an OPL file already written
 /// (`expected`) and the second `pbf` decoded under `policy`; the decoding is
-/// the run's, kept on failure, and `expected` is kept.
+/// the run's, kept on failure, and `expected` is kept. With `basis`, an
+/// output whose stored summary matches the expected file is decided
+/// without a decode ([`sequence_by_summary`]).
 pub(crate) fn compare_sequence_with_opl(
     harness: &mut Harness,
     expected: &Path,
+    basis: Option<&Basis>,
     pbf: &Path,
     listing: &Path,
     policy: Policy,
 ) -> Result<Merged, Error> {
+    if let Some(basis) = basis
+        && let Some(merged) = sequence_by_summary(harness, basis, pbf, listing, policy)?
+    {
+        return Ok(merged);
+    }
     decoded(harness, pbf, policy, |harness, b| {
         let (merged, [_, summary]) = harness.timed(MERGE_STEP, || {
             merge(expected, b, listing, false, |_| {}, |_| {})

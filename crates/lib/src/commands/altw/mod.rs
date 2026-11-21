@@ -63,6 +63,20 @@ fn node_coordinate_domain_error(node_id: i64, lat: i32, lon: i32) -> Error {
     ))
 }
 
+/// Two records for one referenced node ID at different coordinates. Neither
+/// is evidence the other is wrong, and stream order is not evidence either,
+/// so no winner is picked: every index strategy refuses the same inputs,
+/// whatever order its workers see the records in. Identical duplicates are
+/// accepted, since they cannot change an answer.
+fn conflicting_node_coordinates_error(node_id: i64, a: (i32, i32), b: (i32, i32)) -> Error {
+    Error::invalid_data(format!(
+        "node {node_id} occurs more than once with different coordinates \
+         (lat {}, lon {} and lat {}, lon {} in decimicrodegrees). Refusing \
+         to choose one as the location of the ways that reference it.",
+        a.0, a.1, b.0, b.1
+    ))
+}
+
 /// What ALTW states about its output: input order, and every way written with
 /// inline coordinates (plus the injected prepass fields when asked).
 fn altw_output_facts(inject_prepass: bool) -> crate::commands::output_header::OutputFacts {

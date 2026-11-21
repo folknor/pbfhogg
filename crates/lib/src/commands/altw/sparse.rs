@@ -15,7 +15,8 @@
 //!   serial consumer, so the dispatcher / merge bottleneck disappears.
 //! - The strictly-increasing-id precondition is gone. Random insertion
 //!   order works because each rank slot is unique and the AtomicU64
-//!   stores are race-free per slot.
+//!   swaps are race-free per slot; a duplicate ID whose coordinates
+//!   disagree is refused rather than resolved by worker timing.
 //! - At the cost of carrying the IdSet (and its rank index) into pass 2:
 //!   ~440 MB + ~100 MB at planet, vs the chunk format's ~440 MB
 //!   `offsets`+`start_pad`. Net RAM is roughly flat.
@@ -179,8 +180,9 @@ impl SparseArrayIndex {
 ///
 /// Borrows the `SparseArrayIndex` mmap as atomic slots for the duration of
 /// pass 1. Each referenced node id maps to an 8-byte slot
-/// (`rank_if_set(id) * 8`). All writes use `AtomicU64::store(Relaxed)`,
-/// eliminating data-race UB even if duplicate node IDs appear in the input.
+/// (`rank_if_set(id) * 8`). All writes use `AtomicU64::swap(Relaxed)`,
+/// which keeps duplicate node IDs free of data races and lets `insert`
+/// refuse a duplicate whose coordinates disagree.
 struct SharedSparseWriter<'a> {
     slots: &'a [AtomicU64],
 }
@@ -217,8 +219,26 @@ impl<'a> SharedSparseWriter<'a> {
                 self.slots.len()
             )
         });
-        slot.store(packed, Ordering::Relaxed);
+        // A swap, not a store: duplicate node IDs reach the same slot, and
+        // the store must notice when they disagree. The slot's modification
+        // order holds every value written to it, so a sequence holding two
+        // distinct coordinates has an adjacent unequal pair, and whichever
+        // insert writes the second of that pair sees the first. The refusal
+        // therefore depends on the records, not on which worker ran last.
+        let prev = slot.swap(packed, Ordering::Relaxed);
+        if prev != 0 && prev != packed {
+            return Err(conflict_from_packed(node_id, prev, packed));
+        }
         Ok(())
+    }
+}
+
+/// The conflicting-duplicate refusal, from two presence-flagged slot words.
+#[cold]
+fn conflict_from_packed(node_id: i64, prev: u64, packed: u64) -> Error {
+    match (unpack(prev), unpack(packed)) {
+        (Some(a), Some(b)) => super::conflicting_node_coordinates_error(node_id, a, b),
+        _ => Error::internal("sparse index slot holds a word without its presence bit"),
     }
 }
 
@@ -233,11 +253,12 @@ impl<'a> SharedSparseWriter<'a> {
 ///      `(id, lat, lon)` tuples via `scan::node::extract_node_tuples`
 ///      (wire-only, no `PrimitiveBlock`). Each worker stores 8 bytes
 ///      into the mmap at `referenced.numeric_rank_if_set(id) << 3` for every
-///      referenced id, via `AtomicU64::store(Relaxed)`. Workers do
+///      referenced id, via `AtomicU64::swap(Relaxed)`. Workers do
 ///      not coordinate beyond the shared `&RankedIdSet` and
 ///      `SharedSparseWriter`.
-///      Duplicate node IDs can touch the same rank more than once; atomic
-///      stores keep those writes race-free.
+///      Duplicate node IDs can touch the same rank more than once; the
+///      swap keeps those writes race-free and refuses a pair that
+///      disagrees, so no coordinate is picked by worker timing.
 ///   4. Wrap the mmap into `SparseArrayIndex`, return.
 ///
 /// `direct_io` is intentionally dropped: blob bodies are pread'd from
@@ -412,29 +433,36 @@ fn advise_random_store(mmap: &memmap2::MmapMut, invocation: &crate::host::Record
 #[allow(clippy::unwrap_used)]
 mod tests {
     #[test]
-    fn borrowed_sparse_writer_keeps_duplicate_stores_atomic() {
+    fn borrowed_sparse_writer_refuses_conflicting_duplicates_from_any_thread() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let slots = [AtomicU64::new(0), AtomicU64::new(0)];
         let writer = super::SharedSparseWriter { slots: &slots };
+        let refused = std::sync::atomic::AtomicU64::new(0);
         std::thread::scope(|scope| {
             for (lat, lon) in [(-900_000_000, -1_800_000_000), (900_000_000, 1_800_000_000)] {
                 let writer = &writer;
+                let refused = &refused;
                 scope.spawn(move || {
                     for _ in 0..1000 {
-                        writer.insert(1, 0, lat, lon).unwrap();
+                        if writer.insert(1, 0, lat, lon).is_err() {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 });
             }
         });
-        let stored = slots[0].load(Ordering::Relaxed);
-        assert!(
-            stored == super::pack(-900_000_000, -1_800_000_000).unwrap()
-                || stored == super::pack(900_000_000, 1_800_000_000).unwrap()
-        );
-        assert_eq!(slots[1].load(Ordering::Relaxed), 0);
-        assert!(writer.insert(2, 1, 900_000_001, 0).is_err());
-        assert_eq!(slots[1].load(Ordering::Relaxed), 0);
+        // Whatever the interleaving, the two values meet in the slot at
+        // least once, and the insert that meets the other refuses.
+        assert!(refused.load(Ordering::Relaxed) >= 1);
+        // Identical duplicates are accepted.
+        writer.insert(2, 1, 5, 6).unwrap();
+        writer.insert(2, 1, 5, 6).unwrap();
+        assert_eq!(slots[1].load(Ordering::Relaxed), super::pack(5, 6).unwrap());
+        let out = [AtomicU64::new(0)];
+        let writer = super::SharedSparseWriter { slots: &out };
+        assert!(writer.insert(3, 0, 900_000_001, 0).is_err());
+        assert_eq!(out[0].load(Ordering::Relaxed), 0);
     }
 
     #[cfg(target_os = "linux")]

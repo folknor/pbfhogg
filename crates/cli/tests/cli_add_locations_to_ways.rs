@@ -68,7 +68,7 @@ fn test_ways() -> Vec<TestWay<'static>> {
     }]
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum IndexBackend {
     // No --index-type: the CLI default, auto. Tests use it on unsorted
     // input, where auto routes sparse without consulting host memory; a
@@ -1720,6 +1720,135 @@ fn external_accepts_node_blobs_sharing_a_boundary_id() {
         })
         .collect();
     assert_eq!(read_way_locations(&output), vec![(10, expected)]);
+}
+
+/// Three nodes per blob from `nodes` (`(id, displaced)`: a displaced record
+/// sits away from `node_at(id)`, or outside the domain when `out`), with one
+/// way over `refs`; both backends must refuse with `needle`.
+fn assert_duplicates_refused_by_both_backends(
+    nodes: &[(i64, Displace)],
+    refs: &[i64],
+    needle: &str,
+) {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("duplicates.osm.pbf");
+    let nodes: Vec<TestNode> = nodes
+        .iter()
+        .map(|&(id, displace)| {
+            let mut n = node_at(id);
+            match displace {
+                Displace::No => {}
+                Displace::Moved => n.lat += 1,
+                Displace::OutOfDomain => n.lat = 900_000_001,
+            }
+            n
+        })
+        .collect();
+    write_multi_block_test_pbf(&input, &nodes, &[way_over(10, refs)], &[], 3);
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let output = dir.path().join("out.osm.pbf");
+        let out = run_altw(&input, &output, true, backend, false);
+        let stderr = out.stderr_str();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{backend:?} must refuse as invalid data; stderr:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{backend:?}: a refused run publishes nothing"
+        );
+        assert!(
+            stderr.contains(needle),
+            "{backend:?}: wanted {needle:?}; stderr:\n{stderr}"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Displace {
+    No,
+    Moved,
+    OutOfDomain,
+}
+
+const CONFLICT: &str = "occurs more than once with different coordinates";
+
+#[test]
+fn conflicting_duplicate_in_one_blob_is_refused_by_both_backends() {
+    use Displace::{Moved, No};
+    assert_duplicates_refused_by_both_backends(&[(1, No), (2, No), (2, Moved)], &[1, 2], CONFLICT);
+}
+
+/// The second record opens the next blob, after the way records for 7 were
+/// all consumed by the first blob: the external walk must still look.
+#[test]
+fn conflicting_duplicate_across_a_blob_boundary_is_refused_by_both_backends() {
+    use Displace::{Moved, No};
+    assert_duplicates_refused_by_both_backends(
+        &[(5, No), (6, No), (7, No), (7, Moved), (8, No), (9, No)],
+        &[7],
+        CONFLICT,
+    );
+}
+
+/// A blob holding nothing but the duplicated node carries the check on to the
+/// blob after it.
+#[test]
+fn conflicting_duplicate_after_a_blob_of_the_same_node_is_refused_by_both_backends() {
+    use Displace::{Moved, No};
+    assert_duplicates_refused_by_both_backends(
+        &[
+            (5, No),
+            (6, No),
+            (7, No),
+            (7, No),
+            (7, No),
+            (7, No),
+            (7, Moved),
+            (8, No),
+            (9, No),
+        ],
+        &[5, 7],
+        CONFLICT,
+    );
+}
+
+#[test]
+fn conflicting_negative_duplicate_is_refused_by_both_backends() {
+    use Displace::{Moved, No};
+    assert_duplicates_refused_by_both_backends(&[(0, No), (-1, No), (-1, Moved)], &[-1], CONFLICT);
+}
+
+/// The external walk resolves the first record; the later, out-of-domain one
+/// is judged too, as sparse judges every referenced record.
+#[test]
+fn out_of_domain_later_duplicate_is_refused_by_both_backends() {
+    use Displace::{No, OutOfDomain};
+    assert_duplicates_refused_by_both_backends(
+        &[
+            (5, No),
+            (6, No),
+            (7, No),
+            (7, OutOfDomain),
+            (8, No),
+            (9, No),
+        ],
+        &[7],
+        "outside the geographic domain",
+    );
+}
+
+/// An out-of-domain first record is judged as such, not compared with the
+/// record after it.
+#[test]
+fn out_of_domain_first_duplicate_is_refused_by_both_backends() {
+    use Displace::{No, OutOfDomain};
+    assert_duplicates_refused_by_both_backends(
+        &[(5, No), (7, OutOfDomain), (7, No)],
+        &[7],
+        "outside the geographic domain",
+    );
 }
 
 #[test]

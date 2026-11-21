@@ -14,8 +14,8 @@
 //!
 //! Reading in the element iterator's order (a group's dense nodes, then its
 //! plain nodes) makes the extracted node set the same set the
-//! rewrite path sees and writes, and gives a duplicated id within one blob
-//! the same winner the iterator would.
+//! rewrite path sees and writes. A duplicated id has no winner: the location
+//! path refuses one whose records disagree (`streaming::merge_coords`).
 //!
 //! All coordinate scaling is checked: granularity is any `int32`, as every
 //! reader takes it, and the exact `offset + granularity * raw`, computed

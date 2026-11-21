@@ -14,6 +14,16 @@
   now refuses missing nodes as soon as its node join has counted them,
   before encoding and writing the output, so a refused run ends earlier.
 
+- **A node at two coordinates is refused, not resolved by chance.**
+  `add-locations-to-ways` and `apply-changes --locations-on-ways` now
+  fail with exit 2 and publish nothing when a node a written way needs
+  occurs more than once at different coordinates. The coordinate used
+  to depend on the index type and, for the sparse index and
+  apply-changes, on worker scheduling. Identical repeats are still
+  accepted, `--ignore-missing-nodes` does not waive the refusal, and an
+  out-of-domain repeat is refused under every index type (the external
+  index used to judge only the first record).
+
 - **A caught worker panic is `ErrorKind::Panicked` and exits 101.** A
   panic on a worker, writer or decode thread that pbfhogg catches at its
   join used to come back as `ErrorKind::Internal` and exit 2, the same

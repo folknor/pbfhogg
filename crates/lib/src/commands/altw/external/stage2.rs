@@ -630,6 +630,9 @@ fn join_bucket<C: ShardCodec>(
 
     let t_resolve = crate::counters::Stopwatch::start();
     let mut record_ptr = 0usize;
+    // The last resolved node, while it may still continue into the next
+    // blob of the span list; see `walk_blob`.
+    let mut carry: Option<Resolved> = None;
     let resolved_before_bucket = w.local_resolved;
     let mut bucket_blobs_read: u64 = 0;
     let mut bucket_straddlers: u64 = 0;
@@ -725,6 +728,7 @@ fn join_bucket<C: ShardCodec>(
                 c,
                 &bkt.records,
                 &mut record_ptr,
+                &mut carry,
                 &w.node_tuples[split..],
                 bucket_lo,
                 family,
@@ -736,6 +740,7 @@ fn join_bucket<C: ShardCodec>(
                 c,
                 &bkt.records,
                 &mut record_ptr,
+                &mut carry,
                 &w.node_tuples[..split],
                 bucket_lo,
                 family,
@@ -836,6 +841,34 @@ struct WalkOut<'o> {
     local_resolved: &'o mut u64,
 }
 
+/// A resolved node: its family key and the coordinate every reference to it
+/// was given.
+type Resolved = (u64, i32, i32);
+
+/// Hold every further record of a resolved node to its first one: in the
+/// geographic domain, and at the same coordinate. A conflicting duplicate is
+/// refused rather than resolved to whichever record the walk met first, so
+/// this backend refuses exactly the inputs the sparse store refuses.
+#[inline]
+fn check_duplicate(family: Family, resolved: Resolved, tuple: &NodeTuple) -> crate::Result<()> {
+    let (key, lat, lon) = resolved;
+    if !crate::coord_pack::in_domain(tuple.lat, tuple.lon) {
+        return Err(super::super::node_coordinate_domain_error(
+            family.id_of(key),
+            tuple.lat,
+            tuple.lon,
+        ));
+    }
+    if (tuple.lat, tuple.lon) != (lat, lon) {
+        return Err(super::super::conflicting_node_coordinates_error(
+            family.id_of(key),
+            (lat, lon),
+            (tuple.lat, tuple.lon),
+        ));
+    }
+    Ok(())
+}
+
 /// Merge-walk one blob's family tuples against the bucket's records from
 /// `record_ptr` on.
 ///
@@ -852,6 +885,17 @@ struct WalkOut<'o> {
 /// Records that find no matching tuple (true orphans - id absent from PBF)
 /// emit nothing; stage 4 fills zero coords for any slot_pos not covered by a
 /// ResolvedEntry, matching the existing missing-ref behaviour.
+///
+/// Duplicate node IDs: every record of a resolved node is compared with the
+/// one that resolved it (`check_duplicate`). In canonical order a node's
+/// records are contiguous, within the blob or across consecutive blobs of
+/// the bucket's span list (every blob holding the key has a span containing
+/// it, so all of them are in this bucket's list, in order). `carry` holds the
+/// last resolved node while it ends the blob's slice, and the next slice's
+/// equal-key prefix is checked against it before the record loop: the
+/// records for that key were consumed by the earlier blob, so the loop
+/// itself would never look. Duplicates of unreferenced nodes are not
+/// examined, as in the sparse store.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn walk_blob<R: ShardRecord>(
@@ -859,6 +903,7 @@ fn walk_blob<R: ShardRecord>(
     c: &Stage2Counters,
     records: &[R],
     record_ptr: &mut usize,
+    carry: &mut Option<Resolved>,
     tuples: &[NodeTuple],
     bucket_lo: u64,
     family: Family,
@@ -869,6 +914,14 @@ fn walk_blob<R: ShardRecord>(
         return Ok(());
     };
     let mut tuple_ptr = 0usize;
+    let mut last: Option<Resolved> = None;
+    if let Some(prev) = carry.take() {
+        while tuple_ptr < tuples.len() && key(tuples[tuple_ptr].id) == prev.0 {
+            check_duplicate(family, prev, &tuples[tuple_ptr])?;
+            tuple_ptr += 1;
+        }
+        last = Some(prev);
+    }
     // Pin decision cached for the current run of equal local keys. Records
     // with the same key are contiguous after the stage-2 sort and a run
     // never spans blobs, so the run is computed once at its start and every
@@ -891,13 +944,24 @@ fn walk_blob<R: ShardRecord>(
             // +/-90 / +/-180 degrees is not a coordinate, and writing it
             // through would make `--index-type` change what the command
             // accepts. The backends must agree on refusal, not just on
-            // counting.
+            // counting. Judged before the duplicate scan compares against it.
             if !crate::coord_pack::in_domain(tuple.lat, tuple.lon) {
                 return Err(super::super::node_coordinate_domain_error(
                     family.id_of(global_key),
                     tuple.lat,
                     tuple.lon,
                 ));
+            }
+            if last.map(|r| r.0) != Some(global_key) {
+                // First record of this node: check its other records once.
+                let this = (global_key, tuple.lat, tuple.lon);
+                for other in tuples[tuple_ptr + 1..]
+                    .iter()
+                    .take_while(|t| key(t.id) == global_key)
+                {
+                    check_duplicate(family, this, other)?;
+                }
+                last = Some(this);
             }
             let blob_start = job
                 .way_slot_starts
@@ -970,6 +1034,7 @@ fn walk_blob<R: ShardRecord>(
         }
         *record_ptr += 1;
     }
+    *carry = last.filter(|r| r.0 == upper);
     Ok(())
 }
 pub(super) type SlotBuckets = SharedSlotBuckets;

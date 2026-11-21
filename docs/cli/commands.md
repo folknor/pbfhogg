@@ -1886,6 +1886,11 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 Embed node coordinates in ways. Two index strategies, and `auto` (the
 default) to choose between them:
 
+A node a way references that occurs more than once at different coordinates
+fails the run with exit 2 and nothing published, under every index strategy
+and with `--ignore-missing-nodes` too; no record is picked as the winner.
+Identical repeats are accepted. See DEVIATIONS.md.
+
 - **auto** (default) - Runs sparse unless the input is sorted and indexed, the page-cache budget can be read from the host, and the estimated sparse store exceeds 80 % of that budget; then it runs external. Where available memory cannot be read (every non-Linux host, containers without a visible cgroup v2 mount) or is at most the 3 GiB the sparse run reserves for itself, it runs sparse. A `Note:` on stderr names the choice and why. An input whose indexdata the external index would refuse (blob ranges out of sorted order), or whose node IDs need its wide record (past about 2^38 from zero), runs sparse, and the note says so. When auto runs sparse against a known budget, the exact store is judged again once the first pass has counted the referenced nodes (referenced IDs the file lacks take slots too, and sets of negative IDs take memory), and if it exceeds the same share auto switches to external, with a second `Note:`. The estimate counts every node, so a sorted file of mostly standalone nodes can be routed to external, whose scratch demand is far higher; pass `--index-type sparse` there. Rule and limits in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
 - **sparse** - A flat memory-mapped array of 8 bytes per referenced node, in scratch storage; works on any PBF, sorted or not, and joins negative node IDs like any other. How it is laid out is in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways). Working-set behavior depends on the available page cache; see [performance/add-locations-to-ways.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/add-locations-to-ways.md) for measurements.
 - **external** - Double radix permutation via 4-stage pipeline with bounded memory and high scratch-disk demand. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. See [performance/add-locations-to-ways.md](https://github.com/folknor/pbfhogg/blob/main/reference/performance/add-locations-to-ways.md) for measured resource use. Joins negative node IDs like any other, and any node ID: IDs past about 2^38 from zero take a wider 16-byte scratch record per ref. It has encoding limits the sparse index does not: at most 2^32 way blobs and 2^32 node blobs, and about 2^40 (1.1e12) way node refs in total. Past one, the run fails with exit 2 naming the limit and pointing at sparse, and nothing is published; details in [pipeline.md](https://github.com/folknor/pbfhogg/blob/main/reference/pipeline.md#add-locations-to-ways).
@@ -2094,6 +2099,8 @@ could not resolve. A base node record a written way takes its coordinate
 from must lie in the geographic domain (latitude within +-90 degrees,
 longitude within +-180, judged on the decimicrodegree value): one outside it
 fails the run with nothing published, as add-locations-to-ways refuses it.
+So does a node such a way needs from the base whose records occur more than
+once at different coordinates; identical repeats are accepted.
 Base nodes no changed way references are not judged. Every base node's
 coordinate must still fit an `i32` decimicrodegree, under any `int32`
 block granularity. Only coordinates that

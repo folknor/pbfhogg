@@ -824,7 +824,14 @@ fn handle_candidate(
         // judges the exact value and reports it). OSC node coordinates
         // are domain-checked at OSC parse and replace base ones in the
         // drain; `needed` holds no OSC-upserted node.
+        //
+        // A base node can occur more than once. Identical records are
+        // harmless; records at different coordinates are refused here, at
+        // the worker flush and at the drain merge - every point where one
+        // value could replace another - so no coordinate is chosen by blob
+        // order or by worker assignment.
         let mut out_of_domain: Option<(i64, i32, i32)> = None;
+        let mut conflict: Option<Conflict> = None;
         extract_node_coords(decompress_buf, node_groups_scratch, |id, lat, lon| {
             if !needed.contains(&id) {
                 return;
@@ -833,11 +840,18 @@ fn handle_candidate(
                 out_of_domain.get_or_insert((id, lat, lon));
                 return;
             }
-            local_coords.insert(id, (lat, lon));
+            if let Some(prev) = local_coords.insert(id, (lat, lon))
+                && prev != (lat, lon)
+            {
+                conflict.get_or_insert((id, prev, (lat, lon)));
+            }
             hits += 1;
         })?;
         if let Some((id, lat, lon)) = out_of_domain {
             return Err(out_of_domain_node_err(id, lat, lon));
+        }
+        if let Some((id, a, b)) = conflict {
+            return Err(conflicting_base_node_err(id, a, b));
         }
         counters
             .loc_node_blobs_scanned
@@ -906,7 +920,7 @@ fn handle_candidate(
     if let Some(loc) = loc
         && !local_coords.is_empty()
     {
-        flush_local_coords(loc.slot, local_coords);
+        flush_local_coords(loc.slot, local_coords)?;
     }
 
     // On the --force path the scanner fills `desc` with a placeholder
@@ -1270,20 +1284,53 @@ fn out_of_domain_node_err(node_id: i64, lat: i32, lon: i32) -> Error {
     ))
 }
 
+/// A node id and the two coordinates its base records disagree on.
+type Conflict = (i64, (i32, i32), (i32, i32));
+
+/// Two base records for one needed node at different coordinates. Neither
+/// is evidence the other is wrong, so no winner is picked.
+#[cold]
+#[inline(never)]
+fn conflicting_base_node_err(node_id: i64, a: (i32, i32), b: (i32, i32)) -> Error {
+    Error::invalid_data(format!(
+        "node {node_id} occurs more than once in the base with different \
+         coordinates (lat {}, lon {} and lat {}, lon {} in decimicrodegrees). \
+         Refusing to choose one as an inline way location.",
+        a.0, a.1, b.0, b.1
+    ))
+}
+
+/// Move `src` into `dst`, refusing a node both hold at different
+/// coordinates. Merge order then cannot decide a coordinate.
+pub(super) fn merge_coords(
+    dst: &mut FxHashMap<i64, (i32, i32)>,
+    src: impl IntoIterator<Item = (i64, (i32, i32))>,
+) -> crate::error::Result<()> {
+    for (id, coord) in src {
+        if let Some(prev) = dst.insert(id, coord)
+            && prev != coord
+        {
+            return Err(conflicting_base_node_err(id, prev, coord));
+        }
+    }
+    Ok(())
+}
+
 fn flush_local_coords(
     slot: &Arc<Mutex<FxHashMap<i64, (i32, i32)>>>,
     local: &mut FxHashMap<i64, (i32, i32)>,
-) {
+) -> crate::error::Result<()> {
     if local.is_empty() {
-        return;
+        return Ok(());
     }
     let mut shared = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if shared.is_empty() {
         std::mem::swap(&mut *shared, local);
+        Ok(())
     } else {
-        shared.extend(local.drain());
+        merge_coords(&mut shared, local.drain())
     }
 }
 
@@ -1446,5 +1493,20 @@ mod tests {
                 .between_tasks(&counters, &crate::host::Call::detached())
                 .is_err()
         );
+    }
+
+    /// The merge every coordinate map goes through (worker flush and drain
+    /// publish) accepts identical duplicates and refuses differing ones,
+    /// whichever map holds which.
+    #[test]
+    fn merge_coords_refuses_only_differing_duplicates() {
+        let mut dst = FxHashMap::default();
+        dst.insert(1, (10, 20));
+        assert!(super::merge_coords(&mut dst, [(1, (10, 20)), (2, (30, 40))]).is_ok());
+        assert_eq!(dst.len(), 2);
+        let Err(err) = super::merge_coords(&mut dst, [(2, (30, 41))]) else {
+            panic!("a differing duplicate must be refused");
+        };
+        assert!(err.to_string().contains("different coordinates"), "{err}");
     }
 }

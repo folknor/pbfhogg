@@ -1,5 +1,28 @@
 # Add Locations To Ways
 
+### Sparse pass 1 swaps instead of storing (plantasjen, 2026-11-21, baseline `59bfcae3`)
+
+The sparse store's per-slot write became `AtomicU64::swap`, so a duplicate
+node ID at a different coordinate is refused instead of resolved by worker
+timing. Planet, `embed-locations --index-type sparse --stop ALTW_PASS1_END`,
+`--iterations 1`, interleaved baseline (`--commit HEAD` at `59bfcae3`) and
+uncommitted variant cells, plantasjen, untrimmed. `ALTW_PASS1` span from
+`--durations`:
+
+| Cell | Arm | UUID | ALTW_PASS1 |
+|---|---|---|---|
+| 1 | baseline | `2dd863d3` | 77.6 s |
+| 2 | variant | `e65bb91f` | 76.6 s |
+| 3 | baseline | `59ec5f53` | 78.1 s |
+| 4 | variant | `74db9676` | 76.7 s |
+
+Variant medians 1.4 s (about 2 %) faster: noise. The swap costs nothing
+measurable on sorted planet input, where pass 1 is bounded by decode and
+the store's page traffic, not by the write instruction. The external stage-2
+duplicate check (one comparison per distinct resolved key, plus one per
+blob for the carry) and the apply-changes merge (a `HashMap::insert` that
+already returned the old value) were not measured separately.
+
 ### Claim checks in add-locations-to-ways and time-filter (bygg, 2026-10-27, commits `5587582a` to `2d4e3404`)
 
 Slice 3 holds every blob add-locations-to-ways decodes to its claim and

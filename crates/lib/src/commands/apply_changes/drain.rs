@@ -1055,7 +1055,19 @@ impl DrainLocations {
                 merged = local;
             } else {
                 freed_bytes += super::streaming::map_table_bytes(&local) as u64;
-                merged.extend(local);
+                // Not a bare `extend`: a base node duplicated across blobs held
+                // by different workers would otherwise take whichever
+                // slot comes last. The OSC seed never collides, since
+                // `needed` holds no OSC-upserted node.
+                // Ranked like the missing-node refusal below: an already
+                // published producer failure or a cancellation outranks it.
+                if let Err(conflict) = super::streaming::merge_coords(&mut merged, local) {
+                    if let Some(e) = failure.take() {
+                        return Err(e);
+                    }
+                    invocation.check()?;
+                    return Err(conflict);
+                }
             }
         }
         counters

@@ -69,6 +69,32 @@ survive a pipeline. Absence has to be reported as absence. `--ignore-missing-nod
 still produces exactly the old output for callers who want it, and the summary
 line is unchanged.
 
+## add-locations-to-ways and apply-changes: a node at two coordinates is refused
+
+**osmium behavior:** No policy. `add-locations-to-ways` stores every node
+record in its location index; a duplicate ID at a different coordinate is
+resolved by the index type (the dense index keeps the last record in stream
+order, the sparse one returns whichever the unstable sort leaves first).
+`apply-changes --locations-on-ways` keeps the first base record it meets.
+
+**pbfhogg behavior:** A node ID the command uses to resolve a way location
+that occurs more than once at different decoded coordinates (decimicrodegrees)
+fails the run with invalid data, under every `--index-type`; nothing is
+published. `--ignore-missing-nodes` does not waive it. Identical duplicates
+are accepted, and duplicates of a node no way needs are not examined. For
+`apply-changes`, only the base records looked up for the ways the OSC creates
+or modifies are compared, and a node the OSC upserts takes its coordinate from
+the OSC, so a conflicting base pair under it is not examined. Every examined
+record is held to the geographic domain.
+
+**Rationale:** Neither record is evidence that the other is wrong, and stream
+order is not evidence either. Picking one wrote a coordinate that depended on
+the index type and, for the sparse index and `apply-changes`, on which worker
+ran last, so the same input gave different geometry from run to run. A refusal
+depends only on the records, so every index strategy and every schedule refuses
+the same inputs. The parity holds for correctly indexed input: a blob whose
+indexdata hides it from the external index's node walk is outside it.
+
 ## apply-changes: missing LocationsOnWays nodes are an error
 
 **osmium behavior:** Under `--locations-on-ways`, a reference of a way from

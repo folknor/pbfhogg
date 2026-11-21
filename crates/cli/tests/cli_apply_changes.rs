@@ -1731,6 +1731,88 @@ fn merge_locations_on_ways_duplicate_base_records_cannot_mask_a_missing_node() {
     assert!(!output.exists(), "failed merge must leave no output");
 }
 
+/// Two base records for one needed node at different coordinates are refused,
+/// whether they share a blob or sit in two blobs (which may reach different
+/// workers): no coordinate is chosen by blob order or worker assignment.
+/// At one worker the split pair meets in the worker's flush; the drain-merge
+/// site is covered by `merge_coords`'s unit test, since worker assignment is
+/// not controllable from here.
+#[test]
+fn merge_locations_on_ways_conflicting_duplicate_base_records_are_refused() {
+    let at = |lat| TestNode {
+        id: 1,
+        lat,
+        lon: 200_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    for (split, jobs) in [(false, None), (true, None), (true, Some(1))] {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        let way = (5, vec![1], vec![(100_000_000, 200_000_000)], vec![]);
+        if split {
+            write_locations_base_in_blobs(&base, &[&[at(100_000_000)], &[at(100_000_001)]], &[way]);
+        } else {
+            write_test_pbf_with_locations(&base, &[at(100_000_000), at(100_000_001)], &[way], &[]);
+        }
+        write_osc(
+            &osc,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"><create><way id="10" version="1"><nd ref="1"/></way></create></osmChange>"#,
+        );
+        let rejected = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                locations_on_ways: true,
+                jobs,
+                ..ApplyOpts::default()
+            },
+        );
+        assert!(
+            !rejected.status.success(),
+            "split={split} jobs={jobs:?}: conflicting duplicates must be refused. stderr:\n{}",
+            rejected.stderr_str()
+        );
+        rejected.assert_stderr_contains("occurs more than once in the base with different");
+        assert!(!output.exists(), "failed merge must leave no output");
+    }
+}
+
+/// A way with inline locations: id, refs, locations, tags.
+type LocatedWay<'a> = (i64, Vec<i64>, Vec<(i32, i32)>, Vec<(&'a str, &'a str)>);
+
+/// A sorted LocationsOnWays base with each node group in its own blob.
+fn write_locations_base_in_blobs(path: &Path, node_blobs: &[&[TestNode]], ways: &[LocatedWay<'_>]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let mut writer = PbfWriter::new(file, Compression::default());
+    let header = HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for nodes in node_blobs {
+        for n in *nodes {
+            bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+        }
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    for (id, refs, locations, tags) in ways {
+        bb.add_way_with_locations(*id, tags.iter().copied(), refs, locations, None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
 /// Merge with --locations-on-ways requires LocationsOnWays in base PBF.
 #[test]
 fn merge_locations_on_ways_requires_base_feature() {

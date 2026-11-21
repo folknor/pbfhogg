@@ -85,27 +85,6 @@ Reported by: encoding.
 locations vector disagrees with refs; the direct builder location API refuses
 the mismatch. The fallback can hide an internal transformation error.
 
-## BUG-009 - Duplicate node IDs resolve to scheduling-dependent coordinates
-
-Reported by: altw-sparse, altw-external, apply-locations.
-
-Sparse ALTW stores duplicate IDs with relaxed atomics, last store wins (within
-a blob the later tuple, across parallel blobs whichever runs last); external
-stage 2 matching takes the first tuple; equal IDs pass the ascending checks. So
-backends disagree and sparse is nondeterministic. apply-changes location mode
-merges worker coordinate maps in slot order, not source order, while the order
-guard permits equal boundary IDs (`drain.rs`). Not reproduced.
-
-Defect hunt 2026-11-17 (altw, P1): two records for node 1 at different
-coordinates followed by a way referencing node 1 produce different inline
-coordinates by engine and possibly worker timing; exact indexdata does not
-prevent it. Refusals also diverge: if the first record is valid and the second
-is outside the domain but fits `i32`, sparse refuses the second insertion,
-while external resolves against the first and never domain-checks the second.
-Claim named: agreement between index strategies, including the explicit
-requirement in `altw/external/stage2.rs` that domain refusals agree. The
-hunter asks for a common refusal policy for conflicting coordinates.
-
 ## BUG-011 - Node-statistics histograms depend on worker scheduling
 
 Reported by: check.

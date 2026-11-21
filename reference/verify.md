@@ -277,7 +277,11 @@ removed unless `--keep`; any other run is kept and its path printed.
 The verifier is single-threaded and owns every child it starts. It is a
 child subreaper; stop signals (SIGTERM, SIGINT, SIGHUP) arrive on a signalfd
 polled beside each child. Launches run in groups, every member started from
-the one thread; a lone launch is a group of one. A group settles before any
+the one thread; a lone launch is a group of one. Grouped launches are an
+OPL comparison's missing decodes, uncached reference runs, and the
+independent pbfhogg runs of diff and cat --dedupe (at most
+`PBFHOGG_GROUP` per group, each group judged before the next starts). A
+group settles before any
 of its outputs is read or another group starts: every leader's status is
 collected, then any surviving descendant is killed and reaped until none
 remains. Inputs are revalidated at each member's exit and again after the
@@ -455,7 +459,9 @@ The steps are wall times summed per label, slowest first: each pbfhogg and
 reference launch (a reference's time includes the cache's handling of its
 artifacts, and a cached reference is listed with its own time; a launch
 group's wall is counted once per label, with every launch in its run
-count, so concurrent decodes show their wall, not their sum), and the verifier's own reading of the OPL decodings: `opl merge`
+count, so concurrent decodes and pbfhogg runs show their wall, not their
+sum; in diff, the strips share the indexed diffs' group, so `pbfhogg
+degrade` shows that group's wall), and the verifier's own reading of the OPL decodings: `opl merge`
 for every comparison walk (including the check's per-record work and the
 listing writes it does inside the walk), `opl order scan` for a standalone
 order check, `opl derive model` for the derive-changes model. Decodes and

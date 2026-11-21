@@ -23,6 +23,13 @@ pub(crate) const SETTLE_POLL: Duration = Duration::from_millis(50);
 /// a long sibling still runs. A lone launch sleeps without a bound.
 pub(crate) const GROUP_ADOPTION_POLL: Duration = Duration::from_millis(100);
 
+/// The most pbfhogg runs a check starts as one launch group
+/// (`Harness::pbfhogg_group`). Bounded by memory, not cores: every member
+/// is a whole pbfhogg command with its own peak on the largest dataset
+/// verified, and the members' peaks add. Four is the largest group a
+/// converted check needs (diff's four indexed-side runs).
+pub(crate) const PBFHOGG_GROUP: usize = 4;
+
 /// Lines and bytes per line a listing preview replays into check detail.
 pub(crate) const PREVIEW_LINES: usize = 50;
 pub(crate) const PREVIEW_LINE_BYTES: usize = 240;

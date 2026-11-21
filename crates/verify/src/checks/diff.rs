@@ -182,41 +182,79 @@ impl DiffRuns {
         (old, new): (&Path, &Path),
         direct_io: bool,
     ) -> Result<Self, Error> {
-        let mut diff = |label, stem, pair, verbose| {
-            pbfhogg_diff(harness, outdir, label, stem, pair, verbose, direct_io)
-        };
-        let indexed_verbose = diff("indexed verbose", "pbfhogg-diff-verbose", (old, new), true)?;
-        let indexed_plain = diff("indexed plain", "pbfhogg-diff", (old, new), false)?;
         // pbfhogg diff has a separate code path for inputs without indexdata.
         // apply-changes refuses an unindexed base, so a raw variant cannot
-        // drive it; stripping both sides of the pair can.
+        // drive it; stripping both sides of the pair can. The two indexed
+        // diffs and the two strips read only the pair and each writes its own
+        // file, so they run as one launch group, consumed in the order they
+        // once ran; the unindexed diffs, which read the strips, follow as a
+        // second group.
         let old_raw = outdir.join("old-unindexed.osm.pbf");
         let new_raw = outdir.join("new-unindexed.osm.pbf");
+        let strip = |input: &Path, output: &Path| {
+            PbfArgv::new("degrade")
+                .arg("--strip-indexdata")
+                .input(input)
+                .output(output)
+        };
+        let indexed = [
+            ("indexed verbose", "pbfhogg-diff-verbose", true),
+            ("indexed plain", "pbfhogg-diff", false),
+        ];
+        let mut launches: Vec<(PbfArgv, PathBuf)> = indexed
+            .iter()
+            .map(|(_, stem, verbose)| {
+                (
+                    text_diff(old, new, *verbose, direct_io),
+                    outdir.join(format!("{stem}.txt")),
+                )
+            })
+            .collect();
+        launches.push((strip(old, &old_raw), outdir.join("old-unindexed.stdout")));
+        launches.push((strip(new, &new_raw), outdir.join("new-unindexed.stdout")));
+        let mut ended = harness.pbfhogg_group(launches)?.into_iter();
+        let mut next = || {
+            ended
+                .next()
+                .ok_or_else(|| Error::tool("a pbfhogg launch group ended short"))
+        };
+        let mut runs = Vec::with_capacity(2);
+        for (label, stem, _) in indexed {
+            let captured = next()?;
+            runs.push(diff_run(harness, outdir, label, stem, &captured)?);
+        }
         harness.msg("--- stripping indexdata from old and new ---");
-        harness.strip_indexdata(old, &old_raw)?;
-        harness.strip_indexdata(new, &new_raw)?;
-        let raw = (old_raw.as_path(), new_raw.as_path());
+        for _ in 0..2 {
+            let captured = next()?;
+            harness.require_success(&captured, "pbfhogg degrade --strip-indexdata")?;
+        }
+        let unindexed = [
+            ("unindexed verbose", "pbfhogg-unindexed-diff-verbose", true),
+            ("unindexed plain", "pbfhogg-unindexed-diff", false),
+        ];
+        let launches = unindexed
+            .iter()
+            .map(|(_, stem, verbose)| {
+                (
+                    text_diff(&old_raw, &new_raw, *verbose, direct_io),
+                    outdir.join(format!("{stem}.txt")),
+                )
+            })
+            .collect();
+        let ended = harness.pbfhogg_group(launches)?;
+        for ((label, stem, _), captured) in unindexed.into_iter().zip(ended) {
+            runs.push(diff_run(harness, outdir, label, stem, &captured)?);
+        }
+        let mut runs = runs.into_iter();
+        let mut take = || {
+            runs.next()
+                .ok_or_else(|| Error::tool("a pbfhogg launch group ended short"))
+        };
         Ok(Self {
-            indexed_verbose,
-            indexed_plain,
-            unindexed_verbose: pbfhogg_diff(
-                harness,
-                outdir,
-                "unindexed verbose",
-                "pbfhogg-unindexed-diff-verbose",
-                raw,
-                true,
-                direct_io,
-            )?,
-            unindexed_plain: pbfhogg_diff(
-                harness,
-                outdir,
-                "unindexed plain",
-                "pbfhogg-unindexed-diff",
-                raw,
-                false,
-                direct_io,
-            )?,
+            indexed_verbose: take()?,
+            indexed_plain: take()?,
+            unindexed_verbose: take()?,
+            unindexed_plain: take()?,
         })
     }
 
@@ -396,22 +434,20 @@ fn against_osmium(
     })
 }
 
-/// Run one pbfhogg text diff to `<stem>.txt`, its stderr to
-/// `<stem>-summary.txt`. Exit 1 means the inputs differ; 2 and above mean
-/// the run did not complete, and its missing summary must not be read.
-fn pbfhogg_diff(
+/// One settled pbfhogg text diff whose listing went to `<stem>.txt`, its
+/// stderr written to `<stem>-summary.txt`. Exit 1 means the inputs differ; 2
+/// and above mean the run did not complete, and its missing summary must not
+/// be read.
+fn diff_run(
     harness: &mut Harness,
     outdir: &Path,
     label: &'static str,
     stem: &str,
-    (old, new): (&Path, &Path),
-    verbose: bool,
-    direct_io: bool,
+    captured: &crate::process::Ended,
 ) -> Result<DiffRun, Error> {
     harness.msg(&format!("--- pbfhogg diff ({label}) ---"));
     let listing = outdir.join(format!("{stem}.txt"));
-    let captured = harness.pbfhogg(text_diff(old, new, verbose, direct_io), &listing)?;
-    harness.require_codes(&captured, &format!("pbfhogg diff ({label})"), &[0, 1])?;
+    harness.require_codes(captured, &format!("pbfhogg diff ({label})"), &[0, 1])?;
     fs::write(outdir.join(format!("{stem}-summary.txt")), &captured.stderr)?;
     let stderr = String::from_utf8_lossy(&captured.stderr);
     for line in stderr.lines() {

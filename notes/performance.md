@@ -2003,10 +2003,14 @@ Landed (link 1 of a chain; rulings and link plan in
 notes/PERF-066-design.md): `Lifecycle::run_group`, a barrier-settled launch
 group spawned from the one thread, with adoption tainting the whole group and
 aborting it early; launch-unique staging; an OPL comparison's missing decodes
-run together as one group.
+run together as one group. Link 2: `Harness::pbfhogg_group`, with diff's
+indexed diffs and strips, its unindexed diffs, and five of cat --dedupe's
+six merges run as groups; denmark diff 47.5 s to 32.9 s and cat --dedupe
+1m21s to 41.4 s (matched pairs in the design document).
 
-What remains: pbfhogg runs and cached reference runs are still one at a
-time, and checks still run in sequence. The redesigns below are the
+What remains: pbfhogg runs in other checks (derive-changes' two OSC
+producers the only candidate with seconds to win), cached reference runs
+one at a time, and checks still run in sequence. The redesigns below are the
 hunters' proposals for that residue; the design document's link plan says
 which parts are being built.
 

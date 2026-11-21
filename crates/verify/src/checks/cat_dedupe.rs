@@ -162,9 +162,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         ("input+window", [a, w]),
         ("window+input", [w, a]),
     ];
-    for (label, inputs) in cases {
-        merge(harness, &outdir, label, pbf, inputs, true, direct_io)?;
-    }
+    merge_grouped(harness, &outdir, pbf, &cases, direct_io)?;
 
     Ok(Some(format!(
         "identical to the input as osmium decodes it (metadata included): merged with itself, \
@@ -174,6 +172,38 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
          witnessing runs that start and end between passthrough stretches; the survivor rule \
          among differing copies is not established"
     )))
+}
+
+/// The merges of `cases`, all on unindexed operands. They read only the
+/// input and the prepared operands and each writes its own output, so they
+/// run as launch groups; each group is judged, in case order, before the
+/// next starts, so a later group's abort cannot hide an earlier verdict. The
+/// self merge stays alone ahead of the derives: an operand outside the
+/// domain (an empty selection) ends the check, and must not pre-empt the
+/// self merge's own verdicts.
+fn merge_grouped(
+    harness: &mut Harness,
+    outdir: &Path,
+    pbf: &Path,
+    cases: &[(&str, [Operand<'_>; 2])],
+    direct_io: bool,
+) -> Result<(), Error> {
+    for chunk in cases.chunks(crate::tunables::PBFHOGG_GROUP) {
+        let launches = chunk
+            .iter()
+            .map(|(label, inputs)| {
+                (
+                    merge_argv(outdir, label, *inputs, true, direct_io),
+                    outdir.join(format!("pbfhogg-{label}.stdout")),
+                )
+            })
+            .collect();
+        let ended = harness.pbfhogg_group(launches)?;
+        for ((label, inputs), captured) in chunk.iter().zip(ended) {
+            judge_merge(harness, outdir, label, pbf, *inputs, &captured)?;
+        }
+    }
+    Ok(())
 }
 
 /// One merge input: its path and its decoded blobs.
@@ -313,8 +343,29 @@ fn derive(
     Ok(operand)
 }
 
-/// One `pbfhogg cat --dedupe` of `inputs`, judged against `pbf` and against
-/// the layout its plan predicts.
+/// The output of the merge labelled `label`.
+fn merge_output(outdir: &Path, label: &str) -> PathBuf {
+    outdir.join(format!("pbfhogg-{label}.osm.pbf"))
+}
+
+/// The `pbfhogg cat --dedupe` of `inputs` into [`merge_output`].
+fn merge_argv(
+    outdir: &Path,
+    label: &str,
+    inputs: [Operand<'_>; 2],
+    force: bool,
+    direct_io: bool,
+) -> PbfArgv {
+    let mut argv = PbfArgv::new("cat").arg("--dedupe");
+    for (input, _) in inputs {
+        argv = argv.input(input);
+    }
+    argv.output(&merge_output(outdir, label))
+        .arg_if(force, "--force")
+        .arg_if(direct_io, "--direct-io")
+}
+
+/// One `pbfhogg cat --dedupe` of `inputs`, run alone and judged.
 fn merge(
     harness: &mut Harness,
     outdir: &Path,
@@ -324,6 +375,20 @@ fn merge(
     force: bool,
     direct_io: bool,
 ) -> Result<(), Error> {
+    let captured = harness.pbfhogg_discard(merge_argv(outdir, label, inputs, force, direct_io))?;
+    judge_merge(harness, outdir, label, pbf, inputs, &captured)
+}
+
+/// The settled merge `label` of `inputs`, judged against `pbf` and against
+/// the layout its plan predicts.
+fn judge_merge(
+    harness: &mut Harness,
+    outdir: &Path,
+    label: &str,
+    pbf: &Path,
+    inputs: [Operand<'_>; 2],
+    captured: &crate::process::Ended,
+) -> Result<(), Error> {
     harness.msg(&format!("--- cat --dedupe {label} ---"));
     let plan = dedupe_plan::predict(&[inputs[0].1, inputs[1].1]);
     let shape = dedupe_plan::shape(&plan);
@@ -331,24 +396,15 @@ fn merge(
         "  predicted: {} blobs, {} passthrough, {} rewritten, {} runs between passthroughs",
         shape.total, shape.passthrough, shape.rewritten, shape.bounded_runs
     ));
-    let out = outdir.join(format!("pbfhogg-{label}.osm.pbf"));
-    let mut argv = PbfArgv::new("cat").arg("--dedupe");
-    for (input, _) in inputs {
-        argv = argv.input(input);
-    }
-    let argv = argv
-        .output(&out)
-        .arg_if(force, "--force")
-        .arg_if(direct_io, "--direct-io");
-    let captured = harness.pbfhogg_discard(argv)?;
+    let out = merge_output(outdir, label);
     let name = format!("pbfhogg cat --dedupe {label}");
-    harness.require_success(&captured, &name)?;
+    harness.require_success(captured, &name)?;
     let expect = if shape.way_rewritten {
         WayLocations::Dropped
     } else {
         WayLocations::Kept
     };
-    harness.judge_way_locations(&name, pbf, &out, &captured, expect)?;
+    harness.judge_way_locations(&name, pbf, &out, captured, expect)?;
 
     let layout = dedupe_plan::judge(&out, &[inputs[0].0, inputs[1].0], &plan)?;
     harness.msg(&format!(

@@ -70,12 +70,20 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         h.run = run::Run::create(&dir, exe, true).unwrap();
         h.run.watch(&input).unwrap();
         std::fs::write(dir.join("fault"), fault).unwrap();
-        std::fs::write(dir.join("trace"), "").unwrap();
+        for label in labels {
+            let file = dir.join(format!("trace-{label}"));
+            if file.exists() {
+                std::fs::remove_file(file).unwrap();
+            }
+        }
         let name = format!("dedupe-{}", if fault.is_empty() { "clean" } else { fault });
         let judged = super::judge(&mut h, &name, |h| checks::cat_dedupe::run(h, &input, true));
         assert_eq!(judged.error, None, "{name}: {judged:?}");
-        let trace = std::fs::read_to_string(dir.join("trace")).unwrap();
-        assert_eq!(trace.lines().collect::<Vec<_>>(), TRACES, "{name}");
+        let trace: Vec<String> = labels
+            .iter()
+            .map(|l| std::fs::read_to_string(dir.join(format!("trace-{l}"))).unwrap())
+            .collect();
+        assert_eq!(trace, TRACES, "{name}");
         match arm {
             None => {
                 assert_eq!(judged.status, harness::CheckStatus::Passed, "{judged:?}");
@@ -248,10 +256,9 @@ fn dedupe(fault: &str, root: &Path, inputs: [&Path; 2], output: &Path) {
     if fault == "layout" {
         blobs.push(fake_pbf::Data::of(0, &[100], true));
     }
-    let mut log = std::fs::read_to_string(root.join("trace")).unwrap();
-    log.push_str(&trace);
-    log.push('\n');
-    std::fs::write(root.join("trace"), log).unwrap();
+    // One file per merge: merges run concurrently, so a shared log would be
+    // a racing read-modify-write.
+    std::fs::write(root.join(format!("trace-{label}")), trace).unwrap();
 
     let declared = inputs
         .iter()

@@ -235,6 +235,70 @@ impl Harness {
         ended
     }
 
+    /// Run pbfhogg CLI invocations together as one launch group
+    /// (`Lifecycle::run_group`), each with its standard output in its own
+    /// sink and its own private directory, and hand back every exit, in
+    /// member order, only once the whole group settled. The members must
+    /// write disjoint files and never read each other's outputs. A group
+    /// abort (a failed start, an overflow, an adoption, a moved input) is the
+    /// error of the whole group, so a caller judges earlier groups before
+    /// starting a later one. Inputs are observed at each member's exit and
+    /// again after settlement. The wall is recorded once per label, every
+    /// launch counted. At most `tunables::PBFHOGG_GROUP` members.
+    pub(crate) fn pbfhogg_group(
+        &mut self,
+        members: Vec<(PbfArgv, PathBuf)>,
+    ) -> Result<Vec<Ended>, Error> {
+        if members.len() > crate::tunables::PBFHOGG_GROUP {
+            return Err(Error::tool(format!(
+                "a pbfhogg launch group of {} members exceeds its bound of {}",
+                members.len(),
+                crate::tunables::PBFHOGG_GROUP
+            )));
+        }
+        let mut labels = Vec::with_capacity(members.len());
+        let mut prepared = Vec::with_capacity(members.len());
+        for (argv, sink) in members {
+            labels.push(format!("pbfhogg {}", argv.subcommand()));
+            let private = self.private_dir("pbfhogg")?;
+            let (args, dirs) = argv.finish(&private);
+            for dir in &dirs {
+                std::fs::create_dir(dir)?;
+            }
+            prepared.push((args, private, sink));
+        }
+        let program = self.run.pbfhogg.clone();
+        let launches: Vec<Launch<'_>> = prepared
+            .iter()
+            .map(|(args, cwd, sink)| Launch {
+                program: &program,
+                args: args.clone(),
+                env: Vec::new(),
+                cwd,
+                sink,
+            })
+            .collect();
+        let started = Instant::now();
+        let run = &mut self.run;
+        let ended = self.life.run_group(&launches, &mut || run.revalidate());
+        let took = started.elapsed();
+        let mut seen: Vec<&String> = Vec::new();
+        for label in &labels {
+            if seen.contains(&label) {
+                if let Some((_, _, n)) = self.steps.iter_mut().find(|(l, _, _)| l == label) {
+                    *n += 1;
+                }
+            } else {
+                self.step(label, took);
+                seen.push(label);
+            }
+        }
+        let ended = ended?;
+        self.run.revalidate()?;
+        self.life.checkpoint()?;
+        Ok(ended)
+    }
+
     /// Run a step whose stdout is not a comparison listing, retaining it in
     /// a launch-private file for diagnosis.
     pub(crate) fn pbfhogg_discard(&mut self, argv: PbfArgv) -> Result<Ended, Error> {

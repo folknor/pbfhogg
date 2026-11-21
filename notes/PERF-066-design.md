@@ -52,6 +52,50 @@ sparred with codex.
   own matched A/B on the checks they convert, measured the same way (the
   tree switched only while no queued brokkr command is waiting).
 
+## Landed in link 2
+
+Sparred with codex (profile `read`) to consensus; the plan's shape A (all
+listed checks) was narrowed to the checks with seconds to win.
+
+- `Harness::pbfhogg_group(Vec<(PbfArgv, PathBuf)>) -> Result<Vec<Ended>>`:
+  a private dir per member, `run_group` observing `Run::revalidate` at each
+  leader exit (the serial `Harness::pbfhogg` observes nothing), then
+  revalidate and checkpoint after settlement; one step wall per label.
+  A group abort is the error of the whole group, so callers judge each
+  group before starting the next.
+- `tunables::PBFHOGG_GROUP` = 4, bounded by summed member memory, not
+  cores; callers chunk.
+- diff: group 1 = indexed verbose, indexed plain, strip old, strip new,
+  consumed in that order; group 2 = the two unindexed diffs.
+- cat --dedupe: the self merge stays serial before the derives (an empty
+  derived operand ends the check and must not pre-empt the self merge's
+  verdicts); the other five merge as chunks of 4 then 1, each chunk judged
+  in case order before the next starts. Merge messages now print at
+  judgement, after the group.
+- `dedupe_fixture.rs`: the fake merge wrote one shared trace file by
+  read-modify-write, which concurrent merges race; each merge now writes
+  `trace-<label>` and the driver assembles them in case order against the
+  same `TRACES`.
+- Not converted, no measurable payoff: getparents, check-ids, extract,
+  tags-filter, inspect-tags, check-refs (each pbfhogg run a second or two at
+  most). derive-changes' indexed and unindexed OSC producers are independent
+  and worth up to about 8 s, but the raw-pair preparation errors and the
+  raw member's result must be held until the original parity point so they
+  cannot suppress the roundtrip findings; left for a later link.
+
+## Payoff of link 2 (matched A/B, 2026-11-21, plantasjen)
+
+A = e6207da8, B = the link uncommitted (switched by stash while nothing was
+queued), denmark, PASS-line check wall, warm summaries (one B warm-up per
+check not counted), order B, A, A, B.
+
+- diff: B 32.9 / A 47.5 / A 47.5 / B 32.8 s, -30.7 % and -30.9 %. `pbfhogg
+  diff` (4 runs) 19.1 s vs 33.4-33.5 s; `pbfhogg degrade` (2 runs) is
+  reported at its group's wall, 1.6-1.7 s.
+- cat --dedupe: B 41.3 / A 1m21 / A 1m21 / B 41.5 s, about -49 % in both
+  pairs. `pbfhogg cat` (6 runs) 23.5 s vs 1m3s.
+- Verdict: pays; both checks clear the every-pair gate by a wide margin.
+
 ## Settled rulings (do not reopen)
 
 1. Shape B, a barrier-settled launch group, is the lifecycle. All members are
@@ -101,24 +145,10 @@ sparred with codex.
 
 ## Link plan
 
-### Link 2 - pbfhogg launch groups in checks (medium-large; codex write-sol-low)
+### Link 2 - landed (see "Landed in link 2")
 
-- Add `Harness::pbfhogg_group(&mut self, Vec<(PbfArgv, PathBuf)>) ->
-  Result<Vec<Result<Ended, Error>>, Error>` beside `Harness::pbfhogg`: a
-  private dir per member (`private_dir`), `self.life.run_group(..,
-  &mut || self.run.revalidate())` (split the borrows as
-  `execute_uncached_group` does), one step wall per label.
-- Bound group size by a new tunable in `crates/verify/src/tunables.rs`
-  (memory on germany, not core count: start at 4 and document why).
-- Convert the independent sub-runs, consuming results in today's order so
-  verdicts and messages print as before, and recording an earlier member's
-  failure before a later member's error is raised: getparents' 8 runs,
-  check-ids' 3 degrades then its 18 `check --ids`, diff's 4 diffs,
-  extract's strategies per region, the tags-filter, inspect-tags and
-  check-refs cases. Read each check before converting; one whose runs read
-  each other's outputs stays serial (ruling 11).
-- Fixture tests under `crates/verify/tests/*_fixture.rs` must still pass
-  unchanged; add none unless a conversion changes a message.
+- Open candidate: derive-changes' two OSC producers, under the error
+  deferral named there, with its own matched A/B.
 
 ### Link 3 - cached reference groups (medium; codex write-sol-low)
 

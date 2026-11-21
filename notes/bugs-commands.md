@@ -166,6 +166,12 @@ scaling). A cutoff decision on an overflowing timestamp should refuse, not
 wrap. Separately, the integer division by 1000 truncates a negative sub-second
 timestamp toward zero, so it compares as a later second than it is.
 
+The same wrap reaches `inspect --show` (`show_element.rs`, through
+`MetaClaims`), on plain `Info` as well as dense slots: a plain timestamp of
+2^61 at granularity 1000 wraps to 0 ms in `Info::milli_timestamp` and prints
+`timestamp: 0`, a false epoch. Unlike export and the OSC writer it does not
+use `milli_timestamp_exact`.
+
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 
 Reported by: extract (flagged as a surprising policy, not counted as a defect).
@@ -215,20 +221,6 @@ so no inversion or overlap is produced. Input already unordered or holding
 overlapping ranges also weakens the documented shapes. Either pick the pair
 by distinct ID or qualify the shape guarantees in `docs/cli/commands.md` to
 unique-ID input.
-
-## CMD-028 - inspect --show drops present zero metadata and never prints visibility
-
-Reported by: check-inspect [P2], cli-binary [P2].
-
-`write_info` (`inspect/show_element.rs`) drops present timestamps, changesets
-and UIDs when their value is zero, and `write_user` drops a present empty
-user. The dense formatter also discards zero values after
-`DenseNodeInfo::claims()` has established that they are present. Neither
-formatter prints visibility, including `visible=false`. As a result, absent
-and explicit-zero metadata display identically, and deleted history objects
-lose their deletion state. This contradicts `CORRECTNESS.md`, which preserves
-presence and zeros in printing outputs, and the `show_element_to` contract to
-write all metadata. The formatter is wrong where decoded claims become text.
 
 ## CMD-029 - Default inspect JSON reports tagged_nodes 0 without measuring it
 

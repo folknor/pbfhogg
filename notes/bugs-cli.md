@@ -17,10 +17,9 @@
 
 Defects from the 2026-11-17 defect hunt in `crates/cli/src/`. Every finding
 was made by one codex hunter reading source at `63d4ec1d`. None was built,
-run or reproduced, and the bracketed priority is the hunter's own label. Two
-findings from the same scope are filed with their library mechanism in
-`notes/bugs-commands.md`: `inspect --show` visibility (CMD-028) and the
-header-only indexed verdict (CMD-033). Entries are in no order of importance.
+run or reproduced, and the bracketed priority is the hunter's own label. A
+finding from the same scope is filed with its library mechanism in
+`notes/bugs-commands.md`: the header-only indexed verdict (CMD-033). Entries are in no order of importance.
 
 ## CLI-002 - Stderr I/O failures panic instead of failing the command
 

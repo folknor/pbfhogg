@@ -949,6 +949,78 @@ fn show_element_quotes_and_escapes_text() {
     );
 }
 
+/// Present zero metadata, an empty user and `visible=false` all print; an
+/// element without metadata prints no metadata line at all.
+#[test]
+fn show_element_prints_present_zeros_and_visibility() {
+    use crate::common::{TestMeta, TestWay};
+    use pbfhogg::ElementKind;
+    use pbfhogg::inspect::show_element_to;
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("meta.osm.pbf");
+    let deleted = TestMeta {
+        visible: false,
+        ..TestMeta::default()
+    };
+    crate::common::write_test_pbf(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: Some(deleted),
+            },
+            TestNode {
+                id: 2,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 3,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: Some(deleted),
+        }],
+        &[],
+    );
+
+    let show = |kind, id| {
+        let mut out: Vec<u8> = Vec::new();
+        let found = show_element_to(
+            &input,
+            kind,
+            id,
+            false,
+            &mut out,
+            &crate::common::test_host(),
+        )
+        .expect("show_element");
+        assert!(found);
+        String::from_utf8(out).expect("utf8 output")
+    };
+
+    let meta =
+        "  version: 1\n  timestamp: 0\n  changeset: 0\n  uid: 0\n  user: \"\"\n  visible: false\n";
+    let node = show(ElementKind::Node, 1);
+    assert_eq!(
+        node,
+        format!("node/1\n  lat: 0.0000000\n  lon: 0.0000000\n{meta}")
+    );
+    let way = show(ElementKind::Way, 3);
+    assert!(
+        way.starts_with(&format!("way/3\n{meta}")),
+        "unexpected output: {way:?}"
+    );
+    let bare = show(ElementKind::Node, 2);
+    assert_eq!(bare, "node/2\n  lat: 0.0000000\n  lon: 0.0000000\n");
+}
+
 /// One raw frame: length prefix, a `BlobHeader` naming `blob_type` and
 /// declaring the body's size, then `body` verbatim.
 fn raw_frame(blob_type: &str, body: &[u8]) -> Vec<u8> {

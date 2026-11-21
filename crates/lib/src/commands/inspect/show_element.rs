@@ -7,6 +7,7 @@ use std::path::Path;
 use super::super::Result;
 use crate::Element;
 use crate::ElementKind;
+use crate::read::claims::MetaClaims;
 use crate::text_quote::{MemberLabel, Quoted};
 
 /// Look up a single element by type and ID and write all its metadata,
@@ -154,68 +155,53 @@ fn write_dense_node_info(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io:
     // is not a claim, and the padding slot of a node without metadata in a
     // block whose other nodes carry it claims nothing.
     if let Some(info) = dn.info()
-        && let Some(claims) = info.claims()
+        && let Some(claims) = MetaClaims::from_dense(info)
     {
-        if let Some(v) = claims.version {
-            writeln!(out, "  version: {v}")?;
-        }
-        if let Some(ts) = claims.milli_timestamp
-            && ts != 0
-        {
-            writeln!(out, "  timestamp: {}", ts / 1000)?;
-        }
-        if let Some(cs) = claims.changeset
-            && cs != -1
-            && cs != 0
-        {
-            writeln!(out, "  changeset: {cs}")?;
-        }
-        if let Some(uid) = claims.uid
-            && uid != 0
-        {
-            writeln!(out, "  uid: {uid}")?;
-        }
-        if let Some(user) = claims.user {
-            write_user(out, user.ok())?; // ok-deliberate: a bad index prints the invalid marker
-        }
+        write_meta(out, &claims)?;
     }
     Ok(())
 }
 
-/// `  user: "name"`, nothing for an empty name, and a bare `<invalid>` for a
+fn write_info(out: &mut impl Write, info: &crate::Info<'_>) -> io::Result<()> {
+    write_meta(out, &MetaClaims::from_info(info))
+}
+
+/// Every claimed field as claimed, zeros and an empty user included, and
+/// nothing for a field the element does not claim, so an absent field and a
+/// present zero print differently. The timestamp prints in whole epoch
+/// seconds, floored like export and OSC. `visible` prints whenever claimed:
+/// a deleted history object shows `visible: false`; a plain element without
+/// the field prints no line.
+fn write_meta(out: &mut impl Write, claims: &MetaClaims<'_>) -> io::Result<()> {
+    if let Some(v) = claims.version {
+        writeln!(out, "  version: {v}")?;
+    }
+    if let Some(ts) = claims.milli_timestamp {
+        writeln!(out, "  timestamp: {}", ts.div_euclid(1000))?;
+    }
+    if let Some(cs) = claims.changeset {
+        writeln!(out, "  changeset: {cs}")?;
+    }
+    if let Some(uid) = claims.uid {
+        writeln!(out, "  uid: {uid}")?;
+    }
+    if let Some(user) = &claims.user {
+        write_user(out, user.as_ref().ok().copied())?; // ok-deliberate: a bad index prints the invalid marker
+    }
+    if let Some(visible) = claims.visible {
+        writeln!(out, "  visible: {visible}")?;
+    }
+    Ok(())
+}
+
+/// `  user: "name"` (an empty name as `""`), and a bare `<invalid>` for a
 /// negative or out-of-range user string index, passed as `None` (a real name
 /// is always quoted, so the sentinel cannot be mistaken for one).
 fn write_user(out: &mut impl Write, user: Option<&str>) -> io::Result<()> {
     match user {
-        Some("") => Ok(()),
         Some(user) => writeln!(out, "  user: {}", Quoted(user)),
         None => writeln!(out, "  user: <invalid>"),
     }
-}
-
-fn write_info(out: &mut impl Write, info: &crate::Info<'_>) -> io::Result<()> {
-    if let Some(v) = info.claimed_version() {
-        writeln!(out, "  version: {v}")?;
-    }
-    if let Some(ts) = info.milli_timestamp()
-        && ts != 0
-    {
-        writeln!(out, "  timestamp: {}", ts / 1000)?;
-    }
-    if let Some(cs) = info.changeset()
-        && cs != 0
-    {
-        writeln!(out, "  changeset: {cs}")?;
-    }
-    if let Some(uid) = info.uid()
-        && uid != 0
-    {
-        writeln!(out, "  uid: {uid}")?;
-    }
-    if let Some(user) = info.user() {
-        write_user(out, user.ok())?;
-    }
-    Ok(())
 }
 
 /// Write tags for elements that implement the standard `tags()` iterator.

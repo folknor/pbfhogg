@@ -551,6 +551,14 @@
 
 ### Fixed
 
+- **`inspect --show` prints every metadata field the element carries.**
+  A present timestamp, changeset or uid of 0 and an empty user name were
+  dropped, so they read like absent fields, and visibility was never
+  printed, so a deleted history object looked visible. They now print,
+  the empty user as `user: ""`, plus a `visible: true|false` line
+  whenever the element states visibility. A negative sub-second
+  timestamp now floors to the earlier second instead of printing 0.
+
 - **`export` writes only positions inside the GeoJSON coordinate range.**
   A tagged node at latitude 100, or a way carrying libosmium's undefined
   location (`214.7483647` on both axes), was written as is. A node or way

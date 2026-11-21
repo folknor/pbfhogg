@@ -815,6 +815,12 @@ newline spans lines; use `--json` to read such a value losslessly. The file
 name is the path's last component as UTF-8, with invalid bytes replaced, in
 every form.
 
+`--show` prints each metadata field the element claims on its own line
+(`version`, `timestamp` in whole epoch seconds, `changeset`, `uid`, `user`,
+`visible`), zeros and an empty user (`user: ""`) included, and no line for a
+field it does not claim. A dense node's claims follow CORRECTNESS.md
+"Version 0 is not a version claim either".
+
 `inspect --json` and `export` use serde_json's JSON escaping for every
 destination, including a terminal. Quotes, backslashes and C0 controls are
 escaped; DEL, C1 controls, U+2028/U+2029 and Unicode bidi controls remain

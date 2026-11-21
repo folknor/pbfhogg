@@ -1,4 +1,5 @@
-//! Completed reference executions only; no pbfhogg verdict is cached.
+//! Completed reference executions, plus summaries of osmium's OPL decodings
+//! (`Summary`); no verdict is cached.
 use crate::error::Error;
 use crate::output;
 use crate::reference::{RunArg, ToolRun};
@@ -169,6 +170,13 @@ impl ReferenceCache {
         let Some(budget) = budget else {
             return;
         };
+        // Summaries are a few hundred bytes each, so they are bounded by
+        // count, not by the artifact budget; a zero budget keeps none.
+        self.retain_summaries(if budget == 0 {
+            0
+        } else {
+            crate::tunables::SUMMARY_RETAIN
+        });
         let read = match fs::read_dir(&self.dir) {
             Ok(read) => read,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -336,9 +344,36 @@ impl ReferenceCache {
     }
 }
 
-struct Key {
-    text: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Key {
+    pub(crate) text: String,
     hex: String,
+}
+
+/// The format of a stored decoding summary; bump it with any change to what
+/// a summary means: the OPL framing hashed, the key parse, the strict rank
+/// or the counting.
+const SUMMARY_FORMAT: u32 = 1;
+const SUMMARIES: &str = "summaries";
+
+/// osmium's reading of one exact input under one OPL policy, observed by the
+/// verifier while it read that decoding whole without a read or parse error:
+/// whether the objects strictly ascend in object order, the object count per
+/// kind, and the XXH3-128 of the whole OPL byte stream, newlines included.
+/// It is an observation of bytes osmium decoded, never a verdict: every
+/// comparison still decides from two summaries, or from the full merge.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Summary {
+    pub(crate) ordered: bool,
+    pub(crate) counts: [u64; 3],
+    pub(crate) digest: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredSummary {
+    format: u32,
+    key: String,
+    summary: Summary,
 }
 /// Seal `staging` and make it the entry at `entry`, replacing any older one.
 fn publish(
@@ -596,6 +631,138 @@ fn hit(
 }
 
 impl ReferenceCache {
+    /// The persistent summary key of each decode in `runs` (uncached
+    /// `osmium cat` runs), all under one observation of the tool's identity,
+    /// so keys made together name one binding. `None` under
+    /// `--fresh-reference` (summaries are neither read nor written then:
+    /// fixture tools answer by file name, not bytes) or when the identity is
+    /// unavailable. `reprobe` allows a new probe when the memo no longer
+    /// holds; without it a moved binding gives `None`. Each run must name
+    /// the output its key promises: osmium picks the OPL writer from `-f`,
+    /// never from the output's name, so a launch writing elsewhere decodes
+    /// the same bytes.
+    pub(crate) fn summary_keys(
+        &mut self,
+        life: &mut crate::process::Lifecycle,
+        watched: &mut crate::run::Run,
+        tools: &crate::reference::Tools,
+        runs: &[ToolRun],
+        reprobe: bool,
+    ) -> Result<Option<Vec<Key>>, Error> {
+        if self.fresh || runs.is_empty() {
+            return Ok(None);
+        }
+        let mut track = Vec::new();
+        let staging = self.staging(&runs[0], &mut track);
+        let result = staging.and_then(|staging| {
+            identity(
+                &mut self.probed,
+                life,
+                watched,
+                &tools.osmium,
+                &staging,
+                reprobe,
+            )
+        });
+        for dir in &track {
+            remove_tree(dir);
+        }
+        let identity = match result {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return Ok(None),
+            Err(e @ (Error::Interrupted | Error::Unsettled(_) | Error::Environment(_))) => {
+                return Err(e);
+            }
+            Err(e) => {
+                output::note(&format!("decoding summaries unavailable: {e}"));
+                return Ok(None);
+            }
+        };
+        let mut keys = Vec::with_capacity(runs.len());
+        for run in runs {
+            let key = key_text(run, &identity, &mut |p| watched.digest_of(p))?;
+            let text = format!("pbfhogg-verify-summary {SUMMARY_FORMAT}\n{}", key.text);
+            keys.push(Key {
+                hex: format!("{:032x}", xxhash_rust::xxh3::xxh3_128(text.as_bytes())),
+                text,
+            });
+        }
+        Ok(Some(keys))
+    }
+
+    fn summary_path(&self, key: &Key) -> PathBuf {
+        self.dir.join(SUMMARIES).join(format!("{}.json", key.hex))
+    }
+
+    /// The stored summary under `key`, if one is valid for its full key
+    /// text; a malformed or mismatched file is a miss and is removed. A hit
+    /// refreshes the file's recency.
+    pub(crate) fn summary(&self, key: &Key) -> Option<Summary> {
+        if self.fresh {
+            return None;
+        }
+        let path = self.summary_path(key);
+        let text = fs::read_to_string(&path).ok()?;
+        match serde_json::from_str::<StoredSummary>(&text) {
+            Ok(stored) if stored.format == SUMMARY_FORMAT && stored.key == key.text => {
+                if let Ok(file) = fs::File::options().append(true).open(&path) {
+                    drop(file.set_modified(std::time::SystemTime::now()));
+                }
+                Some(stored.summary)
+            }
+            _ => {
+                drop(fs::remove_file(&path));
+                None
+            }
+        }
+    }
+
+    /// Store `summary` under `key`, replacing any older one. A failure is a
+    /// note: a summary saves later work and is never evidence.
+    pub(crate) fn publish_summary(&self, key: &Key, summary: &Summary) {
+        if self.fresh {
+            return;
+        }
+        let path = self.summary_path(key);
+        let result = (|| -> Result<(), Error> {
+            fs::create_dir_all(self.dir.join(SUMMARIES))?;
+            let tmp = path.with_extension(format!("{}.tmp", self.run_id));
+            let text = serde_json::to_string(&StoredSummary {
+                format: SUMMARY_FORMAT,
+                key: key.text.clone(),
+                summary: summary.clone(),
+            })
+            .map_err(|e| Error::tool(e.to_string()))?;
+            fs::write(&tmp, text)?;
+            fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            output::note(&format!("cannot store a decoding summary: {e}"));
+        }
+    }
+
+    /// Keep the newest `keep` summaries by recency; zero keeps none.
+    fn retain_summaries(&self, keep: usize) {
+        let Ok(read) = fs::read_dir(self.dir.join(SUMMARIES)) else {
+            return;
+        };
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = read
+            .flatten()
+            .map(|e| {
+                let used = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (used, e.path())
+            })
+            .collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.0));
+        for (_, path) in files.into_iter().skip(keep) {
+            drop(fs::remove_file(&path));
+        }
+    }
+
     pub(crate) fn execute(
         &mut self,
         life: &mut crate::process::Lifecycle,

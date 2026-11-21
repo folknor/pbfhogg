@@ -386,6 +386,37 @@ impl Harness {
     /// group's wall is recorded once per label, counting every launch, so a
     /// step's time is the wall the group took, not the sum of its members.
     /// Runs that read each other's outputs cannot share a group.
+    /// The persistent decoding-summary keys of `runs`, under one identity
+    /// observation ([`crate::reference_cache::ReferenceCache::summary_keys`]).
+    pub(crate) fn summary_keys(
+        &mut self,
+        runs: &[ToolRun],
+        reprobe: bool,
+    ) -> Result<Option<Vec<crate::reference_cache::Key>>, Error> {
+        self.cache
+            .summary_keys(&mut self.life, &mut self.run, &self.tools, runs, reprobe)
+    }
+
+    /// The stored decoding summary under `key`, if any.
+    pub(crate) fn summary(
+        &self,
+        key: &crate::reference_cache::Key,
+    ) -> Option<crate::reference_cache::Summary> {
+        self.cache.summary(key)
+    }
+
+    /// Store a decoding summary; inputs are revalidated first, so a summary
+    /// is published only while every watched input still holds.
+    pub(crate) fn publish_summary(
+        &mut self,
+        key: &crate::reference_cache::Key,
+        summary: &crate::reference_cache::Summary,
+    ) -> Result<(), Error> {
+        self.run.revalidate()?;
+        self.cache.publish_summary(key, summary);
+        Ok(())
+    }
+
     pub(crate) fn reference_group(
         &mut self,
         runs: &[(&ToolRun, &Path)],

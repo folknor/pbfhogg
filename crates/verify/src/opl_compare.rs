@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::harness::Harness;
 use crate::reference::ToolRun;
+use crate::reference_cache::{Key, Summary};
 
 /// What a comparison reads from each object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +188,11 @@ struct Entry {
     /// Read by a call that failed: the error names this file, so it is
     /// never evicted or discarded and stays in the kept run directory.
     kept: bool,
+    /// The persistent summary key this decoding was made under: planned
+    /// before its launch and observed again, unchanged, once the group
+    /// settled. `None` when no identity bound it; such a decoding serves
+    /// merges but never a stored summary.
+    key: Option<Key>,
 }
 
 impl Entry {
@@ -269,6 +275,21 @@ impl Decodings {
         self.trim(crate::tunables::DECODING_BUDGET)
     }
 
+    /// Record `scan` as the order and counts of `source`.
+    fn record(&mut self, source: Source, scan: Scan) {
+        if !self.scans.iter().any(|(s, _)| *s == source) {
+            self.scans.push((source, scan));
+        }
+    }
+
+    /// The persistent key of the decoding at `path`, if it has one.
+    fn key_of(&self, path: &Path) -> Option<Key> {
+        self.entries
+            .iter()
+            .find(|e| e.path == path)
+            .and_then(|e| e.key.clone())
+    }
+
     /// Record `scan` as the order and counts of the source `path` decodes.
     fn publish(&mut self, path: &Path, scan: Scan) {
         let Some(source) = self
@@ -347,6 +368,149 @@ fn acquire_hit(
     Ok(Some(path))
 }
 
+/// The decode a persistent summary key describes: `osmium cat` of `pbf`
+/// under `policy`, its output named `decoding.opl`. The launch writes a
+/// numbered name in the run's store instead; osmium picks the OPL writer
+/// from `-f`, never from the output's name, so both decode the same bytes.
+fn key_run(pbf: &Path, policy: Policy) -> ToolRun {
+    ToolRun::osmium("opl-compare.1")
+        .arg("cat")
+        .input(pbf)
+        .args(&["-f", &policy.format(), "-o"])
+        .output(Path::new("decoding.opl"))
+        .arg("--overwrite")
+        .uncached()
+}
+
+/// Give each settled decoding at `opls` its planned key when the identity,
+/// observed again without a reprobe, still gives the same full key text.
+fn seal_keys(
+    harness: &mut Harness,
+    planned: Option<Vec<Key>>,
+    key_runs: &[ToolRun],
+    opls: &[&Path],
+) -> Result<(), Error> {
+    let Some(planned) = planned else {
+        return Ok(());
+    };
+    let Some(again) = harness.summary_keys(key_runs, false)? else {
+        return Ok(());
+    };
+    for ((planned, again), opl) in planned.into_iter().zip(again).zip(opls) {
+        if planned == again
+            && let Some(e) = harness
+                .run
+                .decodings
+                .entries
+                .iter_mut()
+                .find(|e| e.path == *opl)
+        {
+            e.key = Some(planned);
+        }
+    }
+    Ok(())
+}
+
+/// Publish `summary` for the decoding at `decoding`, under the key its
+/// bytes were made under; a decoding with no key publishes nothing.
+fn publish_summary(harness: &mut Harness, decoding: &Path, summary: &Summary) -> Result<(), Error> {
+    match harness.run.decodings.key_of(decoding) {
+        Some(key) => harness.publish_summary(&key, summary),
+        None => Ok(()),
+    }
+}
+
+/// The summary of the decoding of `pbf` under `policy`, made (or reused
+/// from the run's store) and scanned whole, when its key is `key`: the key
+/// the caller looked up under, so both summaries of a comparison name one
+/// tool binding. `None` when the decoding has another key or none, or when
+/// the scan meets a read or parse error; the full merge then reports it.
+fn scanned(
+    harness: &mut Harness,
+    pbf: &Path,
+    policy: Policy,
+    key: &Key,
+) -> Result<Option<Summary>, Error> {
+    decoded(harness, pbf, policy, |harness, path| {
+        if harness.run.decodings.key_of(path).as_ref() != Some(key) {
+            return Ok(None);
+        }
+        let Ok((ordered, counts, summary)) = harness.timed("opl summary scan", || scan_order(path))
+        else {
+            return Ok(None);
+        };
+        harness
+            .run
+            .decodings
+            .publish(path, Scan { ordered, counts });
+        publish_summary(harness, path, &summary)?;
+        Ok(Some(summary))
+    })
+}
+
+/// A strict comparison of `first` and `second` under `policy` decided from
+/// their decodings' stored summaries, without a merge: both summaries under
+/// one tool binding, both strictly ordered, with equal counts and equal
+/// whole-stream digests. With one summary stored, the other side alone is
+/// decoded and scanned. Any other outcome is `None` and the caller merges as
+/// before, so a difference, a disorder or a decoding error is always the
+/// merge's to report. A pass writes an empty `listing`.
+fn by_summaries(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+) -> Result<Option<Merged>, Error> {
+    harness.run.watch(first)?;
+    harness.run.watch(second)?;
+    let runs = [key_run(first, policy), key_run(second, policy)];
+    let Some(keys) = harness.summary_keys(&runs, true)? else {
+        return Ok(None);
+    };
+    let (a, b) = match (harness.summary(&keys[0]), harness.summary(&keys[1])) {
+        (Some(a), Some(b)) => (a, b),
+        (Some(a), None) if a.ordered => match scanned(harness, second, policy, &keys[1])? {
+            Some(b) => (a, b),
+            None => return Ok(None),
+        },
+        (None, Some(b)) if b.ordered => match scanned(harness, first, policy, &keys[0])? {
+            Some(a) => (a, b),
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    if !(a.ordered && b.ordered && a == b) {
+        return Ok(None);
+    }
+    harness.run.revalidate()?;
+    harness.checkpoint()?;
+    File::create(listing)?;
+    for (pbf, s) in [(first, &a), (second, &b)] {
+        let source = Source::of(pbf)?;
+        harness.run.decodings.record(
+            source,
+            Scan {
+                ordered: true,
+                counts: s.counts,
+            },
+        );
+    }
+    let merged = Merged {
+        first: a.counts,
+        second: b.counts,
+        same: a.counts.iter().sum(),
+        ..Merged::default()
+    };
+    harness.msg(&format!(
+        "  OPL comparison {}: decided by equal decoding summaries (xxh3-128 {}), same={}",
+        listing.display(),
+        a.digest,
+        merged.same
+    ));
+    Ok(Some(merged))
+}
+
 /// Decode every operand of `sides` whose slot is still empty, as one launch
 /// group: the osmium decodes run together, so a comparison's decode wall is
 /// its slowest operand's, not their sum. Operands of one source and policy
@@ -397,6 +561,14 @@ fn acquire_missing(
         .run
         .decodings
         .trim(crate::tunables::DECODING_BUDGET.saturating_sub(estimate))?;
+    // Each decode's persistent key, planned before the launch under one
+    // identity observation; it is kept below only if the same observation,
+    // made again once the group settled, still gives it.
+    let key_runs: Vec<ToolRun> = plan
+        .iter()
+        .map(|(_, policy, pbf, _)| key_run(pbf, *policy))
+        .collect();
+    let planned_keys = harness.summary_keys(&key_runs, true)?;
     let dir = harness.run.dir.join("decodings");
     std::fs::create_dir_all(&dir)?;
     let mut runs = Vec::with_capacity(plan.len());
@@ -442,11 +614,14 @@ fn acquire_missing(
             pins: u32::try_from(fills.len()).map_err(|e| Error::tool(e.to_string()))?,
             used: tick,
             kept: false,
+            key: None,
         });
         for i in fills {
             slots[i] = Some(opl.clone());
         }
     }
+    let opls: Vec<&Path> = runs.iter().map(|(_, _, opl)| opl.as_path()).collect();
+    seal_keys(harness, planned_keys, &key_runs, &opls)?;
     // Aliases: every operand, not only the one osmium read, must still be
     // the source its slot's decoding was planned from.
     for (i, source) in planned {
@@ -546,7 +721,23 @@ pub(crate) fn compare(
     policy: Policy,
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
-    compare_paired(harness, first, second, listing, policy, each, |_| {})
+    if let Some(merged) = by_summaries(harness, first, second, listing, policy)? {
+        return Ok(merged);
+    }
+    walk(harness, first, second, listing, policy, true, each, |_| {})
+}
+
+/// [`compare`] always by the full merge, never from stored summaries: for
+/// a check whose subject is the merge itself (field-policies).
+pub(crate) fn compare_merged(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+) -> Result<Merged, Error> {
+    walk(harness, first, second, listing, policy, true, each, |_| {})
 }
 
 /// [`compare`] for streams in any order: the merge walk advances the side
@@ -635,13 +826,32 @@ pub(crate) fn compare_judged(
     policy: Policy,
     each: impl FnMut(Group),
 ) -> Result<Walked, Error> {
+    if let Some(merged) = by_summaries(harness, first, second, listing, policy)? {
+        let scan = |counts| {
+            Ok(Scan {
+                ordered: true,
+                counts,
+            })
+        };
+        return Ok(Walked {
+            scans: [scan(merged.first), scan(merged.second)],
+            merged: Ok(merged),
+            listing_note: None,
+        });
+    }
     let sides = [(first, policy), (second, policy)];
     with_decodings(harness, &sides, |harness, held| {
         let (a, b) = (&held[0], &held[1]);
-        let walked = harness.timed(MERGE_STEP, || merge_judged(a, b, listing, each))?;
+        let (walked, summaries) =
+            harness.timed(MERGE_STEP, || merge_judged(a, b, listing, each))?;
         for (path, scan) in [a, b].into_iter().zip(&walked.scans) {
             if let Ok(scan) = scan {
                 harness.run.decodings.publish(path, *scan);
+            }
+        }
+        for (path, summary) in [a, b].into_iter().zip(&summaries) {
+            if let Some(summary) = summary {
+                publish_summary(harness, path, summary)?;
             }
         }
         if let Ok(merged) = &walked.merged {
@@ -679,7 +889,11 @@ fn walk(
     // completed merge keeps no decoding beside it, even when they differ.
     with_decodings(harness, &sides, |harness, held| {
         let (a, b) = (&held[0], &held[1]);
-        let merged = harness.timed(MERGE_STEP, || merge(a, b, listing, strict, each, paired))?;
+        let (merged, summaries) =
+            harness.timed(MERGE_STEP, || merge(a, b, listing, strict, each, paired))?;
+        for (path, summary) in [a, b].into_iter().zip(&summaries) {
+            publish_summary(harness, path, summary)?;
+        }
         if strict {
             // A completed strict merge read both sides whole, ascending.
             for (path, counts) in [(a, merged.first), (b, merged.second)] {
@@ -707,6 +921,9 @@ fn walk(
 /// their nodes (an invalid-location geometry error), which every way-only or
 /// filtered output is.
 pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]), Error> {
+    // Watched before the stat that picks a scan: a replacement between the
+    // two fails the revalidation instead of being blessed.
+    harness.run.watch(pbf)?;
     let source = Source::of(pbf)?;
     if let Some(scan) = harness
         .run
@@ -716,11 +933,30 @@ pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]
         .find(|(s, _)| *s == source)
         .map(|(_, scan)| *scan)
     {
-        harness.run.watch(pbf)?;
         harness.run.revalidate()?;
         harness.checkpoint()?;
         harness.msg(&format!(
             "  {}: order and counts from the run's earlier reading of its decoding",
+            pbf.display()
+        ));
+        return Ok((scan.ordered, scan.counts));
+    }
+    // A stored summary of any policy: every policy writes the object keys
+    // alike, so a successful whole decoding under one answers order and
+    // counts under all.
+    let runs = [Policy::CONTENT, Policy::NO_LOCATIONS, Policy::FULL].map(|p| key_run(pbf, p));
+    if let Some(keys) = harness.summary_keys(&runs, true)?
+        && let Some(stored) = keys.iter().find_map(|k| harness.summary(k))
+    {
+        harness.run.revalidate()?;
+        harness.checkpoint()?;
+        let scan = Scan {
+            ordered: stored.ordered,
+            counts: stored.counts,
+        };
+        harness.run.decodings.record(source, scan);
+        harness.msg(&format!(
+            "  {}: order and counts from a stored summary of its decoding",
             pbf.display()
         ));
         return Ok((scan.ordered, scan.counts));
@@ -733,27 +969,22 @@ pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]
         .find(|e| e.source == source)
         .map_or(Policy::CONTENT, |e| e.policy);
     decoded(harness, pbf, policy, |harness, path| {
-        let (ordered, counts) = harness.timed("opl order scan", || scan_order(path))?;
+        let (ordered, counts, summary) = harness.timed("opl order scan", || scan_order(path))?;
         harness
             .run
             .decodings
             .publish(path, Scan { ordered, counts });
+        publish_summary(harness, path, &summary)?;
         Ok((ordered, counts))
     })
 }
 
-/// The key scan of [`order`] over one OPL file.
-fn scan_order(opl: &Path) -> Result<(bool, [u64; 3]), Error> {
+/// The key scan of [`order`] over one OPL file, with its summary.
+fn scan_order(opl: &Path) -> Result<(bool, [u64; 3], Summary), Error> {
     let mut stream = Stream::open(opl)?;
-    let mut ordered = true;
-    let mut last = None;
-    while let Some(key) = stream.read_record()? {
-        if last.is_some_and(|last| rank(key) <= rank(last)) {
-            ordered = false;
-        }
-        last = Some(key);
-    }
-    Ok((ordered, stream.counts))
+    while stream.read_record()?.is_some() {}
+    let summary = stream.summary();
+    Ok((summary.ordered, stream.counts, summary))
 }
 
 /// What `osmium derive-changes` from `old` to `new` gives once applied back
@@ -844,9 +1075,10 @@ pub(crate) fn compare_with_opl_each(
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
     decoded(harness, pbf, policy, |harness, a| {
-        let merged = harness.timed(MERGE_STEP, || {
+        let (merged, [summary, _]) = harness.timed(MERGE_STEP, || {
             merge(a, expected, listing, true, each, |_| {})
         })?;
+        publish_summary(harness, a, &summary)?;
         harness.run.decodings.publish(
             a,
             Scan {
@@ -870,18 +1102,35 @@ pub(crate) fn compare_sequence_with_opl(
     policy: Policy,
 ) -> Result<Merged, Error> {
     decoded(harness, pbf, policy, |harness, b| {
-        let merged = harness.timed(MERGE_STEP, || {
+        let (merged, [_, summary]) = harness.timed(MERGE_STEP, || {
             merge(expected, b, listing, false, |_| {}, |_| {})
         })?;
+        publish_summary(harness, b, &summary)?;
         log_merge(harness, listing, &merged);
         Ok(merged)
     })
 }
 
+/// The file beneath a [`Stream`]'s buffer, digesting every byte as the
+/// buffer fills: hashed in buffer-sized reads rather than per line, so a
+/// stream read to its end has the digest of the whole file.
+struct Hashing {
+    file: File,
+    hasher: xxhash_rust::xxh3::Xxh3,
+}
+
+impl std::io::Read for Hashing {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.file, buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
 /// One OPL stream: its current record and the key it last held.
 struct Stream {
     path: PathBuf,
-    reader: BufReader<File>,
+    reader: BufReader<Hashing>,
     line: Vec<u8>,
     number: u64,
     key: Option<(usize, i64)>,
@@ -889,6 +1138,11 @@ struct Stream {
     /// The line of the first record at or below its predecessor, once a
     /// strict read has met one.
     stepped: Option<u64>,
+    /// Whether any record so far was at or below its predecessor, whatever
+    /// the read's strictness; with the reader's digest, a stream read to its
+    /// end yields its [`Summary`].
+    seen: Option<(usize, i64)>,
+    disordered: bool,
 }
 
 impl Stream {
@@ -897,13 +1151,30 @@ impl Stream {
             .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
         Ok(Self {
             path: path.to_path_buf(),
-            reader: BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file),
+            reader: BufReader::with_capacity(
+                crate::tunables::OPL_READ_BUFFER,
+                Hashing {
+                    file,
+                    hasher: xxhash_rust::xxh3::Xxh3::new(),
+                },
+            ),
             line: Vec::new(),
             number: 0,
             key: None,
             counts: [0; 3],
             stepped: None,
+            seen: None,
+            disordered: false,
         })
+    }
+
+    /// The summary of a stream read to its end without error.
+    fn summary(&self) -> Summary {
+        Summary {
+            ordered: !self.disordered,
+            counts: self.counts,
+            digest: format!("{:032x}", self.reader.get_ref().hasher.digest128()),
+        }
     }
 
     fn error(&self, why: &str) -> Error {
@@ -972,6 +1243,10 @@ impl Stream {
         }
         let key = parse_key(&self.line).map_err(|why| self.error(why))?;
         self.counts[key.0] += 1;
+        if self.seen.is_some_and(|last| rank(key) <= rank(last)) {
+            self.disordered = true;
+        }
+        self.seen = Some(key);
         Ok(Some(key))
     }
 }
@@ -1014,7 +1289,7 @@ fn merge(
     strict: bool,
     each: impl FnMut(Group),
     paired: impl FnMut(Pair<'_>),
-) -> Result<Merged, Error> {
+) -> Result<(Merged, [Summary; 2]), Error> {
     let mut a = Stream::open(first)?;
     let mut b = Stream::open(second)?;
     let mut out = BufWriter::new(File::create(listing)?);
@@ -1023,7 +1298,8 @@ fn merge(
     out.flush()?;
     merged.first = a.counts;
     merged.second = b.counts;
-    Ok(merged)
+    // A completed merge read both streams to their ends.
+    Ok((merged, [a.summary(), b.summary()]))
 }
 
 /// The strict [`merge`] of [`compare_judged`]: a step-down is a judgment of
@@ -1033,7 +1309,7 @@ fn merge_judged(
     second: &Path,
     listing: &Path,
     each: impl FnMut(Group),
-) -> Result<Walked, Error> {
+) -> Result<(Walked, [Option<Summary>; 2]), Error> {
     let mut a = Stream::open(first)?;
     let mut b = Stream::open(second)?;
     let mut out = BufWriter::new(File::create(listing)?);
@@ -1049,11 +1325,14 @@ fn merge_judged(
                     counts,
                 })
             };
-            Ok(Walked {
-                scans: [scan(a.counts), scan(b.counts)],
-                merged: Ok(merged),
-                listing_note: None,
-            })
+            Ok((
+                Walked {
+                    scans: [scan(a.counts), scan(b.counts)],
+                    merged: Ok(merged),
+                    listing_note: None,
+                },
+                [Some(a.summary()), Some(b.summary())],
+            ))
         }
         // Only a strict read that stepped down sets `stepped`, and it
         // returns at once, so this error is that cursor's.
@@ -1064,11 +1343,20 @@ fn merge_judged(
                     listing.display()
                 )
             });
-            Ok(Walked {
-                scans: [a.drain(), b.drain()],
-                merged: Err(e),
-                listing_note,
-            })
+            let scans = [a.drain(), b.drain()];
+            // A side drained whole has a summary, disordered or not.
+            let summaries = [
+                scans[0].is_ok().then(|| a.summary()),
+                scans[1].is_ok().then(|| b.summary()),
+            ];
+            Ok((
+                Walked {
+                    scans,
+                    merged: Err(e),
+                    listing_note,
+                },
+                summaries,
+            ))
         }
         Err(e) => Err(e),
     }
@@ -1159,8 +1447,37 @@ mod tests {
         std::fs::write(&pa, a).unwrap();
         std::fs::write(&pb, b).unwrap();
         let mut groups = Vec::new();
-        let merged = merge(&pa, &pb, &pl, strict, |g| groups.push(g), |_| {})?;
+        let (merged, _) = merge(&pa, &pb, &pl, strict, |g| groups.push(g), |_| {})?;
         Ok((merged, groups, std::fs::read_to_string(&pl).unwrap()))
+    }
+
+    fn summaries(a: &str, b: &str, strict: bool) -> [Summary; 2] {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (pa, pb, pl) = (dir.join("a.opl"), dir.join("b.opl"), dir.join("l.txt"));
+        std::fs::write(&pa, a).unwrap();
+        std::fs::write(&pb, b).unwrap();
+        merge(&pa, &pb, &pl, strict, |_| {}, |_| {}).unwrap().1
+    }
+
+    #[test]
+    fn a_summary_digests_the_whole_stream_and_judges_its_order() {
+        let text = "n1 v1 Ta=bc x1 y1\nw5 v1 T Nn1\n";
+        let [a, b] = summaries(text, text, true);
+        assert_eq!(a, b);
+        assert!(a.ordered);
+        assert_eq!(a.counts, [1, 1, 0]);
+        assert_eq!(
+            a.digest,
+            format!("{:032x}", xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
+        );
+        // Records the merge calls different give different digests.
+        let [a, b] = summaries("n1 v1 Ta=bc x1 y1\n", "n1 v1 Tab=c x1 y1\n", true);
+        assert!(a.digest != b.digest);
+        // A sequence walk reads a disordered stream whole and says so.
+        let [a, _] = summaries("n2 v1\nn1 v1\n", "n2 v1\nn1 v1\n", false);
+        assert!(!a.ordered);
+        assert_eq!(a.counts, [2, 0, 0]);
     }
 
     #[test]
@@ -1235,7 +1552,7 @@ mod tests {
         let (pa, pb, pl) = (dir.join("a.opl"), dir.join("b.opl"), dir.join("l.txt"));
         std::fs::write(&pa, a).unwrap();
         std::fs::write(&pb, b).unwrap();
-        merge_judged(&pa, &pb, &pl, |_| {})
+        merge_judged(&pa, &pb, &pl, |_| {}).map(|(walked, _)| walked)
     }
 
     #[test]

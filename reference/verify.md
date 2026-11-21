@@ -27,7 +27,9 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   then ID zero, negative IDs by magnitude, positive IDs by magnitude) that
   requires each side strictly ascending, so it also certifies, as osmium
   decodes them, that neither side repeats or misorders an object, and
-  compares every record line byte for byte. Repack and degrade use the same
+  compares every record line byte for byte, unless stored decoding
+  summaries decide it ("Decoding summaries" under Reference cache). Repack
+  and degrade use the same
   merge walk without the order requirement (`compare_sequence`, as osmium
   diff walks its inputs): no unmatched or differing record then means the
   two record sequences are equal element by element, in any order; that is
@@ -322,11 +324,13 @@ is unsupported.
 ## Reference cache
 
 Completed reference executions are stored at
-`SCRATCH/tools/verify-reference/` (format 2). No pbfhogg output, observation,
-or verdict is cached: every comparison runs again. The element comparison's
-OPL decodings are not cached across runs either: each is as large as its
+`SCRATCH/tools/verify-reference/` (format 2). No pbfhogg output or verdict
+is cached: every comparison is decided again. The element comparison's OPL
+decodings are not cached across runs either: each is as large as its
 input, and publishing them filled a germany run's scratch; within a run
-they are reused under a budget ("Decoding reuse" above). A hit is shown as
+they are reused under a budget ("Decoding reuse" above). What is kept
+across runs is a summary of each decoding ("Decoding summaries" below). A
+hit is shown as
 `osmium sort cached 1.2s` in the check's steps, timed like a run (probes,
 digests, validation and placement); `--verbose` also shows the hit in detail.
 
@@ -378,6 +382,48 @@ rehashes and drops it.
 normally concluded run. Zero retains none. A separate `used` file records
 recency. Cache storage or eviction failures are reported; eviction failures
 do not change the verification verdict.
+
+### Decoding summaries
+
+A summary is osmium's reading of one exact input under one OPL policy, as
+the verifier observed it while reading that decoding whole without a read
+or parse error: whether its objects strictly ascend in object order, its
+object count per kind, and the XXH3-128 of the whole OPL byte stream. It is
+stored in `SCRATCH/tools/verify-reference/summaries/`, one small file per
+key, for every input decoded, pbfhogg outputs included: it describes bytes
+osmium decoded, keyed by those bytes, and says nothing about the command
+that wrote them. The key is the decode's reference-cache key (tool identity
+with its `ldd` closure, controlled environment, literal arguments with the
+`-f` policy, input content digest and filename suffix) under a summary
+format version, and a lookup compares the full key text. A decode's key is
+planned before its launch and must be observed again, unchanged and without
+a new probe, once its launch group settled; a decoding whose key did not
+hold publishes no summary. Publication revalidates every watched input
+first. A malformed or mismatched summary file is a miss and is removed.
+
+A strict comparison (`compare`, `compare_judged`; the harness's element
+equality and judged order walks, diff's comparison and the element-diff
+comparisons of `verify_element_diff`) is decided from summaries when both sides' summaries, looked
+up under one tool binding, are strictly ordered with equal counts and
+equal digests: neither side is decoded or merged, the listing is written
+empty and the result counts every object as the same. With one side's
+summary stored, only the other side is decoded and scanned; its summary
+must carry the key looked up. Any other outcome (a miss, a difference, a
+disorder, a read or parse error) falls back to the full merge, which alone
+reports differences and errors. Equality decided this way is equality of
+two 128-bit fingerprints, not a byte comparison: a collision between two
+streams with the same keys could pass. That is accepted under the same
+assumption the reference cache already makes when an input digest selects
+a stored osmium output, for a local single-user tool with no adversary.
+An order scan (`order`) answers from a stored summary under any policy.
+Paired walks (renumber), sequence walks (repack, degrade), the derive
+model and field-policies, whose subject is the merge itself, always merge.
+
+Summaries are neither read nor written under `--fresh-reference`; every
+fixture test runs in that mode, since its fake osmium answers by file name,
+not bytes. Retention keeps the most recently used `SUMMARY_RETAIN`
+summaries (`crates/verify/src/tunables.rs`) after a normally concluded run;
+a zero budget, and `clean-references`, keep none.
 
 `brokkr run pbfhogg-verify -- clean-references` removes completed entries and
 old staging/trash without needing a pbfhogg executable, dataset or reference

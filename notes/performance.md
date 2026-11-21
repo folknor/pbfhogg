@@ -1840,7 +1840,7 @@ What remains:
   are still written to files and read back, never streamed (`-o -`): a pipe
   needs the launch group to hand out stdout pipes and the merge to read
   while the group runs, which barrier settlement forbids (PERF-066 design).
-- No reuse across runs (PERF-065).
+- Across runs only summaries are reused, not decodings (PERF-065).
 - One decoding per policy: NO_LOCATIONS and CONTENT are never projected
   from FULL, since no field-policies control holds such a projection. A
   file compared under two policies decodes twice; cat --dedupe's input is
@@ -1961,48 +1961,36 @@ Risks:
 
 Kind: high-conviction rewrite (all eight).
 
-## PERF-065 - Decodings and verdicts are recomputed every run
+## PERF-065 - Decoding summaries leave some comparisons merging every run
 
 Reported by: orchestration-opus, engine-opus, heavy-opus, other-opus,
 orchestration-codex.
 
-Mechanism: `opl_compare::decode` is uncached because its output is as large as
-the input. So each cached osmium reference artifact, and the pinned dataset, is
-decoded again on every run, as is every pbfhogg output that is byte-stable
-across commits (deterministic encoders; the writing program carries no hash).
+Landed: cross-run decoding summaries (ordered, counts, XXH3-128 of the OPL
+stream) in the reference cache, keyed by the decode's reference key; strict
+comparisons and order scans decide from them (reference/verify.md "Decoding
+summaries"). Denmark `sort` on plantasjen, A = 16e70d27, B = the change
+uncommitted, PASS-line check wall: A 18.4 / 18.8 / 18.5 s; B warm 0.73 /
+0.72 / 0.71 s; B cold (summaries removed) 18.9 / 18.7 s, within noise of A
+once the digest moved under the read buffer (per-line hashing cost about
+1.6 s). `cat` 22.7 s cold to 0.69 s warm.
 
-Redesigns:
+Residue:
 
-- engine-opus: store each `Summary` (a few hundred bytes) in the reference
-  cache, keyed by osmium identity, summary format version, and the data-blob
-  payload digest plus the header facts osmium consults (so `writingprogram` or
-  replication fields do not break a hit). The summary is osmium's reading of
-  exact bytes, so it stays inside the cache's "completed reference executions
-  only" rule. Comparisons still run every time.
-- orchestration-opus: persist the blob-granular chunks of PERF-064.
-- heavy-opus: cache the decodings of reference artifacts and the dataset as
-  zstd or lz4 OPL text (exact), in preference to a record-digest stream.
-- other-opus: a merge-verdict cache keyed by both sides' digests, policy,
-  strictness, osmium identity and the verifier binary digest. On a hit neither
-  side is decoded. The fallback is a per-object `(kind, id, xxh3)` stream (24
-  bytes per object, about 1.4 GB for denmark), and only a mismatch re-decodes.
-  Never cache an Environment or Interrupted outcome.
-- codex-orchestration: cache a compact decoded representation for CLI-only
-  oracles consumed solely as records, keep real PBFs where a later CLI needs
-  them, and avoid filling the cache with routine decodes of fresh pbfhogg
-  outputs.
+- Untested end to end: every fixture test runs under `--fresh-reference`,
+  which disables summaries, so the summary hit, the one-hit scan and the
+  key sealing in `opl_compare` have only the unit test of `Stream`'s
+  summary. A fixture whose fake osmium answers by bytes would cover them.
+- The one-hit path (pbfhogg output bytes changed, reference summary stored)
+  is unmeasured: denmark sort and cat outputs were byte-stable.
+- Paired walks (renumber), sequence walks (repack, degrade reencode),
+  `compare_with_opl` (apply-changes, derive-changes expected models) and the
+  derive model always decode and merge. A sequence walk over two equal
+  digests is decidable the same way; the others need their records.
+- A fresh decode of a missing side is still a full file-backed decode; the
+  shortcut saves the other side and the merge only.
 
-Payoff: on the development loop, files whose bytes did not change are never
-decoded again. other-opus calls this the largest wall reduction available to
-its scope once PERF-064 exists. engine-opus suggests measuring first: if the
-engine's share is well under half the run, build this before PERF-064.
-
-Risks: key completeness; the cache budget; caching anything that amounts to a
-pbfhogg verdict (other-opus's verdict cache includes the verifier binary in its
-key to stay a pure function; orchestration-opus says in-run-only for pbfhogg
-fixtures).
-
-Kind: high-conviction rewrite (engine-opus); orchestration-owned machinery.
+Kind: orchestration-owned machinery.
 
 ## PERF-066 - Only OPL decodes run concurrently in the verifier
 

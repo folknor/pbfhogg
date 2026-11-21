@@ -627,7 +627,8 @@ fn compare(
     policy: Policy,
 ) -> Result<Compared, Error> {
     let mut groups = Vec::new();
-    let merged = opl_compare::compare(harness, a, b, listing, policy, |g| groups.push(g))?;
+    // The merge itself is this check's subject, so never stored summaries.
+    let merged = opl_compare::compare_merged(harness, a, b, listing, policy, |g| groups.push(g))?;
     Ok(Compared { merged, groups })
 }
 

@@ -4,7 +4,8 @@
 //! caller when its meaning changes), a program, literal arguments with its
 //! inputs and outputs marked, and the exit codes that complete it. The
 //! declaration is what the reference cache keys on; only completed reference
-//! executions are reused. Every pbfhogg comparison still runs.
+//! executions, and summaries of osmium's OPL decodings, are reused. Every
+//! pbfhogg comparison is still decided, from summaries or by a merge.
 //!
 //! A run starts from a controlled environment, not the caller's: a fixed
 //! `PATH` for what a launcher script runs, a C UTF-8 locale, UTC, and a

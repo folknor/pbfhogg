@@ -25,7 +25,32 @@ Every later link is built from this document alone.
   sibling that never exits is still running).
 - Denmark `sort` on plantasjen at the link-1 tree: PASS 18.8 s, `osmium cat
   7.1s (2 runs)` as one group wall (the earlier serial run at d8b9c548 was
-  20.2 s in total; no matched A/B was run, so no speedup is claimed).
+  20.2 s in total).
+
+## Payoff of link 1 (matched A/B, 2026-11-21, plantasjen)
+
+User ruling: the item does not close, and no further link lands, until each
+link proves it pays off. Link 1 was measured as A = verifier from 4f484d00
+checked out uncommitted, B = 16e70d27, denmark, PASS-line check wall, one run
+per cell, each arm switch rebuilt outside the timed wall. Plan and verdict
+sparred with codex.
+
+- `sort`, balanced order BA, AB, BA: B 13.1 / A 18.1, A 18.1 / B 13.0,
+  B 13.0 / A 17.9 s, so -27.6 %, -28.2 %, -27.4 %. `osmium cat` (2 runs)
+  B 7.0-7.1 s vs A 11.7-11.9 s; `opl merge`, `pbfhogg sort` and the cached
+  `osmium sort` unchanged. Pays: the gate (more than 3 % in every pair) is
+  cleared.
+- `cat-dedupe`, order A, B, A, B (two cells queued on the brokkr lock while
+  the tree was switched, so the third cell's arm is inferred, not proven):
+  totals 2m55 / 2m50 / 2m50 / 2m44; `osmium cat` (11 runs) A 45.4 / 45.1 s,
+  B 40.8 / 40.7 s; `opl merge` drifted down through the sequence in both
+  arms. It holds one two-miss call (four order scans, six one-miss
+  comparisons against a shared decoding), so the decode stage drops about
+  10 % and the check-wall gain is unproven. Recorded as a mixed workload,
+  not a win. It did not clear the every-pair gate.
+- Verdict: link 1 stays, on the `sort` result. Later links each need their
+  own matched A/B on the checks they convert, measured the same way (the
+  tree switched only while no queued brokkr command is waiting).
 
 ## Settled rulings (do not reopen)
 

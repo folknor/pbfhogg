@@ -53,6 +53,11 @@ pub(crate) const TEST_REPORT_GRACE: Duration = Duration::from_millis(100);
 /// Keep up to 20 GiB of completed reference artifacts by default.
 pub(crate) const REFERENCE_BUDGET: u64 = 20 * 1024 * 1024 * 1024;
 
+/// Decoding summaries the reference cache keeps, newest first. Each is a
+/// few hundred bytes; a full verify publishes some dozens per dataset, so
+/// this holds many commits' worth of every configured dataset.
+pub(crate) const SUMMARY_RETAIN: usize = 4096;
+
 /// Idle OPL decodings a run retains for reuse, in bytes, after each
 /// release (`opl_compare::Decodings`). Sized to hold a few denmark-scale
 /// decodings, so an input compared again and again is decoded once, while a

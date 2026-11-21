@@ -1836,9 +1836,10 @@ on this host.
 
 What remains:
 
-- Decodes are still serial, written to files and read back, never streamed
-  (`-o -`) or run concurrently; that needs the multi-child lifecycle of
-  PERF-066.
+- A call's missing decodes now run together as one launch group, but they
+  are still written to files and read back, never streamed (`-o -`): a pipe
+  needs the launch group to hand out stdout pipes and the merge to read
+  while the group runs, which barrier settlement forbids (PERF-066 design).
 - No reuse across runs (PERF-065).
 - One decoding per policy: NO_LOCATIONS and CONTENT are never projected
   from FULL, since no field-policies control holds such a projection. A
@@ -2003,18 +2004,22 @@ fixtures).
 
 Kind: high-conviction rewrite (engine-opus); orchestration-owned machinery.
 
-## PERF-066 - The verifier runs one child at a time
+## PERF-066 - Only OPL decodes run concurrently in the verifier
 
-Reported by: all eight.
+Reported by: orchestration-opus, orchestration-codex, engine-opus,
+heavy-opus, other-opus (the engine-codex, heavy-codex and other-codex
+reports do not discuss the lifecycle).
 
-Mechanism: `process::Lifecycle::run` spawns one child and waits, and `settle`
-kills and reaps every child of the subreaper (`waitpid(-1)` until ECHILD), so a
-second live launch would be killed by the first one's settlement. `Harness` is
-one `&mut` threaded through closures, and `all::run` calls the checks in
-sequence. Every pbfhogg run, osmium run and decode, including both sides of
-every comparison, is therefore serial. `PR_SET_PDEATHSIG` fires on the death of
-the forking thread, so children must be spawned from one thread
-(engine-opus).
+Landed (link 1 of a chain; rulings and link plan in
+notes/PERF-066-design.md): `Lifecycle::run_group`, a barrier-settled launch
+group spawned from the one thread, with adoption tainting the whole group and
+aborting it early; launch-unique staging; an OPL comparison's missing decodes
+run together as one group.
+
+What remains: pbfhogg runs and cached reference runs are still one at a
+time, and checks still run in sequence. The redesigns below are the
+hunters' proposals for that residue; the design document's link plan says
+which parts are being built.
 
 Redesigns:
 

@@ -17,6 +17,12 @@ pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 /// The longest single poll sleep while settling; readiness wakes it sooner.
 pub(crate) const SETTLE_POLL: Duration = Duration::from_millis(50);
 
+/// The longest poll sleep while a launch group of more than one member
+/// runs: each wakeup scans for an adopted descendant, which aborts the
+/// group. Adoption raises no descriptor, so only this bound finds one while
+/// a long sibling still runs. A lone launch sleeps without a bound.
+pub(crate) const GROUP_ADOPTION_POLL: Duration = Duration::from_millis(100);
+
 /// Lines and bytes per line a listing preview replays into check detail.
 pub(crate) const PREVIEW_LINES: usize = 50;
 pub(crate) const PREVIEW_LINE_BYTES: usize = 240;

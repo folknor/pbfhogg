@@ -55,6 +55,12 @@ pub(crate) struct ReferenceCache {
     /// The tool's `--version` and `ldd` answers, probed once per run and
     /// reused while what they were observed against still holds.
     probed: Option<Probed>,
+    /// Staging directories made so far this run. Each staging name carries
+    /// its own number beside the run ID and the `ToolRun` ID, so no launch
+    /// meets an earlier one's leftover tree (a run ID is reused by every
+    /// call, and a staging tree an unsettled or failed launch left behind
+    /// stays until the next run's startup sweep).
+    stagings: u64,
 }
 
 /// One run's probe of the reference tool, bound to what the probe saw: the
@@ -124,7 +130,25 @@ impl ReferenceCache {
             run_id,
             fresh,
             probed: None,
+            stagings: 0,
         })
+    }
+
+    /// A fresh staging tree for `run`, with its artifact, home and scratch
+    /// directories. The root is pushed onto `track` as soon as it exists, so
+    /// a failure creating a subdirectory still leaves it owned.
+    fn staging(&mut self, run: &ToolRun, track: &mut Vec<PathBuf>) -> Result<PathBuf, Error> {
+        self.stagings += 1;
+        let staging = self.dir.join(format!(
+            "{STAGING_PREFIX}{}-{}-{}",
+            self.run_id, run.id, self.stagings
+        ));
+        fs::create_dir(&staging)?;
+        track.push(staging.clone());
+        for sub in [ARTIFACTS, "home", "scratch"] {
+            fs::create_dir(staging.join(sub))?;
+        }
+        Ok(staging)
     }
     /// Keep the cache within `budget` logical bytes (the artifact sizes its
     /// manifests record): the most recently used entries that fit stay,
@@ -585,13 +609,7 @@ impl ReferenceCache {
             watched.watch(input)?;
         }
         life.checkpoint()?;
-        let staging = self
-            .dir
-            .join(format!("{STAGING_PREFIX}{}-{}", self.run_id, run.id));
-        fs::create_dir(&staging)?;
-        for sub in [ARTIFACTS, "home", "scratch"] {
-            fs::create_dir(staging.join(sub))?;
-        }
+        let staging = self.staging(run, &mut Vec::new())?;
         let outputs = run.outputs()?;
         let key = if run.uncached {
             None
@@ -672,6 +690,101 @@ impl ReferenceCache {
             ended,
             cached: false,
         })
+    }
+
+    /// Run uncached reference runs together as one launch group, each with
+    /// its standard output in its sink, and settle each in run order. Every
+    /// watched input is observed at each member's exit and again once the
+    /// group has settled; every member is judged before any is placed, and
+    /// a group that did not settle cleanly places nothing. A later member's
+    /// failed placement leaves the earlier members placed. Runs that consume
+    /// each other's outputs cannot share a group.
+    pub(crate) fn execute_uncached_group(
+        &mut self,
+        life: &mut crate::process::Lifecycle,
+        watched: &mut crate::run::Run,
+        tools: &crate::reference::Tools,
+        runs: &[(&ToolRun, &Path)],
+    ) -> Result<Vec<Settled>, Error> {
+        let mut stagings = Vec::with_capacity(runs.len());
+        let result = self.group_in(life, watched, tools, runs, &mut stagings);
+        // A tree that did not settle may still be writing there; the next
+        // run's startup sweep removes what stays.
+        if matches!(result, Err(Error::Unsettled(_))) {
+            return result;
+        }
+        for staging in &stagings {
+            if staging.exists() {
+                remove_tree(staging);
+            }
+        }
+        result
+    }
+
+    fn group_in(
+        &mut self,
+        life: &mut crate::process::Lifecycle,
+        watched: &mut crate::run::Run,
+        tools: &crate::reference::Tools,
+        runs: &[(&ToolRun, &Path)],
+        stagings: &mut Vec<PathBuf>,
+    ) -> Result<Vec<Settled>, Error> {
+        use crate::process::Launch;
+        for (run, _) in runs {
+            if !run.uncached {
+                return Err(Error::tool(format!(
+                    "reference run {} is cached and cannot join a launch group",
+                    run.id
+                )));
+            }
+            for input in run.inputs() {
+                watched.watch(input)?;
+            }
+        }
+        life.checkpoint()?;
+        let mut planned = Vec::with_capacity(runs.len());
+        for (run, _) in runs {
+            let staging = self.staging(run, stagings)?;
+            planned.push((
+                staged_args(run, &staging),
+                crate::reference::run_env(&staging),
+                staging.join(ARTIFACTS).join(STDOUT),
+                run.outputs()?,
+            ));
+        }
+        watched.revalidate()?;
+        let launches: Vec<Launch<'_>> = planned
+            .iter()
+            .zip(stagings.iter())
+            .map(|((args, env, sink, _), staging)| Launch {
+                program: &tools.osmium,
+                args: args.clone(),
+                env: env.clone(),
+                cwd: staging,
+                sink,
+            })
+            .collect();
+        let result = life.run_group(&launches, &mut || watched.revalidate());
+        // Check even when launching/settling failed; interruption and
+        // unsettled trees take priority.
+        let validation = watched.revalidate();
+        let ended = result?;
+        validation?;
+        let mut settled = Vec::with_capacity(runs.len());
+        for (((run, _), ended), (staging, (_, _, _, outputs))) in
+            runs.iter().zip(ended).zip(stagings.iter().zip(&planned))
+        {
+            settled.push(judge(run, &staging.join(ARTIFACTS), outputs, ended)?);
+        }
+        for ((settled, (_, sink)), (staging, (_, _, _, outputs))) in
+            settled.iter().zip(runs).zip(stagings.iter().zip(&planned))
+        {
+            if matches!(settled, Settled::Complete { .. }) {
+                life.checkpoint()?;
+                place(&staging.join(ARTIFACTS), outputs, sink)?;
+            }
+        }
+        Ok(settled)
     }
 }
 
@@ -980,6 +1093,7 @@ mod tests {
             run_id: "test".into(),
             fresh: false,
             probed: None,
+            stagings: 0,
         };
         let newest = entry(&cache.dir, 'a', 40, 10);
         let huge = entry(&cache.dir, 'b', 500, 20);
@@ -1187,6 +1301,7 @@ mod tests {
             run_id: "test".into(),
             fresh: false,
             probed: None,
+            stagings: 0,
         };
         assert!(cache.lookup(&entry, &key, &run, &outputs).is_some());
         // Linking moves ctime only; the entry stays valid.
@@ -1229,6 +1344,7 @@ mod tests {
             run_id: "test".into(),
             fresh: false,
             probed: None,
+            stagings: 0,
         };
         let key = Key {
             text: "k".into(),
@@ -1256,6 +1372,7 @@ mod tests {
             run_id: "test".into(),
             fresh: false,
             probed: None,
+            stagings: 0,
         };
         for (hex, stderr, found) in [("02", "Done.\n", true), ("03", "boom\n", false)] {
             let staging = root.join(format!(".staging-1-{hex}"));

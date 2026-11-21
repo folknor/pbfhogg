@@ -52,7 +52,7 @@ pub(crate) mod verify_opl;
 #[path = "../src/verify_fileinfo.rs"]
 pub(crate) mod verify_fileinfo;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 #[path = "apply_fixture.rs"]
@@ -252,6 +252,9 @@ fn driver(role: &str, dir: &Path) {
         no_children();
         return;
     }
+    if let Some(members) = role.strip_prefix("group=") {
+        return group_driver(&mut lifecycle, &exe, dir, members);
+    }
     let sink = dir.join("stdout");
     let result = lifecycle.run(&process::Launch {
         program: &exe,
@@ -297,6 +300,54 @@ fn driver(role: &str, dir: &Path) {
     no_children();
 }
 
+/// One launch group of the comma-separated worker roles `members`.
+/// `rendezvous` pairs meet on a FIFO, which only members alive at once can
+/// do; an orphan or an overflow beside a parked sibling must abort the group
+/// at once, not wait for the sibling that never exits.
+fn group_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path, members: &str) {
+    let fifo =
+        std::ffi::CString::new(dir.join("rendezvous.fifo").as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let roles: Vec<&str> = members.split(',').collect();
+    let sinks: Vec<_> = (0..roles.len())
+        .map(|i| dir.join(format!("stdout.{i}")))
+        .collect();
+    let launches: Vec<_> = roles
+        .iter()
+        .zip(&sinks)
+        .map(|(role, sink)| process::Launch {
+            program: exe,
+            args: vec![(*role).into()],
+            env: vec![],
+            cwd: dir,
+            sink,
+        })
+        .collect();
+    let mut observed = 0;
+    let result = life.run_group(&launches, &mut || {
+        observed += 1;
+        Ok(())
+    });
+    match members {
+        "rendezvous-write,rendezvous-read" => {
+            let ended = result.unwrap();
+            assert!(ended.iter().all(|e| e.status.success()));
+            assert_eq!(observed, 2);
+        }
+        "orphan,parked" => assert!(
+            matches!(result, Err(error::Error::Environment(_))),
+            "{result:?}"
+        ),
+        "overflow,parked" => assert!(
+            matches!(result, Err(error::Error::Tool(ref why)) if why.contains("stderr exceeded")),
+            "{result:?}"
+        ),
+        _ => panic!("unknown group"),
+    }
+    no_children();
+}
+
 fn parent_death() {
     use std::os::unix::process::ExitStatusExt;
     // This process is already a subreaper. After the driver dies its child
@@ -331,6 +382,23 @@ fn descendant(role: &str) -> std::process::Child {
 fn worker(role: &str) {
     match role {
         "parked" => std::thread::park(),
+        "rendezvous-write" => {
+            // wait-deliberate: opening a FIFO blocks until its reader opens;
+            // the outer test's HangBound catches a serial lifecycle.
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open("rendezvous.fifo")
+                .unwrap();
+            fifo.write_all(b"x").unwrap();
+        }
+        "rendezvous-read" => {
+            // wait-deliberate: as for the writer.
+            let mut byte = [0_u8; 1];
+            std::fs::File::open("rendezvous.fifo")
+                .unwrap()
+                .read_exact(&mut byte)
+                .unwrap();
+        }
         "dying-parent" => {
             let mut lifecycle = process::Lifecycle::install().unwrap();
             let exe = std::env::current_exe().unwrap();

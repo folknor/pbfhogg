@@ -114,10 +114,11 @@ pub const CONSTRUCTORS: &[Constructor] = &[
         count: 1,
     },
     // The verifier's one spawn point: every pbfhogg, reference-tool and
-    // provisioning launch goes through its lifecycle owner.
+    // provisioning launch goes through its lifecycle owner, which spawns
+    // each member of a launch group from the one forking thread.
     Constructor {
         file: "crates/verify/src/process.rs",
-        owner: "Lifecycle::run",
+        owner: "Lifecycle::spawn_all",
         program: "launch.program",
         count: 1,
     },

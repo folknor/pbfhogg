@@ -311,6 +311,9 @@ fn acquire_hit(
     pbf: &Path,
     policy: Policy,
 ) -> Result<Option<PathBuf>, Error> {
+    // Watched before the stat that picks the entry: a replacement between
+    // the two fails the revalidation below instead of being blessed.
+    harness.run.watch(pbf)?;
     let source = Source::of(pbf)?;
     let Some(path) = harness
         .run
@@ -322,7 +325,6 @@ fn acquire_hit(
     else {
         return Ok(None);
     };
-    harness.run.watch(pbf)?;
     harness.run.revalidate()?;
     harness.checkpoint()?;
     harness.run.decodings.tick += 1;
@@ -345,62 +347,124 @@ fn acquire_hit(
     Ok(Some(path))
 }
 
-fn acquire(harness: &mut Harness, pbf: &Path, policy: Policy) -> Result<PathBuf, Error> {
-    if let Some(path) = acquire_hit(harness, pbf, policy)? {
-        return Ok(path);
+/// Decode every operand of `sides` whose slot is still empty, as one launch
+/// group: the osmium decodes run together, so a comparison's decode wall is
+/// its slowest operand's, not their sum. Operands of one source and policy
+/// (one file twice, or hard links of one inode) share a single decode, with
+/// a pin per slot. Every operand's path is watched, aliases included, and
+/// each must still have the stamp its decode was planned under once the
+/// group has settled. Each decode is registered and its slot filled as soon
+/// as it is judged, so an earlier operand's decoding is held, and kept as
+/// evidence, when a later one fails.
+fn acquire_missing(
+    harness: &mut Harness,
+    sides: &[(&Path, Policy)],
+    slots: &mut [Option<PathBuf>],
+) -> Result<(), Error> {
+    // Each unique missing (source, policy), with the slots it fills.
+    let mut plan: Vec<(Source, Policy, &Path, Vec<usize>)> = Vec::new();
+    // Each missing operand's own planned source. The watch comes first, so
+    // a replacement between it and the stat makes the next revalidation
+    // fail rather than bless the new file.
+    let mut planned: Vec<(usize, Source)> = Vec::new();
+    for (i, ((pbf, policy), slot)) in sides.iter().zip(slots.iter()).enumerate() {
+        if slot.is_some() {
+            continue;
+        }
+        harness.run.watch(pbf)?;
+        let source = Source::of(pbf)?;
+        planned.push((i, source.clone()));
+        match plan
+            .iter_mut()
+            .find(|(s, p, _, _)| *s == source && p == policy)
+        {
+            Some((_, _, _, fills)) => fills.push(i),
+            None => plan.push((source, *policy, pbf, vec![i])),
+        }
     }
-    let source = Source::of(pbf)?;
-    harness.run.decodings.tick += 1;
-    let tick = harness.run.decodings.tick;
-    let estimate = source
-        .stamp
-        .2
-        .saturating_mul(crate::tunables::OPL_EXPANSION);
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let estimate = plan.iter().fold(0_u64, |sum, (source, ..)| {
+        sum.saturating_add(
+            source
+                .stamp
+                .2
+                .saturating_mul(crate::tunables::OPL_EXPANSION),
+        )
+    });
     harness
         .run
         .decodings
         .trim(crate::tunables::DECODING_BUDGET.saturating_sub(estimate))?;
     let dir = harness.run.dir.join("decodings");
     std::fs::create_dir_all(&dir)?;
-    harness.run.decodings.made += 1;
-    let opl = dir.join(format!("{}.opl", harness.run.decodings.made));
-    let captured = harness.reference(
-        &ToolRun::osmium("opl-compare.1")
+    let mut runs = Vec::with_capacity(plan.len());
+    for (_, policy, pbf, _) in &plan {
+        harness.run.decodings.made += 1;
+        let opl = dir.join(format!("{}.opl", harness.run.decodings.made));
+        let run = ToolRun::osmium("opl-compare.1")
             .arg("cat")
             .input(pbf)
             .args(&["-f", &policy.format(), "-o"])
             .output(&opl)
             .arg("--overwrite")
-            .uncached(),
-        &opl.with_extension("stdout"),
-    )?;
-    harness.require_success(&captured, "osmium cat to OPL")?;
-    // A successful decode's stdout is no evidence; a failed one's stays.
-    std::fs::remove_file(opl.with_extension("stdout"))?;
-    // The stamp the decode was keyed under must still be the file's.
-    if Source::of(pbf)? != source {
-        return Err(Error::Environment(format!(
-            "{} changed while osmium decoded it",
-            pbf.display()
-        )));
+            .uncached();
+        runs.push((run, opl.with_extension("stdout"), opl));
     }
-    let bytes = std::fs::metadata(&opl)?.len();
-    harness.run.decodings.entries.push(Entry {
-        source,
-        policy,
-        path: opl.clone(),
-        bytes,
-        pins: 1,
-        used: tick,
-        kept: false,
-    });
-    Ok(opl)
+    let group: Vec<(&ToolRun, &Path)> = runs
+        .iter()
+        .map(|(run, sink, _)| (run, sink.as_path()))
+        .collect();
+    let captured = harness.reference_group(&group)?;
+    for ((source, policy, pbf, fills), (captured, (_, sink, opl))) in
+        plan.into_iter().zip(captured.into_iter().zip(runs.iter()))
+    {
+        let captured = captured?;
+        harness.require_success(&captured, "osmium cat to OPL")?;
+        // A successful decode's stdout is no evidence; a failed one's stays.
+        std::fs::remove_file(sink)?;
+        // The stamp the decode was keyed under must still be the file's.
+        if Source::of(pbf)? != source {
+            return Err(Error::Environment(format!(
+                "{} changed while osmium decoded it",
+                pbf.display()
+            )));
+        }
+        let bytes = std::fs::metadata(opl)?.len();
+        harness.run.decodings.tick += 1;
+        let tick = harness.run.decodings.tick;
+        harness.run.decodings.entries.push(Entry {
+            source,
+            policy,
+            path: opl.clone(),
+            bytes,
+            pins: u32::try_from(fills.len()).map_err(|e| Error::tool(e.to_string()))?,
+            used: tick,
+            kept: false,
+        });
+        for i in fills {
+            slots[i] = Some(opl.clone());
+        }
+    }
+    // Aliases: every operand, not only the one osmium read, must still be
+    // the source its slot's decoding was planned from.
+    for (i, source) in planned {
+        let pbf = sides[i].0;
+        if Source::of(pbf)? != source {
+            return Err(Error::Environment(format!(
+                "{} changed while osmium decoded it",
+                pbf.display()
+            )));
+        }
+    }
+    harness.run.revalidate()
 }
 
 /// Run `work` over pinned decodings of `sides` (each a file and its
-/// policy), in side order, releasing them after. Retained decodings are
-/// pinned first and only then are the missing ones made, so no operand is
-/// evicted to make room for another. When an acquire or `work` fails, each
+/// policy), releasing them after. Retained decodings are pinned first, in
+/// side order, and only then are the missing ones made, together as one
+/// launch group, so no operand is evicted to make room for another. When an acquire or `work` fails, each
 /// decoding acquired is kept: never evicted or discarded, so the path an
 /// error names stays in the kept run directory, and the failure stays the
 /// one raised. `work` returns whether its outcome, though `Ok`, is a failure
@@ -412,26 +476,27 @@ fn with_decodings<T>(
 ) -> Result<T, Error> {
     let mut slots: Vec<Option<PathBuf>> = vec![None; sides.len()];
     let mut outcome = Ok(None);
-    'acquire: for hits in [true, false] {
-        for ((pbf, policy), slot) in sides.iter().zip(&mut slots) {
-            if slot.is_some() {
-                continue;
-            }
-            let got = if hits {
-                acquire_hit(harness, pbf, *policy)
-            } else {
-                acquire(harness, pbf, *policy).map(Some)
-            };
-            match got {
-                Ok(path) => *slot = path,
-                Err(e) => {
-                    outcome = Err(e);
-                    break 'acquire;
-                }
+    for ((pbf, policy), slot) in sides.iter().zip(&mut slots) {
+        match acquire_hit(harness, pbf, *policy) {
+            Ok(path) => *slot = path,
+            Err(e) => {
+                outcome = Err(e);
+                break;
             }
         }
     }
+    if outcome.is_ok()
+        && let Err(e) = acquire_missing(harness, sides, &mut slots)
+    {
+        outcome = Err(e);
+    }
     let held: Vec<PathBuf> = slots.iter().flatten().cloned().collect();
+    // A stop during placement or staging cleanup is seen before the walk.
+    if outcome.is_ok()
+        && let Err(e) = harness.checkpoint()
+    {
+        outcome = Err(e);
+    }
     if outcome.is_ok() {
         outcome = work(harness, &held).map(Some);
     }

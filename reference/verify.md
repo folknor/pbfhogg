@@ -51,10 +51,13 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   merge, a judged walk's drain), under any policy, since every policy
   writes the kind and ID alike; record bytes are never projected from one
   policy to another. A call pins its retained operands before it makes any
-  missing one. Idle decodings are evicted least recently used down to
+  missing one, and makes its missing ones together, as one launch group (see
+  Processes): one decode per distinct source and policy, a pin per operand,
+  every operand path watched and its stamp rechecked once the group settles.
+  Idle decodings are evicted least recently used down to
   `DECODING_BUDGET` (`crates/verify/src/tunables.rs`) after each use, one
-  larger than the budget first, and before each new decode down to the
-  budget less an estimate of it; a germany-scale estimate alone exceeds the
+  larger than the budget first, and before each group of new decodes down
+  to the budget less the sum of their estimates; a germany-scale estimate alone exceeds the
   budget and sheds them all. The budget bounds retained idle bytes, not the
   filesystem's headroom for the decode in flight. At the run's end the
   store is removed, kept run or not, except decodings kept as evidence.
@@ -271,12 +274,22 @@ removed unless `--keep`; any other run is kept and its path printed.
 
 The verifier is single-threaded and owns every child it starts. It is a
 child subreaper; stop signals (SIGTERM, SIGINT, SIGHUP) arrive on a signalfd
-polled beside each child. Each launch settles before its output is read or
-another launch starts: the leader's status is collected, then any surviving
-descendant is killed and reaped until none remains.
+polled beside each child. Launches run in groups, every member started from
+the one thread; a lone launch is a group of one. A group settles before any
+of its outputs is read or another group starts: every leader's status is
+collected, then any surviving descendant is killed and reaped until none
+remains. Inputs are revalidated at each member's exit and again after the
+group settles.
 
 - A descendant that outlived its leader makes the check ENVIRONMENT: its
-  outputs may be partial.
+  outputs may be partial. With several members alive it cannot be
+  attributed to one, so it taints the whole group; while siblings run, the
+  wait looks for one at a bounded interval and aborts the group as soon as
+  it is seen, and a descendant seen only as a reaped exit counts too.
+- Any abort of a group (stop signal, stderr overflow, adoption, moved
+  input, failed start) kills every member and settles the group before the
+  error is raised; an unreapable tree wins over an interrupt, and an
+  interrupt over the abort's own error.
 - A tree that cannot be reaped stops the run (exit 2, directory kept).
 - A stop signal kills the running tree at once and exits 130. Every child
   carries a parent-death SIGKILL; a descendant forked by a launcher does not
@@ -376,7 +389,9 @@ Each check prints one line on stdout: `NAME: PASS (time; steps)`, optionally
 with the claim a PASS establishes, or `FAIL`, `ENVIRONMENT`, `INTERRUPTED`.
 The steps are wall times summed per label, slowest first: each pbfhogg and
 reference launch (a reference's time includes the cache's handling of its
-artifacts, and a cached reference is listed with its own time), and the verifier's own reading of the OPL decodings: `opl merge`
+artifacts, and a cached reference is listed with its own time; a launch
+group's wall is counted once per label, with every launch in its run
+count, so concurrent decodes show their wall, not their sum), and the verifier's own reading of the OPL decodings: `opl merge`
 for every comparison walk (including the check's per-record work and the
 listing writes it does inside the walk), `opl order scan` for a standalone
 order check, `opl derive model` for the derive-changes model. Decodes and
@@ -1025,7 +1040,8 @@ were each caught as `ERROR`, exit 2: CONTENT keeping metadata (five
 controls under content) and FULL dropping metadata (ten controls under
 full and between).
 
-Every child, including probes, uses `Lifecycle::run`.
+Every child, including probes, uses `Lifecycle::run_group` (`Lifecycle::run`
+is a group of one).
 Child setup clears the signal mask, installs parent-death SIGKILL and checks
 the parent race. Cancellation checkpoints precede launches, verdicts, run
 cleanup and exit, and reference publication. Input stamps

@@ -30,6 +30,9 @@ fn verifier_lifecycle() {
         "armed",
         "wrong-parent",
         "parent-death",
+        "group=rendezvous-write,rendezvous-read",
+        "group=orphan,parked",
+        "group=overflow,parked",
     ] {
         let dir = scratch.cell();
         run_worker(role, &dir);

@@ -6,12 +6,15 @@
 //! every descendant of a launch is reparented here when its parent exits.
 //!
 //! Every launch - pbfhogg, a reference tool, a provisioning or probe tool -
-//! goes through [`Lifecycle::run`], and settles before the next one starts:
-//! the leader's status is collected, then any descendant still alive is
-//! killed and reaped until `waitpid` reports ECHILD. Only then is a launch's
-//! output read. A descendant that outlived its leader is an environment
-//! outcome (its outputs may be partial); one that cannot be reaped is
-//! [`Error::Unsettled`], after which nothing may run.
+//! goes through [`Lifecycle::run_group`] ([`Lifecycle::run`] is a group of
+//! one). The members of a group start together, and the group settles
+//! before any of its outputs is read or another group starts: every
+//! leader's status is collected, then any descendant still alive is killed
+//! and reaped until `waitpid` reports ECHILD. A descendant that outlived its
+//! leader is an environment outcome for the whole group (its outputs may be
+//! partial, and with siblings alive it cannot be attributed to one); one
+//! that cannot be reaped is [`Error::Unsettled`], after which nothing may
+//! run.
 //!
 //! Cancellation: `brokkr kill` and Ctrl-C reach this process as a signal,
 //! and brokkr follows its SIGTERM with SIGKILL after a short grace. While a
@@ -149,87 +152,240 @@ impl Lifecycle {
     /// Start `launch`, wait for it and settle its tree. The exit status is
     /// the caller's to judge.
     pub(crate) fn run(&mut self, launch: &Launch<'_>) -> Result<Ended, Error> {
-        self.checkpoint()?;
-        let sink = File::create(launch.sink)
-            .map_err(|e| Error::tool(format!("create {}: {e}", launch.sink.display())))?;
-        let mut cmd = Command::new(launch.program);
-        cmd.env_clear()
-            .args(&launch.args)
-            .envs(launch.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(launch.cwd)
-            .stdin(Stdio::null())
-            .stdout(sink)
-            .stderr(Stdio::piped());
-        let parent = self.pid;
-        // SAFETY: the closure runs between fork and exec and calls only
-        // async-signal-safe functions on locals.
-        unsafe {
-            cmd.pre_exec(move || {
-                prepare_child(parent);
-                Ok(())
-            });
-        }
-        let label = launch.program.display().to_string();
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::tool(format!("start {label}: {e}")))?;
-        let waited = self.wait(&mut child);
-        // Whatever the wait concluded, nothing of this launch may outlive it.
-        let adopted =
-            settle(Some(child.id())).map_err(|e| Error::Unsettled(format!("{label}: {e}")))?;
-        let (status, stderr) = waited?;
-        if adopted {
-            return Err(Error::Environment(format!(
-                "a descendant of {label} outlived it and was killed; its outputs may be partial"
-            )));
-        }
-        Ok(Ended { status, stderr })
+        let mut ended = self.run_group(std::slice::from_ref(launch), &mut || Ok(()))?;
+        ended
+            .pop()
+            .ok_or_else(|| Error::tool("a launch group of one ended empty"))
     }
 
-    /// Wait for the leader, draining its stderr, or for a stop signal.
-    fn wait(&mut self, child: &mut std::process::Child) -> Result<(ExitStatus, Vec<u8>), Error> {
-        let mut err = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::tool("missing stderr pipe"))?;
-        nonblocking(err.as_raw_fd())?;
-        let leader = pidfd(child.id())?;
-        let mut captured = Capture::default();
-        let mut fds = [
-            pollfd(self.signals.as_raw_fd()),
-            pollfd(err.as_raw_fd()),
-            pollfd(leader.as_raw_fd()),
-        ];
-        // loop-ends: the leader exits (pidfd readable) or a stop signal
-        // arrives (signalfd readable); poll sleeps until one is ready.
-        let status = loop {
+    /// Start every launch of `launches` together, wait for all of them and
+    /// settle the whole group once: the barrier is where results become
+    /// usable, and nothing of any member is handed back before it. The exit
+    /// statuses, in launch order, are the caller's to judge.
+    ///
+    /// `observe` runs at each leader's exit, the caller's observation of its
+    /// inputs that a lone launch gets after it; an `Err` aborts the group.
+    ///
+    /// A descendant that outlives its leader cannot be attributed to one
+    /// member once several are alive, and it may have touched any member's
+    /// files, so it makes the whole group an environment outcome. While more
+    /// than one member runs, the wait scans for one at every bounded wakeup
+    /// (`tunables::GROUP_ADOPTION_POLL`) and aborts the group as soon as it
+    /// is seen, so an orphan never runs beside a long sibling. An abort -
+    /// a stop signal, a member's stderr overflow, an adoption, an observer
+    /// error, a failed start - kills every member, settles, and returns that
+    /// error for the group: [`Error::Unsettled`] wins over everything, then
+    /// [`Error::Interrupted`], then the abort's own error.
+    pub(crate) fn run_group(
+        &mut self,
+        launches: &[Launch<'_>],
+        observe: &mut dyn FnMut() -> Result<(), Error>,
+    ) -> Result<Vec<Ended>, Error> {
+        self.checkpoint()?;
+        let mut members = Vec::with_capacity(launches.len());
+        let mut waited = self.spawn_all(launches, &mut members);
+        if waited.is_ok() {
+            waited = self.wait_group(&mut members, observe);
+        }
+        // Whatever the wait concluded, nothing of this group may outlive it.
+        // On the clean path every leader is already collected; on an abort
+        // the sweep kills and reaps the rest and owns their statuses. Every
+        // live leader whose pidfd is held is signalled first, so a sweep that
+        // fails early (descriptors exhausted) has still stopped them.
+        for m in members.iter().filter(|m| m.status.is_none()) {
+            // A failed signal here is retried by the sweep, whose own
+            // failure is the group's Unsettled.
+            if let Some(fd) = &m.pidfd
+                && kill(fd).is_err()
+            {
+                continue;
+            }
+        }
+        let mut leaders: Vec<u32> = members
+            .iter()
+            .filter(|m| m.status.is_none())
+            .map(|m| m.child.id())
+            .collect();
+        let labels = || {
+            members
+                .iter()
+                .map(|m| m.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let adopted =
+            settle(&mut leaders).map_err(|e| Error::Unsettled(format!("{}: {e}", labels())))?;
+        // A stop that arrived during the wait's cleanup wins over its error.
+        self.checkpoint()?;
+        waited?;
+        if adopted {
+            return Err(Error::Environment(format!(
+                "a descendant of {} outlived its launch; its outputs may be partial",
+                labels()
+            )));
+        }
+        members
+            .into_iter()
+            .map(|m| {
+                let status = m
+                    .status
+                    .ok_or_else(|| Error::tool(format!("{}: status lost", m.label)))?;
+                Ok(Ended {
+                    status,
+                    stderr: m.captured.bytes,
+                })
+            })
+            .collect()
+    }
+
+    /// Spawn each launch from this, the one forking thread (the parent-death
+    /// signal is keyed to it). A member is registered the moment it exists,
+    /// before any fallible setup, so a later failure still settles it.
+    fn spawn_all(
+        &mut self,
+        launches: &[Launch<'_>],
+        members: &mut Vec<Member>,
+    ) -> Result<(), Error> {
+        for launch in launches {
+            self.checkpoint()?;
+            let sink = File::create(launch.sink)
+                .map_err(|e| Error::tool(format!("create {}: {e}", launch.sink.display())))?;
+            let mut cmd = Command::new(launch.program);
+            cmd.env_clear()
+                .args(&launch.args)
+                .envs(launch.env.iter().map(|(k, v)| (k, v)))
+                .current_dir(launch.cwd)
+                .stdin(Stdio::null())
+                .stdout(sink)
+                .stderr(Stdio::piped());
+            let parent = self.pid;
+            // SAFETY: the closure runs between fork and exec and calls only
+            // async-signal-safe functions on locals.
+            unsafe {
+                cmd.pre_exec(move || {
+                    prepare_child(parent);
+                    Ok(())
+                });
+            }
+            let label = launch.program.display().to_string();
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| Error::tool(format!("start {label}: {e}")))?;
+            let stderr = child.stderr.take();
+            members.push(Member {
+                child,
+                label,
+                stderr,
+                pidfd: None,
+                captured: Capture::default(),
+                status: None,
+            });
+            let member = members
+                .last_mut()
+                .ok_or_else(|| Error::tool("member lost"))?;
+            let err = member
+                .stderr
+                .as_ref()
+                .ok_or_else(|| Error::tool("missing stderr pipe"))?;
+            nonblocking(err.as_raw_fd())?;
+            member.pidfd = Some(pidfd(member.child.id())?);
+        }
+        Ok(())
+    }
+
+    /// Wait for every leader, draining each stderr, or for a stop signal.
+    fn wait_group(
+        &mut self,
+        members: &mut [Member],
+        observe: &mut dyn FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let bounded = members.len() > 1;
+        // loop-ends: every leader exits (its pidfd readable), a stop signal
+        // arrives (signalfd readable) or the group aborts; poll sleeps until
+        // a descriptor is ready, or the adoption scan's bound with siblings.
+        loop {
             if self.signal_pending()? {
                 self.cancelled = true;
                 return Err(Error::Interrupted);
             }
-            captured.drain(&mut err)?;
-            if captured.overflow {
-                return Err(Error::tool(format!(
-                    "stderr exceeded {} bytes",
-                    tunables::STDERR_LIMIT
-                )));
+            // loop-ends: one non-blocking pass over the live members.
+            for m in members.iter_mut().filter(|m| m.status.is_none()) {
+                m.drain()?;
+                if let Some(status) = m.child.try_wait()? {
+                    // Reaped: recorded first, so an abort below never counts
+                    // this PID, which may be reused, as a live leader.
+                    m.status = Some(status);
+                    m.pidfd = None;
+                    // The leader is gone. What a surviving descendant writes
+                    // later is not collected: such a descendant makes the
+                    // group an environment outcome anyway.
+                    m.drain()?;
+                    m.stderr = None;
+                    observe()?;
+                }
             }
-            if let Some(status) = child.try_wait()? {
-                break status;
+            if members.iter().all(|m| m.status.is_some()) {
+                return Ok(());
             }
-            poll(&mut fds, -1)?;
+            if bounded {
+                let live: Vec<u32> = members
+                    .iter()
+                    .filter(|m| m.status.is_none())
+                    .map(|m| m.child.id())
+                    .collect();
+                if children()?.iter().any(|pid| !live.contains(pid)) {
+                    return Err(Error::Environment(
+                        "a launch's descendant outlived it while its siblings ran".into(),
+                    ));
+                }
+            }
+            let mut fds = vec![pollfd(self.signals.as_raw_fd())];
+            for m in members.iter().filter(|m| m.status.is_none()) {
+                if let Some(err) = &m.stderr {
+                    fds.push(pollfd(err.as_raw_fd()));
+                }
+                if let Some(fd) = &m.pidfd {
+                    fds.push(pollfd(fd.as_raw_fd()));
+                }
+            }
+            let timeout = if bounded {
+                i32::try_from(tunables::GROUP_ADOPTION_POLL.as_millis())
+                    .map_err(io::Error::other)?
+            } else {
+                -1
+            };
+            poll(&mut fds, timeout)?;
+        }
+    }
+}
+
+/// One live member of a launch group. `stderr` is dropped at EOF or at the
+/// leader's exit and `pidfd` at its exit, so neither keeps the poll ready.
+struct Member {
+    child: std::process::Child,
+    label: String,
+    stderr: Option<std::process::ChildStderr>,
+    pidfd: Option<OwnedFd>,
+    captured: Capture,
+    status: Option<ExitStatus>,
+}
+
+impl Member {
+    fn drain(&mut self) -> Result<(), Error> {
+        let Some(err) = self.stderr.as_mut() else {
+            return Ok(());
         };
-        // The leader is gone. What a surviving descendant writes later is not
-        // collected: such a descendant makes the launch an environment
-        // outcome anyway, once the caller settles the tree.
-        captured.drain(&mut err)?;
-        if captured.overflow {
+        if self.captured.drain(err)? {
+            self.stderr = None;
+        }
+        if self.captured.overflow {
             return Err(Error::tool(format!(
-                "stderr exceeded {} bytes",
+                "{}: stderr exceeded {} bytes",
+                self.label,
                 tunables::STDERR_LIMIT
             )));
         }
-        Ok((status, captured.bytes))
+        Ok(())
     }
 }
 
@@ -257,12 +413,13 @@ struct Capture {
 }
 
 impl Capture {
-    fn drain(&mut self, reader: &mut impl Read) -> io::Result<()> {
+    /// Read what `reader` holds now; `true` once it is closed.
+    fn drain(&mut self, reader: &mut impl Read) -> io::Result<bool> {
         let mut buf = vec![0; tunables::DRAIN_BUFFER];
         // loop-ends: the pipe is empty (WouldBlock), closed (0), or overflows.
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => return Ok(()),
+                Ok(0) => return Ok(true),
                 Ok(n) => {
                     let keep = n.min(tunables::STDERR_LIMIT.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(&buf[..keep]);
@@ -270,10 +427,10 @@ impl Capture {
                     // A continuous writer must not starve signal handling or
                     // settlement. The caller treats overflow as a launch error.
                     if self.overflow {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -365,10 +522,13 @@ fn children() -> io::Result<Vec<u32>> {
     Ok(ids)
 }
 
-/// Kill and reap every child of this process until ECHILD. `leader` is the
-/// launch's own process, which may still be alive (interrupted) or already
-/// reaped; any other child found is adopted, and the result says so.
-fn settle(leader: Option<u32>) -> io::Result<bool> {
+/// Kill and reap every child of this process until ECHILD. `leaders` are
+/// the group's leaders not yet reaped (an aborted group's live ones; none on
+/// the clean path). Each PID is classified as it is seen, against a set that
+/// shrinks as leaders are reaped, so a reused PID is never mistaken for a
+/// leader. Any other child, found alive or only as a reaped exit, is
+/// adopted, and the result says so.
+fn settle(leaders: &mut Vec<u32>) -> io::Result<bool> {
     let start = Instant::now();
     let mut adopted = false;
     // loop-ends: waitpid reports ECHILD; each pass kills what it finds and
@@ -379,7 +539,7 @@ fn settle(leader: Option<u32>) -> io::Result<bool> {
         }
         let mut killed = Vec::new();
         for pid in children()? {
-            adopted |= Some(pid) != leader;
+            adopted |= !leaders.contains(&pid);
             match pidfd(pid) {
                 Ok(fd) => {
                     kill(&fd)?;
@@ -389,7 +549,13 @@ fn settle(leader: Option<u32>) -> io::Result<bool> {
                 Err(e) => return Err(e),
             }
         }
-        if reap()? {
+        let none_left = reap(&mut |pid| match leaders.iter().position(|&l| l == pid) {
+            Some(i) => {
+                leaders.swap_remove(i);
+            }
+            None => adopted = true,
+        })?;
+        if none_left {
             return Ok(adopted);
         }
         let mut fds: Vec<_> = killed.iter().map(|fd| pollfd(fd.as_raw_fd())).collect();
@@ -398,8 +564,9 @@ fn settle(leader: Option<u32>) -> io::Result<bool> {
     }
 }
 
-/// Reap every exited child; `true` once none is left.
-fn reap() -> io::Result<bool> {
+/// Reap every exited child, handing each PID to `seen` in reap order;
+/// `true` once none is left.
+fn reap(seen: &mut dyn FnMut(u32)) -> io::Result<bool> {
     // loop-ends: no exited child remains (0) or no child at all (ECHILD).
     loop {
         let mut status = 0;
@@ -407,6 +574,9 @@ fn reap() -> io::Result<bool> {
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
         if pid == 0 {
             return Ok(false);
+        }
+        if let Ok(pid) = u32::try_from(pid) {
+            seen(pid);
         }
         if pid < 0 {
             let e = io::Error::last_os_error();
@@ -428,7 +598,7 @@ mod tests {
     fn capture_keeps_a_bounded_prefix_and_flags_overflow() {
         let mut capture = Capture::default();
         let data = vec![b'x'; tunables::STDERR_LIMIT + 3];
-        capture.drain(&mut data.as_slice()).unwrap();
+        assert!(!capture.drain(&mut data.as_slice()).unwrap());
         assert_eq!(capture.bytes.len(), tunables::STDERR_LIMIT);
         assert!(capture.overflow);
     }

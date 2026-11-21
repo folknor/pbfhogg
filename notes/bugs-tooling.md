@@ -49,20 +49,6 @@ a uniqueness that sorting does not promise. The hunter says the verifier
 documentation's strict-uniqueness requirement is wrong for this command:
 ordering and uniqueness need separate judgments.
 
-## TOOL-004 - A settled reference environment failure poisons later checks
-
-Reported by: verify [P2].
-
-Reference staging names (`reference_cache.rs`) contain RUNID and the reusable
-`ToolRun.id`, with no launch identifier. If a reference descendant outlives
-its leader, lifecycle settlement correctly returns `Environment`, but
-`result?` then leaves the staging directory behind. The suite continues as
-promised, and its next use of that run ID, for example `opl-compare.1`, fails
-`create_dir` with `AlreadyExists`. A recoverable environment outcome becomes a
-fatal verifier error, breaking the explicit promise to continue past
-environment outcomes. Launch-unique staging would stop later checks from
-depending on earlier failures.
-
 ## TOOL-005 - verify geocode builds its osmium reference from unsorted input
 
 Reported by: verify [P2].
@@ -409,3 +395,17 @@ The comment describes selection without metadata or header checks.
 `compare_outputs` compares metadata and checks sort features on the sorted
 path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
 keep those checks when batching requests.
+
+## TOOL-046 - A moved input turns a verifier error into ENVIRONMENT
+
+Reported by: the PERF-066 spar (codex), verified at the code.
+
+`Harness::run_check` (`crates/verify/src/harness.rs`) keeps `Interrupted`
+and `Unsettled` from the check, but for every other result computes
+`validation.and(result)`: when the final input revalidation fails, its
+`Environment` replaces the check's own error. A `Tool` error (for example a
+stderr overflow, which reference/verify.md says is a verifier error, exit 2)
+becomes ENVIRONMENT and `all` continues. Decide which wins; the contract
+reads as if the verifier error should, so `Tool` probably belongs in the
+pass-through arm beside `Interrupted` and `Unsettled`. Left for the user
+because it changes which outcomes stop a suite.

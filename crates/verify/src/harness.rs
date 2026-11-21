@@ -377,6 +377,50 @@ impl Harness {
         } else {
             self.step(&label, started.elapsed());
         }
+        self.settled_reference(run, settled)
+    }
+
+    /// Uncached reference runs started together as one launch group (see
+    /// `Lifecycle::run_group`), each with its standard output in its sink,
+    /// and each judged as [`Self::reference`] judges one, in run order. The
+    /// group's wall is recorded once per label, counting every launch, so a
+    /// step's time is the wall the group took, not the sum of its members.
+    /// Runs that read each other's outputs cannot share a group.
+    pub(crate) fn reference_group(
+        &mut self,
+        runs: &[(&ToolRun, &Path)],
+    ) -> Result<Vec<Result<Ended, Error>>, Error> {
+        let started = Instant::now();
+        let settled =
+            self.cache
+                .execute_uncached_group(&mut self.life, &mut self.run, &self.tools, runs)?;
+        let took = started.elapsed();
+        let mut labels: Vec<String> = Vec::new();
+        for (run, _) in runs {
+            let label = run.label();
+            if labels.contains(&label) {
+                if let Some((_, _, n)) = self.steps.iter_mut().find(|(l, _, _)| *l == label) {
+                    *n += 1;
+                }
+            } else {
+                self.step(&label, took);
+                labels.push(label);
+            }
+        }
+        let mut out = Vec::with_capacity(runs.len());
+        for ((run, _), settled) in runs.iter().zip(settled) {
+            out.push(self.settled_reference(run, settled));
+        }
+        Ok(out)
+    }
+
+    fn settled_reference(
+        &mut self,
+        run: &ToolRun,
+        settled: crate::reference_cache::Settled,
+    ) -> Result<Ended, Error> {
+        use crate::reference_cache::Settled;
+        let label = run.label();
         if let Settled::Unaccepted { ended } = &settled
             && ended.signal() == Some(libc::SIGKILL)
         {

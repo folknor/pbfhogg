@@ -443,7 +443,7 @@ fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<u64, Error> {
     for kind in 0..KINDS.len() {
         let file = File::open(decoding)
             .map_err(|e| Error::Failed(format!("cannot open {}: {e}", decoding.display())))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file);
         loop {
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
@@ -630,7 +630,7 @@ impl Listing {
             .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
         Ok(Self {
             path: path.to_path_buf(),
-            reader: BufReader::new(file),
+            reader: BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file),
             line: Vec::new(),
             number: 0,
             pending: None,

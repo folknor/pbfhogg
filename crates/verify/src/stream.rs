@@ -32,27 +32,29 @@ pub(crate) fn read_report(path: &Path) -> Result<String, Error> {
     })
 }
 
-/// Call `f` once per line with at most its first `head` bytes (newline
-/// excluded), assembling heads across buffer refills.
-pub(crate) fn for_each_line_head(
-    path: &Path,
+/// The first `max_lines` lines, each at most its first `head` bytes (newline
+/// excluded, a last line without one counted), assembled across buffer
+/// refills, and whether any byte follows them. Reading stops at the first
+/// byte past the last line kept, so a long listing is not read to its end.
+fn line_heads(
+    mut reader: impl BufRead,
     head: usize,
-    f: impl FnMut(&[u8]),
-) -> Result<(), Error> {
-    line_heads(open(path)?, head, f).map_err(|e| read_error(path, &e))
-}
-
-fn line_heads(mut reader: impl BufRead, head: usize, mut f: impl FnMut(&[u8])) -> io::Result<()> {
+    max_lines: usize,
+) -> io::Result<(Vec<Vec<u8>>, bool)> {
+    let mut lines = Vec::new();
     let mut current: Vec<u8> = Vec::with_capacity(head);
     let mut in_line = false;
-    // loop-ends: end of input.
+    // loop-ends: end of input, or the first byte past `max_lines` lines.
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
             if in_line {
-                f(&current);
+                lines.push(current);
             }
-            return Ok(());
+            return Ok((lines, false));
+        }
+        if lines.len() == max_lines {
+            return Ok((lines, true));
         }
         let len = buf.len();
         let mut start = 0;
@@ -66,10 +68,12 @@ fn line_heads(mut reader: impl BufRead, head: usize, mut f: impl FnMut(&[u8])) -
             let room = head.saturating_sub(current.len());
             current.extend_from_slice(&segment[..segment.len().min(room)]);
             if ended {
-                f(&current);
-                current.clear();
+                lines.push(std::mem::take(&mut current));
                 in_line = false;
                 start += segment.len() + 1;
+                if lines.len() == max_lines && start < len {
+                    return Ok((lines, true));
+                }
             } else {
                 start = len;
             }
@@ -85,15 +89,12 @@ pub(crate) fn preview(
     max_lines: usize,
     max_line_bytes: usize,
 ) -> Result<(Vec<String>, bool), Error> {
-    let mut lines = Vec::new();
-    let mut more = false;
-    for_each_line_head(path, max_line_bytes, |line| {
-        if lines.len() < max_lines {
-            lines.push(String::from_utf8_lossy(line).into_owned());
-        } else {
-            more = true;
-        }
-    })?;
+    let (lines, more) =
+        line_heads(open(path)?, max_line_bytes, max_lines).map_err(|e| read_error(path, &e))?;
+    let lines = lines
+        .iter()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect();
     Ok((lines, more))
 }
 
@@ -134,9 +135,56 @@ mod tests {
 
     fn heads(data: &[u8], head: usize, capacity: usize) -> Vec<Vec<u8>> {
         let reader = std::io::BufReader::with_capacity(capacity, data);
-        let mut out = Vec::new();
-        line_heads(reader, head, |l| out.push(l.to_vec())).unwrap();
-        out
+        let (lines, more) = line_heads(reader, head, usize::MAX).unwrap();
+        assert!(!more);
+        lines
+    }
+
+    /// A reader of `data` that fails any read once `limit` bytes are out.
+    struct Fenced<'a> {
+        data: &'a [u8],
+        limit: usize,
+    }
+
+    impl std::io::Read for Fenced<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.limit == 0 {
+                return Err(std::io::Error::other("read past the fence"));
+            }
+            let n = out.len().min(self.limit).min(self.data.len());
+            out[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            self.limit -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn line_heads_stop_at_the_first_byte_past_the_kept_lines() {
+        // "a\nb\n" kept, then one byte of a huge unterminated third line.
+        let data = b"a\nb\ncccccccccccccccccccc";
+        for capacity in [1, 2, 3, 5, 64] {
+            let fenced = Fenced { data, limit: 5 };
+            let reader = std::io::BufReader::with_capacity(capacity, fenced);
+            let (lines, more) = line_heads(reader, 8, 2).unwrap();
+            assert_eq!(
+                lines,
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "capacity {capacity}"
+            );
+            assert!(more, "capacity {capacity}");
+        }
+        let (lines, more) = line_heads(&b"a\nb\n"[..], 8, 2).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(!more);
+        let (lines, more) = line_heads(&b"a\nb\n\n"[..], 8, 2).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(more, "an empty extra line is more");
+        let (lines, more) = line_heads(&b"x"[..], 8, 0).unwrap();
+        assert!(lines.is_empty());
+        assert!(more);
+        let (_, more) = line_heads(&b""[..], 8, 0).unwrap();
+        assert!(!more);
     }
 
     #[test]

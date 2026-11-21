@@ -322,7 +322,7 @@ pub(crate) fn listing(
 /// Join the XML scan of `osc` with its OPL `opl` into the listing `out`;
 /// returns the change count.
 fn zip(osc: &Path, opl: &Path, out: &Path) -> Result<u64, Error> {
-    let mut lines = BufReader::new(File::open(opl)?);
+    let mut lines = BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, File::open(opl)?);
     let mut writer = BufWriter::new(File::create(out)?);
     let mut count: u64 = 0;
     let mut failure: Option<String> = None;

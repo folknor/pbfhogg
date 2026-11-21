@@ -24,6 +24,11 @@ pub(crate) const PREVIEW_LINE_BYTES: usize = 240;
 /// Read buffer for hashing the executable under test.
 pub(crate) const DIGEST_BUFFER: usize = 1 << 20;
 
+/// Read buffer for every sequential scan of an OPL file (a decoding, an
+/// expected file, a listing): a full decoding is as large as its input, and
+/// the default 8 KiB would cost one `read` per 8 KiB of it.
+pub(crate) const OPL_READ_BUFFER: usize = 1 << 20;
+
 /// Fail-stop bound for lifecycle tests, below brokkr's per-test watchdog.
 #[cfg(test)]
 #[allow(

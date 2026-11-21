@@ -202,6 +202,15 @@ impl Harness {
         }
     }
 
+    /// Run `work`, the verifier's own reading of files it holds, and record
+    /// its wall time as the step `label`, whatever it returns.
+    pub(crate) fn timed<T>(&mut self, label: &str, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let out = work();
+        self.step(label, started.elapsed());
+        out
+    }
+
     /// Run the pbfhogg CLI under test with its standard output written to
     /// the file `sink`.
     /// The exit status is the caller's to judge.
@@ -434,7 +443,10 @@ impl Harness {
     /// osmium's reading of `pbf` (`osmium fileinfo -e`), its report beside
     /// it; counts and order go into the detail.
     pub(crate) fn fileinfo(&mut self, pbf: &Path) -> Result<FileInfo, Error> {
-        // A file read twice in one check gets a fresh reading each time.
+        // A file read twice in one check gets a fresh reading each time:
+        // reference placement refuses an existing name, so a repeated read
+        // needs the old report gone. Kept deliberately over a fresh path per
+        // call, which would only leave more scratch behind.
         let report = pbf.with_extension("fileinfo.json");
         match std::fs::remove_file(&report) {
             Ok(()) => {}

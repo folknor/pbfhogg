@@ -278,3 +278,24 @@ host, says nothing (`cli_input_contract.rs` pins `Says::Nothing` for
 `diff -j 1`). Whether `-j 0` resolving to one worker prints anything
 anywhere was not checked. Either the docs narrow to "above one worker" or
 the gate goes; the verifier now passes `--jobs 2` and depends on neither.
+
+## DOC-031 - Undeclared way coordinate arrays have no documented behaviour
+
+Reported by: the TOOL-045 refusal (bf9266ed). Needs a maintainer decision.
+
+A way can carry lat/lon coordinate arrays while the header does not declare
+`LocationsOnWays`. `docs/cli/commands.md` says nothing about what `cat`,
+`sort`, `getid --invert` and `cat --dedupe` do with such arrays. Today's
+behaviour, read from source at bf9266ed: blobs copied whole keep the arrays
+as bytes; re-encoded ways drop them; `cat`'s rebuild of a blob it cannot
+classify keeps them. pbfhogg never declares `LocationsOnWays` on output when
+the input does not, so the verifier compares these outputs without
+coordinates and the arrays are outside every verdict. `repack` drops them by
+design (pinned by `repack_strips_coords_when_input_flag_absent`) and
+`degrade` always drops them; both are already settled.
+
+The decision: either document the per-command behaviour as it is, which
+makes byte-carry on passthrough a contract; or document that undeclared
+arrays are unspecified and may be kept or dropped; or make the commands
+treat them uniformly (always drop, as repack does). The first two are doc
+edits; the third changes passthrough output and needs measuring.

@@ -135,6 +135,9 @@ impl Merged {
     }
 }
 
+/// The step label of every merge walk, timed apart from the decodes it reads.
+const MERGE_STEP: &str = "opl merge";
+
 /// `osmium cat` of `pbf` to OPL under `policy`, into `opl`.
 pub(crate) fn decode(
     harness: &mut Harness,
@@ -143,7 +146,13 @@ pub(crate) fn decode(
     policy: Policy,
 ) -> Result<(), Error> {
     let format = policy.format();
-    // A file decoded twice in one check gets a fresh decoding each time.
+    // A file decoded twice in one check gets a fresh decoding each time:
+    // reference placement links into an absent name and refuses an existing
+    // one, so a repeated decode to the same path needs the old pair gone.
+    // Deliberately kept over fresh per-call paths: the verifier never
+    // retries, the first decoding of a path is merged and removed before any
+    // second one, and fresh paths would only leave more scratch behind. The
+    // delete of an absent file costs one unlink.
     for stale in [opl.to_path_buf(), opl.with_extension("stdout")] {
         match std::fs::remove_file(&stale) {
             Ok(()) => {}
@@ -271,7 +280,7 @@ pub(crate) fn compare_judged(
     let b = listing.with_extension("second.opl");
     decode(harness, first, &a, policy)?;
     decode(harness, second, &b, policy)?;
-    let walked = merge_judged(&a, &b, listing, each)?;
+    let walked = harness.timed(MERGE_STEP, || merge_judged(&a, &b, listing, each))?;
     if let Ok(merged) = &walked.merged {
         harness.msg(&format!(
             "  OPL merge {}: same={} first-only={} second-only={} differs={}",
@@ -303,7 +312,7 @@ fn walk(
     let b = listing.with_extension("second.opl");
     decode(harness, first, &a, policy)?;
     decode(harness, second, &b, policy)?;
-    let merged = merge(&a, &b, listing, strict, each, paired)?;
+    let merged = harness.timed(MERGE_STEP, || merge(&a, &b, listing, strict, each, paired))?;
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -332,6 +341,13 @@ pub(crate) fn order(
     opl: &Path,
 ) -> Result<(bool, [u64; 3]), Error> {
     decode(harness, pbf, opl, Policy::CONTENT)?;
+    let scanned = harness.timed("opl order scan", || scan_order(opl))?;
+    std::fs::remove_file(opl)?;
+    Ok(scanned)
+}
+
+/// The key scan of [`order`] over one OPL file.
+fn scan_order(opl: &Path) -> Result<(bool, [u64; 3]), Error> {
     let mut stream = Stream::open(opl)?;
     let mut ordered = true;
     let mut last = None;
@@ -341,10 +357,7 @@ pub(crate) fn order(
         }
         last = Some(key);
     }
-    let counts = stream.counts;
-    drop(stream);
-    std::fs::remove_file(opl)?;
-    Ok((ordered, counts))
+    Ok((ordered, stream.counts))
 }
 
 /// What `osmium derive-changes` from `old` to `new` gives once applied back
@@ -371,7 +384,9 @@ pub(crate) fn osmium_derive_roundtrip(
     let b = expected.with_extension("new.opl");
     decode(harness, old, &a, Policy::CONTENT)?;
     decode(harness, new, &b, Policy::CONTENT)?;
-    let retained = retained_by_osmium_derive(&a, &b, expected)?;
+    let retained = harness.timed("opl derive model", || {
+        retained_by_osmium_derive(&a, &b, expected)
+    })?;
     for opl in [&a, &b] {
         std::fs::remove_file(opl)?;
     }
@@ -438,7 +453,9 @@ pub(crate) fn compare_with_opl_each(
 ) -> Result<Merged, Error> {
     let a = listing.with_extension("first.opl");
     decode(harness, pbf, &a, policy)?;
-    let merged = merge(&a, expected, listing, true, each, |_| {})?;
+    let merged = harness.timed(MERGE_STEP, || {
+        merge(&a, expected, listing, true, each, |_| {})
+    })?;
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -463,7 +480,9 @@ pub(crate) fn compare_sequence_with_opl(
 ) -> Result<Merged, Error> {
     let b = listing.with_extension("second.opl");
     decode(harness, pbf, &b, policy)?;
-    let merged = merge(expected, &b, listing, false, |_| {}, |_| {})?;
+    let merged = harness.timed(MERGE_STEP, || {
+        merge(expected, &b, listing, false, |_| {}, |_| {})
+    })?;
     harness.msg(&format!(
         "  OPL merge {}: same={} first-only={} second-only={} differs={}",
         listing.display(),
@@ -495,7 +514,7 @@ impl Stream {
             .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
         Ok(Self {
             path: path.to_path_buf(),
-            reader: BufReader::new(file),
+            reader: BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file),
             line: Vec::new(),
             number: 0,
             key: None,

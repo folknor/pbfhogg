@@ -283,7 +283,7 @@ fn read_model(
 fn opl_lines(path: &Path) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>>, Error> {
     let file = File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file);
     let path = path.to_path_buf();
     let mut number = 0u64;
     let mut done = false;

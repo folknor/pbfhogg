@@ -2554,20 +2554,13 @@ Kind: low value.
 
 Reported by: engine-opus, heavy-opus, orchestration-opus, orchestration-codex.
 
-- Every OPL reader uses an 8 KiB `BufReader` (`opl_compare::Stream`,
-  `verify_reencode::Listing`, `apply_changes::opl_lines`,
-  `verify_change_listing::zip`), about 2 million `read` calls per 16 GB merge.
-  Use 1 MiB.
-- `Harness::step` times launches only, so the verifier's own read and merge
-  never appears in the PASS line. Add an `opl merge` step label, then measure
-  one denmark `all` before building anything (heavy-opus and engine-opus both
-  propose this as the first move).
-- `stream::preview` scans to EOF after it already has the displayed lines and
-  knows there are more (failure latency only).
-- `Run::revalidate` stats every watched input after every run and check, which
-  is quadratic in launches.
-- `opl_compare::decode` and `Harness::fileinfo` delete stale outputs only
-  because one check reads the same file twice. On a failing run, the first
-  side's multi-GB OPL is left behind by design.
+The PASS line's steps now time the verifier's own OPL reading
+(`opl merge`, `opl order scan`, `opl derive model`) apart from the decodes.
+What remains is the measurement those labels exist for: one denmark `all`,
+read for the split between `osmium cat` and the merge, before any redesign of
+the comparison path is argued from cost. It waits on the session rule that
+forbids `verify all` until the reference-path items have landed. No baseline
+with the 8 KiB OPL readers exists to set against it; the readers are now
+1 MiB.
 
 Kind: local.

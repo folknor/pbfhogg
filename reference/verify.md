@@ -33,7 +33,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   their claim, not identity under a sort. Differing identities are
   classified first-only, second-only or differing and written to a listing
   beside the outputs, both sides' records included; the OPL pair is removed
-  once merged and kept only when the merge itself fails. This is equality of osmium-decoded records under a field
+  once merged and kept when the merge fails; when the second side's decode
+  fails, the first side's decoding remains as well. This is equality of osmium-decoded records under a field
   policy, not of wire fields: absent metadata becomes libosmium's defaults on
   both sides, timestamps are whole seconds, coordinates are at 1e-7 degrees
   and a string is cut at an embedded NUL. OPL escapes its separators, so tag
@@ -270,8 +271,11 @@ entries only).
 `brokkr run` holds the machine lock for the verifier's whole life, which
 keeps every cooperating writer (the dataset tool, benches, another
 verifier) away. Each input's identity (device, inode, size, mtime, ctime) is
-recorded when resolved and compared after every reference run and every
-check; a change makes the check ENVIRONMENT. That detects ordinary external
+recorded when resolved; every pass compares every watched input with that
+first stamp, after every reference run (and at the cache's own points inside
+one) and every check, and a change makes the check ENVIRONMENT. These are
+sequential metadata observations, not a guarantee that no input moved
+between them. That detects ordinary external
 replacement; concurrent namespace manipulation by a process outside the lock
 is unsupported.
 
@@ -326,6 +330,13 @@ tool. It uses the same config and scratch selection as verification.
 
 Each check prints one line on stdout: `NAME: PASS (time; steps)`, optionally
 with the claim a PASS establishes, or `FAIL`, `ENVIRONMENT`, `INTERRUPTED`.
+The steps are wall times summed per label, slowest first: each pbfhogg and
+reference launch (a reference's time includes the cache's handling of its
+artifacts), and the verifier's own reading of the OPL decodings: `opl merge`
+for every comparison walk (including the check's per-record work and the
+listing writes it does inside the walk), `opl order scan` for a standalone
+order check, `opl derive model` for the derive-changes model. Decodes and
+removals are outside these spans.
 Detail is replayed only for a check that did not pass, or streamed with
 `--verbose`. A comparison failure recorded during a check is its verdict even
 if a later step ends it with an environment error. `all` runs every check in

@@ -119,6 +119,14 @@ impl Run {
     }
 
     /// `Err(Environment)` when a watched input moved since it was resolved.
+    ///
+    /// Every pass stats every watched path, so the cost grows with launches
+    /// times watches; at tens of each per check it is a few hundred
+    /// `stat`s, left deliberately. A watch outside the current launch's
+    /// inputs can still bear on the verdict or on cache publication, and
+    /// the calls before a launch, after it, at publication and at a check's
+    /// end guard different transitions; any narrowing has to show what can
+    /// change between the calls it collapses.
     pub(crate) fn revalidate(&self) -> Result<(), Error> {
         for (path, then) in &self.inputs {
             if stamp(path)? != *then {

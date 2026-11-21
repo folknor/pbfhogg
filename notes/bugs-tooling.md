@@ -392,17 +392,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-036 - check-refs compares counts that measure different things
-
-Reported by: other-codex.
-
-pbfhogg reduces the missing nodes in ways to distinct IDs
-(`commands/check/refs.rs`), while osmium counts each missing reference
-(`command_check_refs.cpp`). So one missing node referenced by two ways gives
-pbfhogg 1 and osmium 2, and the verifier compares them for equality in both
-modes (`checks/check_refs.rs`). Decide which quantity the check is meant to
-judge.
-
 ## TOOL-037 - multi-extract parity passes after the single-pass route falls back
 
 Reported by: other-codex.

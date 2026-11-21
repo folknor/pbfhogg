@@ -1060,7 +1060,7 @@ refused). A blob holding several kinds in order passes it; one whose way
 group comes before a node group fails it (`type order: node after way`).
 A `Note:` says the input has blobs without indexdata.
 
-For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
+For missing node refs in ways and missing relation-to-relation members, reports unique missing IDs with the occurrence count when they differ: `Missing node refs in ways: 1 (2 references)`, `Missing relation members: 706 (777 references)`. JSON carries both counts (`missing_node_refs` and `missing_node_ref_occurrences`, `missing_relation_members` and `missing_relation_member_occurrences`). The `FAILED (N missing references)` total sums the unique counts.
 
 The ID check judges monotonicity by canonical OSM order - `0`, then the
 negative IDs by ascending absolute value, then the positives - which is the

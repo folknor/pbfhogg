@@ -30,7 +30,12 @@ pub struct RefCheckResult {
     pub node_count: u64,
     pub way_count: u64,
     pub relation_count: u64,
+    /// Distinct node IDs missing from ways.
     pub missing_node_refs: u64,
+    /// Way node refs that point to missing nodes, every occurrence counted:
+    /// osmium check-refs's `Nodes in ways missing`. May exceed
+    /// `missing_node_refs` when a missing node is referenced more than once.
+    pub missing_node_ref_occurrences: u64,
     pub missing_way_refs: u64,
     pub missing_node_members: u64,
     pub missing_relation_members: u64,
@@ -169,7 +174,9 @@ fn append_capped_missing_refs(
 /// its set before a reference to it is finally judged, whatever the file's
 /// order). Reports unique missing relation IDs for relation-to-relation
 /// members (deferred to a post-pass to handle forward references, then
-/// deduplicated).
+/// deduplicated). Node refs in ways and relation-to-relation members also
+/// carry their occurrence counts, the quantity osmium check-refs reports for
+/// those two classes.
 ///
 /// # Errors
 ///
@@ -831,6 +838,7 @@ fn check_refs_inner(
         way_count: tally.way_count,
         relation_count: tally.relation_count,
         missing_node_refs: 0,
+        missing_node_ref_occurrences: 0,
         missing_way_refs: 0,
         missing_node_members: 0,
         missing_relation_members: 0,
@@ -842,6 +850,7 @@ fn check_refs_inner(
     // `missing_dedup` name from the sort-and-dedup it replaced.
     let t_dedup = Stopwatch::start();
     result.missing_node_refs = tally.missing_nodes_in_ways.len();
+    result.missing_node_ref_occurrences = tally.missing_node_refs_occurrences;
     result.missing_way_refs = tally.missing_ways_in_relations.len();
     result.missing_node_members = tally.missing_nodes_in_relations.len();
     let missing_dedup_ms = t_dedup.elapsed_ms();

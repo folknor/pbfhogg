@@ -3887,6 +3887,7 @@ fn run_check(
                     "way_count": result.way_count,
                     "relation_count": result.relation_count,
                     "missing_node_refs": result.missing_node_refs,
+                    "missing_node_ref_occurrences": result.missing_node_ref_occurrences,
                     "missing_way_refs": result.missing_way_refs,
                     "missing_node_members": result.missing_node_members,
                     "missing_relation_members": result.missing_relation_members,
@@ -3971,11 +3972,19 @@ fn run_check(
                     result.node_count, result.way_count, result.relation_count
                 )?;
                 if result.missing_node_refs > 0 {
-                    writeln!(
-                        out,
-                        "Missing node refs in ways: {}",
-                        result.missing_node_refs
-                    )?;
+                    if result.missing_node_ref_occurrences > result.missing_node_refs {
+                        writeln!(
+                            out,
+                            "Missing node refs in ways: {} ({} references)",
+                            result.missing_node_refs, result.missing_node_ref_occurrences,
+                        )?;
+                    } else {
+                        writeln!(
+                            out,
+                            "Missing node refs in ways: {}",
+                            result.missing_node_refs
+                        )?;
+                    }
                 }
                 if check_relations {
                     if result.missing_way_refs > 0 {

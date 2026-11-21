@@ -337,24 +337,30 @@ pub fn tool(args: &[OsString]) -> i32 {
             if fault == "report" {
                 println!("Referential integrity: OK\nMissing node refs in ways: 4");
             } else if args.contains(&"--check-relations") {
+                // One missing node referenced twice, one missing relation
+                // referenced twice: the total counts each ID once.
                 println!(
-                    "Missing relation members: 1 (2 references)\nReferential integrity: FAILED (1 missing references)"
+                    "Missing node refs in ways: 1 (2 references)\nMissing relation members: 1 (2 references)\nReferential integrity: FAILED (2 missing references)"
                 );
                 return 1;
             } else {
-                println!("Referential integrity: OK");
+                println!(
+                    "Missing node refs in ways: 1 (2 references)\nReferential integrity: FAILED (1 missing references)"
+                );
+                return 1;
             }
         }
         "check-refs" => {
+            // osmium counts every referencing occurrence.
             eprintln!(
-                "There are 3 nodes, 2 ways, and 1 relations in this file.\nNodes in ways missing: 0"
+                "There are 3 nodes, 2 ways, and 1 relations in this file.\nNodes in ways missing: 2"
             );
             if args.contains(&"-r") {
                 eprintln!(
                     "Nodes in relations missing: 0\nWays in relations missing: 0\nRelations in relations missing: 2"
                 );
-                return 1;
             }
+            return 1;
         }
         "add-locations-to-ways" => {
             if args.contains(&"--index-type") {

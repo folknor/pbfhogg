@@ -248,3 +248,17 @@ planning four node shards). The negative-ID fallback wording in these files
 is already corrected; the rest needs checking against the planner's actual
 cuts before rewording, since some assertions may depend on how many units a
 fixture is cut into.
+
+## DOC-029 - A way's empty trailing packed refs segment decodes differently from osmium
+
+Reported by: the check-refs occurrence-count spar (codex), source review
+only, not reproduced.
+
+A way whose packed `refs` field is split into a nonempty segment followed by
+an empty one keeps its refs in pbfhogg (`take_packed` in
+`crates/lib/src/read/wire.rs` concatenates segments, as protobuf specifies),
+while vendored libosmium (`pbf_decoder.hpp`, way decoding) overwrites its
+`refs` view on each occurrence, so the trailing empty segment erases them.
+The two tools then disagree on the way's node list and on anything counted
+from it (check-refs's nodes-in-ways count among them). If confirmed, this is
+a deliberate spec-following deviation that DEVIATIONS.md does not record.

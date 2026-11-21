@@ -683,19 +683,18 @@ counts, however often the same node is referenced. For node and way members of
 relations it counts each missing ID once.
 
 **pbfhogg behavior:** Reports unique missing IDs as the primary count for every
-class. For relation-to-relation members the occurrence count follows in
-parentheses when it differs from the unique count:
+class. For missing node refs in ways and for relation-to-relation members the
+occurrence count follows in parentheses when it differs from the unique count:
+`Missing node refs in ways: 1 (2 references)`,
 `Missing relation members: 706 (777 references)`, and JSON carries
-`missing_relation_member_occurrences`. For missing node refs in ways
-(`Missing node refs in ways`) neither the human report nor JSON carries an
-occurrence count; only the distinct count is printed.
+`missing_node_ref_occurrences` and `missing_relation_member_occurrences`. The
+`FAILED (N missing references)` total sums the unique counts.
 
-**Impact:** Both tools find the same set of missing IDs. For relation members
-the difference is presentational: osmium's count corresponds to pbfhogg's
-occurrence (parenthesized) count, not the primary count. For node refs in ways
-the two numbers cannot be reconciled from pbfhogg's output on any input where a
-missing node is referenced more than once: osmium's figure is larger. Node and
-way members of relations agree.
+**Impact:** Both tools find the same set of missing IDs. The difference is
+presentational: for those two classes osmium's count corresponds to pbfhogg's
+occurrence (parenthesized, or the bare count when they are equal) count, not
+the primary count, and the verifier compares exactly that. Node and way members
+of relations agree.
 
 ## Negative IDs: pbfhogg answers by the signed ID
 

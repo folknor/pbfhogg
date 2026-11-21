@@ -53,11 +53,12 @@ pbfhogg check input.pbf --ids                    # ID uniqueness/ordering only
 pbfhogg check input.pbf --json                   # machine-readable output
 ```
 
-**Counting difference:** For missing relation-to-relation members, osmium reports
-the number of broken references (occurrences), while pbfhogg reports unique
-missing IDs with the occurrence count in parentheses when they differ:
-`Missing relation members: 706 (777 references)`. Both tools find the same
-set of missing IDs.
+**Counting difference:** For missing node refs in ways and missing
+relation-to-relation members, osmium reports the number of broken references
+(occurrences), while pbfhogg reports unique missing IDs with the occurrence
+count in parentheses when they differ: `Missing node refs in ways: 1 (2
+references)`, `Missing relation members: 706 (777 references)`. Both tools
+find the same set of missing IDs.
 
 ### removeid is now `getid --invert`
 

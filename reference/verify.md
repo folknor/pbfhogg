@@ -469,7 +469,12 @@ refuses negative IDs and negative references osmium could fold.
 
 Check-refs reads pbfhogg's original input and osmium's sorted copy when
 needed. It accepts osmium exit 1 only with the complete final summary and
-requires empty stdout. It does not accept `--direct-io`.
+requires empty stdout. It does not accept `--direct-io`. Osmium counts
+missing node refs in ways and relation-to-relation members per referencing
+occurrence and node and way members once per ID, so each class compares
+osmium's count with pbfhogg's count of the same quantity: the parenthesized
+occurrence count where pbfhogg prints one, else its bare count. pbfhogg's
+unique counts must sum to its FAILED total.
 
 Inspect-tags runs `pbfhogg inspect tags` and `osmium tags-count` on the
 input, over every kind and over ways alone. Both reports are parsed whole

@@ -2054,18 +2054,21 @@ fn refs_field(stdout: &str, field: &str) -> u64 {
 /// the degrade *output* alone, per the spec's Section 7.3 definition: a
 /// reference dangles iff its target `(kind, id)` is absent from the output.
 /// Returns `(missing_node_refs, missing_way_refs, missing_node_members,
-/// missing_relation_members)`.
-fn expected_dangles(out: &crate::common::NormalizedPbf) -> (u64, u64, u64, u64) {
+/// missing_relation_members)` and, apart, the way node refs to missing nodes
+/// counted per occurrence.
+fn expected_dangles(out: &crate::common::NormalizedPbf) -> ((u64, u64, u64, u64), u64) {
     use std::collections::BTreeSet;
     let node_ids: BTreeSet<i64> = out.nodes.iter().map(|n| n.id).collect();
     let way_ids: BTreeSet<i64> = out.ways.iter().map(|w| w.id).collect();
     let rel_ids: BTreeSet<i64> = out.relations.iter().map(|r| r.id).collect();
 
     let mut missing_node_refs = BTreeSet::new();
+    let mut missing_node_ref_occurrences = 0;
     for w in &out.ways {
         for r in &w.refs {
             if !node_ids.contains(r) {
                 missing_node_refs.insert(*r);
+                missing_node_ref_occurrences += 1;
             }
         }
     }
@@ -2090,10 +2093,13 @@ fn expected_dangles(out: &crate::common::NormalizedPbf) -> (u64, u64, u64, u64) 
         }
     }
     (
-        missing_node_refs.len() as u64,
-        missing_way_refs.len() as u64,
-        missing_node_members.len() as u64,
-        missing_relation_members.len() as u64,
+        (
+            missing_node_refs.len() as u64,
+            missing_way_refs.len() as u64,
+            missing_node_members.len() as u64,
+            missing_relation_members.len() as u64,
+        ),
+        missing_node_ref_occurrences,
     )
 }
 
@@ -2105,7 +2111,7 @@ fn expected_dangles(out: &crate::common::NormalizedPbf) -> (u64, u64, u64, u64) 
 fn assert_check_refs_matches_output(path: &Path) -> u64 {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let out = read_normalized(path);
-    let (mnr, mwr, mnm, mrm) = expected_dangles(&out);
+    let ((mnr, mwr, mnm, mrm), mnr_occurrences) = expected_dangles(&out);
     let check = CliInvoker::new(&invocation_scratch)
         .arg("check")
         .arg(path)
@@ -2119,6 +2125,33 @@ fn assert_check_refs_matches_output(path: &Path) -> u64 {
         mnr,
         "missing_node_refs"
     );
+    assert_eq!(
+        refs_field(&stdout, "missing_node_ref_occurrences"),
+        mnr_occurrences,
+        "missing_node_ref_occurrences"
+    );
+    // The human report appends the occurrences, osmium check-refs's count,
+    // only where they exceed the distinct IDs.
+    let human = CliInvoker::new(&invocation_scratch)
+        .arg("check")
+        .arg(path)
+        .arg("--refs")
+        .run()
+        .stdout_str();
+    let line = if mnr == 0 {
+        None
+    } else if mnr_occurrences > mnr {
+        Some(format!(
+            "Missing node refs in ways: {mnr} ({mnr_occurrences} references)"
+        ))
+    } else {
+        Some(format!("Missing node refs in ways: {mnr}"))
+    };
+    let printed = human
+        .lines()
+        .find(|l| l.starts_with("Missing node refs in ways"))
+        .map(str::to_owned);
+    assert_eq!(printed, line, "{human}");
     assert_eq!(
         refs_field(&stdout, "missing_way_refs"),
         mwr,

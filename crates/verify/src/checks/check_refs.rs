@@ -4,12 +4,14 @@
 //! counts structurally rather than comparing raw text. Known semantic differences:
 //!
 //! - Ways-only mode: pbfhogg skips relation blobs and reports "0 relations" in its
-//!   element summary, while osmium always reports the full relation count. Both
-//!   agree on the actual check result (missing node reference count).
+//!   element summary, while osmium always reports the full relation count.
 //!
-//! - With-relations mode: pbfhogg reports "Missing relation members: 706 (777
-//!   references)" where 777 is the occurrence count that matches osmium's output.
-//!   We extract the trailing number (the references count) for comparison.
+//! - Missing node refs in ways and missing relation members: pbfhogg's primary
+//!   count is distinct IDs, osmium's is every referencing occurrence. pbfhogg
+//!   appends the occurrences when they differ ("Missing relation members: 706
+//!   (777 references)", likewise "Missing node refs in ways: 1 (2
+//!   references)"), and that trailing number is what is compared with
+//!   osmium, in both modes; the distinct number reconciles the FAILED total.
 //!
 //! Each side's exit must agree with its report: exit 1 exactly when something
 //! is missing. pbfhogg is the command under test, so a disagreement there is
@@ -39,8 +41,12 @@ const CLAIM_UNSORTED: &str = "on unsorted input, osmium check-refs reads an osmi
 /// Parsed pbfhogg check --refs counts for structural comparison.
 #[derive(Default)]
 struct CheckRefCounts {
-    /// Missing node references in ways (ways-only and with-relations modes).
+    /// Missing node references in ways, every occurrence (ways-only and
+    /// with-relations modes): the M of "N (M references)", or the bare N.
+    /// osmium's `Nodes in ways missing` counts the same.
     nodes_in_ways: Option<u64>,
+    /// The distinct missing nodes in ways, the N, which sums into the total.
+    nodes_in_ways_distinct: Option<u64>,
     /// Missing node members in relations.
     nodes_in_relations: Option<u64>,
     /// Missing way members in relations.
@@ -85,8 +91,9 @@ impl CheckRefCounts {
 /// pbfhogg's ways-only missing-node-in-ways count.
 ///
 /// A clean file says `Referential integrity: OK` (0), a dirty one `Missing
-/// node refs in ways: N` and `FAILED (N missing references)`; with only way
-/// node refs checked the two must be equal. Anything else is `None`.
+/// node refs in ways: N` or `N (M references)` and `FAILED (N missing
+/// references)`; with only way node refs checked the two N must be equal.
+/// The count returned is the occurrences, M. Anything else is `None`.
 fn pbfhogg_ways_only(counts: &CheckRefCounts) -> Option<u64> {
     if counts.clean()? {
         return Some(0);
@@ -95,12 +102,14 @@ fn pbfhogg_ways_only(counts: &CheckRefCounts) -> Option<u64> {
     (counts.nodes_in_relations.is_none()
         && counts.ways_in_relations.is_none()
         && counts.relations_in_relations.is_none()
-        && counts.total_missing == Some(in_ways))
-    .then_some(in_ways)
+        && counts.total_missing.is_some()
+        && counts.total_missing == counts.nodes_in_ways_distinct)
+        .then_some(in_ways)
 }
 
-/// pbfhogg's with-relations counts as `[nodes in ways, nodes in relations,
-/// ways in relations, relation member references]`.
+/// pbfhogg's with-relations counts as `[node refs in ways, nodes in
+/// relations, ways in relations, relation member references]`, the first and
+/// last counted per occurrence as osmium counts them.
 ///
 /// A clean file prints only `Referential integrity: OK`, which is all zeros.
 /// A dirty file omits the lines of classes with nothing missing, so an absent
@@ -113,11 +122,12 @@ fn pbfhogg_with_relations(counts: &CheckRefCounts) -> Option<[u64; 4]> {
     }
     let total = counts.total_missing?;
     let in_ways = counts.nodes_in_ways.unwrap_or(0);
+    let in_ways_distinct = counts.nodes_in_ways_distinct.unwrap_or(0);
     let nodes = counts.nodes_in_relations.unwrap_or(0);
     let ways = counts.ways_in_relations.unwrap_or(0);
     let rel_distinct = counts.relations_distinct.unwrap_or(0);
     let rel_refs = counts.relations_in_relations.unwrap_or(0);
-    let accounted = in_ways
+    let accounted = in_ways_distinct
         .checked_add(nodes)?
         .checked_add(ways)?
         .checked_add(rel_distinct)?;
@@ -160,23 +170,19 @@ fn parse_pbfhogg(text: &str) -> CheckRefCounts {
                 .and_then(decimal)
                 .is_some_and(|n| set_once(&mut counts.total_missing, n))
         } else if let Some(rest) = line.strip_prefix("Missing node refs in ways: ") {
-            decimal(rest).is_some_and(|n| set_once(&mut counts.nodes_in_ways, n))
+            distinct_and_references(rest).is_some_and(|(d, r)| {
+                set_once(&mut counts.nodes_in_ways_distinct, d)
+                    && set_once(&mut counts.nodes_in_ways, r)
+            })
         } else if let Some(rest) = line.strip_prefix("Missing node members in relations: ") {
             decimal(rest).is_some_and(|n| set_once(&mut counts.nodes_in_relations, n))
         } else if let Some(rest) = line.strip_prefix("Missing way refs in relations: ") {
             decimal(rest).is_some_and(|n| set_once(&mut counts.ways_in_relations, n))
         } else if let Some(rest) = line.strip_prefix("Missing relation members: ") {
-            let (distinct, refs) = match rest.split_once(" (") {
-                Some((distinct, refs)) => (distinct, refs.strip_suffix(" references)")),
-                None => (rest, Some(rest)),
-            };
-            match (decimal(distinct), refs.and_then(decimal)) {
-                (Some(d), Some(r)) => {
-                    set_once(&mut counts.relations_distinct, d)
-                        && set_once(&mut counts.relations_in_relations, r)
-                }
-                _ => false,
-            }
+            distinct_and_references(rest).is_some_and(|(d, r)| {
+                set_once(&mut counts.relations_distinct, d)
+                    && set_once(&mut counts.relations_in_relations, r)
+            })
         } else {
             false
         };
@@ -185,6 +191,25 @@ fn parse_pbfhogg(text: &str) -> CheckRefCounts {
         }
     }
     counts
+}
+
+/// The `(distinct, references)` of a class count printed as `N` or as
+/// `N (M references)`. pbfhogg prints the suffix only when the occurrences
+/// exceed the distinct IDs, so a bare `N` is `(N, N)` and the suffixed form
+/// requires `M > N`; a class line is printed only for a positive count.
+fn distinct_and_references(rest: &str) -> Option<(u64, u64)> {
+    let (d, r) = match rest.split_once(" (") {
+        Some((distinct, refs)) => {
+            let d = decimal(distinct)?;
+            let r = decimal(refs.strip_suffix(" references)")?)?;
+            (r > d).then_some((d, r))?
+        }
+        None => {
+            let n = decimal(rest)?;
+            (n, n)
+        }
+    };
+    (d > 0).then_some((d, r))
 }
 
 /// A plain decimal count.
@@ -627,6 +652,52 @@ Referential integrity: FAILED (13 missing references)
             pbfhogg_with_relations(&parse_pbfhogg(text)),
             Some([3, 0, 10, 0])
         );
+    }
+
+    #[test]
+    fn node_refs_in_ways_compare_their_occurrences() {
+        // One missing node referenced by two ways: pbfhogg's distinct 1 is
+        // the total's, its 2 references are osmium's "Nodes in ways missing".
+        let ways_only = "\
+Missing node refs in ways: 1 (2 references)
+Referential integrity: FAILED (1 missing references)
+";
+        assert_eq!(pbfhogg_ways_only(&parse_pbfhogg(ways_only)), Some(2));
+        let with_relations = "\
+Missing node refs in ways: 1 (2 references)
+Missing relation members: 2 (3 references)
+Referential integrity: FAILED (3 missing references)
+";
+        assert_eq!(
+            pbfhogg_with_relations(&parse_pbfhogg(with_relations)),
+            Some([2, 0, 0, 3])
+        );
+        // The total sums the distinct count, never the occurrences.
+        let by_refs = "\
+Missing node refs in ways: 1 (2 references)
+Referential integrity: FAILED (2 missing references)
+";
+        assert_eq!(pbfhogg_ways_only(&parse_pbfhogg(by_refs)), None);
+        assert_eq!(pbfhogg_with_relations(&parse_pbfhogg(by_refs)), None);
+        // Occurrences are printed only above the distinct count, and a class
+        // line only for a positive count.
+        for text in [
+            "Missing node refs in ways: 2 (2 references)\nReferential integrity: FAILED (2 \
+             missing references)\n",
+            "Missing node refs in ways: 5 (3 references)\nReferential integrity: FAILED (5 \
+             missing references)\n",
+            "Missing relation members: 5 (3 references)\nReferential integrity: FAILED (5 \
+             missing references)\n",
+            "Missing node refs in ways: 0\nReferential integrity: FAILED (0 missing \
+             references)\n",
+            "Missing node refs in ways: 1 (2 refs)\nReferential integrity: FAILED (1 \
+             missing references)\n",
+        ] {
+            let c = parse_pbfhogg(text);
+            assert!(c.malformed, "{text}");
+            assert_eq!(pbfhogg_ways_only(&c), None, "{text}");
+            assert_eq!(pbfhogg_with_relations(&c), None, "{text}");
+        }
     }
 
     #[test]

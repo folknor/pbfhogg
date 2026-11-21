@@ -294,6 +294,10 @@ fn check_refs_counts_unique_missing_ids_per_category_across_blobs() {
     let report = run_check_refs(&path, true, Some(0)).expect("check_refs");
     assert_eq!(report.missing_node_refs, 3, "n5, n6 and n7, each once");
     assert_eq!(
+        report.missing_node_ref_occurrences, 5,
+        "every way ref to a missing node, as osmium counts them"
+    );
+    assert_eq!(
         report.missing_node_members, 1,
         "n5 again, in its own category"
     );
@@ -1111,6 +1115,10 @@ fn check_refs_judges_an_unindexed_file_as_its_indexed_twin_in_any_order() {
                     counters.get("checkrefs_missing_node_refs_occurrences"),
                     2,
                     "{what}: n99 twice, counted once per occurrence"
+                );
+                assert_eq!(
+                    report.missing_node_ref_occurrences, 2,
+                    "{what}: the report carries the same occurrences"
                 );
             }
         }

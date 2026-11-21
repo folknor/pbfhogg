@@ -320,6 +320,15 @@
 
 ### Added
 
+- **Occurrence count for missing node refs in ways.** `check --refs`
+  appends the number of way node refs to missing nodes when it exceeds
+  the distinct missing IDs (`Missing node refs in ways: 1 (2
+  references)`), as it already did for relation members, and JSON adds
+  `missing_node_ref_occurrences` (library:
+  `RefCheckResult::missing_node_ref_occurrences`). That is the figure
+  `osmium check-refs` prints as `Nodes in ways missing`; before, it could
+  not be recovered from pbfhogg's output.
+
 - **`has_negative_ids` report fields.** The ID check reports whether
   any element ID of a selected kind is negative (`has_negative_ids` in
   `check --ids --json`, a `Negative IDs:` line in its text, and the

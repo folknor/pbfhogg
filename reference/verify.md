@@ -49,7 +49,19 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   `-f pbf,locations_on_ways=true` when the input declares it, and every
   osmium output or sorted copy written with that option must declare it (a
   verifier error otherwise), so a kept declaration is compared coordinate
-  by coordinate.
+  by coordinate. The option follows the declaration, not the payload, in
+  cat, sort, `getid --invert` and `cat --dedupe` on purpose. Lat/lon arrays
+  an input carries without declaring them are not content these commands
+  promise: a blob copied whole keeps them as bytes, a re-encoded way drops
+  them (cat's rebuild of an unclassifiable blob keeps them). pbfhogg never
+  declares them on such an input, so `Policy::between` reads no coordinates
+  whatever option the reference got, and no false failure is possible.
+  `cat --dedupe` still holds every passthrough blob byte for byte to the
+  operand it was fed, arrays included. Asking osmium for the arrays by
+  payload instead would be wrong there: a derived operand then declares
+  `LocationsOnWays`, a merge of two such operands correctly keeps it, and
+  the judge, which holds the merge to the undeclared input, would fail a
+  correct output.
 - **The field policies are held to real data** by `field-policies`, the
   first check of the suite, which runs no pbfhogg. On a slice of the input
   built by osmium (the first IDs of each kind's first data blob, `getid -r`

@@ -21,7 +21,10 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     // The reference keeps the input's inline coordinates when it declares
     // them (osmium writes them only when asked), so a kept declaration is
     // compared coordinate by coordinate rather than switching the comparison
-    // to one without them.
+    // to one without them. Lat/lon arrays without the declaration are not
+    // content pbfhogg promises (copied blobs keep them as bytes), and its
+    // output never declares them, so the comparison reads no coordinates
+    // there whatever option the reference got.
     let declares = crate::pbf_frames::header(pbf)?.optional_feature("LocationsOnWays");
     let locations = if crate::pbf_frames::first_data_blob_indexed(pbf)? {
         WayLocations::Kept

@@ -409,17 +409,3 @@ The comment describes selection without metadata or header checks.
 `compare_outputs` compares metadata and checks sort features on the sorted
 path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
 keep those checks when batching requests.
-
-## TOOL-045 - other verifier references pick way coordinates from the header flag
-
-Reported by: the repack and degrade reference rewrite.
-
-repack and degrade now judge coordinates from osmium's decoding of the
-input, never from the `LocationsOnWays` declaration. The same header-gated
-choice of `-f pbf,locations_on_ways=true` remains in `checks/sort.rs`,
-`checks/cat.rs`, `checks/getid_removeid.rs` and `checks/cat_dedupe.rs`. On an
-input whose ways carry lat/lon arrays without the declaration, pbfhogg cat
-carries them by payload presence while the osmium reference written without
-the option drops them, so the comparison may fail a correct output or, under
-a policy blind to coordinates, see nothing. Settle per command what pbfhogg
-does with undeclared arrays, then derive each reference's option from that.

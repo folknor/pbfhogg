@@ -295,6 +295,9 @@ impl Invert<'_> {
             invert_way_locations(ids),
         )?;
 
+        // The declaration, not payload arrays: undeclared arrays are not
+        // content pbfhogg promises and its output never declares them, so
+        // the comparison reads no coordinates there whatever osmium wrote.
         let declares = crate::pbf_frames::header(self.pbf)?.optional_feature("LocationsOnWays");
         let theirs = self.outdir.join(format!("osmium-{name}.osm.pbf"));
         let mut run = ToolRun::osmium("removeid.1")

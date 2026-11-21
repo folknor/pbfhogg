@@ -41,6 +41,10 @@ fn osmium_sort_as(
     sink: &Path,
     multipass: bool,
 ) -> Result<(), Error> {
+    // Gated on the declaration, never on payload arrays: undeclared arrays
+    // are not content pbfhogg promises, and its output never declares them,
+    // so Policy::between reads no coordinates on such an input whatever
+    // option the copy got (reference/verify.md, "Element equality").
     let locations = crate::pbf_frames::header(input)?.optional_feature("LocationsOnWays");
     let mut run = ToolRun::osmium("sort.1").arg("sort").input(input);
     if multipass {

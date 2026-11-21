@@ -94,6 +94,12 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
              ID order (a repeated ID or a disorder), outside the domain this check judges",
         ));
     }
+    // The derived operands ask osmium for inline coordinates by the input's
+    // declaration, never by payload arrays: an operand asked for them on an
+    // undeclared input would declare LocationsOnWays, a merge of two such
+    // operands would correctly keep it, and the judge, holding the merge to
+    // the undeclared input, would fail a correct output. Passthrough blobs
+    // are still held byte for byte to the operand fed, arrays included.
     let locations = header.optional_feature("LocationsOnWays");
     let input = dedupe_plan::entries(pbf)?;
     let a: Operand<'_> = (pbf, &input);

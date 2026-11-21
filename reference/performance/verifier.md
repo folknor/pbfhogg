@@ -33,6 +33,24 @@ order B, A, A, B:
   likely accounts for the merge being slower than A's file merge; the cold
   path was not A/B-measured.
 
+### diff --format osc: both derives in one launch group
+
+A = cefb81c6, B = cefb81c6 plus the change that strips both inputs as one
+group, then runs the indexed and unindexed `diff --format osc` together,
+holding the strips' and the unindexed derive's outcome to the parity
+verdict, and drops the informational `osmium fileinfo`. Warm summaries
+(one B warm-up, 17.6 s, not counted), order B, A, A, B:
+
+- Check wall B 17.5 / A 18.3 / A 18.3 / B 17.3 s, -4.4 and -5.5 %.
+- `pbfhogg diff` (2 runs) 15.3-15.5 s against 16.2-16.3 s: the unindexed
+  derive is most of it, so the overlap hides only the indexed derive's
+  second or two. The earlier estimate of "up to about 8 s" assumed the
+  two derives took about equal time; they do not.
+- A first shape, grouping the strips with the indexed derive and the
+  unindexed derive with pbfhogg's roundtrip apply (under 1 s), measured
+  B 18.2 / A 19.4 / A 18.3 s against the same A: within noise, not landed.
+- Verdict: pays, modestly.
+
 ## History
 
 ### Launch groups (2026-11-21)

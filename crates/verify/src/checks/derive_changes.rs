@@ -8,6 +8,7 @@ use crate::error::Error;
 use crate::harness::{Harness, Role, Verdict};
 use crate::opl_compare::{self, Policy};
 use crate::osc;
+use crate::process::Ended;
 use crate::reference::ToolRun;
 use crate::verify_input_order;
 
@@ -76,15 +77,63 @@ pub fn run(
     )?;
     harness.require_success(&captured, "pbfhogg apply-changes")?;
 
-    // Step 2: Derive changes with both tools.
+    // Step 2: Derive changes with both tools. The two pbfhogg derives, the
+    // indexed one and its rerun on the pair stripped of indexdata, take
+    // about the same time and read only settled files, so they run as one
+    // launch group after the strips, a group of their own. Only the indexed
+    // derive is judged here. The strips' outcome and the unindexed derive's
+    // exit are held to the parity point at the end, where they were judged
+    // when they ran last, so their failure cannot suppress the roundtrip
+    // findings; with a failed strip the unindexed derive is not launched. A
+    // group abort (a failed start, an overflow, an adoption, a moved input)
+    // still ends the check where it happens.
     let pbfhogg_osc = outdir.join("pbfhogg.osc.gz");
+    let old_raw = outdir.join("old-unindexed.osm.pbf");
+    let new_raw = outdir.join("new-unindexed.osm.pbf");
+    let raw_osc = outdir.join("pbfhogg-unindexed.osc.gz");
 
-    harness.msg("--- pbfhogg diff --format osc ---");
-    let captured = harness.pbfhogg_discard(osc_diff(pbf, &new_pbf, &pbfhogg_osc, direct_io))?;
+    harness.msg("--- stripping indexdata from old and new ---");
+    let mut ended = harness
+        .pbfhogg_group(vec![
+            (strip(pbf, &old_raw), outdir.join("old-unindexed.stdout")),
+            (
+                strip(&new_pbf, &new_raw),
+                outdir.join("new-unindexed.stdout"),
+            ),
+        ])?
+        .into_iter();
+    let mut next = || {
+        ended
+            .next()
+            .ok_or_else(|| Error::tool("a pbfhogg launch group ended short"))
+    };
+    let strip_old = next()?;
+    let strip_new = next()?;
+    // Old before new, the order they once ran in.
+    let strips = harness
+        .require_success(&strip_old, "pbfhogg degrade --strip-indexdata")
+        .and_then(|()| harness.require_success(&strip_new, "pbfhogg degrade --strip-indexdata"));
+
+    harness.msg("--- pbfhogg diff --format osc, indexed and unindexed inputs ---");
+    let mut launches = vec![(
+        osc_diff(pbf, &new_pbf, &pbfhogg_osc, direct_io),
+        outdir.join("pbfhogg-osc.stdout"),
+    )];
+    if strips.is_ok() {
+        launches.push((
+            osc_diff(&old_raw, &new_raw, &raw_osc, direct_io),
+            outdir.join("pbfhogg-unindexed-osc.stdout"),
+        ));
+    }
+    let mut ended = harness.pbfhogg_group(launches)?.into_iter();
+    let captured = ended
+        .next()
+        .ok_or_else(|| Error::tool("a pbfhogg launch group ended short"))?;
+    let raw_derive = strips.map(|()| ended.next());
     // Like a text diff, it exits 1 when the inputs differ - the normal case
     // here - and still writes its OSC; 2 and above are real failures.
     harness.require_codes(&captured, "pbfhogg diff --format osc", &[0, 1])?;
-    // The unindexed rerun below matches this OSC whichever engine either run
+    // The unindexed rerun matches this OSC whichever engine either run
     // took, so each run's route is judged from its own diagnostics.
     diff_summary::record_fallback_note(
         harness,
@@ -161,9 +210,6 @@ pub fn run(
         &outdir.join("osmium-cross-roundtrip.stdout"),
     )?;
     harness.require_success(&captured, "osmium apply-changes (pbfhogg OSC)")?;
-
-    harness.msg("=== element counts ===");
-    harness.print_fileinfo("roundtrip-osmium", &rt_osmium)?;
 
     // Content only: pbfhogg's OSC is content-based by design (metadata and
     // inline way coordinates are not content), so an object whose version
@@ -248,7 +294,9 @@ pub fn run(
         harness.record(&format!("diff {label}"), verdict);
     }
 
-    let parity = unindexed_osc_matches(harness, &outdir, pbf, &new_pbf, &pbfhogg_osc, direct_io)?;
+    let raw_derive =
+        raw_derive?.ok_or_else(|| Error::tool("a pbfhogg launch group ended short"))?;
+    let parity = unindexed_osc_matches(harness, &raw_derive, &raw_osc, &pbfhogg_osc)?;
     harness.record("unindexed OSC vs indexed OSC", parity);
 
     Ok(Some("element-content roundtrips against new and osmium, pbfhogg's OSC applied by both tools; indexed/unindexed OSC decompressed bytes identical; the fallback note confirms which engine the indexdata predicate selects, not engine entry; metadata, visibility and inline coordinates not judged".into()))
@@ -332,8 +380,17 @@ fn refused(
     Ok(claim)
 }
 
-/// Rerun the derive on the same pair stripped of indexdata and require the
-/// indexed run's OSC exactly.
+/// `pbfhogg degrade --strip-indexdata INPUT -o OUTPUT`, buffered: it builds
+/// an unindexed comparison input.
+fn strip(input: &Path, output: &Path) -> PbfArgv {
+    PbfArgv::new("degrade")
+        .arg("--strip-indexdata")
+        .input(input)
+        .output(output)
+}
+
+/// Judge the derive rerun on the same pair stripped of indexdata, requiring
+/// the indexed run's OSC exactly.
 ///
 /// pbfhogg diff has a separate code path for inputs without indexdata, meant
 /// to write the same OSC, full metadata included. apply-changes refuses an
@@ -343,23 +400,12 @@ fn refused(
 /// to osmium too.
 fn unindexed_osc_matches(
     harness: &mut Harness,
-    outdir: &Path,
-    old: &Path,
-    new: &Path,
+    captured: &Ended,
+    raw_osc: &Path,
     indexed_osc: &Path,
-    direct_io: bool,
 ) -> Result<Verdict, Error> {
-    let old_raw = outdir.join("old-unindexed.osm.pbf");
-    let new_raw = outdir.join("new-unindexed.osm.pbf");
-    harness.msg("--- stripping indexdata from old and new ---");
-    harness.strip_indexdata(old, &old_raw)?;
-    harness.strip_indexdata(new, &new_raw)?;
-
-    let raw_osc = outdir.join("pbfhogg-unindexed.osc.gz");
-    harness.msg("--- pbfhogg diff --format osc (unindexed inputs) ---");
-    let captured = harness.pbfhogg_discard(osc_diff(&old_raw, &new_raw, &raw_osc, direct_io))?;
     harness.require_codes(
-        &captured,
+        captured,
         "pbfhogg diff --format osc (unindexed inputs)",
         &[0, 1],
     )?;
@@ -371,7 +417,7 @@ fn unindexed_osc_matches(
     );
 
     harness.msg("=== diff: unindexed OSC vs indexed OSC ===");
-    match osc::first_content_difference(&raw_osc, indexed_osc)? {
+    match osc::first_content_difference(raw_osc, indexed_osc)? {
         None => {
             harness.msg("  PASS (identical content)");
             Ok(Verdict::Pass)

@@ -196,8 +196,9 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   verdict.
   `osmium fileinfo -e` cannot serve here, since it refuses a file whose ways
   lack their nodes, as every way-only or filtered output does; it still
-  reads whole inputs for check-ids, repack and degrade, and derive-changes
-  prints it for context. apply-changes does not run it.
+  reads whole inputs for check-ids, repack and degrade. apply-changes and
+  derive-changes do not run it: their strict comparisons already judge
+  order and count.
 - **Header claims** (`Sort.Type_then_ID` and `LocationsOnWays` among the
   optional features, and the sort feature in either list) are read by the
   verifier's own `OSMHeader` reader (`pbf_frames::header`).
@@ -282,8 +283,14 @@ child subreaper; stop signals (SIGTERM, SIGINT, SIGHUP) arrive on a signalfd
 polled beside each child. Launches run in groups, every member started from
 the one thread; a lone launch is a group of one. Grouped launches are an
 OPL comparison's missing decodes, uncached reference runs, and the
-independent pbfhogg runs of diff and cat --dedupe (at most
-`PBFHOGG_GROUP` per group, each group judged before the next starts). A
+independent pbfhogg runs of diff, diff --format osc and cat --dedupe (at
+most `PBFHOGG_GROUP` per group, each group judged before the next starts;
+in diff --format osc the two strips run together, then the indexed and
+unindexed derives together, or the indexed derive alone when a strip
+failed; the indexed exit is judged at settlement, while the strips' exits
+and the unindexed derive's exit and fallback note are judged at the parity
+verdict, after the roundtrip verdicts; a group abort is raised at the group
+boundary). A
 group settles before any
 of its outputs is read or another group starts: every leader's status is
 collected, then any surviving descendant is killed and reaped until none
@@ -470,7 +477,9 @@ artifacts, and a cached reference is listed with its own time; a launch
 group's wall is counted once per label, with every launch in its run
 count, so concurrent decodes and pbfhogg runs show their wall, not their
 sum; in diff, the strips share the indexed diffs' group, so `pbfhogg
-degrade` shows that group's wall), and the verifier's own reading of the OPL decodings: `opl merge`
+degrade` shows that group's wall; in diff --format osc the strips are a
+group of their own and, when both succeed, the indexed and unindexed
+derives share the next), and the verifier's own reading of the OPL decodings: `opl merge`
 for every comparison walk (including the check's per-record work and the
 listing writes it does inside the walk), `opl order scan` for a standalone
 order check, `opl derive model` for the derive-changes model, `opl expected projection`

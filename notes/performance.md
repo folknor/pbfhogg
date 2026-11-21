@@ -1956,7 +1956,8 @@ Risks:
 - Streaming loses the "OPL pair kept on error" property; re-decode on the
   failure path.
 - CPU oversubscription from several osmium pools (`OSMIUM_POOL_THREADS`).
-- Lifecycle concurrency (PERF-066).
+- Lifecycle concurrency (launch groups settle at a barrier; see
+  reference/verify.md "Processes").
 - An extra FULL decode for files only ever compared under CONTENT.
 - renumber's attribution needs paired events even for equal records, and
   degrade needs ordered removal events, so the merge must be exposed, not only
@@ -1995,26 +1996,6 @@ Residue:
   shortcut saves the other side and the merge only.
 
 Kind: orchestration-owned machinery.
-
-## PERF-066 - derive-changes runs its two OSC producers one after the other
-
-Residue of the verifier's launch-group work (landed: barrier-settled launch
-groups, concurrent decodes within a comparison, pbfhogg launch groups in diff
-and cat --dedupe; matched pairs in reference/performance/verifier.md, which
-also records the refusals: grouping cached reference runs, a per-launch
-subreaper shim, and groups in the checks whose runs take a second or two).
-
-What remains: derive-changes' indexed and unindexed OSC producers are
-independent and worth up to about 8 s on denmark. Running them as one
-`Harness::pbfhogg_group` needs the raw-pair preparation errors and the raw
-member's result held until the original parity point, so neither can
-suppress the roundtrip findings. Needs its own matched A/B.
-
-Not planned: running whole checks concurrently (a scheduler over per-check
-contexts, as the hunters proposed). It would need consuming one launch's
-result while unrelated siblings run, which is what the refused shim was for.
-
-Kind: local.
 
 ## PERF-067 - Reference cache retention is by recency, not recompute cost
 
@@ -2175,19 +2156,33 @@ Kind: smaller win.
 
 Reported by: other-codex, other-opus, orchestration-codex, engine-codex.
 
-Mechanism: text diff commissions four comparisons. derive-changes decodes
-`new` three times for pairwise content checks, decodes two roundtrips again to
-compare them to each other, and can make an extra old/new pass for osmium's
-omitted-delete exception. On the production side, each stripped diff arm goes
-through `StreamingBlocks::new_sequential`, where the merge itself drives both
+Narrowed 2026-11-21 on the verifier side. Landed elsewhere since filing:
+the order checks are folded into the first derive pair, each file is
+decoded once per run (the in-run store), warm runs decide all four derive
+pairs from summaries with no decode or merge, and the pbfhogg runs of both
+checks run in launch groups (derive-changes' two derives together; warm
+denmark B A A B 17.5 / 18.3 / 18.3 / 17.3 s in
+reference/performance/verifier.md). Warm, derive-changes' cost is its
+unindexed derive (about 15 s of the 17 s); the indexed one takes a second
+or two.
+
+Residue, verifier side (cold only, unmeasured): a 4-way walk over `new`
+and the three roundtrips would save three of the four merge read passes,
+and on a host where the store evicts idle decodings under
+`DECODING_BUDGET` (germany scale) also repeat decodes, at the price of
+four live OPL files at once. It must keep each pair's error, judged-order
+and listing behaviour when a cursor steps down. Streaming the text diff's
+old/new merge into the listing judge saves only the write and reread of a
+change-set-sized listing. The omission exception from cursors touches a
+failure path unreachable on the configured datasets. Take none of these
+without a cold phase split showing material cost.
+
+On the production side, each stripped diff arm goes through
+`StreamingBlocks::new_sequential`, where the merge itself drives both
 decoders.
 
 Redesigns:
 
-- Verifier side: stream an independent old/new merge into the text-listing
-  judge. Feed `new` and the three roundtrips into one multiway comparison that
-  produces all four pair verdicts, including when several fail. Compute the
-  omission exception from the old-only record and the next key in `new`.
 - Production side (other-codex): a bounded parallel reader deriving kind,
   count, order and key ranges from the actual payloads (`BlockBuffer::project`,
   `KindIds`, the ordered project workers). Compare byte-identical ranges once

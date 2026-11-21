@@ -128,6 +128,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
                 "",
                 "roundtrip",
                 "roundtrip-metadata",
+                "roundtrip-strip",
+                "roundtrip-raw-exit",
                 "raw-osc",
                 "kind-change",
                 "kind-change-extra",
@@ -235,6 +237,12 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
         // derive-changes: a broken roundtrip fails both roundtrip arms and
         // nothing else, a raw OSC only the index comparison, a published
         // refusal each side once.
+        // A strip or unindexed derive failing in the same run as a broken
+        // roundtrip: the unindexed side runs early in launch groups, but its
+        // failure is raised only after the roundtrip findings are recorded.
+        ("osc", "roundtrip-strip" | "roundtrip-raw-exit") => {
+            assert_unindexed_failure_after_roundtrips(fault, judged);
+        }
         ("osc", _) => {
             assert_eq!(judged.error, None, "{judged:?}");
             match fault {
@@ -285,6 +293,41 @@ fn assert_judged(check: &str, fault: &str, judged: &super::Judged) {
         }
         _ => {}
     }
+}
+
+/// The roundtrip findings recorded, then the held unindexed-side error.
+fn assert_unindexed_failure_after_roundtrips(fault: &str, judged: &super::Judged) {
+    assert_eq!(
+        judged.failed,
+        [
+            "diff pbfhogg roundtrip vs new",
+            "diff pbfhogg roundtrip vs osmium roundtrip"
+        ],
+        "{judged:?}"
+    );
+    let program = if fault == "roundtrip-strip" {
+        "pbfhogg degrade --strip-indexdata failed"
+    } else {
+        "pbfhogg diff --format osc (unindexed inputs) failed"
+    };
+    assert!(
+        judged.error.as_deref().is_some_and(|e| e.contains(program)),
+        "{judged:?}"
+    );
+}
+
+/// The faults under which pbfhogg's own roundtrip is wrong.
+const BROKEN_ROUNDTRIP: [&str; 3] = ["roundtrip", "roundtrip-strip", "roundtrip-raw-exit"];
+
+/// The strip of new refused under the `roundtrip-strip` fault.
+fn strip_refused(subcommand: &str, fault: &str, output: &str) -> bool {
+    let refused = subcommand == "degrade"
+        && fault == "roundtrip-strip"
+        && output.ends_with("new-unindexed.osm.pbf");
+    if refused {
+        eprintln!("strip refused");
+    }
+    refused
 }
 
 pub fn tool(args: &[OsString]) -> i32 {
@@ -348,11 +391,14 @@ pub fn tool(args: &[OsString]) -> i32 {
                 );
                 assert!(!args.contains(&"--tmp-dir"));
             }
+            if strip_refused(args[0], &fault, output) {
+                return 2;
+            }
             if args[0] == "derive-changes" {
                 std::fs::write(output, "<osmChange/>").unwrap();
             } else {
                 let roundtrip = output.ends_with("roundtrip-pbfhogg.osm.pbf");
-                let broken = fault == "roundtrip" && roundtrip;
+                let broken = roundtrip && BROKEN_ROUNDTRIP.contains(&fault.as_str());
                 // An OSC carries no metadata the roundtrip could keep, so
                 // a version-only change of the roundtrip must pass.
                 let versioned = fault == "roundtrip-metadata" && roundtrip;
@@ -438,6 +484,12 @@ fn diff_tool(args: &[&str], fault: &str, check: &str) -> i32 {
     // pbfhogg's note on an unindexed pair at more than one worker; the route
     // fault prints it on the indexed pair instead, outputs unchanged.
     let raw = args.iter().any(|a| a.contains("unindexed.osm.pbf"));
+    // A failed strip must keep the unindexed derive from launching at all.
+    assert!(!(raw && fault == "roundtrip-strip"), "{args:?}");
+    if osc && raw && fault == "roundtrip-raw-exit" {
+        eprintln!("raw derive failed");
+        return 2;
+    }
     if raw != (fault == "route") {
         eprintln!("Note: Using sequential comparison: missing indexdata");
     }

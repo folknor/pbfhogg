@@ -17,7 +17,6 @@ use crate::output::{self, Detail};
 use crate::process::{Ended, Launch, Lifecycle};
 use crate::reference::{ToolRun, Tools};
 use crate::run::Run;
-use crate::verify_fileinfo::{self, FileInfo};
 use crate::{pbf_frames, stream, tunables};
 
 /// The outcome of one comparison inside a check.
@@ -579,33 +578,6 @@ impl Harness {
             ended.status,
             ended.stderr_text().trim()
         )))
-    }
-
-    /// osmium's reading of `pbf` (`osmium fileinfo -e`), its report beside
-    /// it; counts and order go into the detail.
-    pub(crate) fn fileinfo(&mut self, pbf: &Path) -> Result<FileInfo, Error> {
-        // A file read twice in one check gets a fresh reading each time:
-        // reference placement refuses an existing name, so a repeated read
-        // needs the old report gone. Kept deliberately over a fresh path per
-        // call, which would only leave more scratch behind.
-        let report = pbf.with_extension("fileinfo.json");
-        match std::fs::remove_file(&report) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        verify_fileinfo::fileinfo(self, pbf, &report)
-    }
-
-    /// Print osmium's counts and order of `pbf` for context. A failed read
-    /// is printed, not propagated (informational); an interrupt still is.
-    pub(crate) fn print_fileinfo(&mut self, label: &str, pbf: &Path) -> Result<(), Error> {
-        match self.fileinfo(pbf) {
-            Ok(_) => {}
-            Err(e @ (Error::Interrupted | Error::Unsettled(_))) => return Err(e),
-            Err(e) => self.msg(&format!("osmium fileinfo failed for {label}: {e}")),
-        }
-        Ok(())
     }
 
     /// Compare the elements of `a` and `b` as osmium decodes them, under

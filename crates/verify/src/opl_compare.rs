@@ -196,7 +196,21 @@ pub(crate) fn compare_sequence(
     policy: Policy,
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
-    walk(harness, first, second, listing, policy, false, each, |_| {})
+    compare_sequence_paired(harness, first, second, listing, policy, each, |_| {})
+}
+
+/// [`compare_sequence`], also handing every paired identity, alike or not,
+/// to `paired` in walk order with both records.
+pub(crate) fn compare_sequence_paired(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+    paired: impl FnMut(Pair<'_>),
+) -> Result<Merged, Error> {
+    walk(harness, first, second, listing, policy, false, each, paired)
 }
 
 /// [`compare`], also handing every paired identity, alike or not, to

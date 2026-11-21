@@ -15,8 +15,11 @@
 //!   each input blob re-encoded alone ([`split`]).
 //! - `--drop-ids`: exactly N objects removed, nothing added or changed, each
 //!   removed object's line a `-` alone; the layout predicted with each input
-//!   blob's survivors. Run twice with one seed (the outputs identical) and
-//!   once with another (held to the same checks). Which N objects go is not
+//!   blob's survivors. Run twice with one seed and once with another (held
+//!   to the same checks). The two same-seed runs must both write or both be
+//!   refused; written, they are byte-identical or else decode to the same
+//!   OPL sequence with the second held to the header, indexdata, blob and
+//!   layout checks on its own ([`judge_repeat`]). Which N objects go is not
 //!   checked against pbfhogg's selection, which is not documented, and
 //!   whether another seed chose another set is coverage, never a verdict.
 //! - `--unsort`: the comparison finds exactly one object moved per kind with
@@ -34,7 +37,8 @@
 //! On a `LocationsOnWays` input every case strips way coordinates (the
 //! decode path drops them whatever the flags), and the check first holds
 //! osmium's reading of the input with coordinates against the reference
-//! without them, to establish that some way carried one. [`run`] takes any
+//! without them, to establish that some way carried one and that the two
+//! differ in nothing else ([`observed_coordinates`]). [`run`] takes any
 //! input and names an input without coordinates as a gap;
 //! [`run_locations`] (the suite's `degrade -l` on the `altw-keep-untagged`
 //! base, or `--locations-on-ways`) fails on one instead.
@@ -50,6 +54,7 @@ use std::path::{Path, PathBuf};
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
+use crate::opl_compare::{self, Policy};
 use crate::verify_reencode::{
     self as reencode, Compared, DEFAULT_CAP, Input, KINDS, LayoutCheck, Listing, Ran, References,
     continuous, split,
@@ -254,11 +259,15 @@ fn run_on(
 }
 
 /// Whether any way in a `LocationsOnWays` input carries inline coordinates:
-/// the reference that keeps them compared with the one that drops them (the
-/// same stable partition when osmium reads the input out of order, so only
-/// the coordinates differ). Any unmatched object means the two references
-/// are not one sequence, an error; the differing records are the objects
-/// whose OPL line, way coordinates included, changed.
+/// osmium's reference that keeps them compared, pair by pair, with the one
+/// that drops them (the same stable partition when osmium reads the input
+/// out of order). Every way of the reference without them must carry no
+/// defined coordinate, since every case is judged against it; a pair may
+/// differ only as a way whose lines agree once each node ref is cut at its
+/// coordinate ([`way_coordinates`]), and such a way is the witness only
+/// when the side with coordinates defines one. An unmatched object, or a
+/// pair differing in anything else (a tag, metadata, a ref), means the two
+/// references are not the same objects, an error.
 fn observed_coordinates(
     harness: &mut Harness,
     outdir: &Path,
@@ -267,8 +276,41 @@ fn observed_coordinates(
 ) -> Result<bool, Error> {
     harness.msg("--- degrade: way coordinates in the input (OPL comparison) ---");
     let with = refs.get(harness, true)?;
-    let compared = reencode::compare(harness, outdir, "coordinates", &with, without)?;
-    let s = compared.merged;
+    let listing = outdir.join("coordinates.diff.opl");
+    let mut lost = 0u64;
+    let mut wrong: Option<String> = None;
+    let s = opl_compare::compare_sequence_paired(
+        harness,
+        &with,
+        without,
+        &listing,
+        Policy::FULL,
+        |_| {},
+        |pair| {
+            if wrong.is_some() {
+                return;
+            }
+            let name = KINDS[pair.kind];
+            if pair.kind != 1 {
+                if pair.first != pair.second {
+                    wrong = Some(format!("{name}{} differs between them", pair.id));
+                }
+                return;
+            }
+            let (kept, defined) = way_coordinates(pair.first);
+            let (dropped, stray) = way_coordinates(pair.second);
+            if stray != 0 {
+                wrong = Some(format!(
+                    "{name}{} keeps {stray} defined coordinates in the reference without them",
+                    pair.id
+                ));
+            } else if kept != dropped {
+                wrong = Some(format!("{name}{} differs beyond its coordinates", pair.id));
+            } else if defined != 0 {
+                lost += 1;
+            }
+        },
+    )?;
     if s.first_only != 0 || s.second_only != 0 {
         return Err(Error::Failed(format!(
             "the references with and without way coordinates differ beyond coordinates: \
@@ -276,11 +318,51 @@ fn observed_coordinates(
             s.first_only, s.second_only
         )));
     }
+    if let Some(why) = wrong {
+        return Err(Error::Failed(format!(
+            "the references with and without way coordinates differ beyond coordinates: {why}"
+        )));
+    }
     harness.msg(&format!(
-        "  {} objects carry way coordinates the reference without them lost",
-        s.differs
+        "  {lost} ways carry coordinates the reference without them lost"
     ));
-    Ok(s.differs > 0)
+    Ok(lost > 0)
+}
+
+/// An OPL way line (osmium's writer with `locations_on_ways=true`) with each
+/// node ref of its `N` field cut at its `x`, and how many of those refs
+/// define a coordinate. libosmium writes every ref as `n<id>x<lon>y<lat>`,
+/// or `n<id>xy` when undefined; the ID is a signed decimal, so the first `x`
+/// is the separator. Fields are split on the raw space: OPL escapes a space
+/// inside a tag, user or role, and only the way's node list is prefixed `N`.
+fn way_coordinates(line: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(line.len());
+    let mut defined = 0;
+    for (i, field) in line.split(|&b| b == b' ').enumerate() {
+        if i != 0 {
+            out.push(b' ');
+        }
+        let Some(refs) = field.strip_prefix(b"N") else {
+            out.extend_from_slice(field);
+            continue;
+        };
+        out.push(b'N');
+        for (j, node) in refs.split(|&b| b == b',').enumerate() {
+            if j != 0 {
+                out.push(b',');
+            }
+            match node.iter().position(|&b| b == b'x') {
+                Some(x) => {
+                    out.extend_from_slice(&node[..x]);
+                    if &node[x + 1..] != b"y" {
+                        defined += 1;
+                    }
+                }
+                None => out.extend_from_slice(node),
+            }
+        }
+    }
+    (out, defined)
 }
 
 fn strip_locations(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
@@ -305,26 +387,39 @@ fn strip_locations(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// The three drops (seed a twice, seed b once). Every written output is
+/// judged whatever the others did: a refusal as too large skips only its
+/// own run's checks.
 fn drop_ids(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
     let total = run.input.total();
     let n = MAX_DROP.min(total / 4);
-    let mut outputs = Vec::new();
-    for (stem, seed) in [
+    let mut outputs: [Option<PathBuf>; 3] = [None, None, None];
+    for (slot, (stem, seed)) in outputs.iter_mut().zip([
         ("drop-a", SEEDS[0]),
         ("drop-a-again", SEEDS[0]),
         ("drop-b", SEEDS[1]),
-    ] {
+    ]) {
         run.harness
             .msg(&format!("--- degrade --drop-ids {n}:{seed} ---"));
         let spec = format!("{n}:{seed}");
-        let Some(out) = run.degrade(stem, &["--drop-ids", &spec])? else {
-            return Ok(());
-        };
-        outputs.push((stem, seed, out));
+        *slot = run.degrade(stem, &["--drop-ids", &spec])?;
     }
     let mut removed_per_kind = [0u64; 3];
-    for (stem, seed, out) in [&outputs[0], &outputs[2]] {
-        let label = format!("degrade --drop-ids {n}:{seed}");
+    let mut listing_a = None;
+    // A refused first run leaves the second, if written, judged in its place.
+    let (first, first_stem, first_suffix) = if outputs[0].is_some() {
+        (0, "drop-a", "")
+    } else {
+        (1, "drop-a-again", " second run")
+    };
+    for (index, stem, seed, suffix) in [
+        (first, first_stem, SEEDS[0], first_suffix),
+        (2, "drop-b", SEEDS[1], ""),
+    ] {
+        let Some(out) = &outputs[index] else {
+            continue;
+        };
+        let label = format!("degrade --drop-ids {n}:{seed}{suffix}");
         let compared = reencode::compare(run.harness, &run.outdir, stem, reference, out)?;
         let per_kind = judge_drop(run, &label, &compared, n, total)?;
         for (most, removed) in removed_per_kind.iter_mut().zip(per_kind) {
@@ -335,49 +430,142 @@ fn drop_ids(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
             let mismatch = predict_drop(&run.input.path, &compared.listing, out)?;
             reencode::record_layout(run.harness, &label, mismatch);
         }
+        if index == 0 {
+            // The repeat's layout is predicted from the first run's removals.
+            listing_a = Some(compared.listing);
+        }
     }
-    let again = reencode::compare(
-        run.harness,
-        &run.outdir,
-        "drop-a-vs-again",
-        &outputs[0].2,
-        &outputs[1].2,
+    judge_repeat(
+        run,
+        n,
+        outputs[0].as_deref(),
+        outputs[1].as_deref(),
+        listing_a.as_deref(),
     )?;
-    let same = again.identical();
-    run.harness.msg(&format!(
-        "  degrade --drop-ids {n}:{}: a second run {} {}",
-        SEEDS[0],
-        if same {
-            "removed the same objects"
-        } else {
-            "differs"
-        },
-        if same { "PASS" } else { "FAIL" }
-    ));
-    run.harness.record(
-        &format!("degrade --drop-ids {n}:{} repeatable", SEEDS[0]),
-        Verdict::from_pass(same),
-    );
-    let seeds = reencode::compare(
-        run.harness,
-        &run.outdir,
-        "drop-a-vs-b",
-        &outputs[0].2,
-        &outputs[2].2,
-    )?;
-    if seeds.identical() {
-        run.gaps.push(format!(
-            "--drop-ids seeds {} and {} removed the same set",
-            SEEDS[0], SEEDS[1]
-        ));
+    if let (Some(a), Some(b)) = (&outputs[0], &outputs[2]) {
+        let seeds = reencode::compare(run.harness, &run.outdir, "drop-a-vs-b", a, b)?;
+        if seeds.identical() {
+            run.gaps.push(format!(
+                "--drop-ids seeds {} and {} removed the same set",
+                SEEDS[0], SEEDS[1]
+            ));
+        }
     }
-    for (kind, removed) in removed_per_kind.iter().enumerate() {
-        if *removed == 0 && run.input.info.counts[kind] > 0 {
-            run.gaps
-                .push(format!("--drop-ids removed no {}", KINDS[kind]));
+    if outputs.iter().any(Option::is_some) {
+        for (kind, removed) in removed_per_kind.iter().enumerate() {
+            if *removed == 0 && run.input.info.counts[kind] > 0 {
+                run.gaps
+                    .push(format!("--drop-ids removed no {}", KINDS[kind]));
+            }
         }
     }
     Ok(())
+}
+
+/// Whether two runs of `--drop-ids` with one seed agree. Byte-identical
+/// outputs carry every verdict of the first over to the second, with no
+/// decode. Otherwise the two must decode to the same OPL sequence, and the
+/// second, whose header, indexdata and blobs OPL does not see, is held to
+/// the header, indexdata and blob checks the first was; on an indexed input
+/// with the same sequence, `listing_a`, the first's removals, also predicts
+/// its layout, since an identical sequence means the same objects went;
+/// the byte difference is then named, never a verdict, since byte
+/// determinism is not documented. One run written and the other refused is
+/// a failure: the same seed gave different outcomes (the written one was
+/// judged on its own by the caller).
+fn judge_repeat(
+    run: &mut Run<'_>,
+    n: u64,
+    a: Option<&Path>,
+    again: Option<&Path>,
+    listing_a: Option<&Path>,
+) -> Result<(), Error> {
+    let spec = format!("{n}:{}", SEEDS[0]);
+    let verdict = format!("degrade --drop-ids {spec} repeatable");
+    let (a, again) = match (a, again) {
+        (Some(a), Some(again)) => (a, again),
+        (None, None) => {
+            run.gaps.push(format!(
+                "pbfhogg refused both runs of --drop-ids {spec}, so its repeatability was not \
+                 established"
+            ));
+            return Ok(());
+        }
+        (written, _) => {
+            run.harness.msg(&format!(
+                "  degrade --drop-ids {spec}: the {} run was refused as too large and the other \
+                 written FAIL",
+                if written.is_some() { "second" } else { "first" }
+            ));
+            run.harness.record(&verdict, Verdict::from_pass(false));
+            return Ok(());
+        }
+    };
+    if same_bytes(a, again)? {
+        run.harness.msg(&format!(
+            "  degrade --drop-ids {spec}: a second run wrote the same bytes PASS"
+        ));
+        run.harness.record(&verdict, Verdict::from_pass(true));
+        return Ok(());
+    }
+    let compared = reencode::compare(run.harness, &run.outdir, "drop-a-vs-again", a, again)?;
+    let same = compared.identical();
+    run.harness.msg(&format!(
+        "  degrade --drop-ids {spec}: a second run {} {}",
+        if same {
+            "decodes to the same OPL sequence in other bytes"
+        } else {
+            "decodes differently"
+        },
+        if same { "PASS" } else { "FAIL" }
+    ));
+    run.harness.record(&verdict, Verdict::from_pass(same));
+    let label = format!("degrade --drop-ids {spec} second run");
+    run.common(&label, again, run.input.sorted_claim)?;
+    if !same {
+        run.harness.replay_listing(&compared.listing)?;
+        return Ok(());
+    }
+    if run.input.indexed
+        && let Some(listing) = listing_a
+    {
+        let mismatch = predict_drop(&run.input.path, listing, again)?;
+        reencode::record_layout(run.harness, &label, mismatch);
+    }
+    run.gaps.push(format!(
+        "the two runs of --drop-ids {spec} decode to the same OPL sequence but differ in PBF \
+         bytes; the second was held to the structural checks on its own"
+    ));
+    Ok(())
+}
+
+/// Whether two files hold the same bytes.
+fn same_bytes(a: &Path, b: &Path) -> Result<bool, Error> {
+    use std::io::{BufRead, BufReader, Read};
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let mut first = BufReader::new(std::fs::File::open(a)?);
+    let mut second = BufReader::new(std::fs::File::open(b)?);
+    let mut other = Vec::new();
+    loop {
+        let chunk = first.fill_buf()?;
+        if chunk.is_empty() {
+            // Equal lengths at the open; a file grown since differs.
+            return Ok(second.fill_buf()?.is_empty());
+        }
+        let len = chunk.len();
+        other.resize(len, 0);
+        match second.read_exact(&mut other) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        if chunk != other.as_slice() {
+            return Ok(false);
+        }
+        first.consume(len);
+    }
 }
 
 /// Hold one drop's diff to exactly `n` removed objects and nothing else;
@@ -637,4 +825,51 @@ fn place_intra(
         )));
     }
     Ok(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::{same_bytes, way_coordinates};
+
+    #[test]
+    fn a_way_loses_only_its_coordinates() {
+        let (kept, defined) = way_coordinates(
+            b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1x1.5y-2.25,n2xy",
+        );
+        let (dropped, stray) =
+            way_coordinates(b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1xy,n2xy");
+        assert_eq!((defined, stray), (1, 0));
+        assert_eq!(kept, dropped);
+        assert_eq!(
+            kept,
+            b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1,n2".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_tag_or_ref_change_survives_the_cut() {
+        let (a, _) = way_coordinates(b"w1 v1 Ta=b Nn1x1y1");
+        for other in [
+            &b"w1 v1 Ta=c Nn1xy"[..],
+            b"w1 v2 Ta=b Nn1xy",
+            b"w1 v1 Ta=b Nn2xy",
+        ] {
+            assert_ne!(a, way_coordinates(other).0);
+        }
+        assert_eq!(way_coordinates(b"w1 v1 N"), (b"w1 v1 N".to_vec(), 0));
+        assert_eq!(way_coordinates(b"w1 v1 Nn1x0y0").1, 1);
+    }
+
+    #[test]
+    fn same_bytes_compares_content() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
+        std::fs::write(&a, b"abcdef").unwrap();
+        std::fs::write(&b, b"abcdef").unwrap();
+        std::fs::write(&c, b"abcdeg").unwrap();
+        assert!(same_bytes(&a, &b).unwrap());
+        assert!(!same_bytes(&a, &c).unwrap());
+    }
 }

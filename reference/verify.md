@@ -653,8 +653,15 @@ more run, else the PASS line says they did not. `--drop-ids N:SEED`, N the small
 of the objects, must remove exactly N objects and change nothing else (each a
 `-` line alone), its layout predicted from each input blob's survivors (the
 removed IDs counted into the blob whose claimed range holds them); it runs
-twice with one seed, the outputs identical, and once with another, held to
-the same checks. Which objects go is not compared with pbfhogg's selection,
+twice with one seed and once with another, held to the same checks. The two
+same-seed runs must both write or both be refused as too large. Written,
+byte-identical outputs carry the first's verdicts over; otherwise they must
+decode to the same OPL sequence, the second is held to the header,
+indexdata, cap and kind-order checks on its own, and on an indexed input with
+the same sequence also to the layout predicted from the first's removals; the
+byte difference is named on the PASS line, never a verdict (byte determinism
+is not documented). A refusal of one drop skips only that run's checks; when
+the first same-seed run is refused, a written second is judged in its place. Which objects go is not compared with pbfhogg's selection,
 which is not documented, and whether the second seed chose another set is
 named, never a verdict. `--unsort` and `--unsort-intra` must move exactly one
 object per kind with more objects than the cap (two or more for intra), its
@@ -682,8 +689,15 @@ does the same on the selected input. The ordinary and locations entries use
 `checks/degrade/` and `checks/degrade-l/`, respectively. On a
 `LocationsOnWays` input the check
 first compares the reference with way coordinates against the one without
-(both the input, or both the same stable partition): an unmatched object is
-a failure, and no differing record means no way carried a coordinate. In the locations entry an input that declares no
+(the input against a plain osmium cat of it, or the two stable partitions
+when osmium reads the input out of order), pair by pair. Every way
+ref of the reference without coordinates must decode undefined; a pair may
+differ only as a way whose two lines agree once each node ref is cut at its
+`x`; an unmatched object, or a pair differing in anything else (a tag,
+metadata, a ref), is an error. The witness is a pair whose side with
+coordinates defines one, and no witness means no way carried a coordinate.
+This holds only between osmium's two reference streams: it does not prove the
+partition kept every other field of the original input. In the locations entry an input that declares no
 `LocationsOnWays`, or whose ways carry no coordinate, fails; elsewhere it is
 a PASS-line gap. That a retained coordinate would be caught rests on
 osmium's OPL writing way node coordinates under `locations_on_ways=true`;

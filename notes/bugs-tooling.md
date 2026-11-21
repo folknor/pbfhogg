@@ -392,25 +392,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-038 - degrade never judges drop-a-again beyond its elements
-
-Reported by: heavy-opus.
-
-`drop-a-again` is compared with `drop-a` on elements only. Its header,
-indexdata (both the verifier's blob decode and `check --index`), blob sizes and
-layout are never judged, so nondeterminism that OPL cannot see would pass. A
-byte comparison closes the gap when the files are identical; otherwise judge
-`again` with `run.common`.
-
-## TOOL-039 - degrade's coordinate witness counts any paired difference
-
-Reported by: engine-codex.
-
-The witness for inline coordinates (`checks/degrade.rs`) treats any paired OPL
-difference between the two reference views as evidence of coordinates, so a
-paired tag or metadata change would also increment `differs`. Check the
-location field and require the rest of the object to agree.
-
 ## TOOL-040 - The OSC structure scan tracks only root, action and object elements
 
 Reported by: engine-codex.
@@ -447,3 +428,21 @@ Reported by: the multi-extract route fix.
 checks never read stderr for them, so parity passes whichever route ran.
 multi-extract now judges its route from the config run's stderr
 (`checks/multi_extract.rs` `Route`); the same shape would fit here.
+
+## TOOL-044 - degrade and repack pick the coordinate reference from the header flag
+
+Reported by: the degrade coordinate witness fix.
+
+`References::get` (`verify_reencode.rs`) and `observed_coordinates` decide
+whether the input carries way coordinates from its `LocationsOnWays`
+declaration, but osmium decodes coordinates from the way payload whatever the
+header says. On an input in standard order with populated lat/lon arrays and
+no declaration, the reference without coordinates is the input itself and the
+witness never runs: a correct strip fails against a coordinate-bearing
+reference, and an output that kept them passes. On the partition branch the
+plain osmium writes drop the arrays, but the PASS line reports nothing to
+strip. Either refuse undeclared arrays explicitly or build the reference and
+the witness from the decoded payload; first settle what pbfhogg does with
+undeclared arrays. Separately, on the partition branch both references are a
+plain-PBF round trip of the input, so a field the plain writer drops (a
+`visible=false` without a history header) is lost on both sides, unseen.

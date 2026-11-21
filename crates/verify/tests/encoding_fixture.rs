@@ -59,31 +59,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let low = dir.join("low.pbf");
     write_pbf(&low, false, 3, &["Sort.Type_then_ID"], &["LocationsOnWays"]);
     judge_degrade_pair(&mut h, exe, &dir, &input, &low);
-    for (fault, path, required, passed) in [
-        ("", &low, true, true),
-        ("no-coords", &low, true, false),
-        ("no-coords", &low, false, true),
-        ("", &input, true, false),
-    ] {
-        std::fs::write(dir.join("fault"), fault).unwrap();
-        h.run = run::Run::create(&dir, exe, true).unwrap();
-        h.run.watch(path).unwrap();
-        let check = if required {
-            checks::degrade::run_locations as checks::ReadCheck
-        } else {
-            checks::degrade::run
-        };
-        let judged = super::judge(&mut h, "degrade", |h| check(h, path, true));
-        // A gap in the requirement is a refusal, never a failed comparison.
-        assert!(judged.failed.is_empty(), "{judged:?}");
-        assert_eq!(judged.error.is_none(), passed, "{judged:?}");
-        assert_eq!(
-            judged.status == harness::CheckStatus::Passed,
-            passed,
-            "fault={fault} required={required} input={}",
-            path.display()
-        );
-    }
+    judge_locations_faults(&mut h, exe, &dir, &input, &low);
     // Only the exact refusal with no published output is accepted.
     for (fault, accepted) in [
         ("refused", true),
@@ -102,6 +78,52 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         assert_eq!(
             matches!(result, Ok(verify_reencode::Ran::TooLarge)),
             accepted
+        );
+    }
+}
+
+/// The coordinate requirement and witness on each input and fault.
+fn judge_locations_faults(
+    h: &mut harness::Harness,
+    exe: &Path,
+    dir: &Path,
+    input: &Path,
+    low: &Path,
+) {
+    for (fault, path, required, passed) in [
+        ("", low, true, true),
+        ("no-coords", low, true, false),
+        ("no-coords", low, false, true),
+        ("way-tag", low, true, false),
+        ("way-tag", low, false, false),
+        ("", input, true, false),
+    ] {
+        std::fs::write(dir.join("fault"), fault).unwrap();
+        h.run = run::Run::create(dir, exe, true).unwrap();
+        h.run.watch(path).unwrap();
+        let check = if required {
+            checks::degrade::run_locations as checks::ReadCheck
+        } else {
+            checks::degrade::run
+        };
+        let judged = super::judge(h, "degrade", |h| check(h, path, true));
+        // A gap in the requirement is a refusal, never a failed comparison.
+        assert!(judged.failed.is_empty(), "{judged:?}");
+        assert_eq!(judged.error.is_none(), passed, "{judged:?}");
+        if fault == "way-tag" {
+            assert!(
+                judged
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("way1 differs beyond its coordinates")),
+                "{judged:?}"
+            );
+        }
+        assert_eq!(
+            judged.status == harness::CheckStatus::Passed,
+            passed,
+            "fault={fault} required={required} input={}",
+            path.display()
         );
     }
 }
@@ -207,12 +229,16 @@ pub fn tool(args: &[OsString]) -> i32 {
             // the output alone: a version, and an inline coordinate its
             // input lacks.
             let ours = name.starts_with("repack") || name.starts_with("degrade");
-            let way =
-                if (name == "low.pbf" && fault != "no-coords") || (ours && fault == "out-coords") {
-                    "w1 v1 Nn1x1y1"
-                } else {
-                    "w1 v1 Nn1x y"
-                };
+            // The way-tag fault gives the input's way a tag its plain
+            // reference lacks, beside the coordinate: not a witness.
+            let way = if name == "low.pbf" && fault == "way-tag" {
+                "w1 v1 Tk=v Nn1x1y1"
+            } else if (name == "low.pbf" && fault != "no-coords") || (ours && fault == "out-coords")
+            {
+                "w1 v1 Nn1x1y1"
+            } else {
+                "w1 v1 Nn1xy"
+            };
             let tag = if fault == "content" && ours {
                 "Tab=c"
             } else {

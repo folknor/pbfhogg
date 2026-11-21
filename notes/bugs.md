@@ -171,23 +171,6 @@ Reported by: sort.
 Compression selection (`renumber/mod.rs`) maps explicit `zlib:6` to `zlib:1`;
 disclosed in CLI source but an observable trap for any pipeline rewrite.
 
-## BUG-022 - degrade does not reliably drop N unique IDs
-
-Reported by: copy.
-
-`select_drop_sets` (`degrade/mod.rs`) counts occurrences and admits repeated
-identical `DropKey`s into its heaps, then inserts into hash sets, so two
-versions of one ID take two slots but select one ID; it can accept N above the
-distinct count and still report N dropped. Marked "likely bug".
-
-Defect hunt 2026-11-17 (passthrough-rewrite): with two versions of node 1,
-requesting one removal deletes both records, because rewriting removes every
-occurrence of a selected ID; requesting two from an input holding only those
-two versions passes the size check but selects one ID. Neither the CLI's
-"exactly N elements" nor `Reencode`'s "exactly this many unique element IDs"
-holds, and the reported dropped count is just N. Selection must use the
-identity that removal and counting use.
-
 ## BUG-023 - cat's blobs_decoded hides decompression
 
 Reported by: copy.

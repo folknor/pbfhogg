@@ -2243,6 +2243,55 @@ fn degrade_drop_ids_validates_arguments_and_total() {
     }
 }
 
+/// A history-shaped input repeats each node ID (one record per version), with
+/// node 2's two records split across blobs. N counts distinct IDs: each
+/// selected ID loses every record, the summary reports the measured removal,
+/// and N above the distinct count is refused although it is within the record
+/// count.
+#[test]
+fn degrade_drop_ids_counts_repeated_ids_once() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let mut nodes = Vec::new();
+    for node in generate_nodes(3, 1) {
+        nodes.push(node.clone());
+        nodes.push(node);
+    }
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 3);
+
+    let run = CliInvoker::new(&invocation_scratch)
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--drop-ids")
+        .arg("2:1")
+        .assert_success();
+    let kept: Vec<i64> = read_normalized(&output)
+        .nodes
+        .iter()
+        .map(|node| node.id)
+        .collect();
+    assert_eq!(kept.len(), 2, "one distinct ID survives, both its records");
+    assert_eq!(kept[0], kept[1]);
+    assert!(
+        format!("{}{}", run.stdout_str(), run.stderr_str()).contains("dropped 4 elements"),
+        "summary reports the measured removal"
+    );
+
+    CliInvoker::new(&invocation_scratch)
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.path().join("refused.osm.pbf"))
+        .arg("--drop-ids")
+        .arg("4:1")
+        .assert_failure()
+        .assert_stderr_contains("input has only 3");
+}
+
 /// `--elements-per-blob 0` is rejected up front.
 #[test]
 fn degrade_rejects_zero_block_cap() {

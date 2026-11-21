@@ -532,6 +532,16 @@
 
 ### Fixed
 
+- **`degrade --drop-ids N:SEED` counts N in distinct IDs.** On input that
+  repeats a `(kind, id)`, such as a history file with one record per
+  version, selection used to count records, so N could select fewer than
+  N IDs, and N above the distinct-ID count passed the size check. It now
+  removes exactly N distinct IDs with every record of each, refuses N
+  above the distinct count before writing output, and the summary's
+  `dropped M elements` (and `DegradeStats::dropped`) is the measured
+  number of records removed rather than the requested N. Selection on
+  unique-ID input is unchanged, seed for seed.
+
 - **`geo` ring functions always return, and the E7 longitude helpers no
   longer overflow.** `geo::point_in_ring_with_antimeridian`,
   `point_in_polygon` and `simplify_ring` looped forever on a ring with an

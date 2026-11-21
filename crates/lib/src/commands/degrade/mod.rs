@@ -75,7 +75,7 @@
 
 use super::output_header::{Bbox, Order, OutputFacts, Ways};
 use crate::read::wire_schema::BlobHeaderField;
-use std::collections::BinaryHeap;
+use std::collections::BTreeSet;
 
 use rustc_hash::FxHashSet;
 
@@ -215,14 +215,21 @@ struct BlockDrop {
     smallest: Vec<DropKey>,
 }
 
-fn keep_smallest(heap: &mut BinaryHeap<DropKey>, n: u64, key: DropKey) {
-    if (heap.len() as u64) < n {
-        heap.push(key);
-    } else if let Some(largest) = heap.peek()
-        && key < *largest
-    {
-        heap.pop();
-        heap.push(key);
+/// Keep the `n` smallest DISTINCT keys seen. Every occurrence of one
+/// `(kind, signed id)` yields the same key, so repeated records (history
+/// files carry one per version) take one slot, matching removal, which
+/// drops every occurrence of a selected ID. A key at or above the maximum
+/// of a full set is rejected; the maximum only falls, so a key rejected or
+/// evicted once is rejected on every later occurrence too. Insert before
+/// evicting, so a repeat of a kept key never shrinks the set. The same rule
+/// merges per-block sets into the global one in any order: a block omits a
+/// key only when it holds `n` distinct smaller ones.
+fn keep_smallest(set: &mut BTreeSet<DropKey>, n: u64, key: DropKey) {
+    if (set.len() as u64) >= n && set.last().is_some_and(|largest| key >= *largest) {
+        return;
+    }
+    if set.insert(key) && (set.len() as u64) > n {
+        set.pop_last();
     }
 }
 
@@ -262,7 +269,10 @@ pub struct Reencode {
     /// The way coordinates every re-encode drops are the request
     /// (`--strip-locations`), so their loss is not warned about.
     pub strip_locations: bool,
-    /// Deterministically remove exactly this many unique element IDs.
+    /// Deterministically remove exactly this many distinct `(kind, signed
+    /// id)` identities, every occurrence of each: on input repeating an ID
+    /// (one record per version) more than N elements go. Fewer distinct IDs
+    /// than N is refused before any output is written.
     pub drop_ids: Option<DropSpec>,
 }
 
@@ -403,6 +413,8 @@ impl DegradeFlags {
 pub struct DegradeStats {
     pub blobs_written: u64,
     pub elements_written: u64,
+    /// Elements removed by `drop_ids`, measured: every occurrence of each
+    /// selected ID, so at least N and exactly N on unique-ID input.
     pub dropped: u64,
     pub flags: DegradeFlags,
 }
@@ -980,9 +992,10 @@ fn degrade_decode_path(
 
     // Selection must finish before opening the writer: an over-large N must
     // not leave a header-only output behind.
+    let mut drop_occurrences: u64 = 0;
     let drop_sets = if let Some(spec) = reencode.drop_ids {
         host.invocation.marker("DEGRADE_DROP_SELECT_START");
-        let sets = select_drop_sets(
+        let (sets, occurrences) = select_drop_sets(
             &shared_file,
             &node_schedule,
             &way_schedule,
@@ -991,6 +1004,7 @@ fn degrade_decode_path(
             host,
         )?;
         host.invocation.marker("DEGRADE_DROP_SELECT_END");
+        drop_occurrences = occurrences;
         Some(sets)
     } else {
         None
@@ -1096,10 +1110,24 @@ fn degrade_decode_path(
             .counter("degrade_unsort_fired_relations", i64::from(unsort_fired[2]));
     }
 
+    // Both passes walk the same schedules and recognise the same element
+    // variants, so every occurrence the selection counted was either written
+    // or removed; the difference is the measured removal count, which
+    // exceeds N when a selected ID occurs more than once.
+    let dropped = if drop_sets.is_some() {
+        drop_occurrences
+            .checked_sub(elements_written)
+            .ok_or_else(|| {
+                Error::internal("degrade wrote more elements than the drop selection pass counted")
+            })?
+    } else {
+        0
+    };
+
     Ok(DegradeStats {
         blobs_written,
         elements_written,
-        dropped: reencode.drop_ids.map_or(0, |spec| spec.n),
+        dropped,
         flags,
     })
 }
@@ -1111,9 +1139,9 @@ fn select_drop_sets(
     relation_schedule: &[crate::scan::classify::ScheduledBlob],
     spec: DropSpec,
     host: &crate::host::Entered<'_>,
-) -> Result<DropSets> {
+) -> Result<(DropSets, u64)> {
     let mut total = 0_u64;
-    let mut heap = BinaryHeap::new();
+    let mut heap = BTreeSet::new();
     for (kind, schedule) in [
         (ElementKind::Node, node_schedule),
         (ElementKind::Way, way_schedule),
@@ -1134,17 +1162,20 @@ fn select_drop_sets(
             host,
         )?;
     }
-    if spec.n > total {
+    // A full set proves at least `n` distinct IDs; a short one holds every
+    // distinct key the input has, so its length is the exact distinct count.
+    if (heap.len() as u64) < spec.n {
         return Err(Error::invalid_argument(format!(
-            "drop_ids: cannot drop {} elements, input has only {}",
-            spec.n, total,
+            "drop_ids: cannot drop {} unique element IDs, input has only {}",
+            spec.n,
+            heap.len(),
         )));
     }
     let mut sets = DropSets::default();
     for key in heap {
         sets.insert(key);
     }
-    Ok(sets)
+    Ok((sets, total))
 }
 
 fn select_block_keys(
@@ -1156,7 +1187,7 @@ fn select_block_keys(
     // hash input and the DropKey ordering) uses this byte, not the enum.
     let kind_byte = hash_kind(kind);
     let mut matched = 0_u64;
-    let mut heap = BinaryHeap::new();
+    let mut heap = BTreeSet::new();
     for element in block.elements() {
         let id = match (&element, kind) {
             (Element::DenseNode(node), ElementKind::Node) => node.id(),
@@ -1178,7 +1209,7 @@ fn select_block_keys(
     }
     BlockDrop {
         matched,
-        smallest: heap.into_vec(),
+        smallest: heap.into_iter().collect(),
     }
 }
 
@@ -1566,7 +1597,7 @@ fn write_central(
 mod tests {
     use super::{DropKey, drop_hash, hash_kind, keep_smallest, mix64};
     use crate::ElementKind;
-    use std::collections::BinaryHeap;
+    use std::collections::BTreeSet;
 
     #[test]
     fn unsort_accepts_the_largest_block_cap_without_overflow() {
@@ -1579,13 +1610,51 @@ mod tests {
     }
 
     fn select(keys: impl IntoIterator<Item = DropKey>, n: u64) -> Vec<DropKey> {
-        let mut heap = BinaryHeap::new();
+        let mut set = BTreeSet::new();
         for key in keys {
-            keep_smallest(&mut heap, n, key);
+            keep_smallest(&mut set, n, key);
         }
-        let mut out = heap.into_vec();
-        out.sort();
-        out
+        set.into_iter().collect()
+    }
+
+    /// The oracle: sort, drop repeats, keep the first `n`.
+    fn oracle(keys: &[DropKey], n: usize) -> Vec<DropKey> {
+        let mut all = keys.to_vec();
+        all.sort();
+        all.dedup();
+        all.truncate(n);
+        all
+    }
+
+    /// Repeated keys (one `(kind, id)` per version in a history file) take
+    /// one slot at block and global level, in any partition and order.
+    #[test]
+    fn drop_selection_counts_repeated_ids_once() {
+        let base = keys();
+        let mut all = Vec::new();
+        for (i, key) in base.iter().enumerate() {
+            for _ in 0..=(i % 3) {
+                all.push(*key);
+            }
+        }
+        all.rotate_left(5);
+        for n in 1..=base.len() + 1 {
+            let expected = oracle(&all, n);
+            assert_eq!(select(all.clone(), n as u64), expected);
+            for chunk_len in [1, 2, 3, 5] {
+                let mut global = BTreeSet::new();
+                for chunk in all.chunks(chunk_len) {
+                    let mut local = BTreeSet::new();
+                    for &key in chunk {
+                        keep_smallest(&mut local, n as u64, key);
+                    }
+                    for key in local {
+                        keep_smallest(&mut global, n as u64, key);
+                    }
+                }
+                assert_eq!(global.into_iter().collect::<Vec<_>>(), expected);
+            }
+        }
     }
 
     fn keys() -> Vec<DropKey> {
@@ -1692,9 +1761,9 @@ mod tests {
     fn drop_selection_partition_invariant() {
         let all = keys();
         let expected = select(all.clone(), 4);
-        let mut global = BinaryHeap::new();
+        let mut global = BTreeSet::new();
         for chunk in all.chunks(2) {
-            let mut local = BinaryHeap::new();
+            let mut local = BTreeSet::new();
             for &key in chunk {
                 keep_smallest(&mut local, 4, key);
             }
@@ -1702,9 +1771,7 @@ mod tests {
                 keep_smallest(&mut global, 4, key);
             }
         }
-        let mut actual = global.into_vec();
-        actual.sort();
-        assert_eq!(actual, expected);
+        assert_eq!(global.into_iter().collect::<Vec<_>>(), expected);
     }
 
     #[test]

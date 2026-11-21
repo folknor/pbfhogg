@@ -1621,8 +1621,9 @@ enum Command {
         /// OsmData blob passes through untouched.
         #[arg(long)]
         strip_bbox: bool,
-        /// Drop exactly N elements chosen deterministically from their kind,
-        /// ID, and SEED. Format: N:SEED (for example 5000:42).
+        /// Drop exactly N distinct element IDs, every record of each, chosen
+        /// deterministically from their kind, ID, and SEED. Format: N:SEED
+        /// (for example 5000:42).
         #[arg(long = "drop-ids", value_name = "N:SEED", value_parser = parse_drop_ids)]
         drop_ids: Option<pbfhogg::degrade::DropSpec>,
         /// Per-blob element cap on the decode path, the most elements any

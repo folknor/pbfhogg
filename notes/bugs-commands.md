@@ -219,6 +219,19 @@ because it checks only `previous.max >= next.min`, which counts descending
 disjoint ranges as overlapping. The command does create disorder, but the
 advertised benchmark shape and its test are wrong at cap 1.
 
+## CMD-056 - degrade's unsort swap can be invisible on repeated IDs
+
+Reported by: the drop-ids distinct-count fix.
+
+Both unsort modes swap a positional pair of surviving records
+(`degrade/mod.rs`, `UnsortKindState`). When the pair holds two records of one
+ID (a history file, one record per version), the swap fires and
+`degrade_unsort_fired_*` says so, but the ID sequence is unchanged (`7, 7`),
+so no inversion or overlap is produced. Input already unordered or holding
+overlapping ranges also weakens the documented shapes. Either pick the pair
+by distinct ID or qualify the shape guarantees in `docs/cli/commands.md` to
+unique-ID input.
+
 ## CMD-028 - inspect --show drops present zero metadata and never prints visibility
 
 Reported by: check-inspect [P2], cli-binary [P2].

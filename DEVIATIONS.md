@@ -744,6 +744,15 @@ member ref, by its absolute value (`positive_id`, `positive_ref`), so a
 matched `w-7` also writes `w7` and a ref to `n-7` also writes `n7`; its
 `-R` mode consults no ID set and is exact, like pbfhogg's.
 
+**Default tags-filter refuses what selection by ID cannot answer.**
+osmium's manual says default mode works correctly on history files only
+with `-R`, and enforces nothing: it writes every version of a matched way
+or relation ID (nodes it tests per record). pbfhogg refuses a PBF
+declaring `HistoricalInformation` before the first pass, and an
+undeclared repeated ID whose records disagree about the expressions after
+the second pass (the matching records counted in pass 1 differ from the
+records pass 2 calls direct); repeats that agree are written in full.
+
 **extract is exact.** Every strategy, single and through `--config`,
 selects what its rules select (`docs/cli/commands.md` "extract") by the
 exact signed ID: a negative node inside the region, a way or relation

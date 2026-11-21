@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **Default `tags-filter` refuses history input.** Without `-R` it
+  selects objects by ID, so on a file holding several versions of one
+  object it wrote every version of a matched ID as a match, kept a
+  non-matching version's tags under `--remove-tags`, and wrote
+  non-matching way versions whose nodes were never collected. It now
+  refuses, with exit 2, a PBF declaring `HistoricalInformation`, and a
+  PBF repeating an ID whose records disagree about the expressions.
+  Repeats that agree still run. Use `-R` on history files, or filter a
+  `time-filter` snapshot.
+
 - **`altw::external::external_join` is removed.** It published `(0, 0)`
   placeholders for unresolvable way node references with no way to
   refuse them, and skipped `AltwOptions::validate`. Call

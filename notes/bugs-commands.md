@@ -151,23 +151,6 @@ classification uses a weaker ordering than the rewrite path. The statement in
 `reference/indexdata-trust.md` that sort does not reorder versions is also
 wrong, since it sometimes does.
 
-## CMD-020 - Default tags-filter treats every occurrence of a matched ID as a match
-
-Reported by: id-filter-selection [P2].
-
-Pass 1 stores matching IDs in sets, and `filter_block_pass2`
-(`tags_filter/mod.rs`) then treats every occurrence of a stored ID as a direct
-match without examining its tags. A sorted history input with
-`n1/v1 amenity=cafe` and `n1/v2 amenity=school`, and no references, outputs
-both versions for `n/amenity=cafe`, both counted as directly matched, and
-`--remove-tags` keeps the non-matching version's tags. For ways: if matching
-`w10/v1` references `n1` and non-matching `w10/v2` references `n2`, both ways
-are written but dependency collection gathers only `n1`. The CLI contract in
-`docs/cli/commands.md` states no uniqueness or history restriction, while
-osmium explicitly limits correct history filtering to `-R`. The hunter asks
-for either a refusal with a documented restriction or occurrence identity kept
-throughout. This does not require adding history support.
-
 ## CMD-021 - time-filter treats an absent dense timestamp as the epoch
 
 Reported by: id-filter-selection [P2].

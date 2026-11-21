@@ -770,6 +770,10 @@ fn tags_filter_two_pass(
     let mut relation_dep_node_ids = IdSet::new();
     let mut has_included_way = false;
     let mut has_included_relation = false;
+    // Matching records per kind (node, way, relation), counted before the
+    // sets deduplicate them; pass 2 must count exactly as many direct
+    // records, see the check after it.
+    let mut matched_records = [0_u64; 3];
 
     // Pass 1: parallel classification via pread-from-workers.
     // Workers own the full PrimitiveBlock lifecycle (pread → decompress →
@@ -790,7 +794,21 @@ fn tags_filter_two_pass(
         let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         header_reader.set_parse_indexdata(true);
         let header_blob = header_reader.leading_header()?;
-        header_blob.to_headerblock()?;
+        // Default mode selects by ID: a matched ID includes every record of
+        // it, and only the matching records' references are collected. On a
+        // history file the versions of one object routinely disagree about
+        // the expression, so the answer would hold non-matching versions as
+        // direct matches with dangling references. `-R` decides per record
+        // and is exact on history; osmium documents the same restriction
+        // but does not enforce it.
+        if header_blob.to_headerblock()?.has_historical_information() {
+            return Err(crate::Error::invalid_data(
+                "tags-filter without omit-referenced selects objects by ID, and the input \
+                 PBF declares HistoricalInformation: the versions of one object can disagree \
+                 about the expressions. Filter the history with omit-referenced, or make a \
+                 snapshot first (time-filter) and filter that.",
+            ));
+        }
         drop(header_reader);
 
         // Build schedule from header-only scan via the pread-only HeaderWalker.
@@ -924,6 +942,9 @@ fn tags_filter_two_pass(
             |_seq, cr| {
                 // Every set is signed: a negative ID is selected exactly,
                 // never folded onto its magnitude twin as osmium does.
+                matched_records[0] += cr.matched_nodes.len() as u64;
+                matched_records[1] += cr.matched_ways.len() as u64;
+                matched_records[2] += cr.matched_relations.len() as u64;
                 for id in cr.matched_nodes {
                     matched_node_ids.insert(id);
                 }
@@ -1168,6 +1189,38 @@ fn tags_filter_two_pass(
 
     writer.flush()?;
     host.invocation.marker("TAGSFILTER_PASS2_END");
+
+    // Pass 2 calls a record direct by its ID alone. Every record pass 1
+    // matched is in a blob pass 2 reads and is counted direct there, so the
+    // totals agree unless the input holds another record of a matched ID
+    // (a repeated ID without the HistoricalInformation declaration, refused
+    // above). If that record matches too, both counts include it and the
+    // run stands: every included record's references were collected. If it
+    // does not match, pass 2 counted it as a direct match, so pass 2's
+    // total is higher. Then the answer would contain a non-matching record
+    // as a match, with its tags kept under remove_tags, and as a way,
+    // with refs that were never collected. That run is refused, and the
+    // staged output is not published. Three additions per pass-1 blob, in
+    // place of re-matching every written record's tags in pass 2.
+    let direct = [
+        stats.nodes_matched,
+        stats.ways_matched,
+        stats.relations_matched,
+    ];
+    if direct != matched_records {
+        return Err(crate::Error::invalid_data(format!(
+            "tags-filter without omit-referenced selects objects by ID, and the input repeats \
+             an ID whose records disagree about the expressions: {} node, {} way and {} \
+             relation records match, but {}, {} and {} records carry a matched ID. Filter \
+             with omit-referenced, which decides per record, or remove the repeats first.",
+            matched_records[0],
+            matched_records[1],
+            matched_records[2],
+            direct[0],
+            direct[1],
+            direct[2],
+        )));
+    }
     Ok(stats)
 }
 
@@ -1860,6 +1913,110 @@ mod tests {
             assert_eq!(elements, expected, "{expression}, {mode}");
             assert_eq!(got, stats, "{expression}, {mode}: counters");
         }
+    }
+
+    type Tags<'a> = &'a [(&'a str, &'a str)];
+
+    /// Writes `n1` twice (tags per record), `n2`, and `w10` twice (tags and
+    /// refs per record), under a header that declares history or not.
+    fn write_repeat_fixture(
+        path: &Path,
+        historical: bool,
+        nodes: [Tags<'_>; 2],
+        ways: [(Tags<'_>, &[i64]); 2],
+    ) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        let mut header = crate::block_builder::HeaderBuilder::new();
+        if historical {
+            header = header.historical();
+        }
+        writer.write_header(&header.build().unwrap()).unwrap();
+        let mut block = BlockBuilder::new();
+        for tags in nodes {
+            block.add_node(1, 10, 10, tags.iter().copied(), None);
+        }
+        block.add_node(2, 10, 10, std::iter::empty::<(&str, &str)>(), None);
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        for (tags, refs) in ways {
+            block.add_way(10, tags.iter().copied(), refs, None);
+        }
+        writer
+            .write_primitive_block(block.take().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    /// Default mode selects by ID, so a repeated ID whose records disagree
+    /// about the expression is refused (a non-matching record would be
+    /// written as a match, a non-matching way with refs never collected),
+    /// and so is any input declaring history. Repeats that agree run, every
+    /// record counted; `-R` decides per record and runs on all of them.
+    #[test]
+    fn two_pass_refuses_repeated_ids_whose_records_disagree() {
+        let dir = crate::path_guard::tests::scratch();
+        let cafe: &[(&str, &str)] = &[("amenity", "cafe")];
+        let school: &[(&str, &str)] = &[("amenity", "school")];
+        let primary: &[(&str, &str)] = &[("highway", "primary")];
+        let track: &[(&str, &str)] = &[("highway", "track")];
+        let path = dir.path().join("repeat.pbf");
+        let refusal = |expression: &str, mode: &str| {
+            let err = run_filter(&path, expression, mode, false)
+                .expect_err(&format!("{expression}, {mode}: ran"));
+            assert!(
+                matches!(err.kind(), crate::error::ErrorKind::InvalidData { .. }),
+                "{err:?}"
+            );
+            err.to_string()
+        };
+
+        write_repeat_fixture(
+            &path,
+            false,
+            [cafe, school],
+            [(primary, &[1]), (track, &[2])],
+        );
+        for mode in ["two-pass", "remove-tags"] {
+            assert!(refusal("n/amenity=cafe", mode).contains("repeats an ID"));
+            assert!(refusal("w/highway=primary", mode).contains("repeats an ID"));
+        }
+        assert!(refusal("n/amenity=school", "invert").contains("repeats an ID"));
+        let (_, elements, _) =
+            run_filter(&path, "w/highway=primary", "omit-referenced", false).unwrap();
+        assert_eq!(elements, [('w', 10)]);
+
+        write_repeat_fixture(
+            &path,
+            false,
+            [cafe, cafe],
+            [(primary, &[1]), (primary, &[2])],
+        );
+        let (_, elements, stats) = run_filter(&path, "n/amenity=cafe", "two-pass", false).unwrap();
+        assert_eq!(elements, [('n', 1), ('n', 1)]);
+        assert_eq!(stats, [2, 0, 0, 0, 0, 0, 0]);
+        let (_, elements, stats) =
+            run_filter(&path, "w/highway=primary", "two-pass", false).unwrap();
+        assert_eq!(
+            elements,
+            [('n', 1), ('n', 1), ('n', 2), ('w', 10), ('w', 10)]
+        );
+        assert_eq!(stats, [0, 3, 0, 2, 0, 0, 0]);
+
+        write_repeat_fixture(
+            &path,
+            true,
+            [cafe, cafe],
+            [(primary, &[1]), (primary, &[1])],
+        );
+        assert!(refusal("n/amenity=cafe", "two-pass").contains("PBF declares"));
+        let (_, elements, _) =
+            run_filter(&path, "n/amenity=cafe", "omit-referenced", false).unwrap();
+        assert_eq!(elements, [('n', 1), ('n', 1)]);
     }
 
     #[test]

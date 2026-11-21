@@ -2292,6 +2292,73 @@ fn degrade_drop_ids_counts_repeated_ids_once() {
         .assert_stderr_contains("input has only 3");
 }
 
+/// Run one unsort mode over a history-shaped node stream (`ids` in input
+/// blobs of `per_blob`) and return the output's node blobs as ID lists.
+fn unsort_history_node_blobs(
+    ids: &[i64],
+    per_blob: usize,
+    mode: &str,
+    cap: usize,
+) -> Vec<Vec<i64>> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let nodes: Vec<_> = ids
+        .iter()
+        .map(|&id| generate_nodes(1, id).remove(0))
+        .collect();
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], per_blob);
+    CliInvoker::new(&invocation_scratch)
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg(mode)
+        .arg("--elements-per-blob")
+        .arg(cap.to_string())
+        .assert_success();
+    blob_elements(&output)
+        .into_iter()
+        .filter(|(kind, _)| *kind == BlobKindLabel::Node)
+        .map(|(_, ids)| ids)
+        .collect()
+}
+
+/// On a history input the record at the `--unsort` cap moves with every
+/// version of its ID, past the next ID, so the swap changes the ID order
+/// (moving one of two versions of ID 3 past the other would not).
+#[test]
+fn degrade_unsort_moves_a_whole_id_run_across_the_boundary() {
+    let blobs = unsort_history_node_blobs(&[1, 2, 3, 3, 4, 5], 6, "--unsort", 3);
+    assert_eq!(blobs, vec![vec![1, 2, 4], vec![3, 3, 5]]);
+}
+
+/// `--unsort-intra` on a history input swaps the first two IDs with all
+/// their versions inside one blob; when the two runs do not fit one block
+/// the kind is left in input order.
+#[test]
+fn degrade_unsort_intra_swaps_whole_id_runs_or_none() {
+    let ids = [1, 1, 2, 2, 3];
+    assert_eq!(
+        unsort_history_node_blobs(&ids, 5, "--unsort-intra", 4),
+        vec![vec![2, 2, 1, 1], vec![3]]
+    );
+    assert_eq!(
+        unsort_history_node_blobs(&ids, 5, "--unsort-intra", 3),
+        vec![vec![1, 1, 2], vec![2, 3]]
+    );
+    // Unique IDs keep the record-pair swap and its input-blob boundary.
+    assert_eq!(
+        unsort_history_node_blobs(&[1, 2, 3], 2, "--unsort-intra", 3),
+        vec![vec![2, 1], vec![3]]
+    );
+    assert_eq!(
+        unsort_history_node_blobs(&[1, 2, 3], 1, "--unsort-intra", 3),
+        vec![vec![2, 1], vec![3]]
+    );
+}
+
 /// `--elements-per-blob 0` is rejected up front.
 #[test]
 fn degrade_rejects_zero_block_cap() {

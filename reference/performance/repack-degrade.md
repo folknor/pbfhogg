@@ -1,5 +1,17 @@
 # Repack Degrade
 
+### degrade --unsort moves ID runs (plantasjen, 2026-11-21, against `9bbd64df`)
+
+`perturb-pbf --unsort yes` on Denmark, interleaved `--iterations 1` cells,
+baseline built from `9bbd64df`, variant the uncommitted run-moving unsort.
+The first variant wrapped every record in `OwnedElement` before the state
+machine and was sign-consistently slower: 6.2 and 6.8 s against 5.8 and
+6.0 s (`fd3e3043`, `6ddbfdfe`, `f3ff9744`, `49dce99f`). With records
+written unwrapped once the move is settled, the variant matched the
+baseline: 5.7 and 5.5 s against 5.6 s (`2a8e98fe`, `d621df8c`,
+`ef9c34b4`), noise. No planet cell was run: after the first `block_cap`
+records per kind the settled path is the same per-record write as before.
+
 ### repack and degrade encode each blob on its worker (bygg, 2026-11-03, against `1f93e674`)
 
 **Attribution** (uncommitted diagnostic on `1f93e674`, sidecar session

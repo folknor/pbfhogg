@@ -551,6 +551,15 @@
 
 ### Fixed
 
+- **`degrade --unsort` and `--unsort-intra` perturb history input.**
+  The swap could pick two versions of one ID, leaving the ID order
+  unchanged and the output not unsorted at all. Both modes now move
+  whole ID runs: `--unsort` moves every version of the ID at the cap
+  past the next ID, and `--unsort-intra` swaps the first two IDs with
+  all their versions in one blob, leaving a kind unperturbed when those
+  records do not fit `--elements-per-blob`. Unique-ID input produces the
+  same output as before.
+
 - **`sort` orders the versions of one object whatever the blob layout.**
   A blob holding `way 7` version 2 before version 1 that overlapped no
   other blob was copied through with its versions descending, while the

@@ -45,7 +45,12 @@
 //!   writer frames.
 //!
 //! Both unsort modes clear `Sort.Type_then_ID` and swap one adjacent
-//! same-kind element pair per kind. They differ in which pair is swapped,
+//! same-kind element pair per kind. On input repeating an ID (a history
+//! file) they move whole ID runs instead, so two versions of one ID are
+//! never the pair (`UnsortKindState`). The shapes below hold for input
+//! already canonically ordered, of one ID sign; on history input, blobs
+//! that share an ID only at their ends (including ones the packing
+//! creates) come on top of them. They differ in which pair is swapped,
 //! which decides whether the disorder lands across an output-blob
 //! boundary or inside a single blob:
 //!
@@ -875,60 +880,181 @@ enum WorkerOutput {
     Owned(KindPayload),
 }
 
-/// Per-kind unsort state held on the merge thread. Holds one element at
-/// the 1-based arrival position `hold_at` and re-injects it one element
-/// later, producing a single adjacent-pair swap per kind.
+/// Per-kind unsort state held on the merge thread. It moves records by ID
+/// run (the consecutive records of one ID, one per version on a history
+/// file), never splitting the two records it reorders out of one ID, so a
+/// move it reports always changes the ID sequence. On unique-ID input every
+/// run is one record and both modes are the plain adjacent-pair swap.
 ///
-/// The two modes differ only in `hold_at`, which decides where the swap
-/// lands:
-///
-/// - `--unsort` (cross-blob overlap): `hold_at = block_cap`. With the
+/// - `--unsort` (cross-blob overlap): holds the run that starts at
+///   surviving same-kind position `block_cap`, writes the first record of
+///   the next distinct ID, then the held run in arrival order. With the
 ///   boundary flush suppressed the central builder packs to `block_cap`,
-///   so the newer element fills and flushes the current output block and
-///   the held smaller-id element opens the next one - the two blobs'
-///   ID ranges overlap. Reachable for any `block_cap >= 1`.
-/// - `--unsort-intra` (intra-blob inversion): `hold_at = 1`. The swap
-///   fires on the first two same-kind elements, which always land at the
-///   start of the first output block (positions 1 and 2), so the
-///   descending step sits inside a blob for any `block_cap >= 2`. This is
-///   independent of input/output blob boundaries, so it stays intra-blob
-///   even when one input blob carries more than `block_cap` same-kind
-///   elements.
+///   so that record fills and flushes the current output block and the
+///   held smaller ID opens the next one: one descending output boundary,
+///   every blob internally ID-monotone. The held run is one ID's records,
+///   unbounded by the cap; this mode generates adversarial test inputs.
+/// - `--unsort-intra` (intra-blob inversion): buffers the first two ID
+///   runs, at most `block_cap` records, and once the second run is
+///   complete writes it before the first into the empty central builder,
+///   so the descending step and both runs sit inside one blob. Input-blob
+///   boundaries met while buffering are replayed as flushes after the pair
+///   (and before the record that completed it, if that came from a later
+///   input blob), so unique-ID output matches the record-pair swap. If the
+///   two runs do not fit one block the records are replayed in arrival
+///   order and the mode does not fire for that kind.
+///
+/// `fired` means the move was made. On input already canonically ordered
+/// it certifies the introduced disorder; on unordered input it does not.
 struct UnsortKindState {
-    held: Option<OwnedElement>,
+    mode: Unsort,
+    cap: usize,
+    /// Surviving same-kind records seen before the buffer started.
     seen: u64,
+    /// Buffered records with the ordinal of the input blob they came from.
+    buf: Vec<(OwnedElement, u64)>,
+    /// Intra only: the first run's length, once the second run has begun.
+    first_run: Option<usize>,
     fired: bool,
-    hold_at: u64,
+    /// The move was made or abandoned; records pass straight through.
+    done: bool,
 }
 
 impl UnsortKindState {
     fn new(mode: Unsort, cap: usize) -> Self {
-        // block_cap validation upstream guarantees hold_at is reachable:
-        // >= 1 for cross-blob, >= 2 for intra-blob.
-        let hold_at = match mode {
-            Unsort::CrossBlob => cap as u64,
-            Unsort::IntraBlob => 1,
-        };
         Self {
-            held: None,
+            mode,
+            cap,
             seen: 0,
+            buf: Vec::new(),
+            first_run: None,
             fired: false,
-            hold_at,
+            done: false,
         }
     }
 
-    fn should_hold(&self) -> bool {
-        self.held.is_none() && !self.fired && self.seen + 1 == self.hold_at
+    /// The 1-based surviving position whose run is held.
+    fn hold_at(&self) -> u64 {
+        match self.mode {
+            Unsort::CrossBlob => self.cap as u64,
+            Unsort::IntraBlob => 1,
+        }
     }
 
-    /// The held element, taken, once the element after which it goes back
-    /// in has arrived; `None` otherwise.
-    fn take_due(&mut self) -> Option<OwnedElement> {
-        if self.seen == self.hold_at {
-            self.held.take()
-        } else {
-            None
+    /// Feed one surviving record from input blob `blob`.
+    fn push(
+        &mut self,
+        elem: OwnedElement,
+        blob: u64,
+        bb: &mut BlockBuilder,
+        output: &mut Vec<OwnedBlock>,
+    ) -> crate::Result<()> {
+        if self.done {
+            return write_owned_to_central(&elem, bb, output);
         }
+        if self.buf.is_empty() {
+            if self.seen + 1 == self.hold_at() {
+                self.buf.push((elem, blob));
+                return Ok(());
+            }
+            self.seen += 1;
+            return write_owned_to_central(&elem, bb, output);
+        }
+        let first_id = self.buf[0].0.id();
+        match self.mode {
+            Unsort::CrossBlob => {
+                if elem.id() == first_id {
+                    self.buf.push((elem, blob));
+                    return Ok(());
+                }
+                write_owned_to_central(&elem, bb, output)?;
+                for (held, _) in self.buf.drain(..) {
+                    write_owned_to_central(&held, bb, output)?;
+                }
+                self.fired = true;
+                self.done = true;
+                Ok(())
+            }
+            Unsort::IntraBlob => {
+                let joins = match self.first_run {
+                    None => elem.id() == first_id,
+                    Some(n) => elem.id() == self.buf[n].0.id(),
+                };
+                if !joins && self.first_run.is_some() {
+                    return self.commit_intra(Some((elem, blob)), bb, output);
+                }
+                if !joins {
+                    self.first_run = Some(self.buf.len());
+                }
+                self.buf.push((elem, blob));
+                if self.buf.len() > self.cap {
+                    self.replay(bb, output)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Intra: write the second run, then the first, then `next` (the record
+    /// that proved the second run complete, absent at end of phase).
+    fn commit_intra(
+        &mut self,
+        next: Option<(OwnedElement, u64)>,
+        bb: &mut BlockBuilder,
+        output: &mut Vec<OwnedBlock>,
+    ) -> crate::Result<()> {
+        let Some(n) = self.first_run else {
+            return Err(crate::error::Error::internal(
+                "an intra unsort commit without a second ID run",
+            ));
+        };
+        let last_blob = self.buf.last().map_or(0, |(_, b)| *b);
+        let mut buf = std::mem::take(&mut self.buf);
+        let second = buf.split_off(n);
+        for (e, _) in second.iter().chain(buf.iter()) {
+            write_owned_to_central(e, bb, output)?;
+        }
+        self.fired = true;
+        self.done = true;
+        if let Some((e, blob)) = next {
+            if blob > last_blob && !bb.is_empty() {
+                flush_local(bb, output)?;
+            }
+            write_owned_to_central(&e, bb, output)?;
+        }
+        Ok(())
+    }
+
+    /// Write the buffer in arrival order, reapplying the input-blob
+    /// boundary flushes it was held across (intra), and give up the move.
+    fn replay(&mut self, bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> crate::Result<()> {
+        let flush_on_boundary = !self.mode_suppresses_flush();
+        let mut prev: Option<u64> = None;
+        for (e, blob) in self.buf.drain(..) {
+            if flush_on_boundary && prev.is_some_and(|p| blob > p) && !bb.is_empty() {
+                flush_local(bb, output)?;
+            }
+            prev = Some(blob);
+            write_owned_to_central(&e, bb, output)?;
+        }
+        self.done = true;
+        Ok(())
+    }
+
+    fn mode_suppresses_flush(&self) -> bool {
+        matches!(self.mode, Unsort::CrossBlob)
+    }
+
+    /// End of phase: an intra pair complete at EOF commits; anything else
+    /// still buffered goes back in arrival order, unfired.
+    fn finish(&mut self, bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> crate::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if matches!(self.mode, Unsort::IntraBlob) && self.first_run.is_some() {
+            return self.commit_intra(None, bb, output);
+        }
+        self.replay(bb, output)
     }
 }
 
@@ -1266,6 +1392,8 @@ fn run_kind_phase(
 
     let mut blobs: u64 = 0;
     let mut elements: u64 = 0;
+    // Ordinal of the next owned tail, for the intra unsort's boundary replay.
+    let mut tail_ordinal: u64 = 0;
 
     // Results arrive in schedule order through the ordered pool, whose window
     // bounds the decoded payloads in flight. A write or encode error ends the
@@ -1338,7 +1466,8 @@ fn run_kind_phase(
                             "a degrade worker shipped owned elements without an unsort mode",
                         ));
                     };
-                    feed_tail_unsort(tail, state, &mut bb, &mut output)?;
+                    feed_tail_unsort(tail, tail_ordinal, state, &mut bb, &mut output)?;
+                    tail_ordinal += 1;
                     blobs += write_central(&mut output, writer, flags)?;
                     elements += tail_n;
                 }
@@ -1348,11 +1477,11 @@ fn run_kind_phase(
         host,
     )?;
 
-    // End-of-phase: re-inject any held element (partial swap fire), then
-    // flush the central builder one last time.
-    if let Some(elem) = unsort.as_mut().and_then(|state| state.held.take()) {
-        write_owned_to_central(&elem, &mut bb, &mut output)?;
-        // This element was already counted in its input tail.
+    // End-of-phase: settle anything still buffered (its elements were
+    // already counted in their input tails), then flush the central builder
+    // one last time.
+    if let Some(state) = unsort.as_mut() {
+        state.finish(&mut bb, &mut output)?;
     }
 
     flush_local(&mut bb, &mut output)?;
@@ -1495,63 +1624,43 @@ fn element_matches_kind(
 }
 
 /// Feed an entire unsort-mode tail into the central builder, applying the
-/// per-kind adjacent-pair swap. Elements are moved out of the tail (no
-/// clones). Mid-stream cap fires append blocks to `output`. Shared by
-/// `--unsort` and `--unsort-intra`; the two differ only in `hold_at` (the
-/// arrival position of the held element) and in whether the merge loop
-/// flushes the central builder at input-blob boundaries.
+/// per-kind ID-run move (see [`UnsortKindState`]). Elements are moved out
+/// of the tail (no clones). Mid-stream cap fires append blocks to `output`.
+/// `blob` is the input blob's ordinal within the phase.
 fn feed_tail_unsort(
     tail: KindPayload,
+    blob: u64,
     unsort: &mut UnsortKindState,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<()> {
+    // Once the move is settled every record goes straight to the builder,
+    // unwrapped: the per-record `OwnedElement` move measured as a wall cost.
     match tail {
         KindPayload::Nodes(v) => {
             for n in v {
-                if unsort.should_hold() {
-                    unsort.held = Some(OwnedElement::Node(n));
-                    unsort.seen += 1;
-                } else if let Some(held) = unsort.take_due() {
+                if unsort.done {
                     crate::owned::write_single_node_local(&n, bb, output)?;
-                    write_owned_to_central(&held, bb, output)?;
-                    unsort.fired = true;
-                    unsort.seen += 1;
                 } else {
-                    crate::owned::write_single_node_local(&n, bb, output)?;
-                    unsort.seen += 1;
+                    unsort.push(OwnedElement::Node(n), blob, bb, output)?;
                 }
             }
         }
         KindPayload::Ways(v) => {
             for w in v {
-                if unsort.should_hold() {
-                    unsort.held = Some(OwnedElement::Way(w));
-                    unsort.seen += 1;
-                } else if let Some(held) = unsort.take_due() {
+                if unsort.done {
                     crate::owned::write_single_way_local(&w, bb, output)?;
-                    write_owned_to_central(&held, bb, output)?;
-                    unsort.fired = true;
-                    unsort.seen += 1;
                 } else {
-                    crate::owned::write_single_way_local(&w, bb, output)?;
-                    unsort.seen += 1;
+                    unsort.push(OwnedElement::Way(w), blob, bb, output)?;
                 }
             }
         }
         KindPayload::Relations(v) => {
             for r in v {
-                if unsort.should_hold() {
-                    unsort.held = Some(OwnedElement::Relation(r));
-                    unsort.seen += 1;
-                } else if let Some(held) = unsort.take_due() {
+                if unsort.done {
                     crate::owned::write_single_relation_local(&r, bb, output)?;
-                    write_owned_to_central(&held, bb, output)?;
-                    unsort.fired = true;
-                    unsort.seen += 1;
                 } else {
-                    crate::owned::write_single_relation_local(&r, bb, output)?;
-                    unsort.seen += 1;
+                    unsort.push(OwnedElement::Relation(r), blob, bb, output)?;
                 }
             }
         }
@@ -1601,12 +1710,9 @@ mod tests {
 
     #[test]
     fn unsort_accepts_the_largest_block_cap_without_overflow() {
-        let mut state = super::UnsortKindState::new(super::Unsort::CrossBlob, usize::MAX);
-        assert!(!state.should_hold());
-        assert!(state.take_due().is_none());
-        state.seen = 1;
-        assert!(!state.should_hold());
-        assert!(state.take_due().is_none());
+        let state = super::UnsortKindState::new(super::Unsort::CrossBlob, usize::MAX);
+        assert_eq!(state.hold_at(), u64::MAX);
+        assert_ne!(state.seen + 1, state.hold_at());
     }
 
     fn select(keys: impl IntoIterator<Item = DropKey>, n: u64) -> Vec<DropKey> {

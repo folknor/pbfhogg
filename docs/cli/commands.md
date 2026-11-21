@@ -1439,8 +1439,8 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--staging-dir <DIR>` | Stage the output in `DIR` instead of beside it (see [Staging directory](#staging-directory)) |
-| `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs (one per kind that has more elements than `--elements-per-blob`). Triggers `sort`'s overlap-rewrite path. |
-| `--unsort-intra` | Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with an internal ID-order inversion but non-overlapping blob ranges - the intra-blob shape `sort`'s overlap detector cannot see. Mutually exclusive with `--unsort`. |
+| `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs (one per kind that has more elements than `--elements-per-blob`). Triggers `sort`'s overlap-rewrite path. On a history input the record at the cap moves together with the rest of its ID's versions, past the first record of the next ID, so the swap always changes the ID order. |
+| `--unsort-intra` | Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with an internal ID-order inversion but non-overlapping blob ranges - the intra-blob shape `sort`'s overlap detector cannot see. On a history input the first two IDs swap with all their versions, in one blob; a kind whose first two IDs hold more records than `--elements-per-blob` is left unperturbed. Mutually exclusive with `--unsort`. |
 | `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved; downstream `add-locations-to-ways` runs see a redundancy-free starting point. |
 | `--strip-indexdata` | Clear `BlobHeader.indexdata` on every OsmData blob. Forces commands into their `--force` / non-indexed fallback paths (`sort`, `getid`, `tags-filter`). Blob payloads are not decompressed. |
 | `--strip-tagdata` | Clear `BlobHeader.tagdata` (the per-blob tag key index) on every OsmData blob, forcing `tags-filter`'s no-hint fallback path. Leaves `indexdata` intact - a tagdata-stripped file is still indexed. |
@@ -1475,7 +1475,7 @@ range-checked at the CLI boundary (1 to 1,000,000,000): the library entry
 point behind it takes the value raw, and 0 is not a threshold - it pins
 the FullScan arm unconditionally.
 
-`--recompress` from the design doc remains deferred. The `--unsort` perturbation is the minimum-viable swap that triggers `sort`'s overlap detector; configurable chaos modes (rotate / shuffle / reverse) are deferred.
+`--recompress` from the design doc remains deferred. The `--unsort` perturbation is the minimum-viable swap that triggers `sort`'s overlap detector; configurable chaos modes (rotate / shuffle / reverse) are deferred. The `--unsort` and `--unsort-intra` shapes are stated for input already in canonical order with IDs of one sign: input that is itself unordered or has overlapping blobs keeps its own disorder on top of the swap, `sort`'s range keys treat a mixed-sign blob conservatively, and on a history input blobs that share an ID only at their ends (including ones the cap packing creates) come on top of the stated overlap.
 
 ### renumber
 

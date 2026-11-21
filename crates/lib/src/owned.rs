@@ -405,6 +405,14 @@ impl OwnedMetadata {
 // ---------------------------------------------------------------------------
 
 impl OwnedElement {
+    pub(crate) fn id(&self) -> i64 {
+        match self {
+            Self::Node(n) => n.id,
+            Self::Way(w) => w.id,
+            Self::Relation(r) => r.id,
+        }
+    }
+
     pub(crate) fn metadata(&self) -> Option<&OwnedMetadata> {
         match self {
             Self::Node(n) => n.metadata.as_ref(),

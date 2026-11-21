@@ -127,9 +127,24 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   strict order check refuse a repeated ID regardless. The rest must drop it with the loss warning. The warning is read from pbfhogg's stderr as the CLI renders
   `header.way_metadata_loss` (`Warning: the input declares ..., which the
   output does not declare`, `LocationsOnWays` a member of the list).
-- **Order and counts** of an output come from its osmium OPL decoding
-  (`opl_compare::order`, no metadata or coordinates): a file is in strict
-  order when its objects ascend by kind and then ID with none repeated.
+- **Order and counts** of an output come from its osmium OPL decoding: a
+  file is in strict order when its objects ascend by kind and then ID with
+  none repeated. Where the output is a side of a strict element comparison
+  and nothing that can fail comes between, the verdict is read from that
+  comparison's own decodings (`opl_compare::compare_judged`): sort's output,
+  derive-changes' new and pbfhogg roundtrip, pbfhogg's side of the
+  input-order family's comparison (cat, tags-filter, getid, getparents,
+  add-locations-to-ways), both sides of each extract strategy, and each
+  multi-extract region. At the first step-down the merge stops pairing,
+  reads each side to its end for its order and counts, records the order
+  verdicts (a reference side's disorder is the error that it cannot be
+  compared by ID), then raises the error the strict merge raises at that
+  cursor; the listing is then a prefix and both OPL files are kept. A read
+  or parse error before any step-down is raised with no order verdict.
+  Elsewhere (the reference side of the input-order family, apply-changes'
+  output, multi-extract's sequential sorted copies) a separate decode
+  (`opl_compare::order`, no metadata or coordinates) judges it first, since
+  a later failure would otherwise lose the verdict.
   `osmium fileinfo -e` cannot serve here, since it refuses a file whose ways
   lack their nodes, as every way-only or filtered output does; it still
   reads whole inputs for check-ids, repack and degrade.

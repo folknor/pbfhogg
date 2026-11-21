@@ -143,6 +143,9 @@ pub fn run(
     harness.print_fileinfo("osmium", &osmium_out)?;
 
     // --- Sort check ---
+    // Its own decode, not folded into the element judgment's strict merge:
+    // the inline-location check and the expected stream's construction come
+    // between, and an error in either would lose this verdict.
     let order = harness.check_sorted("pbfhogg apply-changes", &pbfhogg_out)?;
     harness.record("pbfhogg apply-changes output order", order);
 

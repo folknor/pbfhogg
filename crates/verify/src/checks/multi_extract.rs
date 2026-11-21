@@ -47,7 +47,7 @@ use crate::checks::sort as verify_sort;
 use crate::error::Error;
 use crate::extract_config::PolygonInput;
 use crate::extract_config::{ExtractStrategy, NamedRegion, PbfhoggCommand};
-use crate::harness::{Harness, Verdict};
+use crate::harness::{Harness, Role, Verdict};
 use crate::pbf_frames::SORT_TYPE_THEN_ID;
 use pbfhogg_devkit::Bbox;
 
@@ -149,6 +149,9 @@ pub fn run(
             let label = format!("sequential extract {}", named.stem);
             record_no_sort_claim(harness, &label, &seq_out)?;
             let copy = sorted_copy(harness, &seq_out)?;
+            // Its own decode, not folded into the region comparison below:
+            // that comes only after the multi-extract run, whose failure
+            // would otherwise lose this verdict.
             let (unique, _) = harness.check_sorted_counted(&label, &copy)?;
             harness.record(&format!("{label} output repeats an ID"), unique);
             copy
@@ -190,9 +193,9 @@ pub fn run(
 
         // Counts alone let a region with substituted IDs or changed content
         // pass, so each region is diffed against its sequential extract; the
-        // counts are printed as context. The diff does not see order (two
-        // equally misordered outputs can diff clean), so the multi output's
-        // order is a verdict of its own.
+        // counts are printed as context. The diff refuses a side out of
+        // strict order, so the multi output's order, a verdict of its own,
+        // is judged from the diff's own decoding.
         harness.msg(&format!("  comparing {label_prefix} regions..."));
         for named in pass_regions {
             let multi_pbf = multi_dir.join(named.output_name());
@@ -215,15 +218,19 @@ pub fn run(
                     format!("{label} output repeats an ID"),
                 )
             };
-            let (ordered, counts) = harness.check_sorted_counted(&label, &compared)?;
-            harness.record(&order, ordered);
             let seq = sequential
                 .get(&named.stem)
                 .ok_or_else(|| Error::Tool(format!("no sequential extract for {}", named.stem)))?;
             let policy = crate::opl_compare::Policy::between(&compared, &seq.compared)?;
-            let same = harness.same_elements(
-                &compared,
-                &seq.compared,
+            let (same, [counts, _]) = harness.same_elements_judged(
+                (
+                    &compared,
+                    Role::Judged {
+                        label: &label,
+                        record: &order,
+                    },
+                ),
+                (&seq.compared, Role::Required),
                 &crate::harness::listing_beside(&compared),
                 policy,
             )?;

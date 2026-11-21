@@ -213,6 +213,67 @@ pub(crate) fn compare_paired(
     walk(harness, first, second, listing, policy, true, each, paired)
 }
 
+/// One side's order as a judged walk read it: whether its objects strictly
+/// ascend in object order, and its object count per kind, both over the
+/// whole stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Scan {
+    pub ordered: bool,
+    pub counts: [u64; 3],
+}
+
+/// What a judged walk ([`compare_judged`]) found.
+#[derive(Debug)]
+pub(crate) struct Walked {
+    /// Each side's order and counts. An `Err` is a read or parse error met
+    /// while draining that side after the other stepped down: that side has
+    /// no whole-stream judgment.
+    pub scans: [Result<Scan, Error>; 2],
+    /// The comparison, or on a step-down the error the strict walk raises at
+    /// the cursor that stepped down, exactly as [`compare`] raises it. The
+    /// listing is then a prefix and both OPL decodings are kept.
+    pub merged: Result<Merged, Error>,
+    /// A failure to flush the prefix listing after a step-down, for the
+    /// detail; the cursor error stays the one raised.
+    pub listing_note: Option<String>,
+}
+
+/// [`compare`], also judging each side's order from the same decodings, so
+/// no caller pays a separate decode for an order verdict. A clean merge
+/// gives both sides ordered with the merge's counts. At the first step-down
+/// the walk saves the error [`compare`] would raise at that cursor, stops
+/// pairing (no further `each`, no further listing lines), and drains each
+/// side to its end for its order and counts. A read or parse error before
+/// any step-down is raised as [`compare`] raises it, with no judgment.
+pub(crate) fn compare_judged(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+) -> Result<Walked, Error> {
+    let a = listing.with_extension("first.opl");
+    let b = listing.with_extension("second.opl");
+    decode(harness, first, &a, policy)?;
+    decode(harness, second, &b, policy)?;
+    let walked = merge_judged(&a, &b, listing, each)?;
+    if let Ok(merged) = &walked.merged {
+        harness.msg(&format!(
+            "  OPL merge {}: same={} first-only={} second-only={} differs={}",
+            listing.display(),
+            merged.same,
+            merged.first_only,
+            merged.second_only,
+            merged.differs
+        ));
+        for opl in [&a, &b] {
+            std::fs::remove_file(opl)?;
+        }
+    }
+    Ok(walked)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk(
     harness: &mut Harness,
@@ -384,6 +445,9 @@ struct Stream {
     number: u64,
     key: Option<(usize, i64)>,
     counts: [u64; 3],
+    /// The line of the first record at or below its predecessor, once a
+    /// strict read has met one.
+    stepped: Option<u64>,
 }
 
 impl Stream {
@@ -397,6 +461,7 @@ impl Stream {
             number: 0,
             key: None,
             counts: [0; 3],
+            stepped: None,
         })
     }
 
@@ -415,6 +480,7 @@ impl Stream {
             return Ok(None);
         };
         if self.key.is_some_and(|last| rank(key) <= rank(last)) {
+            self.stepped = Some(self.number);
             return Err(self.error(
                 "an object at or below the previous one: the stream is not in strict kind and ID \
                  order",
@@ -432,6 +498,21 @@ impl Stream {
         } else {
             self.read_record()
         }
+    }
+
+    /// Read the rest of the stream after a step-down, for its order and
+    /// counts: the first step-down is kept, later ones only confirm it.
+    fn drain(&mut self) -> Result<Scan, Error> {
+        while let Some(key) = self.read_record()? {
+            if self.stepped.is_none() && self.key.is_some_and(|last| rank(key) <= rank(last)) {
+                self.stepped = Some(self.number);
+            }
+            self.key = Some(key);
+        }
+        Ok(Scan {
+            ordered: self.stepped.is_none(),
+            counts: self.counts,
+        })
     }
 
     /// Advance to the next record and count it, whatever its order.
@@ -490,13 +571,78 @@ fn merge(
     second: &Path,
     listing: &Path,
     strict: bool,
-    mut each: impl FnMut(Group),
-    mut paired: impl FnMut(Pair<'_>),
+    each: impl FnMut(Group),
+    paired: impl FnMut(Pair<'_>),
 ) -> Result<Merged, Error> {
     let mut a = Stream::open(first)?;
     let mut b = Stream::open(second)?;
     let mut out = BufWriter::new(File::create(listing)?);
     let mut merged = Merged::default();
+    pair_streams(&mut a, &mut b, &mut out, strict, &mut merged, each, paired)?;
+    out.flush()?;
+    merged.first = a.counts;
+    merged.second = b.counts;
+    Ok(merged)
+}
+
+/// The strict [`merge`] of [`compare_judged`]: a step-down is a judgment of
+/// both sides, its cursor error saved, rather than an early return.
+fn merge_judged(
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    each: impl FnMut(Group),
+) -> Result<Walked, Error> {
+    let mut a = Stream::open(first)?;
+    let mut b = Stream::open(second)?;
+    let mut out = BufWriter::new(File::create(listing)?);
+    let mut merged = Merged::default();
+    match pair_streams(&mut a, &mut b, &mut out, true, &mut merged, each, |_| {}) {
+        Ok(()) => {
+            out.flush()?;
+            merged.first = a.counts;
+            merged.second = b.counts;
+            let scan = |counts| {
+                Ok(Scan {
+                    ordered: true,
+                    counts,
+                })
+            };
+            Ok(Walked {
+                scans: [scan(a.counts), scan(b.counts)],
+                merged: Ok(merged),
+                listing_note: None,
+            })
+        }
+        // Only a strict read that stepped down sets `stepped`, and it
+        // returns at once, so this error is that cursor's.
+        Err(e) if a.stepped.is_some() || b.stepped.is_some() => {
+            let listing_note = out.flush().err().map(|f| {
+                format!(
+                    "  the prefix listing {} could not be flushed: {f}",
+                    listing.display()
+                )
+            });
+            Ok(Walked {
+                scans: [a.drain(), b.drain()],
+                merged: Err(e),
+                listing_note,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The pairing loop of [`merge`] over two open streams.
+fn pair_streams(
+    a: &mut Stream,
+    b: &mut Stream,
+    out: &mut BufWriter<File>,
+    strict: bool,
+    merged: &mut Merged,
+    mut each: impl FnMut(Group),
+    mut paired: impl FnMut(Pair<'_>),
+) -> Result<(), Error> {
     let mut ka = a.advance(strict)?;
     let mut kb = b.advance(strict)?;
     loop {
@@ -553,10 +699,7 @@ fn merge(
             }
         }
     }
-    out.flush()?;
-    merged.first = a.counts;
-    merged.second = b.counts;
-    Ok(merged)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -643,6 +786,48 @@ mod tests {
                 .0
                 .identical()
         );
+    }
+
+    fn judged(a: &str, b: &str) -> Result<Walked, Error> {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (pa, pb, pl) = (dir.join("a.opl"), dir.join("b.opl"), dir.join("l.txt"));
+        std::fs::write(&pa, a).unwrap();
+        std::fs::write(&pb, b).unwrap();
+        merge_judged(&pa, &pb, &pl, |_| {})
+    }
+
+    #[test]
+    fn a_judged_walk_judges_both_sides_and_keeps_the_cursor_error() {
+        let ordered = "n1 v1\nn2 v1\nw1 v1\n";
+        let walked = judged(ordered, ordered).unwrap();
+        let scan = Scan {
+            ordered: true,
+            counts: [2, 1, 0],
+        };
+        assert_eq!(walked.scans[0].as_ref().unwrap(), &scan);
+        assert_eq!(walked.merged.unwrap().first, [2, 1, 0]);
+
+        // The second side steps down at its line 3, before the first side's
+        // line 3 is read: that cursor's error is the one raised, and both
+        // sides are still judged whole.
+        let walked = judged("n1 v1\nn10 v1\nn9 v1\nw1 v1\n", "n1 v1\nn3 v1\nn2 v1\n").unwrap();
+        let err = walked.merged.unwrap_err().to_string();
+        assert!(err.contains("b.opl line 3"), "{err}");
+        let first = walked.scans[0].as_ref().unwrap();
+        assert_eq!((first.ordered, first.counts), (false, [3, 1, 0]));
+        let second = walked.scans[1].as_ref().unwrap();
+        assert_eq!((second.ordered, second.counts), (false, [3, 0, 0]));
+
+        // A repeat on one side; the other side is ordered, and a parse error
+        // in a drained side is that side's alone.
+        let walked = judged("n1 v1\nn1 v1\n", "n1 v1\nn2 v1\nx\n").unwrap();
+        assert!(walked.merged.is_err());
+        assert!(!walked.scans[0].as_ref().unwrap().ordered);
+        assert!(walked.scans[1].is_err());
+
+        // A read error before any step-down is raised, not judged.
+        assert!(judged("n1 v1", "n1 v1\n").is_err());
     }
 
     #[test]

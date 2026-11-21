@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::argv::PbfArgv;
 use crate::error::Error;
-use crate::harness::{Harness, Verdict};
+use crate::harness::{Harness, Role, Verdict};
 use crate::opl_compare::{self, Policy};
 use crate::osc;
 use crate::reference::ToolRun;
@@ -155,8 +155,11 @@ pub fn run(
     // Content only: pbfhogg's OSC is content-based by design (metadata and
     // inline way coordinates are not content), so an object whose version
     // moved without a content change is not in it.
+    // The first comparison, pbfhogg's roundtrip against new, also judges the
+    // order of both from its decodings; a separate order decode after these
+    // strict comparisons could only pass.
     let mut verdicts = Vec::with_capacity(4);
-    for (label, listing, a, b) in [
+    for (index, (label, listing, a, b)) in [
         (
             "pbfhogg roundtrip vs new",
             "pbfhogg-vs-new",
@@ -181,11 +184,28 @@ pub fn run(
             &rt_pbfhogg,
             &rt_osmium,
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         harness.msg(&format!("=== diff: {label} ==="));
-        let diff = harness.same_elements(
-            a,
-            b,
+        let (role_a, role_b) = if index == 0 {
+            (
+                Role::Judged {
+                    label: "roundtrip-pbfhogg",
+                    record: "roundtrip-pbfhogg order",
+                },
+                Role::Judged {
+                    label: "new",
+                    record: "new order",
+                },
+            )
+        } else {
+            (Role::Required, Role::Required)
+        };
+        let (diff, _) = harness.same_elements_judged(
+            (a, role_a),
+            (b, role_b),
             &outdir.join(format!("roundtrip-{listing}.diff.txt")),
             Policy::CONTENT,
         )?;
@@ -217,10 +237,6 @@ pub fn run(
 
     let parity = unindexed_osc_matches(harness, &outdir, pbf, &new_pbf, &pbfhogg_osc, direct_io)?;
     harness.record("unindexed OSC vs indexed OSC", parity);
-    let order = harness.check_sorted("new", &new_pbf)?;
-    harness.record("new order", order);
-    let order = harness.check_sorted("roundtrip-pbfhogg", &rt_pbfhogg)?;
-    harness.record("roundtrip-pbfhogg order", order);
 
     Ok(Some("element-content roundtrips against new and osmium, pbfhogg's OSC applied by both tools; indexed/unindexed OSC decompressed bytes identical; metadata, visibility and inline coordinates not judged".into()))
 }

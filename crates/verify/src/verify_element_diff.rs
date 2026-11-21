@@ -11,8 +11,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::counts::Counts;
 use crate::error::Error;
-use crate::harness::Harness;
+use crate::harness::{Harness, Role};
 use crate::opl_compare::{self, Class, Policy};
 use crate::osc::{OscAction, OscKind};
 
@@ -112,18 +113,38 @@ pub(crate) fn scan_element_diff(
     new: &Path,
     listing: &Path,
     policy: Policy,
-    mut each: impl FnMut(OscAction, OscKind, i64),
+    each: impl FnMut(OscAction, OscKind, i64),
 ) -> Result<(), Error> {
+    opl_compare::compare(harness, old, new, listing, policy, classify(each))?;
+    Ok(())
+}
+
+/// [`scan_element_diff`] with each side's order judged under its [`Role`]
+/// from the same decodings ([`Harness::judge_walk`]); returns both sides'
+/// counts.
+pub(crate) fn scan_element_diff_judged(
+    harness: &mut Harness,
+    old: (&Path, Role<'_>),
+    new: (&Path, Role<'_>),
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(OscAction, OscKind, i64),
+) -> Result<[Counts; 2], Error> {
+    let walked =
+        opl_compare::compare_judged(harness, old.0, new.0, listing, policy, classify(each))?;
+    Ok(harness.judge_walk([old, new], walked)?.1)
+}
+
+fn classify(mut each: impl FnMut(OscAction, OscKind, i64)) -> impl FnMut(opl_compare::Group) {
     let kinds = [OscKind::Node, OscKind::Way, OscKind::Relation];
-    opl_compare::compare(harness, old, new, listing, policy, |group| {
+    move |group| {
         let action = match group.class {
             Class::FirstOnly => OscAction::Delete,
             Class::SecondOnly => OscAction::Create,
             Class::Differs => OscAction::Modify,
         };
         each(action, kinds[group.kind], group.id);
-    })?;
-    Ok(())
+    }
 }
 
 #[cfg(test)]

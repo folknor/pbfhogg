@@ -38,6 +38,29 @@ impl Verdict {
     }
 }
 
+/// How a judged comparison ([`Harness::same_elements_judged`],
+/// [`Harness::judge_walk`]) treats one side's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role<'a> {
+    /// Must be in strict order, else the comparison could not be made: the
+    /// walk's cursor error. Nothing is printed.
+    Required,
+    /// The side's order is a verdict of its own: its counts and order line
+    /// are printed under `label` and the verdict recorded as `record`.
+    Judged { label: &'a str, record: &'a str },
+    /// A reference output: its counts and order are printed under `label`,
+    /// and disorder is the error that it cannot be compared by ID.
+    Reference { label: &'a str },
+}
+
+fn counts_of([nodes, ways, relations]: [u64; 3]) -> crate::counts::Counts {
+    crate::counts::Counts {
+        nodes,
+        ways,
+        relations,
+    }
+}
+
 /// What a command's documented header rule allows its output's
 /// `LocationsOnWays` declaration to be on an input that declares it
 /// ([`Harness::judge_way_locations`]).
@@ -470,32 +493,111 @@ impl Harness {
         label: &str,
         pbf: &Path,
     ) -> Result<(Verdict, crate::counts::Counts), Error> {
-        let (ordered, [nodes, ways, relations]) =
-            opl_compare::order(self, pbf, &pbf.with_extension("order.opl"))?;
-        let counts = crate::counts::Counts {
-            nodes,
-            ways,
-            relations,
-        };
+        let (ordered, counts) = opl_compare::order(self, pbf, &pbf.with_extension("order.opl"))?;
+        let scan = opl_compare::Scan { ordered, counts };
+        Ok((self.report_order(label, pbf, scan), counts_of(scan.counts)))
+    }
+
+    /// Print `label`'s counts and order verdict from `scan`, a reading of
+    /// `pbf`. The header hint is context: a header that cannot be read goes
+    /// to the detail and the verdict stands.
+    fn report_order(&mut self, label: &str, pbf: &Path, scan: opl_compare::Scan) -> Verdict {
+        let [nodes, ways, relations] = scan.counts;
         self.msg(&format!(
             "  {label}: {nodes} nodes, {ways} ways, {relations} relations"
         ));
-        if ordered {
+        if scan.ordered {
             self.msg(&format!("  {label}: in strict order (osmium OPL) PASS"));
-            return Ok((Verdict::Pass, counts));
+            return Verdict::Pass;
         }
-        let hint = if pbf_frames::header(pbf)?.declares_sorted() {
-            format!(
+        let hint = match pbf_frames::header(pbf) {
+            Ok(header) if header.declares_sorted() => format!(
                 " - header declares {} but element order disagrees",
                 pbf_frames::SORT_TYPE_THEN_ID
-            )
-        } else {
-            String::new()
+            ),
+            Ok(_) => String::new(),
+            Err(e) => {
+                self.msg(&format!(
+                    "  {label}: header unreadable for the order hint: {e}"
+                ));
+                String::new()
+            }
         };
         self.msg(&format!(
             "  {label}: NOT in strict order (osmium OPL){hint} FAIL"
         ));
-        Ok((Verdict::Fail, counts))
+        Verdict::Fail
+    }
+
+    /// [`same_elements`](Self::same_elements) with each side's order judged
+    /// from the comparison's own decodings ([`opl_compare::compare_judged`])
+    /// under its [`Role`]; returns the verdict and both sides' counts.
+    pub(crate) fn same_elements_judged(
+        &mut self,
+        a: (&Path, Role<'_>),
+        b: (&Path, Role<'_>),
+        listing: &Path,
+        policy: Policy,
+    ) -> Result<(Verdict, [crate::counts::Counts; 2]), Error> {
+        let walked = opl_compare::compare_judged(self, a.0, b.0, listing, policy, |_| {})?;
+        let (merged, counts) = self.judge_walk([a, b], walked)?;
+        let verdict = Verdict::from_pass(merged.identical());
+        if verdict == Verdict::Fail {
+            self.replay_listing(listing)?;
+        }
+        Ok((verdict, counts))
+    }
+
+    /// Report and record each side of a judged walk by its [`Role`], in
+    /// side order, then raise: a [`Role::Reference`] side's deliberate
+    /// error first, else the walk's cursor error. A side whose drain failed
+    /// has no judgment; its error goes to the detail and the cursor error
+    /// stays the one raised.
+    pub(crate) fn judge_walk(
+        &mut self,
+        sides: [(&Path, Role<'_>); 2],
+        walked: opl_compare::Walked,
+    ) -> Result<(opl_compare::Merged, [crate::counts::Counts; 2]), Error> {
+        if let Some(note) = &walked.listing_note {
+            self.msg(note);
+        }
+        let mut reference = None;
+        for ((pbf, role), scan) in sides.into_iter().zip(walked.scans) {
+            let label = match role {
+                Role::Required => None,
+                Role::Judged { label, .. } | Role::Reference { label } => Some(label),
+            };
+            let scan = match scan {
+                Ok(scan) => scan,
+                Err(e) => {
+                    self.msg(&format!(
+                        "  {}: no order judgment, its decoding could not be read whole: {e}",
+                        label.map_or_else(|| pbf.display().to_string(), str::to_owned)
+                    ));
+                    continue;
+                }
+            };
+            match role {
+                Role::Required => {}
+                Role::Judged { label, record } => {
+                    let verdict = self.report_order(label, pbf, scan);
+                    self.record(record, verdict);
+                }
+                Role::Reference { label } => {
+                    if !self.report_order(label, pbf, scan).is_pass() && reference.is_none() {
+                        reference = Some(Error::Failed(format!(
+                            "{label} output is not in strict order, so it cannot be compared \
+                             with pbfhogg's by ID"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(e) = reference {
+            return Err(e);
+        }
+        let merged = walked.merged?;
+        Ok((merged, [counts_of(merged.first), counts_of(merged.second)]))
     }
 
     /// Run one check and print its result line. `Err` is only an interrupt

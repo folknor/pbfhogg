@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use crate::argv::PbfArgv;
 use crate::checks::sort;
 use crate::error::Error;
-use crate::harness::{Harness, Verdict};
+use crate::harness::{Harness, Role, Verdict};
 use crate::opl_compare::Policy;
 use crate::pbf_frames::{self, Header, SORT_TYPE_THEN_ID};
 
@@ -127,6 +127,10 @@ pub(crate) fn compare_outputs(
     ours: &Path,
     theirs: &Path,
 ) -> Result<(), Error> {
+    // The reference's order is a precondition settled before anything of
+    // pbfhogg's is judged, so its own decode stays: folded into the
+    // comparison, a pbfhogg header verdict or copy-sort failure could come
+    // first and hide it.
     if !harness.check_sorted(osmium_label, theirs)?.is_pass() {
         return Err(Error::Failed(format!(
             "{osmium_label} output is not in strict order, so it cannot be compared with \
@@ -134,10 +138,14 @@ pub(crate) fn compare_outputs(
         )));
     }
     let pbfhogg_label = format!("pbfhogg {label}");
-    let compared = if order.sorted {
-        let verdict = harness.check_sorted(&pbfhogg_label, ours)?;
-        harness.record(&format!("{pbfhogg_label} output order"), verdict);
-        ours.to_path_buf()
+    // pbfhogg's order (on unsorted input, the osmium-sorted copy's, which
+    // proves no repeated ID) is judged from the comparison's own decoding.
+    let (compared, order_label, order_record) = if order.sorted {
+        (
+            ours.to_path_buf(),
+            pbfhogg_label.clone(),
+            format!("{pbfhogg_label} output order"),
+        )
     } else {
         let claims = harness.has_sort_flag(ours)?;
         harness.msg(&format!(
@@ -151,14 +159,22 @@ pub(crate) fn compare_outputs(
         );
         let copy = ours.with_extension("sorted.pbf");
         sort::osmium_sort(harness, ours, &copy, &ours.with_extension("sorted.sink"))?;
-        let verdict = harness.check_sorted(&format!("{pbfhogg_label} (osmium-sorted)"), &copy)?;
-        harness.record(&format!("{pbfhogg_label} output repeats an ID"), verdict);
-        copy
+        (
+            copy,
+            format!("{pbfhogg_label} (osmium-sorted)"),
+            format!("{pbfhogg_label} output repeats an ID"),
+        )
     };
     let policy = Policy::between(&compared, theirs)?;
-    let diff = harness.same_elements(
-        &compared,
-        theirs,
+    let (diff, _) = harness.same_elements_judged(
+        (
+            &compared,
+            Role::Judged {
+                label: &order_label,
+                record: &order_record,
+            },
+        ),
+        (theirs, Role::Required),
         &crate::harness::listing_beside(&compared),
         policy,
     )?;

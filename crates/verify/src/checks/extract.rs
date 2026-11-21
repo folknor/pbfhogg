@@ -51,7 +51,7 @@ use crate::error::Error;
 use crate::extract_config::PolygonInput;
 use crate::extract_config::Region;
 use crate::extract_config::{ExtractStrategy, PbfhoggCommand};
-use crate::harness::{Harness, Verdict};
+use crate::harness::{Harness, Role, Verdict};
 use crate::osc::{OscAction, OscKind};
 use crate::pbf_frames::SORT_TYPE_THEN_ID;
 use crate::reference::ToolRun;
@@ -284,31 +284,31 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             )?;
             (sorted, format!("{label} output repeats an ID"))
         };
-        let (ours_sorted, ours) = harness.check_sorted_counted(&label, &compared)?;
-        harness.record(&order_failure, ours_sorted);
-        let (theirs_sorted, theirs) = harness.check_sorted_counted(
-            &format!("osmium extract --{strategy_name}{suffix}"),
-            &osmium_out,
-        )?;
-        // A reference output with repeated or out-of-order IDs cannot be
-        // compared by key: the diff could pair one copy and list the other
-        // as osmium-only, hiding a conflicting content. That is a comparison
-        // that could not be made, never a pass.
-        if !theirs_sorted.is_pass() {
-            return Err(Error::Failed(format!(
-                "osmium extract --{strategy_name}{suffix} output is not in strict order, so it \
-                 cannot be compared with pbfhogg's by ID"
-            )));
-        }
-
         // --- Element diff, classified as it streams ---
+        // Both sides' order and counts come from the diff's own decodings:
+        // pbfhogg's order is recorded, then a reference output with repeated
+        // or out-of-order IDs is the error that it cannot be compared by key
+        // (the diff could pair one copy and list the other as osmium-only,
+        // hiding a conflicting content), never a pass.
         let keep_relations = *strategy == ExtractStrategy::Simple;
         let mut report = ExtractDiffReport::default();
         let policy = crate::opl_compare::Policy::between(&compared, &osmium_out)?;
-        element_diff::scan_element_diff(
+        let osmium_label = format!("osmium extract --{strategy_name}{suffix}");
+        let [ours, theirs] = element_diff::scan_element_diff_judged(
             harness,
-            &compared,
-            &osmium_out,
+            (
+                &compared,
+                Role::Judged {
+                    label: &label,
+                    record: &order_failure,
+                },
+            ),
+            (
+                &osmium_out,
+                Role::Reference {
+                    label: &osmium_label,
+                },
+            ),
             &outdir.join(format!("pbfhogg-vs-osmium-{strategy_name}.diff.txt")),
             policy,
             |action, kind, id| {
@@ -318,12 +318,9 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
                 report.classify(action).add(kind, id);
             },
         )?;
-        let shared = if ours_sorted.is_pass() {
-            Some(shared_counts(&ours, &theirs, &report)?)
-        } else {
-            None
-        };
-        report.print(harness, strategy_name, shared.as_ref());
+        // A clean strict diff proves both sides ordered.
+        let shared = shared_counts(&ours, &theirs, &report)?;
+        report.print(harness, strategy_name, &shared);
         membership.extend(report.membership_clause(strategy_name));
         if report.content_mismatch.total() > 0 {
             harness.fail(format!(
@@ -464,11 +461,9 @@ impl ExtractDiffReport {
     }
 
     /// The strategy's full account, into the check's detail.
-    fn print(&self, harness: &mut Harness, strategy: &str, shared: Option<&[u64; 3]>) {
-        let coverage = match shared {
-            Some([n, w, r]) => format!("shared {n} nodes, {w} ways, {r} relations"),
-            None => "shared coverage unavailable (pbfhogg's output is not in strict order)".into(),
-        };
+    fn print(&self, harness: &mut Harness, strategy: &str, shared: &[u64; 3]) {
+        let [n, w, r] = shared;
+        let coverage = format!("shared {n} nodes, {w} ways, {r} relations");
         if self.content_mismatch.total() > 0 {
             self.content_mismatch
                 .print("FAIL ", "content differs on a shared ID", |line| {

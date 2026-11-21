@@ -233,16 +233,26 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // reference's header, so the claim multipass omits is not needed here.
     osmium_sort_as(h, pbf, &theirs, &outdir.join("osmium.stdout"), true)?;
     let policy = crate::opl_compare::Policy::between(&ours, &theirs)?;
-    let diff = h.same_elements(&ours, &theirs, &listing_beside(&ours), policy)?;
+    // pbfhogg's order is judged from the comparison's own decoding: a
+    // separate order decode after the strict comparison could only pass.
+    let (diff, _) = h.same_elements_judged(
+        (
+            &ours,
+            crate::harness::Role::Judged {
+                label: "pbfhogg sort",
+                record: "pbfhogg sort output order",
+            },
+        ),
+        (&theirs, crate::harness::Role::Required),
+        &listing_beside(&ours),
+        policy,
+    )?;
     h.msg(if diff == crate::harness::Verdict::Pass {
         "  diff: PASS (identical)"
     } else {
         "  diff: FAIL (differences found)"
     });
     h.record("pbfhogg vs osmium elements", diff);
-
-    let order = h.check_sorted("pbfhogg sort", &ours)?;
-    h.record("pbfhogg sort output order", order);
     Ok(None)
 }
 

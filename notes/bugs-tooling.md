@@ -392,33 +392,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-033 - Order verdicts behind a strict merge can never fire
-
-Reported by: heavy-opus, engine-opus, orchestration-opus, other-opus.
-
-`sort::run` calls `check_sorted(ours)` after a strict `same_elements`. That
-merge returns `Err(Failed)` the moment either side steps down, so the order
-verdict, and its "header declares Sort.Type_then_ID but element order
-disagrees" hint, can never appear. The same pattern shows up elsewhere:
-
-- `diff --format osc` runs `check_sorted(new)` and `check_sorted(rt_pbfhogg)`
-  after four strict comparisons.
-- `compare_outputs` (cat, tags-filter, getid, getparents, add-locations) and
-  apply-changes record the order verdict first, but the strict merge after it
-  errors anyway.
-
-In all of these, a disordered output ends as an `Err` naming a deleted OPL
-file instead of the deliberate verdict. Each of these calls is also a full
-osmium decode: three can only pass, and the others duplicate the merge's
-reading.
-
-Proposed fix, same in every report: the strict merge records each side's
-order verdict and counts, keeping the key scan going so the counts message
-stays the same, and then raises the error it raises today. The callers drop
-their separate order decodes and record the claims under today's names. This
-covers sort, compare_outputs, apply-changes, derive-changes, extract (two
-`check_sorted_counted`) and multi-extract.
-
 ## TOOL-034 - A missing declared reference output is accepted as success
 
 Reported by: orchestration-codex.

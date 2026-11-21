@@ -87,6 +87,14 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         )));
     }
 
+    // The input's decodings are shared across the six merges through the
+    // run's store and the cross-run summaries, so the input is decoded at
+    // most twice cold (this content scan, then the merges' policy) and not
+    // at all warm. Scanning here under the merges' policy to save the first
+    // was weighed and refused: it saves one cold decode, under the noise
+    // floor of this check's wall, and changes which failure wins on an input
+    // whose metadata osmium cannot write as OPL (a content decode skips
+    // usernames, so it still reports the order fault first).
     let (ordered, _) = opl_compare::order(harness, pbf)?;
     if !ordered {
         return Err(Error::tool(

@@ -207,6 +207,11 @@ pub(crate) fn judge(
                 let mut consumed = 0usize;
                 let mut last: Option<i64> = None;
                 while let Some(got) = next {
+                    // The blob after a run is inflated too: its own first kind
+                    // and ID are the evidence that the run ended there, so
+                    // the boundary is read from the output rather than
+                    // assumed from the plan. One blob per run end, negligible
+                    // beside osmium's whole-file decodes.
                     let ids = pbf_frames::blob_ids(out, got.payload_offset, got.datasize)?;
                     let Some(&(k, first)) = ids.first() else {
                         return Ok(Err(format!("output data blob {} is empty", got.index)));

@@ -1843,10 +1843,11 @@ What remains:
 - Across runs only summaries are reused, not decodings (PERF-065).
 - One decoding per policy: NO_LOCATIONS and CONTENT are never projected
   from FULL, since no field-policies control holds such a projection. A
-  file compared under two policies decodes twice; cat --dedupe's input is
-  decoded under CONTENT for its order scan and again under the merge
-  policy. Ordering the order scan after, or decoding it at the merge
-  policy, would save that decode.
+  file compared under two policies decodes twice. cat --dedupe's input
+  (CONTENT order scan, then the merge policy) stays that way deliberately:
+  the saving is one cold decode, under the noise floor, and a CONTENT scan
+  keeps reporting an order fault before a metadata the OPL writer refuses;
+  the reasoning is at the order gate in checks/cat_dedupe.rs.
 - Byte-identical files at distinct inodes decode apart (the stamp key was
   chosen over a content digest: the encoding fixture's fake osmium answers
   by name over byte-identical PBFs, and no fresh output is hashed).
@@ -2200,29 +2201,6 @@ cursor-dependent `-l` cases.
 
 Kind: rewrite (heavy-codex); local (heavy-opus, 3 decodes to 2 and no
 rewrites).
-
-## PERF-073 - cat --dedupe decodes the input once per merge
-
-Reported by: heavy-opus, heavy-codex, orchestration-codex.
-
-Mechanism: six `same_elements(out, input)` calls and one `order(input)` decode
-the input 7 times. The three derived operands each get a CONTENT order decode.
-The window arms re-decode passthrough payloads they already prove
-byte-identical, and the layout judge decodes the lookahead blob to detect a run
-end.
-
-Redesigns:
-
-- heavy-opus: decode the input once (the NO_LOCATIONS and CONTENT keys are the
-  same) and compare each output with `compare_with_opl`. Cache the operands'
-  order and counts beside their artifacts.
-- heavy-codex: certify the base once and fold layout and element judgment
-  together, skipping a decode only when the exact payload is proven to
-  represent the next expected span. Replace the two tags-filter producers with
-  one independent partition into amenity and complement. Keep the file
-  descriptors and buffers open.
-
-Kind: local (heavy-opus); rewrite (heavy-codex).
 
 ## PERF-074 - sort runs osmium multipass even on already ordered input
 

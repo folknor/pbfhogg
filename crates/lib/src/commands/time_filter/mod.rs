@@ -468,7 +468,7 @@ fn time_filter_snapshot(
 /// timestamp check and the visibility check. Updates `stats` for the drop
 /// counters along the way. Returning `None` means the caller should `continue`.
 fn snapshot_gate(
-    ts: Option<i64>,
+    ts: Option<crate::Result<i64>>,
     ident: (&str, i64),
     visible: bool,
     cutoff_timestamp: i64,
@@ -817,8 +817,20 @@ fn version_violation(
 // naming the element.
 // ---------------------------------------------------------------------------
 
+// Every helper below returns the claim in whole seconds, rounded down
+// (`div_euclid`), so a version is eligible when its timestamp falls within
+// or before the cutoff second: -1 ms is second -1, not 0. The claim's
+// scaling by `date_granularity` is exact, and one that overflows `i64` is an
+// `Err` the caller refuses: a wrapped value would be kept or dropped by an
+// arbitrary comparison, or read as padding on a versionless dense slot.
+
+/// The claimed timestamp in whole seconds, rounded down.
+fn claim_seconds(claim: Option<crate::Result<i64>>) -> Option<crate::Result<i64>> {
+    claim.map(|ms| ms.map(|ms| ms.div_euclid(1000)))
+}
+
 /// `None` means the element carries no timestamp at all.
-fn dense_timestamp(dn: &DenseNode<'_>) -> Option<i64> {
+fn dense_timestamp(dn: &DenseNode<'_>) -> Option<crate::Result<i64>> {
     // A timestamp column, when the group carries one, has a value for every
     // node, so the column alone does not say this node has a timestamp.
     // Absence is `info()` returning None (a metadata-stripped dense block),
@@ -828,23 +840,27 @@ fn dense_timestamp(dn: &DenseNode<'_>) -> Option<i64> {
     // metadata among nodes that carry it. Each reads 0 and must not pass as
     // the epoch; `claimed_milli_timestamp` is the slot rule every metadata
     // output shares.
-    Some(dn.info()?.claimed_milli_timestamp()? / 1000)
+    claim_seconds(dn.info()?.claimed_milli_timestamp())
 }
 
-fn node_timestamp(n: &Node<'_>) -> Option<i64> {
-    Some(n.info().milli_timestamp()? / 1000)
+fn node_timestamp(n: &Node<'_>) -> Option<crate::Result<i64>> {
+    claim_seconds(n.info().claimed_milli_timestamp())
 }
 
-fn way_timestamp(w: &Way<'_>) -> Option<i64> {
-    Some(w.info().milli_timestamp()? / 1000)
+fn way_timestamp(w: &Way<'_>) -> Option<crate::Result<i64>> {
+    claim_seconds(w.info().claimed_milli_timestamp())
 }
 
-fn relation_timestamp(r: &Relation<'_>) -> Option<i64> {
-    Some(r.info().milli_timestamp()? / 1000)
+fn relation_timestamp(r: &Relation<'_>) -> Option<crate::Result<i64>> {
+    claim_seconds(r.info().claimed_milli_timestamp())
 }
 
-/// Turn an absent timestamp into the error that names it.
-fn require_timestamp(ts: Option<i64>, kind: &str, id: i64) -> crate::Result<i64> {
+/// Turn an absent timestamp into the error that names it, and an
+/// overflowing one into its scaling error, named the same way.
+fn require_timestamp(ts: Option<crate::Result<i64>>, kind: &str, id: i64) -> crate::Result<i64> {
+    let ts = ts
+        .transpose()
+        .map_err(|err| err.context(format!("time-filter: {kind} {id}")))?;
     ts.ok_or_else(|| {
         crate::Error::invalid_data(format!(
             "time-filter: {kind} {id} carries no timestamp. Filtering by time needs one, and \
@@ -1048,6 +1064,30 @@ mod tests {
             s.dropped_no_snapshot_version,
         ];
         Ok((std::fs::read(&output).unwrap(), elements, stats))
+    }
+
+    /// Claims are judged in whole seconds rounded down: a negative
+    /// sub-second timestamp belongs to the second before the epoch, not to
+    /// second 0, and a scaling error passes through to the refusal.
+    #[test]
+    fn claim_seconds_rounds_down() {
+        for (ms, want) in [
+            (-1, -1),
+            (-1000, -1),
+            (-1001, -2),
+            (0, 0),
+            (999, 0),
+            (1500, 1),
+        ] {
+            assert_eq!(
+                super::claim_seconds(Some(Ok(ms))).unwrap().unwrap(),
+                want,
+                "{ms} ms"
+            );
+        }
+        assert!(super::claim_seconds(None).is_none());
+        let err = crate::read::claims::scale_milli_timestamp(i64::MAX, 1000).unwrap_err();
+        assert!(super::require_timestamp(super::claim_seconds(Some(Err(err))), "node", 7).is_err());
     }
 
     /// Neither path reads indexdata, so an input whose indexdata is false on

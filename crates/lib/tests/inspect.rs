@@ -1021,6 +1021,58 @@ fn show_element_prints_present_zeros_and_visibility() {
     assert_eq!(bare, "node/2\n  lat: 0.0000000\n  lon: 0.0000000\n");
 }
 
+/// A timestamp whose scaling to milliseconds overflows `i64` prints the
+/// `<invalid>` marker, dense and plain alike. Wrapped, 2^61 seconds at the
+/// default granularity is 0 ms and printed `timestamp: 0`, a false epoch.
+#[test]
+fn show_element_marks_a_timestamp_whose_scaling_overflows() {
+    use crate::common::{TestMeta, TestWay};
+    use pbfhogg::ElementKind;
+    use pbfhogg::inspect::show_element_to;
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("overflow.osm.pbf");
+    let far = TestMeta {
+        timestamp: 1 << 61,
+        ..TestMeta::default()
+    };
+    crate::common::write_test_pbf(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 0,
+            lon: 0,
+            tags: vec![],
+            meta: Some(far),
+        }],
+        &[TestWay {
+            id: 3,
+            refs: vec![1],
+            tags: vec![],
+            meta: Some(far),
+        }],
+        &[],
+    );
+    for (kind, id) in [(ElementKind::Node, 1), (ElementKind::Way, 3)] {
+        let mut out: Vec<u8> = Vec::new();
+        let found = show_element_to(
+            &input,
+            kind,
+            id,
+            false,
+            &mut out,
+            &crate::common::test_host(),
+        )
+        .expect("show_element");
+        assert!(found);
+        let text = String::from_utf8(out).expect("utf8 output");
+        assert!(
+            text.contains("\n  timestamp: <invalid>\n"),
+            "unexpected output: {text:?}"
+        );
+    }
+}
+
 /// One raw frame: length prefix, a `BlobHeader` naming `blob_type` and
 /// declaring the body's size, then `body` verbatim.
 fn raw_frame(blob_type: &str, body: &[u8]) -> Vec<u8> {

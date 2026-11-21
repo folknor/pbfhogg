@@ -551,6 +551,19 @@
 
 ### Fixed
 
+- **An element timestamp whose millisecond scaling overflows is refused,
+  not wrapped.** `time-filter`, `export --metadata` and `digest --form
+  full` used to read such a timestamp wrapped to an arbitrary value: a
+  plausible date that time-filter kept or dropped by a meaningless
+  comparison, or exactly 0, which on a versionless dense node read as
+  padding. Each now refuses it as invalid data naming the element, as
+  `diff --format osc` already did; `inspect --show` prints
+  `timestamp: <invalid>`. time-filter now judges timestamps in whole
+  seconds rounded down, so a pre-1970 sub-second timestamp belongs to the
+  second before it rather than the one after. Re-encoding commands copy a
+  timestamp at the default `date_granularity` verbatim, so such a value
+  is no longer rewritten as a different one.
+
 - **`degrade --unsort` and `--unsort-intra` perturb history input.**
   The swap could pick two versions of one ID, leaving the ID order
   unchanged and the output not unsorted at all. Both modes now move

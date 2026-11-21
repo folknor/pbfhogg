@@ -506,8 +506,8 @@ fn map_sentinel(value: i64) -> i64 {
 /// Way or Relation `kind` `id`, for re-encoding.
 ///
 /// Each field is present exactly when the `Info` carries it (after the
-/// reader's Osmosis -1 normalisation; the timestamp truncated to whole
-/// seconds), so re-encoding through the `add_*_partial` builder methods
+/// reader's Osmosis -1 normalisation; the timestamp as
+/// [`output_timestamp_seconds`] converts it), so re-encoding through the `add_*_partial` builder methods
 /// neither invents a 0 for an absent field nor drops the fields of a
 /// versionless `Info`. `None` when the `Info` carries no field at all.
 ///
@@ -536,6 +536,25 @@ pub(crate) fn element_metadata_dropping_user<'a>(
     element_metadata_impl::<false>(kind, id, info)
 }
 
+/// The `date_granularity` every block pbfhogg writes declares: the
+/// protobuf default, 1000 ms.
+pub(crate) const OUTPUT_DATE_GRANULARITY: i64 = 1000;
+
+/// A stored timestamp re-expressed in the whole seconds an output block at
+/// [`OUTPUT_DATE_GRANULARITY`] stores. At the same granularity the raw value
+/// is copied verbatim, so the output reads back exactly the claim the input
+/// made, an overflowing scaling included. Any other granularity is scaled
+/// (wrapping, as the permissive read accessor scales) and truncated to
+/// whole seconds, which loses sub-second precision and can wrap.
+#[inline]
+pub(crate) fn output_timestamp_seconds(raw: i64, date_granularity: i64) -> i64 {
+    if date_granularity == OUTPUT_DATE_GRANULARITY {
+        raw
+    } else {
+        raw.wrapping_mul(date_granularity) / 1000
+    }
+}
+
 #[inline]
 fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
     kind: crate::ElementKind,
@@ -549,7 +568,7 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
     };
     let meta = PartialMetadata {
         version: info.version(),
-        timestamp: info.milli_timestamp().map(|ms| ms / 1000),
+        timestamp: info.output_timestamp_seconds(),
         changeset: info.changeset(),
         uid: info.uid(),
         user,
@@ -568,7 +587,8 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
 /// version of -1 is written as 0 (both claim no version) and a changeset of
 /// -1 as 0 (which `claims` reads it as). So
 /// `DenseNodeInfo::claims` reads the output as it read the input, apart
-/// from sub-second timestamps, which are truncated to whole seconds. The
+/// from a timestamp under a non-default `date_granularity`, which
+/// [`output_timestamp_seconds`] truncates to whole seconds. The
 /// user name is resolved as in [`element_metadata`]: a bad user string index
 /// is an error, not an empty user.
 pub(crate) fn dense_node_metadata<'a>(
@@ -613,7 +633,7 @@ fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool>(
     Ok(Some(DenseMetadata {
         meta: Metadata {
             version: reencoded_version(info.version()),
-            timestamp: info.milli_timestamp() / 1000,
+            timestamp: info.output_timestamp_seconds(),
             changeset: map_sentinel(info.changeset()),
             uid: info.uid(),
             user,
@@ -639,12 +659,12 @@ fn bad_user(
 /// Extract [`RawPartialMetadata`] from an [`Info`](crate::Info), each field
 /// present exactly when the source carries it, preserving the raw string
 /// table index for the user name. `None` when the `Info` carries no field.
-/// The timestamp is the source's, scaled by its `date_granularity` and
-/// truncated to whole seconds.
+/// The timestamp is the source's, as [`output_timestamp_seconds`] converts
+/// it.
 pub(crate) fn element_raw_partial_metadata(info: &crate::Info<'_>) -> Option<RawPartialMetadata> {
     let meta = RawPartialMetadata {
         version: info.version(),
-        timestamp: info.milli_timestamp().map(|ms| ms / 1000),
+        timestamp: info.output_timestamp_seconds(),
         changeset: info.changeset(),
         uid: info.uid(),
         user_sid: info.raw_user_sid(),
@@ -659,7 +679,7 @@ pub(crate) fn element_raw_partial_metadata(info: &crate::Info<'_>) -> Option<Raw
 pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMetadata> {
     dn.info().map(|info| RawMetadata {
         version: reencoded_version(info.version()),
-        timestamp: info.milli_timestamp() / 1000,
+        timestamp: info.output_timestamp_seconds(),
         changeset: map_sentinel(info.changeset()),
         uid: info.uid(),
         user_sid: info.raw_user_sid(),

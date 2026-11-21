@@ -12,11 +12,30 @@
 use crate::error::Result;
 use crate::{DenseNodeInfo, Info};
 
+/// A raw timestamp scaled by the block's `date_granularity` to
+/// milliseconds, exactly. A scaling that overflows `i64` is an error: the
+/// public accessors wrap there, and a wrapped value reads as a plausible
+/// date (raw `i64::MAX` at granularity 1000 is -1000 ms), or as exactly 0,
+/// which a versionless dense slot would take for padding. Every output that
+/// prints, compares or selects by a claimed timestamp goes through this.
+#[inline]
+pub(crate) fn scale_milli_timestamp(raw: i64, date_granularity: i64) -> Result<i64> {
+    raw.checked_mul(date_granularity).ok_or_else(|| {
+        crate::error::new_wire_error(
+            "timestamp scaled by the block's date_granularity overflows i64 milliseconds; \
+             the blob's timestamp or granularity is corrupt",
+        )
+    })
+}
+
 /// What one element claims, field by field. `None` is "not claimed".
 #[derive(Clone, Debug)]
 pub(crate) struct MetaClaims<'a> {
     pub(crate) version: Option<i32>,
-    pub(crate) milli_timestamp: Option<i64>,
+    /// The claimed timestamp in milliseconds; a scaling that overflows
+    /// `i64` is an `Err` value ([`scale_milli_timestamp`]), judged by each
+    /// output like a bad user index.
+    pub(crate) milli_timestamp: Option<Result<i64>>,
     pub(crate) changeset: Option<i64>,
     pub(crate) uid: Option<i32>,
     /// The claimed user name, resolved; a bad string index is an `Err`
@@ -32,7 +51,7 @@ impl<'a> MetaClaims<'a> {
     pub(crate) fn from_info(info: &Info<'a>) -> Self {
         Self {
             version: info.claimed_version(),
-            milli_timestamp: info.milli_timestamp(),
+            milli_timestamp: info.claimed_milli_timestamp(),
             changeset: info.changeset(),
             uid: info.uid(),
             user: info.user(),

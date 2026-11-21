@@ -133,26 +133,19 @@ rewriters disagree on one input shape. Pick one rule (refuse a `changesets`
 field in any data blob, or keep unknown fields everywhere) and apply it to
 all three.
 
-## CMD-057 - time-filter compares a wrapped dense timestamp against the cutoff
+## CMD-059 - inspect --extended census reads wrapped timestamps
 
-Reported by: the time-filter padding-slot fix (spar review).
+Reported by: the timestamp-claim scaling fix (spar review).
 
-`DenseNodeInfo::milli_timestamp` scales by `date_granularity` with wrapping
-multiplication, and time-filter's dense accessor (through
-`claimed_milli_timestamp`) compares that value with the cutoff. A decoded
-timestamp far enough out to overflow wraps to an arbitrary value: it can wrap
-to a plausible time and be kept or dropped by the wrong comparison, or wrap to
-exactly 0 on a versionless slot and be refused as padding. The OSC writer
-already uses `milli_timestamp_exact` for this ambiguity (CORRECTNESS.md, OSC
-scaling). A cutoff decision on an overflowing timestamp should refuse, not
-wrap. Separately, the integer division by 1000 truncates a negative sub-second
-timestamp toward zero, so it compares as a later second than it is.
-
-The same wrap reaches `inspect --show` (`show_element.rs`, through
-`MetaClaims`), on plain `Info` as well as dense slots: a plain timestamp of
-2^61 at granularity 1000 wraps to 0 ms in `Info::milli_timestamp` and prints
-`timestamp: 0`, a false epoch. Unlike export and the OSC writer it does not
-use `milli_timestamp_exact`.
+The metadata census in `inspect/project.rs` (plain and dense projections)
+scales raw timestamps with `wrapping_mul` and then applies its
+`millis != 0` availability test and timestamp range to the result. It does
+not go through the exact claim readings (`claimed_milli_timestamp`) the
+other metadata outputs now share, and it has its own documented availability
+rule, so it was left alone. An overflowing scaling that wraps to 0 silently
+drops a timestamp from the coverage counts; one that wraps to a non-zero
+value poisons the reported timestamp range with an arbitrary date. Refuse,
+or count it as a separate invalid class, rather than wrap.
 
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 

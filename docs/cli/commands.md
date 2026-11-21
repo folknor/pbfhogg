@@ -818,7 +818,9 @@ every form.
 `--show` prints each metadata field the element claims on its own line
 (`version`, `timestamp` in whole epoch seconds, `changeset`, `uid`, `user`,
 `visible`), zeros and an empty user (`user: ""`) included, and no line for a
-field it does not claim. A dense node's claims follow CORRECTNESS.md
+field it does not claim. A timestamp whose scaling by the block's
+`date_granularity` overflows 64-bit milliseconds prints
+`timestamp: <invalid>`. A dense node's claims follow CORRECTNESS.md
 "Version 0 is not a version claim either".
 
 `inspect --json` and `export` use serde_json's JSON escaping for every
@@ -1708,7 +1710,9 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 | `--metadata` | Add available `@version`, `@timestamp`, `@changeset`, `@uid`, `@user`, and `@visible` properties |
 
 Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC
-strings. Tags that collide with emitted reserved property names are omitted.
+strings; under `--metadata`, a timestamp whose scaling by the block's
+`date_granularity` overflows 64-bit milliseconds is refused, naming the
+element. Tags that collide with emitted reserved property names are omitted.
 Polygon exterior rings are closed and counterclockwise. Nodes and ways with
 invalid geometry are skipped and reported in the stderr summary, after
 `--bbox`, expression and type selection. A node or way is invalid when any
@@ -1961,6 +1965,13 @@ pbfhogg time-filter [OPTIONS] --output <OUTPUT> <FILE> <TIMESTAMP>
 ```
 
 The timestamp can be UNIX seconds or RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+
+Element timestamps are judged in whole seconds, rounded down, so a version
+is eligible when its timestamp falls within or before the cutoff second (a
+pre-1970 sub-second timestamp belongs to the second before it, not the one
+after). An element timestamp whose scaling by the block's
+`date_granularity` overflows 64-bit milliseconds is refused as invalid
+data, naming the element.
 
 The output's replication timestamp is the earlier of the input's and the
 cutoff; the input's sequence number is kept only when the input's timestamp

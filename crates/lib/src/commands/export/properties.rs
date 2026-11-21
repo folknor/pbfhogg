@@ -61,7 +61,12 @@ where
                 push_name(buf, &mut first, "@version")?;
                 write!(buf, "{value}").ok();
             }
-            if let Some(millis) = meta.milli_timestamp {
+            if let Some(millis) = &meta.milli_timestamp {
+                // Scaled exactly: an overflow is refused, not printed as
+                // the wrapped date.
+                let millis = *millis
+                    .as_ref()
+                    .map_err(|err| err.clone().context(format!("{object_type} {id}")))?;
                 push_name(buf, &mut first, "@timestamp")?;
                 let seconds = millis.div_euclid(1000);
                 push_json_string(buf, &crate::commands::format_epoch_secs(seconds))?;

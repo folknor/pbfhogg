@@ -46,9 +46,16 @@ zero, so that separate compatibility difference also needs a ruling.
 
 Reported by: decode, encoding, sort, tags, altw-sparse, osc.
 
-`owned.rs` metadata conversion (`element_metadata_impl`,
-`dense_node_metadata_impl`, plain and dense conversions) divides millisecond
-timestamps by 1000 and the builder writes default timestamp framing; owned node
+`owned.rs` metadata conversion (`output_timestamp_seconds`, behind every
+plain and dense conversion and apply-changes' `output_info`) copies a
+timestamp at the default `date_granularity` verbatim, but under any other
+granularity scales it with wrapping multiplication and truncates toward
+zero to seconds, and the builder writes default timestamp framing. So a
+sub-second timestamp loses its fraction, an overflowing scaling is written
+as the wrapped value (an input claim the readers refuse becomes a valid
+one), a versionless dense slot at -1 ms is written as 0 and reads back as
+padding, and flooring instead would overflow for `i64::MIN` ms when scaled
+back. Preserving the source framing on rebuild is the fix shape. Owned node
 conversion narrows nanodegrees to decimicrodegrees under default coordinate
 framing. Inputs with finer precision change whenever a command rebuilds instead
 of passing through: tags-filter, sort overlap rewrites (passthrough keeps

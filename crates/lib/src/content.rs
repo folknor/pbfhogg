@@ -585,7 +585,7 @@ fn write_meta(out: &mut Vec<u8>, meta: Option<MetaClaims<'_>>) -> Result<()> {
         return Ok(());
     };
     write_opt(out, m.version.map(i32::to_le_bytes));
-    write_opt(out, m.milli_timestamp.map(i64::to_le_bytes));
+    write_opt(out, m.milli_timestamp.transpose()?.map(i64::to_le_bytes));
     write_opt(out, m.changeset.map(i64::to_le_bytes));
     write_opt(out, m.uid.map(i32::to_le_bytes));
     match m.user {

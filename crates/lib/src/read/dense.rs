@@ -496,6 +496,13 @@ impl<'a> DenseNodeInfo<'a> {
         i128::from(self.timestamp) * i128::from(self.date_granularity)
     }
 
+    /// The timestamp as a re-encoded output block stores it; see
+    /// `owned::output_timestamp_seconds`.
+    #[inline]
+    pub(crate) fn output_timestamp_seconds(&self) -> i64 {
+        crate::owned::output_timestamp_seconds(self.timestamp, self.date_granularity)
+    }
+
     /// Returns the visibility status of an element.
     // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]
@@ -530,13 +537,19 @@ impl<'a> DenseNodeInfo<'a> {
     /// present column's value, 0 included. The rule [`claims`](Self::claims)
     /// applies to the timestamp, without its other fields' cost; the zero
     /// test is on milliseconds, so a sub-second timestamp is a claim.
+    ///
+    /// The scaling is exact: one that overflows `i64` is an `Err` claim
+    /// (`read::claims::scale_milli_timestamp`), never padding, since only a
+    /// value that is exactly 0 is.
     #[inline]
-    pub(crate) fn claimed_milli_timestamp(&self) -> Option<i64> {
+    pub(crate) fn claimed_milli_timestamp(&self) -> Option<Result<i64>> {
         if !self.columns.timestamp() {
             return None;
         }
-        let milli = self.milli_timestamp();
-        (self.version >= 1 || milli != 0).then_some(milli)
+        match crate::read::claims::scale_milli_timestamp(self.timestamp, self.date_granularity) {
+            Ok(0) if self.version < 1 => None,
+            scaled => Some(scaled),
+        }
     }
 
     /// The metadata fields this slot claims, for outputs that print them;
@@ -624,7 +637,9 @@ impl<'a> DenseNodeInfo<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct DenseClaims<'a> {
     pub(crate) version: Option<i32>,
-    pub(crate) milli_timestamp: Option<i64>,
+    /// An `Err` when the scaling overflows; see
+    /// [`claimed_milli_timestamp`](DenseNodeInfo::claimed_milli_timestamp).
+    pub(crate) milli_timestamp: Option<Result<i64>>,
     pub(crate) changeset: Option<i64>,
     pub(crate) uid: Option<i32>,
     /// The claimed user name, already resolved. A bad string index is an
@@ -917,7 +932,7 @@ mod tests {
             assert!(info.visible(), "absent visible reads true");
             let claims = info.claims().unwrap();
             assert_eq!(claims.version, Some(want_version));
-            assert_eq!(claims.milli_timestamp, Some(want_ts * 1000));
+            assert_eq!(claims.milli_timestamp.unwrap().unwrap(), want_ts * 1000);
             assert_eq!((claims.changeset, claims.uid), (None, None));
             assert!(claims.user.is_none());
             assert_eq!(claims.visible, Some(true));
@@ -988,6 +1003,63 @@ mod tests {
         assert!(infos[1].1.as_ref().unwrap().visible());
     }
 
+    /// A timestamp whose scaling overflows `i64` milliseconds is an `Err`
+    /// claim, versioned or not; the wrapping value (0 for 2^61 seconds at
+    /// granularity 1000) would read as padding on the versionless slot.
+    #[test]
+    fn an_overflowing_timestamp_scaling_is_an_err_claim_never_padding() {
+        let mut builder = BlockBuilder::new();
+        builder.add_node(1, 0, 0, [], Some(&meta(0, 1 << 61, 0, 0, "")));
+        builder.add_node(2, 0, 0, [], Some(&meta(3, 1 << 61, 0, 0, "")));
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        for (id, info) in dense_infos(&block) {
+            let info = info.unwrap();
+            assert_eq!(
+                info.milli_timestamp(),
+                0,
+                "node {id}: the wrapping accessor wraps"
+            );
+            assert!(
+                matches!(info.claimed_milli_timestamp(), Some(Err(_))),
+                "node {id}"
+            );
+            assert!(matches!(
+                info.claims().unwrap().milli_timestamp,
+                Some(Err(_))
+            ));
+        }
+    }
+
+    /// At the output granularity the re-encode copies the stored timestamp
+    /// verbatim, across the signed delta boundary and through values whose
+    /// millisecond scaling overflows, so the output claims what the input
+    /// claimed.
+    #[test]
+    fn reencode_keeps_raw_timestamps_at_the_default_granularity() {
+        let raws = [i64::MAX, i64::MIN, 1 << 61, -1, 0, (1 << 61) + 1];
+        let mut builder = BlockBuilder::new();
+        for (id, &ts) in (1..).zip(&raws) {
+            builder.add_node(id, 0, 0, [], Some(&meta(1, ts, 1, 1, "u")));
+        }
+        let bytes = builder.take().unwrap().unwrap().to_vec();
+        let block = PrimitiveBlock::from_vec(bytes).unwrap();
+        let mut out = BlockBuilder::new();
+        for element in block.elements() {
+            let Element::DenseNode(node) = element else {
+                panic!("dense only");
+            };
+            let meta = crate::owned::dense_node_metadata(&node).unwrap();
+            out.add_node_dense(node.id(), 0, 0, [], meta.as_ref());
+        }
+        let back = PrimitiveBlock::from_vec(out.take().unwrap().unwrap().to_vec()).unwrap();
+        let got: Vec<i64> = dense_infos(&back)
+            .iter()
+            .map(|(_, i)| i.as_ref().unwrap().output_timestamp_seconds())
+            .collect();
+        assert_eq!(got, raws);
+    }
+
     /// The Osmosis -1 version no longer blanks the slot: printing claims its
     /// real fields by value, and the re-encode keeps them with version 0 and
     /// the -1 changeset as 0.
@@ -1002,7 +1074,7 @@ mod tests {
         };
         let claims = node.info().unwrap().claims().unwrap();
         assert_eq!(claims.version, None);
-        assert_eq!(claims.milli_timestamp, Some(5000));
+        assert_eq!(claims.milli_timestamp.unwrap().unwrap(), 5000);
         assert_eq!((claims.changeset, claims.uid), (None, Some(9)));
         assert_eq!(claims.user.unwrap().unwrap(), "bob");
 

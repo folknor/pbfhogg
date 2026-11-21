@@ -1032,7 +1032,10 @@ fn packed_uint32_count(data: &[u8], strings: usize) -> Result<usize> {
 /// checks that both scales fit their declared signed int32 type, without
 /// imposing positivity or checking the scaled values. Delta reconstruction
 /// is modular. Timestamp scaling (`raw * date_granularity`) also wraps in
-/// `milli_timestamp` and kin, so debug and release agree and nothing panics.
+/// the public `milli_timestamp` accessors, so debug and release agree and
+/// nothing panics; the claim readings every metadata output shares
+/// (`claimed_milli_timestamp`, `read::claims`) scale exactly and carry an
+/// overflow as an error, at the access, like the coordinates.
 /// Coordinate scaling does not wrap: `offset + granularity * raw` is
 /// computed exactly by the coordinate accessors of `Node`, `DenseNode` and
 /// `WayNodeLocation`, which refuse (`nano_lat`, `decimicro_lat` and kin

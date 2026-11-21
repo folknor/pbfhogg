@@ -187,9 +187,10 @@ enum NodeRoute<M> {
 ///   DEVIATIONS.md.)
 /// - Otherwise (no version, 0 or negative): a dense slot claims a field only
 ///   by a value no padding slot holds, so every present field must hold one:
-///   a timestamp non-zero in milliseconds (the readers' wrapping scale by the
-///   builder's default `date_granularity` of 1000), a positive changeset and
-///   uid, a non-empty user, `visible` false.
+///   a timestamp non-zero (the readers scale it exactly, so only 0 reads
+///   as padding; one whose scaling overflows reads as the same refused claim
+///   in either encoding), a positive changeset and uid, a non-empty user,
+///   `visible` false.
 fn partial_columns(
     version: Option<i32>,
     timestamp: Option<i64>,
@@ -201,7 +202,7 @@ fn partial_columns(
     let ok = if version.is_some_and(|v| v >= 1) {
         visible.is_some() && changeset != Some(-1)
     } else {
-        timestamp.is_none_or(|t| t.wrapping_mul(1000) != 0)
+        timestamp.is_none_or(|t| t != 0)
             && changeset.is_none_or(|c| c > 0)
             && uid.is_none_or(|u| u > 0)
             && user.is_none_or(|nonempty| nonempty)
@@ -2713,7 +2714,7 @@ mod tests {
 
     type Claimed = (
         Option<i32>,
-        Option<i64>,
+        Option<Option<i64>>,
         Option<i64>,
         Option<i32>,
         Option<String>,
@@ -2731,7 +2732,9 @@ mod tests {
         claims.map_or((None, None, None, None, None, None), |c| {
             (
                 c.version,
-                c.milli_timestamp,
+                // An overflowing scaling is an inner None, so both
+                // encodings must agree on refusing it too.
+                c.milli_timestamp.map(Result::ok),
                 c.changeset,
                 c.uid,
                 c.user.map(|u| u.expect("user resolves").to_owned()),
@@ -2859,11 +2862,6 @@ mod tests {
                 uid: Some(0),
                 ..PartialMetadata::default()
             },
-            // Non-zero seconds, zero milliseconds after the wrapping scale.
-            PartialMetadata {
-                timestamp: Some(1 << 61),
-                ..PartialMetadata::default()
-            },
             // Below version 1 an explicit empty user reads as padding.
             PartialMetadata {
                 timestamp: Some(9),
@@ -2890,6 +2888,12 @@ mod tests {
                 uid: Some(4),
                 user: Some("m"),
                 visible: Some(false),
+                ..PartialMetadata::default()
+            },
+            // Seconds whose millisecond scaling overflows: both encodings
+            // claim the same refused timestamp, never dense padding.
+            PartialMetadata {
+                timestamp: Some(1 << 61),
                 ..PartialMetadata::default()
             },
         ];

@@ -472,6 +472,45 @@ fn dense_timestamps_claimed_by_value_or_version_are_kept() {
     }
 }
 
+/// A timestamp whose scaling to milliseconds overflows `i64` is refused,
+/// naming the node. Wrapped, 2^61 + 1 seconds at the default granularity is
+/// 1000 ms and was kept below the cutoff; 2^61 alone wraps to 0, which on a
+/// versionless slot read as padding and was refused as a missing timestamp.
+#[test]
+fn time_filter_refuses_a_timestamp_whose_scaling_overflows() {
+    let dir = crate::common::test_scratch();
+    for history in [false, true] {
+        for (version, timestamp) in [(1, (1_i64 << 61) + 1), (0, 1_i64 << 61)] {
+            let input = dir
+                .path()
+                .join(format!("overflow-{history}-{version}.osm.pbf"));
+            let output = dir
+                .path()
+                .join(format!("overflow-{history}-{version}.out.osm.pbf"));
+            write_node_blocks(
+                &input,
+                history,
+                true,
+                &[&[(1, 1, 100), (2, version, timestamp)]],
+            );
+            let invocation_scratch = pbfhogg_test_scratch::scratch();
+            let out = CliInvoker::new(&invocation_scratch)
+                .arg("time-filter")
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .arg("250")
+                .assert_failure();
+            let stderr = out.stderr_str();
+            assert!(
+                stderr.contains("node 2") && stderr.contains("overflows i64 milliseconds"),
+                "history={history} version={version}; stderr:\n{stderr}"
+            );
+            assert!(!output.exists(), "a refused run publishes nothing");
+        }
+    }
+}
+
 fn snapshot_meta(version: i32, timestamp: i64, visible: bool) -> Metadata<'static> {
     Metadata {
         version,

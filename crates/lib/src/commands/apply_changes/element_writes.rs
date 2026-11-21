@@ -200,18 +200,14 @@ impl<'a> BaseWrites<'a> {
     }
 }
 
-/// The source block's `date_granularity` that `BlockBuilder`'s output blocks
-/// declare (by omitting the field).
-const DEFAULT_DATE_GRANULARITY: i32 = 1000;
-
 /// A raw `Info` sub-message as the default-framed output block must carry it.
 ///
 /// `Info.timestamp` is in units of the block's `date_granularity`
 /// milliseconds, and an output block declares the default 1000. Under the
 /// default the bytes are copied as they are. Otherwise every timestamp field
-/// is rewritten as `raw * date_granularity / 1000` seconds (wrapping, as the
-/// read accessor scales), the conversion the base nodes of the same rewrite
-/// get, so one rewritten blob keeps one whole-second contract. Every other
+/// is rewritten by `owned::output_timestamp_seconds`, the conversion the
+/// base nodes of the same rewrite get, so one rewritten blob keeps one
+/// whole-second contract. Every other
 /// field keeps its bytes, unknown fields included; a timestamp field that is
 /// absent stays absent, and one not varint-typed is copied like an unknown
 /// field, as the parser treats it.
@@ -226,7 +222,7 @@ fn output_info<'b>(
     let Some(info) = info else {
         return Ok(None);
     };
-    if date_granularity == DEFAULT_DATE_GRANULARITY {
+    if i64::from(date_granularity) == crate::owned::OUTPUT_DATE_GRANULARITY {
         return Ok(Some(info));
     }
     buf.clear();
@@ -234,7 +230,7 @@ fn output_info<'b>(
     while let Some((field, wire_type)) = cursor.read_tag()? {
         if field == 2 && wire_type == WIRE_VARINT {
             let raw = cursor.read_varint_i64()?;
-            let seconds = raw.wrapping_mul(i64::from(date_granularity)) / 1000;
+            let seconds = crate::owned::output_timestamp_seconds(raw, i64::from(date_granularity));
             encode_tag(buf, 2, WIRE_VARINT);
             encode_varint(buf, seconds.cast_unsigned());
         } else {

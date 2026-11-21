@@ -476,7 +476,7 @@ fn push_info_attrs(
     kind: ElementKind,
     id: i64,
     version: Option<i32>,
-    milli_timestamp: Option<i64>,
+    milli_timestamp: Option<crate::Result<i64>>,
     changeset: Option<i64>,
     uid: Option<i32>,
     user: Option<&str>,
@@ -485,6 +485,9 @@ fn push_info_attrs(
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
+    // The claim is scaled exactly; an overflow is refused rather than
+    // printed as the wrapped date.
+    let milli_timestamp = milli_timestamp.transpose().map_err(in_element(kind, id))?;
     if let Some(milli_timestamp) = milli_timestamp {
         // Floor, not truncate, so a pre-1970 millisecond timestamp lands in
         // the right second; export formats the same way.
@@ -512,24 +515,6 @@ fn push_info_attrs(
         push_attribute_escaped(elem, "user", u).map_err(in_element(kind, id))?;
     }
     Ok(())
-}
-
-/// Refuse a timestamp whose scaling by the block's `date_granularity`
-/// overflows `i64`. The permissive accessors wrap there, and a wrapped
-/// value can read as a plausible date (raw `i64::MAX` at granularity 1000
-/// is -1000 ms, `1969-12-31T23:59:59Z`) or, in a versionless dense slot, as
-/// the zero padding that drops the claim. Once the exact value fits, the
-/// wrapping accessor returns that same value, so every claim rule built on
-/// it is judged correctly.
-fn check_timestamp_scaling(exact: Option<i128>, kind: ElementKind, id: i64) -> crate::Result<()> {
-    match exact {
-        Some(exact) if i64::try_from(exact).is_err() => Err(crate::error::new_wire_error(
-            "timestamp scaled by the block's date_granularity overflows i64 milliseconds; \
-             the blob's timestamp or granularity is corrupt",
-        )
-        .context(format!("{} {id}", kind.as_str()))),
-        _ => Ok(()),
-    }
 }
 
 /// The decimicrodegree coordinates a derived node is printed at, checked
@@ -598,15 +583,6 @@ fn write_dense_node_xml<W: std::io::Write>(
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
-    // Checked before the claims, which judge a versionless slot's timestamp
-    // by its (wrapping) value: a wrap to zero would drop the claim silently.
-    if let Some(info) = node.info() {
-        check_timestamp_scaling(
-            Some(info.milli_timestamp_exact()),
-            ElementKind::Node,
-            node.id(),
-        )?;
-    }
     // A DenseInfo block decodes every field for every element, so presence
     // is read from the values: `claims` says which fields this slot claims
     // (all of them for a positive version, none for a negative one, and
@@ -653,7 +629,6 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
     let info = node.info();
-    check_timestamp_scaling(info.milli_timestamp_exact(), ElementKind::Node, node.id())?;
     // Called unconditionally: every field is independently optional in the
     // wire format, so gating the whole call on `version` being present would
     // discard a timestamp, changeset, uid or user carried by an Info block
@@ -666,7 +641,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
         ElementKind::Node,
         node.id(),
         info.claimed_version(),
-        info.milli_timestamp(),
+        info.claimed_milli_timestamp(),
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
@@ -691,7 +666,6 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = way.info();
-    check_timestamp_scaling(info.milli_timestamp_exact(), ElementKind::Way, way.id())?;
     // Unconditional for the same reason as the node path above: presence is
     // per field, not gated on `version`.
     push_info_attrs(
@@ -699,7 +673,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
         ElementKind::Way,
         way.id(),
         info.claimed_version(),
-        info.milli_timestamp(),
+        info.claimed_milli_timestamp(),
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
@@ -731,11 +705,6 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = rel.info();
-    check_timestamp_scaling(
-        info.milli_timestamp_exact(),
-        ElementKind::Relation,
-        rel.id(),
-    )?;
     // Unconditional for the same reason as the node path above: presence is
     // per field, not gated on `version`.
     push_info_attrs(
@@ -743,7 +712,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
         ElementKind::Relation,
         rel.id(),
         info.claimed_version(),
-        info.milli_timestamp(),
+        info.claimed_milli_timestamp(),
         info.changeset(),
         info.uid(),
         info.user().transpose()?,

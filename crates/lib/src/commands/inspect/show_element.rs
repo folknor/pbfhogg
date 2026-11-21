@@ -176,8 +176,12 @@ fn write_meta(out: &mut impl Write, claims: &MetaClaims<'_>) -> io::Result<()> {
     if let Some(v) = claims.version {
         writeln!(out, "  version: {v}")?;
     }
-    if let Some(ts) = claims.milli_timestamp {
-        writeln!(out, "  timestamp: {}", ts.div_euclid(1000))?;
+    match &claims.milli_timestamp {
+        // A scaling that overflows i64 milliseconds prints the marker, like
+        // a bad user index, rather than the wrapped value.
+        Some(Ok(ts)) => writeln!(out, "  timestamp: {}", ts.div_euclid(1000))?,
+        Some(Err(_)) => writeln!(out, "  timestamp: <invalid>")?,
+        None => {}
     }
     if let Some(cs) = claims.changeset {
         writeln!(out, "  changeset: {cs}")?;

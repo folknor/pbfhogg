@@ -673,6 +673,25 @@ interleaved baseline (clean `c5d88ef9` via `--commit HEAD`) and variant
 Medians are equal (246.5 s each) and the sign flips between pairs: no
 measurable cost. The ~10 s band is drift between cells, not the change.
 
+## Exact timestamp claims and verbatim re-encode (plantasjen, 2026-11-21, against `3ce0176a`)
+
+Every metadata output's timestamp claim scales by `date_granularity` with
+a checked multiply (an overflow is a refusal, not a wrap); time-filter
+floors claims to seconds; the re-encode conversions copy a timestamp at
+the default granularity verbatim instead of multiplying and dividing.
+`time-snapshot --dataset planet`, `--iterations 1`, interleaved baseline
+(clean `3ce0176a` via `--commit HEAD`) and variant (uncommitted):
+
+| Order | Arm | Wall | Run |
+|---|---|---|---|
+| 1 | baseline | 242 s | `1d040fc3` |
+| 2 | variant | 243 s | `89d52b94` |
+| 3 | variant | 242 s | `92479fae` |
+| 4 | baseline | 241 s | `c7aa2ea2` |
+
+Medians 241.5 s baseline, 242.5 s variant, under half a percent: no
+measurable cost.
+
 ## Changes with no cell of their own (2026-10-24 to 2026-10-30)
 
 Each was argued neutral or below noise and never measured alone. Listed

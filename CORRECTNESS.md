@@ -171,7 +171,10 @@ Re-encoding keeps what these rules read: the conversions that feed a rewrite
 keep every dense slot, its fields and its group's columns (a complete group is
 written with all six), writing a `-1` version or changeset as 0, so the
 output claims what the input did, apart from sub-second timestamps, which are
-truncated to whole seconds. A plain `Info` is
+truncated to whole seconds. At the default `date_granularity` of 1000 the
+stored timestamp is copied verbatim, so even one whose millisecond scaling
+overflows reads back as the same refused claim; only a block at another
+granularity is scaled and truncated. A plain `Info` is
 re-encoded with each field present exactly when it was decoded present
 (`element_metadata` in `crates/lib/src/owned.rs`): the `-1` version or
 changeset stays absent, the other fields stay as carried. A node is written
@@ -535,8 +538,10 @@ coordinates come from the exact accessors. A value that does not fit `i32`
 decimicrodegrees is a wire-format refusal, and one outside +-90 / +-180
 degrees on the very `i32` printed is invalid data. Timestamps are scaled
 exactly, and a scaling that overflows `i64` milliseconds is a wire-format
-refusal. That check comes before the dense claim rules, which would otherwise
-read a wrap to zero as padding. Timestamps print through `format_rfc3339_utc`,
+refusal. The scaling is the claim rules' own (every metadata output, export,
+`digest --form full`, `inspect --show` and time-filter among them, reads the
+same exact claim), so an overflow is never read as a wrap to zero, which a
+versionless dense slot would take for padding. Timestamps print through `format_rfc3339_utc`,
 whose domain is the parser's: years 0000 to 9999. The delete timestamp
 override is held to the same domain as an invalid argument before either
 input is opened. Deleted elements print only ID, version and the override, so

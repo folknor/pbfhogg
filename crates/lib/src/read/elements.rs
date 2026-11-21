@@ -944,6 +944,27 @@ impl<'a> Info<'a> {
             .map(|ts| i128::from(ts) * i128::from(self.block.date_granularity))
     }
 
+    /// The timestamp in milliseconds this element claims, `None` when the
+    /// field is absent, and an `Err` when its scaling by `date_granularity`
+    /// overflows `i64` (see `read::claims::scale_milli_timestamp`). The
+    /// reading every metadata output shares, in place of the wrapping
+    /// [`milli_timestamp`](Self::milli_timestamp).
+    #[inline]
+    pub(crate) fn claimed_milli_timestamp(&self) -> Option<crate::Result<i64>> {
+        self.info.timestamp.map(|ts| {
+            crate::read::claims::scale_milli_timestamp(ts, i64::from(self.block.date_granularity))
+        })
+    }
+
+    /// The timestamp as a re-encoded output block stores it; see
+    /// `owned::output_timestamp_seconds`.
+    #[inline]
+    pub(crate) fn output_timestamp_seconds(&self) -> Option<i64> {
+        self.info.timestamp.map(|ts| {
+            crate::owned::output_timestamp_seconds(ts, i64::from(self.block.date_granularity))
+        })
+    }
+
     /// Returns the changeset id.
     #[inline]
     pub fn changeset(&self) -> Option<i64> {

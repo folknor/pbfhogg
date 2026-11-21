@@ -331,27 +331,23 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-/// Put each artifact of `source` at its check path, and stdout at `stdout`.
-/// Destinations must be absent. `complete` requires every artifact; otherwise
-/// (a run that was not published) only the ones the run wrote are placed.
-/// On failure the names this placement made are removed.
-fn place(
-    source: &Path,
-    outputs: &[(String, &Path)],
-    sink: &Path,
-    complete: bool,
-) -> Result<(), Error> {
+/// Put each artifact of `source` at its check path, and stdout at `sink`.
+/// Only a complete run is placed, so every artifact is required and must
+/// still be a regular file: the post-run identity probe launches the tool
+/// again in the staging tree, so a source the completion probe accepted can
+/// have changed since. Destinations must be absent. On failure the names this
+/// placement made are removed.
+fn place(source: &Path, outputs: &[(String, &Path)], sink: &Path) -> Result<(), Error> {
     let mut targets: Vec<(&str, &Path)> = outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
     targets.push((STDOUT, sink));
     let mut made: Vec<PathBuf> = Vec::new();
     let result = (|| -> Result<(), Error> {
         for (name, dest) in targets {
             let src = source.join(name);
-            if !src.exists() {
-                if complete {
-                    return Err(Error::tool(format!("cached artifact {name} is missing")));
-                }
-                continue;
+            if !fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
+                return Err(Error::tool(format!(
+                    "reference artifact {name} is no longer a regular file at placement"
+                )));
             }
             place_one(&src, dest)?;
             made.push(dest.to_path_buf());
@@ -404,6 +400,104 @@ fn place_one(src: &Path, dest: &Path) -> Result<(), Error> {
     }
 }
 
+/// How a reference execution settled. Completion is decided once, here, from
+/// the same probe that gates publication and placement, so the caller never
+/// re-derives it from the exit status alone.
+#[derive(Debug)]
+pub(crate) enum Settled {
+    /// An accepted outcome with every declared output and stdout present as
+    /// regular files, placed at the check's paths. `cached` is a lookup hit.
+    Complete {
+        ended: crate::process::Ended,
+        cached: bool,
+    },
+    /// The exit, or its stderr condition, is not accepted; a signal death is
+    /// here too. Nothing is placed.
+    Unaccepted { ended: crate::process::Ended },
+    /// An accepted outcome that left declared artifacts missing or not
+    /// regular files, each with its reason. Nothing is placed.
+    InvalidOutputs {
+        ended: crate::process::Ended,
+        invalid: Vec<(String, &'static str)>,
+    },
+}
+
+/// Each of `names` under `dir` that is not a regular file, with the reason.
+/// A metadata error other than absence is the verifier's own I/O failure.
+fn invalid_artifacts<'a>(
+    dir: &Path,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<Vec<(String, &'static str)>, Error> {
+    let mut invalid = Vec::new();
+    for name in names {
+        match fs::symlink_metadata(dir.join(name)) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => invalid.push((name.to_owned(), "not a regular file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                invalid.push((name.to_owned(), "missing"));
+            }
+            Err(e) => {
+                return Err(Error::tool(format!(
+                    "cannot inspect reference artifact {name}: {e}"
+                )));
+            }
+        }
+    }
+    Ok(invalid)
+}
+
+/// Settle a fresh run from its exit and its staged `artifacts`. The exit is
+/// judged before any artifact is probed, so no artifact I/O can mask an
+/// unaccepted outcome such as a SIGKILL. `Complete` here means only that the
+/// run may go on to publication and placement.
+fn judge(
+    run: &ToolRun,
+    artifacts: &Path,
+    outputs: &[(String, &Path)],
+    ended: crate::process::Ended,
+) -> Result<Settled, Error> {
+    if !ended
+        .code()
+        .is_some_and(|c| run.completes(c, &ended.stderr))
+    {
+        return Ok(Settled::Unaccepted { ended });
+    }
+    let invalid = invalid_artifacts(
+        artifacts,
+        outputs.iter().map(|(n, _)| n.as_str()).chain([STDOUT]),
+    )?;
+    if invalid.is_empty() {
+        Ok(Settled::Complete {
+            ended,
+            cached: false,
+        })
+    } else {
+        Ok(Settled::InvalidOutputs { ended, invalid })
+    }
+}
+
+/// Place a validated published `entry` and settle it as a complete hit with
+/// its stored exit.
+fn hit(
+    entry: &Path,
+    exit_code: i32,
+    outputs: &[(String, &Path)],
+    sink: &Path,
+) -> Result<Settled, Error> {
+    use std::os::unix::process::ExitStatusExt;
+    place(&entry.join(ARTIFACTS), outputs, sink)?;
+    let stderr = fs::read(entry.join(ARTIFACTS).join(STDERR))?;
+    // Recency is separate from the immutable published manifest.
+    fs::write(entry.join("used"), [])?;
+    Ok(Settled::Complete {
+        ended: crate::process::Ended {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stderr,
+        },
+        cached: true,
+    })
+}
+
 impl ReferenceCache {
     pub(crate) fn execute(
         &self,
@@ -412,9 +506,8 @@ impl ReferenceCache {
         tools: &crate::reference::Tools,
         run: &ToolRun,
         sink: &Path,
-    ) -> Result<(crate::process::Ended, bool), Error> {
-        use crate::process::{Ended, Launch};
-        use std::os::unix::process::ExitStatusExt;
+    ) -> Result<Settled, Error> {
+        use crate::process::Launch;
         for input in run.inputs() {
             watched.watch(input)?;
         }
@@ -439,18 +532,9 @@ impl ReferenceCache {
             let entry = self.dir.join(&key.hex);
             if let Some(manifest) = self.lookup(&entry, key, run, &outputs) {
                 life.checkpoint()?;
-                place(&entry.join(ARTIFACTS), &outputs, sink, true)?;
-                let stderr = fs::read(entry.join(ARTIFACTS).join(STDERR))?;
-                // Recency is separate from the immutable published manifest.
-                fs::write(entry.join("used"), [])?;
+                let settled = hit(&entry, manifest.exit_code, &outputs, sink)?;
                 remove_tree(&staging);
-                return Ok((
-                    Ended {
-                        status: std::process::ExitStatus::from_raw(manifest.exit_code << 8),
-                        stderr,
-                    },
-                    true,
-                ));
+                return Ok(settled);
             }
         }
         let args = staged_args(run, &staging);
@@ -466,15 +550,16 @@ impl ReferenceCache {
         let validation = watched.revalidate();
         let ended = result?;
         validation?;
-        let completed = ended
-            .code()
-            .is_some_and(|c| run.completes(c, &ended.stderr))
-            && outputs.iter().all(|(n, _)| {
-                fs::symlink_metadata(staging.join(ARTIFACTS).join(n)).is_ok_and(|m| m.is_file())
-            });
+        let ended = match judge(run, &staging.join(ARTIFACTS), &outputs, ended) {
+            Ok(Settled::Complete { ended, .. }) => ended,
+            incomplete => {
+                remove_tree(&staging);
+                return incomplete;
+            }
+        };
         fs::write(staging.join(ARTIFACTS).join(STDERR), &ended.stderr)?;
         let mut source = staging.join(ARTIFACTS);
-        if completed && let Some(key) = key {
+        if let Some(key) = key {
             let now = identity_text_again(life, tools, &staging, run)?;
             watched.revalidate()?;
             if now.as_ref().is_some_and(|now| now.hex == key.hex) {
@@ -508,11 +593,14 @@ impl ReferenceCache {
                 output::note("reference identity changed; result not cached");
             }
         }
-        place(&source, &outputs, sink, completed)?;
+        place(&source, &outputs, sink)?;
         if staging.exists() {
             remove_tree(&staging);
         }
-        Ok((ended, false))
+        Ok(Settled::Complete {
+            ended,
+            cached: false,
+        })
     }
 }
 
@@ -897,7 +985,7 @@ mod tests {
         fs::create_dir_all(&check).unwrap();
         let out = check.join("osmium.osm.pbf");
         let outputs = vec![("osmium.osm.pbf".to_owned(), out.as_path())];
-        place(&source, &outputs, &check.join("osmium.stdout"), true).unwrap();
+        place(&source, &outputs, &check.join("osmium.stdout")).unwrap();
         assert_eq!(fs::read(&out).unwrap(), b"pbf");
         assert_eq!(
             fs::metadata(&out).unwrap().ino(),
@@ -905,8 +993,18 @@ mod tests {
         );
         // A second placement over the same names is refused and leaves the
         // first in place.
-        assert!(place(&source, &outputs, &check.join("osmium.stdout"), true).is_err());
+        assert!(place(&source, &outputs, &check.join("osmium.stdout")).is_err());
         assert!(out.exists());
+        // A source that is no longer a regular file is refused, and the
+        // names already made are rolled back.
+        let fresh = root.join("fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        let moved = fresh.join("osmium.osm.pbf");
+        let outputs = vec![("osmium.osm.pbf".to_owned(), moved.as_path())];
+        fs::remove_file(source.join(STDOUT)).unwrap();
+        std::os::unix::fs::symlink(source.join("osmium.osm.pbf"), source.join(STDOUT)).unwrap();
+        assert!(place(&source, &outputs, &fresh.join("osmium.stdout")).is_err());
+        assert!(!moved.exists());
     }
 
     #[test]
@@ -940,13 +1038,7 @@ mod tests {
         };
         assert!(cache.lookup(&entry, &key, &run, &outputs).is_some());
         // Linking moves ctime only; the entry stays valid.
-        place(
-            &entry.join(ARTIFACTS),
-            &outputs,
-            &check.join("o.stdout"),
-            true,
-        )
-        .unwrap();
+        place(&entry.join(ARTIFACTS), &outputs, &check.join("o.stdout")).unwrap();
         assert!(cache.lookup(&entry, &key, &run, &outputs).is_some());
         // Replacing an artifact's bytes moves its stamp; the rehash fails it.
         let artifact = entry.join(ARTIFACTS).join("osmium.osm.pbf");

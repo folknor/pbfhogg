@@ -348,20 +348,27 @@ impl Harness {
     /// SIGKILL, which the verifier never sends one while it waits, is an
     /// environment outcome: commonly the kernel OOM killer, and it says
     /// nothing about pbfhogg. The run's inputs are revalidated before its
-    /// outcome is used.
+    /// outcome is used. The run succeeds only as the cache settled it:
+    /// an accepted outcome whose declared outputs and stdout are all present
+    /// as regular files and placed. An accepted exit that left a declared
+    /// output missing fails here, naming the artifact, rather than at a later
+    /// read of the absent file.
     pub(crate) fn reference(&mut self, run: &ToolRun, sink: &Path) -> Result<Ended, Error> {
+        use crate::reference_cache::Settled;
         let label = run.label();
         let started = Instant::now();
-        let (ended, cached) =
-            self.cache
-                .execute(&mut self.life, &mut self.run, &self.tools, run, sink)?;
-        if cached {
+        let settled = self
+            .cache
+            .execute(&mut self.life, &mut self.run, &self.tools, run, sink)?;
+        if matches!(settled, Settled::Complete { cached: true, .. }) {
             self.msg(&format!("  {label}: cached reference"));
             self.step(&format!("{label} cached"), Duration::ZERO);
         } else {
             self.step(&label, started.elapsed());
         }
-        if ended.signal() == Some(libc::SIGKILL) {
+        if let Settled::Unaccepted { ended } = &settled
+            && ended.signal() == Some(libc::SIGKILL)
+        {
             return Err(Error::Environment(format!(
                 "{label} (reference run {}) was killed by SIGKILL, which the verifier did not \
                  send (commonly the kernel OOM killer); the comparison could not be made",
@@ -372,18 +379,27 @@ impl Harness {
             self.run.watch(input)?;
         }
         self.run.revalidate()?;
-        if !ended
-            .code()
-            .is_some_and(|code| run.completes(code, &ended.stderr))
-        {
-            return Err(Error::Failed(format!(
+        match settled {
+            Settled::Complete { ended, .. } => Ok(ended),
+            Settled::Unaccepted { ended } => Err(Error::Failed(format!(
                 "{label} (reference run {}) failed: {}: {}",
                 run.id,
                 ended.status,
                 ended.stderr_text().trim()
-            )));
+            ))),
+            Settled::InvalidOutputs { ended, invalid } => Err(Error::Failed(format!(
+                "{label} (reference run {}) exited with accepted status {} but its declared \
+                 output {}: {}",
+                run.id,
+                ended.status,
+                invalid
+                    .iter()
+                    .map(|(name, why)| format!("{name} is {why}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ended.stderr_text().trim()
+            ))),
         }
-        Ok(ended)
     }
 
     /// `Err` unless a pbfhogg launch exited 0.

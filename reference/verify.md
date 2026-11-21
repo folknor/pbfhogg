@@ -278,6 +278,11 @@ started by launcher scripts and libraries loaded outside the `ldd` closure
 are outside that identity.
 
 Only accepted exits with every declared output present can be published.
+The same probe settles the run for its check: a fresh run that exits with
+an accepted status but leaves a declared output or its stdout missing, or
+not a regular file, is a check failure naming each such artifact, exactly
+as an unaccepted exit is. A run that did not complete places nothing at the
+check's paths.
 Inputs and tool identity are checked again after execution; input movement
 is ENVIRONMENT. After all children settle, cancellation and input identity
 are checked immediately before the completed staging tree is renamed into

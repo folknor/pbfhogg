@@ -137,7 +137,9 @@ fn main() {
         let count = input.with_extension("count");
         let previous = std::fs::read_to_string(&count).unwrap_or_default();
         std::fs::write(count, format!("{previous}x")).unwrap();
-        std::fs::copy(input, &args[3]).unwrap();
+        if args.get(4).is_none_or(|a| a != "omit") {
+            std::fs::copy(input, &args[3]).unwrap();
+        }
         if args.get(4).is_some_and(|a| a == "mutate") {
             std::fs::write(input, b"changed").unwrap();
         }
@@ -394,6 +396,37 @@ fn worker(role: &str) {
     }
 }
 
+/// Run the fixture twice in `mode`, a run that must not complete: each runs
+/// afresh (an incomplete run is never published) and places nothing.
+fn incomplete_runs(
+    life: &mut process::Lifecycle,
+    watched: &mut run::Run,
+    tools: &reference::Tools,
+    cache: &reference_cache::ReferenceCache,
+    input: &Path,
+    dir: &Path,
+    mode: &str,
+) -> Vec<reference_cache::Settled> {
+    let mut settled = Vec::new();
+    for n in 0..2 {
+        let target = dir.join(format!("{mode}{n}"));
+        std::fs::create_dir(&target).unwrap();
+        let declared = reference::ToolRun::osmium(format!("{mode}.1"))
+            .arg("cache-copy")
+            .input(input)
+            .output(&target.join("out.pbf"))
+            .arg(mode);
+        settled.push(
+            cache
+                .execute(life, watched, tools, &declared, &target.join("stdout"))
+                .unwrap(),
+        );
+        assert!(!target.join("out.pbf").exists());
+        assert!(!target.join("stdout").exists());
+    }
+    settled
+}
+
 fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     if !["/usr/bin/ldd", "/bin/ldd"]
         .iter()
@@ -418,7 +451,7 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
             .arg("cache-copy")
             .input(&input)
             .output(&output);
-        let (ended, cached) = cache
+        let settled = cache
             .execute(
                 life,
                 &mut watched,
@@ -427,35 +460,33 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
                 &target.join("stdout"),
             )
             .unwrap();
+        let reference_cache::Settled::Complete { ended, cached } = settled else {
+            panic!("copy run did not complete: {settled:?}");
+        };
         assert!(ended.status.success());
         assert_eq!(cached, hit);
         assert_eq!(std::fs::read(output).unwrap(), b"input");
     }
     assert_eq!(std::fs::read(input.with_extension("count")).unwrap(), b"xx");
     cache.fresh = false;
-    for n in 0..2 {
-        let target = dir.join(format!("failed{n}"));
-        std::fs::create_dir(&target).unwrap();
-        let declared = reference::ToolRun::osmium("failed.1")
-            .arg("cache-copy")
-            .input(&input)
-            .output(&target.join("out.pbf"))
-            .arg("fail");
-        let (ended, cached) = cache
-            .execute(
-                life,
-                &mut watched,
-                &tools,
-                &declared,
-                &target.join("stdout"),
-            )
-            .unwrap();
+    for settled in incomplete_runs(life, &mut watched, &tools, &cache, &input, dir, "fail") {
+        let reference_cache::Settled::Unaccepted { ended } = settled else {
+            panic!("failing run was not unaccepted: {settled:?}");
+        };
         assert_eq!(ended.code(), Some(1));
-        assert!(!cached);
+    }
+    // An accepted exit that leaves its declared output missing is settled as
+    // invalid, never as complete.
+    for settled in incomplete_runs(life, &mut watched, &tools, &cache, &input, dir, "omit") {
+        let reference_cache::Settled::InvalidOutputs { ended, invalid } = settled else {
+            panic!("omitting run was not invalid: {settled:?}");
+        };
+        assert!(ended.status.success());
+        assert_eq!(invalid, vec![("out.pbf".to_owned(), "missing")]);
     }
     assert_eq!(
         std::fs::read(input.with_extension("count")).unwrap(),
-        b"xxxx"
+        b"xxxxxx"
     );
     let declared = reference::ToolRun::osmium("mutate.1")
         .arg("cache-copy")
@@ -490,9 +521,12 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
         .arg("cache-copy")
         .input(&input)
         .output(&output);
-    let (ended, cached) = cache
+    let settled = cache
         .execute(life, &mut later, &tools, &declared, &target.join("stdout"))
         .unwrap();
+    let reference_cache::Settled::Complete { ended, cached } = settled else {
+        panic!("rewritten run did not complete: {settled:?}");
+    };
     assert!(ended.status.success());
     assert!(!cached);
     assert_eq!(std::fs::read(output).unwrap(), b"rewritten");

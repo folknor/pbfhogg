@@ -1,7 +1,7 @@
 //! How a verifier step ends when it does not complete.
 
-/// A step that did not complete. Only `Failed` is a statement about pbfhogg;
-/// the others say the comparison could not be made.
+/// A step that did not complete. Only `Failed` fails a check; the others say
+/// the comparison could not be made.
 #[derive(Debug)]
 pub(crate) enum Error {
     /// SIGTERM, SIGINT or SIGHUP reached the verifier: neither PASS nor FAIL.
@@ -11,7 +11,9 @@ pub(crate) enum Error {
     /// launch.
     Environment(String),
     /// A comparison found pbfhogg wrong, or pbfhogg failed a run it had to
-    /// complete.
+    /// complete. A reference run that did not complete (an unaccepted exit,
+    /// or an accepted one missing a declared output) also fails its check
+    /// here, since no comparison stands without it.
     Failed(String),
     /// The verifier could not establish that every descendant of a launch is
     /// gone. No later launch, comparison or cache publication is safe, so a

@@ -392,18 +392,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-034 - A missing declared reference output is accepted as success
-
-Reported by: orchestration-codex.
-
-A fresh reference run that exits with an accepted status but leaves a declared
-output missing fails the cache's `completed` check. Execution still returns
-the accepted status, though, and `Harness::reference` accepts it
-(`reference_cache.rs` completion and placement, `harness.rs` outcome check).
-The missing artifact is found downstream, where the producer-specific
-diagnostic can be lost. Make artifact presence part of the settled producer
-result.
-
 ## TOOL-035 - apply_changes::opl_lines accepts a truncated final line
 
 Reported by: engine-opus.

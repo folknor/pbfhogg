@@ -369,7 +369,7 @@ suite because a later comparison cannot make that run complete.
 | `check-refs` | `osmium check-refs` | missing counts per class in ways-only and relation modes, each exit held to its complete report |
 | `check-ids` | `osmium fileinfo -e` and independent framing reader | plain/full verdict, exit, counts and indexed status on input, derived disorder and five fixed fixtures |
 | `repack` | osmium OPL decodings, walked in file order | element sequence including metadata and way coordinates, header features, true indexdata, caps and documented blob layout |
-| `degrade` | osmium OPL decodings, walked in file order | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on a `LocationsOnWays` input (`--locations-on-ways`, suite `degrade -l`) |
+| `degrade` | osmium OPL decodings, walked in file order | retained elements, removals and swaps, header features, true indexdata, caps, layout predictions and swap positions; way coordinates stripped on an input whose ways carry them, declared or not (`--locations-on-ways`, suite `degrade -l`) |
 | `apply-changes` | verifier-owned change model over the OSC scan, `osmium cat` of the OSC and `osmium getid -H` base records; `osmium apply-changes` | predicted version-regression refusals; every identity the OSC touches holds its last change in file order or nothing after a final delete; untouched identities equal to osmium; osmium held to its own precedence model; strict output order; optional inline-location consistency |
 | `merge-changes` | independent positional model and `osmium merge-changes -s` | concatenation, positional simplify, first version regression refusal, delete bodies and serial parity |
 | `tags-filter --input-kind osc` | `osmium tags-filter -R` on input OPL | selected creates/modifies, every delete, grouped input order, action/metadata/body records and serial parity |
@@ -606,11 +606,18 @@ lengths (`opl_compare::compare_sequence`). No unmatched or differing
 record means the two sequences are identical element by element, whatever
 their order, a shifted tag boundary (`a=bc` against `ab=c`) included; only
 reference-side records means the output is a subsequence of the reference.
-A moved or removed object is listed with its line. The reference is the input when osmium reads it in
-kind and ID order (fileinfo `objects_ordered`), else a stable partition
-osmium builds (`osmium cat -t` per kind, then `osmium cat` of the three: each
-kind keeps its input order); for degrade it is written without way
-coordinates (plain `osmium cat`), since every re-encode drops them. Layout:
+A moved or removed object is listed with its line. The reference side is an
+OPL file the verifier writes from osmium's decoding of the input under the
+same policy (`opl_compare::compare_sequence_with_opl`): the decoding's
+records kind by kind, each kind in file order (a stable partition, the
+decoding itself when osmium reads the input in kind and ID order), with every
+way-node coordinate rewritten undefined (`n<id>xy`) where the command must
+drop them. No reference is a PBF osmium writes: libosmium's writer chooses
+its own blocks and can exceed the 32 MiB limit on input pbfhogg re-encodes,
+and its plain writer drops `visible` without a history header. Whether the
+input's ways carry coordinates is counted from that decoding, never read
+from the header: libosmium decodes lat/lon arrays whether or not
+`LocationsOnWays` is declared, and so does pbfhogg. Layout:
 each output's indexdata must be on every blob and true: kind, count and
 exact ID range by the verifier's own decode of every blob
 (`pbf_frames::index_truth`, raw or zlib; any other compression is an error),
@@ -636,8 +643,10 @@ correctness not established; an arm all of whose runs refuse is an error.
 `repack` runs the default cap (no `--elements-per-blob`, held to the
 documented 8000), 3000 (a cap that does not divide 8000-element blobs) and
 64000 (one that grows them), each of which must leave the element sequence
-identical, metadata and way coordinates included, and claim both header
-features as the input does; on an indexed input the layout must be repack's
+identical, metadata included and way coordinates kept on an input declaring
+`LocationsOnWays` and dropped on one that does not (repack's header gate
+drops undeclared arrays), and claim both header features as the input does;
+on an indexed input the layout must be repack's
 rule exactly: per kind, a blob of at least the cap flushes the builder and is
 written as full blocks of the cap and its remainder alone, a smaller one goes
 element by element into the builder, which flushes at the cap. A fourth case
@@ -685,27 +694,24 @@ first blob, and no blob ranges may overlap. The unsort modes must not claim
 Which input each arm strips coordinates on: the decode path drops inline way
 coordinates on every case, whatever the flags, so every case strips them
 when the input carries them and none does otherwise. The suite's `degrade`
-entry runs on the suite input (by default `indexed`, which declares no
-`LocationsOnWays`; the PASS line names the gap). The suite's `degrade -l`
+entry runs on the suite input (by default `indexed`, whose ways carry no
+coordinates; the PASS line names the gap). The suite's `degrade -l`
 entry runs the whole check on the selected generation's
 `altw-keep-untagged` base, and standalone `degrade --locations-on-ways`
 does the same on the selected input. The ordinary and locations entries use
-`checks/degrade/` and `checks/degrade-l/`, respectively. On a
-`LocationsOnWays` input the check
-first compares the reference with way coordinates against the one without
-(the input against a plain osmium cat of it, or the two stable partitions
-when osmium reads the input out of order), pair by pair. Every way
-ref of the reference without coordinates must decode undefined; a pair may
-differ only as a way whose two lines agree once each node ref is cut at its
-`x`; an unmatched object, or a pair differing in anything else (a tag,
-metadata, a ref), is an error. The witness is a pair whose side with
-coordinates defines one, and no witness means no way carried a coordinate.
-This holds only between osmium's two reference streams: it does not prove the
-partition kept every other field of the original input. In the locations entry an input that declares no
-`LocationsOnWays`, or whose ways carry no coordinate, fails; elsewhere it is
-a PASS-line gap. That a retained coordinate would be caught rests on
-osmium's OPL writing way node coordinates under `locations_on_ways=true`;
-the generated fixtures fake osmium and exercise only the wiring.
+`checks/degrade/` and `checks/degrade-l/`, respectively. The witness is the
+count, while the expected file is written, of input ways osmium decodes with
+at least one defined coordinate; it counts the input, so a refused
+`--strip-locations` beside drops that removed every such way still counts.
+In the locations entry an input with no such way fails, whatever its header
+declares; elsewhere it is a PASS-line gap. That a retained coordinate would
+be caught rests on osmium's OPL writing way node coordinates under
+`locations_on_ways=true`; undefined and absent coordinates print alike
+(`n<id>xy`), so an output carrying arrays of undefined locations reads as
+stripped: the comparison sees decoded coordinates, not the wire arrays. A
+defined coordinate osmium's OPL writer cannot format fails the input
+decoding, an error. The generated fixtures fake osmium and exercise only the
+wiring.
 
 
 Change-only checks resolve no PBF. Merge-changes takes `--osc-seq`, repeated

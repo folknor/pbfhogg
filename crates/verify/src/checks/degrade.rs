@@ -3,9 +3,10 @@
 //! cap, against osmium's reading of the input (the shared rules and readers
 //! are [`crate::verify_reencode`]).
 //!
-//! The reference is the input without way coordinates, since every
-//! re-encode drops them, partitioned by kind when osmium does not read it in
-//! order. Every case must claim no `LocationsOnWays`, claim
+//! The expected sequence is osmium's decoding of the input with every
+//! way-node coordinate written undefined, since every re-encode drops them,
+//! partitioned by kind when osmium does not read it in order. Every case
+//! must claim no `LocationsOnWays`, claim
 //! `Sort.Type_then_ID` as the input does except under an unsort mode
 //! (never), carry indexdata on every blob, true by the verifier's own blob
 //! decode and by `check --index`, and hold no blob over the cap or empty,
@@ -34,14 +35,18 @@
 //!   kind's lowest ID by osmium fileinfo, decoded second in the kind's first
 //!   blob: the first two objects swapped. No blob ranges overlap.
 //!
-//! On a `LocationsOnWays` input every case strips way coordinates (the
-//! decode path drops them whatever the flags), and the check first holds
-//! osmium's reading of the input with coordinates against the reference
-//! without them, to establish that some way carried one and that the two
-//! differ in nothing else ([`observed_coordinates`]). [`run`] takes any
-//! input and names an input without coordinates as a gap;
-//! [`run_locations`] (the suite's `degrade -l` on the `altw-keep-untagged`
-//! base, or `--locations-on-ways`) fails on one instead.
+//! On an input whose ways carry coordinates every case strips them (the
+//! decode path drops them whatever the flags). Whether any way carries one
+//! is counted from osmium's decoding of the input, never read from the
+//! header: libosmium and pbfhogg both decode lat/lon arrays whether or not
+//! `LocationsOnWays` is declared, so an undeclared input with arrays is
+//! stripped and judged like a declared one. The comparison sees decoded
+//! coordinates, so an output carrying arrays of undefined locations reads as
+//! stripped. [`run`] takes any input and names an input without coordinates
+//! as a gap; [`run_locations`] (the suite's `degrade -l` on the
+//! `altw-keep-untagged` base, or `--locations-on-ways`) fails on one
+//! instead. The count is of the input: a refused `--strip-locations` with
+//! drops that removed every coordinate-bearing way still counts.
 //!
 //! `--drop-ids` and the unsort modes need an input osmium reads in strict
 //! order and holds no negative ID (their predictions read claimed ranges
@@ -54,10 +59,9 @@ use std::path::{Path, PathBuf};
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::opl_compare::{self, Policy};
 use crate::verify_reencode::{
-    self as reencode, Compared, DEFAULT_CAP, Input, KINDS, LayoutCheck, Listing, Ran, References,
-    continuous, split,
+    self as reencode, Compared, DEFAULT_CAP, Expected, Input, KINDS, LayoutCheck, Listing, Ran,
+    References, continuous, split,
 };
 
 /// The drop seeds: the first runs twice, the second once.
@@ -153,24 +157,12 @@ fn run_on(
 ) -> Result<Option<String>, Error> {
     harness.msg("--- degrade: reading the input ---");
     let input = reencode::read_input(harness, outdir, pbf)?;
-    if require_locations && !input.locations {
+    let reference = References::new(outdir, &input).get(harness, true)?;
+    let coordinates = reference.coordinate_ways > 0;
+    if !coordinates && require_locations {
         return Err(Error::Failed(
-            "the input declares no LocationsOnWays, so coordinate stripping cannot be verified \
-             on it"
-                .to_owned(),
-        ));
-    }
-    let mut refs = References::new(outdir, &input);
-    let reference = refs.get(harness, false)?;
-    let coordinates = if input.locations {
-        observed_coordinates(harness, outdir, &mut refs, &reference)?
-    } else {
-        false
-    };
-    if input.locations && !coordinates && require_locations {
-        return Err(Error::Failed(
-            "the input declares LocationsOnWays but osmium finds no way whose coordinates the \
-             reference lost, so coordinate stripping cannot be verified on it"
+            "osmium decodes no way of the input with a defined coordinate, so coordinate \
+             stripping cannot be verified on it"
                 .to_owned(),
         ));
     }
@@ -228,22 +220,17 @@ fn run_on(
                 .to_owned(),
         );
     }
-    if !input.locations {
+    if !coordinates {
         run.gaps.push(
-            "the input declares no LocationsOnWays, so no case had a way coordinate to strip"
-                .to_owned(),
-        );
-    } else if !coordinates {
-        run.gaps.push(
-            "the input declares LocationsOnWays but no way carries a coordinate, so no case had \
-             one to strip"
+            "osmium decodes no way of the input with a defined coordinate, so no case had one \
+             to strip"
                 .to_owned(),
         );
     }
     if !input.standard {
         run.gaps.push(
-            "osmium does not read the input in kind and ID order: elements compared with \
-             osmium's stable partition of it by kind"
+            "osmium does not read the input in kind and ID order: elements compared with a \
+             stable partition by kind of osmium's decoding"
                 .to_owned(),
         );
     }
@@ -258,114 +245,7 @@ fn run_on(
     Ok(Some(claim.join("; ")))
 }
 
-/// Whether any way in a `LocationsOnWays` input carries inline coordinates:
-/// osmium's reference that keeps them compared, pair by pair, with the one
-/// that drops them (the same stable partition when osmium reads the input
-/// out of order). Every way of the reference without them must carry no
-/// defined coordinate, since every case is judged against it; a pair may
-/// differ only as a way whose lines agree once each node ref is cut at its
-/// coordinate ([`way_coordinates`]), and such a way is the witness only
-/// when the side with coordinates defines one. An unmatched object, or a
-/// pair differing in anything else (a tag, metadata, a ref), means the two
-/// references are not the same objects, an error.
-fn observed_coordinates(
-    harness: &mut Harness,
-    outdir: &Path,
-    refs: &mut References<'_>,
-    without: &Path,
-) -> Result<bool, Error> {
-    harness.msg("--- degrade: way coordinates in the input (OPL comparison) ---");
-    let with = refs.get(harness, true)?;
-    let listing = outdir.join("coordinates.diff.opl");
-    let mut lost = 0u64;
-    let mut wrong: Option<String> = None;
-    let s = opl_compare::compare_sequence_paired(
-        harness,
-        &with,
-        without,
-        &listing,
-        Policy::FULL,
-        |_| {},
-        |pair| {
-            if wrong.is_some() {
-                return;
-            }
-            let name = KINDS[pair.kind];
-            if pair.kind != 1 {
-                if pair.first != pair.second {
-                    wrong = Some(format!("{name}{} differs between them", pair.id));
-                }
-                return;
-            }
-            let (kept, defined) = way_coordinates(pair.first);
-            let (dropped, stray) = way_coordinates(pair.second);
-            if stray != 0 {
-                wrong = Some(format!(
-                    "{name}{} keeps {stray} defined coordinates in the reference without them",
-                    pair.id
-                ));
-            } else if kept != dropped {
-                wrong = Some(format!("{name}{} differs beyond its coordinates", pair.id));
-            } else if defined != 0 {
-                lost += 1;
-            }
-        },
-    )?;
-    if s.first_only != 0 || s.second_only != 0 {
-        return Err(Error::Failed(format!(
-            "the references with and without way coordinates differ beyond coordinates: \
-             {} objects only with them, {} only without",
-            s.first_only, s.second_only
-        )));
-    }
-    if let Some(why) = wrong {
-        return Err(Error::Failed(format!(
-            "the references with and without way coordinates differ beyond coordinates: {why}"
-        )));
-    }
-    harness.msg(&format!(
-        "  {lost} ways carry coordinates the reference without them lost"
-    ));
-    Ok(lost > 0)
-}
-
-/// An OPL way line (osmium's writer with `locations_on_ways=true`) with each
-/// node ref of its `N` field cut at its `x`, and how many of those refs
-/// define a coordinate. libosmium writes every ref as `n<id>x<lon>y<lat>`,
-/// or `n<id>xy` when undefined; the ID is a signed decimal, so the first `x`
-/// is the separator. Fields are split on the raw space: OPL escapes a space
-/// inside a tag, user or role, and only the way's node list is prefixed `N`.
-fn way_coordinates(line: &[u8]) -> (Vec<u8>, usize) {
-    let mut out = Vec::with_capacity(line.len());
-    let mut defined = 0;
-    for (i, field) in line.split(|&b| b == b' ').enumerate() {
-        if i != 0 {
-            out.push(b' ');
-        }
-        let Some(refs) = field.strip_prefix(b"N") else {
-            out.extend_from_slice(field);
-            continue;
-        };
-        out.push(b'N');
-        for (j, node) in refs.split(|&b| b == b',').enumerate() {
-            if j != 0 {
-                out.push(b',');
-            }
-            match node.iter().position(|&b| b == b'x') {
-                Some(x) => {
-                    out.extend_from_slice(&node[..x]);
-                    if &node[x + 1..] != b"y" {
-                        defined += 1;
-                    }
-                }
-                None => out.extend_from_slice(node),
-            }
-        }
-    }
-    (out, defined)
-}
-
-fn strip_locations(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
+fn strip_locations(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
     run.harness.msg("--- degrade --strip-locations ---");
     let Some(out) = run.degrade("strip-locations", &["--strip-locations"])? else {
         return Ok(());
@@ -390,7 +270,7 @@ fn strip_locations(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
 /// The three drops (seed a twice, seed b once). Every written output is
 /// judged whatever the others did: a refusal as too large skips only its
 /// own run's checks.
-fn drop_ids(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
+fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
     let total = run.input.total();
     let n = MAX_DROP.min(total / 4);
     let mut outputs: [Option<PathBuf>; 3] = [None, None, None];
@@ -443,7 +323,7 @@ fn drop_ids(run: &mut Run<'_>, reference: &Path) -> Result<(), Error> {
         listing_a.as_deref(),
     )?;
     if let (Some(a), Some(b)) = (&outputs[0], &outputs[2]) {
-        let seeds = reencode::compare(run.harness, &run.outdir, "drop-a-vs-b", a, b)?;
+        let seeds = reencode::compare_outputs(run.harness, &run.outdir, "drop-a-vs-b", a, b)?;
         if seeds.identical() {
             run.gaps.push(format!(
                 "--drop-ids seeds {} and {} removed the same set",
@@ -508,7 +388,8 @@ fn judge_repeat(
         run.harness.record(&verdict, Verdict::from_pass(true));
         return Ok(());
     }
-    let compared = reencode::compare(run.harness, &run.outdir, "drop-a-vs-again", a, again)?;
+    let compared =
+        reencode::compare_outputs(run.harness, &run.outdir, "drop-a-vs-again", a, again)?;
     let same = compared.identical();
     run.harness.msg(&format!(
         "  degrade --drop-ids {spec}: a second run {} {}",
@@ -657,7 +538,7 @@ fn predict_drop(input: &Path, listing: &Path, output: &Path) -> Result<Option<St
     layout.finish()
 }
 
-fn unsort(run: &mut Run<'_>, reference: &Path, intra: bool) -> Result<(), Error> {
+fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Error> {
     let flag = if intra { "--unsort-intra" } else { "--unsort" };
     let stem = flag.trim_start_matches('-');
     let label = format!("degrade {flag}");
@@ -830,36 +711,7 @@ fn place_intra(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{same_bytes, way_coordinates};
-
-    #[test]
-    fn a_way_loses_only_its_coordinates() {
-        let (kept, defined) = way_coordinates(
-            b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1x1.5y-2.25,n2xy",
-        );
-        let (dropped, stray) =
-            way_coordinates(b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1xy,n2xy");
-        assert_eq!((defined, stray), (1, 0));
-        assert_eq!(kept, dropped);
-        assert_eq!(
-            kept,
-            b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1,n2".to_vec()
-        );
-    }
-
-    #[test]
-    fn a_tag_or_ref_change_survives_the_cut() {
-        let (a, _) = way_coordinates(b"w1 v1 Ta=b Nn1x1y1");
-        for other in [
-            &b"w1 v1 Ta=c Nn1xy"[..],
-            b"w1 v2 Ta=b Nn1xy",
-            b"w1 v1 Ta=b Nn2xy",
-        ] {
-            assert_ne!(a, way_coordinates(other).0);
-        }
-        assert_eq!(way_coordinates(b"w1 v1 N"), (b"w1 v1 N".to_vec(), 0));
-        assert_eq!(way_coordinates(b"w1 v1 Nn1x0y0").1, 1);
-    }
+    use super::same_bytes;
 
     #[test]
     fn same_bytes_compares_content() {

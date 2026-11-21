@@ -10,10 +10,10 @@
 //! osmium diff's checksum feeds identically, differs here. No first-only,
 //! second-only or differing record says the two object sequences are
 //! identical element by element, whatever their order; a removed or moved
-//! object is listed with its line. The reference is the input when its kinds
-//! are grouped in order, else a stable partition osmium builds (each kind's
-//! objects in input order); for a comparison that must not see way
-//! coordinates (degrade drops them) it is written without them.
+//! object is listed with its line. The expected side is osmium's OPL
+//! decoding of the input, partitioned stably by kind by the verifier (each
+//! kind's objects in input order), with every way-node coordinate written
+//! undefined where the command must drop them ([`References`]).
 //!
 //! **Layout.** Every output blob's indexdata is first held to its payload:
 //! kind, count and ID range by the verifier's own decode of every blob
@@ -47,7 +47,6 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::opl_compare::{self, Merged, Policy};
-use crate::reference::ToolRun;
 
 /// pbfhogg's documented default `--elements-per-blob`, for repack and for
 /// degrade's decode path: the cap a run that omits the flag is held to.
@@ -98,8 +97,7 @@ pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Re
         .any(|f| f == HISTORY)
     {
         return Err(Error::Failed(format!(
-            "{} declares {HISTORY}: the comparison needs one object per kind and ID, and \
-             osmium's plain references drop deleted objects' visibility",
+            "{} declares {HISTORY}: the comparison needs one object per kind and ID",
             pbf.display()
         )));
     }
@@ -347,13 +345,32 @@ pub(super) fn judge_header(
 // References
 // ---------------------------------------------------------------------------
 
-/// The files the arms compare an output's elements with, built by osmium
-/// from the input once each and kept for the check.
+/// An expected record sequence: an OPL file the verifier wrote from
+/// osmium's [`Policy::FULL`] decoding of the input.
+#[derive(Clone)]
+pub(super) struct Expected {
+    pub path: PathBuf,
+    /// The input's ways with at least one defined inline coordinate, as
+    /// osmium decodes them (whatever the header declares).
+    pub coordinate_ways: u64,
+}
+
+/// The expected sequences the arms compare an output's elements with, each
+/// built once per check from one osmium decoding of the input.
+///
+/// No reference is a PBF osmium writes: a fresh osmium PBF write can fail
+/// where pbfhogg succeeds (libosmium's writer packs records into blocks of
+/// its own choosing, against the 32 MiB limit, not the input's), and its
+/// plain writer drops `visible` without a history header. The expected file
+/// is osmium's FULL OPL decoding of the input itself, so every field osmium
+/// reads survives into it. Which ways carry coordinates is taken from that
+/// decoding, never from the header's `LocationsOnWays`: libosmium decodes
+/// the lat/lon arrays whatever the header says, and so does pbfhogg.
 pub(super) struct References<'a> {
     outdir: &'a Path,
     input: &'a Input,
-    with_locations: Option<PathBuf>,
-    without_locations: Option<PathBuf>,
+    kept: Option<Expected>,
+    stripped: Option<Expected>,
 }
 
 impl<'a> References<'a> {
@@ -361,118 +378,140 @@ impl<'a> References<'a> {
         Self {
             outdir,
             input,
-            with_locations: None,
-            without_locations: None,
+            kept: None,
+            stripped: None,
         }
     }
 
-    /// The input's objects with each kind in input order and the kinds
-    /// grouped nodes, ways, relations, way coordinates kept when
-    /// `locations` (and present), else dropped. The input itself when it is
-    /// that already.
-    pub fn get(&mut self, harness: &mut Harness, locations: bool) -> Result<PathBuf, Error> {
-        let keep = locations || !self.input.locations;
-        let slot = if keep {
-            &self.with_locations
-        } else {
-            &self.without_locations
-        };
-        if let Some(path) = slot {
-            return Ok(path.clone());
+    /// The input's objects, each kind in input order and the kinds grouped
+    /// nodes, ways, relations (a stable partition, the decoding itself on an
+    /// input already grouped), every way-node coordinate written undefined
+    /// (`n<id>xy`) when `strip`, as osmium decodes it otherwise.
+    pub fn get(&mut self, harness: &mut Harness, strip: bool) -> Result<Expected, Error> {
+        let slot = if strip { &self.stripped } else { &self.kept };
+        if let Some(expected) = slot {
+            return Ok(expected.clone());
         }
-        let path = if self.input.standard && keep {
-            self.input.path.clone()
-        } else if self.input.standard {
-            harness.msg("--- reference: the input without way coordinates (osmium cat) ---");
-            let out = self.outdir.join("reference-plain.osm.pbf");
-            Self::osmium_cat(
-                harness,
-                "reencode-plain.1",
-                &[&self.input.path],
-                &[],
-                &out,
-                false,
-                "osmium cat (reference)",
-            )?;
-            out
+        let stem = if strip {
+            "expected-stripped"
         } else {
-            self.partition(harness, keep && self.input.locations)?
+            "expected"
         };
-        if keep {
-            self.with_locations = Some(path.clone());
-        } else {
-            self.without_locations = Some(path.clone());
-        }
-        Ok(path)
-    }
-
-    /// A stable partition of the input by kind: `osmium cat -t <kind>` per
-    /// kind, then `osmium cat` of the three in kind order. osmium cat drains
-    /// each input in read order before the next, so each kind keeps its input
-    /// order.
-    fn partition(&self, harness: &mut Harness, locations: bool) -> Result<PathBuf, Error> {
         harness.msg(&format!(
-            "--- reference: the input partitioned by kind (osmium cat -t){} ---",
-            if locations {
-                ", way coordinates kept"
+            "--- reference: osmium's decoding of the input{}{} ---",
+            if self.input.standard {
+                ""
+            } else {
+                ", partitioned by kind"
+            },
+            if strip {
+                ", way coordinates written undefined"
             } else {
                 ""
             }
         ));
-        let suffix = if locations { "-locations" } else { "" };
-        let mut parts = Vec::new();
-        for kind in KINDS {
-            let part = self
-                .outdir
-                .join(format!("reference-{kind}{suffix}.osm.pbf"));
-            Self::osmium_cat(
-                harness,
-                "reencode-partition.1",
-                &[&self.input.path],
-                &["-t", kind],
-                &part,
-                locations,
-                "osmium cat -t (reference)",
-            )?;
-            parts.push(part);
+        let decoding = self.outdir.join(format!("{stem}.input.opl"));
+        opl_compare::decode(harness, &self.input.path, &decoding, Policy::FULL)?;
+        let path = self.outdir.join(format!("{stem}.opl"));
+        let coordinate_ways = partition(&decoding, &path, strip)?;
+        std::fs::remove_file(&decoding)?;
+        harness.msg(&format!(
+            "  {coordinate_ways} ways carry a defined coordinate in osmium's decoding"
+        ));
+        let expected = Expected {
+            path,
+            coordinate_ways,
+        };
+        if strip {
+            self.stripped = Some(expected.clone());
+        } else {
+            self.kept = Some(expected.clone());
         }
-        let out = self
-            .outdir
-            .join(format!("reference-partition{suffix}.osm.pbf"));
-        let refs: Vec<&Path> = parts.iter().map(PathBuf::as_path).collect();
-        Self::osmium_cat(
-            harness,
-            "reencode-partition-join.1",
-            &refs,
-            &[],
-            &out,
-            locations,
-            "osmium cat (reference partition)",
-        )?;
-        Ok(out)
+        Ok(expected)
     }
+}
 
-    fn osmium_cat(
-        harness: &mut Harness,
-        id: &str,
-        inputs: &[&Path],
-        args: &[&str],
-        out: &Path,
-        locations: bool,
-        label: &str,
-    ) -> Result<(), Error> {
-        let mut run = ToolRun::osmium(id).arg("cat");
-        for input in inputs {
-            run = run.input(input);
+/// Write `decoding`'s records to `out` kind by kind (one read per kind, each
+/// kind in file order), each way's coordinates stripped when `strip`;
+/// returns how many ways defined a coordinate. A line that is not an object
+/// record, or a last line without its newline, is an error.
+fn partition(decoding: &Path, out: &Path, strip: bool) -> Result<u64, Error> {
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::new(File::create(out)?);
+    let mut coordinate_ways = 0;
+    let mut line = Vec::new();
+    for kind in 0..KINDS.len() {
+        let file = File::open(decoding)
+            .map_err(|e| Error::Failed(format!("cannot open {}: {e}", decoding.display())))?;
+        let mut reader = BufReader::new(file);
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let Some(body) = line.strip_suffix(b"\n") else {
+                return Err(Error::Failed(format!(
+                    "{}: a last line without its newline (truncated?)",
+                    decoding.display()
+                )));
+            };
+            let (k, _) = opl_compare::parse_key(body)
+                .map_err(|why| Error::Failed(format!("{}: {why}", decoding.display())))?;
+            if k != kind {
+                continue;
+            }
+            if kind == 1 {
+                let (projected, defined) = strip_way_coordinates(body);
+                coordinate_ways += u64::from(defined > 0);
+                writer.write_all(if strip { &projected } else { body })?;
+            } else {
+                writer.write_all(body)?;
+            }
+            writer.write_all(b"\n")?;
         }
-        run = run.args(args);
-        if locations {
-            run = run.args(&["-f", "pbf,locations_on_ways=true"]);
-        }
-        let run = run.arg("-o").output(out).arg("--overwrite");
-        let captured = harness.reference(&run, &out.with_extension("stdout"))?;
-        harness.require_success(&captured, label)
     }
+    writer.flush()?;
+    Ok(coordinate_ways)
+}
+
+/// An OPL way line (osmium's writer with `locations_on_ways=true`) with every
+/// node ref of its `N` field written undefined, and how many refs defined a
+/// coordinate. libosmium writes every ref as `n<id>x<lon>y<lat>`, or
+/// `n<id>xy` when undefined; the ID is a signed decimal, so the first `x` is
+/// the separator. Fields are split on the raw space: OPL escapes a space
+/// inside a tag, user or role, and only the way's node list is prefixed `N`.
+/// Undefined and absent coordinates print alike, so an output carrying
+/// all-undefined arrays reads as stripped: the comparison sees decoded
+/// coordinates, not the wire arrays.
+pub(super) fn strip_way_coordinates(line: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(line.len());
+    let mut defined = 0;
+    for (i, field) in line.split(|&b| b == b' ').enumerate() {
+        if i != 0 {
+            out.push(b' ');
+        }
+        let Some(refs) = field.strip_prefix(b"N").filter(|_| i != 0) else {
+            out.extend_from_slice(field);
+            continue;
+        };
+        out.push(b'N');
+        for (j, node) in refs.split(|&b| b == b',').enumerate() {
+            if j != 0 {
+                out.push(b',');
+            }
+            match node.iter().position(|&b| b == b'x') {
+                Some(x) => {
+                    out.extend_from_slice(&node[..x]);
+                    out.extend_from_slice(b"xy");
+                    if &node[x + 1..] != b"y" {
+                        defined += 1;
+                    }
+                }
+                None => out.extend_from_slice(node),
+            }
+        }
+    }
+    (out, defined)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,19 +530,40 @@ impl Compared {
     }
 }
 
-/// The reference's and the output's OPL records (metadata and inline way
-/// coordinates) walked in file order ([`opl_compare::compare_sequence`]),
-/// the listing of every unmatched or differing record at `<stem>.diff.opl`.
+/// The expected records and the output's OPL records (metadata and inline
+/// way coordinates) walked in file order
+/// ([`opl_compare::compare_sequence_with_opl`]), the listing of every
+/// unmatched or differing record at `<stem>.diff.opl`, `-` expected and `+`
+/// output.
 pub(super) fn compare(
     harness: &mut Harness,
     outdir: &Path,
     stem: &str,
-    reference: &Path,
+    expected: &Expected,
     output: &Path,
 ) -> Result<Compared, Error> {
     let listing = outdir.join(format!("{stem}.diff.opl"));
+    let merged = opl_compare::compare_sequence_with_opl(
+        harness,
+        &expected.path,
+        output,
+        &listing,
+        Policy::FULL,
+    )?;
+    Ok(Compared { merged, listing })
+}
+
+/// [`compare`] of two outputs, both decoded by osmium.
+pub(super) fn compare_outputs(
+    harness: &mut Harness,
+    outdir: &Path,
+    stem: &str,
+    first: &Path,
+    second: &Path,
+) -> Result<Compared, Error> {
+    let listing = outdir.join(format!("{stem}.diff.opl"));
     let merged =
-        opl_compare::compare_sequence(harness, reference, output, &listing, Policy::FULL, |_| {})?;
+        opl_compare::compare_sequence(harness, first, second, &listing, Policy::FULL, |_| {})?;
     Ok(Compared { merged, listing })
 }
 
@@ -1041,6 +1101,46 @@ mod tests {
         split(8000, 0, &mut emit).unwrap();
         continuous(8000, 8000, &mut emit).unwrap();
         assert_eq!(blocks, [8000, 8000, 1000, 8000]);
+    }
+
+    #[test]
+    fn stripping_rewrites_only_way_node_coordinates() {
+        let (out, defined) = strip_way_coordinates(
+            b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1x1.5y-2.25,n2xy",
+        );
+        assert_eq!(defined, 1);
+        assert_eq!(
+            out,
+            b"w7 v2 dV c3 t2020-01-01T00:00:00Z i4 uN%20x Thighway=x Nn-1xy,n2xy".to_vec()
+        );
+        assert_eq!(strip_way_coordinates(b"w1 v1 N"), (b"w1 v1 N".to_vec(), 0));
+        assert_eq!(strip_way_coordinates(b"w1 v1 Nn1x0y0").1, 1);
+        assert_eq!(strip_way_coordinates(b"w1 v1 Nn1xy").1, 0);
+    }
+
+    #[test]
+    fn the_partition_groups_kinds_in_file_order_and_counts_coordinate_ways() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (decoding, out) = (dir.join("d.opl"), dir.join("e.opl"));
+        std::fs::write(
+            &decoding,
+            "w5 v1 Nn1x1y1\nn2 v1\nr1 v1 M\nn1 v1\nw3 v1 Nn2xy\n",
+        )
+        .unwrap();
+        assert_eq!(partition(&decoding, &out, true).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "n2 v1\nn1 v1\nw5 v1 Nn1xy\nw3 v1 Nn2xy\nr1 v1 M\n"
+        );
+        assert_eq!(partition(&decoding, &out, false).unwrap(), 1);
+        assert!(
+            std::fs::read_to_string(&out)
+                .unwrap()
+                .contains("w5 v1 Nn1x1y1\n")
+        );
+        std::fs::write(&decoding, "n1 v1").unwrap();
+        assert!(partition(&decoding, &out, false).is_err());
     }
 
     #[test]

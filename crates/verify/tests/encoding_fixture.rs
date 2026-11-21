@@ -52,14 +52,18 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             assert_encoding(fault, arms, &judged);
         }
     }
-    // A LocationsOnWays input: the reference is osmium cat without
-    // coordinates, and the coverage diff must find a way that lost them.
-    // Requiring coordinates fails on an input that declares none, or whose
-    // coverage diff finds none; without the requirement that is a gap.
+    // An input whose ways carry coordinates, declared or not: the expected
+    // sequence is osmium's decoding with them written undefined, and its
+    // count of coordinate-bearing ways is the coverage. Requiring
+    // coordinates fails on an input osmium decodes none in; without the
+    // requirement that is a gap.
     let low = dir.join("low.pbf");
     write_pbf(&low, false, 3, &["Sort.Type_then_ID"], &["LocationsOnWays"]);
+    let undeclared = dir.join("undeclared.pbf");
+    write_pbf(&undeclared, false, 3, &["Sort.Type_then_ID"], &[]);
     judge_degrade_pair(&mut h, exe, &dir, &input, &low);
-    judge_locations_faults(&mut h, exe, &dir, &input, &low);
+    judge_locations_faults(&mut h, exe, &dir, &input, &low, &undeclared);
+    judge_undeclared_repack(&mut h, exe, &dir, &undeclared);
     // Only the exact refusal with no published output is accepted.
     for (fault, accepted) in [
         ("refused", true),
@@ -89,9 +93,12 @@ fn judge_locations_faults(
     dir: &Path,
     input: &Path,
     low: &Path,
+    undeclared: &Path,
 ) {
     for (fault, path, required, passed) in [
         ("", low, true, true),
+        ("", undeclared, true, true),
+        ("", undeclared, false, true),
         ("no-coords", low, true, false),
         ("no-coords", low, false, true),
         ("way-tag", low, true, false),
@@ -107,17 +114,21 @@ fn judge_locations_faults(
             checks::degrade::run
         };
         let judged = super::judge(h, "degrade", |h| check(h, path, true));
-        // A gap in the requirement is a refusal, never a failed comparison.
-        assert!(judged.failed.is_empty(), "{judged:?}");
-        assert_eq!(judged.error.is_none(), passed, "{judged:?}");
         if fault == "way-tag" {
+            // The input way's tag is in the expected sequence, so an output
+            // without it fails the element comparison of every case.
+            assert!(judged.error.is_none(), "{judged:?}");
             assert!(
                 judged
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("way1 differs beyond its coordinates")),
+                    .failed
+                    .contains(&"degrade --strip-locations elements".to_owned()),
                 "{judged:?}"
             );
+        } else {
+            // A gap in the requirement is a refusal, never a failed
+            // comparison.
+            assert!(judged.failed.is_empty(), "{judged:?}");
+            assert_eq!(judged.error.is_none(), passed, "{judged:?}");
         }
         assert_eq!(
             judged.status == harness::CheckStatus::Passed,
@@ -125,6 +136,32 @@ fn judge_locations_faults(
             "fault={fault} required={required} input={}",
             path.display()
         );
+    }
+}
+
+/// repack on an input carrying coordinates it does not declare: an output
+/// that drops them, as repack's header gate does, passes; one that keeps
+/// them fails each case's element comparison.
+fn judge_undeclared_repack(h: &mut harness::Harness, exe: &Path, dir: &Path, undeclared: &Path) {
+    for (fault, passes) in [("", true), ("out-coords", false)] {
+        std::fs::write(dir.join("fault"), fault).unwrap();
+        h.run = run::Run::create(dir, exe, true).unwrap();
+        h.run.watch(undeclared).unwrap();
+        let judged = super::judge(h, "repack", |h| checks::repack::run(h, undeclared, true));
+        assert!(judged.error.is_none(), "{judged:?}");
+        assert_eq!(
+            judged.status == harness::CheckStatus::Passed,
+            passes,
+            "fault={fault}: {judged:?}"
+        );
+        if !passes {
+            assert!(
+                judged
+                    .failed
+                    .contains(&"repack default cap elements".to_owned()),
+                "{judged:?}"
+            );
+        }
     }
 }
 
@@ -231,10 +268,12 @@ pub fn tool(args: &[OsString]) -> i32 {
             let ours = name.starts_with("repack") || name.starts_with("degrade");
             // The way-tag fault gives the input's way a tag its plain
             // reference lacks, beside the coordinate: not a witness.
-            let way = if name == "low.pbf" && fault == "way-tag" {
+            // undeclared.pbf carries coordinates without declaring
+            // LocationsOnWays: osmium decodes them all the same.
+            let coords = name == "low.pbf" || name == "undeclared.pbf";
+            let way = if coords && fault == "way-tag" {
                 "w1 v1 Tk=v Nn1x1y1"
-            } else if (name == "low.pbf" && fault != "no-coords") || (ours && fault == "out-coords")
-            {
+            } else if (coords && fault != "no-coords") || (ours && fault == "out-coords") {
                 "w1 v1 Nn1x1y1"
             } else {
                 "w1 v1 Nn1xy"
@@ -248,12 +287,6 @@ pub fn tool(args: &[OsString]) -> i32 {
             let output = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
             let opl = format!("n1 v{version} {tag}\nn2 v1\nn3 v1\n{way}\n");
             std::fs::write(output, crate::fake_pbf::project(&args, &opl)).unwrap();
-        }
-        "cat" => {
-            // The reference without way coordinates: plain PBF output.
-            assert!(!args.iter().any(|a| a.contains("locations_on_ways")));
-            let output = Path::new(args[args.iter().position(|a| *a == "-o").unwrap() + 1]);
-            write_pbf(output, false, 3, &["Sort.Type_then_ID"], &[]);
         }
         "repack" | "degrade" => {
             assert!(args.contains(&"--staging-dir"));

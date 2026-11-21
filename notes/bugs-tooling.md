@@ -410,20 +410,16 @@ The comment describes selection without metadata or header checks.
 path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
 keep those checks when batching requests.
 
-## TOOL-044 - degrade and repack pick the coordinate reference from the header flag
+## TOOL-045 - other verifier references pick way coordinates from the header flag
 
-Reported by: the degrade coordinate witness fix.
+Reported by: the repack and degrade reference rewrite.
 
-`References::get` (`verify_reencode.rs`) and `observed_coordinates` decide
-whether the input carries way coordinates from its `LocationsOnWays`
-declaration, but osmium decodes coordinates from the way payload whatever the
-header says. On an input in standard order with populated lat/lon arrays and
-no declaration, the reference without coordinates is the input itself and the
-witness never runs: a correct strip fails against a coordinate-bearing
-reference, and an output that kept them passes. On the partition branch the
-plain osmium writes drop the arrays, but the PASS line reports nothing to
-strip. Either refuse undeclared arrays explicitly or build the reference and
-the witness from the decoded payload; first settle what pbfhogg does with
-undeclared arrays. Separately, on the partition branch both references are a
-plain-PBF round trip of the input, so a field the plain writer drops (a
-`visible=false` without a history header) is lost on both sides, unseen.
+repack and degrade now judge coordinates from osmium's decoding of the
+input, never from the `LocationsOnWays` declaration. The same header-gated
+choice of `-f pbf,locations_on_ways=true` remains in `checks/sort.rs`,
+`checks/cat.rs`, `checks/getid_removeid.rs` and `checks/cat_dedupe.rs`. On an
+input whose ways carry lat/lon arrays without the declaration, pbfhogg cat
+carries them by payload presence while the osmium reference written without
+the option drops them, so the comparison may fail a correct output or, under
+a policy blind to coordinates, see nothing. Settle per command what pbfhogg
+does with undeclared arrays, then derive each reference's option from that.

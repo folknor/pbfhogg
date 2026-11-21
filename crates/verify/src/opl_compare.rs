@@ -451,6 +451,31 @@ pub(crate) fn compare_with_opl_each(
     Ok(merged)
 }
 
+/// [`compare_sequence`] with the first side an OPL file already written
+/// (`expected`) and the second `pbf` decoded under `policy`; the decoding is
+/// removed once merged, `expected` is kept.
+pub(crate) fn compare_sequence_with_opl(
+    harness: &mut Harness,
+    expected: &Path,
+    pbf: &Path,
+    listing: &Path,
+    policy: Policy,
+) -> Result<Merged, Error> {
+    let b = listing.with_extension("second.opl");
+    decode(harness, pbf, &b, policy)?;
+    let merged = merge(expected, &b, listing, false, |_| {}, |_| {})?;
+    harness.msg(&format!(
+        "  OPL merge {}: same={} first-only={} second-only={} differs={}",
+        listing.display(),
+        merged.same,
+        merged.first_only,
+        merged.second_only,
+        merged.differs
+    ));
+    std::fs::remove_file(&b)?;
+    Ok(merged)
+}
+
 /// One OPL stream: its current record and the key it last held.
 struct Stream {
     path: PathBuf,

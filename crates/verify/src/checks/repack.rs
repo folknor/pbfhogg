@@ -6,9 +6,12 @@
 //! documented block layout (the shared rules and readers are
 //! [`crate::verify_reencode`]).
 //!
-//! Every case must keep the element sequence, metadata and way coordinates
-//! included (record by record against the input, or the stable partition of an
-//! input osmium does not read in order); claim `Sort.Type_then_ID` and
+//! Every case must keep the element sequence, metadata and, on an input
+//! declaring `LocationsOnWays`, way coordinates included (record by record
+//! against osmium's decoding of the input, stably partitioned by kind when
+//! osmium does not read it in order); on an input that does not declare it,
+//! every way coordinate its payload carries must be dropped (repack's header
+//! gate); claim `Sort.Type_then_ID` and
 //! `LocationsOnWays` as the input does; carry indexdata on every blob, true
 //! by the verifier's own blob decode and by `check --index`; hold no blob
 //! over the cap or empty, kinds in
@@ -46,9 +49,18 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let outdir = harness.subdir("repack")?;
     harness.msg("--- repack: reading the input ---");
     let input = reencode::read_input(harness, &outdir, pbf)?;
-    let mut refs = References::new(&outdir, &input);
-    let reference = refs.get(harness, true)?;
+    // repack carries way coordinates only from an input declaring
+    // LocationsOnWays and drops undeclared arrays (its documented header
+    // gate), so the expected sequence strips them otherwise.
+    let reference = References::new(&outdir, &input).get(harness, !input.locations)?;
     let mut gaps: Vec<String> = Vec::new();
+    if !input.locations && reference.coordinate_ways > 0 {
+        harness.msg(&format!(
+            "  the input declares no LocationsOnWays but {} ways carry coordinates: every case \
+             must drop them",
+            reference.coordinate_ways
+        ));
+    }
     let mut refused: Vec<String> = Vec::new();
     let mut witnesses = Witnesses::default();
     let mut verified = 0u32;
@@ -157,8 +169,8 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     }
     if !input.standard {
         gaps.push(
-            "osmium does not read the input in kind and ID order: elements compared with \
-             osmium's stable partition of it by kind"
+            "osmium does not read the input in kind and ID order: elements compared with a \
+             stable partition by kind of osmium's decoding"
                 .to_owned(),
         );
     }

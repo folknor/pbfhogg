@@ -402,7 +402,7 @@ fn incomplete_runs(
     life: &mut process::Lifecycle,
     watched: &mut run::Run,
     tools: &reference::Tools,
-    cache: &reference_cache::ReferenceCache,
+    cache: &mut reference_cache::ReferenceCache,
     input: &Path,
     dir: &Path,
     mode: &str,
@@ -469,7 +469,7 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     }
     assert_eq!(std::fs::read(input.with_extension("count")).unwrap(), b"xx");
     cache.fresh = false;
-    for settled in incomplete_runs(life, &mut watched, &tools, &cache, &input, dir, "fail") {
+    for settled in incomplete_runs(life, &mut watched, &tools, &mut cache, &input, dir, "fail") {
         let reference_cache::Settled::Unaccepted { ended } = settled else {
             panic!("failing run was not unaccepted: {settled:?}");
         };
@@ -477,7 +477,7 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     }
     // An accepted exit that leaves its declared output missing is settled as
     // invalid, never as complete.
-    for settled in incomplete_runs(life, &mut watched, &tools, &cache, &input, dir, "omit") {
+    for settled in incomplete_runs(life, &mut watched, &tools, &mut cache, &input, dir, "omit") {
         let reference_cache::Settled::InvalidOutputs { ended, invalid } = settled else {
             panic!("omitting run was not invalid: {settled:?}");
         };

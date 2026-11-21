@@ -293,9 +293,13 @@ The key includes the declared run ID, literal arguments, input content and
 filename suffixes, output artifact names, controlled environment, executable
 bytes and version, and the shared-library closure resolved by `ldd`.
 Identity probes use the same lifecycle and private environment as tool runs.
-The `--version` and `ldd` probes run at every key observation, since a
-library newly placed earlier on the search path changes the closure without
-moving any file already named. File digests of inputs, the executable and
+The `--version` and `ldd` probes run once per run. Their answers are bound
+to the executable's digest and, for each library path `ldd` printed, its
+canonical target and that target's digest; every key observation checks
+that binding and probes again when any part of it moved. A library newly
+placed earlier on the search path, or an `/etc/ld.so.preload`, moves no
+file the probe named and is not detected: the verifier is a local
+single-user tool and does not defend against it. File digests of inputs, the executable and
 its libraries are taken once per run and reused while the file's stamp
 (device, inode, size, mtime, ctime) is unchanged; a first digest reads
 through one handle whose stamp must hold before and after, and a file seen
@@ -311,13 +315,14 @@ not a regular file, is a check failure naming each such artifact, exactly
 as an unaccepted exit is. A run that did not complete places nothing at the
 check's paths.
 Inputs and tool identity are checked again after execution; input movement
-is ENVIRONMENT. After all children settle, cancellation and input identity
-are checked immediately before the completed staging tree is renamed into
+is ENVIRONMENT. After all children settle, cancellation, input identity and
+the tool binding (without a new probe) are checked immediately before the completed staging tree is renamed into
 place. Staging paths include RUNID; sweeps exclude the current run's staging
 and removals never follow symlinks. Published artifacts and manifests are
-immutable. Lookups hash every artifact to check integrity; the manifest's
-artifact stamps are not trusted in its place, because mtime can be set back
-and placement moves ctime. Publication fsyncs artifacts, manifest and
+immutable. A lookup accepts an artifact whose stamp (device, inode, size,
+mtime; not ctime, which placement moves) equals the one its manifest
+recorded, without reading it, and hashes it in full only when the stamp
+moved; a rewrite in place with mtime set back is not detected. Publication fsyncs artifacts, manifest and
 directories. Checks receive
 private hard links (copies across filesystems), so eviction cannot remove a
 live check's files. When a run-local reference artifact becomes an input,

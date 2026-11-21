@@ -52,6 +52,56 @@ pub(crate) struct ReferenceCache {
     pub(crate) dir: PathBuf,
     pub(crate) run_id: String,
     pub(crate) fresh: bool,
+    /// The tool's `--version` and `ldd` answers, probed once per run and
+    /// reused while what they were observed against still holds.
+    probed: Option<Probed>,
+}
+
+/// One run's probe of the reference tool, bound to what the probe saw: the
+/// executable's digest, and for each library path `ldd` printed, its
+/// canonical target and that target's digest. Any of those moving means the
+/// answers may no longer describe the tool a launch would load, so the memo
+/// is dropped and the probes run again. A new probe resolves the closure
+/// twice and keeps its answers only when the binding held across both.
+struct Probed {
+    program: PathBuf,
+    program_digest: String,
+    version: String,
+    libs: Vec<(PathBuf, PathBuf, String)>,
+}
+
+impl Probed {
+    /// Whether every observation the probe answers were bound to still holds.
+    fn holds(&self, watched: &mut crate::run::Run, program: &Path) -> Result<bool, Error> {
+        if self.program != program || watched.digest_of(program)? != self.program_digest {
+            return Ok(false);
+        }
+        for (raw, canonical, hex) in &self.libs {
+            if fs::canonicalize(raw).ok().as_ref() != Some(canonical)
+                || watched.digest_of(canonical)? != *hex
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn text(&self) -> String {
+        let mut libs: Vec<(&PathBuf, &String)> =
+            self.libs.iter().map(|(_, c, hex)| (c, hex)).collect();
+        libs.sort();
+        libs.dedup();
+        let mut text = format!(
+            "tool {} {}\nversion {:?}\n",
+            self.program.display(),
+            self.program_digest,
+            self.version
+        );
+        for (path, hex) in libs {
+            text.push_str(&format!("lib {} {hex}\n", path.display()));
+        }
+        text
+    }
 }
 impl ReferenceCache {
     pub(crate) fn new(scratch: &Path, run_id: String, fresh: bool) -> Result<Self, Error> {
@@ -69,7 +119,12 @@ impl ReferenceCache {
                 remove_tree(&entry.path());
             }
         }
-        Ok(Self { dir, run_id, fresh })
+        Ok(Self {
+            dir,
+            run_id,
+            fresh,
+            probed: None,
+        })
     }
     /// Keep the cache within `budget` logical bytes (the artifact sizes its
     /// manifests record): the most recently used entries that fit stay,
@@ -218,14 +273,22 @@ impl ReferenceCache {
             for artifact in &manifest.artifacts {
                 let path = entry.join(ARTIFACTS).join(&artifact.name);
                 let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-                if !meta.is_file() || digest(&path).map_err(|e| e.to_string())? != artifact.xxh128 {
+                if !meta.is_file() {
+                    return Err(format!("{} is not a regular file", artifact.name));
+                }
+                // The recorded stamp (device, inode, size, mtime) stands in
+                // for the bytes: published artifacts are read-only and
+                // nothing in a local single-user run rewrites them in place
+                // and sets mtime back. Placement links and input detachment
+                // move only nlink and ctime, which the stamp leaves out. A
+                // moved stamp (a remount, say) falls back to the full digest.
+                if Stamp::of(&meta) != artifact.stamp
+                    && digest(&path).map_err(|e| e.to_string())? != artifact.xxh128
+                {
                     return Err(format!("{} no longer matches its digest", artifact.name));
                 }
             }
-            // Read only once its digest held above. The manifest stamp is
-            // not trusted in place of the digest: mtime can be set back, and
-            // hard-link placement moves ctime, so a stamp check would admit a
-            // rewritten artifact that this full read refuses.
+            // Read only once its stamp or digest held above.
             if run.conditional(manifest.exit_code) {
                 let stderr = fs::read(entry.join(ARTIFACTS).join(STDERR))
                     .map_err(|e| format!("{STDERR}: {e}"))?;
@@ -510,7 +573,7 @@ fn hit(
 
 impl ReferenceCache {
     pub(crate) fn execute(
-        &self,
+        &mut self,
         life: &mut crate::process::Lifecycle,
         watched: &mut crate::run::Run,
         tools: &crate::reference::Tools,
@@ -533,7 +596,7 @@ impl ReferenceCache {
         let key = if run.uncached {
             None
         } else {
-            cache_key(life, watched, tools, &staging, run)?
+            cache_key(&mut self.probed, life, watched, tools, &staging, run)?
         };
         watched.revalidate()?;
         if !self.fresh
@@ -570,7 +633,8 @@ impl ReferenceCache {
         fs::write(staging.join(ARTIFACTS).join(STDERR), &ended.stderr)?;
         let mut source = staging.join(ARTIFACTS);
         if let Some(key) = key {
-            let now = identity_text_again(life, watched, tools, &staging, run)?;
+            let probed = &mut self.probed;
+            let now = identity_text_again(probed, life, watched, tools, &staging, run, true)?;
             watched.revalidate()?;
             if now.as_ref().is_some_and(|now| now.hex == key.hex) {
                 life.checkpoint()?;
@@ -581,10 +645,7 @@ impl ReferenceCache {
                     &key.text,
                     ended.code().unwrap_or(0),
                     &outputs,
-                    || {
-                        watched.revalidate()?;
-                        life.checkpoint()
-                    },
+                    || sealed_checkpoint(probed, life, watched, tools, &staging, run, &key.hex),
                 ) {
                     Ok(()) => {
                         source = entry.join(ARTIFACTS);
@@ -614,14 +675,36 @@ impl ReferenceCache {
     }
 }
 
+/// The last check before a sealed staging tree is renamed into place.
+/// Sealing reads every artifact in full, so the tool is observed once more,
+/// without a reprobe: the staging tree is sealed by now. A moved identity
+/// declines publication; input movement and cancellation end the run.
+fn sealed_checkpoint(
+    probed: &mut Option<Probed>,
+    life: &mut crate::process::Lifecycle,
+    watched: &mut crate::run::Run,
+    tools: &crate::reference::Tools,
+    staging: &Path,
+    run: &ToolRun,
+    hex: &str,
+) -> Result<(), Error> {
+    let sealed = identity_text_again(probed, life, watched, tools, staging, run, false)?;
+    if !sealed.is_some_and(|now| now.hex == hex) {
+        return Err(Error::tool("reference identity changed during publication"));
+    }
+    watched.revalidate()?;
+    life.checkpoint()
+}
+
 fn cache_key(
+    probed: &mut Option<Probed>,
     life: &mut crate::process::Lifecycle,
     watched: &mut crate::run::Run,
     tools: &crate::reference::Tools,
     staging: &Path,
     run: &ToolRun,
 ) -> Result<Option<Key>, Error> {
-    let identity = match identity(life, watched, &tools.osmium, staging) {
+    let identity = match identity(probed, life, watched, &tools.osmium, staging, true) {
         Ok(identity) => identity,
         Err(e @ (Error::Interrupted | Error::Unsettled(_) | Error::Environment(_))) => {
             return Err(e);
@@ -660,20 +743,23 @@ fn staged_args(run: &ToolRun, staging: &Path) -> Vec<std::ffi::OsString> {
         .collect()
 }
 
-/// The key observed again after a fresh run. The `ldd` and `--version`
-/// probes run again deliberately: a library newly placed earlier on the
-/// executable's search path, or an `/etc/ld.so.preload`, changes the
-/// resolved closure without moving any file the first probe named, so no
-/// stamp of those files can stand in for re-resolving it. Only the file
-/// digests come from the run's stamp-checked memo.
+/// The key observed again after a fresh run: the run's probe memo is checked
+/// against the executable, each library path's target and each library's
+/// digest, and the inputs' digests are rechecked by stamp. The probes run
+/// again only when that binding moved and `reprobe` allows it. A library
+/// newly placed earlier on the search path, or an `/etc/ld.so.preload`,
+/// moves no file the probe named and goes unseen; a local single-user
+/// verifier does not defend against that.
 fn identity_text_again(
+    probed: &mut Option<Probed>,
     life: &mut crate::process::Lifecycle,
     watched: &mut crate::run::Run,
     tools: &crate::reference::Tools,
     staging: &Path,
     run: &ToolRun,
+    reprobe: bool,
 ) -> Result<Option<Key>, Error> {
-    identity(life, watched, &tools.osmium, staging)?
+    identity(probed, life, watched, &tools.osmium, staging, reprobe)?
         .as_deref()
         .map(|id| key_text(run, id, &mut |p| watched.digest_of(p)))
         .transpose()
@@ -713,12 +799,28 @@ fn extension(path: &Path) -> String {
         .map_or_else(String::new, |i| name[i..].to_owned())
 }
 
+/// The tool identity text, from the run's probe memo while it holds, else
+/// from a new probe when `reprobe` allows one. `None` is no identity: the
+/// probes failed, the executable moved during them, or the memo no longer
+/// holds and no reprobe is allowed.
 fn identity(
+    probed: &mut Option<Probed>,
     life: &mut crate::process::Lifecycle,
     watched: &mut crate::run::Run,
     program: &Path,
     private: &Path,
+    reprobe: bool,
 ) -> Result<Option<String>, Error> {
+    if let Some(memo) = probed.as_ref() {
+        if memo.holds(watched, program)? {
+            return Ok(Some(memo.text()));
+        }
+        *probed = None;
+    }
+    if !reprobe {
+        return Ok(None);
+    }
+    let program_digest = watched.digest_of(program)?;
     let Some(version) = probe(life, program, vec!["--version".into()], private)? else {
         return Ok(None);
     };
@@ -735,24 +837,39 @@ fn identity(
     let Some(paths) = parse_ldd(&libraries) else {
         return Ok(None);
     };
-    let mut paths = paths
-        .into_iter()
-        .map(fs::canonicalize)
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();
-    paths.dedup();
-    let mut text = format!(
-        "tool {} {}\nversion {version:?}\n",
-        program.display(),
-        watched.digest_of(program)?
-    );
-    for path in paths {
-        text.push_str(&format!(
-            "lib {} {}\n",
-            path.display(),
-            watched.digest_of(&path)?
-        ));
+    let mut libs = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let canonical = fs::canonicalize(&raw)?;
+        let hex = watched.digest_of(&canonical)?;
+        libs.push((raw, canonical, hex));
     }
+    let memo = Probed {
+        program: program.to_path_buf(),
+        program_digest,
+        version,
+        libs,
+    };
+    // The closure is resolved once more after the digests, and the binding
+    // must hold across it: an executable or library replaced between the
+    // first `ldd` and its digest would otherwise pair one file's answers
+    // with another's bytes for the rest of the run.
+    let Some(again) = probe(life, ldd, vec![program.as_os_str().to_owned()], private)? else {
+        return Ok(None);
+    };
+    if parse_ldd(&again).as_deref()
+        != Some(
+            memo.libs
+                .iter()
+                .map(|l| l.0.clone())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        || !memo.holds(watched, program)?
+    {
+        return Ok(None);
+    }
+    let text = memo.text();
+    *probed = Some(memo);
     Ok(Some(text))
 }
 
@@ -862,6 +979,7 @@ mod tests {
             dir: root.join("verify-reference"),
             run_id: "test".into(),
             fresh: false,
+            probed: None,
         };
         let newest = entry(&cache.dir, 'a', 40, 10);
         let huge = entry(&cache.dir, 'b', 500, 20);
@@ -1068,19 +1186,29 @@ mod tests {
             dir: root.to_path_buf(),
             run_id: "test".into(),
             fresh: false,
+            probed: None,
         };
         assert!(cache.lookup(&entry, &key, &run, &outputs).is_some());
         // Linking moves ctime only; the entry stays valid.
         place(&entry.join(ARTIFACTS), &outputs, &check.join("o.stdout")).unwrap();
         assert!(cache.lookup(&entry, &key, &run, &outputs).is_some());
-        // Replacing an artifact's bytes moves its stamp; the rehash fails it.
+        // The stamp stands in for the bytes: a same-size rewrite in place
+        // with mtime set back is trusted by design.
         let artifact = entry.join(ARTIFACTS).join("osmium.osm.pbf");
+        let mtime = fs::metadata(&artifact).unwrap().modified().unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&artifact).unwrap();
+        (&file).write_all(b"PBF").unwrap();
+        file.set_modified(mtime).unwrap();
+        drop(file);
+        assert!(cache.lookup(&entry, &key, &run, &outputs).is_some());
+        // Replacing an artifact's bytes moves its stamp; the rehash fails it.
         fs::remove_file(&artifact).unwrap();
         fs::write(&artifact, b"different").unwrap();
         assert!(cache.lookup(&entry, &key, &run, &outputs).is_none());
         assert!(!entry.exists());
-        // The check's own link kept the original bytes.
-        assert_eq!(fs::read(&out).unwrap(), b"pbf");
+        // The check's own link kept the inode it was placed with.
+        assert_eq!(fs::read(&out).unwrap(), b"PBF");
     }
 
     #[test]
@@ -1100,6 +1228,7 @@ mod tests {
             dir: root.to_path_buf(),
             run_id: "test".into(),
             fresh: false,
+            probed: None,
         };
         let key = Key {
             text: "k".into(),
@@ -1126,6 +1255,7 @@ mod tests {
             dir: root.to_path_buf(),
             run_id: "test".into(),
             fresh: false,
+            probed: None,
         };
         for (hex, stderr, found) in [("02", "Done.\n", true), ("03", "boom\n", false)] {
             let staging = root.join(format!(".staging-1-{hex}"));

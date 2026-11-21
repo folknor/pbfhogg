@@ -2073,10 +2073,9 @@ Kind: high-conviction rewrite.
 
 Reported by: orchestration-opus, other-opus.
 
-Residue after the per-run digest memo and real hit timing landed (tool,
-library and input digests are now taken once per run and reused while the
-file stamp holds; the `ldd`/`--version` probes, the digest on lookup and the
-publication fsync stay, with reasons at their code sites).
+Residue after the per-run digest memo, once-per-run tool probes,
+stamp-trusted lookups and real hit timing landed (the publication fsync
+stays, with its reason at the code site).
 
 `retain` keeps the most recently used entries that fit the byte budget
 (default 20 GiB). Denmark's working set (about 4-5 GB) fits; germany's (about

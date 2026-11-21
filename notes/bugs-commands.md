@@ -346,3 +346,23 @@ so two adjacent elements with large tag values can land in one block that the
 writer then refuses as too large. The input is valid; the command fails. The
 helper is available to them; adopting it needs a matched measurement per
 command, since the check runs per added element.
+
+## CMD-060 - degrade --unsort may have slowed down, and is slow on planet
+
+Reported by: the CMD-056 follow-up measurement (2026-11-21, plantasjen).
+
+`3ce0176a` changed `degrade --unsort` and `--unsort-intra` to move whole ID
+runs (`degrade/mod.rs`). Its denmark A/B was noise, but germany
+`perturb-pbf --unsort yes`, interleaved `--iterations 1`, was slower in both
+pairs: `9bbd64df` 60.6 s (`7f54472a`) and 63.9 s (`f6699714`) against
+`3ce0176a` 65.1 s (`5898d9cf`) and 65.8 s (`b41d44ae`), +8 % and +3 %. In
+the second pair the node phase was equal (25.0 s) and the whole gap sat in
+the way phase (36.4 s against 38.2 s at 4.6 cores both, the change cell
+writing about 110 MB more), so drive state is not ruled out. Separately, a
+planet `--unsort yes` cell on `3ce0176a` ran past 12 minutes before it was
+stopped, where planet `degrade --strip-locations` and repack run 150 to 165
+s (`reference/performance/repack-degrade.md`). No planet `--unsort` baseline
+has ever been recorded, so whether that wall is the change, the mode, or the
+host is unknown. Next: one planet cell at `9bbd64df` to establish the mode's
+baseline, then a matched pair; if the change is the cost, it comes out or
+is made cheaper.

@@ -38,6 +38,10 @@ refuses wrong-typed known fields, unaudited against the library decoder.
 Each is a file one side reads and the other refuses; none changes a value
 both accept.
 
+The 2026-11-21 verifier performance hunt (engine-opus) also flagged the zstd
+refusal: `index_truth` and the layout predictions cannot run on a zstd output,
+which is a coverage gap if a check ever re-encodes with zstd.
+
 ## VER-144 - Source-policy rules re-parse every file with syn, in debug
 
 Measured 2026-11-18 on bygg (debug `brokkr test`): the single real-tree

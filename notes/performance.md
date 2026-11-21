@@ -527,6 +527,17 @@ metadata or location handling changes when replacing owned conversions.
 
 Kind: high-conviction rewrite.
 
+2026-11-21 verifier hunt (heavy-codex, other-codex): the same funnel is what
+`verify degrade` and `verify check-ids` pay for, since both unsort modes build
+dataset-sized fixtures through it although the perturbation touches only the
+first two ID runs or the first output boundary per kind. Their proposal: a
+small coordinator settles the swap and its boundary records while workers
+encode the settled blocks. `--unsort-intra` keeps input boundaries away from
+the splice, and `--unsort` needs a prefix-count plan for continuous packing to
+the cap. They also report that forced repack decodes each unindexed blob in
+all three kind phases; one decode dispatching its actual kinds removes that
+while still exercising `--force`.
+
 ## PERF-015 - Sort and blob merge serialize each overlap component on one worker
 
 Reported by: sort, merge, encoding, copy.
@@ -1406,6 +1417,12 @@ honestly under a different algorithm.
 
 Kind: highest scaling payoff (check).
 
+2026-11-21 verifier hunt (heavy-codex): `verify add-locations-to-ways` runs
+`check --locations --agreement` on both engine outputs, and apply-changes -l
+runs it too, so this cost is paid several times per `verify all`. The
+proposal is the same one: project node coordinates and ordered way-reference
+observations once, and route compact observations by node ID.
+
 ## PERF-047 - Digest builds elements and hashes on one consumer
 
 Reported by: check.
@@ -1445,6 +1462,12 @@ then discarded); narrow inspect getters (timestamp-only enables the full
 census).
 
 Kind: medium-priority redesign; local changes.
+
+2026-11-21 verifier hunt (other-codex): `verify check-ids` runs plain and
+`--full` on each of four dataset-sized cases, and both execute the same order
+proof before `--full` rereads the disordered kinds. Share the ID projection
+between the two consumers, keeping validated ID columns for any kind that
+needs duplicate replay.
 
 ## PERF-049 - Renumber map construction does atomic per-node insertion
 
@@ -1775,3 +1798,776 @@ Redesign: bounded batches folded into one shared accumulator, or a
 scratch-backed sort and dedupe where the final set also needs a bound.
 
 Payoff: bounded memory on exotic ID layouts; nothing on planet-shaped input.
+
+# pbfhogg-verify (2026-11-21 hunt)
+
+Findings from the 2026-11-21 verifier performance hunt, prompted by `verify
+all` on denmark growing from about 3 minutes to 12-20. Eight hunters, two per
+scope (Opus at high effort as a harness subagent, and codex gpt-6.2-sol at high
+effort), reading code at `e8377a78` only. Nothing was built, run or measured:
+every count and payoff is a source-derived hypothesis, and where the hunters'
+counts differ, the entry gives both. "Reported by" names scope and model and
+states a fact about the reports, not a verdict. Defects found on the way are in
+`notes/bugs-tooling.md`.
+
+Scope names: orchestration (main, all, run, selection, harness, process,
+stream, reference, reference_cache), engine (opl_compare, verify_opl, the diff
+and listing readers, pbf_frames, osc, verify_reencode, verify_input_order,
+verify_extsort, counts), heavy (degrade, add-locations, apply-changes, sort,
+repack, cat, cat-dedupe, renumber, merge-changes, field-policies), other
+(geocode, extract, multi-extract, check-ids, check-refs, getid, getparents,
+diff, derive-changes, tags-filter, inspect-tags).
+
+## PERF-064 - Every comparison materializes fresh OPL decodings and reuses none
+
+Reported by: all eight (orchestration, engine, heavy and other, both models).
+
+Mechanism: every element judgment goes through `opl_compare::decode`/`walk`.
+Each decode runs `osmium cat -f opl... -o FILE` (marked `.uncached()`) to
+completion. On denmark that is several GB of text, which engine-opus puts at
+about 80-100 bytes per object and heavy-opus at about 7-8 GB at FULL. The
+second side is decoded only after the first, then both files are merged on one
+thread through 8 KiB `BufReader`s and deleted. The API is pairwise and takes
+paths, so the decode is hidden inside each call. Order (`check_sorted`,
+`order`), counts (`osmium_counts`) and equality (`same_elements`) are separate
+calls, and each pays its own full decode. `opl_compare::decode` says so: "A file
+decoded twice in one check gets a fresh decoding each time."
+
+Census of full-size decodes in one `verify all`:
+
+- orchestration-opus: about 90, of which about 40 are distinct (content,
+  policy) pairs, about 35 distinct files, and about ten denmark-equivalents of
+  unique blob payload. The input alone is decoded to OPL more than 20 times.
+- engine-opus: about 70-80, of which 30-40 are distinct.
+- heavy-opus: about 77 in its checks alone.
+
+Per check, as the hunters read it:
+
+- sort: 3.
+- cat: 12 partial decodes, 4 per `compare_outputs`.
+- cat --dedupe: 13-16, with the input decoded 7 times.
+- add-locations all: 10.
+- repack: 8, with the input decoded 4 times.
+- degrade: 14 (16 with -l), with the input decoded 5 times and drop-a 3 times.
+- apply-changes: 3, plus the rewrites `osmium.opl` and `expected.opl`.
+- diff --format osc: 10 (13 on the omission path), with `new` decoded 4 times.
+- getid-removeid: 9 full-size and 13 small.
+- extract: 16 per region over 6 files.
+- getparents: 32 small.
+- tags-filter: 12 small.
+- multi-extract: 3 per region per pass.
+
+Each full pairwise comparison writes and rereads about 15 GB (heavy-opus).
+
+Redesigns:
+
+- orchestration-opus: a run-wide, single-flight `Decodings` service keyed by
+  osmium identity, policy and content. It streams `osmium cat -o -`, derives
+  order, counts and first/last key once per decoding, and stores zstd OPL
+  chunks with per-chunk summaries (about 1 GB for denmark FULL).
+  - Blob granularity: chunks are keyed by (osmium identity, format, header
+    features, Blob payload digest). Synthetic PBFs of the missing blobs are
+    decoded and the output split per blob by `pbf_frames::blob_ids` counts,
+    refusing the split if first/last keys disagree. Passthrough outputs then
+    decode only their rewritten blobs, and the merge skips whole chunks whose
+    stored digests match.
+  - Proposed sequencing: local fixes first, then an in-run file-granular memo
+    plus the fixture store, then streaming plus the concurrent launcher, and
+    blob granularity plus persistence last.
+- engine-opus: one streamed decoding per distinct content digest, always at
+  FULL (`opl,locations_on_ways=true`).
+  - NO_LOCATIONS and CONTENT become field-level projections of the FULL line.
+  - A `Summary` is folded while streaming: per-kind counts, the strict-order
+    verdict with its first violation (never an early error), XXH3-128 stream
+    digests per policy, and the header facts. Hashing is chunk-parallel on
+    worker threads.
+  - A comparison is decided from the summaries when both sides are ordered and
+    the digests are equal. Otherwise it runs a concurrent streamed merge that
+    writes today's listings unchanged.
+  - Record adapters replace the files written only to be read back
+    (apply-changes expected, derive omission model, kind filters).
+  - API sketch: `Engine { identity, summary, records, compare }`,
+    `Summary { counts, order, digest {full, no_locations, content},
+    locations_declared }`.
+- heavy-opus: plan-then-execute inside each check. Producers run first. The
+  check declares its decodings as (file, policy), memoized by content digest,
+  and its relations: sequence, strict, against_expected, order and counts. An
+  executor starts one piped `osmium cat` per distinct decoding (pipe enlarged
+  with `F_SETPIPE_SZ`) and broadcasts line-aligned `Arc<[u8]>` chunks over
+  bounded channels to consumer threads that run today's walk bodies unchanged.
+  The wait graph is acyclic. Measured against this design, degrade goes 14 to
+  7 decodes, add-locations to 3, and cat --dedupe to one pass of the input plus
+  6 outputs.
+- other-opus: a `Decoded` handle per (content, policy), with keys, counts and
+  order as by-products, and an N-way merge that writes every pair's listing
+  byte-identical to today. derive-changes becomes 4 decodes instead of 10,
+  extract 6 per region instead of 16 (with `present_members` turned into a
+  sorted intersection), getid-removeid 4 instead of 9 full-size, and getparents
+  16 instead of 32. Order becomes a recorded verdict that keeps scanning, after
+  which the same error is raised.
+- codex-orchestration: one decoded record source per immutable PBF. It feeds
+  order, duplicates, counts and comparisons from one ordered scan, streams
+  single-use outputs into their judges, and keeps a replayable block-oriented
+  form for high-fan-out artifacts (base, updated PBF, roundtrips, locations
+  reference). The decoder is libosmium-backed: it first emits the OPL
+  projection through bounded streams, then structured records once equivalence
+  is shown.
+- codex-engine: libosmium as the semantic decoder through a thin batch adapter
+  over `osmium cat`'s reader. It produces compact batches holding identity,
+  source position, normalized metadata, coordinates, ordered tags, refs and
+  members, with key-only projections for counts. Two batch cursors accumulate
+  order and counts and deliver typed pairs to the judges, and OPL is generated
+  only for diagnostics. It copies the architecture of pbfhogg's
+  `into_blocks_pipelined` and its fused transforms without linking them. It
+  also sorts compact identity indexes for comparison-only sorting, and turns
+  repack's stable kind partition into a projection instead of 3 filtered cats
+  plus a join.
+
+The hunters disagree in four places:
+
+- **Wire format.** engine-opus keeps OPL as the wire and calls a
+  verifier-owned decoder a later two-tier option at most. Both codex hunters
+  propose a libosmium-backed typed decoder.
+- **Projections from FULL.** engine-opus derives NO_LOCATIONS and CONTENT from
+  FULL by projection, proved once on denmark and kept as a field-policies
+  control. heavy-opus (its L9) says to decode once per (file, policy) without
+  projection until field-policies gains that control.
+- **Equality by hash.** engine-opus and orchestration-opus accept a PASS
+  decided by XXH3-128 digest equality, noting the cache already trusts that
+  hash, with BLAKE3 or comparing chunk digests of the decoded text as the
+  conservative alternatives. heavy-opus would rather cache compressed text
+  than hash streams.
+- **pbfhogg's library readers.** Every Opus hunter and codex-engine reject the
+  library as a decoder, because the crate links no pbfhogg and a shared
+  decoder bug would hide. codex-orchestration and codex-heavy cite
+  `ElementReader` for pbfhogg-native observations only.
+
+Payoff: heavy-opus expects about 2x on the heavy checks from the local
+removals alone and 3-5x overall. other-opus expects 4-8x on getid-removeid and
+derive-changes. engine-opus says that if decode and compare are at least half
+the run, they shrink by 3-4x. Every redesign also removes tens of GB of scratch
+writes per run, a recorded wall-time hazard on these drives.
+
+Risks:
+
+- One shared decoding feeds many checks.
+- Per-blob decode equivalence under a synthetic header needs its own control.
+- Header-dependent decoding.
+- Specific strictness diagnostics and byte-identical listings must survive.
+- The storage budget on germany.
+- Hash-equality trust.
+- Streaming loses the "OPL pair kept on error" property; re-decode on the
+  failure path.
+- CPU oversubscription from several osmium pools (`OSMIUM_POOL_THREADS`).
+- Lifecycle concurrency (PERF-066).
+- An extra FULL decode for files only ever compared under CONTENT.
+- renumber's attribution needs paired events even for equal records, and
+  degrade needs ordered removal events, so the merge must be exposed, not only
+  its verdict (codex-engine, codex-heavy).
+
+Kind: high-conviction rewrite (all eight).
+
+## PERF-065 - Decodings and verdicts are recomputed every run
+
+Reported by: orchestration-opus, engine-opus, heavy-opus, other-opus,
+orchestration-codex.
+
+Mechanism: `opl_compare::decode` is uncached because its output is as large as
+the input. So each cached osmium reference artifact, and the pinned dataset, is
+decoded again on every run, as is every pbfhogg output that is byte-stable
+across commits (deterministic encoders; the writing program carries no hash).
+
+Redesigns:
+
+- engine-opus: store each `Summary` (a few hundred bytes) in the reference
+  cache, keyed by osmium identity, summary format version, and the data-blob
+  payload digest plus the header facts osmium consults (so `writingprogram` or
+  replication fields do not break a hit). The summary is osmium's reading of
+  exact bytes, so it stays inside the cache's "completed reference executions
+  only" rule. Comparisons still run every time.
+- orchestration-opus: persist the blob-granular chunks of PERF-064.
+- heavy-opus: cache the decodings of reference artifacts and the dataset as
+  zstd or lz4 OPL text (exact), in preference to a record-digest stream.
+- other-opus: a merge-verdict cache keyed by both sides' digests, policy,
+  strictness, osmium identity and the verifier binary digest. On a hit neither
+  side is decoded. The fallback is a per-object `(kind, id, xxh3)` stream (24
+  bytes per object, about 1.4 GB for denmark), and only a mismatch re-decodes.
+  Never cache an Environment or Interrupted outcome.
+- codex-orchestration: cache a compact decoded representation for CLI-only
+  oracles consumed solely as records, keep real PBFs where a later CLI needs
+  them, and avoid filling the cache with routine decodes of fresh pbfhogg
+  outputs.
+
+Payoff: on the development loop, files whose bytes did not change are never
+decoded again. other-opus calls this the largest wall reduction available to
+its scope once PERF-064 exists. engine-opus suggests measuring first: if the
+engine's share is well under half the run, build this before PERF-064.
+
+Risks: key completeness; the cache budget; caching anything that amounts to a
+pbfhogg verdict (other-opus's verdict cache includes the verifier binary in its
+key to stay a pure function; orchestration-opus says in-run-only for pbfhogg
+fixtures).
+
+Kind: high-conviction rewrite (engine-opus); orchestration-owned machinery.
+
+## PERF-066 - The verifier runs one child at a time
+
+Reported by: all eight.
+
+Mechanism: `process::Lifecycle::run` spawns one child and waits, and `settle`
+kills and reaps every child of the subreaper (`waitpid(-1)` until ECHILD), so a
+second live launch would be killed by the first one's settlement. `Harness` is
+one `&mut` threaded through closures, and `all::run` calls the checks in
+sequence. Every pbfhogg run, osmium run and decode, including both sides of
+every comparison, is therefore serial. `PR_SET_PDEATHSIG` fires on the death of
+the forking thread, so children must be spawned from one thread
+(engine-opus).
+
+Redesigns:
+
+- orchestration-opus: per-launch containment through a shim, the verifier
+  re-executed in a hidden mode that sets `PR_SET_CHILD_SUBREAPER` and
+  `PDEATHSIG`, runs the program, then kills and reaps what it adopted and
+  reports survivors. The verifier stays the backstop. Namespaces and cgroups
+  are rejected as unsafe defaults. `Harness` splits into thread-safe shared
+  services (launcher, single-flight cache, decodings, fixture store, watch
+  list) and per-check contexts. A resource-aware scheduler hands out tokens
+  per class (pbfhogg, osmium with a memory estimate, decodes). Result lines
+  are buffered and emitted in suite order. field-policies gates the later
+  verdicts but not the later work.
+- codex-orchestration: per-check verdict state, shared immutable artifacts,
+  and a supervisor settling each launch tree independently (a subreaper worker
+  per active launch), with signals, cancellation and final reaping under one
+  coordinator. Long producers start early, for example geocode's reference
+  preparation and the two OSC roundtrips. Admission is bounded by memory, CPU
+  and scratch writes.
+- engine-opus and heavy-opus: launch groups with piped stdout and every
+  stdout, stderr, pidfd and the signalfd multiplexed, settled together.
+  Consumers return their messages for emission in a fixed order.
+- other-opus: a launch DAG per check (plan, then executor with a concurrency
+  budget). It names the independent sub-runs:
+  - check-ids: 3 degrades, then 18 `check --ids`.
+  - diff: 4 diffs.
+  - derive-changes: the derives, strips and 3 roundtrips.
+  - extract: 3 strategies per region, and regions independent of each other.
+  - multi-extract: its sequential extracts.
+  - getparents: 8 runs.
+  - The tags-filter, inspect-tags and check-refs cases.
+  - geocode: both builds and both osmium chains at once, models while the
+    builds run, and both queries together.
+
+Payoff: a comparison's wall becomes about max(decode A, decode B) instead of
+the sum plus the merge. other-opus expects about 2x on check-ids, extract,
+multi-extract and getparents.
+
+Risks: the shim or supervisor must re-prove the no-survivor guarantee with the
+rigour `process.rs` has today; attributing an adopted orphan when several
+children are alive; memory on germany, so bound by estimate, not core count;
+staging-name collisions (`opl-compare.1` and similar are reused across checks;
+needs single-flight and a per-launch suffix); per-step timings turning into
+summed time rather than wall.
+
+Kind: high-conviction rewrite.
+
+## PERF-067 - The reference cache re-proves identity on every call
+
+Reported by: orchestration-opus, orchestration-codex, engine-opus, heavy-opus,
+other-opus.
+
+Mechanism:
+
+- `cache_key` runs `osmium --version` and `ldd`, then digests osmium and every
+  linked library, and `identity_text_again` repeats all of it after a miss.
+- `key_text` digests every input in full on every call, so the denmark input
+  is re-hashed by each cached reference that reads it, dozens of times per run.
+- `lookup` re-digests every artifact on a hit, ignoring the manifest `Stamp`.
+- `publish` calls `sync_all` on multi-GB artifacts and directories.
+- Dataset resolution already computes an observed digest, which the verifier
+  drops (codex-orchestration).
+- A hit is recorded as zero time in the step breakdown, so none of this shows
+  up (codex-orchestration).
+- `retain` keeps entries by recency within the byte budget, so a cheap large
+  `osmium cat -t` output can evict an expensive `osmium sort`. other-opus calls
+  LRU loss of geocode's four osmium artifacts the likely cause of that check's
+  2.5-4.4 minute spread.
+
+Redesigns:
+
+- Compute the tool identity once per run, rechecking stamps before publish.
+- Memoize input digests by watched stamp, sharing one digest between the cache
+  key, the engine identity and `Run::watch`.
+- orchestration-opus: trust a matching stamp on read-only cache files and
+  fall back to the digest otherwise, which deliberately weakens tamper
+  evidence. Keep the fsync, or verify by digest only the entries published
+  before the current boot.
+- codex-orchestration: one immutable handle and one validation result per
+  artifact per run, validating content during the consumer's read.
+- Retention by recompute cost per byte, with wall time recorded in the
+  manifest (orchestration-opus), or a retention priority for geocode's
+  artifacts (other-opus).
+
+Payoff: heavy-opus estimates seconds per run, not minutes. The retention
+change is what decides whether a warm run is actually warm.
+
+Risks: weakened tamper evidence if stamps are trusted.
+
+Kind: local, medium.
+
+## PERF-068 - Run::watch copies every cache-placed artifact before it is read
+
+Reported by: orchestration-opus, engine-opus, other-opus, orchestration-codex.
+
+Mechanism: the cache places artifacts by hard link. When such a link later
+becomes an input, `Run::watch` sees `nlink > 1` and calls `private_input_copy`
+to copy the whole file, because a later link or eviction would move the shared
+inode's ctime. Nearly every osmium output that is then decoded gets copied in
+full first: sort, cat, extract, apply-changes, add-locations, renumber, the
+derive roundtrips, and getid's two denmark-sized removeid outputs. That is
+probably several GB of writes per run, on the critical path.
+
+Redesigns:
+
+- orchestration-opus: stamp such files without ctime, since the cache itself
+  identifies artifacts by dev, ino, size and mtime; or use a reflink; or copy
+  at placement for artifacts known to be re-read.
+- other-opus: `copy_file_range`, or verify the artifact's digest at use.
+- codex-orchestration: owner-held immutable artifacts serving every reader
+  from one stable path for the run.
+
+Kind: local, medium.
+
+## PERF-069 - Checks rebuild the same fixtures independently
+
+Reported by: orchestration-opus, orchestration-codex, heavy-codex, other-opus,
+other-codex.
+
+Mechanism: identical argv on identical inputs is run by several checks:
+
+- `pbfhogg apply-changes INPUT OSC` (buffered) is run by apply-changes (when
+  `--direct-io` is off), diff and diff --format osc.
+- `degrade --strip-indexdata INPUT` is run by repack, check-ids, diff and
+  derive-changes. The same strip of `new` is run by diff and derive-changes.
+- check-ids' cross-blob `--unsort` at cap 8000 matches degrade's default cap,
+  but the argv differs (`--elements-per-blob 8000 --force`). The intra-blob
+  input is stripped and needs distinct framing.
+- extract's buffered polygon simple run is identical to multi-extract's
+  sequential polygon baseline.
+- `reencode::read_input` on the input (fileinfo, header, framing,
+  `index_truth`, `check --index`) is run by both repack and degrade.
+- The OSC is parsed separately by plain apply, apply -l, merge-changes and
+  tags-filter --input-kind osc.
+
+Redesign: a run-level, single-flight memo keyed by (executable digest,
+canonical argv with inputs by content digest, I/O mode). It returns the
+artifact plus its recorded exit and stderr, kept in-run only because these are
+pbfhogg outputs. Each check still judges its own claims and reports its own
+failure if a shared prerequisite fails, and the store records which check
+built an entry. codex-orchestration counts five full-file producer launches
+saved in the buffered default case. Under `--direct-io`, the judged direct
+run keeps its own entry.
+
+Risks: stderr that a check judges must be the recorded stderr; never alias an
+artifact a check mutates (check-ids `append_empty_claim` mutates only its
+copy); suite order should put the consumers of a shared artifact next to each
+other.
+
+Kind: structural, medium-large; high confidence (codex-orchestration).
+
+## PERF-070 - degrade and repack decode the reference once per case
+
+Reported by: heavy-opus, heavy-codex, engine-codex.
+
+Mechanism: `reencode::compare` re-decodes the reference for every case, 5
+times in degrade, 6 in degrade -l (counting `observed_coordinates`) and 4 in
+repack. degrade's `drop-a` is decoded three times. The five audited degrade
+outputs, and repack's four, each also get an ID decode, `check --index`, a
+claims walk and layout work, and repack's layout predictor walks the original
+claims once per kind per case. On a locations base, degrade also writes a
+coordinate-free reference PBF.
+
+Redesigns:
+
+- heavy-opus (local, exact):
+  - Keep one reference decoding per check and compare every output against
+    it, which needs a sequence-walk `compare_with_opl_each`.
+  - `drop-a` against `drop-a-again`: byte equality implies identical
+    decodings.
+  - `drop-a` against `drop-b`: once both pass `judge_drop`, they are equal
+    exactly when the two listings are byte-equal.
+  - Together these take degrade from 14 decodes to 6.
+- heavy-codex (rewrite): make the input a reusable source of ordered records
+  plus per-blob facts and judge each output as it is read.
+  - Derive the coordinate-free expectation on the reference side, and read
+    outputs with coordinates on.
+  - Count removals per span in the walk; check unsort against the predicted
+    swap.
+  - Feed cap, kind order, overlap and layout checks from one frame
+    observation.
+  - Keep the independently executed same-seed repeat. Removal lists settle
+    whether the two seeds match.
+  - On failure, use the retained streams for today's diagnostics.
+  - The seam is the decompressed frame. The same facts serve degrade, repack
+    and parts of cat-dedupe.
+
+Risks: diagnostic parity; the alternate locations base needs its own facts.
+
+Kind: high-conviction rewrite (heavy-codex, "first rewrite"); local removals
+(heavy-opus).
+
+## PERF-071 - add-locations-to-ways --mode all decodes ten times for three files
+
+Reported by: heavy-opus, heavy-codex, orchestration-codex.
+
+Mechanism: `compare_outputs` runs once per engine against the same osmium
+output: an order decode per side, then a strict merge of both. Then comes
+engine parity. That is 10 osmium decodes, plus two `digest --form full`, plus
+two `check --locations --agreement`. The location judge itself decodes nodes
+for keys and again for coordinates.
+
+Redesigns:
+
+- heavy-opus: decode the osmium output once and compare both engines against
+  it. Engine parity follows by transitivity, exactly, when both osmium
+  comparisons passed under `Policy::FULL`: record it PASS without decoding,
+  and run it as today otherwise. Keep `digest --form full` parity. This gives
+  3 decodes.
+- heavy-codex: a three-way ordered merge emitting every verdict with its own
+  per-pair field policy. Fuse the native digest projection with location-fact
+  extraction on the same frames. Project node coordinates and way references
+  once, and route them by node ID when partitioning (see PERF-046), which also
+  serves apply-changes -l.
+
+Risks: the transitivity guard is `Policy::between` returning FULL for both; the
+unsorted route keeps external's refusal and duplicate detection.
+
+Kind: local (heavy-opus); rewrite (heavy-codex).
+
+## PERF-072 - apply-changes writes osmium's decoding twice to merge it once
+
+Reported by: heavy-opus, heavy-codex, engine-opus, engine-codex,
+orchestration-codex.
+
+Mechanism: `judge_elements` decodes osmium's output to `osmium.opl`.
+`write_expected` copies its untouched records into `expected.opl` with the
+model's winners inserted (about 12 GB of writes per heavy-opus), and
+`compare_with_opl_each` reads that file back against a fresh decode of
+pbfhogg's output. It also runs `osmium getid -H -I` over the base, an
+informational `print_fileinfo` on the reference that decides nothing, and a
+separate order decode of pbfhogg's output.
+
+Redesign: the expected stream becomes a cursor. Untouched osmium records are
+merged with the sparse, ordered model winners as pbfhogg's records arrive.
+osmium's touched records are routed to the precedence judgment, keeping their
+multiplicity. Order and counts come from the same walk, and fileinfo is dropped
+or run only on failure. heavy-codex adds a verified range-to-frame map for the
+touched-base lookup (payoff depends on OSC density), and emitting the reference
+projection directly from osmium's apply operation in plain mode.
+
+Risks: refusal ordering, signed IDs, absent versus explicit versions, and the
+cursor-dependent `-l` cases.
+
+Kind: rewrite (heavy-codex); local (heavy-opus, 3 decodes to 2 and no
+rewrites).
+
+## PERF-073 - cat --dedupe decodes the input once per merge
+
+Reported by: heavy-opus, heavy-codex, orchestration-codex.
+
+Mechanism: six `same_elements(out, input)` calls and one `order(input)` decode
+the input 7 times. The three derived operands each get a CONTENT order decode.
+The window arms re-decode passthrough payloads they already prove
+byte-identical, and the layout judge decodes the lookahead blob to detect a run
+end.
+
+Redesigns:
+
+- heavy-opus: decode the input once (the NO_LOCATIONS and CONTENT keys are the
+  same) and compare each output with `compare_with_opl`. Cache the operands'
+  order and counts beside their artifacts.
+- heavy-codex: certify the base once and fold layout and element judgment
+  together, skipping a decode only when the exact payload is proven to
+  represent the next expected span. Replace the two tags-filter producers with
+  one independent partition into amenity and complement. Keep the file
+  descriptors and buffers open.
+
+Kind: local (heavy-opus); rewrite (heavy-codex).
+
+## PERF-074 - sort runs osmium multipass even on already ordered input
+
+Reported by: heavy-codex, orchestration-codex.
+
+Mechanism: the check always runs osmium's multipass sort, which opens the input
+once per kind, even when independent decoding proves the input is strictly
+ordered, in which case a stable sort cannot permute anything. The multipass
+artifact also differs from the simple-sort artifact other checks request (the
+simple path writes a sort declaration).
+
+Redesign: on proven order, use the independently read input sequence with the
+same projection. On disorder, use an independent stable sort that emits
+comparison records directly. Keep type, signed-ID and version ordering,
+duplicate rejection and the way-location prediction. Provide a declared PBF
+only to the consumers that need one.
+
+Risks: the header alone is insufficient evidence; equivalence to osmium's PBF
+write/read normalization (visibility, coordinates) must be established first.
+
+Kind: high-payoff oracle rewrite (heavy-codex).
+
+## PERF-075 - cat and the reencode partition commission extra osmium passes
+
+Reported by: orchestration-codex, engine-codex, heavy-codex.
+
+Mechanism: `cat` asks osmium for three kind-filtered PBFs and decodes each
+again. On nonstandard order, `verify_reencode`'s partition path runs three
+filtered `osmium cat` passes plus a fourth to join them.
+
+Redesign: one independent base scan supplies the per-kind views and the stable
+kind partition. Keep real osmium output where a check observes its header,
+roundtrip behaviour or blob packing. A way-only result still needs an order
+judgment without its referenced nodes.
+
+Kind: smaller win.
+
+## PERF-076 - diff and derive-changes prepare each input pair repeatedly
+
+Reported by: other-codex, other-opus, orchestration-codex, engine-codex.
+
+Mechanism: text diff commissions four comparisons. derive-changes decodes
+`new` three times for pairwise content checks, decodes two roundtrips again to
+compare them to each other, and can make an extra old/new pass for osmium's
+omitted-delete exception. On the production side, each stripped diff arm goes
+through `StreamingBlocks::new_sequential`, where the merge itself drives both
+decoders.
+
+Redesigns:
+
+- Verifier side: stream an independent old/new merge into the text-listing
+  judge. Feed `new` and the three roundtrips into one multiway comparison that
+  produces all four pair verdicts, including when several fail. Compute the
+  omission exception from the old-only record and the next key in `new`.
+- Production side (other-codex): a bounded parallel reader deriving kind,
+  count, order and key ranges from the actual payloads (`BlockBuffer::project`,
+  `KindIds`, the ordered project workers). Compare byte-identical ranges once
+  they are validated and counted, and merge divergent ranges by key. Each
+  serializer runs from the prepared comparison. Do not trust indexed counts
+  for a stripped blob, and do not derive plain from verbose, which would make
+  the projection check tautological.
+- engine-codex, local: judge verbose diff refs and members as typed sequences,
+  format only the checked items, and index unique tag keys once.
+
+Risks: buffering large divergent ranges; duplicates at range boundaries.
+
+Kind: high-conviction rewrite (other-codex).
+
+## PERF-077 - The verifier's own frame reader is serial and reopens per blob
+
+Reported by: engine-opus, engine-codex, heavy-opus, heavy-codex,
+orchestration-opus.
+
+Mechanism:
+
+- `pbf_frames::index_truth` walks claims serially, then for each blob calls
+  `read_block`, which opens the file, seeks, allocates and inflates with
+  `flate2`'s default miniz backend on one thread (about 7,700 opens on
+  denmark).
+- `blob_ids_and_shape` walks the groups again.
+- It runs on the input in degrade and repack and on every repack and degrade
+  output, about a dozen whole-file inflates per run (estimate: several seconds
+  each).
+- Header-only walks use a `BufReader` plus `seek`, so readahead pulls in
+  payloads the walk skips.
+- Dedupe passthrough allocates buffers per payload pair.
+
+Redesign: read the frames once and inflate on a worker pool, folding in file
+order so the first violation stays stable. Copy the shape of pbfhogg's
+`read/pipeline.rs` without linking it. Return count, kind, extrema and shape in
+one pass and memoize per file digest. Use `pread` plus `POSIX_FADV_RANDOM` for
+header walks, as `read/header_walker.rs` does. Use an inflater that is not
+pbfhogg's (system zlib or zlib-ng) to keep the decode independent. Fuse with
+the claims walks that judge the same output (`output_blobs`, `LayoutCheck`,
+`judge_header`). codex-engine adds reusing decode results for byte-equal
+payloads across related files while judging each occurrence's framing
+separately.
+
+Risks: sharing buffers only where both interpretations see the bytes they need;
+keep `check --index` and the header-only paths.
+
+Kind: medium local (engine-opus, heavy-opus); high-conviction rewrite
+(engine-codex, its second).
+
+## PERF-078 - geocode builds two full indexes and rebuilds its reference model serially
+
+Reported by: other-codex, other-opus, orchestration-codex.
+
+Mechanism: in sequence, the check:
+
+1. runs `build-geocode-index` at tolerance 20 and again at 0. The 0 build is
+   judged only for admin answers, yet each build hashes, resolves, generates
+   S2 entries through scratch buckets, writes and smoke-tests the whole input.
+2. runs two osmium `tags-filter` plus `add-locations-to-ways -f opl` chains.
+3. parses both OPLs on one thread with a `String` per line. Admin keeps a
+   SipHash entry for every node.
+4. draws 1000 uniform queries, up to 40,000 witness attempts and 600 admin
+   witnesses. Each attempt computes full tied expectations for every class
+   before acceptance, which needs only categories; `expect_street` clones a
+   `String` and inserts into a `HashSet` per candidate. `AdminModel::expect`
+   scans every polygon per query, twice per query, once per band.
+5. runs two `geocode-query`.
+
+Redesigns:
+
+- other-codex (production): one builder producing both admin variants. Rings,
+  hole ownership and area are assembled once, then each output is simplified
+  and checked for representability separately, sharing the address, street,
+  interpolation and cell files, and both are reopened through the reader.
+- other-codex (reference): a libosmium worker selecting both arms and emitting
+  typed model inputs. Keep the distinction between a way's location at read
+  time and its node's final presence.
+- other-opus:
+  - A launch DAG: both builds and both osmium chains at once, the models
+    built during the builds.
+  - Cache the reference product (queries plus expectations) keyed by the two
+    OPL digests and the verifier digest.
+  - An exact parallel witness draw. splitmix64 state is a counter and every
+    attempt consumes exactly four draws, so attempts can be evaluated in
+    batches and accepted in order, stopping at the same attempt.
+  - Cheap nearest-only acceptance, with the full `Expect` built only for kept
+    attempts.
+  - A parallel mmap model parse applied in line order.
+  - Grid-bucketed admin polygons with containment computed once for both
+    bands.
+  - On a cold cache, one union tags-filter could feed both models.
+- other-opus, open question: build the tolerance-0 index from the boundary-only
+  osmium output. It would be tiny, but it takes `--allow-unindexed`, a
+  different path, so it needs a maintainer ruling.
+
+Risks: memory with concurrent builds at germany scale. The admin witness set
+depends on where the witness loop stopped, so any loop change silently changes
+the admin queries; a parallel draw must keep the attempt count exactly, and a
+test pinning the attempt count on a fixture would guard it (other-opus).
+
+Kind: high-conviction rewrite (both).
+
+## PERF-079 - merge-changes and the OSC listing path sort pointers into text
+
+Reported by: engine-codex, heavy-codex, heavy-opus, engine-opus.
+
+Mechanism: the OSC path reads each file twice, joins the XML metadata scan to
+osmium's OPL by position, and writes an escaped listing. merge-changes then
+concatenates the listings (again for replay), externally sorts occurrence
+descriptors, seeks back into the text one survivor at a time, sorts the
+survivors again by action, and builds each fixture's model twice. The
+`OscParser::feed` state machine does a `mem::take` per byte and allocates a
+`Vec` per tag, and `Utf8Validator::push` copies every 16 KiB chunk.
+
+Redesigns:
+
+- engine-codex and heavy-codex: one decompressed XML stream feeds the strict
+  scan and osmium's body decoder, joined by occurrence. Fold histories by
+  signed identity, keeping the first claim, high water mark, first regression
+  and winner. Emit the survivors as three already-ordered action streams with
+  no second sort. Replay reuses the occurrence storage.
+- heavy-opus: hold `simplify-j1` to `simplify` with `listing::same_content`
+  before its own model comparison. Launch groups let the per-case runs
+  overlap.
+- engine-opus: `memchr` in text state and in-place UTF-8 validation.
+
+Risks: occurrence order, delete bodies, absent versus empty attributes, the
+mixed-timestamp condition, byte parity for jobs.
+
+Kind: rewrite (codex, ranked below PBF); local (opus). Matters only for large
+OSC inputs.
+
+## PERF-080 - extract and multi-extract re-ask osmium questions they already answered
+
+Reported by: other-opus, other-codex, engine-opus, orchestration-codex.
+
+Mechanism: per region, extract runs three strategies on each side, with
+order-check decodes before each diff. `verify_extract_simple::adjudicate`
+decodes complete-ways relations twice, runs `osmium removeid` on osmium's
+simple output and diffs it against the original to find which members are
+present, then compares pbfhogg simple against complete-ways separately.
+multi-extract runs `check_sorted_counted(multi)` before `same_elements`, and
+decodes the sequential outputs again for the mixed pass.
+
+Redesign: one ordered comparison of pbfhogg simple, osmium simple and osmium
+complete-ways, collecting member IDs as the records pass (negative IDs are
+already refused, so removeid's absolute-value matching never mattered). Use
+osmium's multi-region config once per strategy where there are several regions
+(other-codex). On the production side, share the classifier work across
+strategies (see PERF-019). Fuse multi-extract's order check into its merge and
+decode each sequential output once.
+
+Kind: rewrite plus local.
+
+## PERF-081 - Selection checks run one tool invocation per request
+
+Reported by: other-codex, other-opus.
+
+Mechanism:
+
+- getparents runs eight selections per tool.
+- getid --add-referenced runs its plain and `--remove-tags` arms separately.
+- getid --invert takes counts from a fifth full decode (`osmium_counts`).
+- check-refs runs two modes, and osmium's `-r` report already holds the
+  ways-only count (cached).
+- inspect-tags runs one report per kind.
+- tags-filter runs one scan per expression.
+- The tags-filter OSC case runs four reference cases.
+- check-ids reads four dataset-sized cases with osmium and runs plain and
+  `--full` reports, which both execute the same order proof.
+
+Redesign: share the decoded relation pass across getparents' W, R, N and M
+requests and resolve the first ref of the selected W way first. Share closure
+in getid's arms. Take the invert counts from the comparison pass. Do the
+check-refs node/way work once. Count inspect-tags in one pass. Route
+tags-filter hits per expression in one scan with per-output pruning (a single
+OR would lose the way-only check). For check-ids, share the ID projection
+between plain and full, and reuse a summary for the stripped input after
+proving payload identity.
+
+Kind: medium.
+
+## PERF-082 - field-policies decodes the same small base many times
+
+Reported by: heavy-opus, heavy-codex, orchestration-opus.
+
+Mechanism: `judge_policies` decodes the base under FULL, NO_LOCATIONS and
+CONTENT inside every control: 52 decodes plus about 100 other osmium launches,
+about 150 processes in all. `between` often resolves to a policy just tested on
+the same pair. The data-scale cost is acquiring the slice (two cached `osmium
+getid` runs over the whole input).
+
+Redesigns:
+
+- Memoize the base's decodings, saving about 40 launches.
+- Evaluate each distinct policy once while still calling `Policy::between` in
+  both directions.
+- Target the sampled IDs through verified frame ranges (heavy-codex).
+- orchestration-opus: the verdict depends on no pbfhogg (verifier executable,
+  osmium identity and input digest), so it could be cached under that key.
+  field-policies need not gate later work, only later verdicts.
+
+Kind: low value.
+
+## PERF-083 - Verifier-wide small costs
+
+Reported by: engine-opus, heavy-opus, orchestration-opus, orchestration-codex.
+
+- Every OPL reader uses an 8 KiB `BufReader` (`opl_compare::Stream`,
+  `verify_reencode::Listing`, `apply_changes::opl_lines`,
+  `verify_change_listing::zip`), about 2 million `read` calls per 16 GB merge.
+  Use 1 MiB.
+- `Harness::step` times launches only, so the verifier's own read and merge
+  never appears in the PASS line. Add an `opl merge` step label, then measure
+  one denmark `all` before building anything (heavy-opus and engine-opus both
+  propose this as the first move).
+- `stream::preview` scans to EOF after it already has the displayed lines and
+  knows there are more (failure latency only).
+- `Run::revalidate` stats every watched input after every run and check, which
+  is quadratic in launches.
+- `opl_compare::decode` and `Harness::fileinfo` delete stale outputs only
+  because one check reads the same file twice. On a failing run, the first
+  side's multi-GB OPL is left behind by design.
+
+Kind: local.

@@ -385,3 +385,126 @@ tests holding bare `is_err()`, discarded `unwrap_err`/`expect_err`, or
 `Err(_)` patterns accept `Panicked`; and no source-policy rule keeps new
 ones out. The settled rulings and the remaining links (CLI refusal bar,
 source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
+
+# From the 2026-11-21 verifier performance hunt
+
+Defects the performance hunters found while reading the code at `e8377a78`
+(see the PERF-064 section of `notes/performance.md` for the hunt). None was
+reproduced.
+
+## TOOL-033 - Order verdicts behind a strict merge can never fire
+
+Reported by: heavy-opus, engine-opus, orchestration-opus, other-opus.
+
+`sort::run` calls `check_sorted(ours)` after a strict `same_elements`. That
+merge returns `Err(Failed)` the moment either side steps down, so the order
+verdict, and its "header declares Sort.Type_then_ID but element order
+disagrees" hint, can never appear. The same pattern shows up elsewhere:
+
+- `diff --format osc` runs `check_sorted(new)` and `check_sorted(rt_pbfhogg)`
+  after four strict comparisons.
+- `compare_outputs` (cat, tags-filter, getid, getparents, add-locations) and
+  apply-changes record the order verdict first, but the strict merge after it
+  errors anyway.
+
+In all of these, a disordered output ends as an `Err` naming a deleted OPL
+file instead of the deliberate verdict. Each of these calls is also a full
+osmium decode: three can only pass, and the others duplicate the merge's
+reading.
+
+Proposed fix, same in every report: the strict merge records each side's
+order verdict and counts, keeping the key scan going so the counts message
+stays the same, and then raises the error it raises today. The callers drop
+their separate order decodes and record the claims under today's names. This
+covers sort, compare_outputs, apply-changes, derive-changes, extract (two
+`check_sorted_counted`) and multi-extract.
+
+## TOOL-034 - A missing declared reference output is accepted as success
+
+Reported by: orchestration-codex.
+
+A fresh reference run that exits with an accepted status but leaves a declared
+output missing fails the cache's `completed` check. Execution still returns
+the accepted status, though, and `Harness::reference` accepts it
+(`reference_cache.rs` completion and placement, `harness.rs` outcome check).
+The missing artifact is found downstream, where the producer-specific
+diagnostic can be lost. Make artifact presence part of the settled producer
+result.
+
+## TOOL-035 - apply_changes::opl_lines accepts a truncated final line
+
+Reported by: engine-opus.
+
+`opl_lines` reads OPL with `BufRead::split(b'\n')`, which yields a final line
+that has no newline. Every other OPL reader (`opl_compare::Stream`,
+`verify_opl`, `verify_diff_opl::Lines`) refuses that as truncation. A
+truncated `base-touched.opl` would be read as complete. Unlikely, since osmium
+exited 0, but it breaks the engine's stated rule.
+
+## TOOL-036 - check-refs compares counts that measure different things
+
+Reported by: other-codex.
+
+pbfhogg reduces the missing nodes in ways to distinct IDs
+(`commands/check/refs.rs`), while osmium counts each missing reference
+(`command_check_refs.cpp`). So one missing node referenced by two ways gives
+pbfhogg 1 and osmium 2, and the verifier compares them for equality in both
+modes (`checks/check_refs.rs`). Decide which quantity the check is meant to
+judge.
+
+## TOOL-037 - multi-extract parity passes after the single-pass route falls back
+
+Reported by: other-codex.
+
+The verifier checks the outputs and headers, but pbfhogg emits a distinct
+diagnostic when the single-pass probe declines (`commands/extract/mod.rs`),
+and the check never looks for it. So parity passes on the fallback route
+without exercising the single pass. Related point: the generated strips share
+endpoints and bbox containment is inclusive, so a node on the seam can
+legitimately appear in two strips. A batched classifier must keep that.
+
+## TOOL-038 - degrade never judges drop-a-again beyond its elements
+
+Reported by: heavy-opus.
+
+`drop-a-again` is compared with `drop-a` on elements only. Its header,
+indexdata (both the verifier's blob decode and `check --index`), blob sizes and
+layout are never judged, so nondeterminism that OPL cannot see would pass. A
+byte comparison closes the gap when the files are identical; otherwise judge
+`again` with `run.common`.
+
+## TOOL-039 - degrade's coordinate witness counts any paired difference
+
+Reported by: engine-codex.
+
+The witness for inline coordinates (`checks/degrade.rs`) treats any paired OPL
+difference between the two reference views as evidence of coordinates, so a
+paired tag or metadata change would also increment `differs`. Check the
+location field and require the rest of the object to agree.
+
+## TOOL-040 - The OSC structure scan tracks only root, action and object elements
+
+Reported by: engine-codex.
+
+`osc.rs`'s strict structure check follows only the root, action and object
+elements, so an unknown unclosed tag can escape the scan. osmium's reading
+gives a separate XML check in the listing path today. Keep that protection if
+the two-file join is removed.
+
+## TOOL-041 - field-policies' FULL control checks the count of differing ways, not which
+
+Reported by: heavy-codex.
+
+`run_between` checks the number of differing ways and that there are no
+one-sided records, but never that the differing IDs match the independently
+classified ways. A comparator that reports the right count on the wrong ways
+clears that part of the control.
+
+## TOOL-042 - getparents' module comment understates its claim
+
+Reported by: other-codex.
+
+The comment describes selection without metadata or header checks.
+`compare_outputs` compares metadata and checks sort features on the sorted
+path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
+keep those checks when batching requests.

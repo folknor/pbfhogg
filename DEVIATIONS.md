@@ -187,9 +187,11 @@ stale for a node the OSC does not carry, and osmium repairs one only in the
 second case above, so compare outputs from a base whose inline coordinates
 agree with its node records. A blob pbfhogg rewrites is written in the
 default framing, so coordinates and timestamps from a source block with
-non-default `granularity`, offsets or `date_granularity` are truncated to
-decimicrodegrees and whole seconds there; blobs copied unchanged keep their
-own framing. The summary's refresh counts cover the way blobs the
+non-default `granularity`, offsets or `date_granularity` are converted to
+decimicrodegrees (truncated toward zero, as libosmium) and whole seconds
+(rounded down, where libosmium truncates toward zero, so a negative
+sub-second timestamp lands one second earlier than osmium writes it) there;
+blobs copied unchanged keep their own framing. The summary's refresh counts cover the way blobs the
 run searched or rewrote, not the whole file.
 
 **Rationale:** The OSC is the only source of new coordinates, which is what

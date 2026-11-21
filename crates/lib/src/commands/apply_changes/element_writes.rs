@@ -88,7 +88,7 @@ pub(super) fn write_base_dense_node_local<O: BlockSink + ?Sized>(
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block)?;
     }
-    let meta = dense_node_raw_metadata(dn);
+    let meta = dense_node_raw_metadata(dn)?;
     // Block construction keeps every dense index a nonnegative int32, so the
     // cast is the identity.
     bb.add_node_raw(
@@ -118,7 +118,7 @@ pub(super) fn write_base_node_local<O: BlockSink + ?Sized>(
     }
     // Partial source metadata keeps its field presence (a plain node out);
     // complete or absent metadata goes dense, as before.
-    let meta = element_raw_partial_metadata(&node.info());
+    let meta = element_raw_partial_metadata(crate::ElementKind::Node, node.id(), &node.info())?;
     bb.add_node_raw_partial(
         node.id(),
         node.decimicro_lat()?,
@@ -204,14 +204,19 @@ impl<'a> BaseWrites<'a> {
 ///
 /// `Info.timestamp` is in units of the block's `date_granularity`
 /// milliseconds, and an output block declares the default 1000. Under the
-/// default the bytes are copied as they are. Otherwise every timestamp field
-/// is rewritten by `owned::output_timestamp_seconds`, the conversion the
-/// base nodes of the same rewrite get, so one rewritten blob keeps one
-/// whole-second contract. Every other
-/// field keeps its bytes, unknown fields included; a timestamp field that is
-/// absent stays absent, and one not varint-typed is copied like an unknown
-/// field, as the parser treats it.
+/// default the bytes are copied as they are. Otherwise the timestamp is
+/// rewritten by `owned::output_timestamp_seconds`, the conversion the base
+/// nodes of the same rewrite get (rounded down to whole seconds, an
+/// overflowing scaling refused), so one rewritten blob keeps one
+/// whole-second contract. Only the effective timestamp is converted: the
+/// parser keeps the last varint field 2, so earlier ones are shadowed and
+/// dropped rather than judged, and the converted value is written after the
+/// other fields. Every other field keeps its bytes, unknown fields
+/// included; a timestamp field that is absent stays absent, and one not
+/// varint-typed is copied like an unknown field, as the parser treats it.
 fn output_info<'b>(
+    kind: crate::ElementKind,
+    id: i64,
     info: Option<&'b [u8]>,
     date_granularity: i32,
     buf: &'b mut Vec<u8>,
@@ -226,18 +231,22 @@ fn output_info<'b>(
         return Ok(Some(info));
     }
     buf.clear();
+    let mut timestamp = None;
     let mut cursor = Cursor::new(info);
     while let Some((field, wire_type)) = cursor.read_tag()? {
         if field == 2 && wire_type == WIRE_VARINT {
-            let raw = cursor.read_varint_i64()?;
-            let seconds = crate::owned::output_timestamp_seconds(raw, i64::from(date_granularity));
-            encode_tag(buf, 2, WIRE_VARINT);
-            encode_varint(buf, seconds.cast_unsigned());
+            timestamp = Some(cursor.read_varint_i64()?);
         } else {
             let bytes = cursor.read_raw_field(wire_type)?;
             encode_tag(buf, field, wire_type);
             buf.extend_from_slice(bytes);
         }
+    }
+    if let Some(raw) = timestamp {
+        let seconds = crate::owned::output_timestamp_seconds(raw, i64::from(date_granularity))
+            .map_err(|e| e.context(format!("{} {id}: timestamp", kind.as_str())))?;
+        encode_tag(buf, 2, WIRE_VARINT);
+        encode_varint(buf, seconds.cast_unsigned());
     }
     Ok(Some(buf))
 }
@@ -254,7 +263,13 @@ pub(super) fn write_base_way_local<O: BlockSink + ?Sized>(
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block)?;
     }
-    let info = output_info(way.info_data(), ctx.date_granularity, &mut ctx.scratch.info)?;
+    let info = output_info(
+        crate::ElementKind::Way,
+        way.id(),
+        way.info_data(),
+        ctx.date_granularity,
+        &mut ctx.scratch.info,
+    )?;
     bb.add_way_raw_bytes(
         way.id(),
         way.keys_data(),
@@ -313,7 +328,13 @@ pub(super) fn write_base_way_local_with_locations<O: BlockSink + ?Sized>(
         tally.deleted_refs += eval.deleted_refs;
         reencode |= eval.stale_refs > 0;
     }
-    let info = output_info(way.info_data(), *date_granularity, info)?;
+    let info = output_info(
+        crate::ElementKind::Way,
+        way.id(),
+        way.info_data(),
+        *date_granularity,
+        info,
+    )?;
     if reencode {
         let changed = refreshed_locations(
             way.refs_data(),
@@ -375,7 +396,13 @@ pub(super) fn write_base_relation_local<O: BlockSink + ?Sized>(
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block)?;
     }
-    let info = output_info(rel.info_data(), ctx.date_granularity, &mut ctx.scratch.info)?;
+    let info = output_info(
+        crate::ElementKind::Relation,
+        rel.id(),
+        rel.info_data(),
+        ctx.date_granularity,
+        &mut ctx.scratch.info,
+    )?;
     bb.add_relation_raw_bytes(
         rel.id(),
         rel.keys_data(),
@@ -385,4 +412,37 @@ pub(super) fn write_base_relation_local<O: BlockSink + ?Sized>(
         rel.types_data(),
         info,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::output_info;
+
+    /// Only the effective (last) timestamp is converted: a shadowed one
+    /// whose scaling would overflow is dropped, not judged, as the parser
+    /// never reads it. An effective one that overflows is refused.
+    #[test]
+    fn output_info_converts_only_the_last_timestamp() {
+        let max = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        let mut info = vec![0x10];
+        info.extend_from_slice(&max);
+        info.extend_from_slice(&[0x08, 0x03, 0x10, 0x14]);
+        let mut buf = Vec::new();
+        let out = output_info(crate::ElementKind::Way, 9, Some(&info), 100, &mut buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, [0x08, 0x03, 0x10, 0x02], "20 x 100 ms is 2 s");
+
+        let mut effective = vec![0x08, 0x03, 0x10];
+        effective.extend_from_slice(&max);
+        let mut buf = Vec::new();
+        let err =
+            output_info(crate::ElementKind::Way, 9, Some(&effective), 100, &mut buf).unwrap_err();
+        assert!(
+            err.report().contains("way 9: timestamp"),
+            "{}",
+            err.report()
+        );
+    }
 }

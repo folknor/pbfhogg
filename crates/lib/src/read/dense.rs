@@ -498,9 +498,26 @@ impl<'a> DenseNodeInfo<'a> {
 
     /// The timestamp as a re-encoded output block stores it; see
     /// `owned::output_timestamp_seconds`.
+    ///
+    /// Also returns whether rounding turned a non-zero millisecond value
+    /// this slot's present column holds into 0 (`zero_timestamp_claim` on
+    /// the builder's dense metadata): a slot written without a version then
+    /// reads that 0 as padding, so the builder writes such a node plain.
+    /// Only a non-default `date_granularity` can round (at the default the
+    /// raw value is copied, and the flag is false without a test), and
+    /// granularity 0 scales every value to 0, which is no claim to lose.
     #[inline]
-    pub(crate) fn output_timestamp_seconds(&self) -> i64 {
-        crate::owned::output_timestamp_seconds(self.timestamp, self.date_granularity)
+    pub(crate) fn output_timestamp(&self) -> Result<(i64, bool)> {
+        if self.date_granularity == crate::owned::OUTPUT_DATE_GRANULARITY {
+            return Ok((self.timestamp, false));
+        }
+        let seconds =
+            crate::owned::output_timestamp_seconds(self.timestamp, self.date_granularity)?;
+        let rounded_away = seconds == 0
+            && self.timestamp != 0
+            && self.date_granularity != 0
+            && self.columns.timestamp();
+        Ok((seconds, rounded_away))
     }
 
     /// Returns the visibility status of an element.
@@ -590,7 +607,8 @@ impl<'a> DenseNodeInfo<'a> {
     ///
     /// The re-encoding conversions (`dense_node_metadata` and its kin) write
     /// what this reads back the same, apart from the sub-second part of a
-    /// timestamp, which they truncate to whole seconds.
+    /// timestamp under a non-default `date_granularity`, which they round
+    /// down to whole seconds (`owned::output_timestamp_seconds`).
     ///
     /// Always `Some` today; the `Option` stays for the callers' shape.
     /// Computed only where an output reads metadata; the dense iterator
@@ -910,6 +928,7 @@ mod tests {
                         ..meta(version, ts, 9, 7, "u")
                     },
                     columns: VERSION_TIMESTAMP,
+                    zero_timestamp_claim: false,
                 }),
             );
         }
@@ -988,6 +1007,7 @@ mod tests {
                         ..meta(0, 0, 0, 0, "")
                     },
                     columns: DenseColumns(DenseColumns::VISIBLE),
+                    zero_timestamp_claim: false,
                 }),
             );
         }
@@ -1055,7 +1075,7 @@ mod tests {
         let back = PrimitiveBlock::from_vec(out.take().unwrap().unwrap().to_vec()).unwrap();
         let got: Vec<i64> = dense_infos(&back)
             .iter()
-            .map(|(_, i)| i.as_ref().unwrap().output_timestamp_seconds())
+            .map(|(_, i)| i.as_ref().unwrap().output_timestamp().unwrap().0)
             .collect();
         assert_eq!(got, raws);
     }

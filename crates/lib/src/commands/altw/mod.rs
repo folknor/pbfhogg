@@ -1420,6 +1420,12 @@ fn process_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
+                    // A retained node keeps its content at the OSM data
+                    // model's precision, not its source framing: a rebuilt
+                    // block is default-framed (docs/cli/commands.md "PBF
+                    // rebuild precision"). The external engine rebuilds
+                    // retained nodes by the same conversion, so the engines
+                    // stay digest-equal.
                     let meta = dense_node_metadata(dn)?;
                     bb.add_node_dense(
                         dn.id(),

@@ -42,37 +42,6 @@ parser needs to distinguish absent from explicit zero. Libosmium rejects both
 missing and zero sizes, while the repository explicitly tests acceptance of
 zero, so that separate compatibility difference also needs a ruling.
 
-## BUG-003 - Rebuild paths truncate timestamps and coordinate precision
-
-Reported by: decode, encoding, sort, tags, altw-sparse, osc.
-
-`owned.rs` metadata conversion (`output_timestamp_seconds`, behind every
-plain and dense conversion and apply-changes' `output_info`) copies a
-timestamp at the default `date_granularity` verbatim, but under any other
-granularity scales it with wrapping multiplication and truncates toward
-zero to seconds, and the builder writes default timestamp framing. So a
-sub-second timestamp loses its fraction, an overflowing scaling is written
-as the wrapped value (an input claim the readers refuse becomes a valid
-one), a versionless dense slot at -1 ms is written as 0 and reads back as
-padding, and flooring instead would overflow for `i64::MIN` ms when scaled
-back. Preserving the source framing on rebuild is the fix shape. Owned node
-conversion narrows nanodegrees to decimicrodegrees under default coordinate
-framing. Inputs with finer precision change whenever a command rebuilds instead
-of passing through: tags-filter, sort overlap rewrites (passthrough keeps
-precision, so the result depends on routing), sparse ALTW filtered retained
-nodes (`altw/mod.rs` `process_block`, where node content is promised
-unchanged). The PBF-to-OSC adapter (`osc/write.rs`) floors millisecond
-timestamps to seconds the same way.
-
-Defect hunt 2026-11-17 (read-block-decoding, passthrough-rewrite): the same
-conversion breaks a documented claim. `docs/cli/commands.md` (repack section)
-says every inline way coordinate round-trips exactly; both repack rewrite paths
-(`repack/mod.rs`) convert to decimicrodegrees, so with granularity 1 a decoded
-coordinate of 101 nanodegrees becomes 100, and 1 nanodegree becomes 0.
-Metadata also goes through whole-second normalization (`owned.rs`). Both
-hunters say the documentation is the wrong side here: "same corpus, different
-encoding" needs explicit precision qualifications.
-
 ## BUG-006 - Rebuild paths drop inline way locations
 
 Reported by: encoding, sort, spatial.
@@ -291,3 +260,21 @@ negatives took the same path they do too. Fix: give duplicates a fixed place
 in report order and pick their examples by canonical ID, or settle every
 occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
 redesign of the same per-blob retention.
+
+## BUG-032 - cat --clean version turns a dense epoch timestamp into padding
+
+Reported by: the codex spar of the rebuild-precision work (code reading).
+
+A versioned dense slot claims every present column, a 0 timestamp
+included. `clean_metadata` (`commands/mod.rs`) zeroes the version under
+`--clean version` but keeps the dense route, so the output slot is
+versionless with timestamp 0, which `DenseNodeInfo::claimed_milli_timestamp`
+reads as padding: the epoch claim is lost (and so is a 0 changeset or uid,
+which a versionless slot cannot claim). Witness: a dense node with version
+3 and timestamp 0 through `cat --clean version`; the input claims 0 s, the
+output claims no timestamp. The re-encode conversions already carry a
+`zero_timestamp_claim` escape for a non-default-granularity claim rounded
+to 0 s, which the builder takes when the slot is versionless after
+cleaning; a claim that was 0 at the source is outside it. The fix is to
+choose the dense-or-plain route from what the cleaned slot would claim. Whether osmium's `--clean version`
+output is the reference here is part of the decision.

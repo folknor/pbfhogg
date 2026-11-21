@@ -38,6 +38,24 @@ the wall is the exact comparison, and `CAT_FILTERED_*` the exact ordered-pass
 total (it excludes the schedule walk and the final flush). Runs from
 `8da26b23` until that change carry no per-kind rows.
 
+### Fallible timestamp conversion and the plain escape cost nothing on cat --clean (plantasjen, 2026-11-21, against `53b1b54d`)
+
+The re-encode metadata conversions became fallible (a `Result` timestamp,
+an out-of-line rescale for non-default `date_granularity`) and every dense
+add checks one `zero_timestamp_claim` flag, in the commit after
+`53b1b54d`. `copy-pbf --dataset planet --clean yes`, `--iterations 1`,
+interleaved A B A B, A at `53b1b54d` via `--commit`, B the uncommitted
+change:
+
+| A, `53b1b54d` | B, fallible conversion |
+|---|---|
+| 284 s (`0159dc53`), 304 s (`47c4b9a3`) | 304 s (`6e99afb6`), 295 s (`432a6d27`) |
+
+Medians 294 and 299.5 s, pair signs disagree (+20 s, -9 s), and A itself
+moved 20 s between its cells: drift, not the change. Neutral by the 2-3 %
+rule; every other re-encoder runs the same per-node conversion, so no
+further cells were run.
+
 ### Exact node coordinate accessors cost nothing on cat --clean (plantasjen, 2026-11-20, against `5cd381d2`)
 
 The re-encoders' node coordinate conversion became exact and fallible

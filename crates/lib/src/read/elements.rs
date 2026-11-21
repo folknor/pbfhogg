@@ -959,7 +959,7 @@ impl<'a> Info<'a> {
     /// The timestamp as a re-encoded output block stores it; see
     /// `owned::output_timestamp_seconds`.
     #[inline]
-    pub(crate) fn output_timestamp_seconds(&self) -> Option<i64> {
+    pub(crate) fn output_timestamp_seconds(&self) -> Option<crate::Result<i64>> {
         self.info.timestamp.map(|ts| {
             crate::owned::output_timestamp_seconds(ts, i64::from(self.block.date_granularity))
         })

@@ -457,6 +457,47 @@ fails with an error rather than write a header that lies.
 | `add-locations-to-ways` | input's | `LocationsOnWays`, plus the prepass features with `--inject-prepass` |
 | `apply-changes` | sorted | `LocationsOnWays` with `--locations-on-ways`, else none |
 
+## PBF rebuild precision
+
+A blob a command copies keeps its bytes, and so its block framing
+(`granularity`, `lat_offset`, `lon_offset`, `date_granularity`) and every
+value exactly as stored. A block a command rebuilds element by element
+(cat's re-encodes, `sort` and `cat --dedupe` overlap runs, `repack`,
+`degrade`'s re-encoding flags, `tags-filter`, `time-filter`, `getid`,
+`getparents`, `extract`, `add-locations-to-ways` retained-node rewrites,
+`apply-changes` rewritten blobs) is written in the default framing, which holds the OSM data model's
+precision: coordinates in decimicrodegrees (1e-7 degrees) and timestamps in
+whole seconds. A source block already in the default framing loses nothing.
+A source block in another framing is converted:
+
+- coordinates are truncated toward zero to decimicrodegrees, as libosmium
+  reads them and as `diff` and `check --locations` compare them;
+- timestamps are scaled exactly to milliseconds and rounded down to the
+  whole second holding the instant, as `time-filter` and the OSC writer
+  round them (libosmium truncates toward zero, which differs for negative
+  sub-second values);
+- a timestamp whose scaling by `date_granularity` overflows, or whose
+  rounded second no longer fits 64-bit milliseconds, is refused with an
+  error naming the element, rather than written as a different, valid
+  timestamp (`cat --clean timestamp` does not convert the timestamp it
+  drops, so it does not refuse it);
+- a dense node whose claimed timestamp rounds to 0 s and which is written
+  without a version (it had none, or `cat --clean version` dropped it) is
+  written as a plain node with an explicit 0, since a versionless dense
+  slot holding 0 reads back as no timestamp.
+
+Under the default `date_granularity` the stored timestamp is copied as it
+is, an overflowing one included, so it reads back as the same refused
+claim. `add-locations-to-ways` splices locations into way blocks rather
+than rebuilding them: a way block keeps its own `date_granularity` and
+stored timestamps. Because the conversion applies only to rebuilt blocks, two outputs
+of the same input can differ below the model precision where one command
+route copies a non-default-framed blob and another rebuilds it (`sort`
+passthrough against an overlap rewrite, say). `pbfhogg diff` and the
+content digest forms compare coordinates at decimicrodegrees and ignore
+metadata, so they see no difference; `digest --form full` compares exact
+nanodegrees and millisecond timestamp claims, so it does.
+
 ## Output files
 
 Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
@@ -1337,8 +1378,8 @@ elements, a group carrying more than one element field, kinds changing
 across groups); an indexed blob is never scanned, so it passes through
 whatever its block holds. Such an unindexed block is rebuilt into
 single-kind blocks by the same rules `--type` and `--clean` re-encode with:
-nodes written dense, coordinates truncated toward zero to decimicrodegrees,
-timestamps truncated to whole seconds, metadata with an absent or sentinel
+nodes written dense, coordinates and timestamps converted as
+[PBF rebuild precision](#pbf-rebuild-precision) describes, metadata with an absent or sentinel
 version discarded, missing fields of retained metadata written as defaults,
 unknown fields discarded. Elements keep their input order, except inside a
 group carrying several element fields, which is written dense nodes, then
@@ -1405,7 +1446,7 @@ no single index describes, are handled as `cat --dedupe` handles them (see
 
 ### repack
 
-Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip; output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
+Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip at the OSM data model's precision (a source block in a non-default framing is converted as [PBF rebuild precision](#pbf-rebuild-precision) describes); output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
 
 Primary use case: producing same-corpus-different-encoding pairs for blob-density measurement (Geofabrik's ~8 k/blob convention vs `planet.openstreetmap.org`'s ~228 k/blob), so commands with implicit blob-count scaling (`HeaderWalker`-based paths in particular) can be measured at controlled densities.
 
@@ -1426,7 +1467,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-Input blobs with fewer elements of a kind than the cap coalesce across input-blob boundaries (growing, e.g. europe 8 k -> 64 k), so caps larger than the input blob size fire correctly. An input blob with at least the cap's worth is encoded on its own: full blocks of the cap, then the rest as its own possibly-under-cap block, which never coalesces with the blobs after it. So on a shrink the output blob count is not the general `ceil(elements / cap)`, and repacking the output again at the same cap can merge such a remainder with the small blobs that follow it. When the input header declares `LocationsOnWays`, the output re-advertises it and every inline way-node coordinate round-trips exactly; the two `pbfhogg.*` prepass features (`WayMembers-v1`, `SharedNodePins-v1`) are dropped with a warning.
+Input blobs with fewer elements of a kind than the cap coalesce across input-blob boundaries (growing, e.g. europe 8 k -> 64 k), so caps larger than the input blob size fire correctly. An input blob with at least the cap's worth is encoded on its own: full blocks of the cap, then the rest as its own possibly-under-cap block, which never coalesces with the blobs after it. So on a shrink the output blob count is not the general `ceil(elements / cap)`, and repacking the output again at the same cap can merge such a remainder with the small blobs that follow it. When the input header declares `LocationsOnWays`, the output re-advertises it and every inline way-node coordinate round-trips at decimicrodegree precision (exactly, from a default-framed block); the two `pbfhogg.*` prepass features (`WayMembers-v1`, `SharedNodePins-v1`) are dropped with a warning.
 
 ### degrade
 
@@ -2162,10 +2203,12 @@ Which blobs are way blobs is their indexdata kind claim (see
 
 **Framing.** Rewritten blocks are written in the default coordinate and date
 framing. A surviving way or relation from a source block with another
-`granularity`, `lat_offset`, `lon_offset` or `date_granularity` is converted:
-coordinates truncated toward zero to decimicrodegrees, timestamps to whole
-seconds (timestamps with or without `--locations-on-ways`). Blobs copied
-unchanged keep their own framing.
+`granularity`, `lat_offset`, `lon_offset` or `date_granularity` is converted
+as [PBF rebuild precision](#pbf-rebuild-precision) describes: coordinates
+truncated toward zero to decimicrodegrees and, under a non-default
+`date_granularity`, timestamps rounded down to whole seconds and an
+overflowing one refused (timestamps with or without
+`--locations-on-ways`). Blobs copied unchanged keep their own framing.
 
 **Summary.** A progress line reports the refresh probe's memory, and the
 summary adds `Inline locations refreshed: R refs in W ways, S way blobs

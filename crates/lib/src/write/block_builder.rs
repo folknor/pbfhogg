@@ -244,6 +244,7 @@ impl RawPartialMetadata {
             user_sid: self.user_sid?,
             visible: self.visible.unwrap_or(true),
             columns: DenseColumns::ALL,
+            zero_timestamp_claim: false,
         })
     }
 
@@ -280,6 +281,32 @@ pub(crate) struct RawMetadata {
     /// for complete metadata, a source group's partial set when re-encoding
     /// one.
     pub columns: DenseColumns,
+    /// [`DenseMetadata::zero_timestamp_claim`] for the raw writers.
+    pub zero_timestamp_claim: bool,
+}
+
+impl RawMetadata {
+    /// [`DenseMetadata::writes_plain`] for raw metadata.
+    #[inline]
+    fn writes_plain(&self) -> bool {
+        self.zero_timestamp_claim && self.version < 1
+    }
+
+    /// [`DenseMetadata::plain_claim_metadata`] for raw metadata: a user index
+    /// other than 0 is a claimed name (the conversion that sets
+    /// `zero_timestamp_claim` on a versionless slot writes an index naming
+    /// the empty string as 0).
+    fn plain_claim_metadata(&self) -> RawPartialMetadata {
+        let c = self.columns;
+        RawPartialMetadata {
+            version: None,
+            timestamp: c.timestamp().then_some(self.timestamp),
+            changeset: (c.changeset() && self.changeset > 0).then_some(self.changeset),
+            uid: (c.uid() && self.uid > 0).then_some(self.uid),
+            user_sid: (c.user() && self.user_sid != 0).then_some(self.user_sid),
+            visible: (c.visible() && !self.visible).then_some(false),
+        }
+    }
 }
 
 /// Complete [`Metadata`] of a dense source node with the `DenseInfo`
@@ -289,6 +316,39 @@ pub(crate) struct RawMetadata {
 pub(crate) struct DenseMetadata<'a> {
     pub meta: Metadata<'a>,
     pub columns: DenseColumns,
+    /// The source slot claims a non-zero timestamp that re-encoding rounded
+    /// down to 0. Written with a version that 0 is a claim; written without
+    /// one (the source had none, or `--clean version` dropped it) a dense
+    /// slot would read it back as padding, so the node is written plain
+    /// instead ([`writes_plain`](Self::writes_plain)). Set only by the
+    /// re-encoding conversions, under a non-default `date_granularity`.
+    pub zero_timestamp_claim: bool,
+}
+
+impl DenseMetadata<'_> {
+    /// Whether the builder writes this node plain, with
+    /// [`plain_claim_metadata`](Self::plain_claim_metadata), rather than
+    /// dense: a rounded-away timestamp claim on a versionless slot.
+    #[inline]
+    pub(crate) fn writes_plain(&self) -> bool {
+        self.zero_timestamp_claim && self.meta.version < 1
+    }
+
+    /// What a versionless dense slot with this metadata claims, as
+    /// `DenseNodeInfo::claims` reads it, as plain metadata: no version, the
+    /// timestamp explicit (0 included), changeset and uid only when
+    /// positive, a user only when non-empty, `visible` only when false.
+    pub(crate) fn plain_claim_metadata(&self) -> PartialMetadata<'_> {
+        let (m, c) = (&self.meta, self.columns);
+        PartialMetadata {
+            version: None,
+            timestamp: c.timestamp().then_some(m.timestamp),
+            changeset: (c.changeset() && m.changeset > 0).then_some(m.changeset),
+            uid: (c.uid() && m.uid > 0).then_some(m.uid),
+            user: (c.user() && !m.user.is_empty()).then_some(m.user),
+            visible: (c.visible() && !m.visible).then_some(false),
+        }
+    }
 }
 
 /// Map a MemberType to its protobuf enum integer value.
@@ -767,6 +827,17 @@ impl BlockBuilder {
         tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         metadata: Option<&DenseMetadata<'_>>,
     ) {
+        if let Some(m) = metadata
+            && m.writes_plain()
+        {
+            return self.add_node_partial(
+                id,
+                decimicro_lat,
+                decimicro_lon,
+                tags,
+                Some(&m.plain_claim_metadata()),
+            );
+        }
         let (meta, columns) = match metadata {
             Some(m) => (Some(&m.meta), m.columns),
             None => (None, DenseColumns::default()),
@@ -955,6 +1026,7 @@ impl BlockBuilder {
             user_sid: meta.user_sid.unwrap_or(0),
             visible: meta.visible.unwrap_or(true),
             columns: self.dense_columns,
+            zero_timestamp_claim: false,
         });
 
         self.elem_scratch.clear();
@@ -1453,6 +1525,17 @@ impl BlockBuilder {
         raw_tags: impl Iterator<Item = (u32, u32)>,
         metadata: Option<&RawMetadata>,
     ) -> Result<()> {
+        if let Some(m) = metadata
+            && m.writes_plain()
+        {
+            return self.add_node_raw_partial(
+                id,
+                decimicro_lat,
+                decimicro_lon,
+                raw_tags,
+                Some(&m.plain_claim_metadata()),
+            );
+        }
         if !self.can_add_node() {
             return Err(self.raw_refusal(BlockType::DenseNodes, id));
         }
@@ -2670,7 +2753,11 @@ mod tests {
                 panic!("plain")
             };
             bb.add_node_raw_partial(10 + n.id(), 0, 0, std::iter::empty(), Some(&complete))?;
-            let meta = crate::owned::element_raw_partial_metadata(&n.info());
+            let meta = crate::owned::element_raw_partial_metadata(
+                crate::ElementKind::Node,
+                n.id(),
+                &n.info(),
+            )?;
             bb.add_node_raw_partial(
                 n.id(),
                 n.decimicro_lat()?,
@@ -2991,7 +3078,11 @@ mod tests {
             let crate::Element::Node(n) = e else {
                 panic!("plain")
             };
-            let raw = crate::owned::element_raw_partial_metadata(&n.info());
+            let raw = crate::owned::element_raw_partial_metadata(
+                crate::ElementKind::Node,
+                n.id(),
+                &n.info(),
+            )?;
             bb.add_node_raw_partial(n.id(), 10, 20, n.raw_tags(), raw.as_ref())?;
         }
         let out = PrimitiveBlock::from_vec(bb.take()?.expect("block").to_vec())?;
@@ -3166,6 +3257,7 @@ mod tests {
             user_sid,
             visible: true,
             columns: crate::DenseColumns::ALL,
+            zero_timestamp_claim: false,
         };
         let mut info = Vec::new();
         for (field, value) in [(1u32, 1u64), (5, 3)] {
@@ -3785,6 +3877,7 @@ mod tests {
             user_sid: i32::MAX,
             visible: true,
             columns: crate::DenseColumns::ALL,
+            zero_timestamp_claim: false,
         };
         let next = RawMetadata {
             version: 1,
@@ -3794,6 +3887,7 @@ mod tests {
             user_sid: -1,
             visible: true,
             columns: crate::DenseColumns::ALL,
+            zero_timestamp_claim: false,
         };
         bb.add_dense_metadata_raw(&first);
         bb.add_dense_metadata_raw(&next);

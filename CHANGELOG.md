@@ -4,6 +4,20 @@
 
 ### Breaking
 
+- **Rebuilt blocks round non-default-granularity timestamps down and refuse
+  overflow.** A command that rebuilds a block from a source block whose
+  `date_granularity` is not the default 1000 used to scale its timestamps
+  with wrapping arithmetic and truncate toward zero, so an overflowing
+  value was written as a different valid timestamp and -1 ms became the
+  epoch. The timestamp is now scaled exactly and rounded down to the whole
+  second (as `time-filter` and the OSC writer round), an overflow is
+  refused with an error naming the element, and a versionless dense node
+  whose claim rounds to 0 s is written as a plain node so the claim is not
+  read back as padding. Default-granularity input, which is every known
+  producer's, is unchanged. The precision contract for rebuilt blocks is
+  now stated once, in the CLI reference's "PBF rebuild precision"; repack's
+  round-trip claim is qualified to it.
+
 - **`time-filter` refuses a dense node whose timestamp is padding.** A
   dense node with no version (0 or the Osmosis -1) and timestamp 0, which
   is what a writer stores for a node without metadata in a block whose

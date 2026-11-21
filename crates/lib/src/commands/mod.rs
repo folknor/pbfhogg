@@ -591,6 +591,7 @@ pub(crate) fn clean_metadata<'a>(
         |DenseMetadata {
              meta: mut m,
              columns,
+             zero_timestamp_claim,
          }| {
             if clean.version {
                 m.version = 0;
@@ -607,7 +608,16 @@ pub(crate) fn clean_metadata<'a>(
             if clean.user {
                 m.user = "";
             }
-            DenseMetadata { meta: m, columns }
+            // A cleaned timestamp is the 0 osmium's `--clean` writes, which a
+            // versionless slot holds as padding, as it always has; only a
+            // kept, rounded-away claim keeps the plain escape, which the
+            // builder takes when the slot is versionless after cleaning
+            // (`--clean version` included).
+            DenseMetadata {
+                meta: m,
+                columns,
+                zero_timestamp_claim: zero_timestamp_claim && !clean.timestamp,
+            }
         },
     )
 }

@@ -170,11 +170,19 @@ encoding is left alone; outputs that print metadata read it instead:
 Re-encoding keeps what these rules read: the conversions that feed a rewrite
 keep every dense slot, its fields and its group's columns (a complete group is
 written with all six), writing a `-1` version or changeset as 0, so the
-output claims what the input did, apart from sub-second timestamps, which are
-truncated to whole seconds. At the default `date_granularity` of 1000 the
-stored timestamp is copied verbatim, so even one whose millisecond scaling
-overflows reads back as the same refused claim; only a block at another
-granularity is scaled and truncated. A plain `Info` is
+output claims what the input did, apart from sub-second timestamps. At the
+default `date_granularity` of 1000 the stored timestamp is copied verbatim,
+so even one whose millisecond scaling overflows reads back as the same
+refused claim. Only a block at another granularity is converted: scaled
+exactly, rounded down to whole seconds, refused where the scaling overflows
+or the rounded second no longer fits i64 milliseconds
+(`output_timestamp_seconds` in `crates/lib/src/owned.rs`). Rounding can
+turn a versionless slot's non-zero claim into the 0 that reads as padding;
+such a node is written plain with an explicit 0 (`zero_timestamp_claim`,
+which also covers a versioned slot that `cat --clean version` leaves
+versionless), so the claim survives. Coordinates of a rebuilt block are truncated toward zero to
+decimicrodegrees under the same rule; docs/cli/commands.md "PBF rebuild
+precision" states the user-facing contract. A plain `Info` is
 re-encoded with each field present exactly when it was decoded present
 (`element_metadata` in `crates/lib/src/owned.rs`): the `-1` version or
 changeset stays absent, the other fields stay as carried. A node is written

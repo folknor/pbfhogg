@@ -2893,12 +2893,13 @@ fn merge_keeps_timestamps_under_a_non_default_date_granularity() {
         }
     }
     // Raw 47 at 100 ms is 4.7 s: whole seconds, 4 s. Raw -35 is -3.5 s,
-    // truncated toward zero like the node path.
+    // rounded down to -4 s like the node path (the second holding the
+    // instant, as time-filter and the OSC writer round).
     assert_eq!(ways[0], (10, Some(4000)));
     let surviving: Vec<_> = relations.into_iter().filter(|(id, _)| *id != 51).collect();
     assert_eq!(
         surviving,
-        vec![(50, Some(-3000)), (52, None), (53, Some(0))]
+        vec![(50, Some(-4000)), (52, None), (53, Some(0))]
     );
 }
 

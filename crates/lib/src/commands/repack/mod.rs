@@ -119,7 +119,12 @@ enum WorkerOutput {
 /// Re-encode `input` to `output` with a per-blob element cap of
 /// `elements_per_blob`. Element semantics are preserved: every element
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
-/// encoding. Output is type-sorted (nodes, then ways, then relations);
+/// encoding, at the OSM data model's precision: every output block is in
+/// the default framing, so a source block at another `granularity`, offset
+/// or `date_granularity` has its coordinates truncated to decimicrodegrees
+/// and its timestamps rounded down to whole seconds (`owned.rs`
+/// `output_timestamp_seconds`; docs/cli/commands.md "PBF rebuild
+/// precision"). Output is type-sorted (nodes, then ways, then relations);
 /// the `Sort.Type_then_ID` flag is propagated when the input has it.
 ///
 /// The input is read in several passes, so it must be a regular file

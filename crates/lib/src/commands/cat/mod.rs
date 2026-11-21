@@ -619,7 +619,7 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
             "{rebuilt} blobs held blocks no single index describes and were rebuilt into \
              single-kind blocks by the full re-encode rules: nodes written dense, \
              coordinates truncated toward zero to decimicrodegrees, retained timestamps \
-             truncated to whole seconds, metadata with an absent or sentinel version \
+             rounded down to whole seconds, metadata with an absent or sentinel version \
              discarded, missing fields of retained metadata written as defaults, unknown \
              fields discarded{omitted_clause}"
         );
@@ -1030,21 +1030,18 @@ fn process_block(
 use super::{clean_metadata, clean_partial_metadata};
 
 /// Resolve metadata for re-encoding. Under `--clean user` the user is dropped
-/// afterwards, so it is not resolved at all: `cat` is the recovery command and
-/// a file with an out-of-range user string index must be rescuable with it.
-/// Every other re-encoding path refuses such an index; roles have no
-/// `--clean` and stay refused.
+/// afterwards, so it is not resolved at all, and under `--clean timestamp`
+/// the timestamp is not converted: `cat` is the recovery command and a file
+/// with an out-of-range user string index, or a timestamp whose scaling
+/// overflows, must be rescuable with it. Every other re-encoding path
+/// refuses both; roles have no `--clean` and stay refused.
 fn element_meta<'a>(
     clean: &CleanAttrs,
     kind: ElementKind,
     id: i64,
     info: &crate::Info<'a>,
 ) -> crate::Result<Option<crate::block_builder::PartialMetadata<'a>>> {
-    if clean.user {
-        crate::owned::element_metadata_dropping_user(kind, id, info)
-    } else {
-        element_metadata(kind, id, info)
-    }
+    crate::owned::element_metadata_for_cat(kind, id, info, clean.user, clean.timestamp)
 }
 
 /// Dense-node counterpart of [`element_meta`].
@@ -1052,11 +1049,7 @@ fn dense_meta<'a>(
     dn: &'a crate::DenseNode<'a>,
     clean: &CleanAttrs,
 ) -> crate::Result<Option<crate::block_builder::DenseMetadata<'a>>> {
-    if clean.user {
-        crate::owned::dense_node_metadata_dropping_user(dn)
-    } else {
-        dense_node_metadata(dn)
-    }
+    crate::owned::dense_node_metadata_for_cat(dn, clean.user, clean.timestamp)
 }
 
 /// Cat with full decode + re-encode, the `--clean` path (with or without a

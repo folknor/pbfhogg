@@ -295,6 +295,11 @@ impl OwnedMetadata {
     /// owned element and a borrowed re-encode of the same input write the
     /// same metadata.
     fn from_dense(dense: DenseMetadata<'_>) -> Self {
+        // Owned elements are never cleaned, so the builder's escape rule can
+        // be applied here once: a versioned slot keeps its 0 as a claim.
+        if dense.writes_plain() {
+            return Self::from_plain(dense.plain_claim_metadata());
+        }
         let meta = dense.meta;
         Self::Dense {
             version: meta.version,
@@ -360,6 +365,7 @@ impl OwnedMetadata {
                     visible: *visible,
                 },
                 columns: *columns,
+                zero_timestamp_claim: false,
             }),
             Self::Plain {
                 version,
@@ -387,6 +393,7 @@ impl OwnedMetadata {
             Ok(DenseMetadata {
                 meta: m,
                 columns: c,
+                ..
             }) => PartialMetadata {
                 version: c.version().then_some(m.version),
                 timestamp: c.timestamp().then_some(m.timestamp),
@@ -515,25 +522,35 @@ fn map_sentinel(value: i64) -> i64 {
 /// index past the block's string table, or negative, is an error naming the
 /// element and the index, not an empty user. The refusal stands even where
 /// the caller later clears the user, except for `cat --clean user`, which
-/// uses [`element_metadata_dropping_user`] and never resolves it.
+/// uses [`element_metadata_for_cat`] and never resolves it.
 pub(crate) fn element_metadata<'a>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
 ) -> Result<Option<PartialMetadata<'a>>> {
-    element_metadata_impl::<true>(kind, id, info)
+    element_metadata_impl::<true, true>(kind, id, info)
 }
 
-/// [`element_metadata`] for `cat --clean user` alone: a present user is not
-/// resolved (it comes back as `Some("")`, an absent one stays `None`), so a
-/// bad user string index does not fail the run. See
-/// [`dense_node_metadata_dropping_user`] for why this exists.
-pub(crate) fn element_metadata_dropping_user<'a>(
+/// [`element_metadata`] for `cat --clean`, which drops what it cleans
+/// before reading it: under `clean_user` a present user is not resolved (it
+/// comes back as `Some("")`, an absent one stays `None`), and under
+/// `clean_timestamp` a present timestamp is not converted (it comes back as
+/// `Some(0)`), so a bad user string index or a timestamp whose scaling
+/// overflows does not fail the run. See [`dense_node_metadata_for_cat`] for
+/// why this exists.
+pub(crate) fn element_metadata_for_cat<'a>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
+    clean_user: bool,
+    clean_timestamp: bool,
 ) -> Result<Option<PartialMetadata<'a>>> {
-    element_metadata_impl::<false>(kind, id, info)
+    match (clean_user, clean_timestamp) {
+        (false, false) => element_metadata_impl::<true, true>(kind, id, info),
+        (true, false) => element_metadata_impl::<false, true>(kind, id, info),
+        (false, true) => element_metadata_impl::<true, false>(kind, id, info),
+        (true, true) => element_metadata_impl::<false, false>(kind, id, info),
+    }
 }
 
 /// The `date_granularity` every block pbfhogg writes declares: the
@@ -541,22 +558,48 @@ pub(crate) fn element_metadata_dropping_user<'a>(
 pub(crate) const OUTPUT_DATE_GRANULARITY: i64 = 1000;
 
 /// A stored timestamp re-expressed in the whole seconds an output block at
-/// [`OUTPUT_DATE_GRANULARITY`] stores. At the same granularity the raw value
-/// is copied verbatim, so the output reads back exactly the claim the input
-/// made, an overflowing scaling included. Any other granularity is scaled
-/// (wrapping, as the permissive read accessor scales) and truncated to
-/// whole seconds, which loses sub-second precision and can wrap.
+/// [`OUTPUT_DATE_GRANULARITY`] stores.
+///
+/// At the same granularity the raw value is copied verbatim, so the output
+/// reads back exactly the claim the input made, an overflowing scaling
+/// included (re-encoding does not judge it; each output that reads the
+/// claim does). Any other granularity is scaled exactly to milliseconds and
+/// rounded down to the whole second holding that instant (as time-filter
+/// and the OSC writer round), so a sub-second part is lost: the OSM data
+/// model, and every rebuilt block, holds whole seconds. A scaling that
+/// overflows is refused rather than written as a different, valid claim,
+/// and so is a second the output could not scale back (`i64::MIN` ms
+/// rounds down past it).
+///
+/// Rounding can turn a dense slot's non-zero claim into 0, which a
+/// versionless dense slot reads as padding; the dense conversions flag that
+/// ([`crate::DenseNodeInfo::output_timestamp`]) and the builder writes such
+/// a node plain when it is written without a version.
 #[inline]
-pub(crate) fn output_timestamp_seconds(raw: i64, date_granularity: i64) -> i64 {
+pub(crate) fn output_timestamp_seconds(raw: i64, date_granularity: i64) -> Result<i64> {
     if date_granularity == OUTPUT_DATE_GRANULARITY {
-        raw
+        Ok(raw)
     } else {
-        raw.wrapping_mul(date_granularity) / 1000
+        rescale_timestamp_seconds(raw, date_granularity)
     }
 }
 
+#[cold]
+#[inline(never)]
+fn rescale_timestamp_seconds(raw: i64, date_granularity: i64) -> Result<i64> {
+    let seconds =
+        crate::read::claims::scale_milli_timestamp(raw, date_granularity)?.div_euclid(1000);
+    if seconds.checked_mul(OUTPUT_DATE_GRANULARITY).is_none() {
+        return Err(crate::error::new_wire_error(
+            "timestamp rounded down to whole seconds no longer fits i64 milliseconds; \
+             the blob's timestamp or granularity is corrupt",
+        ));
+    }
+    Ok(seconds)
+}
+
 #[inline]
-fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
+fn element_metadata_impl<'a, const RESOLVE_USER: bool, const CONVERT_TIMESTAMP: bool>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
@@ -566,9 +609,16 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
         Some(_) if !RESOLVE_USER => Some(""),
         Some(user) => Some(user.map_err(|e| bad_user(e, kind, id, info.raw_user_sid()))?),
     };
+    let timestamp = if CONVERT_TIMESTAMP {
+        info.output_timestamp_seconds()
+            .transpose()
+            .map_err(|e| e.context(format!("{} {id}: timestamp", kind.as_str())))?
+    } else {
+        info.milli_timestamp().map(|_| 0)
+    };
     let meta = PartialMetadata {
         version: info.version(),
-        timestamp: info.output_timestamp_seconds(),
+        timestamp,
         changeset: info.changeset(),
         uid: info.uid(),
         user,
@@ -588,31 +638,42 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
 /// -1 as 0 (which `claims` reads it as). So
 /// `DenseNodeInfo::claims` reads the output as it read the input, apart
 /// from a timestamp under a non-default `date_granularity`, which
-/// [`output_timestamp_seconds`] truncates to whole seconds. The
+/// [`output_timestamp_seconds`] rounds down to whole seconds (refusing one
+/// whose scaling overflows; a claim that rounds to 0 is flagged
+/// `zero_timestamp_claim`, and written plain when versionless). The
 /// user name is resolved as in [`element_metadata`]: a bad user string index
 /// is an error, not an empty user.
 pub(crate) fn dense_node_metadata<'a>(
     dn: &'a crate::DenseNode<'a>,
 ) -> Result<Option<DenseMetadata<'a>>> {
-    dense_node_metadata_impl::<true>(dn)
+    dense_node_metadata_impl::<true, true>(dn)
 }
 
-/// [`dense_node_metadata`] for `cat --clean user` alone: the user is not
-/// resolved (it comes back empty).
+/// [`dense_node_metadata`] for `cat --clean`: under `clean_user` the user is
+/// not resolved (it comes back empty), under `clean_timestamp` the
+/// timestamp is not converted (it comes back 0).
 ///
 /// `cat` is the recovery command, and `--clean user` drops the user, so the
 /// user string index of an element it is about to discard is never looked up:
-/// a file whose user index is out of range can be rescued with it. Every other
-/// re-encoding command and flag keeps the refusal, because it writes or acts
-/// on the user. Roles have no `--clean` and stay refused.
-pub(crate) fn dense_node_metadata_dropping_user<'a>(
+/// a file whose user index is out of range can be rescued with it. The same
+/// holds for `--clean timestamp` and a timestamp whose scaling overflows.
+/// Every other re-encoding command and flag keeps the refusals, because it
+/// writes or acts on the field. Roles have no `--clean` and stay refused.
+pub(crate) fn dense_node_metadata_for_cat<'a>(
     dn: &'a crate::DenseNode<'a>,
+    clean_user: bool,
+    clean_timestamp: bool,
 ) -> Result<Option<DenseMetadata<'a>>> {
-    dense_node_metadata_impl::<false>(dn)
+    match (clean_user, clean_timestamp) {
+        (false, false) => dense_node_metadata_impl::<true, true>(dn),
+        (true, false) => dense_node_metadata_impl::<false, true>(dn),
+        (false, true) => dense_node_metadata_impl::<true, false>(dn),
+        (true, true) => dense_node_metadata_impl::<false, false>(dn),
+    }
 }
 
 #[inline]
-fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool>(
+fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool, const CONVERT_TIMESTAMP: bool>(
     dn: &'a crate::DenseNode<'a>,
 ) -> Result<Option<DenseMetadata<'a>>> {
     let Some(info) = dn.info() else {
@@ -630,17 +691,31 @@ fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool>(
     } else {
         ""
     };
+    let (timestamp, zero_timestamp_claim) = if CONVERT_TIMESTAMP {
+        dense_output_timestamp(dn.id(), info)?
+    } else {
+        (0, false)
+    };
     Ok(Some(DenseMetadata {
         meta: Metadata {
             version: reencoded_version(info.version()),
-            timestamp: info.output_timestamp_seconds(),
+            timestamp,
             changeset: map_sentinel(info.changeset()),
             uid: info.uid(),
             user,
             visible: info.visible(),
         },
         columns: info.columns().for_reencode(),
+        zero_timestamp_claim,
     }))
+}
+
+/// A dense slot's output timestamp and its rounded-to-zero flag
+/// (`DenseNodeInfo::output_timestamp`), the error naming the node.
+#[inline]
+fn dense_output_timestamp(id: i64, info: &crate::DenseNodeInfo<'_>) -> Result<(i64, bool)> {
+    info.output_timestamp()
+        .map_err(|e| e.context(format!("node {id}: timestamp")))
 }
 
 /// Name the element and the string index on a failed user lookup.
@@ -661,31 +736,58 @@ fn bad_user(
 /// table index for the user name. `None` when the `Info` carries no field.
 /// The timestamp is the source's, as [`output_timestamp_seconds`] converts
 /// it.
-pub(crate) fn element_raw_partial_metadata(info: &crate::Info<'_>) -> Option<RawPartialMetadata> {
+pub(crate) fn element_raw_partial_metadata(
+    kind: crate::ElementKind,
+    id: i64,
+    info: &crate::Info<'_>,
+) -> Result<Option<RawPartialMetadata>> {
     let meta = RawPartialMetadata {
         version: info.version(),
-        timestamp: info.output_timestamp_seconds(),
+        timestamp: info
+            .output_timestamp_seconds()
+            .transpose()
+            .map_err(|e| e.context(format!("{} {id}: timestamp", kind.as_str())))?,
         changeset: info.changeset(),
         uid: info.uid(),
         user_sid: info.raw_user_sid(),
         visible: info.visible_opt(),
     };
-    (meta != RawPartialMetadata::default()).then_some(meta)
+    Ok((meta != RawPartialMetadata::default()).then_some(meta))
 }
 
 /// Extract [`RawMetadata`] from a [`DenseNode`](crate::DenseNode), preserving
 /// the raw string table index for the user name, under
-/// [`dense_node_metadata`]'s rules.
-pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMetadata> {
-    dn.info().map(|info| RawMetadata {
-        version: reencoded_version(info.version()),
-        timestamp: info.output_timestamp_seconds(),
+/// [`dense_node_metadata`]'s rules, the plain escape included. For that
+/// escape the user index is judged by the name it resolves to, as
+/// `DenseNodeInfo::claims` judges it: an index naming the empty string is
+/// written as 0, so the plain node does not claim an empty user.
+pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Result<Option<RawMetadata>> {
+    let Some(info) = dn.info() else {
+        return Ok(None);
+    };
+    let (timestamp, zero_timestamp_claim) = dense_output_timestamp(dn.id(), info)?;
+    let version = reencoded_version(info.version());
+    let mut user_sid = info.raw_user_sid();
+    // Only the plain escape (a rounded-away claim on a versionless slot)
+    // judges the user by its name; the dense route copies the index.
+    if zero_timestamp_claim && version < 1 && user_sid != 0 {
+        let name = info
+            .user()
+            .map_err(|e| bad_user(e, crate::ElementKind::Node, dn.id(), Some(user_sid)))?;
+        if name.is_empty() {
+            user_sid = 0;
+        }
+    }
+    Ok(Some(RawMetadata {
+        version,
+        timestamp,
         changeset: map_sentinel(info.changeset()),
         uid: info.uid(),
-        user_sid: info.raw_user_sid(),
+        user_sid,
         visible: info.visible(),
         columns: info.columns().for_reencode(),
-    })
+        zero_timestamp_claim,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +800,15 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
 // infallible tag iterators, which cannot shorten a list: block construction
 // refused any tag string index past the table.
 
+// Owned nodes hold decimicrodegrees, so a node from a block at a finer
+// `granularity` or a non-zero offset is truncated toward zero here. That is
+// the rebuild contract, not an oversight (docs/cli/commands.md "PBF rebuild
+// precision"): the OSM data model, libosmium and `diff` hold 1e-7 degrees,
+// no known producer writes another framing, and carrying the source framing
+// into the output cannot represent a way whose locations come from blocks
+// of different framings (a refreshed or newly located way), so preserving
+// it was considered and declined. Only `digest --form full` sees the
+// difference against a copied blob.
 pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> Result<OwnedNode> {
     Ok(OwnedNode {
         id: dn.id(),
@@ -1014,6 +1125,205 @@ mod tests {
                 crate::ErrorKind::StringtableIndexOutOfBounds { .. }
             ),
             "{report}"
+        );
+    }
+
+    /// `bytes` reparsed with a `date_granularity` (`PrimitiveBlock` field
+    /// 18) appended; a later scalar field replaces an earlier one, and the
+    /// builder writes none.
+    fn with_date_granularity(mut bytes: Vec<u8>, granularity: u8) -> PrimitiveBlock {
+        assert!(granularity < 0x80, "one-byte varint");
+        bytes.extend_from_slice(&[0x90, 0x01, granularity]);
+        PrimitiveBlock::from_vec(bytes).unwrap()
+    }
+
+    /// The default granularity copies verbatim (an overflowing claim stays
+    /// the same refused claim); any other rounds the exact milliseconds down
+    /// to whole seconds and refuses what the output could not hold.
+    #[test]
+    fn output_timestamps_round_down_and_refuse_overflow() {
+        use super::output_timestamp_seconds as out;
+        assert_eq!(out(1_700_000_000, 1000).unwrap(), 1_700_000_000);
+        assert_eq!(out(i64::MAX, 1000).unwrap(), i64::MAX);
+        assert_eq!(out(1_500, 1).unwrap(), 1);
+        assert_eq!(out(999, 1).unwrap(), 0);
+        assert_eq!(out(-1, 1).unwrap(), -1, "floor, not truncation toward zero");
+        assert_eq!(out(-1_000, 1).unwrap(), -1);
+        assert_eq!(out(-1_001, 1).unwrap(), -2);
+        assert_eq!(out(7, 0).unwrap(), 0);
+        assert!(
+            out(i64::MAX, 2).is_err(),
+            "a scaling that overflows is refused"
+        );
+        assert!(
+            out(i64::MIN, 1).is_err(),
+            "i64::MIN ms rounds down to a second that does not scale back"
+        );
+        assert_eq!(out(i64::MIN + 808, 1).unwrap(), i64::MIN / 1000);
+    }
+
+    /// A versionless dense slot claiming 500 ms under granularity 1 rounds
+    /// to 0 s, which a dense slot would read as padding: every re-encode
+    /// route (borrowed, owned, raw) writes it plain with an explicit 0, and a
+    /// versioned slot, whose 0 is a claim, stays dense.
+    #[test]
+    fn a_versionless_sub_second_claim_rounding_to_zero_is_written_plain() {
+        let mut src = BlockBuilder::new();
+        for (id, version) in [(1, 0), (2, 3)] {
+            src.add_node(
+                id,
+                0,
+                0,
+                [],
+                Some(&Metadata {
+                    version,
+                    timestamp: 500,
+                    changeset: 0,
+                    uid: 0,
+                    user: "",
+                    visible: true,
+                }),
+            );
+        }
+        let block = with_date_granularity(src.take().unwrap().unwrap().to_vec(), 1);
+
+        let mut borrowed = BlockBuilder::new();
+        let mut owned = BlockBuilder::new();
+        let mut raw = BlockBuilder::new();
+        raw.pre_seed_string_table(&block).unwrap();
+        for element in block.elements() {
+            let Element::DenseNode(dn) = element else {
+                panic!("dense source");
+            };
+            let claimed = dn.info().unwrap().claimed_milli_timestamp();
+            assert_eq!(claimed.unwrap().unwrap(), 500, "the source claims 500 ms");
+            let meta = super::dense_node_metadata(&dn).unwrap();
+            borrowed.add_node_dense(dn.id(), 0, 0, [], meta.as_ref());
+            super::add_owned_node(&mut owned, &read_dense_node(&dn).unwrap());
+            let raw_meta = super::dense_node_raw_metadata(&dn).unwrap();
+            raw.add_node_raw(dn.id(), 0, 0, std::iter::empty(), raw_meta.as_ref())
+                .unwrap();
+        }
+        for (route, bb) in [("borrowed", borrowed), ("owned", owned), ("raw", raw)] {
+            let mut bb = bb;
+            let out = one_block(&mut bb);
+            let mut elements = out.elements();
+            let Some(Element::Node(plain)) = elements.next() else {
+                panic!("{route}: the versionless node is written plain");
+            };
+            // The source's zero changeset and uid, empty user (at a non-zero
+            // string index) and visible slot are padding, so the plain node
+            // claims the timestamp alone.
+            assert_eq!(
+                (plain.id(), info_fields(&plain.info())),
+                (1, (None, Some(0), None, None, None, None)),
+                "{route}: the versionless claim survives as an explicit 0, alone"
+            );
+            let Some(Element::DenseNode(dense)) = elements.next() else {
+                panic!("{route}: the versioned node stays dense");
+            };
+            let claimed = dense.info().unwrap().claimed_milli_timestamp();
+            assert_eq!((dense.id(), claimed.map(|t| t.unwrap())), (2, Some(0)));
+        }
+    }
+
+    /// `--clean version` on a versioned slot whose claim rounds to 0 s leaves
+    /// it versionless, so it takes the plain escape too; `--clean timestamp`
+    /// writes the cleaned 0 as padding, as it always has.
+    #[test]
+    fn cleaning_decides_the_escape_from_the_cleaned_slot() {
+        let mut src = BlockBuilder::new();
+        src.add_node(
+            1,
+            0,
+            0,
+            [],
+            Some(&Metadata {
+                version: 3,
+                timestamp: 500,
+                changeset: 9,
+                uid: 4,
+                user: "u",
+                visible: true,
+            }),
+        );
+        let block = with_date_granularity(src.take().unwrap().unwrap().to_vec(), 1);
+        let Some(Element::DenseNode(dn)) = block.elements().next() else {
+            panic!("dense node");
+        };
+        let clean = |version, timestamp| crate::commands::cat::CleanAttrs {
+            version,
+            changeset: false,
+            timestamp,
+            uid: false,
+            user: false,
+        };
+        let write = |c: &crate::commands::cat::CleanAttrs| {
+            let meta = crate::commands::clean_metadata(super::dense_node_metadata(&dn).unwrap(), c);
+            let mut bb = BlockBuilder::new();
+            bb.add_node_dense(1, 0, 0, [], meta.as_ref());
+            one_block(&mut bb)
+        };
+        let out = write(&clean(true, false));
+        let Some(Element::Node(n)) = out.elements().next() else {
+            panic!("the cleaned versionless node is written plain");
+        };
+        assert_eq!(
+            info_fields(&n.info()),
+            (None, Some(0), Some(9), Some(4), Some("u".to_owned()), None)
+        );
+        let out = write(&clean(false, true));
+        let Some(Element::DenseNode(d)) = out.elements().next() else {
+            panic!("a versioned node with a cleaned timestamp stays dense");
+        };
+        assert_eq!(
+            d.info()
+                .unwrap()
+                .claimed_milli_timestamp()
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A timestamp whose millisecond scaling overflows under a non-default
+    /// granularity is refused by the re-encode, naming the node.
+    #[test]
+    fn an_overflowing_rescaled_timestamp_is_refused() {
+        let mut src = BlockBuilder::new();
+        src.add_node(
+            7,
+            0,
+            0,
+            [],
+            Some(&Metadata {
+                version: 1,
+                timestamp: i64::MAX / 2,
+                changeset: 1,
+                uid: 1,
+                user: "u",
+                visible: true,
+            }),
+        );
+        let block = with_date_granularity(src.take().unwrap().unwrap().to_vec(), 4);
+        let Some(Element::DenseNode(dn)) = block.elements().next() else {
+            panic!("dense node");
+        };
+        let Err(err) = super::dense_node_metadata(&dn) else {
+            panic!("an overflowing scaling must be refused, not wrapped");
+        };
+        assert!(
+            err.report().contains("node 7: timestamp"),
+            "{}",
+            err.report()
+        );
+        assert!(super::dense_node_raw_metadata(&dn).is_err());
+        let cleaned = super::dense_node_metadata_for_cat(&dn, false, true)
+            .expect("cat --clean timestamp does not judge the timestamp it drops")
+            .unwrap();
+        assert_eq!(
+            (cleaned.meta.timestamp, cleaned.zero_timestamp_claim),
+            (0, false)
         );
     }
 }

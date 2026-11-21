@@ -921,6 +921,17 @@ fn walk(
 /// their nodes (an invalid-location geometry error), which every way-only or
 /// filtered output is.
 pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]), Error> {
+    order_as(harness, pbf, Policy::CONTENT)
+}
+
+/// [`order`], decoding under `cold` when no scan, stored summary or
+/// retained decoding of `pbf` answers: for a caller that decodes `pbf` under
+/// `cold` next, which then reuses the run's decoding while it is retained.
+pub(crate) fn order_as(
+    harness: &mut Harness,
+    pbf: &Path,
+    cold: Policy,
+) -> Result<(bool, [u64; 3]), Error> {
     // Watched before the stat that picks a scan: a replacement between the
     // two fails the revalidation instead of being blessed.
     harness.run.watch(pbf)?;
@@ -967,7 +978,7 @@ pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]
         .entries
         .iter()
         .find(|e| e.source == source)
-        .map_or(Policy::CONTENT, |e| e.policy);
+        .map_or(cold, |e| e.policy);
     decoded(harness, pbf, policy, |harness, path| {
         let (ordered, counts, summary) = harness.timed("opl order scan", || scan_order(path))?;
         harness
@@ -1118,13 +1129,17 @@ pub(crate) struct Basis {
 /// Byte-identical OPL streams pair every record equal in the walk, in any
 /// order, so the walk would find them identical; XXH3-128 equality stands
 /// for byte equality under the same accepted assumption as [`by_summaries`].
-/// Any other outcome is `None` and the caller decodes and merges.
+/// Any other outcome is `None` and the caller decodes and merges. With
+/// `strict` the output's stored summary must also be ordered, so a
+/// summary that contradicts byte equality with a strictly ascending
+/// expected stream goes to the strict merge instead.
 fn sequence_by_summary(
     harness: &mut Harness,
     basis: &Basis,
     pbf: &Path,
     listing: &Path,
     policy: Policy,
+    strict: bool,
 ) -> Result<Option<Merged>, Error> {
     harness.run.watch(&basis.source)?;
     harness.run.watch(pbf)?;
@@ -1138,7 +1153,7 @@ fn sequence_by_summary(
     let Some(out) = harness.summary(&keys[1]) else {
         return Ok(None);
     };
-    if out.counts != basis.counts || out.digest != basis.digest {
+    if out.counts != basis.counts || out.digest != basis.digest || (strict && !out.ordered) {
         return Ok(None);
     }
     harness.run.revalidate()?;
@@ -1181,7 +1196,7 @@ pub(crate) fn compare_sequence_with_opl(
     policy: Policy,
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
-        && let Some(merged) = sequence_by_summary(harness, basis, pbf, listing, policy)?
+        && let Some(merged) = sequence_by_summary(harness, basis, pbf, listing, policy, false)?
     {
         return Ok(merged);
     }
@@ -1195,15 +1210,61 @@ pub(crate) fn compare_sequence_with_opl(
     })
 }
 
+/// A strict comparison of `pbf`, decoded under `policy`, with an expected
+/// OPL stream that is never written: `projection` yields its bytes, and
+/// `basis` describes them (counts and XXH3-128 of the whole stream, the
+/// sealed key of the decoding it projects). The caller guarantees the
+/// stream strictly ascends: then an output whose stored summary is ordered
+/// and has the basis's counts and digest is byte-identical to it, so it is
+/// decided without a decode ([`sequence_by_summary`], strict), and the
+/// listing is written empty. Otherwise `pbf` is decoded and strictly merged
+/// against `projection()`, `pbf` first; `name` labels the projected side in
+/// errors and should name the evidence it is made from. The projection's
+/// digest is never published as any summary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compare_with_projection_each<R: std::io::Read>(
+    harness: &mut Harness,
+    pbf: &Path,
+    basis: Option<&Basis>,
+    name: &Path,
+    projection: impl FnOnce() -> Result<R, Error>,
+    listing: &Path,
+    policy: Policy,
+    each: impl FnMut(Group),
+) -> Result<Merged, Error> {
+    if let Some(basis) = basis
+        && let Some(merged) = sequence_by_summary(harness, basis, pbf, listing, policy, true)?
+    {
+        return Ok(merged);
+    }
+    decoded(harness, pbf, policy, |harness, a| {
+        let first = Stream::open(a)?;
+        let second = Stream::from_reader(projection()?, name);
+        let (merged, [summary, _]) = harness.timed(MERGE_STEP, || {
+            merge_streams(first, second, listing, true, each, |_| {})
+        })?;
+        publish_summary(harness, a, &summary)?;
+        harness.run.decodings.publish(
+            a,
+            Scan {
+                ordered: true,
+                counts: merged.first,
+            },
+        );
+        log_merge(harness, listing, &merged);
+        Ok(merged)
+    })
+}
+
 /// The file beneath a [`Stream`]'s buffer, digesting every byte as the
 /// buffer fills: hashed in buffer-sized reads rather than per line, so a
 /// stream read to its end has the digest of the whole file.
-struct Hashing {
-    file: File,
+struct Hashing<R = File> {
+    file: R,
     hasher: xxhash_rust::xxh3::Xxh3,
 }
 
-impl std::io::Read for Hashing {
+impl<R: std::io::Read> std::io::Read for Hashing<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = std::io::Read::read(&mut self.file, buf)?;
         self.hasher.update(&buf[..n]);
@@ -1211,10 +1272,12 @@ impl std::io::Read for Hashing {
     }
 }
 
-/// One OPL stream: its current record and the key it last held.
-struct Stream {
+/// One OPL stream: its current record and the key it last held. Its bytes
+/// come from a file, or from any reader that yields a whole OPL stream
+/// (`path` then names what that reader projects, for messages).
+struct Stream<R = File> {
     path: PathBuf,
-    reader: BufReader<Hashing>,
+    reader: BufReader<Hashing<R>>,
     line: Vec<u8>,
     number: u64,
     key: Option<(usize, i64)>,
@@ -1233,7 +1296,13 @@ impl Stream {
     fn open(path: &Path) -> Result<Self, Error> {
         let file = File::open(path)
             .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-        Ok(Self {
+        Ok(Stream::from_reader(file, path))
+    }
+}
+
+impl<R: std::io::Read> Stream<R> {
+    fn from_reader(file: R, path: &Path) -> Self {
+        Self {
             path: path.to_path_buf(),
             reader: BufReader::with_capacity(
                 crate::tunables::OPL_READ_BUFFER,
@@ -1249,7 +1318,7 @@ impl Stream {
             stepped: None,
             seen: None,
             disordered: false,
-        })
+        }
     }
 
     /// The summary of a stream read to its end without error.
@@ -1374,8 +1443,25 @@ fn merge(
     each: impl FnMut(Group),
     paired: impl FnMut(Pair<'_>),
 ) -> Result<(Merged, [Summary; 2]), Error> {
-    let mut a = Stream::open(first)?;
-    let mut b = Stream::open(second)?;
+    merge_streams(
+        Stream::open(first)?,
+        Stream::open(second)?,
+        listing,
+        strict,
+        each,
+        paired,
+    )
+}
+
+/// [`merge`] over two open streams.
+fn merge_streams<A: std::io::Read, B: std::io::Read>(
+    mut a: Stream<A>,
+    mut b: Stream<B>,
+    listing: &Path,
+    strict: bool,
+    each: impl FnMut(Group),
+    paired: impl FnMut(Pair<'_>),
+) -> Result<(Merged, [Summary; 2]), Error> {
     let mut out = BufWriter::new(File::create(listing)?);
     let mut merged = Merged::default();
     pair_streams(&mut a, &mut b, &mut out, strict, &mut merged, each, paired)?;
@@ -1447,9 +1533,9 @@ fn merge_judged(
 }
 
 /// The pairing loop of [`merge`] over two open streams.
-fn pair_streams(
-    a: &mut Stream,
-    b: &mut Stream,
+fn pair_streams<A: std::io::Read, B: std::io::Read>(
+    a: &mut Stream<A>,
+    b: &mut Stream<B>,
     out: &mut BufWriter<File>,
     strict: bool,
     merged: &mut Merged,

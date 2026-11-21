@@ -225,6 +225,7 @@ Tables covering several commands stay intact in cross-command or subsystem files
 - [repack-degrade](repack-degrade.md)
 - [sort](sort.md)
 - [tags-filter](tags-filter.md)
+- [verifier](verifier.md)
 - [write-pipeline](write-pipeline.md)
 
 ## History

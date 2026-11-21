@@ -190,11 +190,14 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   or parse error before any step-down is raised with no order verdict.
   Elsewhere (the reference side of the input-order family, apply-changes'
   output, multi-extract's sequential sorted copies) a separate decode
-  (`opl_compare::order`, no metadata or coordinates) judges it first, since
-  a later failure would otherwise lose the verdict.
+  (`opl_compare::order`, no metadata or coordinates; apply-changes decodes
+  under its comparison's policy instead, so its element merge reuses that
+  decoding) judges it first, since a later failure would otherwise lose the
+  verdict.
   `osmium fileinfo -e` cannot serve here, since it refuses a file whose ways
   lack their nodes, as every way-only or filtered output does; it still
-  reads whole inputs for check-ids, repack and degrade.
+  reads whole inputs for check-ids, repack and degrade, and derive-changes
+  prints it for context. apply-changes does not run it.
 - **Header claims** (`Sort.Type_then_ID` and `LocationsOnWays` among the
   optional features, and the sort feature in either list) are read by the
   verifier's own `OSMHeader` reader (`pbf_frames::header`).
@@ -437,7 +440,13 @@ comparison of the two drop seeds is decided from their removal listings
 when both passed their removals: each output is the expected sequence,
 whose identities are unique, less the records its listing names in walk
 order, so the outputs are equal exactly when the listings are
-byte-equal; otherwise the two outputs are merged. Paired walks
+byte-equal; otherwise the two outputs are merged. Apply-changes' strict
+comparison against its expected stream (`compare_with_projection_each`)
+is decided the same way, by the stream's counts and XXH3-128 against the
+output's stored summary, which must also be ordered, re-observing the key
+of the osmium decoding the stream is projected from: the stream strictly
+ascends by construction, so byte equality is the strict merge's pass. The
+stream's digest is never stored as a summary. Paired walks
 (renumber), the other sequence walks, the derive model and
 field-policies, whose subject is the merge itself, always merge.
 
@@ -464,7 +473,8 @@ sum; in diff, the strips share the indexed diffs' group, so `pbfhogg
 degrade` shows that group's wall), and the verifier's own reading of the OPL decodings: `opl merge`
 for every comparison walk (including the check's per-record work and the
 listing writes it does inside the walk), `opl order scan` for a standalone
-order check, `opl derive model` for the derive-changes model. Decodes and
+order check, `opl derive model` for the derive-changes model, `opl expected projection`
+for apply-changes' validating pass over osmium's decoding. Decodes and
 removals are outside these spans.
 Detail is replayed only for a check that did not pass, or streamed with
 `--verbose`. A comparison failure recorded during a check is its verdict even
@@ -548,7 +558,15 @@ output, with no reference run. Otherwise pbfhogg must succeed, and its
 output must be strictly ordered and equal, under the no-inline-coordinates
 OPL projection, to an expected stream: for each touched identity its last
 OSC occurrence in file order, or nothing when that is a delete; for every
-other identity osmium's output, which copies the base. osmium resolves a
+other identity osmium's output, which copies the base. The stream is
+never written: one pass over osmium's decoding holds its untouched records
+to strict order, collects its touched records and digests the stream
+(`opl expected projection` in the steps), and the comparison is decided
+from the output's stored summary or else merged against a second pass over
+the same decoding, pinned throughout. A failed comparison leaves the listing
+(both sides of every difference) and, on a decode or merge error, the
+decodings it held; the expected stream is rebuilt from osmium's decoding
+and the model, not kept as a file. osmium resolves a
 touched identity by its own rules (highest version, then later valid
 timestamp, then later occurrence; the base wins only by strictly beating
 that candidate; written only if visible), so it is held to that model

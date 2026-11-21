@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use super::apply_model::{Key, Model, OsmiumExpect};
@@ -137,16 +137,17 @@ pub fn run(
     let captured = harness.reference(&osmium_run, &outdir.join("osmium.stdout"))?;
     harness.require_success(&captured, "osmium apply-changes")?;
 
-    // --- Element counts ---
-    // pbfhogg's output is summarised by its sort check below.
-    harness.msg("=== element counts ===");
-    harness.print_fileinfo("osmium", &osmium_out)?;
+    // No `osmium fileinfo` of osmium's output: it decided nothing here (its
+    // counts were printed for context only, and cost a whole read cold).
+    // pbfhogg's output is counted by its sort check below.
 
     // --- Sort check ---
-    // Its own decode, not folded into the element judgment's strict merge:
-    // the inline-location check and the expected stream's construction come
-    // between, and an error in either would lose this verdict.
-    let order = harness.check_sorted("pbfhogg apply-changes", &pbfhogg_out)?;
+    // Its own reading, not folded into the element judgment's strict merge:
+    // the inline-location check and the expected stream's projection come
+    // between, and an error in either would lose this verdict. Cold it
+    // decodes under the element judgment's policy, whose merge then reuses
+    // the run's decoding while it is retained.
+    let order = harness.check_sorted_as("pbfhogg apply-changes", &pbfhogg_out, POLICY)?;
     harness.record("pbfhogg apply-changes output order", order);
 
     // --- Inline locations (-l only) ---
@@ -277,9 +278,9 @@ fn read_model(
 /// The lines of an OPL file, each without its one terminating LF. A last
 /// line without its LF is refused as truncation, as every other verifier OPL
 /// reader refuses it: osmium's own OPL parser accepts one, so a cut-short
-/// file would otherwise read as complete, and `write_expected` would even
-/// re-terminate it. The iterator ends after its first error.
-fn opl_lines(path: &Path) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>>, Error> {
+/// file would otherwise read as complete, and the expected stream's
+/// projection would even re-terminate it. The iterator ends after its first error.
+fn opl_lines(path: &Path) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>> + use<>, Error> {
     let file = File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
     let mut reader = BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, file);
@@ -378,6 +379,16 @@ fn stale_summary(report: &str) -> String {
 /// records for the touched ones. Then judge osmium's touched records
 /// against its own model. `Err(Error::Failed(...))` if pbfhogg differs; an
 /// osmium departure from its model is recorded as a failed comparison.
+///
+/// The expected stream is never written. One pass over osmium's decoding
+/// ([`Projection`]) validates it, collects osmium's touched records and
+/// digests the stream; an output whose stored decoding summary matches that
+/// digest is decided without decoding it, and otherwise the output is decoded
+/// and merged against a second pass over the same decoding, which stays
+/// pinned for the whole judgment. The report is returned through that lease
+/// and only then turned into verdicts, so a classified difference keeps no
+/// decoding, as a completed merge's listing holds both sides of every
+/// difference; a decode or merge error keeps the decodings it held.
 fn judge_elements(
     harness: &mut Harness,
     model: &Model,
@@ -388,18 +399,31 @@ fn judge_elements(
 ) -> Result<(), Error> {
     harness.msg("=== pbfhogg vs the change model and osmium ===");
     let expectations = model.expectations(locations_on_ways);
-    let expected = outdir.join("expected.opl");
-    let osmium_touched = opl_compare::decoded(harness, osmium_out, POLICY, |_, opl| {
-        write_expected(opl, &expected, model, &expectations)
-    })?;
-
-    let mut report = Report::default();
     let listing = outdir.join("pbfhogg-vs-expected.diff.txt");
-    opl_compare::compare_with_opl_each(harness, pbfhogg_out, &expected, &listing, POLICY, |g| {
-        report.classify(g, model.touches((g.kind, g.id)));
+    let report = opl_compare::decoded(harness, osmium_out, POLICY, |harness, opl| {
+        let projected = harness.timed("opl expected projection", || {
+            project(opl, model, &expectations)
+        })?;
+        let basis = opl_compare::decoding_key(harness, opl).map(|key| opl_compare::Basis {
+            source: osmium_out.to_path_buf(),
+            key,
+            counts: projected.counts,
+            digest: projected.digest.clone(),
+        });
+        let mut report = Report::default();
+        opl_compare::compare_with_projection_each(
+            harness,
+            pbfhogg_out,
+            basis.as_ref(),
+            opl,
+            || Projection::open(opl, model, &expectations),
+            &listing,
+            POLICY,
+            |g| report.classify(g, model.touches((g.kind, g.id))),
+        )?;
+        report.judge_osmium(&expectations, &projected.touched);
+        Ok(report)
     })?;
-    std::fs::remove_file(&expected)?;
-    report.judge_osmium(&expectations, &osmium_touched);
 
     report.print(harness);
     if report.osmium_off_model.total() > 0 {
@@ -420,56 +444,149 @@ fn judge_elements(
     Ok(())
 }
 
-/// Write the expected pbfhogg stream to `expected`: `osmium_opl`'s untouched
-/// records, held to strict object order, merged with the model's live
-/// touched records. Every osmium record of a touched identity is returned
-/// instead, read in any order and any multiplicity, for the osmium judgment.
-fn write_expected(
+/// What the validating pass over osmium's decoding found.
+struct Projected {
+    /// Every osmium record of a touched identity, in any order and any
+    /// multiplicity, for the osmium judgment.
+    touched: HashMap<Key, Vec<Vec<u8>>>,
+    /// Records of the expected stream per kind.
+    counts: [u64; 3],
+    /// XXH3-128 of the expected stream's bytes, newlines included, spelled
+    /// as a decoding summary's digest is.
+    digest: String,
+}
+
+/// One whole pass of [`Projection`] over `osmium_opl`, digesting what it
+/// yields and keeping osmium's touched records.
+fn project(
     osmium_opl: &Path,
-    expected: &Path,
     model: &Model,
     expectations: &[(Key, Option<&[u8]>, OsmiumExpect)],
-) -> Result<HashMap<Key, Vec<Vec<u8>>>, Error> {
-    let mut out = BufWriter::new(File::create(expected)?);
-    let mut live = expectations
-        .iter()
-        .filter_map(|&(key, pbfhogg, _)| pbfhogg.map(|line| (key, line)))
-        .peekable();
-    let mut touched: HashMap<Key, Vec<Vec<u8>>> = HashMap::new();
-    let mut last: Option<Key> = None;
-    for line in opl_lines(osmium_opl)? {
-        let line = line?;
-        let key = parse_key(&line)
-            .map_err(|why| Error::Failed(format!("osmium apply-changes output: {why}")))?;
-        if model.touches(key) {
-            touched.entry(key).or_default().push(line);
-            continue;
-        }
-        if last.is_some_and(|last| rank(key) <= rank(last)) {
-            return Err(Error::Failed(
-                "osmium apply-changes output: an untouched object at or below the previous \
-                 one: not in strict kind and ID order"
-                    .into(),
-            ));
-        }
-        last = Some(key);
-        while let Some(&(k, record)) = live.peek() {
-            if rank(k) >= rank(key) {
-                break;
+) -> Result<Projected, Error> {
+    let mut projection = Projection::open(osmium_opl, model, expectations)?;
+    projection.touched = Some(HashMap::new());
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut counts = [0u64; 3];
+    while let Some((key, record)) = projection.next_record()? {
+        counts[key.0] += 1;
+        hasher.update(&record);
+        hasher.update(b"\n");
+    }
+    Ok(Projected {
+        touched: projection.touched.unwrap_or_default(),
+        counts,
+        digest: format!("{:032x}", hasher.digest128()),
+    })
+}
+
+/// The expected pbfhogg stream, made on the fly: `osmium_opl`'s untouched
+/// records, held to strict object order, merged with the model's live
+/// touched records. osmium's records of touched identities are skipped, or
+/// collected into `touched` when it is set. Strictly ascending by
+/// construction: the untouched records are held to it, the live records
+/// come sorted from the model, and the two key sets are disjoint because
+/// every touched key is routed away. As a [`Read`] it yields the stream's
+/// bytes, each record with its LF.
+struct Projection<'a, I> {
+    lines: I,
+    model: &'a Model,
+    live: std::iter::Peekable<std::vec::IntoIter<(Key, &'a [u8])>>,
+    last: Option<Key>,
+    /// The osmium record read but not yet yielded (a live record ranked
+    /// below it goes first).
+    held: Option<(Key, Vec<u8>)>,
+    touched: Option<HashMap<Key, Vec<Vec<u8>>>>,
+    /// Bytes of the current record not yet read out.
+    pending: Vec<u8>,
+    at: usize,
+}
+
+impl<'a> Projection<'a, Box<dyn Iterator<Item = Result<Vec<u8>, Error>>>> {
+    fn open(
+        osmium_opl: &Path,
+        model: &'a Model,
+        expectations: &'a [(Key, Option<&'a [u8]>, OsmiumExpect)],
+    ) -> Result<Self, Error> {
+        let live: Vec<(Key, &[u8])> = expectations
+            .iter()
+            .filter_map(|&(key, pbfhogg, _)| pbfhogg.map(|line| (key, line)))
+            .collect();
+        Ok(Self {
+            lines: Box::new(opl_lines(osmium_opl)?),
+            model,
+            live: live.into_iter().peekable(),
+            last: None,
+            held: None,
+            touched: None,
+            pending: Vec::new(),
+            at: 0,
+        })
+    }
+}
+
+impl<I: Iterator<Item = Result<Vec<u8>, Error>>> Projection<'_, I> {
+    /// The next untouched osmium record, `None` at the end of the decoding.
+    fn next_untouched(&mut self) -> Result<Option<(Key, Vec<u8>)>, Error> {
+        for line in self.lines.by_ref() {
+            let line = line?;
+            let key = parse_key(&line)
+                .map_err(|why| Error::Failed(format!("osmium apply-changes output: {why}")))?;
+            if self.model.touches(key) {
+                if let Some(touched) = &mut self.touched {
+                    touched.entry(key).or_default().push(line);
+                }
+                continue;
             }
-            out.write_all(record)?;
-            out.write_all(b"\n")?;
-            live.next();
+            if self.last.is_some_and(|last| rank(key) <= rank(last)) {
+                return Err(Error::Failed(
+                    "osmium apply-changes output: an untouched object at or below the previous \
+                     one: not in strict kind and ID order"
+                        .into(),
+                ));
+            }
+            self.last = Some(key);
+            return Ok(Some((key, line)));
         }
-        out.write_all(&line)?;
-        out.write_all(b"\n")?;
+        Ok(None)
     }
-    for (_, record) in live {
-        out.write_all(record)?;
-        out.write_all(b"\n")?;
+
+    /// The expected stream's next record, `None` at its end.
+    fn next_record(&mut self) -> Result<Option<(Key, Vec<u8>)>, Error> {
+        if self.held.is_none() {
+            self.held = self.next_untouched()?;
+        }
+        let live_first = match (self.live.peek(), &self.held) {
+            (Some(&(k, _)), Some((key, _))) => rank(k) < rank(*key),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if live_first {
+            return Ok(self.live.next().map(|(k, record)| (k, record.to_vec())));
+        }
+        Ok(self.held.take())
     }
-    out.flush()?;
-    Ok(touched)
+}
+
+impl<I: Iterator<Item = Result<Vec<u8>, Error>>> Read for Projection<'_, I> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at == self.pending.len() {
+            match self
+                .next_record()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+            {
+                None => return Ok(0),
+                Some((_, mut record)) => {
+                    record.push(b'\n');
+                    self.pending = record;
+                    self.at = 0;
+                }
+            }
+        }
+        let n = buf.len().min(self.pending.len() - self.at);
+        buf[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
 }
 
 const KINDS: [OscKind; 3] = [OscKind::Node, OscKind::Way, OscKind::Relation];

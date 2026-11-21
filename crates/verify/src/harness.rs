@@ -656,6 +656,19 @@ impl Harness {
         Ok(self.check_sorted_counted(label, pbf)?.0)
     }
 
+    /// [`Self::check_sorted`], decoding under `cold` when nothing recorded
+    /// answers ([`opl_compare::order_as`]).
+    pub(crate) fn check_sorted_as(
+        &mut self,
+        label: &str,
+        pbf: &Path,
+        cold: Policy,
+    ) -> Result<Verdict, Error> {
+        let (ordered, counts) = opl_compare::order_as(self, pbf, cold)?;
+        let scan = opl_compare::Scan { ordered, counts };
+        Ok(self.report_order(label, pbf, scan))
+    }
+
     /// The same order verdict and osmium's counts from the same reading.
     pub(crate) fn check_sorted_counted(
         &mut self,

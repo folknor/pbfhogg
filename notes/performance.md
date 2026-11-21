@@ -1839,7 +1839,9 @@ What remains:
 - A call's missing decodes now run together as one launch group, but they
   are still written to files and read back, never streamed (`-o -`): a pipe
   needs the launch group to hand out stdout pipes and the merge to read
-  while the group runs, which barrier settlement forbids (PERF-066 design).
+  while the group runs, which barrier settlement forbids (a settled
+  ruling of the launch-group work: no member output is read before its
+  whole group settles).
 - Across runs only summaries are reused, not decodings (PERF-065).
 - One decoding per policy: NO_LOCATIONS and CONTENT are never projected
   from FULL, since no field-policies control holds such a projection. A
@@ -1985,7 +1987,8 @@ Residue:
 - The one-hit path (pbfhogg output bytes changed, reference summary stored)
   is unmeasured: denmark sort and cat outputs were byte-stable.
 - Paired walks (renumber), sequence walks (repack, degrade reencode),
-  `compare_with_opl` (apply-changes, derive-changes expected models) and the
+  `compare_with_opl` (the derive-changes expected model; apply-changes now
+  decides from summaries) and the
   derive model always decode and merge. A sequence walk over two equal
   digests is decidable the same way; the others need their records.
 - A fresh decode of a missing side is still a full file-backed decode; the
@@ -1993,72 +1996,25 @@ Residue:
 
 Kind: orchestration-owned machinery.
 
-## PERF-066 - Only OPL decodes run concurrently in the verifier
+## PERF-066 - derive-changes runs its two OSC producers one after the other
 
-Reported by: orchestration-opus, orchestration-codex, engine-opus,
-heavy-opus, other-opus (the engine-codex, heavy-codex and other-codex
-reports do not discuss the lifecycle).
+Residue of the verifier's launch-group work (landed: barrier-settled launch
+groups, concurrent decodes within a comparison, pbfhogg launch groups in diff
+and cat --dedupe; matched pairs in reference/performance/verifier.md, which
+also records the refusals: grouping cached reference runs, a per-launch
+subreaper shim, and groups in the checks whose runs take a second or two).
 
-Landed (link 1 of a chain; rulings and link plan in
-notes/PERF-066-design.md): `Lifecycle::run_group`, a barrier-settled launch
-group spawned from the one thread, with adoption tainting the whole group and
-aborting it early; launch-unique staging; an OPL comparison's missing decodes
-run together as one group. Link 2: `Harness::pbfhogg_group`, with diff's
-indexed diffs and strips, its unindexed diffs, and five of cat --dedupe's
-six merges run as groups; denmark diff 47.5 s to 32.9 s and cat --dedupe
-1m21s to 41.4 s (matched pairs in the design document).
+What remains: derive-changes' indexed and unindexed OSC producers are
+independent and worth up to about 8 s on denmark. Running them as one
+`Harness::pbfhogg_group` needs the raw-pair preparation errors and the raw
+member's result held until the original parity point, so neither can
+suppress the roundtrip findings. Needs its own matched A/B.
 
-What remains: pbfhogg runs in other checks (derive-changes' two OSC
-producers the only candidate with seconds to win), cached reference runs
-one at a time, and checks still run in sequence. The redesigns below are the
-hunters' proposals for that residue; the design document's link plan says
-which parts are being built.
+Not planned: running whole checks concurrently (a scheduler over per-check
+contexts, as the hunters proposed). It would need consuming one launch's
+result while unrelated siblings run, which is what the refused shim was for.
 
-Redesigns:
-
-- orchestration-opus: per-launch containment through a shim, the verifier
-  re-executed in a hidden mode that sets `PR_SET_CHILD_SUBREAPER` and
-  `PDEATHSIG`, runs the program, then kills and reaps what it adopted and
-  reports survivors. The verifier stays the backstop. Namespaces and cgroups
-  are rejected as unsafe defaults. `Harness` splits into thread-safe shared
-  services (launcher, single-flight cache, decodings, fixture store, watch
-  list) and per-check contexts. A resource-aware scheduler hands out tokens
-  per class (pbfhogg, osmium with a memory estimate, decodes). Result lines
-  are buffered and emitted in suite order. field-policies gates the later
-  verdicts but not the later work.
-- codex-orchestration: per-check verdict state, shared immutable artifacts,
-  and a supervisor settling each launch tree independently (a subreaper worker
-  per active launch), with signals, cancellation and final reaping under one
-  coordinator. Long producers start early, for example geocode's reference
-  preparation and the two OSC roundtrips. Admission is bounded by memory, CPU
-  and scratch writes.
-- engine-opus and heavy-opus: launch groups with piped stdout and every
-  stdout, stderr, pidfd and the signalfd multiplexed, settled together.
-  Consumers return their messages for emission in a fixed order.
-- other-opus: a launch DAG per check (plan, then executor with a concurrency
-  budget). It names the independent sub-runs:
-  - check-ids: 3 degrades, then 18 `check --ids`.
-  - diff: 4 diffs.
-  - derive-changes: the derives, strips and 3 roundtrips.
-  - extract: 3 strategies per region, and regions independent of each other.
-  - multi-extract: its sequential extracts.
-  - getparents: 8 runs.
-  - The tags-filter, inspect-tags and check-refs cases.
-  - geocode: both builds and both osmium chains at once, models while the
-    builds run, and both queries together.
-
-Payoff: a comparison's wall becomes about max(decode A, decode B) instead of
-the sum plus the merge. other-opus expects about 2x on check-ids, extract,
-multi-extract and getparents.
-
-Risks: the shim or supervisor must re-prove the no-survivor guarantee with the
-rigour `process.rs` has today; attributing an adopted orphan when several
-children are alive; memory on germany, so bound by estimate, not core count;
-staging-name collisions (`opl-compare.1` and similar are reused across checks;
-needs single-flight and a per-launch suffix); per-step timings turning into
-summed time rather than wall.
-
-Kind: high-conviction rewrite.
+Kind: local.
 
 ## PERF-067 - Reference cache retention is by recency, not recompute cost
 
@@ -2178,33 +2134,6 @@ Risks: the transitivity guard is `Policy::between` returning FULL for both; the
 unsorted route keeps external's refusal and duplicate detection.
 
 Kind: local (heavy-opus); rewrite (heavy-codex).
-
-## PERF-072 - apply-changes writes osmium's decoding twice to merge it once
-
-Reported by: heavy-opus, heavy-codex, engine-opus, engine-codex,
-orchestration-codex.
-
-Mechanism: `judge_elements` decodes osmium's output to `osmium.opl`.
-`write_expected` copies its untouched records into `expected.opl` with the
-model's winners inserted (about 12 GB of writes per heavy-opus), and
-`compare_with_opl_each` reads that file back against a fresh decode of
-pbfhogg's output. It also runs `osmium getid -H -I` over the base, an
-informational `print_fileinfo` on the reference that decides nothing, and a
-separate order decode of pbfhogg's output.
-
-Redesign: the expected stream becomes a cursor. Untouched osmium records are
-merged with the sparse, ordered model winners as pbfhogg's records arrive.
-osmium's touched records are routed to the precedence judgment, keeping their
-multiplicity. Order and counts come from the same walk, and fileinfo is dropped
-or run only on failure. heavy-codex adds a verified range-to-frame map for the
-touched-base lookup (payoff depends on OSC density), and emitting the reference
-projection directly from osmium's apply operation in plain mode.
-
-Risks: refusal ordering, signed IDs, absent versus explicit versions, and the
-cursor-dependent `-l` cases.
-
-Kind: rewrite (heavy-codex); local (heavy-opus, 3 decodes to 2 and no
-rewrites).
 
 ## PERF-074 - sort runs osmium multipass even on already ordered input
 

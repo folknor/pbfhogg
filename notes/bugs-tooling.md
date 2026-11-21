@@ -409,3 +409,16 @@ becomes ENVIRONMENT and `all` continues. Decide which wins; the contract
 reads as if the verifier error should, so `Tool` probably belongs in the
 pass-through arm beside `Interrupted` and `Unsettled`. Left for the user
 because it changes which outcomes stop a suite.
+
+## TOOL-047 - reference/verify.md says every fixture runs with --fresh-reference
+
+Reported by: the PERF-072 scout, not yet verified at the code.
+
+reference/verify.md "Decoding summaries" says summaries are neither read nor
+written under `--fresh-reference` and that every fixture test runs in that
+mode. The apply, change, dedupe, extract, getid, read and refs fixtures build
+their cache with `ReferenceCache::new(.., false)`; only the encoding and diff
+fixtures pass `true`. Either summaries can fire in those fixtures (their fake
+osmium keys decodes by content marker, so a stored summary could decide a
+comparison the fixture means to merge), or the doc's claim rests on some
+other switch. Establish which and fix the doc or the fixtures.

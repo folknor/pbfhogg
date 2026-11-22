@@ -255,7 +255,8 @@ never silently means something new:
   refusal**: an unindexed input taking diff's sequential path, `-j 0`
   resolving to one worker on a one-core host. The same
   command line must not be valid on one machine or file and invalid on
-  another. Such a fallback prints a `Note:`.
+  another. Whether a fallback prints a `Note:` depends on the command and
+  the path it takes.
 - **Every flag is parsed and checked before any input is opened**: malformed
   values (`--bbox`, `--start-id`, the time-filter timestamp, `--drop-ids`,
   `--output-header`, `--compression`, `-j`), flag combinations, and
@@ -284,9 +285,14 @@ An explicit `-j` (any value, `0` included) is refused where it can have no
 effect: `tags-filter -R`, `inspect` outside `--nodes`. One exception to the
 rule:
 
-- **diff**: with both inputs indexed, `N` workers merge the work units both
-  inputs are streamed into, at any `N`; without indexdata the run is the
-  sequential element stream, with a `Note:`.
+- **diff** (text and `--format osc`): with both inputs indexed, `N` workers
+  merge the work units both inputs are streamed into, at any `N`. When the
+  initial probe finds an unindexed input, diff uses the sequential element
+  stream. It prints `Note: Using sequential comparison: missing indexdata`
+  only if the resolved worker count exceeds one. Automatic sizing uses the
+  host's reported parallelism, or one worker if the host reports none.
+  Resolving `-j 0` to one worker is silent, and `-j 1` also produces no
+  fallback note.
 
 `apply-changes -j 1` runs one worker beside the scanner and drain threads;
 its automatic sizing still starts at two. Its single worker decodes,
@@ -342,8 +348,8 @@ expressions check rather than clap's.
 `renumber` has no `--force`: its schedule needs indexdata on every blob and
 has no fallback, so an unindexed blob is a hard error. `getparents`,
 `time-filter`, `diff`, `digest`, `check` and `export` never refuse unindexed
-input, so they have no `--force` either (`diff` prints a `Note:` when an
-unindexed input sends it to its sequential path).
+input, so they have no `--force` either. See [Worker threads](#worker-threads)
+for when `diff` prints a note about its sequential path.
 
 `build-geocode-index` is the exception: its indexdata switch is
 `--allow-unindexed`, and its `--force` is a legacy shorthand for both

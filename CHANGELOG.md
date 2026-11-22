@@ -574,6 +574,10 @@
 
 ### Fixed
 
+- The CLI reference now explains when `diff` and `diff --format osc`
+  report a sequential fallback for unindexed input. If you rely on that
+  note, pass `--jobs 2` to get it even on a host that reports one worker.
+
 - **An element timestamp whose millisecond scaling overflows is refused,
   not wrapped.** `time-filter`, `export --metadata` and `digest --form
   full` used to read such a timestamp wrapped to an arbitrary value: a

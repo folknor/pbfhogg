@@ -263,22 +263,6 @@ The two tools then disagree on the way's node list and on anything counted
 from it (check-refs's nodes-in-ways count among them). If confirmed, this is
 a deliberate spec-following deviation that DEVIATIONS.md does not record.
 
-## DOC-030 - commands.md says every run-time fallback prints a Note
-
-Reported by: the verify diff fallback-note fix.
-
-`docs/cli/commands.md` (the input-contract bullet on run-time fallbacks)
-lists an unindexed input taking diff's sequential path and `-j 0`
-resolving to one worker, then says "Such a fallback prints a `Note:`"; its
-unindexed-input section says `diff` prints a `Note:` on that path. Diff and
-`diff --format osc` print theirs only when more than one worker was asked
-for (`jobs > 1` in `crates/lib/src/commands/diff/mod.rs` `compare` and
-`derive.rs`), so an unindexed diff at `-j 1`, or at `-j 0` on a one-core
-host, says nothing (`cli_input_contract.rs` pins `Says::Nothing` for
-`diff -j 1`). Whether `-j 0` resolving to one worker prints anything
-anywhere was not checked. Either the docs narrow to "above one worker" or
-the gate goes; the verifier now passes `--jobs 2` and depends on neither.
-
 ## DOC-031 - Undeclared way coordinate arrays have no documented behaviour
 
 Reported by: the TOOL-045 refusal (bf9266ed). Needs a maintainer decision.

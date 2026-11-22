@@ -12,19 +12,35 @@
 //! for the header's required features; [`blob_ids`] reads one named data
 //! blob's elements on request, the bounded exception `verify degrade` takes
 //! for the few elements it locates, and [`index_truth`] reads every data
-//! blob to hold each claim's kind, count and ID range to its elements.
-//! [`header`] reads the header's required and optional features, the claims
-//! checks route on, without asking the pbfhogg CLI under test.
+//! blob carrying indexdata to hold each claim's kind, count and ID range to
+//! its elements. [`header`] reads the header's required and optional
+//! features, the claims checks route on, without asking the pbfhogg CLI
+//! under test.
+//!
+//! Where pbfhogg and libosmium disagree on a frame, the payload or header
+//! fields it reads, the reader refuses: the checks that read content also
+//! judge osmium's decoding, so admitting what libosmium refuses (zstd, a
+//! compressed blob without a valid `raw_size`) adds nothing, and admitting
+//! what pbfhogg refuses (an unsupported required feature, invalid UTF-8 in a
+//! header string or blob type, an ID split across `DenseNodes` occurrences)
+//! could pass an output pbfhogg cannot reopen. reference/verify.md lists the
+//! rules and the places it is stricter than both. Optional fields are
+//! recognised by number and wire type as both readers recognise them; the
+//! framing fields `type` and `datasize` refuse another wire type, as pbfhogg
+//! does. The header's bbox is not read. It never reads a value differently
+//! from them.
 //!
 //! The indexdata decoder follows pbfhogg's wire format (its `blob_meta`
 //! module): a version byte (1 with exactly 26 bytes, 2 or 3 with exactly 42),
 //! the element kind ordinal (node 0, way 1, relation 2), the minimum and
 //! maximum ID as little-endian `i64` at offsets 2 and 10, and the element
-//! count as little-endian `u64` at 18. It refuses exactly the claims pbfhogg
-//! cannot read - an unknown version, a length the version does not declare,
-//! an unknown kind, an inverted range, or two non-empty indexdata fields on
-//! one header - so a file this walk accepts is one pbfhogg reads on its
-//! indexdata path. An unknown future version is a loud refusal naming it.
+//! count as little-endian `u64` at 18. It refuses every claim pbfhogg cannot
+//! read - an unknown version, an unknown kind, an inverted range - and two it
+//! reads as no index for that blob: a length the version does not declare,
+//! and two non-empty indexdata fields on one header. A verifier treats a
+//! present but unusable claim as a finding, never as absence. Every claim
+//! this walk accepts is one pbfhogg reads on its indexdata path. An unknown
+//! future version is a loud refusal naming it.
 //!
 //! The walk assumes the file is not modified in place while it runs: one
 //! open handle serves the whole walk, and its length is read once.
@@ -455,7 +471,7 @@ pub(crate) fn first_data_blob_indexed(path: &Path) -> Result<bool, Error> {
 /// nodes, ways and relations in field order. The payload at
 /// `payload_offset` (`datasize` bytes, as [`Claims`] reports them) is read
 /// and decompressed, raw or zlib; any other compression is an error naming
-/// it. A group holding changesets is an error. Bounded by one blob.
+/// it. Changesets are skipped. Bounded by one blob.
 pub(crate) fn blob_ids(
     path: &Path,
     payload_offset: u64,
@@ -480,8 +496,10 @@ pub(crate) fn blob_ids_and_shape(
         if let (2, Value::Bytes(group)) = field.map_err(&fail)? {
             let mut seen: Option<u32> = None;
             for f in Fields::new(group) {
-                let (number, _) = f.map_err(&fail)?;
-                if (1..=4).contains(&number) {
+                // Only a length-delimited field 1 to 4 is an element field;
+                // another wire type is an unknown field `block_ids` skips,
+                // so it never makes a group mixed.
+                if let (number @ 1..=4, Value::Bytes(_)) = f.map_err(&fail)? {
                     if seen.is_some_and(|s| s != number) {
                         single = false;
                     }
@@ -539,9 +557,10 @@ impl IndexTruth {
     }
 }
 
-/// Decode every data blob of `path` (raw or zlib; any other compression is
-/// an error naming it, never a skip) and hold each indexdata claim to the
-/// blob's elements: every element of the claimed kind, the claimed count,
+/// Decode every data blob of `path` that carries indexdata (raw or zlib; any
+/// other compression is an error naming it, never a skip; a blob without
+/// indexdata is counted, not decoded) and hold each claim to the blob's
+/// elements: every element of the claimed kind, the claimed count,
 /// and, for a nonempty blob, the claimed minimum and maximum ID exactly.
 pub(crate) fn index_truth(path: &Path) -> Result<IndexTruth, Error> {
     const SHOWN: usize = 10;
@@ -594,27 +613,40 @@ pub(crate) fn index_truth(path: &Path) -> Result<IndexTruth, Error> {
 }
 
 /// The `(kind, id)` of every element of a `PrimitiveBlock`.
+///
+/// Fields are recognised by number and wire type together, as pbfhogg's
+/// block, group and element parsers and libosmium's `pbf_decoder` do: a
+/// known number with another wire type is an unknown field and is skipped,
+/// so a file both readers accept is never refused here for it. Changesets
+/// (group field 5) are skipped by both and here too. What this walk refuses
+/// beyond them - a repeated or absent scalar ID, a wrapping dense delta, an
+/// ID split across `DenseNodes` occurrences the two readers resolve
+/// differently - is its declared domain, never a reading of its own.
 fn block_ids(block: &[u8]) -> Result<Vec<(usize, i64)>, String> {
     let mut ids = Vec::new();
     for field in Fields::new(block) {
-        match field? {
-            (2, Value::Bytes(group)) => group_ids(group, &mut ids)?,
-            (2, _) => return Err("primitivegroup has the wrong wire type".into()),
-            _ => {}
+        if let (2, Value::Bytes(group)) = field? {
+            group_ids(group, &mut ids)?;
         }
     }
     Ok(ids)
 }
 
 fn group_ids(group: &[u8], ids: &mut Vec<(usize, i64)>) -> Result<(), String> {
+    let mut dense_seen = false;
     for field in Fields::new(group) {
         match field? {
             (1, Value::Bytes(node)) => ids.push((0, zigzag(message_id(node)?))),
-            (2, Value::Bytes(dense)) => dense_ids(dense, ids)?,
+            (2, Value::Bytes(dense)) => {
+                // pbfhogg refuses a second `dense` field in one group, empty
+                // or not; libosmium decodes each.
+                if std::mem::replace(&mut dense_seen, true) {
+                    return Err("a group holds two DenseNodes".into());
+                }
+                dense_ids(dense, ids)?;
+            }
             (3, Value::Bytes(way)) => ids.push((1, int64(message_id(way)?))),
             (4, Value::Bytes(relation)) => ids.push((2, int64(message_id(relation)?))),
-            (5, _) => return Err("a group holds changesets".into()),
-            (1..=4, _) => return Err("group field has the wrong wire type".into()),
             _ => {}
         }
     }
@@ -622,25 +654,29 @@ fn group_ids(group: &[u8], ids: &mut Vec<(usize, i64)>) -> Result<(), String> {
 }
 
 /// Field 1 of a `Node`, `Way` or `Relation` message, as its raw varint.
+/// Another wire type on field 1 is an unknown field, skipped.
 fn message_id(message: &[u8]) -> Result<u64, String> {
     let mut id = None;
     for field in Fields::new(message) {
-        match field? {
-            (1, Value::Varint(v)) => {
-                if id.replace(v).is_some() {
-                    return Err("an element carries two ids".into());
-                }
-            }
-            (1, _) => return Err("element id has the wrong wire type".into()),
-            _ => {}
+        if let (1, Value::Varint(v)) = field?
+            && id.replace(v).is_some()
+        {
+            return Err("an element carries two ids".into());
         }
     }
     id.ok_or_else(|| "an element without an id".to_owned())
 }
 
 /// `DenseNodes.id` (field 1): delta-coded `sint64`, packed or not.
+///
+/// The IDs must be ones pbfhogg and libosmium both read: pbfhogg refuses a
+/// second non-empty occurrence and ignores an empty packed one, libosmium
+/// takes the last occurrence, empty included. So a second non-empty
+/// occurrence, or an empty packed one after a non-empty one, is refused; a
+/// leading empty one agrees in both and is read as nothing.
 fn dense_ids(dense: &[u8], ids: &mut Vec<(usize, i64)>) -> Result<(), String> {
     let mut last: i64 = 0;
+    let mut filled = false;
     let mut push = |raw: u64| -> Result<(), String> {
         last = last
             .checked_add(zigzag(raw))
@@ -649,16 +685,26 @@ fn dense_ids(dense: &[u8], ids: &mut Vec<(usize, i64)>) -> Result<(), String> {
         Ok(())
     };
     for field in Fields::new(dense) {
-        match field? {
-            (1, Value::Bytes(packed)) => {
+        let field = field?;
+        if !matches!(field, (1, Value::Bytes(_) | Value::Varint(_))) {
+            continue;
+        }
+        if filled {
+            return Err("dense ids span two occurrences".into());
+        }
+        match field {
+            (_, Value::Bytes(packed)) => {
                 let mut values = Fields::new(packed);
+                filled = !values.rest.is_empty();
                 while !values.rest.is_empty() {
                     push(values.varint()?)?;
                 }
             }
-            (1, Value::Varint(v)) => push(v)?,
-            (1, _) => return Err("dense ids have the wrong wire type".into()),
-            _ => {}
+            (_, Value::Varint(v)) => {
+                filled = true;
+                push(v)?;
+            }
+            (_, Value::Fixed) => {}
         }
     }
     Ok(())
@@ -901,7 +947,14 @@ fn parse_blob_header(bytes: &[u8]) -> Result<BlobHeader, String> {
     let mut datasize = None;
     for field in Fields::new(bytes) {
         match field? {
-            (1, Value::Bytes(v)) => blob_type = Some(String::from_utf8_lossy(v).into_owned()),
+            // Each occurrence must be UTF-8, as pbfhogg checks each one; a
+            // later valid type does not excuse an earlier invalid one.
+            (1, Value::Bytes(v)) => {
+                blob_type = Some(
+                    String::from_utf8(v.to_vec())
+                        .map_err(|_| "blob header type is not UTF-8".to_owned())?,
+                );
+            }
             (2, Value::Bytes(v)) => {
                 // pbfhogg ignores an empty occurrence and reads two non-empty
                 // ones as conflicting claims: no usable index.
@@ -952,11 +1005,18 @@ fn int32(v: u64) -> Result<i64, String> {
 fn blob_content(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut payload: Option<(u32, &[u8])> = None;
     let mut raw_size = None;
+    // libosmium refuses a zero or over-cap raw_size at its occurrence on a
+    // compressed blob, even when a later one is valid.
+    let mut out_of_range = None;
     for field in Fields::new(bytes) {
         match field? {
             (2, Value::Varint(v)) => {
-                raw_size =
-                    Some(u64::try_from(int32(v)?).map_err(|_| "raw_size is negative".to_owned())?);
+                let size =
+                    u64::try_from(int32(v)?).map_err(|_| "raw_size is negative".to_owned())?;
+                if size == 0 || size > MAX_BLOB_LEN {
+                    out_of_range.get_or_insert(size);
+                }
+                raw_size = Some(size);
             }
             (field @ (1 | 3..=7), Value::Bytes(v)) => {
                 if payload.replace((field, v)).is_some() {
@@ -987,9 +1047,16 @@ fn blob_content(bytes: &[u8]) -> Result<Vec<u8>, String> {
             Ok(raw.to_vec())
         }
         Some((3, zlib)) => {
+            // libosmium refuses a compressed blob without raw_size, and a
+            // negative, zero or over-cap one at the occurrence, where pbfhogg
+            // decodes the first and lets a later raw_size override the rest.
+            // They stay refused: the checks that read payloads also judge
+            // osmium's decoding, so admitting them would judge nothing more.
             let size = raw_size.ok_or("zlib blob has no raw_size")?;
-            if size >= MAX_BLOB_LEN {
-                return Err(format!("raw_size {size} out of range"));
+            // A decompressed block of exactly 32 MiB is legal to pbfhogg and
+            // libosmium alike.
+            if let Some(bad) = out_of_range {
+                return Err(format!("raw_size {bad} out of range"));
             }
             let size = usize::try_from(size).map_err(|e| e.to_string())?;
             let mut out = Vec::with_capacity(size);
@@ -1005,21 +1072,58 @@ fn blob_content(bytes: &[u8]) -> Result<Vec<u8>, String> {
             }
             Ok(out)
         }
+        // zstd (field 7) pbfhogg decodes and libosmium refuses; lz4 the
+        // reverse when osmium is built with it; lzma both refuse. The checks
+        // that read payloads also judge osmium's decoding of the file, so
+        // supporting either here would add no coverage.
         Some((field, _)) => Err(format!("blob compression field {field} unsupported")),
         None => Err("blob has no payload".into()),
     }
 }
 
+/// The required features a header may name: the ones pbfhogg implements,
+/// matched exactly, as pbfhogg matches them. libosmium prefix-matches the
+/// same three names, so every header accepted here both readers accept.
+/// Spelled here, not taken from pbfhogg, so the list stays the verifier's.
+const READABLE_REQUIRED_FEATURES: [&str; 3] =
+    ["OsmSchema-V0.6", "DenseNodes", "HistoricalInformation"];
+
 /// `HeaderBlock.required_features` (field 4) and `optional_features`
 /// (field 5), both repeated strings.
+///
+/// The header must be one pbfhogg reopens: a required feature outside
+/// [`READABLE_REQUIRED_FEATURES`] is refused, and so is invalid UTF-8 in
+/// any string field pbfhogg decodes as text (the two feature lists,
+/// `writingprogram` 16, `source` 17, `osmosis_replication_base_url` 34),
+/// where libosmium would carry the bytes. A judged output whose header
+/// pbfhogg cannot read therefore never passes on this reader. The bbox
+/// submessage is not read here.
 fn header_features(block: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
+    let text = |name: &str, v: &[u8]| {
+        String::from_utf8(v.to_vec()).map_err(|_| format!("invalid UTF-8 in {name}"))
+    };
     let (mut required, mut optional) = (Vec::new(), Vec::new());
     for field in Fields::new(block) {
         match field? {
-            (4, Value::Bytes(v)) => required.push(String::from_utf8_lossy(v).into_owned()),
-            (5, Value::Bytes(v)) => optional.push(String::from_utf8_lossy(v).into_owned()),
-            // Another wire type on field 4 or 5 is an unknown field, skipped
-            // as pbfhogg and libosmium do.
+            (4, Value::Bytes(v)) => {
+                let feature = text("required_features", v)?;
+                if !READABLE_REQUIRED_FEATURES.contains(&feature.as_str()) {
+                    return Err(format!("required feature {feature:?} unsupported"));
+                }
+                required.push(feature);
+            }
+            (5, Value::Bytes(v)) => optional.push(text("optional_features", v)?),
+            (16, Value::Bytes(v)) => {
+                text("writingprogram", v)?;
+            }
+            (17, Value::Bytes(v)) => {
+                text("source", v)?;
+            }
+            (34, Value::Bytes(v)) => {
+                text("osmosis_replication_base_url", v)?;
+            }
+            // Another wire type on a known number is an unknown field,
+            // skipped as pbfhogg and libosmium do.
             _ => {}
         }
     }
@@ -1047,14 +1151,6 @@ impl Header {
 
     pub(crate) fn optional_feature(&self, feature: &str) -> bool {
         self.optional.iter().any(|f| f == feature)
-    }
-
-    /// `Sort.Type_then_ID` in either list.
-    pub(crate) fn declares_sorted(&self) -> bool {
-        self.required
-            .iter()
-            .chain(&self.optional)
-            .any(|f| f == SORT_TYPE_THEN_ID)
     }
 }
 
@@ -1137,6 +1233,9 @@ impl<'a> Fields<'a> {
             .filter(|n| (1..=MAX_FIELD_NUMBER).contains(n))
             .ok_or("field number out of range")?;
         let value = match key & 7 {
+            // Decoded in full even when the field is then skipped, so a
+            // skipped varint past 64 bits is refused where pbfhogg's skip
+            // only scans for its end: stricter, never a different value.
             0 => Value::Varint(self.varint()?),
             1 => {
                 self.take(8)?;
@@ -1255,13 +1354,109 @@ mod tests {
         assert_eq!(blob_content(&blob).unwrap(), block);
     }
 
+    /// The header reader admits only a header pbfhogg reopens: exact
+    /// supported required features and valid UTF-8 in its text fields.
+    #[test]
+    fn header_features_refuse_what_pbfhogg_cannot_reopen() {
+        use super::header_features;
+        let with = |number: u64, v: &[u8]| {
+            let mut block = Vec::new();
+            bytes_field(4, b"DenseNodes", &mut block);
+            bytes_field(number, v, &mut block);
+            header_features(&block)
+        };
+        assert!(with(4, b"HistoricalInformation").is_ok());
+        assert!(with(16, b"osmium/1.0").is_ok());
+        for refused in [
+            with(4, b"DenseNode"),
+            with(4, b"Sort.Type_then_ID"),
+            with(4, b"\xff"),
+            with(5, b"\xff"),
+            with(16, b"\xff"),
+            with(17, b"\xff"),
+            with(34, b"\xff"),
+        ] {
+            assert!(refused.is_err());
+        }
+    }
+
+    /// A zlib block of exactly 32 MiB inflates; one byte more is refused.
+    #[test]
+    fn zlib_raw_size_at_the_cap_is_accepted() {
+        use super::{MAX_BLOB_LEN, blob_content};
+        let blob = |raw_size: u64| {
+            let mut out = Vec::new();
+            varint(2 << 3, &mut out);
+            varint(raw_size, &mut out);
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&vec![0u8; MAX_BLOB_LEN as usize]).unwrap();
+            bytes_field(3, &enc.finish().unwrap(), &mut out);
+            out
+        };
+        assert_eq!(
+            blob_content(&blob(MAX_BLOB_LEN)).unwrap().len() as u64,
+            MAX_BLOB_LEN
+        );
+        assert!(blob_content(&blob(MAX_BLOB_LEN + 1)).is_err());
+    }
+
+    /// The ID walk skips wrong-typed and changeset fields as pbfhogg and
+    /// libosmium do, and refuses dense IDs the two readers resolve apart.
+    #[test]
+    fn id_walk_skips_unknown_fields_and_refuses_split_dense_ids() {
+        use super::block_ids;
+        let way = |extra: &dyn Fn(&mut Vec<u8>)| {
+            let mut way = Vec::new();
+            bytes_field(1, &[], &mut way);
+            varint(1 << 3, &mut way);
+            varint(7, &mut way);
+            extra(&mut way);
+            way
+        };
+        let mut group = Vec::new();
+        bytes_field(3, &way(&|_| {}), &mut group);
+        varint(1 << 3, &mut group);
+        varint(5, &mut group);
+        bytes_field(5, b"changeset", &mut group);
+        let mut block = Vec::new();
+        varint(2 << 3, &mut block);
+        varint(1, &mut block);
+        bytes_field(2, &group, &mut block);
+        assert_eq!(block_ids(&block).unwrap(), [(1, 7)]);
+
+        let dense = |occurrences: &[&[u8]]| {
+            let mut dense = Vec::new();
+            for o in occurrences {
+                bytes_field(1, o, &mut dense);
+            }
+            let mut group = Vec::new();
+            bytes_field(2, &dense, &mut group);
+            let mut block = Vec::new();
+            bytes_field(2, &group, &mut block);
+            block_ids(&block)
+        };
+        // zigzag 2 is ID 1, then a delta of 2 is ID 3.
+        assert_eq!(dense(&[&[], &[2, 4]]).unwrap(), [(0, 1), (0, 3)]);
+        assert!(dense(&[&[2], &[4]]).is_err());
+        assert!(dense(&[&[2], &[]]).is_err());
+
+        let mut two = Vec::new();
+        bytes_field(2, &[], &mut two);
+        bytes_field(2, &[], &mut two);
+        let mut block = Vec::new();
+        bytes_field(2, &two, &mut block);
+        assert!(block_ids(&block).is_err());
+    }
+
     fn header_payload(features: &[&str], zlib: bool) -> Vec<u8> {
         let mut block = Vec::new();
         for f in features {
             bytes_field(4, f.as_bytes(), &mut block);
         }
         let mut blob = Vec::new();
-        if zlib {
+        // An empty block compresses to a raw_size of zero, which libosmium
+        // and so the reader refuse; it is written raw instead.
+        if zlib && !block.is_empty() {
             let mut enc =
                 flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(&block).unwrap();

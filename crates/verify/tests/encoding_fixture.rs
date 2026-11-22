@@ -9,7 +9,7 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let dir = dir.join("encoding-fixture");
     std::fs::create_dir(&dir).unwrap();
     let input = dir.join("input.pbf");
-    write_pbf(&input, false, 3, &["Sort.Type_then_ID"], &[]);
+    write_pbf(&input, false, 3, &[], &[]);
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache = reference_cache::ReferenceCache::new(&dir, "encoding".into(), true).unwrap();
     let mut h = harness::Harness::new(
@@ -58,9 +58,9 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     // coordinates fails on an input osmium decodes none in; without the
     // requirement that is a gap.
     let low = dir.join("low.pbf");
-    write_pbf(&low, false, 3, &["Sort.Type_then_ID"], &["LocationsOnWays"]);
+    write_pbf(&low, false, 3, &[], &["LocationsOnWays"]);
     let undeclared = dir.join("undeclared.pbf");
-    write_pbf(&undeclared, false, 3, &["Sort.Type_then_ID"], &[]);
+    write_pbf(&undeclared, false, 3, &[], &[]);
     judge_degrade_pair(&mut h, exe, &dir, &input, &low);
     judge_locations_faults(&mut h, exe, &dir, &input, &low, &undeclared);
     judge_undeclared_repack(&mut h, exe, &dir, &undeclared);
@@ -191,7 +191,7 @@ fn judge_degrade_pair(h: &mut harness::Harness, exe: &Path, dir: &Path, input: &
 /// (`arms`, the check's re-encodings in order with their block caps), or
 /// to the error it must raise instead.
 fn assert_encoding(fault: &str, arms: &[(&str, u32)], judged: &super::Judged) {
-    let passes = fault.is_empty() || fault == "required-output";
+    let passes = fault.is_empty();
     assert_eq!(
         judged.status,
         if passes {
@@ -224,6 +224,7 @@ fn assert_encoding(fault: &str, arms: &[(&str, u32)], judged: &super::Judged) {
             Some("as too large for the format: nothing was re-encoded, so nothing was verified")
         }
         "published" => Some("failed: exit status: 2: too large; lower --elements-per-blob"),
+        "required-output" => Some("required feature \"Sort.Type_then_ID\" unsupported"),
         _ => None,
     };
     match error {
@@ -309,7 +310,8 @@ pub fn tool(args: &[OsString]) -> i32 {
             assert!(args.contains(&"--direct-io"));
             assert!(args.contains(&"--force"));
             // The output claims what the faults ask of its header: a sort
-            // feature among the required ones changes no optional claim.
+            // feature among the required ones is a header pbfhogg cannot
+            // reopen, which the verifier's header reader refuses.
             let required: &[&str] = if fault == "required-output" {
                 &["Sort.Type_then_ID"]
             } else {

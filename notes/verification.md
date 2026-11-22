@@ -20,28 +20,6 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-147 - Verifier frame readers still differ from pbfhogg in acceptance
-
-Reported by: wrong-wire-type alignment of the verifier readers (spar, 2026-11-20).
-
-With field dispatch now on number and wire type in every reader in
-`crates/verify/src/pbf_frames.rs`, other acceptance rules still differ from
-pbfhogg's: `blob_content` refuses a zlib blob without `raw_size` (pbfhogg
-decodes it), refuses zstd, and refuses the first negative `raw_size` even when
-a later valid one wins in pbfhogg; `header_features` reads feature strings
-lossily and records required features pbfhogg refuses, where pbfhogg refuses
-invalid UTF-8; `Fields` decodes a skipped varint fully and refuses a 64-bit
-overflow that pbfhogg's skip only scans past. The module and `index_truth`
-docs claim broader parity (and "every data blob") than the code delivers. The
-verifier ID walk (`block_ids`, `group_ids`, `message_id`, `dense_ids`) still
-refuses wrong-typed known fields, unaudited against the library decoder.
-Each is a file one side reads and the other refuses; none changes a value
-both accept.
-
-The 2026-11-21 verifier performance hunt (engine-opus) also flagged the zstd
-refusal: `index_truth` and the layout predictions cannot run on a zstd output,
-which is a coverage gap if a check ever re-encodes with zstd.
-
 ## VER-148 - A queued heavy scenario skips as green behind its siblings
 
 Reported by: the check wall-time audit's spar (codex, 2026-11-21), from

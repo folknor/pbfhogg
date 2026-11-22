@@ -351,10 +351,11 @@ impl Harness {
         self.require_success(&ended, "pbfhogg degrade --strip-indexdata")
     }
 
-    /// Whether `pbf`'s header declares `Sort.Type_then_ID` in either feature
-    /// list, read by the verifier's own header reader.
+    /// Whether `pbf`'s header declares `Sort.Type_then_ID`, read by the
+    /// verifier's own header reader. Only the optional list can hold it: the
+    /// reader refuses it as a required feature, as pbfhogg and libosmium do.
     pub(crate) fn has_sort_flag(&mut self, pbf: &Path) -> Result<bool, Error> {
-        Ok(pbf_frames::header(pbf)?.declares_sorted())
+        Ok(pbf_frames::header(pbf)?.optional_sorted())
     }
 
     pub(crate) fn compare_sort_feature(
@@ -686,7 +687,7 @@ impl Harness {
             return Verdict::Pass;
         }
         let hint = match pbf_frames::header(pbf) {
-            Ok(header) if header.declares_sorted() => format!(
+            Ok(header) if header.optional_sorted() => format!(
                 " - header declares {} but element order disagrees",
                 pbf_frames::SORT_TYPE_THEN_ID
             ),

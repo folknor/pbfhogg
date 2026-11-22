@@ -157,16 +157,18 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         std::fs::write(dir.join("check"), check).unwrap();
         for fault in faults {
             std::fs::write(dir.join("fault"), fault).unwrap();
-            // A required-only sort feature must still take the refusal route.
+            // An input without the optional sort feature takes the refusal
+            // route. (As a required feature it is a header pbfhogg cannot
+            // read, which the verifier's header reader refuses.)
             if ["unsorted", "publish"].contains(&fault) {
-                fake_pbf::write_with(&input, &[SORTED], &[], "unsorted");
+                fake_pbf::write_with(&input, &[], &[], "unsorted");
             } else if check == "text" {
                 // The text pair's decodings key on content alone.
-                fake_pbf::write_with(&input, &[SORTED], &[SORTED], "text-old");
+                fake_pbf::write_with(&input, &[], &[SORTED], "text-old");
             } else if fault.starts_with("kind-change") {
-                fake_pbf::write_with(&input, &[SORTED], &[SORTED], "derive-old");
+                fake_pbf::write_with(&input, &[], &[SORTED], "derive-old");
             } else {
-                fake_pbf::write_with(&input, &[SORTED], &[SORTED], "sorted");
+                fake_pbf::write_with(&input, &[], &[SORTED], "sorted");
             }
             h.run = run::Run::create(&dir, exe, true).unwrap();
             h.run.watch(&input).unwrap();

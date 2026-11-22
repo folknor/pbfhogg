@@ -200,8 +200,26 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   derive-changes do not run it: their strict comparisons already judge
   order and count.
 - **Header claims** (`Sort.Type_then_ID` and `LocationsOnWays` among the
-  optional features, and the sort feature in either list) are read by the
-  verifier's own `OSMHeader` reader (`pbf_frames::header`).
+  optional features) are read by the verifier's own `OSMHeader` reader
+  (`pbf_frames::header`).
+- **The frame reader's acceptance** (`pbf_frames`): where pbfhogg and
+  libosmium disagree on what it reads, it refuses. Optional fields are
+  recognised by number and wire type as both readers recognise them, so a
+  known number with another wire type, and a group's changesets, are
+  skipped; the framing fields `type` and `datasize` refuse another wire
+  type, as pbfhogg does. Payloads are raw or zlib only: pbfhogg reads zstd
+  and refuses lz4, libosmium refuses zstd. On a zlib blob it refuses what
+  libosmium refuses: no `raw_size`, or any occurrence that is zero,
+  negative or above 32 MiB. It refuses what pbfhogg refuses, so an output
+  pbfhogg cannot reopen never passes on it: a required feature other than
+  `OsmSchema-V0.6`, `DenseNodes` and `HistoricalInformation` (exactly),
+  invalid UTF-8 in a blob type, the feature lists, `writingprogram`,
+  `source` or the replication base URL, two `DenseNodes` in a group, and
+  `DenseNodes` IDs in an occurrence after a non-empty one. It is stricter
+  than both on a repeated or absent scalar ID, a skipped varint past 64
+  bits, and indexdata with an undeclared length or two non-empty fields,
+  which pbfhogg reads as an unindexed blob. The header's bbox is not read.
+  It never reads a value differently from them.
 - **Sorted copies** are written by `osmium sort`, with
   `-f pbf,locations_on_ways=true` when the source declares
   `LocationsOnWays`, so inline coordinates survive into the comparison; a

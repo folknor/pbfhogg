@@ -146,35 +146,47 @@ fn a_block_iterator_blocked_on_the_callers_stream() {
     assert_eq!(invocation.capabilities(), Capabilities::default());
 }
 
+/// The payload of the one unwind this test means to catch, so a setup
+/// failure or a missed park cannot pass for it.
+struct DeliberateUnwind;
+
 #[test]
 fn a_parked_reader_is_released_during_unwind() {
     let _bound = hang_bound();
     let invocation = Invocation::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let (parked_tx, parked_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let stream = ParkingRead {
-            bytes: std::io::Cursor::new(base_bytes()),
-            owner: std::thread::current().id(),
-            parked: parked_tx,
-            release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
-            released: false,
-        };
-        let blocks = pbfhogg::ElementReader::new(stream)
-            .expect("reader")
-            .invocation(invocation.clone())
-            .into_blocks_pipelined()
-            .expect("pipeline");
-        let _guarded = ReleasedBeforeJoin {
-            release: Some(release_tx),
-            joined: blocks,
-        };
-        parked_rx
-            .recv_timeout(pbfhogg::TEST_OBSERVE_BOUND)
-            .expect("the pipeline reached the caller's stream");
-        panic!("unwind while the caller's reader is parked");
+    // Setup and the park observation run outside `catch_unwind`: their
+    // failures fail the test, and the guard still releases the reader
+    // before its join while they unwind.
+    let (parked_tx, parked_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::channel();
+    let stream = ParkingRead {
+        bytes: std::io::Cursor::new(base_bytes()),
+        owner: std::thread::current().id(),
+        parked: parked_tx,
+        release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
+        released: false,
+    };
+    let blocks = pbfhogg::ElementReader::new(stream)
+        .expect("reader")
+        .invocation(invocation.clone())
+        .into_blocks_pipelined()
+        .expect("pipeline");
+    let guarded = ReleasedBeforeJoin {
+        release: Some(release_tx),
+        joined: blocks,
+    };
+    parked_rx
+        .recv_timeout(pbfhogg::TEST_OBSERVE_BOUND)
+        .expect("the pipeline reached the caller's stream");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guarded = guarded;
+        std::panic::resume_unwind(Box::new(DeliberateUnwind));
     }));
-    assert!(result.is_err(), "the deliberate panic was caught");
+    match result {
+        Err(payload) if payload.is::<DeliberateUnwind>() => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+        Ok(()) => unreachable!("the closure always unwinds"),
+    }
     assert_eq!(invocation.capabilities(), Capabilities::default());
 }
 

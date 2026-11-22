@@ -101,6 +101,19 @@ fn scratch_base() -> &'static Path {
 /// test's `HangBound` before acquiring it and drop the writer or child
 /// before the lease.
 ///
+/// That order is deliberate: the bound is one combined budget for the
+/// admission wait, the scenario and its cleanup, so time spent behind other
+/// holders counts against it. Contention is expected to stay short because
+/// every holder acquires once per test and keeps its critical section to a
+/// small fixture; nothing proves a wait below the bound, and a holder must
+/// not grow into a long one. A wait that exhausts the budget, or a nested
+/// acquisition (`flock` is per open file description, so a second lease in
+/// one process blocks on the first), is a named failure, never a skip: a
+/// timed acquisition that skipped could not tell healthy queueing from a
+/// nested or leaked lease, and a blocked `flock` cannot be cancelled.
+/// Arming the bound after the lease instead would not spare a long wait
+/// either, since the runner's per-test watchdog counts it all the same.
+///
 /// # Panics
 ///
 /// If the scratch base cannot be opened or locked.

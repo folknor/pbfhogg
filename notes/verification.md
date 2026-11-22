@@ -20,18 +20,6 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-149 - Two test waits that load can trip or pass vacuously
-
-Reported by: the same spar, from source. `a_parked_reader_is_released_during_unwind`
-(`crates/lib/tests/capabilities.rs`) accepts any panic inside its
-`catch_unwind`, so a receive timeout before the reader parks passes
-without observing the park; it should require the deliberate panic.
-`sort_overlapping_blobs_uring` (`crates/cli/tests/cli_sort.rs`) arms its
-hang bound before blocking on the checkout-wide locked-memory lease
-(`crates/test-scratch/src/lib.rs`), so time spent waiting for other lease
-holders, from any binary, counts against the bound before io_uring is
-even probed. Neither seen failing.
-
 ## VER-144 - Source-policy rules re-parse every file with syn, in debug
 
 Measured 2026-11-18 on bygg (debug `brokkr test`): the single real-tree

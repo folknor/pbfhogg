@@ -1219,6 +1219,8 @@ mod backends {
             pbfhogg::TEST_HANG_REPORT_GRACE,
             "sort --io-uring",
         );
+        // Armed before the lease on purpose: one budget over the admission
+        // wait and the run (see `locked_memory_lease`).
         let _lease = pbfhogg_test_scratch::locked_memory_lease();
         let invocation_scratch = pbfhogg_test_scratch::scratch();
         let dir = crate::common::test_scratch();

@@ -1437,7 +1437,9 @@ const _: () = {
 /// skipping as environmental. Not a failure bound: on an ordinary host the
 /// gate never waits, and on one whose limit admits few heavy scenarios at a
 /// time, a test that would otherwise run past the watchdog behind its
-/// siblings skips instead. Admission plus the scenario itself must still
+/// siblings skips instead. A same-thread nested ticket fails without
+/// waiting and a ticket outliving its scenario fails that scenario's test,
+/// so an expiry is never the only report of either. Admission plus the scenario itself must still
 /// finish before the watchdog; heavy scenarios are small fixtures.
 pub const TEST_FD_ADMISSION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 

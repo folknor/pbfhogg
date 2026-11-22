@@ -20,21 +20,6 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-148 - A queued heavy scenario skips as green behind its siblings
-
-Reported by: the check wall-time audit's spar (codex, 2026-11-21), from
-source; no skip observed. `heavy_ticket` in
-`crates/lib/tests/common/fd_gate.rs` skips a scenario whose admission
-waits out `TEST_FD_ADMISSION_BOUND` behind siblings, and a skip passes.
-On a stock host (hard `RLIMIT_NOFILE` 524288) the gate holds hundreds of
-heavy units and never waits; on one near 3072 two units fill it
-(`host_contract.rs` `concurrent_external_joins_use_distinct_scratch`
-takes both), and the FIFO queue can hold a one-unit request behind a
-two-unit head with a unit free. Since check lanes run at `budget =
-"cores"` the library `all` binary gets several test threads, so this is
-more reachable there than it was at one thread. Proposed: queue expiry
-fails the test; only a request above total capacity stays a skip.
-
 ## VER-149 - Two test waits that load can trip or pass vacuously
 
 Reported by: the same spar, from source. `a_parked_reader_is_released_during_unwind`

@@ -292,7 +292,7 @@ NAME` list each harness in turn to find one test.
   join's stage-1 minimum, so a descriptor-heavy run on it refuses typed
   rather than running ungated. A scenario that runs external joins first
   takes one ticket of whole-run units from the binary's gate
-  (`common::heavy_ticket`, in `crates/lib/tests/common/fd_gate.rs`) and
+  (`common::with_heavy_ticket`, in `crates/lib/tests/common/fd_gate.rs`) and
   builds its hosts from it (`common::heavy_host`, or a test-local
   provider delegating to the ticket). A test's `host::FdPool` is built
   only by `fd_gate::pool` (a textlint holds the rest of the tree to it),
@@ -323,8 +323,20 @@ NAME` list each harness in turn to find one test.
   shared binary includes every concurrent test and light use grows with
   the runner's thread count; light tests' descriptors, every command
   that requests none, and test-local providers that answer outright
-  rather than delegating to a ticket are not counted; and a test holding
-  a ticket must not take another (it waits on itself and skips).
+  rather than delegating to a ticket are not counted; and a nested
+  request from a thread the scenario spawned is not seen (it would wait
+  on its own scenario and skip).
+  The scenario runs inside `common::with_heavy_ticket`, which owns the
+  ticket's lifetime so that an ownership defect fails a test on every
+  host rather than only waiting out the bound and passing as a skip: a
+  request made while a scenario runs on the same thread panics before it
+  queues, and any host, provider, pool or grant of the ticket still alive
+  when the scenario returns normally panics, naming it (a scenario that
+  panics already fails, and skips this check). The escaped part keeps
+  its charge until it drops, so a sibling queued behind it may still
+  skip, but never as the only report. On an ordinary host the gate never
+  fills, so the expiry skip otherwise belongs to a limit that admits few
+  heavy scenarios at once.
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily
   swaps the panic hook to silence its deliberate worker panic. While the
   replacement is installed, it can also suppress panic output from another

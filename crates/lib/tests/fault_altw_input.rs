@@ -114,9 +114,18 @@ fn run<'a>(
 /// follow the replacement.
 fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: Option<u64>) {
     // One run at a time; any route may be external.
-    let Some(ticket) = crate::common::heavy_ticket(1, &format!("check_route {route:?}")) else {
-        return;
-    };
+    crate::common::with_heavy_ticket(1, &format!("check_route {route:?}"), |ticket| {
+        check_admitted_route(ticket, route, memory_available, opens, racing);
+    });
+}
+
+fn check_admitted_route(
+    ticket: &Arc<crate::common::FdTicket>,
+    route: Route,
+    memory_available: Option<u64>,
+    opens: u64,
+    racing: Option<u64>,
+) {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
@@ -128,7 +137,7 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
         route,
         &input,
         &reference,
-        &host(&ticket, memory_available),
+        &host(ticket, memory_available),
         dir.path(),
     )
     .unwrap_or_else(|e| panic!("{route:?}: unreplaced run: {e}"));
@@ -138,7 +147,7 @@ fn check_route(route: Route, memory_available: Option<u64>, opens: u64, racing: 
         for scenario in [reopen_cell::Scenario::Pinned, reopen_cell::Scenario::Path] {
             write_input(&input, indexed);
             write_replacement(&replacement);
-            let host = host(&ticket, memory_available);
+            let host = host(ticket, memory_available);
             let run_cell = |pin: &pbfhogg::read::input::PinnedInput, scenario| {
                 host.invocation
                     .faults()

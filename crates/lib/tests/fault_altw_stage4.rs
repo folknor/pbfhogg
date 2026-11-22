@@ -80,76 +80,79 @@ fn assert_stage3_stopped(host: &pbfhogg::host::Host) {
     );
 }
 
-/// A host for one external join, or `None` when the descriptor gate
-/// skipped the test.
-fn heavy(test: &str) -> Option<pbfhogg::host::Host> {
-    crate::common::heavy_ticket(1, test).map(|ticket| crate::common::heavy_host(&ticket))
+/// Run `scenario` on a host for one external join, unless the descriptor
+/// gate skips the test.
+fn heavy(test: &str, scenario: impl FnOnce(&pbfhogg::host::Host)) {
+    crate::common::with_heavy_ticket(1, test, |ticket| {
+        scenario(&crate::common::heavy_host(ticket));
+    });
 }
 
 /// A failure before stage 4's pool starts aborts the router.
 #[test]
 fn a_stage4_failure_at_start_stops_stage3() {
-    let Some(host) = heavy("a_stage4_failure_at_start_stops_stage3") else {
-        return;
-    };
-    let faults = host.invocation.faults();
-    faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
-    faults
-        .altw_stage4_fail_at_start
-        .store(true, Ordering::SeqCst);
+    heavy("a_stage4_failure_at_start_stops_stage3", |host| {
+        let faults = host.invocation.faults();
+        faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
+        faults
+            .altw_stage4_fail_at_start
+            .store(true, Ordering::SeqCst);
 
-    let err = run_failing(&host);
-    assert!(
-        err.contains("test-hooks: stage 4 failing at start"),
-        "the run failed, but not with stage 4's error: {err}"
-    );
-    assert_stage3_stopped(&host);
+        let err = run_failing(host);
+        assert!(
+            err.contains("test-hooks: stage 4 failing at start"),
+            "the run failed, but not with stage 4's error: {err}"
+        );
+        assert_stage3_stopped(host);
+    });
 }
 
 /// A consumer error inside the pool, with a worker waiting on the held
 /// bucket, aborts the router before the pool joins that worker.
 #[test]
 fn a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3() {
-    let Some(host) = heavy("a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3")
-    else {
-        return;
-    };
-    let faults = host.invocation.faults();
-    faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
-    faults
-        .altw_stage4_fail_consume_at
-        .store(0, Ordering::SeqCst);
+    heavy(
+        "a_stage4_consumer_error_releases_its_parked_workers_and_stops_stage3",
+        |host| {
+            let faults = host.invocation.faults();
+            faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
+            faults
+                .altw_stage4_fail_consume_at
+                .store(0, Ordering::SeqCst);
 
-    let err = run_failing(&host);
-    assert!(
-        err.contains("test-hooks: stage 4 consumer failing at ordinal 0"),
-        "the run failed, but not with stage 4's error: {err}"
+            let err = run_failing(host);
+            assert!(
+                err.contains("test-hooks: stage 4 consumer failing at ordinal 0"),
+                "the run failed, but not with stage 4's error: {err}"
+            );
+            assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
+            assert_stage3_stopped(host);
+        },
     );
-    assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
-    assert_stage3_stopped(&host);
 }
 
 /// The same with a consumer panic: the consumer's guard aborts the router
 /// during the unwind, before the pool joins.
 #[test]
 fn a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3() {
-    let Some(host) = heavy("a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3")
-    else {
-        return;
-    };
-    let faults = host.invocation.faults();
-    faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
-    faults
-        .altw_stage4_panic_consume_at
-        .store(0, Ordering::SeqCst);
+    heavy(
+        "a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3",
+        |host| {
+            let faults = host.invocation.faults();
+            faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
+            faults
+                .altw_stage4_panic_consume_at
+                .store(0, Ordering::SeqCst);
 
-    let err = run_failing(&host);
-    assert!(
-        err.contains("test-hooks: stage 4 consumer panicking at ordinal 0"),
-        "the run failed, but not with stage 4's panic: {err}"
+            let err = run_failing(host);
+            assert!(
+                err.contains("test-hooks: stage 4 consumer panicking at ordinal 0"),
+                "the run failed, but not with stage 4's panic: {err}"
+            );
+            assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
+            assert_stage3_stopped(host);
+        },
     );
-    assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
-    assert_stage3_stopped(&host);
 }
 
 /// A worker panic, with another worker waiting on the held bucket, aborts
@@ -158,19 +161,20 @@ fn a_stage4_consumer_panic_releases_its_parked_workers_and_stops_stage3() {
 /// panic only once every other worker has finished its task.
 #[test]
 fn a_stage4_worker_panic_releases_its_parked_workers_and_stops_stage3() {
-    let Some(host) = heavy("a_stage4_worker_panic_releases_its_parked_workers_and_stops_stage3")
-    else {
-        return;
-    };
-    let faults = host.invocation.faults();
-    faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
-    faults.altw_stage4_panic_work_at.store(0, Ordering::SeqCst);
+    heavy(
+        "a_stage4_worker_panic_releases_its_parked_workers_and_stops_stage3",
+        |host| {
+            let faults = host.invocation.faults();
+            faults.altw_stage3_hold_bucket.store(0, Ordering::SeqCst);
+            faults.altw_stage4_panic_work_at.store(0, Ordering::SeqCst);
 
-    let err = run_failing(&host);
-    assert!(
-        err.contains("stage 4 thread"),
-        "the run failed, but not with stage 4's panic: {err}"
+            let err = run_failing(host);
+            assert!(
+                err.contains("stage 4 thread"),
+                "the run failed, but not with stage 4's panic: {err}"
+            );
+            assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
+            assert_stage3_stopped(host);
+        },
     );
-    assert!(faults.altw_stage4_way0_entered.load(Ordering::SeqCst));
-    assert_stage3_stopped(&host);
 }

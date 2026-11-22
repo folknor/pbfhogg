@@ -44,12 +44,6 @@ impl Inputs {
         Self::build(None)
     }
 
-    /// Inputs for a heavy scenario, or `None` when its ticket was not
-    /// admitted (reported as a skip).
-    fn heavy(test: &str) -> Option<Self> {
-        crate::common::heavy_ticket(1, test).map(|ticket| Self::build(Some(ticket)))
-    }
-
     fn build(ticket: Option<std::sync::Arc<crate::common::FdTicket>>) -> Self {
         let dir = crate::common::test_scratch();
         crate::common::write_base_pbf(&dir.path().join("base.osm.pbf"));
@@ -1062,19 +1056,19 @@ fn sweep(test: &str, module: &str, mut each: impl FnMut(&str, Command, &Inputs) 
     let mut failures = Vec::new();
     for scenario in scenarios(module) {
         let name = format!("{module}: {}", scenario.mode);
-        let heavy;
-        let inputs = if scenario.heavy {
-            match Inputs::heavy(test) {
-                Some(inputs) => {
-                    heavy = inputs;
-                    &heavy
-                }
-                None => continue,
-            }
+        if scenario.heavy {
+            // The heavy inputs end with the scenario, inside its ticket.
+            let found = crate::common::with_heavy_ticket(1, test, |ticket| {
+                each(
+                    &name,
+                    scenario.run,
+                    &Inputs::build(Some(std::sync::Arc::clone(ticket))),
+                )
+            });
+            failures.extend(found.unwrap_or_default());
         } else {
-            &light
-        };
-        failures.extend(each(&name, scenario.run, inputs));
+            failures.extend(each(&name, scenario.run, &light));
+        }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

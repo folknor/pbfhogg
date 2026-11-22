@@ -39,57 +39,54 @@ fn input(dir: &std::path::Path) -> std::path::PathBuf {
 }
 #[test]
 fn process_actions_fire_once_at_each_hook_site() {
-    let Some(ticket) =
-        crate::common::heavy_ticket(1, "process_actions_fire_once_at_each_hook_site")
-    else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let base = input(dir.path());
-    let actions = Arc::new(Actions {
-        fd: AtomicUsize::new(0),
-        ticket,
+    crate::common::with_heavy_ticket(1, "process_actions_fire_once_at_each_hook_site", |ticket| {
+        let dir = crate::common::test_scratch();
+        let base = input(dir.path());
+        let actions = Arc::new(Actions {
+            fd: AtomicUsize::new(0),
+            ticket: Arc::clone(ticket),
+        });
+        let mut host = crate::common::test_host();
+        host.process = Arc::clone(&actions) as Arc<dyn ProcessActions>;
+        let overrides = pbfhogg::HeaderOverrides::default();
+        let clean = pbfhogg::cat::CleanAttrs {
+            version: true,
+            ..Default::default()
+        };
+        pbfhogg::cat::cat(
+            &[&base],
+            crate::common::out(dir.path().join("clean.pbf")),
+            None,
+            &clean,
+            &Default::default(),
+            &overrides,
+            &host,
+        )
+        .expect("cat clean");
+        // cat asks for one descriptor per pinned input before pinning them.
+        assert_eq!(actions.fd.load(Relaxed), 1);
+        actions.fd.store(0, Relaxed);
+        external_join(
+            &base,
+            &dir.path().join("external.pbf"),
+            &host,
+            crate::common::scratch_in(dir.path()),
+        )
+        .expect("external");
+        assert_eq!(actions.fd.load(Relaxed), 1);
+        actions.fd.store(0, Relaxed);
+        pbfhogg::cat::cat(
+            &[&base],
+            crate::common::out(dir.path().join("cat.pbf")),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &overrides,
+            &host,
+        )
+        .expect("cat");
+        assert_eq!(actions.fd.load(Relaxed), 1);
     });
-    let mut host = crate::common::test_host();
-    host.process = Arc::clone(&actions) as Arc<dyn ProcessActions>;
-    let overrides = pbfhogg::HeaderOverrides::default();
-    let clean = pbfhogg::cat::CleanAttrs {
-        version: true,
-        ..Default::default()
-    };
-    pbfhogg::cat::cat(
-        &[&base],
-        crate::common::out(dir.path().join("clean.pbf")),
-        None,
-        &clean,
-        &Default::default(),
-        &overrides,
-        &host,
-    )
-    .expect("cat clean");
-    // cat asks for one descriptor per pinned input before pinning them.
-    assert_eq!(actions.fd.load(Relaxed), 1);
-    actions.fd.store(0, Relaxed);
-    external_join(
-        &base,
-        &dir.path().join("external.pbf"),
-        &host,
-        crate::common::scratch_in(dir.path()),
-    )
-    .expect("external");
-    assert_eq!(actions.fd.load(Relaxed), 1);
-    actions.fd.store(0, Relaxed);
-    pbfhogg::cat::cat(
-        &[&base],
-        crate::common::out(dir.path().join("cat.pbf")),
-        None,
-        &Default::default(),
-        &Default::default(),
-        &overrides,
-        &host,
-    )
-    .expect("cat");
-    assert_eq!(actions.fd.load(Relaxed), 1);
 }
 struct CountingResources(AtomicUsize);
 impl Resources for CountingResources {
@@ -233,63 +230,64 @@ fn input_evictions_follow_the_page_cache_policy() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_join_evicts_its_scratch_and_no_input() {
-    let Some(ticket) =
-        crate::common::heavy_ticket(1, "external_join_evicts_its_scratch_and_no_input")
-    else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let base = input(dir.path());
-    let sink = Arc::new(RecordingSink::default());
-    let mut host = crate::common::heavy_host(&ticket);
-    host.page_cache = pbfhogg::host::PageCachePolicy::Keep;
-    host.invocation = pbfhogg::host::Invocation::with_sink(
-        Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
-    );
-    run_external_join(
-        &base,
-        &dir.path().join("external.pbf"),
-        &host,
-        crate::common::scratch_in(dir.path()),
-    )
-    .expect("external join");
+    crate::common::with_heavy_ticket(
+        1,
+        "external_join_evicts_its_scratch_and_no_input",
+        |ticket| {
+            let dir = crate::common::test_scratch();
+            let base = input(dir.path());
+            let sink = Arc::new(RecordingSink::default());
+            let mut host = crate::common::heavy_host(ticket);
+            host.page_cache = pbfhogg::host::PageCachePolicy::Keep;
+            host.invocation = pbfhogg::host::Invocation::with_sink(
+                Arc::clone(&sink) as Arc<dyn pbfhogg::debug::InstrumentSink>
+            );
+            run_external_join(
+                &base,
+                &dir.path().join("external.pbf"),
+                &host,
+                crate::common::scratch_in(dir.path()),
+            )
+            .expect("external join");
 
-    let samples = sink.counters.lock().expect("sink").clone();
-    // Stage-end counters are emitted once each; a second sample would hide
-    // behind any last-value reading.
-    let emitted = |name: &str| -> u64 {
-        let values: Vec<i64> = samples
-            .iter()
-            .filter(|(n, _)| n == name)
-            .map(|&(_, v)| v)
-            .collect();
-        assert_eq!(values.len(), 1, "{name} emitted {values:?}");
-        u64::try_from(values[0]).expect("non-negative")
-    };
-    let id_shards = emitted("s2_fadvise_calls");
-    let slot_written = emitted("s2_slot_fadvise_calls");
-    let slot_read = emitted("s3_fadvise_calls");
-    let slot_bytes = emitted("s2_slot_bytes_written");
+            let samples = sink.counters.lock().expect("sink").clone();
+            // Stage-end counters are emitted once each; a second sample would hide
+            // behind any last-value reading.
+            let emitted = |name: &str| -> u64 {
+                let values: Vec<i64> = samples
+                    .iter()
+                    .filter(|(n, _)| n == name)
+                    .map(|&(_, v)| v)
+                    .collect();
+                assert_eq!(values.len(), 1, "{name} emitted {values:?}");
+                u64::try_from(values[0]).expect("non-negative")
+            };
+            let id_shards = emitted("s2_fadvise_calls");
+            let slot_written = emitted("s2_slot_fadvise_calls");
+            let slot_read = emitted("s3_fadvise_calls");
+            let slot_bytes = emitted("s2_slot_bytes_written");
 
-    assert!(id_shards > 0, "no id shard evicted");
-    assert_eq!(
-        emitted("s2_fadvise_bytes"),
-        emitted("s1a_id_shard_bytes_written"),
-        "every id-shard byte written is evicted after it is read back"
+            assert!(id_shards > 0, "no id shard evicted");
+            assert_eq!(
+                emitted("s2_fadvise_bytes"),
+                emitted("s1a_id_shard_bytes_written"),
+                "every id-shard byte written is evicted after it is read back"
+            );
+            assert!(emitted("s2_fadvise_bytes") > 0);
+            assert_eq!(slot_written, emitted("extjoin_slot_bucket_count"));
+            assert!(slot_bytes > 0, "the fixture resolves no location");
+            assert_eq!(emitted("s2_slot_fadvise_bytes"), slot_bytes);
+            assert_eq!(slot_read, emitted("extjoin_slot_buckets_nonempty"));
+            assert!(slot_read > 0);
+            assert_eq!(emitted("s3_fadvise_bytes"), slot_bytes);
+            assert_eq!(
+                counter(&host.invocation, "fadvise_scratch_evictions"),
+                id_shards + slot_written + slot_read,
+                "an eviction no stage counter accounts for"
+            );
+            assert_eq!(counter(&host.invocation, "fadvise_input_evictions"), 0);
+        },
     );
-    assert!(emitted("s2_fadvise_bytes") > 0);
-    assert_eq!(slot_written, emitted("extjoin_slot_bucket_count"));
-    assert!(slot_bytes > 0, "the fixture resolves no location");
-    assert_eq!(emitted("s2_slot_fadvise_bytes"), slot_bytes);
-    assert_eq!(slot_read, emitted("extjoin_slot_buckets_nonempty"));
-    assert!(slot_read > 0);
-    assert_eq!(emitted("s3_fadvise_bytes"), slot_bytes);
-    assert_eq!(
-        counter(&host.invocation, "fadvise_scratch_evictions"),
-        id_shards + slot_written + slot_read,
-        "an eviction no stage counter accounts for"
-    );
-    assert_eq!(counter(&host.invocation, "fadvise_input_evictions"), 0);
 }
 
 /// Each run's counters are its own invocation's: two runs at once, on inputs
@@ -1182,36 +1180,37 @@ fn external_join(
 #[cfg(pbfhogg_test_hooks)]
 #[test]
 fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
-    let Some(ticket) = crate::common::heavy_ticket(
+    crate::common::with_heavy_ticket(
         1,
         "external_join_stage4_backend_refusal_stays_typed_across_the_join",
-    ) else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let base = input(dir.path());
-    let host = crate::common::heavy_host(&ticket);
-    let faults = host.invocation.faults();
-    faults.refuse_output_backend.store(true, Relaxed);
-    let output = dir.path().join("refused.pbf");
-    let Err(err) = external_join(&base, &output, &host, crate::common::scratch_in(dir.path()))
-    else {
-        panic!("an injected backend refusal must fail the run");
-    };
-    match err.kind() {
-        pbfhogg::ErrorKind::PlatformUnsupported { source, .. } => assert_eq!(
-            source.to_string(),
-            pbfhogg::test_hooks::INJECTED_BACKEND_REFUSAL,
-            "a different platform refusal arrived: {err}"
-        ),
-        other => panic!("the stage 4 refusal lost its type at the join: {other:?} ({err})"),
-    }
-    assert_eq!(
-        faults.output_backend_refusals.load(Relaxed),
-        1,
-        "the refusal must come from stage 4's single writer construction"
+        |ticket| {
+            let dir = crate::common::test_scratch();
+            let base = input(dir.path());
+            let host = crate::common::heavy_host(ticket);
+            let faults = host.invocation.faults();
+            faults.refuse_output_backend.store(true, Relaxed);
+            let output = dir.path().join("refused.pbf");
+            let Err(err) =
+                external_join(&base, &output, &host, crate::common::scratch_in(dir.path()))
+            else {
+                panic!("an injected backend refusal must fail the run");
+            };
+            match err.kind() {
+                pbfhogg::ErrorKind::PlatformUnsupported { source, .. } => assert_eq!(
+                    source.to_string(),
+                    pbfhogg::test_hooks::INJECTED_BACKEND_REFUSAL,
+                    "a different platform refusal arrived: {err}"
+                ),
+                other => panic!("the stage 4 refusal lost its type at the join: {other:?} ({err})"),
+            }
+            assert_eq!(
+                faults.output_backend_refusals.load(Relaxed),
+                1,
+                "the refusal must come from stage 4's single writer construction"
+            );
+            assert!(!output.exists(), "a refused run published an output");
+        },
     );
-    assert!(!output.exists(), "a refused run published an output");
 }
 
 /// The same stage 4 contract on the real O_DIRECT refusal path.
@@ -1228,116 +1227,122 @@ fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn external_backend_output_refusal_stays_typed_across_stage_join() {
-    let Some(ticket) = crate::common::heavy_ticket(
+    crate::common::with_heavy_ticket(
         1,
         "external_backend_output_refusal_stays_typed_across_stage_join",
-    ) else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
+        |ticket| {
+            let dir = crate::common::test_scratch();
+            let input = dir.path().join("input.osm.pbf");
+            let output = dir.path().join("output.osm.pbf");
 
-    let nodes = crate::common::generate_nodes(6, 1);
-    let mut ways = crate::common::generate_ways(1, 1_000, 3, 1);
-    ways[0].refs = vec![1, 2, 3];
-    crate::common::write_multi_block_test_pbf(&input, &nodes, &ways, &[], 3);
+            let nodes = crate::common::generate_nodes(6, 1);
+            let mut ways = crate::common::generate_ways(1, 1_000, 3, 1);
+            ways[0].refs = vec![1, 2, 3];
+            crate::common::write_multi_block_test_pbf(&input, &nodes, &ways, &[], 3);
 
-    let result = pbfhogg::altw::add_locations_to_ways(
-        &input,
-        crate::common::out(&output),
-        &pbfhogg::altw::AltwOptions {
-            keep_untagged_nodes: true,
-            write: pbfhogg::write::WriteOptions {
-                backend: pbfhogg::write::OutputBackend::Direct,
-                direct_reads: false,
-                ..pbfhogg::write::WriteOptions::default()
-            },
-            index_type: pbfhogg::altw::IndexType::External,
-            inject_prepass: false,
-            ignore_missing_nodes: false,
+            let result = pbfhogg::altw::add_locations_to_ways(
+                &input,
+                crate::common::out(&output),
+                &pbfhogg::altw::AltwOptions {
+                    keep_untagged_nodes: true,
+                    write: pbfhogg::write::WriteOptions {
+                        backend: pbfhogg::write::OutputBackend::Direct,
+                        direct_reads: false,
+                        ..pbfhogg::write::WriteOptions::default()
+                    },
+                    index_type: pbfhogg::altw::IndexType::External,
+                    inject_prepass: false,
+                    ignore_missing_nodes: false,
+                },
+                &pbfhogg::HeaderOverrides::default(),
+                &crate::common::heavy_host(ticket),
+                crate::common::scratch_in(dir.path()),
+            );
+            match result {
+                Ok(_) => crate::common::skip("O_DIRECT output accepted on this filesystem"),
+                Err(error) => assert!(
+                    matches!(
+                        error.kind(),
+                        pbfhogg::ErrorKind::PlatformUnsupported {
+                            feature: "direct-io",
+                            ..
+                        }
+                    ),
+                    "an output-side O_DIRECT refusal must stay typed; got: {}",
+                    error.report(),
+                ),
+            }
         },
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::heavy_host(&ticket),
-        crate::common::scratch_in(dir.path()),
     );
-    match result {
-        Ok(_) => crate::common::skip("O_DIRECT output accepted on this filesystem"),
-        Err(error) => assert!(
-            matches!(
-                error.kind(),
-                pbfhogg::ErrorKind::PlatformUnsupported {
-                    feature: "direct-io",
-                    ..
-                }
-            ),
-            "an output-side O_DIRECT refusal must stay typed; got: {}",
-            error.report(),
-        ),
-    }
 }
 
 #[test]
 fn concurrent_external_joins_use_distinct_scratch() {
     // Two joins run at once.
-    let Some(ticket) =
-        crate::common::heavy_ticket(2, "concurrent_external_joins_use_distinct_scratch")
-    else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let base = input(dir.path());
-    let host = crate::common::heavy_host(&ticket);
-    let reference = dir.path().join("reference.pbf");
-    run_external_join(
-        &base,
-        &reference,
-        &host,
-        crate::common::scratch_in(dir.path()),
-    )
-    .expect("sequential external join");
-    // Both outputs share one parent, so both runs place their scratch
-    // directory beside each other under the same pid.
-    let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
-    struct Overlap(std::sync::Barrier, Arc<crate::common::FdTicket>);
-    impl ProcessActions for Overlap {
-        // Both requests meet at the barrier before either is granted, so
-        // the runs overlap; each grant is the ticket's fixed grant, never a
-        // live probe that the other run's descriptors would move.
-        fn fd_allowance(&self, wanted: u64) -> FdReservation {
-            self.0.wait();
-            self.1.fd_allowance(wanted)
-        }
-    }
-    let mut host = host;
-    host.process = Arc::new(Overlap(std::sync::Barrier::new(2), Arc::clone(&ticket)));
-    // The barrier cannot be released if one run fails before reaching it.
-    // Armed after admission and the sequential run, which are not the
-    // scenario's hang.
-    let _hang = hang_bound("the concurrent external joins did not end");
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = outputs
-            .iter()
-            .map(|output| {
-                scope.spawn(|| {
-                    run_external_join(&base, output, &host, crate::common::scratch_in(dir.path()))
-                })
-            })
-            .collect();
-        for handle in handles {
-            handle
-                .join()
-                .expect("external join thread")
-                .expect("concurrent external join");
-        }
-    });
-    let expected = crate::common::read_all_elements_with_coords(&reference);
-    for output in &outputs {
-        let got = crate::common::read_all_elements_with_coords(output);
-        assert_eq!(got.nodes, expected.nodes, "{}", output.display());
-        assert_eq!(got.ways, expected.ways, "{}", output.display());
-        assert_eq!(got.relations, expected.relations, "{}", output.display());
-    }
+    crate::common::with_heavy_ticket(
+        2,
+        "concurrent_external_joins_use_distinct_scratch",
+        |ticket| {
+            let dir = crate::common::test_scratch();
+            let base = input(dir.path());
+            let host = crate::common::heavy_host(ticket);
+            let reference = dir.path().join("reference.pbf");
+            run_external_join(
+                &base,
+                &reference,
+                &host,
+                crate::common::scratch_in(dir.path()),
+            )
+            .expect("sequential external join");
+            // Both outputs share one parent, so both runs place their scratch
+            // directory beside each other under the same pid.
+            let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
+            struct Overlap(std::sync::Barrier, Arc<crate::common::FdTicket>);
+            impl ProcessActions for Overlap {
+                // Both requests meet at the barrier before either is granted, so
+                // the runs overlap; each grant is the ticket's fixed grant, never a
+                // live probe that the other run's descriptors would move.
+                fn fd_allowance(&self, wanted: u64) -> FdReservation {
+                    self.0.wait();
+                    self.1.fd_allowance(wanted)
+                }
+            }
+            let mut host = host;
+            host.process = Arc::new(Overlap(std::sync::Barrier::new(2), Arc::clone(ticket)));
+            // The barrier cannot be released if one run fails before reaching it.
+            // Armed after admission and the sequential run, which are not the
+            // scenario's hang.
+            let _hang = hang_bound("the concurrent external joins did not end");
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = outputs
+                    .iter()
+                    .map(|output| {
+                        scope.spawn(|| {
+                            run_external_join(
+                                &base,
+                                output,
+                                &host,
+                                crate::common::scratch_in(dir.path()),
+                            )
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("external join thread")
+                        .expect("concurrent external join");
+                }
+            });
+            let expected = crate::common::read_all_elements_with_coords(&reference);
+            for output in &outputs {
+                let got = crate::common::read_all_elements_with_coords(output);
+                assert_eq!(got.nodes, expected.nodes, "{}", output.display());
+                assert_eq!(got.ways, expected.ways, "{}", output.display());
+                assert_eq!(got.relations, expected.relations, "{}", output.display());
+            }
+        },
+    );
 }
 #[test]
 fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
@@ -1360,58 +1365,57 @@ fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
 #[test]
 fn fixed_memory_routes_auto() {
     // One of the routes runs an external join.
-    let Some(ticket) = crate::common::heavy_ticket(1, "fixed_memory_routes_auto") else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let base = input(dir.path());
-    let allowance: u64 = 3 << 30;
-    for (memory, backend, prefix) in [
-        (Some(8 << 30), "sparse", "(store estimate"),
-        (Some(allowance + 1), "external", "(store estimate"),
-        (Some(allowance), "sparse", "(sorted=true, indexed=true;"),
-        (Some(0), "sparse", "(sorted=true, indexed=true;"),
-        (
-            None,
-            "sparse",
-            "(sorted=true, indexed=true; available memory unknown",
-        ),
-    ] {
-        let sink = Arc::new(Recording::default());
-        let mut host = crate::common::heavy_host(&ticket);
-        host.diagnostics = pbfhogg::host::Diagnostics::new(
-            Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
-        );
-        host.resources = Arc::new(pbfhogg::host::Fixed {
-            parallelism: std::num::NonZeroUsize::new(4),
-            memory_available: memory,
-        });
-        let opts = pbfhogg::altw::AltwOptions {
-            keep_untagged_nodes: true,
-            write: Default::default(),
-            index_type: pbfhogg::altw::IndexType::Auto,
-            inject_prepass: false,
-            ignore_missing_nodes: false,
-        };
-        pbfhogg::altw::add_locations_to_ways(
-            &base,
-            crate::common::out(dir.path().join(format!("auto-{memory:?}.pbf"))),
-            &opts,
-            &Default::default(),
-            &host,
-            crate::common::scratch_in(dir.path()),
-        )
-        .expect("auto");
-        let prefix = format!("auto-selected index type {backend} {prefix}");
-        assert!(
-            sink.0
-                .lock()
-                .expect("sink")
-                .iter()
-                .any(|(key, text)| key == "altw.auto_select" && text.starts_with(&prefix)),
-            "{memory:?} bytes must route {backend}"
-        );
-    }
+    crate::common::with_heavy_ticket(1, "fixed_memory_routes_auto", |ticket| {
+        let dir = crate::common::test_scratch();
+        let base = input(dir.path());
+        let allowance: u64 = 3 << 30;
+        for (memory, backend, prefix) in [
+            (Some(8 << 30), "sparse", "(store estimate"),
+            (Some(allowance + 1), "external", "(store estimate"),
+            (Some(allowance), "sparse", "(sorted=true, indexed=true;"),
+            (Some(0), "sparse", "(sorted=true, indexed=true;"),
+            (
+                None,
+                "sparse",
+                "(sorted=true, indexed=true; available memory unknown",
+            ),
+        ] {
+            let sink = Arc::new(Recording::default());
+            let mut host = crate::common::heavy_host(ticket);
+            host.diagnostics = pbfhogg::host::Diagnostics::new(
+                Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
+            );
+            host.resources = Arc::new(pbfhogg::host::Fixed {
+                parallelism: std::num::NonZeroUsize::new(4),
+                memory_available: memory,
+            });
+            let opts = pbfhogg::altw::AltwOptions {
+                keep_untagged_nodes: true,
+                write: Default::default(),
+                index_type: pbfhogg::altw::IndexType::Auto,
+                inject_prepass: false,
+                ignore_missing_nodes: false,
+            };
+            pbfhogg::altw::add_locations_to_ways(
+                &base,
+                crate::common::out(dir.path().join(format!("auto-{memory:?}.pbf"))),
+                &opts,
+                &Default::default(),
+                &host,
+                crate::common::scratch_in(dir.path()),
+            )
+            .expect("auto");
+            let prefix = format!("auto-selected index type {backend} {prefix}");
+            assert!(
+                sink.0
+                    .lock()
+                    .expect("sink")
+                    .iter()
+                    .any(|(key, text)| key == "altw.auto_select" && text.starts_with(&prefix)),
+                "{memory:?} bytes must route {backend}"
+            );
+        }
+    });
 }
 
 /// A sorted, indexed file `name` in `dir`: untagged nodes `nodes`, one way
@@ -1455,87 +1459,86 @@ fn one_way_file(
 /// explicit `--index-type external` runs.
 #[test]
 fn auto_rechecks_the_exact_store_and_never_routes_to_a_refusal() {
-    let Some(ticket) = crate::common::heavy_ticket(1, "auto_rechecks_the_exact_store") else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let file =
-        |name: &str, nodes: &[i64], refs: &[i64]| one_way_file(dir.path(), name, nodes, refs);
-    let dangling = file("dangling.osm.pbf", &[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6]);
-    let negative = file("negative.osm.pbf", &[0, -1, 1, 2], &[-1, 0, 1, 2]);
-    let wide = file("wide.osm.pbf", &[1, 2, 3, 1 << 39], &[1, 2, 3, 1 << 39]);
-    let memory = (3_u64 << 30) + 40;
-    for (input, notes, missing) in [
-        (
-            &dangling,
-            &[
-                (
+    crate::common::with_heavy_ticket(1, "auto_rechecks_the_exact_store", |ticket| {
+        let dir = crate::common::test_scratch();
+        let file =
+            |name: &str, nodes: &[i64], refs: &[i64]| one_way_file(dir.path(), name, nodes, refs);
+        let dangling = file("dangling.osm.pbf", &[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6]);
+        let negative = file("negative.osm.pbf", &[0, -1, 1, 2], &[-1, 0, 1, 2]);
+        let wide = file("wide.osm.pbf", &[1, 2, 3, 1 << 39], &[1, 2, 3, 1 << 39]);
+        let memory = (3_u64 << 30) + 40;
+        for (input, notes, missing) in [
+            (
+                &dangling,
+                &[
+                    (
+                        "altw.auto_select",
+                        "auto-selected index type sparse (store estimate",
+                    ),
+                    ("altw.auto_recheck", "auto re-routed to index type external"),
+                ][..],
+                2,
+            ),
+            (
+                &negative,
+                &[
+                    (
+                        "altw.auto_select",
+                        "auto-selected index type sparse (store estimate",
+                    ),
+                    ("altw.auto_recheck", "auto re-routed to index type external"),
+                ][..],
+                0,
+            ),
+            (
+                &wide,
+                &[(
                     "altw.auto_select",
-                    "auto-selected index type sparse (store estimate",
-                ),
-                ("altw.auto_recheck", "auto re-routed to index type external"),
-            ][..],
-            2,
-        ),
-        (
-            &negative,
-            &[
-                (
-                    "altw.auto_select",
-                    "auto-selected index type sparse (store estimate",
-                ),
-                ("altw.auto_recheck", "auto re-routed to index type external"),
-            ][..],
-            0,
-        ),
-        (
-            &wide,
-            &[(
-                "altw.auto_select",
-                "auto-selected index type sparse (sorted=true, indexed=true; auto does not \
+                    "auto-selected index type sparse (sorted=true, indexed=true; auto does not \
                  route this input to the external index: its node keys reach",
-            )][..],
-            0,
-        ),
-    ] {
-        let sink = Arc::new(Recording::default());
-        let mut host = crate::common::heavy_host(&ticket);
-        host.diagnostics = pbfhogg::host::Diagnostics::new(
-            Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
-        );
-        host.resources = Arc::new(pbfhogg::host::Fixed {
-            parallelism: std::num::NonZeroUsize::new(4),
-            memory_available: Some(memory),
-        });
-        let opts = pbfhogg::altw::AltwOptions {
-            keep_untagged_nodes: true,
-            write: Default::default(),
-            index_type: pbfhogg::altw::IndexType::Auto,
-            inject_prepass: false,
-            ignore_missing_nodes: true,
-        };
-        let stats = pbfhogg::altw::add_locations_to_ways(
-            input,
-            crate::common::out(input.with_extension("out.pbf")),
-            &opts,
-            &Default::default(),
-            &host,
-            crate::common::scratch_in(dir.path()),
-        )
-        .expect("auto");
-        assert_eq!(stats.missing_locations, missing, "{}", input.display());
-        let seen = sink.0.lock().expect("sink").clone();
-        for (key, prefix) in notes {
-            assert!(
-                seen.iter()
-                    .any(|(k, text)| k == key && text.starts_with(prefix)),
-                "{}: no {key} note starting {prefix:?} in {seen:?}",
-                input.display()
+                )][..],
+                0,
+            ),
+        ] {
+            let sink = Arc::new(Recording::default());
+            let mut host = crate::common::heavy_host(ticket);
+            host.diagnostics = pbfhogg::host::Diagnostics::new(
+                Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
             );
+            host.resources = Arc::new(pbfhogg::host::Fixed {
+                parallelism: std::num::NonZeroUsize::new(4),
+                memory_available: Some(memory),
+            });
+            let opts = pbfhogg::altw::AltwOptions {
+                keep_untagged_nodes: true,
+                write: Default::default(),
+                index_type: pbfhogg::altw::IndexType::Auto,
+                inject_prepass: false,
+                ignore_missing_nodes: true,
+            };
+            let stats = pbfhogg::altw::add_locations_to_ways(
+                input,
+                crate::common::out(input.with_extension("out.pbf")),
+                &opts,
+                &Default::default(),
+                &host,
+                crate::common::scratch_in(dir.path()),
+            )
+            .expect("auto");
+            assert_eq!(stats.missing_locations, missing, "{}", input.display());
+            let seen = sink.0.lock().expect("sink").clone();
+            for (key, prefix) in notes {
+                assert!(
+                    seen.iter()
+                        .any(|(k, text)| k == key && text.starts_with(prefix)),
+                    "{}: no {key} note starting {prefix:?} in {seen:?}",
+                    input.display()
+                );
+            }
+            let rechecked = seen.iter().any(|(k, _)| k == "altw.auto_recheck");
+            assert_eq!(rechecked, notes.len() == 2, "{seen:?}");
         }
-        let rechecked = seen.iter().any(|(k, _)| k == "altw.auto_recheck");
-        assert_eq!(rechecked, notes.len() == 2, "{seen:?}");
-    }
+    });
 }
 
 /// Every scratch-producing backend works in the run directory it is handed

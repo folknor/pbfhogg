@@ -33,11 +33,14 @@
 //! admission observes them: the count is process-wide, includes every
 //! concurrent test and is taken after the run's peak, and light use grows
 //! with the runner's thread count, so a check would fail on large hosts
-//! against whichever test happened to be admitted. A test
-//! holding a ticket must not ask for another: that waits on itself until
-//! the admission bound and skips. A scenario that cannot be admitted (its
-//! units exceed what the limit leaves, or the admission bound expires
-//! behind its siblings) skips as environmental before it opens anything.
+//! against whichever test happened to be admitted. A scenario runs inside
+//! [`with_heavy_ticket`], which owns the ticket's lifetime: asking for a
+//! second ticket while one runs on the thread panics, and so does any part
+//! of the ticket outliving the scenario, so neither defect can wait out the
+//! admission bound and pass as a skip. A scenario that cannot be admitted
+//! (its units exceed what the limit leaves, or the admission bound expires
+//! behind its siblings' running scenarios) skips as environmental before it
+//! opens anything.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,10 +219,66 @@ impl Drop for Admission {
     }
 }
 
+thread_local! {
+    /// The heavy scenario running on this thread, if any.
+    static RUNNING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Clears this thread's running scenario, on return and on unwind alike.
+struct Running;
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.with(|running| running.borrow_mut().take());
+    }
+}
+
+/// Run a scenario of up to `runs` descriptor-heavy runs at once under one
+/// admitted ticket. `None` means the scenario was skipped as environmental
+/// and reported, and `run` never ran: its units exceed what the limit
+/// leaves, or it was not admitted within the bound behind siblings holding
+/// the gate (on an ordinary host the gate never fills, so that skip is
+/// reached only where the limit admits few heavy scenarios at once).
+///
+/// Ownership defects fail rather than wait and skip, on every host: a
+/// scenario asking for a ticket while one runs on its thread panics before
+/// it queues, and once `run` returns the scenario must hold nothing of its
+/// ticket (no host, provider, pool or grant built from it, in its result
+/// or anywhere else), or the call panics naming the scenario. The
+/// descriptors themselves return to the gate when the last real holder
+/// drops.
+pub(crate) fn with_heavy_ticket<R>(
+    runs: u64,
+    test: &str,
+    run: impl FnOnce(&Arc<FdTicket>) -> R,
+) -> Option<R> {
+    if let Some(outer) = RUNNING.with(|running| running.borrow().clone()) {
+        panic!(
+            "{test}: asked for a descriptor ticket while {outer} holds one on this thread; \
+             a scenario takes one ticket with a unit per simultaneous heavy run"
+        );
+    }
+    let ticket = admit(runs, test)?;
+    RUNNING.with(|running| *running.borrow_mut() = Some(test.to_owned()));
+    let running = Running;
+    let admission = Arc::downgrade(&ticket.admission);
+    let result = run(&ticket);
+    drop(ticket);
+    drop(running);
+    // Counted without upgrading: a temporary owner taken here could become
+    // the last one and release into the gate's lock from inside this check.
+    let owners = admission.strong_count();
+    assert!(
+        owners == 0,
+        "{test}: {owners} owner(s) of its descriptor ticket outlived the scenario; \
+         every host, provider and grant built from a ticket ends with its scenario"
+    );
+    Some(result)
+}
+
 /// Admit a scenario running up to `runs` descriptor-heavy runs at once.
-/// `None` means the scenario was skipped as environmental and reported;
-/// the caller returns before building anything.
-pub(crate) fn heavy_ticket(runs: u64, test: &str) -> Option<Arc<FdTicket>> {
+/// `None` means the scenario was skipped as environmental and reported.
+fn admit(runs: u64, test: &str) -> Option<Arc<FdTicket>> {
     let want = runs.saturating_mul(pbfhogg::TEST_HEAVY_RUN_FDS);
     let gate = gate();
     if want > gate.capacity {
@@ -236,7 +295,10 @@ pub(crate) fn heavy_ticket(runs: u64, test: &str) -> Option<Arc<FdTicket>> {
     state.next += 1;
     state.queue.push_back(id);
     // loop-ends: parks on the gate's condvar; admission and every ticket
-    // drop notify, and the deadline is an environmental skip
+    // drop notify, and the deadline is an environmental skip: a nested
+    // request on the thread was refused before queueing, and a ticket
+    // outliving its scenario fails that scenario's test, so a skip here is
+    // never the only report of an ownership defect
     loop {
         if state.queue.front() == Some(&id) && state.free >= want {
             state.queue.pop_front();

@@ -450,86 +450,87 @@ impl pbfhogg::debug::InstrumentSink for MarkerLog {
 /// and the refusal says so.
 #[test]
 fn altw_refusal_counts_each_unresolved_reference() {
-    let Some(ticket) =
-        crate::common::heavy_ticket(1, "altw_refusal_counts_each_unresolved_reference")
-    else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("in.osm.pbf");
-    let output = dir.path().join("out.osm.pbf");
-    let nodes = vec![TestNode {
-        id: 1,
-        lat: 550_000_000,
-        lon: 120_000_000,
-        tags: vec![("name", "present")],
-        meta: None,
-    }];
-    let ways = vec![
-        TestWay {
-            id: 10,
-            refs: vec![1, 999, 999],
-            tags: vec![("highway", "primary")],
-            meta: None,
-        },
-        TestWay {
-            id: 11,
-            refs: vec![999, 1],
-            tags: vec![("highway", "primary")],
-            meta: None,
-        },
-    ];
-    write_test_pbf_sorted(&input, &nodes, &ways, &[]);
-    for index_type in [
-        pbfhogg::altw::IndexType::Sparse,
-        pbfhogg::altw::IndexType::External,
-    ] {
-        let mut opts = altw_options();
-        opts.index_type = index_type;
-        // External takes indexed input only and refuses `force`.
-        opts.write.force = matches!(index_type, pbfhogg::altw::IndexType::Sparse);
-        let markers = std::sync::Arc::new(MarkerLog::default());
-        let mut host = crate::common::heavy_host(&ticket);
-        host.invocation =
-            pbfhogg::host::Invocation::with_sink(std::sync::Arc::clone(&markers)
-                as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>);
-        let Err(err) = pbfhogg::altw::add_locations_to_ways(
-            &input,
-            crate::common::out(&output),
-            &opts,
-            &pbfhogg::HeaderOverrides::default(),
-            &host,
-            crate::common::scratch_in(dir.path()),
-        ) else {
-            panic!("{index_type:?}: an unresolvable way ref must fail the default policy");
-        };
-        if index_type == pbfhogg::altw::IndexType::External {
-            // The external join's count is final when stage 2 returns, and it
-            // refuses there: stages 3 and 4 never start.
-            let seen = markers.0.lock().expect("markers").clone();
-            assert!(
-                seen.iter().any(|m| m == "EXTJOIN_STAGE2_END")
-                    && !seen.iter().any(|m| m == "EXTJOIN_STREAMING_START"),
-                "external must refuse right after stage 2: {seen:?}"
-            );
-        }
-        assert!(
-            matches!(
-                err.kind(),
-                pbfhogg::ErrorKind::MissingNodeLocations {
-                    count: 3,
-                    counted: pbfhogg::Unresolved::WayNodeReferences,
+    crate::common::with_heavy_ticket(
+        1,
+        "altw_refusal_counts_each_unresolved_reference",
+        |ticket| {
+            let dir = crate::common::test_scratch();
+            let input = dir.path().join("in.osm.pbf");
+            let output = dir.path().join("out.osm.pbf");
+            let nodes = vec![TestNode {
+                id: 1,
+                lat: 550_000_000,
+                lon: 120_000_000,
+                tags: vec![("name", "present")],
+                meta: None,
+            }];
+            let ways = vec![
+                TestWay {
+                    id: 10,
+                    refs: vec![1, 999, 999],
+                    tags: vec![("highway", "primary")],
+                    meta: None,
+                },
+                TestWay {
+                    id: 11,
+                    refs: vec![999, 1],
+                    tags: vec![("highway", "primary")],
+                    meta: None,
+                },
+            ];
+            write_test_pbf_sorted(&input, &nodes, &ways, &[]);
+            for index_type in [
+                pbfhogg::altw::IndexType::Sparse,
+                pbfhogg::altw::IndexType::External,
+            ] {
+                let mut opts = altw_options();
+                opts.index_type = index_type;
+                // External takes indexed input only and refuses `force`.
+                opts.write.force = matches!(index_type, pbfhogg::altw::IndexType::Sparse);
+                let markers = std::sync::Arc::new(MarkerLog::default());
+                let mut host = crate::common::heavy_host(ticket);
+                host.invocation =
+                    pbfhogg::host::Invocation::with_sink(std::sync::Arc::clone(&markers)
+                        as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>);
+                let Err(err) = pbfhogg::altw::add_locations_to_ways(
+                    &input,
+                    crate::common::out(&output),
+                    &opts,
+                    &pbfhogg::HeaderOverrides::default(),
+                    &host,
+                    crate::common::scratch_in(dir.path()),
+                ) else {
+                    panic!("{index_type:?}: an unresolvable way ref must fail the default policy");
+                };
+                if index_type == pbfhogg::altw::IndexType::External {
+                    // The external join's count is final when stage 2 returns, and it
+                    // refuses there: stages 3 and 4 never start.
+                    let seen = markers.0.lock().expect("markers").clone();
+                    assert!(
+                        seen.iter().any(|m| m == "EXTJOIN_STAGE2_END")
+                            && !seen.iter().any(|m| m == "EXTJOIN_STREAMING_START"),
+                        "external must refuse right after stage 2: {seen:?}"
+                    );
                 }
-            ),
-            "{index_type:?}: expected three unresolved references, got: {err:?}"
-        );
-        assert!(
-            err.to_string()
-                .contains("3 way node references (each use of a node in each way counted)"),
-            "{index_type:?}: the message must say what it counts: {err}"
-        );
-        assert!(!output.exists(), "{index_type:?}: nothing may be published");
-    }
+                assert!(
+                    matches!(
+                        err.kind(),
+                        pbfhogg::ErrorKind::MissingNodeLocations {
+                            count: 3,
+                            counted: pbfhogg::Unresolved::WayNodeReferences,
+                        }
+                    ),
+                    "{index_type:?}: expected three unresolved references, got: {err:?}"
+                );
+                assert!(
+                    err.to_string()
+                        .contains("3 way node references (each use of a node in each way counted)"),
+                    "{index_type:?}: the message must say what it counts: {err}"
+                );
+                assert!(!output.exists(), "{index_type:?}: nothing may be published");
+            }
+        },
+    );
 }
 
 /// The overwrite half: a library caller pointing at an existing file must

@@ -201,65 +201,65 @@ fn dedupe_holds_its_grant_through_pass_two() {
 #[test]
 fn external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two() {
     // The pool's provider holds a ticket unit per grant.
-    let Some(ticket) = crate::common::heavy_ticket(
+    crate::common::with_heavy_ticket(
         1,
         "external_stage_one_is_capped_by_the_pool_and_releases_before_stage_two",
-    ) else {
-        return;
-    };
-    let dir = crate::common::test_scratch();
-    let [input, _] = inputs(dir.path());
-    let output = dir.path().join("out.osm.pbf");
-    // Headroom 64 plus one worker's 256 shards, short of a second worker.
-    let budget = 64 + 256 + 100;
-    let shared = Arc::new(pool(budget, Some(&ticket)));
-    let (host, watch) = watched(&shared, &["EXTJOIN_STAGE1_END", "EXTJOIN_STAGE2_START"]);
-    external_join(
-        &input,
-        &output,
-        &host,
-        crate::common::scratch_in(dir.path()),
-    )
-    .expect("external join with one worker");
-    let seen = watch.seen.lock().expect("seen").clone();
-    assert_eq!(
-        seen,
-        [
-            ("EXTJOIN_STAGE1_END".to_owned(), budget),
-            ("EXTJOIN_STAGE2_START".to_owned(), budget),
-        ],
-        "released when stage 1 returns"
-    );
-    let counters = watch.counters.lock().expect("counters").clone();
-    let counter = |name: &str| {
-        counters
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|&(_, v)| v)
-            .unwrap_or_else(|| panic!("{name} missing: {counters:?}"))
-    };
-    assert_eq!(
-        counter("extjoin_cpu_cap_workers"),
-        2,
-        "the test host's cores"
-    );
-    assert_eq!(
-        counter("extjoin_fd_available"),
-        i64::try_from(budget).expect("small")
-    );
-    assert_eq!(counter("extjoin_fd_cap_workers"), 1, "capped by the pool");
+        |ticket| {
+            let dir = crate::common::test_scratch();
+            let [input, _] = inputs(dir.path());
+            let output = dir.path().join("out.osm.pbf");
+            // Headroom 64 plus one worker's 256 shards, short of a second worker.
+            let budget = 64 + 256 + 100;
+            let shared = Arc::new(pool(budget, Some(ticket)));
+            let (host, watch) = watched(&shared, &["EXTJOIN_STAGE1_END", "EXTJOIN_STAGE2_START"]);
+            external_join(
+                &input,
+                &output,
+                &host,
+                crate::common::scratch_in(dir.path()),
+            )
+            .expect("external join with one worker");
+            let seen = watch.seen.lock().expect("seen").clone();
+            assert_eq!(
+                seen,
+                [
+                    ("EXTJOIN_STAGE1_END".to_owned(), budget),
+                    ("EXTJOIN_STAGE2_START".to_owned(), budget),
+                ],
+                "released when stage 1 returns"
+            );
+            let counters = watch.counters.lock().expect("counters").clone();
+            let counter = |name: &str| {
+                counters
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|&(_, v)| v)
+                    .unwrap_or_else(|| panic!("{name} missing: {counters:?}"))
+            };
+            assert_eq!(
+                counter("extjoin_cpu_cap_workers"),
+                2,
+                "the test host's cores"
+            );
+            assert_eq!(
+                counter("extjoin_fd_available"),
+                i64::try_from(budget).expect("small")
+            );
+            assert_eq!(counter("extjoin_fd_cap_workers"), 1, "capped by the pool");
 
-    let small = Arc::new(pool(64 + 256 - 1, Some(&ticket)));
-    let (host, _) = watched(&small, &[]);
-    let refused = dir.path().join("refused.osm.pbf");
-    let err = external_join(
-        &input,
-        &refused,
-        &host,
-        crate::common::scratch_in(dir.path()),
-    )
-    .err()
-    .expect("below one worker refuses");
-    assert!(err.to_string().contains("host granted"), "{err}");
-    assert_eq!(small.available(), 64 + 256 - 1);
+            let small = Arc::new(pool(64 + 256 - 1, Some(ticket)));
+            let (host, _) = watched(&small, &[]);
+            let refused = dir.path().join("refused.osm.pbf");
+            let err = external_join(
+                &input,
+                &refused,
+                &host,
+                crate::common::scratch_in(dir.path()),
+            )
+            .err()
+            .expect("below one worker refuses");
+            assert!(err.to_string().contains("host granted"), "{err}");
+            assert_eq!(small.available(), 64 + 256 - 1);
+        },
+    );
 }

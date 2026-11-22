@@ -242,7 +242,7 @@ pub use skip::{Backend, backend_unavailable, fail_if_required, skip};
 #[allow(dead_code)]
 pub(crate) mod fd_gate;
 #[allow(unused_imports)]
-pub(crate) use fd_gate::{FdTicket, heavy_host, heavy_ticket};
+pub(crate) use fd_gate::{FdTicket, heavy_host, with_heavy_ticket};
 
 // ---------------------------------------------------------------------------
 // Test element structs - lightweight descriptions of OSM elements for building

@@ -29,8 +29,12 @@
 //! each kind a requested object add-self adds that is no parent. Each one
 //! absent is named in the check's PASS line.
 //!
-//! What a pass establishes is selection: element content and tags compared
-//! by ID, not metadata, the header, or which blobs either tool skipped.
+//! For each request and mode, [`compare_outputs`] compares element content,
+//! tags and metadata by ID. On sorted input it checks strict output order
+//! and compares the sort features. On unsorted input it checks that pbfhogg
+//! omits `Sort.Type_then_ID` and compares through sorted copies. Each mode
+//! separately checks that pbfhogg omits `LocationsOnWays` and warns of its
+//! loss when the input declares it. Blob skipping is outside the comparison.
 
 use std::path::{Path, PathBuf};
 

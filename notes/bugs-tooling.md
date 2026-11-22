@@ -387,15 +387,6 @@ elements, so an unknown unclosed tag can escape the scan. osmium's reading
 gives a separate XML check in the listing path today. Keep that protection if
 the two-file join is removed.
 
-## TOOL-042 - getparents' module comment understates its claim
-
-Reported by: other-codex.
-
-The comment describes selection without metadata or header checks.
-`compare_outputs` compares metadata and checks sort features on the sorted
-path, and each mode judges `LocationsOnWays` separately. Fix the comment, and
-keep those checks when batching requests.
-
 ## TOOL-046 - A moved input turns a verifier error into ENVIRONMENT
 
 Reported by: the PERF-066 spar (codex), verified at the code.

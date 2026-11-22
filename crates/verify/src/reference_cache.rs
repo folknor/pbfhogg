@@ -350,6 +350,19 @@ pub(crate) struct Key {
     hex: String,
 }
 
+impl Key {
+    /// The key of another observation of the same decoding: this key's full
+    /// text with `kind` appended, so it names the same decode under the same
+    /// tool binding and never collides with the plain summary.
+    pub(crate) fn derived(&self, kind: &str) -> Self {
+        let text = format!("{}{kind}\n", self.text);
+        Self {
+            hex: format!("{:032x}", xxhash_rust::xxh3::xxh3_128(text.as_bytes())),
+            text,
+        }
+    }
+}
+
 /// The format of a stored decoding summary; bump it with any change to what
 /// a summary means: the OPL framing hashed, the key parse, the strict rank
 /// or the counting.
@@ -370,10 +383,10 @@ pub(crate) struct Summary {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct StoredSummary {
+struct StoredSummary<T> {
     format: u32,
     key: String,
-    summary: Summary,
+    summary: T,
 }
 /// Seal `staging` and make it the entry at `entry`, replacing any older one.
 fn publish(
@@ -698,12 +711,19 @@ impl ReferenceCache {
     /// text; a malformed or mismatched file is a miss and is removed. A hit
     /// refreshes the file's recency.
     pub(crate) fn summary(&self, key: &Key) -> Option<Summary> {
+        self.summary_of(key)
+    }
+
+    /// [`summary`](Self::summary) of any stored observation type (a plain
+    /// [`Summary`], or a check's own reading of a decoding under a
+    /// [`Key::derived`] key).
+    pub(crate) fn summary_of<T: serde::de::DeserializeOwned>(&self, key: &Key) -> Option<T> {
         if self.fresh {
             return None;
         }
         let path = self.summary_path(key);
         let text = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str::<StoredSummary>(&text) {
+        match serde_json::from_str::<StoredSummary<T>>(&text) {
             Ok(stored) if stored.format == SUMMARY_FORMAT && stored.key == key.text => {
                 if let Ok(file) = fs::File::options().append(true).open(&path) {
                     drop(file.set_modified(std::time::SystemTime::now()));
@@ -720,6 +740,12 @@ impl ReferenceCache {
     /// Store `summary` under `key`, replacing any older one. A failure is a
     /// note: a summary saves later work and is never evidence.
     pub(crate) fn publish_summary(&self, key: &Key, summary: &Summary) {
+        self.publish_summary_of(key, summary);
+    }
+
+    /// [`publish_summary`](Self::publish_summary) of any stored observation
+    /// type.
+    pub(crate) fn publish_summary_of<T: serde::Serialize>(&self, key: &Key, summary: &T) {
         if self.fresh {
             return;
         }
@@ -730,7 +756,7 @@ impl ReferenceCache {
             let text = serde_json::to_string(&StoredSummary {
                 format: SUMMARY_FORMAT,
                 key: key.text.clone(),
-                summary: summary.clone(),
+                summary,
             })
             .map_err(|e| Error::tool(e.to_string()))?;
             fs::write(&tmp, text)?;

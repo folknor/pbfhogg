@@ -67,6 +67,29 @@ uncommitted):
   in line with the 43-45 s recorded when its summaries landed.
 - Verdict: pays. A cold run still decodes and merges every case.
 
+### renumber: paired walk decided from canonical readings
+
+A = 8cf241db, B = 8cf241db plus the change that stores each output's
+canonical reading after a passing walk and decides a later run from two
+of them, on plantasjen, denmark, warm plain summaries, B measured
+uncommitted:
+
+- Where the time went before: with the attribution closure replaced by
+  a no-op, A's `opl merge` was 10.3 s against 8.7 s with it, so the
+  record-by-record proof costs nothing measurable; the merge is the pair
+  loop over two OPL decodings of about 59 million records each.
+- Cold readings (removed before each B cell), order B, A, A, B: check
+  wall 27.0 / 22.0 / 22.4 / 27.0 s; `opl merge` 18.5 / 13.6 / 13.8 /
+  18.4 s. Building both readings costs about 4.8 s, paid whenever a
+  reading is missing: an output's bytes changed, or the reading was
+  never stored or was evicted.
+- Warm readings: B 1.5 / 1.7 s, against A's 22.0-22.4 s: no decode, no
+  merge; `pbfhogg renumber` (1.2-1.3 s) is the check. pbfhogg's denmark
+  output is byte-stable across runs, so its keys repeat.
+- The stored readings counted 441 node, 32943 way and 706 relation
+  orphans, the walk's own figures.
+- Verdict: pays.
+
 ## History
 
 ### Launch groups (2026-11-21)

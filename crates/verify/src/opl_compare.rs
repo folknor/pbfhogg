@@ -773,7 +773,11 @@ pub(crate) fn compare_sequence_paired(
 }
 
 /// [`compare`], also handing every paired identity, alike or not, to
-/// `paired` in object order with both records.
+/// `paired` in object order with both records. Never decided from plain
+/// summaries: the caller's subject is the pairs. Also returns each side's
+/// decoding key, when its decode was sealed under one (never under
+/// `--fresh-reference`), so the caller may publish its own reading of the
+/// decodings it walked ([`Harness::publish_summary_of`]).
 pub(crate) fn compare_paired(
     harness: &mut Harness,
     first: &Path,
@@ -782,8 +786,37 @@ pub(crate) fn compare_paired(
     policy: Policy,
     each: impl FnMut(Group),
     paired: impl FnMut(Pair<'_>),
-) -> Result<Merged, Error> {
-    walk(harness, first, second, listing, policy, true, each, paired)
+) -> Result<(Merged, [Option<Key>; 2]), Error> {
+    let mut keys = [None, None];
+    let merged = walk_keyed(
+        harness,
+        first,
+        second,
+        listing,
+        policy,
+        true,
+        each,
+        paired,
+        Some(&mut keys),
+    )?;
+    Ok((merged, keys))
+}
+
+/// The persistent keys the decodings of `files` under `policy` would be
+/// sealed under, planned now under one tool-identity observation, each file
+/// watched first: what a check looks its own stored readings up under before
+/// deciding whether to decode at all. `None` under `--fresh-reference` or
+/// when the identity is unavailable.
+pub(crate) fn planned_keys(
+    harness: &mut Harness,
+    files: &[&Path],
+    policy: Policy,
+) -> Result<Option<Vec<Key>>, Error> {
+    for file in files {
+        harness.run.watch(file)?;
+    }
+    let runs: Vec<ToolRun> = files.iter().map(|f| key_run(f, policy)).collect();
+    harness.summary_keys(&runs, true)
 }
 
 /// One side's order as a judged walk read it: whether its objects strictly
@@ -884,6 +917,24 @@ fn walk(
     each: impl FnMut(Group),
     paired: impl FnMut(Pair<'_>),
 ) -> Result<Merged, Error> {
+    walk_keyed(
+        harness, first, second, listing, policy, strict, each, paired, None,
+    )
+}
+
+/// [`walk`], also filling `keys` with each decoding's sealed key.
+#[allow(clippy::too_many_arguments)]
+fn walk_keyed(
+    harness: &mut Harness,
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+    policy: Policy,
+    strict: bool,
+    each: impl FnMut(Group),
+    paired: impl FnMut(Pair<'_>),
+    keys: Option<&mut [Option<Key>; 2]>,
+) -> Result<Merged, Error> {
     let sides = [(first, policy), (second, policy)];
     // The listing holds every differing record from both sides, so a
     // completed merge keeps no decoding beside it, even when they differ.
@@ -891,6 +942,12 @@ fn walk(
         let (a, b) = (&held[0], &held[1]);
         let (merged, summaries) =
             harness.timed(MERGE_STEP, || merge(a, b, listing, strict, each, paired))?;
+        if let Some(keys) = keys {
+            *keys = [
+                harness.run.decodings.key_of(a),
+                harness.run.decodings.key_of(b),
+            ];
+        }
         for (path, summary) in [a, b].into_iter().zip(&summaries) {
             publish_summary(harness, path, summary)?;
         }

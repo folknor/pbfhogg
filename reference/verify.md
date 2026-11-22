@@ -464,9 +464,11 @@ is decided the same way, by the stream's counts and XXH3-128 against the
 output's stored summary, which must also be ordered, re-observing the key
 of the osmium decoding the stream is projected from: the stream strictly
 ascends by construction, so byte equality is the strict merge's pass. The
-stream's digest is never stored as a summary. Paired walks
-(renumber), the other sequence walks, the derive model and
-field-policies, whose subject is the merge itself, always merge.
+stream's digest is never stored as a summary. Renumber's paired walk is
+decided from a reading of its own, stored beside each output's plain
+summary under a key derived from it (the renumber paragraph below).
+The other sequence walks, the derive model and field-policies, whose
+subject is the merge itself, always merge.
 
 Summaries are neither read nor written under `--fresh-reference`; every
 fixture test runs in that mode, since its fake osmium answers by file name,
@@ -1017,6 +1019,23 @@ sides or lie outside its kind's live range on both, and those orphan
 names must correspond one to one per kind across the file. That proves the
 outputs the same reference graph up to orphan naming, the documented
 deviation; it does not check pbfhogg's orphan mapping against the input.
+
+A passing walk also stores, for each output's decoding sealed under a
+key (never under `--fresh-reference`) whose reading is eligible, a
+canonical reading: per kind its count and first and last ID, the number of distinct
+orphans per referenced kind, and the XXH3-128 of the stream with every
+list reference rewritten as its live ID or, outside the kind's own
+consecutive range, the orphan's first-occurrence ordinal in that kind
+(relation members naming relations replayed in a counted trailer once the
+relation range is final). A later run whose two outputs decode under the
+same keys passes from two equal readings whose first and last IDs are the
+renumbered start and end of each nonempty kind, without decoding or merging: the
+equality is the walk's predicate, under the same fingerprint assumption
+as any summary. Such a pass reports no raw difference count and no
+`--verbose` preview. Anything else, a missing reading, an ID not in
+canonical decimal, an unknown list item or a kind that is not
+consecutive, walks.
+
 Starts at the ends of the ID range are no osmium oracle (osmium refuses
 `i64::MIN` and `i64::MAX` as IDs and overflows near them); pbfhogg's own
 tests cover them.

@@ -124,8 +124,19 @@ fn split_item(item: &[u8]) -> Option<(u8, i64, &[u8])> {
     if digits == 0 {
         return None;
     }
+    // Accumulated toward the sign, so `i64::MIN` parses and anything past
+    // either end is `None`, as `str::parse` reads it.
+    let mut id: i64 = 0;
+    for &b in &rest[sign..sign + digits] {
+        let d = i64::from(b - b'0');
+        id = id.checked_mul(10)?;
+        id = if sign == 1 {
+            id.checked_sub(d)?
+        } else {
+            id.checked_add(d)?
+        };
+    }
     let digits = sign + digits;
-    let id = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
     Some((letter, id, &rest[digits..]))
 }
 
@@ -296,6 +307,270 @@ impl Attribution {
     }
 }
 
+/// The derived-key kind of a [`CanonicalSummary`]; bump its number with any
+/// change to the canonical encoding below.
+const CANONICAL_KIND: &str = "renumber-canonical 1";
+
+/// One renumbered output's decoding with its orphan names abstracted away:
+/// stored across runs beside the plain decoding summary, so a warm run whose
+/// two outputs decode as before decides from two of these without decoding
+/// or merging (see [`Canonical`] for what equality of two proves). An
+/// observation of one file, never a verdict: the verdict is decided again
+/// from both, every run.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+struct CanonicalSummary {
+    counts: [u64; 3],
+    /// Per kind, the first and last object ID, for a nonempty kind.
+    ends: [Option<(i64, i64)>; 3],
+    /// Distinct orphan IDs referenced, per referenced kind.
+    orphans: [u64; 3],
+    /// XXH3-128 of the canonical stream.
+    digest: String,
+}
+
+/// The canonical reading of one strictly ordered renumber output, record by
+/// record. Each kind's live range is the file's own: its objects must be
+/// consecutive IDs (both ends nonzero and of one sign, `|last - first| + 1`
+/// objects), which with strict order means exactly the IDs between the ends.
+/// Nodes, and every field but a way's `N` list or a relation's `M` list, are
+/// hashed verbatim. Each list item keeps its type letter and encoded
+/// remainder; its ID becomes `L` and the parsed decimal when inside the
+/// referenced kind's range, else `O` and the orphan's first-occurrence
+/// ordinal in that kind, one table per referenced kind over the whole
+/// stream, equal records included. A reference to a kind whose range is not
+/// final yet (relation members naming relations) becomes `D`, and its ID is
+/// replayed in a counted trailer once every range is final.
+///
+/// Two such streams with equal digests, counts and ends, and ends at the
+/// expected start, are the attribution's predicate: equal nodes and fields,
+/// objects at the renumbered IDs, live references alike, every other
+/// reference outside its range on both sides, and the orphan names one to
+/// one both ways (equal ordinals at two positions mean the same orphan on
+/// both sides or a different one on both). It cannot recover how many raw
+/// records differ, nor the listing. Any ID not in canonical decimal, an
+/// unknown list item, or a kind that is not consecutive makes the reading
+/// ineligible, and the check then walks.
+struct Canonical {
+    hasher: xxhash_rust::xxh3::Xxh3,
+    counts: [u64; 3],
+    ends: [Option<(i64, i64)>; 3],
+    orphans: [std::collections::HashMap<i64, u64>; 3],
+    deferred: Vec<(usize, i64)>,
+    /// The kind of the record being read.
+    current: usize,
+    /// Each kind's [`range`](Self::range), fixed once the stream passed it.
+    finals: [Option<Option<(i128, i128)>>; 3],
+    eligible: bool,
+    /// Canonical bytes not hashed yet.
+    buf: Vec<u8>,
+}
+
+impl Canonical {
+    fn new() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+            counts: [0; 3],
+            ends: [None; 3],
+            orphans: Default::default(),
+            deferred: Vec::new(),
+            current: 0,
+            finals: [Some(None); 3],
+            eligible: true,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The inclusive live range of `kind`, when its objects so far are
+    /// consecutive; `Some(None)` for a kind with none; `None` when not.
+    fn range(&self, kind: usize) -> Option<Option<(i128, i128)>> {
+        let Some((first, last)) = self.ends[kind] else {
+            return Some(None);
+        };
+        let (first, last) = (i128::from(first), i128::from(last));
+        let one_sign = (first > 0 && last > 0) || (first < 0 && last < 0);
+        let span = (last - first).unsigned_abs() + 1;
+        (one_sign && span == u128::from(self.counts[kind]))
+            .then_some(Some((first.min(last), first.max(last))))
+    }
+
+    /// Make `kind` the kind being read, fixing the range of every kind
+    /// below it.
+    fn advance(&mut self, kind: usize) {
+        if kind > self.current {
+            for k in self.current..kind {
+                self.finals[k] = self.range(k);
+            }
+            self.current = kind;
+        }
+    }
+
+    /// The canonical encoding of a reference to `kind`'s `id`, appended to
+    /// `out`, once `kind`'s range is final.
+    fn encode(&mut self, kind: usize, id: i64, out: &mut Vec<u8>) {
+        let Some(range) = self.finals[kind] else {
+            self.eligible = false;
+            return;
+        };
+        if range.is_some_and(|(lo, hi)| (lo..=hi).contains(&i128::from(id))) {
+            out.push(b'L');
+            push_decimal(out, id.unsigned_abs(), id < 0);
+        } else {
+            let table = &mut self.orphans[kind];
+            let next = u64::try_from(table.len()).unwrap_or(u64::MAX);
+            let ordinal = *table.entry(id).or_insert(next);
+            out.push(b'O');
+            push_decimal(out, ordinal, false);
+        }
+    }
+
+    /// One record of the stream, in its strict order.
+    fn record(&mut self, kind: usize, id: i64, line: &[u8]) {
+        if !self.eligible {
+            return;
+        }
+        self.advance(kind);
+        self.counts[kind] += 1;
+        self.ends[kind] = Some(match self.ends[kind] {
+            None => (id, id),
+            Some((first, _)) => (first, id),
+        });
+        let mut out = std::mem::take(&mut self.buf);
+        if kind == 0 {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            self.buffered(out);
+            return;
+        }
+        let list = if kind == 1 { b'N' } else { b'M' };
+        for (i, field) in line.split(|&b| b == b' ').enumerate() {
+            if i > 0 {
+                out.push(b' ');
+            }
+            match field.split_first() {
+                Some((&letter, items)) if letter == list => {
+                    out.push(letter);
+                    if !items.is_empty() {
+                        self.items(items, &mut out);
+                    }
+                }
+                _ => out.extend_from_slice(field),
+            }
+        }
+        out.push(b'\n');
+        self.buffered(out);
+    }
+
+    /// Keep the pending canonical bytes, hashing them once a read buffer's
+    /// worth has gathered: one hash update per line would cost more than
+    /// the encoding.
+    fn buffered(&mut self, mut out: Vec<u8>) {
+        if out.len() >= crate::tunables::OPL_READ_BUFFER {
+            self.hasher.update(&out);
+            out.clear();
+        }
+        self.buf = out;
+    }
+
+    fn items(&mut self, items: &[u8], out: &mut Vec<u8>) {
+        for (i, item) in items.split(|&c| c == b',').enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            let Some((letter, id, rest)) = split_item(item) else {
+                self.eligible = false;
+                return;
+            };
+            let digits = &item[1..item.len() - rest.len()];
+            let (Some(kind), true) = (item_kind(letter), canonical_decimal(digits)) else {
+                self.eligible = false;
+                return;
+            };
+            out.push(letter);
+            if kind < self.current {
+                self.encode(kind, id, out);
+            } else {
+                out.push(b'D');
+                self.deferred.push((kind, id));
+            }
+            out.extend_from_slice(rest);
+        }
+    }
+
+    /// The summary, when the whole reading is eligible.
+    fn finish(mut self) -> Option<CanonicalSummary> {
+        self.advance(3);
+        self.hasher.update(&self.buf);
+        let deferred = std::mem::take(&mut self.deferred);
+        self.hasher
+            .update(format!("\0deferred {}\n", deferred.len()).as_bytes());
+        let mut out = Vec::new();
+        for (kind, id) in deferred {
+            out.clear();
+            out.push(b"nwr"[kind]);
+            self.encode(kind, id, &mut out);
+            out.push(b'\n');
+            self.hasher.update(&out);
+        }
+        if self.finals.contains(&None) {
+            self.eligible = false;
+        }
+        self.eligible.then(|| CanonicalSummary {
+            counts: self.counts,
+            ends: self.ends,
+            orphans: self
+                .orphans
+                .each_ref()
+                .map(|t| u64::try_from(t.len()).unwrap_or(u64::MAX)),
+            digest: format!("{:032x}", self.hasher.digest128()),
+        })
+    }
+}
+
+/// Whether `digits` (an optional `-` and ASCII digits, as [`split_item`]
+/// accepted them) spell their value the one way `i64`'s `Display` does: no
+/// leading zero and no `-0`.
+fn canonical_decimal(digits: &[u8]) -> bool {
+    let magnitude = digits.strip_prefix(b"-").unwrap_or(digits);
+    match magnitude {
+        [b'0'] => magnitude.len() == digits.len(),
+        [b'0', ..] => false,
+        _ => true,
+    }
+}
+
+/// Append `value` in decimal, after a `-` when `negative`.
+fn push_decimal(out: &mut Vec<u8>, mut value: u64, negative: bool) {
+    let mut digits = [0_u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        // A remainder below ten fits a byte.
+        digits[at] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    if negative {
+        out.push(b'-');
+    }
+    out.extend_from_slice(&digits[at..]);
+}
+
+/// Whether two canonical readings decide the comparison: equal, and each
+/// nonempty kind starting at its renumbered start and counting its way.
+fn canonical_pass(a: &CanonicalSummary, b: &CanonicalSummary, start: [i128; 3]) -> bool {
+    a == b
+        && (0..3).all(|kind| match a.ends[kind] {
+            None => true,
+            Some((first, last)) => {
+                let step = if start[kind] > 0 { 1 } else { -1 };
+                let span = i128::from(a.counts[kind]) - 1;
+                i128::from(first) == start[kind] && i128::from(last) == start[kind] + step * span
+            }
+        })
+}
+
 /// Why the comparison fails, or `None` when it passes. osmium's output is
 /// the merge's first side; `attribution` is the record-by-record proof's
 /// first failure.
@@ -344,6 +619,61 @@ fn fmt_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// The PASS claim.
+const CLAIM: &str = "every object at its renumbered ID and identical as osmium decodes it, \
+                     except orphan reference IDs, which lie outside the live range on both \
+                     sides and correspond one to one; pbfhogg's orphan mapping is not checked \
+                     against the input";
+
+/// The comparison decided from both outputs' stored canonical readings
+/// ([`CanonicalSummary`]), without decoding or merging: both looked up under
+/// one tool binding, and [`canonical_pass`]. Anything else is a walk, so
+/// every failure and every diagnostic is the walk's.
+fn by_canonical(
+    harness: &mut Harness,
+    osmium_out: &Path,
+    pbfhogg_out: &Path,
+    policy: Policy,
+    start: [i128; 3],
+) -> Result<Decision, Error> {
+    let Some(keys) = opl_compare::planned_keys(harness, &[osmium_out, pbfhogg_out], policy)? else {
+        return Ok(Decision::Walk { publish: false });
+    };
+    let read = |h: &Harness, key: &crate::reference_cache::Key| {
+        h.summary_of::<CanonicalSummary>(&key.derived(CANONICAL_KIND))
+    };
+    let (Some(a), Some(b)) = (read(harness, &keys[0]), read(harness, &keys[1])) else {
+        return Ok(Decision::Walk { publish: true });
+    };
+    if !canonical_pass(&a, &b, start) {
+        return Ok(Decision::Walk { publish: true });
+    }
+    harness.run.revalidate()?;
+    harness.checkpoint()?;
+    harness.msg(&format!(
+        "  element counts: osmium={} pbfhogg={}; decided by equal canonical readings \
+         (xxh3-128 {}), raw differences not counted; distinct orphans referenced: nodes {}, \
+         ways {}, relations {}",
+        fmt_num(a.counts.iter().sum()),
+        fmt_num(b.counts.iter().sum()),
+        a.digest,
+        a.orphans[0],
+        a.orphans[1],
+        a.orphans[2],
+    ));
+    harness.msg("  result: PASS (decided by canonical readings)");
+    Ok(Decision::Decided)
+}
+
+/// What [`by_canonical`] left the check to do.
+enum Decision {
+    /// Passed from the stored readings.
+    Decided,
+    /// Walk; `publish` when summaries are kept at all (not under
+    /// `--fresh-reference`), so the walk's readings are worth making.
+    Walk { publish: bool },
 }
 
 /// Cross-validate `pbfhogg renumber` against `osmium renumber`.
@@ -440,18 +770,43 @@ pub fn run(
 
     // --- The element comparison, classified by kind ---------------------
     let policy = Policy::between(&osmium_out, &pbfhogg_out)?;
+    let start = start_ids(start_id)?;
+    let publish = match by_canonical(harness, &osmium_out, &pbfhogg_out, policy, start)? {
+        Decision::Decided => return Ok(Some(CLAIM.into())),
+        Decision::Walk { publish } => publish,
+    };
     let mut classified = Classified::default();
-    let mut attribution = Attribution::new(start_ids(start_id)?);
-    let merged = opl_compare::compare_paired(
+    let mut attribution = Attribution::new(start);
+    let mut canonical = [Canonical::new(), Canonical::new()];
+    for reading in &mut canonical {
+        // A reading nothing will store is not made.
+        reading.eligible = publish;
+    }
+    let (merged, keys) = opl_compare::compare_paired(
         harness,
         &osmium_out,
         &pbfhogg_out,
         &diff_log,
         policy,
         |g| classified.add(g),
-        |p| attribution.pair(p),
+        |p| {
+            canonical[0].record(p.kind, p.id, p.first);
+            canonical[1].record(p.kind, p.id, p.second);
+            attribution.pair(p);
+        },
     )?;
     let (unexplained, orphan_records, orphans) = attribution.finish();
+    let passed = judge(&merged, &classified, unexplained.as_deref()).is_none();
+    if passed {
+        // Only a passing walk paired every record, so each reading saw its
+        // whole stream; each is stored under the key its decoding was
+        // sealed under, and never when the decode had none.
+        for (key, reading) in keys.iter().zip(canonical) {
+            if let (Some(key), Some(summary)) = (key, reading.finish()) {
+                harness.publish_summary_of(&key.derived(CANONICAL_KIND), &summary)?;
+            }
+        }
+    }
 
     let total: u64 = merged.first.iter().sum();
     harness.msg(&format!(
@@ -502,13 +857,7 @@ pub fn run(
                      DEVIATIONS.md)",
                 );
             }
-            Ok(Some(
-                "every object at its renumbered ID and identical as osmium decodes it, except \
-                 orphan reference IDs, which lie outside the live range on both sides and \
-                 correspond one to one; pbfhogg's orphan mapping is not checked against the \
-                 input"
-                    .into(),
-            ))
+            Ok(Some(CLAIM.into()))
         }
     }
 }
@@ -664,6 +1013,74 @@ mod tests {
         }
         assert!(a.finish().0.is_some());
         assert_eq!(start_ids(Some("0,-5,7")).unwrap(), [1, -5, 7]);
+    }
+
+    /// Both canonical readings of paired (osmium, pbfhogg) records, and
+    /// whether they decide a pass from `start`.
+    fn canonical(records: &[(&str, &str)], start: [i128; 3]) -> bool {
+        let mut sides = [Canonical::new(), Canonical::new()];
+        for (first, second) in records {
+            let kind = match first.as_bytes()[0] {
+                b'n' => 0,
+                b'w' => 1,
+                _ => 2,
+            };
+            let id = first[1..first.find(' ').unwrap()].parse().unwrap();
+            sides[0].record(kind, id, first.as_bytes());
+            sides[1].record(kind, id, second.as_bytes());
+        }
+        let [a, b] = sides.map(Canonical::finish);
+        matches!((a, b), (Some(a), Some(b)) if canonical_pass(&a, &b, start))
+    }
+
+    /// The canonical readings decide exactly what the attribution decides,
+    /// over the attribution's own cases.
+    #[test]
+    fn canonical_readings_agree_with_the_attribution() {
+        let good: [&[(&str, &str)]; 4] = [
+            &[
+                ("w1 v1 Nn1,n3", "w1 v1 Nn1,n12"),
+                ("w2 v1 Nn3,n2", "w2 v1 Nn12,n2"),
+                ("r1 v1 Mn3@a,w1@,r2@", "r1 v1 Mn12@a,w1@,r2@"),
+                ("r2 v1 Mr4@", "r2 v1 Mr9@"),
+            ],
+            &[("w1 v1 Nn0", "w1 v1 Nn0")],
+            &[("w1 v1 Nn-4", "w1 v1 Nn3")],
+            &[("r1 v1 Mr2@", "r1 v1 Mr2@"), ("r2 v1 M", "r2 v1 M")],
+        ];
+        for case in good {
+            let records = with(case);
+            assert_eq!(attribute(&records).0, None, "{case:?}");
+            assert!(canonical(&records, [1; 3]), "{case:?}");
+        }
+        let bad: [&[(&str, &str)]; 10] = [
+            &[("n3 v1 x1 y1", "n3 v1 x2 y1")],
+            &[("w1 v1 Ta=1 Nn3", "w1 v1 Ta=2 Nn12")],
+            &[("w1 v1 Nn1", "w1 v1 Nn2")],
+            &[("w1 v1 Nn2", "w1 v1 Nn12")],
+            &[("r1 v1 Mn3@a", "r1 v1 Mn12@b")],
+            &[("r1 v1 Mn1@,n2@", "r1 v1 Mn1@")],
+            &[("w1 v1 Nn3,n4", "w1 v1 Nn12,n12")],
+            &[("w1 v1 Nn12", "w1 v1 Nn12"), ("w2 v1 Nn13", "w2 v1 Nn12")],
+            &[("w2 v1 Nn1", "w2 v1 Nn1")],
+            &[("r1 v1 Mr2@", "r1 v1 Mr7@"), ("r2 v1 M", "r2 v1 M")],
+        ];
+        for case in bad {
+            let records = with(case);
+            assert!(attribute(&records).0.is_some(), "{case:?}");
+            assert!(!canonical(&records, [1; 3]), "{case:?}");
+        }
+        // Counting down, and a start the outputs do not begin at.
+        let down = [
+            ("n-1 v1 x1 y1", "n-1 v1 x1 y1"),
+            ("n-2 v1 x1 y1", "n-2 v1 x1 y1"),
+            ("w-1 v1 Nn-1,n-3", "w-1 v1 Nn-1,n5"),
+            ("w-2 v1 Nn-3,n-2", "w-2 v1 Nn5,n-2"),
+        ];
+        assert!(canonical(&down, [-1; 3]));
+        assert!(!canonical(&down, [1; 3]));
+        // A non-canonical decimal makes the reading ineligible.
+        assert!(!canonical(&with(&[("w1 v1 Nn01", "w1 v1 Nn01")]), [1; 3]));
     }
 
     #[test]

@@ -443,12 +443,6 @@ impl Harness {
         self.settled_reference(run, settled)
     }
 
-    /// Uncached reference runs started together as one launch group (see
-    /// `Lifecycle::run_group`), each with its standard output in its sink,
-    /// and each judged as [`Self::reference`] judges one, in run order. The
-    /// group's wall is recorded once per label, counting every launch, so a
-    /// step's time is the wall the group took, not the sum of its members.
-    /// Runs that read each other's outputs cannot share a group.
     /// The persistent decoding-summary keys of `runs`, under one identity
     /// observation ([`crate::reference_cache::ReferenceCache::summary_keys`]).
     pub(crate) fn summary_keys(
@@ -480,6 +474,33 @@ impl Harness {
         Ok(())
     }
 
+    /// A check's own stored reading of a decoding, under a derived key
+    /// ([`crate::reference_cache::Key::derived`]), if any.
+    pub(crate) fn summary_of<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &crate::reference_cache::Key,
+    ) -> Option<T> {
+        self.cache.summary_of(key)
+    }
+
+    /// Store a check's own reading of a decoding, as
+    /// [`Self::publish_summary`] stores a plain one.
+    pub(crate) fn publish_summary_of<T: serde::Serialize>(
+        &mut self,
+        key: &crate::reference_cache::Key,
+        summary: &T,
+    ) -> Result<(), Error> {
+        self.run.revalidate()?;
+        self.cache.publish_summary_of(key, summary);
+        Ok(())
+    }
+
+    /// Uncached reference runs started together as one launch group (see
+    /// `Lifecycle::run_group`), each with its standard output in its sink,
+    /// and each judged as [`Self::reference`] judges one, in run order. The
+    /// group's wall is recorded once per label, counting every launch, so a
+    /// step's time is the wall the group took, not the sum of its members.
+    /// Runs that read each other's outputs cannot share a group.
     pub(crate) fn reference_group(
         &mut self,
         runs: &[(&ToolRun, &Path)],

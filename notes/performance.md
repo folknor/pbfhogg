@@ -1987,11 +1987,17 @@ Residue:
   summary. A fixture whose fake osmium answers by bytes would cover them.
 - The one-hit path (pbfhogg output bytes changed, reference summary stored)
   is unmeasured: denmark sort and cat outputs were byte-stable.
-- Paired walks (renumber), sequence walks (repack, degrade reencode),
-  `compare_with_opl` (the derive-changes expected model; apply-changes now
-  decides from summaries) and the
-  derive model always decode and merge. A sequence walk over two equal
-  digests is decidable the same way; the others need their records.
+- `compare_with_opl` (the derive-changes expected model) and the derive
+  model always decode and merge. Repack, degrade and renumber decide warm
+  runs from stored readings, but a cold or changed output still decodes
+  and merges both sides.
+- Renumber's canonical readings are decided only when both are stored:
+  with one output changed, both sides are decoded and walked again,
+  though the unchanged side's stored reading could stand in for its
+  decode (the changed side would still need a full reading). Building
+  both readings during a cold walk costs about 4.8 s on denmark
+  (reference/performance/verifier.md). Like the other summaries, no test
+  reaches the hit path, since fixtures run under `--fresh-reference`.
 - A fresh decode of a missing side is still a full file-backed decode; the
   shortcut saves the other side and the merge only.
 

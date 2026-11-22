@@ -51,6 +51,22 @@ verdict, and drops the informational `osmium fileinfo`. Warm summaries
   B 18.2 / A 19.4 / A 18.3 s against the same A: within noise, not landed.
 - Verdict: pays, modestly.
 
+### degrade: drop and unsort cases decided from predicted streams
+
+A = bdf10df4, B = bdf10df4 plus the change that holds a warm drop or
+unsort output's stored summary to a predicted stream (the expected file
+with the documented swap, or less the records the output's blobs do not
+hold), on plantasjen, denmark, warm summaries, order B, A, B (B measured
+uncommitted):
+
+- Check wall B 1m17s / A 1m55s / B 1m13s, about -35 %.
+- A: `opl merge` 33.0 s (4 runs), `osmium cat` 29.9 s (5 runs). B: no
+  merge, `osmium cat` 6.3 / 5.8 s (the input only). `pbfhogg degrade`
+  19.7-22.2 s on both arms is now most of the check.
+- `verify repack` on B (its cases take the unchanged prediction): 46.8 s,
+  in line with the 43-45 s recorded when its summaries landed.
+- Verdict: pays. A cold run still decodes and merges every case.
+
 ## History
 
 ### Launch groups (2026-11-21)

@@ -60,8 +60,8 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::verify_reencode::{
-    self as reencode, Compared, DEFAULT_CAP, Expected, Input, KINDS, LayoutCheck, Listing, Ran,
-    References, continuous, split,
+    self as reencode, Compared, DEFAULT_CAP, Expected, Input, KINDS, LayoutCheck, Listing,
+    Prediction, Ran, References, continuous, split,
 };
 
 /// The drop seeds: the first runs twice, the second once.
@@ -121,6 +121,17 @@ impl Run<'_> {
         let blobs = reencode::output_blobs(out, DEFAULT_CAP)?;
         reencode::record_blobs(self.harness, label, &blobs);
         Ok(blobs)
+    }
+
+    /// [`reencode::compare`] of one output against the expected sequence.
+    fn compare(
+        &mut self,
+        stem: &str,
+        reference: &Expected,
+        out: &Path,
+        prediction: Prediction,
+    ) -> Result<Compared, Error> {
+        reencode::compare(self.harness, &self.outdir, stem, reference, out, prediction)
     }
 
     fn fail(&mut self, label: &str, why: &str) {
@@ -251,7 +262,7 @@ fn strip_locations(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error>
         return Ok(());
     };
     let label = "degrade --strip-locations";
-    let compared = reencode::compare(run.harness, &run.outdir, "strip-locations", reference, &out)?;
+    let compared = run.compare("strip-locations", reference, &out, Prediction::Unchanged)?;
     reencode::record_identical(run.harness, label, &compared)?;
     run.common(label, &out, run.input.sorted_claim)?;
     if run.input.indexed {
@@ -303,7 +314,9 @@ fn drop_ids(run: &mut Run<'_>, reference: &Expected) -> Result<(), Error> {
             continue;
         };
         let label = format!("degrade --drop-ids {n}:{seed}{suffix}");
-        let compared = reencode::compare(run.harness, &run.outdir, stem, reference, out)?;
+        // A warm run's candidate is the expected sequence less what the
+        // output's blobs do not hold.
+        let compared = run.compare(stem, reference, out, Prediction::Survivors)?;
         let (per_kind, ok) = judge_drop(run, &label, &compared, n, total)?;
         if ok {
             passed[index] = Some(compared.listing.clone());
@@ -560,6 +573,20 @@ fn predict_drop(input: &Path, listing: &Path, output: &Path) -> Result<Option<St
     layout.finish()
 }
 
+/// Per kind, where an unsort mode documents its swap when the kind fires:
+/// the kind's records `i` and `i + 1` counted from 0 in walk order, its
+/// first two under `--unsort-intra` (two or more objects), its records
+/// `cap` and `cap + 1` counted from 1 under `--unsort` (more than `cap`).
+fn swaps(counts: [u64; 3], intra: bool) -> [Option<u64>; 3] {
+    counts.map(|count| {
+        if intra {
+            (count >= 2).then_some(0)
+        } else {
+            (count > DEFAULT_CAP).then_some(DEFAULT_CAP - 1)
+        }
+    })
+}
+
 fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Error> {
     let flag = if intra { "--unsort-intra" } else { "--unsort" };
     let stem = flag.trim_start_matches('-');
@@ -569,13 +596,8 @@ fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Er
         return Ok(());
     };
     let counts = run.input.info.counts;
-    let fires: [bool; 3] = std::array::from_fn(|k| {
-        if intra {
-            counts[k] >= 2
-        } else {
-            counts[k] > DEFAULT_CAP
-        }
-    });
+    let swap = swaps(counts, intra);
+    let fires = swap.map(|at| at.is_some());
     let k = fires.iter().filter(|f| **f).count() as u64;
     if k == 0 {
         run.gaps.push(format!(
@@ -583,7 +605,7 @@ fn unsort(run: &mut Run<'_>, reference: &Expected, intra: bool) -> Result<(), Er
         ));
     }
     let total = run.input.total();
-    let compared = reencode::compare(run.harness, &run.outdir, stem, reference, &out)?;
+    let compared = run.compare(stem, reference, &out, Prediction::Swap(swap))?;
     let s = compared.merged;
     if !(s.first_only == k && s.second_only == k && s.differs == 0 && s.same + k == total) {
         run.fail(

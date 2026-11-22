@@ -1121,18 +1121,53 @@ pub(crate) struct Basis {
     pub digest: String,
 }
 
+/// The OPL stream a caller predicts an output decodes to, made by walking
+/// the expected file a [`Basis`] describes: its per-kind counts and
+/// XXH3-128, and the merge's result had that stream been merged against
+/// the expected file, whose listing the prediction wrote.
+#[derive(Debug, Clone)]
+pub(crate) struct Predicted {
+    pub counts: [u64; 3],
+    pub digest: String,
+    pub merged: Merged,
+}
+
+/// The prediction that the output decodes to the expected file itself:
+/// its counts and digest, every record paired equal, the listing empty.
+pub(crate) fn unchanged(basis: &Basis) -> impl FnOnce(&Path) -> Result<Option<Predicted>, Error> {
+    let (counts, digest) = (basis.counts, basis.digest.clone());
+    move |listing| {
+        File::create(listing)?;
+        Ok(Some(Predicted {
+            counts,
+            digest,
+            merged: Merged {
+                first: counts,
+                second: counts,
+                same: counts.iter().sum(),
+                ..Merged::default()
+            },
+        }))
+    }
+}
+
 /// A sequence walk of the expected file `basis` describes against `pbf`
 /// decided from `pbf`'s stored decoding summary, with no decode and no
 /// merge: the source's key, observed again with the output's in one tool
 /// binding, must still be the one the expected file was made under, and
-/// the output's stored counts and digest must equal the expected file's.
-/// Byte-identical OPL streams pair every record equal in the walk, in any
-/// order, so the walk would find them identical; XXH3-128 equality stands
-/// for byte equality under the same accepted assumption as [`by_summaries`].
-/// Any other outcome is `None` and the caller decodes and merges. With
-/// `strict` the output's stored summary must also be ordered, so a
-/// summary that contradicts byte equality with a strictly ascending
-/// expected stream goes to the strict merge instead.
+/// the output's stored counts and digest must equal those of the stream
+/// `predict` names. `predict` runs only once that summary is found; it
+/// writes the listing the merge would write for its stream to the staged
+/// path it is handed, which is renamed over `listing` only after a match,
+/// the revalidation and the checkpoint (a miss removes it), and returns
+/// `None` when it cannot predict. Byte-identical OPL streams merge to the
+/// same result, so a matching prediction's [`Merged`] and listing are the
+/// merge's; XXH3-128 equality stands for byte equality under the same
+/// accepted assumption as [`by_summaries`]. Any other outcome is `None`
+/// and the caller decodes and merges. With `strict` the output's stored
+/// summary must also be ordered, so a summary that contradicts byte
+/// equality with a strictly ascending expected stream goes to the strict
+/// merge instead.
 fn sequence_by_summary(
     harness: &mut Harness,
     basis: &Basis,
@@ -1140,6 +1175,7 @@ fn sequence_by_summary(
     listing: &Path,
     policy: Policy,
     strict: bool,
+    predict: impl FnOnce(&Path) -> Result<Option<Predicted>, Error>,
 ) -> Result<Option<Merged>, Error> {
     harness.run.watch(&basis.source)?;
     harness.run.watch(pbf)?;
@@ -1153,12 +1189,26 @@ fn sequence_by_summary(
     let Some(out) = harness.summary(&keys[1]) else {
         return Ok(None);
     };
-    if out.counts != basis.counts || out.digest != basis.digest || (strict && !out.ordered) {
+    if strict && !out.ordered {
         return Ok(None);
     }
+    let mut staged = listing.as_os_str().to_owned();
+    staged.push(".predicted");
+    let staged = PathBuf::from(staged);
+    let predicted = match predict(&staged)? {
+        Some(p) if p.counts == out.counts && p.digest == out.digest => p,
+        _ => {
+            match std::fs::remove_file(&staged) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(None);
+        }
+    };
     harness.run.revalidate()?;
     harness.checkpoint()?;
-    File::create(listing)?;
+    std::fs::rename(&staged, listing)?;
     harness.run.decodings.record(
         Source::of(pbf)?,
         Scan {
@@ -1166,18 +1216,15 @@ fn sequence_by_summary(
             counts: out.counts,
         },
     );
-    let merged = Merged {
-        first: basis.counts,
-        second: out.counts,
-        same: out.counts.iter().sum(),
-        ..Merged::default()
-    };
+    let merged = predicted.merged;
     harness.msg(&format!(
-        "  OPL comparison {}: decided by the expected file's digest and the output's stored \
-         decoding summary (xxh3-128 {}), same={}",
+        "  OPL comparison {}: decided by the predicted stream's digest and the output's stored \
+         decoding summary (xxh3-128 {}), same={} first_only={} second_only={}",
         listing.display(),
         out.digest,
-        merged.same
+        merged.same,
+        merged.first_only,
+        merged.second_only
     ));
     Ok(Some(merged))
 }
@@ -1185,8 +1232,8 @@ fn sequence_by_summary(
 /// [`compare_sequence`] with the first side an OPL file already written
 /// (`expected`) and the second `pbf` decoded under `policy`; the decoding is
 /// the run's, kept on failure, and `expected` is kept. With `basis`, an
-/// output whose stored summary matches the expected file is decided
-/// without a decode ([`sequence_by_summary`]).
+/// output whose stored summary matches the stream `predict` names is
+/// decided without a decode ([`sequence_by_summary`]).
 pub(crate) fn compare_sequence_with_opl(
     harness: &mut Harness,
     expected: &Path,
@@ -1194,9 +1241,11 @@ pub(crate) fn compare_sequence_with_opl(
     pbf: &Path,
     listing: &Path,
     policy: Policy,
+    predict: impl FnOnce(&Path) -> Result<Option<Predicted>, Error>,
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
-        && let Some(merged) = sequence_by_summary(harness, basis, pbf, listing, policy, false)?
+        && let Some(merged) =
+            sequence_by_summary(harness, basis, pbf, listing, policy, false, predict)?
     {
         return Ok(merged);
     }
@@ -1233,7 +1282,8 @@ pub(crate) fn compare_with_projection_each<R: std::io::Read>(
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
-        && let Some(merged) = sequence_by_summary(harness, basis, pbf, listing, policy, true)?
+        && let Some(merged) =
+            sequence_by_summary(harness, basis, pbf, listing, policy, true, unchanged(basis))?
     {
         return Ok(merged);
     }
@@ -1451,6 +1501,19 @@ fn merge(
         each,
         paired,
     )
+}
+
+/// The non-strict sequence [`merge`] of two OPL files, for tests that hold
+/// a prediction to what the merge itself writes and counts: the merge's
+/// result and the second side's summary.
+#[cfg(test)]
+pub(crate) fn sequence_merge(
+    first: &Path,
+    second: &Path,
+    listing: &Path,
+) -> Result<(Merged, [u64; 3], String), Error> {
+    let (merged, [_, summary]) = merge(first, second, listing, false, |_| {}, |_| {})?;
+    Ok((merged, summary.counts, summary.digest))
 }
 
 /// [`merge`] over two open streams.

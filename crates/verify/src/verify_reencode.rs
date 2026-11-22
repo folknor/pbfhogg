@@ -599,6 +599,7 @@ pub(super) fn compare(
     stem: &str,
     expected: &Expected,
     output: &Path,
+    prediction: Prediction,
 ) -> Result<Compared, Error> {
     let listing = outdir.join(format!("{stem}.diff.opl"));
     let merged = opl_compare::compare_sequence_with_opl(
@@ -608,8 +609,191 @@ pub(super) fn compare(
         output,
         &listing,
         Policy::FULL,
+        |staged| {
+            let Some(basis) = &expected.basis else {
+                return Ok(None);
+            };
+            let whole = (basis.counts, basis.digest.as_str());
+            match prediction {
+                Prediction::Unchanged => opl_compare::unchanged(basis)(staged),
+                Prediction::Swap(at) => predict(&expected.path, whole, staged, |kind, _, index| {
+                    Ok(Some(if at[kind] == Some(index) {
+                        Edit::SwapNext
+                    } else {
+                        Edit::Keep
+                    }))
+                }),
+                Prediction::Survivors => {
+                    let Ok(mut survivors) = FrameIds::open(output) else {
+                        return Ok(None);
+                    };
+                    predict(&expected.path, whole, staged, |kind, id, _| {
+                        Ok(match survivors.peek() {
+                            Ok(next) if next == Some((kind, id)) => {
+                                survivors.pending = None;
+                                Some(Edit::Keep)
+                            }
+                            Ok(_) => Some(Edit::Remove),
+                            // The candidate cannot be formed: the merge decides.
+                            Err(_) => None,
+                        })
+                    })
+                }
+            }
+        },
     )?;
     Ok(Compared { merged, listing })
+}
+
+/// What stream a case predicts its output decodes to, so that a warm run's
+/// stored output summary can decide [`compare`] with no decode and no
+/// merge. Every prediction is only a candidate: the verdict is the
+/// equality of its counts and XXH3-128 with the summary of osmium's
+/// decoding of the output, and a miss decodes and merges.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Prediction {
+    /// The expected file itself.
+    Unchanged,
+    /// The expected file with, per kind holding `Some(i)`, the kind's
+    /// records `i` and `i + 1` (from 0, in walk order) swapped: what an
+    /// unsort mode documents.
+    Swap([Option<u64>; 3]),
+    /// The expected file less every record whose identity the output's
+    /// blobs do not hold next, read by the verifier's own frame decoder:
+    /// the candidate for a drop, whose selection is pbfhogg's.
+    Survivors,
+}
+
+/// What [`predict`]'s walker does with one expected record.
+enum Edit {
+    Keep,
+    /// Listed `-`, not in the predicted stream.
+    Remove,
+    /// Held and written after the next record, which must be of its kind;
+    /// listed `-` and `+` together, as the merge lists an adjacent swap of
+    /// `a < q` (it reaches `a` against `q`, lists `-a`, pairs `q`, then
+    /// meets `a` below the next expected record and lists `+a`).
+    SwapNext,
+}
+
+/// Walk the expected file once, digesting the stream `decide` edits it into
+/// and writing to `listing` exactly the lines the sequence merge of the
+/// expected file against that stream would. The unedited bytes are also
+/// digested and held to `basis`, so the walk read the file the basis
+/// describes. `decide` sees each record's kind, ID and position within its
+/// kind; it returning `None`, a malformed line, or a swap whose partner is
+/// missing or of another kind, makes the whole prediction `None`.
+fn predict(
+    expected: &Path,
+    (counts, digest): ([u64; 3], &str),
+    listing: &Path,
+    mut decide: impl FnMut(usize, i64, u64) -> Result<Option<Edit>, Error>,
+) -> Result<Option<opl_compare::Predicted>, Error> {
+    use std::io::Write;
+    let mut reader =
+        BufReader::with_capacity(crate::tunables::OPL_READ_BUFFER, File::open(expected)?);
+    let mut out = std::io::BufWriter::new(File::create(listing)?);
+    let mut whole = xxhash_rust::xxh3::Xxh3::new();
+    let mut stream = xxhash_rust::xxh3::Xxh3::new();
+    let mut first = [0u64; 3];
+    let mut second = [0u64; 3];
+    let mut merged = opl_compare::Merged::default();
+    let mut held: Option<(usize, Vec<u8>)> = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        whole.update(&line);
+        let Some(body) = line.strip_suffix(b"\n") else {
+            return Ok(None);
+        };
+        let Ok((kind, id)) = opl_compare::parse_key(body) else {
+            return Ok(None);
+        };
+        let index = first[kind];
+        first[kind] += 1;
+        if let Some((held_kind, moved)) = held.take() {
+            if held_kind != kind {
+                return Ok(None);
+            }
+            stream.update(&line);
+            stream.update(&moved);
+            second[kind] += 2;
+            merged.same += 1;
+            merged.first_only += 1;
+            merged.second_only += 1;
+            out.write_all(b"-")?;
+            out.write_all(&moved)?;
+            out.write_all(b"+")?;
+            out.write_all(&moved)?;
+            continue;
+        }
+        match decide(kind, id, index)? {
+            None => return Ok(None),
+            Some(Edit::Keep) => {
+                stream.update(&line);
+                second[kind] += 1;
+                merged.same += 1;
+            }
+            Some(Edit::Remove) => {
+                merged.first_only += 1;
+                out.write_all(b"-")?;
+                out.write_all(&line)?;
+            }
+            Some(Edit::SwapNext) => held = Some((kind, line.clone())),
+        }
+    }
+    if held.is_some() || first != counts || format!("{:032x}", whole.digest128()) != digest {
+        return Ok(None);
+    }
+    out.into_inner()
+        .map_err(|e| Error::Failed(format!("cannot write {}: {}", listing.display(), e.error())))?
+        .sync_all()?;
+    merged.first = first;
+    merged.second = second;
+    Ok(Some(opl_compare::Predicted {
+        counts: second,
+        digest: format!("{:032x}", stream.digest128()),
+        merged,
+    }))
+}
+
+/// The identities an output's blobs hold, in file order, read by the
+/// verifier's frame decoder one blob at a time, with one held for a peek.
+struct FrameIds {
+    path: PathBuf,
+    claims: pbf_frames::Claims,
+    blob: std::vec::IntoIter<(usize, i64)>,
+    pending: Option<(usize, i64)>,
+}
+
+impl FrameIds {
+    fn open(path: &Path) -> Result<Self, Error> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            claims: pbf_frames::Claims::open(path)?,
+            blob: Vec::new().into_iter(),
+            pending: None,
+        })
+    }
+
+    /// The next identity, left in place; `None` past the last blob.
+    fn peek(&mut self) -> Result<Option<(usize, i64)>, Error> {
+        while self.pending.is_none() {
+            if let Some(next) = self.blob.next() {
+                self.pending = Some(next);
+                break;
+            }
+            let Some(blob) = self.claims.next_blob()? else {
+                return Ok(None);
+            };
+            self.blob =
+                pbf_frames::blob_ids(&self.path, blob.payload_offset, blob.datasize)?.into_iter();
+        }
+        Ok(self.pending)
+    }
 }
 
 /// [`compare`] of two outputs, both decoded by osmium.
@@ -1109,6 +1293,79 @@ pub(super) fn record_layout(harness: &mut Harness, label: &str, mismatch: Option
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Predict `edit` of `expected`, merge `expected` against `actual`, and
+    /// require the two to agree on everything the judges read: the result,
+    /// the listing bytes, the counts and the digest.
+    fn agrees(
+        expected: &str,
+        actual: &str,
+        decide: impl FnMut(usize, i64, u64) -> Result<Option<Edit>, Error>,
+    ) -> opl_compare::Merged {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (e, a) = (dir.join("e.opl"), dir.join("a.opl"));
+        let (pl, ml) = (dir.join("p.txt"), dir.join("m.txt"));
+        std::fs::write(&e, expected).unwrap();
+        std::fs::write(&a, actual).unwrap();
+        let (_, counts, digest) = opl_compare::sequence_merge(&e, &e, &ml).unwrap();
+        let p = predict(&e, (counts, &digest), &pl, decide)
+            .unwrap()
+            .unwrap();
+        let (merged, counts, digest) = opl_compare::sequence_merge(&e, &a, &ml).unwrap();
+        assert_eq!(p.merged, merged);
+        assert_eq!((p.counts, p.digest), (counts, digest));
+        assert_eq!(std::fs::read(&pl).unwrap(), std::fs::read(&ml).unwrap());
+        merged
+    }
+
+    #[test]
+    fn a_predicted_swap_or_drop_writes_what_the_merge_writes() {
+        let e = "n1 v1\nn2 v1\nn3 v1\nw1 v1\nw2 v1\nr7 v1\n";
+        // Each kind's swap at its own position, the way swap at its end and
+        // the next kind's first record right after it.
+        let at = [Some(1), Some(0), None];
+        let m = agrees(
+            e,
+            "n1 v1\nn3 v1\nn2 v1\nw2 v1\nw1 v1\nr7 v1\n",
+            |k, _, i| {
+                Ok(Some(if at[k] == Some(i) {
+                    Edit::SwapNext
+                } else {
+                    Edit::Keep
+                }))
+            },
+        );
+        assert_eq!((m.first_only, m.second_only, m.same), (2, 2, 4));
+        let gone = [(0, 1), (0, 3), (2, 7)];
+        let m = agrees(e, "n2 v1\nw1 v1\nw2 v1\n", |k, id, _| {
+            Ok(Some(if gone.contains(&(k, id)) {
+                Edit::Remove
+            } else {
+                Edit::Keep
+            }))
+        });
+        assert_eq!((m.first_only, m.second_only, m.same), (3, 0, 3));
+    }
+
+    #[test]
+    fn a_prediction_refuses_an_unpaired_swap_or_a_file_unlike_its_basis() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let dir = scratch.path();
+        let (e, l) = (dir.join("e.opl"), dir.join("l.txt"));
+        std::fs::write(&e, "n1 v1\nw1 v1\n").unwrap();
+        let (_, counts, digest) = opl_compare::sequence_merge(&e, &e, &l).unwrap();
+        let swap_last_node =
+            |k: usize, _, _| Ok(Some(if k == 0 { Edit::SwapNext } else { Edit::Keep }));
+        assert!(
+            predict(&e, (counts, &digest), &l, swap_last_node)
+                .unwrap()
+                .is_none()
+        );
+        let keep = |_, _, _| Ok(Some(Edit::Keep));
+        assert!(predict(&e, (counts, "0"), &l, keep).unwrap().is_none());
+        assert!(predict(&e, (counts, &digest), &l, keep).unwrap().is_some());
+    }
 
     fn repack(cap: u64, counts: &[u64]) -> (Vec<u64>, Witnesses) {
         let mut blocks = Vec::new();

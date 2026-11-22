@@ -437,12 +437,23 @@ summary key, that key is observed again with the output's in one tool
 binding, and the output's stored summary has the counts and XXH3-128 the
 verifier computed for the expected file as it wrote it: byte-identical
 streams pair every record equal in any order, so the listing is written
-empty. Any other outcome decodes the output and merges. Every case takes
-this path; it pays where the sequences must be identical
-(`--strip-locations` and every repack case), while an output that differs
-from the expected sequence, as a drop or firing unsort output does by
-design, falls back to the merge, which publishes the summary a later run
-reads. The case's judge reads the decided counts as it would a merge's. Degrade's
+empty. Any other outcome decodes the output and merges. Where the output
+differs from the expected sequence by design, the stored summary is held
+instead to a predicted stream the verifier derives by walking the expected
+file once (whose own bytes are re-digested and held to the file's recorded
+counts and digest in the same walk): for `--unsort-intra` each firing
+kind's first two records swapped, for `--unsort` its records `cap` and
+`cap + 1` swapped, and for a drop the expected sequence less every record
+whose identity the output's blobs, read by the verifier's own frame
+decoder, do not hold next. The walk writes, to a staged file renamed into
+place only after a match, the listing the merge would write for that
+stream (`-` for a removed record; `-a` then `+a` for a swapped `a < q`),
+and its counts. The frame decoder only picks a drop's candidate; the
+verdict is still the equality with osmium's stored summary, so a wrong
+candidate can only fall back to the merge. A cold run, or an output whose
+bytes changed, merges, and the merge publishes the summary a later run
+reads. The case's judge reads the decided counts and listing as it would
+a merge's. Degrade's
 comparison of the two drop seeds is decided from their removal listings
 when both passed their removals: each output is the expected sequence,
 whose identities are unique, less the records its listing names in walk

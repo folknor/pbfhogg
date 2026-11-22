@@ -2058,35 +2058,32 @@ other.
 
 Kind: structural, medium-large; high confidence (codex-orchestration).
 
-## PERF-070 - degrade and repack still decode and merge on cold runs and in drop and unsort cases
+## PERF-070 - degrade and repack still decode and merge on cold runs
 
-Reported by: heavy-opus, heavy-codex, engine-codex. Narrowed 2026-11-21.
+Reported by: heavy-opus, heavy-codex, engine-codex. Narrowed 2026-11-22.
 
-Landed: the input is decoded once per check into one verifier-written
-expected file, whose XXH3-128 and counts are computed as it is written. A
-case whose output has a stored decoding summary under the same osmium
-binding and digest is decided with no decode and no merge
-(`--strip-locations`, every repack case), and degrade's two drop seeds are
-compared by their removal listings. Denmark on plantasjen, matched V B V
-(variant, HEAD 0e07dcd6, variant), warm: repack 43.4s / 1m39s / 44.6s,
-degrade 1m50s / 2m14s / 1m48s.
+Landed: every warm case, drop and unsort included, is decided from the
+output's stored summary against a stream predicted from the expected file
+(reference/verify.md "Decoding summaries"); warm denmark degrade 1m55s to
+1m13-1m17s (reference/performance/verifier.md).
 
 Residue:
 
 - A cold run, or an output whose bytes changed, still decodes and merges
   every case. A cheaper cold path (hash-scan the output decoding, merge
   only on mismatch) is unmeasured.
-- Drop and unsort cases need their listing, so each still decodes its
-  output and merges against the expected file (4 merges, 5 decodes in
-  degrade).
+- A warm drop case inflates its output twice with the verifier's frame
+  decoder: once for the survivor candidate, once in `index_truth`.
 - `partition` reads the input decoding three times (once per kind) and
   rewrites it whole even when the input is already grouped, and repack and
   degrade each build the same stripped expected file in their own check.
 - Each audited output still gets `index_truth`, `check --index`, a claims
   walk and layout work, and the layout predictors walk the input claims
   once per kind per case (the frame-reader half is PERF-077).
-- No test reaches the summary-decided sequence walk: fixtures run with
-  `--fresh-reference`, whose fake osmium answers by file name.
+- No test reaches the summary-decided sequence walk end to end: fixtures
+  run with `--fresh-reference`, whose fake osmium answers by file name,
+  and their 3-object input runs no drop or unsort case. Unit tests hold
+  the predicted listing, counts and digest to the merge's.
 
 ## PERF-071 - add-locations-to-ways --mode all decodes ten times for three files
 

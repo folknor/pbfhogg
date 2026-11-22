@@ -137,7 +137,14 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         }
         let label = format!("repack {}", case.label);
         let cap = case.cap.unwrap_or(DEFAULT_CAP);
-        let compared = reencode::compare(harness, &outdir, &stem, &reference, &out)?;
+        let compared = reencode::compare(
+            harness,
+            &outdir,
+            &stem,
+            &reference,
+            &out,
+            reencode::Prediction::Unchanged,
+        )?;
         reencode::record_identical(harness, &label, &compared)?;
         reencode::judge_header(harness, &label, &out, input.sorted_claim, input.locations)?;
         reencode::judge_index(harness, &outdir, &label, &out)?;

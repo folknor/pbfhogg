@@ -378,15 +378,6 @@ Defects the performance hunters found while reading the code at `e8377a78`
 (see the PERF-064 section of `notes/performance.md` for the hunt). None was
 reproduced.
 
-## TOOL-040 - The OSC structure scan tracks only root, action and object elements
-
-Reported by: engine-codex.
-
-`osc.rs`'s strict structure check follows only the root, action and object
-elements, so an unknown unclosed tag can escape the scan. osmium's reading
-gives a separate XML check in the listing path today. Keep that protection if
-the two-file join is removed.
-
 ## TOOL-046 - A moved input turns a verifier error into ENVIRONMENT
 
 Reported by: the PERF-066 spar (codex), verified at the code.

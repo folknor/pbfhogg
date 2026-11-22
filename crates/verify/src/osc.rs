@@ -10,7 +10,10 @@
 //! starts within them. It does **not** parse element bodies (tags,
 //! refs, members, coordinates) - those aren't needed for
 //! those checks and pulling in a full XML stack just to discard them
-//! would be churn. [`scan_osc_changes`] also decodes each entry's metadata
+//! would be churn. The lexer still ends every markup form where XML 1.0
+//! does, and the strict scan matches every end tag against the element it
+//! closes, so nesting is checked here rather than borrowed from the XML
+//! parser a caller also runs. [`scan_osc_changes`] also decodes each entry's metadata
 //! attributes, the part of a change an OPL reading cannot tell apart
 //! (`verify merge-changes` and `verify tags-filter-osc`). It scans
 //! incrementally and retains only the current tag, so large Planet or
@@ -463,10 +466,22 @@ struct OscParser<F> {
     section: Section,
     /// The entry element open in strict mode (`node`, `way`, `relation`).
     open: Option<&'static str>,
+    /// Strict mode: the name of every element open, outermost first. Every
+    /// end tag must close the innermost one, so an unknown element left
+    /// unclosed or closed out of order is refused by the scan itself, not
+    /// only by whichever XML parser a caller also runs.
+    stack: Vec<String>,
     root: Root,
+    /// Whether the prolog already held a DOCTYPE; XML allows one.
+    doctype_seen: bool,
     scan: ScanState,
 }
 
+/// The lexer's state between bytes. Every markup form ends where XML 1.0
+/// ends it, not at the first `>`: a processing instruction at `?>`, a
+/// CDATA section at `]]>`, a DOCTYPE at the first `>` outside its quoted
+/// literals. Ending any of them early would read their content as markup,
+/// where a `<!--` in a processing instruction once swallowed a real entry.
 #[derive(Default)]
 enum ScanState {
     #[default]
@@ -476,8 +491,56 @@ enum ScanState {
     /// inside, if any: XML allows a raw `>` in an attribute value, so only a
     /// `>` outside quotes ends the tag.
     Tag(Vec<u8>, Option<u8>),
+    /// A comment, with the run of trailing dashes (at most two) seen.
     Comment(u8),
-    Declaration,
+    /// A processing instruction; the flag says the last byte was `?`.
+    Pi(bool),
+    /// A CDATA section, with the run of trailing `]` (at most two) seen.
+    Cdata(u8),
+    /// A DOCTYPE, with the quote of the literal it is inside, if any.
+    Doctype(Option<u8>),
+}
+
+/// How a tag opens or closes an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagKind {
+    Start,
+    Empty,
+    End,
+}
+
+/// XML's whitespace: space, tab, line feed and carriage return only.
+fn is_xml_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// A tag's text (between `<` and `>`) as its kind, element name and
+/// attribute text. The name ends at XML whitespace and is compared exactly;
+/// an end tag carries nothing but whitespace after its name. A name that is
+/// empty or holds a character no XML name may (`< node>`, `</ node>`,
+/// `<node id="1"//>`) is refused.
+fn parse_tag(tag: &str) -> Result<(TagKind, &str, &str), String> {
+    let (kind, body) = if let Some(rest) = tag.strip_prefix('/') {
+        (TagKind::End, rest)
+    } else if let Some(rest) = tag.strip_suffix('/') {
+        (TagKind::Empty, rest)
+    } else {
+        (TagKind::Start, tag)
+    };
+    let end = body.find(is_xml_space).unwrap_or(body.len());
+    let (name, rest) = body.split_at(end);
+    if name.is_empty() || name.contains(['/', '<', '>', '=', '"', '\'']) {
+        return Err(format!("malformed tag <{tag}>"));
+    }
+    if kind == TagKind::End && !rest.chars().all(is_xml_space) {
+        return Err(format!("malformed end tag <{tag}>"));
+    }
+    // Outside a quoted value a `/` may only be the empty-element marker,
+    // which is already stripped; a value ends at its quote, never at `/`.
+    if rest.trim_end_matches(is_xml_space).ends_with('/') {
+        return Err(format!("malformed tag <{tag}>"));
+    }
+    Ok((kind, name, rest.trim_start_matches(is_xml_space)))
 }
 
 /// The quote state after `byte` inside a tag: a quote opens a value, the
@@ -497,7 +560,9 @@ impl<F: FnMut(OscAction, OscKind, i64, &str) -> Result<(), String>> OscParser<F>
             ids,
             section: Section::None,
             open: None,
+            stack: Vec::new(),
             root: Root::Before,
+            doctype_seen: false,
             scan: ScanState::Text,
         }
     }
@@ -510,65 +575,115 @@ impl<F: FnMut(OscAction, OscKind, i64, &str) -> Result<(), String>> OscParser<F>
                 ScanState::Text => ScanState::Text,
                 ScanState::Probe(mut prefix) => {
                     prefix.push(byte);
-                    if prefix.as_slice() == b"!--" {
-                        ScanState::Comment(0)
-                    } else if b"!--".starts_with(prefix.as_slice()) || prefix.as_slice() == b"?" {
-                        ScanState::Probe(prefix)
-                    } else if prefix.starts_with(b"!") || prefix.starts_with(b"?") {
-                        ScanState::Declaration
-                    } else if byte == b'>' {
-                        self.process_tag(&prefix[..prefix.len() - 1])?;
-                        ScanState::Text
-                    } else {
-                        let quote = next_quote(None, byte);
-                        ScanState::Tag(prefix, quote)
-                    }
+                    self.probe(prefix)?
                 }
                 ScanState::Tag(tag, None) if byte == b'>' => {
                     self.process_tag(&tag)?;
                     ScanState::Text
                 }
+                // XML forbids a raw `<` anywhere in a tag, quoted values
+                // included; reading past one would let an attribute value
+                // swallow an entry's markup.
+                ScanState::Tag(..) if byte == b'<' => return Err("a raw < inside a tag".into()),
                 ScanState::Tag(mut tag, quote) => {
                     tag.push(byte);
                     ScanState::Tag(tag, next_quote(quote, byte))
                 }
-                ScanState::Comment(mut trailing_dashes) => {
-                    if byte == b'>' && trailing_dashes == 2 {
-                        ScanState::Text
-                    } else {
-                        trailing_dashes = if byte == b'-' {
-                            (trailing_dashes + 1).min(2)
-                        } else {
-                            0
-                        };
-                        ScanState::Comment(trailing_dashes)
-                    }
+                ScanState::Comment(2) if byte == b'>' => ScanState::Text,
+                ScanState::Comment(2) => return Err("-- inside an XML comment".into()),
+                ScanState::Comment(dashes) => {
+                    ScanState::Comment(if byte == b'-' { dashes + 1 } else { 0 })
                 }
-                ScanState::Declaration if byte == b'>' => ScanState::Text,
-                ScanState::Declaration => ScanState::Declaration,
+                ScanState::Pi(true) if byte == b'>' => ScanState::Text,
+                ScanState::Pi(_) => ScanState::Pi(byte == b'?'),
+                ScanState::Cdata(2) if byte == b'>' => ScanState::Text,
+                ScanState::Cdata(brackets) => ScanState::Cdata(if byte == b']' {
+                    (brackets + 1).min(2)
+                } else {
+                    0
+                }),
+                ScanState::Doctype(None) if byte == b'[' => {
+                    return Err("a DOCTYPE internal subset is not supported".into());
+                }
+                ScanState::Doctype(None) if byte == b'>' => ScanState::Text,
+                ScanState::Doctype(quote) => ScanState::Doctype(next_quote(quote, byte)),
             };
         }
         Ok(())
     }
 
+    /// The state after the bytes following a `<` so far: a markup form once
+    /// its opening is complete, a tag once it cannot be one, still a probe
+    /// while it may yet become one.
+    fn probe(&mut self, prefix: Vec<u8>) -> Result<ScanState, String> {
+        const COMMENT: &[u8] = b"!--";
+        const CDATA: &[u8] = b"![CDATA[";
+        const DOCTYPE: &[u8] = b"!DOCTYPE";
+        let p = prefix.as_slice();
+        if p == b"?" {
+            return Ok(ScanState::Pi(false));
+        }
+        if p == COMMENT {
+            return Ok(ScanState::Comment(0));
+        }
+        if p == CDATA {
+            if self.root != Root::Open {
+                return Err("a CDATA section outside the root element".into());
+            }
+            return Ok(ScanState::Cdata(0));
+        }
+        if p == DOCTYPE {
+            if self.root != Root::Before || self.doctype_seen {
+                return Err("a DOCTYPE outside the prolog, or a second one".into());
+            }
+            self.doctype_seen = true;
+            return Ok(ScanState::Doctype(None));
+        }
+        if p.starts_with(b"!") {
+            if [COMMENT, CDATA, DOCTYPE].iter().any(|m| m.starts_with(p)) {
+                return Ok(ScanState::Probe(prefix));
+            }
+            return Err(format!(
+                "unsupported markup <{}",
+                String::from_utf8_lossy(p)
+            ));
+        }
+        match p.last() {
+            Some(b'<') => Err("a raw < inside a tag".into()),
+            Some(b'>') => {
+                self.process_tag(&p[..p.len() - 1])?;
+                Ok(ScanState::Text)
+            }
+            byte => {
+                let quote = byte.and_then(|&b| next_quote(None, b));
+                Ok(ScanState::Tag(prefix, quote))
+            }
+        }
+    }
+
     fn process_tag(&mut self, tag: &[u8]) -> Result<(), String> {
         let tag = std::str::from_utf8(tag).map_err(|error| error.to_string())?;
+        let (kind, name, attrs) = parse_tag(tag)?;
         if self.ids == Ids::Strict {
-            self.check_structure(tag)?;
+            self.check_structure(kind, name)?;
         }
-        if let Some(name) = tag.strip_prefix('/') {
-            let name = name.trim();
+        if kind == TagKind::End {
             match name {
                 "create" | "modify" | "delete" => self.section = Section::None,
-                "osmChange" if self.root == Root::Open => self.root = Root::Closed,
+                // Strict: only the end tag that empties the stack closes the
+                // root, never an inner element of the same name.
+                "osmChange"
+                    if self.root == Root::Open
+                        && (self.ids == Ids::Lenient || self.stack.is_empty()) =>
+                {
+                    self.root = Root::Closed;
+                }
                 _ => {}
             }
             return Ok(());
         }
 
-        let self_closing = tag.ends_with('/');
-        let stripped = tag.trim_end_matches('/').trim();
-        let (name, attrs) = split_tag_name(stripped);
+        let self_closing = kind == TagKind::Empty;
         match self.root {
             Root::Before if name == "osmChange" => {
                 self.root = if self_closing {
@@ -603,45 +718,36 @@ impl<F: FnMut(OscAction, OscKind, i64, &str) -> Result<(), String>> OscParser<F>
         Ok(())
     }
 
-    /// Strict mode's structure: an action block holds element entries and is
-    /// not nested; an entry sits in an action block, holds no entry, and is
-    /// closed by its own end tag; the root closes with nothing left open.
-    /// Anything else could carry an entry the scan never delivers, so it is
-    /// an error. Runs before the tag is otherwise processed; the root
-    /// checks are [`process_tag`](Self::process_tag)'s own.
-    fn check_structure(&mut self, tag: &str) -> Result<(), String> {
-        if let Some(name) = tag.strip_prefix('/') {
-            let name = name.trim();
-            match name {
-                "create" | "modify" | "delete" => {
-                    let open = match self.section {
-                        Section::Create => Some("create"),
-                        Section::Modify => Some("modify"),
-                        Section::Delete => Some("delete"),
-                        Section::None => None,
-                    };
-                    if open != Some(name) {
-                        return Err(format!("</{name}> closes no open <{name}> action block"));
-                    }
-                    if let Some(open) = self.open {
-                        return Err(format!("</{name}> closes an action with <{open}> open"));
-                    }
+    /// Strict mode's structure: every element, known or not, is closed by
+    /// its own end tag in order, so the root closes with nothing left open;
+    /// an action block holds element entries and is not nested; an entry
+    /// sits in an action block and holds no entry. Anything else could carry
+    /// an entry the scan never delivers, so it is an error. Runs before the
+    /// tag is otherwise processed; the root checks are
+    /// [`process_tag`](Self::process_tag)'s own.
+    ///
+    /// What the scan guarantees on its own is element nesting and an
+    /// account of every literal entry. It is not a full XML well-formedness
+    /// check (attribute syntax outside entries, name characters, references
+    /// in text go unread): every caller also has osmium read the same
+    /// document, and that reading's success is the rest of the XML check.
+    fn check_structure(&mut self, kind: TagKind, name: &str) -> Result<(), String> {
+        if kind == TagKind::End {
+            match self.stack.last() {
+                None => return Err(format!("</{name}> closes nothing open")),
+                Some(top) if top != name => {
+                    return Err(format!("</{name}> does not close the open <{top}>"));
                 }
-                "node" | "way" | "relation" => {
-                    if self.open != Some(name) {
-                        return Err(format!("</{name}> closes no open <{name}>"));
-                    }
-                    self.open = None;
+                Some(_) => {
+                    self.stack.pop();
                 }
-                "osmChange" if self.section.action().is_some() || self.open.is_some() => {
-                    return Err("</osmChange> with an action block or entry still open".into());
-                }
-                _ => {}
+            }
+            if kind_of(name).is_some() {
+                self.open = None;
             }
             return Ok(());
         }
-        let self_closing = tag.ends_with('/');
-        let (name, _) = split_tag_name(tag.trim_end_matches('/').trim());
+        let self_closing = kind == TagKind::Empty;
         match name {
             "create" | "modify" | "delete" => {
                 if self.section.action().is_some() || self.open.is_some() {
@@ -665,6 +771,9 @@ impl<F: FnMut(OscAction, OscKind, i64, &str) -> Result<(), String>> OscParser<F>
             }
             _ => {}
         }
+        if !self_closing {
+            self.stack.push(name.to_owned());
+        }
         Ok(())
     }
 
@@ -672,7 +781,9 @@ impl<F: FnMut(OscAction, OscKind, i64, &str) -> Result<(), String>> OscParser<F>
         match self.scan {
             ScanState::Text => {}
             ScanState::Comment(_) => return Err("unterminated XML comment".to_owned()),
-            ScanState::Declaration => return Err("unterminated XML declaration".to_owned()),
+            ScanState::Pi(_) => return Err("unterminated processing instruction".to_owned()),
+            ScanState::Cdata(_) => return Err("unterminated CDATA section".to_owned()),
+            ScanState::Doctype(_) => return Err("unterminated DOCTYPE".to_owned()),
             ScanState::Probe(_) | ScanState::Tag(..) => {
                 return Err("incomplete XML tag".to_owned());
             }
@@ -683,12 +794,6 @@ impl<F: FnMut(OscAction, OscKind, i64, &str) -> Result<(), String>> OscParser<F>
             Root::Open => Err("missing closing </osmChange> (truncated?)".to_owned()),
         }
     }
-}
-
-fn split_tag_name(tag: &str) -> (&str, &str) {
-    let s = tag.trim_start();
-    let split = s.find(|c: char| c.is_ascii_whitespace()).unwrap_or(s.len());
-    (&s[..split], s[split..].trim_start())
 }
 
 /// Extract the value of the `id` attribute from a tag's attribute
@@ -1160,23 +1265,23 @@ mod tests {
             ),
             (
                 r#"<osmChange><create><way id="1"></relation></create></osmChange>"#,
-                "closes no open <relation>",
+                "does not close the open <way>",
             ),
             (
                 r#"<osmChange><create><way id="1"></create></osmChange>"#,
-                "with <way> open",
+                "does not close the open <way>",
             ),
             (
                 r#"<osmChange></create></osmChange>"#,
-                "closes no open <create>",
+                "does not close the open <osmChange>",
             ),
             (
                 r#"<osmChange><create><node id="2"/></delete></osmChange>"#,
-                "closes no open <delete>",
+                "does not close the open <create>",
             ),
             (
                 r#"<osmChange><create><node id="1"/></osmChange>"#,
-                "still open",
+                "does not close the open <create>",
             ),
         ] {
             let err = scan_osc_text_as(xml, Ids::Strict, |_, _, _| {}).unwrap_err();
@@ -1330,8 +1435,102 @@ mod tests {
     }
 
     #[test]
-    fn split_tag_name_separates_name_and_attrs() {
-        assert_eq!(split_tag_name(r#"node id="1""#), ("node", r#"id="1""#));
-        assert_eq!(split_tag_name("create"), ("create", ""));
+    fn parse_tag_separates_kind_name_and_attrs() {
+        assert_eq!(
+            parse_tag(r#"node id="1""#).unwrap(),
+            (TagKind::Start, "node", r#"id="1""#)
+        );
+        assert_eq!(parse_tag("create").unwrap(), (TagKind::Start, "create", ""));
+        assert_eq!(
+            parse_tag("node\tid=\"1\"/").unwrap(),
+            (TagKind::Empty, "node", "id=\"1\"")
+        );
+        assert_eq!(parse_tag("/way \n").unwrap(), (TagKind::End, "way", ""));
+        for bad in [" node", "/ node", "/way x", "node id=\"1\"//", "", "/"] {
+            assert!(parse_tag(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn strict_nesting_refuses_unknown_elements_closed_out_of_order() {
+        for (xml, why) in [
+            (
+                r#"<osmChange><create><node id="1"><tag k="a" v="b"></node></create></osmChange>"#,
+                "does not close the open <tag>",
+            ),
+            (
+                r#"<osmChange><create><node id="1"/></foo></create></osmChange>"#,
+                "does not close the open <create>",
+            ),
+            (
+                r#"<osmChange><create><foo><node id="1"/></create></osmChange>"#,
+                "does not close the open <foo>",
+            ),
+            (r#"<osmChange><osmChange></osmChange>"#, "missing closing"),
+            (
+                r#"<osmChange><create><node id="1"><tag k="a" v="b"><![CDATA[> </tag>]]></node></create></osmChange>"#,
+                "does not close the open <tag>",
+            ),
+        ] {
+            let err = scan_osc_text_as(xml, Ids::Strict, |_, _, _| {}).unwrap_err();
+            assert!(err.contains(why), "{xml}: {err}");
+        }
+    }
+
+    #[test]
+    fn markup_forms_end_where_xml_ends_them() {
+        let strict = |xml: &str| {
+            let mut seen = Vec::new();
+            scan_osc_text_as(xml, Ids::Strict, |_, _, id| seen.push(id)).map(|()| seen)
+        };
+        // A processing instruction ends at `?>`: its `<!--` opens no comment
+        // that could swallow the node.
+        assert_eq!(
+            strict(
+                "<osmChange><create><?p > <!-- ?><node id=\"1\"/><?p --> ?></create></osmChange>"
+            ),
+            Ok(vec![1])
+        );
+        // CDATA content is text, `>` and end-tag lookalikes included.
+        assert_eq!(
+            strict(
+                "<osmChange><create><node id=\"1\"><![CDATA[> </foo>]]]></node></create></osmChange>"
+            ),
+            Ok(vec![1])
+        );
+        // A DOCTYPE's quoted literal may hold `>`.
+        assert_eq!(
+            strict(
+                "<!DOCTYPE osmChange SYSTEM \"> <foo>\"><osmChange><create><node id=\"2\"/></create></osmChange>"
+            ),
+            Ok(vec![2])
+        );
+        for (xml, why) in [
+            (
+                "<!DOCTYPE osmChange [<!ENTITY e \"x\">]><osmChange/>",
+                "internal subset",
+            ),
+            (
+                "<osmChange><!DOCTYPE osmChange></osmChange>",
+                "outside the prolog",
+            ),
+            ("<!DOCTYPE a><!DOCTYPE a><osmChange/>", "a second one"),
+            ("<![CDATA[x]]><osmChange/>", "outside the root"),
+            ("<osmChange><!ELEMENT x></osmChange>", "unsupported markup"),
+            ("<osmChange><!-- a -- b --></osmChange>", "-- inside"),
+            (
+                "<osmChange><create marker=\"<node id='1'/>\"></create></osmChange>",
+                "raw <",
+            ),
+            (
+                "<osmChange><create><?p</create></osmChange>",
+                "unterminated processing",
+            ),
+        ] {
+            let err = strict(xml).unwrap_err();
+            assert!(err.contains(why), "{xml}: {err}");
+            // The lexer is the same in both modes.
+            assert!(scan_osc_text(xml, |_, _, _| {}).is_err(), "{xml}");
+        }
     }
 }

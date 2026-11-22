@@ -55,7 +55,10 @@ pub(crate) fn read_int32(cursor: &mut Cursor<'_>, overflow_msg: &'static str) ->
 /// non-empty occurrence is a hard error naming the field. Empty occurrences are
 /// ignored in either position, since an empty segment contributes nothing to a
 /// concatenation - so the only rejected shape is two occurrences that both
-/// carry data, which no known writer produces.
+/// carry data, which no known writer produces. libosmium's last-wins also
+/// means an empty occurrence after a data-bearing one erases the column there
+/// (a way with no nodes) while it is ignored here; DEVIATIONS.md, "a packed
+/// array is read from its one data-bearing occurrence", records both.
 #[inline]
 fn take_packed<'a>(
     cursor: &mut Cursor<'a>,
@@ -1331,6 +1334,40 @@ mod tests {
         ];
         let way = WireWay::parse(&unpacked).unwrap();
         assert_eq!(way.refs_data, [0x04u8].as_slice());
+    }
+
+    #[test]
+    fn way_refs_keep_their_data_around_an_empty_packed_segment() {
+        // Protobuf concatenation: an empty occurrence adds nothing in either
+        // position. libosmium keeps the last occurrence, so for the
+        // empty-last shape it reads the way with no nodes; DEVIATIONS.md
+        // records the difference.
+        let empty_last = [
+            0x08,
+            0x01,
+            tag(8, WIRE_LEN),
+            0x01,
+            0x04,
+            tag(8, WIRE_LEN),
+            0x00,
+        ];
+        assert_eq!(
+            WireWay::parse(&empty_last).unwrap().refs_data,
+            [0x04u8].as_slice()
+        );
+        let empty_first = [
+            0x08,
+            0x01,
+            tag(8, WIRE_LEN),
+            0x00,
+            tag(8, WIRE_LEN),
+            0x01,
+            0x04,
+        ];
+        assert_eq!(
+            WireWay::parse(&empty_first).unwrap().refs_data,
+            [0x04u8].as_slice()
+        );
     }
 
     #[test]

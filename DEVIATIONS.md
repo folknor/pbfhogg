@@ -1062,6 +1062,37 @@ libosmium, and an occurrence carrying only unknown fields (non-empty body, no
 entries) followed by a populated one is refused here and accepted by
 libosmium. `cat --repair` has no rewrite for this shape.
 
+## PBF decoding: a packed array is read from its one data-bearing occurrence
+
+Protobuf lets a packed repeated field (`Way.refs`, `Relation.memids`, a
+`DenseNodes` or `DenseInfo` column, an element's `keys` and `vals`, and the
+rest) appear several times, packed or as individually tagged varints, and
+defines the value as the concatenation of every occurrence in field order.
+pbfhogg reads at most one occurrence that carries data: an empty occurrence is
+ignored in either position, so every accepted shape reads as its protobuf
+concatenation, and a second data-bearing occurrence is a hard error naming the
+message and field. That refusal is the deviation from protobuf; the read path
+is built on one borrowed slice per array, which cannot express a join, and no
+known writer splits an array. It covers the element decoder and the scanners
+routed through it (way and node scanners, indexdata generation, apply-changes
+refresh, `check --locations`), renumber's wire splice and both
+add-locations-to-ways way reframers. Because each unpacked value is its own
+occurrence, unpacked support is exact for a one-element array and an error
+beyond it. renumber also refuses the unpacked form of `DenseNodes.id`,
+`Way.refs`, `Relation.memids` and `Relation.types` outright, since its splice
+needs one packed byte range. `reference/truncation-handling.md` records why.
+
+libosmium keeps the last occurrence of each packed field, empty or not, so the
+two readers also differ on input pbfhogg accepts: an empty occurrence after a
+data-bearing one erases the column for libosmium. A way whose `refs` end in an
+empty occurrence has its node list here and none in osmium; an emptied
+`Relation.memids`, `roles_sid` or `types` gives the relation no members there;
+an emptied `DenseNodes.id` gives the group no nodes, and an emptied
+coordinate column makes libosmium refuse the block. renumber and
+add-locations-to-ways leave such an empty occurrence in place in what they
+write, so their output carries the same shape. osmium comparisons on such
+input can therefore disagree, check-refs and geocode among them.
+
 ## PBF decoding: required features are matched exactly
 
 Like libosmium, pbfhogg refuses a HeaderBlock declaring a required feature

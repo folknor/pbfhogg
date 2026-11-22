@@ -44,9 +44,7 @@ Reported by: read-framing, sort-renumber.
 The project says every deliberate deviation from protobuf is recorded in
 `DEVIATIONS.md`, and `docs/cli/deviations.md` points there. Missing entries:
 the multi-payload Blob refusal, which `reference/truncation-handling.md`
-acknowledges as a compatibility departure; and renumber's refusal of legal
-unpacked fields and split packed segments (`renumber/wire_rewrite.rs`), also
-described only in `truncation-handling.md`. ALTW's undocumented framing
+acknowledges as a compatibility departure. ALTW's undocumented framing
 refusal is filed as CMD-014 in `notes/bugs-commands.md`.
 
 ## DOC-005 - Way::node_locations claims to consult the header
@@ -248,20 +246,6 @@ planning four node shards). The negative-ID fallback wording in these files
 is already corrected; the rest needs checking against the planner's actual
 cuts before rewording, since some assertions may depend on how many units a
 fixture is cut into.
-
-## DOC-029 - A way's empty trailing packed refs segment decodes differently from osmium
-
-Reported by: the check-refs occurrence-count spar (codex), source review
-only, not reproduced.
-
-A way whose packed `refs` field is split into a nonempty segment followed by
-an empty one keeps its refs in pbfhogg (`take_packed` in
-`crates/lib/src/read/wire.rs` concatenates segments, as protobuf specifies),
-while vendored libosmium (`pbf_decoder.hpp`, way decoding) overwrites its
-`refs` view on each occurrence, so the trailing empty segment erases them.
-The two tools then disagree on the way's node list and on anything counted
-from it (check-refs's nodes-in-ways count among them). If confirmed, this is
-a deliberate spec-following deviation that DEVIATIONS.md does not record.
 
 ## DOC-031 - Undeclared way coordinate arrays have no documented behaviour
 

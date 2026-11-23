@@ -864,7 +864,7 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
         out.stderr_str()
     );
 
-    // Passthrough summary fires when blobs_decoded == 0; in
+    // Nothing is re-encoded or rewritten; in
     // type-filter raw passthrough we expect exactly 2 way blobs
     // through, so the line is "2 blobs passed through".
     let stderr = out.stderr_str();
@@ -974,7 +974,7 @@ fn clean_keeps_input_order() {
             &input,
             "all.osm.pbf",
             &[],
-            "Decoded 3 blobs, wrote 6 elements"
+            "Rebuilt elements from 3 input blobs (6 elements written)"
         ),
         [
             ("way", 31, 31, 1),
@@ -989,7 +989,7 @@ fn clean_keeps_input_order() {
             &poisoned,
             "ways.osm.pbf",
             &["--type", "way"],
-            "Decoded 2 blobs, wrote 2 elements"
+            "Rebuilt elements from 2 input blobs (2 elements written)"
         ),
         [("way", 31, 31, 1), ("way", 30, 30, 1)]
     );
@@ -2186,7 +2186,12 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
         .arg(&output)
         .run();
     assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
-    out.assert_stderr_contains("Decoded 4 blobs, wrote 8009 elements; 2 blobs passed through");
+    out.assert_stderr_contains(
+        "Rebuilt elements from 4 input blobs (8009 elements written); 2 blobs passed through",
+    );
+    // The reindexed ordinary block passed through but was opened to scan it:
+    // the four rebuilt blobs and it.
+    out.assert_stderr_contains("Opened the payloads of 5 input blobs");
     // The note tells the three rebuilt blobs from the omitted empty one.
     out.assert_stderr_contains("Note: 3 blobs held blocks no single index describes");
     out.assert_stderr_contains("; 1 more such blobs yielded no elements and were omitted");
@@ -3085,6 +3090,14 @@ fn repair_merges_a_repeated_info_and_dense_info() {
         "merged repeated metadata in 2 elements and 1 dense groups across 3 input blobs",
     );
     out.assert_stderr_contains("Repaired 3 input blobs");
+    // Each repaired blob's fate is a rewrite, not a silent zero: the
+    // summary once read "0 blobs passed through" here.
+    out.assert_stderr_contains("3 blobs rewritten\n");
+    assert!(
+        !out.stderr_str().contains("passed through"),
+        "{}",
+        out.stderr_str()
+    );
     assert_eq!(ordered_elements(&output), ordered_elements(&reference));
     assert_eq!(data_blob_indexdata(&output), vec![true, true, true]);
     CliInvoker::new(&invocation_scratch)

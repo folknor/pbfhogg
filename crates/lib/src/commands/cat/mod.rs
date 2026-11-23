@@ -41,33 +41,63 @@ impl CleanAttrs {
 }
 
 /// Statistics from a cat operation.
+///
+/// Every input data blob the run copied or opened has exactly one fate:
+/// passed through, rewritten or re-encoded. An indexed blob a type filter
+/// skips on its indexdata has none and is counted nowhere. Separately,
+/// `blobs_payloads_opened` counts the work: a blob that passed through may
+/// still have been opened, to index or validate it.
 pub struct CatStats {
+    /// Input data blobs whose payload bytes were written unchanged: the
+    /// frame copied whole, or its header rebuilt to add indexdata (sidecar
+    /// `cat_blobs_passthrough`).
     pub blobs_passthrough: u64,
-    /// Input blobs decoded (sidecar `cat_blobs_decoded`, and the summary's
-    /// "Decoded N blobs"), not output blobs written.
-    pub blobs_decoded: u64,
+    /// Input data blobs whose payload [`repair()`] replaced by the merged
+    /// one and recompressed, written as one blob (sidecar
+    /// `cat_blobs_rewritten`); always 0 from [`cat`] and with `clean`,
+    /// where a repaired blob is re-encoded.
+    pub blobs_rewritten: u64,
+    /// Input data blobs decoded into elements and written from them
+    /// (sidecar `cat_blobs_reencoded`), counted whether or not the rebuild
+    /// wrote any element: a type filter or an empty block can leave none.
+    /// Not output blobs written.
+    pub blobs_reencoded: u64,
+    /// Elements written by the re-encode; elements inside passed-through
+    /// or rewritten blobs are not counted.
     pub elements_written: u64,
-    /// Input blobs [`repair()`] rewrote (each counted once, however many
-    /// output blobs it became); always 0 from [`cat`].
+    /// Input data blobs whose payload the run opened (decompressed, or read
+    /// as a raw body), once per blob whatever its fate (sidecar
+    /// `cat_blobs_payloads_opened`). At least `blobs_reencoded +
+    /// blobs_rewritten`; any excess is passed-through blobs opened to scan
+    /// their index or to validate them.
+    pub blobs_payloads_opened: u64,
+    /// Input blobs whose repeated metadata [`repair()`] merged, each counted
+    /// once whatever its fate; always 0 from [`cat`].
     pub blobs_repaired: u64,
 }
 
 impl CatStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        if self.blobs_decoded > 0 && self.blobs_passthrough > 0 {
+        let mut fates: Vec<String> = Vec::new();
+        if self.blobs_reencoded > 0 {
+            fates.push(format!(
+                "Rebuilt elements from {} input blobs ({} elements written)",
+                self.blobs_reencoded, self.elements_written,
+            ));
+        }
+        if self.blobs_rewritten > 0 {
+            fates.push(format!("{} blobs rewritten", self.blobs_rewritten));
+        }
+        if self.blobs_passthrough > 0 || fates.is_empty() {
+            fates.push(format!("{} blobs passed through", self.blobs_passthrough));
+        }
+        writeln!(w, "{}", fates.join("; "))?;
+        if self.blobs_payloads_opened > self.blobs_reencoded + self.blobs_rewritten {
             writeln!(
                 w,
-                "Decoded {} blobs, wrote {} elements; {} blobs passed through",
-                self.blobs_decoded, self.elements_written, self.blobs_passthrough,
+                "Opened the payloads of {} input blobs",
+                self.blobs_payloads_opened,
             )?;
-        } else if self.blobs_decoded > 0 {
-            writeln!(
-                w,
-                "Decoded {} blobs, wrote {} elements",
-                self.blobs_decoded, self.elements_written,
-            )?;
-        } else {
-            writeln!(w, "{} blobs passed through", self.blobs_passthrough)?;
         }
         if self.blobs_repaired > 0 {
             writeln!(w, "Repaired {} input blobs", self.blobs_repaired)?;
@@ -280,7 +310,11 @@ pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
     host.invocation
         .counter("cat_blobs_passthrough", result.blobs_passthrough);
     host.invocation
-        .counter("cat_blobs_decoded", result.blobs_decoded);
+        .counter("cat_blobs_rewritten", result.blobs_rewritten);
+    host.invocation
+        .counter("cat_blobs_reencoded", result.blobs_reencoded);
+    host.invocation
+        .counter("cat_blobs_payloads_opened", result.blobs_payloads_opened);
     host.invocation
         .counter("cat_elements_written", result.elements_written);
     Ok(result)
@@ -428,6 +462,8 @@ fn cat_passthrough(
     // The subset of `blobs_reencoded` that yielded no elements.
     let mut blobs_omitted: u64 = 0;
     let mut elements_reencoded: u64 = 0;
+    // Every unindexed blob: reframed (passed through) or re-encoded.
+    let mut payloads_opened: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     for input in files {
@@ -459,6 +495,7 @@ fn cat_passthrough(
                         let locate = |e: Error| frames.locate(id, e);
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)
                             .map_err(locate)?;
+                        payloads_opened += 1;
                         let (index, tagdata) =
                             scan_block_ids_and_tags(&decompress_buf).map_err(locate)?;
                         let index = match index {
@@ -514,8 +551,10 @@ fn cat_passthrough(
     note_reencoded(host, blobs_reencoded - blobs_omitted, blobs_omitted);
     Ok(CatStats {
         blobs_passthrough: blobs,
-        blobs_decoded: blobs_reencoded,
+        blobs_rewritten: 0,
+        blobs_reencoded,
         elements_written: elements_reencoded,
+        blobs_payloads_opened: payloads_opened,
         blobs_repaired: 0,
     })
 }
@@ -547,7 +586,10 @@ fn repair_passthrough(
     let compression = write.compression;
     let metrics = &host.invocation.metrics().writer;
 
+    // Every data blob is opened to validate it, so the opened count is the
+    // sum of the three fates.
     let mut copied: u64 = 0;
+    let mut rewritten: u64 = 0;
     let mut rebuilt: u64 = 0;
     let mut omitted: u64 = 0;
     let mut elements_rebuilt: u64 = 0;
@@ -572,8 +614,7 @@ fn repair_passthrough(
                 }
                 match repaired.outcome {
                     repair::Outcome::Copied => copied += 1,
-                    // Counted by the tally, below.
-                    repair::Outcome::Rewritten => {}
+                    repair::Outcome::Rewritten => rewritten += 1,
                     repair::Outcome::Rebuilt { blocks, elements } => {
                         rebuilt += 1;
                         omitted += u64::from(blocks == 0);
@@ -592,14 +633,16 @@ fn repair_passthrough(
     tally.note(host);
     Ok(CatStats {
         blobs_passthrough: copied,
-        blobs_decoded: rebuilt,
+        blobs_rewritten: rewritten,
+        blobs_reencoded: rebuilt,
         elements_written: elements_rebuilt,
+        blobs_payloads_opened: copied + rewritten + rebuilt,
         blobs_repaired: tally.blobs,
     })
 }
 
 /// Announce the blobs plain cat did not copy byte for byte: the summary
-/// counts them as decoded, which alone does not say their content was
+/// counts them as re-encoded, which alone does not say their content was
 /// normalised (rebuilt) or dropped (omitted). The note states the rules
 /// that applied, not that each one changed a value in the run's input.
 fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
@@ -937,10 +980,13 @@ fn cat_type_passthrough(
     }
 
     writer.flush()?;
+    // Only an unindexed blob is opened, and every one is re-encoded.
     Ok(CatStats {
         blobs_passthrough,
-        blobs_decoded,
+        blobs_rewritten: 0,
+        blobs_reencoded: blobs_decoded,
         elements_written,
+        blobs_payloads_opened: blobs_decoded,
         blobs_repaired: 0,
     })
 }
@@ -1149,10 +1195,13 @@ fn cat_filtered(
     writer.flush()?;
     tally.note(host);
 
+    // Every scheduled blob is opened once and re-encoded, repaired or not.
     Ok(CatStats {
         blobs_passthrough: 0,
-        blobs_decoded,
+        blobs_rewritten: 0,
+        blobs_reencoded: blobs_decoded,
         elements_written: elements,
+        blobs_payloads_opened: blobs_decoded,
         blobs_repaired: tally.blobs,
     })
 }

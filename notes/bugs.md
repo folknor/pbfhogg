@@ -76,21 +76,6 @@ Reported by: sort.
 Compression selection (`renumber/mod.rs`) maps explicit `zlib:6` to `zlib:1`;
 disclosed in CLI source but an observable trap for any pipeline rewrite.
 
-## BUG-023 - cat's blobs_decoded hides decompression
-
-Reported by: copy.
-
-Unindexed plain cat decompresses ordinary blobs to generate indexdata but counts
-them as passthrough; `blobs_decoded` counts only rebuilt unclassifiable blobs.
-
-Defect hunt 2026-11-17 (passthrough-rewrite): the repair path has the same
-gap. `repair_passthrough` (`cat/mod.rs`) validates every data blob, but sets
-`blobs_decoded` only from blobs rebuilt into single-kind blocks, and
-`Outcome::Rewritten` increments neither decoded nor passthrough counts. One
-repaired, classifiable blob can report `0 blobs passed through` then
-`Repaired 1 input blobs`, with `cat_blobs_decoded = 0`, against
-`CatStats::blobs_decoded`'s documented meaning.
-
 ## BUG-024 - Export keeps decoding after a write failure
 
 Reported by: spatial.

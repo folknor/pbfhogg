@@ -454,7 +454,7 @@ pub(crate) enum Command {
 /// What a command returned that judgments read.
 #[derive(Clone, Copy)]
 pub(crate) enum Returned {
-    Cat { passthrough: u64, decoded: u64 },
+    Cat { passthrough: u64, reencoded: u64 },
     Digest(pbfhogg::digest::Digest),
     Counts(crate::synthetic::Counts),
     Nothing,
@@ -654,7 +654,7 @@ impl Command {
                     pbfhogg::cat::cat(&refs, out, *type_filter, clean, write, overrides, host)?;
                 Ok(Returned::Cat {
                     passthrough: stats.blobs_passthrough,
-                    decoded: stats.blobs_decoded,
+                    reencoded: stats.blobs_reencoded,
                 })
             }
             Self::Digest {

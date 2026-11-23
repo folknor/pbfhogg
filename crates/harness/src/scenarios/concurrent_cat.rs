@@ -43,9 +43,11 @@ const OWN_COUNTERS: &[&str] = &["counters.own-call.v1"];
 /// Each call's sealed snapshot holds its own engine counters.
 const OWN_SNAPSHOT: &[&str] = &["counters.own-snapshot.v1"];
 /// The cat counters a passthrough call emits, each exactly once.
-const CAT_COUNTERS: [&str; 3] = [
+const CAT_COUNTERS: [&str; 5] = [
     "cat_blobs_passthrough",
-    "cat_blobs_decoded",
+    "cat_blobs_rewritten",
+    "cat_blobs_reencoded",
+    "cat_blobs_payloads_opened",
     "cat_elements_written",
 ];
 
@@ -389,14 +391,14 @@ fn judge(
     );
     // The exact inventory, from the generated input and independent of
     // what the call returned: every block of an indexed input is copied
-    // raw, so none is decoded and no element is re-encoded. Each name once,
+    // raw, so none is opened, rewritten or re-encoded. Each name once,
     // no other cat counter: a sample delivered to both taps shows twice.
     let expected = i64::try_from(blocks).unwrap_or(i64::MAX);
     let mut samples = watch.samples();
     samples.sort();
     let mut inventory: Vec<(String, i64)> = CAT_COUNTERS
         .iter()
-        .zip([expected, 0, 0])
+        .zip([expected, 0, 0, 0, 0])
         .map(|(name, value)| ((*name).to_owned(), value))
         .collect();
     inventory.sort();

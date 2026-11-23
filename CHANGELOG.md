@@ -4,6 +4,20 @@
 
 ### Breaking
 
+- **cat's blob counts say what happened to each blob and what was
+  opened.** `CatStats::blobs_decoded` is renamed `blobs_reencoded` (input
+  blobs rebuilt from their elements), and `blobs_rewritten` and
+  `blobs_payloads_opened` are new. A `cat --repair` blob repaired in place
+  used to be counted nowhere, so a run could print `0 blobs passed
+  through`; it now counts as rewritten. A blob reframed with fresh
+  indexdata still counts as passed through, but its decompression is no
+  longer hidden. The summary reads `Rebuilt elements from N input blobs
+  (M elements written); R blobs rewritten; K blobs passed through`, with
+  zero clauses dropped, then `Opened the payloads of P input blobs` when
+  blobs that passed through were opened to index or validate them. The
+  sidecar counter `cat_blobs_decoded` is now `cat_blobs_reencoded`, beside
+  new `cat_blobs_rewritten` and `cat_blobs_payloads_opened`.
+
 - **`degrade --unsort` refuses `--elements-per-blob 1`.** At a cap of 1
   every blob holds one element, and single-element blobs of distinct IDs
   never overlap, so the swap only permuted blobs: `sort` restored the

@@ -25,8 +25,8 @@ were added to `notes/bugs.md` instead of being filed here: tag truncation
 apply-changes base version precedence (since fixed: a change set older
 than the base element is refused), plain nodes in
 renumber (since fixed: renumber rewrites plain node groups), degrade drop
-counting (BUG-022) and cat decode counters
-(BUG-023). Entries are in no
+counting (BUG-022) and cat decode counters (since fixed: cat counts
+each blob's fate and the payloads it opened). Entries are in no
 order of importance.
 
 ## CMD-065 - renumber overrides an explicit zlib level 6 with level 1

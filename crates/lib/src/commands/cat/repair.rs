@@ -332,7 +332,8 @@ pub(super) struct RepairScratch {
 
 /// What became of one input data blob.
 pub(super) enum Outcome {
-    /// Copied whole, or reframed with scanned indexdata.
+    /// Copied whole, or reframed with scanned indexdata: its payload bytes
+    /// unchanged, though it was decompressed to validate it.
     Copied,
     /// Repaired into one blob: its rewritten payload, recompressed.
     Rewritten,

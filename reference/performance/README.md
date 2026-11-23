@@ -138,7 +138,10 @@ usually small.
   read the same either side. `cat_blobs_decoded` and cat's "Decoded N blobs"
   count input blobs decoded, not output blobs written, from `8da26b23`; a
   `cat --clean` or `cat --type` row before it is not comparable on that
-  counter. The unindexed diff and derive-changes merge decodes through a
+  counter. That counter was later renamed `cat_blobs_reencoded`, with the
+  same counting rule, beside new `cat_blobs_rewritten` and
+  `cat_blobs_payloads_opened`; older rows carry only the old name and say
+  nothing of passed-through blobs that were opened. The unindexed diff and derive-changes merge decodes through a
   recycling pool from `126cbce2` and feeds the
   `pipeline_decompress_pool_*` drop counters, which earlier such rows lack;
   indexed runs at any `-j` decode into a fresh buffer per block and are

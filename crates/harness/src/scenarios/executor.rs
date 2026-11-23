@@ -159,28 +159,28 @@ impl Observation for Judge {
     }
 }
 
-/// `b.framing-on-caller-pool`: no blob passed through, some decoded, some
-/// payloads framed, and every framed payload framed on a worker of the
+/// `b.framing-on-caller-pool`: no blob passed through, some re-encoded,
+/// some payloads framed, and every framed payload framed on a worker of the
 /// caller's pool, read from the sealed call's final counters.
 fn framing_on_caller_pool(record: &CallRecord) -> Outcome {
     let stats = match record.returned {
         Some(Returned::Cat {
             passthrough,
-            decoded,
-        }) => Some((passthrough, decoded)),
+            reencoded,
+        }) => Some((passthrough, reencoded)),
         _ => None,
     };
     let framed = record.sealed_counter(FRAMED);
     let on_pool = record.sealed_counter(FRAMED_ON_EXECUTOR);
     let ok = matches!(
         (stats, framed, on_pool),
-        (Some((0, decoded)), Some(f), Some(p)) if decoded > 0 && f > 0 && p == f
+        (Some((0, reencoded)), Some(f), Some(p)) if reencoded > 0 && f > 0 && p == f
     );
     Outcome::judge(
         "b.framing-on-caller-pool",
         ok,
         format!(
-            "cat (passthrough, decoded) {stats:?}; {FRAMED} {framed:?}; \
+            "cat (passthrough, reencoded) {stats:?}; {FRAMED} {framed:?}; \
              {FRAMED_ON_EXECUTOR} {on_pool:?}"
         ),
     )

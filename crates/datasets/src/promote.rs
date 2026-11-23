@@ -111,20 +111,13 @@ fn publish_output(req: &Request<'_>, dir: &Path, dest: &Path, digest: &str) -> R
                     dest.display()
                 ));
             }
+            // A retry reuses what an earlier run may not have made durable.
+            layout::make_durable(dest)?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Recovery must not fill an absent registered destination with
-            // a different pin.
-            let dest_path = layout::publication_path(dest)?;
-            for (_, path) in layout::registered_paths(req.config, req.host, dir)? {
-                let named = layout::publication_path(&path)?;
-                if named == dest_path {
-                    return Err(format!(
-                        "publication path {} is already registered",
-                        named.display()
-                    ));
-                }
-            }
+            // Recovery must not fill an absent destination any registration
+            // resolves through, dangling aliases included.
+            layout::claim(req.config, req.host, dir, dest)?;
             // Even an unusual manually configured staging name belongs to
             // the registry, and the output must survive its staging.
             let staged = layout::stage(req.config, req.host, dir, req.dataset, dest, &[req.file])?;
@@ -319,6 +312,56 @@ mod tests {
         assert!(run(&req).unwrap_err().contains("already registered"));
         assert_eq!(std::fs::read(&staged).unwrap(), b"registered bytes");
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn polygons_and_dangling_aliases_of_the_final_name_are_protected() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let root = scratch.path();
+        let dir = root.join("data");
+        std::fs::create_dir(&dir).unwrap();
+        let input = root.join("output.osm.pbf");
+        std::fs::write(&input, b"generated").unwrap();
+        let digest = file_digest(&input).unwrap();
+        let dest = dir.join(format!("tiny-named-indexed-{digest}.osm.pbf"));
+        let staged = layout::partial("tiny", &dest);
+        let path = root.join("brokkr.toml");
+        // A polygon registered at the staging name is never unlinked.
+        std::fs::write(&staged, b"polygon").unwrap();
+        let text = format!(
+            "[h]\ndata = 'data'\n[h.datasets.tiny]\n[h.datasets.other.polygon.p]\nfile = {:?}\n",
+            staged.file_name().unwrap().to_str().unwrap()
+        );
+        std::fs::write(&path, &text).unwrap();
+        let config = Config::load(&path, None).unwrap();
+        let req = Request {
+            config: &config,
+            host: "h",
+            dataset: "tiny",
+            file: &input,
+            snapshot: "named",
+            replace: false,
+            producer: Producer::Cat,
+            strip_indexdata: false,
+        };
+        assert!(run(&req).unwrap_err().contains("staging name"));
+        assert_eq!(std::fs::read(&staged).unwrap(), b"polygon");
+        std::fs::remove_file(&staged).unwrap();
+        // A registration through a dangling alias of the absent final name
+        // is never filled.
+        std::os::unix::fs::symlink(&dest, dir.join("alias")).unwrap();
+        let text =
+            "[h]\ndata = 'data'\n[h.datasets.tiny]\n[h.datasets.other.pmtiles.t]\nfile = 'alias'\n";
+        std::fs::write(&path, text).unwrap();
+        let config = Config::load(&path, None).unwrap();
+        let err = run(&Request {
+            config: &config,
+            ..req
+        })
+        .unwrap_err();
+        assert!(err.contains("publication name"), "{err}");
+        assert!(dest.symlink_metadata().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]

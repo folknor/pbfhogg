@@ -311,3 +311,22 @@ session ledger. Neither `docs/cli/commands.md` (the `--json` row names only
 the current version), the doc comment in `json.rs`, nor CHANGELOG states it,
 so a JSON consumer cannot tell what a version change promises, and the next
 schema edit has nothing to follow.
+
+## DOC-036 - The Blob raw_size cross-check is stricter than libosmium with no DEVIATIONS.md entry
+
+Reported by: the spar accounting of the ALTW coordinate-framing conversion,
+from its scout's lateral (2026-11-24).
+
+`reference/truncation-handling.md` (the Blob-envelope bullets) records that
+once decompression has run, a declared `Blob.raw_size` that disagrees with
+the payload actually produced is refused as corruption, and says pbfhogg is
+"stricter than libosmium in one direction": libosmium sizes its output
+buffer to `raw_size` and calls `uncompress`, so an oversized `raw_size`
+succeeds there and yields a payload zero-padded to the declared length,
+where pbfhogg refuses. AGENTS.md says every deliberate deviation from
+osmium is recorded in DEVIATIONS.md, and the multi-payload Blob refusal
+described next to it in the same document now has its DEVIATIONS.md
+section, but `DEVIATIONS.md` has no entry for the `raw_size` cross-check
+(searched for "raw_size" and "raw size"). Record the deviation in
+DEVIATIONS.md, with the libosmium behaviour checked against
+`research/libosmium/include/osmium/io/detail/pbf_decoder.hpp`.

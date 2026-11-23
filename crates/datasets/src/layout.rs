@@ -41,29 +41,77 @@ pub(crate) fn registered_paths(
     host: &str,
     dir: &Path,
 ) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut out = Vec::new();
-    for (key, view) in config.dataset_views(host).map_err(|e| e.to_string())? {
-        for generation in std::iter::once(&view.primary).chain(view.snapshots.values()) {
-            for entry in generation.pbf.values().chain(generation.osc.values()) {
-                out.push((key.clone(), dir.join(&entry.file)));
-            }
+    Ok(config
+        .registered_files(host)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(key, file)| (key, dir.join(file)))
+        .collect())
+}
+
+/// Refuse when replacing, filling or unlinking the directory entry `target`
+/// would break a registered file anywhere on the host, or any path in
+/// `protect`; `role` names the entry in the refusal.
+///
+/// The question is whether resolving a protected path looks up the very
+/// directory entry the operation changes, not whether the two paths end at
+/// the same file: a registration can traverse the name as a symlinked
+/// directory or reach it through a dangling symlink, and an unused symlink
+/// at the name that points at a registered file is harmless to replace.
+/// Directories are compared by device and inode, so a bind-mounted alias of
+/// the data directory is seen through. Names compare bytewise, so the
+/// guarantee holds on case-sensitive directories only; `..` is popped
+/// lexically, which can over-refuse but never under-refuse.
+fn veto(
+    config: &Config,
+    host: &str,
+    dir: &Path,
+    target: &Path,
+    role: &str,
+    protect: &[&Path],
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let meta = std::fs::metadata(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let entry = (
+        (meta.dev(), meta.ino()),
+        target.file_name().unwrap_or_default(),
+    );
+    for path in protect {
+        if resolution_uses(path, entry)? {
+            return Err(format!(
+                "{} is the {role}, but resolving {} passes through it; move it elsewhere first",
+                target.display(),
+                path.display()
+            ));
         }
     }
-    Ok(out)
+    for (owner, path) in registered_paths(config, host, dir)? {
+        if resolution_uses(&path, entry)? {
+            return Err(format!(
+                "{} is the {role}, but resolving {} registered by '{owner}' passes \
+                 through it; it is already registered",
+                target.display(),
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to write, replace or adopt the final name `dest` when any
+/// registration on the host resolves through that directory entry (see
+/// `veto`). Every producer asks this before touching a final name.
+pub(crate) fn claim(config: &Config, host: &str, dir: &Path, dest: &Path) -> Result<(), String> {
+    veto(config, host, dir, dest, "publication name", &[])
 }
 
 /// Prepare the staged sibling of `dest` for a writer of dataset `key`:
 /// refuse when unlinking it would break a registered file anywhere on the
-/// host, or any path in `protect`, else remove whatever stale file is there.
-///
-/// The question is whether resolving a protected path looks up the very
-/// directory entry the unlink removes, not whether the two paths end at the
-/// same file: a registration can traverse the staging name as a symlinked
-/// directory, and an unused symlink at the staging name that points at a
-/// registered file is harmless to unlink. Directories are compared by
-/// device and inode, so a bind-mounted alias of the data directory is seen
-/// through. Names compare bytewise; case-insensitive directories are not
-/// accounted for.
+/// host, or any path in `protect` (see `veto`), else remove whatever stale
+/// file is there.
 pub(crate) fn stage(
     config: &Config,
     host: &str,
@@ -73,36 +121,19 @@ pub(crate) fn stage(
     protect: &[&Path],
 ) -> Result<PathBuf, String> {
     let staged = partial(key, dest);
-    let parent = staged
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let meta = std::fs::metadata(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    let entry = (
-        (meta.dev(), meta.ino()),
-        staged.file_name().unwrap_or_default(),
-    );
-    for path in protect {
-        if resolution_uses(path, entry)? {
-            return Err(format!(
-                "{} is the staging name, but resolving {} passes through it; move it elsewhere first",
-                staged.display(),
-                path.display()
-            ));
-        }
-    }
-    for (owner, path) in registered_paths(config, host, dir)? {
-        if resolution_uses(&path, entry)? {
-            return Err(format!(
-                "{} is the staging name, but resolving {} registered by '{owner}' passes \
-                 through it; it is already registered",
-                staged.display(),
-                path.display()
-            ));
-        }
-    }
+    veto(config, host, dir, &staged, "staging name", protect)?;
     clear(&staged)?;
     Ok(staged)
+}
+
+/// Make a file found complete at its final name durable before it is
+/// registered: a run that died between rename and directory fsync left a
+/// name a power failure could still lose.
+pub(crate) fn make_durable(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    sync_parent(path)
 }
 
 /// Whether resolving `path` looks up `name` inside the directory identified
@@ -199,18 +230,6 @@ fn clear(staged: &Path) -> Result<(), String> {
     }
 }
 
-/// Resolve symlinks even when the final filename does not exist yet.
-pub(crate) fn publication_path(path: &Path) -> Result<PathBuf, String> {
-    match std::fs::canonicalize(path) {
-        Ok(path) => Ok(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or("file has no parent")?;
-            Ok(publication_path(parent)?.join(path.file_name().ok_or("file has no name")?))
-        }
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -259,5 +278,10 @@ mod tests {
         // A registration of the target file itself does not use the entry.
         assert!(!resolution_uses(&data.join("store/raw.osm.pbf"), entry).unwrap());
         assert!(!resolution_uses(&data.join("absent/x"), entry).unwrap());
+        // A dangling alias of an absent final name is a use of that entry.
+        let fresh = data.join("fresh.osm.pbf");
+        let fresh_entry = ((meta.dev(), meta.ino()), fresh.file_name().unwrap());
+        symlink(&fresh, root.join("dangling")).unwrap();
+        assert!(resolution_uses(&root.join("dangling"), fresh_entry).unwrap());
     }
 }

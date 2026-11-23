@@ -110,9 +110,8 @@ are validated before rotation.
 Only the final HEAD response's Last-Modified establishes upstream newness.
 Missing, invalid or non-newer dates require `--force`; HEAD errors still
 fail even with force. Force requires refresh; refresh conflicts with
-`--as-snapshot`. Canonical destination collisions with any registered
-primary or snapshot on the selected host refuse, including symlink aliases.
-With `--osc-seq`, continuity comes from the new raw only, never the
+`--as-snapshot`. Its PBF final names take the publication-name rule
+(below) before any transfer. With `--osc-seq`, continuity comes from the new raw only, never the
 archived sequence. Old seq values and OSCs archive together.
 
 ## Locks, publication and registry ownership
@@ -123,26 +122,54 @@ unlocked. Each acquisition child inherits the lock as stdin, so an orphaned
 writer prevents retry until it exits. This assumes curl and pbfhogg keep
 stdin open until exit.
 
-The lock's content records the source identity of potentially unregistered
-acquisition files. Raw and OSC adoption requires an already matching
-identity; a torn record matches nothing. Identity is rewritten only when
-nothing is adoptable. The staged sibling of `NAME` is `.partial.KEY.NAME`;
-dataset keys never contain `.`, so two datasets, which hold different
-locks, never share a staging name. Stale staged files are removed under the
-lock before their writer starts, except that the removal refuses when
-resolving any file registered on the host (or the input being promoted)
-would look up that staging entry, whether the registration names it
-directly or traverses it through a symlink; directories compare by device
-and inode, so a bind-mounted alias is seen through. Leftovers from the
-older `.partial-NAME` spelling are never removed by the tool. Registered shared diffs do not require a recovery
-identity. Retry preserves registered pins and can recover completed,
-unregistered publication safely.
+The lock file's content is never written. What download published under a
+key is recorded per file in `DATA/.KEY.download.journal`, one line per
+publication: name, kind (`raw`, `osc` or `indexed`), source origin and
+XXH3-128 digest. A file at a final name is adopted (raw, OSC) or replaced
+(indexed) only when it is a regular file and a record matches its name,
+kind, the request's origin and its current bytes; anything else at the
+name refuses and is left in place. So a crash between publication and
+registration never lets another source sharing the dataset key, another
+kind of output, or another dataset whose final name coincides claim the
+file. Retry reuses any completed publication recorded for that name and
+origin; it makes no claim about which upstream generation the bytes came
+from. A publication's record is added, keeping the name's earlier records,
+before its rename, and the name's superseded records are retired after the
+rename and directory fsync, so a crash in between leaves both the old and
+the new bytes recognisable. The journal is replaced atomically on each
+write; a lost, unparseable or pre-journal record matches nothing, which
+refuses recovery rather than misattributing it. Registered shared diffs
+are referenced, never written, and need no record.
 
-Publication writes a staged sibling, fsyncs it, renames it to the final
-name, fsyncs the directory, then hashes the file. One atomic registry write
-follows, using its own staged write, fsync, rename and directory fsync.
-A final acquisition filename therefore denotes complete bytes; failure
-before registration can leave recoverable unregistered files.
+The staged sibling of `NAME` is `.partial.KEY.NAME`; dataset keys never
+contain `.`, so two datasets, which hold different locks, never share a
+staging name. One rule protects every directory entry the tool changes -
+staging names, final publication names, the journal and its staging
+name: the change refuses when resolving any file registered on the
+selected host (or the input being promoted) would look up that entry,
+whether the registration names it directly, traverses it as a symlinked
+directory, or reaches it through a symlink, dangling or not. Directories
+compare by device and inode, so a bind-mounted alias is seen through; names
+compare bytewise, so the guarantee holds on case-sensitive directories
+only. An unused symlink at a name that merely points at a registered file
+is not a use of the entry. Every table under a dataset that carries a
+`file` key counts as a registration, whatever its kind (PBF, OSC, polygon,
+PMTiles or any other), so `file` is reserved in dataset tables.
+Registrations in other configs or hosts sharing the data directory are not
+visible. Final names of different dataset keys can coincide (`foo-bar`
+snapshot `baz` and `foo` snapshot `bar-baz`); only brokkr's machine lock
+serialises such runs. Stale staged files are removed under the lock before
+their writer starts. Leftovers from the older `.partial-NAME` spelling are
+never removed by the tool. Retry preserves registered pins.
+
+Publication writes a staged sibling, fsyncs it, hashes it, records it in
+the journal, renames it to the final name and fsyncs the directory. An
+adopted file is fsynced with its directory before registration, since the
+run that published it may have died before its directory fsync. One atomic
+registry write follows, using its own staged write, fsync, rename and
+directory fsync. A final acquisition filename therefore denotes complete
+bytes; failure before registration can leave recoverable unregistered
+files.
 
 Devkit edits the one project/include file owning the dataset table.
 Dataset ownership split across files refuses. A new dataset goes into the

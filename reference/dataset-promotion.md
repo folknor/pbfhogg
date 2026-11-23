@@ -44,16 +44,19 @@ Promotion copies the input into the selected host's data directory. It
 never consumes or modifies the input. Published names are
 `DATASET-SNAPSHOT-VARIANT-XXH128.osm.pbf`, with the observed 32-digit
 XXH3-128 digest. The per-dataset `.DATASET.download.lock` is shared with
-acquisition and held through registry commit, without modifying its source
-identity record. brokkr holds its machine lock around the whole invocation.
+acquisition and held through registry commit; promotion neither reads nor
+writes download's recovery journal. brokkr holds its machine lock around the whole invocation.
 
 The copy is staged as a hidden sibling, checked against the input digest,
 fsynced, renamed, and followed by directory fsync. Only then does devkit's
 registry writer atomically replace the owning config file. The writer
 preserves the owning include and legacy or explicit host namespace; split
 ownership refuses. Existing final files are reused only when regular and
-byte-equal. Symlinks and different bytes refuse. Publication never clears a
-registered staging path or fills an absent registered destination.
+byte-equal, and are fsynced with their directory before registration.
+Symlinks and different bytes refuse. Publication never clears a staging
+path or fills an absent destination that any registration on the host
+resolves through, of any kind and through any symlink, dangling or not
+(the rule in [datasets.md](datasets.md#locks-publication-and-registry-ownership)).
 
 Digest-qualified names keep replacement safe across process death: before
 the registry commit the old registry still names unchanged old bytes. A

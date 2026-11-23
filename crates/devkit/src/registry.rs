@@ -47,23 +47,42 @@ pub struct DatasetView {
 }
 
 impl Config {
-    /// All registered datasets for one host, for publication collision checks.
-    pub fn dataset_views(&self, host: &str) -> Result<BTreeMap<String, DatasetView>, Error> {
+    /// Every file registered on one host, as (dataset key, `file` value), for
+    /// publication collision checks. Kind-agnostic: any table, or table in
+    /// an array, anywhere under a dataset that carries a string `file` is a
+    /// registration (PBF, OSC, polygon, PMTiles, or a kind this crate does
+    /// not read), so `file` is a reserved field in dataset tables.
+    pub fn registered_files(&self, host: &str) -> Result<Vec<(String, String)>, Error> {
+        fn walk(value: &toml::Value, key: &str, out: &mut Vec<(String, String)>) {
+            match value {
+                toml::Value::Table(table) => {
+                    if let Some(toml::Value::String(file)) = table.get("file") {
+                        out.push((key.to_owned(), file.clone()));
+                    }
+                    for child in table.values() {
+                        walk(child, key, out);
+                    }
+                }
+                toml::Value::Array(items) => {
+                    for child in items {
+                        walk(child, key, out);
+                    }
+                }
+                _ => {}
+            }
+        }
         let table = self.selected_host(host)?;
         let Some(datasets) = table.get("datasets") else {
-            return Ok(BTreeMap::new());
+            return Ok(Vec::new());
         };
         let datasets = datasets
             .as_table()
             .ok_or_else(|| Error::message("datasets must be a table"))?;
-        datasets
-            .keys()
-            .map(|key| {
-                self.dataset(host, key)?
-                    .map(|view| (key.clone(), view))
-                    .ok_or_else(|| Error::message("dataset disappeared"))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for (key, dataset) in datasets {
+            walk(dataset, key, &mut out);
+        }
+        Ok(out)
     }
 
     /// The dataset `key` of `host`, or `None` when the host has no such

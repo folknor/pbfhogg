@@ -6,6 +6,7 @@
 //! links no pbfhogg.
 mod date;
 mod download;
+mod journal;
 mod layout;
 mod lock;
 mod output;

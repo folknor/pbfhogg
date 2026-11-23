@@ -200,7 +200,7 @@ fn sequence_insert_preserves_entry_and_refuses_replacement() {
 }
 
 #[test]
-fn host_inventory_includes_composed_datasets_and_all_generations() {
+fn host_inventory_includes_composed_datasets_and_every_file_kind() {
     let (_scratch, root) = root_with(&[
         (
             "brokkr.toml",
@@ -208,19 +208,28 @@ fn host_inventory_includes_composed_datasets_and_all_generations() {
         ),
         (
             "host.toml",
-            "[host.h.datasets.b.snapshot.s.osc.12]\nfile = \"b\"\n",
+            "[host.h.datasets.b.snapshot.s.osc.12]\nfile = \"b\"\n[host.h.datasets.b.polygon.p]\nfile = \"p.json\"\n[host.h.datasets.b.pmtiles.t]\nfile = \"t.pmtiles\"\n[[host.h.datasets.b.future]]\nfile = \"f\"\n",
         ),
     ]);
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
-    let views = config.dataset_views("h").unwrap();
+    let mut files = config.registered_files("h").unwrap();
+    files.sort();
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(k, f)| (k.as_str(), f.as_str()))
+        .collect();
     assert_eq!(
-        views.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["a", "b"]
+        files,
+        [
+            ("a", "a"),
+            ("b", "b"),
+            ("b", "f"),
+            ("b", "p.json"),
+            ("b", "t.pmtiles")
+        ]
     );
-    assert_eq!(views["a"].primary.pbf["raw"].file, "a");
-    assert_eq!(views["b"].snapshots["s"].osc[&12].file, "b");
-    assert!(config.dataset_views("empty").unwrap().is_empty());
-    assert!(config.dataset_views("absent").is_err());
+    assert!(config.registered_files("empty").unwrap().is_empty());
+    assert!(config.registered_files("absent").is_err());
 }
 
 #[test]

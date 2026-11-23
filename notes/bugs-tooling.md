@@ -88,83 +88,6 @@ Reported by: verify (flagged as a coverage limitation).
 `checks/sort.rs` never passes `--force`, so selecting an unindexed raw input
 exercises the CLI's indexdata refusal rather than sort's supported fallback.
 
-## TOOL-008 - Dataset recovery can attribute one source's bytes to another
-
-Reported by: datasets-devkit [P1].
-
-`bind_identity` (`crates/datasets/src/download.rs`) rewrites the dataset-wide
-identity when the current target is absent, without checking older
-recoverable raw files. Sequence: acquisition of `asia/georgia` publishes its
-raw file on day A and dies before registration. On day B, acquisition of
-`north-america/us/georgia` uses a different filename, rewrites the identity
-and registers successfully. Acquiring snapshot A for the US dataset then
-adopts the leftover Asian raw file, because the identity now matches the US
-source. This breaks the source identity and safe recovery contract in
-`reference/datasets.md`. One mutable identity cannot describe every retained
-unregistered publication.
-
-## TOOL-009 - Generating a missing indexed PBF can overwrite another dataset's file
-
-Reported by: datasets-devkit [P1].
-
-`generate_indexed` (`download.rs`) checks filenames only within the selected
-dataset, by literal string equality, and ordinary primary acquisition and new
-snapshot acquisition do not call the host-wide destination check. If
-Denmark's registered raw file is `shared.osm.pbf` and another dataset
-registers `shared-with-indexdata.osm.pbf`, downloading Denmark with its
-indexed entry missing replaces the other dataset's bytes and leaves its pin
-unchanged. Absolute and alternate path spellings also get past the local
-check. This violates registered-file preservation and the promise that
-acquiring a snapshot leaves existing generations unchanged. Every acquisition
-path needs the same ownership checks.
-
-The final-name checks that do exist (refresh, OSC, promotion) compare
-canonical endpoints, which is the wrong question for a rename: `rename`
-replaces the destination entry, so a registration that traverses the final
-name as a symlinked directory is broken while the endpoints differ. The
-staging removal already asks the right question (`layout::stage`, does
-resolving a registration look up this entry); publication should share it.
-Final names also coincide across datasets (`foo-bar` snapshot `baz` and
-`foo` snapshot `bar-baz` both publish `foo-bar-baz.osm.pbf`) under
-different dataset locks, so only Brokkr's machine lock serialises them.
-
-## TOOL-012 - The alias resolver does not follow dangling symlinks
-
-Reported by: datasets-devkit [P2].
-
-`publication_path` (`crates/datasets/src/layout.rs`) treats `canonicalize`
-returning `NotFound` as an absent filename. If `alias -> destination` exists
-but `destination` does not, it returns the path of `alias` instead of its
-target. Refresh and promotion can then fill a destination already registered
-through that alias, bypassing collision protection and possibly installing
-bytes inconsistent with the registered pin. This contradicts the helper's
-documented behaviour and promotion's promise in
-`reference/dataset-promotion.md` not to fill absent registered destinations.
-
-## TOOL-013 - The collision inventory leaves out polygons and PMTiles
-
-Reported by: datasets-devkit [P2].
-
-`DatasetView` and `Generation` (`registry.rs`) keep only PBF and OSC entries,
-and download and promotion use that view as their inventory of registered
-paths. A configured polygon at a promotion staging path is invisible to the
-protection check (`promote.rs`), so promotion deletes it. An absent registered
-polygon destination can likewise be filled. PMTiles registrations have the
-same gap. This breaks the unqualified registered-path protection contract.
-
-## TOOL-014 - Recovery registers files without making them durable first
-
-Reported by: datasets-devkit [P2].
-
-Fresh publication syncs the file and its directory, but raw adoption
-(`download.rs`), OSC adoption and promotion reuse (`promote.rs`) do no
-equivalent sync. If a process dies after the rename but before the directory
-fsync, the retry sees the complete file and registers it without first making
-the directory entry durable. A later power failure can keep the registry
-commit and lose the publication. Promotion can also reuse an existing equal
-file whose bytes were never synced. This breaks the documented ordering that
-durable publication comes before durable registration.
-
 ## TOOL-015 - Distinct OSC registrations silently collapse onto one sequence
 
 Reported by: datasets-devkit [P2].
@@ -332,6 +255,14 @@ re-read since.
 which follows a symlink at that name. A symlink planted at the lock path can
 make the lock open, and possibly create, a file elsewhere. The staging and
 registry writers now refuse entries they do not own; the lock open does not.
+
+The lock name also sits outside the publication-name rule every other
+entry the tool changes now takes (`layout::claim`): a registration (of
+any kind) naming `.KEY.download.lock`, or reaching it through a dangling
+symlink, is filled by the lock's `create`. Its content is no longer
+written (the recovery record moved to `.KEY.download.journal`), so a hard
+link to a registered file is no longer corrupted, only locked. Raised by
+the spar partner on the dataset-recovery work (2026-11-24).
 
 ## TOOL-032 - Refusal tests that accept any error can pass on a panic
 

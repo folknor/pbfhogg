@@ -4,7 +4,16 @@
 
 ### Breaking
 
-- **`inspect --json` is `schema_version` 4: `id_ranges.<type>.monotonic`
+- **`inspect --json` is `schema_version` 5: the header replication
+  timestamp prints as a UTC timestamp.** JSON
+  `header.replication.timestamp`, the text `Repl:` line and
+  `--get header.replication.timestamp` printed the raw seconds, unlike
+  every other timestamp inspect prints and unlike `osmium fileinfo`. All
+  three now print `YYYY-MM-DDTHH:MM:SSZ`, which
+  `--output-header osmosis_replication_timestamp=` accepts back; a year
+  outside 0000 to 9999 prints expanded.
+
+- **`inspect --json` was `schema_version` 4: `id_ranges.<type>.monotonic`
   is `null` when the index-only report cannot decide it.** A blob's
   claimed ID range does not say in what order the blob holds its IDs, yet
   the index-only `--id-ranges` report answered `yes` whenever consecutive

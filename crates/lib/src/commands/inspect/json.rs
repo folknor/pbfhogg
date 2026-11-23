@@ -7,7 +7,7 @@
 
 #![cfg(feature = "commands")]
 
-use super::format::format_timestamp;
+use super::format::{format_replication_timestamp, format_timestamp};
 use super::types::{
     BlockInfo, ExtendedStats, InspectReport, LocationStats, MetadataCoverage, ScanState,
     TypeIdRange, TypeStats, anomaly_blocks,
@@ -43,7 +43,7 @@ impl InspectReport {
             "bbox": bbox,
             "replication": {
                 "sequence": hm.replication_sequence,
-                "timestamp": hm.replication_timestamp,
+                "timestamp": hm.replication_timestamp.map(format_replication_timestamp),
                 "url": hm.replication_url,
             },
         });
@@ -62,7 +62,7 @@ impl InspectReport {
             .collect();
 
         let mut json = serde_json::json!({
-            "schema_version": 4,
+            "schema_version": 5,
             "file": self.file_name,
             "file_size": self.file_size,
             "header": header,

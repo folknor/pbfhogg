@@ -54,6 +54,18 @@ pub(super) fn format_timestamp(millis: i64) -> String {
     crate::commands::format_epoch_millis(millis)
 }
 
+/// Format the header's `osmosis_replication_timestamp` (Unix seconds) the way
+/// every inspect output prints it: the text `Repl:` line, JSON
+/// `header.replication.timestamp` and both `--get` routes. RFC 3339 UTC for
+/// years 0000 to 9999, which `--output-header osmosis_replication_timestamp=`
+/// reads back; outside that range an expanded year (five digits, or a
+/// sign), since the report describes any
+/// signed value the header holds rather than refusing the file. libosmium
+/// likewise turns this field into an ISO string.
+pub fn format_replication_timestamp(secs: i64) -> String {
+    crate::commands::format_epoch_secs(secs)
+}
+
 pub(super) fn yes_no(b: bool) -> String {
     if b {
         "yes".to_string()

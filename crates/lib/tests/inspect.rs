@@ -256,7 +256,7 @@ fn inspect_json_base() {
     let json = report.to_json(None);
 
     // Schema version
-    assert_eq!(json["schema_version"], 4);
+    assert_eq!(json["schema_version"], 5);
 
     // File metadata
     assert!(

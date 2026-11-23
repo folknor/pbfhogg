@@ -134,7 +134,10 @@ impl InspectReport {
                 parts.push(format!("seq {seq}"));
             }
             if let Some(ts) = hm.replication_timestamp {
-                parts.push(format!("timestamp {ts}"));
+                parts.push(format!(
+                    "timestamp {}",
+                    super::format::format_replication_timestamp(ts)
+                ));
             }
             if let Some(ref url) = hm.replication_url {
                 parts.push(Quoted(url).to_string());
@@ -462,7 +465,7 @@ impl InspectReport {
             InspectGetKeyKind::HeaderReplicationTimestamp => self
                 .header_meta
                 .replication_timestamp
-                .map(|t| t.to_string()),
+                .map(super::format::format_replication_timestamp),
             InspectGetKeyKind::Indexed => Some(self.is_indexed.to_string()),
             InspectGetKeyKind::BlocksTotal => Some(self.total_blocks.to_string()),
             InspectGetKeyKind::ElementsNodes => Some(self.state.node_count.to_string()),

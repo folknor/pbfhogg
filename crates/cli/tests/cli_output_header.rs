@@ -1380,6 +1380,81 @@ fn the_replication_timestamp_override_accepts_rfc3339() {
     );
 }
 
+/// inspect prints the replication timestamp as a UTC timestamp in every
+/// output, and the `--get` value of an in-range year feeds straight back into
+/// the override. Past year 9999 it prints the expanded year, which the
+/// override refuses while still taking the seconds.
+#[test]
+fn inspect_prints_the_replication_timestamp_as_utc_and_it_round_trips() {
+    let fx = Fx::new(&[Fixture::Plain]);
+    let inspect = |file: &Path, extra: &[&str]| -> String {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        let mut args: Vec<OsString> = vec!["inspect".into(), file.into()];
+        args.extend(extra.iter().map(OsString::from));
+        CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_success()
+            .stdout_str()
+    };
+    let stamp = |value: &str| -> PathBuf {
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        let header = format!("osmosis_replication_timestamp={value}");
+        let (args, outputs) = simple(
+            &fx,
+            "cat",
+            &[fx.path(Fixture::Plain)],
+            &["--output-header", &header],
+        );
+        CliInvoker::new(&invocation_scratch)
+            .args(&args)
+            .assert_success();
+        outputs[0].clone()
+    };
+
+    for (secs, spelled) in [
+        (2000_i64, "1970-01-01T00:33:20Z"),
+        (253_402_300_800, "10000-01-01T00:00:00Z"),
+    ] {
+        let file = stamp(&secs.to_string());
+        let header_only = inspect(&file, &["--get", "header.replication.timestamp"]);
+        assert_eq!(header_only, format!("{spelled}\n"), "header-only --get");
+        let full = inspect(
+            &file,
+            &["--get", "header.replication.timestamp", "--extended"],
+        );
+        assert_eq!(full, format!("{spelled}\n"), "full-scan --get");
+        let text = inspect(&file, &[]);
+        assert!(
+            text.contains(&format!("timestamp {spelled}")),
+            "text report: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&inspect(&file, &["--json"])).unwrap();
+        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["header"]["replication"]["timestamp"], spelled);
+    }
+
+    let round_tripped = stamp("1970-01-01T00:33:20Z");
+    assert_eq!(
+        read_header(&round_tripped).osmosis_replication_timestamp(),
+        Some(2000)
+    );
+
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let (args, _) = simple(
+        &fx,
+        "cat",
+        &[fx.path(Fixture::Plain)],
+        &[
+            "--output-header",
+            "osmosis_replication_timestamp=10000-01-01T00:00:00Z",
+        ],
+    );
+    CliInvoker::new(&invocation_scratch)
+        .args(&args)
+        .assert_failure()
+        .assert_stderr_contains("expected UNIX seconds");
+}
+
 /// apply-changes drops the base's replication position, and a caller that
 /// knows the new one stamps it.
 #[test]

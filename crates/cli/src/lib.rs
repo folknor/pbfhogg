@@ -5267,7 +5267,7 @@ fn run_inspect(
                     .map(|s| s.to_string()),
                 Some(pbfhogg::inspect::InspectGetKeyKind::HeaderReplicationTimestamp) => header
                     .osmosis_replication_timestamp()
-                    .map(|t| t.to_string()),
+                    .map(pbfhogg::inspect::format_replication_timestamp),
                 _ => return Err(format!("unknown key: {key}").into()),
             };
             let Some(v) = val else {

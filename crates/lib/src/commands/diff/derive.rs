@@ -555,6 +555,13 @@ impl<W: Write> MergeSink for ChangeWriters<W> {
         }
         Ok(())
     }
+
+    /// Content plus visibility: a visibility-only change is a modify of the
+    /// new record, so a hide carries the new side's tombstone version and
+    /// an unhide restores the object. The text diff keeps content alone.
+    fn equality(&self) -> crate::content::Equality {
+        crate::content::Equality::ContentVisibility
+    }
 }
 
 impl<W: Write> ChangeWriters<W> {
@@ -679,6 +686,10 @@ impl UnitWriters<'_> {
 impl super::units::UnitSink for UnitWriters<'_> {
     type Item = (Section, Vec<u8>);
     type Stats = UnitDone;
+
+    fn equality(&self) -> crate::content::Equality {
+        self.w.equality()
+    }
 
     fn record_into(
         &mut self,

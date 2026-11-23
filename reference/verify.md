@@ -1020,7 +1020,8 @@ producing tool; osmium also applies pbfhogg's OSC, so what that OSC means
 is decided by a tool other than pbfhogg. All three roundtrips are compared
 with new, and the two own-tool roundtrips with each other, by content-only
 element equality (no metadata, visibility or inline coordinates: pbfhogg's
-OSC is content-based by design, and the domain is a non-history snapshot).
+OSC is decided by content plus visibility, and the domain is a non-history
+snapshot of visible objects, where visibility never changes).
 Osmium's derive writes no delete for an old-only object when the next new
 object in object order has its ID under a later kind (DEVIATIONS.md
 "derive-changes"). When osmium's roundtrip differs from new, the verifier models that omission from the OPL of old and new: if it

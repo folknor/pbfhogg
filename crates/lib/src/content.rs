@@ -2,7 +2,8 @@
 //! kind and ID are compared on.
 //!
 //! `diff` (text and `--format osc`, every path) decides "common" versus
-//! "modified" with [`content_equal`], and `digest` hashes the same token
+//! "modified" with [`content_equal`] (`--format osc` adds visibility, see
+//! [`Equality`]), and `digest` hashes the same token
 //! stream through [`write_record`]. Nothing else in the crate may define
 //! element equality; a second definition is how the two drift apart, and a
 //! digest that drifts from diff turns a cached verification into a false
@@ -23,6 +24,9 @@
 //!
 //! Never content: metadata of any kind (version, timestamp, changeset, uid,
 //! user, `visible`), header fields, and anything about the encoding.
+//! Derive (`diff --format osc`) alone also compares visibility, through
+//! [`Equality::ContentVisibility`]; that is a merge equality defined here,
+//! not content, and no digest form hashes it.
 //!
 //! Tag strings always resolve: block construction refuses a tag key or
 //! value index past the string table. Roles are resolved through the
@@ -184,6 +188,51 @@ impl Relation {
             }
             _ => Ok(content),
         }
+    }
+}
+
+/// What a merge judges a same-ID pair "equal" by. Every merge sink states
+/// its own; none inherits one, so a sink cannot fall back to a relation it
+/// did not choose.
+///
+/// [`Equality::Relation`] is a record [`Relation`] (`diff`, text and every
+/// other non-OSC output). [`Equality::ContentVisibility`] is derive's
+/// (`diff --format osc`): [`content_equal`] plus the same [`hidden`]
+/// reading, so a visibility-only change is a modify of the new record (a
+/// hidden one printed `visible="false"`, which apply records as the
+/// deletion with the new side's version). It is an equality only, never a
+/// record form: `write_record` takes a [`Relation`], so no digest can hash
+/// it and print the same record for a visible and a hidden element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Equality {
+    Relation(Relation),
+    ContentVisibility,
+}
+
+impl Equality {
+    /// Whether `a` and `b` are "common" under this equality; errors as
+    /// [`Relation::equal`].
+    #[inline]
+    pub(crate) fn equal(self, a: &Element<'_>, b: &Element<'_>) -> Result<bool> {
+        match self {
+            Equality::Relation(r) => r.equal(a, b),
+            Equality::ContentVisibility => Ok(content_equal(a, b)? && hidden(a) == hidden(b)),
+        }
+    }
+}
+
+/// The element's metadata claims `visible=false`: exactly the claim the OSC
+/// writer (`osc::write::push_info_attrs`) prints as `visible="false"`. A
+/// plain `Info` claims it only when it carries the field as false. A dense
+/// slot claims it whenever its value is false, versioned or not (see
+/// `DenseNodeInfo::claims`; an absent column decodes as true); a dense node
+/// without `DenseInfo` claims nothing.
+pub(crate) fn hidden(e: &Element<'_>) -> bool {
+    match e {
+        Element::DenseNode(dn) => dn.info().is_some_and(|i| !i.visible()),
+        Element::Node(n) => n.info().visible_opt() == Some(false),
+        Element::Way(w) => w.info().visible_opt() == Some(false),
+        Element::Relation(r) => r.info().visible_opt() == Some(false),
     }
 }
 

@@ -447,7 +447,8 @@ change.
 
 **pbfhogg behavior:** `diff --format osc` decides by content - coordinates,
 tags, way refs and relation members, exactly what `diff` compares (defined in
-`crates/lib/src/content.rs`) - and ignores metadata. Applying the derived OSC to the old
+`crates/lib/src/content.rs`) - plus visibility, and ignores the rest of the
+metadata. Applying the derived OSC to the old
 PBF therefore gives a file whose content equals the new PBF's, so a `diff` of
 the result against the new PBF reports no differences. Creates and modifies
 carry each element's metadata (version, timestamp, changeset, uid, user, and
@@ -457,15 +458,21 @@ written) and deletes carry its version, the same whether or not the inputs have 
 pins that the metadata of a changed element survives the roundtrip.
 
 What that check cannot see is metadata, and anything else outside the content
-definition (inline way coordinates, `visible`, the file header). An element
-whose only change is its metadata (a version bump with identical content) is
-not a change at all: it gets no OSC entry, and the applied result keeps the old
-file's metadata for it; that includes a visibility-only change, so an object
-hidden in the new file with unchanged content stays visible after the apply.
-The content roundtrip holds for snapshots of visible objects: a hidden record
-in the new file whose content differs (or that is new) is written as a hidden
-create or modify, which apply records as the object's deletion, so the result
-lacks a record the new file still carries. A further margin: a dense node with no version (stored
+definition (inline way coordinates, the file header). An element whose only
+change is its metadata (a version bump with identical content) is not a change
+at all: it gets no OSC entry, and the applied result keeps the old file's
+metadata for it. Visibility is the exception: an element whose `visible`
+claim changes (visible to hidden, or back) with identical content is written
+as a modify of the new record, carrying the new side's version. A hidden one
+is printed `visible="false"`, which apply records as the object's deletion
+with that version, rather than as a delete, which would carry only the old
+version and let an older stale version resurrect it; an unhidden one restores
+the object. A hidden record unchanged on both sides gets no entry. The content
+roundtrip holds for snapshots of visible objects: a hidden record in the new
+file that is new, changed or newly hidden is written as a hidden create or
+modify, so the result lacks a record the new file still carries, and a
+visibility-only change is now subject to every refusal of the modify writer
+(an unrepresentable coordinate, timestamp or string). A further margin: a dense node with no version (stored
 as version 0) prints only its non-zero metadata fields, because a zero there
 cannot be told apart from the padding a node without metadata gets (see
 CORRECTNESS.md, "Version 0 is not a version claim either"), so a zero-valued

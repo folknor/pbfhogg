@@ -175,20 +175,3 @@ negatives took the same path they do too. Fix: give duplicates a fixed place
 in report order and pick their examples by canonical ID, or settle every
 occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
 redesign of the same per-blob retention.
-
-## BUG-034 - diff --format osc emits nothing for a visibility-only change
-
-Reported by: the codex spar of the hidden-upsert emission fix.
-
-`diff --format osc` classifies by content alone (`commands/diff/derive.rs`,
-`crate::content`), and `visible` is outside content. A created or modified
-element that is hidden in the new file is now written with
-`visible="false"`, so apply records its deletion; but an object visible in
-old and hidden in new with identical content gets no OSC entry at all, and
-the applied result keeps it visible. Whether a hidden record deletes thus
-depends on an unrelated content change. Fixing it means making visibility an
-input to OSC classification (a visible-to-hidden transition is a hidden
-modify carrying the new side's version, not a synthesized delete, so a stale
-older version cannot resurrect it), without changing what text `diff`
-reports. Treating hidden records as absent was weighed and rejected: it
-loses the tombstone's version claim.

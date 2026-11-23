@@ -316,7 +316,7 @@ pub(crate) fn stream_merge_phase(
     kind: ElementKind,
     sink: &mut impl MergeSink,
 ) -> Result<()> {
-    let relation = sink.relation();
+    let equality = sink.equality();
     let mut on_action = |action: BlockMergeAction<'_>| sink.record(kind, &action);
     let mut old_block: Option<PrimitiveBlock> = None;
     let mut new_block: Option<PrimitiveBlock> = None;
@@ -348,7 +348,7 @@ pub(crate) fn stream_merge_phase(
                     old_head = Some(o);
                 }
                 std::cmp::Ordering::Equal => {
-                    if relation.equal(&o, &n)? {
+                    if equality.equal(&o, &n)? {
                         on_action(BlockMergeAction::ElementEqual(&o))?;
                     } else {
                         on_action(BlockMergeAction::ElementModified { old: &o, new: &n })?;
@@ -452,11 +452,9 @@ impl<'a> BlockRun<'a> {
 pub(crate) trait MergeSink {
     fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()>;
 
-    /// The equality a same-ID pair is judged "equal" or "modified" by.
-    /// Derive keeps the default: OSC cannot express a way-coordinate change.
-    fn relation(&self) -> crate::content::Relation {
-        crate::content::Relation::Content
-    }
+    /// The equality a same-ID pair is judged "equal" or "modified" by. No
+    /// default: every sink names its own (see [`crate::content::Equality`]).
+    fn equality(&self) -> crate::content::Equality;
 }
 
 /// One OsmData blob's provenance and index metadata, from its frame header.
@@ -1529,7 +1527,7 @@ fn element_merge_pair<S: MergeSink>(
                 if let (Some(o), Some(n)) = (old_iter.next(), new_iter.next()) {
                     old_consumed += 1;
                     new_consumed += 1;
-                    if sink.relation().equal(&o, &n)? {
+                    if sink.equality().equal(&o, &n)? {
                         sink.record(kind, &BlockMergeAction::ElementEqual(&o))?;
                     } else {
                         sink.record(

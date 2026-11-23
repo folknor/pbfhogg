@@ -522,8 +522,8 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
         Ok(())
     }
 
-    fn relation(&self) -> crate::content::Relation {
-        self.options.relation()
+    fn equality(&self) -> crate::content::Equality {
+        crate::content::Equality::Relation(self.options.relation())
     }
 }
 
@@ -657,8 +657,8 @@ impl units::UnitSink for TextUnitSink<'_> {
     type Item = Vec<u8>;
     type Stats = DiffStats;
 
-    fn relation(&self) -> crate::content::Relation {
-        self.sink.options.relation()
+    fn equality(&self) -> crate::content::Equality {
+        crate::content::Equality::Relation(self.sink.options.relation())
     }
 
     /// An action is formatted whole into the local buffer, then every full

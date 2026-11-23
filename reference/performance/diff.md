@@ -323,6 +323,22 @@ baseline 4m51s, 4m41s (`2cfba709`, `a0bacafd`), variant 4m38s, 4m36s
 (`f7a2f2d5`, `7903553f`). No cost. These cells ran the single exact scan;
 the landed fast-path pre-scan (see merge-changes.md) only removes work.
 
+## Visibility in derive's equality (bygg, 2026-11-23, against `7a32357d`)
+
+`--format osc` judges a same-ID pair by content plus visibility: a pair
+whose content compares equal also reads each side's `visible` (a way or
+relation `Info` parse, a dense slot field). Same workload as above,
+`--iterations 1`, no `fstrim` before the suite; pair 1 baseline first, pair
+2 variant first. Variant cells ran on the uncommitted tree.
+
+| Pair | Baseline | Variant |
+|---|---|---|
+| 1 | `86d3ed50` 2m18s | `eda153d7` 2m21s |
+| 2 | `46c48299` 2m25s | `85fddb34` 2m21s |
+
+Signs disagree across pairs and every delta is within 2-3 %, so the change
+has no cost.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

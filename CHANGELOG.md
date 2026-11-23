@@ -809,7 +809,10 @@
   written without the attribute, so applying the OSC made it a visible
   object. It is now written with `visible="false"`, which `apply-changes`
   (and osmium) apply as the object's deletion. An explicit `true` is still
-  not written.
+  not written. A change of visibility alone (hidden or unhidden with
+  unchanged content) used to get no OSC entry at all; it is now a modify
+  of the new record carrying its new version. The text `diff` still
+  compares content only.
 
 - The CLI reference now explains when `diff` and `diff --format osc`
   report a sequential fallback for unindexed input. If you rely on that

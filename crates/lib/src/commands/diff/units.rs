@@ -112,10 +112,8 @@ pub(super) trait UnitSink: Send {
     fn finish_into(self, out: &mut dyn UnitOut<Self::Item>) -> Result<Self::Stats>;
 
     /// The equality the merge judges same-ID pairs by (see
-    /// [`MergeSink::relation`]).
-    fn relation(&self) -> crate::content::Relation {
-        crate::content::Relation::Content
-    }
+    /// [`MergeSink::equality`]). No default, as there.
+    fn equality(&self) -> crate::content::Equality;
 }
 
 /// A command's side of the run, on the calling thread: it receives every
@@ -400,8 +398,8 @@ impl<S: UnitSink> MergeSink for Chunking<'_, '_, S> {
         self.sink.record_into(kind, action, &mut self.out)
     }
 
-    fn relation(&self) -> crate::content::Relation {
-        self.sink.relation()
+    fn equality(&self) -> crate::content::Equality {
+        self.sink.equality()
     }
 }
 

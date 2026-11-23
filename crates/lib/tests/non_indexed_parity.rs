@@ -823,6 +823,115 @@ fn derive_changes_non_indexed_parity() {
     assert!(changed.contains("timestamp=\"2023-11-14T22:13:24Z\" changeset=\"9004\""));
 }
 
+/// A same-content pair whose visibility differs is a modify of the new
+/// record on every derive route: a hide prints the new version with
+/// `visible="false"` (apply's deletion, carrying the tombstone's version),
+/// an unhide prints it without `visible`. A versionless dense hidden slot
+/// counts too. The text diff still reports every such pair as common.
+#[test]
+fn derive_classifies_a_visibility_only_change_as_a_modify() {
+    let dir = crate::common::test_scratch();
+    let hidden = |version| TestMeta {
+        visible: false,
+        ..meta(version)
+    };
+    let mut nodes = generate_nodes(8, 1);
+    for n in &mut nodes {
+        n.meta = Some(meta(1));
+    }
+    let mut ways = generate_ways(2, 1_000, 3, 1);
+    for w in &mut ways {
+        w.meta = Some(meta(1));
+    }
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![TestMember {
+            id: MemberId::Way(1_000),
+            role: "outer",
+        }],
+        tags: vec![("type", "multipolygon")],
+        meta: Some(meta(1)),
+    }];
+    let mut old_nodes = nodes.clone();
+    old_nodes[3].meta = Some(hidden(1));
+    let mut new_nodes = nodes;
+    new_nodes[1].meta = Some(hidden(5));
+    new_nodes[3].meta = Some(meta(6));
+    new_nodes[5].meta = Some(hidden(0));
+    let mut new_ways = ways.clone();
+    new_ways[0].meta = Some(hidden(5));
+    let mut new_relations = relations.clone();
+    new_relations[0].meta = Some(hidden(5));
+
+    let paths = ["old_idx", "old_non", "new_idx", "new_non"]
+        .map(|name| dir.path().join(format!("{name}.osm.pbf")));
+    write_multi_block_test_pbf(&paths[0], &old_nodes, &ways, &relations, 3);
+    write_multi_block_non_indexed_pbf(&paths[1], &old_nodes, &ways, &relations, 3);
+    write_multi_block_test_pbf(&paths[2], &new_nodes, &new_ways, &new_relations, 3);
+    write_multi_block_non_indexed_pbf(&paths[3], &new_nodes, &new_ways, &new_relations, 3);
+    let [old_idx, old_non, new_idx, new_non] = paths;
+
+    let indexed = derive_text(dir.path(), &old_idx, &new_idx, "ii.osc");
+    for (old, new, name) in [
+        (&old_non, &new_non, "nn.osc"),
+        (&old_idx, &new_non, "in.osc"),
+    ] {
+        assert_eq!(derive_text(dir.path(), old, new, name), indexed, "{name}");
+    }
+    let (before, modify) = indexed.split_once("<modify>").expect("a modify section");
+    let (modify, _) = modify.split_once("</modify>").expect("modify closes");
+    assert!(
+        !before.contains("<node ") && !before.contains("<way "),
+        "{indexed}"
+    );
+    let entries: Vec<&str> = modify
+        .split('<')
+        .filter(|e| {
+            ["node ", "way ", "relation "]
+                .iter()
+                .any(|k| e.starts_with(k))
+        })
+        .collect();
+    assert_eq!(entries.len(), 5, "{indexed}");
+    let entry = |prefix: &str| {
+        *entries
+            .iter()
+            .find(|e| e.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} in {indexed}"))
+    };
+    for (prefix, version) in [
+        ("node id=\"2\"", Some(5)),
+        ("way id=\"1000\"", Some(5)),
+        ("relation id=\"100\"", Some(5)),
+        ("node id=\"6\"", None),
+    ] {
+        let e = entry(prefix);
+        assert!(e.contains("visible=\"false\""), "{e}");
+        match version {
+            Some(v) => assert!(e.contains(&format!("version=\"{v}\"")), "{e}"),
+            None => assert!(!e.contains("version="), "{e}"),
+        }
+    }
+    let unhide = entry("node id=\"4\"");
+    assert!(
+        unhide.contains("version=\"6\"") && !unhide.contains("visible="),
+        "{unhide}"
+    );
+    let after_modify = indexed.split_once("</modify>").map_or("", |(_, rest)| rest);
+    assert!(
+        !after_modify.contains("id=\""),
+        "no delete expected: {indexed}"
+    );
+
+    for (old, new) in [(&old_idx, &new_idx), (&old_non, &new_non)] {
+        let text = diff_text(old, new);
+        assert!(
+            !text.lines().any(|l| l.starts_with(['*', '+', '-'])),
+            "text diff must see only common pairs: {text}"
+        );
+    }
+}
+
 /// The same for the text diff, verbose details included.
 #[test]
 fn diff_non_indexed_parity() {

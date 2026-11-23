@@ -82,7 +82,7 @@ message = "glibc-only allocator calls belong in target_env gnu gated debug/proce
 # `io::Write` instead. Rule two matches the bare identifier, not the call, so
 # `use std::io::stdout as out;` cannot rename its way past it.
 # `region = "code"` keeps doc examples, comments and
-# clap help strings out of scope. `eprintln!` stays legal.
+# clap help strings out of scope. Stderr has its own rule, `no-eprint-macro`.
 # crates/lib/tests/common is mounted by path into pbfhogg (where `commands` is on by
 # default) and into pbfhogg-cli (where `commands` is a no-op feature, off in
 # the `all`, `musl` and `musl-all` sweeps). A gate on either feature in a shared helper

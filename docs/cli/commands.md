@@ -65,7 +65,7 @@ now accepts it).
 
 Every command uses the same contract. `1` is reserved for a command that
 ran to completion and whose answer is negative; a command that could not
-run at all exits `2`, so a script can branch on the answer without
+run, or could not deliver its output or diagnostics, exits `2`, so a script can branch on the answer without
 swallowing failures. `3` is the one failure split out of `2`: a
 requested platform I/O feature is unavailable, so the same invocation
 without that flag can succeed. `64` (`EX_USAGE`) is a command line refused
@@ -79,9 +79,9 @@ convention.
 |------|---------|
 | `0` | Success. |
 | `1` | The command ran and its answer is negative. Only four commands can produce it: `diff` (differences found), `inspect --indexed` (the first data blob lacks indexdata; a header-only file is indexed), `inspect --show` (element not in the file), and `check` (integrity violations). Nothing is printed to stderr for it beyond the command's normal output. |
-| `2` | The command failed or refused: missing or unreadable input, an existing output without `--overwrite`, an output that aliases an input, unsorted or unindexed input it will not take, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error, and a value the command itself refuses once the command line was accepted (the `build-geocode-index` S2 level bounds, a `renumber --start-id` from which the input's IDs would run past the 64-bit range, an `-i`/`-I` ID source holding no ID). `Error: ...` goes to stderr. A command line clap or the CLI refuses is `64`, not `2`. |
+| `2` | The command failed or refused: missing or unreadable input, an existing output without `--overwrite`, an output that aliases an input, unsorted or unindexed input it will not take, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error (a failed stderr write included, below, after a run that otherwise completed), and a value the command itself refuses once the command line was accepted (the `build-geocode-index` S2 level bounds, a `renumber --start-id` from which the input's IDs would run past the 64-bit range, an `-i`/`-I` ID source holding no ID). `Error: ...` goes to stderr, unless stderr itself is what failed. A command line clap or the CLI refuses is `64`, not `2`. |
 | `3` | The command failed because the host refused a requested I/O feature at setup: `--direct-io` on a filesystem that rejects `O_DIRECT` at open (tmpfs, some overlay and network filesystems) or on a file whose reported direct I/O alignment (`statx` `STATX_DIOALIGN`) is not a power of two or exceeds the direct I/O transfer buffer, or `--io-uring` where the kernel lacks io_uring or `WriteFixed`, a sandbox denies `io_uring_setup`, or the kernel refuses the writer's registered buffer pool while `RLIMIT_MEMLOCK` is below it. On kernels before 5.12, which also charge the ring itself to `RLIMIT_MEMLOCK`, a low limit can instead fail ring creation with a generic `ENOMEM` that pbfhogg cannot tell apart from kernel resource exhaustion; that case exits `2`. stderr carries `Error: platform feature <feature> unavailable: ...` with `<feature>` `direct-io` or `io-uring` (an `--io-uring` output also opens with `O_DIRECT`, so it can report either). A refused `--direct-io` input reads `Error: platform feature direct-io unavailable: failed to open <path>: Invalid argument (os error 22)`. Failures after setup, including an `EINVAL` or `ENOSPC` mid-run, stay `2`. The code follows the typed error chain, not the message text: it survives added context, `io::Error` carriers, and the thread joins of multi-stage commands, so it holds when the refusal is raised by a worker stage, such as the output writer of the external `add-locations-to-ways` backend (which previously exited `2` for the same refusal). |
-| `64` | Usage error (`EX_USAGE`): the command line was refused before command execution, during argument parsing (an unknown flag, a missing, malformed or conflicting argument, a retired short flag, `--direct-io` or `--io-uring` in a build without the feature, a missing subcommand) or during the CLI's own option validation (the [Flag rules](#flag-rules), malformed expressions whether given on the command line or in an `-e` file, `tags-filter` with an `-e` file holding no expression, malformed positional IDs, an unknown `inspect --get` key, an OSC output name). Printed by clap on stderr, as an `error: ...` diagnostic with a usage line, or as help when a subcommand or argument is missing; never as `Error: ...`. No output is reserved or opened and no scratch directory is created. A missing or unreadable `-e` file is a `2`. `--help` and `--version` exit `0`. Before this status existed, usage errors exited `2`. |
+| `64` | Usage error (`EX_USAGE`): the command line was refused before command execution, during argument parsing (an unknown flag, a missing, malformed or conflicting argument, a retired short flag, `--direct-io` or `--io-uring` in a build without the feature, a missing subcommand) or during the CLI's own option validation (the [Flag rules](#flag-rules), malformed expressions whether given on the command line or in an `-e` file, `tags-filter` with an `-e` file holding no expression, malformed positional IDs, an unknown `inspect --get` key, an OSC output name). Printed by clap on stderr, as an `error: ...` diagnostic with a usage line, or as help when a subcommand or argument is missing; never as `Error: ...`. No output is reserved or opened and no scratch directory is created. A missing or unreadable `-e` file is a `2`. `--help` and `--version` exit `0` (`2` if their text cannot be written, below). Before this status existed, usage errors exited `2`. |
 | `101` | The command panicked or reported a caught panic: a panic on the main thread, which the Rust runtime reports on stderr, or a panic on a worker, writer or decode thread that pbfhogg caught at its join and returned, printed as `Error: ... <who> panicked: <payload>`. Either is a defect in pbfhogg, never a refusal of the input. The code follows the typed error chain, like `3`, and outranks every other status, including an interruption that arrived during the same run. Before this status, a caught worker panic exited `2`. |
 | `130` | Interrupted by SIGINT (Ctrl-C). See [Interruption](#interruption). |
 | `143` | Interrupted by SIGTERM. See [Interruption](#interruption). |
@@ -97,6 +97,23 @@ has no verdict yet and ends with `0`. Any other returned error keeps its
 status, even if stdout also failed while the command cleaned up. For
 example, an `export` that finds a truncated input exits `2`. Usage errors,
 platform refusals and interruptions keep their own statuses.
+
+A stderr whose reader has gone away (`pbfhogg ... 2>&1 | head`) is not a
+failure either: the diagnostics stop and the status is the command's own.
+Any other stderr write failure (`2>/dev/full`, a full disk behind
+`2>file`) is an I/O error. The diagnostics stop, the command runs to its
+end, and a run that would have exited `0` or `1` exits `2` instead, with
+no `Error:` line since stderr cannot take one; anything it published
+stays. This holds for the stdout reader-gone `0` above too. A run that
+already has a failure status (`2`, `3`, `64`, `101`, `130`, `143`) keeps
+it. A run that writes nothing to stderr, such as a `-q` run with no
+warning, is unaffected. `--help` and `--version` follow the stdout rule:
+`0` into a closed pipe, `2` for any other write failure. One write is
+counted only if its failure is recorded before the status is chosen: the
+signal "stopping" notice, which a separate thread prints so the exit never
+waits on a stuck stderr. A run that writes no stderr line of its own after
+it (`--help`, or a run ended by stdout's reader leaving) can exit `0`
+although that notice failed.
 
 ### Interruption
 

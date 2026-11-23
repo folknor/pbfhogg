@@ -632,6 +632,14 @@
 
 ### Fixed
 
+- **A failing stderr or `--help` write is an I/O error, exit 2.** A stderr
+  write that failed other than by its reader going away (`2>/dev/full`, a
+  full disk behind `2>file`) panicked and exited 101, the defect status. It
+  now stops the diagnostics, lets the command finish, and turns a completed
+  run's `0` or `1` into `2`; a failure status stands. `--help` and
+  `--version` whose text cannot be written exit `2` instead of `0`. A closed
+  pipe on either stream is unchanged.
+
 - **`inspect --show` no longer misses an element under a false sorted
   header.** On a file claiming `Sort.Type_then_ID` it stopped at the first
   blob whose ID range lay past the target, so blobs out of order under that

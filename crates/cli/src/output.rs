@@ -28,8 +28,8 @@
 //!
 //! It is also the one place the binary writes stderr, through
 //! [`stderr_line`] and [`stderr_fragment`] (the `cli_eprintln!` and
-//! `cli_eprint!` macros), so that a closed stderr stops the diagnostics
-//! without ending the run. Its flag is kept apart from stdout's.
+//! `cli_eprint!` macros), so that a failed stderr stops the diagnostics
+//! without ending the run. Its flags are kept apart from stdout's.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,20 +147,55 @@ pub(crate) fn tolerate_reader_gone<E: Into<Box<dyn std::error::Error>>>(
     }
 }
 
-/// Set once a stderr write has failed with `BrokenPipe`. Never cleared, and
-/// deliberately separate from [`READER_GONE`]: losing the diagnostics reader
-/// (`pbfhogg sort ... 2>&1 | head`) must not change how stdout or the exit
-/// status are handled, so it never feeds [`reader_gone`] or
-/// [`tolerate_reader_gone`].
-static STDERR_READER_GONE: AtomicBool = AtomicBool::new(false);
+/// Flush std's stdout, for text written through it by a dependency (clap's
+/// help and version) rather than through [`PipeSafeStdout`], so a write
+/// failure still buffered there surfaces as a value.
+pub(crate) fn flush_std_stdout() -> io::Result<()> {
+    io::stdout().lock().flush()
+}
+
+/// Set once a stderr write has failed, for any reason. Never cleared: every
+/// later stderr write is skipped. Deliberately separate from
+/// [`READER_GONE`]: losing the diagnostics stream (`pbfhogg sort ... 2>&1 |
+/// head`) must not change how stdout is handled, so it never feeds
+/// [`reader_gone`] or [`tolerate_reader_gone`].
+static STDERR_STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// Set once a stderr write has failed with anything but `BrokenPipe`
+/// (`2>/dev/full`, a full disk behind `2>file`). Read once, by `run`, when
+/// it forms the exit status: a run that completed (`0` or `1`) but could not
+/// deliver a diagnostic it wrote exits `2` instead, the I/O-error status, as
+/// a non-`EPIPE` stdout failure does. A failure status the run already has
+/// stands. A reader that went away (`BrokenPipe`) is not a failure, the same
+/// rule as stdout's, and never sets it.
+static STDERR_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Whether stderr writes have stopped, for a writer that bypasses
+/// [`write_stderr`] (clap's usage text) to honour the same cutoff.
+pub(crate) fn stderr_stopped() -> bool {
+    STDERR_STOPPED.load(Ordering::Relaxed)
+}
+
+/// Whether a stderr write failed other than by its reader going away.
+///
+/// A failure is counted once recorded. The signal notice is written by a
+/// detached thread, so a run that writes no stderr line of its own after it
+/// (an Ok run's late-signal note is one; `--help` or a stdout-gone end is
+/// not) may choose its status before that thread records a failed notice.
+/// Waiting for it would hang the exit on a stuck stderr, which the notice
+/// thread exists to avoid.
+pub(crate) fn stderr_failed() -> bool {
+    STDERR_FAILED.load(Ordering::Relaxed)
+}
 
 /// Write one diagnostic line to stderr: the `eprintln!` equivalent.
 ///
-/// `eprintln!` panics when stderr's reader has gone away, which used to abort
-/// the whole command with status 101 halfway through its work. Here a closed
-/// stderr stops the diagnostics and nothing else: the command completes and
-/// its exit status is its own. Any other stderr failure still panics with
-/// std's own message, as `eprintln!` would.
+/// `eprintln!` panics when a stderr write fails, which used to abort the
+/// whole command with status 101 - the defect status - halfway through its
+/// work. Here a failed stderr write stops the diagnostics and nothing else:
+/// the command completes. A closed stderr (`BrokenPipe`) leaves the exit
+/// status the command's own; any other failure is recorded for `run`, which
+/// turns a completed run's `0` or `1` into `2` (see [`STDERR_FAILED`]).
 pub(crate) fn stderr_line(args: std::fmt::Arguments<'_>) {
     write_stderr(args, true);
 }
@@ -181,7 +216,7 @@ pub(crate) fn hold_stderr(f: &mut dyn FnMut()) {
 
 fn write_stderr(args: std::fmt::Arguments<'_>, newline: bool) {
     let mut handle = io::stderr().lock();
-    if STDERR_READER_GONE.load(Ordering::Relaxed) {
+    if STDERR_STOPPED.load(Ordering::Relaxed) {
         return;
     }
     let result = if newline {
@@ -189,16 +224,15 @@ fn write_stderr(args: std::fmt::Arguments<'_>, newline: bool) {
     } else {
         handle.write_fmt(args)
     };
-    match result {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-            STDERR_READER_GONE.store(true, Ordering::Relaxed);
+    if let Err(e) = result {
+        STDERR_STOPPED.store(true, Ordering::Relaxed);
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            STDERR_FAILED.store(true, Ordering::Relaxed);
         }
-        Err(e) => panic!("failed printing to stderr: {e}"),
     }
 }
 
-/// `eprintln!` that survives a closed stderr; see [`stderr_line`].
+/// `eprintln!` that survives a failed stderr; see [`stderr_line`].
 macro_rules! cli_eprintln {
     () => {
         $crate::output::stderr_line(format_args!(""))
@@ -208,7 +242,7 @@ macro_rules! cli_eprintln {
     };
 }
 
-/// `eprint!` that survives a closed stderr; see [`stderr_fragment`].
+/// `eprint!` that survives a failed stderr; see [`stderr_fragment`].
 macro_rules! cli_eprint {
     ($($arg:tt)+) => {
         $crate::output::stderr_fragment(format_args!($($arg)+))

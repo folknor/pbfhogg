@@ -355,6 +355,32 @@ impl<'a> CliInvoker<'a> {
         self
     }
 
+    /// Point stderr at `/dev/full`, where every write fails with `ENOSPC`:
+    /// a stderr write failure that is not the reader going away. The
+    /// captured stderr is then empty.
+    #[cfg(target_os = "linux")]
+    pub fn stderr_full(mut self) -> Self {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open /dev/full");
+        self.cmd.stderr(full);
+        self.stderr_closed = true;
+        self
+    }
+
+    /// Point stdout at `/dev/full`; see [`Self::stderr_full`].
+    #[cfg(target_os = "linux")]
+    pub fn stdout_full(mut self) -> Self {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open /dev/full");
+        self.cmd.stdout(full);
+        self.stdout_closed = true;
+        self
+    }
+
     /// Cap the size of any file the child writes at `bytes` (`RLIMIT_FSIZE`),
     /// with `SIGXFSZ` ignored, so a write that would extend a file past it
     /// fails with `EFBIG` ("File too large") instead of killing the child: a

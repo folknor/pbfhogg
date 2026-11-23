@@ -147,12 +147,45 @@ fn accept_outcome(
 /// missing (`DisplayHelpOnMissingArgumentOrSubcommand`) goes to stderr and
 /// is a refusal like any other. clap's own status for those is `2`, which
 /// `pbfhogg` keeps for runtime failures.
+///
+/// Help and version are output like any stdout report: printed into a
+/// stdout whose reader went away they still exit `0`, but any other write
+/// failure (`--help >/dev/full`) is an I/O error and exits `2`, and so does a
+/// stderr diagnostic written earlier that failed (see [`completed`]). A
+/// usage refusal is `64` whether or not its text could be written.
 fn clap_exit(err: &clap::Error) -> process::ExitCode {
-    drop(err.print());
     if err.use_stderr() {
-        process::ExitCode::from(ExitStatus::Usage.code())
+        // Stderr writes stop at the first failure, clap's included. The
+        // check and the print share the stderr lock clap's print takes
+        // anyway, so a failure the signal notice is recording cannot slip
+        // between them.
+        output::hold_stderr(&mut || {
+            if !output::stderr_stopped() {
+                drop(err.print());
+            }
+        });
+        return process::ExitCode::from(ExitStatus::Usage.code());
+    }
+    let printed = err.print();
+    // clap writes through std's stdout, which may still hold the tail of
+    // the text in its buffer.
+    match printed.and_then(|()| output::flush_std_stdout()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            process::ExitCode::from(ExitStatus::Failed.code())
+        }
+        _ => completed(Outcome::Positive.code()),
+    }
+}
+
+/// The exit status of a run that completed with `code` (`0` or `1`): `2`
+/// instead when a stderr write failed other than by its reader going away,
+/// since a diagnostic the run wrote was lost to an I/O error. A failure
+/// status never passes through here; it stands as it is.
+fn completed(code: u8) -> process::ExitCode {
+    if output::stderr_failed() {
+        process::ExitCode::from(ExitStatus::Failed.code())
     } else {
-        process::ExitCode::SUCCESS
+        process::ExitCode::from(code)
     }
 }
 
@@ -3633,7 +3666,7 @@ pub fn run() -> process::ExitCode {
                     ),
                 );
             }
-            process::ExitCode::from(outcome.code())
+            completed(outcome.code())
         }
         // A caught panic outranks everything else the run reports, a signal
         // that also arrived included: it is a defect, and no refusal or
@@ -3666,8 +3699,8 @@ pub fn run() -> process::ExitCode {
                 // the returned error, not on whether stdout ever failed: a
                 // buffered writer dropped after an input error flushes into
                 // the closed pipe too, and that must not erase the input
-                // error (see `output`).
-                process::ExitCode::SUCCESS
+                // error (see `output`). A failed stderr still makes it `2`.
+                completed(Outcome::Positive.code())
             } else {
                 output::cli_eprintln!(
                     "Error: {}{}",

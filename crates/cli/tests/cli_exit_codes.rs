@@ -206,6 +206,122 @@ fn a_closed_stderr_keeps_the_failure_status() {
     assert_eq!(code(&out), EXIT_FAILED);
 }
 
+/// A stderr write that fails other than by its reader going away
+/// (`2>/dev/full`) is an I/O error: a completed run exits 2, not 0, and never
+/// 101, the defect status a panic on the write used to give. The output the
+/// run published stays.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_stderr_fails_a_completed_run() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+    let nodes = crate::common::generate_nodes(50, 1);
+    crate::common::write_indexed_pbf(&input, &nodes, &[], &[]);
+
+    let out = CliInvoker::new(&invocation_scratch)
+        .stderr_full()
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .run();
+    assert_eq!(code(&out), EXIT_FAILED);
+    let read = crate::common::read_all_elements_with_coords(&output);
+    assert_eq!(read.nodes.len(), nodes.len(), "the output must be complete");
+}
+
+/// A negative answer whose diagnostics were lost to an I/O error is 2 as
+/// well: `1` promises a run that completed, and this one could not deliver
+/// its summary.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_stderr_fails_a_negative_answer() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let c = dir.path().join("c.osm.pbf");
+    write_two_nodes(&a, 110_000_000);
+    write_two_nodes(&c, 999_000_000);
+
+    let out = CliInvoker::new(&invocation_scratch)
+        .stderr_full()
+        .arg("diff")
+        .arg(a.as_os_str())
+        .arg(c.as_os_str())
+        .run();
+    assert_eq!(code(&out), EXIT_FAILED);
+}
+
+/// A failure keeps its status when its `Error:` line cannot be written, and
+/// does not become a panic.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_stderr_keeps_the_failure_status() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let missing = dir.path().join("does-not-exist.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    let out = CliInvoker::new(&invocation_scratch)
+        .stderr_full()
+        .arg("sort")
+        .arg(missing.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .run();
+    assert_eq!(code(&out), EXIT_FAILED);
+}
+
+/// A quiet run that wrote nothing to the failing stderr lost nothing, so it
+/// succeeds: the status follows a failed write, not the stream's state.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_stderr_nobody_wrote_to_is_not_a_failure() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+    let nodes = crate::common::generate_nodes(50, 1);
+    crate::common::write_indexed_pbf(&input, &nodes, &[], &[]);
+
+    let out = CliInvoker::new(&invocation_scratch)
+        .stderr_full()
+        .arg("-q")
+        .arg("sort")
+        .arg(input.as_os_str())
+        .arg("-o")
+        .arg(output.as_os_str())
+        .run();
+    assert_eq!(code(&out), EXIT_SUCCESS);
+}
+
+/// Help and version that cannot be written (`--help >/dev/full`) are an I/O
+/// error, 2; a usage refusal stays 64 whether or not its text was written.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_and_usage_into_a_failed_stream() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    for args in [&["--help"][..], &["--version"], &["sort", "--help"]] {
+        let out = CliInvoker::new(&invocation_scratch)
+            .stdout_full()
+            .args(args)
+            .run();
+        assert_eq!(code(&out), EXIT_FAILED, "{args:?}");
+    }
+    let out = CliInvoker::new(&invocation_scratch)
+        .stdout_closed()
+        .arg("--help")
+        .run();
+    assert_eq!(code(&out), EXIT_SUCCESS, "help into a closed pipe");
+    let out = CliInvoker::new(&invocation_scratch)
+        .stderr_full()
+        .arg("--no-such-flag")
+        .run();
+    assert_eq!(code(&out), EXIT_USAGE);
+}
+
 /// `inspect --indexed` answers a yes/no question. "No" is 1; a broken
 /// invocation is 2.
 #[test]

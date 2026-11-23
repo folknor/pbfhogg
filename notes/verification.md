@@ -96,39 +96,6 @@ several containing areas); witnesses aimed at overlaps would need an overlap sea
 crossings and interiors, not only vertices, since two areas can overlap with no vertex of
 either inside the other.
 
-## VER-151 - No test pins that a direct-I/O output is truncated to its logical size
-
-Reported by: spar accounting window 1 (scout lateral from the DirectWriter
-fail-stop work).
-
-`DirectWriter` writes whole aligned buffers with `O_DIRECT`, zero-padding the
-last one, and its final flush truncates the file back to the bytes actually
-written (`set_len` to the logical size in `write/direct_writer.rs`).
-`roundtrip_direct_io` in `crates/lib/tests/roundtrip.rs` (a
-`PbfWriter::to_path_direct` roundtrip) carries the comment "Verify exact
-file size - no padding left over", but asserts only that the file is not
-empty. A regression that left the alignment padding in place would still
-pass, since a reader may stop before trailing zeros. The test should compare
-the file length with the bytes written (or with a buffered write of the same
-blocks), as its comment says it does.
-
-## VER-152 - DirectWriter under PbfWriter::new is driven by no test
-
-Reported by: spar accounting window 1 (scout lateral from the DirectWriter
-fail-stop work).
-
-`DirectWriter` is public and can be handed to the synchronous
-`PbfWriter::new(writer)`, but its only in-tree caller is
-`FileWriter::direct_in`, under the pipelined direct constructors; no test or
-command wraps it in `PbfWriter::new`. On that route `PbfWriter::flush` keeps
-no error of its own (its `flush_error` is set only for a pipelined writer),
-so what a failed and retried flush reports depends entirely on
-`DirectWriter`'s own fail-stop state (a failed writer refuses later writes
-and flushes). That contract is unit-tested inside `direct_writer.rs`, but
-not through `PbfWriter::new`, where `finalize_writer` runs on every flush. A
-test writing blocks through `PbfWriter::new(DirectWriter::create(...))`,
-including a failed-flush case under the test hooks, would cover the route.
-
 ## VER-153 - The OPL relation reader refuses canonical order with negative IDs
 
 Reported by: scout lateral from the inspect ordering work.

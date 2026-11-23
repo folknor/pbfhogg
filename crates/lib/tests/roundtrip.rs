@@ -591,6 +591,8 @@ fn roundtrip_uncompressed() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn roundtrip_direct_io() {
+    use pbfhogg::write::direct_writer::DirectWriter;
+
     let dir = crate::common::test_scratch();
     let path = dir.path().join("direct_io.osm.pbf");
 
@@ -623,15 +625,40 @@ fn roundtrip_direct_io() {
         std::iter::empty::<(&str, &str)>(),
         None,
     );
-    let bytes = bb.take().unwrap().unwrap();
-    writer.write_primitive_block(bytes).unwrap();
+    let nodes = bb.take().unwrap().unwrap().to_vec();
+    writer.write_primitive_block(&nodes).unwrap();
 
     bb.add_way(10, [("highway", "path")], &[1, 2, 3], None);
-    let bytes = bb.take().unwrap().unwrap();
-    writer.write_primitive_block(bytes).unwrap();
+    let ways = bb.take().unwrap().unwrap();
+    writer.write_primitive_block(ways).unwrap();
 
     writer.flush().unwrap();
     crate::common::assert_direct_opened(writer.invocation(), "write", "to_path_direct");
+
+    let mut expected = Vec::new();
+    let mut buffered = PbfWriter::new(&mut expected, Compression::default());
+    buffered.write_header(&header).unwrap();
+    for block in [nodes.as_slice(), ways] {
+        buffered.write_primitive_block(block).unwrap();
+    }
+    buffered.flush().unwrap();
+    drop(buffered);
+
+    // The fixture must require padding for this comparison to test truncation.
+    assert!(expected.len() < 4096);
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+
+    let sync_path = dir.path().join("sync_direct_io.osm.pbf");
+    let direct = DirectWriter::create(&sync_path).unwrap();
+    let mut sync = PbfWriter::new(direct, Compression::default());
+    sync.write_header(&header).unwrap();
+    for block in [nodes.as_slice(), ways] {
+        sync.write_primitive_block(block).unwrap();
+    }
+    sync.flush().unwrap();
+    assert_eq!(std::fs::read(&sync_path).unwrap(), expected);
+    sync.flush().unwrap();
+    assert_eq!(std::fs::read(&sync_path).unwrap(), expected);
 
     // Read back with standard reader
     let reader = BlobReader::from_path(&path).unwrap();
@@ -679,10 +706,6 @@ fn roundtrip_direct_io() {
         }
         _ => panic!("expected Way"),
     }
-
-    // Verify exact file size - no padding left over
-    let meta = std::fs::metadata(&path).unwrap();
-    assert!(meta.len() > 0, "file should not be empty");
 }
 
 /// Write a PBF through the pipelined O_DIRECT path, read back, verify ordering.

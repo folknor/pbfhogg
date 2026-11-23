@@ -388,6 +388,38 @@ mod tests {
         assert!(w.write(b"more").is_err(), "a failed writer refuses writes");
     }
 
+    #[test]
+    fn synchronous_pbf_writer_propagates_sticky_direct_flush_failure() {
+        use crate::ErrorKind;
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let dir = crate::path_guard::tests::scratch();
+        let mut writer = PbfWriter::new(failing_writer(dir.path()), Compression::default());
+        writer
+            .write_header(&HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let mut builder = BlockBuilder::new();
+        builder.add_node(1, 0, 0, [("k", "v")], None);
+        writer
+            .write_primitive_block(builder.take().unwrap().unwrap())
+            .unwrap();
+
+        let first = writer.flush().expect_err("the tail write must fail");
+        let again = writer
+            .flush()
+            .expect_err("the failed sink must stay failed");
+        let (ErrorKind::Io(first), ErrorKind::Io(again)) = (first.kind(), again.kind()) else {
+            panic!("expected I/O errors, got: {first}; {again}");
+        };
+        assert_eq!(first.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(again.kind(), first.kind());
+        assert!(
+            again.to_string().contains(&first.to_string()),
+            "got: {again}"
+        );
+    }
+
     /// A failing buffer flush inside `write_all` counts only the bytes
     /// actually accepted, and the failing call takes nothing.
     #[test]

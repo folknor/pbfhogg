@@ -543,6 +543,50 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["inspect", "IN", "--get", "header.bbox", "--blocks"],
         "cannot be used with",
     ),
+    // `--get` prints the one value and nothing else, so a flag whose only
+    // effect is a report section, or another report, is refused beside it.
+    (
+        &["inspect", "IN", "--get", "elements.nodes", "--nodes"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--get", "elements.nodes", "--id-ranges"],
+        "cannot be used with",
+    ),
+    // `--indexed` is a verdict answered by the exit status; it composes with
+    // no report flag, so a quiet run has nothing left to print.
+    (
+        &["inspect", "IN", "--indexed", "--extended"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--blocks"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--id-ranges"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--locations"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--anomalies"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--nodes"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--get", "indexed"],
+        "cannot be used with",
+    ),
+    (
+        &["inspect", "IN", "--indexed", "--distrust-metadata"],
+        "cannot be used with",
+    ),
     // A retired short flag names the long flag to spell.
     (&["cat", "IN", "-o", "OUT", "-c", "version"], "--clean"),
     (&["extract", "IN", "-c", "config.json"], "--config"),

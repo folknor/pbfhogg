@@ -2095,7 +2095,19 @@ enum Command {
         file: Option<PathBuf>,
         /// Check if PBF has blob-level indexdata (exit code 0/1). Reads the
         /// first data blob only; later blobs are not checked.
-        #[arg(long)]
+        ///
+        /// A verdict mode of its own: its answer is the exit status, so it
+        /// takes no report flag. The full report carries its own all-blob
+        /// `Indexed:` line, so there is nothing a combined run could add
+        /// that is not either a second, possibly disagreeing, verdict or
+        /// output a quiet run would have to drop.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "nodes", "blocks", "id_ranges", "locations", "anomalies",
+                "extended", "get", "distrust_metadata",
+            ],
+        )]
         indexed: bool,
         /// Analyze node coordinate statistics for FOR compression sizing
         #[arg(long)]
@@ -2147,12 +2159,16 @@ enum Command {
         show: Option<ElementRef>,
         /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first").
         /// Data and metadata paths enable extended stats automatically.
-        /// Not with --blocks or --anomalies, which only shape the full report.
+        /// Not with --blocks, --anomalies or --id-ranges, which only shape
+        /// the full report, nor --nodes, whose report is not a value: the
+        /// output is the one value and nothing else. --extended, --locations
+        /// and --distrust-metadata stay legal: each makes the scan decode
+        /// payloads, which can change an elements.* count.
         #[arg(
             short,
             long,
             value_name = "KEY",
-            conflicts_with_all = ["blocks", "anomalies"]
+            conflicts_with_all = ["blocks", "anomalies", "id_ranges", "nodes"]
         )]
         get: Option<String>,
         /// Machine-readable JSON output. Not with --nodes (node stats have no
@@ -5045,11 +5061,11 @@ fn run_show_element(
 /// Which of `run_inspect`'s four execution shapes a flag combination
 /// resolves to, decided once up front.
 ///
-/// The distinction is *alone vs combined*, and it is a live one: clap
-/// rejects `--show` alongside anything and `-j`/`--force` outside
-/// `--nodes`, but `--indexed --extended` and friends remain legal - a
-/// combined run does the full scan and folds the extra reports in, while
-/// a flag alone gets its fast path that skips the scan entirely.
+/// clap rejects `--show` and `--indexed` alongside any report flag, `--get`
+/// beside `--nodes`, and `-j`/`--force` outside `--nodes`, but
+/// `--nodes --extended` and friends remain legal - a combined run does the
+/// full scan and folds the node report in, while a flag alone gets its
+/// fast path that skips the scan entirely.
 enum InspectMode<'a> {
     /// `--indexed` alone: header probe only, no full inspect.
     IndexedOnly,
@@ -5077,18 +5093,17 @@ impl<'a> InspectMode<'a> {
             || flags.locations
             || flags.anomalies
             || blocks.is_some();
-        if flags.indexed && !scan_extras && !flags.nodes && get.is_none() {
+        // clap refuses `--indexed` beside every report flag.
+        if flags.indexed {
             return Self::IndexedOnly;
         }
-        if flags.nodes && !scan_extras && !flags.indexed && get.is_none() {
+        if flags.nodes && !scan_extras && get.is_none() {
             return Self::NodesOnly;
         }
         if let Some(key) = get
             && get_lookup
                 .is_some_and(|lookup| lookup.need() == pbfhogg::inspect::InspectGetNeed::Header)
             && !scan_extras
-            && !flags.nodes
-            && !flags.indexed
         {
             return Self::HeaderGet {
                 key,
@@ -5112,7 +5127,7 @@ fn run_inspect(
     let get_lookup = get.map(pbfhogg::inspect::inspect_get_lookup);
     let mode = InspectMode::resolve(&flags, blocks, get, get_lookup);
     let InspectFlags {
-        indexed,
+        indexed: _,
         nodes,
         id_ranges,
         locations,
@@ -5126,7 +5141,7 @@ fn run_inspect(
 
     // `--distrust-metadata` only means something for the scanning report:
     // `--indexed` asks whether indexdata is present (distrusting its contents
-    // does not change the answer), `--nodes` decodes every node already, and
+    // does not change the answer; clap refuses that pair), `--nodes` decodes every node already, and
     // Header and file get paths read without the inspect scan. Rejecting says so
     // rather than accepting a flag that would do nothing.
     // Decided before the input is touched. (`--json` with `--nodes` or
@@ -5239,15 +5254,14 @@ fn run_inspect(
     } else {
         blocks
     };
-    // With `--indexed` or `--nodes` the run is several library calls on one
-    // input (the scan, the indexdata probe, the node statistics), each
-    // opening it afresh, so the input is pinned here, before any of them,
-    // and each reads through the pin: a file renamed over the input mid-run
-    // cannot answer one question from each file. Alone, the scan decides for
-    // itself (it pins when it may read twice), so a full-decode-only scan
-    // still reads a FIFO.
+    // With `--nodes` the run is two library calls on one input (the scan and
+    // the node statistics), each opening it afresh, so the input is pinned
+    // here, before either, and each reads through the pin: a file renamed
+    // over the input mid-run cannot answer one question from each file.
+    // Alone, the scan decides for itself (it pins when it may read twice),
+    // so a full-decode-only scan still reads a FIFO.
     host.invocation.check()?;
-    let pin = if indexed || nodes {
+    let pin = if nodes {
         Some(pbfhogg::read::input::PinnedInput::pin(path, host)?)
     } else {
         None
@@ -5266,14 +5280,6 @@ fn run_inspect(
         host,
     )?;
 
-    // --indexed combined with other flags: check and report, set exit code
-    let has_index = if indexed {
-        Some(pbfhogg::has_indexdata_in(input, direct_io, host)?)
-    } else {
-        None
-    };
-    let exit_not_indexed = has_index == Some(false);
-
     // --nodes combined with other flags: run node stats, printed below
     let node_report = if nodes {
         Some(pbfhogg::inspect::node_stats::node_stats(
@@ -5282,13 +5288,10 @@ fn run_inspect(
     } else {
         None
     };
-    // The completion decision: the indexdata probe has no checkpoint of its
-    // own, so a cancellation during it must not still produce an answer.
+    // The completion decision, as for `--indexed`.
     host.invocation.check()?;
 
-    // Everything is computed; only output remains. `--indexed` makes the
-    // exit status an answer, and a reader that left early must not cost it.
-    // The requested value is resolved before anything is written, so a key
+    // Everything is computed; only output remains. The requested value is resolved before anything is written, so a key
     // without a value fails the command whatever stdout does.
     let got = match get {
         Some(key) => match report.get_value(key) {
@@ -5299,38 +5302,25 @@ fn run_inspect(
     };
     let printed = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut out = output::buffered();
-        if let Some(has_index) = has_index
-            && !json
-        {
-            writeln!(out, "Indexed: {}", if has_index { "yes" } else { "no" })?;
-        }
-        if let Some(ref node_report) = node_report {
-            node_report.write_report(&mut out)?;
-        }
+        // clap refuses `--get` beside `--nodes`, so a value is never
+        // preceded by the node report.
         if let Some(val) = got.as_ref() {
             writeln!(out, "{val}")?;
-        } else if json {
-            let mut value = report.to_json_filtered(block_limit, anomalies);
-            if indexed && let serde_json::Value::Object(ref mut map) = value {
-                map.insert(
-                    "indexed".to_string(),
-                    serde_json::Value::Bool(!exit_not_indexed),
-                );
-            }
-            writeln!(out, "{value}")?;
         } else {
-            report.write_report_filtered(&mut out, block_limit, anomalies)?;
+            if let Some(ref node_report) = node_report {
+                node_report.write_report(&mut out)?;
+            }
+            if json {
+                writeln!(out, "{}", report.to_json_filtered(block_limit, anomalies))?;
+            } else {
+                report.write_report_filtered(&mut out, block_limit, anomalies)?;
+            }
         }
         out.flush()?;
         Ok(())
     })();
     output::tolerate_reader_gone(printed)?;
-
-    Ok(if exit_not_indexed {
-        Outcome::Negative
-    } else {
-        Outcome::Positive
-    })
+    Ok(Outcome::Positive)
 }
 
 fn run_apply_changes(

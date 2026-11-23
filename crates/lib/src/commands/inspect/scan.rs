@@ -426,7 +426,9 @@ fn full_decode_scan(
         Ok(())
     })?;
 
-    let is_indexed = total_data_blobs > 0 && indexed_blobs == total_data_blobs;
+    // No data blob lacks indexdata, so a header-only file is indexed: the same
+    // answer as the index-only walk and the first-data-blob probe.
+    let is_indexed = indexed_blobs == total_data_blobs;
 
     // Compute objects_ordered from the block-kind order + ID monotonicity.
     if let Some(ref mut ext) = state.extended {

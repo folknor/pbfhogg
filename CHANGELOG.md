@@ -11,6 +11,23 @@
   there; a number is always a decoded count, available with
   `--distrust-metadata` or any decoding flag.
 
+- **`inspect --indexed` is a verdict of its own, and `inspect --get` prints
+  only its value.** `--indexed` now refuses (exit 64) `--nodes`,
+  `--blocks`, `--id-ranges`, `--locations`, `--anomalies`, `--extended`,
+  `--get` and `--distrust-metadata`. A combined run used to print the
+  first-blob verdict line before the report even under `-q`, and to
+  overwrite the JSON report's `indexed` with the first-blob answer; the
+  report's own `Indexed:` line answers across every data blob. `--get` now
+  refuses `--nodes` and `--id-ranges`, which only added a report around
+  the value.
+
+- **A header-only file is indexed on every `inspect` route.** The
+  full-decode scan (`--extended`, `--locations`, `--distrust-metadata`)
+  reported it as not indexed, so `--extended --get indexed` said `false`
+  where `--get indexed` said `true`. The extended text report on a file
+  with no objects now prints both metadata coverage lines as `(none)`
+  instead of omitting them.
+
 - **`osc::load_all_diffs` refuses entries it cannot load.** A
   sequence-named entry whose metadata could not be read (an unsearchable
   directory, a dangling symlink) was silently left out, so the loader

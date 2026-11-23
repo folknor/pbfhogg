@@ -425,11 +425,11 @@ impl InspectReport {
                 bb.max_lat as f64 * 1e-9
             )?;
         }
+        // Printed with no objects too: both predicates are false at a zero
+        // total, so both lines read `(none)`, as osmium's fileinfo does.
         let m = &ext.metadata;
-        if m.total > 0 {
-            write_metadata_line(out, "All objects have:", m, true)?;
-            write_metadata_line(out, "Some objects have:", m, false)?;
-        }
+        write_metadata_line(out, "All objects have:", m, true)?;
+        write_metadata_line(out, "Some objects have:", m, false)?;
         Ok(())
     }
 

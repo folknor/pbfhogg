@@ -2111,22 +2111,21 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
 
 /// inspect pins its input wherever a run reads it more than once: the scan
 /// that may fall back from the header walk to a full decode, node
-/// statistics, and any run composing the scan with `--indexed` or `--nodes`
-/// (the CLI pins those before the first call, even where the scan alone
-/// would read once). A FIFO is refused there rather than opened (a blocking
-/// open would wait for a writer, and none is attached).
+/// statistics, and any run composing the scan with `--nodes` (the CLI pins
+/// those before the first call, even where the scan alone would read once).
+/// A FIFO is refused there rather than opened (a blocking open would wait
+/// for a writer, and none is attached).
 #[cfg(unix)]
 #[test]
 fn inspect_pins_its_input_wherever_it_reads_it_twice() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
-    let modes: [&[&str]; 5] = [
+    let modes: [&[&str]; 4] = [
         &[],
         &["--nodes"],
-        &["--extended", "--indexed"],
         &["--extended", "--nodes"],
-        &["--blocks", "--indexed"],
+        &["--blocks", "--nodes"],
     ];
     for extra in modes {
         let out = CliInvoker::new(&invocation_scratch)
@@ -2362,6 +2361,39 @@ fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
     assert_eq!(out.status.code(), Some(2), "stdout:\n{}", out.stdout_str());
     assert!(out.stderr_str().contains(MISSING_HEADER));
     assert!(!out.stdout_str().contains("Indexed"));
+}
+
+/// Every inspect route calls a header-only file indexed: the index-only
+/// walk, and the full decode `--extended` forces. With no objects the
+/// extended report still prints both metadata coverage lines, as `(none)`.
+#[test]
+fn inspect_calls_a_header_only_file_indexed_on_every_route() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let fx = Fx::new();
+    for extra in [&[][..], &["--extended"], &["--distrust-metadata"]] {
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("inspect")
+            .arg(fx.path("header-only.osm.pbf"))
+            .args(extra)
+            .args(["--get", "indexed"])
+            .run();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{extra:?}: {}",
+            out.stderr_str()
+        );
+        assert_eq!(out.stdout_str(), "true\n", "{extra:?}");
+    }
+    let out = CliInvoker::new(&invocation_scratch)
+        .args(["inspect", "--extended"])
+        .arg(fx.path("header-only.osm.pbf"))
+        .run();
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{}", out.stderr_str());
+    let stdout = out.stdout_str();
+    assert!(!stdout.contains("Indexed:  no"), "{stdout}");
+    assert!(stdout.contains("All objects have: (none)"), "{stdout}");
+    assert!(stdout.contains("Some objects have: (none)"), "{stdout}");
 }
 
 /// The first-data-blob probe completes the frame it answers from: a file

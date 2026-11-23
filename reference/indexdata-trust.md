@@ -528,6 +528,8 @@ Current behaviour recorded as such, not as a contract to preserve:
   re-encode such blocks into indexable ones, only a hand-made file has one.
 - `inspect --indexed` reports the first-blob probe, so it says yes for a
   partially indexed file whose first data blob is indexed, and no for one
-  whose first data blob is not.
+  whose first data blob is not. The report's `Indexed:` line and
+  `--get indexed` answer across every data blob, and `--indexed` refuses
+  every report flag, so the two answers are never printed together.
 - Only `tags-filter`, `inspect` and `sort` have `--distrust-metadata`; every
   other command believes the claims with no way to decline them.

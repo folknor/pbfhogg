@@ -600,7 +600,7 @@ The input is pinned before the header read (see "One input, one file, across pas
 
 Header-only scan (fast path on indexed PBFs - reads blob headers without decompression). Selective decode on demand for `--nodes`, `--blocks`, or element display.
 
-Pinning (see "One input, one file, across passes") is decided per library entry: the scan pins when its index-only walk may run, since a data blob without indexdata sends it back to the start for a full decode; a decode-only scan (`--extended`, `--locations`, `--distrust-metadata`) opens once and takes no pin; `node_stats` pins (indexdata probe, then schedule walk); the `--get` header route (`inspect::inspect_header`) opens once and takes `file.size` from that open's descriptor. The CLI pins once itself when `--indexed` or `--nodes` joins the scanning report, and hands the pin to every call.
+Pinning (see "One input, one file, across passes") is decided per library entry: the scan pins when its index-only walk may run, since a data blob without indexdata sends it back to the start for a full decode; a decode-only scan (`--extended`, `--locations`, `--distrust-metadata`) opens once and takes no pin; `node_stats` pins (indexdata probe, then schedule walk); the `--get` header route (`inspect::inspect_header`) opens once and takes `file.size` from that open's descriptor. The CLI pins once itself when `--nodes` joins the scanning report, and hands the pin to every call (`--indexed` is refused beside the report, so it never joins one).
 
 Opt-in block and anomaly listings retain all per-blob records. The scan
 accepts `show_blocks`, but limits and anomaly filters belong to later
@@ -914,8 +914,8 @@ once. `inspect`'s scan is the same case: whether its index-only walk falls
 back to a full decode is learned from the walk, so it pins before the walk,
 while a scan the options make decode-only reads once and takes no pin.
 Where a front end composes several entry points on one input, it pins once
-and hands the pin to each (the `inspect` CLI does, when `--indexed` or
-`--nodes` joins the scan; the `check` CLI does, when more than one check
+and hands the pin to each (the `inspect` CLI does, when `--nodes` joins
+the scan; the `check` CLI does, when more than one check
 runs).
 
 A pass whose reads a later pass repeats can be folded into that pass

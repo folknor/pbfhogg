@@ -208,21 +208,6 @@ with date granularity 1 counts as metadata but produces no timestamp range.
 inspect through the reader's accepted arithmetic. Explicit optional extrema
 would keep "no observation" distinct from "extreme observation".
 
-## CMD-033 - A header-only file is indexed or not depending on inspect mode
-
-Reported by: check-inspect [P3], cli-binary [P2].
-
-The index-only path (`inspect/scan.rs`) returns `indexed=true` for a
-header-only file, while the decoded path requires at least one data blob. For
-the same valid header-only file, `inspect --get indexed` returns `true`,
-`inspect --extended --get indexed` returns `false`, and
-`inspect --indexed --extended` prints an affirmative probe verdict followed by
-a report saying `Indexed: no`. `docs/cli/commands.md` explicitly defines
-header-only files as indexed, and the library's full-scan result is the wrong
-side. Separately, the extended text renderer (`inspect/report.rs`) omits
-metadata coverage entirely when there are no objects, although the
-documentation promises `All objects have: (none)`.
-
 ## CMD-058 - Export writes LineStrings whose emitted positions all coincide
 
 Reported by: export polygon-degeneracy work [P3].

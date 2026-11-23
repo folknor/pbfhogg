@@ -79,21 +79,6 @@ Defect hunt 2026-11-17 (check-inspect, P2) restates this as part of its
 `data.objects_ordered` finding; the other half of that finding is a separate
 mechanism, filed as CMD-030 in `notes/bugs-commands.md`.
 
-## BUG-014 - OSC attribute helpers skip trailing malformed attributes
-
-Reported by: osc.
-
-The attribute helpers (`xml_parse.rs`) return after finding the requested field,
-so `<nd ref="1" broken/>` leaves `broken` unexamined; quick-xml start-event
-construction does not validate attributes itself.
-
-Defect hunt 2026-11-17 (osc-parsing, P2): `<member type="node" ref="1"
-role="outer" role=broken/>` is accepted because every lookup stops before the
-malformed trailing attribute; tags and node references have equivalent holes,
-and re-emission silently removes the offending tail. Claim named: the
-malformed-role refusal contract in `CORRECTNESS.md`. The parser needs to
-validate the complete child attribute list.
-
 ## BUG-017 - apply-changes direct reads do not reach the bulk reads
 
 Reported by: apply-core.

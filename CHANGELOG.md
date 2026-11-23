@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **A malformed OSC attribute is refused wherever it sits.** The OSC
+  readers stopped at the attribute they wanted, so a malformed or
+  duplicated attribute after it (`<nd ref="1" broken/>`, `<member
+  type="node" ref="1" role="a" role=b/>`) was accepted, and merge-changes
+  and tags-filter OSC wrote the element back without it. Every command
+  now refuses it, on `tag`, `nd` and `member` in any section, and on the
+  start tags no command reads: the root, the section tags, `<bbox>` and
+  `<bounds>`, and unrecognised root-level elements. The error reads
+  "malformed attribute on <ELEMENT>".
+
 - **A BlobHeader with an absent or zero `datasize` is refused.** The
   header parse used to read an omitted `datasize` as zero and accept an
   explicit zero, so such a frame passed as an empty body: header walks,

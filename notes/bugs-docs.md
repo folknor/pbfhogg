@@ -282,3 +282,13 @@ makes byte-carry on passthrough a contract; or document that undeclared
 arrays are unspecified and may be kept or dropped; or make the commands
 treat them uniformly (always drop, as repack does). The first two are doc
 edits; the third changes passthrough output and needs measuring.
+
+## DOC-033 - OSC child-read differences from libosmium are not in DEVIATIONS.md
+
+Reported by: the OSC trailing-attribute fix (scout).
+
+pbfhogg refuses a `<tag>` without `k` or `v` ("missing attribute 'k'");
+libosmium's `get_tag` (`xml_input_format.hpp`) reads an absent `k` or `v` as
+the empty string. pbfhogg ignores `lat`/`lon` on an `<nd>`, while libosmium
+parses and validates them as a location (DOC-014 covers the re-emission
+drop). Neither difference is recorded in DEVIATIONS.md.

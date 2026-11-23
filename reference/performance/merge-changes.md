@@ -8,6 +8,17 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Child attribute lists checked to the end (plantasjen, 2026-11-23, `68629f07` + change)
+
+Every `tag`, `nd` and `member` attribute list is walked to its end, in one
+pass for `tag` and `member` (formerly two and three lookups). Planet
+7-OSC default merge (`--osc 4914..4920`), `--iterations 1`, `--commit`
+baseline interleaved: baseline 5821, 5793 ms (`dce677c4`, `9c76af3c`),
+variant 5763, 5740 ms (`c32c8357`, `fe73afbf`). No cost. Those variant
+cells ran the generic one-pass reader on `nd` too, the form that cost
+about 4 % on OSC tags-filter (see tags-filter.md); the landed `nd` loop
+is that form's cheaper replacement and was not re-measured here.
+
 ### Exact decimal coordinate rounding (plantasjen, 2026-11-20, `a36f263e` + change)
 
 OSC coordinates keep the `f64` reading and fall back to an exact decimal

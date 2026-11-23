@@ -59,6 +59,20 @@ silent wrong answer. A fix would refuse every non-predefined named
 `GeneralRef`, scan the remaining attributes of each start tag for `&name;`
 outside the five predefined names, and refuse a DOCTYPE outside the prolog.
 
+## CMD-061 - OSC readers accept attribute lexical errors quick-xml does not check
+
+Reported by: the OSC trailing-attribute fix (spar with codex).
+
+Every admitted OSC start tag now has its attribute list walked to the end
+with quick-xml 0.42's checked iterator, which refuses a missing `=`, an
+unquoted or unterminated value and a duplicated key. It does not require
+whitespace between attributes (`<tag k="a"v="b"/>` reads as `k` and `v`)
+or check attribute name characters; Expat refuses both. Parity, not a wrong
+value, unless a producer relies on the run-together form. A fix belongs in
+the driver's per-event byte scan (`check_event_chars`), which already walks
+every start tag, and must be measured on planet merge-changes and OSC
+tags-filter.
+
 ## CMD-011 - Unindexed gzip derive ignores the -j worker cap
 
 Reported by: diff [P2].

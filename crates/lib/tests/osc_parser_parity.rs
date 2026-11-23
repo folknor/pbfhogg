@@ -872,6 +872,82 @@ fn every_consumer_refuses_a_malformed_member_role() {
     assert_all_accept(dir.path(), &input, "missing and empty roles");
 }
 
+/// quick-xml checks attributes lazily, one per step of the iterator, so a
+/// reader that stopped at the attribute it wanted used to accept a
+/// malformed or duplicated one after it, and the re-emitters then dropped
+/// the tail. Every admitted start tag is now walked to its end, whether a
+/// sink reads it (`tag`, `nd`, `member`, in live and deleted objects) or
+/// not (the root, a section, `<bbox>` inside a way, an unrecognised
+/// root-level element), as libosmium's Expat checks every start tag.
+#[test]
+fn every_consumer_refuses_a_malformed_trailing_attribute() {
+    let dir = crate::common::test_scratch();
+    let children: [(&str, &str); 6] = [
+        (
+            "<relation id=\"1\" version=\"2\">\
+             <member type=\"node\" ref=\"1\" role=\"outer\" role=broken/></relation>",
+            "member",
+        ),
+        (
+            "<relation id=\"1\" version=\"2\">\
+             <member type=\"node\" ref=\"1\" ref=\"2\"/></relation>",
+            "member",
+        ),
+        (
+            "<way id=\"1\" version=\"2\"><nd ref=\"1\" broken/></way>",
+            "nd",
+        ),
+        (
+            "<node id=\"1\" version=\"2\" lat=\"1\" lon=\"1\">\
+             <tag k=\"a\" v=\"b\" v=\"c\"/></node>",
+            "tag",
+        ),
+        (
+            "<node id=\"1\" version=\"2\" lat=\"1\" lon=\"1\">\
+             <tag k=\"a\" v=\"b\" x=y/></node>",
+            "tag",
+        ),
+        (
+            "<way id=\"1\" version=\"2\"><nd ref=\"1\"/><bbox minlat=0/></way>",
+            "bbox",
+        ),
+    ];
+    for section in ["create", "delete"] {
+        for (object, element) in children {
+            let input = dir.path().join("trailing.osc.gz");
+            write_gz(
+                &input,
+                &format!(
+                    "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <{section}>\n    \
+                     {object}\n  </{section}>\n</osmChange>"
+                ),
+            );
+            let needle = format!("malformed attribute on <{element}>");
+            assert_all_refuse(dir.path(), &input, &needle, &format!("{section} {object}"));
+        }
+    }
+    let unread: [(&str, &str); 3] = [
+        (
+            "<osmChange version=\"0.6\" broken>\n  <create/>\n</osmChange>",
+            "osmChange",
+        ),
+        (
+            "<osmChange version=\"0.6\">\n  <create x=\"1\" x=\"2\"/>\n</osmChange>",
+            "create",
+        ),
+        (
+            "<osmChange version=\"0.6\">\n  <bounds minlat=0/>\n</osmChange>",
+            "bounds",
+        ),
+    ];
+    for (doc, element) in unread {
+        let input = dir.path().join("unread.osc.gz");
+        write_gz(&input, &format!("<?xml version=\"1.0\"?>\n{doc}"));
+        let needle = format!("malformed attribute on <{element}>");
+        assert_all_refuse(dir.path(), &input, &needle, doc);
+    }
+}
+
 /// Each sink used to decide on its own which children of an object in
 /// `<delete>` to parse: the overlay skipped tags and members but parsed
 /// `nd`, tags-filter skipped only tags, merge-changes parsed everything. So

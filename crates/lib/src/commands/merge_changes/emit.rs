@@ -29,7 +29,7 @@ use crate::osc::write::{
     OwnedMetadata, append_attr, append_attr_escaped, append_int_attr, in_element,
 };
 use crate::osc::xml_parse::{
-    DeleteChildren, OscSink, append_str_attr, coord_to_decimicro, delete_coords, parse_i64_attr,
+    DeleteChildren, OscSink, append_tag, coord_to_decimicro, delete_coords, parse_i64_attr,
     parse_member_into, parse_nd, scan_owned_metadata_into,
 };
 
@@ -190,13 +190,11 @@ impl ElementBuf {
         let ctx = || in_element(kind, id);
         let start = self.tags.len();
         self.tags.push_str("tag");
-        // k then v, as `parse_tag` reads them.
+        // k then v, by the reader `parse_tag` shares.
         let k = self.tag_text.len();
-        append_str_attr(e, "k", &mut self.tag_text)?;
-        let v = self.tag_text.len();
-        append_attr_escaped(&mut self.tags, "k", &self.tag_text[k..v]).map_err(ctx())?;
-        append_str_attr(e, "v", &mut self.tag_text)?;
+        let v = append_tag(e, &mut self.tag_text)?;
         let end = self.tag_text.len();
+        append_attr_escaped(&mut self.tags, "k", &self.tag_text[k..v]).map_err(ctx())?;
         append_attr_escaped(&mut self.tags, "v", &self.tag_text[v..end]).map_err(ctx())?;
         self.tag_ranges.push((start, self.tags.len()));
         self.tag_pairs.push((k, v, end));

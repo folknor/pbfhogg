@@ -1,5 +1,20 @@
 # Tags Filter
 
+### OSC child attribute lists checked to the end (plantasjen, 2026-11-23, `68629f07` + change)
+
+`tag-select --input-kind osc --input 4913` (planet, the bench's default filter),
+`--iterations 1`, `--commit 68629f07` baseline interleaved. A generic
+one-pass reader (every attribute slotted into an array, then interpreted)
+on all three child kinds cost about 4 %, sign-consistent over four pairs:
+baseline 2343, 2349, 2383, 2346 ms (`df80555e`, `e8ccb51c`, `9e650f7e`,
+`a83f378b`), variant 2473, 2438, 2454, 2459 ms (`e5ad6599`, `50459dfb`,
+`aebe0608`, `96b4ef43`). Clean HEAD built in the main target, 2412 and
+2359 ms (`4e6c46a7`, `a192c383`), ruled out the binary's build location.
+`nd`, the most numerous child, then got its own loop (read `ref`, then
+drain the rest of the checked iterator): variant 2359, 2324 ms
+(`e0815056`, `48df5aa0`) against baseline 2296 ms (`46037260`), in the
+noise. That is the landed form.
+
 ### OSC tags-filter streams in input order (bygg, 2026-11-19, against `50a00440`)
 
 The change: OSC mode runs on merge-changes' ordered streaming drain

@@ -177,15 +177,19 @@ pub(crate) fn parse_i64_attr(
     for attr_result in e.attributes() {
         let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            return parse_decoded(&attr, str::parse::<i64>)?.map_err(|(text, err)| {
-                Error::invalid_data_with(
-                    format!("attribute '{name}' is not a valid integer: '{text}'"),
-                    err,
-                )
-            });
+            return i64_value(&attr, name);
         }
     }
     Err(missing_attr(name))
+}
+
+fn i64_value(attr: &Attribute<'_>, name: &str) -> ParseResult<i64> {
+    parse_decoded(attr, str::parse::<i64>)?.map_err(|(text, err)| {
+        Error::invalid_data_with(
+            format!("attribute '{name}' is not a valid integer: '{text}'"),
+            err,
+        )
+    })
 }
 
 /// The longest coordinate token the `f64` path decides alone. Up to this
@@ -320,84 +324,67 @@ fn exact_decimal_e7(s: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-pub(crate) fn parse_str_attr(
-    e: &quick_xml::events::BytesStart<'_>,
-    name: &str,
-) -> ParseResult<String> {
-    let mut out = String::new();
-    append_str_attr(e, name, &mut out)?;
-    Ok(out)
+/// Walk the whole attribute list of a start tag whose attributes no reader
+/// otherwise visits in full, refusing the first one quick-xml's checked
+/// iterator reports malformed (no `=`, an unquoted or unterminated value)
+/// or duplicated. The iterator is lazy: a reader that stops at the
+/// attribute it wants never sees a malformed one after it, so every
+/// admitted start tag is walked to the end exactly once, by its reader or
+/// here. That is the iterator's checks only; it does not require
+/// whitespace between attributes, validate names, or resolve references in
+/// values nobody reads.
+fn check_attrs(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
+    for attr_result in e.attributes() {
+        attr_result.map_err(|err| malformed_attr(e, err))?;
+    }
+    Ok(())
 }
 
-/// [`parse_str_attr`], appending the normalized value to `out` instead of
-/// allocating it: the same lookup and the same refusals.
-pub(crate) fn append_str_attr(
+#[cold]
+fn malformed_attr(
     e: &quick_xml::events::BytesStart<'_>,
-    name: &str,
-    out: &mut String,
-) -> ParseResult<()> {
+    err: impl std::error::Error + Send + Sync + 'static,
+) -> Error {
+    Error::invalid_data_with(
+        format!("malformed attribute on <{}>", e.name().into_inner()),
+        err,
+    )
+}
+
+/// One pass over every attribute of an object child (`tag`, `member`;
+/// `nd` has its own loop, see [`parse_nd`]): refuse the first malformed or duplicated attribute in
+/// document order, and return each of `names` where present. The single
+/// pass is the whole-list check (see [`check_attrs`]) and the lookup at
+/// once, so a malformed attribute after the wanted ones is refused, and
+/// a child is iterated once rather than once per field. The fields are
+/// interpreted afterwards, in the caller's fixed order.
+fn child_attrs<'a, const N: usize>(
+    e: &'a quick_xml::events::BytesStart<'_>,
+    names: [&str; N],
+) -> ParseResult<[Option<Attribute<'a>>; N]> {
+    let mut found: [Option<Attribute<'a>>; N] = std::array::from_fn(|_| None);
     for attr_result in e.attributes() {
-        let attr = attr_result.map_err(xml_err)?;
-        if attr.key.as_ref() == name {
-            let val = attr
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map_err(xml_err)?;
-            out.push_str(&val);
-            return Ok(());
+        let attr = attr_result.map_err(|err| malformed_attr(e, err))?;
+        // The iterator refuses a duplicated key, so each slot fills once.
+        if let Some((_, slot)) = names
+            .iter()
+            .zip(found.iter_mut())
+            .find(|(name, _)| attr.key.as_ref() == **name)
+        {
+            *slot = Some(attr);
         }
     }
-    Err(missing_attr(name))
+    Ok(found)
 }
 
-// A malformed attribute is an error even when the attribute is optional.
-// Until 2026-10-26 a malformed optional `role` read as absent and an empty
-// role was written; that silently altered the data. The accepted OSC contract
-// changed (maintainer ruling, review audit) to match the PBF re-encoding
-// paths, the OSC arena and libosmium, whose expat parser rejects malformed XML
-// outright. Absent stays `Ok(false)`; only a malformed attribute is refused.
-#[cfg(test)]
-pub(crate) fn parse_str_attr_optional(
-    e: &quick_xml::events::BytesStart<'_>,
-    name: &str,
-) -> ParseResult<Option<String>> {
-    let mut out = String::new();
-    Ok(append_str_attr_optional(e, name, &mut out)?.then_some(out))
-}
-
-/// An optional attribute's normalized value, appended to `out`;
-/// `Ok(false)` when absent, refused when malformed.
-pub(crate) fn append_str_attr_optional(
-    e: &quick_xml::events::BytesStart<'_>,
-    name: &str,
-    out: &mut String,
-) -> ParseResult<bool> {
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| {
-            Error::invalid_data_with(
-                format!(
-                    "malformed attribute on <{}> while reading '{name}'",
-                    e.name().into_inner()
-                ),
-                err,
-            )
-        })?;
-        if attr.key.as_ref() == name {
-            let val = attr
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map_err(|err| {
-                    Error::invalid_data_with(
-                        format!(
-                            "malformed '{name}' attribute on <{}>",
-                            e.name().into_inner()
-                        ),
-                        err,
-                    )
-                })?;
-            out.push_str(&val);
-            return Ok(true);
-        }
-    }
-    Ok(false)
+/// A required string attribute's normalized value, appended to `out`.
+fn push_str_value(attr: Option<&Attribute<'_>>, name: &str, out: &mut String) -> ParseResult<()> {
+    let attr = attr.ok_or_else(|| missing_attr(name))?;
+    let val = attr
+        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+        .map_err(xml_err)?;
+    out.push_str(&val);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -406,23 +393,58 @@ pub(crate) fn append_str_attr_optional(
 
 /// A `<tag>`: its required `k` and `v`.
 pub(crate) fn parse_tag(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<(String, String)> {
-    let k = parse_str_attr(e, "k")?;
-    let v = parse_str_attr(e, "v")?;
+    let [k_attr, v_attr] = child_attrs(e, ["k", "v"])?;
+    let (mut k, mut v) = (String::new(), String::new());
+    push_str_value(k_attr.as_ref(), "k", &mut k)?;
+    push_str_value(v_attr.as_ref(), "v", &mut v)?;
     Ok((k, v))
 }
 
-/// An `<nd>`: its required `ref`.
-pub(crate) fn parse_nd(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<i64> {
-    parse_i64_attr(e, "ref")
+/// [`parse_tag`] into a caller-owned buffer: `k` then `v` appended to `out`,
+/// returning the offset in `out` where `v` begins. The same pass and the
+/// same refusals.
+pub(crate) fn append_tag(
+    e: &quick_xml::events::BytesStart<'_>,
+    out: &mut String,
+) -> ParseResult<usize> {
+    let [k_attr, v_attr] = child_attrs(e, ["k", "v"])?;
+    push_str_value(k_attr.as_ref(), "k", out)?;
+    let v_start = out.len();
+    push_str_value(v_attr.as_ref(), "v", out)?;
+    Ok(v_start)
 }
 
-/// A `<member>`, read in one fixed order (type, ref, role) so every sink
-/// reports the same error when several attributes are bad.
+/// An `<nd>`: its required `ref`, then the rest of the list checked, so a
+/// malformed attribute after `ref` is refused (an unusable `ref` value is
+/// refused first). Not [`child_attrs`]: an `nd` is the most numerous child
+/// and that generic form measured about 4 % slower on planet tags-filter
+/// OSC; this one is in the noise.
+pub(crate) fn parse_nd(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<i64> {
+    let mut attrs = e.attributes();
+    let mut ref_id = None;
+    for attr_result in attrs.by_ref() {
+        let attr = attr_result.map_err(|err| malformed_attr(e, err))?;
+        if attr.key.as_ref() == "ref" {
+            ref_id = Some(i64_value(&attr, "ref")?);
+            break;
+        }
+    }
+    // The rest of the list, checked (see `child_attrs`).
+    for attr_result in attrs {
+        attr_result.map_err(|err| malformed_attr(e, err))?;
+    }
+    ref_id.ok_or_else(|| missing_attr("ref"))
+}
+
+/// A `<member>`. A malformed or duplicated attribute anywhere in the list
+/// is refused first, in document order; the fields are then interpreted in
+/// one fixed order (type, ref, role), so every sink, sharing this one
+/// reader, reports the same error when several attributes are bad.
 pub(crate) struct ParsedMember {
     pub(crate) kind: ElementKind,
     pub(crate) ref_id: i64,
     /// Empty when absent; a malformed role is refused (see
-    /// [`append_str_attr_optional`]).
+    /// [`parse_member_into`]).
     pub(crate) role: String,
 }
 
@@ -454,20 +476,40 @@ pub(crate) fn parse_member(e: &quick_xml::events::BytesStart<'_>) -> ParseResult
 /// [`parse_member`] without allocating: the type text goes through
 /// `type_scratch` (cleared first), the role is appended to `role_out`
 /// (nothing when absent). The same order and the same refusals.
+///
+/// A malformed attribute is an error even when the attribute is optional.
+/// Until 2026-10-26 a malformed optional `role` read as absent and an
+/// empty role was written; that silently altered the data. The accepted OSC
+/// contract changed (maintainer ruling) to match the PBF re-encoding paths,
+/// the OSC arena and libosmium, whose Expat parser rejects malformed XML
+/// outright: a role whose value does not normalize is refused, and so is a
+/// malformed attribute anywhere in the list, before or after the ones read.
+/// Absent stays empty.
 pub(crate) fn parse_member_into(
     e: &quick_xml::events::BytesStart<'_>,
     type_scratch: &mut String,
     role_out: &mut String,
 ) -> ParseResult<(ElementKind, i64)> {
+    let [type_attr, ref_attr, role_attr] = child_attrs(e, ["type", "ref", "role"])?;
     type_scratch.clear();
-    append_str_attr(e, "type", type_scratch)?;
+    push_str_value(type_attr.as_ref(), "type", type_scratch)?;
     let Some(kind) = ElementKind::from_name(type_scratch) else {
         return Err(Error::invalid_data(format!(
             "unknown relation member type: '{type_scratch}'"
         )));
     };
-    let ref_id = parse_i64_attr(e, "ref")?;
-    append_str_attr_optional(e, "role", role_out)?;
+    let ref_id = i64_value(ref_attr.as_ref().ok_or_else(|| missing_attr("ref"))?, "ref")?;
+    if let Some(role) = role_attr {
+        let val = role
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|err| {
+                Error::invalid_data_with(
+                    format!("malformed 'role' attribute on <{}>", e.name().into_inner()),
+                    err,
+                )
+            })?;
+        role_out.push_str(&val);
+    }
     Ok((kind, ref_id))
 }
 
@@ -784,7 +826,8 @@ fn handle_element_child<S: OscSink>(
         ("tag", _) => route_child(Child::Tag, e, section, sink),
         ("nd", ElementKind::Way) => route_child(Child::Nd, e, section, sink),
         ("member", ElementKind::Relation) => route_child(Child::Member, e, section, sink),
-        ("bbox" | "bounds", ElementKind::Way | ElementKind::Relation) => Ok(()),
+        // Ignored, but its attributes are still checked (`check_attrs`).
+        ("bbox" | "bounds", ElementKind::Way | ElementKind::Relation) => check_attrs(e),
         _ => Err(misplaced(name, &format!("inside <{}>", kind.as_str()))),
     }
 }
@@ -848,6 +891,7 @@ fn handle_open<S: OscSink>(
         }
         Level::Root => {
             if let Some(action) = action_for(name) {
+                check_attrs(e).map_err(|err| input_fault(path, err))?;
                 if !is_empty {
                     state.section = action;
                     state.level = Level::Section;
@@ -872,8 +916,13 @@ fn handle_open<S: OscSink>(
                 ));
             } else if name == ROOT {
                 return Err(input_fault(path, misplaced(name, "inside <osmChange>")));
-            } else if !is_empty {
-                state.level = Level::Other;
+            } else {
+                // An unrecognised root-level element (`<bounds>`, `<note>`)
+                // is ignored, its attributes still checked.
+                check_attrs(e).map_err(|err| input_fault(path, err))?;
+                if !is_empty {
+                    state.level = Level::Other;
+                }
             }
         }
         Level::Doc => {
@@ -883,6 +932,7 @@ fn handle_open<S: OscSink>(
                     misplaced(name, "as the document root (expected <osmChange>)"),
                 ));
             }
+            check_attrs(e).map_err(|err| input_fault(path, err))?;
             // `<osmChange version="0.6"/>` is a complete, valid, empty
             // change document.
             state.level = if is_empty { Level::Done } else { Level::Root };
@@ -1907,20 +1957,53 @@ mod tests {
 
     #[test]
     fn absent_role_is_none_and_malformed_role_is_refused() -> crate::Result<()> {
-        let absent = quick_xml::events::BytesStart::new("member");
+        let absent =
+            quick_xml::events::BytesStart::from_content("member type=\"node\" ref=\"1\"", 6);
+        assert_eq!(parse_member(&absent)?.role, "");
         let malformed = quick_xml::events::BytesStart::from_content("member role=broken", 6);
-        assert_eq!(parse_str_attr_optional(&absent, "role")?, None);
-        let err = parse_str_attr_optional(&malformed, "role")
+        let err = parse_member(&malformed)
             .err()
             .ok_or_else(|| Error::internal("malformed role accepted"))?;
         assert!(err.to_string().contains("member"), "{err}");
-        assert!(parse_str_attr(&malformed, "role").is_err());
         let unknown = quick_xml::events::BytesStart::from_content(
             "member type=\"unknown\" ref=\"1\" role=\"r\"",
             6,
         );
         assert!(parse_member(&unknown).is_err());
         Ok(())
+    }
+
+    /// The child readers walk the whole attribute list, so a malformed or
+    /// duplicated attribute after the ones they read is still refused.
+    #[test]
+    fn a_malformed_trailing_child_attribute_is_refused() {
+        let start = |s: &str| {
+            let name_len = s.find(' ').unwrap_or(s.len());
+            quick_xml::events::BytesStart::from_content(s.to_owned(), name_len)
+        };
+        for bad in [
+            r#"member type="node" ref="1" role="outer" role=broken"#,
+            r#"member type="node" ref="1" role="a" role="b""#,
+            r#"member type="node" ref="1" ref="2""#,
+            r#"member type="node" ref="1" broken"#,
+        ] {
+            assert!(parse_member(&start(bad)).is_err(), "{bad}");
+        }
+        for bad in [
+            r#"nd ref="1" broken"#,
+            r#"nd ref="1" ref="2""#,
+            r#"nd ref="1" x=y"#,
+        ] {
+            assert!(parse_nd(&start(bad)).is_err(), "{bad}");
+        }
+        for bad in [r#"tag k="a" v="b" broken"#, r#"tag k="a" v="b" v="c""#] {
+            assert!(parse_tag(&start(bad)).is_err(), "{bad}");
+            assert!(
+                append_tag(&start(bad), &mut String::new()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_nd(&start(r#"nd ref="1" unknown="ignored""#)).is_ok());
     }
 
     #[test]

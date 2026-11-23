@@ -617,7 +617,15 @@ a create or modify the filter does not keep) takes its unvalidated attribute
 text with it. Every
 `tag`, `nd` and `member` is read by one parser per child kind, whatever the
 command: a missing role reads as empty, and a malformed role, an unknown member
-type, or a missing `k`, `v` or `ref` is refused. The children of an object in
+type, or a missing `k`, `v` or `ref` is refused. Each child's attribute list is
+read to its end, so an attribute quick-xml's checked iterator reports malformed
+(no `=`, an unquoted or unterminated value) or duplicated is refused wherever it
+sits, after the attributes read included; so is one on a start tag no sink reads
+(the root, a section, `<bbox>` or `<bounds>`, an unrecognised root-level
+element). Object start tags are read to the end by their metadata scan. Lexical
+rules that iterator does not check (whitespace between attributes, name
+characters, an undeclared entity in a value nothing reads) still pass, where
+libosmium's Expat refuses them. The children of an object in
 `<delete>` get that same parse in the driver, so every command refuses the same
 malformed delete; apply-changes then keeps only the delete's identity and
 version, while the re-emitters keep and write the delete's body, as osmium

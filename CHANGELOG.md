@@ -683,6 +683,14 @@
 
 ### Fixed
 
+- **`add-locations-to-ways` accepts indexed way blocks in a non-default
+  coordinate framing.** A way block whose `granularity` was not 100 or
+  whose coordinate offsets were nonzero failed the run on indexed input,
+  though the unindexed `--force` path accepted it. The way block is now
+  written in the default framing, keeping its `date_granularity`. Such a
+  block that also holds nodes is still refused (exit 2), and so is a way
+  block whose `date_granularity` does not fit `int32`.
+
 - **`add-locations-to-ways --index-type external` counts the nodes of a
   node blob it drops whole.** Removing untagged nodes, the external join
   skips a blob of only untagged non-member nodes without decoding it, and

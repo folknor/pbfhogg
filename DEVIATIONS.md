@@ -1078,6 +1078,37 @@ libosmium, and an occurrence carrying only unknown fields (non-empty body, no
 entries) followed by a populated one is refused here and accepted by
 libosmium. `cat --repair` has no rewrite for this shape.
 
+## PBF decoding: a Blob with more than one payload field is refused
+
+`Blob` carries its payload in one of `raw`, `zlib_data`, `lzma_data`,
+`OBSOLETE_bzip2_data`, `lz4_data` and `zstd_data`. Protobuf would read a blob
+holding several of them as the last one present. pbfhogg refuses any blob
+carrying two payload occurrences, empty or not and the same field or not, with
+an error listing the exclusive fields, at the one Blob parser every read path
+shares.
+They are alternative encodings of one payload, and two earlier pbfhogg parsers
+disagreed about such a blob, so one blob decoded to two different blocks
+depending on the read path; refusing removes the ambiguity rather than
+choosing a winner. libosmium answers a third way as it walks the fields: it
+returns on the first `raw` it meets, throws on an `lzma_data` or `zstd_data`
+(and on `lz4_data` when built without LZ4), skips bzip2, and
+otherwise keeps the last supported compressed field. No known writer produces
+the shape. `reference/truncation-handling.md` records the
+trade.
+
+## add-locations-to-ways: nodes in a non-default-framed way blob are refused
+
+A way blob is spliced, not rebuilt: its way coordinates are written in
+decimicrodegrees and its `granularity`, `lat_offset` and `lon_offset` are
+dropped, so the output block is in the default framing whatever the input's
+(its `date_granularity` and timestamps are kept). A node in the same blob is
+copied verbatim and would be misread under the dropped framing, so a way blob
+in a non-default coordinate framing that also holds a `Node` or a non-empty
+`DenseNodes` is refused, though protobuf and the PBF format allow it. osmium
+rebuilds every block and accepts it; `repack` rebuilds the input one kind per
+block (plain `cat` copies an indexed blob whole and does not). Neither the
+pbfhogg nor the osmium writer produces a non-default framing.
+
 ## PBF decoding: a packed array is read from its one data-bearing occurrence
 
 Protobuf lets a packed repeated field (`Way.refs`, `Relation.memids`, a

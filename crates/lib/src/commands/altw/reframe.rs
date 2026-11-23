@@ -124,10 +124,12 @@ fn parse_block_top(
 
 /// The block-level walk both way reframes share (this sparse one and
 /// external stage 4's): the StringTable's byte range, which is returned,
-/// each PrimitiveGroup's range into `group_ranges`, and the scalar framing
-/// fields 17 to 20 re-encoded into `scalar_fields` after
-/// [`check_default_coord_framing`] has refused any that is not the PBF
-/// default. Both buffers are cleared first. A block without a StringTable is
+/// each PrimitiveGroup's range into `group_ranges`, and every
+/// `date_granularity` (18) occurrence, validated as an `int32`, into
+/// `scalar_fields`. The coordinate framing (17, 19, 20) is read and dropped:
+/// the output block is in the default framing, and
+/// [`refuse_coordinates_under_dropped_framing`] refuses the one shape that
+/// makes that unsound. Both buffers are cleared first. A block without a StringTable is
 /// refused, and so is one with two data-bearing StringTable occurrences
 /// (`read::wire::take_string_table`, the decoder's rule): the way's string
 /// indices are copied through against the one table this returns, so it must
@@ -146,6 +148,9 @@ pub(super) fn parse_way_block_top(
     group_ranges.clear();
     scalar_fields.clear();
     let mut stringtable: Option<&[u8]> = None;
+    // `(granularity, lat_offset, lon_offset)`, last occurrence wins per
+    // field, as the decoder reads them.
+    let mut framing = DEFAULT_COORD_FRAMING;
 
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor
@@ -166,11 +171,34 @@ pub(super) fn parse_way_block_top(
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 group_ranges.push((offset, data.len()));
             }
-            (17..=20, WIRE_VARINT) => {
+            (17, WIRE_VARINT) => {
+                framing.0 = crate::read::wire::read_int32(
+                    &mut cursor,
+                    "PrimitiveBlock.granularity exceeds int32",
+                )?;
+            }
+            (19, WIRE_VARINT) => {
+                framing.1 = cursor
+                    .read_varint_i64()
+                    .map_err(|e| crate::Error::from(e).context("reframe lat_offset"))?;
+            }
+            (20, WIRE_VARINT) => {
+                framing.2 = cursor
+                    .read_varint_i64()
+                    .map_err(|e| crate::Error::from(e).context("reframe lon_offset"))?;
+            }
+            (18, WIRE_VARINT) => {
+                // Validated as the decoder reads it, so the splice never
+                // publishes a date_granularity its own reader refuses, then
+                // copied in occurrence order: the copied timestamps keep
+                // their meaning.
                 let raw = cursor
                     .read_raw_field(wire_type)
-                    .map_err(|e| crate::Error::from(e).context("reframe scalar"))?;
-                check_default_coord_framing(field, raw)?;
+                    .map_err(|e| crate::Error::from(e).context("reframe date_granularity"))?;
+                crate::read::wire::read_int32(
+                    &mut Cursor::new(raw),
+                    "PrimitiveBlock.date_granularity exceeds int32",
+                )?;
                 encode_tag(scalar_fields, field, wire_type);
                 scalar_fields.extend_from_slice(raw);
             }
@@ -178,6 +206,10 @@ pub(super) fn parse_way_block_top(
                 .skip_field(wire_type)
                 .map_err(|e| crate::Error::from(e).context("reframe skip"))?,
         }
+    }
+
+    if framing != DEFAULT_COORD_FRAMING {
+        refuse_coordinates_under_dropped_framing(decompressed, group_ranges, framing)?;
     }
 
     stringtable
@@ -190,52 +222,71 @@ pub(super) fn parse_way_block_top(
         .ok_or_else(|| crate::Error::invalid_data("reframe: no StringTable in PrimitiveBlock"))
 }
 
-/// Refuse a way blob whose coordinate framing is not the PBF default.
+/// The PBF default `(granularity, lat_offset, lon_offset)`.
+const DEFAULT_COORD_FRAMING: (i32, i64, i64) = (100, 0, 0);
+
+/// Refuse a way blob in a non-default coordinate framing that carries node
+/// coordinates the splice would copy.
 ///
-/// The reframe path writes `Way.lat` / `Way.lon` (fields 9 / 10) straight
-/// from `NodeIndex`, which stores decimicrodegrees, while copying the source
-/// block's `granularity` (17), `lat_offset` (19) and `lon_offset` (20)
-/// verbatim into the output. The reader reconstructs
-/// `lat = lat_offset + granularity * value`, so the round trip is only
-/// correct when `granularity == 100` and both offsets are zero. On a block
-/// declaring, say, `granularity = 1000` every way coordinate this path emits
-/// is off by a factor of ten - and it is emitted as well-formed PBF that
-/// reads back cleanly, so nothing downstream ever notices.
-///
-/// Dropping the fields instead is not safe in general: a mixed blob's
-/// DenseNodes are copied through verbatim and would be reinterpreted under
-/// the new framing. Refusing is the honest option. `write/block_builder.rs`
-/// omits 17 / 19 / 20 entirely and relies on the defaults, so every pbfhogg
-/// and osmium producer passes this check; field 18 (`date_granularity`) does
-/// not affect coordinates and is copied unexamined.
-pub(in crate::commands::altw) fn check_default_coord_framing(
-    field: u32,
-    raw: &[u8],
+/// Both reframes write every `Way.lat` / `Way.lon` (fields 9 / 10) in
+/// decimicrodegrees, stripping any the input carried, and the output block
+/// omits `granularity` (17), `lat_offset` (19) and `lon_offset` (20), so the
+/// default framing reads them back exactly: a way block in any legal framing
+/// is converted, as a rebuilt block is. Relations and changesets carry no
+/// coordinates. The one thing the dropped framing would corrupt is a node
+/// copied through verbatim, whose raw coordinates the default framing would
+/// reinterpret. So when the framing is not the default, a group carrying a
+/// `Node` (field 1) or a non-empty `DenseNodes` (field 2) is refused rather
+/// than re-encoded; an empty `DenseNodes` holds no coordinates. Checked here,
+/// not left to the kind refusal of an earlier scan, so the splice is sound
+/// on its own. The walk runs only on a non-default block, which no pbfhogg
+/// or osmium producer writes.
+fn refuse_coordinates_under_dropped_framing(
+    decompressed: &[u8],
+    group_ranges: &[(usize, usize)],
+    framing: (i32, i64, i64),
 ) -> crate::Result<()> {
-    let (name, default) = match field {
-        17 => ("granularity", 100_u64),
-        19 => ("lat_offset", 0),
-        20 => ("lon_offset", 0),
-        // 18 is date_granularity - irrelevant to coordinates.
-        _ => return Ok(()),
-    };
-    let mut value: u64 = 0;
-    for (i, byte) in raw.iter().enumerate() {
-        value |= u64::from(byte & 0x7f) << (i * 7);
-        if byte & 0x80 == 0 {
-            break;
+    for &(offset, len) in group_ranges {
+        let mut cursor = Cursor::new(&decompressed[offset..offset + len]);
+        while let Some((field, wire_type)) = cursor
+            .read_tag()
+            .map_err(|e| crate::Error::from(e).context("reframe framing gtag"))?
+        {
+            let carrier = match (field, wire_type) {
+                (1, WIRE_LEN) => {
+                    cursor
+                        .read_len_delimited()
+                        .map_err(|e| crate::Error::from(e).context("reframe framing node"))?;
+                    Some("a plain node message")
+                }
+                (2, WIRE_LEN) => {
+                    let dense = cursor
+                        .read_len_delimited()
+                        .map_err(|e| crate::Error::from(e).context("reframe framing dense"))?;
+                    (!dense.is_empty()).then_some("a non-empty dense node message")
+                }
+                _ => {
+                    cursor
+                        .skip_field(wire_type)
+                        .map_err(|e| crate::Error::from(e).context("reframe framing gskip"))?;
+                    None
+                }
+            };
+            if let Some(name) = carrier {
+                let (granularity, lat_offset, lon_offset) = framing;
+                return Err(crate::Error::invalid_data(format!(
+                    "reframe: a way blob in a non-default coordinate framing \
+                     (granularity {granularity}, lat_offset {lat_offset}, \
+                     lon_offset {lon_offset}) also carries {name}. \
+                     add-locations-to-ways writes its way blocks in the default \
+                     framing and copies nodes in a way blob verbatim, so their \
+                     coordinates would be reinterpreted. Re-encoding the input \
+                     through a full decode and encode separates the kinds."
+                )));
+            }
         }
     }
-    if value == default {
-        return Ok(());
-    }
-    Err(crate::Error::invalid_data(format!(
-        "reframe: PrimitiveBlock.{name} is {value}, not the default {default}. \
-         add-locations-to-ways writes way coordinates in decimicrodegrees and \
-         cannot honour a non-default coordinate framing on this path; the \
-         output would be silently wrong. Re-encoding the input through a full \
-         decode and encode writes the default framing."
-    )))
+    Ok(())
 }
 
 /// Walk one `PrimitiveGroup`. Way submessages get reframed (locations
@@ -706,64 +757,95 @@ mod tests {
         block
     }
 
-    /// A block whose coordinate framing is not the PBF default must be
-    /// refused, not reframed.
-    ///
-    /// This path writes fields 9 / 10 straight from `NodeIndex`, which holds
-    /// decimicrodegrees, while copying `granularity` / `lat_offset` /
-    /// `lon_offset` verbatim into the output. The reader reconstructs
-    /// `lat = lat_offset + granularity * value`, so on a `granularity = 1000`
-    /// block every way coordinate came out ten times too large - written as
-    /// well-formed PBF that reads back cleanly, with no downstream check able
-    /// to notice.
+    /// Append a PrimitiveGroup holding one field-`field` message with
+    /// `payload` to a block built by `way_block`.
+    fn with_node_group(mut block: Vec<u8>, field: u32, payload: &[u8]) -> Vec<u8> {
+        let mut group = Vec::new();
+        len_delimited(field, payload, &mut group);
+        len_delimited(2, &group, &mut block);
+        block
+    }
+
+    /// A way block in any legal coordinate framing is converted to the
+    /// default one. The way coordinates are written in decimicrodegrees and
+    /// the framing fields are dropped, so the output is byte-identical to the
+    /// default-framed block's. Copying the framing through, as this path once
+    /// did, read every coordinate of a `granularity = 1000` block back ten
+    /// times too large, as well-formed PBF; refusing it, as it did next,
+    /// refused legal input the unindexed path converts.
     #[test]
-    fn non_default_coordinate_framing_is_refused() {
-        for (field, value, name) in [
-            (17_u32, 1000_i64, "granularity"),
-            (19, 500_000_000, "lat_offset"),
-            (20, -500_000_000, "lon_offset"),
+    fn non_default_coordinate_framing_is_converted() {
+        let plain = run(&way_block(42, &[7], true)).0;
+        for framing in [
+            [(17_u32, 1000_i64)].as_slice(),
+            &[(19, 500_000_000)],
+            &[(20, -500_000_000)],
+            &[(17, 1), (19, -7), (20, 9)],
         ] {
-            let block = with_scalar(way_block(42, &[7], true), field, value);
-            let err = try_run(&block).expect_err("non-default framing must be refused");
-            assert!(
-                err.to_string().contains(name) && err.to_string().contains("not the default"),
-                "expected the coordinate-framing guard naming {name}. Got: {err}"
+            let mut block = way_block(42, &[7], true);
+            for &(field, value) in framing {
+                block = with_scalar(block, field, value);
+            }
+            let (out, ways, missing) = run(&block);
+            assert_eq!((ways, missing), (1, 0), "{framing:?}");
+            assert_eq!(
+                out, plain,
+                "{framing:?} must reframe to the default framing"
             );
         }
     }
 
-    /// The guard must not fire on the framing every real producer writes.
-    /// Explicit defaults are legal protobuf and must reframe exactly as an
-    /// absent field does, and `date_granularity` (18) must pass untouched -
-    /// it has nothing to do with coordinates.
+    /// The dropped framing would reinterpret a node copied through
+    /// verbatim, so a non-default way blob that carries one is refused. An
+    /// empty DenseNodes holds no coordinate and passes, and a default-framed
+    /// blob is never walked for nodes.
     #[test]
-    fn default_coordinate_framing_and_date_granularity_still_pass() {
+    fn nodes_under_a_non_default_framing_are_refused() {
+        let framed = || with_scalar(way_block(42, &[7], true), 17, 1000);
+        for (field, payload, name) in [
+            (1_u32, &[0x08_u8, 0x02][..], "plain node"),
+            (2, &[0x0A, 0x01, 0x02], "dense node"),
+        ] {
+            let err = try_run(&with_node_group(framed(), field, payload))
+                .expect_err("a node under a dropped framing must be refused");
+            assert!(
+                err.to_string().contains(name) && err.to_string().contains("non-default"),
+                "expected the framing guard naming {name}. Got: {err}"
+            );
+            let (_, ways, _) = run(&with_node_group(way_block(42, &[7], true), field, payload));
+            assert_eq!(ways, 1, "a default-framed {name} is copied, not refused");
+        }
+        let (_, ways, _) = run(&with_node_group(framed(), 2, &[]));
+        assert_eq!(ways, 1, "an empty DenseNodes carries no coordinate");
+
+        // The last occurrence of a framing field is the one in force, as the
+        // decoder reads it.
+        let node = |block| with_node_group(block, 1, &[0x08, 0x02]);
+        let last_default = with_scalar(framed(), 17, 100);
+        let (_, ways, _) = run(&node(last_default));
+        assert_eq!(ways, 1, "1000 then 100 is default-framed in effect");
+        let last_framed = with_scalar(with_scalar(way_block(42, &[7], true), 17, 100), 17, 1000);
+        try_run(&node(last_framed)).expect_err("100 then 1000 is non-default in effect");
+    }
+
+    /// `date_granularity` (18) is copied through so the copied timestamps
+    /// keep their meaning, but only once the decoder would accept it: an
+    /// out-of-range value is refused rather than published.
+    #[test]
+    fn date_granularity_is_validated_and_copied() {
         let plain = run(&way_block(42, &[7], true)).0;
-
-        let explicit = with_scalar(
-            with_scalar(with_scalar(way_block(42, &[7], true), 17, 100), 19, 0),
-            20,
-            0,
-        );
-        let (explicit_out, ways, missing) = run(&explicit);
+        // A non-default value, so dropping it would change every timestamp.
+        let (out, ways, missing) = run(&with_scalar(way_block(42, &[7], true), 18, 1));
         assert_eq!((ways, missing), (1, 0));
-        // The reframed output is the group bytes followed by the copied
-        // scalar fields, so an explicitly-default block must produce exactly
-        // the implicit-default output plus those three fields verbatim.
-        let mut expected = plain.clone();
-        expected.extend_from_slice(&[0x88, 0x01, 100, 0x98, 0x01, 0, 0xA0, 0x01, 0]);
-        assert_eq!(
-            explicit_out, expected,
-            "explicitly-default framing must reframe identically and copy \
-             fields 17 / 19 / 20 through unchanged"
-        );
+        let mut expected = plain;
+        expected.extend_from_slice(&[0x90, 0x01, 0x01]);
+        assert_eq!(out, expected);
 
-        let dated = with_scalar(way_block(42, &[7], true), 18, 1000);
-        let (_, ways, missing) = run(&dated);
-        assert_eq!(
-            (ways, missing),
-            (1, 0),
-            "date_granularity is not a coordinate framing field"
+        let err = try_run(&with_scalar(way_block(42, &[7], true), 18, 1 << 31))
+            .expect_err("an out-of-range date_granularity must be refused");
+        assert!(
+            err.to_string().contains("date_granularity exceeds int32"),
+            "{err}"
         );
     }
 

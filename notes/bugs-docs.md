@@ -37,16 +37,6 @@ Reported by: read-framing.
 The doc in `read/claims.rs` says negative versions yield no claims. The
 implementation keeps available non-padding metadata.
 
-## DOC-004 - Deliberate protobuf refusals are missing from DEVIATIONS.md
-
-Reported by: read-framing, sort-renumber.
-
-The project says every deliberate deviation from protobuf is recorded in
-`DEVIATIONS.md`, and `docs/cli/deviations.md` points there. Missing entries:
-the multi-payload Blob refusal, which `reference/truncation-handling.md`
-acknowledges as a compatibility departure. ALTW's undocumented framing
-refusal is filed as CMD-014 in `notes/bugs-commands.md`.
-
 ## DOC-005 - Way::node_locations claims to consult the header
 
 Reported by: read-block-decoding.

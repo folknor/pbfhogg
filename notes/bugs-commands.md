@@ -84,20 +84,6 @@ pool that uses every reported core. This contradicts the documented rule in
 `docs/cli/commands.md` that `N` caps worker pools at `N`. These are
 compression workers, not the separately exempted reader or drain threads.
 
-## CMD-014 - ALTW refuses legal non-default way coordinate framing without documenting it
-
-Reported by: altw [P2].
-
-`check_default_coord_framing` (`altw/reframe.rs`), used by both indexed
-engines, rejects any way block whose granularity is not 100 or whose
-coordinate offsets are nonzero. An ordinary indexed way block with
-`granularity = 1000` fails even when every referenced node exists, while the
-forced decode-all sparse path (no indexdata) accepts it. This contradicts the
-sparse input coverage documented in `docs/cli/commands.md`, and the
-deliberate protobuf restriction is missing from `DEVIATIONS.md`. The refusal
-does prevent wrong coordinates. The hunter says to either convert the framing
-or document the refusal.
-
 ## CMD-017 - wait_ready emits a WAIT span before confirming it parked
 
 Reported by: altw (lateral observation).

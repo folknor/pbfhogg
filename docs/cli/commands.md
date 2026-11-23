@@ -523,7 +523,15 @@ Under the default `date_granularity` the stored timestamp is copied as it
 is, an overflowing one included, so it reads back as the same refused
 claim. `add-locations-to-ways` splices locations into way blocks rather
 than rebuilding them: a way block keeps its own `date_granularity` and
-stored timestamps. Because the conversion applies only to rebuilt blocks, two outputs
+stored timestamps, while its coordinate framing is converted to the default
+(the way coordinates it writes are decimicrodegrees, and any it carried are
+replaced). A way block in a non-default coordinate framing that also holds
+nodes (a `Node` or a non-empty `DenseNodes` beside its ways) is refused,
+exit 2, since the splice copies those nodes verbatim and the default framing
+would misread them; `repack`, which rebuilds every block one kind per block,
+separates the kinds (plain `cat` copies an indexed blob whole and does not).
+An invalid `date_granularity` (outside `int32`) in a way block is refused
+rather than copied. Because the conversion of retained values applies only to rebuilt blocks, two outputs
 of the same input can differ below the model precision where one command
 route copies a non-default-framed blob and another rebuilds it (`sort`
 passthrough against an overlap rewrite, say). `pbfhogg diff` and the

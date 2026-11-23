@@ -1086,9 +1086,10 @@ fn reframe_way_blob_with_locations(
     }
 
     // Level 1: PrimitiveBlock - find string table + groups. Shared with the
-    // sparse reframe, including its coordinate-framing refusal: this path
-    // appends decimicrodegree fields 9 / 10 alongside a copied granularity /
-    // offset triple exactly as that one does.
+    // sparse reframe, including its coordinate-framing conversion: this path
+    // appends decimicrodegree fields 9 / 10 and drops the source granularity
+    // and offsets exactly as that one does, refusing a node it would copy
+    // under a non-default framing.
     let t_block = crate::counters::Stopwatch::start();
     let (st_offset, st_len) = super::super::reframe::parse_way_block_top(
         decompressed,
@@ -1320,7 +1321,7 @@ fn reframe_way_blob_with_locations(
         t_group.record_ns(&counters.group_reframe_ns);
     }
 
-    // Append scalar fields (granularity, etc.).
+    // Append the copied date_granularity; the coordinate framing is dropped.
     output.extend_from_slice(&scratch.scalar_fields);
 
     if sidecar_way_idx != expected_ways_usize {

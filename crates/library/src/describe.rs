@@ -100,8 +100,9 @@ impl Role {
 pub(crate) struct Call {
     pub(crate) id: String,
     pub(crate) label: String,
-    /// The capability ids the call's stream verdict stands for; nonempty
-    /// makes the driver add `<call>/brokkr.stream`.
+    /// The capability ids the call's stream verdict stands for in a
+    /// certification. The driver adds `<call>/brokkr.stream` for every call
+    /// regardless; this only assigns its coverage.
     pub(crate) stream: Vec<String>,
 }
 

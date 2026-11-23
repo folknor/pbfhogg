@@ -322,21 +322,19 @@ fn collect(
             doc,
             &p.run_dir.join(ROLES_DIR),
         ));
+        // Every call owes its stream account, whether or not its `stream`
+        // claims coverage: coverage only decides which capabilities
+        // certification credits with this result, never whether a stream
+        // defect or an unverifiable stream fails the run.
         let stream = crate::stream::judge(id, doc, &records, &loss);
-        if scenario
-            .calls
-            .iter()
-            .any(|c| c.id == *id && !c.stream.is_empty())
-        {
-            report.results.push((
-                Some(id.clone()),
-                Outcome {
-                    id: "brokkr.stream".into(),
-                    status: stream.status,
-                    detail: stream.detail,
-                },
-            ));
-        }
+        report.results.push((
+            Some(id.clone()),
+            Outcome {
+                id: "brokkr.stream".into(),
+                status: stream.status,
+                detail: stream.detail,
+            },
+        ));
     }
     for (call, r) in &report.results {
         if r.status != Status::Pass {

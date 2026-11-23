@@ -115,20 +115,6 @@ ownership inventory and one shared acquisition and recovery protocol, because
 parsing pins, sequence keys, aliases and ownership separately in each path is
 already producing contradictory answers.
 
-## TOOL-020 - Omitting stream coverage disables stream enforcement
-
-Reported by: library-protocol [P1].
-
-`crates/library/src/run.rs` computes every call's stream verdict but keeps it
-only when the call declares a nonempty `stream` capability list. Otherwise
-even a proven failure is discarded. A declaration that omits `stream` can pass
-verification despite a missing terminal record, duplicate terminal records or
-sealing values that disagree with its snapshot, and other calls can still
-cover `stream.sealed.v1`, so certification passes too. This breaks the
-contract in `reference/library-protocol.md` that stream accounting must pass.
-Coverage should decide which capabilities a result supports, not whether
-protocol violations fail the run.
-
 ## TOOL-021 - The nofile certifications do not exercise real descriptor limits
 
 Reported by: library-protocol [P1].

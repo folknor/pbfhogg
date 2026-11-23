@@ -124,10 +124,10 @@ character.
   Measurement and profiling). True requires exactly one call.
 - `calls`: at least one, ids unique within the scenario, none `setup`. Each
   has a one-line `label`, and may have `stream`: a list of capability ids,
-  each at most once, that the call's stream verdict stands for. A nonempty
-  list makes the driver add `<call>/brokkr.stream` (see The call stream), which
-  covers those capabilities in a certification; absent and `[]` mean the
-  same. There is no CLI replay.
+  each at most once, that the call's stream verdict stands for. The driver
+  adds `<call>/brokkr.stream` for every call (see The call stream); the list
+  only names the capabilities that result covers in a certification, and
+  absent and `[]` mean the same: no coverage, the same obligation. There is no CLI replay.
 - `roles`: every path the scenario uses (the discard sink excepted, see
   Discard sink), ids unique within the scenario; possibly none.
 - `assertions`: the scenario's assertion inventory, ids unique within the
@@ -439,8 +439,9 @@ call document:
 - **Otherwise complete**: it passes when every snapshot counter has its
   sealing emission, and fails naming the ones that have none.
 
-For a call whose `stream` lists capabilities, the driver adds the verdict as
-`<call>/brokkr.stream`, with reasons as its detail. A non-pass fails verification.
+For every call, whatever its `stream` lists, the driver adds the verdict as
+`<call>/brokkr.stream`, with reasons as its detail. A non-pass fails
+verification; coverage decides only which capabilities the result certifies.
 
 ## The verdict and retained evidence
 
@@ -454,7 +455,7 @@ harness result, or exit 1 with none, is inconsistent. `unevaluated` fails
 as `fail` does, while remaining distinct in records.
 
 The driver adds `<call>/brokkr.seal` (pass only when sealed) and
-`<call>/brokkr.stream` for declared stream coverage. Driver results do not
+`<call>/brokkr.stream` for every call. Driver results do not
 change whether the worker's own exit is consistent. The reserved `brokkr.*`
 assertion namespace, wire name `brokkr-json-v1` and seed recipe remain
 unchanged: an ownership move is not a wire-format revision.

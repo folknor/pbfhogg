@@ -125,4 +125,35 @@ fn scenario_launch_and_evidence() {
             }
         }
     }
+    uncovered_stream(scenario, &root);
+}
+
+/// A call claiming no stream coverage still owes its stream account: a good
+/// stream passes, a proven defect fails. Called from the one test that owns
+/// adopted workers.
+fn uncovered_stream(mut scenario: describe::Scenario, root: &std::path::Path) {
+    scenario.calls[0].stream.clear();
+    for (mode, fails) in [("ok", false), ("stream", true)] {
+        scenario.id = mode.into();
+        scenario.roles[0].source = describe::RoleSource::Output {
+            owner: "a".into(),
+            seeded: false,
+        };
+        let report = run::verify(std::path::Path::new(EXE), &scenario, &[], root).unwrap();
+        let stream_failed = report
+            .failures
+            .iter()
+            .any(|f| f.contains("brokkr.stream") && f.contains("snapshot holds"));
+        assert_eq!(
+            stream_failed, fails,
+            "uncovered {mode}: {:?}",
+            report.failures
+        );
+        assert_eq!(
+            report.failures.is_empty(),
+            !fails,
+            "uncovered {mode}: {:?}",
+            report.failures
+        );
+    }
 }

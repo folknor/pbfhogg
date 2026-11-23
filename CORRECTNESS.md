@@ -35,7 +35,10 @@ indexdata scanner (`blob_meta::scan`), renumber's wire splice and both
 add-locations-to-ways way reframers, so every walk that selects a table
 selects the same one; keeping the last table had resolved tags against the
 wrong strings. The `PrimitiveGroup.dense` message itself is stricter and
-refuses any repeat (`WireGroup::dense`).
+refuses any repeat (`WireGroup::dense`), and so does the header's
+`HeaderBlock.bbox` (`WireHeaderBlock::parse`), whose one occurrence must also
+carry all four required coordinates; DEVIATIONS.md "PBF decoding: the header
+bbox appears at most once, complete" records why.
 
 **Remaining compatibility limit:** Legal protobuf messages that split an
 array across data-bearing occurrences, or a metadata message across

@@ -27,7 +27,8 @@
 //! rules and the places it is stricter than both. Optional fields are
 //! recognised by number and wire type as both readers recognise them; the
 //! framing fields `type` and `datasize` refuse another wire type, as pbfhogg
-//! does. The header's bbox is not read. It never reads a value differently
+//! does. The header's bbox is judged for shape only (at most one occurrence,
+//! all four coordinates present); its values are not read. It never reads a value differently
 //! from them.
 //!
 //! The indexdata decoder follows pbfhogg's wire format (its `blob_meta`
@@ -1097,14 +1098,23 @@ const READABLE_REQUIRED_FEATURES: [&str; 3] =
 /// `writingprogram` 16, `source` 17, `osmosis_replication_base_url` 34),
 /// where libosmium would carry the bytes. A judged output whose header
 /// pbfhogg cannot read therefore never passes on this reader. The bbox
-/// submessage is not read here.
+/// submessage (field 1) is refused when repeated or missing a coordinate,
+/// as pbfhogg refuses it; its values are not read.
 fn header_features(block: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
     let text = |name: &str, v: &[u8]| {
         String::from_utf8(v.to_vec()).map_err(|_| format!("invalid UTF-8 in {name}"))
     };
     let (mut required, mut optional) = (Vec::new(), Vec::new());
+    let mut bbox_seen = false;
     for field in Fields::new(block) {
         match field? {
+            (1, Value::Bytes(v)) => {
+                if bbox_seen {
+                    return Err("HeaderBlock.bbox appears twice".into());
+                }
+                bbox_seen = true;
+                header_bbox_complete(v)?;
+            }
             (4, Value::Bytes(v)) => {
                 let feature = text("required_features", v)?;
                 if !READABLE_REQUIRED_FEATURES.contains(&feature.as_str()) {
@@ -1128,6 +1138,23 @@ fn header_features(block: &[u8]) -> Result<(Vec<String>, Vec<String>), String> {
         }
     }
     Ok((required, optional))
+}
+
+/// A `HeaderBBox` body (`HeaderBlock` field 1) carries each of its four
+/// required coordinates (fields 1 to 4) as a varint, as pbfhogg and libosmium
+/// both demand. Only presence is judged; the values are not read.
+fn header_bbox_complete(body: &[u8]) -> Result<(), String> {
+    let mut seen = [false; 4];
+    for field in Fields::new(body) {
+        if let (n @ 1..=4, Value::Varint(_)) = field? {
+            seen[usize::try_from(n - 1).map_err(|e| e.to_string())?] = true;
+        }
+    }
+    if seen.iter().all(|s| *s) {
+        Ok(())
+    } else {
+        Err("HeaderBlock.bbox is missing a required coordinate".into())
+    }
 }
 
 /// The `Sort.Type_then_ID` feature pbfhogg branches on.
@@ -1378,6 +1405,32 @@ mod tests {
         ] {
             assert!(refused.is_err());
         }
+    }
+
+    /// The header bbox appears at most once with all four coordinates.
+    #[test]
+    fn header_bbox_must_be_single_and_complete() {
+        use super::header_features;
+        let complete = [0x08, 0x02, 0x10, 0x04, 0x18, 0x06, 0x20, 0x08];
+        let header = |bodies: &[&[u8]]| {
+            let mut block = Vec::new();
+            for body in bodies {
+                bytes_field(1, body, &mut block);
+            }
+            header_features(&block)
+        };
+        assert!(header(&[]).is_ok());
+        assert!(header(&[&complete]).is_ok());
+        assert!(header(&[&[]]).is_err());
+        assert!(header(&[&complete[..6]]).is_err());
+        assert!(header(&[&complete, &[]]).is_err());
+        assert!(header(&[&complete, &complete]).is_err());
+        // A varint on field 1 is an unknown field, not a second bbox.
+        let mut block = Vec::new();
+        bytes_field(1, &complete, &mut block);
+        varint(1 << 3, &mut block);
+        varint(1, &mut block);
+        assert!(header_features(&block).is_ok());
     }
 
     /// A zlib block of exactly 32 MiB inflates; one byte more is refused.

@@ -1120,6 +1120,31 @@ command's internal indexdata precondition reads only framing and leaves the
 header to the command's own reader, so a command may refuse missing
 indexdata before it reaches the header refusal.
 
+## PBF decoding: the header bbox appears at most once, complete
+
+`HeaderBlock.bbox` (field 1, length-delimited) may appear once, and that
+occurrence must carry all four of its `required` coordinates as varints; a
+correctly typed zero counts, and a coordinate of another wire type is an
+unknown field that does not. A missing coordinate, an empty occurrence and a
+second occurrence of any kind are refused, by every HeaderBlock decode and
+by the verifier's own header reader. Earlier pbfhogg read a missing
+coordinate as 0 and let a later occurrence replace an earlier one, so a
+complete box followed by an empty one read as `(0, 0, 0, 0)`.
+
+Protobuf would merge repeated occurrences field by field, and libosmium
+decodes each occurrence alone, refusing an incomplete one, and keeps them
+all as a list (`Header::box` is the first, `osmium sort` joins them). The
+two disagree whenever a repeat carries data, so pbfhogg reads neither way
+and refuses. It therefore refuses legal protobuf that splits the box across
+occurrences, and two complete boxes libosmium accepts; no known writer emits
+either. A single complete box reads the same occurrence in both readers, but
+not always the same value: libosmium truncates nanodegrees to its
+100-nanodegree grid, normalises an inverted box by extending it with its
+corners, and treats a coordinate equal to `i64::MAX` as absent, while
+pbfhogg keeps the four stored values exactly. `degrade`'s header-only
+passthrough does not decode the header, so `--strip-bbox` there removes a
+malformed bbox without refusing it.
+
 ## PBF decoding: a group holding several element fields is read in kind order
 
 The PBF format puts one kind of element in each `PrimitiveGroup`, but nothing

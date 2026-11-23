@@ -23,19 +23,6 @@ the scope or scopes, and the bracketed priority is the hunter's own label.
 Findings that match an existing mechanism were added to `notes/bugs.md`
 instead of being filed here. Entries are in no order of importance.
 
-## FMT-004 - Repeated header bbox occurrences overwrite instead of merging
-
-Reported by: read-block-decoding [P2].
-
-The bbox assignment in `WireHeaderBlock::parse` (`read/block.rs`) replaces the
-whole previous message, and `WireHeaderBBox::parse` initializes every
-coordinate to zero. A complete bbox followed by an empty bbox occurrence
-therefore becomes `(0, 0, 0, 0)`; protobuf merging would leave it unchanged.
-Splitting coordinates across occurrences also loses earlier ones. The wrong
-extent reaches `HeaderBlock::bbox`, inspection and output-header derivation.
-It is a silent embedded-message replacement outside the recorded
-repeated-`Info`/`DenseInfo` refusal policy.
-
 ## FMT-005 - BlobReader::seek does not resume a failed reader
 
 Reported by: read-framing.

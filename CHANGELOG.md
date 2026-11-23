@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- **A header bbox must appear once with all four coordinates.** A
+  `HeaderBlock.bbox` missing a coordinate read that coordinate as 0, and a
+  repeated bbox replaced the earlier one, so a complete box followed by an
+  empty one reported `(0, 0, 0, 0)` to `HeaderBlock::bbox`, `inspect` and
+  output headers. Both shapes are now refused when the header is decoded.
 - **A malformed OSC attribute is refused wherever it sits.** The OSC
   readers stopped at the attribute they wanted, so a malformed or
   duplicated attribute after it (`<nd ref="1" broken/>`, `<member

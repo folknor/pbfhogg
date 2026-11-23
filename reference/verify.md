@@ -214,11 +214,13 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   pbfhogg cannot reopen never passes on it: a required feature other than
   `OsmSchema-V0.6`, `DenseNodes` and `HistoricalInformation` (exactly),
   invalid UTF-8 in a blob type, the feature lists, `writingprogram`,
-  `source` or the replication base URL, two `DenseNodes` in a group, and
+  `source` or the replication base URL, a header bbox that is repeated or
+  lacks one of its four coordinates, two `DenseNodes` in a group, and
   `DenseNodes` IDs in an occurrence after a non-empty one. It is stricter
   than both on a repeated or absent scalar ID, a skipped varint past 64
   bits, and indexdata with an undeclared length or two non-empty fields,
-  which pbfhogg reads as an unindexed blob. The header's bbox is not read.
+  which pbfhogg reads as an unindexed blob. The header bbox's values are
+  not read.
   It never reads a value differently from them.
 - **Sorted copies** are written by `osmium sort`, with
   `-f pbf,locations_on_ways=true` when the source declares

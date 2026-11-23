@@ -73,30 +73,42 @@ pub(crate) struct WireHeaderBBox {
 }
 
 impl WireHeaderBBox {
+    /// Parse one `HeaderBBox` message. Its four coordinates are `required`
+    /// in osmformat.proto, so each must be present as a varint; a missing
+    /// one (an empty message included, or a coordinate of another wire type,
+    /// which is an unknown field) is refused rather than read as 0, as
+    /// libosmium's `decode_header_bbox` refuses it. A coordinate repeated
+    /// inside the one message keeps its last value, as protobuf and
+    /// libosmium both read it.
     fn parse(data: &[u8]) -> Result<Self> {
         use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
-        let mut left: i64 = 0;
-        let mut right: i64 = 0;
-        let mut top: i64 = 0;
-        let mut bottom: i64 = 0;
+        let mut left: Option<i64> = None;
+        let mut right: Option<i64> = None;
+        let mut top: Option<i64> = None;
+        let mut bottom: Option<i64> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
-                (header_bbox::LEFT, 0) => left = cursor.read_sint64()?,
-                (header_bbox::RIGHT, 0) => right = cursor.read_sint64()?,
-                (header_bbox::TOP, 0) => top = cursor.read_sint64()?,
-                (header_bbox::BOTTOM, 0) => bottom = cursor.read_sint64()?,
+                (header_bbox::LEFT, 0) => left = Some(cursor.read_sint64()?),
+                (header_bbox::RIGHT, 0) => right = Some(cursor.read_sint64()?),
+                (header_bbox::TOP, 0) => top = Some(cursor.read_sint64()?),
+                (header_bbox::BOTTOM, 0) => bottom = Some(cursor.read_sint64()?),
                 _ => cursor.skip_field(wire_type)?,
             }
         }
 
-        Ok(WireHeaderBBox {
-            left,
-            right,
-            top,
-            bottom,
-        })
+        match (left, right, top, bottom) {
+            (Some(left), Some(right), Some(top), Some(bottom)) => Ok(WireHeaderBBox {
+                left,
+                right,
+                top,
+                bottom,
+            }),
+            _ => Err(new_wire_error(
+                "HeaderBlock.bbox is missing a required coordinate",
+            )),
+        }
     }
 }
 
@@ -152,8 +164,17 @@ impl WireHeaderBlock {
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
                 header_block::BBOX_TAG => {
-                    // bbox: HeaderBBox submessage
+                    // bbox: HeaderBBox submessage, at most once. Protobuf
+                    // would merge a repeat field by field and libosmium
+                    // keeps every occurrence as a list whose first entry is
+                    // the box; the two disagree on any repeat, so a second
+                    // occurrence, empty included, is refused. See
+                    // DEVIATIONS.md "PBF decoding: the header bbox appears
+                    // at most once, complete".
                     let sub_data = cursor.read_len_delimited()?;
+                    if bbox.is_some() {
+                        return Err(new_wire_error("HeaderBlock.bbox appears twice"));
+                    }
                     bbox = Some(WireHeaderBBox::parse(sub_data)?);
                 }
                 header_block::REQUIRED_FEATURES_TAG => {
@@ -276,7 +297,8 @@ impl HeaderBlock {
         self.header.writingprogram.as_deref()
     }
 
-    /// Returns the source of the `bbox` field or `None` if unset.
+    /// Returns the header's `source` string (the data's origin), or `None`
+    /// if unset.
     pub fn source(&self) -> Option<&str> {
         self.header.source.as_deref()
     }
@@ -3599,6 +3621,73 @@ mod header_wire_type_tests {
             }
             assert!(err.to_string().contains(&format!("{bad:?}")));
         }
+    }
+
+    /// A bbox occurrence (field 1) whose body is `body`.
+    fn bbox_field(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x0a, u8::try_from(body.len()).unwrap()];
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// left 1, right 2, top 3, bottom 4 (zigzag 2, 4, 6, 8).
+    const COMPLETE: [u8; 8] = [0x08, 0x02, 0x10, 0x04, 0x18, 0x06, 0x20, 0x08];
+
+    #[test]
+    fn a_complete_bbox_reads_as_written() {
+        let b = WireHeaderBlock::parse(&bbox_field(&COMPLETE))
+            .unwrap()
+            .bbox
+            .unwrap();
+        assert_eq!((b.left, b.right, b.top, b.bottom), (1, 2, 3, 4));
+        // A correctly typed zero counts as present.
+        let zeros = [0x08, 0x00, 0x10, 0x00, 0x18, 0x00, 0x20, 0x00];
+        let b = WireHeaderBlock::parse(&bbox_field(&zeros))
+            .unwrap()
+            .bbox
+            .unwrap();
+        assert_eq!((b.left, b.right, b.top, b.bottom), (0, 0, 0, 0));
+        // A coordinate repeated inside the one message keeps its last value.
+        let mut repeated = COMPLETE.to_vec();
+        repeated.extend_from_slice(&[0x08, 0x0a]);
+        let b = WireHeaderBlock::parse(&bbox_field(&repeated))
+            .unwrap()
+            .bbox
+            .unwrap();
+        assert_eq!(b.left, 5);
+        // A varint on field 1 beside it is an unknown field, not a repeat.
+        let mut h = bbox_field(&COMPLETE);
+        h.extend_from_slice(&[0x08, 0x01]);
+        assert!(WireHeaderBlock::parse(&h).unwrap().bbox.is_some());
+    }
+
+    #[test]
+    fn an_incomplete_bbox_is_refused() {
+        // Empty, three coordinates, and bottom as a fixed64 (unknown field).
+        let wrong_wire = [
+            0x08, 0x02, 0x10, 0x04, 0x18, 0x06, 0x21, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        for body in [&[][..], &COMPLETE[..6], &wrong_wire[..]] {
+            let err = WireHeaderBlock::parse(&bbox_field(body)).unwrap_err();
+            assert!(
+                err.to_string().contains("missing a required coordinate"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_bbox_is_refused() {
+        // Complete then empty, and complete twice: the repeat is refused.
+        for second in [&[][..], &COMPLETE[..]] {
+            let h = [bbox_field(&COMPLETE), bbox_field(second)].concat();
+            let err = WireHeaderBlock::parse(&h).unwrap_err();
+            assert!(err.to_string().contains("appears twice"), "{err}");
+        }
+        // Coordinates split across two occurrences: the first is already
+        // incomplete.
+        let h = [bbox_field(&COMPLETE[..4]), bbox_field(&COMPLETE[4..])].concat();
+        assert!(WireHeaderBlock::parse(&h).is_err());
     }
 
     #[test]

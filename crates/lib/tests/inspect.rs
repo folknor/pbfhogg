@@ -124,6 +124,10 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
     .expect("inspect");
     assert_eq!(quoted.to_json(None)["elements"]["nodes"], 3);
     assert_eq!(measured.to_json(None)["elements"]["nodes"], 3);
+    // indexdata has no tag count: the fast path leaves it unmeasured (null),
+    // the decode measures the fixture's one tagged node.
+    assert!(quoted.to_json(None)["elements"]["tagged_nodes"].is_null());
+    assert_eq!(measured.to_json(None)["elements"]["tagged_nodes"], 1);
 
     pbfhogg::degrade::degrade(
         &honest,
@@ -163,6 +167,22 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
     );
     assert_eq!(json["elements"]["ways"], 2);
     assert_eq!(json["elements"]["relations"], 1);
+}
+
+/// A decoded file without tagged nodes reports a measured zero, a number,
+/// distinct from the index-only walk's null.
+#[test]
+fn inspect_decoded_untagged_nodes_report_a_measured_zero() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("untagged.osm.pbf");
+    write_nodes_blocks(&input, &[3]);
+    let measured = pbfhogg::inspect::inspect(
+        &input,
+        &inspect_opts(false, true),
+        &crate::common::test_host(),
+    )
+    .expect("inspect");
+    assert_eq!(measured.to_json(None)["elements"]["tagged_nodes"], 0);
 }
 
 fn write_indexed_simple_pbf(path: &std::path::Path) {
@@ -236,7 +256,7 @@ fn inspect_json_base() {
     let json = report.to_json(None);
 
     // Schema version
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
 
     // File metadata
     assert!(
@@ -254,9 +274,11 @@ fn inspect_json_base() {
 
     // Elements
     assert_eq!(json["elements"]["nodes"], 3);
-    // tagged_nodes is 0 when the index-only fast path is used (no decompression),
-    // because indexdata doesn't store per-element tag counts.
-    assert!(json["elements"]["tagged_nodes"].is_u64());
+    // indexdata carries no tag count, so the index-only walk publishes the
+    // key as null (unmeasured), never as a measured zero; the fixture holds
+    // one tagged node.
+    assert!(json["elements"].get("tagged_nodes").is_some());
+    assert!(json["elements"]["tagged_nodes"].is_null());
     assert_eq!(json["elements"]["ways"], 2);
     assert_eq!(json["elements"]["relations"], 1);
     assert_eq!(json["elements"]["total"], 6);

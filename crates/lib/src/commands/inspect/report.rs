@@ -175,13 +175,15 @@ impl InspectReport {
         let total = self.state.node_count + self.state.way_count + self.state.relation_count;
         writeln!(out, "Elements: {} total", format_number(total))?;
 
-        if self.state.tagged_node_count > 0 {
+        // The suffix asserts a count only when one was measured and is
+        // positive; the index-only scan measures none, so it prints none.
+        if let Some(tagged) = self.tagged_nodes.filter(|&n| n > 0) {
             writeln!(
                 out,
                 "  {:13}{}  ({} tagged)",
                 "Nodes:",
                 format_number(self.state.node_count),
-                format_number(self.state.tagged_node_count)
+                format_number(tagged)
             )?;
         } else {
             writeln!(

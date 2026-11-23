@@ -787,6 +787,10 @@ pub struct InspectReport {
     pub(super) is_indexed: bool,
     pub(super) total_blocks: u64,
     pub(super) accum: BlockAccum,
+    /// Tagged nodes, `None` when the completed scan did not measure them
+    /// (the index-only walk). The renderers read this, never
+    /// `state.tagged_node_count`, which the index-only walk leaves at 0.
+    pub(super) tagged_nodes: Option<u64>,
     pub(super) state: ScanState,
 }
 

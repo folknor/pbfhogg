@@ -292,3 +292,20 @@ libosmium's `get_tag` (`xml_input_format.hpp`) reads an absent `k` or `v` as
 the empty string. pbfhogg ignores `lat`/`lon` on an `<nd>`, while libosmium
 parses and validates them as a location (DOC-014 covers the re-emission
 drop). Neither difference is recorded in DEVIATIONS.md.
+
+## DOC-034 - No durable document says when inspect JSON bumps schema_version
+
+Reported by: the spar accounting of the inspect tagged_nodes null change
+(window 2).
+
+`inspect --json` carries `schema_version` (3 at the time of filing, hard-coded
+in `crates/lib/src/commands/inspect/json.rs`). Its history follows an unwritten
+policy: removing `ordering.sequence` bumped it, adding the key
+`data.has_negative_ids` did not, and turning `elements.tagged_nodes` from a
+number into a nullable number bumped it. The rule applied in that last change
+was "changing an existing field's type, including to nullable, bumps the
+version; a purely added key does not". It is recorded only in a transient
+session ledger. Neither `docs/cli/commands.md` (the `--json` row names only
+the current version), the doc comment in `json.rs`, nor CHANGELOG states it,
+so a JSON consumer cannot tell what a version change promises, and the next
+schema edit has nothing to follow.

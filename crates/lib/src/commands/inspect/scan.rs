@@ -264,6 +264,11 @@ fn try_index_only_scan(
         is_indexed: true,
         total_blocks: total_data_blobs,
         accum,
+        // indexdata carries no tag count, so a walk over data blobs has not
+        // measured one; with no data blob the zero is exact. Deliberately
+        // not decoded here: counting would decode every node blob and
+        // forfeit the header-only walk (`--distrust-metadata` measures it).
+        tagged_nodes: (total_data_blobs == 0).then_some(0),
         state,
     }))
 }
@@ -454,6 +459,7 @@ fn full_decode_scan(
         is_indexed,
         total_blocks: total_data_blobs,
         accum,
+        tagged_nodes: Some(state.tagged_node_count),
         state,
     })
 }

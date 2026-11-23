@@ -171,17 +171,6 @@ because it checks only `previous.max >= next.min`, which counts descending
 disjoint ranges as overlapping. The command does create disorder, but the
 advertised benchmark shape and its test are wrong at cap 1.
 
-## CMD-029 - Default inspect JSON reports tagged_nodes 0 without measuring it
-
-Reported by: check-inspect [P2].
-
-The index-only scan (`inspect/scan.rs`) accumulates element counts but never
-counts tagged nodes, yet `inspect/json.rs` always publishes
-`"tagged_nodes": 0`. An honest indexed file with tagged nodes reports zero by
-default and a positive count under `--distrust-metadata`. This breaks the
-field's meaning without needing corrupt metadata. An unmeasured count should
-be represented as unavailable, separately from a measured zero.
-
 ## CMD-030 - data.objects_ordered rejects a mixed-kind blob in canonical order
 
 Reported by: check-inspect [P2].

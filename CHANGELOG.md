@@ -4,6 +4,13 @@
 
 ### Breaking
 
+- **`inspect --json` is `schema_version` 3: `elements.tagged_nodes` is
+  `null` when unmeasured.** The default index-only path never counted
+  tagged nodes (indexdata has no tag count) yet published `0`, so an
+  indexed file with tagged nodes read as having none. It is now `null`
+  there; a number is always a decoded count, available with
+  `--distrust-metadata` or any decoding flag.
+
 - **`osc::load_all_diffs` refuses entries it cannot load.** A
   sequence-named entry whose metadata could not be read (an unsearchable
   directory, a dangling symlink) was silently left out, so the loader

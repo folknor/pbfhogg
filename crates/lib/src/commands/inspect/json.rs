@@ -62,7 +62,7 @@ impl InspectReport {
             .collect();
 
         let mut json = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "file": self.file_name,
             "file_size": self.file_size,
             "header": header,
@@ -77,7 +77,7 @@ impl InspectReport {
             },
             "elements": {
                 "nodes": self.state.node_count,
-                "tagged_nodes": self.state.tagged_node_count,
+                "tagged_nodes": self.tagged_nodes,
                 "ways": self.state.way_count,
                 "relations": self.state.relation_count,
                 "total": self.state.node_count + self.state.way_count + self.state.relation_count,

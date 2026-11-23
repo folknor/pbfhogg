@@ -142,31 +142,6 @@ cancelled, and returns success. This contradicts the per-write cancellation
 contract documented next to it. Publication still prevents a cancelled staged
 output from being published. The defect is in the write method's behaviour.
 
-## FMT-019 - A panicking diagnostic sink can abort the process via SummaryWriter
-
-Reported by: concurrency-host [P2].
-
-`SummaryWriter::write` (`host.rs`) calls the sink before removing the completed
-line from its buffer. If the sink panics, unwinding drops the writer, and its
-destructor sends the still-buffered text to the same sink. A sink that always
-panics therefore causes a second panic during unwinding, which aborts the
-process. This breaks the repository's stated avoidance of panicking cleanup
-and the writer's one-event-per-line behaviour, and `DiagnosticSink` imposes no
-non-panicking requirement. Fix: remove pending text from state before calling
-out, and make destructor delivery safe during unwinding. The same hunter
-separately noted, unmeasured, that repeated front-draining of the `Vec` makes
-one large write of many short lines quadratic.
-
-## FMT-020 - SummaryWriter::flush succeeds without flushing
-
-Reported by: concurrency-host [P3].
-
-Writing an unterminated line and calling `flush()` (`host.rs`) returns success
-and delivers nothing to the sink. The bytes stay buffered until a newline or
-destruction. This violates the `std::io::Write::flush` contract the type
-implements. Flushing should deliver the pending fragment, as destruction
-already does.
-
 ## FMT-021 - PipelinedBlocks teardown destroys panic payloads
 
 Reported by: concurrency-host [P2].
@@ -182,19 +157,6 @@ and can panic instead of returning its promised internal error. This breaks
 the teardown's own stated intent to suppress the background panic during
 cleanup. The session boundary should consume caught payloads under the same
 policy as the scoped infrastructure.
-
-## FMT-022 - Scratch cleanup can abort an already-unwinding process
-
-Reported by: filesystem-output.
-
-When removal fails, `RunScratch::cleanup` (`scratch.rs`) calls the caller's
-diagnostic sink directly, including when it is invoked from `Drop` during a
-panic unwind, and `Diagnostics::emit` (`host.rs`) does not contain that
-callback's panic. An existing panic, plus a scratch removal failure, plus a
-panicking sink, gives a double panic and a process abort that interrupts the
-remaining cleanup. The output layer already handles this exact hazard by
-suppressing cleanup callbacks during unwinding (`emit_cleanup`, `output.rs`).
-Scratch has no equivalent protection.
 
 ## FMT-024 - path_guard same_file stringifies the original I/O error
 

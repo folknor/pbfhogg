@@ -330,9 +330,11 @@ omission; `Diagnostics::discard()` is an explicit choice) receives a
 `Warning` with key `output.cleanup` for every removal that failed and every
 entry kept back, naming what is left. They are emitted when the output is
 dropped, after every sync publication attempted, so a sink cannot interrupt
-durability; while a panic is unwinding nothing is emitted, because a sink
-that panicked then would abort the process, and the next scan reports the
-leftover instead. A previous output whose contents cannot be unlinked stays
+durability. Delivery is attempted while a panic is unwinding too: a sink
+that panics is contained (its payload forgotten, the sink switched off for
+that `Diagnostics` and its clones, `Diagnostics::sink_failed` set), so it
+cannot turn the unwind into an abort, and a sink switched off earlier
+receives nothing more; the next scan still reports the leftover. A previous output whose contents cannot be unlinked stays
 in its `.pbfhogg-backup-*` entry, possibly partly removed.
 
 ## Alternatives considered

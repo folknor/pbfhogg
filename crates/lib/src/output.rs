@@ -69,7 +69,9 @@
 //!   whose writer was not finished or failed ([`OutputError::Unfinished`]).
 //! - **Trouble that does not fail the run is reported, never dropped.** Every
 //!   output is constructed with a [`Diagnostics`]; cleanup that fails, and
-//!   anything kept back from cleanup, becomes an `output.cleanup` warning.
+//!   anything kept back from cleanup, becomes an `output.cleanup` warning,
+//!   delivered while a panic unwinds too. A sink that panicked earlier has
+//!   been switched off ([`Diagnostics::sink_failed`]) and gets nothing more.
 //!
 //! The staging and backup names, which an external tool may delete, and the
 //! guarantee a caller-chosen staging directory gives a caller that removes
@@ -2317,13 +2319,10 @@ impl Target {
     }
 }
 
-/// Report cleanup trouble. A sink that panicked while a panic is already
-/// unwinding would abort the process, so nothing is emitted then: a
-/// panicking run's leftovers are found by the next scan instead.
+/// Report cleanup trouble. This runs from destructors, during unwinding
+/// too; `Diagnostics::emit` contains a panicking sink, so a sink panic here
+/// cannot become a second panic that aborts the process.
 fn emit_cleanup(diagnostics: &Diagnostics, message: &str) {
-    if std::thread::panicking() {
-        return;
-    }
     diagnostics.emit(
         crate::host::EventKind::Warning,
         "output.cleanup",
@@ -4421,6 +4420,53 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].0, "output.cleanup");
         assert!(events[0].1.contains("is kept"), "{events:?}");
+    }
+
+    /// Cleanup trouble is reported while a panic unwinds, and a sink that
+    /// panics then is contained instead of aborting the process: the
+    /// original payload survives, the protected entry stays, and the
+    /// handle reports the sink switched off.
+    #[test]
+    fn cleanup_reports_during_unwinding_and_contains_a_panicking_sink() {
+        struct PanicsWhileUnwinding(Mutex<Vec<(&'static str, bool)>>);
+        impl crate::host::DiagnosticSink for PanicsWhileUnwinding {
+            fn event(&self, event: &crate::host::Event<'_>) {
+                let unwinding = std::thread::panicking();
+                self.0.lock().unwrap().push((event.key, unwinding));
+                if unwinding {
+                    std::panic::resume_unwind(Box::new("sink"));
+                }
+            }
+        }
+        let run = crate::host::Host::for_tests();
+        let dir = scratch();
+        let sink = Arc::new(PanicsWhileUnwinding(Mutex::new(Vec::new())));
+        let diagnostics =
+            Diagnostics::new(Arc::clone(&sink) as Arc<dyn crate::host::DiagnosticSink>);
+        let out = OutputDir::new(
+            dir.path().join("index"),
+            Overwrite::Refuse,
+            None,
+            &diagnostics,
+        )
+        .unwrap();
+        let out = out.bind(&run.invocation).expect("bind output fixture");
+        let writer = out.writer().unwrap();
+        let inner = writer.path().join(".pbfhogg-backup-1-0.x");
+        fs::create_dir(&inner).unwrap();
+        drop(writer);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _out = out;
+            std::panic::resume_unwind(Box::new("original"));
+        }));
+        let payload = match caught {
+            Err(payload) => payload,
+            Ok(()) => panic!("the closure unwinds"),
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"original"));
+        assert!(inner.exists());
+        assert_eq!(*sink.0.lock().unwrap(), [("output.cleanup", true)]);
+        assert!(diagnostics.sink_failed());
     }
 
     /// A staging entry that cannot be removed is reported, not lost.

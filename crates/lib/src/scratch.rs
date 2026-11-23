@@ -380,6 +380,8 @@ impl RunScratch {
         // Close the lock last: a scanner never sees the directory unlocked
         // while it still holds scratch.
         self.lock = None;
+        // Reported during unwinding too: `Diagnostics::emit` contains a
+        // panicking sink, so this cannot turn a panic into an abort.
         if let Err(e) = result {
             self.diagnostics.emit(
                 crate::host::EventKind::Warning,

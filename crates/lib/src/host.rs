@@ -2394,6 +2394,17 @@ pub enum EventKind {
 /// destruction of thread-local values it creates there, must not wait for
 /// the call to end or for anything the invoking thread holds until it does.
 /// [`InstrumentSink`](crate::debug::InstrumentSink) states the same rule.
+///
+/// Events also arrive from destructors while a panic is unwinding (scratch
+/// and output cleanup report from there). A panic escaping `event` is
+/// contained: the panic hook still runs, the payload is forgotten rather
+/// than dropped (its destructor is caller code and could panic again), the
+/// sink is switched off for the [`Diagnostics`] it was handed to and every
+/// clone of it, and the run carries on;
+/// [`Diagnostics::sink_failed`] tells the caller its stream is incomplete.
+/// Containment covers the call, not the sink's own destructor, which runs
+/// when the last `Diagnostics` holding it drops, possibly during unwinding,
+/// and must not panic.
 pub trait DiagnosticSink: Send + Sync {
     fn event(&self, event: &Event<'_>);
 }
@@ -2409,6 +2420,9 @@ pub trait DiagnosticSink: Send + Sync {
 #[derive(Clone)]
 pub struct Diagnostics {
     sink: Arc<dyn DiagnosticSink>,
+    /// Latched when the sink panics; shared by clones, not by another
+    /// `Diagnostics::new` over the same sink.
+    failed: Arc<std::sync::atomic::AtomicBool>,
 }
 impl std::fmt::Debug for Diagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2421,20 +2435,30 @@ impl DiagnosticSink for Discard {
 }
 impl Diagnostics {
     pub fn new(sink: Arc<dyn DiagnosticSink>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            failed: Arc::default(),
+        }
     }
     pub fn discard() -> Self {
         Self::new(Arc::new(Discard))
+    }
+    /// Whether the sink panicked and was switched off, so events after that
+    /// panic (and the one it panicked on) were not delivered. Calls already
+    /// in flight when the latch trips may still reach the sink.
+    pub fn sink_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn summary_writer(&self, key: &'static str) -> SummaryWriter<'_> {
         SummaryWriter {
             diagnostics: self,
             key,
-            bytes: Vec::new(),
+            pending: Vec::new(),
         }
     }
+    /// Deliver one event, the sink's panic contained (see [`DiagnosticSink`]).
     pub(crate) fn emit(&self, kind: EventKind, key: &'static str, args: std::fmt::Arguments<'_>) {
-        self.sink.event(&Event { kind, key, args });
+        contained(&self.failed, || self.sink.event(&Event { kind, key, args }));
     }
     /// Emit the event once per `invocation`: the first `diag_once!` with
     /// `key` under that invocation (or a clone of it) reaches the sink, every
@@ -2452,37 +2476,62 @@ impl Diagnostics {
     }
 }
 /// Converts byte-oriented summary output into one event per completed line.
+///
+/// Bytes after the last newline are held until a later write completes the
+/// line. `flush` ends that fragment: it is delivered as one event, and a later
+/// write starts a new one. Dropping the writer does the same. Each line is
+/// decoded (lossily) only once complete, so a code point split across writes
+/// survives.
 pub struct SummaryWriter<'a> {
     diagnostics: &'a Diagnostics,
     key: &'static str,
-    bytes: Vec<u8>,
+    /// The unfinished line: bytes since the last newline.
+    pending: Vec<u8>,
+}
+impl SummaryWriter<'_> {
+    fn deliver(&self, line: &[u8]) {
+        self.diagnostics.emit(
+            EventKind::Summary,
+            self.key,
+            format_args!("{}", String::from_utf8_lossy(line)),
+        );
+    }
+    /// Deliver the pending fragment, taken out of the writer first so
+    /// nothing can deliver it twice.
+    fn end_fragment(&mut self) {
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.deliver(&line);
+        }
+    }
 }
 impl std::io::Write for SummaryWriter<'_> {
+    /// Scans only `buf`, once: every completed line is delivered, and only
+    /// the unfinished suffix is kept.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.bytes.extend_from_slice(buf);
-        while let Some(end) = self.bytes.iter().position(|b| *b == b'\n') {
-            self.diagnostics.emit(
-                EventKind::Summary,
-                self.key,
-                format_args!("{}", String::from_utf8_lossy(&self.bytes[..end])),
-            );
-            self.bytes.drain(..=end);
+        let mut rest = buf;
+        while let Some(end) = rest.iter().position(|b| *b == b'\n') {
+            let (line, tail) = (&rest[..end], &rest[end + 1..]);
+            rest = tail;
+            if self.pending.is_empty() {
+                self.deliver(line);
+            } else {
+                let mut joined = std::mem::take(&mut self.pending);
+                joined.extend_from_slice(line);
+                self.deliver(&joined);
+            }
         }
+        self.pending.extend_from_slice(rest);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        self.end_fragment();
         Ok(())
     }
 }
 impl Drop for SummaryWriter<'_> {
     fn drop(&mut self) {
-        if !self.bytes.is_empty() {
-            self.diagnostics.emit(
-                EventKind::Summary,
-                self.key,
-                format_args!("{}", String::from_utf8_lossy(&self.bytes)),
-            );
-        }
+        self.end_fragment();
     }
 }
 macro_rules! diag {
@@ -2539,5 +2588,53 @@ mod diagnostic_tests {
             *sink.0.lock().expect("sink"),
             ["one", "two", "partial", "tail"]
         );
+    }
+    /// `flush` ends the pending fragment as one event and `Drop` does not
+    /// resend it; an empty flush and empty lines behave; a code point split
+    /// across writes is decoded whole; one write of many lines splits them.
+    #[test]
+    fn summary_writer_flush_ends_the_fragment() {
+        let sink = Arc::new(Sink::default());
+        let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        {
+            let mut w = d.summary_writer("summary");
+            write!(w, "label - ").expect("write");
+            w.flush().expect("flush");
+            w.flush().expect("flush");
+            let snowman = "\u{2603}".as_bytes();
+            w.write_all(&snowman[..1]).expect("write");
+            w.write_all(&snowman[1..]).expect("write");
+            w.write_all(b"\n\na\nb\nc\n").expect("write");
+        }
+        assert_eq!(
+            *sink.0.lock().expect("sink"),
+            ["label - ", "\u{2603}", "", "a", "b", "c"]
+        );
+        assert!(!d.sink_failed());
+    }
+    struct Panicking(std::sync::atomic::AtomicUsize);
+    impl DiagnosticSink for Panicking {
+        fn event(&self, _e: &Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::panic::resume_unwind(Box::new("sink"));
+        }
+    }
+    /// A panicking sink is contained and switched off for the handle and its
+    /// clones: the writer's line is not resent from `Drop`.
+    #[test]
+    fn a_panicking_sink_is_contained_and_switched_off() {
+        let sink = Arc::new(Panicking(std::sync::atomic::AtomicUsize::new(0)));
+        let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        {
+            let mut w = d.summary_writer("summary");
+            writeln!(w, "one").expect("write");
+            write!(w, "partial").expect("write");
+        }
+        d.clone()
+            .emit(EventKind::Warning, "key", format_args!("later"));
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(d.clone().sink_failed());
+        let fresh = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        assert!(!fresh.sink_failed());
     }
 }

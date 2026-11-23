@@ -632,6 +632,17 @@
 
 ### Fixed
 
+- **A panicking `DiagnosticSink` can no longer abort the process.** A
+  panic in a sink during cleanup that ran while another panic unwound
+  (a failed scratch removal, or a `SummaryWriter` resending its line
+  from its destructor) was a double panic and aborted. A sink panic is
+  now contained like an `InstrumentSink`'s: the sink is switched off for
+  that `Diagnostics` and its clones, the run carries on, and the new
+  `Diagnostics::sink_failed` reports the stream incomplete. Output
+  cleanup warnings are now also delivered while a panic unwinds, where
+  they used to be skipped. `SummaryWriter::flush` now delivers the
+  pending unterminated fragment as one event instead of doing nothing.
+
 - **`DirectWriter` stops at its first I/O error.** A failed final flush
   used to make every later `flush` return `Ok` without writing the tail
   or truncating the padding, and a write whose buffer flush failed counted

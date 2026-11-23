@@ -630,6 +630,9 @@ pub(crate) struct CallRecord {
     diagnostics: Vec<Value>,
     collector: Arc<Collector>,
     diagnostics_released: bool,
+    /// The call's sink panicked: the library switched it off, so the events
+    /// after that panic were never delivered.
+    diagnostics_sink_failed: bool,
 }
 
 impl CallRecord {
@@ -664,7 +667,7 @@ pub(crate) struct Ctx<'a> {
     settings: Settings,
     all_passed: bool,
     /// Each call's collector, kept to detect a late event.
-    late: Vec<(&'static str, Arc<Collector>, bool)>,
+    late: Vec<(&'static str, Arc<Collector>, bool, bool)>,
     inventory: Mutex<Inventory>,
 }
 
@@ -817,6 +820,10 @@ impl Ctx<'_> {
         let seal = invocation.seal();
         let seal_us = self.fifo.now_us();
         drop(released);
+        // Sampled before the host drops: a bool holds no collector reference,
+        // so the ownership proof below is unaffected, and a sender that
+        // escaped and panics later fails that proof instead.
+        let diagnostics_sink_failed = host.diagnostics.sink_failed();
         drop(host);
         // The body must join its work before returning. Exclusive ownership
         // proves that no diagnostic sender (including a weak reference) escaped
@@ -843,6 +850,7 @@ impl Ctx<'_> {
             diagnostics,
             collector,
             diagnostics_released,
+            diagnostics_sink_failed,
         })
     }
 
@@ -944,6 +952,7 @@ impl Ctx<'_> {
             record.id,
             Arc::clone(&record.collector),
             record.diagnostics_released,
+            record.diagnostics_sink_failed,
         ));
         let publications: Vec<Value> = record
             .publications
@@ -985,15 +994,18 @@ impl Ctx<'_> {
     /// This covers delivery through the supplied sink, not arbitrary work or
     /// diagnostics a body sends to an unrelated sink. Events a collector
     /// refused for its budget fail the scenario too, for the setup collector
-    /// as well as every call's: truncated evidence never certifies.
+    /// as well as every call's: truncated evidence never certifies. So does a
+    /// call whose sink panicked, which the library then switched off.
     fn late_report(&self) -> String {
         let calls = self
             .late
             .iter()
-            .filter(|(_, c, released)| !released || c.late() > 0 || c.dropped() > 0)
-            .map(|(id, c, released)| {
+            .filter(|(_, c, released, failed)| {
+                !released || *failed || c.late() > 0 || c.dropped() > 0
+            })
+            .map(|(id, c, released, failed)| {
                 format!(
-                    "call {id}: diagnostic senders released at close: {released}; {} late diagnostic events; {} events dropped over budget",
+                    "call {id}: diagnostic senders released at close: {released}; sink panicked: {failed}; {} late diagnostic events; {} events dropped over budget",
                     c.late(),
                     c.dropped(),
                 )

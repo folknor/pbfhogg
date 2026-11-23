@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **Compression levels are checked types.** `Compression::Zlib` and
+  `Compression::Zstd` carry `ZlibLevel` and `ZstdLevel` instead of bare
+  integers; build them with `Compression::zlib(level)` /
+  `Compression::zstd(level)`, which refuse a level the backend does not
+  support. A hand-built `Compression::Zlib(10)` used to panic inside the
+  writer on its first blob; that value can no longer be constructed.
+  `ParseCompressionError` is renamed `CompressionError`. The parser and
+  `--compression` now accept every zstd level the linked zstd library
+  supports, including negative levels below `zstd:-7`, and refuse levels
+  outside its range instead of letting zstd clamp them.
+
 - **`inspect --json` is `schema_version` 5: the header replication
   timestamp prints as a UTC timestamp.** JSON
   `header.replication.timestamp`, the text `Repl:` line and

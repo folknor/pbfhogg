@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, Tag, blob, blob_header};
 
-use super::compression::Compression;
+use super::compression::{Compression, ZlibLevel, ZstdLevel};
 
 use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
 
@@ -45,9 +45,9 @@ pub(super) struct FrameScratch {
     /// blob, read from here by whoever writes the frame.
     compress_buf: Vec<u8>,
     /// Reusable zlib compressor (lazy-initialized on first zlib blob).
-    zlib_compressor: Option<(u32, Compress)>,
+    zlib_compressor: Option<(ZlibLevel, Compress)>,
     /// Reusable zstd compressor (lazy-initialized on first zstd blob).
-    zstd_compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
+    zstd_compressor: Option<(ZstdLevel, zstd::bulk::Compressor<'static>)>,
 }
 
 impl FrameScratch {
@@ -526,16 +526,14 @@ fn encode_blob_body(
         Compression::Zstd(level) => {
             let compressor = match &mut scratch.zstd_compressor {
                 Some((cached_level, compressor)) if *cached_level == *level => compressor,
-                // Built lazily, per worker, on its first zstd blob. A parsed
-                // `Compression` (the CLI's argument boundary) has its level
-                // range-checked already, so from the CLI a failure here is a
-                // resource failure (zstd could not allocate its context), not
-                // a configuration error found late; only a library caller
-                // building `Compression::Zstd` by hand can reach it with a
-                // bad level. Built before it replaces the cached one, so a
+                // Built lazily, per worker, on its first zstd blob.
+                // `ZstdLevel` is checked against the linked zstd's own range
+                // when it is built, so a failure here is a resource failure
+                // (zstd could not apply its parameters), never a bad level
+                // found late. Built before it replaces the cached one, so a
                 // failure leaves that one in place.
                 slot => {
-                    let built = zstd::bulk::Compressor::new(*level)?;
+                    let built = zstd::bulk::Compressor::new(level.get())?;
                     &mut slot.insert((*level, built)).1
                 }
             };
@@ -572,12 +570,15 @@ fn encode_payload_field_head(head: &mut Vec<u8>, field: u32, len: usize) {
 }
 
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
-fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) -> Result<()> {
+fn compress_zlib(uncompressed: &[u8], level: ZlibLevel, scratch: &mut FrameScratch) -> Result<()> {
     let compressor = match &mut scratch.zlib_compressor {
         Some((cached_level, compressor)) if *cached_level == level => compressor,
         slot => {
             &mut slot
-                .insert((level, Compress::new(FlateCompression::new(level), true)))
+                .insert((
+                    level,
+                    Compress::new(FlateCompression::new(level.get()), true),
+                ))
                 .1
         }
     };
@@ -898,8 +899,8 @@ mod tests {
         let block: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         for compression in [
             Compression::None,
-            Compression::Zlib(1),
-            Compression::Zstd(1),
+            Compression::Zlib(ZlibLevel::FAST),
+            Compression::Zstd(ZstdLevel::DEFAULT),
         ] {
             let mut scratch = FrameScratch::new();
             let body = encoded_body(&block, &compression, &mut scratch);
@@ -930,8 +931,8 @@ mod tests {
         let payload = vec![0; usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits") + 1];
         for compression in [
             Compression::None,
-            Compression::Zlib(1),
-            Compression::Zstd(1),
+            Compression::Zlib(ZlibLevel::FAST),
+            Compression::Zstd(ZstdLevel::DEFAULT),
         ] {
             let mut scratch = FrameScratch::new();
             let error =
@@ -948,7 +949,10 @@ mod tests {
     #[test]
     fn compressed_payload_at_raw_limit_can_be_framed() {
         let payload = vec![0; usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits")];
-        for compression in [Compression::Zlib(1), Compression::Zstd(1)] {
+        for compression in [
+            Compression::Zlib(ZlibLevel::FAST),
+            Compression::Zstd(ZstdLevel::DEFAULT),
+        ] {
             frame_blob(
                 "OSMData",
                 &payload,
@@ -986,8 +990,8 @@ mod tests {
     fn empty_payload_still_emits_the_blob_payload_field() {
         for compression in [
             Compression::None,
-            Compression::Zlib(1),
-            Compression::Zstd(1),
+            Compression::Zlib(ZlibLevel::FAST),
+            Compression::Zstd(ZstdLevel::DEFAULT),
         ] {
             let mut scratch = FrameScratch::new();
             let body = encoded_body(&[], &compression, &mut scratch);
@@ -1109,7 +1113,7 @@ mod tests {
             parts.parts().concat()
         };
         let payload = vec![7u8; 64 * 1024];
-        for compression in [Compression::None, Compression::Zstd(1)] {
+        for compression in [Compression::None, Compression::Zstd(ZstdLevel::DEFAULT)] {
             let mut scratch = FrameScratch::new();
             let first = frame(&payload, compression, &mut scratch);
             assert_eq!(first, parts_of(&payload, compression), "{compression:?}");
@@ -1120,10 +1124,18 @@ mod tests {
         assert!(raw.ends_with(&[0x0a, 3, 1, 2, 3]), "raw field of 3 bytes");
 
         let mut scratch = FrameScratch::new();
-        frame(&payload, Compression::Zstd(1), &mut scratch);
+        frame(
+            &payload,
+            Compression::Zstd(ZstdLevel::DEFAULT),
+            &mut scratch,
+        );
         let warmed = scratch.compress_buf.capacity();
         assert!(warmed > 0, "the compressor's output buffer is kept");
-        frame(&[1, 2, 3], Compression::Zstd(1), &mut scratch);
+        frame(
+            &[1, 2, 3],
+            Compression::Zstd(ZstdLevel::DEFAULT),
+            &mut scratch,
+        );
         assert_eq!(
             scratch.compress_buf.capacity(),
             warmed,
@@ -1140,7 +1152,7 @@ mod tests {
             let parts = frame_in_scratch(
                 "OSMData",
                 &big,
-                &Compression::Zstd(1),
+                &Compression::Zstd(ZstdLevel::DEFAULT),
                 None,
                 None,
                 None,
@@ -1151,7 +1163,7 @@ mod tests {
             assert!(parts.payload.len() > 1024, "incompressible payload");
             assert!(probe.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY);
         }
-        let framed = frame(&big, Compression::Zstd(1), &mut scratch);
+        let framed = frame(&big, Compression::Zstd(ZstdLevel::DEFAULT), &mut scratch);
         let mut decoded = Vec::new();
         {
             // The assembled outlier frame carries the whole block: its body is
@@ -1204,7 +1216,7 @@ mod tests {
         let payload: Vec<u8> = (0..10_000u32)
             .map(|i| u8::try_from(i % 251).expect("below 256"))
             .collect();
-        for compression in [Compression::None, Compression::Zstd(1)] {
+        for compression in [Compression::None, Compression::Zstd(ZstdLevel::DEFAULT)] {
             let whole = frame_blob_pipelined(
                 &payload,
                 &compression,

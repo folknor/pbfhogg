@@ -1017,12 +1017,12 @@ fn sort_compression_level_parity() {
         ("none", Compression::None, dir.path().join("none.osm.pbf")),
         (
             "zlib6",
-            Compression::Zlib(6),
+            Compression::default(),
             dir.path().join("zlib6.osm.pbf"),
         ),
         (
             "zstd3",
-            Compression::Zstd(3),
+            Compression::zstd(3).expect("valid zstd level"),
             dir.path().join("zstd3.osm.pbf"),
         ),
     ];
@@ -1055,12 +1055,12 @@ fn tags_filter_compression_level_parity() {
         ("none", Compression::None, dir.path().join("none.osm.pbf")),
         (
             "zlib6",
-            Compression::Zlib(6),
+            Compression::default(),
             dir.path().join("zlib6.osm.pbf"),
         ),
         (
             "zstd3",
-            Compression::Zstd(3),
+            Compression::zstd(3).expect("valid zstd level"),
             dir.path().join("zstd3.osm.pbf"),
         ),
     ];
@@ -1104,7 +1104,7 @@ fn none_compression_reads_back_identical() {
 
     for (compression, output) in [
         (Compression::None, &out_none),
-        (Compression::Zlib(6), &out_zlib),
+        (Compression::default(), &out_zlib),
     ] {
         let opts = forced(compression);
         pbfhogg::commands::sort::sort(

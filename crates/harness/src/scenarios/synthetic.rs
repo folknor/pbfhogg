@@ -12,7 +12,7 @@ use crate::runner::{CallRecord, Done, Observation};
 use crate::synthetic::{Reader, Writer};
 use crate::workload::{CallPlan, Command, HostPlan, InputRole, Returned, Workload};
 use pbfhogg::host::PageCachePolicy;
-use pbfhogg::writer::Compression;
+use pbfhogg::writer::{Compression, ZlibLevel, ZstdLevel};
 
 /// The decode arms: id, label, reader.
 const DECODE: &[(&str, &str, Reader)] = &[
@@ -50,13 +50,13 @@ const ENCODE: &[(&str, &str, Writer, Compression)] = &[
         "encode-sync-zlib-6",
         "encode input into the discard sink, sync writer, zlib level 6",
         Writer::Sync,
-        Compression::Zlib(6),
+        Compression::Zlib(ZlibLevel::DEFAULT),
     ),
     (
         "encode-sync-zstd-3",
         "encode input into the discard sink, sync writer, zstd level 3",
         Writer::Sync,
-        Compression::Zstd(3),
+        Compression::Zstd(ZstdLevel::DEFAULT),
     ),
     (
         "encode-pipelined-none",
@@ -68,13 +68,13 @@ const ENCODE: &[(&str, &str, Writer, Compression)] = &[
         "encode-pipelined-zlib-6",
         "encode input into the discard sink, pipelined writer, zlib level 6",
         Writer::Pipelined,
-        Compression::Zlib(6),
+        Compression::Zlib(ZlibLevel::DEFAULT),
     ),
     (
         "encode-pipelined-zstd-3",
         "encode input into the discard sink, pipelined writer, zstd level 3",
         Writer::Pipelined,
-        Compression::Zstd(3),
+        Compression::Zstd(ZstdLevel::DEFAULT),
     ),
 ];
 

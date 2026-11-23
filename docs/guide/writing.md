@@ -368,11 +368,13 @@ The `Compression` enum controls blob compression:
 
 | Mode | Description |
 |------|-------------|
-| `Compression::Zlib(level)` | Standard PBF compression. Level 6 is the default, matching osmium. Level 0-9. |
-| `Compression::Zstd(level)` | Better ratio and faster decompression than zlib. Not all PBF consumers support zstd yet. |
+| `Compression::Zlib(ZlibLevel)` | Standard PBF compression. Level 6 is the default, matching osmium. Level 0-9. |
+| `Compression::Zstd(ZstdLevel)` | Better ratio and faster decompression than zlib. Not all PBF consumers support zstd yet. |
 | `Compression::None` | No compression. Fastest writes, largest files. Ideal for intermediate files or erofs storage. |
 
-`Compression::default()` is `Zlib(6)`.
+The levels are checked types: `Compression::zlib(level)` and `Compression::zstd(level)` (or `ZlibLevel::new` / `ZstdLevel::new`) return an error for a level the backend does not support, zlib outside 0-9 and zstd outside the linked zstd library's own range, so a writer is never handed a level that fails while encoding. Parsing a spec string (`"zlib:9"`, `"zstd:19"`) goes through the same checks.
+
+`Compression::default()` is zlib level 6 (`Compression::Zlib(ZlibLevel::DEFAULT)`).
 
 With pipelined writes (`to_path`), compression is dispatched to rayon and all modes converge to the decode + serialization floor. The choice mainly affects file size and downstream read speed.
 

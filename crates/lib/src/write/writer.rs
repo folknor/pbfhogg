@@ -26,7 +26,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 // Compression type moved to the sibling `compression` module; re-exported
 // here to preserve the public `crate::writer::Compression` API.
-pub use crate::write::compression::{Compression, ParseCompressionError};
+pub use crate::write::compression::{Compression, CompressionError, ZlibLevel, ZstdLevel};
 
 // Blob framing / encoding helpers live in the sibling `framing` module.
 use super::framing::{FrameScratch, PIPELINE_SCRATCH, frame_blob_into, frame_in_scratch};

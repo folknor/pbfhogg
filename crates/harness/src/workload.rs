@@ -23,7 +23,7 @@ use pbfhogg::digest::Form;
 use pbfhogg::extract::ExtractStrategy;
 use pbfhogg::host::{Host, PageCachePolicy};
 use pbfhogg::write::{OutputBackend, WriteOptions};
-use pbfhogg::writer::Compression;
+use pbfhogg::writer::{Compression, ZlibLevel};
 use pbfhogg::{FieldOverride, HeaderOverrides, Overwrite, TypeFilter};
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -37,7 +37,7 @@ pub(crate) const MISSING: &str = "absent.osm.pbf";
 pub(crate) const NODES_PER_BLOCK: i64 = 100;
 /// A generated node input's compression, header sort flag and coordinate
 /// step: setup writes with these and the plan spells them.
-const NODES_COMPRESSION: Compression = Compression::Zlib(6);
+const NODES_COMPRESSION: Compression = Compression::Zlib(ZlibLevel::DEFAULT);
 const NODES_SORTED: bool = true;
 const NODES_COORD_STEP: i32 = 1000;
 
@@ -463,7 +463,7 @@ pub(crate) enum Returned {
 /// The write options every call uses unless it says otherwise, every field
 /// spelled so a changed library default cannot change the workload unseen.
 pub(crate) const WRITE: WriteOptions = WriteOptions {
-    compression: Compression::Zlib(6),
+    compression: Compression::Zlib(ZlibLevel::DEFAULT),
     backend: OutputBackend::Buffered,
     direct_reads: false,
     force: false,
@@ -790,8 +790,8 @@ fn build_output(
 fn compression_json(compression: Compression) -> Result<String, String> {
     Ok(match compression {
         Compression::None => "none".to_owned(),
-        Compression::Zlib(level) => format!("zlib:{level}"),
-        Compression::Zstd(level) => format!("zstd:{level}"),
+        Compression::Zlib(level) => format!("zlib:{}", level.get()),
+        Compression::Zstd(level) => format!("zstd:{}", level.get()),
         other => return Err(format!("no plan spelling for compression {other:?}")),
     })
 }

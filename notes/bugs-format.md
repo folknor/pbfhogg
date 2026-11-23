@@ -82,20 +82,18 @@ number of real decompressions. A file holding only extension blobs after its
 header yields a positive inferred decompression count with none performed. The
 counter and its documented interpretation disagree.
 
-## FMT-013 - Invalid compression levels panic instead of returning an error
+## FMT-030 - zstd context allocation failure panics instead of erroring
 
-Reported by: write-encoding [P2], write-backends.
+Reported by: spar partner during the checked-compression-level work.
 
-`Compression::Zlib(10)` can be constructed through the public enum.
-`compress_zlib` (`write/framing.rs`) forwards it straight to
-`flate2::Compress::new`, and the locked zlib-rs backend asserts when
-initialization rejects the level. A synchronous header write or path
-constructor can therefore unwind instead of returning its declared `Result`.
-The CLI string parser protects CLI users, but library callers bypass it.
-`write/compression.rs` acknowledges this explicitly and cites compatibility.
-Both hunters say that rationale conflicts with the pre-1.0 premise. The
-proposed fix is a checked compression-level type, or validation at the writer
-boundary before any output is created.
+`zstd::bulk::Compressor::new` returns `io::Result`, but builds its context
+with `CCtx::default()` first, which calls `create()` and panics if zstd
+returns null. An allocation failure on a framing worker's first zstd blob
+therefore unwinds rather than returning the writer's `Result`. Levels can no
+longer cause a failure there (`ZstdLevel` is checked against the linked
+library's range). A fix would build the context with `CCtx::try_create()`
+and set the level through `zstd_safe` directly in `write/framing.rs`.
+Allocation-failure class; low priority.
 
 ## FMT-018 - PbfWriter::write_header skips the cancellation checkpoint
 

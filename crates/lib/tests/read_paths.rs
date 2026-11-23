@@ -376,8 +376,8 @@ fn pipelined_matches_sequential() {
 fn for_each_matches_pipelined_across_compressions() {
     for compression in [
         Compression::None,
-        Compression::Zlib(6),
-        Compression::Zstd(3),
+        Compression::default(),
+        Compression::zstd(3).expect("valid zstd level"),
     ] {
         let dir = crate::common::test_scratch();
         let path = dir.path().join("generated.osm.pbf");

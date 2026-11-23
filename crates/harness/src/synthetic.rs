@@ -330,7 +330,7 @@ mod tests {
     use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
     use pbfhogg::elements::MemberId;
     use pbfhogg::host::{Diagnostics, Executor, Fixed, Host, Invocation, NoProcessActions};
-    use pbfhogg::writer::{Compression, PbfWriter};
+    use pbfhogg::writer::{Compression, PbfWriter, ZlibLevel, ZstdLevel};
     use pbfhogg::{Element, ElementReader};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -373,7 +373,7 @@ mod tests {
     fn write_input(path: &Path) {
         let mut writer = PbfWriter::new(
             std::fs::File::create(path).expect("create"),
-            Compression::Zlib(6),
+            Compression::Zlib(ZlibLevel::DEFAULT),
         );
         writer
             .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
@@ -580,11 +580,11 @@ mod tests {
 
     const ARMS: [(Writer, Compression, u64); 6] = [
         (Writer::Sync, Compression::None, 1),
-        (Writer::Sync, Compression::Zlib(6), 3),
-        (Writer::Sync, Compression::Zstd(3), 7),
+        (Writer::Sync, Compression::Zlib(ZlibLevel::DEFAULT), 3),
+        (Writer::Sync, Compression::Zstd(ZstdLevel::DEFAULT), 7),
         (Writer::Pipelined, Compression::None, 1),
-        (Writer::Pipelined, Compression::Zlib(6), 3),
-        (Writer::Pipelined, Compression::Zstd(3), 7),
+        (Writer::Pipelined, Compression::Zlib(ZlibLevel::DEFAULT), 3),
+        (Writer::Pipelined, Compression::Zstd(ZstdLevel::DEFAULT), 7),
     ];
 
     const COUNTS: Counts = Counts {
@@ -699,7 +699,7 @@ mod tests {
     fn write_bad_role(path: &Path) {
         let mut writer = PbfWriter::new(
             std::fs::File::create(path).expect("create"),
-            Compression::default(),
+            Compression::Zlib(ZlibLevel::DEFAULT),
         );
         writer
             .write_header(&HeaderBuilder::new().build().expect("header"))
@@ -747,7 +747,7 @@ mod tests {
         let input = scratch.child("bad-indexdata.osm.pbf");
         let mut writer = PbfWriter::new(
             std::fs::File::create(&input).expect("create"),
-            Compression::default(),
+            Compression::Zlib(ZlibLevel::DEFAULT),
         );
         writer
             .write_header(&HeaderBuilder::new().build().expect("header"))

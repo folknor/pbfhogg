@@ -269,7 +269,7 @@ fn intact_pbf() -> Vec<u8> {
 
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut writer = PbfWriter::new(&mut buf, Compression::Zlib(6));
+        let mut writer = PbfWriter::new(&mut buf, Compression::default());
         writer
             .write_header(&HeaderBuilder::new().build().unwrap())
             .unwrap();

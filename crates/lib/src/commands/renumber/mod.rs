@@ -57,7 +57,7 @@ use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
 use crate::error::Error;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::write::WriteOptions;
-use crate::writer::Compression;
+use crate::writer::{Compression, ZlibLevel};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -459,7 +459,7 @@ pub(crate) fn renumber_external_to<'a>(
     // omission separately (for example Option<Compression>) from CLI parsing
     // through this entry point and migrating its library callers together.
     let effective_compression = if compression == Compression::default() {
-        Compression::Zlib(1)
+        Compression::Zlib(ZlibLevel::FAST)
     } else {
         compression
     };

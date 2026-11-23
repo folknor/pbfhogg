@@ -1839,7 +1839,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut writer = PbfWriter::new(&mut buf, Compression::Zlib(6));
+            let mut writer = PbfWriter::new(&mut buf, Compression::default());
             let header = HeaderBuilder::new().build().unwrap();
             writer.write_header(&header).unwrap();
             for _ in 0..data_blobs {

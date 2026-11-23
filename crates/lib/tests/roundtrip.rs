@@ -240,7 +240,7 @@ fn roundtrip_dense_nodes_no_metadata() {
 fn roundtrip_ways() {
     let mut buf = Vec::new();
     {
-        let mut writer = PbfWriter::new(&mut buf, Compression::Zlib(6));
+        let mut writer = PbfWriter::new(&mut buf, Compression::default());
         let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
@@ -975,7 +975,7 @@ fn uring_writer_refuses_non_regular_targets() {
 fn roundtrip_zstd() {
     let mut buf = Vec::new();
     {
-        let mut writer = PbfWriter::new(&mut buf, Compression::Zstd(3));
+        let mut writer = PbfWriter::new(&mut buf, Compression::zstd(3).expect("valid zstd level"));
         let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 

@@ -29,6 +29,19 @@ counting (BUG-022) and cat decode counters
 (BUG-023). Entries are in no
 order of importance.
 
+## CMD-065 - renumber overrides an explicit zlib level 6 with level 1
+
+Reported by: spar partner during the checked-compression-level work.
+
+`renumber` (`commands/renumber/mod.rs`) substitutes zlib level 1 whenever
+`WriteOptions.compression == Compression::default()`, because the CLI
+flattens the shared `--compression` argument and cannot tell omission from an
+explicit `zlib` or `zlib:6`. `docs/cli/commands.md` documents the wart. A
+library caller asking for level 6 also silently gets level 1. Proposed fix:
+give renumber a command-specific CLI default of `zlib:1` and have the library
+honour `WriteOptions.compression` verbatim; update the docs and CHANGELOG, and
+test the chosen level directly (a decode round trip passes at either level).
+
 ## CMD-052 - OSC readers accept undeclared entities and a misplaced DOCTYPE
 
 Reported by: the XML 1.0 input character check (spar with codex).

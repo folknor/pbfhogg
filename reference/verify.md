@@ -170,8 +170,15 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   or absent scalar ID, a wrapping dense delta, compression other than raw or
   zlib) is a verifier error. The domain also holds each `(kind, id)` once:
   sort also rewrites a decoded blob whose versions of a repeated ID descend,
-  which the prediction does not read, and the sort check's comparison and
-  strict order check refuse a repeated ID regardless. The rest must drop it with the loss warning. The warning is read from pbfhogg's stderr as the CLI renders
+  which the prediction does not read. The sort check holds its input to that
+  domain before judging anything pbfhogg did: a `HistoricalInformation`
+  header is refused, and osmium's reference sort runs first, its output's
+  strict order scanned, so a repeated object anywhere in the input (across
+  blobs included) is a verifier error, never a pbfhogg verdict. The domain
+  assumes a conforming snapshot; a `visible=false` record under a header
+  without `HistoricalInformation` is not detected. The rest must drop it
+  with the loss warning. The warning is read from pbfhogg's stderr as the
+  CLI renders
   `header.way_metadata_loss` (`Warning: the input declares ..., which the
   output does not declare`, `LocationsOnWays` a member of the list).
 - **Order and counts** of an output come from its osmium OPL decoding: a
@@ -559,7 +566,7 @@ suite because a later comparison cannot make that run complete.
 | Check | Compared against | Established by |
 |---|---|---|
 | `field-policies` | osmium decodings of one-field edits of an osmium-built slice of the input | each policy reads exactly the field classes it claims, with every edit isolated by an independent decoding; `between` by declaration (see How outputs are judged) |
-| `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim |
+| `sort` | `osmium sort -s multipass` | element equality, and the output's strict order from its OPL decoding, never the header claim; an input holding an object more than once (a history header, or a repeat the reference sort's order scan finds) is `ERROR` |
 | `cat` | `osmium cat` | node, way and relation outputs: element equality, strict order and one-way sort-feature comparison |
 | `cat --dedupe` (command `cat-dedupe`) | the input itself, osmium OPL decodings | self-merge, merge with an osmium-derived subset, the disjoint union of that subset and its complement in both orders, and merges with a window of the input's own blobs in both orders: element equality with the input, blob layout and summary counts against the plan predicted from both framings, sort claim and `LocationsOnWays` header rule; Unsorted refusal on claimless input |
 | `tags-filter` | `osmium tags-filter -R` | three expressions with omitted references, same content/order checks as cat |

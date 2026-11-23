@@ -36,19 +36,6 @@ membership failure. This breaks the claim that extract compares membership in
 the same region. The verifier must translate the intended integer edges into
 an equivalent reference bbox, or explicitly refuse that comparison domain.
 
-## TOOL-003 - verify sort rejects correctly preserved repeated IDs
-
-Reported by: verify [P2].
-
-Sort promises to keep every element (`blob_merge.rs`), so an indexed history
-input with `n1 v1` and `n1 v2` can be correctly sorted by both tools while
-keeping both records. `checks/sort.rs` uses the shared comparator, whose key
-holds only kind and ID, and its strict advancement (`opl_compare.rs`) rejects
-the second `n1`. The separate output-order check rejects it too. This imposes
-a uniqueness that sorting does not promise. The hunter says the verifier
-documentation's strict-uniqueness requirement is wrong for this command:
-ordering and uniqueness need separate judgments.
-
 ## TOOL-005 - verify geocode builds its osmium reference from unsorted input
 
 Reported by: verify [P2].

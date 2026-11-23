@@ -636,7 +636,7 @@ fn boundary_tool(args: &[std::ffi::OsString]) {
         .map(Path::new)
         .find(|p| p.file_name().is_some_and(|n| n == "input.pbf"))
         .unwrap();
-    let mode = std::fs::read_to_string(input).unwrap();
+    let mode = fake_pbf::marker(input);
     if mode == "interrupt" {
         std::fs::write(input.with_extension("ready"), "ready").unwrap();
         // SAFETY: pause has no arguments. The verifier's stop must kill this child.

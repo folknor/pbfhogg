@@ -167,7 +167,9 @@ const VERIFIER: &str = env!("CARGO_BIN_EXE_pbfhogg-verify");
 fn boundary_command(dir: &std::path::Path, mode: &str) -> std::process::Command {
     std::fs::create_dir_all(dir).unwrap();
     std::os::unix::fs::symlink(EXE, dir.join("osmium")).unwrap();
-    std::fs::write(dir.join("input.pbf"), mode).unwrap();
+    // A valid header-only PBF: the sort check reads the input's header
+    // before any tool runs, and the boundary tool keys on the marker.
+    fake_pbf::write(&dir.join("input.pbf"), &[], mode);
     std::fs::write(
         dir.join("brokkr.toml"),
         "[host.fixture]\nscratch = 'scratch'\n",
@@ -209,6 +211,23 @@ fn verifier_command_exit_boundaries() {
     std::fs::remove_file(bad.join("input.pbf")).unwrap();
     let output = cmd.output().unwrap();
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+    // A history input is outside the sort check's domain: a verifier error,
+    // raised before any tool runs, never a pbfhogg verdict.
+    let history = scratch.cell().join("boundary-fixture");
+    let mut cmd = boundary_command(&history, "fail");
+    fake_pbf::write_with(
+        &history.join("input.pbf"),
+        &["HistoricalInformation"],
+        &[],
+        "fail",
+    );
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("sort: ERROR") && stdout.contains("HistoricalInformation"),
+        "{output:?}"
+    );
     let stop = scratch.cell().join("boundary-fixture");
     let mut cmd = boundary_command(&stop, "interrupt");
     use std::os::unix::ffi::OsStrExt;

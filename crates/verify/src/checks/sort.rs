@@ -152,9 +152,9 @@ fn range_keys(min: i64, max: i64) -> ((u8, u64), (u8, u64)) {
 /// dense ID delta that wraps, compression other than raw or zlib) is a
 /// verifier error, though pbfhogg accepts it. Each `(kind, id)` occurs once:
 /// pbfhogg also rewrites a scanned blob whose versions of a repeated ID
-/// descend, which this model does not read, and the check's element
-/// comparison and order check refuse a repeated ID before this verdict could
-/// matter. Within the domain the verdict is exact, so there is no
+/// descend, which this model does not read, and [`run`] refuses an input
+/// holding a repeated ID as a verifier error before this verdict is made.
+/// Within the domain the verdict is exact, so there is no
 /// keep-or-drop middle.
 pub(crate) fn sort_way_locations(
     blobs: impl IntoIterator<Item = SortBlob>,
@@ -209,6 +209,42 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     let outdir = h.subdir("sort")?;
     h.msg("=== verify sort ===");
 
+    // The domain is a snapshot: one object per kind and ID. pbfhogg sort
+    // keeps every record of a repeated ID (docs/cli/commands.md), but the
+    // strict comparison keys on kind and ID alone, and the reference cannot
+    // judge the order of records of one ID and version (osmium breaks that
+    // tie by timestamp, pbfhogg keeps input order). So the input is held to
+    // the domain before anything pbfhogg did is judged: a declared history
+    // file up front, and an undeclared repeat by the reference sort below.
+    let header = crate::pbf_frames::header(pbf)?;
+    if header.required.iter().any(|f| f == "HistoricalInformation") {
+        return Err(Error::Tool(format!(
+            "{} declares HistoricalInformation; the sort check compares one object per \
+             kind and ID, which a history file does not have",
+            pbf.display()
+        )));
+    }
+    let theirs = outdir.join(OSMIUM_SORTED);
+    // Multipass: this check judges elements and pbfhogg's order, never the
+    // reference's header, so the claim multipass omits is not needed here.
+    // Run first, so its order scan settles the domain before pbfhogg runs.
+    osmium_sort_as(h, pbf, &theirs, &outdir.join("osmium.stdout"), true)?;
+    // osmium sorts without deduplicating, so its output out of strict order
+    // means the input holds an object more than once (or osmium misordered
+    // it): a verifier error either way, never a pbfhogg verdict. The policy
+    // is a decoding cache hint for the comparison below; the scan reads
+    // keys only.
+    let hint = crate::opl_compare::Policy::between(pbf, &theirs)?;
+    let (ordered, _) = crate::opl_compare::order_as(h, &theirs, hint)?;
+    if !ordered {
+        return Err(Error::Tool(format!(
+            "osmium sort's output of {} is not in strict kind and ID order: the input \
+             holds an object more than once, outside the sort check's domain of one \
+             object per kind and ID",
+            pbf.display()
+        )));
+    }
+
     let ours = outdir.join("pbfhogg.osm.pbf");
     let ended = h.pbfhogg(
         PbfArgv::new("sort")
@@ -224,7 +260,6 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // warned one and a keep must not be lost.
     // An input without the declaration needs no prediction (the judge only
     // holds the output to not declaring it), so it pays no decode.
-    let header = crate::pbf_frames::header(pbf)?;
     let expect = if header.optional_feature("LocationsOnWays") {
         sort_way_locations(sort_blobs(pbf, header.optional_sorted())?)
     } else {
@@ -232,10 +267,6 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     };
     h.judge_way_locations("pbfhogg sort", pbf, &ours, &ended, expect)?;
 
-    let theirs = outdir.join(OSMIUM_SORTED);
-    // Multipass: this check judges elements and pbfhogg's order, never the
-    // reference's header, so the claim multipass omits is not needed here.
-    osmium_sort_as(h, pbf, &theirs, &outdir.join("osmium.stdout"), true)?;
     let policy = crate::opl_compare::Policy::between(&ours, &theirs)?;
     // pbfhogg's order is judged from the comparison's own decoding: a
     // separate order decode after the strict comparison could only pass.

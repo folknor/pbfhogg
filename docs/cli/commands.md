@@ -2590,7 +2590,7 @@ Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring
 | sort | All reads direct, including copied ranges | All PBF writes direct | Yes |
 | repack | Front read direct; classify preads buffered | All PBF writes direct | Yes |
 | degrade | Front read and raw frames direct; decode classify preads buffered | All PBF writes direct | Yes |
-| renumber | Header read direct; bulk reads buffered | All PBF writes direct | - |
+| renumber | All reads direct | All PBF writes direct | - |
 | extract | Front reads direct; pread passes buffered; fallback streams direct | Single output direct; config single-pass outputs buffered | - |
 | tags-filter | Front read and -R stream direct; two-pass preads and dependency scans buffered | All PBF writes direct; OSC refuses flag | - |
 | export | No direct I/O flag | No PBF output | - |
@@ -2598,7 +2598,7 @@ Where commands use `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring
 | getparents | Dispatch probe and fallback stream direct; scheduled preads buffered | All PBF writes direct | - |
 | time-filter | Header and history stream direct; snapshot classify preads buffered | All PBF writes direct | - |
 | add-locations-to-ways | Front reads direct; index, dependency and external-stage preads buffered | All PBF writes direct | - |
-| apply-changes | Front read direct; scanner, body preads and passthrough reads buffered | All PBF writes direct | Yes |
+| apply-changes | All base PBF reads direct, including copied ranges; OSC read buffered | All PBF writes direct | Yes |
 | diff | All PBF reads direct, including indexed parallel comparison | No PBF output | - |
 | digest | All reads direct | - | - |
 | build-geocode-index | Indexdata probe and replication header read direct; schedule header walk, Pass 1, Pass 1.5 and Phase 2a preads and the whole-file input digest buffered | Index output buffered, not PBF | - |

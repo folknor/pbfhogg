@@ -29,15 +29,36 @@
 //!
 //! A buffer whose bytes move on whole ([`ReadBuf::take`], a raw frame handed
 //! to the writer) keeps nothing, so nothing is released or counted.
+//!
+//! The transport rule lives here too. A pool that reads an [`InputFile`]
+//! reads it through [`ReadBuf::read_input_at`], which honours the input's
+//! transport: a buffered input is pread into the plain buffer, an input
+//! opened `O_DIRECT` (`InputFile::direct`) is read in aligned spans into an
+//! aligned scratch the buffer makes on first use, and the requested bytes
+//! are borrowed from it where they landed. Both allocations follow the same
+//! retention line, each charged and released on its own. A direct read's
+//! bytes leave by [`ReadBuf::take`] as a copy into a fresh `Vec` (the
+//! aligned allocation cannot be handed on as one), leaving the scratch for
+//! the next read.
 
 use crate::read::header_walker::Positional;
+use crate::read::input::InputFile;
 use crate::tunables::READ_BUF_MAX_RETAINED_CAPACITY;
 
-/// One worker's read buffer; see the module docs for its growth and
-/// retention rules.
+/// One worker's read buffer; see the module docs for its growth, retention
+/// and transport rules.
 #[derive(Default)]
 pub(crate) struct ReadBuf {
     buf: Vec<u8>,
+    /// The aligned scratch direct inputs are read through, made on the first
+    /// direct read (and remade when an input's alignment differs).
+    #[cfg(feature = "linux-direct-io")]
+    scratch: Option<crate::read::direct_reader::AlignedScratch>,
+    /// Where the last read's bytes are: `None` in `buf`, `Some(range)` in
+    /// `scratch`. Reset at the start of every read, so a failed read, a
+    /// switch of transport or a `take` never leaves stale bytes visible.
+    #[cfg(feature = "linux-direct-io")]
+    direct: Option<std::ops::Range<usize>>,
 }
 
 impl ReadBuf {
@@ -51,6 +72,10 @@ impl ReadBuf {
         offset: u64,
         len: usize,
     ) -> std::io::Result<&[u8]> {
+        #[cfg(feature = "linux-direct-io")]
+        {
+            self.direct = None;
+        }
         if len > self.buf.capacity() {
             // Free the old buffer before allocating its replacement, so the
             // two are never held at once.
@@ -58,24 +83,83 @@ impl ReadBuf {
             self.buf = Vec::with_capacity(len);
         }
         self.buf.resize(len, 0);
-        src.pread_exact(&mut self.buf, offset)?;
+        if let Err(e) = src.pread_exact(&mut self.buf, offset) {
+            self.buf.clear();
+            return Err(e);
+        }
         Ok(&self.buf)
     }
 
-    /// The bytes of the last read.
+    /// Read exactly `len` bytes at `offset` of `input` in the input's own
+    /// transport (see the module docs) and return them; `UnexpectedEof` when
+    /// the file ends first.
+    pub(crate) fn read_input_at(
+        &mut self,
+        input: &InputFile,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<&[u8]> {
+        #[cfg(feature = "linux-direct-io")]
+        if let Some(align) = input.direct_align() {
+            use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
+            use std::os::unix::fs::FileExt as _;
+            self.direct = None;
+            // The plain buffer holds no current bytes from here on.
+            self.buf.clear();
+            let scratch = match &mut self.scratch {
+                Some(s) if s.align() == align => s,
+                slot => slot.insert(AlignedScratch::new(align)),
+            };
+            let file = input.file();
+            read_aligned_in(len, offset, scratch, |dst, at| file.read_at(dst, at))?;
+            // `read_aligned_in` leaves the bytes at the offset's distance
+            // past its aligned block (`align` is a power of two).
+            #[allow(clippy::cast_possible_truncation)]
+            let lead = (offset & (align as u64 - 1)) as usize;
+            self.direct = Some(lead..lead + len);
+            return Ok(self.bytes());
+        }
+        self.read_exact_at(&**input.file(), offset, len)
+    }
+
+    /// The bytes of the last read (empty after a failed read or a `take`).
     pub(crate) fn bytes(&self) -> &[u8] {
+        #[cfg(feature = "linux-direct-io")]
+        if let (Some(range), Some(scratch)) = (&self.direct, &self.scratch) {
+            return scratch.held_bytes(range.clone());
+        }
         &self.buf
     }
 
-    /// The capacity held, for a caller's own peak sample.
+    /// The capacity held across both allocations (the aligned one with its
+    /// padding), for a caller's own peak sample.
     pub(crate) fn capacity(&self) -> usize {
-        self.buf.capacity()
+        #[cfg(feature = "linux-direct-io")]
+        {
+            self.buf.capacity()
+                + self
+                    .scratch
+                    .as_ref()
+                    .map_or(0, crate::read::direct_reader::AlignedScratch::held)
+        }
+        #[cfg(not(feature = "linux-direct-io"))]
+        {
+            self.buf.capacity()
+        }
     }
 
     /// Move the last read's bytes out whole (a frame handed on to a writer
-    /// or a drain), leaving the buffer empty. Not a release: the allocation
-    /// lives on downstream, so nothing is counted.
+    /// or a drain), leaving the buffer empty. Not a release: a buffered
+    /// read's allocation lives on downstream, so nothing is counted. A direct
+    /// read's bytes are copied into a fresh `Vec` of their exact length; the
+    /// scratch stays, under the retention line.
     pub(crate) fn take(&mut self) -> Vec<u8> {
+        #[cfg(feature = "linux-direct-io")]
+        if self.direct.is_some() {
+            let out = self.bytes().to_vec();
+            self.direct = None;
+            return out;
+        }
         std::mem::take(&mut self.buf)
     }
 
@@ -89,11 +173,15 @@ impl ReadBuf {
 
     /// [`release_outlier`](Self::release_outlier) at `limit`, for a holder
     /// whose own measurement chose a different line; counted the same way.
+    /// Each allocation (the plain buffer, the aligned scratch with its
+    /// padding) is tested against the line and counted on its own; returns
+    /// whether either was released.
     pub(crate) fn release_past(
         &mut self,
         limit: usize,
         invocation: &crate::host::Recorder,
     ) -> bool {
+        let mut released = false;
         let capacity = self.buf.capacity();
         if capacity > limit {
             self.buf = Vec::new();
@@ -101,9 +189,16 @@ impl ReadBuf {
                 .metrics()
                 .decompress
                 .record_read_buf_release(capacity);
-            return true;
+            released = true;
         }
-        false
+        #[cfg(feature = "linux-direct-io")]
+        if let Some(scratch) = &mut self.scratch
+            && scratch.release_past(limit, invocation)
+        {
+            self.direct = None;
+            released = true;
+        }
+        released
     }
 }
 
@@ -190,6 +285,71 @@ mod tests {
                 .read_buf_release_capacity_bytes
                 .load(Relaxed),
             (LIMIT + 1) as u64
+        );
+    }
+
+    /// A direct input is read through the aligned scratch: unaligned ranges
+    /// return exactly their bytes, a following buffered read shows its own,
+    /// `take` copies the span out and leaves nothing visible, and the
+    /// scratch is charged and released on its own.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn a_direct_input_reads_through_the_aligned_scratch() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("in.bin");
+        let len = 3 * crate::direct_io::DIO_ALIGN_FLOOR + 123;
+        let bytes: Vec<u8> = (0..len).map(byte).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        // Only a typed direct-io refusal skips (announced, and failed where
+        // the gate requires the backend).
+        if !crate::test_support::direct_reads_supported(dir.path(), "the direct ReadBuf reads") {
+            return;
+        }
+        let direct = crate::read::input::InputFile::direct_for_tests(&path).unwrap();
+        let buffered = crate::read::input::InputFile::open(path.as_path()).unwrap();
+        let mut read = ReadBuf::default();
+
+        assert_eq!(
+            read.read_input_at(&direct, 7, 1000).unwrap(),
+            &bytes[7..1007]
+        );
+        assert_eq!(read.bytes(), &bytes[7..1007]);
+        assert!(read.capacity() >= 1000);
+        assert_eq!(read.read_input_at(&direct, 0, 0).unwrap(), &[] as &[u8]);
+        // Ends at EOF inside an aligned block.
+        assert_eq!(
+            read.read_input_at(&direct, 100, len - 100).unwrap(),
+            &bytes[100..]
+        );
+        let err = read.read_input_at(&direct, 1, len).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            read.bytes().is_empty(),
+            "a failed read leaves no bytes visible"
+        );
+
+        read.read_input_at(&direct, 5, 50).unwrap();
+        assert_eq!(read.take(), &bytes[5..55]);
+        assert!(
+            read.bytes().is_empty(),
+            "a taken direct read leaves nothing"
+        );
+
+        assert_eq!(read.read_input_at(&buffered, 9, 20).unwrap(), &bytes[9..29]);
+        read.read_input_at(&direct, 11, 20).unwrap();
+        assert_eq!(read.bytes(), &bytes[11..31]);
+        assert_eq!(
+            read.read_input_at(&buffered, 13, 20).unwrap(),
+            &bytes[13..33]
+        );
+
+        let call = crate::host::Call::detached();
+        assert!(read.release_past(0, &call));
+        assert_eq!(read.capacity(), 0);
+        assert_eq!(
+            call.metrics().decompress.read_buf_releases.load(Relaxed),
+            2,
+            "each allocation is released and counted on its own"
         );
     }
 

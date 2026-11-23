@@ -62,22 +62,6 @@ compression estimate change with scheduling or `-j`. The comment claiming the
 histogram shape is preserved is false. Proposed: order coordinate batches
 before forming windows.
 
-## BUG-017 - apply-changes direct reads do not reach the bulk reads
-
-Reported by: apply-core.
-
-`direct_reads` reaches the initial `InputFront`, but the scanner opens a
-buffered walker (`scanner.rs`) and the worker pool opens a plain file
-(`streaming.rs`), so the heavy reads stay buffered.
-
-## BUG-018 - renumber direct reads do not reach the bulk reads
-
-Reported by: sort.
-
-The initial header read gets the flag, but payload workers use `pin.open()` and
-schedule construction opens the ordinary header walker (`renumber/mod.rs` input
-setup).
-
 ## BUG-019 - apply-changes blob-size percentiles sample passthrough only
 
 Reported by: apply-core.

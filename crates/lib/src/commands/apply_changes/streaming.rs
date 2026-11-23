@@ -129,6 +129,8 @@ struct WorkerLoc<'a> {
 pub(super) struct StreamingConfig {
     /// The run's pinned base; the pool opens one description of it.
     pub base: crate::read::input::PinnedInput,
+    /// Open that description `O_DIRECT` (the run's `direct_reads`).
+    pub direct_reads: bool,
     pub diff: Arc<SortedDiff>,
     /// Number of worker threads (`MergeOptions::parallelism`, one included).
     pub worker_count: usize,
@@ -283,6 +285,7 @@ pub(super) fn run_workers(
 ) {
     let StreamingConfig {
         base,
+        direct_reads,
         diff,
         worker_count,
         locations,
@@ -316,8 +319,9 @@ pub(super) fn run_workers(
     // separate from the scanner walker's FADV_RANDOM one and the drain's
     // splice source (advice and readahead state are per description; see
     // the copy-input comment in `rewrite::merge_to`). Advice sensitivity is
-    // unmeasured for this pool.
-    let shared_file = match crate::read::input::InputSource::from(&base).open() {
+    // unmeasured for this pool. Under direct reads it is `O_DIRECT`, and each
+    // worker's `BaseRead` reads it in aligned spans.
+    let shared_file = match crate::read::input::InputFile::for_reads(&base, direct_reads, &cancel) {
         Ok(file) => file,
         Err(e) => {
             failure.publish(e);
@@ -415,7 +419,7 @@ pub(super) fn run_workers(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn worker_loop(
     _worker_id: usize,
-    file: &std::fs::File,
+    file: &crate::read::input::InputFile,
     source: &Arc<Path>,
     candidate_rx: &Mutex<mpsc::Receiver<ScannedBlob>>,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
@@ -630,14 +634,14 @@ impl BaseRead {
     /// `blob_reads`.
     fn read_at(
         &mut self,
-        file: &std::fs::File,
+        file: &crate::read::input::InputFile,
         offset: u64,
         len: usize,
         counters: &WorkerCounters,
     ) -> Result<()> {
         counters.blob_reads.fetch_add(1, Ordering::Relaxed);
         let before = self.buf.capacity();
-        let read = self.buf.read_exact_at(file, offset, len).map(|_| ());
+        let read = self.buf.read_input_at(file, offset, len).map(|_| ());
         let capacity = self.buf.capacity();
         if capacity != before {
             counters.read_buf_allocs.fetch_add(1, Ordering::Relaxed);
@@ -679,7 +683,7 @@ pub(super) fn map_table_bytes<K, V>(map: &FxHashMap<K, V>) -> usize {
 // would fragment the descriptor pipeline without clarifying it.
 #[allow(clippy::too_many_lines)]
 fn handle_candidate(
-    file: &std::fs::File,
+    file: &crate::read::input::InputFile,
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
@@ -1170,7 +1174,7 @@ fn single_kind_range(block: &crate::PrimitiveBlock) -> Result<Option<(ElementKin
 /// (`--direct-io`): pread the **full framed bytes** and ship them so the
 /// drain can `write_raw_owned` without re-framing.
 fn handle_owned_passthrough(
-    file: &std::fs::File,
+    file: &crate::read::input::InputFile,
     desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
@@ -1361,12 +1365,21 @@ mod tests {
     use crate::tunables::{DECOMPRESS_POOL_MAX_RETAINED_CAPACITY, MAX_RETAINED_SCRATCH_CAPACITY};
     use std::os::unix::fs::FileExt as _;
 
-    fn input(len: usize) -> (pbfhogg_test_scratch::TestScratch, std::fs::File) {
+    fn input(
+        len: usize,
+    ) -> (
+        pbfhogg_test_scratch::TestScratch,
+        crate::read::input::InputFile,
+    ) {
         let dir = crate::path_guard::tests::scratch();
         let file = dir.anonymous_file();
         let bytes: Vec<u8> = (0..len).map(byte).collect();
         file.write_all_at(&bytes, 0).expect("write input");
-        (dir, file)
+        let input = crate::read::input::InputFile::from_parts(
+            std::sync::Arc::new(file),
+            std::sync::Arc::from(std::path::Path::new("anonymous")),
+        );
+        (dir, input)
     }
 
     /// The input's byte at offset `i`.

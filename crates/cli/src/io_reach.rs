@@ -58,7 +58,7 @@ pub(super) const REACH: &[Reach] = &[
     },
     Reach {
         path: &["renumber"],
-        reads: "Header read direct; bulk reads buffered",
+        reads: "All reads direct",
         writes: "All PBF writes direct",
         uring: "-",
     },
@@ -106,7 +106,7 @@ pub(super) const REACH: &[Reach] = &[
     },
     Reach {
         path: &["apply-changes"],
-        reads: "Front read direct; scanner, body preads and passthrough reads buffered",
+        reads: "All base PBF reads direct, including copied ranges; OSC read buffered",
         writes: "All PBF writes direct",
         uring: "Yes",
     },

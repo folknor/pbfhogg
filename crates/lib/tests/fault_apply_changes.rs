@@ -1925,4 +1925,87 @@ mod apply_changes {
             write_multi_block_test_pbf(&base, &generate_nodes(40, 1), &[], &[], 5);
         }
     }
+
+    /// Direct reads reach every read of the base: on the owned route (a
+    /// `Direct` backend) the front read, the scanner's walker and the worker
+    /// pool's descriptor, and on the splice route (a splice-capable backend
+    /// with direct reads, which the library allows independently) the splice
+    /// source too, every one opened `O_DIRECT`. The fixture sends both
+    /// worker candidates (the OSC's two nodes) and untouched blobs, so each
+    /// reader reads; both outputs equal the buffered run's bytes. The
+    /// producers open from their own threads, so the transports are compared
+    /// as a count, not an order.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn direct_reads_reach_every_base_open() {
+        use pbfhogg::test_hooks::Transport;
+        use pbfhogg::write::OutputBackend;
+
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        write_multi_block_test_pbf(&base, &generate_nodes(40, 1), &[], &[], 5);
+        write_osc(&osc, REPLACEMENT_OSC);
+        let run = |backend: OutputBackend, direct_reads: bool, output: &Path| {
+            let host = crate::common::test_host();
+            // Armed past every open: it never fires, it only records them.
+            host.invocation.faults().arm_input_replacement(
+                &base,
+                &dir.path().join("unused.osm.pbf"),
+                u64::MAX,
+            );
+            let opts = MergeOptions {
+                write: WriteOptions {
+                    backend,
+                    direct_reads,
+                    ..WriteOptions::default()
+                },
+                parallelism: pbfhogg::Parallelism::from_jobs(2),
+                ..MergeOptions::default()
+            };
+            let result = merge(
+                base.as_path(),
+                &osc,
+                common::out(output),
+                &opts,
+                &pbfhogg::HeaderOverrides::default(),
+                &host,
+            );
+            let report = host
+                .invocation
+                .faults()
+                .input_replacement()
+                .expect("armed replacement");
+            (result, report.transports)
+        };
+
+        let reference = dir.path().join("reference.osm.pbf");
+        run(OutputBackend::Parallel, false, &reference)
+            .0
+            .expect("buffered run");
+        let expected = std::fs::read(&reference).expect("read reference output");
+
+        for (backend, opens) in [(OutputBackend::Direct, 3), (OutputBackend::Parallel, 4)] {
+            let output = dir.path().join(format!("direct-{backend:?}.osm.pbf"));
+            let (result, transports) = run(backend, true, &output);
+            match result {
+                Ok(_) => {}
+                Err(e) if crate::common::direct_io_unavailable(&e) => {
+                    crate::common::skip(format!("{backend:?}: {e}"));
+                    return;
+                }
+                Err(e) => panic!("{backend:?}: direct run: {e}"),
+            }
+            assert_eq!(
+                transports,
+                vec![Transport::Direct; opens],
+                "{backend:?}: every base open is direct"
+            );
+            assert_eq!(
+                std::fs::read(&output).expect("read output"),
+                expected,
+                "{backend:?}: direct reads write the buffered run's bytes"
+            );
+        }
+    }
 }

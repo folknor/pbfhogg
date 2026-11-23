@@ -1299,16 +1299,14 @@ impl Source {
     }
 }
 
-/// A frame read buffer, one per thread that reads frames: a plain buffer
-/// for buffered sources and an aligned scratch for direct ones (remade when
-/// a source's alignment differs from the one it was made for). Both follow
-/// the read buffers' retention limit through [`FrameBuf::release_outlier`],
-/// called once a frame's bytes are done with.
+/// A frame read buffer, one per thread that reads frames: a
+/// [`ReadBuf`](crate::read::read_buf::ReadBuf), which reads each source in
+/// its own transport (buffered, or aligned spans for a direct one) and
+/// follows the read buffers' retention limit through
+/// [`FrameBuf::release_outlier`], called once a frame's bytes are done with.
 #[derive(Default)]
 pub(crate) struct FrameBuf {
     buf: crate::read::read_buf::ReadBuf,
-    #[cfg(feature = "linux-direct-io")]
-    scratch: Option<crate::read::direct_reader::AlignedScratch>,
 }
 
 impl FrameBuf {
@@ -1318,33 +1316,15 @@ impl FrameBuf {
     pub(crate) fn read(&mut self, source: &Source, frame: &Frame) -> Result<&[u8]> {
         #[allow(clippy::cast_possible_truncation)]
         let len = frame.frame_len as usize;
-        #[cfg(feature = "linux-direct-io")]
-        if let Some(align) = source.input.direct_align() {
-            use crate::read::direct_reader::{AlignedScratch, read_aligned_in};
-            use std::os::unix::fs::FileExt as _;
-            let scratch = match &mut self.scratch {
-                Some(s) if s.align() == align => s,
-                slot => slot.insert(AlignedScratch::new(align)),
-            };
-            let file = source.input.file();
-            return read_aligned_in(len, frame.file_offset, scratch, |dst, at| {
-                file.read_at(dst, at)
-            })
-            .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)));
-        }
         self.buf
-            .read_exact_at(&**source.input.file(), frame.file_offset, len)
+            .read_input_at(&source.input, frame.file_offset, len)
             .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)))
     }
 
     /// Apply the read buffers' retention limit (`crate::read::read_buf`) to
-    /// whichever buffer the last frame went through.
+    /// both of its allocations.
     pub(crate) fn release_outlier(&mut self, invocation: &crate::host::Recorder) {
         self.buf.release_outlier(invocation);
-        #[cfg(feature = "linux-direct-io")]
-        if let Some(scratch) = &mut self.scratch {
-            scratch.release_outlier(invocation);
-        }
     }
 }
 

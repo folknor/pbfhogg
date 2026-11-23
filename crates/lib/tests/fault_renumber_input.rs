@@ -8,9 +8,9 @@
 //! each open in turn, the last included. Every open is taken on the calling
 //! thread before any worker starts, so the counts are exact.
 //!
-//! The opens, in order: the header read (`O_DIRECT` under direct reads),
-//! the one description every data phase preads (pass 1, stage 2d, R1 and
-//! R2d), then the schedule walk's own description.
+//! The opens, in order: the header read, the one description every data
+//! phase preads (pass 1, stage 2d, R1 and R2d), then the schedule walk's own
+//! description; all three `O_DIRECT` under direct reads.
 //!
 //! Renumbering rewrites every ID, so a replacement that differed only in
 //! IDs would renumber to the same output; this one differs in coordinates,
@@ -221,7 +221,7 @@ fn reference(
     assert_eq!(counted.attempts, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.verified, OPENS, "{route:?}: {counted:?}");
     assert_eq!(counted.refused, 0, "{route:?}: {counted:?}");
-    crate::common::witness_transports(route.direct, &counted, || "DBB", &format!("{route:?}"));
+    crate::common::witness_transports(route.direct, &counted, || "DDD", &format!("{route:?}"));
     assert_renumbered_input(&output, &stats, &format!("{route:?}, unreplaced"));
     let bytes = std::fs::read(&output).expect("read reference output");
     std::fs::remove_file(&output).expect("remove reference output");
@@ -320,8 +320,8 @@ fn buffered_reads_only_the_pinned_input() {
     check_replacements(route, dir.path(), &input, &expected);
 }
 
-/// The header read opens `O_DIRECT` when asked to, through the pin's own
-/// direct open; the shared data description and the walk stay buffered.
+/// Every open is `O_DIRECT` when asked to, through the pin's own direct
+/// open: the header read, the shared data description and the walk.
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn direct_reads_follow_the_pinned_input() {

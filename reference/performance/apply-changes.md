@@ -38,6 +38,20 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### `--direct-io` reaching the scanner, pool and splice reads (bygg, 2026-11-23, `fc3b6b79` + change)
+
+Before the change `--direct-io` read only the front read `O_DIRECT`; the
+scanner's walker, the worker pool's preads and the splice source stayed
+buffered. After it every base read is direct. Planet `apply-diff --osc 4913
+--direct-io yes`, `--iterations 1`, baseline `--commit HEAD` then variant
+uncommitted: 194 s (`9df6c948`) against 195 s (`957bc116`). Streaming
+130.2 s against 130.9 s, node transition creates 58.3 s against 58.6 s,
+disk read in the streaming phase 58.8 GB against 59.5 GB at 29.6 and 29.8
+cores. Neutral: at planet the base does not fit the page cache, so the
+buffered reads were device reads too. The default (buffered) path gained
+one transport branch per blob read and was not measured. Renumber's
+equivalent change (its pools and schedule walk) is unmeasured.
+
 ### XML 1.0 character check on every OSC input event (bygg, 2026-11-19, `a664c724` + change)
 
 Planet `apply-diff --osc 4913` after `fstrim`, `--iterations 1`:

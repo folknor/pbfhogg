@@ -206,10 +206,14 @@ together so the surface changes once.
   - `Developer` events (`[altw external] ...`, the geocode hotpath
     counters) carry `key=value` text or a bracketed prefix of their own.
 
-- [ ] **Aligned read transport for worker pools remains separate work.**
-  Ignored `direct_io` parameters remain plumbing; accepting the flag does not
-  promise direct reads on those paths. Worker pools need their own aligned
-  transport per worker because the walker's shared scratch cannot cross threads.
+- [ ] **Direct reads for the remaining buffered worker pools.** The per-worker
+  aligned transport exists: a pool holding an `InputFile` from
+  `InputFile::for_reads` reads it through `ReadBuf::read_input_at`, which
+  reads a direct input in aligned spans (renumber and apply-changes use it).
+  The pools `crates/cli/src/io_reach.rs` still lists as buffered (repack,
+  degrade, extract, tags-filter, getid, getparents, time-filter,
+  add-locations-to-ways, inspect, check, build-geocode-index) can adopt it;
+  until then their ignored `direct_io` parameters remain plumbing.
 
 ## Lint exemptions (moved out of the hygiene drain 2026-10-26)
 

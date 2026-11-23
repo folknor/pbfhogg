@@ -41,7 +41,7 @@ use std::sync::mpsc;
 use crate::ElementKind;
 use crate::blob::BlobKind;
 use crate::error::Result;
-use crate::read::header_walker::HeaderWalker;
+use crate::read::header_walker::{HeaderWalker, Positional};
 use crate::read::input::PinnedInput;
 
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
@@ -91,6 +91,13 @@ pub(super) struct ScannerLocations {
 pub(super) struct ScannerConfig<'a> {
     /// The run's pinned base; the walker opens its own description of it.
     pub base: &'a PinnedInput,
+    /// Walk the base `O_DIRECT` (the run's `direct_reads`; ignored in a
+    /// build without `linux-direct-io`, as every direct read is).
+    #[cfg_attr(
+        not(feature = "linux-direct-io"),
+        allow(dead_code, reason = "read only by the direct walk")
+    )]
+    pub direct_reads: bool,
     pub diff: &'a SortedDiff,
     /// `Some` under `--locations-on-ways`, which enables the node→way
     /// barrier: at the first way or relation descriptor the scanner sends its
@@ -108,14 +115,37 @@ pub(super) struct ScannerConfig<'a> {
 ///
 /// On error, closes its output channels by returning - workers and drain
 /// will see `Disconnected` on their reads and exit.
-#[allow(clippy::too_many_lines)]
+///
+/// The walk opens its own description of the base: buffered
+/// (`HeaderWalker::open`, `FADV_RANDOM`), or `O_DIRECT` under direct reads
+/// (`HeaderWalker::open_direct`). An open failure returns before any
+/// descriptor is dispatched, closing the channels the same way.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_>) -> Result<u64> {
+    // The span starts before the walker's open, as it always has.
+    host.invocation.marker("MERGE_SCANNER_START");
+    #[cfg(feature = "linux-direct-io")]
+    if cfg.direct_reads {
+        let walker = HeaderWalker::open_direct(cfg.base, host)?;
+        return scan(walker, cfg, host);
+    }
+    let walker = HeaderWalker::open(cfg.base, host)?;
+    scan(walker, cfg, host)
+}
+
+/// [`run_scanner`]'s walk over an opened walker, whatever its transport.
+#[allow(clippy::too_many_lines)]
+fn scan<P: Positional>(
+    mut walker: HeaderWalker<P>,
+    cfg: ScannerConfig<'_>,
+    host: &crate::host::Entered<'_>,
+) -> Result<u64> {
     // Destructure so clippy sees us taking ownership of the channels,
     // which matters: the SyncSenders dropping at scanner exit is what
     // signals end-of-input to the worker pool and drain.
     let ScannerConfig {
-        base,
+        base: _,
+        direct_reads: _,
         diff,
         locations,
         channels,
@@ -130,12 +160,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Entered<'_
         Route::Owned => None,
     };
 
-    host.invocation.marker("MERGE_SCANNER_START");
-
     // A partially indexed base is refused at the blob that shows it, as by
     // every command-input walk. Descriptors already dispatched are discarded
     // with the run, whose output is never published.
-    let mut walker = HeaderWalker::open(base, host)?;
     let mut seq: u64 = 0;
     // Under --locations-on-ways the scanner waits for the drain's signal at
     // the first way or relation descriptor (or at EOF when there is none),

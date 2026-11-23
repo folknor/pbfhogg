@@ -41,7 +41,7 @@ pub(super) struct Pass1Result {
 pub(super) fn pass1_parallel_scan(
     schedule: &[BlobTask],
     start_node_id: i64,
-    shared_file: &std::fs::File,
+    shared_file: &crate::read::input::InputFile,
     source: &std::sync::Arc<std::path::Path>,
     node_id_set: &IdSet,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,

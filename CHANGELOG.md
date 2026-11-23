@@ -664,6 +664,12 @@
 
 ### Fixed
 
+- **`apply-changes --direct-io` and `renumber --direct-io` read the whole
+  input `O_DIRECT`.** The flag reached only the front or header read; the
+  header walks, the worker preads and (apply-changes) the copied ranges
+  stayed in the page cache. Every PBF input read is now direct; the OSC
+  read stays buffered. Planet apply-changes wall is unchanged.
+
 - **`merge-changes` and `tags-filter --input-kind osc` accept a hidden node
   without coordinates.** A `<create>` or `<modify>` node with
   `visible="false"` (an OSM deleted version, which carries no location)

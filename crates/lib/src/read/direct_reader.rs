@@ -397,13 +397,45 @@ impl AlignedScratch {
     /// size is the aligned span, padding included. Call once a read's bytes
     /// are done with.
     pub(crate) fn release_outlier(&mut self, invocation: &crate::host::Recorder) {
+        self.release_past(crate::tunables::READ_BUF_MAX_RETAINED_CAPACITY, invocation);
+    }
+
+    /// [`release_outlier`](Self::release_outlier) at `limit`, for a holder on
+    /// a different line (`ReadBuf::release_past`); counted the same way.
+    /// Returns whether it released.
+    pub(crate) fn release_past(
+        &mut self,
+        limit: usize,
+        invocation: &crate::host::Recorder,
+    ) -> bool {
         let held = self.held();
-        if held > crate::tunables::READ_BUF_MAX_RETAINED_CAPACITY {
+        if held > limit {
             self.free();
             invocation
                 .metrics()
                 .decompress
                 .record_read_buf_release(held);
+            return true;
+        }
+        false
+    }
+
+    /// The bytes at `range` of the allocation, as the last read left them;
+    /// empty for an empty range. A range past the allocation is a broken
+    /// caller, refused by the slice bounds check.
+    pub(crate) fn held_bytes(&self, range: std::ops::Range<usize>) -> &[u8] {
+        if range.is_empty() {
+            return &[];
+        }
+        match self.alloc {
+            // Safety: the allocation holds `layout.size()` initialised bytes
+            // (zeroed at allocation, overwritten only by reads), borrowed
+            // shared through `&self`.
+            Some((ptr, layout)) => {
+                let all = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), layout.size()) };
+                &all[range]
+            }
+            None => &[][range],
         }
     }
 
@@ -431,6 +463,14 @@ impl AlignedScratch {
         }
     }
 }
+
+// Safety: the scratch exclusively owns its allocation (no alias of the
+// pointer leaves it except borrows tied to `&self`/`&mut self`), every
+// mutation goes through `&mut self`, and freeing it on another thread than
+// the one that allocated it is allowed by the global allocator. So moving it
+// to a worker thread is sound; it stays `!Sync`, and `DirectPositional`'s
+// `RefCell` keeps that type single-threaded on its own.
+unsafe impl Send for AlignedScratch {}
 
 impl Drop for AlignedScratch {
     fn drop(&mut self) {

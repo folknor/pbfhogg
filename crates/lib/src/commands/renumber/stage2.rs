@@ -33,7 +33,7 @@ pub(super) struct Stage2dResult {
 
 #[hotpath::measure]
 pub(super) fn stage2d_parallel_way_assembly(
-    shared_file: &std::fs::File,
+    shared_file: &crate::read::input::InputFile,
     source: &std::sync::Arc<std::path::Path>,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     way_id_sets: &mut [IdSet],

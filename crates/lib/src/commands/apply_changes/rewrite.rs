@@ -473,7 +473,8 @@ pub(crate) fn merge_to<'a>(
     //
     // The base is opened again by the scanner's header walker
     // (`FADV_RANDOM`) and once for the whole worker pool (plain preads of
-    // candidate bodies), besides this plain splice source. Separate open
+    // candidate bodies), besides this plain splice source; under direct
+    // reads all three are `O_DIRECT` instead, with no advice. Separate open
     // file descriptions are kept here, so the walker's RANDOM advice and
     // each reader's readahead state stay off the others' reads. Whether the
     // pool would read as fast under RANDOM is unmeasured here: altw
@@ -490,8 +491,16 @@ pub(crate) fn merge_to<'a>(
             .faults()
             .apply_changes_force_owned_route
             .load(std::sync::atomic::Ordering::Relaxed);
+    // Under direct reads the splice source is `O_DIRECT` too: the range copy
+    // reads a direct input in aligned spans and never hands it to
+    // `copy_file_range` (`crate::write::copy_range`, and the io_uring
+    // writer's aligned CopyRange read), so a copied range is a direct read.
     let splice_source = if splice {
-        Some(crate::read::input::InputFile::open(&base)?)
+        Some(crate::read::input::InputFile::for_reads(
+            &base,
+            direct_io,
+            &host.invocation,
+        )?)
     } else {
         None
     };
@@ -567,6 +576,7 @@ pub(crate) fn merge_to<'a>(
 
     let scanner_cfg = ScannerConfig {
         base: &base,
+        direct_reads: direct_io,
         diff: &diff,
         locations: scanner_locations,
         channels: ScannerChannels {
@@ -578,6 +588,7 @@ pub(crate) fn merge_to<'a>(
 
     let streaming_cfg = StreamingConfig {
         base: base.clone(),
+        direct_reads: direct_io,
         diff: Arc::clone(&diff),
         worker_count,
         locations: worker_locations,

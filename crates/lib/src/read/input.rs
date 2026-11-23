@@ -792,6 +792,24 @@ impl InputFile {
         })
     }
 
+    /// `pin` opened for a pool's positional reads in the transport the run
+    /// asked for: `O_DIRECT` when `direct` (the `direct_reads` option) and
+    /// the build has `linux-direct-io`, else buffered. Its readers read it
+    /// through `ReadBuf::read_input_at` (or another reader that honours
+    /// [`Self::direct_align`]), never as a plain `File`.
+    pub(crate) fn for_reads(
+        pin: &PinnedInput,
+        direct: bool,
+        _invocation: &crate::host::Recorder,
+    ) -> Result<Self> {
+        #[cfg(feature = "linux-direct-io")]
+        if direct {
+            return Self::direct(pin, _invocation);
+        }
+        let _ = direct;
+        Self::open(pin)
+    }
+
     /// `path` opened `O_DIRECT` without a pin, for the range-copy tests.
     #[cfg(all(test, feature = "linux-direct-io"))]
     pub(crate) fn direct_for_tests(path: &Path) -> Result<Self> {

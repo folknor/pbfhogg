@@ -30,7 +30,7 @@ use crate::idset::IdSet;
 /// applies, so the set holds exactly the ids R2d will look up.
 #[hotpath::measure]
 pub(super) fn relation_r1_collect_ids(
-    shared_file: &std::fs::File,
+    shared_file: &crate::read::input::InputFile,
     source: &std::sync::Arc<std::path::Path>,
     relation_schedule: &[BlobTask],
     relation_id_set: &mut IdSet,
@@ -125,7 +125,7 @@ pub(super) struct R2dResult {
 /// Parallel R2d: wire-format splice rewriter for relation blobs.
 #[hotpath::measure]
 pub(super) fn relation_r2d_assembly(
-    shared_file: &std::fs::File,
+    shared_file: &crate::read::input::InputFile,
     source: &std::sync::Arc<std::path::Path>,
     relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,

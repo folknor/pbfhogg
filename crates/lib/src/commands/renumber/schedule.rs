@@ -59,23 +59,42 @@ impl BlobTask {
 /// Walks via the pread-only `HeaderWalker` + `posix_fadvise(RANDOM)` so
 /// blob bodies stay out of the page cache during this scan - renumber's
 /// downstream pread workers share one other description of the input and
-/// touch only the blobs they rewrite.
+/// touch only the blobs they rewrite. Under `direct` (direct reads) the walk
+/// is `O_DIRECT` instead (`HeaderWalker::open_direct`), and fills no cache.
 #[hotpath::measure]
 pub(super) fn build_all_blob_schedules(
     input: &PinnedInput,
+    direct: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
     // Its own open, derived from the run's pin, on purpose: this walk's
-    // descriptor carries FADV_RANDOM, which is kept off the workers' shared
-    // plain body descriptor (advice sensitivity is unmeasured for those
-    // pools; `InputSource::open_random_access` records where it was
-    // measured), and the caller's header reader (which
+    // buffered descriptor carries FADV_RANDOM, which is kept off the
+    // workers' shared plain body descriptor (advice sensitivity is
+    // unmeasured for those pools; `InputSource::open_random_access` records
+    // where it was measured), and the caller's header reader (which
     // established that the file opens with an OsmHeader and is sorted) is a
     // sequential read, O_DIRECT under direct I/O, already closed. The walk
     // starts at the beginning and consumes the leading frame itself; the
     // walker would accept a data blob there, so the leading-header contract
     // is the caller's earlier read, not this check.
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    #[cfg(feature = "linux-direct-io")]
+    if direct {
+        return walk(
+            crate::read::header_walker::HeaderWalker::open_direct(input, host)?,
+            input,
+        );
+    }
+    let _ = direct;
+    walk(
+        crate::read::header_walker::HeaderWalker::open(input, host)?,
+        input,
+    )
+}
+
+fn walk<P: crate::read::header_walker::Positional>(
+    mut walker: crate::read::header_walker::HeaderWalker<P>,
+    input: &PinnedInput,
+) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
     drop(
         walker
             .next_header()?

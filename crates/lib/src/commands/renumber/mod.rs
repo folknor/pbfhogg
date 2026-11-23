@@ -267,14 +267,14 @@ impl BlobBuffers {
     /// `self.decompressed`.
     fn load(
         &mut self,
-        file: &std::fs::File,
+        file: &crate::read::input::InputFile,
         task: &BlobTask,
         counters: &StageCounters,
     ) -> crate::Result<()> {
         let t = crate::counters::Stopwatch::start();
         let raw = self
             .raw
-            .read_exact_at(file, task.data_offset, task.data_size)
+            .read_input_at(file, task.data_offset, task.data_size)
             .map_err(|e| {
                 Error::from(e).context(format!("pread failed at offset {}", task.data_offset))
             })?;
@@ -430,7 +430,8 @@ pub(crate) fn renumber_external_to<'a>(
     // derived from this one pin, so a file renamed over the input mid-run
     // cannot be read partly from each: the header read below, the one
     // description every data phase preads, and the schedule walk's own
-    // `FADV_RANDOM` description. Where `/proc/self/fd` reopens the pin every
+    // description (`FADV_RANDOM` when buffered). Under direct reads all
+    // three are `O_DIRECT`. Where `/proc/self/fd` reopens the pin every
     // open reaches the pinned file, otherwise on Unix a replaced input fails
     // the run (`PinnedInput` says what it does off Unix). Taken before any
     // other open of it.
@@ -480,8 +481,10 @@ pub(crate) fn renumber_external_to<'a>(
         host,
     )?;
 
-    // Single shared input fd for all phases - pread is concurrent-safe.
-    let shared_file = pin.open()?;
+    // Single shared input description for all phases - pread is
+    // concurrent-safe. `O_DIRECT` under direct reads: every worker reads it
+    // through its own `ReadBuf`, which reads a direct input in aligned spans.
+    let shared_file = crate::read::input::InputFile::for_reads(&pin, direct_io, &host.invocation)?;
     // The path every worker locates its errors against, captured once.
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
     let file_len = pin.metadata()?.len();
@@ -490,7 +493,8 @@ pub(crate) fn renumber_external_to<'a>(
 
     // ---- Blob schedule scan ----
     let t_sched = Stopwatch::start();
-    let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(&pin, host)?;
+    let (pass1_schedule, way_schedule, relation_schedule) =
+        build_all_blob_schedules(&pin, direct_io, host)?;
     host.invocation
         .counter("renumber_ext_schedule_ms", t_sched.elapsed_ms());
 

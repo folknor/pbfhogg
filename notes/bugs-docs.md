@@ -228,6 +228,18 @@ Reported by: check-inspect.
 `reference/osmium-parity.md` recommends `inspect -e`. That flag now refuses
 and names `--extended` instead.
 
+## DOC-035 - osmium-parity.md pairs inspect -g header.bbox with a key osmium lacks
+
+Reported by: the spar accounting of the inspect --distrust-metadata refusal.
+
+`docs/cli/osmium-parity.md` and `reference/osmium-parity.md` show
+`osmium fileinfo -g header.bbox input.pbf` as the counterpart of
+`pbfhogg inspect -g header.bbox input.pbf`. osmium fileinfo has no
+`header.bbox` key and refuses it as an unknown `--get` value; its key is
+`header.boxes` (the known-key list in
+`research/osmium-tool/src/command_fileinfo.cpp`). The example should name
+`header.boxes` on the osmium side.
+
 ## DOC-024 - diff test comments still describe a header walk and ID-range shards
 
 Reported by: the negative-ID documents commit's spar (codex).

@@ -88,18 +88,6 @@ Reported by: verify (flagged as a coverage limitation).
 `checks/sort.rs` never passes `--force`, so selecting an unindexed raw input
 exercises the CLI's indexdata refusal rather than sort's supported fallback.
 
-## TOOL-017 - A configured FIFO hangs digest resolution
-
-Reported by: datasets-devkit [P2].
-
-`file_digest` (`crates/devkit/src/datasets.rs`) opens the path before checking
-its type. Opening a FIFO for reading with no writer blocks indefinitely, so
-the intended refusal never runs. `resolve_input`, OSC selection and polygon
-selection reach this directly, and a malformed registered input can hang the
-tool while it holds brokkr's machine lock, instead of returning the promised
-invalid-entry error. The fix belongs at the file-opening boundary, because a
-metadata check alone would leave a replacement race.
-
 ## TOOL-018 - Planet acquisition prints instructions that register the wrong sequence
 
 Reported by: datasets-devkit [P2].
@@ -220,24 +208,6 @@ precedence and surface as a content difference blamed on pbfhogg. Traced
 from source only; derive emits new's versions, so whether real derives
 reach it is unchecked.
 
-## TOOL-030 - The dataset lock file is opened following symlinks
-
-Reported by: the scout of the download staging item (2026-11-20); not
-re-read since.
-
-`pbfhogg-datasets` opens its per-dataset lock file with an ordinary open,
-which follows a symlink at that name. A symlink planted at the lock path can
-make the lock open, and possibly create, a file elsewhere. The staging and
-registry writers now refuse entries they do not own; the lock open does not.
-
-The lock name also sits outside the publication-name rule every other
-entry the tool changes now takes (`layout::claim`): a registration (of
-any kind) naming `.KEY.download.lock`, or reaching it through a dangling
-symlink, is filled by the lock's `create`. Its content is no longer
-written (the recovery record moved to `.KEY.download.journal`), so a hard
-link to a registered file is no longer corrupted, only locked. Raised by
-the spar partner on the dataset-recovery work (2026-11-24).
-
 ## TOOL-032 - Refusal tests that accept any error can pass on a panic
 
 Reported by: the release-sweep retirement (commit `e716ad49`).
@@ -251,6 +221,18 @@ tests holding bare `is_err()`, discarded `unwrap_err`/`expect_err`, or
 `Err(_)` patterns accept `Panicked`; and no source-policy rule keeps new
 ones out. The settled rulings and the remaining links (CLI refusal bar,
 source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
+
+## TOOL-049 - Promotion reopens its input by name after hashing it
+
+Reported by: the spar partner on the digest-open work (2026-11-24); not
+reproduced.
+
+`promote` hashes `--file` through the devkit digest, whose open no longer
+blocks on a FIFO and checks the type on the descriptor, then copies the
+file with `std::fs::copy` by name. A FIFO or other file swapped in between
+can hang the copy, under brokkr's machine lock (different bytes are caught
+by the later re-hash of the staged copy, a hang is not). Holding the checked
+descriptor through the copy would close it.
 
 # From the 2026-11-21 verifier performance hunt
 

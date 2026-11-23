@@ -44,7 +44,7 @@ pub(crate) fn run(req: &Request<'_>) -> Result<(), String> {
     }
     let dir = req.config.data_dir(req.host).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let _lock = DatasetLock::acquire(&dir, req.dataset)?;
+    let _lock = DatasetLock::acquire(req.config, req.host, &dir, req.dataset, &[req.file])?;
     let view = req
         .config
         .dataset(req.host, req.dataset)
@@ -364,6 +364,77 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
+    /// The lock name is never filled for a registration or the promoted
+    /// input, and a symlink, FIFO or hard link at it is not a lock.
+    #[test]
+    fn the_lock_name_refuses_what_it_does_not_own() {
+        use std::os::unix::fs::symlink;
+        let scratch = pbfhogg_test_scratch::scratch();
+        let root = scratch.path();
+        let dir = root.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = root.join("brokkr.toml");
+        let lock = dir.join(".tiny.download.lock");
+        let elsewhere = root.join("elsewhere");
+        let base = "[h]\ndata = 'data'\n[h.datasets.tiny]\norigin = 'local'\n";
+        let load = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            Config::load(&path, None).unwrap()
+        };
+
+        // A registration naming the lock, directly or through a dangling
+        // symlink, or a promotion input that does: nothing is created.
+        let direct = load(&format!(
+            "{base}[h.datasets.other.pmtiles.t]\nfile = '.tiny.download.lock'\n"
+        ));
+        let err = DatasetLock::acquire(&direct, "h", &dir, "tiny", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("dataset lock name"), "{err}");
+        symlink(&lock, dir.join("alias")).unwrap();
+        let aliased = load(&format!(
+            "{base}[h.datasets.other.pmtiles.t]\nfile = 'alias'\n"
+        ));
+        assert!(DatasetLock::acquire(&aliased, "h", &dir, "tiny", &[]).is_err());
+        let plain = load(base);
+        assert!(DatasetLock::acquire(&plain, "h", &dir, "tiny", &[&dir.join("alias")]).is_err());
+        assert!(lock.symlink_metadata().is_err());
+
+        // A symlink at the lock name, live or dangling, is not followed.
+        symlink(&elsewhere, &lock).unwrap();
+        let err = DatasetLock::acquire(&plain, "h", &dir, "tiny", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(elsewhere.symlink_metadata().is_err());
+        std::fs::write(&elsewhere, b"x").unwrap();
+        assert!(DatasetLock::acquire(&plain, "h", &dir, "tiny", &[]).is_err());
+        std::fs::remove_file(&lock).unwrap();
+
+        // A hard link shares another file's inode.
+        std::fs::hard_link(&elsewhere, &lock).unwrap();
+        let err = DatasetLock::acquire(&plain, "h", &dir, "tiny", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("single link"), "{err}");
+        std::fs::remove_file(&lock).unwrap();
+
+        // A FIFO with no writer refuses at once.
+        let c_path = std::ffi::CString::new(lock.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a scalar mode.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = DatasetLock::acquire(&plain, "h", &dir, "tiny", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("regular file"), "{err}");
+        std::fs::remove_file(&lock).unwrap();
+
+        // An ordinary lock is created, then reused in place.
+        drop(DatasetLock::acquire(&plain, "h", &dir, "tiny", &[]).unwrap());
+        assert!(DatasetLock::acquire(&plain, "h", &dir, "tiny", &[]).is_ok());
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"x");
+    }
+
     #[test]
     fn refusals_preserve_registry_and_input() {
         let scratch = pbfhogg_test_scratch::scratch();
@@ -396,7 +467,7 @@ mod tests {
         assert!(run(&req).is_err());
         req.dataset = "tiny";
         let dir = root.join("data");
-        let lock = DatasetLock::acquire(&dir, "tiny").unwrap();
+        let lock = DatasetLock::acquire(&config, "h", &dir, "tiny", &[]).unwrap();
         assert!(run(&req).unwrap_err().contains("held"));
         drop(lock);
         let digest = file_digest(&input).unwrap();

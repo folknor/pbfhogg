@@ -14,6 +14,8 @@ autoexamples = false
 autobenches = false
 
 [dependencies]
+# O_NONBLOCK for the digest open, so a FIFO at a registered name refuses.
+libc = "0.2"
 toml = "1.1.3"
 # Lossless edits of hand-maintained host files (the dataset registry writer).
 toml_edit = "0.25.13"

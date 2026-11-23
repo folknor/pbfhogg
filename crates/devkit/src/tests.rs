@@ -132,6 +132,42 @@ fn pins_are_checked_and_unpinned_bytes_are_observed_afresh() {
     assert!(config.resolve_input("m", "d", None, "r", "raw").is_err());
 }
 
+/// A FIFO with no writer at a registered name, directly or through a
+/// symlink, refuses at once instead of blocking in the open; a symlink to a
+/// regular file is still followed.
+#[test]
+fn a_registered_fifo_refuses_without_blocking() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let canonical = std::fs::canonicalize(scratch.path()).unwrap();
+    let root = canonical.as_path();
+    write(root, "data/real", "abc");
+    let fifo = root.join("data/fifo");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path and a scalar mode.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    std::os::unix::fs::symlink(&fifo, root.join("data/to-fifo")).unwrap();
+    std::os::unix::fs::symlink(root.join("data/real"), root.join("data/to-real")).unwrap();
+    for (file, succeeds) in [("fifo", false), ("to-fifo", false), ("to-real", true)] {
+        write(
+            root,
+            "brokkr.toml",
+            &format!("[m.datasets.d.pbf.raw]\nfile = '{file}'\n"),
+        );
+        let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
+        let resolved = config.resolve_input("m", "d", None, "r", "raw");
+        assert_eq!(resolved.is_ok(), succeeds, "{file}");
+        if !succeeds {
+            assert!(
+                resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expected a regular file"),
+                "{file}"
+            );
+        }
+    }
+}
+
 #[test]
 fn precedence_user_layer_and_named_arrays() {
     let scratch = pbfhogg_test_scratch::scratch();

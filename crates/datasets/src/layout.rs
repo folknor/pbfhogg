@@ -108,6 +108,19 @@ pub(crate) fn claim(config: &Config, host: &str, dir: &Path, dest: &Path) -> Res
     veto(config, host, dir, dest, "publication name", &[])
 }
 
+/// Refuse to create or open the dataset lock at `lock` when any registration
+/// on the host, or any path in `protect`, resolves through that directory
+/// entry (see `veto`): its creation would fill an absent registered name.
+pub(crate) fn reserve_lock(
+    config: &Config,
+    host: &str,
+    dir: &Path,
+    lock: &Path,
+    protect: &[&Path],
+) -> Result<(), String> {
+    veto(config, host, dir, lock, "dataset lock name", protect)
+}
+
 /// Prepare the staged sibling of `dest` for a writer of dataset `key`:
 /// refuse when unlinking it would break a registered file anywhere on the
 /// host, or any path in `protect` (see `veto`), else remove whatever stale

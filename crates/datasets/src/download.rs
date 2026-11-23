@@ -484,7 +484,7 @@ pub(crate) fn run(req: &Request<'_>) -> Result<(), String> {
     let key = resolved.key.as_str();
     let data_dir = req.config.data_dir(req.host).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))?;
-    let lock = DatasetLock::acquire(&data_dir, key)?;
+    let lock = DatasetLock::acquire(req.config, req.host, &data_dir, key, &[])?;
     note(&format!("=== {key} ({}) ===", resolved.source.origin()));
 
     if let Some(snap) = req.snapshot {

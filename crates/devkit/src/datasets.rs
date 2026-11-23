@@ -15,10 +15,24 @@ pub struct ResolvedInput {
 }
 
 /// Compute XXH3-128 over file bytes, printed as 32 lowercase hex digits.
-/// Directories and unreadable inputs are errors. No cache can hide changes.
+/// Anything but a regular file, and unreadable inputs, are errors. No cache
+/// can hide changes.
+///
+/// The open is nonblocking and the type is checked on the open descriptor,
+/// so a FIFO at the name (directly, through a symlink, or swapped in after
+/// any earlier stat) refuses instead of waiting for a writer. Symlinks are
+/// followed: a registered file may be a link onto another drive. Reads of a
+/// regular file ignore `O_NONBLOCK`. Opening a device can still reach its
+/// driver before the check; registrations are operator-written, and only
+/// an `O_PATH` reopen through procfs would close that.
 pub fn file_digest(path: &Path) -> Result<String, Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let at = |e| Error::message(format!("{}: {e}", path.display()));
-    let mut file = std::fs::File::open(path).map_err(at)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(at)?;
     if !file.metadata().map_err(at)?.is_file() {
         return Err(Error::message(format!(
             "{}: expected a regular file",

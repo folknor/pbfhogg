@@ -126,7 +126,13 @@ The permanent `DATA/.KEY.download.lock` uses a nonblocking exclusive flock
 held through registry commit. It is never unlinked, renamed or explicitly
 unlocked. Each acquisition child inherits the lock as stdin, so an orphaned
 writer prevents retry until it exits. This assumes curl and pbfhogg keep
-stdin open until exit.
+stdin open until exit. The lock is opened without following a symlink and
+without blocking, and only a regular file with one link is a lock: a
+symlink, FIFO, device or hard link at the name refuses and is left in place
+(an orphan of an older tool may still hold the inode it reached). Every
+invocation sharing a dataset's staging entries must see the same lock inode
+for its key; a mount layered over the lock name alone breaks that and is
+not detected.
 
 The lock file's content is never written. What download published under a
 key is recorded per file in `DATA/.KEY.download.journal`, one line per
@@ -151,7 +157,7 @@ The staged sibling of `NAME` is `.partial.KEY.NAME`; dataset keys never
 contain `.`, so two datasets, which hold different locks, never share a
 staging name. One rule protects every directory entry the tool changes -
 staging names, final publication names, the journal and its staging
-name: the change refuses when resolving any file registered on the
+name, and the lock name, which creating the lock would fill: the change refuses when resolving any file registered on the
 selected host (or the input being promoted) would look up that entry,
 whether the registration names it directly, traverses it as a symlinked
 directory, or reaches it through a symlink, dangling or not. Directories

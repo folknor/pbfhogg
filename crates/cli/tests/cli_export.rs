@@ -110,24 +110,120 @@ fn write_node_without_metadata(path: &Path) {
     writer.flush().unwrap();
 }
 
-fn write_node_with_timestamp(path: &Path, timestamp: i64) {
+fn write_timestamped_nodes(path: &Path, nodes: &[(i64, i32, i32, i64)], millis_on_wire: bool) {
     let file = std::fs::File::create(path).unwrap();
     let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
     writer
         .write_header(&HeaderBuilder::new().build().unwrap())
         .unwrap();
     let mut builder = BlockBuilder::new();
-    let meta = Metadata {
-        version: 1,
-        timestamp,
-        changeset: 1,
-        uid: 1,
-        user: "mapper",
-        visible: true,
-    };
-    builder.add_node(5, 0, 0, [("name", "dated")], Some(&meta));
-    write_block(&mut writer, &mut builder);
+    for &(id, lat, lon, timestamp) in nodes {
+        let meta = Metadata {
+            version: 1,
+            timestamp,
+            changeset: 1,
+            uid: 1,
+            user: "mapper",
+            visible: true,
+        };
+        builder.add_node(id, lat, lon, [("name", "dated")], Some(&meta));
+    }
+    let block = builder.take().unwrap().unwrap();
+    if millis_on_wire {
+        // The builder writes raw timestamp counts and omits date_granularity.
+        // Append PrimitiveBlock field 18 as a varint with value 1 ms.
+        let mut block = block.to_vec();
+        block.extend_from_slice(&[0x90, 0x01, 0x01]);
+        writer.write_primitive_block(&block).unwrap();
+    } else {
+        writer.write_primitive_block(block).unwrap();
+    }
     writer.flush().unwrap();
+}
+
+/// Exercise the same millisecond fixture through every report renderer and
+/// through GeoJSON properties. An instant just before the epoch tests floor
+/// rounding, and one just after it tests zero padding.
+#[test]
+fn fractional_timestamps_in_inspect_and_export() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let temp = crate::common::test_scratch();
+    let input = temp.path().join("millis.osm.pbf");
+    write_timestamped_nodes(
+        &input,
+        &[
+            (1, -20_000_000, 30_000_000, -1),
+            (2, 40_000_000, -10_000_000, 7),
+        ],
+        true,
+    );
+    let first = "1969-12-31T23:59:59.999Z";
+    let last = "1970-01-01T00:00:00.007Z";
+
+    let inspect = || {
+        CliInvoker::new(&invocation_scratch)
+            .arg("inspect")
+            .arg(&input)
+            .arg("--extended")
+    };
+    let report = inspect().assert_success();
+    let stdout = report.stdout_str();
+    let timestamps = format!("Timestamps: {first} .. {last}");
+    assert!(stdout.lines().any(|line| line == timestamps), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line == "Data bbox:  -1,-2,3,4"),
+        "{stdout}"
+    );
+
+    let report = inspect().arg("--json").assert_success();
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(json["schema_version"], 5);
+    assert_eq!(json["data"]["timestamp"]["first"], first);
+    assert_eq!(json["data"]["timestamp"]["last"], last);
+    assert_eq!(
+        json["data"]["bbox"],
+        serde_json::json!([-1.0, -2.0, 3.0, 4.0])
+    );
+
+    for (key, expected) in [
+        ("data.timestamp.first", format!("{first}\n")),
+        ("data.timestamp.last", format!("{last}\n")),
+        ("data.bbox", "-1 -2 3 4\n".to_owned()),
+    ] {
+        assert_eq!(
+            inspect().args(["--get", key]).assert_success().stdout_str(),
+            expected,
+            "{key}"
+        );
+    }
+
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(&input)
+        .args(["--type", "node", "--metadata"])
+        .assert_success();
+    let exported = features(&output.stdout);
+    assert_eq!(exported.len(), 2);
+    for (feature, (id, timestamp)) in exported.iter().zip([(1, first), (2, last)]) {
+        assert_eq!(feature["properties"]["@id"], id);
+        assert_eq!(feature["properties"]["@timestamp"], timestamp);
+    }
+}
+
+#[test]
+fn metadata_timestamp_scaling_overflow_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let temp = crate::common::test_scratch();
+    let input = temp.path().join("overflow.osm.pbf");
+    // At the default 1000 ms granularity, unchecked scaling wraps to 1000 ms.
+    write_timestamped_nodes(&input, &[(5, 0, 0, (1_i64 << 61) + 1)], false);
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(&input)
+        .args(["--type", "node", "--metadata"])
+        .assert_failure()
+        .assert_stderr_contains("node 5")
+        .assert_stderr_contains("overflows i64 milliseconds");
 }
 
 /// `@timestamp` is RFC 3339: the last second of year 9999 is written, the
@@ -138,7 +234,7 @@ fn metadata_timestamp_beyond_year_9999_is_refused() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let temp = crate::common::test_scratch();
     let last = temp.path().join("last.pbf");
-    write_node_with_timestamp(&last, 253_402_300_799);
+    write_timestamped_nodes(&last, &[(5, 0, 0, 253_402_300_799)], false);
     let output = CliInvoker::new(&invocation_scratch)
         .arg("export")
         .arg(last.as_os_str())
@@ -151,7 +247,7 @@ fn metadata_timestamp_beyond_year_9999_is_refused() {
         "9999-12-31T23:59:59Z"
     );
     let beyond = temp.path().join("beyond.pbf");
-    write_node_with_timestamp(&beyond, 253_402_300_800);
+    write_timestamped_nodes(&beyond, &[(5, 0, 0, 253_402_300_800)], false);
     CliInvoker::new(&invocation_scratch)
         .arg("export")
         .arg(beyond.as_os_str())

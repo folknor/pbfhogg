@@ -112,25 +112,3 @@ judges such relations correctly; the comparison that records the false
 failure needs a refusal or a magnitude-collision model at the extract
 oracle boundary. No verified dataset holds negative IDs, so it has not
 fired.
-
-## VER-154 - Rendered timestamps and the export scaling refusal have no end-to-end test
-
-Reported by: the inspect/export timestamp-formatting work (2026-11-23),
-implementer and scout lateral.
-
-Timestamps now print as the floored second with an exact `.SSS` fraction
-when the instant is not whole (`format_epoch_millis` in
-`crates/lib/src/commands/mod.rs`, used by `inspect --extended` and
-`export --metadata`). The formatter, the presence rules and the year-9999
-export refusal are tested, but no test reads actual command output for a
-file with a non-default `date_granularity` (so sub-second timestamps
-exist): nothing asserts a fractional `Timestamps:` line in the text report,
-`data.timestamp.first`/`last` in inspect JSON, a `--get data.timestamp.*`
-value, the data bbox as rendered, or a fractional `@timestamp` in export.
-Nor does any test drive `export --metadata` on a timestamp whose scaling by
-`date_granularity` overflows 64-bit milliseconds, which the CLI reference
-says is refused naming the element. A wiring regression in any of these
-renderers would pass. A fixture block with granularity 1 and a few
-sub-second timestamps, run through `inspect --extended` (text, JSON, get)
-and `export --metadata`, plus one overflowing case for export, would cover
-them.

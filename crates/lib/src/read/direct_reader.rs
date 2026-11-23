@@ -123,11 +123,9 @@ pub struct DirectReader {
     align: usize,
     /// Whether we've hit EOF on the underlying fd.
     eof: bool,
-    /// File length captured once at open. Input files are read-only for the
-    /// reader's lifetime, so `skip` validates an aligned target against this
-    /// instead of paying an `fstat` per skip.
-    file_len: u64,
-    /// Where `fill` stops without a syscall: `file_len` for a regular file,
+    /// The refill cutoff: `fill` starting here or past it returns 0 without
+    /// a syscall (one starting below it may still return bytes past it,
+    /// should the file have grown). The length at open for a regular file,
     /// whose last read there would only re-read the final partial block to
     /// learn it is at the end, and unbounded otherwise (a non-regular
     /// file's metadata length says nothing about how much it serves). Block
@@ -162,8 +160,8 @@ impl DirectReader {
     /// Skip `n` bytes without materializing data.
     ///
     /// Discards any buffered bytes that overlap the skip range. A target past
-    /// the buffer at an aligned offset is checked against the length captured
-    /// at open and left for the next read. An unaligned one cannot start a
+    /// the buffer at an aligned offset is checked against the file's current
+    /// length (an `fstat`) and left for the next read. An unaligned one cannot start a
     /// direct read, so the buffer is refilled from the aligned offset below it
     /// and the read position lands at the target inside it; a target past the
     /// end of the file fails there.
@@ -187,17 +185,24 @@ impl DirectReader {
         let past_buf = n - buffered;
         let target = self.file_pos + past_buf;
         let aligned = target & !(self.align as u64 - 1);
-        self.buf.clear_for_fill();
 
         if aligned == target {
             // Validate the logical target now; the next read starts there.
-            if target > self.file_len {
+            // Against the file's length now, not at open: a payload
+            // truncated after open must not pass here and leave the next
+            // read at the target to report a clean end. One `fstat`, only
+            // for a target past the buffer that happens to be aligned. A
+            // failed `fstat` leaves the reader as it was.
+            let len = self.file.metadata()?.len().min(self.read_limit);
+            self.buf.clear_for_fill();
+            if target > len {
                 self.eof = true;
                 return Err(past_end());
             }
             self.file_pos = target;
             return Ok(());
         }
+        self.buf.clear_for_fill();
 
         // Fill from the aligned offset below the target until the buffer
         // reaches it. A short transfer is rebased by `fill_with`, not taken
@@ -332,9 +337,8 @@ impl DirectReader {
         let metadata = file.metadata().map_err(|e| {
             crate::Error::from(e).context(format!("failed to stat {}", path.display()))
         })?;
-        let file_len = metadata.len();
         let read_limit = if metadata.is_file() {
-            file_len
+            metadata.len()
         } else {
             u64::MAX
         };
@@ -344,7 +348,6 @@ impl DirectReader {
             buf,
             align,
             eof: false,
-            file_len,
             read_limit,
             file_pos: 0,
         })
@@ -1005,6 +1008,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_aligned_skip_past_a_truncation_after_open_is_unexpected_eof() {
+        // The payload is declared up to an aligned target, and the file is
+        // cut inside it after the reader opened: the skip must refuse, not
+        // land there for the next read to report a clean end.
+        let len = 3 * IO_BUF_BYTES;
+        let mut h = Harness::new(len, &[usize::MAX]);
+        h.read_exact(10).unwrap();
+        let cut = IO_BUF_BYTES + 5;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(h._dir.path().join("sequential.bin"))
+            .unwrap()
+            .set_len(cut as u64)
+            .unwrap();
+        h.fake.data.truncate(cut);
+        let err = h.skip(2 * IO_BUF_BYTES as u64 - 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // Up to the current end is still a skip that succeeds.
+        let mut h = Harness::new(len, &[usize::MAX]);
+        h.read_exact(10).unwrap();
+        h.skip(2 * IO_BUF_BYTES as u64 - 10).unwrap();
     }
 
     #[test]

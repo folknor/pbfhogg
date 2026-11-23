@@ -258,9 +258,14 @@ impl<'a> InputSource<'a> {
         invocation: Option<&crate::host::Recorder>,
     ) -> Result<(File, usize)> {
         match *self {
-            Self::Path(path) => {
-                crate::direct_io::open_for_read_verified(path, path, 0, |_| Ok(()), invocation)
-            }
+            Self::Path(path) => crate::direct_io::open_for_read_verified(
+                path,
+                path,
+                0,
+                |_| Ok(()),
+                |_| Ok(()),
+                invocation,
+            ),
             Self::Pinned(pin) => pin.open_direct(invocation),
         }
     }
@@ -323,7 +328,13 @@ impl<'a> InputSource<'a> {
 ///   the run stops rather than read some passes from each file. These opens
 ///   are non-blocking, so a FIFO put in the input's place cannot hang the
 ///   run, but the open itself still happens: a device put in its place
-///   sees the open before it is refused.
+///   sees the open before it is refused. An `O_DIRECT` open that the
+///   replacement makes fail (Linux refuses one on a FIFO, or on a
+///   filesystem without direct I/O, with `EINVAL`) yields no file to check,
+///   so the path is `stat`ed after the failure and another file there is
+///   refused as `InputReplaced` too, not as direct I/O being unavailable.
+///   That look comes after the failure and is best effort; an open failing
+///   any other way (`EACCES`, say) is the ordinary I/O error it is.
 ///
 /// Either way every descriptor is checked against the pin (`fstat`, device
 /// and inode) before it is returned, and its `O_NONBLOCK` is cleared again.
@@ -571,9 +582,31 @@ impl PinnedInput {
                 &self.0.path,
                 libc::O_NONBLOCK,
                 |file| self.verify(file),
+                |there| self.identify_refused(there),
                 invocation,
             )
         })
+    }
+
+    /// What a direct open refused with `EINVAL` or `EOPNOTSUPP` found at
+    /// `open_path`: [`ErrorKind::InputReplaced`](crate::ErrorKind::InputReplaced)
+    /// when a `stat` there (following links, as the open did) shows another
+    /// file, so a FIFO or a file on a filesystem without direct I/O put in
+    /// the input's place is not reported as the platform refusing direct
+    /// I/O. The pinned file, or a failed `stat`, keeps the open's own
+    /// refusal. Through `/proc/self/fd` the `stat` reaches the pinned file
+    /// itself, so there the refusal is always the platform's.
+    #[cfg(all(unix, feature = "linux-direct-io"))]
+    fn identify_refused(&self, open_path: &Path) -> Result<()> {
+        // A metadata look, not an open: nothing put in the input's place
+        // sees a second open.
+        #[allow(clippy::disallowed_methods)]
+        match std::fs::metadata(open_path) {
+            Ok(meta) if identity_of(&meta) != self.0.identity => {
+                Err(crate::error::new_input_replaced(&self.0.path))
+            }
+            _ => Ok(()),
+        }
     }
 
     #[cfg(unix)]
@@ -952,6 +985,25 @@ mod pin_tests {
                 .err()
                 .unwrap();
         assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
+    }
+
+    /// A FIFO put in the input's place fails the direct open itself with
+    /// `EINVAL`, before there is a file to verify; it is still the
+    /// replacement, not direct I/O being unavailable.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn path_reopen_refuses_a_fifo_replacement_of_a_direct_open() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = crate::path_guard::tests::scratch();
+        let (input, _) = fixture(dir.path());
+        let pin = PinnedInput::pin_with(&input, &Host::for_tests().entered(), true).unwrap();
+        std::fs::remove_file(&input).unwrap();
+        let c_path = std::ffi::CString::new(input.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = pin.open_direct(None).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
+        assert_eq!(err.source_path(), Some(input.as_path()));
     }
 
     /// Every later open is a description of its own (own offset), and none

@@ -190,7 +190,7 @@ mod imp {
     /// failure is an ordinary I/O error the caller names.
     #[cfg(feature = "linux-direct-io")]
     pub(crate) fn open_for_read(path: &Path) -> Result<(File, usize)> {
-        open_for_read_verified(path, path, 0, |_| Ok(()), None)
+        open_for_read_verified(path, path, 0, |_| Ok(()), |_| Ok(()), None)
     }
 
     /// [`open_for_read`] of `open_path` with `extra_flags` added to
@@ -200,12 +200,26 @@ mod imp {
     /// alignment refusal a different file could earn. Failures name
     /// `display`, never `open_path` (a pinned input reopens through
     /// `/proc/self/fd`).
+    ///
+    /// An open refused with `EINVAL` or `EOPNOTSUPP` produces no file to
+    /// verify, yet that is also how Linux refuses `O_DIRECT` on a FIFO or a
+    /// file on a filesystem without direct I/O put in the expected file's
+    /// place. So before such a refusal is reported as the platform's,
+    /// `identify_refused` is handed `open_path` to look at what is there now
+    /// and return the error a different file earns. It is a look after the
+    /// failure, so best effort: a replacement gone again before the look is
+    /// missed, and one arriving after the failed open is blamed for it. Its
+    /// `Ok` keeps the platform refusal. Fixing the order instead (a buffered
+    /// open, verified, then `O_DIRECT` set by `fcntl`) is not equivalent:
+    /// overlayfs and FUSE decide direct I/O at open, so a flag set later can
+    /// pass and fail only at the first read.
     #[cfg(feature = "linux-direct-io")]
     pub(crate) fn open_for_read_verified(
         open_path: &Path,
         display: &Path,
         extra_flags: i32,
         verify: impl FnOnce(&File) -> Result<()>,
+        identify_refused: impl FnOnce(&Path) -> Result<()>,
         invocation: Option<&crate::host::Recorder>,
     ) -> Result<(File, usize)> {
         #[allow(clippy::disallowed_methods)]
@@ -213,7 +227,15 @@ mod imp {
             .read(true)
             .custom_flags(libc::O_DIRECT | extra_flags)
             .open(open_path);
-        let file = opened.map_err(|e| crate::error::direct_io_open_error_at(display, e))?;
+        let file = match opened {
+            Ok(file) => file,
+            Err(e) => {
+                if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+                    identify_refused(open_path)?;
+                }
+                return Err(crate::error::direct_io_open_error_at(display, e));
+            }
+        };
         verify(&file)?;
         let align = resolve(observed(query(&file, Access::Read), invocation))
             .map_err(|r| refusal(Some(display), r))?;
@@ -430,8 +452,15 @@ mod tests {
         };
         assert_ne!(flags(&written) & libc::O_DIRECT, 0, "write open");
         drop(written);
-        let (read, _) =
-            super::imp::open_for_read_verified(&path, &path, 0, |_| Ok(()), Some(&call)).unwrap();
+        let (read, _) = super::imp::open_for_read_verified(
+            &path,
+            &path,
+            0,
+            |_| Ok(()),
+            |_| Ok(()),
+            Some(&call),
+        )
+        .unwrap();
         assert_ne!(flags(&read) & libc::O_DIRECT, 0, "read open");
         let (unbound, _) = super::imp::open_for_read(&path).unwrap();
         assert_ne!(flags(&unbound) & libc::O_DIRECT, 0, "unbound read open");

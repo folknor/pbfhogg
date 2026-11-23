@@ -808,7 +808,13 @@ its start, and every later open of it is an `InputSource::Pinned` open:
 - Otherwise each open goes through the path, non-blocking, and an open that
   finds a different file there (device and inode) fails the run with
   `ErrorKind::InputReplaced` instead of mixing files. A device put in the
-  input's place still sees that open before it is refused.
+  input's place still sees that open before it is refused. An `O_DIRECT`
+  open that a replacement makes fail with `EINVAL` or `EOPNOTSUPP` (a FIFO,
+  or a file on a filesystem without direct I/O) leaves nothing to check, so
+  the path is `stat`ed after the failure and a different file there is
+  `InputReplaced`, not a direct-io platform refusal (exit 3). That look is
+  best effort: it follows the failure, so a replacement already undone is
+  missed. Any other open failure stays an ordinary I/O error.
 
 What a pin does not catch: a change behind the same file (an in-place
 rewrite or truncation), and a replacement before the pin is taken. Only a

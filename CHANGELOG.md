@@ -670,6 +670,16 @@
   stayed in the page cache. Every PBF input read is now direct; the OSC
   read stays buffered. Planet apply-changes wall is unchanged.
 
+- **A `--direct-io` input replaced mid-run by a FIFO, or by a file on a
+  filesystem without direct I/O, fails as a replaced input, not exit 3.**
+  Where inputs reopen through their path (no usable `/proc/self/fd`), the
+  refused `O_DIRECT` open was reported as direct I/O being unavailable.
+
+- **An O_DIRECT read refuses a blob payload cut after the input was
+  opened, when the payload ends on an aligned offset.** The skip checked
+  the length captured at open, so the walk could end cleanly short of the
+  declared payload.
+
 - **`merge-changes` and `tags-filter --input-kind osc` accept a hidden node
   without coordinates.** A `<create>` or `<modify>` node with
   `visible="false"` (an OSM deleted version, which carries no location)

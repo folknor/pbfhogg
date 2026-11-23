@@ -330,7 +330,11 @@ impl Positional for crate::read::direct_reader::DirectPositional {
 /// The extent is captured at open, and bytes already read into the window are
 /// retained: a file that shrank after open fails the next `pread` inside the
 /// captured extent (`UnexpectedEof`, an error) rather than reading as a
-/// shorter file, but headers a window already holds are served from it. Only
+/// shorter file, but headers a window already holds are served from it, and
+/// there may be no next `pread` at all: a skip across a final payload cut
+/// after open reaches the captured end, which is the clean tail. A file
+/// changed in place during the walk is outside the truncation contract
+/// (`reference/truncation-handling.md`, Stance). Only
 /// a captured remainder of 0-3 bytes at a frame boundary is the clean tail,
 /// and it is recognised without reading it, window or not.
 ///

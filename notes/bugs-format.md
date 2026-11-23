@@ -58,35 +58,17 @@ compressed-byte budget. The sizes are derived from the representation, not
 measured. Keeping the guarantee would need admission that accounts for decoded
 storage, tables and worker scratch.
 
-## FMT-010 - A replaced pinned input can surface as PlatformUnsupported
+## FMT-029 - The frame conformance matrix has no O_DIRECT FileReader source
 
-Reported by: read-pipeline [P2].
+Reported by: implementer of the pinned direct-open and aligned-skip fixes.
 
-`PinnedInput` (`read/input.rs`) promises `InputReplaced` when its fallback path
-reopen meets a different file, including a FIFO. The direct reopen adds
-`O_DIRECT` before identity verification, and `open_for_read_verified`
-(`direct_io.rs`) classifies an open failure before it runs `verify`. With
-procfs reopening unavailable, replace the pinned path with a FIFO. The direct
-open fails with `EINVAL` and becomes `PlatformUnsupported` instead of
-`InputReplaced`. A replacement on a filesystem that refuses direct I/O behaves
-the same way. This changes the typed failure and the CLI exit classification.
-The fault is in classifying backend setup failure before establishing which
-input it concerned.
-
-## FMT-011 - An aligned direct skip validates against the length captured at open
-
-Reported by: read-pipeline [P2].
-
-`DirectReader::skip_with` (`read/direct_reader.rs`) checks an aligned target
-only against the length captured at open. Read a BlobHeader whose payload
-extends past the current buffer, then truncate the file inside that payload.
-If the declared end is aligned, the skip succeeds against the stale length,
-the next read returns zero, and the frame walk can report a clean EOF. This
-breaks the unconditional shape-4 refusal and source-equivalence claims in
-`reference/truncation-handling.md`. Pinning's documented lack of snapshot
-isolation does not establish that a declared payload still exists. The hunter
-says either the skip needs a current-extent check or the documentation must
-limit the guarantee to immutable inputs.
+`reference/truncation-handling.md` says the full matrix, every truncation shape
+through every source, is `read/frame_conformance_tests.rs`. Its `Source` enum
+drives buffered `FileReader`, `BlobReader` and both header walkers, but no
+frame walk over `FileReader::Direct`, so `DirectReader::skip` (both its
+aligned and unaligned branches) is outside the matrix the document cites. Only
+the reader's own unit tests cover it. A direct source, skipping where the
+platform refuses O_DIRECT, would make the claim true.
 
 ## FMT-012 - pipeline_decode_tasks counts blobs that are never decompressed
 

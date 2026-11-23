@@ -28,6 +28,22 @@ bytes or 1-3 leftover bytes of an incomplete next length prefix.
 That shape is the natural signal of "end of input" and is
 tolerated.
 
+All of this is about an input that does not change while it is
+read: the file's content as it stands. An input truncated or
+rewritten in place during the read is outside it (an input pin
+catches a replaced file, not a change behind the same one; see
+`reference/pipeline.md`). Each source applies the frame policy to the
+bytes and the extent it observes, and they observe differently, so a
+concurrent change can give source-dependent outcomes, a clean end
+included. The pread walker is the plain case: it validates a payload
+skip against the size it captured at `open()`, so with the last
+frame's header read and its payload truncated afterwards, the skip
+reaches the captured end and the walk finishes through the clean-tail
+branch without another read. `DirectReader::skip` does check an
+aligned target against the file's current length, and its other skips
+read, so the cut in that example is refused there; that narrows the
+window but is no snapshot either.
+
 ## Header position and declared size
 
 Every reader rejects an OSMHeader frame after the first frame, before
@@ -147,10 +163,12 @@ the payload with `BlobReaderSource::skip_relative` (which keeps a
 past the end succeeds and only a read can tell; a `FileReader` skips
 through `FileReader::skip` (the same for buffered input,
 `DirectReader::skip` for O_DIRECT, which validates its target
-itself); and the pread walker compares the payload extent against
-the file size it captured at `open()`.
+itself, an aligned one against the file's length at that moment);
+and the pread walker compares the payload extent against the file
+size it captured at `open()`.
 
-The sources agree on every frame-layer outcome and report it in the
+On an input that does not change during the walk (see the Stance),
+the sources agree on every frame-layer outcome and report it in the
 same words at the same location. The full matrix, every truncation
 shape and size guard through every source, is
 `crates/lib/src/read/frame_conformance_tests.rs`, one expectation per case,
@@ -208,7 +226,8 @@ only when the skip would pass EOF, because a seek past EOF succeeds
 and only the read can tell. A zero-byte skip returns without
 reading. `FileReader::skip` over an O_DIRECT file does not use a
 sentinel: `DirectReader::skip` validates the target against EOF
-itself.
+itself, by reading for an unaligned target and by an `fstat` for an
+aligned one.
 
 Commands that consume `BlobReader` / `ElementReader` inherit the contract
 automatically: an `Err` from

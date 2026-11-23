@@ -4,7 +4,24 @@
 
 ### Breaking
 
-- **`inspect --json` is `schema_version` 3: `elements.tagged_nodes` is
+- **`inspect --json` is `schema_version` 4: `id_ranges.<type>.monotonic`
+  is `null` when the index-only report cannot decide it.** A blob's
+  claimed ID range does not say in what order the blob holds its IDs, yet
+  the index-only `--id-ranges` report answered `yes` whenever consecutive
+  ranges ascended, so a file unsorted inside a blob, or holding negative
+  IDs, read as monotonic until decoded. It now says `no` where the claims
+  prove descent, `yes` only when every blob claims one element, and
+  `unknown` (`null`) otherwise; `--distrust-metadata` decodes and answers.
+
+- **`inspect --extended` judges `data.objects_ordered` (`Ordered:`) by
+  canonical OSM order over the element stream.** It compared IDs signed
+  numerically, so a file `sort` wrote with negative IDs read as unordered,
+  and it took any mixed-kind block for disorder, so a block holding a node
+  group then a way group read as unordered. It now says whether the
+  decoded elements strictly ascend by type and then canonical ID, the
+  order `check --ids` accepts.
+
+- **`inspect --json` was `schema_version` 3: `elements.tagged_nodes` is
   `null` when unmeasured.** The default index-only path never counted
   tagged nodes (indexdata has no tag count) yet published `0`, so an
   indexed file with tagged nodes read as having none. It is now `null`

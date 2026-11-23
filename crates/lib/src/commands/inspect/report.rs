@@ -391,7 +391,11 @@ impl InspectReport {
                     label,
                     format_number_signed(ids.min_id),
                     format_number_signed(ids.max_id),
-                    if ids.monotonic { "yes" } else { "no" }
+                    match ids.monotonic() {
+                        Some(true) => "yes",
+                        Some(false) => "no",
+                        None => "unknown",
+                    }
                 )?;
             }
         }

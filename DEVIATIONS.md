@@ -725,8 +725,11 @@ are one key to them; the paragraphs below name them.
 renumbers a negative ID by its signed value. `diff` and `diff --format osc`
 order and cut by canonical keys (`crates/lib/src/commands/diff/units.rs`),
 `sort` and `cat --dedupe` order canonically, and `inspect --show` takes
-signed query IDs. (`inspect --extended`'s `objects_ordered` still judges
-order numerically, a known defect.) Per command:
+signed query IDs. `inspect --extended`'s `objects_ordered` judges
+canonical order like `osmium fileinfo`, except that a repeated ID within a
+kind is unordered here, where fileinfo reports it as ordered with
+`multiple_versions`; `inspect --id-ranges` monotonicity is a numeric report
+field. Per command:
 
 **renumber numbers live objects as osmium does.** It renumbers negative
 node, way and relation IDs, refs and members by canonical rank, as osmium's

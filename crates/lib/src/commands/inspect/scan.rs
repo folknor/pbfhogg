@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use super::super::Result;
-use super::types::{BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState};
+use super::types::{
+    BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, ScanState, TypeIdRange,
+};
 #[cfg(test)]
 use super::types::{UserNames, classify_block, update_extended_for_element};
 use crate::ElementKind;
@@ -430,22 +432,18 @@ fn full_decode_scan(
     // answer as the index-only walk and the first-data-blob probe.
     let is_indexed = indexed_blobs == total_data_blobs;
 
-    // Compute objects_ordered from the block-kind order + ID monotonicity.
+    // objects_ordered: the decoded element stream strictly ascends by kind,
+    // then canonical ID. Kinds never stepping back plus each kind's IDs
+    // ascending canonically is exactly that, an equal ID within a kind
+    // included as a violation. The block layout (`ordering.standard`) is a
+    // different question: a block holding a node group then a way group is
+    // a mixed segment there and in order here.
     if let Some(ref mut ext) = state.extended {
-        let type_ordered = accum.ordering.is_standard();
-        let ids_monotonic = state
-            .node_ids
-            .as_ref()
-            .is_none_or(|r| !r.has_data() || r.monotonic)
-            && state
-                .way_ids
-                .as_ref()
-                .is_none_or(|r| !r.has_data() || r.monotonic)
-            && state
-                .relation_ids
-                .as_ref()
-                .is_none_or(|r| !r.has_data() || r.monotonic);
-        ext.objects_ordered = type_ordered && ids_monotonic;
+        let ids_canonical = [&state.node_ids, &state.way_ids, &state.relation_ids]
+            .into_iter()
+            .flatten()
+            .all(TypeIdRange::canonical);
+        ext.objects_ordered = state.kind_order.is_ordered() && ids_canonical;
         // `--extended` always decodes, so these ranges are the elements'
         // own IDs, never an indexdata claim.
         ext.has_negative_ids = [&state.node_ids, &state.way_ids, &state.relation_ids]

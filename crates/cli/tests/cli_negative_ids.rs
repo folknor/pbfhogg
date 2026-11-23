@@ -48,7 +48,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::common::mixed_sign::{
-    Layout, MixedSignGraph, Relabel, changed_graph, dangling_graph, mixed_sign_graph, osc_between,
+    Layout, MIXED_SIGN_BLOCK, MixedSignGraph, Relabel, changed_graph, dangling_graph,
+    mixed_sign_graph, osc_between,
 };
 use crate::common::model::MemberKind;
 use crate::common::{NormalizedElement, TestNode, TestRelation, TestWay, read_in_file_order};
@@ -300,6 +301,10 @@ impl Case {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the registry holds no known gap today; a newly found one is marked with it"
+    )]
     fn gaps(self, gaps: Vec<Gap>) -> Self {
         Self { gaps, ..self }
     }
@@ -315,6 +320,10 @@ struct Gap {
     reason: &'static str,
 }
 
+#[allow(
+    dead_code,
+    reason = "the registry holds no known gap today; a newly found one is marked with it"
+)]
 const fn gap(check: &'static str, framing: Option<Framing>, sig: Sig, reason: &'static str) -> Gap {
     Gap {
         check,
@@ -326,6 +335,10 @@ const fn gap(check: &'static str, framing: Option<Framing>, sig: Sig, reason: &'
 }
 
 /// The exact wrong observation a gap expects.
+#[allow(
+    dead_code,
+    reason = "the registry holds no known gap today; a newly found one is marked with it"
+)]
 enum Sig {
     /// The element tokens missing from and extra in the result, exactly.
     Tokens {
@@ -2402,9 +2415,34 @@ fn altw_true_miss_refused() -> Case {
 // inspect
 // ---------------------------------------------------------------------------
 
+/// What the index-only report may say of numeric ascent from the claims
+/// of `ids` written [`MIXED_SIGN_BLOCK`] to a blob: descent where a blob's
+/// minimum does not exceed the previous maximum or a blob claims more
+/// elements than its range holds IDs, ascent only when every blob holds
+/// one element, otherwise nothing (JSON `null`).
+fn claimed_ascent(ids: &[i64]) -> serde_json::Value {
+    let mut undecided = false;
+    let mut prev_max: Option<i64> = None;
+    for blob in ids.chunks(MIXED_SIGN_BLOCK) {
+        let (min, max) = (*blob.iter().min().unwrap(), *blob.iter().max().unwrap());
+        let span = i128::from(max) - i128::from(min) + 1;
+        if blob.len() as i128 > span || prev_max.is_some_and(|p| min <= p) {
+            return false.into();
+        }
+        undecided |= blob.len() > 1;
+        prev_max = Some(max);
+    }
+    if undecided {
+        serde_json::Value::Null
+    } else {
+        true.into()
+    }
+}
+
 /// Counts and numeric ID extrema, judged against the arm's own graph; the
 /// ranges' monotonicity is numeric, so the mixed graph's canonical order is
-/// not monotonic there while its twin's is.
+/// not monotonic there while its twin's is. The index-only report says only
+/// what the blobs' claimed ranges prove ([`claimed_ascent`]).
 fn inspect_report() -> Case {
     Case::both(
         BOTH,
@@ -2425,12 +2463,16 @@ fn inspect_report() -> Case {
             let mut got = Vec::new();
             for (kind, ids) in &kinds {
                 let range = &v["id_ranges"][kind];
+                let monotonic = if o.framing.indexed() {
+                    claimed_ascent(ids)
+                } else {
+                    ids.is_sorted_by(|a, b| a < b).into()
+                };
                 want.push(format!(
-                    "{kind} {} {} {} {}",
+                    "{kind} {} {} {} {monotonic}",
                     ids.len(),
                     ids.iter().min().unwrap(),
                     ids.iter().max().unwrap(),
-                    ids.is_sorted_by(|a, b| a < b)
                 ));
                 got.push(format!(
                     "{kind} {} {} {} {}",
@@ -2441,20 +2483,11 @@ fn inspect_report() -> Case {
             findings
         },
     )
-    .gaps(vec![gap(
-        "report",
-        Some(Framing::Indexed),
-        Sig::Tokens {
-            missing: &["relations 6 -7 11 false"],
-            extra: &["relations 6 -7 11 true"],
-        },
-        "the index-only report judges monotonicity on blob ID ranges, which cannot \
-         see the numeric descent inside the relation blob [-1, -7, 1]",
-    )])
 }
 
-/// The full-decode report counts every element of every kind, and says
-/// whether any element ID is negative.
+/// The full-decode report counts every element of every kind, says
+/// whether any element ID is negative, and finds the graph, written in
+/// canonical order, ordered (`data.objects_ordered`).
 fn inspect_extended() -> Case {
     Case::both(
         BOTH,
@@ -2467,7 +2500,7 @@ fn inspect_extended() -> Case {
             let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
             let g = w.base();
             let want = vec![format!(
-                "{} {} {} {}",
+                "{} {} {} {} true",
                 g.nodes.len(),
                 g.ways.len(),
                 g.relations.len(),
@@ -2475,8 +2508,12 @@ fn inspect_extended() -> Case {
             )];
             let e = &v["elements"];
             let got = vec![format!(
-                "{} {} {} {}",
-                e["nodes"], e["ways"], e["relations"], v["data"]["has_negative_ids"]
+                "{} {} {} {} {}",
+                e["nodes"],
+                e["ways"],
+                e["relations"],
+                v["data"]["has_negative_ids"],
+                v["data"]["objects_ordered"]
             )];
             findings.extend(compare("counts", &want, &got, false));
             findings

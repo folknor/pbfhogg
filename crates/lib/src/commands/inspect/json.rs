@@ -62,7 +62,7 @@ impl InspectReport {
             .collect();
 
         let mut json = serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "file": self.file_name,
             "file_size": self.file_size,
             "header": header,
@@ -114,7 +114,7 @@ fn type_stats_json(ts: &TypeStats) -> serde_json::Value {
 #[cfg(feature = "commands")]
 fn id_range_json(r: &TypeIdRange) -> serde_json::Value {
     if r.has_data() {
-        serde_json::json!({ "min": r.min_id, "max": r.max_id, "monotonic": r.monotonic, "count": r.count })
+        serde_json::json!({ "min": r.min_id, "max": r.max_id, "monotonic": r.monotonic(), "count": r.count })
     } else {
         serde_json::Value::Null
     }

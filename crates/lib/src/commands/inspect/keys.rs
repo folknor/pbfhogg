@@ -44,7 +44,8 @@ pub enum InspectGetKeyKind {
     ElementsRelations,
     /// The total number of elements.
     ElementsTotal,
-    /// Whether the elements follow standard ordering.
+    /// Whether the decoded elements strictly ascend by kind, then canonical
+    /// OSM ID.
     DataObjectsOrdered,
     /// Whether some decoded element ID is negative.
     DataHasNegativeIds,

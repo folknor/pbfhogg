@@ -197,10 +197,26 @@ pub(super) struct BlockInfo {
 // ID range per element type (--id-ranges)
 // ---------------------------------------------------------------------------
 
+/// One kind's IDs: numeric extrema, and two ascent verdicts over the IDs in
+/// element order. `numeric` is the `--id-ranges` report field, strict
+/// signed ascent (ADR-0028 keeps report fields named numeric numeric);
+/// `canonical` is strict ascent in canonical OSM order (`osm_id`), which is
+/// what `data.objects_ordered` claims. Neither stands in for the other once
+/// an ID is negative: `-1, -2` ascends canonically only, `-2, -1`
+/// numerically only.
 pub(super) struct TypeIdRange {
     pub(super) min_id: i64,
     pub(super) max_id: i64,
-    pub(super) monotonic: bool,
+    numeric: bool,
+    canonical: bool,
+    /// Set by the index-only route when the claims cannot decide numeric
+    /// ascent: a blob claiming more than one element can hold its IDs in
+    /// any order under the same extrema and count, and a claim no
+    /// non-empty payload can have proves nothing.
+    undecided: bool,
+    /// Index-only route: some blob's claims placed elements, so `prev_id`
+    /// is a real boundary.
+    placed: bool,
     /// The first ID seen (meaningful once `count > 0`).
     first_id: i64,
     /// The last ID seen.
@@ -213,7 +229,10 @@ impl TypeIdRange {
         Self {
             min_id: i64::MAX,
             max_id: i64::MIN,
-            monotonic: true,
+            numeric: true,
+            canonical: true,
+            undecided: false,
+            placed: false,
             first_id: i64::MIN,
             prev_id: i64::MIN,
             count: 0,
@@ -227,34 +246,71 @@ impl TypeIdRange {
         if id > self.max_id {
             self.max_id = id;
         }
-        if self.count > 0 && id <= self.prev_id {
-            self.monotonic = false;
-        }
-        if self.count == 0 {
+        if self.count > 0 {
+            self.numeric &= id > self.prev_id;
+            self.canonical &= !crate::osm_id::osm_id_le(id, self.prev_id);
+        } else {
             self.first_id = id;
         }
         self.prev_id = id;
         self.count += 1;
     }
 
-    /// Update from a blob's aggregated ID range (index-only mode).
-    /// Monotonicity is checked at inter-blob granularity: each blob's min_id
-    /// must exceed the previous blob's max_id for the same element type.
+    /// Update from a blob's claimed ID range (index-only mode). The claims
+    /// prove numeric descent when a blob's minimum does not exceed the
+    /// previous blob's maximum (both are elements, in that order), or when
+    /// a blob claims more elements than its range holds IDs (one repeats).
+    /// They prove ascent only when every blob claims a single element, so
+    /// any other blob leaves the answer undecided unless descent is proven.
+    /// The canonical verdict is never read on this route.
     pub(super) fn update_from_blob(&mut self, blob_min: i64, blob_max: i64, blob_count: u64) {
-        if blob_min < self.min_id {
-            self.min_id = blob_min;
+        if blob_count == 0 {
+            // No element, so no position: the previous blob's maximum stays
+            // the boundary.
+            return;
         }
-        if blob_max > self.max_id {
-            self.max_id = blob_max;
+        self.min_id = self.min_id.min(blob_min);
+        self.max_id = self.max_id.max(blob_max);
+        let span = i128::from(blob_max) - i128::from(blob_min) + 1;
+        if span <= 0 || (blob_count == 1 && blob_min != blob_max) {
+            // No payload has these claims, so they place no element: the
+            // verdict is undecided and the boundary stays where it was.
+            self.undecided = true;
+            self.count += blob_count;
+            return;
         }
-        if self.count > 0 && blob_min <= self.prev_id {
-            self.monotonic = false;
+        if i128::from(blob_count) > span {
+            self.numeric = false;
+        } else if blob_count > 1 {
+            self.undecided = true;
         }
-        if self.count == 0 {
+        if self.placed && blob_min <= self.prev_id {
+            self.numeric = false;
+        }
+        if !self.placed {
             self.first_id = blob_min;
+            self.placed = true;
         }
         self.prev_id = blob_max;
         self.count += blob_count;
+    }
+
+    /// Whether the IDs strictly ascend numerically: `None` when the route
+    /// that built the range could not decide (index-only claims).
+    pub(super) fn monotonic(&self) -> Option<bool> {
+        if !self.numeric {
+            Some(false)
+        } else if self.undecided {
+            None
+        } else {
+            Some(true)
+        }
+    }
+
+    /// Whether the IDs strictly ascend in canonical OSM order. Decoded
+    /// routes only.
+    pub(super) fn canonical(&self) -> bool {
+        self.canonical
     }
 
     pub(super) fn has_data(&self) -> bool {
@@ -271,24 +327,84 @@ impl TypeIdRange {
     /// (the next data blob's, in file order). Exactly what feeding `part`'s
     /// IDs one by one through [`Self::update`] gives: an empty `part` leaves
     /// the boundary where it was, and a `part` whose first ID does not
-    /// exceed the last ID so far breaks monotonicity.
+    /// exceed the last ID so far breaks each ascent it does not follow.
     pub(super) fn append(&mut self, part: &TypeIdRange) {
         if part.count == 0 {
             return;
         }
-        if self.count > 0 && part.first_id <= self.prev_id {
-            self.monotonic = false;
-        }
-        // An empty range takes the part's first ID, so a range built by
-        // appending can itself be appended (a group's parts into a blob's).
-        if self.count == 0 {
+        if self.count > 0 {
+            self.numeric &= part.first_id > self.prev_id;
+            self.canonical &= !crate::osm_id::osm_id_le(part.first_id, self.prev_id);
+        } else {
+            // An empty range takes the part's first ID, so a range built by
+            // appending can itself be appended (a group's parts into a
+            // blob's).
             self.first_id = part.first_id;
         }
-        self.monotonic &= part.monotonic;
+        self.numeric &= part.numeric;
+        self.canonical &= part.canonical;
+        self.undecided |= part.undecided;
         self.min_id = self.min_id.min(part.min_id);
         self.max_id = self.max_id.max(part.max_id);
         self.prev_id = part.prev_id;
         self.count += part.count;
+    }
+}
+
+/// Whether the decoded element stream's kinds never step back (nodes, then
+/// ways, then relations), judged group by group. The element readers yield
+/// a group's dense nodes, plain nodes, ways, then relations, so a group is
+/// kind-ordered on its own and its first and last kinds are its lowest and
+/// highest present ones; an empty group is neutral. This is the element
+/// order `data.objects_ordered` reads, not the block layout
+/// [`OrderingSummary`] reports: a block holding a node group then a way
+/// group is in order here and a mixed segment there.
+#[derive(Clone, Copy)]
+pub(super) struct KindOrder {
+    first: Option<ElementKind>,
+    last: Option<ElementKind>,
+    ordered: bool,
+}
+
+impl KindOrder {
+    pub(super) fn new() -> Self {
+        Self {
+            first: None,
+            last: None,
+            ordered: true,
+        }
+    }
+
+    /// One validated group, by the kinds of the elements it holds.
+    pub(super) fn group(&mut self, kinds: crate::element_kind::ElementKindSet) {
+        let mut present = kinds.iter();
+        let Some(low) = present.next() else {
+            return;
+        };
+        let high = present.last().unwrap_or(low);
+        self.append(&Self {
+            first: Some(low),
+            last: Some(high),
+            ordered: true,
+        });
+    }
+
+    /// Append `part`, the kinds of the elements that follow.
+    pub(super) fn append(&mut self, part: &KindOrder) {
+        let Some(part_first) = part.first else {
+            return;
+        };
+        if let Some(last) = self.last {
+            self.ordered &= last <= part_first;
+        } else {
+            self.first = Some(part_first);
+        }
+        self.ordered &= part.ordered;
+        self.last = part.last;
+    }
+
+    pub(super) fn is_ordered(&self) -> bool {
+        self.ordered
     }
 }
 
@@ -449,6 +565,8 @@ pub(super) struct ScanState {
     pub(super) relation_ids: Option<TypeIdRange>,
     pub(super) loc_stats: Option<LocationStats>,
     pub(super) extended: Option<ExtendedStats>,
+    /// The decoded element stream's kind order, for `data.objects_ordered`.
+    pub(super) kind_order: KindOrder,
 }
 
 impl ScanState {
@@ -488,6 +606,7 @@ impl ScanState {
             } else {
                 None
             },
+            kind_order: KindOrder::new(),
         }
     }
 
@@ -499,6 +618,7 @@ impl ScanState {
         self.tagged_node_count += part.tagged_node_count;
         self.way_count += part.way_count;
         self.relation_count += part.relation_count;
+        self.kind_order.append(&part.kind_order);
         for (acc, p) in [
             (&mut self.node_ids, &part.node_ids),
             (&mut self.way_ids, &part.way_ids),
@@ -998,7 +1118,9 @@ mod census_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, OrderingSummary, TypeIdRange};
+    use super::{
+        BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, KindOrder, OrderingSummary, TypeIdRange,
+    };
 
     #[test]
     fn empty_blobs_are_neutral_and_reported_as_anomalies() {
@@ -1054,8 +1176,114 @@ mod tests {
         }
     }
 
-    fn fields(r: &TypeIdRange) -> (i64, i64, bool, i64, u64) {
-        (r.min_id, r.max_id, r.monotonic, r.prev_id, r.count)
+    fn fields(r: &TypeIdRange) -> (i64, i64, Option<bool>, bool, i64, u64) {
+        (
+            r.min_id,
+            r.max_id,
+            r.monotonic(),
+            r.canonical(),
+            r.prev_id,
+            r.count,
+        )
+    }
+
+    /// The two decoded verdicts part ways exactly where negative IDs make
+    /// numeric and canonical order differ; an equal ID fails both.
+    #[test]
+    fn numeric_and_canonical_ascent_are_judged_apart() {
+        let verdict = |ids: &[i64]| {
+            let mut r = TypeIdRange::new();
+            for &id in ids {
+                r.update(id);
+            }
+            (r.monotonic(), r.canonical())
+        };
+        assert_eq!(verdict(&[0, -1, -2, 1]), (Some(false), true));
+        assert_eq!(verdict(&[-2, -1]), (Some(true), false));
+        assert_eq!(verdict(&[-1, -1]), (Some(false), false));
+        assert_eq!(verdict(&[1, 2, 3]), (Some(true), true));
+        assert_eq!(verdict(&[3, 2]), (Some(false), false));
+    }
+
+    /// The index-only verdict says only what the claims prove: descent from
+    /// overlapping ranges or a count no range can hold, ascent only when
+    /// every blob claims one element, unknown otherwise.
+    #[test]
+    fn claimed_ranges_decide_only_what_they_prove() {
+        let verdict = |blobs: &[(i64, i64, u64)]| {
+            let mut r = TypeIdRange::new();
+            for &(min, max, count) in blobs {
+                r.update_from_blob(min, max, count);
+            }
+            r.monotonic()
+        };
+        assert_eq!(verdict(&[(1, 1, 1), (3, 3, 1)]), Some(true));
+        assert_eq!(verdict(&[(-1, 1, 3), (7, 11, 3)]), None);
+        assert_eq!(verdict(&[(1, 5, 3), (5, 9, 3)]), Some(false));
+        assert_eq!(verdict(&[(7, 7, 2)]), Some(false));
+        assert_eq!(verdict(&[(9, 9, 1), (0, 0, 0), (7, 7, 1)]), Some(false));
+        // A claim no payload has proves nothing and places no element.
+        assert_eq!(verdict(&[(1, 1, 1), (2, 9, 1), (3, 3, 1)]), None);
+        assert_eq!(
+            verdict(&[(i64::MIN, i64::MIN, 1), (i64::MIN, i64::MIN, 1)]),
+            Some(false)
+        );
+        assert_eq!(verdict(&[(i64::MIN, i64::MAX, 3)]), None);
+    }
+
+    /// Kind order is judged over groups: a group's kinds are in order, an
+    /// empty group is neutral, and appending blob summaries equals one
+    /// serial pass over their groups.
+    #[test]
+    fn kind_order_follows_groups_and_appends_serially() {
+        use crate::ElementKind::{Node, Relation, Way};
+        use crate::element_kind::ElementKindSet;
+        let set = |kinds: &[crate::ElementKind]| {
+            let mut s = ElementKindSet::default();
+            for &k in kinds {
+                s.add(k);
+            }
+            s
+        };
+        let groups: [&[&[crate::ElementKind]]; 5] = [
+            &[&[Node], &[Way], &[Relation]],
+            &[&[Node, Way], &[], &[Way, Relation]],
+            &[&[Way], &[Node]],
+            &[&[Node, Relation], &[Way]],
+            &[&[], &[Relation], &[Relation]],
+        ];
+        for seq in groups {
+            let mut serial = KindOrder::new();
+            for g in seq {
+                serial.group(set(g));
+            }
+            for split in 0..=seq.len() {
+                let mut acc = KindOrder::new();
+                for part_groups in [&seq[..split], &seq[split..]] {
+                    let mut part = KindOrder::new();
+                    for g in part_groups {
+                        part.group(set(g));
+                    }
+                    acc.append(&part);
+                }
+                assert_eq!(
+                    acc.is_ordered(),
+                    serial.is_ordered(),
+                    "{seq:?} split {split}"
+                );
+            }
+        }
+        let ordered = |seq: &[&[crate::ElementKind]]| {
+            let mut k = KindOrder::new();
+            for g in seq {
+                k.group(set(g));
+            }
+            k.is_ordered()
+        };
+        assert!(ordered(&[&[Node], &[Way], &[Relation]]));
+        assert!(ordered(&[&[Node, Way], &[], &[Way, Relation]]));
+        assert!(!ordered(&[&[Way], &[Node]]));
+        assert!(!ordered(&[&[Node, Relation], &[Way]]));
     }
 
     /// Appending per-blob ranges in order equals one serial pass over the

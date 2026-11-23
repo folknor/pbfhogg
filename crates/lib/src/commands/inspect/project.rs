@@ -314,7 +314,8 @@ impl GroupProjection for InspectProjection {
         }
     }
 
-    fn group_end(&mut self, _kinds: crate::element_kind::ElementKindSet) {
+    fn group_end(&mut self, kinds: crate::element_kind::ElementKindSet) {
+        self.state.kind_order.group(kinds);
         if let Some(ids) = self.state.node_ids.as_mut() {
             ids.append(&self.dense_ids);
             ids.append(&self.plain_ids);
@@ -353,10 +354,11 @@ mod tests {
     fn range(r: Option<&TypeIdRange>) -> String {
         r.map_or_else(String::new, |r| {
             format!(
-                "{} {} {} {} {} {:?}",
+                "{} {} {:?} {} {} {} {:?}",
                 r.min_id,
                 r.max_id,
-                r.monotonic,
+                r.monotonic(),
+                r.canonical(),
                 r.count,
                 r.has_data(),
                 r.bounds()
@@ -603,6 +605,68 @@ mod tests {
                 "{what}: fixture must be valid"
             );
             assert_same(&bytes, what);
+        }
+    }
+
+    /// A block holding a node group then a way group is a mixed block, yet
+    /// its element stream is in kind order; the groups the other way round
+    /// are not. The block is one encoded block followed by the other's
+    /// `primitivegroup` records only (neither carries tags or metadata, so
+    /// the first's string table serves both).
+    #[test]
+    fn kind_order_reads_groups_not_the_block_layout() {
+        fn varint(bytes: &[u8], at: &mut usize) -> u64 {
+            let mut value = 0u64;
+            for shift in (0..64).step_by(7) {
+                let b = bytes[*at];
+                *at += 1;
+                value |= u64::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            value
+        }
+        // The top-level field 2 (`primitivegroup`) records of a block.
+        let groups_of = |block: &[u8]| {
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at < block.len() {
+                let start = at;
+                let tag = varint(block, &mut at);
+                match tag & 7 {
+                    0 => {
+                        varint(block, &mut at);
+                    }
+                    2 => {
+                        let len = varint(block, &mut at) as usize;
+                        at += len;
+                    }
+                    other => panic!("unexpected wire type {other}"),
+                }
+                if tag >> 3 == 2 {
+                    out.extend_from_slice(&block[start..at]);
+                }
+            }
+            out
+        };
+        let encode = |build: &dyn Fn(&mut BlockBuilder)| {
+            let mut b = BlockBuilder::new();
+            build(&mut b);
+            b.take().expect("encode").expect("bytes").to_vec()
+        };
+        let nodes = encode(&|b| {
+            b.add_node(1, 10, 20, [], None);
+            b.add_node(2, 11, 21, [], None);
+        });
+        let ways = encode(&|b| b.add_way(1, [], &[1, 2], None));
+        for (first, second, ordered) in [(&nodes, &ways, true), (&ways, &nodes, false)] {
+            let bytes = [first.as_slice(), groups_of(second).as_slice()].concat();
+            let (mut st, mut gr) = (Vec::new(), Vec::new());
+            let ((state, kind, elements), ()) =
+                scan_block_bytes(&bytes, &mut st, &mut gr, false, false, true).unwrap();
+            assert_eq!((kind, elements), (BlockKind::Mixed, 3));
+            assert_eq!(state.kind_order.is_ordered(), ordered);
         }
     }
 

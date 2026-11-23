@@ -171,19 +171,6 @@ because it checks only `previous.max >= next.min`, which counts descending
 disjoint ranges as overlapping. The command does create disorder, but the
 advertised benchmark shape and its test are wrong at cap 1.
 
-## CMD-030 - data.objects_ordered rejects a mixed-kind blob in canonical order
-
-Reported by: check-inspect [P2].
-
-`inspect/scan.rs` derives element ordering partly from the block-layout
-summary, which declares every mixed-kind blob nonstandard. A legal block
-holding a node group followed by a way group therefore reports unordered
-objects, although its elements are in canonical order and `check --ids`
-passes them. This breaks the field's stated meaning (`inspect/keys.rs`).
-Element ordering needs decoded group-order evidence, because block-layout
-classification answers a different question. The signed-comparator half of
-the same finding is BUG-012 in `notes/bugs.md`.
-
 ## CMD-031 - inspect timestamp formatting drops milliseconds
 
 Reported by: check-inspect [P2].

@@ -256,7 +256,7 @@ fn inspect_json_base() {
     let json = report.to_json(None);
 
     // Schema version
-    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["schema_version"], 4);
 
     // File metadata
     assert!(
@@ -338,7 +338,9 @@ fn inspect_json_with_id_ranges() {
     assert_eq!(nodes["min"], 1);
     assert_eq!(nodes["max"], 3);
     assert_eq!(nodes["count"], 3);
-    assert_eq!(nodes["monotonic"], true);
+    // Three nodes in one indexed blob: the claimed range cannot say in what
+    // order they come, so the index-only report leaves it undecided.
+    assert!(nodes["monotonic"].is_null());
 
     let ways = &json["id_ranges"]["ways"];
     assert_eq!(ways["min"], 10);
@@ -349,6 +351,27 @@ fn inspect_json_with_id_ranges() {
     assert_eq!(rels["min"], 100);
     assert_eq!(rels["max"], 100);
     assert_eq!(rels["count"], 1);
+    // One relation claimed: its single ID is ordered by itself.
+    assert_eq!(rels["monotonic"], true);
+
+    // Decoded, the order inside each blob is seen.
+    let decoded = pbfhogg::inspect::inspect(
+        &input,
+        &pbfhogg::inspect::InspectOptions {
+            show_blocks: false,
+            show_id_ranges: true,
+            show_locations: false,
+            extended: false,
+            distrust_metadata: true,
+            direct_io: false,
+        },
+        &crate::common::test_host(),
+    )
+    .expect("inspect")
+    .to_json(None);
+    for kind in ["nodes", "ways", "relations"] {
+        assert_eq!(decoded["id_ranges"][kind]["monotonic"], true, "{kind}");
+    }
 }
 
 #[test]

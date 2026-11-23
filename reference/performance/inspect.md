@@ -79,6 +79,25 @@ cell ran cold after its build). Phase split identical (22.3 vs 22.4 avg
 cores, same peak anon). It landed. The walls are plantasjen's and not
 comparable with the bygg cells above.
 
+## Inspect --extended: canonical ascent and group kind order (bygg, 2026-11-23, against `a7a48bb6`)
+
+`data.objects_ordered` gained a second per-ID verdict (strict canonical
+ascent, beside the numeric one) and a per-group kind-order fold. Planet
+`brokkr bench --iterations 1 file-info --mode extended`, interleaved;
+baselines `--commit HEAD` at `a7a48bb6`, variants dirty-tree cells of that
+tree plus the change:
+
+| UUID | Cell | Wall |
+|---|---|---:|
+| `5cd8ede1` | baseline, first after worktree build | 29.0 s |
+| `405b164f` | variant, first after build | 28.9 s |
+| `7d79605d` | baseline | 28.9 s |
+| `6e6591f7` | variant | 27.8 s |
+
+Within noise (both pairs at or below the baseline; the -4 % second pair is
+not claimed as a win). Phase split alike (22.2 vs 23.9 avg cores, peak anon
+within 3 %). It landed.
+
 ## inspect --nodes reads through a projection (bygg, 2026-11-02, against `5ec5eefc`)
 
 `inspect --nodes` reads each node blob through a projection on the block

@@ -443,8 +443,9 @@ tags, way refs and relation members, exactly what `diff` compares (defined in
 `crates/lib/src/content.rs`) - and ignores metadata. Applying the derived OSC to the old
 PBF therefore gives a file whose content equals the new PBF's, so a `diff` of
 the result against the new PBF reports no differences. Creates and modifies
-carry each element's metadata (version, timestamp, changeset, uid, user) and
-deletes carry its version, the same whether or not the inputs have indexdata;
+carry each element's metadata (version, timestamp, changeset, uid, user, and
+`visible="false"` when the element is hidden; an explicit `true` is not
+written) and deletes carry its version, the same whether or not the inputs have indexdata;
 `derive_then_apply_preserves_metadata` in `crates/lib/tests/roundtrip_invariants.rs`
 pins that the metadata of a changed element survives the roundtrip.
 
@@ -452,7 +453,12 @@ What that check cannot see is metadata, and anything else outside the content
 definition (inline way coordinates, `visible`, the file header). An element
 whose only change is its metadata (a version bump with identical content) is
 not a change at all: it gets no OSC entry, and the applied result keeps the old
-file's metadata for it. A further margin: a dense node with no version (stored
+file's metadata for it; that includes a visibility-only change, so an object
+hidden in the new file with unchanged content stays visible after the apply.
+The content roundtrip holds for snapshots of visible objects: a hidden record
+in the new file whose content differs (or that is new) is written as a hidden
+create or modify, which apply records as the object's deletion, so the result
+lacks a record the new file still carries. A further margin: a dense node with no version (stored
 as version 0) prints only its non-zero metadata fields, because a zero there
 cannot be told apart from the padding a node without metadata gets (see
 CORRECTNESS.md, "Version 0 is not a version claim either"), so a zero-valued

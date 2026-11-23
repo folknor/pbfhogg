@@ -585,6 +585,13 @@
 
 ### Fixed
 
+- **`diff --format osc` keeps a hidden element hidden.** A created or
+  modified element whose PBF metadata says `visible=false` used to be
+  written without the attribute, so applying the OSC made it a visible
+  object. It is now written with `visible="false"`, which `apply-changes`
+  (and osmium) apply as the object's deletion. An explicit `true` is still
+  not written.
+
 - The CLI reference now explains when `diff` and `diff --format osc`
   report a sequential fallback for unindexed input. If you rely on that
   note, pass `--jobs 2` to get it even on a host that reports one worker.

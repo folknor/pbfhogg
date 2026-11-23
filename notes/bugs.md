@@ -79,13 +79,6 @@ Defect hunt 2026-11-17 (check-inspect, P2) restates this as part of its
 `data.objects_ordered` finding; the other half of that finding is a separate
 mechanism, filed as CMD-030 in `notes/bugs-commands.md`.
 
-## BUG-013 - PBF-to-OSC emission drops visibility
-
-Reported by: osc.
-
-`push_info_attrs` (`osc/write.rs`) takes no visibility argument, so a created
-or modified element with `visible=false` loses the attribute.
-
 ## BUG-014 - OSC attribute helpers skip trailing malformed attributes
 
 Reported by: osc.
@@ -262,3 +255,20 @@ to 0 s, which the builder takes when the slot is versionless after
 cleaning; a claim that was 0 at the source is outside it. The fix is to
 choose the dense-or-plain route from what the cleaned slot would claim. Whether osmium's `--clean version`
 output is the reference here is part of the decision.
+
+## BUG-034 - diff --format osc emits nothing for a visibility-only change
+
+Reported by: the codex spar of the hidden-upsert emission fix.
+
+`diff --format osc` classifies by content alone (`commands/diff/derive.rs`,
+`crate::content`), and `visible` is outside content. A created or modified
+element that is hidden in the new file is now written with
+`visible="false"`, so apply records its deletion; but an object visible in
+old and hidden in new with identical content gets no OSC entry at all, and
+the applied result keeps it visible. Whether a hidden record deletes thus
+depends on an unrelated content change. Fixing it means making visibility an
+input to OSC classification (a visible-to-hidden transition is a hidden
+modify carrying the new side's version, not a synthesized delete, so a stale
+older version cannot resurrect it), without changing what text `diff`
+reports. Treating hidden records as absent was weighed and rejected: it
+loses the tombstone's version claim.

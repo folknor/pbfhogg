@@ -470,6 +470,17 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 /// refuses it, so derive would publish a file apply cannot read. It is
 /// refused here instead; dropping the attribute would be a silent wrong
 /// answer.
+///
+/// **Visibility: only `false` is written.** A created or modified element
+/// whose metadata claims `visible=false` is printed with `visible="false"`,
+/// which both pbfhogg's and osmium's apply read as the object's deleted
+/// state (a versioned delete). Dropping it would publish a hidden record as
+/// a visible upsert. An explicit `true` is not written: it is OSC's meaning
+/// of an absent attribute, the dense read and re-encode rules treat an
+/// absent `visible` column as `true` (and `BlockBuilder` writes the column
+/// on every complete-metadata node), so printing it would put `visible="true"`
+/// on every node of a pbfhogg-written file and print the same element
+/// differently by representation.
 #[allow(clippy::too_many_arguments)]
 fn push_info_attrs(
     elem: &mut BytesStart<'_>,
@@ -480,6 +491,7 @@ fn push_info_attrs(
     changeset: Option<i64>,
     uid: Option<i32>,
     user: Option<&str>,
+    visible: Option<bool>,
 ) -> crate::Result<()> {
     if let Some(version) = version {
         let v_str = version.to_string();
@@ -513,6 +525,9 @@ fn push_info_attrs(
         && !u.is_empty()
     {
         push_attribute_escaped(elem, "user", u).map_err(in_element(kind, id))?;
+    }
+    if visible == Some(false) {
+        elem.push_attribute(("visible", "false"));
     }
     Ok(())
 }
@@ -600,6 +615,7 @@ fn write_dense_node_xml<W: std::io::Write>(
             claims.changeset,
             claims.uid,
             claims.user.transpose()?,
+            claims.visible,
         )?;
     }
 
@@ -645,6 +661,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
+        info.visible_opt(),
     )?;
 
     let mut tags = node.tags().peekable();
@@ -677,6 +694,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
+        info.visible_opt(),
     )?;
 
     let mut refs = way.refs().peekable();
@@ -716,6 +734,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
         info.changeset(),
         info.uid(),
         info.user().transpose()?,
+        info.visible_opt(),
     )?;
 
     let mut members = rel.members().peekable();
@@ -1137,7 +1156,38 @@ mod tests {
         Ok(())
     }
 
-    const META_ATTRS: [&str; 5] = ["version=", "timestamp=", "changeset=", "uid=", "user="];
+    const META_ATTRS: [&str; 6] = [
+        "version=",
+        "timestamp=",
+        "changeset=",
+        "uid=",
+        "user=",
+        "visible=",
+    ];
+
+    /// A hidden created or modified element keeps `visible="false"`, which
+    /// apply reads as the object's deleted state; dropping it published a
+    /// hidden record as a visible upsert. A visible one prints no
+    /// `visible` at all, plain and dense alike.
+    #[test]
+    fn a_hidden_element_prints_visible_false_and_a_visible_one_prints_none() -> crate::Result<()> {
+        for visible in [false, true] {
+            let m = crate::write::block_builder::Metadata {
+                visible,
+                ..meta(3, 9)
+            };
+            let way = borrowed_way_xml(&m)?;
+            let node = borrowed_dense_xml(&[(1, Some(m))])?;
+            for xml in [way.as_str(), node[0].as_str()] {
+                if visible {
+                    assert!(!xml.contains("visible="), "got: {xml}");
+                } else {
+                    assert!(xml.contains("visible=\"false\""), "got: {xml}");
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn meta(version: i32, uid: i32) -> crate::write::block_builder::Metadata<'static> {
         crate::write::block_builder::Metadata {

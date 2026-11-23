@@ -247,6 +247,21 @@ is already corrected; the rest needs checking against the planner's actual
 cuts before rewording, since some assertions may depend on how many units a
 fixture is cut into.
 
+## DOC-032 - Unknown extension blob types are skipped with no DEVIATIONS.md entry
+
+Reported by: the BUG-002 implementer (2026-11-23), from the scout's lateral.
+
+pbfhogg accepts and skips a blob whose type is neither `OSMHeader` nor
+`OSMData`, given a positive datasize (`read/frame.rs` keeps the existing
+skip policy for unknown extension blobs, and
+`reference/truncation-handling.md` says the low-level APIs keep it).
+libosmium refuses any data blob that is not `OSMData`. `DEVIATIONS.md`
+records every deliberate deviation from osmium, but has no entry for this
+one (searched for "unknown blob", "extension blob", "unknown type").
+`CORRECTNESS.md` was already narrowed to claim reference-reader acceptance
+only for the upper size bound. Either record the deviation or change the
+policy.
+
 ## DOC-031 - Undeclared way coordinate arrays have no documented behaviour
 
 Reported by: the TOOL-045 refusal (bf9266ed). Needs a maintainer decision.

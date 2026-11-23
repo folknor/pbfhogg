@@ -13,9 +13,9 @@
 //! where the driver attributes a failure to the output, not the input.
 //!
 //! The byte contract is the owned writers': `id`, then `lat` and `lon` for
-//! a node that has them (`coord_to_decimicro` then `format_coord`; always a
-//! created or modified node, a deleted one when its input gave both, see
-//! `delete_coords`), then the metadata in `OwnedMetadata::push_attrs` order
+//! a node that has them (`node_coords` then `format_coord`; always a visible
+//! created or modified node, a deleted or hidden one when its input gave
+//! both), then the metadata in `OwnedMetadata::push_attrs` order
 //! and escaping; a deleted object keeps the body its input gave, written
 //! as a live one's; an element with no retained child is self-closing. The differential tests hold the sink to the owned
 //! path byte for byte.
@@ -29,8 +29,8 @@ use crate::osc::write::{
     OwnedMetadata, append_attr, append_attr_escaped, append_int_attr, in_element,
 };
 use crate::osc::xml_parse::{
-    DeleteChildren, OscSink, append_tag, coord_to_decimicro, delete_coords, parse_i64_attr,
-    parse_member_into, parse_nd, scan_owned_metadata_into,
+    DeleteChildren, OscSink, append_tag, node_coords, parse_i64_attr, parse_member_into, parse_nd,
+    scan_owned_metadata_into,
 };
 
 /// One element's start tag and children, checked and rendered into reused
@@ -148,16 +148,15 @@ impl ElementBuf {
         e: &BytesStart<'_>,
     ) -> crate::Result<()> {
         // The owned sink's order: id, metadata, then a node's lat and lon
-        // (required of a live node, optional on a delete).
+        // (required of a visible live node, optional on a delete or a
+        // hidden create or modify).
         let id = parse_i64_attr(e, "id")?;
         let has_meta = scan_owned_metadata_into(e, &mut self.meta)?;
-        let coords = match (kind, action) {
-            (ElementKind::Node, Action::Delete) => delete_coords(e, id)?,
-            (ElementKind::Node, _) => Some((
-                coord_to_decimicro(e, "lat", id)?,
-                coord_to_decimicro(e, "lon", id)?,
-            )),
-            _ => None,
+        let coords = if kind == ElementKind::Node {
+            let optional = action == Action::Delete || (has_meta && self.meta.hidden());
+            node_coords(e, id, optional)?
+        } else {
+            None
         };
 
         self.head.clear();

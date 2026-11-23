@@ -381,6 +381,13 @@ change that is silently different from its input is the outcome pbfhogg
 refuses. `apply-changes` keeps only a delete's identity and version claim,
 so the location cannot change its answer; it accepts the same file.
 
+A created or modified node whose `visible` reads exactly `false` is the
+object's deleted state (apply-changes records it as a delete), so the same
+rule covers it: no location is accepted, both coordinates are re-emitted,
+and half a location or an unusable value is refused where apply-changes
+accepts it. The node stays in its input section with its `visible`
+attribute; libosmium's writer moves a hidden object into `<delete>`.
+
 ## merge-changes and tags-filter OSC: an explicit empty metadata attribute is written back
 
 **osmium behavior:** libosmium holds a user as a plain string with no

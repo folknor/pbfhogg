@@ -1432,9 +1432,8 @@ pub(crate) fn coord_to_decimicro(
 ) -> ParseResult<i32> {
     let (degrees, exact) = parse_coord_attr(e, name).map_err(|err| {
         err.context(format!(
-            "OSC node {id}: {name} attribute is missing or unparsable (a created or \
-             modified node must carry usable coordinates; storing it at 0/0 would silently \
-             move it to the Gulf of Guinea)"
+            "OSC node {id}: {name} attribute is missing or unparsable (storing it at 0/0 \
+             would silently move the node to the Gulf of Guinea)"
         ))
     })?;
     // Two independent checks. The geographic one comes first because it is
@@ -1510,19 +1509,45 @@ pub(crate) fn delete_coords(
             let read = |name| {
                 coord_to_decimicro(e, name, id).map_err(|err| {
                     err.context(format!(
-                        "OSC deleted node {id}: a location given on a delete is re-emitted, \
-                         so it must be usable"
+                        "OSC deleted or hidden node {id}: a location given on it is \
+                         re-emitted, so it must be usable"
                     ))
                 })
             };
             Ok(Some((read("lat")?, read("lon")?)))
         }
         (true, false) | (false, true) => Err(Error::invalid_data(format!(
-            "OSC deleted node {id} carries {} without {}; refusing to re-emit half a location",
+            "OSC deleted or hidden node {id} carries {} without {}; refusing to re-emit half \
+             a location",
             if lat { "lat" } else { "lon" },
             if lat { "lon" } else { "lat" },
         ))),
     }
+}
+
+/// A node's location, for the sinks that re-emit it (merge-changes and
+/// tags-filter OSC, production and test oracles alike).
+///
+/// `location_optional` is true for a node in `<delete>` and for a created or
+/// modified one that says `visible="false"` (see
+/// [`crate::osc::write::OwnedMetadata::hidden`]): both are the object's
+/// deleted state, which apply-changes records as a versioned delete needing
+/// no coordinates, and OSM's own deleted versions carry none. Such a node
+/// follows [`delete_coords`] (both or neither) and keeps its section and its
+/// `visible` attribute on re-emission. A visible created or modified node
+/// must carry usable coordinates ([`coord_to_decimicro`]).
+pub(crate) fn node_coords(
+    e: &quick_xml::events::BytesStart<'_>,
+    id: i64,
+    location_optional: bool,
+) -> ParseResult<Option<(i32, i32)>> {
+    if location_optional {
+        return delete_coords(e, id);
+    }
+    Ok(Some((
+        coord_to_decimicro(e, "lat", id)?,
+        coord_to_decimicro(e, "lon", id)?,
+    )))
 }
 
 /// Read an element's metadata into the owned representation used by the
@@ -1611,7 +1636,8 @@ pub(crate) fn scan_owned_metadata_into(
             MetaField::Version => unreachable!("handled above"),
         };
         meta.present |= bit;
-        // A repeated attribute keeps its last value, as the owned scan did.
+        // The attribute iterator refuses a duplicated key, so each slot is
+        // filled at most once; the clear is for the reused buffer.
         slot.clear();
         slot.push_str(&text);
         Ok(())

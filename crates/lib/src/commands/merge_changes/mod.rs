@@ -33,8 +33,8 @@ use crate::osc::write::{
 use crate::osc::xml_parse::OscAction;
 #[cfg(test)]
 use crate::osc::xml_parse::{
-    DeleteChildren, OscSink, coord_to_decimicro, delete_coords, parse_i64_attr, parse_member,
-    parse_nd, parse_osc_path, parse_owned_metadata, parse_tag,
+    DeleteChildren, OscSink, node_coords, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
+    parse_owned_metadata, parse_tag,
 };
 
 /// `merge-changes` speaks the same three actions as the shared parser.
@@ -486,24 +486,17 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
     ) -> crate::Result<()> {
         let id = parse_i64_attr(e, "id")?;
         let metadata = parse_owned_metadata(e)?;
+        let hidden = metadata.as_ref().is_some_and(OwnedMetadata::hidden);
         let mut elem = CurrentElem::new(kind, id, metadata);
 
-        // Coordinates are required of a created or modified node and
-        // optional on a delete, kept when given. This used to be
+        // Coordinates are required of a visible created or modified node
+        // and optional on a delete or a hidden one, kept when given. This used to be
         // `parse_f64_attr_optional(...).unwrap_or(0.0)` followed by a
         // saturating `as i32`, which put a coordinate-less node at 0/0 in
         // the Gulf of Guinea and clamped `lat="1e30"` to `i32::MAX`.
-        // Same rule as the overlay parser now, because it is the same
-        // function.
+        // The same function the byte sink calls, so the oracle cannot drift.
         if kind == ElementKind::Node {
-            elem.location = if action == Action::Delete {
-                delete_coords(e, id)?
-            } else {
-                Some((
-                    coord_to_decimicro(e, "lat", id)?,
-                    coord_to_decimicro(e, "lon", id)?,
-                ))
-            };
+            elem.location = node_coords(e, id, action == Action::Delete || hidden)?;
         }
 
         self.action = action;

@@ -141,17 +141,17 @@ fn a_time_filter_snapshot_of_a_history_file_is_an_apply_changes_base() {
 </osmChange>"#,
     )
     .expect("write osc");
-    let apply = |base: &Path| {
+    let apply = |base: &Path, osc: &Path| {
         CliInvoker::new(&invocation_scratch)
             .arg("apply-changes")
             .arg(base)
-            .arg(&osc)
+            .arg(osc)
             .arg("-o")
             .arg(&output)
             .run()
     };
 
-    let refused = apply(&history);
+    let refused = apply(&history, &osc);
     assert_eq!(refused.status.code(), Some(2), "{}", refused.stderr_str());
     assert!(
         refused.stderr_str().contains("HistoricalInformation"),
@@ -163,16 +163,37 @@ fn a_time_filter_snapshot_of_a_history_file_is_an_apply_changes_base() {
     run_time_filter(&history, &snapshot, 250);
     assert!(!read_header(&snapshot).has_historical_information());
 
-    let applied = apply(&snapshot);
+    let expected = vec![NodeSnapshot {
+        id: 1,
+        version: 2,
+        milli_timestamp: 200_000,
+    }];
+    let applied = apply(&snapshot, &osc);
     assert!(applied.status.success(), "{}", applied.stderr_str());
-    assert_eq!(
-        read_nodes_with_metadata(&output),
-        vec![NodeSnapshot {
-            id: 1,
-            version: 2,
-            milli_timestamp: 200_000
-        }]
-    );
+    assert_eq!(read_nodes_with_metadata(&output), expected);
+
+    // The same coordinate-less hidden change, re-emitted by merge-changes
+    // (streaming and simplify) and by OSC tags-filter first, applies to the
+    // same answer.
+    for (name, args) in [
+        ("merge", vec!["merge-changes"]),
+        ("simplify", vec!["merge-changes", "--simplify"]),
+        ("filter", vec!["tags-filter", "--input-kind", "osc", "a=b"]),
+    ] {
+        let re_emitted = dir.path().join(format!("{name}.osc.gz"));
+        let (command, rest) = args.split_first().expect("a command");
+        let mut cli = CliInvoker::new(&invocation_scratch).arg(command);
+        if *command == "tags-filter" {
+            cli = cli.arg(&osc).args(rest);
+        } else {
+            cli = cli.args(rest).arg(&osc);
+        }
+        cli.arg("-o").arg(&re_emitted).assert_success();
+        std::fs::remove_file(&output).expect("remove the previous output");
+        let applied = apply(&snapshot, &re_emitted);
+        assert!(applied.status.success(), "{name}: {}", applied.stderr_str());
+        assert_eq!(read_nodes_with_metadata(&output), expected, "{name}");
+    }
 }
 
 #[test]

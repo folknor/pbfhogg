@@ -208,6 +208,13 @@ impl OwnedMetadata {
         }
     }
 
+    /// The element says `visible="false"`: the decoded text exactly, the
+    /// test the overlay's metadata reader applies, so `False` is visible on
+    /// every route and an empty `visible` is absent (never recorded).
+    pub(crate) fn hidden(&self) -> bool {
+        self.has(Self::PRESENT_VISIBLE) && self.visible == "false"
+    }
+
     fn has(&self, bit: u8) -> bool {
         self.present & bit != 0
     }

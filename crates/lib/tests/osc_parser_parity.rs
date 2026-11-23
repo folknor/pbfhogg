@@ -804,6 +804,91 @@ fn every_consumer_refuses_an_unusable_coordinate() {
     assert_all_accept(dir.path(), &input, "valid extremes and a bare delete");
 }
 
+/// A created or modified node that says `visible="false"` is the object's
+/// deleted state: apply-changes records it as a delete and needs no
+/// coordinates on it, and OSM's deleted versions carry none. The
+/// re-emitters used to require coordinates on it, so such a change applied
+/// directly but was refused once routed through merge-changes or OSC
+/// tags-filter. They now hold it to the delete-section rule (both or
+/// neither) and keep its section and `visible`. `False` is visible on every
+/// route and still needs coordinates. The public overlay (`parse_osc_file`,
+/// not apply-changes, which records the hidden upsert as a delete) stages a
+/// hidden upsert with its location, so it alone still requires one. The
+/// apply-changes round trip is held in the CLI time-filter test.
+#[test]
+fn re_emitters_accept_a_hidden_node_without_coordinates() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("hidden.osc");
+    std::fs::write(
+        &input,
+        r#"<osmChange version="0.6"><create>
+<node id="1" version="1" visible="false"><tag k="highway" v="primary"/></node>
+</create><modify>
+<node id="2" version="3" visible="&#102;alse"/>
+</modify></osmChange>"#,
+    )
+    .unwrap();
+    let out = |n: &str| dir.path().join(format!("hidden-{n}.osc.gz"));
+    merge_verdict(&input, &out("m")).unwrap();
+    simplify_verdict(&input, &out("s")).unwrap();
+    tags_filter_verdict(&input, &out("t")).unwrap();
+    for n in ["m", "s", "t"] {
+        let xml = read_gz(&out(n));
+        assert!(
+            !xml.contains("lat=") && !xml.contains("lon="),
+            "{n}: invented a location: {xml}"
+        );
+        assert!(
+            !xml.contains("<delete>"),
+            "{n}: moved a record to delete: {xml}"
+        );
+        if n == "t" {
+            assert!(
+                !xml.contains(r#"id="2""#),
+                "t: kept the untagged node: {xml}"
+            );
+        }
+        let create = xml.find("<create>").unwrap();
+        let one = xml
+            .find(r#"<node id="1" version="1" visible="false""#)
+            .unwrap();
+        assert!(create < one, "{n}: node 1 left create: {xml}");
+        // tags-filter drops the untagged node 2 by its predicate.
+        if n != "t" {
+            let modify = xml.find("<modify>").unwrap();
+            let two = xml
+                .find(r#"<node id="2" version="3" visible="false""#)
+                .unwrap();
+            assert!(
+                one < modify && modify < two,
+                "{n}: node 2 left modify: {xml}"
+            );
+        }
+    }
+    // The public overlay stages the hidden upsert, location included.
+    assert!(overlay_verdict(&input).unwrap_err().contains("OSC node 1"));
+
+    for (case, attrs) in [
+        ("capitalised False", r#"id="1" version="1" visible="False""#),
+        (
+            "half a location",
+            r#"id="1" lat="1.0" version="1" visible="false""#,
+        ),
+        (
+            "bad location",
+            r#"id="1" lat="abc" lon="2.0" version="1" visible="false""#,
+        ),
+    ] {
+        let input = dir.path().join("refused.osc");
+        std::fs::write(
+            &input,
+            format!("<osmChange version=\"0.6\"><create><node {attrs}/></create></osmChange>"),
+        )
+        .unwrap();
+        assert_all_refuse(dir.path(), &input, "node 1", case);
+    }
+}
+
 /// A relation member whose `type` is not node, way or relation. The
 /// overlay's writer refused to emit such a member, but two sinks
 /// accepted it at parse time and one writer mapped it to "node" - which

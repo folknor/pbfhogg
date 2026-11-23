@@ -649,6 +649,13 @@
 
 ### Fixed
 
+- **`merge-changes` and `tags-filter --input-kind osc` accept a hidden node
+  without coordinates.** A `<create>` or `<modify>` node with
+  `visible="false"` (an OSM deleted version, which carries no location)
+  applied directly but was refused by both re-emitters. They now treat it
+  as a delete's location: none, or both usable coordinates; half a location
+  is refused. It keeps its section and `visible` attribute.
+
 - **`export --metadata` writes only RFC 3339 `@timestamp` values, with
   milliseconds kept.** A timestamp in year 10000 or later printed with a
   five-digit year, and a sub-second one lost its fraction, so 1 ms printed

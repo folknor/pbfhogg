@@ -25,8 +25,8 @@ use crate::osc::xml_parse::{DeleteChildren, OscSink};
 use crate::osc::xml_parse::{LexBatch, OscAction};
 #[cfg(test)]
 use crate::osc::xml_parse::{
-    coord_to_decimicro, delete_coords, parse_i64_attr, parse_member, parse_nd, parse_osc_path,
-    parse_owned_metadata, parse_tag,
+    node_coords, parse_i64_attr, parse_member, parse_nd, parse_osc_path, parse_owned_metadata,
+    parse_tag,
 };
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 
@@ -356,17 +356,13 @@ impl OscSink for FilterSink<'_> {
         // it. Dropping it here is how this filter used to turn a
         // metadata-bearing change stream into an anonymous one.
         let metadata = parse_owned_metadata(e)?;
+        let hidden = metadata.as_ref().is_some_and(crate::osc::write::OwnedMetadata::hidden);
 
         let mut cur = CurrentElem::new(kind, id, metadata);
         if kind == ElementKind::Node {
-            cur.location = if action == Section::Delete {
-                delete_coords(e, id)?
-            } else {
-                Some((
-                    coord_to_decimicro(e, "lat", id)?,
-                    coord_to_decimicro(e, "lon", id)?,
-                ))
-            };
+            // A hidden create or modify is the object's deleted state: its
+            // location is optional, as a delete's is.
+            cur.location = node_coords(e, id, action == Section::Delete || hidden)?;
         }
         self.current = Some(cur);
         Ok(())

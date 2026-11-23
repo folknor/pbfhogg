@@ -612,7 +612,12 @@ hidden whether a change is applied directly or after re-emission (`False` is
 visible on both routes). apply-changes writes a snapshot, so a hidden create
 or modify is recorded as a versioned delete of its object (its version claim
 reaches the version gates like any delete's; a hidden node needs no
-coordinates); the public overlay parser still stages it as a hidden upsert.
+coordinates); the public overlay parser still stages it as a hidden upsert,
+location required. The re-emitters accept a hidden node without coordinates
+under the delete-section location rule (both or neither, each usable) and
+keep its section and `visible`, so a retained coordinate-less hidden record
+carries the same action, identity, version claim and visibility through
+re-emission.
 osmium apply-changes in snapshot mode likewise writes the winning record only
 when it is visible. An empty `visible=""` is the attribute absent for
 every consumer: it is no visibility claim and does not by itself give an

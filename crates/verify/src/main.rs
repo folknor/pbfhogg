@@ -175,7 +175,7 @@ struct MergeArgs {
     #[command(flatten)]
     source: Source,
     #[arg(long, conflicts_with_all = ["osc", "osc_range"])]
-    osc_seq: Option<String>,
+    osc_seq: Option<u64>,
     #[arg(long, conflicts_with = "osc_range")]
     osc: Vec<PathBuf>,
     #[arg(long)]
@@ -189,7 +189,7 @@ struct DiffArgs {
     #[arg(long, value_parser = ["text", "osc"], default_value = "text")]
     format: String,
     #[arg(long, conflicts_with = "osc")]
-    osc_seq: Option<String>,
+    osc_seq: Option<u64>,
     #[arg(long)]
     osc: Option<PathBuf>,
 }
@@ -567,7 +567,7 @@ fn dispatch_diff(b: &Boundary, h: &mut Harness, args: &DiffArgs) -> Result<Endin
     };
     let osc = selection
         .osc(&selection::Selections {
-            osc_seq: args.osc_seq.clone(),
+            osc_seq: args.osc_seq,
             osc: args.osc.clone(),
         })?
         .ok_or_else(|| Error::tool("diff needs a configured OSC or --osc"))?;
@@ -741,7 +741,7 @@ fn dispatch_merge(b: &Boundary, h: &mut Harness, args: &MergeArgs) -> Result<End
     } else {
         selection
             .osc(&selection::Selections {
-                osc_seq: args.osc_seq.clone(),
+                osc_seq: args.osc_seq,
                 ..Default::default()
             })?
             .into_iter()
@@ -817,7 +817,7 @@ mod tests {
         let selections =
             Args::try_parse_from(["x", "all", "--osc-seq", "42", "--bbox=-1,2,3,4"]).unwrap();
         assert!(
-            matches!(selections.check, Check::All(s) if s.selections.osc_seq.as_deref() == Some("42") && s.bbox.is_some())
+            matches!(selections.check, Check::All(s) if s.selections.osc_seq == Some(42) && s.bbox.is_some())
         );
         assert!(
             Args::try_parse_from(["x", "all", "--osc", "fixture.osc", "--osc-seq", "42"]).is_err()

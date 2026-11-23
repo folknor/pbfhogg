@@ -373,24 +373,26 @@ file = 'base.pbf'
 file = 'b.osc'
 [m.datasets.d.snapshot.bad.osc.10]
 file = 'missing.osc'
+[m.datasets.d.snapshot.padded.osc.011]
+file = 'b.osc'
 ",
     );
     let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
     assert!(c.select_osc("m", "d", None, None).is_err());
     assert_eq!(
-        c.select_osc("m", "d", None, Some("10"))
+        c.select_osc("m", "d", None, Some(10))
             .unwrap()
             .unwrap()
             .variant,
         "10"
     );
-    assert!(c.select_osc("m", "d", None, Some("12")).is_err());
+    assert!(c.select_osc("m", "d", None, Some(12)).is_err());
     assert!(
         c.select_osc("m", "d", Some("empty"), None)
             .unwrap()
             .is_none()
     );
-    assert!(c.select_osc("m", "d", Some("empty"), Some("10")).is_err());
+    assert!(c.select_osc("m", "d", Some("empty"), Some(10)).is_err());
     assert!(c.select_osc("m", "d", Some("missing"), None).is_err());
     assert!(c.select_osc("m", "d", Some("bad"), None).is_err());
     assert_eq!(
@@ -407,6 +409,15 @@ file = 'missing.osc'
     );
     assert!(c.select_osc_range("m", "d", None, 10, 12).is_err());
     assert!(c.select_osc_range("m", "d", None, 11, 10).is_err());
+    // A non-canonical key refuses the table for every selection, so a sole
+    // `011` is never selectable by one path and missing for another.
+    assert!(c.select_osc("m", "d", Some("padded"), None).is_err());
+    assert!(c.select_osc("m", "d", Some("padded"), Some(11)).is_err());
+    assert!(
+        c.select_osc_range("m", "d", Some("padded"), 11, 11)
+            .is_err()
+    );
+    assert!(c.has_osc("m", "d", Some("padded")).is_err());
     assert!(c.select_pbf("m", "d", None, "raw").unwrap().is_some());
     assert!(
         c.select_pbf("m", "d", Some("empty"), "raw")

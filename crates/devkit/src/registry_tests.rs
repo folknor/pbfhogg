@@ -69,6 +69,37 @@ xxhash = \"0123456789ABCDEF0123456789abcdef\"
 }
 
 #[test]
+fn typed_view_refuses_ambiguous_osc_keys_and_retired_pins() {
+    let refused = |body: &str| {
+        let text = format!("[h.datasets.d]\n{body}");
+        let (_s, root) = root_with(&[("brokkr.toml", &text)]);
+        let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
+        config.dataset("h", "d").unwrap_err().to_string()
+    };
+    // Two spellings of one sequence never collapse onto one entry.
+    let both = "[h.datasets.d.osc.11]\nfile = 'a'\n[h.datasets.d.osc.011]\nfile = 'b'\n";
+    assert!(refused(both).contains("canonical"));
+    for key in ["011", "'+11'", "''", "99999999999999999999"] {
+        let body = format!("[h.datasets.d.osc.{key}]\nfile = 'a'\n");
+        assert!(refused(&body).contains("canonical"), "{key}");
+    }
+    for table in ["osc.10", "pbf.raw", "snapshot.s.osc.10"] {
+        let body = format!("[h.datasets.d.{table}]\nfile = 'a'\nsha256 = 'x'\n");
+        assert!(refused(&body).contains("retired"), "{table}");
+    }
+    let (_s, root) = root_with(&[(
+        "brokkr.toml",
+        "[h.datasets.d.osc.0]\nfile = 'a'\n[h.datasets.d.osc.10]\nfile = 'b'\n",
+    )]);
+    let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
+    let view = config.dataset("h", "d").unwrap().unwrap();
+    assert_eq!(
+        view.primary.osc.keys().copied().collect::<Vec<_>>(),
+        [0, 10]
+    );
+}
+
+#[test]
 fn edits_preserve_comments_and_escape_names() {
     let before =
         "# top\nproject = \"pbfhogg\"\n\n# kept\n[h.datasets.d]\norigin = \"x\" # trailing\n";

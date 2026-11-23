@@ -31,6 +31,12 @@ Primary acquisition is a no-op for configured, valid entries. Every missing
 target entry is registered, including recoverable unregistered raw files and
 OSCs. Registered files must exist and pass their configured XXH3-128 pins;
 pins and configured replication sequences are never rewritten.
+An `osc` key is a canonical decimal sequence (digits only, no sign, no
+leading zero except `0`); a table holding any other key, such as `011` beside
+`11`, refuses as a whole in acquisition, promotion and verify OSC selection,
+so two spellings never name one sequence. The retired `sha256` pin refuses
+wherever an entry is parsed (acquisition, promotion, verify and library
+input resolution); an entry pinned only by it is never treated as unpinned.
 Unregistered indexed files are always regenerated from the selected raw
 with the handed CLI's `pbfhogg cat`, never adopted.
 

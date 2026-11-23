@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::datasets::normalize_digest;
+use crate::datasets::{normalize_digest, refuse_retired_pin};
 use crate::{Config, Error};
 
 /// One registered file: `file` relative to the host data directory (or
@@ -231,16 +231,8 @@ fn generation(table: &toml::Table) -> Result<Generation, Error> {
         }
     }
     let mut osc = BTreeMap::new();
-    if let Some(seqs) = table.get("osc") {
-        let seqs = seqs
-            .as_table()
-            .ok_or_else(|| Error::message("'osc' must be a table"))?;
-        for (seq, entry) in seqs {
-            let seq: u64 = seq
-                .parse()
-                .map_err(|_| Error::message(format!("osc key '{seq}' is not a sequence")))?;
-            osc.insert(seq, file_entry(entry)?);
-        }
+    for (seq, entry) in osc_entries(table)?.unwrap_or_default() {
+        osc.insert(seq, file_entry_table(entry)?);
     }
     Ok(Generation {
         download_date: string(table, "download_date")?,
@@ -249,13 +241,59 @@ fn generation(table: &toml::Table) -> Result<Generation, Error> {
     })
 }
 
-fn file_entry(value: &toml::Value) -> Result<FileEntry, Error> {
-    let table = value
+/// The one decoder of a generation's `osc` table, shared by acquisition
+/// (`generation`) and selection (`select_osc`), so both read the same
+/// sequences. `None` when the table is absent. Every key must be a canonical
+/// decimal sequence (digits only, no sign, no leading zero except `0`) and
+/// every entry a table: `011` and `11` would otherwise name one sequence
+/// with two files, and the registry writer only ever emits canonical keys.
+pub(crate) fn osc_entries(
+    generation: &toml::Table,
+) -> Result<Option<BTreeMap<u64, &toml::Table>>, Error> {
+    let Some(seqs) = generation.get("osc") else {
+        return Ok(None);
+    };
+    let seqs = seqs
         .as_table()
-        .ok_or_else(|| Error::message("a file entry must be a table"))?;
+        .ok_or_else(|| Error::message("'osc' must be a table"))?;
+    let mut out = BTreeMap::new();
+    for (key, entry) in seqs {
+        let entry = entry
+            .as_table()
+            .ok_or_else(|| Error::message(format!("osc.{key} must be a table")))?;
+        out.insert(osc_sequence(key)?, entry);
+    }
+    Ok(Some(out))
+}
+
+fn osc_sequence(key: &str) -> Result<u64, Error> {
+    let canonical = !key.is_empty()
+        && key.bytes().all(|b| b.is_ascii_digit())
+        && (key == "0" || !key.starts_with('0'));
+    canonical
+        .then(|| key.parse::<u64>().ok())
+        .flatten()
+        .ok_or_else(|| {
+            Error::message(format!(
+                "osc key '{key}' is not a canonical sequence (decimal digits, no sign, \
+                 no leading zero)"
+            ))
+        })
+}
+
+fn file_entry(value: &toml::Value) -> Result<FileEntry, Error> {
+    file_entry_table(
+        value
+            .as_table()
+            .ok_or_else(|| Error::message("a file entry must be a table"))?,
+    )
+}
+
+fn file_entry_table(table: &toml::Table) -> Result<FileEntry, Error> {
     let file = string(table, "file")?
         .filter(|f| !f.trim().is_empty())
         .ok_or_else(|| Error::message("a file entry requires a non-empty 'file'"))?;
+    refuse_retired_pin(table)?;
     let xxhash = string(table, "xxhash")?
         .map(|d| normalize_digest(&d))
         .transpose()?;

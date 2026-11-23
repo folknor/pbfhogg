@@ -1,5 +1,8 @@
 //! Optional dataset selections. Absence is distinct from invalid configuration.
+use std::collections::BTreeMap;
+
 use crate::datasets::{child_table, optional_string};
+use crate::registry::osc_entries;
 use crate::{Config, Error, ResolvedInput};
 
 /// Four finite coordinates, preserving the spelling used on command lines.
@@ -120,31 +123,34 @@ impl Config {
         host: &str,
         dataset: &str,
         snapshot: Option<&str>,
-        sequence: Option<&str>,
+        sequence: Option<u64>,
     ) -> Result<Option<ResolvedInput>, Error> {
         let table = self.osc_table(host, dataset, snapshot)?;
-        let sequence = match sequence {
-            Some(seq) => seq,
+        let (sequence, entry) = match sequence {
+            Some(seq) => {
+                let entry = table
+                    .as_ref()
+                    .and_then(|t| t.get(&seq))
+                    .ok_or_else(|| Error::message(format!("missing osc.{seq}")))?;
+                (seq, *entry)
+            }
             None => match table {
                 None => return Ok(None),
                 Some(t) if t.is_empty() => return Ok(None),
                 Some(t) if t.len() == 1 => t
-                    .keys()
+                    .into_iter()
                     .next()
                     .ok_or_else(|| Error::message("OSC selection disappeared"))?,
                 Some(t) => {
                     return Err(Error::message(format!(
                         "multiple OSC entries ({}); select --osc-seq",
-                        t.keys().cloned().collect::<Vec<_>>().join(", ")
+                        t.keys().map(u64::to_string).collect::<Vec<_>>().join(", ")
                     )));
                 }
             },
         };
-        let entry = child_table(
-            table.ok_or_else(|| Error::message(format!("missing osc.{sequence}")))?,
-            sequence,
-        )?;
-        self.resolve_entry(host, "osc", sequence, entry).map(Some)
+        self.resolve_entry(host, "osc", &sequence.to_string(), entry)
+            .map(Some)
     }
 
     /// Whether the selected OSC table has any entries. Never falls back.
@@ -164,8 +170,8 @@ impl Config {
         host: &str,
         dataset: &str,
         snapshot: Option<&str>,
-    ) -> Result<Option<&toml::Table>, Error> {
-        optional_table(self.selection_table(host, dataset, snapshot)?, "osc")
+    ) -> Result<Option<BTreeMap<u64, &toml::Table>>, Error> {
+        osc_entries(self.selection_table(host, dataset, snapshot)?)
     }
 
     /// Resolve every integer in an inclusive OSC range, in ascending order.
@@ -181,10 +187,13 @@ impl Config {
         if lo > hi {
             return Err(Error::message("OSC range must be ascending"));
         }
+        let table = self.osc_table(host, dataset, snapshot)?.unwrap_or_default();
         (lo..=hi)
             .map(|seq| {
-                self.select_osc(host, dataset, snapshot, Some(&seq.to_string()))?
-                    .ok_or_else(|| Error::message(format!("missing osc.{seq}")))
+                let entry = table
+                    .get(&seq)
+                    .ok_or_else(|| Error::message(format!("missing osc.{seq}")))?;
+                self.resolve_entry(host, "osc", &seq.to_string(), entry)
             })
             .collect()
     }

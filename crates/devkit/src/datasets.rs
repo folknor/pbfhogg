@@ -89,11 +89,7 @@ impl Config {
         let file = optional_string(entry, "file")?
             .filter(|file| !file.trim().is_empty())
             .ok_or_else(|| Error::message("file entry requires a non-empty 'file'"))?;
-        if entry.contains_key("sha256") {
-            return Err(Error::message(
-                "dataset pin 'sha256' is retired; configure 'xxhash' instead",
-            ));
-        }
+        refuse_retired_pin(entry)?;
         let expected_digest = optional_string(entry, "xxhash")?
             .map(normalize_digest)
             .transpose()?;
@@ -175,6 +171,18 @@ pub(crate) fn optional_string<'a>(
                 .ok_or_else(|| Error::message(format!("'{key}' must be a string")))
         })
         .transpose()
+}
+
+/// Every reader of a file entry (input resolution and the registry's typed
+/// view for acquisition and promotion) refuses the retired `sha256` pin, so
+/// an entry pinned only that way is never treated as unpinned.
+pub(crate) fn refuse_retired_pin(entry: &toml::Table) -> Result<(), Error> {
+    if entry.contains_key("sha256") {
+        return Err(Error::message(
+            "dataset pin 'sha256' is retired; configure 'xxhash' instead",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_digest(value: &str) -> Result<String, Error> {

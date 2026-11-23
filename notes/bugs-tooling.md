@@ -88,32 +88,6 @@ Reported by: verify (flagged as a coverage limitation).
 `checks/sort.rs` never passes `--force`, so selecting an unindexed raw input
 exercises the CLI's indexdata refusal rather than sort's supported fallback.
 
-## TOOL-015 - Distinct OSC registrations silently collapse onto one sequence
-
-Reported by: datasets-devkit [P2].
-
-`generation` (`registry.rs`) parses string keys to `u64` and inserts them
-without a duplicate check, so the valid TOML keys `011` and `11` become one
-entry and silently discard a file and its pin. This bypasses the requirement
-in `reference/datasets.md` that every registered donor exists, passes its pin
-and agrees with other copies. Conversely, `select_osc` uses literal string
-keys, so a sole `011` entry exists for acquisition but is missing for a
-numeric range requesting sequence 11. The two devkit readers disagree, and
-sequence interpretation needs one representation that refuses ambiguous
-registrations.
-
-## TOOL-016 - Acquisition silently ignores retired sha256 pins
-
-Reported by: datasets-devkit [P2].
-
-`file_entry` (`registry.rs`) reads `xxhash` and ignores `sha256`, so a file
-carrying only the retired pin becomes unpinned in `DatasetView`, and
-acquisition accepts it without checking the pin. The other reader,
-`resolve_entry` (`crates/devkit/src/datasets.rs`), explicitly refuses the same
-configuration, as the retirement contract requires. This is reachable through
-the supported `--config` selection of another project's registry, even when
-brokkr's own config is valid.
-
 ## TOOL-017 - A configured FIFO hangs digest resolution
 
 Reported by: datasets-devkit [P2].

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Selections {
     /// Select a configured OSC sequence (otherwise require exactly one).
     #[arg(long, conflicts_with = "osc")]
-    pub(crate) osc_seq: Option<String>,
+    pub(crate) osc_seq: Option<u64>,
     /// Fixture OSC instead of a dataset-resolved change file.
     #[arg(long)]
     pub(crate) osc: Option<PathBuf>,
@@ -59,12 +59,7 @@ impl Selection<'_> {
         };
         Ok(self
             .config
-            .select_osc(
-                self.host,
-                &self.source.dataset,
-                selected,
-                args.osc_seq.as_deref(),
-            )?
+            .select_osc(self.host, &self.source.dataset, selected, args.osc_seq)?
             .map(|input| input.path))
     }
 
@@ -210,7 +205,7 @@ file = 'missing.pbf'
                 .ends_with("snap.osc")
         );
         let explicit = Selections {
-            osc_seq: Some("10".into()),
+            osc_seq: Some(10),
             ..Default::default()
         };
         assert!(select(&config, &source).osc(&explicit).is_err());

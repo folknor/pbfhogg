@@ -240,23 +240,27 @@ impl S4Consumer<'_> {
         self.write_ms += t_w.elapsed_ms();
 
         self.passthrough_blobs += 1;
-        self.total_stats.blobs_passthrough += 1;
+        // Credited by the claimed count, checked: the claim is unbounded.
+        let mut delta = Stats {
+            blobs_passthrough: 1,
+            ..Stats::default()
+        };
         match desc.kind {
             crate::ElementKind::Node => {
-                self.total_stats.nodes_read += desc.count;
-                self.total_stats.nodes_written += desc.count;
+                delta.nodes_read = desc.count;
+                delta.nodes_written = desc.count;
             }
             crate::ElementKind::Relation => {
-                self.total_stats.relations_written += desc.count;
+                delta.relations_written = desc.count;
             }
             crate::ElementKind::Way => {
                 // Ways never pass through (they need coord_payloads
-                // splicing). Fall through without touching stats;
+                // splicing). Fall through without touching element stats;
                 // unreachable in practice but we avoid a hard panic here
                 // since this is on the output path.
             }
         }
-        Ok(())
+        self.total_stats.merge(&delta)
     }
 }
 
@@ -277,7 +281,7 @@ impl S4Consumer<'_> {
         self.cancel.faults().on_altw_stage4_consume(ordinal)?;
         #[cfg(not(pbfhogg_test_hooks))]
         let _ = ordinal;
-        self.total_stats.merge(&block_stats);
+        self.total_stats.merge(&block_stats)?;
         for block in blocks {
             // Each output handoff is a boundary for the router abort.
             self.router.check()?;
@@ -354,6 +358,8 @@ pub(super) fn stage4_assembly(
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
     let mut way_sidecar_idx: usize = 0;
     let mut skipped_node_blobs: u64 = 0;
+    // Node statistics of the blobs dropped whole, seeding the consumer's.
+    let mut skipped_stats = Stats::default();
 
     // Stage 4 schedule diagnostics.
     let mut s4_node_blobs_total: u64 = 0;
@@ -391,7 +397,15 @@ pub(super) fn stage4_assembly(
                     s4_node_blobs_kept_by_members += 1;
                 }
                 if !has_members {
+                    // Every node in it is read and dropped: credited by the
+                    // claimed count, so the summary counts the same nodes
+                    // a decode would (sparse counts them one by one).
                     skipped_node_blobs += 1;
+                    skipped_stats.merge(&Stats {
+                        nodes_read: meta.count,
+                        nodes_dropped: meta.count,
+                        ..Stats::default()
+                    })?;
                     continue;
                 }
             }
@@ -522,7 +536,7 @@ pub(super) fn stage4_assembly(
         file: &shared_file,
         input,
         writer: &mut writer,
-        total_stats: Stats::default(),
+        total_stats: skipped_stats,
         bytes_written: 0,
         write_calls: 0,
         write_ms: 0,

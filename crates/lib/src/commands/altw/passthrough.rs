@@ -563,24 +563,28 @@ impl Pass2Consumer<'_> {
         let t_write = crate::counters::Stopwatch::start();
         self.writer.write_raw_owned(frame)?;
         self.write_ns += t_write.elapsed_ns();
-        self.total_stats.blobs_passthrough += 1;
+        // Credited by the claimed count, checked: the claim is unbounded.
+        let mut delta = Stats {
+            blobs_passthrough: 1,
+            ..Stats::default()
+        };
         match desc.kind {
             Some(ElementKind::Node) => {
-                self.total_stats.nodes_read += desc.count;
-                self.total_stats.nodes_written += desc.count;
+                delta.nodes_read = desc.count;
+                delta.nodes_written = desc.count;
             }
             Some(ElementKind::Relation) => {
-                self.total_stats.relations_written += desc.count;
+                delta.relations_written = desc.count;
             }
             Some(ElementKind::Way) | None => {
                 // Ways never pass through (they need location splicing).
                 // `None` means a blob with no indexdata reached the consumer
                 // as passthrough, which the schedule filter excludes by
                 // construction (only Relation/Node can be passthrough).
-                // Stats untouched.
+                // Element stats untouched.
             }
         }
-        Ok(())
+        self.total_stats.merge(&delta)
     }
 }
 
@@ -597,7 +601,7 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Con
         _ordinal: usize,
         (blocks, block_stats): (Vec<OwnedBlock>, Stats),
     ) -> crate::Result<()> {
-        self.total_stats.merge(&block_stats);
+        self.total_stats.merge(&block_stats)?;
         let t_write = crate::counters::Stopwatch::start();
         for block in blocks {
             self.writer.write_primitive_block_owned(block)?;

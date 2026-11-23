@@ -227,6 +227,49 @@ fn out_of_domain_node_coordinates_are_refused_by_both_backends() {
     }
 }
 
+/// A node blob holding only untagged non-member nodes is dropped whole by
+/// the external join without a decode; its nodes still count as read and
+/// dropped, exactly as sparse counts them one by one.
+#[test]
+fn wholly_dropped_node_blob_is_counted_by_both_backends() {
+    let nodes: Vec<TestNode> = (1..=3)
+        .map(|id| TestNode {
+            id,
+            lat: 550_000_000 + i32::try_from(id).expect("small id") * 1_000_000,
+            lon: 120_000_000,
+            tags: vec![],
+            meta: None,
+        })
+        .collect();
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 2, 3],
+        tags: vec![("highway", "residential")],
+        meta: None,
+    }];
+    for backend in [IndexBackend::Sparse, IndexBackend::External] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+        write_indexed_pbf(&input, &nodes, &ways, &[]);
+
+        let out = run_altw(&input, &output, false, backend, false);
+        assert!(
+            out.status.success(),
+            "{backend:?}: run failed; stderr:\n{}",
+            out.stderr_str(),
+        );
+        assert!(
+            out.stderr_str()
+                .contains("3 nodes read, 0 written, 3 dropped"),
+            "{backend:?}: stats counters mismatch; stderr:\n{}",
+            out.stderr_str(),
+        );
+        assert!(read_node_ids(&output).is_empty());
+        assert_eq!(read_way_locations(&output).len(), 1);
+    }
+}
+
 /// Convenience: run with default index, assert success.
 fn run_altw_ok(input: &Path, output: &Path, keep_untagged_nodes: bool) -> CliOutput {
     let out = run_altw(

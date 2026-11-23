@@ -341,6 +341,11 @@ impl NodeIndex {
 // ---------------------------------------------------------------------------
 
 /// Statistics from the add-locations-to-ways operation.
+///
+/// Every input node is counted once in `nodes_read` and once in either
+/// `nodes_written` or `nodes_dropped`. A node blob copied raw or dropped
+/// whole without a decode is credited by its indexdata `count` claim
+/// (reference/indexdata-trust.md); decoded blobs are counted per element.
 #[derive(Default)]
 pub struct Stats {
     pub nodes_read: u64,
@@ -355,15 +360,43 @@ pub struct Stats {
 
 impl Stats {
     /// Accumulate stats from another `Stats` instance into this one.
-    pub fn merge(&mut self, src: &Stats) {
-        self.nodes_read += src.nodes_read;
-        self.nodes_written += src.nodes_written;
-        self.nodes_dropped += src.nodes_dropped;
-        self.ways_written += src.ways_written;
-        self.relations_written += src.relations_written;
-        self.missing_locations += src.missing_locations;
-        self.blobs_passthrough += src.blobs_passthrough;
-        self.blobs_decoded += src.blobs_decoded;
+    ///
+    /// Claimed indexdata counts feed these sums unbounded, so a sum that
+    /// does not fit is refused as invalid data rather than wrapped or
+    /// saturated into a wrong summary. On error `self` is unchanged.
+    pub fn merge(&mut self, src: &Stats) -> crate::Result<()> {
+        fn add(a: u64, b: u64, field: &str) -> crate::Result<u64> {
+            a.checked_add(b).ok_or_else(|| {
+                crate::Error::invalid_data(format!(
+                    "add-locations-to-ways statistics overflow in {field} \
+                     (indexdata count claims too large)"
+                ))
+            })
+        }
+        let merged = Stats {
+            nodes_read: add(self.nodes_read, src.nodes_read, "nodes_read")?,
+            nodes_written: add(self.nodes_written, src.nodes_written, "nodes_written")?,
+            nodes_dropped: add(self.nodes_dropped, src.nodes_dropped, "nodes_dropped")?,
+            ways_written: add(self.ways_written, src.ways_written, "ways_written")?,
+            relations_written: add(
+                self.relations_written,
+                src.relations_written,
+                "relations_written",
+            )?,
+            missing_locations: add(
+                self.missing_locations,
+                src.missing_locations,
+                "missing_locations",
+            )?,
+            blobs_passthrough: add(
+                self.blobs_passthrough,
+                src.blobs_passthrough,
+                "blobs_passthrough",
+            )?,
+            blobs_decoded: add(self.blobs_decoded, src.blobs_decoded, "blobs_decoded")?,
+        };
+        *self = merged;
+        Ok(())
     }
 
     /// Print a summary of the operation to stderr.
@@ -1371,7 +1404,7 @@ fn write_output_decode_all(
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
             }
-            stats.merge(&block_stats);
+            stats.merge(&block_stats)?;
             decoded_blocks += 1;
             if decoded_blocks.is_multiple_of(64) {
                 host.invocation.counter("altw_pass2_blocks", decoded_blocks);
@@ -1514,6 +1547,31 @@ mod tests {
     };
 
     const GB: u64 = 1_000_000_000;
+
+    /// A claimed count that overflows a statistic is refused, and the
+    /// refused merge leaves the receiver as it was.
+    #[test]
+    fn stats_merge_refuses_overflow_and_leaves_receiver_intact() {
+        let mut stats = super::Stats {
+            nodes_read: 1,
+            ways_written: 7,
+            ..super::Stats::default()
+        };
+        let claim = super::Stats {
+            nodes_read: u64::MAX,
+            ways_written: 1,
+            ..super::Stats::default()
+        };
+        assert!(stats.merge(&claim).is_err());
+        assert_eq!((stats.nodes_read, stats.ways_written), (1, 7));
+        stats
+            .merge(&super::Stats {
+                nodes_dropped: 2,
+                ..super::Stats::default()
+            })
+            .expect("fits");
+        assert_eq!(stats.nodes_dropped, 2);
+    }
 
     /// The recheck uses the estimate route's threshold on the exact store,
     /// and takes extra anon off the budget: `store <= 80 % of (budget -

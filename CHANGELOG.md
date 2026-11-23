@@ -683,6 +683,15 @@
 
 ### Fixed
 
+- **`add-locations-to-ways --index-type external` counts the nodes of a
+  node blob it drops whole.** Removing untagged nodes, the external join
+  skips a blob of only untagged non-member nodes without decoding it, and
+  its nodes were left out of the summary: a file of only such nodes
+  reported `0 nodes read, 0 written, 0 dropped`. They now count as read
+  and dropped by the blob's indexdata count, matching the sparse index.
+  `Stats::merge` now returns a `Result`, refusing as invalid data a
+  statistic that overflows `u64` from claimed counts instead of wrapping.
+
 - **`degrade --corrupt-tagdata`, `--corrupt-indexdata` and
   `--corrupt-indexdata-kind` no longer publish an oversized `BlobHeader`.**
   The replacement hint could grow a `BlobHeader` already near the 64 KiB

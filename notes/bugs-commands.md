@@ -98,18 +98,6 @@ deliberate protobuf restriction is missing from `DEVIATIONS.md`. The refusal
 does prevent wrong coordinates. The hunter says to either convert the framing
 or document the refusal.
 
-## CMD-016 - External ALTW statistics leave out whole dropped node blobs
-
-Reported by: altw [P2].
-
-When stage 4 (`altw/external/stage4.rs`) finds an entirely untagged node blob
-with no relation members, it continues without updating node statistics. A
-file of only such nodes plus ways that reference them can report
-`0 nodes read, 0 written, 0 dropped`, although coordinates were resolved from
-those nodes and every node record was removed. Sparse reports the dropped
-nodes. This breaks the meaning of `Stats::nodes_dropped` and of the printed
-summary.
-
 ## CMD-017 - wait_ready emits a WAIT span before confirming it parked
 
 Reported by: altw (lateral observation).

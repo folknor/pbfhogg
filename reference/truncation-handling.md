@@ -61,8 +61,17 @@ blobs. An OSMHeader is accepted again after rewinding to the stream start
 `WireBlobHeader::parse` checks `datasize` as a signed int32 before narrowing.
 Out-of-range varints cannot alias a smaller frame length (for example,
 2^32 + 100 becoming 100). Sign-extended negative int32 values retain their
-value and reach the existing negative-size guard; the existing 32 MiB
-serialized-body cap still applies before any body allocation or skip.
+value and reach the non-positive-size guard; the 32 MiB serialized-body
+cap still applies before any body allocation or skip.
+
+`datasize` is required and must be positive, for every blob type: an
+absent field and an explicit zero are refused by the header parse, as
+libosmium refuses both. A serialized `Blob` always carries a payload
+field, so a zero-length body is never a real frame, and accepting one
+would let a header walk, a raw walk or an unknown-type skip pass an
+empty frame that a full decode refuses as an empty blob. The parse owns
+every datasize guard, so a header that is both mispositioned and
+missing its size reports the size.
 
 ## The five shapes
 
@@ -116,8 +125,8 @@ there is no per-command relaxation. The contract sites are:
 
 - `read::frame::Frames` (`crates/lib/src/read/frame.rs`) - the one frame
   walk. It owns the length prefix, the shape-1 EOF policy, both size
-  guards (zero-length and `MAX_BLOB_HEADER_SIZE`), the header parse,
-  the header-position rule, the declared-datasize guards, shapes 2-4
+  guards (zero-length and `MAX_BLOB_HEADER_SIZE`), the header parse
+  with its declared-datasize guards, the header-position rule, shapes 2-4
   and the provenance stamped on every frame error. Every frame
   reader holds one over its own byte source: `BlobReader`
   (streaming, for its iterator and for `next_header_skip_blob`),

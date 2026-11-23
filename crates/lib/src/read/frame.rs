@@ -8,8 +8,8 @@
 //! frames through undecoded ([`Frames::next_raw`]) and the input-front probes
 //! all hold a `Frames` over their own source and nothing else of the frame
 //! format: the length prefix, the EOF policy, both size guards, the header
-//! parse, the leading-header rule, the declared-datasize guards, the
-//! truncation errors and the provenance stamped on every failure live here
+//! parse (which owns the declared-datasize guards: present, positive, under
+//! the cap), the leading-header rule, the truncation errors and the provenance stamped on every failure live here
 //! once.
 //!
 //! The frame format used to be decoded in three places with three copies of
@@ -54,8 +54,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::blob::{
-    BlobKind, BlobReaderSource, BlobSite, ByteOffset, MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE,
-    WireBlobHeader, warn_unrecognised_indexdata,
+    BlobKind, BlobReaderSource, BlobSite, ByteOffset, MAX_BLOB_HEADER_SIZE, WireBlobHeader,
+    warn_unrecognised_indexdata,
 };
 use crate::blob_meta::BlobIndex;
 use crate::error::{BlobError, Error, Location, Result, new_blob_error};
@@ -634,20 +634,8 @@ impl<S: FrameSource> Frames<S> {
             None => id.ordinal == Some(0),
         };
         check_header_position(&header.blob_type, at_start)?;
-        if header.datasize < 0 {
-            return Err(new_blob_error(BlobError::InvalidDataSize {
-                size: header.datasize,
-            }));
-        }
-        // Reject an oversized declared datasize before any caller allocates,
-        // reads or skips the payload. `MAX_BLOB_MESSAGE_SIZE` caps the
-        // decompressed block only after the compressed body is in memory, so
-        // without this a hostile datasize drives an outsized allocation.
-        let datasize = header.datasize as u64;
-        if datasize >= MAX_BLOB_DATASIZE {
-            return Err(new_blob_error(BlobError::DataSizeTooBig { size: datasize }));
-        }
-        let data_size = datasize as usize;
+        // The parse refused an absent, non-positive or oversized datasize.
+        let data_size = header.datasize.len();
 
         self.pos = header_start.map(|s| s + header_len as u64);
         self.pending = Some(Pending {
@@ -791,7 +779,7 @@ fn truncated(part: TruncatedPart, len: usize, start: Option<u64>) -> Error {
 /// Apply both length-prefix guards and return the validated header length.
 ///
 /// * A zero-length `BlobHeader` consumes 4 bytes and declares nothing: no
-///   type, `datasize == 0`. Accepting it turns a run of zero bytes into a
+///   type, no datasize. Accepting it turns a run of zero bytes into a
 ///   stream of legal empty frames that every consumer skips as "unknown blob
 ///   type", so infinite garbage reads as a clean success with empty output.
 /// * A length at or above [`MAX_BLOB_HEADER_SIZE`] is beyond the format's cap,

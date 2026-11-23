@@ -120,7 +120,7 @@ impl Blob {
     /// Length of the body (the `Blob` message) in bytes.
     #[cfg_attr(not(feature = "commands"), allow(dead_code))]
     pub(crate) fn body_len(&self) -> usize {
-        usize::try_from(self.header.datasize).unwrap_or(0)
+        self.header.datasize.len()
     }
 
     /// Attach this blob's true provenance - its index and byte offset, as
@@ -302,9 +302,8 @@ impl Blob {
     /// or pathological blobs accumulate file-sized memory under the cap.
     pub(crate) fn retained_len(&self) -> u64 {
         // datasize is the Blob message size = the parent buffer length that the
-        // payload slices keep alive. Negative sizes are rejected upstream in
-        // `BlobReader`; treat any stray negative as zero rather than wrapping.
-        u64::try_from(self.header.datasize).unwrap_or(0)
+        // payload slices keep alive; positive by construction.
+        u64::from(self.header.datasize.get())
     }
 
     /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
@@ -372,9 +371,12 @@ impl BlobHeader {
 
     /// Returns the size of the following blob in bytes.
     // wontfix(name-no-get-prefix): inherited from osmpbf public API
+    /// Always positive and below the 32 MiB declared-size cap: a header
+    /// whose datasize is absent, zero, negative or over the cap is refused.
     #[inline]
+    #[allow(clippy::cast_possible_wrap, reason = "the size is below 32 MiB")]
     pub fn get_blob_size(&self) -> i32 {
-        self.header.datasize
+        self.header.datasize.get() as i32
     }
 }
 
@@ -1719,7 +1721,7 @@ mod tests {
         for (kind, expected_type) in pairs {
             let ff_header = WireBlobHeader {
                 blob_type: kind.clone(),
-                datasize: 0,
+                datasize: crate::read::blob_wire::DataSize::for_tests(1),
                 indexdata: None,
                 indexdata_present: false,
                 unrecognised_indexdata_len: None,
@@ -1746,7 +1748,7 @@ mod tests {
         // file-sized memory can accumulate under the in-flight cap.
         let header = WireBlobHeader {
             blob_type: BlobKind::OsmData,
-            datasize: 1_000_000,
+            datasize: crate::read::blob_wire::DataSize::for_tests(1_000_000),
             indexdata: None,
             indexdata_present: false,
             unrecognised_indexdata_len: None,
@@ -1762,31 +1764,10 @@ mod tests {
         assert_eq!(blob.retained_len(), 1_000_000);
     }
 
-    #[test]
-    fn retained_len_treats_negative_datasize_as_zero() {
-        // datasize is validated non-negative upstream in BlobReader; a stray
-        // negative must clamp to 0 rather than wrap to a huge u64 charge.
-        let header = WireBlobHeader {
-            blob_type: BlobKind::OsmData,
-            datasize: -1,
-            indexdata: None,
-            indexdata_present: false,
-            unrecognised_indexdata_len: None,
-            tagdata: None,
-            tagdata_present: false,
-            waymembers: None,
-        };
-        let wire = WireBlob {
-            data: None,
-            raw_size: None,
-        };
-        assert_eq!(Blob::new(header, wire, None).retained_len(), 0);
-    }
-
     fn blob_with_waymembers(waymembers: Option<Vec<u8>>) -> Blob {
         let header = WireBlobHeader {
             blob_type: BlobKind::OsmData,
-            datasize: 0,
+            datasize: crate::read::blob_wire::DataSize::for_tests(1),
             indexdata: None,
             indexdata_present: false,
             unrecognised_indexdata_len: None,

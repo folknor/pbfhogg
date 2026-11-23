@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **A BlobHeader with an absent or zero `datasize` is refused.** The
+  header parse used to read an omitted `datasize` as zero and accept an
+  explicit zero, so such a frame passed as an empty body: header walks,
+  raw passthrough (`cat`, `degrade`, `getid`, `check --index`) and the
+  unknown-type skip accepted it, an extension frame could be silently
+  skipped, and only a full decode failed, as an empty blob. Both are now
+  refused for every blob type, as libosmium refuses them, before the
+  header-position rule. The negative-size error now reads "blob header
+  datasize must be positive". `BlobHeader::get_blob_size` is always
+  positive.
+
 - **Rebuilt blocks round non-default-granularity timestamps down and refuse
   overflow.** A command that rebuilds a block from a source block whose
   `date_granularity` is not the default 1000 used to scale its timestamps

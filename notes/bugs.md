@@ -26,22 +26,6 @@ reading or an API hazard rather than a demonstrated wrong result; that label is
 kept. "Reported by" is a fact about the reports. Entries are in no order of
 importance.
 
-## BUG-002 - Missing BlobHeader datasize becomes zero
-
-Reported by: framing.
-
-`WireBlobHeader::parse` defaults `datasize` to zero and never checks presence,
-so an omitted required size becomes a zero-byte payload. Header-only and raw
-passthrough paths can accept it while a later decode fails differently.
-
-Defect hunt 2026-11-17 (read-framing, P2): `Frames` (`frame.rs`) then accepts
-the manufactured zero, so a header with a type but no datasize becomes a
-completed frame with an empty body; after a valid leading header, an extension
-frame with no datasize can be silently skipped and the input accepted. The
-parser needs to distinguish absent from explicit zero. Libosmium rejects both
-missing and zero sizes, while the repository explicitly tests acceptance of
-zero, so that separate compatibility difference also needs a ruling.
-
 ## BUG-006 - Rebuild paths drop inline way locations
 
 Reported by: encoding, sort, spatial.

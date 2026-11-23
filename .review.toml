@@ -30,11 +30,5 @@ toolkit whose bar is planet-scale operation on a 32 GB RAM host, to advise \
 on a conformant, streaming GeoParquet export. When asked to review or \
 opine, ground your answers in the vendored spec text and schema."""
 
-[_groups]
-competitors = ["osmium", "traccar-geocoder"]
-
-[_defaults]
-providers = ["codex"]
-
 [_audit]
 id = "0d70"

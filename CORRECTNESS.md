@@ -381,8 +381,9 @@ the `BlobHeader` message (64 KiB), and says nothing about a serialized-`Blob`
 `datasize` ceiling. The bound is the *de facto interoperability limit* - the
 reference reader (OSM-binary, `FileBlockHead`) applies a single 32 MiB
 `MAX_BODY_SIZE` directly to `BlobHeader.datasize` and rejects anything at or
-above it. Mirroring that reader exactly means every file pbfhogg accepts the
-reference reader also accepts. A consequence worth stating: a blob carrying its
+above it. Mirroring that reader exactly means pbfhogg accepts no declared size
+above what the reference reader accepts. The lower bound matches libosmium: an
+absent or zero `datasize` is refused for every blob type. A consequence worth stating: a blob carrying its
 content uncompressed in `raw` at exactly the 32 MiB content cap serializes to a
 few bytes over 32 MiB (protobuf framing plus the `raw_size` hint), so it too is
 rejected by the reference reader - interoperable files cannot carry such a blob.

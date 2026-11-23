@@ -8,7 +8,7 @@ use bytes::Bytes;
 use super::wire_schema::{blob, blob_header};
 
 use crate::blob_meta::{INDEX_SIZE, INDEX_SIZE_V1, WireIndexdata};
-use crate::error::{Result, new_wire_error};
+use crate::error::{BlobError, Result, new_blob_error, new_wire_error};
 
 /// Blob type parsed from BlobHeader, avoiding per-blob String allocation.
 ///
@@ -21,6 +21,59 @@ pub(crate) enum BlobKind {
     Unknown(String),
 }
 
+/// A declared `BlobHeader.datasize` that frames a body: present, positive
+/// and below [`MAX_BLOB_DATASIZE`]. Only [`WireBlobHeader::parse`] builds
+/// one, so every frame a reader walks has a body of at least one byte.
+///
+/// `datasize` is a required field and a serialized `Blob` always carries a
+/// payload field, so an absent or zero size is never a real frame: it is a
+/// header-only frame that every consumer skipping unknown types, every raw
+/// walk and every header walk would accept as an empty body, while a full
+/// decode refuses it as an empty blob. libosmium (`decode_blob_header`)
+/// refuses both, for every blob type; so does pbfhogg, extension blobs
+/// included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DataSize(std::num::NonZeroU32);
+
+impl DataSize {
+    /// Validate a decoded int32 datasize, or `None` when the field was absent.
+    fn validate(size: Option<i32>) -> Result<Self> {
+        let Some(size) = size else {
+            return Err(new_wire_error("BlobHeader has no datasize field"));
+        };
+        let positive = match u32::try_from(size).map(std::num::NonZeroU32::new) {
+            Ok(Some(positive)) => positive,
+            Ok(None) | Err(_) => return Err(new_blob_error(BlobError::InvalidDataSize { size })),
+        };
+        // Reject an oversized declared datasize before any caller allocates,
+        // reads or skips the payload. `MAX_BLOB_MESSAGE_SIZE` caps the
+        // decompressed block only after the compressed body is in memory, so
+        // without this a hostile datasize drives an outsized allocation.
+        if u64::from(positive.get()) >= MAX_BLOB_DATASIZE {
+            return Err(new_blob_error(BlobError::DataSizeTooBig {
+                size: u64::from(positive.get()),
+            }));
+        }
+        Ok(Self(positive))
+    }
+
+    /// The size in bytes. Fits `i32` and `usize` (below the 32 MiB cap).
+    pub(crate) fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The size as a buffer length.
+    pub(crate) fn len(self) -> usize {
+        self.0.get() as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(size: u32) -> Self {
+        let size = i32::try_from(size).unwrap_or_else(|e| panic!("{e}"));
+        Self::validate(Some(size)).unwrap_or_else(|e| panic!("{e}"))
+    }
+}
+
 /// Parsed BlobHeader from protobuf wire format.
 ///
 /// Fields: type (string, field 1), indexdata (bytes, field 2), datasize
@@ -28,7 +81,7 @@ pub(crate) enum BlobKind {
 #[derive(Clone, Debug)]
 pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
-    pub datasize: i32,
+    pub datasize: DataSize,
     pub unrecognised_indexdata_len: Option<usize>,
     /// Blob-level index in the fixed-size reader carrier: a 42-byte v2/v3
     /// field, or a 26-byte v1 field zero-padded. Built only by
@@ -90,7 +143,7 @@ impl WireBlobHeader {
         use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
-        let mut datasize: i32 = 0;
+        let mut datasize: Option<i32> = None;
         let mut indexdata: Option<[u8; INDEX_SIZE]> = None;
         let mut indexdata_present = false;
         let mut unrecognised_indexdata_len = None;
@@ -177,8 +230,12 @@ impl WireBlobHeader {
                     // Validate before narrowing: otherwise 2^32 + N aliases
                     // to N and moves the next frame boundary. Sign-extended
                     // negative int32 values remain intact for the size guard.
-                    datasize =
-                        super::wire::read_int32(&mut cursor, "BlobHeader.datasize exceeds int32")?;
+                    // The range checks run after the loop, on the value
+                    // protobuf keeps (the last occurrence).
+                    datasize = Some(super::wire::read_int32(
+                        &mut cursor,
+                        "BlobHeader.datasize exceeds int32",
+                    )?);
                 }
                 blob_header::TAGDATA if parse_tagdata => {
                     // tagdata: per-blob tag key index (len-delimited). Same
@@ -211,12 +268,16 @@ impl WireBlobHeader {
 
         // `type` is a required field. A header that omits it (or carries an
         // empty string) is not a valid frame descriptor, but it parses to
-        // `Unknown("")` with `datasize == 0`, which every consumer skips as an
-        // unrecognised blob type - so garbage would read as clean success.
+        // `Unknown("")`, which every consumer skips as an unrecognised blob
+        // type - so garbage would read as clean success. Checked before the
+        // datasize, so a header missing both reports the type.
         // Rejecting here covers every frame decoder at one site.
         if matches!(&blob_type, BlobKind::Unknown(s) if s.is_empty()) {
             return Err(new_wire_error("BlobHeader has no type field"));
         }
+        // The size guards run here, before the frame walk's header-position
+        // rule: a header with both faults reports its size.
+        let datasize = DataSize::validate(datasize)?;
 
         Ok(WireBlobHeader {
             blob_type,
@@ -530,8 +591,8 @@ pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 /// the *de facto interoperability limit*: the reference reader (OSM-binary,
 /// `FileBlockHead`) applies a single 32 MiB `MAX_BODY_SIZE` directly to
 /// `BlobHeader.datasize` and rejects anything at or above it. We mirror that
-/// reader exactly, so every file pbfhogg accepts the reference reader also
-/// accepts. A consequence worth stating: a blob carrying its content
+/// reader exactly, so pbfhogg accepts no declared size above what the
+/// reference reader accepts. A consequence worth stating: a blob carrying its content
 /// uncompressed in the `raw` field at exactly the 32 MiB content cap serializes
 /// to a few bytes over 32 MiB (protobuf field tags, the length prefix, and the
 /// `raw_size` hint), so it too is rejected by the reference reader -
@@ -737,14 +798,47 @@ mod tests {
     fn sign_extended_negative_datasize_reaches_the_negative_size_guard() {
         for (wire, expected) in [(u64::MAX, -1), (0xffff_ffff_8000_0000, i32::MIN)] {
             let bytes = header_with_datasize(wire);
-            let parsed = WireBlobHeader::parse(&bytes, false, false, false).unwrap();
-            assert_eq!(parsed.datasize, expected);
+            let err = WireBlobHeader::parse(&bytes, false, false, false).unwrap_err();
+            assert!(matches!(
+                err.kind(),
+                ErrorKind::Blob(BlobError::InvalidDataSize { size }) if *size == expected
+            ));
             let err = parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard())
                 .unwrap_err();
             assert!(matches!(
                 err.kind(),
                 ErrorKind::Blob(BlobError::InvalidDataSize { size }) if *size == expected
             ));
+        }
+    }
+
+    /// `datasize` is required and frames a body: an absent field and an
+    /// explicit zero are both refused, for a known type and an extension
+    /// type alike (libosmium refuses both too). The last occurrence wins, as
+    /// protobuf says, so a later valid size supersedes an earlier zero.
+    #[test]
+    fn absent_or_zero_datasize_is_refused() {
+        for kind in [&b"OSMData"[..], b"OSMHeader", b"x-extension"] {
+            let mut absent = vec![0x0A, kind.len() as u8];
+            absent.extend_from_slice(kind);
+            let err = WireBlobHeader::parse(&absent, true, true, true).unwrap_err();
+            assert!(err.to_string().contains("no datasize"), "{err}");
+
+            let mut zero = absent.clone();
+            zero.extend_from_slice(&[0x18, 0x00]);
+            let err = WireBlobHeader::parse(&zero, true, true, true).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    ErrorKind::Blob(BlobError::InvalidDataSize { size: 0 })
+                ),
+                "{err}"
+            );
+
+            let mut superseded = zero;
+            superseded.extend_from_slice(&[0x18, 0x05]);
+            let parsed = WireBlobHeader::parse(&superseded, true, true, true).unwrap();
+            assert_eq!(parsed.datasize.get(), 5);
         }
     }
 

@@ -304,7 +304,7 @@ fn frames_of(pbf: &[u8]) -> Vec<FrameAt> {
             usize::try_from(u32::from_be_bytes(pbf[at..at + 4].try_into().unwrap())).unwrap();
         let header =
             WireBlobHeader::parse(&pbf[at + 4..at + 4 + header_len], false, false, false).unwrap();
-        let datasize = usize::try_from(header.datasize).unwrap();
+        let datasize = header.datasize.len();
         frames.push(FrameAt {
             start: at,
             header_len,
@@ -618,6 +618,35 @@ fn guard_cases(fx: &Fixture) -> Vec<Case> {
             data(u64::MAX),
             fx.refusal(Kind::InvalidDataSize(-1)),
         ),
+        // `datasize` frames a body: absent and zero are refused for every
+        // type, so an extension frame cannot be an accepted empty skip.
+        case(
+            "datasize 0, file ends after the header",
+            fx.with_last_frame(&blob_header("OSMData", Some(0)), &[]),
+            fx.refusal(Kind::InvalidDataSize(0)),
+        ),
+        case(
+            "datasize absent",
+            fx.with_last_frame(&blob_header("OSMData", None), &[]),
+            fx.refusal(Kind::Wire),
+        ),
+        case(
+            "extension blob, datasize 0",
+            fx.with_last_frame(&blob_header("x-extension", Some(0)), &[]),
+            fx.refusal(Kind::InvalidDataSize(0)),
+        ),
+        case(
+            "extension blob, datasize absent",
+            fx.with_last_frame(&blob_header("x-extension", None), &[]),
+            fx.refusal(Kind::Wire),
+        ),
+        // The size is part of the header parse, so it is refused before the
+        // position rule.
+        case(
+            "second OSMHeader, datasize 0",
+            fx.with_last_frame(&blob_header("OSMHeader", Some(0)), &[]),
+            fx.refusal(Kind::InvalidDataSize(0)),
+        ),
         case(
             "datasize past int32",
             data((1_u64 << 32) + 100),
@@ -642,7 +671,7 @@ fn guard_cases(fx: &Fixture) -> Vec<Case> {
     ]
 }
 
-/// Just inside each guard: the largest accepted values, and the empty payload.
+/// Just inside each guard: the largest accepted values.
 fn boundary_cases(fx: &Fixture) -> Vec<Case> {
     let max_data = usize::try_from(MAX_BLOB_DATASIZE).unwrap();
     let header_max = usize::try_from(MAX_BLOB_HEADER_SIZE).unwrap() - 1;
@@ -659,11 +688,6 @@ fn boundary_cases(fx: &Fixture) -> Vec<Case> {
                 fx.refusal(Kind::Eof),
             )
         },
-        case(
-            "datasize 0, file ends after the header",
-            fx.with_last_frame(&blob_header("OSMData", Some(0)), &[]),
-            Seen::End { frames: 3 },
-        ),
         // Wider than the walk's probe window, so it takes the second pread.
         case(
             "valid BlobHeader one below the cap",

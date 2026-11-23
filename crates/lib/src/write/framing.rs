@@ -444,6 +444,11 @@ fn encode_frame_header(
             MAX_BLOB_DATASIZE,
         ));
     }
+    // The reader refuses a zero datasize (a serialized Blob always carries a
+    // payload field), so an empty body is a caller bug, never input.
+    if body_len == 0 {
+        return Err(Error::internal("refusing to frame an empty Blob body"));
+    }
     let datasize = i32::try_from(body_len)
         .map_err(|_| Error::internal(format!("blob datasize overflow: {body_len} bytes")))?;
     if encode_blob_header_into(

@@ -237,10 +237,7 @@ pub(super) fn run<C: UnitConsumer>(
         // already been released.
         match planner.join() {
             Ok(()) => result,
-            Err(payload) => Err(crate::error::panic_error(
-                "diff unit planner",
-                payload.as_ref(),
-            )),
+            Err(payload) => Err(crate::error::panic_error("diff unit planner", payload)),
         }
     })
 }
@@ -334,7 +331,7 @@ fn drive<C: UnitConsumer>(
                 invocation,
             )
         }))
-        .unwrap_or_else(|payload| Err(crate::error::panic_error(C::WORKER, payload.as_ref())))
+        .unwrap_or_else(|payload| Err(crate::error::panic_error(C::WORKER, payload)))
     };
     run_ordered_streams_from(&mut source, workers, config, |_| (), work, &mut adapter)?;
     adapter.close_kind();

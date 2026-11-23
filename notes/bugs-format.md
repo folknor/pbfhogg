@@ -44,22 +44,6 @@ Its documentation (`read/decompress.rs`) promises the same refusals as
 decompressor rejects for size mismatch. Diff's documented byte-equality
 shortcut explains why. The hunter says the helper's promise is what is wrong.
 
-## FMT-008 - PipelinedBlocks returns queued blocks after cancellation
-
-Reported by: read-pipeline [P2], concurrency-host [P2].
-
-`PipelinedBlocks::next` (`read/reader.rs`) admits each call through
-`Invocation::call`, which refuses sealing but not cancellation, and it never
-checks the token itself. If the background pipeline fills the queue and blocks
-sending, and the invocation is then cancelled, later `next()` calls still
-return queued `Ok(block)` values while the session is active. read-pipeline
-adds a second case: if the pipeline already finished, the iterator can deliver
-every queued block and then a clean EOF without reporting cancellation at all.
-This breaks the next-blob cancellation guarantee documented on
-`ElementReader::invocation`. Both hunters place the fault in the session
-adapter, which needs cancellation checkpoints at its receive and delivery
-boundary.
-
 ## FMT-009 - par_map_reduce's sub-2-GiB working-set guarantee is false
 
 Reported by: read-pipeline [P2].
@@ -141,22 +125,6 @@ Every other public write entry in `write/writer.rs` checks cancellation, but
 cancelled, and returns success. This contradicts the per-write cancellation
 contract documented next to it. Publication still prevents a cancelled staged
 output from being published. The defect is in the write method's behaviour.
-
-## FMT-021 - PipelinedBlocks teardown destroys panic payloads
-
-Reported by: concurrency-host [P2].
-
-`threads::scope` keeps a primary panic and forgets secondary payloads, and
-`JoinedPool` forgets caught payloads because their destructors may panic.
-`PipelinedBlocks::drop` (`read/reader.rs`) uses `drop(h.join())`, which
-destroys an error payload. A caller-supplied `Read` can panic after the header
-with a payload whose destructor also panics. If the iterator is then dropped
-during another unwind, destroying that payload aborts the process. The
-disconnect branch of `next()` also destroys the payload after formatting it,
-and can panic instead of returning its promised internal error. This breaks
-the teardown's own stated intent to suppress the background panic during
-cleanup. The session boundary should consume caught payloads under the same
-policy as the scoped infrastructure.
 
 ## FMT-024 - path_guard same_file stringifies the original I/O error
 

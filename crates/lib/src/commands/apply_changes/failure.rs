@@ -54,7 +54,7 @@ impl FailureSlot {
     }
 
     /// Preserve a thread's panic message as an ordinary pipeline failure.
-    pub(super) fn publish_panic(&self, owner: &str, payload: &(dyn std::any::Any + Send)) {
+    pub(super) fn publish_panic(&self, owner: &str, payload: Box<dyn std::any::Any + Send>) {
         self.publish(panic_error(owner, payload));
     }
 

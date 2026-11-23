@@ -551,10 +551,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         }));
         let item = match item {
             Ok(item) => item,
-            Err(payload) => Some(Err(crate::error::panic_error(
-                "decode task",
-                payload.as_ref(),
-            ))),
+            Err(payload) => Some(Err(crate::error::panic_error("decode task", payload))),
         };
         // Cold: only a failure pays for the location. The blob carries its
         // true index and offset; `seq` is a pipeline-internal ordering key

@@ -1145,7 +1145,7 @@ pub(crate) fn external_join_in(
             )?;
             let rel_res = match rel_handle {
                 Some(handle) => Some(handle.join().map_err(|payload| {
-                    crate::error::panic_error("relation scan thread", payload.as_ref())
+                    crate::error::panic_error("relation scan thread", payload)
                 })??),
                 None => None,
             };
@@ -1486,7 +1486,7 @@ pub(crate) fn external_join_in(
         let join_s3 = |handle: crate::threads::Handle<'_, '_, '_, crate::Result<()>>| {
             handle
                 .join()
-                .map_err(|payload| crate::error::panic_error("stage 3 thread", payload.as_ref()))
+                .map_err(|payload| crate::error::panic_error("stage 3 thread", payload))
                 .and_then(|r| r)
         };
         let s4_handle = match s4_spawned {
@@ -1504,7 +1504,7 @@ pub(crate) fn external_join_in(
         let s3_res = join_s3(s3_handle);
         let s4_res = s4_handle
             .join()
-            .map_err(|payload| crate::error::panic_error("stage 4 thread", payload.as_ref()))
+            .map_err(|payload| crate::error::panic_error("stage 4 thread", payload))
             .and_then(|r| r);
 
         // Prefer the stage 3 error if both failed (it's usually the root

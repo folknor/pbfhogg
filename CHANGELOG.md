@@ -632,6 +632,21 @@
 
 ### Fixed
 
+- **A cancelled `into_blocks_pipelined` iterator stops at the next call.**
+  Cancelling the invocation used to let `next()` keep returning blocks the
+  pipeline had already queued, and a pipeline that had finished reading
+  ended in a clean `None` with the cancel never reported. A `next()` that
+  begins with the invocation cancelled now returns `Cancelled` at once,
+  whatever was read ahead (a queued error included), and the iteration
+  ends; any error item now ends the iteration too.
+
+- **A panic payload whose destructor panics no longer aborts the process
+  at teardown.** A caller `Read` or `Write` that panicked with such a
+  payload could abort when a pipelined block iterator, a writer or a
+  worker pool joined the thread during another unwind, or turned the
+  promised `Panicked` error into a second panic. Caught payloads that are
+  not a plain message are now forgotten instead of dropped.
+
 - **A panicking `DiagnosticSink` can no longer abort the process.** A
   panic in a sink during cleanup that ran while another panic unwound
   (a failed scratch removal, or a `SummaryWriter` resending its line

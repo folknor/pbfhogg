@@ -461,9 +461,12 @@ pub(super) fn stage3_slot_reorder(
                     }
                 }
                 Err(payload) => {
+                    // A later panic behind an earlier failure is still
+                    // disposed of under the payload policy, never dropped.
                     if first_err.is_none() {
-                        first_err =
-                            Some(crate::error::panic_error("worker thread", payload.as_ref()));
+                        first_err = Some(crate::error::panic_error("worker thread", payload));
+                    } else {
+                        crate::error::discard_panic(payload);
                     }
                 }
             }

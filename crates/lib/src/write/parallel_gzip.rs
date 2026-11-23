@@ -256,7 +256,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                     );
                 }));
                 if let Err(payload) = caught {
-                    worker_failure.record_panic("parallel gzip worker", payload.as_ref());
+                    worker_failure.record_panic("parallel gzip worker", payload);
                 }
                 // Recorded first, so the writer thread sees the failure.
                 if worker_failure.stopped() {
@@ -299,7 +299,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                 )
             }));
             let out = caught.unwrap_or_else(|payload| {
-                writer_failure.record_panic("parallel gzip writer thread", payload.as_ref());
+                writer_failure.record_panic("parallel gzip writer thread", payload);
                 None
             });
             drop(compressed_rx);
@@ -404,15 +404,14 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         self.raw_tx = None;
         for h in std::mem::take(&mut self.worker_handles) {
             if let Err(payload) = h.join() {
-                self.failure
-                    .record_panic("parallel gzip worker", payload.as_ref());
+                self.failure.record_panic("parallel gzip worker", payload);
             }
         }
         match self.writer_handle.take()?.join() {
             Ok(inner) => inner,
             Err(payload) => {
                 self.failure
-                    .record_panic("parallel gzip writer thread", payload.as_ref());
+                    .record_panic("parallel gzip writer thread", payload);
                 None
             }
         }
@@ -681,7 +680,7 @@ fn guarded<T>(failure: &FirstFailure, who: &str, f: impl FnOnce() -> io::Result<
             None
         }
         Err(payload) => {
-            failure.record_panic(who, payload.as_ref());
+            failure.record_panic(who, payload);
             None
         }
     }

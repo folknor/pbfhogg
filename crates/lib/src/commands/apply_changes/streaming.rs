@@ -373,7 +373,7 @@ pub(super) fn run_workers(
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => failure.publish(e),
-                    Err(payload) => failure.publish_panic("streaming worker", &*payload),
+                    Err(payload) => failure.publish_panic("streaming worker", payload),
                 }
                 drop(drain_tx);
             });

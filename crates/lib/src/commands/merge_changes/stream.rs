@@ -388,10 +388,8 @@ where
             (self.encode)(&batch, path)
         }))
         .unwrap_or_else(|payload| {
-            Err(
-                crate::error::panic_error("merge-changes worker", payload.as_ref())
-                    .context(format!("while merging {}", path.display())),
-            )
+            Err(crate::error::panic_error("merge-changes worker", payload)
+                .context(format!("while merging {}", path.display())))
         });
         drop(tx.send(Msg::Member {
             input,
@@ -696,7 +694,7 @@ fn read_input<'s, T, E>(
         Ok(Ok(batches)) => Msg::ReaderDone { input, batches },
         Ok(Err(error)) => Msg::ReaderFailed(error),
         Err(payload) => Msg::ReaderFailed(
-            crate::error::panic_error("merge-changes reader", payload.as_ref())
+            crate::error::panic_error("merge-changes reader", payload)
                 .context(format!("while reading {}", path.display())),
         ),
     };

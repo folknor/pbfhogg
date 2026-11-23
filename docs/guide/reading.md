@@ -167,6 +167,8 @@ Returns an `Iterator<Item = Result<PrimitiveBlock>>` backed by a background pipe
 
 Dropping the iterator early closes its channel and joins the background thread, so the pipeline normally stops instead of reading the rest of the file. The drop waits for that thread: it cannot interrupt a read of the `Read` you supplied, so a read that never returns keeps the drop from returning. Making the stream progress is the caller's obligation. Dropping does not cancel the invocation, and `Invocation::cancel` does not interrupt an ongoing read either.
 
+Cancellation is decided at your position in the iteration, not the pipeline's: once the invocation is cancelled, the next `next()` returns `ErrorKind::Cancelled` without waiting, whatever the pipeline had already read ahead (a queued error included), and the iteration ends. A `next()` already waiting when the cancel lands returns `Cancelled` in place of the block it receives. Any error item ends the iteration.
+
 ```rust
 use pbfhogg::ElementReader;
 

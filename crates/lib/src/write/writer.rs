@@ -84,7 +84,7 @@ fn pipeline_send_error(pipeline: &mut WritePipeline) -> Error {
             Ok(Ok(())) => Error::internal(
                 "writer thread finished before all blobs were sent; output is incomplete",
             ),
-            Err(payload) => panic_error("writer thread", payload.as_ref()),
+            Err(payload) => panic_error("writer thread", payload),
         },
         // Defensive fallback: recovered failures normally return above.
         None => Error::internal("writer thread terminated"),
@@ -1334,7 +1334,7 @@ impl<W: Write> PbfWriter<W> {
             if let Some(handle) = pipeline.join_handle.take() {
                 handle
                     .join()
-                    .map_err(|payload| panic_error("writer thread", payload.as_ref()))??;
+                    .map_err(|payload| panic_error("writer thread", payload))??;
             }
         }
         if let Some(ref mut w) = self.writer {
@@ -1531,7 +1531,7 @@ impl<W: Write> Drop for PbfWriter<W> {
                 // an earlier-error `?` bail-out (the primary error
                 // dominates), or a forgotten flush, which only the unit-test
                 // assertion below catches.
-                drop(handle.join());
+                crate::error::discard_join(handle.join());
             }
         }
         #[cfg(test)]

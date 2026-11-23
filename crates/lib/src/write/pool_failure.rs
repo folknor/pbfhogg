@@ -75,7 +75,7 @@ impl FirstFailure {
     /// Record a caught panic, keeping its message. `who` names the thread
     /// role (`"parallel writer pool worker"`), so the surfaced error reads
     /// `"<who> panicked: <payload>"`.
-    pub(crate) fn record_panic(&self, who: &str, payload: &(dyn Any + Send)) {
+    pub(crate) fn record_panic(&self, who: &str, payload: Box<dyn Any + Send>) {
         self.record(panic_error(who, payload));
     }
 
@@ -130,7 +130,7 @@ mod tests {
         })
         .expect_err("panicked");
         let f = FirstFailure::new();
-        f.record_panic("pool worker", payload.as_ref());
+        f.record_panic("pool worker", payload);
         let msg = f.take().expect("recorded").to_string();
         assert_eq!(msg, "pool worker panicked: boom 7");
     }

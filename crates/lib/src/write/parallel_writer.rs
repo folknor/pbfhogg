@@ -239,7 +239,7 @@ fn run_pool<'w, 'scope, 'env>(
         match dispatched {
             Ok(Ok(())) => {}
             Ok(Err(e)) => failure.record(e),
-            Err(payload) => failure.record_panic("parallel writer dispatcher", payload.as_ref()),
+            Err(payload) => failure.record_panic("parallel writer dispatcher", payload),
         }
     }
 
@@ -255,7 +255,7 @@ fn run_pool<'w, 'scope, 'env>(
         // `pool_worker` catches its own panics, so this is a backstop for a
         // panic outside that catch (in the payload's own destructor, say).
         if let Err(payload) = handle.join() {
-            failure.record_panic("parallel writer pool worker", payload.as_ref());
+            failure.record_panic("parallel writer pool worker", payload);
         }
     }
 }
@@ -367,7 +367,7 @@ fn pool_worker(
         worker_loop(index, &rx, file, failure, cancel);
     }));
     if let Err(payload) = caught {
-        failure.record_panic("parallel writer pool worker", payload.as_ref());
+        failure.record_panic("parallel writer pool worker", payload);
     }
     drop(rx);
 }
@@ -506,7 +506,7 @@ mod tests {
 
         handle
             .join()
-            .map_err(|payload| crate::error::panic_error("writer thread", payload.as_ref()))??;
+            .map_err(|payload| crate::error::panic_error("writer thread", payload))??;
 
         let mut actual = Vec::new();
         std::fs::File::open(&out)?.read_to_end(&mut actual)?;

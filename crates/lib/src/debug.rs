@@ -359,7 +359,8 @@ impl CallSink {
     /// End the stream with `snapshot`: the sealing emissions, then the
     /// terminal record, on the sealing thread. `hook` runs after the last
     /// sealing emission (a test parks or panics there). Never unwinds: an
-    /// unwind before the terminal record is caught, its payload forgotten,
+    /// unwind before the terminal record is caught, its payload discarded
+    /// without running a caller destructor,
     /// and the stream ends `!failed`; after the terminal write only atomic
     /// stores run, so the account always agrees with a terminal record that
     /// reached the FIFO.
@@ -377,7 +378,7 @@ impl CallSink {
         let unwound = match unwound {
             Ok(()) => false,
             Err(payload) => {
-                std::mem::forget(payload);
+                crate::error::discard_panic(payload);
                 true
             }
         };

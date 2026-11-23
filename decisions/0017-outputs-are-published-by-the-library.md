@@ -331,7 +331,7 @@ omission; `Diagnostics::discard()` is an explicit choice) receives a
 entry kept back, naming what is left. They are emitted when the output is
 dropped, after every sync publication attempted, so a sink cannot interrupt
 durability. Delivery is attempted while a panic is unwinding too: a sink
-that panics is contained (its payload forgotten, the sink switched off for
+that panics is contained (its payload forgotten unless it is a plain message, the sink switched off for
 that `Diagnostics` and its clones, `Diagnostics::sink_failed` set), so it
 cannot turn the unwind into an abort, and a sink switched off earlier
 receives nothing more; the next scan still reports the leftover. A previous output whose contents cannot be unlinked stays

@@ -32,9 +32,41 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// A kind of its own rather than `Internal` so that a caught panic can never
 /// pass for a refusal: a test that names the refusal it expects fails on a
 /// panic, and the CLI exits 101 for one as it does for an uncaught panic.
+///
+/// It consumes the payload under [`discard_panic`]'s policy, so no caller
+/// can destroy one by letting it fall out of scope.
 #[cold]
-pub(crate) fn panic_error(who: &str, payload: &(dyn std::any::Any + Send)) -> Error {
-    Error::panicked(who.to_owned(), panic_message(payload).to_owned())
+pub(crate) fn panic_error(who: &str, payload: Box<dyn std::any::Any + Send>) -> Error {
+    let error = Error::panicked(who.to_owned(), panic_message(payload.as_ref()).to_owned());
+    discard_panic(payload);
+    error
+}
+
+/// Disposes of a caught panic payload that is not resumed. A `String` or
+/// `&'static str` payload (what `panic!` with a message produces) is dropped
+/// normally, since those destructors cannot panic. Any other payload is
+/// forgotten, not dropped: its destructor is caller code and could panic
+/// again, here or during an unwind, where it would abort the process. This
+/// is the policy `threads::scope`, `JoinedPool` and the host's sink
+/// containment follow; a forgotten payload that holds a capability is then
+/// reported truthfully by a seal as unticketed (ADR-0020).
+#[cold]
+pub(crate) fn discard_panic(payload: Box<dyn std::any::Any + Send>) {
+    match payload.downcast::<String>() {
+        Ok(message) => drop(message),
+        Err(other) => match other.downcast::<&'static str>() {
+            Ok(message) => drop(message),
+            Err(opaque) => std::mem::forget(opaque),
+        },
+    }
+}
+
+/// Disposes of a discarded thread join's panic, if it panicked, under
+/// [`discard_panic`]: for a teardown that has no error to return.
+pub(crate) fn discard_join<T>(joined: std::thread::Result<T>) {
+    if let Err(payload) = joined {
+        discard_panic(payload);
+    }
 }
 
 // Error data structures are modeled on the `csv` crate by BurntSushi.
@@ -1728,7 +1760,7 @@ mod tests {
     #[test]
     fn a_caught_panic_is_found_under_every_wrapping() {
         let payload: Box<dyn std::any::Any + Send> = Box::new("boom 7");
-        let panic = panic_error("writer thread", payload.as_ref());
+        let panic = panic_error("writer thread", payload);
         assert!(matches!(
             panic.kind(),
             ErrorKind::Panicked { who, payload } if who == "writer thread" && payload == "boom 7"

@@ -426,6 +426,15 @@ impl<R: Read + Send> ElementReader<R> {
     /// iterator does not cancel the reader's invocation, and cancelling the
     /// invocation does not interrupt an ongoing read either.
     ///
+    /// Cancellation is decided at the caller's position, not the pipeline's:
+    /// a `next` that begins with the invocation cancelled returns
+    /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled) without waiting,
+    /// whatever the pipeline has already queued (a failure included), and the
+    /// iteration ends. A `next` already waiting when the cancel lands returns
+    /// `Cancelled` instead of the block it receives, which waits on the
+    /// pipeline's next event, so on the caller's `Read`. Any error item ends
+    /// the iteration.
+    ///
     /// This is the iterator equivalent of [`for_each_block_pipelined`](Self::for_each_block_pipelined).
     /// Use it when you need loop control (early exit, zipping two files, interleaving work).
     ///
@@ -1428,8 +1437,33 @@ impl Iterator for PipelinedBlocks {
                 return Some(Err(sealed));
             }
         };
-        match self.rx.as_ref()?.recv() {
-            Ok(item) => Some(item.map(|block| block.issued(&call))),
+        // The queue is read-ahead the caller has not reached: a call that
+        // begins with the token tripped stops here, whatever is queued (a
+        // failure included), as a sequential read of the next blob would,
+        // and never waits on the producer. Ending the session drops the
+        // queue, which also releases a producer parked in its send.
+        if let Err(cancelled) = self.invocation.check() {
+            self.rx = None;
+            return Some(Err(cancelled));
+        }
+        let received = self.rx.as_ref()?.recv();
+        // Tripped while waiting: the block is not delivered. A failure that
+        // arrived is passed through below (the cancel raced it; either
+        // answer is truthful), and a clean end decides at this checkpoint.
+        if !matches!(received, Ok(Err(_)))
+            && let Err(cancelled) = self.invocation.check()
+        {
+            self.rx = None;
+            return Some(Err(cancelled));
+        }
+        match received {
+            Ok(Ok(block)) => Some(Ok(block.issued(&call))),
+            Ok(Err(e)) => {
+                // Terminal: the producer sends nothing after it, and its
+                // normal exit must not read as a second outcome.
+                self.rx = None;
+                Some(Err(e))
+            }
             Err(_) => {
                 // The channel closed. On the normal path the pipeline thread
                 // has already sent every block (and any error) and set
@@ -1445,9 +1479,7 @@ impl Iterator for PipelinedBlocks {
                     // A panic is `Panicked`; a thread that ended unpanicked
                     // without completing is a broken invariant.
                     Some(Err(match self.handle.take().map(JoinHandle::join) {
-                        Some(Err(payload)) => {
-                            crate::error::panic_error("pipeline thread", payload.as_ref())
-                        }
+                        Some(Err(payload)) => crate::error::panic_error("pipeline thread", payload),
                         _ => Error::internal("pipeline thread terminated without completing"),
                     }))
                 }
@@ -1463,9 +1495,12 @@ impl Drop for PipelinedBlocks {
         // Join the background thread (waits for pipeline cleanup). An early
         // iterator drop has no error return channel. Do not resume its panic:
         // this may already be cleanup during another unwind. Exhausting the
-        // iterator reports the payload through `next` instead.
+        // iterator reports the payload through `next` instead. Nor is the
+        // payload dropped: its destructor is caller code (a caller `Read`
+        // can panic with any payload) and could panic again during that
+        // unwind, which aborts; `discard_join` forgets an opaque one.
         if let Some(h) = self.handle.take() {
-            drop(h.join());
+            crate::error::discard_join(h.join());
         }
     }
 }
@@ -2086,5 +2121,144 @@ mod tests {
             .expect("at least one block")
             .expect("first block must decode");
         drop(partial);
+    }
+
+    /// A cancel is reported at the caller's position: whatever the pipeline
+    /// read ahead (blocks still queued, or a pipeline that already finished)
+    /// is given up, the next call returns `Cancelled` once, and the
+    /// iteration ends.
+    #[test]
+    fn a_cancelled_block_iterator_gives_up_what_it_read_ahead() {
+        let dir = crate::path_guard::tests::scratch();
+        let fixture = dir.child("input.osm.pbf");
+        crate::test_support::multi_blob_pbf(&fixture);
+        let open = |invocation: &crate::host::Invocation| {
+            ElementReader::from_path(&fixture)
+                .unwrap()
+                .resources(crate::host::Host::for_tests().resources)
+                .invocation(invocation.clone())
+                .into_blocks_pipelined()
+                .unwrap()
+        };
+        let is_cancelled = |item: Option<crate::Result<crate::PrimitiveBlock>>| match item {
+            Some(Err(e)) => matches!(e.kind(), crate::ErrorKind::Cancelled),
+            _ => false,
+        };
+
+        // Mid-file: blocks after the first may be queued or not; either way
+        // none is delivered.
+        let invocation = crate::host::Invocation::new();
+        let mut blocks = open(&invocation);
+        blocks.next().expect("a first block").expect("it decodes");
+        let _outcome = invocation.cancel();
+        assert!(
+            is_cancelled(blocks.next()),
+            "a cancel must stop the next call"
+        );
+        assert!(blocks.next().is_none(), "then the iteration ends");
+
+        // Every block delivered, the pipeline finished: a cancel before the
+        // closing call still decides it, as a read-only command's last
+        // checkpoint does.
+        let invocation = crate::host::Invocation::new();
+        let mut blocks = open(&invocation);
+        for _ in 0..3 {
+            blocks.next().expect("a block").expect("it decodes");
+        }
+        let _outcome = invocation.cancel();
+        assert!(
+            is_cancelled(blocks.next()),
+            "the closing call reports the cancel"
+        );
+        assert!(blocks.next().is_none());
+    }
+
+    /// A failure the pipeline queued ahead of the caller loses to a cancel
+    /// that precedes the call; a failure received is terminal.
+    #[test]
+    fn a_queued_failure_loses_to_a_cancel_and_a_received_one_ends_iteration() {
+        use std::sync::atomic::AtomicBool;
+        let build = |invocation: &crate::host::Invocation| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(Err(crate::Error::internal("queued failure")))
+                .unwrap();
+            drop(tx);
+            let call = invocation.call().unwrap();
+            PipelinedBlocks {
+                rx: Some(rx),
+                handle: None,
+                completed: Arc::new(AtomicBool::new(true)),
+                _ticket: call.ticket(crate::host::Kind::Session),
+                invocation: invocation.clone(),
+            }
+        };
+
+        let invocation = crate::host::Invocation::new();
+        let mut blocks = build(&invocation);
+        let _outcome = invocation.cancel();
+        let err = blocks.next().expect("an item").map(drop).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Cancelled),
+            "got: {err}"
+        );
+        assert!(blocks.next().is_none());
+
+        let invocation = crate::host::Invocation::new();
+        let mut blocks = build(&invocation);
+        let err = blocks.next().expect("an item").map(drop).unwrap_err();
+        assert!(err.to_string().contains("queued failure"), "got: {err}");
+        let _outcome = invocation.cancel();
+        assert!(
+            blocks.next().is_none(),
+            "a received failure is the one outcome: no later Cancelled"
+        );
+    }
+
+    /// A pipeline thread that panicked with a payload whose destructor also
+    /// panics is reported and torn down without that destructor running:
+    /// `next` returns its `Panicked` error, and a drop during another unwind
+    /// does not abort the process.
+    #[test]
+    fn a_hostile_panic_payload_is_never_dropped() {
+        use std::sync::atomic::AtomicBool;
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                panic!("payload destructor ran");
+            }
+        }
+        let build = || {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<crate::Result<crate::PrimitiveBlock>>(1);
+            // Never parks; the iterator owns and joins the handle.
+            let handle = std::thread::spawn(move || {
+                let _tx = tx;
+                std::panic::panic_any(Bomb);
+            });
+            let call = crate::host::Call::detached();
+            PipelinedBlocks {
+                rx: Some(rx),
+                handle: Some(handle),
+                completed: Arc::new(AtomicBool::new(false)),
+                _ticket: call.ticket(crate::host::Kind::Session),
+                invocation: call.handle().clone(),
+            }
+        };
+
+        let mut reported = build();
+        let err = reported.next().expect("an item").map(drop).unwrap_err();
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Panicked { who, .. } if who == "pipeline thread"),
+            "got: {err}"
+        );
+        drop(reported);
+
+        // Dropped unexhausted while another panic unwinds: dropping the
+        // payload there would be a double panic, an abort.
+        let torn_down = build();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = torn_down;
+            panic!("caller unwinds");
+        }));
+        assert!(unwound.is_err());
     }
 }

@@ -59,7 +59,13 @@ returns `ErrorKind::Cancelled` (`Error::is_cancelled`).
   recorded when the consumer reaches it in task order, since an earlier task
   may still fail: from then on no checkpoint masks it, while a failure a
   worker or the source produced ahead of the consumer is still speculative
-  and may lose to `Cancelled` at an earlier task's checkpoint.
+  and may lose to `Cancelled` at an earlier task's checkpoint. The
+  pipelined block iterator is the one place that ordered consumer runs
+  ahead of the caller: its queue is read-ahead the caller has not reached,
+  so an admitted `next` that finds the token tripped returns `Cancelled`
+  whatever the queue holds (a failure included), exactly as a sequential
+  read starting that blob would. A failure the caller has received is
+  terminal and ends the iteration.
 - **Outputs are bound to their invocation explicitly, before work.** An
   output is constructed unbound (it can be built before a run's per-call
   token exists) and `Output::bind(self, &Invocation)` (likewise `OutputDir`

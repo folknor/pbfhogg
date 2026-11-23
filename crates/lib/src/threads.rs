@@ -21,9 +21,11 @@
 //!
 //! Panics: [`Handle::join`] returns a thread's panic to its caller. A thread
 //! nobody joined that panicked has its payload re-raised once every thread
-//! has been joined (the first such payload; the others are forgotten, as a
-//! payload's destructor could panic again). If the body itself panicked, its
-//! panic is the one that continues and every child payload is forgotten.
+//! has been joined (the first such payload; the others are disposed of by
+//! `error::discard_panic`, which forgets any payload but a plain message, as
+//! its destructor could panic again). If the body itself panicked, its panic
+//! is the one that continues and every child payload is disposed of the same
+//! way.
 //! Neither a join nor the disposal of a result runs under the registry
 //! borrow.
 
@@ -114,7 +116,7 @@ impl<'w, 'scope, 'env> Scope<'w, 'scope, 'env> {
     }
 
     /// Join every thread not yet joined, in spawn order. Returns the first
-    /// panic payload; later ones are forgotten.
+    /// panic payload; later ones go to `error::discard_panic`.
     fn join_all(&self) -> Option<Box<dyn std::any::Any + Send>> {
         let mut first = None;
         let mut index = 0;
@@ -133,7 +135,7 @@ impl<'w, 'scope, 'env> Scope<'w, 'scope, 'env> {
                 if first.is_none() {
                     first = Some(payload);
                 } else {
-                    std::mem::forget(payload);
+                    crate::error::discard_panic(payload);
                 }
             }
         }
@@ -195,7 +197,7 @@ where
             }
             Err(payload) => {
                 if let Some(child) = child_panic {
-                    std::mem::forget(child);
+                    crate::error::discard_panic(child);
                 }
                 std::panic::resume_unwind(payload)
             }

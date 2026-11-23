@@ -116,12 +116,11 @@ impl Drop for Workers {
         self.hooks.faults().on_built_pool_join();
         for handle in self.handles.drain(..) {
             // A worker that panicked does not stop the join of the rest. Its
-            // payload is forgotten, not dropped: the destructor could panic
-            // again, here or during an unwind (`Invocation::deliver` does the
-            // same).
-            if let Err(payload) = handle.join() {
-                std::mem::forget(payload);
-            }
+            // payload is never dropped as caller code: `discard_join` drops a
+            // plain message, whose destructor cannot panic, and forgets any
+            // other, whose destructor could panic again, here or during an
+            // unwind.
+            crate::error::discard_join(handle.join());
         }
     }
 }

@@ -463,7 +463,7 @@ impl WritePipeline {
                 let handle = pipeline.join_handle.take();
                 drop(pipeline);
                 if let Some(h) = handle {
-                    drop(h.join());
+                    crate::error::discard_join(h.join());
                 }
                 Err(e)
             }
@@ -476,10 +476,9 @@ impl WritePipeline {
                         Error::internal(format!("{label} exited without init signal"))
                     }
                     Some(Ok(Err(e))) => e,
-                    Some(Err(payload)) => crate::error::panic_error(
-                        &format!("{label} (during init)"),
-                        payload.as_ref(),
-                    ),
+                    Some(Err(payload)) => {
+                        crate::error::panic_error(&format!("{label} (during init)"), payload)
+                    }
                     None => Error::internal(format!("{label} handle missing")),
                 })
             }

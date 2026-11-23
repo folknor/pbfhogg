@@ -190,8 +190,9 @@ enum SinkSlot {
 }
 
 /// Run `emit` with its unwinding contained: a panic latches `failed`, and
-/// the caught payload is forgotten, not dropped, since its destructor is
-/// caller code too and could panic again.
+/// the caught payload goes to `error::discard_panic`, which forgets any
+/// payload but a plain message, since its destructor is caller code too and
+/// could panic again.
 fn contained(failed: &std::sync::atomic::AtomicBool, emit: impl FnOnce()) {
     use std::sync::atomic::Ordering::Relaxed;
     if failed.load(Relaxed) {
@@ -199,7 +200,7 @@ fn contained(failed: &std::sync::atomic::AtomicBool, emit: impl FnOnce()) {
     }
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(emit)) {
         failed.store(true, Relaxed);
-        std::mem::forget(payload);
+        crate::error::discard_panic(payload);
     }
 }
 
@@ -450,7 +451,7 @@ impl Invocation {
         let snapshot = match prepared {
             Ok(snapshot) => snapshot,
             Err(payload) => {
-                std::mem::forget(payload);
+                crate::error::discard_panic(payload);
                 self.0.word.0.store(word::FAILED, Release);
                 return SealOutcome::Refused(SealRefusal::FinalizationFailed);
             }
@@ -2398,7 +2399,8 @@ pub enum EventKind {
 /// Events also arrive from destructors while a panic is unwinding (scratch
 /// and output cleanup report from there). A panic escaping `event` is
 /// contained: the panic hook still runs, the payload is forgotten rather
-/// than dropped (its destructor is caller code and could panic again), the
+/// than dropped unless it is a plain `String` or `&str` message (any other
+/// destructor is caller code and could panic again), the
 /// sink is switched off for the [`Diagnostics`] it was handed to and every
 /// clone of it, and the run carries on;
 /// [`Diagnostics::sink_failed`] tells the caller its stream is incomplete.

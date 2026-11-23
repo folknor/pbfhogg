@@ -636,7 +636,7 @@ pub(crate) fn merge_to<'a>(
                 match result {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => scanner_failure.publish(e),
-                    Err(payload) => scanner_failure.publish_panic("scanner", &*payload),
+                    Err(payload) => scanner_failure.publish_panic("scanner", payload),
                 }
                 // Keep the channel connected until publication, even though
                 // run_scanner has already dropped its own channels on return.
@@ -666,10 +666,10 @@ pub(crate) fn merge_to<'a>(
         let scanner_join = scanner_handle.join();
         let workers_join = workers_handle.join();
         if let Err(payload) = scanner_join {
-            failure.publish_panic("scanner", &*payload);
+            failure.publish_panic("scanner", payload);
         }
         if let Err(payload) = workers_join {
-            failure.publish_panic("worker pool", &*payload);
+            failure.publish_panic("worker pool", payload);
         }
         // The drain checks producer failures before reporting a seq gap.
         // Keep its error: a later scanner send failure can be a consequence

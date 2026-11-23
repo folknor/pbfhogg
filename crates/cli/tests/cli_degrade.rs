@@ -528,10 +528,12 @@ fn blob_elements(path: &Path) -> Vec<(BlobKindLabel, Vec<i64>)> {
     out
 }
 
-/// Count adjacent same-kind blob pairs with overlapping ID ranges
-/// (`max_id` of one blob >= `min_id` of the next same-kind blob). The CLI
-/// promises exactly one such overlap per eligible kind under `--unsort`,
-/// so tests assert on the count, not just presence.
+/// Count adjacent same-kind blob pairs, in file order, whose ranges meet or
+/// descend (`max_id` of one blob >= `min_id` of the next same-kind blob).
+/// This is a file-order property, not `sort`'s overlap: a descending step
+/// between disjoint blobs counts here, though `sort`'s planner only
+/// permutes such blobs. `planner_overlap_components` is the overlap that
+/// sends `sort` to its rewrite.
 fn count_adjacent_overlaps(
     blobs: &[(BlobKindLabel, i64, i64, usize)],
     kind: BlobKindLabel,
@@ -544,6 +546,45 @@ fn count_adjacent_overlaps(
             a_max >= b_min
         })
         .count()
+}
+
+/// The sizes of the overlap components `sort`'s merge planner forms over
+/// the blobs of `kind`: blobs ordered by first ID, a component extending
+/// while the next blob's first ID is at most the running maximum. Only
+/// components of two or more blobs are returned. Compares plain `i64`,
+/// which matches the planner's canonical key order only for non-negative
+/// IDs, so it is for the positive-ID fixtures here.
+fn planner_overlap_components(
+    blobs: &[(BlobKindLabel, i64, i64, usize)],
+    kind: BlobKindLabel,
+) -> Vec<usize> {
+    let mut same: Vec<(i64, i64)> = blobs
+        .iter()
+        .filter(|(k, ..)| *k == kind)
+        .map(|&(_, min, max, _)| {
+            assert!(
+                min >= 0,
+                "planner_overlap_components needs non-negative IDs"
+            );
+            (min, max)
+        })
+        .collect();
+    same.sort_unstable();
+    let mut components = Vec::new();
+    let mut i = 0;
+    while i < same.len() {
+        let mut run_max = same[i].1;
+        let mut j = i + 1;
+        while j < same.len() && same[j].0 <= run_max {
+            run_max = run_max.max(same[j].1);
+            j += 1;
+        }
+        if j - i >= 2 {
+            components.push(j - i);
+        }
+        i = j;
+    }
+    components
 }
 
 /// Count strictly-descending steps (internal ID inversions) across all
@@ -1510,13 +1551,14 @@ fn assert_unsort_cross_blob_shape(output: &Path, input: &Path) {
             same_count >= 2,
             "kind {kind:?}: need at least 2 blobs to verify overlap, got {same_count}"
         );
-        // The CLI promises exactly one adjacent cross-blob overlap per
-        // eligible kind - the minimum perturbation that fires sort's
-        // detect_overlaps. Count it, don't just check presence.
+        // The CLI promises exactly one overlap component of two blobs per
+        // eligible kind, as sort's planner forms them - the minimum
+        // perturbation that fires its overlap rewrite. Count it, don't
+        // just check presence.
         assert_eq!(
-            count_adjacent_overlaps(&summary, kind),
-            1,
-            "kind {kind:?}: expected exactly one adjacent cross-blob overlap, \
+            planner_overlap_components(&summary, kind),
+            vec![2],
+            "kind {kind:?}: expected exactly one two-blob overlap component, \
              blobs were {:?}",
             summary
                 .iter()
@@ -2490,12 +2532,11 @@ fn degrade_unsort_intra_rejects_block_cap_one() {
         .assert_stderr_contains("--elements-per-blob >= 2");
 }
 
-/// `--unsort --elements-per-blob 1` is supported (not a silent no-op): each output
-/// blob holds one element, and swapping the first two adjacent
-/// single-element blobs produces exactly one descending cross-blob step -
-/// the same overlap shape sort's detect_overlaps fires on.
+/// `--unsort --elements-per-blob 1` is rejected: single-element blobs of
+/// distinct IDs never overlap, so the swap would only permute blobs `[2]`,
+/// `[1]`, which `sort`'s planner restores without its overlap rewrite.
 #[test]
-fn degrade_unsort_accepts_block_cap_one() {
+fn degrade_unsort_rejects_block_cap_one() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
@@ -2511,9 +2552,54 @@ fn degrade_unsort_accepts_block_cap_one() {
         .arg("--unsort")
         .arg("--elements-per-blob")
         .arg("1")
+        .assert_failure()
+        .assert_stderr_contains("--unsort needs --elements-per-blob >= 2");
+    assert!(!output.exists(), "a refused run must write no output");
+}
+
+/// At its smallest accepted cap, 2, `--unsort` still produces the overlap:
+/// ids `1, 2, 3, 4, ...` pack as `[1, 3]`, `[2, 4]`, and `sort`'s planner
+/// joins those two blobs into one overlap run per kind, which it rewrites.
+#[test]
+fn degrade_unsort_at_block_cap_two_fires_sorts_overlap_rewrite() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let unsorted = dir.path().join("unsorted.osm.pbf");
+    let resorted = dir.path().join("resorted.osm.pbf");
+
+    write_unsort_fixture(&input);
+
+    CliInvoker::new(&invocation_scratch)
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&unsorted)
+        .arg("--unsort")
+        .arg("--elements-per-blob")
+        .arg("2")
         .assert_success();
 
-    assert_unsort_cross_blob_shape(&output, &input);
+    assert_unsort_cross_blob_shape(&unsorted, &input);
+    let elements = blob_elements(&unsorted);
+    let first_nodes: Vec<&Vec<i64>> = elements
+        .iter()
+        .filter(|(k, _)| *k == BlobKindLabel::Node)
+        .map(|(_, ids)| ids)
+        .take(2)
+        .collect();
+    assert_eq!(first_nodes, [&vec![1, 3], &vec![2, 4]]);
+
+    // One two-blob overlap run for each of the three kinds.
+    CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&unsorted)
+        .arg("-o")
+        .arg(&resorted)
+        .arg("--force")
+        .assert_success()
+        .assert_stderr_contains("6 blobs in overlap runs");
+    assert_sorted_file(&resorted);
 }
 
 mod tier2 {
@@ -2587,8 +2673,8 @@ mod tier2 {
             BlobKindLabel::Relation,
         ] {
             assert_eq!(
-                count_adjacent_overlaps(&blob_index_summary(&output), kind),
-                1
+                planner_overlap_components(&blob_index_summary(&output), kind),
+                vec![2]
             );
             assert_eq!(
                 count_intra_blob_inversions(&blob_elements(&output), kind),

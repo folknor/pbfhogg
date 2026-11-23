@@ -629,13 +629,19 @@ fn validate_command(
             Ok(None)
         }
         Command::Degrade {
+            unsort,
             unsort_intra,
             elements_per_blob,
             ..
-        } if elements_per_blob.get() < degrade_min_cap(*unsort_intra) => Err(usage(
+        } if elements_per_blob.get() < degrade_min_cap(*unsort, *unsort_intra) => Err(usage(
             &["degrade"],
-            "--unsort-intra needs --elements-per-blob >= 2: an intra-blob inversion requires at \
-             least two same-kind elements inside one output block",
+            if *unsort_intra {
+                "--unsort-intra needs --elements-per-blob >= 2: an intra-blob inversion requires \
+                 at least two same-kind elements inside one output block"
+            } else {
+                "--unsort needs --elements-per-blob >= 2: single-element blobs of distinct IDs \
+                 never have overlapping ranges, so a cap of 1 cannot produce the overlap"
+            },
         )),
         Command::Check { .. } => validate_check(command, matches, quiet).map(|()| None),
         // A quiet `inspect --indexed` prints nothing: its answer is the exit
@@ -1597,12 +1603,13 @@ enum Command {
         output: OutputArg,
         /// Clear `Sort.Type_then_ID`; pack blobs to the cap so exactly one
         /// adjacent same-kind blob pair per kind has overlapping ID ranges
-        /// (cross-blob overlap). Fires `sort`'s overlap-rewrite path.
+        /// (cross-blob overlap). Fires `sort`'s overlap-rewrite path. Needs
+        /// `--elements-per-blob` of at least 2.
         #[arg(long, conflicts_with = "unsort_intra")]
         unsort: bool,
         /// Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with
         /// an internal ID-order inversion but non-overlapping blob ranges
-        /// (intra-blob shape for `sort`'s monotonicity blind spot).
+        /// (the intra-blob shape a range-only overlap check misses).
         #[arg(long = "unsort-intra")]
         unsort_intra: bool,
         /// Drop inline way-node coordinates (`LocationsOnWays`).
@@ -2702,9 +2709,11 @@ fn degrade_reencodes(
 }
 
 /// The smallest `--elements-per-blob` a degrade re-encode accepts: an
-/// intra-blob inversion needs two same-kind elements in one output block.
-fn degrade_min_cap(unsort_intra: bool) -> usize {
-    if unsort_intra { 2 } else { 1 }
+/// intra-blob inversion needs two same-kind elements in one output block,
+/// and a cross-blob overlap needs blobs whose ranges can meet, which
+/// single-element blobs of distinct IDs never do.
+fn degrade_min_cap(unsort: bool, unsort_intra: bool) -> usize {
+    if unsort || unsort_intra { 2 } else { 1 }
 }
 
 /// The element-cap advice for a blob too large to write: the command's cap
@@ -2725,7 +2734,7 @@ fn element_cap_advice(command: &Command) -> Option<&'static str> {
             ..
         } => {
             degrade_reencodes(*unsort, *unsort_intra, *strip_locations, drop_ids.is_some())
-                && elements_per_blob.get() > degrade_min_cap(*unsort_intra)
+                && elements_per_blob.get() > degrade_min_cap(*unsort, *unsort_intra)
         }
         _ => false,
     };
@@ -5674,8 +5683,10 @@ mod advice_tests {
             (&["--drop-ids", "1:1"], true),
             (&["--strip-indexdata", "--strip-locations"], true),
             // At the mode's smallest cap there is nothing to lower to.
-            (&["--unsort", "--elements-per-blob", "1"], false),
-            (&["--unsort", "--elements-per-blob", "2"], true),
+            (&["--strip-locations", "--elements-per-blob", "1"], false),
+            (&["--strip-locations", "--elements-per-blob", "2"], true),
+            (&["--unsort", "--elements-per-blob", "2"], false),
+            (&["--unsort", "--elements-per-blob", "3"], true),
             (&["--unsort-intra", "--elements-per-blob", "2"], false),
             (&["--unsort-intra", "--elements-per-blob", "3"], true),
             (&["inspect", "in.pbf"], false),

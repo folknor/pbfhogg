@@ -230,6 +230,42 @@ fn an_empty_reencode_needs_indexdata_unless_forced() {
     assert_eq!(forced.result.expect("forced").elements_written, 13);
 }
 
+/// Neither unsort shape exists at a block cap of 1: one element per blob
+/// leaves no room for an intra-blob inversion, and single-element blobs of
+/// distinct IDs never overlap. Both modes refuse before writing anything.
+#[test]
+fn both_unsort_modes_refuse_a_block_cap_of_one() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_located(&input, true);
+
+    for mode in [
+        pbfhogg::degrade::Unsort::CrossBlob,
+        pbfhogg::degrade::Unsort::IntraBlob,
+    ] {
+        let refused = run(
+            &input,
+            &output,
+            reencode(Reencode {
+                unsort: Some(mode),
+                block_cap: std::num::NonZeroUsize::MIN,
+                ..Reencode::default()
+            }),
+            false,
+        );
+        let err = refused.result.err().expect("a cap of 1 is refused");
+        assert!(
+            matches!(err.kind(), pbfhogg::ErrorKind::InvalidArgument { .. }),
+            "{mode:?}: {err:?}"
+        );
+        assert!(
+            !output.exists(),
+            "{mode:?}: a refused run publishes nothing"
+        );
+    }
+}
+
 /// The block cap is a re-encode setting: a re-encode reports the one it
 /// used, the header-only passthrough reports none.
 #[test]

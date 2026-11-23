@@ -59,23 +59,29 @@
 //!   per-input-blob boundary flush is suppressed, so the central
 //!   `BlockBuilder` packs continuously to `block_cap`: the newer element
 //!   fills and flushes the current output block, and the held
-//!   smaller-id element opens the next one. The result is exactly one
-//!   adjacent same-kind blob pair per kind whose indexdata ID ranges
-//!   overlap - the minimum perturbation that makes `sort`'s
-//!   `detect_overlaps` dispatch to the overlap-rewrite path. The two
-//!   output blobs stay internally ID-monotone. Valid for any
-//!   `block_cap >= 1`.
+//!   smaller-id element opens the next one. For every kind with more
+//!   surviving elements than `block_cap`, the result is exactly one
+//!   overlap component of two blobs, as `sort`'s merge planner forms
+//!   them (blobs ordered by first ID, joined while a range reaches the
+//!   next) - the minimum perturbation that sends `sort` down its
+//!   overlap-rewrite path. The two output blobs stay internally
+//!   ID-monotone. Requires `block_cap >= 2`: at a cap of 1 every blob
+//!   is one element, so no two distinct-ID blobs can overlap and the
+//!   swap only permutes blobs, which `sort` restores without a rewrite.
+//!   Repeated IDs on history input can overlap at cap 1, but plain
+//!   cap-1 packing yields those overlaps without any swap, so the mode
+//!   adds no overlap there either; it is rejected up front.
 //! - `--unsort-intra` (intra-blob inversion): swaps the first two
 //!   same-kind elements. That pair always lands at the start of the
 //!   first output block (positions 1 and 2), so the descending step
 //!   sits inside a blob for any `block_cap >= 2` - independent of where
 //!   input- or output-blob boundaries fall, and in particular even when
 //!   one input blob carries more than `block_cap` same-kind elements.
-//!   Blob ID ranges stay non-overlapping, so `detect_overlaps` returns
-//!   zero - this is the adversarial shape for `sort`'s intra-blob
-//!   monotonicity blind spot (a blob internally unsorted but
-//!   range-disjoint passes straight through while the header still
-//!   claims sortedness). Requires `block_cap >= 2`; a cap of 1 cannot
+//!   Blob ID ranges stay non-overlapping, so `sort`'s planner forms no
+//!   overlap component: the blob must be caught by its separate
+//!   intra-blob check (a blob internally unsorted but range-disjoint,
+//!   which a range-only overlap test would pass straight through).
+//!   Requires `block_cap >= 2`; a cap of 1 cannot
 //!   hold two same-kind elements in one block and is rejected up front.
 
 use super::output_header::{Bbox, Order, OutputFacts, Ways};
@@ -244,7 +250,7 @@ fn keep_smallest(set: &mut BTreeSet<DropKey>, n: u64, key: DropKey) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsort {
     /// Cross-blob unsort (`--unsort`): adjacent same-kind blobs get
-    /// overlapping ID ranges. Valid at any block cap.
+    /// overlapping ID ranges. Needs a block cap of at least 2.
     CrossBlob,
     /// Intra-blob unsort (`--unsort-intra`): one same-kind blob gets an
     /// internal ID inversion. Needs a block cap of at least 2.
@@ -532,22 +538,35 @@ pub(crate) fn degrade_to(
              one to nothing and the others to a deliberately wrong index",
         ));
     }
-    // An intra-blob inversion needs two same-kind elements sitting inside
-    // one output block. A cap of 1 puts every element in its own block, so
-    // the requested shape is impossible - reject it rather than silently
-    // clearing Sort.Type_then_ID and emitting an untouched (still-monotone)
-    // stream. Cross-blob `unsort` IS achievable at cap 1: two adjacent
-    // single-element blobs with a descending step overlap, so it stays
-    // supported.
+    // Both unsort shapes are impossible at a cap of 1, which puts every
+    // element in its own block. An intra-blob inversion needs two same-kind
+    // elements inside one block. A cross-blob overlap needs two blobs whose
+    // ranges meet, and single-element blobs of distinct IDs never do: the
+    // swap only yields a descending file-order step between disjoint blobs,
+    // which `sort`'s planner (blobs ordered by first ID) restores by
+    // permuting blobs, never reaching its overlap rewrite. Repeated IDs on
+    // history input do overlap at cap 1, but plain cap-1 packing produces
+    // that without a swap. Reject rather than emit a different workload.
     if let Some(reencode) = flags.reencode
-        && reencode.unsort == Some(Unsort::IntraBlob)
         && reencode.block_cap.get() < 2
     {
-        return Err(Error::invalid_argument(
-            "an intra-blob unsort needs a block cap of at least 2: an \
-             intra-blob inversion requires at least two same-kind elements \
-             inside one output block, which a cap of 1 cannot hold",
-        ));
+        match reencode.unsort {
+            Some(Unsort::IntraBlob) => {
+                return Err(Error::invalid_argument(
+                    "an intra-blob unsort needs a block cap of at least 2: an \
+                     intra-blob inversion requires at least two same-kind elements \
+                     inside one output block, which a cap of 1 cannot hold",
+                ));
+            }
+            Some(Unsort::CrossBlob) => {
+                return Err(Error::invalid_argument(
+                    "a cross-blob unsort needs a block cap of at least 2: \
+                     single-element blobs of distinct IDs never have \
+                     overlapping ranges, so a cap of 1 cannot produce the overlap",
+                ));
+            }
+            None => {}
+        }
     }
 
     let reencode = flags.reencode;
@@ -902,9 +921,12 @@ enum WorkerOutput {
 /// move it reports always changes the ID sequence. On unique-ID input every
 /// run is one record and both modes are the plain adjacent-pair swap.
 ///
-/// - `--unsort` (cross-blob overlap): holds the run that starts at
-///   surviving same-kind position `block_cap`, writes the first record of
-///   the next distinct ID, then the held run in arrival order. With the
+/// - `--unsort` (cross-blob overlap): holds the records of the ID at
+///   surviving same-kind position `block_cap`, from that position on (a
+///   run begun before it keeps its earlier versions in place), writes the
+///   first record of the next distinct ID, then the held records in
+///   arrival order. With no next distinct ID the held records are
+///   replayed in order and the mode does not fire. With the
 ///   boundary flush suppressed the central builder packs to `block_cap`,
 ///   so that record fills and flushes the current output block and the
 ///   held smaller ID opens the next one: one descending output boundary,

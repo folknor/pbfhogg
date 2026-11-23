@@ -145,19 +145,6 @@ nonzero area are refused because their wrapped coordinates have zero area. The
 recorded raw-ring refusal policy explains the second case, and the hunter did
 not count widening the accepted set as a defect.
 
-## CMD-026 - degrade --unsort at cap 1 does not produce overlapping blobs
-
-Reported by: passthrough-rewrite.
-
-With unique ascending IDs and cap 1, swapping the first pair
-(`degrade/mod.rs`) produces singleton blobs `[2]`, `[1]`, `[3]`, whose ranges
-are disjoint. The merge planner sorts entries by first ID before detecting
-overlap, so `sort` can restore order by permuting blobs without rewriting an
-overlap run. The test helper in `crates/cli/tests/cli_degrade.rs` hides this
-because it checks only `previous.max >= next.min`, which counts descending
-disjoint ranges as overlapping. The command does create disorder, but the
-advertised benchmark shape and its test are wrong at cap 1.
-
 ## CMD-058 - Export writes LineStrings whose emitted positions all coincide
 
 Reported by: export polygon-degeneracy work [P3].

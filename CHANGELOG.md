@@ -4,6 +4,14 @@
 
 ### Breaking
 
+- **`degrade --unsort` refuses `--elements-per-blob 1`.** At a cap of 1
+  every blob holds one element, and single-element blobs of distinct IDs
+  never overlap, so the swap only permuted blobs: `sort` restored the
+  order without its overlap rewrite, the workload `--unsort` exists to
+  produce. The CLI now exits 64 and the library's `Unsort::CrossBlob`
+  returns an invalid-argument error below a cap of 2, as
+  `--unsort-intra` already did.
+
 - **Compression levels are checked types.** `Compression::Zlib` and
   `Compression::Zstd` carry `ZlibLevel` and `ZstdLevel` instead of bare
   integers; build them with `Compression::zlib(level)` /
@@ -808,8 +816,8 @@
 - **`degrade --unsort` and `--unsort-intra` perturb history input.**
   The swap could pick two versions of one ID, leaving the ID order
   unchanged and the output not unsorted at all. Both modes now move
-  whole ID runs: `--unsort` moves every version of the ID at the cap
-  past the next ID, and `--unsort-intra` swaps the first two IDs with
+  whole ID runs: `--unsort` moves the version at the cap and its ID's
+  later versions past the next ID, and `--unsort-intra` swaps the first two IDs with
   all their versions in one blob, leaving a kind unperturbed when those
   records do not fit `--elements-per-blob`. Unique-ID input produces the
   same output as before.

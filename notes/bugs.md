@@ -20,7 +20,7 @@ for the scope names). Where the 2026-11-17 defect hunt reported the same
 mechanism, its account is appended to the entry under a "Defect hunt
 2026-11-17" paragraph naming its scopes; its other findings are in
 `notes/bugs-format.md`, `notes/bugs-commands.md`, `notes/bugs-geocode.md`,
-`notes/bugs-cli.md`, `notes/bugs-tooling.md` and `notes/bugs-docs.md`. They are as reported, read from source, not reproduced
+`notes/bugs-tooling.md` and `notes/bugs-docs.md`. They are as reported, read from source, not reproduced
 unless an entry says so, and some hunters marked their own finding as a code
 reading or an API hazard rather than a demonstrated wrong result; that label is
 kept. "Reported by" is a fact about the reports. Entries are in no order of

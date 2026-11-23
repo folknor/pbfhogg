@@ -587,6 +587,37 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["inspect", "IN", "--indexed", "--distrust-metadata"],
         "cannot be used with",
     ),
+    // No blob metadata can change a header or file value, on either route.
+    (
+        &["inspect", "IN", "--get", "file.size", "--distrust-metadata"],
+        "scanning report only",
+    ),
+    (
+        &[
+            "inspect",
+            "IN",
+            "--get",
+            "header.bbox",
+            "--extended",
+            "--distrust-metadata",
+        ],
+        "scanning report only",
+    ),
+    (
+        &[
+            "inspect",
+            "IN",
+            "--get",
+            "header.bbox",
+            "--locations",
+            "--distrust-metadata",
+        ],
+        "scanning report only",
+    ),
+    (
+        &["inspect", "IN", "--nodes", "--distrust-metadata"],
+        "scanning report only",
+    ),
     // A retired short flag names the long flag to spell.
     (&["cat", "IN", "-o", "OUT", "-c", "version"], "--clean"),
     (&["extract", "IN", "-c", "config.json"], "--config"),

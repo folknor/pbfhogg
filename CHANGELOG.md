@@ -38,6 +38,12 @@
   refuses `--nodes` and `--id-ranges`, which only added a report around
   the value.
 
+- **`inspect --get` with a `header.*` or `file.*` key refuses
+  `--distrust-metadata` (exit 64) beside `--extended` or `--locations`
+  too.** Those flags send the key through the full scan, where the refusal
+  used to lapse although the value still comes from the header or the file
+  itself.
+
 - **A header-only file is indexed on every `inspect` route.** The
   full-decode scan (`--extended`, `--locations`, `--distrust-metadata`)
   reported it as not indexed, so `--extended --get indexed` said `false`

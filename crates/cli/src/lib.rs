@@ -2196,7 +2196,9 @@ enum Command {
         /// the full report, nor --nodes, whose report is not a value: the
         /// output is the one value and nothing else. --extended, --locations
         /// and --distrust-metadata stay legal: each makes the scan decode
-        /// payloads, which can change an elements.* count.
+        /// payloads, which can change an elements.* count. A header.* or
+        /// file.* key refuses --distrust-metadata: no blob metadata can
+        /// change its value.
         #[arg(
             short,
             long,
@@ -5172,12 +5174,14 @@ fn run_inspect(
         quiet,
     } = flags;
 
-    // `--distrust-metadata` only means something for the scanning report:
-    // `--indexed` asks whether indexdata is present (distrusting its contents
-    // does not change the answer; clap refuses that pair), `--nodes` decodes every node already, and
-    // Header and file get paths read without the inspect scan. Rejecting says so
-    // rather than accepting a flag that would do nothing.
-    // Decided before the input is touched. (`--json` with `--nodes` or
+    // `--distrust-metadata` only means something for the scanning report.
+    // `--nodes` alone decodes every node already. A header or file `--get`
+    // key is refused on every route, not only the header-only one: beside
+    // `--extended` or `--locations` it is answered by the full scan, but
+    // from the header block, the file name or the file size, none of which
+    // any blob metadata can change. (`--indexed` beside it is a clap
+    // conflict.) Rejecting says so rather than accepting a flag that would
+    // do nothing. Decided before the input is touched. (`--json` with `--nodes` or
     // `--get`, which have no JSON shape, is refused by clap.) The key table is
     // the whole set `get_value` answers, so an unknown key is refused here
     // rather than after a scan.
@@ -5186,10 +5190,12 @@ fn run_inspect(
     {
         return Err(usage(&["inspect"], format!("unknown key: {key}")));
     }
-    if distrust_metadata && !matches!(mode, InspectMode::Full) {
+    let header_key =
+        get_lookup.is_some_and(|lookup| lookup.need() == pbfhogg::inspect::InspectGetNeed::Header);
+    if distrust_metadata && (header_key || !matches!(mode, InspectMode::Full)) {
         return Err(usage(
             &["inspect"],
-            "--distrust-metadata applies to the scanning report only, not to --indexed, --nodes \
+            "--distrust-metadata applies to the scanning report only, not to --nodes alone \
              or a header/file --get key",
         ));
     }

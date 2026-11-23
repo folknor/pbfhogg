@@ -277,3 +277,20 @@ has ever been recorded, so whether that wall is the change, the mode, or the
 host is unknown. Next: one planet cell at `9bbd64df` to establish the mode's
 baseline, then a matched pair; if the change is the cost, it comes out or
 is made cheaper.
+
+## CMD-064 - inspect prints the header replication timestamp as a raw integer
+
+Reported by: scout lateral from the inspect timestamp-formatting work
+(2026-11-23), from source; not run.
+
+`inspect` writes the header's `osmosis_replication_timestamp` as the raw
+epoch-seconds integer in all three outputs: the text report's replication
+line (`timestamp N`, `inspect/report.rs`), JSON `header.replication.timestamp`
+(`inspect/json.rs`), and `--get header.replication.timestamp`. Every other
+timestamp inspect prints (the data timestamp range) is an RFC 3339 UTC
+string, and libosmium's PBF decoder turns this header field into an ISO
+string (`Timestamp::to_iso()` in `pbf_decoder.hpp`), which is what
+`osmium fileinfo` shows. DEVIATIONS.md records no such difference. Decide
+whether the integer is the intended form (then say so in
+`docs/cli/commands.md` and DEVIATIONS.md) or format it like the data range;
+changing the JSON value's type would bump inspect's `schema_version`.

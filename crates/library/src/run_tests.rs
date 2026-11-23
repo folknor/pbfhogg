@@ -62,6 +62,23 @@ fn ids_are_never_reused_after_a_run_is_removed() {
     assert_ne!(first, second);
 }
 #[test]
+fn allocation_starts_past_the_highest_canonical_reservation() {
+    let owner = pbfhogg_test_scratch::scratch();
+    let ids = owner.path().join(".library-run-ids");
+    std::fs::create_dir_all(&ids).unwrap();
+    // Only names the allocator spells count; a directory occupies its name too.
+    for name in ["library-7", "library-0100", "library-+200", "other-300"] {
+        std::fs::write(ids.join(name), b"").unwrap();
+    }
+    std::fs::create_dir(ids.join("library-9")).unwrap();
+    let first = allocate(owner.path()).unwrap();
+    assert_eq!(first, owner.path().join("library-10"));
+    // At the top of the sequence the search falls back to the gaps.
+    std::fs::write(ids.join(format!("library-{}", u64::MAX)), b"").unwrap();
+    let gap = allocate(owner.path()).unwrap();
+    assert_eq!(gap, owner.path().join("library-0"));
+}
+#[test]
 fn evidence_does_not_follow_a_preinstalled_directory_link() {
     let owner = pbfhogg_test_scratch::scratch();
     let p = prepare(&scenario(), &BTreeMap::new(), owner.path(), 0).unwrap();

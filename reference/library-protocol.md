@@ -58,10 +58,14 @@ closed:
 - an object is never accepted in array form.
 
 Each refusal names the path into the document, such as
-`describe.scenarios[0].roles[2].owner`. The exceptions are text that is not
-JSON at all and a number beyond the range of a double (`1e400`), which the
-JSON parser itself refuses before any path exists; those name a line and
-column instead.
+`describe.scenarios[0].roles[2].owner`, or `request.bindings["out-b"]` for
+a member of a map with free keys. Both sides read documents with
+serde_json, so they judge JSON syntax alike. Malformed JSON (a bad escape
+such as `\u+061`, a leading zero, trailing bytes, invalid UTF-8), a number
+beyond the range of a double (`1e400`), and nesting beyond the reader's
+recursion limit (an implementation limit, far deeper than any schema here)
+are refused during parsing, before schema validation; those refusals name
+a line and column instead.
 
 Every document the harness writes carries `protocol`, an integer. The
 independent driver implements 1 and refuses any other value, naming both.

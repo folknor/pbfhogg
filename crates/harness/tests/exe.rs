@@ -660,42 +660,55 @@ fn bad_requests_are_refused_quietly() {
     // field and field type is exercised without another invalid field.
     for (case, expected) in [
         ("unknown scenario", "no scenario"),
-        ("missing binding", "bindings name"),
-        ("extra binding", "bindings name"),
-        ("duplicate key", "duplicate key"),
-        ("duplicate binding", "duplicate key"),
-        ("negative zero", "not a plain integer"),
-        ("leading zero", "not a plain integer"),
-        ("fraction", "a number with a fraction or exponent"),
-        ("exponent", "a number with a fraction or exponent"),
-        ("trailing bytes", "trailing bytes"),
+        (
+            "missing binding",
+            r#"request.bindings: missing key "out-b""#,
+        ),
+        ("extra binding", r#"request.bindings: unknown key "extra""#),
+        ("duplicate key", r#"request: duplicate key "iteration""#),
+        (
+            "duplicate binding",
+            r#"request.bindings: duplicate key "out-b""#,
+        ),
+        ("negative zero", "request.iteration: expected an integer"),
+        ("leading zero", "not valid JSON"),
+        ("fraction", "request.iteration: expected an integer"),
+        ("exponent", "request.iteration: expected an integer"),
+        ("trailing bytes", "trailing characters"),
+        ("bad unicode escape", "not valid JSON"),
         ("protocol version", "request.protocol:"),
         ("negative iteration", "request.iteration: out of range"),
         ("large iteration", "request.iteration: out of range"),
-        ("missing protocol", "lacks a required key"),
-        ("missing scenario", "lacks a required key"),
-        ("missing iteration", "lacks a required key"),
-        ("missing bindings", "lacks a required key"),
+        ("missing protocol", r#"request: missing key "protocol""#),
+        ("missing scenario", r#"request: missing key "scenario""#),
+        ("missing iteration", r#"request: missing key "iteration""#),
+        ("missing bindings", r#"request: missing key "bindings""#),
         (
             "protocol type",
-            "request.protocol: unknown key or wrong type",
+            "request.protocol: expected an integer, found null",
         ),
         (
             "scenario type",
-            "request.scenario: unknown key or wrong type",
+            "request.scenario: expected a string, found null",
         ),
         (
             "iteration type",
-            "request.iteration: unknown key or wrong type",
+            "request.iteration: expected an integer, found null",
         ),
         (
             "bindings type",
-            "request.bindings: unknown key or wrong type",
+            "request.bindings: expected an object, found null",
         ),
-        ("unknown field", "request.extra: unknown key or wrong type"),
-        ("binding type", "request.bindings.out-b: not a string"),
-        ("relative binding", "request.bindings.out-b: not absolute"),
-        ("non-object", "the request is not an object"),
+        ("unknown field", r#"request: unknown key "extra""#),
+        (
+            "binding type",
+            r#"request.bindings["out-b"]: expected a string, found an integer"#,
+        ),
+        (
+            "relative binding",
+            r#"request.bindings["out-b"]: not absolute"#,
+        ),
+        ("non-object", "request: expected an object, found an array"),
     ] {
         let run_dir = RunDir::new(|roles| {
             let mut value = repeat_request(&input, roles, 0);
@@ -728,32 +741,39 @@ fn bad_requests_are_refused_quietly() {
                 "non-object" => value = serde_json::json!([]),
                 _ => {}
             }
-            let text = serde_json::to_string(&value).expect("request JSON");
-            // Text edits preserve spellings that serde_json would normalize.
-            let text = match case {
-                "duplicate key" => {
-                    text.replacen("\"iteration\":0", "\"iteration\":0,\"iteration\":0", 1)
-                }
-                "duplicate binding" => {
-                    let binding =
-                        serde_json::to_string(&value["bindings"]["out-b"]).expect("path JSON");
-                    text.replacen(
-                        "\"bindings\":{",
-                        &format!("\"bindings\":{{\"out-b\":{binding},"),
-                        1,
-                    )
-                }
-                "negative zero" => text.replacen("\"iteration\":0", "\"iteration\":-0", 1),
-                "leading zero" => text.replacen("\"iteration\":0", "\"iteration\":00", 1),
-                "fraction" => text.replacen("\"iteration\":0", "\"iteration\":0.5", 1),
-                "exponent" => text.replacen("\"iteration\":0", "\"iteration\":0e0", 1),
-                "trailing bytes" => format!("{text} x"),
-                _ => text,
-            };
-            text.into_bytes()
+            respell(case, &value).into_bytes()
         });
         assert_request_refused(&run_dir, case, expected);
         assert!(run_dir.entries("roles").is_empty());
+    }
+}
+
+/// The request text for `case`. Text edits preserve spellings that
+/// serde_json would normalize.
+fn respell(case: &str, value: &Value) -> String {
+    let text = serde_json::to_string(value).expect("request JSON");
+    match case {
+        "duplicate key" => text.replacen("\"iteration\":0", "\"iteration\":0,\"iteration\":0", 1),
+        "duplicate binding" => {
+            let binding = serde_json::to_string(&value["bindings"]["out-b"]).expect("path JSON");
+            text.replacen(
+                "\"bindings\":{",
+                &format!("\"bindings\":{{\"out-b\":{binding},"),
+                1,
+            )
+        }
+        "negative zero" => text.replacen("\"iteration\":0", "\"iteration\":-0", 1),
+        "leading zero" => text.replacen("\"iteration\":0", "\"iteration\":00", 1),
+        "fraction" => text.replacen("\"iteration\":0", "\"iteration\":0.5", 1),
+        "exponent" => text.replacen("\"iteration\":0", "\"iteration\":0e0", 1),
+        "trailing bytes" => format!("{text} x"),
+        // A plus sign where JSON requires four hexadecimal digits.
+        "bad unicode escape" => text.replacen(
+            "\"scenario\":\"repeat-cat\"",
+            r#""scenario":"repeat-c\u+061t""#,
+            1,
+        ),
+        _ => text,
     }
 }
 

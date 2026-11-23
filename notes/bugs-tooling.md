@@ -266,37 +266,6 @@ call whose readings start at 10,000,000 us is rejected even when every
 duration and stream boundary is valid. Durations should be checked relative
 to `entry_us`, with stream checks kept against the call's recorded interval.
 
-## TOOL-023 - The worker accepts malformed JSON Unicode escapes
-
-Reported by: library-protocol [P2].
-
-`crates/harness/src/json.rs` parses the four bytes after `\u` with
-`u32::from_str_radix`, which accepts a leading `+`, while JSON requires four
-hexadecimal digits. `"scenario":"repeat-c\u+061t"` is accepted and decoded as
-`repeat-cat`, so with otherwise valid bindings malformed JSON reaches workload
-execution. This breaks the protocol's strict JSON boundary. The hunter
-suggests replacing the handwritten lexer with strict deserialization.
-
-## TOOL-024 - Worker request refusals omit the promised document paths
-
-Reported by: library-protocol [P3].
-
-The contract in `reference/library-protocol.md` promises a document path for
-schema and integer refusals. The worker reports duplicate keys and fractional
-numbers by byte offset only (`json.rs`), and a missing required field produces
-only "the request lacks a required key" (`request.rs`). These inputs are
-refused, but callers cannot identify the offending field as promised.
-
-## TOOL-025 - Quadratic work in run allocation and the worker string parser
-
-Reported by: library-protocol (maintenance and performance observations).
-
-Run allocation (`crates/library/src/run.rs`) searches the permanently reserved
-IDs from zero on every allocation, so N runs make O(N^2) failed create
-attempts. The worker's string parser revalidates the whole remaining input as
-UTF-8 while consuming one character, so long request strings parse in
-quadratic time.
-
 ## TOOL-026 - merge-workload can take its timing from an input filename
 
 Reported by: bench.
@@ -404,3 +373,15 @@ fixtures pass `true`. Either summaries can fire in those fixtures (their fake
 osmium keys decodes by content marker, so a stored summary could decide a
 comparison the fixture means to merge), or the doc's claim rests on some
 other switch. Establish which and fix the doc or the fixtures.
+
+## TOOL-048 - Verifier escape decoders accept a sign where digits are due
+
+Reported by: the library-protocol JSON spar, verified at the code.
+
+`crates/verify/src/osc.rs` decodes `&#x...;` with `u32::from_str_radix` and
+`&#...;` with `str::parse`, and `unescape` in `verify_change_listing.rs`
+decodes `%XX` with `u8::from_str_radix`. None checks the digits first, so
+`&#x+41;`, `&#+65;` and `%+A` are accepted (as `A`, `A` and a newline).
+XML and the listing escape both require bare digits, so malformed input
+reads as valid instead of being refused. `verify_diff_opl.rs` already
+guards with `is_ascii_hexdigit`; the other two should do the same.

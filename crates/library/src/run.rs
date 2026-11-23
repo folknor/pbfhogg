@@ -23,12 +23,53 @@ fn path_string(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("non-UTF-8 path: {}", path.display()))
 }
 /// Atomic create-new allocation with no reuse, including after a pass removes its directory.
+///
+/// The search starts one past the highest reservation a directory listing
+/// shows, so the reservations every earlier run left behind cost one
+/// listing rather than one failed create each. The listing is only a
+/// starting point: `create_new` alone decides ownership, so a reservation a
+/// concurrent driver makes after the listing is skipped like any other.
+/// Gaps are never refilled while the sequence can still advance; only when
+/// it cannot does the search fall back to every id from zero.
 pub(crate) fn allocate(root: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     // Persist each reservation outside the removable run directory.
     let reservations = root.join(".library-run-ids");
     std::fs::create_dir_all(&reservations)?;
-    for sequence in 0_u64.. {
+    let mut highest = None;
+    for entry in std::fs::read_dir(&reservations)? {
+        // Any entry type occupies its name for create_new, so each counts.
+        if let Some(sequence) = entry?.file_name().to_str().and_then(reserved_sequence) {
+            highest = highest.max(Some(sequence));
+        }
+    }
+    let start = highest.map_or(Some(0), |h: u64| h.checked_add(1));
+    if let Some(start) = start
+        && let Some(path) = reserve(root, &reservations, start..=u64::MAX)?
+    {
+        return Ok(path);
+    }
+    reserve(root, &reservations, 0..=u64::MAX)?
+        .ok_or_else(|| std::io::Error::other("run id space exhausted"))
+}
+
+/// The sequence of a reservation name exactly as [`allocate`] spells it
+/// (`library-N`, `N` decimal without a sign or a leading zero), else `None`.
+fn reserved_sequence(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("library-")?;
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    canonical.then(|| digits.parse().ok()).flatten()
+}
+
+/// Reserve the first free id in `sequences` and create its run directory.
+fn reserve(
+    root: &Path,
+    reservations: &Path,
+    sequences: std::ops::RangeInclusive<u64>,
+) -> std::io::Result<Option<PathBuf>> {
+    for sequence in sequences {
         let id = format!("library-{sequence}");
         match std::fs::OpenOptions::new()
             .write(true)
@@ -38,13 +79,13 @@ pub(crate) fn allocate(root: &Path) -> std::io::Result<PathBuf> {
             Ok(_) => {
                 let path = root.join(id);
                 std::fs::create_dir(&path)?;
-                return Ok(path);
+                return Ok(Some(path));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::other("run id space exhausted"))
+    Ok(None)
 }
 struct Fifo(PathBuf);
 impl Drop for Fifo {

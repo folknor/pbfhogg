@@ -1,9 +1,18 @@
-//! A strict JSON reader for the request: the protocol's document rules
-//! (`reference/library-protocol.md`, Documents) refuse a duplicate key, a number with a
-//! fraction or exponent, `-0`, a byte order mark and anything after the
-//! document but whitespace. A generic reader would merge duplicate keys and
-//! read `-0` as `0` before any check could see them, so the request is read
-//! by this one.
+//! The request's JSON tree, read under the protocol's document rules
+//! (`reference/library-protocol.md`, Documents).
+//!
+//! serde_json does the lexing, so the escapes, UTF-8, number grammar, byte
+//! order mark and trailing bytes are judged by the same parser the driver
+//! uses, and any text that is not JSON is refused there with a line and
+//! column. Parsing into `serde_json::Value` would merge duplicate keys and
+//! read `-0` as a number, so the document goes through this visitor
+//! instead: objects keep every member in document order, so
+//! [`crate::request`] can refuse a duplicate with its path, and every number
+//! that is not an integer in -2^63 to 2^64-1 (a fraction, an exponent, `-0`,
+//! or out of range) is kept as [`Json::NotInteger`], which no field accepts,
+//! so its refusal names a path too.
+
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 /// A JSON value as the protocol admits it: integers only, objects with
 /// their keys in document order.
@@ -12,224 +21,105 @@ pub(crate) enum Json {
     Null,
     Bool(bool),
     Int(i128),
+    /// Any number that is not an integer in -2^63 to 2^64-1.
+    NotInteger,
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
 }
 
-/// Nesting deeper than this is refused rather than recursed into.
-const DEPTH_MAX: usize = 64;
-
-/// Parse `text` as one document.
-pub(crate) fn parse(text: &str) -> Result<Json, String> {
-    let mut parser = Parser {
-        bytes: text.as_bytes(),
-        at: 0,
-    };
-    parser.skip_ws();
-    let value = parser.value(0)?;
-    parser.skip_ws();
-    if parser.at != parser.bytes.len() {
-        return Err(format!("trailing bytes at offset {}", parser.at));
+impl Json {
+    /// What the value is, for a refusal that found it where another was due.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "a boolean",
+            Self::Int(_) => "an integer",
+            Self::NotInteger => {
+                "a number that is not an integer in -2^63 to 2^64-1 (a fraction, an exponent, \
+                 -0, or out of range)"
+            }
+            Self::Str(_) => "a string",
+            Self::Arr(_) => "an array",
+            Self::Obj(_) => "an object",
+        }
     }
-    Ok(value)
 }
 
-struct Parser<'a> {
-    bytes: &'a [u8],
-    at: usize,
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonVisitor)
+    }
 }
 
-impl Parser<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.at).copied()
+struct JsonVisitor;
+
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Json;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
     }
 
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.at += 1;
-        }
+    fn visit_unit<E: de::Error>(self) -> Result<Json, E> {
+        Ok(Json::Null)
     }
 
-    fn eat(&mut self, literal: &[u8]) -> bool {
-        if self.bytes[self.at..].starts_with(literal) {
-            self.at += literal.len();
-            true
-        } else {
-            false
-        }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Json, E> {
+        Ok(Json::Bool(v))
     }
 
-    fn error<T>(&self, what: &str) -> Result<T, String> {
-        Err(format!("{what} at offset {}", self.at))
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Json, E> {
+        Ok(Json::Int(i128::from(v)))
     }
 
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > DEPTH_MAX {
-            return self.error("nesting too deep");
-        }
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(Json::Str),
-            Some(b'-' | b'0'..=b'9') => self.integer(),
-            _ if self.eat(b"true") => Ok(Json::Bool(true)),
-            _ if self.eat(b"false") => Ok(Json::Bool(false)),
-            _ if self.eat(b"null") => Ok(Json::Null),
-            _ => self.error("expected a value"),
-        }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Json, E> {
+        Ok(Json::Int(i128::from(v)))
     }
 
-    fn object(&mut self, depth: usize) -> Result<Json, String> {
-        self.at += 1;
-        let mut members: Vec<(String, Json)> = Vec::new();
-        self.skip_ws();
-        if self.eat(b"}") {
-            return Ok(Json::Obj(members));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return self.error("expected a key");
-            }
-            let key = self.string()?;
-            if members.iter().any(|(k, _)| *k == key) {
-                return self.error(&format!("duplicate key {key:?}"));
-            }
-            self.skip_ws();
-            if !self.eat(b":") {
-                return self.error("expected ':'");
-            }
-            self.skip_ws();
-            let value = self.value(depth + 1)?;
-            members.push((key, value));
-            self.skip_ws();
-            if self.eat(b"}") {
-                return Ok(Json::Obj(members));
-            }
-            if !self.eat(b",") {
-                return self.error("expected ',' or '}'");
-            }
-        }
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Json, E> {
+        Ok(Json::NotInteger)
     }
 
-    fn array(&mut self, depth: usize) -> Result<Json, String> {
-        self.at += 1;
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Json, E> {
+        Ok(Json::Str(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Json, E> {
+        Ok(Json::Str(v))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
         let mut items = Vec::new();
-        self.skip_ws();
-        if self.eat(b"]") {
-            return Ok(Json::Arr(items));
+        while let Some(item) = seq.next_element::<Json>()? {
+            items.push(item);
         }
-        loop {
-            self.skip_ws();
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            if self.eat(b"]") {
-                return Ok(Json::Arr(items));
-            }
-            if !self.eat(b",") {
-                return self.error("expected ',' or ']'");
-            }
-        }
+        Ok(Json::Arr(items))
     }
 
-    /// An integer without fraction, exponent, leading zero or `-0`.
-    fn integer(&mut self) -> Result<Json, String> {
-        let start = self.at;
-        let negative = self.eat(b"-");
-        let digits = self.at;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.at += 1;
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut members = Vec::new();
+        while let Some((key, value)) = map.next_entry::<String, Json>()? {
+            members.push((key, value));
         }
-        let text = &self.bytes[digits..self.at];
-        if text.is_empty() || (text.len() > 1 && text[0] == b'0') || (negative && text == b"0") {
-            self.at = start;
-            return self.error("not a plain integer");
-        }
-        if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
-            return self.error("a number with a fraction or exponent");
-        }
-        let spelled = std::str::from_utf8(&self.bytes[start..self.at]).unwrap_or("");
-        spelled
-            .parse::<i128>()
-            .map(Json::Int)
-            .or_else(|_| self.error("an integer out of range"))
+        Ok(Json::Obj(members))
     }
+}
 
-    fn string(&mut self) -> Result<String, String> {
-        self.at += 1;
-        let mut out = String::new();
-        loop {
-            let Some(byte) = self.peek() else {
-                return self.error("unterminated string");
-            };
-            match byte {
-                b'"' => {
-                    self.at += 1;
-                    return Ok(out);
-                }
-                b'\\' => {
-                    self.at += 1;
-                    out.push(self.escape()?);
-                }
-                0..=0x1f => return self.error("a control character in a string"),
-                _ => {
-                    // Copy one whole UTF-8 character; the input is a &str.
-                    let rest = std::str::from_utf8(&self.bytes[self.at..]).unwrap_or("");
-                    let Some(c) = rest.chars().next() else {
-                        return self.error("invalid UTF-8");
-                    };
-                    out.push(c);
-                    self.at += c.len_utf8();
-                }
-            }
-        }
-    }
+/// Parse `bytes` as one document: only whitespace may follow it.
+pub(crate) fn parse(bytes: &[u8]) -> Result<Json, String> {
+    serde_json::from_slice::<Json>(bytes).map_err(|e| format!("the request is not valid JSON: {e}"))
+}
 
-    fn escape(&mut self) -> Result<char, String> {
-        let Some(byte) = self.peek() else {
-            return self.error("unterminated escape");
-        };
-        self.at += 1;
-        Ok(match byte {
-            b'"' => '"',
-            b'\\' => '\\',
-            b'/' => '/',
-            b'b' => '\u{8}',
-            b'f' => '\u{c}',
-            b'n' => '\n',
-            b'r' => '\r',
-            b't' => '\t',
-            b'u' => return self.unicode(),
-            _ => return self.error("an unknown escape"),
-        })
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let Some(digits) = self.bytes.get(self.at..self.at + 4) else {
-            return self.error("a short \\u escape");
-        };
-        let text = std::str::from_utf8(digits).unwrap_or("");
-        let value = u32::from_str_radix(text, 16).or_else(|_| self.error("a bad \\u escape"))?;
-        self.at += 4;
-        Ok(value)
-    }
-
-    fn unicode(&mut self) -> Result<char, String> {
-        let high = self.hex4()?;
-        let code = if (0xD800..0xDC00).contains(&high) {
-            if !self.eat(b"\\u") {
-                return self.error("an unpaired surrogate");
-            }
-            let low = self.hex4()?;
-            if !(0xDC00..0xE000).contains(&low) {
-                return self.error("an unpaired surrogate");
-            }
-            0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
-        } else {
-            high
-        };
-        char::from_u32(code).map_or_else(|| self.error("an invalid code point"), Ok)
+/// A key for a refusal: quoted, and cut so an arbitrarily long key cannot
+/// push the rest of the reason past the refusal's length limit.
+pub(crate) fn shown_key(key: &str) -> String {
+    const SHOWN_MAX: usize = 80;
+    if key.chars().count() > SHOWN_MAX {
+        let cut: String = key.chars().take(SHOWN_MAX).collect();
+        format!("{cut:?}...")
+    } else {
+        format!("{key:?}")
     }
 }
 
@@ -239,7 +129,8 @@ mod tests {
 
     #[test]
     fn reads_a_request_shaped_document() {
-        let doc = parse(r#" {"a": [1, -2, true, null], "b": "xé\n"} "#).expect("valid");
+        let text = r#" {"a": [1, -2, true, null], "b": "xé\n", "a": 0} "#;
+        let doc = parse(text.as_bytes()).expect("valid");
         assert_eq!(
             doc,
             Json::Obj(vec![
@@ -253,26 +144,48 @@ mod tests {
                     ])
                 ),
                 ("b".into(), Json::Str("x\u{e9}\n".into())),
+                ("a".into(), Json::Int(0)),
             ])
         );
     }
 
     #[test]
-    fn refuses_what_the_protocol_refuses() {
-        for bad in [
-            r#"{"a": 1, "a": 2}"#,
-            "-0",
-            "01",
-            "1.0",
-            "1e3",
-            "{} x",
-            "\u{feff}{}",
-            r#""a
-b""#,
-            "[1,]",
-            "",
-        ] {
-            assert!(parse(bad).is_err(), "{bad:?} must be refused");
+    fn numbers_outside_the_integer_domain_survive_as_not_integer() {
+        for text in ["-0", "1.0", "1e3", "0e0", "18446744073709551616"] {
+            assert_eq!(parse(text.as_bytes()), Ok(Json::NotInteger), "{text}");
         }
+        assert_eq!(
+            parse(b"18446744073709551615"),
+            Ok(Json::Int(i128::from(u64::MAX)))
+        );
+        assert_eq!(
+            parse(b"-9223372036854775808"),
+            Ok(Json::Int(i128::from(i64::MIN)))
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_json_is_refused_by_the_parser() {
+        for bad in [
+            &b"01"[..],
+            b"{} x",
+            "\u{feff}{}".as_bytes(),
+            b"\"a\nb\"",
+            b"[1,]",
+            b"",
+            br#""repeat-c\u+061t""#,
+            br#""\u12""#,
+            br#""\ud800""#,
+            b"\"\xff\"",
+        ] {
+            let refused = parse(bad).expect_err("must be refused");
+            assert!(refused.contains("line"), "{bad:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn long_strings_parse() {
+        let text = format!("\"{}\"", "\u{e9}".repeat(1 << 20));
+        assert!(matches!(parse(text.as_bytes()), Ok(Json::Str(s)) if s.len() == 2 << 20));
     }
 }

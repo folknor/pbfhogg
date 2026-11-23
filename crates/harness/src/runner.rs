@@ -112,9 +112,9 @@ fn profile_from_env() -> bool {
 /// from the environment the library driver sets. A refusal writes
 /// `refusal.json` when it can.
 pub(crate) fn run_from_env(request: &Path, private_dir: &Path, artefacts: &Path) -> Exit {
-    let outcome = std::fs::read_to_string(request)
+    let outcome = std::fs::read(request)
         .map_err(|e| format!("cannot read the request: {e}"))
-        .and_then(|text| crate::request::parse(&text))
+        .and_then(|bytes| crate::request::parse(&bytes))
         .and_then(|request| {
             run_launch(&Launch {
                 scenario: &request.scenario,
@@ -323,13 +323,24 @@ fn shared_results(unplanned: String, late: String) -> [Outcome; 2] {
 /// once the directories are resolved.
 fn check_bindings(decl: &ScenarioDecl, bindings: &BTreeMap<String, PathBuf>) -> Result<(), String> {
     use crate::protocol::Role;
-    let declared: Vec<&str> = decl.roles.iter().map(|r| r.id).collect();
-    let bound: Vec<&str> = bindings.keys().map(String::as_str).collect();
-    let mut sorted = declared.clone();
-    sorted.sort_unstable();
-    if sorted != bound {
+    // `bindings` names every role of the scenario and nothing else, so an
+    // extra role is an unknown key and an absent one a missing key, each
+    // refused with its path into the request (in bench mode the harness
+    // builds the bindings from the roles, so neither can occur).
+    if let Some(extra) = bindings
+        .keys()
+        .find(|bound| !decl.roles.iter().any(|r| r.id == bound.as_str()))
+    {
         return Err(format!(
-            "bindings name {bound:?}, the scenario's roles are {sorted:?}"
+            "request.bindings: unknown key {}, not a role of scenario {:?}",
+            crate::json::shown_key(extra),
+            decl.id
+        ));
+    }
+    if let Some(missing) = decl.roles.iter().find(|r| !bindings.contains_key(r.id)) {
+        return Err(format!(
+            "request.bindings: missing key {:?}, a role of scenario {:?}",
+            missing.id, decl.id
         ));
     }
     let mut seen: Vec<(PathBuf, bool, &str)> = Vec::new();

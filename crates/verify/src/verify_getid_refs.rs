@@ -282,7 +282,25 @@ struct Choice {
 fn choose_relation(harness: &mut Harness, input: &RefsInput<'_>) -> Result<Choice, Error> {
     let relations = opl::input_relations(harness, &input.order.reference_input, input.outdir)?;
     let mut nesting = Nesting::default();
-    let records = opl::scan_relations(&relations, |r| nesting.add(r))?;
+    // The reader admits signed IDs; this check's domain is non-negative, and
+    // `refuse_negative_ids` read only the indexdata's claimed minimum, so a
+    // decoded negative relation the claim hid is refused here, before it
+    // could be chosen and handed to osmium, which matches by magnitude.
+    let mut negative = None;
+    let records = opl::scan_relations(&relations, |r| {
+        if r.id < 0 {
+            negative.get_or_insert(r.id);
+        }
+        nesting.add(r);
+    })?;
+    if let Some(id) = negative {
+        return Err(Error::Failed(format!(
+            "{} holds relation {id}, which the input's indexdata did not claim; osmium getid -r \
+             and osmium removeid match an ID by its absolute value and pbfhogg does not, so \
+             getid cannot be compared on it",
+            relations.display()
+        )));
+    }
     let claimed = input.summary.count(2);
     if records != claimed {
         return Err(Error::Failed(format!(
@@ -509,6 +527,18 @@ fn exercised(
             members: o.members.clone(),
         });
     })?;
+    // The reader admits signed IDs; osmium's lookup by magnitude can return a
+    // negative object the indexdata's claimed minimum hid, so a decoded one
+    // is refused here rather than counted as an object the request pulled.
+    if let Some(o) = objects.iter().find(|o| o.id < 0) {
+        return Err(Error::Failed(format!(
+            "{} holds {} {}, which the input's indexdata did not claim; getid \
+             --add-referenced cannot be compared on it",
+            listing.display(),
+            ["node", "way", "relation"][o.kind.index()],
+            o.id
+        )));
+    }
     let requested: BTreeSet<(usize, i64)> = request.iter().copied().collect();
     judge_exercised(&objects, &requested, chain.map(|(_, r3)| r3)).map_err(|why| {
         Error::Failed(format!(

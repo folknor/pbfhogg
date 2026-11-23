@@ -96,17 +96,22 @@ several containing areas); witnesses aimed at overlaps would need an overlap sea
 crossings and interiors, not only vertices, since two areas can overlap with no vertex of
 either inside the other.
 
-## VER-153 - The OPL relation reader refuses canonical order with negative IDs
+## VER-155 - verify extract's complete_ways oracle folds relation IDs by magnitude
 
-Reported by: scout lateral from the inspect ordering work.
+Reported by: spar partner during the OPL reader signed-ID work.
 
-`crates/verify/src/verify_opl.rs` refuses an osmium-written OPL relation
-whose ID is numerically at or below the previous one ("does not ascend").
-Canonical OSM order (ADR-0028, osmium's `id_order`) puts `-1` before `-7`
-before `1`, so a correctly sorted file with negative relation IDs would be
-refused for descent. No verified dataset holds negative IDs today, so it has
-not fired. The comparison should be strict canonical ascent; the verify
-crate does not link pbfhogg, so it needs its own copy of the order.
+osmium's complete_ways strategy marks a selected relation by its absolute
+ID (`research/osmium-tool/src/extract/strategy_complete_ways.cpp`), so an
+input holding `r-7` (member inside the box) and `r7` (member outside) gets
+both relations in osmium's output while a correct pbfhogg output holds only
+`r-7`. The complete_ways equality in `crates/verify/src/checks/extract.rs`
+then reports a FAIL against pbfhogg, and no input-ID guard stops it (the
+simple-relations adjudication guards only negative members). The OPL
+readers now admit signed record IDs, so the simple adjudication itself
+judges such relations correctly; the comparison that records the false
+failure needs a refusal or a magnitude-collision model at the extract
+oracle boundary. No verified dataset holds negative IDs, so it has not
+fired.
 
 ## VER-154 - Rendered timestamps and the export scaling refusal have no end-to-end test
 

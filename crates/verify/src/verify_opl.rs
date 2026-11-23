@@ -17,7 +17,12 @@
 //! relation, a line without its terminating newline (a truncated file), a
 //! record with no member field or more than one, a member token it cannot
 //! read, and an ID that does not strictly ascend are each an error, never a
-//! record silently skipped. An `M` with nothing after it is a relation with
+//! record silently skipped. Record IDs are signed and ascend in osmium's
+//! object order ([`crate::opl_compare::rank`]: kind, then ID zero, the
+//! negative IDs by magnitude, the positive IDs by magnitude), the canonical
+//! order osmium writes; a numeric comparison would refuse a correctly sorted
+//! `r-1`, `r-7`, `r1` for descent. Whether a check can judge a negative ID
+//! is the check's question, not the reader's. An `M` with nothing after it is a relation with
 //! no members.
 
 #![allow(
@@ -30,6 +35,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::error::Error;
+use crate::opl_compare::rank;
 use crate::osc::OscKind;
 
 /// The relations of `reference_input` (the input osmium reads) as OPL, at
@@ -63,7 +69,8 @@ pub(crate) struct OplRelation {
 }
 
 /// Hand every relation record of the OPL file at `path` to `each`, in file
-/// order; returns the record count. IDs must strictly ascend.
+/// order; returns the record count. IDs must strictly ascend in osmium's
+/// object order.
 pub(crate) fn scan_relations(
     path: &Path,
     mut each: impl FnMut(&OplRelation),
@@ -93,7 +100,7 @@ pub(crate) fn scan_relations(
             return Err(at("no terminating newline (truncated?)".into()));
         };
         let relation = parse_relation(body).map_err(at)?;
-        if last.is_some_and(|last| relation.id <= last) {
+        if last.is_some_and(|last| rank((2, relation.id)) <= rank((2, last))) {
             return Err(at(format!(
                 "relation {} does not ascend from {}",
                 relation.id,
@@ -119,9 +126,9 @@ pub(crate) struct OplObject {
 /// Hand every object record of the OPL file at `path` (`osmium cat -f opl`
 /// of a whole file) to `each`, in file order; returns the record count.
 /// Kinds must come nodes, then ways, then relations, and IDs strictly ascend
-/// within each, so no object is repeated. A way must carry exactly one node
-/// field and a relation exactly one member field, other kinds neither; at
-/// most one tag field; an ID must not be negative.
+/// within each in osmium's object order, so no object is repeated. A way must
+/// carry exactly one node field and a relation exactly one member field,
+/// other kinds neither; at most one tag field.
 pub(crate) fn scan_objects(path: &Path, mut each: impl FnMut(&OplObject)) -> Result<u64, Error> {
     let file = File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open OPL {}: {e}", path.display())))?;
@@ -150,7 +157,7 @@ pub(crate) fn scan_objects(path: &Path, mut each: impl FnMut(&OplObject)) -> Res
         let object = parse_object(body).map_err(at)?;
         let position = (object.kind.index(), object.id);
         if let Some(previous) = last
-            && position <= previous
+            && rank(position) <= rank(previous)
         {
             return Err(at(format!(
                 "{} {} does not follow {} {} in type-then-ID order",
@@ -190,7 +197,7 @@ fn parse_object(line: &[u8]) -> Result<OplObject, String> {
     let name = kind_name(kind);
     let id = parse_id(digits).ok_or_else(|| {
         format!(
-            "{name} id {:?} is not a non-negative integer",
+            "{name} id {:?} is not a decimal integer",
             String::from_utf8_lossy(digits)
         )
     })?;
@@ -267,7 +274,7 @@ fn parse_relation(line: &[u8]) -> Result<OplRelation, String> {
     let id = match first.split_first() {
         Some((b'r', digits)) => parse_id(digits).ok_or_else(|| {
             format!(
-                "relation id {:?} is not a non-negative integer",
+                "relation id {:?} is not a decimal integer",
                 String::from_utf8_lossy(digits)
             )
         })?,
@@ -331,16 +338,19 @@ fn parse_ref(text: &[u8]) -> Option<i64> {
     std::str::from_utf8(text).ok()?.parse().ok()
 }
 
-/// A non-negative decimal ID: ASCII digits only, no sign, no leading zero
-/// but in `0` itself (osmium writes an object with ID zero as it is).
-fn parse_id(digits: &[u8]) -> Option<i64> {
+/// A record ID as osmium writes it: an optional minus sign, then ASCII
+/// digits with no leading zero but in `0` itself (osmium writes an object
+/// with ID zero as it is), and no `-0`.
+fn parse_id(text: &[u8]) -> Option<i64> {
+    let digits = text.strip_prefix(b"-").unwrap_or(text);
     if digits.is_empty()
+        || (digits == b"0" && digits.len() != text.len())
         || (digits[0] == b'0' && digits.len() > 1)
         || !digits.iter().all(u8::is_ascii_digit)
     {
         return None;
     }
-    std::str::from_utf8(digits).ok()?.parse().ok()
+    std::str::from_utf8(text).ok()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -400,6 +410,38 @@ mod tests {
     }
 
     #[test]
+    fn signed_ids_ascend_in_osmium_object_order() {
+        let scratch_dir = pbfhogg_test_scratch::scratch();
+        let dir = scratch_dir.path().join("fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seen = scan_text(
+            &dir,
+            "signed.opl",
+            "r0 M\nr-1 M\nr-7 Mn1@\nr-9223372036854775808 M\nr1 M\nr7 M\n",
+        )
+        .unwrap();
+        let ids: Vec<i64> = seen.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, -1, -7, i64::MIN, 1, 7]);
+        let objects = scan_object_text(
+            &dir,
+            "signed-objects.opl",
+            "n-2 T\nn3 T\nw-1 N\nr-4 M\nr2 M\n",
+        )
+        .unwrap();
+        let keys: Vec<(OscKind, i64)> = objects.iter().map(|o| (o.0, o.1)).collect();
+        assert_eq!(
+            keys,
+            vec![
+                (OscKind::Node, -2),
+                (OscKind::Node, 3),
+                (OscKind::Way, -1),
+                (OscKind::Relation, -4),
+                (OscKind::Relation, 2)
+            ]
+        );
+    }
+
+    #[test]
     fn anything_it_cannot_account_for_is_an_error() {
         let scratch_dir = pbfhogg_test_scratch::scratch();
         let dir = scratch_dir.path().join("fixture");
@@ -416,10 +458,17 @@ mod tests {
             ("r5 Mw-@\n", "member"),
             ("r5 Mw1x@\n", "member"),
             ("r5 Mw1@,\n", "member"),
-            ("r-5 M\n", "non-negative integer"),
-            ("r05 M\n", "non-negative integer"),
+            ("r05 M\n", "decimal integer"),
+            ("r-05 M\n", "decimal integer"),
+            ("r-0 M\n", "decimal integer"),
+            ("r- M\n", "decimal integer"),
+            ("r+5 M\n", "decimal integer"),
             ("r6 M\nr6 M\n", "does not ascend"),
             ("r6 M\nr5 M\n", "does not ascend"),
+            ("r-6 M\nr-6 M\n", "does not ascend"),
+            ("r-7 M\nr-1 M\n", "does not ascend"),
+            ("r1 M\nr-1 M\n", "does not ascend"),
+            ("r-1 M\nr0 M\n", "does not ascend"),
         ]
         .into_iter()
         .enumerate()
@@ -495,8 +544,10 @@ mod tests {
             ("w1 Nw2\n", "node ref"),
             ("w1 Nn\n", "node ref"),
             ("w1 Nn1,\n", "node ref"),
-            ("n00 T\n", "non-negative integer"),
-            ("n-1 T\n", "non-negative integer"),
+            ("n00 T\n", "decimal integer"),
+            ("n-0 T\n", "decimal integer"),
+            ("n1 T\nn-1 T\n", "does not follow"),
+            ("n-3 T\nn-2 T\n", "does not follow"),
             ("x1 T\n", "not an object record"),
             ("n1 T", "terminating newline"),
         ]

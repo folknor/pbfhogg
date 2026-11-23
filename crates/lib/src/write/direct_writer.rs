@@ -118,10 +118,27 @@ pub struct DirectWriter {
     /// The direct I/O alignment `crate::direct_io` discovered for `file`: a
     /// power of two dividing the buffer capacity.
     align: usize,
-    /// Total logical bytes written (for ftruncate at the end).
+    /// Bytes accepted by `write` (copied into the buffer), the length the
+    /// file is truncated to at the end. Counted per copied chunk, never for
+    /// bytes a failed call did not take.
     logical_size: u64,
-    /// Whether flush_final has already been called.
-    flushed: bool,
+    state: State,
+}
+
+/// Where a [`DirectWriter`] stands. Fail-stop: an I/O error is final.
+enum State {
+    /// Accepting writes.
+    Open,
+    /// `flush` padded, wrote and truncated the file successfully.
+    Finished,
+    /// A `write(2)` or `ftruncate` failed. What reached the file is unknown:
+    /// `write_all` may have written a prefix of the buffer and advanced the
+    /// fd offset before failing, and an `O_DIRECT` retry from there would be
+    /// misaligned or duplicate bytes. So nothing is retried; every later
+    /// `write` and `flush` reports the original cause, and `Drop` leaves the
+    /// file alone, since a `set_len` to the accepted size could zero-extend
+    /// over bytes that never reached the disk.
+    Failed(io::ErrorKind, String),
 }
 
 impl DirectWriter {
@@ -146,8 +163,32 @@ impl DirectWriter {
             buf,
             align,
             logical_size: 0,
-            flushed: false,
+            state: State::Open,
         })
+    }
+
+    /// The error a call on a writer in `state` returns, if any.
+    fn refusal(&self) -> Option<io::Error> {
+        match &self.state {
+            State::Open => None,
+            // A call-order error, carried through the `Write` signature whole.
+            State::Finished => Some(
+                crate::Error::invalid_argument(
+                    "DirectWriter: write after flush; the file has already been \
+                     padded and truncated to its final size",
+                )
+                .into(),
+            ),
+            State::Failed(kind, cause) => Some(io::Error::new(
+                *kind,
+                format!("DirectWriter: an earlier write failed and the writer is stopped: {cause}"),
+            )),
+        }
+    }
+
+    /// Run `step`, moving to `Failed` if it errors.
+    fn fail_stop<T>(&mut self, step: impl FnOnce(&mut Self) -> io::Result<T>) -> io::Result<T> {
+        step(self).inspect_err(|e| self.state = State::Failed(e.kind(), e.to_string()))
     }
 
     /// Write the full aligned buffer to the fd, handling partial writes.
@@ -169,22 +210,30 @@ impl DirectWriter {
     }
 
     /// Final flush: pad the remaining data to an aligned boundary, write it,
-    /// then truncate the file to the actual logical size.
+    /// then truncate the file to the actual logical size. `Finished` is
+    /// recorded only once both steps succeeded, so a repeated flush is a
+    /// no-op only after a real success; a failure is sticky.
     fn flush_final(&mut self) -> io::Result<()> {
-        if self.flushed {
-            return Ok(());
+        match self.state {
+            State::Open => {}
+            State::Finished => return Ok(()),
+            State::Failed(..) => {
+                if let Some(err) = self.refusal() {
+                    return Err(err);
+                }
+            }
         }
-        self.flushed = true;
-
-        if self.buf.len > 0 {
-            // Round up to the next aligned boundary.
-            let aligned = round_up(self.buf.len, self.align);
-            self.buf.zero_pad_to(aligned);
-            self.flush_buf()?;
-        }
-
-        // Trim the file to the actual byte count (remove zero-padding).
-        self.file.set_len(self.logical_size)?;
+        self.fail_stop(|w| {
+            if w.buf.len > 0 {
+                // Round up to the next aligned boundary.
+                let aligned = round_up(w.buf.len, w.align);
+                w.buf.zero_pad_to(aligned);
+                w.flush_buf()?;
+            }
+            // Trim the file to the actual byte count (remove zero-padding).
+            w.file.set_len(w.logical_size)
+        })?;
+        self.state = State::Finished;
         Ok(())
     }
 
@@ -196,35 +245,29 @@ impl DirectWriter {
 }
 
 impl Write for DirectWriter {
+    /// Accepts at most one buffer's worth per call, so an `Err` always
+    /// means this call took nothing and `Ok(n)` means exactly `n` bytes were
+    /// copied and counted. A full buffer is written at the start of the next
+    /// call (or by `flush`), never after the copy, so its error cannot follow
+    /// an acceptance.
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        // `flush` is final for this type: it pads the buffer to an aligned
-        // block, writes it, and `ftruncate`s the file back to the logical
-        // size.
-        // The fd offset is then past zero padding that the truncation just
-        // removed, so anything written afterwards would land after a
-        // mid-file zero gap - readers see nulls where a BlobHeader belongs -
-        // and the final partial buffer would be dropped silently, because
-        // `flush_final` early-returns on the latch and `Drop` calls the same
-        // latched function. Refuse instead of producing that file.
-        if self.flushed {
-            // A call-order error, carried through the `Write` signature whole.
-            return Err(crate::Error::invalid_argument(
-                "DirectWriter: write after flush; the file has already been \
-                 padded and truncated to its final size",
-            )
-            .into());
+        // After a successful `flush` the fd offset is past zero padding that
+        // the truncation removed, so anything written afterwards would land
+        // after a mid-file zero gap - readers see nulls where a BlobHeader
+        // belongs. After a failure the file content is unknown. Refuse both.
+        if let Some(err) = self.refusal() {
+            return Err(err);
         }
-        self.logical_size += data.len() as u64;
-        let mut offset = 0;
-        while offset < data.len() {
-            let chunk = (data.len() - offset).min(self.buf.remaining());
-            self.buf.extend(&data[offset..offset + chunk]);
-            offset += chunk;
-            if self.buf.remaining() == 0 {
-                self.flush_buf()?;
-            }
+        if data.is_empty() {
+            return Ok(0);
         }
-        Ok(data.len())
+        if self.buf.remaining() == 0 {
+            self.fail_stop(Self::flush_buf)?;
+        }
+        let chunk = data.len().min(self.buf.remaining());
+        self.buf.extend(&data[..chunk]);
+        self.logical_size += chunk as u64;
+        Ok(chunk)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -235,16 +278,19 @@ impl Write for DirectWriter {
 impl Drop for DirectWriter {
     fn drop(&mut self) {
         #[cfg(test)]
-        let flushed = self.flushed;
-        // Best-effort cleanup still finalizes the file, but only an explicit
-        // flush can report its I/O error. An error bail-out reaching here is
-        // expected (the primary error dominates). The crate's own unit-test
-        // builds assert when a non-panicking path skipped the explicit flush;
-        // see `PbfWriter`'s `Drop` for why it is not every debug build.
-        drop(self.flush_final());
+        let settled = !matches!(self.state, State::Open);
+        // Best-effort cleanup still finalizes an open file (the error that
+        // abandoned it was someone else's), but only an explicit flush can
+        // report its I/O error. A failed writer is left as it is; see
+        // `State::Failed`. The crate's own unit-test builds assert when a
+        // non-panicking path skipped the explicit flush; see `PbfWriter`'s
+        // `Drop` for why it is not every debug build.
+        if matches!(self.state, State::Open) {
+            drop(self.flush_final());
+        }
         #[cfg(test)]
         debug_assert!(
-            std::thread::panicking() || flushed,
+            std::thread::panicking() || settled,
             "DirectWriter dropped before flush(); call flush() to observe deferred errors"
         );
     }
@@ -296,7 +342,7 @@ mod tests {
             buf: AlignedBuffer::new(IO_BUF_BYTES, DIO_ALIGN_FLOOR).unwrap(),
             align: DIO_ALIGN_FLOOR,
             logical_size: 0,
-            flushed: false,
+            state: State::Open,
         };
         w.write_all(b"first").unwrap();
         w.flush().unwrap();
@@ -311,5 +357,49 @@ mod tests {
             "the refused bytes must not have reached the file, and the \
              zero padding must still have been truncated away"
         );
+    }
+
+    /// A writer over a file opened read-only: every `write(2)` fails.
+    fn failing_writer(dir: &std::path::Path) -> DirectWriter {
+        let path = dir.join("ro.bin");
+        File::create(&path).unwrap();
+        DirectWriter {
+            file: File::open(&path).unwrap(),
+            buf: AlignedBuffer::new(IO_BUF_BYTES, DIO_ALIGN_FLOOR).unwrap(),
+            align: DIO_ALIGN_FLOOR,
+            logical_size: 0,
+            state: State::Open,
+        }
+    }
+
+    /// A failed final flush stays failed: a retry must not report success.
+    #[test]
+    fn a_failed_flush_is_sticky() {
+        let dir = crate::path_guard::tests::scratch();
+        let mut w = failing_writer(dir.path());
+        w.write_all(b"tail").unwrap();
+        let first = w.flush().expect_err("the tail write must fail");
+        let again = w.flush().expect_err("a retried flush must not succeed");
+        assert_eq!(again.kind(), first.kind());
+        assert!(
+            again.to_string().contains(&first.to_string()),
+            "got: {again}"
+        );
+        assert!(w.write(b"more").is_err(), "a failed writer refuses writes");
+    }
+
+    /// A failing buffer flush inside `write_all` counts only the bytes
+    /// actually accepted, and the failing call takes nothing.
+    #[test]
+    fn a_failed_write_counts_only_accepted_bytes() {
+        let dir = crate::path_guard::tests::scratch();
+        let mut w = failing_writer(dir.path());
+        let data = vec![7u8; IO_BUF_BYTES * 2];
+        assert_eq!(w.write(&data).unwrap(), IO_BUF_BYTES);
+        assert!(w.write(&data[IO_BUF_BYTES..]).is_err());
+        assert_eq!(w.logical_size, IO_BUF_BYTES as u64);
+        assert!(w.write_all(&data).is_err());
+        assert_eq!(w.logical_size, IO_BUF_BYTES as u64);
+        assert!(w.flush().is_err());
     }
 }

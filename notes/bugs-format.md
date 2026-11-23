@@ -131,35 +131,6 @@ Both hunters say that rationale conflicts with the pre-1.0 premise. The
 proposed fix is a checked compression-level type, or validation at the writer
 boundary before any output is created.
 
-## FMT-016 - DirectWriter::flush reports success after a failed finalization
-
-Reported by: write-backends [P2].
-
-`flush_final` (`write/direct_writer.rs`) sets `flushed = true` before it writes
-the padded tail or truncates the file. If either step fails, every later
-`flush` returns `Ok(())` at once, and `Drop` skips the unfinished work. For
-example, a tail write fails with ENOSPC, space is freed, and a retried flush
-succeeds without writing the tail. A truncation failure likewise leaves the
-padding while later flushes claim success. This breaks `flush`'s documented
-finalization contract for the public `DirectWriter`, including one wrapped in
-`PbfWriter::new`. The pipelined `PbfWriter`'s retained flush error protects
-that particular route.
-
-## FMT-017 - DirectWriter::write mishandles partial failures
-
-Reported by: write-backends [P2].
-
-`logical_size` (`write/direct_writer.rs`) counts the whole supplied slice
-before it is accepted. If flushing the first buffer fails, the rest of the
-slice was never copied but is already in the eventual truncation length. With
-a two-buffer input, a failure while flushing the first buffer followed by a
-successful flush writes the first buffer and zero-extends the file over the
-missing second. Separately, `flush_buf` keeps the whole buffer after a partial
-write followed by an error, although the file cursor has advanced, so a retry
-writes the prefix again. This breaks the `Write::write` acceptance contract
-and the promised logical byte count. The hunter notes that fixing the
-finalization latch (FMT-016) alone does not fix this.
-
 ## FMT-018 - PbfWriter::write_header skips the cancellation checkpoint
 
 Reported by: write-backends [P2].

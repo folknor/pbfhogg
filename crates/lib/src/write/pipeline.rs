@@ -875,10 +875,13 @@ pub(super) fn deliver_in_order<S: OutputSink>(
 /// Writer thread of the buffered and `O_DIRECT` backends: deliver, then
 /// finish the file.
 ///
-/// On an error the sink is NOT finished, so an `O_DIRECT` sink is finalised
-/// by `DirectWriter::Drop` calling `flush_final` best-effort - the short file
-/// still gets padded and `set_len`'d. That is deliberate. The padding is not
-/// what makes a truncated file look plausible: every backend writes whole
+/// On an error the sink is NOT finished, so an `O_DIRECT` sink whose own
+/// writes did not fail is finalised by `DirectWriter::Drop` calling
+/// `flush_final` best-effort - the short file still gets padded and
+/// `set_len`'d. (A sink whose own `write(2)` or `ftruncate` failed is left
+/// untouched: its content is unknown and may end mid-blob.) That is
+/// deliberate. The padding is not what makes a truncated file look
+/// plausible: when the error was upstream, every backend has written whole
 /// blobs, so a short file ends on a blob boundary and reads as a valid
 /// shorter PBF regardless. Skipping the `O_DIRECT` finalisation would only
 /// leave a partial page of alignment zeros on the end, which is harder to

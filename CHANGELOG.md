@@ -632,6 +632,14 @@
 
 ### Fixed
 
+- **`DirectWriter` stops at its first I/O error.** A failed final flush
+  used to make every later `flush` return `Ok` without writing the tail
+  or truncating the padding, and a write whose buffer flush failed counted
+  bytes it never took, so a later flush could zero-extend the file or
+  write a prefix twice. Now a failure is reported again by every later
+  `write` and `flush`, `write` returns only bytes it actually accepted,
+  and a failed writer's file is left as it is on drop.
+
 - **A failing stderr or `--help` write is an I/O error, exit 2.** A stderr
   write that failed other than by its reader going away (`2>/dev/full`, a
   full disk behind `2>file`) panicked and exited 101, the defect status. It

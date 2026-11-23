@@ -28,6 +28,18 @@ use lex::Source;
 
 /// Every Rust file under each workspace member's `src/` and `tests/`, keyed
 /// by repository-relative path with `/` separators.
+///
+/// It holds tokens, not syn trees, and each structural rule parses the
+/// files it needs itself. A shared parse cache is not available here: the
+/// real-tree tests share one corpus across libtest threads, so it must be
+/// `Sync`, and a `syn::File` is neither `Send` nor `Sync` (its token
+/// streams and spans carry proc-macro2's `Rc` marker even outside a proc
+/// macro). The repeated parse is kept cheap instead by building the syn
+/// stack optimized in test builds (root `Cargo.toml`). Should a rule's
+/// audit approach the test watchdog again, the shape that parses once is a
+/// per-file pass that lends each parsed file to every applicable rule's own
+/// accumulator on one thread and then drops it, finishing with each rule's
+/// corpus-wide checks.
 pub struct Corpus {
     pub root: PathBuf,
     pub files: BTreeMap<String, Source>,

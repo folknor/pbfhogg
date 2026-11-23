@@ -72,7 +72,7 @@ disallowed_methods = "allow"
 # Test builds (every brokkr check sweep, brokkr test) compile the workspace's
 # own crates at opt-level 1: the suites spend their time in pbfhogg's codec,
 # geometry and source-audit code and in the debug pbfhogg binary the CLI
-# tests spawn. Third-party crates stay at 0 so a dependency bump does not
+# tests spawn. Third-party crates default to 0 so a dependency bump does not
 # cost an optimized rebuild. Debug assertions and overflow checks stay on.
 # On `test`, not `dev`, so `cargo build` and rust-analyzer keep dev's
 # settings.
@@ -81,6 +81,22 @@ opt-level = 1
 
 [profile.test.package."*"]
 opt-level = 0
+
+# The exception: the syn parser stack the source-policy audits run builds at
+# 3. Each structural rule parses its files with syn on its own (a parsed
+# tree is not Sync, so the shared corpus cannot hold one), and at 0 the
+# parse alone took a real-tree audit to about 4 s of the fixed 20 s test
+# watchdog; at 3 it is about 1.4 s, measured 2026-11-23 on bygg. Unversioned so a syn bump keeps it.
+# Named overrides also reach host-side proc-macro builds of these crates;
+# their extra compile recurs whenever cargo invalidates those artifacts.
+[profile.test.package.syn]
+opt-level = 3
+
+[profile.test.package.proc-macro2]
+opt-level = 3
+
+[profile.test.package.unicode-ident]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

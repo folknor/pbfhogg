@@ -177,6 +177,27 @@ loop) and pass 1; the gap sits in the CPU-bound write loop and the later
 HEAD direct-io cell `ef8f68ee` ran that same buffered pass 2 in 251.7 s,
 so it is drift between cells, not the change, and is not claimed.
 
+Fail-stop `DirectWriter` (bygg, planet, 2026-11-23, `d111f84d` against
+`3c10e070`). The commit gives the `O_DIRECT` writer an Open, Finished,
+Failed state, counts only accepted bytes and takes at most one buffer
+flush per `write` call. Cell: `brokkr bench --iterations 1 copy-pbf
+--dataset planet --type way --direct-io yes`, a filtered raw passthrough
+that writes 29.46 GB through `DirectWriter` (`writer_direct_write_bytes`,
+`writer_buffered_write_calls` 0), both arms `--commit` worktrees, after
+`sudo fstrim -av`, order A B B A: `3c10e070` 37.8 s (`7b6bb83f`),
+`d111f84d` 37.7 s (`923ed05f`), `d111f84d` 36.7 s (`5f98bffa`),
+`3c10e070` 40.2 s (`ad3c182c`). Medians 39.0 s against 37.2 s; the
+commit arm is not slower in either pair. Writer-thread time
+(`writer_handoff_ns`) is 6.38 and 7.29 s at the parent against 6.48 and
+7.13 s at the commit, and the run is read-bound at 0.1 avg cores in
+`CAT_SCAN`. Within noise. `writer_direct_write_calls` reads 17530 at the
+parent and 129906 at the commit for the same bytes. It counts
+`FileWriter` `write` calls, and since `d111f84d` a `DirectWriter::write`
+accepts at most one 256 KiB buffer's worth, so `write_all` splits each
+frame (1.68 MB mean here) into about seven calls instead of one. The
+counter does not compare across `d111f84d`, and those extra calls cost
+nothing measurable on this cell.
+
 `sort --direct-io --io-uring` with direct pass-2 copies (bygg, planet,
 sorted input, 2026-11-04, change on top of `bc075247`). The copied-through
 frames are now read `O_DIRECT` in aligned chunks into the uring writer's

@@ -469,8 +469,9 @@ host; it does not refuse such a lane before building.
 
 Every tested sweep's test build uses cargo's `test` profile (no sweep sets
 a `profile` of its own): dev, except that the
-workspace's own crates compile at opt-level 1 (third-party crates stay at
-0), with debug assertions and overflow checks on; see "Check wall time".
+workspace's own crates compile at opt-level 1 (third-party crates default
+to 0; the syn parser stack the source audits run, `syn`, `proc-macro2` and
+`unicode-ident`, builds at 3), with debug assertions and overflow checks on; see "Check wall time".
 No suite runs the shipped release profile (fat LTO, debug assertions and
 overflow checks off). A gate sweep that did
 was retired as too costly for what it alone caught. What covers its ground:
@@ -484,7 +485,8 @@ and the suite does not yet forbid that shape); the `no-debug-only-invariants` te
 enforces ADR-0021, so a production debug-only check exists only on a line
 carrying its `debug-only-measured:` record, which review polices; and every
 bench and verify run is a release build on real data. Not covered by any
-suite: a miscompile or undefined behaviour that only opt-level 3 exposes,
+suite: a miscompile or undefined behaviour that only opt-level 3 exposes
+in workspace code or the shipped release build,
 and timing-sensitive behaviour of the exact shipped shape (both backends,
 no hook cfg, no profiling feature).
 
@@ -846,7 +848,10 @@ opt-level 1 against 8.1s at 0.
   where sysfs topology is unreadable. Never a fixed count: one number
   fits one host.
 - **Test builds compile the workspace at opt-level 1** (`[profile.test]`
-  in the root `Cargo.toml`, third-party crates held at 0). The suites'
+  in the root `Cargo.toml`, third-party crates held at 0 except the syn
+  parser stack, at 3, since every structural source audit parses its files
+  with syn on its own and at 0 that parse took a real-tree audit to about
+  4 s of the 20 s watchdog). The suites'
   CPU is pbfhogg's own codec, geometry and source-audit code, in the test
   process and in the debug `pbfhogg` children the CLI tests spawn. It is
   on `test`, not `dev`, so a plain `cargo build` keeps dev's settings.

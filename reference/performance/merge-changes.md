@@ -8,6 +8,24 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### Hidden create or modify node may omit coordinates (bygg, 2026-11-23, `c37ad061` against `0b353eba`)
+
+`c37ad061` adds, per node, a hidden test on the decoded metadata and
+routes the location through one `node_coords` helper. Planet 7-OSC
+(`--osc 4914..4920`), `brokkr bench --iterations 1 merge-diffs`, both arms
+`--commit` worktrees, interleaved:
+
+| Mode | `0b353eba` | `c37ad061` | Medians |
+|---|---|---|---|
+| default | 3094 (`596788cd`), 3087 (`5e7cb795`), 3096 ms (`16283553`) | 3155 (`dc525628`), 2966 (`602951bf`), 3030 ms (`a5116c07`) | 3094 against 3030 ms, -2.1 % |
+| `--simplify` | 4475 (`6f448d86`), 4335 ms (`95b543e1`) | 4486 (`4f34aa0a`), 4386 ms (`8ae64dfe`) | 4405 against 4436 ms, +0.7 % |
+
+Order was A B B A A B for default and A B B A for simplify. In the
+simplify pair `95b543e1` against `8ae64dfe` every phase is within 3 %
+(parse 2567 vs 2592 ms, simplify 242 vs 239 ms, emit 1097 vs 1132 ms).
+Within noise on both paths. The OSC tags-filter cells are in
+tags-filter.md.
+
 ### Child attribute lists checked to the end (plantasjen, 2026-11-23, `68629f07` + change)
 
 Every `tag`, `nd` and `member` attribute list is walked to its end, in one

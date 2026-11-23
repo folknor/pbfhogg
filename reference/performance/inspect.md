@@ -98,6 +98,49 @@ Within noise (both pairs at or below the baseline; the -4 % second pair is
 not claimed as a win). Phase split alike (22.2 vs 23.9 avg cores, peak anon
 within 3 %). It landed.
 
+## Inspect --extended: millisecond formatter and count-decided presence (bygg, 2026-11-23, `69b7e77e` against `05db9183`)
+
+`69b7e77e` moved inspect onto the shared millisecond timestamp formatter
+and decides timestamp and bbox presence by count and min/max instead of
+sentinels; per-element census work was claimed unchanged. Both arms
+`--commit` worktrees, `brokkr bench --iterations 1 file-info --mode
+extended`, interleaved, after `sudo fstrim -av` and four planet
+`copy-pbf` cells:
+
+| UUID | Dataset | Arm | Wall |
+|---|---|---|---:|
+| `a226e523` | planet | `05db9183` | 27.8 s |
+| `3225aa7f` | planet | `69b7e77e` | 29.0 s |
+| `d4ff3700` | planet | `69b7e77e` | 29.0 s |
+| `7ee5d05b` | planet | `05db9183` | 29.0 s |
+| `02dad109` | planet | `05db9183` | 29.0 s |
+| `94272e80` | planet | `69b7e77e` | 29.0 s |
+| `4dc8b363` | germany, warm-up | `05db9183` | 1.468 s |
+| `95303af0` | germany, warm-up | `69b7e77e` | 1.486 s |
+| `3201dd3f` | germany | `69b7e77e` | 1.468 s |
+| `f260b113` | germany | `05db9183` | 1.401 s |
+| `2f2c7800` | germany | `05db9183` | 1.412 s |
+| `db669eef` | germany | `69b7e77e` | 1.436 s |
+| `eeb90492` | germany | `69b7e77e` | 1.472 s |
+| `38a320a9` | germany | `05db9183` | 1.414 s |
+| `eb3aa117` | germany | `05db9183` | 1.410 s |
+| `a494f5c6` | germany | `69b7e77e` | 1.418 s |
+
+Planet medians 29.0 s each; every cell after the first sits at the
+drive's read ceiling (about 3 GB/s, 22-24 avg cores), so planet cannot
+show a CPU cost here. The first cell's 27.8 s is the same fast first-cell
+effect as `6e6591f7` above, not the arm. Germany is page-cache warm and
+CPU-bound: medians 1.411 s against 1.452 s (+2.9 %), commit arm slower in
+all four pairs (+0.6 to +4.8 %). The phase split does not attribute it to
+more work: `38a320a9` against `eeb90492` is 35.8 against 35.5
+core-seconds (25.4 vs 24.2 avg cores), and a hotpath pair
+(`a8f785aa` 1.466 s, `57620cbf` 1.508 s) has `scan_block_buffer` at
+294.6 against 291.3 us per blob and `decompress_pooled` 230.5 against
+226.5 us, the commit arm marginally lower on both. Verdict: within noise
+on planet; at the 2-3 % edge on warm germany with no per-blob or
+core-second cost behind it, so not a regression. `export --metadata`,
+the commit's other path, has no registered bench and was not measured.
+
 ## inspect --nodes reads through a projection (bygg, 2026-11-02, against `5ec5eefc`)
 
 `inspect --nodes` reads each node blob through a projection on the block

@@ -20,19 +20,6 @@ source; costs are derived from the code unless an entry says measured. "Reported
 by" records which scopes raised a finding and is a fact about the reports, not a
 verdict on the code. Entries are in no order of importance.
 
-## VER-144 - Source-policy rules re-parse every file with syn, in debug
-
-Measured 2026-11-18 on bygg (debug `brokkr test`): the single real-tree
-audit test took 18.8 s of brokkr's fixed 20 s per-test watchdog before the
-ID sign rule landed, and timed out in the parallel gate after it. Per rule:
-loop_waits 4.1 s, host_independence 3.5 s, environment 3.5 s, test_modules
-2.3 s, statics 1.5 s, library_text 1.4 s, corpus load 0.7 s; each rule
-parses the files it needs with syn on its own. The audit is now one test
-per rule over a shared corpus, so no single test owns the sum, but the
-slowest rules still parse the same files repeatedly. Parsing each file
-once in `Corpus` (lazily, shared by every structural rule) would cut the
-total; a single rule growing past the watchdog is the residual risk.
-
 ## VER-130 - The descriptor gate's charges are asserted, not observed
 
 Residue, unobserved under the current design: the io_uring arm of the charge witness

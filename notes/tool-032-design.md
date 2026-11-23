@@ -70,8 +70,9 @@ declarations). Flags the forms that accept or discard an arbitrary error:
 `_`-prefixed binding, `drop`). Exemption: a `// any-error-deliberate:
 <reason>` comment token bound to the expression's span, not the line; test
 two candidates on one line. In-memory fixtures for each form, the
-exemption and the legal `Err(_) => panic!` shape. Mind the 20 s watchdog
-(VER-144 cost note in `notes/verification.md`).
+exemption and the legal `Err(_) => panic!` shape. Mind the 20 s watchdog: a
+structural rule parses its files with syn itself (the `Corpus` doc in
+`crates/source-policy/src/lib.rs` says why and names the parse-once shape).
 
 **Link 4 - the sweep (large, may split by tree).** Every site link 3
 flags: name the kind (or closed set) the test promises, or take the

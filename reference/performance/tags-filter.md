@@ -1,5 +1,17 @@
 # Tags Filter
 
+### OSC hidden node may omit coordinates (bygg, 2026-11-23, `c37ad061` against `0b353eba`)
+
+`c37ad061` adds, per node, a hidden test on the decoded metadata and
+routes the location through one `node_coords` helper. `brokkr bench
+--iterations 1 tag-select --dataset planet --input-kind osc --input 4920`
+(default filter), both arms `--commit` worktrees, order A B B A:
+`0b353eba` 1703.6 ms (`b637319d`), `c37ad061` 1696.0 ms (`95b7a1d3`),
+`c37ad061` 1770.0 ms (`0919671b`), `0b353eba` 1709.7 ms (`b476849f`).
+Medians 1707 against 1733 ms (+1.5 %), pair signs mixed (-0.4 %,
++3.5 %), both arms at 3.1 avg cores in `TAGSFILTEROSC`. Within noise.
+The merge-changes cells of the same commit are in merge-changes.md.
+
 ### OSC child attribute lists checked to the end (plantasjen, 2026-11-23, `68629f07` + change)
 
 `tag-select --input-kind osc --input 4913` (planet, the bench's default filter),

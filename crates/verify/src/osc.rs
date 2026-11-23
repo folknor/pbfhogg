@@ -213,17 +213,8 @@ fn decode_attribute(raw: &str) -> Result<String, String> {
                     "gt" => '>',
                     "quot" => '"',
                     "apos" => '\'',
-                    _ => {
-                        let code = if let Some(hex) = name.strip_prefix("#x") {
-                            u32::from_str_radix(hex, 16).ok()
-                        } else if let Some(dec) = name.strip_prefix('#') {
-                            dec.parse().ok()
-                        } else {
-                            None
-                        };
-                        code.and_then(char::from_u32)
-                            .ok_or_else(|| format!("unknown reference &{name}; in {raw:?}"))?
-                    }
+                    _ => char_reference(name)
+                        .ok_or_else(|| format!("unknown reference &{name}; in {raw:?}"))?,
                 };
                 out.push(decoded);
                 while chars.peek().is_some_and(|&(i, _)| i <= at + end) {
@@ -234,6 +225,37 @@ fn decode_attribute(raw: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// A numeric character reference body (between `&` and `;`) as XML 1.0's
+/// `CharRef` spells it: `#` and decimal digits, or `#x` (lowercase) and hex
+/// digits, at least one, any number of leading zeros, naming a `Char`.
+/// Anything else is `None`: a sign (`&#x+41;`, which `from_str_radix` alone
+/// would take), an empty body, `&#0;` or `&#xFFFE;` - the references Expat
+/// refuses, so osmium's reading of the same document refuses them too.
+fn char_reference(name: &str) -> Option<char> {
+    let (digits, radix) = if let Some(hex) = name.strip_prefix("#x") {
+        (hex, 16)
+    } else {
+        (name.strip_prefix('#')?, 10)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut code: u32 = 0;
+    for c in digits.chars() {
+        // Saturates past the Unicode range, which the Char test then refuses.
+        code = code
+            .saturating_mul(radix)
+            .saturating_add(c.to_digit(radix)?);
+    }
+    let is_xml_char =
+        matches!(code, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x1_0000..=0x10_FFFF);
+    if is_xml_char {
+        char::from_u32(code)
+    } else {
+        None
+    }
 }
 
 /// [`scan_osc_file`] for an OSC a tool generated as a comparison: a node,
@@ -1400,6 +1422,37 @@ mod tests {
             "id=\"1\" user",
         ] {
             assert!(parse_meta(attrs).is_err(), "{attrs}");
+        }
+    }
+
+    #[test]
+    fn character_references_follow_the_xml_charref_spelling() {
+        for (raw, want) in [
+            ("&#x41;", "A"),
+            ("&#x0041;", "A"),
+            ("&#x6a;", "j"),
+            ("&#065;", "A"),
+            ("&#xD;&#9;&#10;", "\r\t\n"),
+            ("&#x10FFFF;", "\u{10FFFF}"),
+        ] {
+            assert_eq!(decode_attribute(raw).unwrap(), want, "{raw}");
+        }
+        for raw in [
+            "&#x+41;",
+            "&#+65;",
+            "&#-65;",
+            "&#x;",
+            "&#;",
+            "&#X41;",
+            "&#x 41;",
+            "&#0;",
+            "&#x1F;",
+            "&#xFFFE;",
+            "&#xD800;",
+            "&#x110000;",
+            "&#99999999999999999999;",
+        ] {
+            assert!(decode_attribute(raw).is_err(), "{raw}");
         }
     }
 

@@ -267,15 +267,28 @@ fn escape_into(out: &mut String, value: &str) {
     }
 }
 
+/// The inverse of [`escape_into`]: every `%` is followed by exactly two
+/// uppercase hex digits, as the writer spells them. A sign (`%+A`, which
+/// `from_str_radix` alone would take) or lowercase hex is a bad escape.
 fn unescape(field: &str) -> Result<String, String> {
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
     let mut bytes = Vec::with_capacity(field.len());
     let raw = field.as_bytes();
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == b'%' {
-            let hex = field
+            let hex = raw
                 .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .and_then(|h| match *h {
+                    [hi, lo] => Some(nibble(hi)? << 4 | nibble(lo)?),
+                    _ => None,
+                })
                 .ok_or_else(|| format!("bad escape in {field:?}"))?;
             bytes.push(hex);
             i += 3;
@@ -626,6 +639,14 @@ mod tests {
         let line = c.record();
         assert_eq!(line.matches('\n').count(), 1);
         assert_eq!(Change::parse(line.trim_end_matches('\n')).unwrap(), c);
+    }
+
+    #[test]
+    fn an_escape_is_two_uppercase_hex_digits() {
+        assert_eq!(unescape("a%0Ab%25%C2%85").unwrap(), "a\nb%\u{85}");
+        for field in ["%+A", "%0a", "%-1", "% A", "%A", "%"] {
+            assert!(unescape(field).is_err(), "{field}");
+        }
     }
 
     #[test]

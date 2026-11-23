@@ -373,15 +373,3 @@ fixtures pass `true`. Either summaries can fire in those fixtures (their fake
 osmium keys decodes by content marker, so a stored summary could decide a
 comparison the fixture means to merge), or the doc's claim rests on some
 other switch. Establish which and fix the doc or the fixtures.
-
-## TOOL-048 - Verifier escape decoders accept a sign where digits are due
-
-Reported by: the library-protocol JSON spar, verified at the code.
-
-`crates/verify/src/osc.rs` decodes `&#x...;` with `u32::from_str_radix` and
-`&#...;` with `str::parse`, and `unescape` in `verify_change_listing.rs`
-decodes `%XX` with `u8::from_str_radix`. None checks the digits first, so
-`&#x+41;`, `&#+65;` and `%+A` are accepted (as `A`, `A` and a newline).
-XML and the listing escape both require bare digits, so malformed input
-reads as valid instead of being refused. `verify_diff_opl.rs` already
-guards with `is_ascii_hexdigit`; the other two should do the same.

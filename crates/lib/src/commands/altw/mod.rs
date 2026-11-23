@@ -79,6 +79,15 @@ fn conflicting_node_coordinates_error(node_id: i64, a: (i32, i32), b: (i32, i32)
 
 /// What ALTW states about its output: input order, and every way written with
 /// inline coordinates (plus the injected prepass fields when asked).
+///
+/// The sorted claim is carried unchecked on the sparse path, deliberately:
+/// sparse cannot see most disorder (way IDs are never compared, relation
+/// blobs may stay raw, the indexed header is written before pass 2), so
+/// dropping the claim on the node disorder pass 1 could see would only change
+/// which false claims survive, and a false claim puts the file outside the
+/// contract (`reference/indexdata-trust.md`, "Raw copies carry claims
+/// forward"; osmium carries it the same way). External checks order because
+/// its join depends on it.
 fn altw_output_facts(inject_prepass: bool) -> crate::commands::output_header::OutputFacts {
     use crate::commands::output_header::{OutputFacts, Ways};
     OutputFacts::carry(Ways::Located {

@@ -95,3 +95,22 @@ Same-level competition is judged only by chance (germany judges one or two queri
 several containing areas); witnesses aimed at overlaps would need an overlap search over edge
 crossings and interiors, not only vertices, since two areas can overlap with no vertex of
 either inside the other.
+
+## VER-150 - extract --clean has no test of its output
+
+Reported by: spar accounting window 1 (lateral from the cat --clean version
+dense-claims work).
+
+`extract --clean` routes dense nodes through `clean_metadata` then
+`add_node_dense` at two call sites of its own (`extract/common.rs`, for the
+simple and complete strategies, and `extract/smart.rs`), and cleaning also
+turns off the simple strategy's bbox raw passthrough and its single-pass
+route. No test checks what any extract strategy writes under `--clean`:
+`crates/cli/tests/cli_extract.rs` never passes `--clean`, the library tests
+use cleaning only in `fault_extract_input.rs` (which checks input pinning,
+not output metadata), `cancel.rs` says cleaning is not exercised, and
+`pbfhogg-verify extract` does not run `--clean`. The shared rule is
+unit-tested in `crates/lib/src/owned.rs` through `clean_metadata` directly,
+so extract's wiring, the passthrough switch-off, and the claims of a cleaned
+versioned dense node (kept zeros written plain) go unwitnessed. A CLI test
+per strategy, mirroring the `cli_cat.rs` clean tests, would cover it.

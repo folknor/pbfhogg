@@ -305,7 +305,9 @@ pub(super) fn build_node_index_sparse(
     // relation under a node claim is one no pass would see), and the exact
     // range and count (a passed-through node blob's count is the run's
     // statistics, and its header is copied into the output). Order is not
-    // checked: the rank-indexed store takes nodes in any order.
+    // checked: the rank-indexed store takes nodes in any order, and the
+    // output carries the input's sorted claim unchecked by decision (see
+    // `altw_output_facts`), so no order verdict is wanted here either.
     let (schedule, claims, shared_input) =
         crate::scan::classify::build_classify_schedule_with_claims(
             input,

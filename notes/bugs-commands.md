@@ -292,20 +292,21 @@ and no data blobs reaches a successful empty reference report. `--refs`
 promises only referential integrity, so its success does not certify that the
 header is readable.
 
-## CMD-040 - Sparse ALTW carries a false sorted header into its output
+## CMD-062 - inspect --show misses a present element under a false sorted stamp
 
-Reported by: the negative-ID ALTW item (2026-11-18), while sparring auto's
-external admission gate; not reproduced.
+Reported by: the sparse ALTW sorted-carry item (2026-11-23), in its spar;
+code trace, not reproduced.
 
-`altw_output_facts` carries the input's order claim, and the sparse index
-does not depend on order, so it never tests that claim. A file stamped
-`Sort.Type_then_ID` whose node blob ranges run `[2]` then `[1]` joins under
-`--index-type sparse` and publishes an output stamped sorted that is not.
-Auto now sees the contradiction in its header walk (the external join's
-order check) and runs sparse instead of routing to external's refusal, so
-it reaches the same output. The fix belongs where the stamp is written, for
-explicit sparse and auto alike: drop the claim, or refuse, when a decoding
-pass proves it false.
+`show_element.rs` returns not-found at the first data blob whose indexdata
+`min_id` lies past a non-negative target when the header claims
+`Sort.Type_then_ID`. A file with exact indexdata whose node blobs run `[2]`
+then `[1]` under that stamp reports `n1` absent, an ordinary negative
+outcome. The file is outside the trust contract, but the indexdata is
+honest and the cost of not stopping early is header-only skips of later
+blobs. Fix: drop the sorted early exit and keep the per-blob kind and
+range skips, regression fixture `[2]`, `[1]` with exact indexdata; update
+the `inspect --show` sentence in `reference/indexdata-trust.md` "Raw copies
+carry claims forward" with it.
 
 ## CMD-041 - renumber refuses a block its rewrite grows past the raw size cap
 

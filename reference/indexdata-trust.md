@@ -296,12 +296,21 @@ claim, so a false bbox survives into a fully renumbered output and a later
 A false `Sort.Type_then_ID` claim is carried the same way. A command whose
 output header takes `Order::AsInput` (`OutputFacts::carry`: sparse
 `add-locations-to-ways`, `extract`, `tags-filter`, `getid`, `getparents`,
-`repack`, plain `cat`) does not depend on order, so it neither checks nor
-repairs it, and a single sorted-claiming input whose elements are out of
-order yields an output header that repeats the claim. The next command that
-depends on order is the one that checks (`apply-changes`, external
-`add-locations-to-ways`, `time-filter`, `renumber`, `sort --distrust-metadata`
-as the remedy). `block_type()` is not a kind test: it names each group by its
+`repack`, plain `cat`, and `degrade` when it re-encodes without `--unsort`)
+does not depend on order, so it neither checks nor repairs it, and a single
+sorted-claiming input whose elements are out of order yields an output
+header that repeats the claim. Sparse `add-locations-to-ways` keeps this by
+decision rather than by omission: it cannot see most disorder (way IDs are
+never compared, relation blobs may never be decoded, its header is written
+before pass 2), so dropping the claim on what it does see would only change
+which false claims survive. Only the commands that depend on order check it
+on the elements they decode (`apply-changes`, external
+`add-locations-to-ways`, `time-filter`, `renumber`), with
+`sort --distrust-metadata` as the remedy. Other consumers believe the stamp
+without checking it: `inspect --show` stops its lookup at the first blob
+whose range lies past the target, so on such a file it can report a present
+element as absent, and simple `extract` picks its pipeline from the stamp.
+Both behave the same on the original input as on a carried copy. `block_type()` is not a kind test: it names each group by its
 first field, so it returns `Mixed` for a changeset or unknown group as well as
 for mixed kinds, and a single label can hide other kinds. No caller treats it
 as evidence of a kind; every kind decision reads

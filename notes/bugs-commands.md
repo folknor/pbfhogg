@@ -171,30 +171,6 @@ because it checks only `previous.max >= next.min`, which counts descending
 disjoint ranges as overlapping. The command does create disorder, but the
 advertised benchmark shape and its test are wrong at cap 1.
 
-## CMD-031 - inspect timestamp formatting drops milliseconds
-
-Reported by: check-inspect [P2].
-
-`format_timestamp` (`inspect/format.rs`) accepts milliseconds but discards the
-fraction by division toward zero. With `date_granularity=1`, 1500 ms displays
-as `1970-01-01T00:00:01Z` and -1 ms becomes the epoch. This affects the text
-report, JSON and timestamp `--get` values. The census explicitly operates in
-milliseconds (`CORRECTNESS.md`), so the formatted range should keep that
-resolution. The export hunter separately noted that export timestamps also
-silently lose their subsecond part.
-
-## CMD-032 - inspect's empty-state sentinels hide extreme values
-
-Reported by: check-inspect [P3].
-
-`ExtendedStats::has_timestamps` (`inspect/types.rs`) treats
-`min_timestamp == i64::MAX` as absence, so a sole timestamp of `i64::MAX`
-with date granularity 1 counts as metadata but produces no timestamp range.
-`DataBbox::has_data` has the same collision when every decoded latitude equals
-`i64::MAX`: the nodes are counted but the bbox disappears. These values reach
-inspect through the reader's accepted arithmetic. Explicit optional extrema
-would keep "no observation" distinct from "extreme observation".
-
 ## CMD-058 - Export writes LineStrings whose emitted positions all coincide
 
 Reported by: export polygon-degeneracy work [P3].
@@ -205,17 +181,6 @@ round to one seven-decimal position, is written and counted as exported.
 RFC 7946 asks for two or more positions, which such a line has, so whether it
 is invalid is a policy question; libosmium's `use_nodes::unique` would
 collapse it and refuse it. Polygons are already judged on emitted area.
-
-## CMD-037 - export --metadata can emit timestamps that are not RFC 3339
-
-Reported by: export [P2].
-
-`export/properties.rs` passes every decoded timestamp to `format_epoch_secs`
-(`commands/mod.rs`) without checking the calendar range. With the default date
-granularity, the raw timestamp `253402300800` produces
-`"10000-01-01T00:00:00Z"`, because the formatter's `04` sets only a minimum
-width. This violates the RFC 3339 UTC promise in `docs/cli/commands.md`. The
-formatter documents its four-digit-year limit, and export does not enforce it.
 
 ## CMD-038 - export --metadata removes tags that collide with no emitted property
 

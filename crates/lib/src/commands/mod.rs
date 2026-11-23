@@ -982,7 +982,7 @@ pub(crate) fn probe_to_first_data_blob(frames: &mut Frames<FileReader>) -> Resul
 /// pbfhogg reader must read back formats through [`format_rfc3339_utc`].
 pub(crate) fn format_epoch_secs(secs: i64) -> String {
     let day_secs = secs.rem_euclid(86400);
-    let days = (secs - day_secs) / 86400;
+    let days = secs.div_euclid(86400);
 
     // Howard Hinnant's algorithm: days since 1970-01-01 → (y, m, d)
     let z = days + 719_468;
@@ -1001,6 +1001,39 @@ pub(crate) fn format_epoch_secs(secs: i64) -> String {
     let s = day_secs % 60;
 
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
+}
+
+/// Format a millisecond epoch timestamp in UTC (RFC 3339 for years 0000 to
+/// 9999, otherwise [`format_epoch_secs`]'s expanded year): the second holding
+/// the instant (rounded down, so `-1` ms is `1969-12-31T23:59:59.999Z`) as
+/// [`format_epoch_secs`] spells it, with a `.SSS` fraction only when the
+/// instant is not a whole second. Whole-second values, every timestamp a
+/// file at the default `date_granularity` holds, print without a fraction.
+/// Defined for every `i64`: the fraction is taken from `millis` itself,
+/// never rebuilt from the floored second.
+pub(crate) fn format_epoch_millis(millis: i64) -> String {
+    let mut out = format_epoch_secs(millis.div_euclid(1000));
+    let frac = millis.rem_euclid(1000);
+    if frac != 0 {
+        out.pop();
+        out.push_str(&format!(".{frac:03}Z"));
+    }
+    out
+}
+
+/// [`format_epoch_millis`] for an output that promises RFC 3339: an error
+/// when the second holding the instant lies outside years 0000 to 9999,
+/// which a four-digit year cannot spell.
+pub(crate) fn format_rfc3339_utc_millis(
+    millis: i64,
+) -> std::result::Result<String, TimestampError> {
+    if (RFC3339_MIN_SECS..=RFC3339_MAX_SECS).contains(&millis.div_euclid(1000)) {
+        Ok(format_epoch_millis(millis))
+    } else {
+        Err(TimestampError(
+            "timestamp lies outside years 0000 to 9999, which RFC 3339 cannot spell",
+        ))
+    }
 }
 
 /// The earliest instant [`parse_rfc3339_utc`] reads: `0000-01-01T00:00:00Z`.
@@ -1136,6 +1169,28 @@ mod tests {
             assert!(format_rfc3339_utc(secs).is_err(), "{secs}");
         }
         Ok(())
+    }
+
+    /// Milliseconds round down to their second and keep a fraction only
+    /// when there is one; the RFC 3339 form refuses a second outside years
+    /// 0000 to 9999, and every `i64` formats without overflow.
+    #[test]
+    fn millisecond_formatting_floors_and_keeps_the_fraction() {
+        assert_eq!(format_epoch_millis(1500), "1970-01-01T00:00:01.500Z");
+        assert_eq!(format_epoch_millis(-1), "1969-12-31T23:59:59.999Z");
+        assert_eq!(format_epoch_millis(1000), "1970-01-01T00:00:01Z");
+        assert_eq!(format_epoch_millis(0), "1970-01-01T00:00:00Z");
+        let _ = (format_epoch_millis(i64::MIN), format_epoch_millis(i64::MAX));
+        let last = RFC3339_MAX_SECS * 1000 + 999;
+        assert_eq!(
+            format_rfc3339_utc_millis(last).as_deref(),
+            Ok("9999-12-31T23:59:59.999Z")
+        );
+        assert!(format_rfc3339_utc_millis(last + 1).is_err());
+        assert!(format_rfc3339_utc_millis(RFC3339_MIN_SECS * 1000).is_ok());
+        assert!(format_rfc3339_utc_millis(RFC3339_MIN_SECS * 1000 - 1).is_err());
+        assert!(format_rfc3339_utc_millis(253_402_300_800_000).is_err());
+        assert!(format_epoch_secs(i64::MIN).ends_with('Z'));
     }
 
     /// `parse_rfc3339_utc` is the exact inverse of `format_epoch_secs` and

@@ -67,9 +67,15 @@ where
                 let millis = *millis
                     .as_ref()
                     .map_err(|err| err.clone().context(format!("{object_type} {id}")))?;
+                // RFC 3339 is promised, so a year outside 0000 to 9999 is
+                // refused rather than spelled with five digits or a sign. A
+                // sub-second instant keeps its milliseconds, so a non-zero
+                // claim never prints as the epoch.
+                let text = crate::commands::format_rfc3339_utc_millis(millis).map_err(|err| {
+                    crate::Error::invalid_data_from(err).context(format!("{object_type} {id}"))
+                })?;
                 push_name(buf, &mut first, "@timestamp")?;
-                let seconds = millis.div_euclid(1000);
-                push_json_string(buf, &crate::commands::format_epoch_secs(seconds))?;
+                push_json_string(buf, &text)?;
             }
             if let Some(value) = meta.changeset {
                 push_name(buf, &mut first, "@changeset")?;

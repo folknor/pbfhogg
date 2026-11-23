@@ -470,8 +470,11 @@ impl DataBbox {
         self.max_lon = self.max_lon.max(nano_lon);
     }
 
+    /// Some position was folded. The empty box is inverted, and any folded
+    /// latitude, `i64::MAX` included, orders the pair; a sentinel test on
+    /// one extremum would lose a box whose every latitude is that value.
     pub(super) fn has_data(&self) -> bool {
-        self.min_lat != i64::MAX
+        self.min_lat <= self.max_lat
     }
 }
 
@@ -518,15 +521,21 @@ impl ExtendedStats {
         }
     }
 
-    pub(super) fn update_timestamp(&mut self, millis: i64) {
+    /// Count a timestamp and fold it into the range; zero is no timestamp.
+    /// The one place both happen, so the coverage count is the range's
+    /// presence.
+    pub(super) fn record_timestamp(&mut self, millis: i64) {
         if millis != 0 {
+            self.metadata.has_timestamp += 1;
             self.min_timestamp = self.min_timestamp.min(millis);
             self.max_timestamp = self.max_timestamp.max(millis);
         }
     }
 
+    /// Some timestamp was recorded. Decided by the count, not by an
+    /// extremum, so a sole timestamp of `i64::MAX` is still a range.
     pub(super) fn has_timestamps(&self) -> bool {
-        self.min_timestamp != i64::MAX
+        self.metadata.has_timestamp > 0
     }
 
     /// Fold in a later blob's stats. `objects_ordered` and
@@ -847,10 +856,7 @@ pub(super) fn count_metadata(
     m.has_changeset += u64::from(changeset > 0);
     m.has_uid += u64::from(uid > 0);
     m.has_user += u64::from(user);
-    if milli_timestamp != 0 {
-        m.has_timestamp += 1;
-        ext.update_timestamp(milli_timestamp);
-    }
+    ext.record_timestamp(milli_timestamp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,8 +1125,31 @@ mod census_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, INSPECT_ORDERING_HEAD_SEGMENTS, KindOrder, OrderingSummary, TypeIdRange,
+        BlockKind, ExtendedStats, INSPECT_ORDERING_HEAD_SEGMENTS, KindOrder, OrderingSummary,
+        TypeIdRange,
     };
+
+    /// Presence is not read off an extremum: a sole `i64::MAX` timestamp
+    /// and a box whose every latitude is `i64::MAX` are observations, and
+    /// folding in an empty blob leaves them so. Zero is no timestamp.
+    #[test]
+    fn extreme_observations_are_present() {
+        let empty = ExtendedStats::new();
+        assert!(!empty.has_timestamps());
+        assert!(!empty.data_bbox.has_data());
+        let mut ext = ExtendedStats::new();
+        ext.record_timestamp(0);
+        assert!(!ext.has_timestamps());
+        ext.record_timestamp(i64::MAX);
+        ext.data_bbox.update(i64::MAX, i64::MAX);
+        ext.append(&empty);
+        assert!(ext.has_timestamps());
+        assert_eq!((ext.min_timestamp, ext.max_timestamp), (i64::MAX, i64::MAX));
+        assert!(ext.data_bbox.has_data());
+        let mut joined = ExtendedStats::new();
+        joined.append(&ext);
+        assert!(joined.has_timestamps() && joined.data_bbox.has_data());
+    }
 
     #[test]
     fn empty_blobs_are_neutral_and_reported_as_anomalies() {

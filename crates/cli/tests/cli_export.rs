@@ -110,6 +110,59 @@ fn write_node_without_metadata(path: &Path) {
     writer.flush().unwrap();
 }
 
+fn write_node_with_timestamp(path: &Path, timestamp: i64) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().build().unwrap())
+        .unwrap();
+    let mut builder = BlockBuilder::new();
+    let meta = Metadata {
+        version: 1,
+        timestamp,
+        changeset: 1,
+        uid: 1,
+        user: "mapper",
+        visible: true,
+    };
+    builder.add_node(5, 0, 0, [("name", "dated")], Some(&meta));
+    write_block(&mut writer, &mut builder);
+    writer.flush().unwrap();
+}
+
+/// `@timestamp` is RFC 3339: the last second of year 9999 is written, the
+/// first of year 10000 is refused naming the element, not spelled with a
+/// five-digit year.
+#[test]
+fn metadata_timestamp_beyond_year_9999_is_refused() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let temp = crate::common::test_scratch();
+    let last = temp.path().join("last.pbf");
+    write_node_with_timestamp(&last, 253_402_300_799);
+    let output = CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(last.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--metadata")
+        .assert_success();
+    assert_eq!(
+        features(&output.stdout)[0]["properties"]["@timestamp"],
+        "9999-12-31T23:59:59Z"
+    );
+    let beyond = temp.path().join("beyond.pbf");
+    write_node_with_timestamp(&beyond, 253_402_300_800);
+    CliInvoker::new(&invocation_scratch)
+        .arg("export")
+        .arg(beyond.as_os_str())
+        .arg("--type")
+        .arg("node")
+        .arg("--metadata")
+        .assert_failure()
+        .assert_stderr_contains("node 5")
+        .assert_stderr_contains("outside years 0000 to 9999");
+}
+
 fn features(output: &[u8]) -> Vec<serde_json::Value> {
     output
         .split(|byte| *byte == b'\n')

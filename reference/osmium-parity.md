@@ -61,7 +61,7 @@ pbfhogg's `export` has no config file - the rules are fixed:
   decimicrodegree of an edge.
 - **Property model** (`crates/lib/src/commands/export/properties.rs::write_properties`):
   every feature gets `@id` and `@type`. `--metadata` adds `@version`,
-  `@timestamp` (RFC 3339 UTC), `@changeset`, `@uid`, `@user`, `@visible`
+  `@timestamp` (an RFC 3339 UTC string where osmium writes integer seconds), `@changeset`, `@uid`, `@user`, `@visible`
   when present on the source element. Remaining OSM tags are emitted as
   properties in source order, first-occurrence-wins on a duplicate key,
   filtered by `--properties` (whitelist) when given, and skipped

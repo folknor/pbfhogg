@@ -209,10 +209,7 @@ impl InspectProjection {
                 }
                 continue;
             };
-            if millis != 0 {
-                ext.metadata.has_timestamp += 1;
-                ext.update_timestamp(millis);
-            }
+            ext.record_timestamp(millis);
         }
     }
 }
@@ -741,6 +738,13 @@ mod tests {
         );
         crate::read::wire_fixtures::field_varint(&mut bytes, 18, 1);
         assert_eq!(census(&bytes), Ok((1, i64::MAX, i64::MAX)));
+        let (mut st, mut gr) = (Vec::new(), Vec::new());
+        let ((state, _, _), ()) =
+            scan_block_bytes(&bytes, &mut st, &mut gr, false, false, true).unwrap();
+        assert!(
+            state.extended.unwrap().has_timestamps(),
+            "the report keeps the range"
+        );
         assert_same(&bytes, "i64::MAX at granularity 1");
     }
 

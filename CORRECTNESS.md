@@ -230,7 +230,9 @@ Boundaries against `fileinfo`, all deliberate:
   user (libosmium refuses the file). "No" therefore means "not established":
   the census cannot tell empty names from broken references.
 - **Timestamps are judged in milliseconds:** a sub-second non-zero timestamp
-  counts; libosmium truncates to whole seconds first.
+  counts, and the printed range keeps the exact milliseconds (`.SSS` after
+  the second holding the instant) when an extreme is not a whole second; libosmium truncates to whole
+  seconds first.
 - **User names:** "non-empty" is byte length; a name starting with NUL counts
   (libosmium tests the first byte).
 - **Values libosmium refuses** (version below -1, changeset below -1 or at

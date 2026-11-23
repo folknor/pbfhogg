@@ -649,6 +649,20 @@
 
 ### Fixed
 
+- **`export --metadata` writes only RFC 3339 `@timestamp` values, with
+  milliseconds kept.** A timestamp in year 10000 or later printed with a
+  five-digit year, and a sub-second one lost its fraction, so 1 ms printed
+  as the epoch. A year outside 0000 to 9999 is now refused, naming the
+  element, and a sub-second timestamp prints its exact milliseconds as
+  `.SSS`. Whole-second timestamps in years 0000 to 9999 print as before.
+
+- **`inspect --extended` keeps the timestamp range's milliseconds and its
+  extreme values.** The range truncated toward zero, so 1500 ms printed as
+  one second and -1 ms as the epoch; it now prints the exact `.SSS` when an
+  extreme is not a whole second. A sole timestamp of the largest
+  representable millisecond, or a box whose every latitude was the largest
+  value, was counted but omitted from the text, JSON and `--get` output.
+
 - **A cancelled `into_blocks_pipelined` iterator stops at the next call.**
   Cancelling the invocation used to let `next()` keep returning blocks the
   pipeline had already queued, and a pipeline that had finished reading

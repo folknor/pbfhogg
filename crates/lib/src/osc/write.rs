@@ -502,7 +502,8 @@ fn push_info_attrs(
     let milli_timestamp = milli_timestamp.transpose().map_err(in_element(kind, id))?;
     if let Some(milli_timestamp) = milli_timestamp {
         // Floor, not truncate, so a pre-1970 millisecond timestamp lands in
-        // the right second; export formats the same way.
+        // the right second. OSC keeps whole seconds because pbfhogg's own
+        // OSC reader parses only `YYYY-MM-DDTHH:MM:SSZ`.
         let ts = crate::commands::format_rfc3339_utc(milli_timestamp.div_euclid(1000)).map_err(
             |err| {
                 crate::Error::invalid_data_from(err).context(format!(

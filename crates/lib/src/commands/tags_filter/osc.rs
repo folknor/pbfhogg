@@ -356,7 +356,9 @@ impl OscSink for FilterSink<'_> {
         // it. Dropping it here is how this filter used to turn a
         // metadata-bearing change stream into an anonymous one.
         let metadata = parse_owned_metadata(e)?;
-        let hidden = metadata.as_ref().is_some_and(crate::osc::write::OwnedMetadata::hidden);
+        let hidden = metadata
+            .as_ref()
+            .is_some_and(crate::osc::write::OwnedMetadata::hidden);
 
         let mut cur = CurrentElem::new(kind, id, metadata);
         if kind == ElementKind::Node {

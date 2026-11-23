@@ -27,8 +27,9 @@
 use std::path::Path;
 
 use crate::common::{
-    TestMember, TestNode, TestRelation, TestWay, node_ids_id_only as node_ids,
-    read_all_elements_id_only as read_all_elements, read_all_elements_with_coords, read_header,
+    NormalizedMeta, TestMember, TestMeta, TestNode, TestRelation, TestWay,
+    node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
+    read_all_elements_with_coords, read_header, read_normalized,
     relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,
     write_test_pbf, write_test_pbf_sorted,
 };
@@ -192,6 +193,83 @@ fn run_extract_multi(input: &Path, config: &Path, strategy: Strategy) -> CliOutp
     strategy_args(cli, strategy)
         .arg("--set-bounds")
         .assert_success()
+}
+
+fn assert_extract_cleans_version(strategy: Strategy, multi: bool) {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    // The sorted, indexed blob is entirely inside the bbox, making it
+    // eligible for simple extract's raw passthrough without cleaning.
+    write_test_pbf_sorted(
+        &input,
+        &[TestNode {
+            id: 1,
+            lat: 557_000_000,
+            lon: 125_000_000,
+            tags: vec![("name", "inside")],
+            meta: Some(TestMeta {
+                version: 7,
+                timestamp: 0,
+                changeset: 0,
+                uid: 0,
+                user: "",
+                visible: true,
+            }),
+        }],
+        &[],
+        &[],
+    );
+
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let config = single_region_config(dir.path());
+    let output = dir.path().join("m.osm.pbf");
+    let cli = CliInvoker::new(&invocation_scratch)
+        .arg("extract")
+        .arg(&input);
+    let cli = if multi {
+        cli.arg("--config").arg(&config)
+    } else {
+        cli.arg("--bbox").arg(BBOX_STR).arg("-o").arg(&output)
+    };
+    strategy_args(cli, strategy)
+        .args(["--clean", "version"])
+        .assert_success();
+
+    let mut expected = read_normalized(&input).nodes;
+    // A versionless dense slot treats these zeros as padding. Plain Info
+    // preserves the explicit claims and omits the default visibility.
+    expected[0].meta = Some(NormalizedMeta {
+        version: None,
+        milli_timestamp: Some(0),
+        changeset: Some(0),
+        uid: Some(0),
+        user: Some(String::new()),
+        visible: None,
+    });
+    let actual = read_normalized(&output);
+    assert_eq!(actual.nodes, expected);
+    assert!(actual.ways.is_empty());
+    assert!(actual.relations.is_empty());
+}
+
+#[test]
+fn simple_extract_cleans_version() {
+    assert_extract_cleans_version(Strategy::Simple, false);
+}
+
+#[test]
+fn complete_ways_extract_cleans_version() {
+    assert_extract_cleans_version(Strategy::CompleteWays, false);
+}
+
+#[test]
+fn smart_extract_cleans_version() {
+    assert_extract_cleans_version(Strategy::Smart, false);
+}
+
+#[test]
+fn simple_multi_extract_cleans_version() {
+    assert_extract_cleans_version(Strategy::Simple, true);
 }
 
 fn write_geojson(path: &Path, content: &str) {

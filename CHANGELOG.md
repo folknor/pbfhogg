@@ -4,6 +4,14 @@
 
 ### Breaking
 
+- **`osc::load_all_diffs` refuses entries it cannot load.** A
+  sequence-named entry whose metadata could not be read (an unsearchable
+  directory, a dangling symlink) was silently left out, so the loader
+  could return a short or empty overlay as success. It is now refused,
+  as are a FIFO, socket or device named as a diff and two diffs with the
+  same sequence number (`4705.osc` and `4705.osc.gz`). A non-UTF-8 name
+  now counts as unmatched for the zero-match refusal, and directory
+  listing errors name the directory.
 - **A header bbox must appear once with all four coordinates.** A
   `HeaderBlock.bbox` missing a coordinate read that coordinate as 0, and a
   repeated bbox replaced the earlier one, so a complete box followed by an

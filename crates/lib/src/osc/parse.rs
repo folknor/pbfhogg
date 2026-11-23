@@ -644,10 +644,18 @@ fn parse_sequence_number(filename: &str) -> Option<u64> {
 
 /// Load numeric-sequence `.osc` and `.osc.gz` diffs from a directory, sorted
 /// by sequence number, and parse them into a single `CompactDiffOverlay`.
-/// Subdirectories are skipped; only files directly inside `diffs_dir` are
-/// considered.
+/// Subdirectories are skipped; only entries directly inside `diffs_dir` are
+/// considered. A sequence-named entry is followed through a symlink and must
+/// be a regular file or a directory; one that cannot be inspected, or is a
+/// FIFO, socket or device, is refused rather than silently left out, since
+/// leaving it out would return a short overlay as success. Two entries with
+/// the same sequence number (`4705.osc` and `4705.osc.gz`, or `04705.osc`)
+/// are refused, because which one wins would depend on directory order.
 /// Later diffs win for conflicts because `parse_osc_file_into` overwrites
 /// existing entries.
+///
+/// The caller keeps the directory and every symlink target stable while
+/// loading: entries are inspected during the scan and opened by path later.
 ///
 /// This remains supported library API for callers that want to load a whole
 /// directory of diffs; the crate has no in-repository production caller.
@@ -658,23 +666,44 @@ pub fn load_all_diffs(
     let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
-    for entry in std::fs::read_dir(diffs_dir)? {
-        let entry = entry?;
+    let listing_error = |e: std::io::Error| {
+        crate::Error::from(e).context(format!(
+            "cannot list OSC diff directory {}",
+            diffs_dir.display()
+        ))
+    };
+    for entry in std::fs::read_dir(diffs_dir).map_err(listing_error)? {
+        let entry = entry.map_err(listing_error)?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let filename = match path.file_name().and_then(|f| f.to_str()) {
-            Some(f) => f.to_string(),
-            None => continue,
+        let inspect_error = |e: std::io::Error| {
+            crate::Error::from(e).context(format!("cannot inspect {}", path.display()))
         };
-        match parse_sequence_number(&filename) {
-            Some(seq) => entries.push((seq, path)),
-            None => skipped.push(filename),
+        let seq = entry.file_name().to_str().and_then(parse_sequence_number);
+        if let Some(seq) = seq {
+            // Follows a symlink, as a diff reached through one loads.
+            let meta = std::fs::metadata(&path).map_err(inspect_error)?;
+            if meta.is_dir() {
+                continue;
+            }
+            if !meta.is_file() {
+                return Err(crate::Error::invalid_argument(format!(
+                    "{} is named as an OSC diff but is not a regular file",
+                    path.display()
+                )));
+            }
+            entries.push((seq, path));
+        } else {
+            // A non-matching name cannot hide a diff, so it is not followed:
+            // a dangling `README` link is not a refusal. Anything but a
+            // directory counts as present for the zero-match guard below.
+            let file_type = entry.file_type().map_err(inspect_error)?;
+            if !file_type.is_dir() {
+                skipped.push(entry.file_name().to_string_lossy().into_owned());
+            }
         }
     }
 
-    // An empty directory is a legitimate no-op. A directory with files but
+    // An empty directory is a legitimate no-op. A directory with entries but
     // no numeric-sequence `.osc` or `.osc.gz` names is an operator error;
     // otherwise it would load zero diffs and the caller could report success
     // without applying any changes.
@@ -684,7 +713,7 @@ pub fn load_all_diffs(
             shown.push("...");
         }
         return Err(crate::Error::invalid_argument(format!(
-            "no OSC diffs matched in {}: {} file(s) are present but none is named \
+            "no OSC diffs matched in {}: {} entries are present but none is named \
              `<sequence>.osc` or `<sequence>.osc.gz`, which are the only names this loader recognises (saw: {}). \
              Loading them as zero diffs would apply no changes and report success.",
             diffs_dir.display(),
@@ -694,6 +723,15 @@ pub fn load_all_diffs(
     }
 
     entries.sort_by_key(|(seq, _)| *seq);
+    if let Some(pair) = entries.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(crate::Error::invalid_argument(format!(
+            "{} and {} both carry OSC sequence {}; which one wins would depend on \
+             directory order",
+            pair[0].1.display(),
+            pair[1].1.display(),
+            pair[0].0
+        )));
+    }
 
     let mut overlay = CompactDiffOverlay::new();
     let total = entries.len();
@@ -1676,6 +1714,81 @@ mod tests {
              </create>\n</osmChange>",
         )?;
         assert!(load_all_diffs(&dir, &crate::host::Diagnostics::discard())?.has_node(3));
+        Ok(())
+    }
+
+    const ONE_NODE_OSC: &str = "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  <create>\n    \
+         <node id=\"3\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n</osmChange>";
+
+    /// A sequence-named entry that cannot be inspected is refused, not left
+    /// out of the overlay. A dangling symlink is the host-independent stat
+    /// failure; an unsearchable directory fails the same call.
+    #[test]
+    fn test_load_all_diffs_refuses_an_uninspectable_sequence_entry() -> ParseResult<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
+        std::fs::write(dir.join("4705.osc"), ONE_NODE_OSC)?;
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("4706.osc"))?;
+        let err = load_all_diffs(&dir, &crate::host::Diagnostics::discard())
+            .err()
+            .expect("a dangling sequence-named link must refuse");
+        assert!(err.to_string().contains("4706.osc"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_all_diffs_ignores_a_dangling_unmatched_link() -> ParseResult<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
+        std::fs::write(dir.join("4705.osc"), ONE_NODE_OSC)?;
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("README"))?;
+        std::fs::create_dir(dir.join("4710.osc"))?;
+        assert!(load_all_diffs(&dir, &crate::host::Diagnostics::discard())?.has_node(3));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_all_diffs_refuses_a_non_regular_sequence_entry() -> ParseResult<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
+        std::fs::write(dir.join("4705.osc"), ONE_NODE_OSC)?;
+        let _socket = std::os::unix::net::UnixListener::bind(dir.join("4706.osc"))?;
+        let err = load_all_diffs(&dir, &crate::host::Diagnostics::discard())
+            .err()
+            .expect("a socket named as a diff must refuse");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_all_diffs_refuses_duplicate_sequences() -> ParseResult<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
+        std::fs::write(dir.join("4705.osc"), ONE_NODE_OSC)?;
+        std::fs::write(dir.join("04705.osc"), ONE_NODE_OSC)?;
+        let err = load_all_diffs(&dir, &crate::host::Diagnostics::discard())
+            .err()
+            .expect("two diffs with one sequence must refuse");
+        assert!(
+            err.to_string().contains("both carry OSC sequence 4705"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_all_diffs_counts_a_non_utf8_name_as_unmatched() -> ParseResult<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
+        std::fs::write(
+            dir.join(std::ffi::OsStr::from_bytes(b"47\xff05.osc")),
+            ONE_NODE_OSC,
+        )?;
+        let err = load_all_diffs(&dir, &crate::host::Diagnostics::discard())
+            .err()
+            .expect("a directory of only an unmatched name must refuse");
+        assert!(err.to_string().contains("none is named"), "{err}");
         Ok(())
     }
 

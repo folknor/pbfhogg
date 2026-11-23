@@ -29,19 +29,6 @@ counting (BUG-022) and cat decode counters
 (BUG-023). Entries are in no
 order of importance.
 
-## CMD-006 - load_all_diffs silently skips files it cannot stat
-
-Reported by: osc-parsing [P2].
-
-The directory scan (`osc/parse.rs`) uses `Path::is_file()`, which returns
-false when the metadata lookup fails. A directory that permits listing names
-but denies searching its children can hold numeric OSC files and still yield
-an empty overlay with "Loaded 0 diffs". A metadata failure on one entry can
-silently omit just that diff. This breaks the loader's promise to load the
-matching files and its explicit protection against successful zero-diff
-mistakes. Metadata failures need to propagate, separately from skipping
-directories.
-
 ## CMD-052 - OSC readers accept undeclared entities and a misplaced DOCTYPE
 
 Reported by: the XML 1.0 input character check (spar with codex).

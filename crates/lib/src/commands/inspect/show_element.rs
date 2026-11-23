@@ -13,8 +13,9 @@ use crate::text_quote::{MemberLabel, Quoted};
 /// Look up a single element by type and ID and write all its metadata,
 /// tags and refs/members to `out`. Returns whether the element was found;
 /// nothing is written when it was not. Uses blob-level indexdata when
-/// available to skip non-matching blobs. On sorted PBFs, exits early once
-/// past the target ID range.
+/// available to skip non-matching blobs without reading their payloads. A
+/// miss walks the whole file: the header's sort claim is not used to stop
+/// early, since it is believed rather than checked.
 pub fn show_element_to<W: Write>(
     path: &Path,
     target_kind: ElementKind,
@@ -46,53 +47,52 @@ fn show_element_inner<W: Write>(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    // The `min_id > target_id` early-exit below is only sound when the
-    // PBF declares `Sort.Type_then_ID`; on an unsorted PBF a later
-    // same-kind blob can have a smaller `min_id` than an earlier blob.
-    // Decode the header blob once up front to establish the invariant.
-    let mut is_sorted = false;
-
+    // A header-first walk: each frame's indexdata (in its `BlobHeader`) can
+    // rule that one blob out, and its payload is then skipped unread. Only
+    // the end of the file rules the target out. There is deliberately no
+    // early exit on a `Sort.Type_then_ID` header: the stamp is believed, not
+    // checked, and a file whose blobs run out of order under it (honest
+    // indexdata, node blobs `[2]` then `[1]`) would otherwise report a
+    // present element absent. A miss costs a header walk, plus a decode of
+    // every blob whose index cannot exclude the target. A skipped body's
+    // `Blob` envelope is never parsed, so a malformed one there is not
+    // refused; a truncated one still is, by the frame walk.
     let mut first = true;
-    for blob_result in &mut reader {
-        let blob = blob_result?;
+    while let Some(frame) = reader.next_frame_header()? {
+        let is_header = matches!(frame.header.blob_type, crate::blob::BlobKind::OsmHeader);
+        let is_data = matches!(frame.header.blob_type, crate::blob::BlobKind::OsmData);
         // The header comes first or the file is not a PBF: a zero-byte or
         // header-less file gets the one missing-header error, not "not found"
         // (or a hit in data blobs the header never described).
-        if first && blob.get_type() != crate::blob::BlobType::OsmHeader {
+        if first && !is_header {
             return Err(crate::error::new_missing_header(path));
         }
-        first = false;
-        match blob.get_type() {
-            crate::blob::BlobType::OsmHeader => {
-                let header = blob.to_headerblock()?;
-                is_sorted = header.is_sorted();
-                continue;
-            }
-            crate::blob::BlobType::OsmData => {}
-            _ => continue,
+        if std::mem::replace(&mut first, false) {
+            // The leading header is decoded, so a malformed one is refused.
+            reader.read_frame_blob(frame)?.to_headerblock()?;
+            continue;
+        }
+        if !is_data {
+            reader.skip_frame_payload()?;
+            continue;
         }
 
-        // Skip blobs that cannot contain the target element.
-        if let Some(idx) = blob.index() {
-            // Wrong element type.
-            if idx.kind != target_kind {
-                continue;
-            }
-            // Target ID outside this blob's range.
-            if target_id < idx.min_id || target_id > idx.max_id {
-                // Sorted PBFs: once past the target, no later blob can
-                // contain it. Unsorted PBFs: must keep scanning - a
-                // later blob can carry a smaller `min_id`.
-                // The numeric compare is canonical order only for a
-                // non-negative target: negative IDs sort between 0 and the
-                // positives (canonical OSM order), so a later blob
-                // can hold a numerically smaller ID.
-                if is_sorted && target_id >= 0 && idx.min_id > target_id {
-                    return Ok(false);
-                }
-                continue;
-            }
+        // Skip blobs that cannot contain the target element: wrong element
+        // type, or the target outside the claimed range (a signed numeric
+        // compare, exact for IDs of either sign).
+        let index = frame
+            .header
+            .indexdata
+            .as_ref()
+            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d));
+        if let Some(idx) = index
+            && (idx.kind != target_kind || target_id < idx.min_id || target_id > idx.max_id)
+        {
+            reader.skip_frame_payload()?;
+            continue;
         }
+
+        let blob = reader.read_frame_blob(frame)?;
 
         blob.decompress_into(&mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(

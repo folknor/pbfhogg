@@ -608,6 +608,15 @@
 
 ### Fixed
 
+- **`inspect --show` no longer misses an element under a false sorted
+  header.** On a file claiming `Sort.Type_then_ID` it stopped at the first
+  blob whose ID range lay past the target, so blobs out of order under that
+  claim could make it report a present element as absent (exit 1). A
+  lookup now ends only at the element or at the end of the file. Blobs
+  that indexdata rules out are skipped without reading their payloads, so
+  a hit is usually faster than before, and a miss costs a walk over every
+  blob header.
+
 - **`--clean version` keeps a dense node's zero-valued claims.** `cat`
   and `extract` with `--clean version` wrote a versioned dense node as a
   versionless dense slot, which reads a timestamp of 0 (the epoch), a

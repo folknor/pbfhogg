@@ -279,21 +279,17 @@ and no data blobs reaches a successful empty reference report. `--refs`
 promises only referential integrity, so its success does not certify that the
 header is readable.
 
-## CMD-062 - inspect --show misses a present element under a false sorted stamp
+## CMD-063 - osmium-parity maps osmium show to inspect --show
 
-Reported by: the sparse ALTW sorted-carry item (2026-11-23), in its spar;
-code trace, not reproduced.
+Reported by: the inspect --show sorted-exit item (2026-11-23), scout pass;
+not followed further.
 
-`show_element.rs` returns not-found at the first data blob whose indexdata
-`min_id` lies past a non-negative target when the header claims
-`Sort.Type_then_ID`. A file with exact indexdata whose node blobs run `[2]`
-then `[1]` under that stamp reports `n1` absent, an ordinary negative
-outcome. The file is outside the trust contract, but the indexdata is
-honest and the cost of not stopping early is header-only skips of later
-blobs. Fix: drop the sorted early exit and keep the per-blob kind and
-range skips, regression fixture `[2]`, `[1]` with exact indexdata; update
-the `inspect --show` sentence in `reference/indexdata-trust.md` "Raw copies
-carry claims forward" with it.
+`docs/cli/osmium-parity.md` and `reference/osmium-parity.md` both say
+osmium's `show` is "Implemented via `inspect --show <TYPE_ID>`". osmium-tool's
+`show` (`command_show.cpp`) is a pager over the whole file in debug, OPL or
+XML format; it takes no ID. The ID lookup in osmium is `getid`. The row
+should say `show` has no equivalent (or name `cat` to a text format if one
+exists) and, if wanted, note `inspect --show` beside `getid`.
 
 ## CMD-041 - renumber refuses a block its rewrite grows past the raw size cap
 

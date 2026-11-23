@@ -270,9 +270,6 @@ Believed and unchecked, with no wrong answer worth a refusal:
   classify-phase filter check (`blob_filter_check`) applies only the kind
   and tag-key rules. Only extract builds a bbox filter, and it applies the
   bbox itself, so no command skips or keeps a blob wrongly because of it.
-- `inspect --show` exits early on a sorted header once a blob's `min_id`
-  passes the target. For a non-negative target that is sound; a negative
-  target never exits early.
 - `degrade --corrupt-indexdata` and `--corrupt-indexdata-kind` refuse a
   blob whose indexdata does not parse, since there is nothing to corrupt.
 
@@ -306,11 +303,14 @@ before pass 2), so dropping the claim on what it does see would only change
 which false claims survive. Only the commands that depend on order check it
 on the elements they decode (`apply-changes`, external
 `add-locations-to-ways`, `time-filter`, `renumber`), with
-`sort --distrust-metadata` as the remedy. Other consumers believe the stamp
-without checking it: `inspect --show` stops its lookup at the first blob
-whose range lies past the target, so on such a file it can report a present
-element as absent, and simple `extract` picks its pipeline from the stamp.
-Both behave the same on the original input as on a carried copy. `block_type()` is not a kind test: it names each group by its
+`sort --distrust-metadata` as the remedy. Simple `extract` believes the
+stamp without checking it: it picks its pipeline from it, the same on the
+original input as on a carried copy. `inspect --show` does not use the stamp
+at all: each blob's range can rule out only that blob, so a lookup stops at
+the element or at the end of the file, and blobs out of order under a false
+stamp cannot turn a present element into a miss.
+
+`block_type()` is not a kind test: it names each group by its
 first field, so it returns `Mixed` for a changeset or unknown group as well as
 for mixed kinds, and a single label can hide other kinds. No caller treats it
 as evidence of a kind; every kind decision reads

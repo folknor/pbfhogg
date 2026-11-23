@@ -927,6 +927,26 @@ impl BlobReader<FileReader> {
     pub(crate) fn skip_frame_payload(&mut self) -> Result<()> {
         self.frames.skip_payload()
     }
+
+    /// Read the pending payload of `header` (just returned by
+    /// [`Self::next_frame_header`]) and parse it into a located [`Blob`],
+    /// as the iterator delivers it: offset, ordinal, frame length and the
+    /// eviction behind the read head included. A malformed envelope ends
+    /// the walk.
+    pub(crate) fn read_frame_blob(&mut self, header: crate::frame::FrameHeader) -> Result<Blob> {
+        let frame_len = header.payload_offset() + header.data_size;
+        let mut body = Vec::with_capacity(header.data_size);
+        self.read_frame_payload(&mut body)?;
+        let frame = RawFrame {
+            header: header.header,
+            body: Bytes::from(body),
+            id: header.id,
+            frame_len,
+        };
+        frame
+            .into_blob(self.frames.path())
+            .inspect_err(|_| self.frames.poison())
+    }
 }
 
 impl<R: Read + Send> Iterator for BlobReader<R> {

@@ -340,13 +340,6 @@ pub const INVENTORY: &[Entry] = &[
         1,
         "non-negative claims take the ascending tally fast path; any other claim is decided by the canonical claim walk",
     ),
-    e(
-        "crates/lib/src/commands/inspect/show_element.rs",
-        "show_element_inner",
-        "if is_sorted && target_id >= 0 && idx.min_id > target_id",
-        1,
-        "early exit only where numeric and canonical order agree (a sorted file and a non-negative target); a negative target keeps scanning",
-    ),
     // External ALTW families.
     e(
         "crates/lib/src/commands/altw/external/keys.rs",

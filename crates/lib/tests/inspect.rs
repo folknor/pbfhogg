@@ -717,31 +717,29 @@ fn node_stats_refuses_a_way_blob_claiming_nodes() {
     assert_eq!(err.blob_index(), Some(WAY_BLOB as u64));
 }
 
-/// Regression: `show_element` must not early-exit on `idx.min_id > target_id`
-/// unless the header declares `Sort.Type_then_ID`.
+/// Regression: `show_element` never stops early on `idx.min_id > target_id`,
+/// with or without a `Sort.Type_then_ID` header. A later same-kind blob can
+/// have a smaller `min_id` than an earlier one: legitimately on an unsorted
+/// file, and on a file whose sorted stamp is false. The stamp is believed
+/// rather than checked, so stopping on it reported a present element absent.
 ///
-/// On an unsorted PBF, a later same-kind blob can legitimately have a
-/// smaller `min_id` than an earlier blob. The pre-fix early-exit at
-/// show_element.rs:53-57 assumed sorted layout unconditionally and
-/// returned "not found" as soon as it saw a blob whose `min_id`
-/// exceeded the target, skipping every later blob - including the one
-/// actually containing the target.
-///
-/// Fixture layout (unsorted by design, no `Sort.Type_then_ID`):
+/// Fixture layout (blobs out of order, exact indexdata), written once
+/// without the stamp and once with it:
 ///   blob 0: nodes 100, 101 (min=100)
-///   blob 1: nodes  50,  51 (min= 50, overlaps/precedes blob 0)
-/// Target: node 51 - pre-fix: returns false; post-fix: returns true.
+///   blob 1: nodes  50,  51 (min= 50, precedes blob 0)
+/// Target: node 51, in the second blob.
 #[test]
-fn show_element_unsorted_pbf_finds_target_in_later_blob() {
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("unsorted.osm.pbf");
+fn show_element_finds_target_in_later_lower_blob() {
+    show_element_finds_target_in_later_lower_blob_with(false);
+    show_element_finds_target_in_later_lower_blob_with(true);
+}
 
-    // Emit nodes in order 100, 101, 50, 51 with block_size=2 and the
-    // `sorted=false` header so the writer produces two 2-node blobs
-    // without declaring `Sort.Type_then_ID` - a layout that's legal
-    // for non-canonical PBFs (hand-edited fixtures, extract outputs
-    // before sort, etc.) but would wrongly trigger `show_element`'s
-    // min_id-based early-exit.
+fn show_element_finds_target_in_later_lower_blob_with(sorted_stamp: bool) {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("out-of-order.osm.pbf");
+
+    // Emit nodes in order 100, 101, 50, 51 with block_size=2, so the
+    // writer produces two 2-node blobs in that order.
     let nodes = vec![
         TestNode {
             id: 100,
@@ -772,7 +770,12 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
             meta: None,
         },
     ];
-    crate::common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
+    crate::common::write_test_pbf_impl(&input, &nodes, &[], &[], sorted_stamp, Some(2));
+    let sorted_read = pbfhogg::ElementReader::from_path(&input)
+        .expect("open fixture")
+        .header()
+        .is_sorted();
+    assert_eq!(sorted_read, sorted_stamp, "fixture header stamp");
 
     use pbfhogg::ElementKind;
     use pbfhogg::inspect::show_element_to;
@@ -788,7 +791,7 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     .expect("show_element");
     assert!(
         found,
-        "node 51 lives in the second blob; must be found on unsorted PBF"
+        "node 51 lives in the second blob; must be found (sorted stamp {sorted_stamp})"
     );
     let text = String::from_utf8(out).expect("utf8 output");
     assert!(text.starts_with("node/51\n"), "unexpected output: {text:?}");
@@ -824,6 +827,35 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     .expect("show miss");
     assert!(!miss, "node 999 shouldn't exist");
     assert!(out_miss.is_empty(), "a miss must write nothing");
+}
+
+/// A miss walks every frame, skipping the payloads indexdata rules out, so a
+/// truncated last blob that cannot hold the target is still refused rather
+/// than read past as a clean "not found". A hit in an earlier blob stops
+/// before it.
+#[test]
+fn show_element_miss_refuses_a_truncated_skipped_blob() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("cut.osm.pbf");
+    crate::common::write_test_pbf_impl(&input, &generate_nodes(6, 1), &[], &[], true, Some(2));
+    let bytes = std::fs::read(&input).expect("read fixture");
+    std::fs::write(&input, &bytes[..bytes.len() - 3]).expect("truncate fixture");
+
+    use pbfhogg::ElementKind;
+    use pbfhogg::inspect::show_element_to;
+    let host = crate::common::test_host();
+    let mut out: Vec<u8> = Vec::new();
+    // Past every blob's range, so the truncated one is skipped, not decoded.
+    let err = show_element_to(&input, ElementKind::Node, 1_000_000, false, &mut out, &host)
+        .expect_err("a truncated frame on the walk is refused");
+    assert!(out.is_empty(), "a refusal writes nothing");
+    assert!(err.byte_offset().is_some(), "the refusal is located: {err}");
+
+    let mut hit: Vec<u8> = Vec::new();
+    let first_id = generate_nodes(6, 1)[0].id;
+    let found = show_element_to(&input, ElementKind::Node, first_id, false, &mut hit, &host)
+        .expect("a hit before the truncated blob");
+    assert!(found);
 }
 
 /// The report's header lines print the file name and each header feature

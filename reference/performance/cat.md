@@ -38,11 +38,30 @@ the wall is the exact comparison, and `CAT_FILTERED_*` the exact ordered-pass
 total (it excludes the schedule walk and the final flush). Runs from
 `8da26b23` until that change carry no per-kind rows.
 
+### The clean-version zero-claim escape is within noise on cat --clean (plantasjen, 2026-11-23, against `fa235757`)
+
+`--clean version` on a versioned dense node now marks its kept columns
+explicit and writes the node plain where one holds a value a versionless
+slot reads as padding (a 0 timestamp, a changeset or uid of 0 or below, an
+empty user); every dense add tests a column mask where it tested a bool.
+`copy-pbf --dataset planet --clean yes`, `--iterations 1`, interleaved
+A B A B, A at `fa235757` via `--commit`, B the uncommitted change:
+
+| A, `fa235757` | B, explicit-claims escape |
+|---|---|
+| 285 s (`12a67ef6`), 284.7 s (`2f38de1d`) | 289 s (`c223ff8c`), 288.0 s (`7374c51c`) |
+
+B is about 1.2 % slower in both pairs, under the 2-3 % rule; the sidecar
+puts the difference in `CAT_NODES` (+2 %, 173.4 s against 177.2 s), the
+other phases level. Output grows from 97,412,026,991 to 97,413,975,050
+bytes (+1.9 MB), so planet does carry versioned nodes with a kept zero
+field that now go plain. Neutral; no further cells.
+
 ### Fallible timestamp conversion and the plain escape cost nothing on cat --clean (plantasjen, 2026-11-21, against `53b1b54d`)
 
 The re-encode metadata conversions became fallible (a `Result` timestamp,
 an out-of-line rescale for non-default `date_granularity`) and every dense
-add checks one `zero_timestamp_claim` flag, in the commit after
+add checks one `zero_timestamp_claim` flag (now the `explicit` column mask), in the commit after
 `53b1b54d`. `copy-pbf --dataset planet --clean yes`, `--iterations 1`,
 interleaved A B A B, A at `53b1b54d` via `--commit`, B the uncommitted
 change:

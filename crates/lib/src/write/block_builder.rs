@@ -281,7 +281,9 @@ pub(crate) struct RawMetadata {
     /// for complete metadata, a source group's partial set when re-encoding
     /// one.
     pub columns: DenseColumns,
-    /// [`DenseMetadata::zero_timestamp_claim`] for the raw writers.
+    /// The source slot claims a non-zero timestamp that re-encoding rounded
+    /// down to 0 ([`DenseMetadata::explicit`]'s timestamp case; the raw
+    /// writers never clean, so rounding is the only way they lose a claim).
     pub zero_timestamp_claim: bool,
 }
 
@@ -316,36 +318,56 @@ impl RawMetadata {
 pub(crate) struct DenseMetadata<'a> {
     pub meta: Metadata<'a>,
     pub columns: DenseColumns,
-    /// The source slot claims a non-zero timestamp that re-encoding rounded
-    /// down to 0. Written with a version that 0 is a claim; written without
-    /// one (the source had none, or `--clean version` dropped it) a dense
-    /// slot would read it back as padding, so the node is written plain
-    /// instead ([`writes_plain`](Self::writes_plain)). Set only by the
-    /// re-encoding conversions, under a non-default `date_granularity`.
-    pub zero_timestamp_claim: bool,
+    /// Columns (among timestamp, changeset, uid and user) whose value is a
+    /// claim even where a versionless slot would read it as padding: a
+    /// timestamp that re-encoding rounded down from a non-zero claim to 0
+    /// under a non-default `date_granularity`, and every kept column of a
+    /// versioned source slot whose version `--clean version` dropped (a
+    /// versioned slot claims a present 0, uid 0 or empty user; see
+    /// `DenseNodeInfo::claims`). Written with a version these values are
+    /// claims; written without one, a dense slot holding such a padding value
+    /// would lose it, so the node is written plain instead
+    /// ([`writes_plain`](Self::writes_plain)). Empty everywhere else, which
+    /// is the whole hot-path cost. Never contains `version` or `visible`.
+    pub explicit: DenseColumns,
 }
 
 impl DenseMetadata<'_> {
     /// Whether the builder writes this node plain, with
     /// [`plain_claim_metadata`](Self::plain_claim_metadata), rather than
-    /// dense: a rounded-away timestamp claim on a versionless slot.
+    /// dense: the slot is written without a version and an
+    /// [`explicit`](Self::explicit) column holds a value a versionless slot
+    /// reads as padding.
     #[inline]
     pub(crate) fn writes_plain(&self) -> bool {
-        self.zero_timestamp_claim && self.meta.version < 1
+        !self.explicit.is_empty() && self.meta.version < 1 && self.loses_explicit_claim()
     }
 
-    /// What a versionless dense slot with this metadata claims, as
-    /// `DenseNodeInfo::claims` reads it, as plain metadata: no version, the
-    /// timestamp explicit (0 included), changeset and uid only when
-    /// positive, a user only when non-empty, `visible` only when false.
+    #[cold]
+    #[inline(never)]
+    fn loses_explicit_claim(&self) -> bool {
+        let (m, e) = (&self.meta, self.explicit);
+        (e.timestamp() && m.timestamp == 0)
+            || (e.changeset() && m.changeset <= 0)
+            || (e.uid() && m.uid <= 0)
+            || (e.user() && m.user.is_empty())
+    }
+
+    /// The plain metadata that keeps what this node claims when written
+    /// without a version: no version; an [`explicit`](Self::explicit)
+    /// column as its value, whatever it is; any other column as
+    /// `DenseNodeInfo::claims` reads a versionless slot - a timestamp only
+    /// when non-zero, changeset and uid only when positive, a user only when
+    /// non-empty - and `visible` only when false.
     pub(crate) fn plain_claim_metadata(&self) -> PartialMetadata<'_> {
-        let (m, c) = (&self.meta, self.columns);
+        let (m, c, e) = (&self.meta, self.columns, self.explicit);
         PartialMetadata {
             version: None,
-            timestamp: c.timestamp().then_some(m.timestamp),
-            changeset: (c.changeset() && m.changeset > 0).then_some(m.changeset),
-            uid: (c.uid() && m.uid > 0).then_some(m.uid),
-            user: (c.user() && !m.user.is_empty()).then_some(m.user),
+            timestamp: (c.timestamp() && (e.timestamp() || m.timestamp != 0))
+                .then_some(m.timestamp),
+            changeset: (c.changeset() && (e.changeset() || m.changeset > 0)).then_some(m.changeset),
+            uid: (c.uid() && (e.uid() || m.uid > 0)).then_some(m.uid),
+            user: (c.user() && (e.user() || !m.user.is_empty())).then_some(m.user),
             visible: (c.visible() && !m.visible).then_some(false),
         }
     }

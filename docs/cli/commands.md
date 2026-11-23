@@ -488,9 +488,19 @@ A source block in another framing is converted:
   timestamp (`cat --clean timestamp` does not convert the timestamp it
   drops, so it does not refuse it);
 - a dense node whose claimed timestamp rounds to 0 s and which is written
-  without a version (it had none, or `cat --clean version` dropped it) is
+  without a version (it had none, or `--clean version` dropped it) is
   written as a plain node with an explicit 0, since a versionless dense
   slot holding 0 reads back as no timestamp.
+
+In any framing, `cat --clean version` and `extract --clean version` on a
+dense node that carried a version keep the fields they do not clean as
+claims, except `visible=true`, which a node without a version does not
+claim (`visible=false` is kept). A node whose kept timestamp is 0 (the
+epoch), kept changeset or uid is 0 or below, or kept user is empty is
+written as a plain node carrying those values explicitly, since a
+versionless dense slot would read them back as absent. A field the command
+cleans claims nothing: a dense node holds it as the 0 osmium writes, a
+plain node omits it.
 
 Under the default `date_granularity` the stored timestamp is copied as it
 is, an overflowing one included, so it reads back as the same refused

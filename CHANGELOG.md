@@ -595,6 +595,14 @@
 
 ### Fixed
 
+- **`--clean version` keeps a dense node's zero-valued claims.** `cat`
+  and `extract` with `--clean version` wrote a versioned dense node as a
+  versionless dense slot, which reads a timestamp of 0 (the epoch), a
+  changeset or uid of 0 and an empty user as absent, so those claims were
+  lost. Such a node is now written as a plain node carrying the fields not
+  cleaned; nodes without such a value stay dense, and cleaned fields still
+  claim nothing.
+
 - **`diff --format osc` keeps a hidden element hidden.** A created or
   modified element whose PBF metadata says `visible=false` used to be
   written without the attribute, so applying the OSC made it a visible

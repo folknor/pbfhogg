@@ -591,8 +591,27 @@ pub(crate) fn clean_metadata<'a>(
         |DenseMetadata {
              meta: mut m,
              columns,
-             zero_timestamp_claim,
+             mut explicit,
          }| {
+            // A versioned slot claims every present column as decoded, zeros
+            // included; dropping its version leaves a slot that would read a
+            // kept 0, uid 0 or empty user as padding, so the kept columns are
+            // marked explicit and the builder writes the node plain where one
+            // holds such a value. A cleaned field is the 0 osmium's `--clean`
+            // writes, which a versionless slot holds as padding, as it always
+            // has: it is never explicit, so cleaning cannot fabricate a claim.
+            // `visible` true is not kept as a claim when the version goes (a
+            // versionless slot never claims it); false survives either way.
+            if clean.version && m.version >= 1 {
+                explicit = columns.kept_value_columns([
+                    clean.timestamp,
+                    clean.changeset,
+                    clean.uid,
+                    clean.user,
+                ]);
+            } else if clean.timestamp {
+                explicit = explicit.without_timestamp();
+            }
             if clean.version {
                 m.version = 0;
             }
@@ -608,15 +627,10 @@ pub(crate) fn clean_metadata<'a>(
             if clean.user {
                 m.user = "";
             }
-            // A cleaned timestamp is the 0 osmium's `--clean` writes, which a
-            // versionless slot holds as padding, as it always has; only a
-            // kept, rounded-away claim keeps the plain escape, which the
-            // builder takes when the slot is versionless after cleaning
-            // (`--clean version` included).
             DenseMetadata {
                 meta: m,
                 columns,
-                zero_timestamp_claim: zero_timestamp_claim && !clean.timestamp,
+                explicit,
             }
         },
     )

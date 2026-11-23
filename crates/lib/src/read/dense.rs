@@ -383,6 +383,33 @@ impl DenseColumns {
         self.0 == 0
     }
 
+    /// The timestamp column alone.
+    pub(crate) const TIMESTAMP_ONLY: Self = Self(Self::TIMESTAMP);
+
+    /// Timestamp, changeset, uid and user of these columns, less those
+    /// flagged: the columns whose value a versioned slot claims as decoded
+    /// and that stay after cleaning (`DenseMetadata::explicit`).
+    #[must_use]
+    pub(crate) fn kept_value_columns(self, cleaned: [bool; 4]) -> Self {
+        let mut bits = self.0 & (Self::TIMESTAMP | Self::CHANGESET | Self::UID | Self::USER);
+        for (gone, bit) in
+            cleaned
+                .into_iter()
+                .zip([Self::TIMESTAMP, Self::CHANGESET, Self::UID, Self::USER])
+        {
+            if gone {
+                bits &= !bit;
+            }
+        }
+        Self(bits)
+    }
+
+    /// Without the timestamp column.
+    #[must_use]
+    pub(crate) fn without_timestamp(self) -> Self {
+        Self(self.0 & !Self::TIMESTAMP)
+    }
+
     /// All five of version, timestamp, changeset, uid and user.
     #[must_use]
     pub fn has_core(self) -> bool {
@@ -500,8 +527,8 @@ impl<'a> DenseNodeInfo<'a> {
     /// `owned::output_timestamp_seconds`.
     ///
     /// Also returns whether rounding turned a non-zero millisecond value
-    /// this slot's present column holds into 0 (`zero_timestamp_claim` on
-    /// the builder's dense metadata): a slot written without a version then
+    /// this slot's present column holds into 0 (the timestamp in the
+    /// builder's `DenseMetadata::explicit`): a slot written without a version then
     /// reads that 0 as padding, so the builder writes such a node plain.
     /// Only a non-default `date_granularity` can round (at the default the
     /// raw value is copied, and the flag is false without a test), and
@@ -928,7 +955,7 @@ mod tests {
                         ..meta(version, ts, 9, 7, "u")
                     },
                     columns: VERSION_TIMESTAMP,
-                    zero_timestamp_claim: false,
+                    explicit: DenseColumns::default(),
                 }),
             );
         }
@@ -1007,7 +1034,7 @@ mod tests {
                         ..meta(0, 0, 0, 0, "")
                     },
                     columns: DenseColumns(DenseColumns::VISIBLE),
-                    zero_timestamp_claim: false,
+                    explicit: DenseColumns::default(),
                 }),
             );
         }

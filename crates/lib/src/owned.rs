@@ -365,7 +365,7 @@ impl OwnedMetadata {
                     visible: *visible,
                 },
                 columns: *columns,
-                zero_timestamp_claim: false,
+                explicit: DenseColumns::default(),
             }),
             Self::Plain {
                 version,
@@ -639,8 +639,8 @@ fn element_metadata_impl<'a, const RESOLVE_USER: bool, const CONVERT_TIMESTAMP: 
 /// `DenseNodeInfo::claims` reads the output as it read the input, apart
 /// from a timestamp under a non-default `date_granularity`, which
 /// [`output_timestamp_seconds`] rounds down to whole seconds (refusing one
-/// whose scaling overflows; a claim that rounds to 0 is flagged
-/// `zero_timestamp_claim`, and written plain when versionless). The
+/// whose scaling overflows; a claim that rounds to 0 is flagged in
+/// `DenseMetadata::explicit`, and written plain when versionless). The
 /// user name is resolved as in [`element_metadata`]: a bad user string index
 /// is an error, not an empty user.
 pub(crate) fn dense_node_metadata<'a>(
@@ -706,7 +706,11 @@ fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool, const CONVERT_TIMESTAM
             visible: info.visible(),
         },
         columns: info.columns().for_reencode(),
-        zero_timestamp_claim,
+        explicit: if zero_timestamp_claim {
+            DenseColumns::TIMESTAMP_ONLY
+        } else {
+            DenseColumns::default()
+        },
     }))
 }
 
@@ -1286,6 +1290,93 @@ mod tests {
         );
     }
 
+    /// A versioned slot claims its present zeros (the epoch, changeset 0,
+    /// uid 0, an empty user); `--clean version` leaves it versionless, where
+    /// a dense slot would read them as padding, so a node holding one is
+    /// written plain with every kept claim explicit. A cleaned field is the
+    /// padding 0 osmium writes and is not claimed, so cleaning a timestamp
+    /// never fabricates an epoch; a slot with no kept zero stays dense.
+    #[test]
+    fn clean_version_keeps_the_zero_claims_of_a_versioned_slot() {
+        let mut src = BlockBuilder::new();
+        for (id, timestamp, changeset, uid, user) in
+            [(1, 0, 0, 0, ""), (2, 1_700_000_000, 9, 4, "u")]
+        {
+            src.add_node(
+                id,
+                0,
+                0,
+                [],
+                Some(&Metadata {
+                    version: 3,
+                    timestamp,
+                    changeset,
+                    uid,
+                    user,
+                    visible: true,
+                }),
+            );
+        }
+        let block = one_block(&mut src);
+        let mut elements = block.elements();
+        let (Some(Element::DenseNode(zero)), Some(Element::DenseNode(set))) =
+            (elements.next(), elements.next())
+        else {
+            panic!("dense nodes");
+        };
+        let clean = |version, timestamp, changeset, uid, user| crate::commands::cat::CleanAttrs {
+            version,
+            changeset,
+            timestamp,
+            uid,
+            user,
+        };
+        let write = |dn: &crate::DenseNode<'_>, c: &crate::commands::cat::CleanAttrs| {
+            let meta = crate::commands::clean_metadata(super::dense_node_metadata(dn).unwrap(), c);
+            let mut bb = BlockBuilder::new();
+            bb.add_node_dense(dn.id(), 0, 0, [], meta.as_ref());
+            one_block(&mut bb)
+        };
+        let plain = |out: &PrimitiveBlock| {
+            let Some(Element::Node(n)) = out.elements().next() else {
+                panic!("written plain");
+            };
+            info_fields(&n.info())
+        };
+        assert_eq!(
+            plain(&write(&zero, &clean(true, false, false, false, false))),
+            (None, Some(0), Some(0), Some(0), Some(String::new()), None),
+            "every kept zero stays claimed"
+        );
+        assert_eq!(
+            plain(&write(&zero, &clean(true, false, false, true, false))),
+            (None, Some(0), Some(0), None, Some(String::new()), None),
+            "the cleaned uid is padding, the kept fields are claims"
+        );
+        assert_eq!(
+            plain(&write(&zero, &clean(true, true, false, false, false))),
+            (None, None, Some(0), Some(0), Some(String::new()), None),
+            "a cleaned timestamp is not turned into an epoch claim"
+        );
+        let out = write(&zero, &clean(true, true, true, true, true));
+        let Some(Element::DenseNode(d)) = out.elements().next() else {
+            panic!("an all-cleaned node keeps nothing to claim and stays dense");
+        };
+        assert!(d.info().unwrap().claimed_milli_timestamp().is_none());
+        let out = write(&set, &clean(true, false, false, false, false));
+        let Some(Element::DenseNode(d)) = out.elements().next() else {
+            panic!("a node with no kept zero stays dense");
+        };
+        assert_eq!(d.info().unwrap().claimed_version(), None);
+        assert_eq!(
+            d.info()
+                .unwrap()
+                .claimed_milli_timestamp()
+                .map(|t| t.unwrap()),
+            Some(1_700_000_000_000)
+        );
+    }
+
     /// A timestamp whose millisecond scaling overflows under a non-default
     /// granularity is refused by the re-encode, naming the node.
     #[test]
@@ -1322,8 +1413,8 @@ mod tests {
             .expect("cat --clean timestamp does not judge the timestamp it drops")
             .unwrap();
         assert_eq!(
-            (cleaned.meta.timestamp, cleaned.zero_timestamp_claim),
-            (0, false)
+            (cleaned.meta.timestamp, cleaned.explicit.is_empty()),
+            (0, true)
         );
     }
 }

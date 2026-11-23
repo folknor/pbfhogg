@@ -178,9 +178,15 @@ exactly, rounded down to whole seconds, refused where the scaling overflows
 or the rounded second no longer fits i64 milliseconds
 (`output_timestamp_seconds` in `crates/lib/src/owned.rs`). Rounding can
 turn a versionless slot's non-zero claim into the 0 that reads as padding;
-such a node is written plain with an explicit 0 (`zero_timestamp_claim`,
-which also covers a versioned slot that `cat --clean version` leaves
-versionless), so the claim survives. Coordinates of a rebuilt block are truncated toward zero to
+such a node is written plain with an explicit 0, so the claim survives.
+`--clean version` does the same for a versioned slot: the columns it keeps
+are claims zeros included, so a node holding a kept 0 timestamp, a
+changeset or uid of 0 or below, or an empty user is written plain with
+those fields explicit; a cleaned field is claimed by neither encoding
+(held as padding when dense, omitted when plain), and `visible` true is
+not kept once the version goes (`DenseMetadata::explicit` in
+`crates/lib/src/write/block_builder.rs`, set by the conversions and by
+`clean_metadata`). Coordinates of a rebuilt block are truncated toward zero to
 decimicrodegrees under the same rule; docs/cli/commands.md "PBF rebuild
 precision" states the user-facing contract. A plain `Info` is
 re-encoded with each field present exactly when it was decoded present

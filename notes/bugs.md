@@ -223,24 +223,6 @@ in report order and pick their examples by canonical ID, or settle every
 occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
 redesign of the same per-blob retention.
 
-## BUG-032 - cat --clean version turns a dense epoch timestamp into padding
-
-Reported by: the codex spar of the rebuild-precision work (code reading).
-
-A versioned dense slot claims every present column, a 0 timestamp
-included. `clean_metadata` (`commands/mod.rs`) zeroes the version under
-`--clean version` but keeps the dense route, so the output slot is
-versionless with timestamp 0, which `DenseNodeInfo::claimed_milli_timestamp`
-reads as padding: the epoch claim is lost (and so is a 0 changeset or uid,
-which a versionless slot cannot claim). Witness: a dense node with version
-3 and timestamp 0 through `cat --clean version`; the input claims 0 s, the
-output claims no timestamp. The re-encode conversions already carry a
-`zero_timestamp_claim` escape for a non-default-granularity claim rounded
-to 0 s, which the builder takes when the slot is versionless after
-cleaning; a claim that was 0 at the source is outside it. The fix is to
-choose the dense-or-plain route from what the cleaned slot would claim. Whether osmium's `--clean version`
-output is the reference here is part of the decision.
-
 ## BUG-034 - diff --format osc emits nothing for a visibility-only change
 
 Reported by: the codex spar of the hidden-upsert emission fix.

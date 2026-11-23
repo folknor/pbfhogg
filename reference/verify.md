@@ -743,8 +743,14 @@ pbfhogg simple must have their first node or way member outside the sets,
 which explains osmium simple's omission. Shared element content must agree.
 A polygon with multiple features, an open ring or an edge spanning more
 than 180 degrees is refused before launching either tool, since their
-interpretations differ. On input without the optional sort feature,
-osmium extracts a sorted copy; pbfhogg output must have no sort claim and
+interpretations differ. osmium extract matches IDs, way refs and members
+by absolute value in every strategy, so an input osmium reads with a
+negative ID is refused before any run, and an osmium output holding a
+negative way ref or relation member is refused before that strategy's
+verdicts; both are verifier errors. An osmium complete_ways or smart run
+that dies "Out of memory" on a negative outside way ref is a reference run
+that did not complete and fails the check. On input without the optional
+sort feature, osmium extracts a sorted copy; pbfhogg output must have no sort claim and
 is compared through a strictly ordered sorted copy. PASS names the regions
 and membership differences, including the simple relation deviation.
 

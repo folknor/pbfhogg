@@ -31,6 +31,13 @@
 //! complete_ways output, which also checks the content of the relations
 //! osmium's simple omits.
 //!
+//! Sign domain. osmium's extract matches IDs, way refs and members by
+//! absolute value and pbfhogg by the signed ID, so membership is compared
+//! only where no sign can fold: an input holding a negative ID is refused
+//! before any run, and an osmium output holding a negative reference before
+//! its strategy's verdicts ([`refuse_negative_refs`]), each as the
+//! verifier's error.
+//!
 //! Input order. pbfhogg branches on `Sort.Type_then_ID` among the input
 //! header's optional features (not the required ones), and so does this
 //! check. With it, pbfhogg's output must be in strict
@@ -158,6 +165,27 @@ pub fn run(
         verify_input_order::osmium_sorted_copy(harness, pbf, &outdir)?
     };
 
+    // --- Sign domain: osmium's extract folds IDs onto their magnitude ---
+    // Every osmium strategy selects, writes and looks parents up by
+    // `positive_id` / `positive_ref`, and pbfhogg by the signed ID
+    // (pbfhogg's DEVIATIONS.md, "extract is exact"), so on an input holding
+    // `r-7` and `r7` the two outputs differ with pbfhogg right. That is a
+    // comparison that cannot be made, never a pbfhogg failure. Read from
+    // the input osmium reads: the osmium-sorted copy keeps every sign.
+    let info = crate::verify_fileinfo::fileinfo(
+        harness,
+        &osmium_input,
+        &outdir.join("input.fileinfo.json"),
+    )?;
+    if let Some((kind, id)) = info.negative_id() {
+        return Err(Error::Tool(format!(
+            "{} holds {} ID {id}; osmium extract matches an ID by its absolute value and pbfhogg \
+             does not, so extract cannot be compared on it",
+            osmium_input.display(),
+            ["node", "way", "relation"][kind]
+        )));
+    }
+
     let claim = if input_sorted { CLAIM } else { CLAIM_UNSORTED };
     let mut claim = format!("{claim}{}", coverage_clause(bbox, polygons));
 
@@ -226,15 +254,8 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         let pbfhogg_args = command
             .extract_args_for(pbf, region, &pbfhogg_out)?
             .arg_if(direct_io, "--direct-io");
-        let captured = harness.pbfhogg_discard(pbfhogg_args)?;
-        harness.require_success(&captured, "pbfhogg extract")?;
-        harness.judge_way_locations(
-            &format!("pbfhogg extract --{strategy_name}"),
-            pbf,
-            &pbfhogg_out,
-            &captured,
-            crate::harness::WayLocations::Dropped,
-        )?;
+        let pbfhogg_captured = harness.pbfhogg_discard(pbfhogg_args)?;
+        harness.require_success(&pbfhogg_captured, "pbfhogg extract")?;
 
         // --- osmium extract ---
         // The bbox run's argv is unchanged from before polygons, so its cached
@@ -261,9 +282,33 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
 
         // --- pbfhogg's order, and the file it is compared through ---
         let label = format!("pbfhogg extract --{strategy_name}{suffix}");
+        let osmium_label = format!("osmium extract --{strategy_name}{suffix}");
         let (compared, order_failure) = if input_sorted {
             (pbfhogg_out.clone(), format!("{label} output order"))
         } else {
+            let sorted = outdir.join(format!("pbfhogg-{strategy_name}.sorted.osm.pbf"));
+            verify_sort::osmium_sort(
+                harness,
+                &pbfhogg_out,
+                &sorted,
+                &outdir.join(format!("pbfhogg-{strategy_name}.sorted.stdout")),
+            )?;
+            (sorted, format!("{label} output repeats an ID"))
+        };
+        let policy = crate::opl_compare::Policy::between(&compared, &osmium_out)?;
+        // Before any verdict of this arm, under the policy the diff reads:
+        // a negative reference osmium wrote makes its membership a possible
+        // magnitude fold, which the comparison cannot tell from a pbfhogg
+        // error.
+        refuse_negative_refs(harness, &osmium_out, policy, &osmium_label)?;
+        harness.judge_way_locations(
+            &format!("pbfhogg extract --{strategy_name}"),
+            pbf,
+            &pbfhogg_out,
+            &pbfhogg_captured,
+            crate::harness::WayLocations::Dropped,
+        )?;
+        if !input_sorted {
             let claims = harness.has_sort_flag(&pbfhogg_out)?;
             let verdict = Verdict::from_pass(!claims);
             harness.msg(&format!(
@@ -275,15 +320,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
                 &format!("{label} output claims {SORT_TYPE_THEN_ID} on unsorted input"),
                 verdict,
             );
-            let sorted = outdir.join(format!("pbfhogg-{strategy_name}.sorted.osm.pbf"));
-            verify_sort::osmium_sort(
-                harness,
-                &pbfhogg_out,
-                &sorted,
-                &outdir.join(format!("pbfhogg-{strategy_name}.sorted.stdout")),
-            )?;
-            (sorted, format!("{label} output repeats an ID"))
-        };
+        }
         // --- Element diff, classified as it streams ---
         // Both sides' order and counts come from the diff's own decodings:
         // pbfhogg's order is recorded, then a reference output with repeated
@@ -292,8 +329,6 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         // hiding a conflicting content), never a pass.
         let keep_relations = *strategy == ExtractStrategy::Simple;
         let mut report = ExtractDiffReport::default();
-        let policy = crate::opl_compare::Policy::between(&compared, &osmium_out)?;
-        let osmium_label = format!("osmium extract --{strategy_name}{suffix}");
         let [ours, theirs] = element_diff::scan_element_diff_judged(
             harness,
             (
@@ -386,6 +421,89 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
     }
 
     Ok(membership_line(&membership, suffix, outdir))
+}
+
+/// The derived-summary kind of [`NegativeRefs`], versioned with its meaning.
+const NEGATIVE_REFS_KIND: &str = "extract-negative-refs 1";
+
+/// The first negative way node ref or relation member in a decoding, in
+/// file order, or none: a stored reading of one osmium output.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+struct NegativeRefs {
+    /// `(holder kind index, holder ID, referenced kind index, ref)`.
+    first: Option<(usize, i64, usize, i64)>,
+}
+
+/// Refuse the comparison when osmium's output at `osmium_out` holds a way
+/// referencing a negative node or a relation with a negative member.
+///
+/// With no negative element ID in the input (refused before any run), an
+/// osmium fold that changes a successful extract's answer needs a negative
+/// reference on an object osmium wrote: a dangling `n-2` matches `n2` through
+/// `positive_ref`, so the way or relation holding it is selected and written,
+/// possibly as a record both outputs share byte for byte (a boundary
+/// relation `n1,n-2` written by both, with osmium alone adding `n2`), and
+/// a relation parent found through a folded member is itself written,
+/// carrying it. So every record of the output is read, shared ones too, not
+/// only the differing ones. The reading is stored under the output's decoding
+/// key, so a warm rerun neither decodes nor scans.
+///
+/// Not covered: osmium complete_ways and smart record a matched way's outside
+/// refs signed into an unsigned set, so a negative one there can end the run
+/// "Out of memory" with no output to read; that is a reference run that did
+/// not complete, which fails its check like any other.
+fn refuse_negative_refs(
+    harness: &mut Harness,
+    osmium_out: &Path,
+    policy: crate::opl_compare::Policy,
+    label: &str,
+) -> Result<(), Error> {
+    let key = crate::opl_compare::planned_keys(harness, &[osmium_out], policy)?
+        .and_then(|keys| keys.into_iter().next())
+        .map(|key| key.derived(NEGATIVE_REFS_KIND));
+    let stored = key
+        .as_ref()
+        .and_then(|key| harness.summary_of::<NegativeRefs>(key));
+    let reading = if let Some(stored) = stored {
+        harness.run.revalidate()?;
+        harness.checkpoint()?;
+        stored
+    } else {
+        crate::opl_compare::decoded(harness, osmium_out, policy, |h, opl| {
+            let mut first = None;
+            crate::verify_opl::scan_objects(opl, |o| {
+                if first.is_some() {
+                    return;
+                }
+                let holder = (o.kind.index(), o.id);
+                first = o
+                    .nodes
+                    .iter()
+                    .map(|&r| (OscKind::Node, r))
+                    .chain(o.members.iter().copied())
+                    .find(|&(_, r)| r < 0)
+                    .map(|(kind, r)| (holder.0, holder.1, kind.index(), r));
+            })?;
+            let reading = NegativeRefs { first };
+            // Stored only under the key this decoding was sealed under,
+            // after the scan read it to its end.
+            if let Some(key) = crate::opl_compare::decoding_key(h, opl) {
+                h.publish_summary_of(&key.derived(NEGATIVE_REFS_KIND), &reading)?;
+            }
+            Ok(reading)
+        })?
+    };
+    match reading.first {
+        None => Ok(()),
+        Some((holder_kind, holder, kind, id)) => {
+            const KINDS: [&str; 3] = ["node", "way", "relation"];
+            Err(Error::Tool(format!(
+                "{label}: {} {holder} references {} {id}; osmium extract matches a reference by \
+                 its absolute value and pbfhogg does not, so extract cannot be compared on it",
+                KINDS[holder_kind], KINDS[kind]
+            )))
+        }
+    }
 }
 
 /// What the simple strategy hands its relation adjudication.

@@ -74,6 +74,12 @@ fail the verifier's planner prediction, because its decoder supports only raw
 and zlib. That becomes `FAIL`, exit 1, blaming pbfhogg for a verifier
 limitation. Repeated scalar IDs and wrapping dense deltas hit the same
 misclassification, although both are documented comparison-domain exclusions.
+`checks/getparents.rs` refuses an input holding a negative ID as
+`Error::Failed` while its own message says getparents "cannot be compared on
+it"; `checks/extract.rs` and `verify_extract_simple.rs` raise the same kind of
+refusal as `Error::Tool`. A related open question: a reference run that dies
+on an osmium limit (extract's "Out of memory" on a negative outside way ref,
+VER-155) is `Error::Failed` by the reference-run contract in `error.rs`.
 
 ## TOOL-007 - verify sort never exercises the unindexed fallback
 

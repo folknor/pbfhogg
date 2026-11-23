@@ -2332,8 +2332,9 @@ multi-extract runs `check_sorted_counted(multi)` before `same_elements`, and
 decodes the sequential outputs again for the mixed pass.
 
 Redesign: one ordered comparison of pbfhogg simple, osmium simple and osmium
-complete-ways, collecting member IDs as the records pass (negative IDs are
-already refused, so removeid's absolute-value matching never mattered). Use
+complete-ways, collecting member IDs as the records pass (the check refuses
+an input with a negative ID and an osmium output with a negative ref or
+member, so removeid's absolute-value matching never matters). Use
 osmium's multi-region config once per strategy where there are several regions
 (other-codex). On the production side, share the classifier work across
 strategies (see PERF-019). Fuse multi-extract's order check into its merge and

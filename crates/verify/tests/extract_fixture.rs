@@ -81,6 +81,29 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             assert_eq!(judged.failed, failed, "{case}");
         }
     }
+    // osmium folds IDs and references onto their magnitude: an input holding
+    // a negative ID, or an osmium output holding a negative reference, is a
+    // comparison that cannot be made, refused as the verifier's error, never
+    // a FAIL. Each case gets its own input marker, so no cached reference run
+    // or stored reading of an earlier case answers it.
+    std::fs::write(dir.join("sorted"), "yes").unwrap();
+    for (fault, said) in [
+        ("negative-id", "holds relation ID -7"),
+        ("negative-ref", "way 1 references node -2"),
+    ] {
+        fake_pbf::write(&input, &[SORTED], fault);
+        std::fs::write(dir.join("fault"), fault).unwrap();
+        h.run = run::Run::create(&dir, exe, true).unwrap();
+        h.run.watch(&input).unwrap();
+        match checks::extract::run(&mut h, &input, Some(&bbox), &[], true) {
+            Err(crate::error::Error::Tool(why)) => {
+                assert!(why.contains(said), "{fault}: {why}");
+                assert!(why.contains("absolute value"), "{fault}: {why}");
+            }
+            other => panic!("{fault}: expected a refusal, got {other:?}"),
+        }
+    }
+    std::fs::write(dir.join("fault"), "").unwrap();
     // Gate a polygon with a known different interpretation before launching.
     h.run = run::Run::create(&dir, exe, true).unwrap();
     std::fs::write(&polygon, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
@@ -146,9 +169,24 @@ pub fn tool(args: &[OsString]) -> i32 {
     }
     if fake_pbf::is_opl_cat(&args) {
         fake_pbf::opl_cat(&args);
+        // Under the negative-ref fault, osmium's extract outputs also hold
+        // a way referencing a negative node, after the record opl_cat wrote.
+        let osmium_side = Path::new(args[1])
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("osmium-"));
+        if fault == "negative-ref" && osmium_side {
+            let out = output();
+            let mut opl = std::fs::read_to_string(out).unwrap();
+            opl.push_str("w1 T Nn-2\n");
+            std::fs::write(out, opl).unwrap();
+        }
         return 0;
     }
     match args[0] {
+        "fileinfo" if fault == "negative-id" => print!(
+            "{}",
+            fake_pbf::fileinfo(1, 0, 2).replace(r#""relations":1}"#, r#""relations":-7}"#)
+        ),
         "fileinfo" => print!("{}", fake_pbf::fileinfo(1, 0, 0)),
         "extract" => {
             if args.contains(&"--config") {

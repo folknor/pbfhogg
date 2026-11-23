@@ -96,19 +96,21 @@ several containing areas); witnesses aimed at overlaps would need an overlap sea
 crossings and interiors, not only vertices, since two areas can overlap with no vertex of
 either inside the other.
 
-## VER-155 - verify extract's complete_ways oracle folds relation IDs by magnitude
+## VER-155 - verify extract fails pbfhogg when osmium dies on a negative way ref
 
 Reported by: spar partner during the OPL reader signed-ID work.
 
-osmium's complete_ways strategy marks a selected relation by its absolute
-ID (`research/osmium-tool/src/extract/strategy_complete_ways.cpp`), so an
-input holding `r-7` (member inside the box) and `r7` (member outside) gets
-both relations in osmium's output while a correct pbfhogg output holds only
-`r-7`. The complete_ways equality in `crates/verify/src/checks/extract.rs`
-then reports a FAIL against pbfhogg, and no input-ID guard stops it (the
-simple-relations adjudication guards only negative members). The OPL
-readers now admit signed record IDs, so the simple adjudication itself
-judges such relations correctly; the comparison that records the false
-failure needs a refusal or a magnitude-collision model at the extract
-oracle boundary. No verified dataset holds negative IDs, so it has not
-fired.
+osmium's complete_ways and smart strategies record a matched way's outside
+node refs signed into an unsigned set
+(`research/osmium-tool/src/extract/strategy_complete_ways.cpp`,
+`strategy_smart.cpp`), so an input whose matched way references a dangling
+negative node (no negative element ID, which `checks/extract.rs` refuses
+before any run) can make osmium exit "Out of memory" with no output. The
+negative-reference refusal reads only completed osmium outputs, so this run
+reaches `settled_reference` as an unaccepted exit, `Error::Failed`, and
+the check reports FAIL (exit 1) against a pbfhogg that answered correctly.
+Classifying it as the verifier's error needs the reference-run failure
+contract (`crates/verify/src/error.rs`, `reference/verify.md` Results) to
+distinguish an osmium limit from an incomplete reference, the open question
+TOOL-006 also raises; a local stderr match in extract alone was rejected as
+an exception to that contract. No verified dataset holds negative refs.

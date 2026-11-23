@@ -145,19 +145,6 @@ nonzero area are refused because their wrapped coordinates have zero area. The
 recorded raw-ring refusal policy explains the second case, and the hunter did
 not count widening the accepted set as a defect.
 
-## CMD-025 - degrade's corruption modes can publish an invalid PBF frame
-
-Reported by: passthrough-rewrite.
-
-`reframe_raw` (`degrade/mod.rs`) appends replacement hints and checks only
-that the resulting header length fits `u32`, not that it stays under the PBF
-header limit of 65,536 bytes. A valid header near the limit grows past it when
-`--corrupt-tagdata` adds a hint, or when index corruption replaces a 26-byte
-v1 index with a 42-byte v2 index. `write_raw_owned` trusts the framing it is
-given, so the command can successfully publish a file its own reader refuses.
-Deliberately false hints are the requested degradation, but invalid framing is
-not. cat's reindex implementation already has the size gate this needs.
-
 ## CMD-026 - degrade --unsort at cap 1 does not produce overlapping blobs
 
 Reported by: passthrough-rewrite.

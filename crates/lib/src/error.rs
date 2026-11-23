@@ -960,6 +960,11 @@ pub enum OversizePart {
     /// The `BlobHeader`, which would fit without the `WayMembers-v1` bitmap;
     /// the bitmap cannot be dropped without misreporting way-member nodes.
     HeaderWayMembers,
+    /// A `BlobHeader` copied from the input with replacement fields appended
+    /// (`degrade`'s corruption modes): the input header leaves no room for
+    /// them. The blob's elements are not re-encoded, so no element cap
+    /// bears on it.
+    RewrittenHeader,
     /// The encoded `Blob` message of an `OSMData` blob. Element counts do not
     /// bound it: one element can exceed it alone.
     Body,
@@ -988,6 +993,11 @@ impl OversizePart {
                 "BlobHeader is {size} bytes, must be smaller than {limit}: the \
                  WayMembers-v1 bitmap cannot be dropped without misreporting way-member \
                  nodes; fewer elements per blob shrink it"
+            ),
+            OversizePart::RewrittenHeader => write!(
+                f,
+                "BlobHeader rewritten with its replacement fields is {size} bytes, must be \
+                 smaller than {limit}; the input header leaves no room for them"
             ),
             OversizePart::Body => write!(
                 f,

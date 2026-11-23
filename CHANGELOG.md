@@ -675,6 +675,14 @@
 
 ### Fixed
 
+- **`degrade --corrupt-tagdata`, `--corrupt-indexdata` and
+  `--corrupt-indexdata-kind` no longer publish an oversized `BlobHeader`.**
+  The replacement hint could grow a `BlobHeader` already near the 64 KiB
+  limit past it (a large WayMembers or unknown field, or a 26-byte v1 index
+  rewritten as 42 bytes). Such a blob is now refused with a header-size
+  error (`OversizePart::RewrittenHeader`, a new variant) and nothing is
+  published.
+
 - **`apply-changes --direct-io` and `renumber --direct-io` read the whole
   input `O_DIRECT`.** The flag reached only the front or header read; the
   header walks, the worker preads and (apply-changes) the copied ranges

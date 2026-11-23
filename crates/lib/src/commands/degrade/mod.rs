@@ -807,7 +807,9 @@ fn corrupted_index(
 /// index is never upgraded to the 42-byte v2 layout), and `WayMembers-v1`
 /// (field 5) plus any unknown/extension fields survive untouched. The blob
 /// payload bytes - and therefore the preserved `datasize` (field 3) - are
-/// copied verbatim.
+/// copied verbatim. A header the corruption re-emits push to the reader's
+/// `MAX_BLOB_HEADER_SIZE` or beyond is refused
+/// ([`OversizePart::RewrittenHeader`](crate::OversizePart::RewrittenHeader)).
 fn reframe_raw(
     header_bytes: &[u8],
     blob_bytes: &[u8],
@@ -837,8 +839,22 @@ fn reframe_raw(
             .ok_or_else(|| Error::internal("could not encode the corrupt tag index"))?;
         protohoggr::encode_bytes_field(&mut header_buf, 4, &bogus);
     }
+    // The frame goes to `write_raw_owned`, which trusts its framing, so the
+    // reader's header bound is enforced here. Stripping only shrinks the
+    // header; the corruption re-emits above can grow one that was already near
+    // the limit (a large WayMembers or unknown field, or a 26-byte v1 index
+    // replaced by a 42-byte one). Refuse rather than drop a field: dropping
+    // the requested lie would leave the flag reading as applied, and dropping
+    // an untargeted field changes what the user did not ask to touch.
+    if header_buf.len() as u64 >= crate::blob::MAX_BLOB_HEADER_SIZE {
+        return Err(crate::error::new_blob_too_large(
+            crate::OversizePart::RewrittenHeader,
+            header_buf.len() as u64,
+            crate::blob::MAX_BLOB_HEADER_SIZE,
+        ));
+    }
     let header_len = u32::try_from(header_buf.len())
-        .map_err(|_| Error::internal(format!("header too large: {} bytes", header_buf.len())))?;
+        .map_err(|_| Error::internal("a BlobHeader under the size limit fits u32"))?;
     let total_len = 4 + header_buf.len() + blob_bytes.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
@@ -1707,6 +1723,93 @@ mod tests {
     use super::{DropKey, drop_hash, hash_kind, keep_smallest, mix64};
     use crate::ElementKind;
     use std::collections::BTreeSet;
+
+    const BODY: &[u8] = b"body";
+
+    /// A `BlobHeader` of `type = OSMData`, `datasize` matching [`BODY`], an
+    /// optional v1 (26-byte) indexdata, and `pad` bytes in an unknown
+    /// length-delimited field standing in for a large WayMembers bitmap.
+    fn header(pad: usize, v1_index: bool) -> Vec<u8> {
+        let mut h = Vec::new();
+        protohoggr::encode_bytes_field(&mut h, 1, b"OSMData");
+        protohoggr::encode_tag(&mut h, 3, protohoggr::WIRE_VARINT);
+        protohoggr::encode_varint(&mut h, BODY.len() as u64);
+        if v1_index {
+            let mut v1 = [0u8; 26];
+            v1[0] = 0x01;
+            v1[2..10].copy_from_slice(&1i64.to_le_bytes());
+            v1[10..18].copy_from_slice(&100i64.to_le_bytes());
+            v1[18..26].copy_from_slice(&100u64.to_le_bytes());
+            protohoggr::encode_bytes_field(&mut h, 2, &v1);
+        }
+        protohoggr::encode_bytes_field(&mut h, 15, &vec![0xAB; pad]);
+        h
+    }
+
+    /// `(corrupt_tagdata, corrupt_index)` reframe of `header(pad, v1_index)`.
+    fn reframe(pad: usize, v1_index: bool, corrupt_tagdata: bool) -> crate::Result<Vec<u8>> {
+        let h = header(pad, v1_index);
+        let corrupt_index = v1_index.then(|| {
+            let mut index =
+                crate::blob_meta::BlobIndex::deserialize(&h[13..39]).expect("v1 index parses");
+            index.kind = ElementKind::Way;
+            index
+        });
+        super::reframe_raw(
+            &h,
+            BODY,
+            corrupt_index.is_some(),
+            corrupt_tagdata,
+            corrupt_tagdata,
+            corrupt_index,
+        )
+    }
+
+    /// Both corruption re-emits grow the header; the largest header the
+    /// reader accepts (limit - 1) is written with its replacement, one byte
+    /// more is refused as a rewritten header rather than published.
+    #[test]
+    fn corruption_growth_is_refused_at_the_header_limit() {
+        let limit = usize::try_from(crate::blob::MAX_BLOB_HEADER_SIZE).expect("limit fits");
+        for (v1_index, corrupt_tagdata) in [(false, true), (true, false), (true, true)] {
+            // Pads stay in the 3-byte length-varint range, so header length
+            // is linear in pad and the growth is constant.
+            let probe = 20_000;
+            let small = reframe(probe, v1_index, corrupt_tagdata).expect("small header fits");
+            let out_len = u32::from_be_bytes(small[..4].try_into().expect("prefix")) as usize;
+            let growth = out_len - header(probe, v1_index).len();
+            assert!(growth > 0, "the re-emit grows the header");
+
+            let fit = probe + (limit - 1 - out_len);
+            let out = reframe(fit, v1_index, corrupt_tagdata).expect("limit - 1 fits");
+            let len = u32::from_be_bytes(out[..4].try_into().expect("prefix")) as usize;
+            assert_eq!(len, limit - 1);
+            assert_eq!(out.len(), 4 + len + BODY.len());
+            let emitted = &out[4..4 + len];
+            if corrupt_tagdata {
+                let key = super::CORRUPT_TAGDATA_KEY;
+                assert!(emitted.windows(key.len()).any(|w| w == key));
+            }
+            if v1_index {
+                // The v1 index was replaced by the 42-byte layout.
+                assert!(emitted.windows(2).any(|w| w == [0x12, 42]));
+            }
+
+            let err = reframe(fit + 1, v1_index, corrupt_tagdata).expect_err("limit refused");
+            match err.kind() {
+                crate::ErrorKind::BlobTooLarge {
+                    part,
+                    size,
+                    limit: l,
+                } => {
+                    assert_eq!(*part, crate::OversizePart::RewrittenHeader);
+                    assert_eq!(*size, limit as u64);
+                    assert_eq!(*l, limit as u64);
+                }
+                other => panic!("unexpected error {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn unsort_accepts_the_largest_block_cap_without_overflow() {

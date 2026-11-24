@@ -22,13 +22,6 @@ source at `63d4ec1d`. Where a hunter judged the code wrong instead, the
 finding is filed in the matching `notes/bugs-*.md` document. Entries are in no
 order of importance.
 
-## DOC-003 - claims.rs says negative versions yield no claims
-
-Reported by: read-framing.
-
-The doc in `read/claims.rs` says negative versions yield no claims. The
-implementation keeps available non-padding metadata.
-
 ## DOC-005 - Way::node_locations claims to consult the header
 
 Reported by: read-block-decoding.
@@ -289,3 +282,45 @@ soon as it meets the field, checks only that it is under 32 MiB and never
 compares it with `raw_size`, so a raw blob with a wrong declared size reads
 in osmium and is refused by pbfhogg. That direction of the deviation is
 unrecorded; the entry should name it beside the zlib case.
+
+## DOC-039 - The verify geocode help and module doc describe the first, two-class check
+
+Reported by: the spar accounting of the verify geocode input-order change,
+from its scout's lateral (2026-11-24).
+
+The `Geocode` subcommand's doc in `crates/verify/src/main.rs`, which clap
+prints as its `--help` line, reads "pbfhogg geocode-query address and street
+answers vs a model of the input". The check also judges interpolation and
+admin answers. The module doc of `crates/verify/src/checks/geocode.rs` still
+says the model reads `osmium tags-filter nw/addr:housenumber w/highway`,
+then `add-locations-to-ways`. `run` filters `w/addr:interpolation` too, runs
+a second decoding of boundary relations, and reads the osmium-sorted copy
+for claimless input. A later paragraph of the same doc says so. Both opening
+descriptions should name what the check judges now.
+
+## DOC-040 - A renumber rationale comment sits above an unrelated struct
+
+Reported by: the spar accounting of the renumber group-field change, from its
+scout's lateral (2026-11-24).
+
+In `crates/lib/src/commands/renumber/wire_rewrite.rs` the comment "Deliberately
+copy key string indices without bounds checks or key lists. Corrupt indices
+pass through as on the read side; per-key validation adds work to this
+measured rewrite loop and changes which inputs it accepts." sits directly
+above the `/// What a rewrite saw in one block.` doc of `Outcome`, not at any
+code that copies key indices. It records a measured-path decision, so a reader
+of the copying loops never sees it. It should move to the copy sites it
+explains.
+
+## DOC-041 - Versions below -1 are accepted with no DEVIATIONS.md entry
+
+Reported by: the scout of the dense-claims doc fix, verified 2026-11-24.
+
+libosmium refuses a version below -1 ("object version must not be
+negative", `pbf_decoder.hpp`, plain Info and DenseInfo alike). pbfhogg
+accepts it and reads it as "no version" for claims; only CORRECTNESS.md's
+inspect --extended section says so, and DEVIATIONS.md has no entry. The two
+encodings also differ on re-encode: plain Info maps only -1 to absent
+(`WireInfo::parse`), so -2 stays raw behind `claimed_version`, while the
+dense re-encode (`reencoded_version` in `owned.rs`) writes -2 as decoded.
+Either the deviation is recorded, or the input is refused as libosmium does.

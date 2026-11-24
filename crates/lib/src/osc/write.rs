@@ -608,12 +608,11 @@ fn write_dense_node_xml<W: std::io::Write>(
     elem.push_attribute(("lon", coord_buf.as_str()));
     // A DenseInfo block decodes every field for every element, so presence
     // is read from the values: `claims` says which fields this slot claims
-    // (all of them for a positive version, none for a negative one, and
-    // only values no padding holds for version 0, which is how writers
+    // (every present column for a version of 1 or more; below 1, a negative
+    // version included, only values no padding holds, which is how writers
     // store a node without metadata in a block whose other nodes carry it).
-    if let Some(info) = node.info()
-        && let Some(claims) = info.claims()
-    {
+    if let Some(info) = node.info() {
+        let claims = info.claims();
         push_info_attrs(
             &mut elem,
             ElementKind::Node,

@@ -511,7 +511,7 @@ pub(crate) fn write_full_record(
             for tag in n.tags() {
                 write_tag(out, tag)?;
             }
-            n.info().and_then(MetaClaims::from_dense)
+            n.info().map(crate::DenseNodeInfo::claims)
         }
         Element::Node(n) => {
             write_nano_coord(out, n.nano_lat()?, n.nano_lon()?);

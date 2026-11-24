@@ -226,7 +226,7 @@ pub fn export<W: Write>(
                     stats.skipped_invalid_nodes += 1;
                     return;
                 }
-                let meta = node.info().and_then(MetaClaims::from_dense);
+                let meta = node.info().map(crate::DenseNodeInfo::claims);
                 write_properties(
                     &mut properties,
                     node.id(),

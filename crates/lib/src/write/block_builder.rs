@@ -3330,7 +3330,7 @@ mod tests {
         use crate::read::claims::MetaClaims;
         let claims = match e {
             crate::Element::Node(n) => Some(MetaClaims::from_info(&n.info())),
-            crate::Element::DenseNode(n) => n.info().and_then(MetaClaims::from_dense),
+            crate::Element::DenseNode(n) => n.info().map(crate::DenseNodeInfo::claims),
             _ => panic!("node"),
         };
         claims.map_or((None, None, None, None, None, None), |c| {

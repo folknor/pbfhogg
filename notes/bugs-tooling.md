@@ -36,6 +36,24 @@ verifier's misuse reads as a pbfhogg failure. Such a box is not a comparison
 domain and should be refused before any run as a verifier error, as an edge
 with more than ten integer digits now is.
 
+## TOOL-051 - verify field-policies locates its slice from input order
+
+Reported by: the spar accounting of the verify geocode input-order change,
+from its scout's lateral (2026-11-24); traced from source, not reproduced.
+
+`controls` in `crates/verify/src/checks/field_policies.rs` builds its slice
+with `osmium getid -r` (and plain `getid` for relations) from the input
+itself. It then runs `osmium add-locations-to-ways -n --ignore-missing-nodes`
+over the pieces, without the osmium-sorted copy that `InputOrder` gives every
+other check. `getid` keeps the input's order, and osmium locates a way only
+from nodes stored before it. On input without the `Sort.Type_then_ID`
+claim, a way stored before its nodes therefore comes out with undefined
+locations. No verdict turns wrong: the way-location and "between" controls
+just lose candidates and can end named as not exercised. But the module doc
+promises that only a class with no candidate record on the input is named
+that way. Reading the pieces from `InputOrder::of(..).reference_input`, as
+geocode now does, would keep that promise.
+
 ## TOOL-047 - A reference that cannot read the dataset input reports FAIL
 
 Reported by: the spar on the verifier's error classification (2026-11-24).

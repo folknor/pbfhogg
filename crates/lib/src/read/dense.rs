@@ -7,6 +7,7 @@ use super::wire::{
     WireDenseInfo, WireDenseNodes,
 };
 use crate::error::Result;
+use crate::read::claims::MetaClaims;
 
 /// An OpenStreetMap node element from a compressed array of dense nodes.
 #[derive(Clone, Debug)]
@@ -596,8 +597,11 @@ impl<'a> DenseNodeInfo<'a> {
         }
     }
 
-    /// The metadata fields this slot claims, for outputs that print them;
-    /// `None` when it claims nothing.
+    /// The metadata fields this slot claims, for outputs that print them.
+    /// A slot that claims nothing is a [`MetaClaims`] with every field `None`.
+    /// No version value drops the slot whole, a negative one included:
+    /// libosmium reads the Osmosis -1 as "no version" and keeps the other
+    /// fields.
     ///
     /// A field whose column the group lacks is never claimed, except
     /// `visible` on a versioned slot (below). A present column decodes a
@@ -627,8 +631,6 @@ impl<'a> DenseNodeInfo<'a> {
     ///   Non-zero fields survive, which is what an apply-changes element
     ///   with a timestamp but no version, or `osmium cat --clean version`
     ///   output, carries.
-    ///   A negative version used to drop the whole slot; it no longer does,
-    ///   as libosmium reads -1 as "no version" and keeps the other fields.
     ///   An absent column decodes as 0 (`visible` as true), which no value
     ///   test claims, so the column rule needs no extra check here.
     ///
@@ -637,14 +639,12 @@ impl<'a> DenseNodeInfo<'a> {
     /// timestamp under a non-default `date_granularity`, which they round
     /// down to whole seconds (`owned::output_timestamp_seconds`).
     ///
-    /// Always `Some` today; the `Option` stays for the callers' shape.
     /// Computed only where an output reads metadata; the dense iterator
     /// and the re-encoding conversions do not call it.
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn claims(&self) -> Option<DenseClaims<'a>> {
+    pub(crate) fn claims(&self) -> MetaClaims<'a> {
         if self.version >= 1 {
             let columns = self.columns;
-            return Some(DenseClaims {
+            return MetaClaims {
                 // An absent version column reads 0, so this one is present.
                 version: Some(self.version),
                 milli_timestamp: self.claimed_milli_timestamp(),
@@ -658,7 +658,7 @@ impl<'a> DenseNodeInfo<'a> {
                 uid: columns.uid().then_some(self.uid),
                 user: columns.user().then(|| self.user()),
                 visible: Some(self.visible),
-            });
+            };
         }
         let user = match self.user_sid {
             0 => None,
@@ -667,31 +667,15 @@ impl<'a> DenseNodeInfo<'a> {
                 resolved => Some(resolved),
             },
         };
-        Some(DenseClaims {
+        MetaClaims {
             version: None,
             milli_timestamp: self.claimed_milli_timestamp(),
             changeset: (self.changeset > 0).then_some(self.changeset),
             uid: (self.uid > 0).then_some(self.uid),
             user,
             visible: (!self.visible).then_some(false),
-        })
+        }
     }
-}
-
-/// The metadata fields one dense slot claims; see [`DenseNodeInfo::claims`].
-#[derive(Clone, Debug)]
-pub(crate) struct DenseClaims<'a> {
-    pub(crate) version: Option<i32>,
-    /// An `Err` when the scaling overflows; see
-    /// [`claimed_milli_timestamp`](DenseNodeInfo::claimed_milli_timestamp).
-    pub(crate) milli_timestamp: Option<Result<i64>>,
-    pub(crate) changeset: Option<i64>,
-    pub(crate) uid: Option<i32>,
-    /// The claimed user name, already resolved. A bad string index is an
-    /// `Err` value here, not a failed claim: each output decides what a
-    /// corrupt name means for it (refuse, or print a marker).
-    pub(crate) user: Option<Result<&'a str>>,
-    pub(crate) visible: Option<bool>,
 }
 
 /// An iterator over dense nodes info. It decodes the delta encoded values.
@@ -976,7 +960,7 @@ mod tests {
             assert_eq!((info.changeset(), info.uid()), (0, 0));
             assert_eq!(info.user().unwrap(), "");
             assert!(info.visible(), "absent visible reads true");
-            let claims = info.claims().unwrap();
+            let claims = info.claims();
             assert_eq!(claims.version, Some(want_version));
             assert_eq!(claims.milli_timestamp.unwrap().unwrap(), want_ts * 1000);
             assert_eq!((claims.changeset, claims.uid), (None, None));
@@ -1044,7 +1028,7 @@ mod tests {
         assert_eq!(infos.len(), 2, "the id array bounds a visible-only group");
         let first = infos[0].1.as_ref().unwrap();
         assert!(!first.visible());
-        let claims = first.claims().unwrap();
+        let claims = first.claims();
         assert_eq!(claims.version, None);
         assert_eq!(claims.visible, Some(false));
         assert!(infos[1].1.as_ref().unwrap().visible());
@@ -1071,10 +1055,7 @@ mod tests {
                 matches!(info.claimed_milli_timestamp(), Some(Err(_))),
                 "node {id}"
             );
-            assert!(matches!(
-                info.claims().unwrap().milli_timestamp,
-                Some(Err(_))
-            ));
+            assert!(matches!(info.claims().milli_timestamp, Some(Err(_))));
         }
     }
 
@@ -1119,7 +1100,7 @@ mod tests {
         let Some(Element::DenseNode(node)) = block.elements().next() else {
             panic!("dense node");
         };
-        let claims = node.info().unwrap().claims().unwrap();
+        let claims = node.info().unwrap().claims();
         assert_eq!(claims.version, None);
         assert_eq!(claims.milli_timestamp.unwrap().unwrap(), 5000);
         assert_eq!((claims.changeset, claims.uid), (None, Some(9)));
@@ -1141,7 +1122,7 @@ mod tests {
         let Some(Element::DenseNode(node)) = block.elements().next() else {
             panic!("dense node");
         };
-        assert_eq!(node.info().unwrap().claims().unwrap().changeset, Some(0));
+        assert_eq!(node.info().unwrap().claims().changeset, Some(0));
         let converted = crate::owned::dense_node_metadata(&node).unwrap().unwrap();
         assert_eq!(converted.meta.changeset, 0);
     }

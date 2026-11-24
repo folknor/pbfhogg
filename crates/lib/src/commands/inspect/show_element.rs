@@ -154,10 +154,8 @@ fn write_dense_node_info(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io:
     // `claims` reads presence from the slot's values: a version of 0 or -1
     // is not a claim, and the padding slot of a node without metadata in a
     // block whose other nodes carry it claims nothing.
-    if let Some(info) = dn.info()
-        && let Some(claims) = MetaClaims::from_dense(info)
-    {
-        write_meta(out, &claims)?;
+    if let Some(info) = dn.info() {
+        write_meta(out, &info.claims())?;
     }
     Ok(())
 }

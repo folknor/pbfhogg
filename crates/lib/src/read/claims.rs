@@ -5,12 +5,14 @@
 //! the wire's, except the version, where 0 is how PBF writers spell "no
 //! version" ([`Info::claimed_version`]). A `DenseInfo` column decodes a value
 //! for every slot, so presence is read from the values
-//! ([`DenseNodeInfo::claims`]). The two readings agree on every element both
+//! ([`DenseNodeInfo::claims`](crate::DenseNodeInfo::claims), which builds a
+//! [`MetaClaims`] too). The two readings agree on every element both
 //! encodings can express; a dense slot cannot say "absent" for a field of a
-//! versioned element, so it claims every field there.
+//! versioned element whose column the group carries, so it claims every
+//! present column there (and `visible` as `true` when that column is absent).
 
+use crate::Info;
 use crate::error::Result;
-use crate::{DenseNodeInfo, Info};
 
 /// A raw timestamp scaled by the block's `date_granularity` to
 /// milliseconds, exactly. A scaling that overflows `i64` is an error: the
@@ -57,19 +59,5 @@ impl<'a> MetaClaims<'a> {
             user: info.user(),
             visible: info.visible_opt(),
         }
-    }
-
-    /// The claims of a dense node slot; `None` when it claims nothing (a
-    /// negative version). See [`DenseNodeInfo::claims`].
-    pub(crate) fn from_dense(info: &DenseNodeInfo<'a>) -> Option<Self> {
-        let claims = info.claims()?;
-        Some(Self {
-            version: claims.version,
-            milli_timestamp: claims.milli_timestamp,
-            changeset: claims.changeset,
-            uid: claims.uid,
-            user: claims.user,
-            visible: claims.visible,
-        })
     }
 }

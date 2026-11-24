@@ -153,18 +153,6 @@ and no data blobs reaches a successful empty reference report. `--refs`
 promises only referential integrity, so its success does not certify that the
 header is readable.
 
-## CMD-063 - osmium-parity maps osmium show to inspect --show
-
-Reported by: the inspect --show sorted-exit item (2026-11-23), scout pass;
-not followed further.
-
-`docs/cli/osmium-parity.md` and `reference/osmium-parity.md` both say
-osmium's `show` is "Implemented via `inspect --show <TYPE_ID>`". osmium-tool's
-`show` (`command_show.cpp`) is a pager over the whole file in debug, OPL or
-XML format; it takes no ID. The ID lookup in osmium is `getid`. The row
-should say `show` has no equivalent (or name `cat` to a text format if one
-exists) and, if wanted, note `inspect --show` beside `getid`.
-
 ## CMD-041 - renumber refuses a block its rewrite grows past the raw size cap
 
 Reported by: the negative-ID renumber item (2026-11-18), while sparring the

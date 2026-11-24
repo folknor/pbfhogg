@@ -697,6 +697,10 @@
 
 ### Fixed
 
+- Corrected the osmium parity guides to use `inspect --extended` and
+  osmium's `header.boxes` key, and to distinguish osmium's whole-file
+  `show` pager from the single-element lookup in `inspect --show`.
+
 - Documented that `inspect --show` refuses `--distrust-metadata`.
 
 - **`add-locations-to-ways` accepts indexed way blocks in a non-default

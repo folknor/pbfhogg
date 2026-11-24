@@ -13,7 +13,7 @@ command count.
 | `sort` | `sort` | Same |
 | `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags; membership per strategy in [DEVIATIONS](../DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
 | `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
-| `getid` | `getid` | Same |
+| `getid` | `getid` | Same command. Use `inspect --show <TYPE_ID>` to display one element by ID. |
 | `getparents` | `getparents` | Same |
 | `renumber` | `renumber` | Same |
 | `add-locations-to-ways` | `add-locations-to-ways` | Same |
@@ -213,12 +213,12 @@ rejected in OSC mode.
 # osmium
 osmium fileinfo input.pbf
 osmium fileinfo -e input.pbf
-osmium fileinfo -g header.bbox input.pbf
+osmium fileinfo -g header.boxes input.pbf
 osmium fileinfo -j input.pbf
 
 # pbfhogg
 pbfhogg inspect input.pbf
-pbfhogg inspect -e input.pbf
+pbfhogg inspect --extended input.pbf
 pbfhogg inspect -g header.bbox input.pbf
 pbfhogg inspect --json input.pbf
 ```
@@ -278,7 +278,7 @@ These osmium flags have no pbfhogg equivalent:
 |----------------|--------|
 | `changeset-filter` | Not planned. Changeset processing is a niche use case. |
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
-| `show` | Implemented via `inspect --show <TYPE_ID>` |
+| `show` | No equivalent. Osmium pages through the file in a text format. |
 
 ## apply-changes: permissive missing-element semantics (parity)
 

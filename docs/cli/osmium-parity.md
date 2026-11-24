@@ -14,7 +14,7 @@ command count.
 | `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags; membership per strategy in [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#extract-per-strategy-membership-against-osmium) |
 | `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
 | `export` | `export` | GeoJSON/GeoJSONSeq only; nodes and ways only (see below) |
-| `getid` | `getid` | pbfhogg also accepts named type/ID forms; bare IDs need `--default-type` |
+| `getid` | `getid` | pbfhogg also accepts named type/ID forms; bare IDs need `--default-type`. Use `inspect --show <TYPE_ID>` to display one element by ID. |
 | `getparents` | `getparents` | Bare IDs need `--default-type` in pbfhogg |
 | `renumber` | `renumber` | Same |
 | `add-locations-to-ways` | `add-locations-to-ways` | Same |
@@ -205,12 +205,12 @@ property, bbox, and metadata flags.
 # osmium
 osmium fileinfo input.pbf
 osmium fileinfo -e input.pbf
-osmium fileinfo -g header.bbox input.pbf
+osmium fileinfo -g header.boxes input.pbf
 osmium fileinfo -j input.pbf
 
 # pbfhogg
 pbfhogg inspect input.pbf
-pbfhogg inspect -e input.pbf
+pbfhogg inspect --extended input.pbf
 pbfhogg inspect -g header.bbox input.pbf
 pbfhogg inspect --json input.pbf
 ```
@@ -278,7 +278,7 @@ These osmium flags have no pbfhogg equivalent:
 |----------------|--------|
 | `changeset-filter` | Not planned. Changeset processing is a niche use case. |
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
-| `show` | Implemented via `inspect --show <TYPE_ID>` |
+| `show` | No equivalent. Osmium pages through the file in a text format. |
 
 ## Indexdata
 

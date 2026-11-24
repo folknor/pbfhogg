@@ -31,7 +31,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_input_order::InputOrder;
 
 /// What a passing check establishes on input without the sort claim.
@@ -473,7 +473,7 @@ pub fn run(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> {
         harness,
         &ToolRun::osmium("check-refs.1")
             .arg("check-refs")
-            .input(&order.reference_input)
+            .input(&order.reference_input, Origin::Other)
             .accept_if(1, osmium_ways_only_completed),
         &outdir.join("osmium-ways.txt"),
         "osmium (ways only)",
@@ -506,7 +506,7 @@ pub fn run(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> {
         harness,
         &ToolRun::osmium("check-refs.1")
             .args(&["check-refs", "-r"])
-            .input(&order.reference_input)
+            .input(&order.reference_input, Origin::Other)
             .accept_if(1, osmium_with_relations_completed),
         &outdir.join("osmium-all.txt"),
         "osmium (with relations)",

@@ -1035,7 +1035,7 @@ fn staged_args(run: &ToolRun, staging: &Path) -> Vec<std::ffi::OsString> {
         .iter()
         .map(|a| match a {
             RunArg::Lit(s) => s.into(),
-            RunArg::Input { prefix, path } => format!("{prefix}{}", path.display()).into(),
+            RunArg::Input { prefix, path, .. } => format!("{prefix}{}", path.display()).into(),
             RunArg::Output { prefix, path } => format!(
                 "{prefix}{}",
                 staging
@@ -1085,7 +1085,9 @@ fn key_text(
     for arg in &run.args {
         let value = match arg {
             RunArg::Lit(s) => format!("literal {s:?}"),
-            RunArg::Input { prefix, path } => {
+            // The origin is deliberately not keyed: it judges a failed run,
+            // and a failed run is never published or reused.
+            RunArg::Input { prefix, path, .. } => {
                 format!("input {prefix:?} {} {:?}", digest(path)?, extension(path))
             }
             RunArg::Output { prefix, path } => format!("output {prefix:?} {:?}", path.file_name()),
@@ -1385,15 +1387,16 @@ mod tests {
         let run = |input: &Path, out: &str| {
             ToolRun::osmium("sort.1")
                 .arg("sort")
-                .input(input)
+                .input(input, crate::reference::Origin::Other)
                 .arg("-o")
                 .output(&root.join("a").join(out))
         };
         let a = key_text(&run(&input, "osmium.osm.pbf"), "tool x\n", &mut digest).unwrap();
-        // Another check directory, same artifact name: the same key.
+        // Another check directory, same artifact name: the same key. So is
+        // another origin, which judges only a failed run, never published.
         let moved = ToolRun::osmium("sort.1")
             .arg("sort")
-            .input(&input)
+            .input(&input, crate::reference::Origin::Pbfhogg)
             .arg("-o")
             .output(&root.join("b").join("osmium.osm.pbf"));
         assert_eq!(

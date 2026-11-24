@@ -29,7 +29,7 @@ use crate::counts::{Counts, osmium_counts};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict, WayLocations};
 use crate::pbf_frames::{self, IndexSummary};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
 
 const KIND_LETTERS: [char; 3] = ['n', 'w', 'r'];
@@ -129,7 +129,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         WayLocations::Dropped,
     )?;
 
-    let selected = osmium_counts(harness, &pbfhogg_getid)?;
+    let selected = osmium_counts(harness, (&pbfhogg_getid, Origin::Pbfhogg))?;
     for (kind, want, got) in selection_verdicts(&ids, selected) {
         let verdict = Verdict::from_pass(u64::try_from(want).ok() == Some(got));
         if verdict.is_pass() {
@@ -148,7 +148,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let osmium_getid = outdir.join("osmium-getid.osm.pbf");
     let mut osmium_run = ToolRun::osmium("getid.1")
         .arg("getid")
-        .input(&order.reference_input);
+        .input(&order.reference_input, Origin::Other);
     for id in &requested {
         osmium_run = osmium_run.arg(id.as_str());
     }
@@ -189,7 +189,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         ways: summary.count(1),
         relations: summary.count(2),
     };
-    let inverted = osmium_counts(harness, &pbfhogg_invert)?;
+    let inverted = osmium_counts(harness, (&pbfhogg_invert, Origin::Pbfhogg))?;
     for (kind, orig, sel, inv) in [
         ("nodes", original.nodes, selected.nodes, inverted.nodes),
         ("ways", original.ways, selected.ways, inverted.ways),
@@ -303,7 +303,7 @@ impl Invert<'_> {
         let theirs = self.outdir.join(format!("osmium-{name}.osm.pbf"));
         let mut run = ToolRun::osmium("removeid.1")
             .arg("removeid")
-            .input(&self.order.reference_input);
+            .input(&self.order.reference_input, Origin::Other);
         for id in &requested {
             run = run.arg(id.as_str());
         }

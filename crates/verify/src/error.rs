@@ -12,9 +12,10 @@ pub(crate) enum Error {
     Environment(String),
     /// A comparison found pbfhogg wrong, or pbfhogg failed a run it had to
     /// complete, or a file pbfhogg wrote is one the verifier's reader
-    /// refuses. A reference run that did not complete (an unaccepted exit,
-    /// or an accepted one missing a declared output) also fails its check
-    /// here, since no comparison stands without it.
+    /// refuses. A reference run with an unaccepted exit also fails its check
+    /// here when it read a pbfhogg output, a presumption since osmium does
+    /// not say which operand it rejected; one that read no pbfhogg output,
+    /// or an accepted exit missing a declared output, is `Tool`.
     Failed(String),
     /// The verifier could not establish that every descendant of a launch is
     /// gone. No later launch, comparison or cache publication is safe, so a
@@ -23,7 +24,8 @@ pub(crate) enum Error {
     /// The verifier could not do its own work: configuration, I/O, an
     /// unsupported comparison domain - an input, reference output or
     /// verifier-made file outside what the comparison or the verifier's
-    /// reader can take, whoever's limit that is. Malformed tool reports are
+    /// reader can take, whoever's limit that is, including a reference run
+    /// that failed reading no pbfhogg output. Malformed tool reports are
     /// `Failed`.
     Tool(String),
 }

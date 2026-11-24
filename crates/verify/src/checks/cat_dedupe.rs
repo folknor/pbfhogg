@@ -95,7 +95,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     // floor of this check's wall, and changes which failure wins on an input
     // whose metadata osmium cannot write as OPL (a content decode skips
     // usernames, so it still reports the order fault first).
-    let (ordered, _) = opl_compare::order(harness, pbf)?;
+    let (ordered, _) = opl_compare::order(harness, (pbf, Origin::Other))?;
     if !ordered {
         return Err(Error::tool(
             "the input claims Sort.Type_then_ID but osmium does not decode it in strict kind and \
@@ -299,7 +299,7 @@ fn derive(
     let (id, command, args) = tool;
     harness.msg(&format!("--- deriving {name} ---"));
     let filtered = outdir.join(format!("{name}-filtered.osm.pbf"));
-    let mut run = ToolRun::osmium(id).arg(command).input(pbf);
+    let mut run = ToolRun::osmium(id).arg(command).input(pbf, Origin::Other);
     for arg in args {
         run = run.arg(arg);
     }
@@ -329,7 +329,7 @@ fn derive(
         )?;
         sorted
     };
-    let (ordered, counts) = opl_compare::order(harness, &operand)?;
+    let (ordered, counts) = opl_compare::order(harness, (&operand, Origin::Other))?;
     harness.msg(&format!(
         "  {name}: {} nodes, {} ways, {} relations",
         counts[0], counts[1], counts[2]
@@ -447,7 +447,12 @@ fn judge_merge(
         Verdict::from_pass(claims),
     );
     let policy = Policy::between((&out, Origin::Pbfhogg), (pbf, Origin::Other))?;
-    let diff = harness.same_elements(&out, pbf, &listing_beside(&out), policy)?;
+    let diff = harness.same_elements(
+        (&out, Origin::Pbfhogg),
+        (pbf, Origin::Other),
+        &listing_beside(&out),
+        policy,
+    )?;
     harness.msg(&format!(
         "  {name}: {}",
         if diff.is_pass() {

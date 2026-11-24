@@ -58,7 +58,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
 use crate::osc::OscKind;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 
 /// What [`run`] reads: the check's directory, the input and how osmium reads
 /// it, the indexdata walk, and whether pbfhogg reads with O_DIRECT.
@@ -167,7 +167,7 @@ fn run_mode(
     let theirs = input.outdir.join(format!("osmium-{stem}.osm.pbf"));
     let mut osmium = ToolRun::osmium(run_id)
         .arg("getid")
-        .input(&input.order.reference_input);
+        .input(&input.order.reference_input, Origin::Other);
     for id in args {
         osmium = osmium.arg(id.as_str());
     }
@@ -512,7 +512,7 @@ fn exercised(
     let captured = harness.reference(
         &ToolRun::osmium("getid-r-opl.1")
             .arg("cat")
-            .input(reference)
+            .input(reference, Origin::Other)
             .args(&["-f", "opl", "-o"])
             .output(&listing)
             .arg("--overwrite"),

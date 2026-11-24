@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, WayLocations};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
 
 /// Cross-validate `pbfhogg cat` against `osmium cat` for node/way/relation types.
@@ -62,7 +62,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
 
         let mut run = ToolRun::osmium("cat.1")
             .arg("cat")
-            .input(&order.reference_input)
+            .input(&order.reference_input, Origin::Other)
             .args(&["-t", elem_type]);
         if declares {
             run = run.args(&["-f", "pbf,locations_on_ways=true"]);

@@ -9,7 +9,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::opl_compare::Policy;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_input_order::{self, InputOrder, Refusal, compare_outputs};
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum AltwMode {
@@ -130,7 +130,7 @@ pub fn run(
     let captured = harness.reference(
         &ToolRun::osmium("add-locations-to-ways.1")
             .args(&["add-locations-to-ways", "--keep-member-nodes"])
-            .input(&order.reference_input)
+            .input(&order.reference_input, Origin::Other)
             .arg("-o")
             .output(&osmium_out)
             .arg("--overwrite"),
@@ -193,7 +193,12 @@ pub fn run(
             b.name()
         ));
         let listing = outdir.join("engine-parity.diff.txt");
-        let verdict = harness.same_elements(a_out, b_out, &listing, Policy::FULL)?;
+        let verdict = harness.same_elements(
+            (a_out, Origin::Pbfhogg),
+            (b_out, Origin::Pbfhogg),
+            &listing,
+            Policy::FULL,
+        )?;
         harness.record(
             &format!("{} vs {} osmium-decoded records", a.name(), b.name()),
             verdict,

@@ -518,7 +518,7 @@ fn getid(
         "field-policies-getid.1"
     })
     .arg("getid")
-    .input(pbf);
+    .input(pbf, Origin::Other);
     for id in ids {
         run = run.arg(id.as_str());
     }
@@ -546,7 +546,7 @@ fn write_pbf(harness: &mut Harness, opl: &Path, pbf: &Path, declared: bool) -> R
     let captured = harness.reference(
         &ToolRun::osmium("field-policies-write.1")
             .arg("cat")
-            .input(opl)
+            .input(opl, Origin::Other)
             .args(&["-f", format, "-o"])
             .output(pbf)
             .arg("--overwrite")
@@ -581,7 +581,7 @@ fn literal_decode(harness: &mut Harness, pbf: &Path, opl: &Path) -> Result<Vec<S
     let captured = harness.reference(
         &ToolRun::osmium("field-policies-opl.1")
             .arg("cat")
-            .input(pbf)
+            .input(pbf, Origin::Other)
             .args(&["-f", "opl,locations_on_ways=true", "-o"])
             .output(opl)
             .arg("--overwrite")
@@ -629,7 +629,15 @@ fn compare(
 ) -> Result<Compared, Error> {
     let mut groups = Vec::new();
     // The merge itself is this check's subject, so never stored summaries.
-    let merged = opl_compare::compare_merged(harness, a, b, listing, policy, |g| groups.push(g))?;
+    // Every file here is osmium's or the verifier's: no pbfhogg run writes.
+    let merged = opl_compare::compare_merged(
+        harness,
+        (a, Origin::Other),
+        (b, Origin::Other),
+        listing,
+        policy,
+        |g| groups.push(g),
+    )?;
     Ok(Compared { merged, groups })
 }
 
@@ -1032,7 +1040,7 @@ fn controls(harness: &mut Harness, pbf: &Path) -> Result<Option<String>, Error> 
         .arg("add-locations-to-ways")
         .args(&["-n", "--ignore-missing-nodes"]);
     for part in &parts {
-        run = run.input(part);
+        run = run.input(part, Origin::Other);
     }
     let captured = harness.reference(
         &run.arg("-o").output(&slice).arg("--overwrite"),

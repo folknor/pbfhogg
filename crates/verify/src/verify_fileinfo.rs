@@ -105,16 +105,16 @@ fn parse(reader: impl std::io::Read) -> Result<FileInfo, String> {
     })
 }
 
-/// osmium fileinfo of `pbf`, its report at `report` (a `.json` file in the
+/// osmium fileinfo of `pbf` (and who wrote it), its report at `report` (a `.json` file in the
 /// check's directory). Exit 0 only; a report that does not read is an error.
 pub(crate) fn fileinfo(
     harness: &mut Harness,
-    pbf: &Path,
+    (pbf, origin): (&Path, crate::reference::Origin),
     report: &Path,
 ) -> Result<FileInfo, Error> {
     let run = ToolRun::osmium("fileinfo-e.1")
         .args(&["fileinfo", "-e", "-j", "--no-crc"])
-        .input(pbf);
+        .input(pbf, origin);
     let captured = harness.reference(&run, report)?;
     harness.require_success(&captured, "osmium fileinfo -e")?;
     let file = std::fs::File::open(report)

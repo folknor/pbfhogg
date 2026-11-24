@@ -109,8 +109,8 @@ fn print_id_sample(kind: &str, sampled: &Sampled, emit: &mut impl FnMut(&str)) {
 /// order is an error, never a verdict.
 pub(crate) fn scan_element_diff(
     harness: &mut Harness,
-    old: &Path,
-    new: &Path,
+    old: opl_compare::Operand<'_>,
+    new: opl_compare::Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(OscAction, OscKind, i64),
@@ -124,15 +124,17 @@ pub(crate) fn scan_element_diff(
 /// counts.
 pub(crate) fn scan_element_diff_judged(
     harness: &mut Harness,
-    old: (&Path, Role<'_>),
-    new: (&Path, Role<'_>),
+    old: (opl_compare::Operand<'_>, Role<'_>),
+    new: (opl_compare::Operand<'_>, Role<'_>),
     listing: &Path,
     policy: Policy,
     each: impl FnMut(OscAction, OscKind, i64),
 ) -> Result<[Counts; 2], Error> {
     let walked =
         opl_compare::compare_judged(harness, old.0, new.0, listing, policy, classify(each))?;
-    Ok(harness.judge_walk([old, new], walked)?.1)
+    Ok(harness
+        .judge_walk([(old.0.0, old.1), (new.0.0, new.1)], walked)?
+        .1)
 }
 
 fn classify(mut each: impl FnMut(OscAction, OscKind, i64)) -> impl FnMut(opl_compare::Group) {

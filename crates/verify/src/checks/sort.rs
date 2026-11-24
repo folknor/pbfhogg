@@ -47,7 +47,7 @@ fn osmium_sort_as(
     // so Policy::between reads no coordinates on such an input whatever
     // option the copy got (reference/verify.md, "Element equality").
     let locations = crate::pbf_frames::header(input, origin)?.optional_feature("LocationsOnWays");
-    let mut run = ToolRun::osmium("sort.1").arg("sort").input(input);
+    let mut run = ToolRun::osmium("sort.1").arg("sort").input(input, origin);
     if multipass {
         run = run.args(&["-s", "multipass"]);
     }
@@ -246,7 +246,7 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // is a decoding cache hint for the comparison below; the scan reads
     // keys only.
     let hint = crate::opl_compare::Policy::between((pbf, Origin::Other), (&theirs, Origin::Other))?;
-    let (ordered, _) = crate::opl_compare::order_as(h, &theirs, hint)?;
+    let (ordered, _) = crate::opl_compare::order_as(h, (&theirs, Origin::Other), hint)?;
     if !ordered {
         return Err(Error::Tool(format!(
             "osmium sort's output of {} is not in strict kind and ID order: the input \
@@ -284,13 +284,13 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // separate order decode after the strict comparison could only pass.
     let (diff, _) = h.same_elements_judged(
         (
-            &ours,
+            (&ours, Origin::Pbfhogg),
             crate::harness::Role::Judged {
                 label: "pbfhogg sort",
                 record: "pbfhogg sort output order",
             },
         ),
-        (&theirs, crate::harness::Role::Required),
+        ((&theirs, Origin::Other), crate::harness::Role::Required),
         &listing_beside(&ours),
         policy,
     )?;

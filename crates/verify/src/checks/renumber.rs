@@ -46,7 +46,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
 use crate::opl_compare::{self, Class, Merged, Policy};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 
 /// Differing identities per kind (node, way, relation) and class.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -735,7 +735,7 @@ pub fn run(
     // --- osmium renumber ------------------------------------------------
     let mut osmium_run = ToolRun::osmium("renumber.1")
         .arg("renumber")
-        .input(pbf)
+        .input(pbf, Origin::Other)
         .arg("-o")
         .output(&osmium_out)
         .arg("--overwrite");
@@ -787,8 +787,8 @@ pub fn run(
     }
     let (merged, keys) = opl_compare::compare_paired(
         harness,
-        &osmium_out,
-        &pbfhogg_out,
+        (&osmium_out, Origin::Other),
+        (&pbfhogg_out, Origin::Pbfhogg),
         &diff_log,
         policy,
         |g| classified.add(g),

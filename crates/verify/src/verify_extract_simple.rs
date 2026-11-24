@@ -86,7 +86,7 @@ fn candidate_relations(
     let captured = harness.reference(
         &ToolRun::osmium("extract-relations.1")
             .arg("cat")
-            .input(input.osmium_complete)
+            .input(input.osmium_complete, crate::pbf_frames::Origin::Other)
             .args(&["-t", "relation", "-f", "opl", "-o"])
             .output(&relations)
             .arg("--overwrite"),
@@ -138,8 +138,8 @@ fn simple_vs_complete(
     )?;
     element_diff::scan_element_diff(
         harness,
-        input.pbfhogg_simple,
-        input.osmium_complete,
+        (input.pbfhogg_simple, input.pbfhogg_simple_origin),
+        (input.osmium_complete, crate::pbf_frames::Origin::Other),
         &outdir.join("pbfhogg-simple-vs-osmium-complete.diff.txt"),
         policy,
         |action, kind, id| match (action, kind) {
@@ -324,9 +324,9 @@ fn present_members(
     let captured = harness.reference(
         &ToolRun::osmium("extract-removeid.1")
             .arg("removeid")
-            .input(osmium_simple)
+            .input(osmium_simple, crate::pbf_frames::Origin::Other)
             .arg("-i")
-            .input(&ids)
+            .input(&ids, crate::pbf_frames::Origin::Other)
             .arg("-o")
             .output(&without)
             .arg("--overwrite"),
@@ -340,8 +340,8 @@ fn present_members(
     )?;
     element_diff::scan_element_diff(
         harness,
-        osmium_simple,
-        &without,
+        (osmium_simple, crate::pbf_frames::Origin::Other),
+        (&without, crate::pbf_frames::Origin::Other),
         &outdir.join("osmium-simple-present-members.diff.txt"),
         policy,
         |action, kind, id| {

@@ -9,7 +9,7 @@ use crate::harness::{Harness, Role, Verdict};
 use crate::opl_compare::{self, Policy};
 use crate::osc;
 use crate::process::Ended;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_input_order;
 
 /// `pbfhogg diff --format osc OLD NEW -o OUT`, which writes run scratch on
@@ -148,8 +148,8 @@ pub fn run(
     let captured = harness.reference(
         &ToolRun::osmium("derive-changes.1")
             .arg("derive-changes")
-            .input(pbf)
-            .input(&new_pbf)
+            .input(pbf, Origin::Other)
+            .input(&new_pbf, Origin::Pbfhogg)
             .arg("-o")
             .output(&osmium_osc)
             .arg("--overwrite"),
@@ -184,8 +184,8 @@ pub fn run(
     let captured = harness.reference(
         &ToolRun::osmium("derive-changes-roundtrip.1")
             .arg("apply-changes")
-            .input(pbf)
-            .input(&osmium_osc)
+            .input(pbf, Origin::Other)
+            .input(&osmium_osc, Origin::Other)
             .arg("-o")
             .output(&rt_osmium)
             .arg("--overwrite"),
@@ -202,8 +202,8 @@ pub fn run(
     let captured = harness.reference(
         &ToolRun::osmium("derive-changes-cross.1")
             .arg("apply-changes")
-            .input(pbf)
-            .input(&pbfhogg_osc)
+            .input(pbf, Origin::Other)
+            .input(&pbfhogg_osc, Origin::Pbfhogg)
             .arg("-o")
             .output(&rt_cross)
             .arg("--overwrite"),
@@ -222,26 +222,26 @@ pub fn run(
         (
             "pbfhogg roundtrip vs new",
             "pbfhogg-vs-new",
-            &rt_pbfhogg,
-            &new_pbf,
+            (rt_pbfhogg.as_path(), Origin::Pbfhogg),
+            (new_pbf.as_path(), Origin::Pbfhogg),
         ),
         (
             "pbfhogg OSC applied by osmium vs new",
             "pbfhogg-osc-by-osmium-vs-new",
-            &rt_cross,
-            &new_pbf,
+            (rt_cross.as_path(), Origin::Other),
+            (new_pbf.as_path(), Origin::Pbfhogg),
         ),
         (
             "osmium roundtrip vs new",
             "osmium-vs-new",
-            &rt_osmium,
-            &new_pbf,
+            (rt_osmium.as_path(), Origin::Other),
+            (new_pbf.as_path(), Origin::Pbfhogg),
         ),
         (
             "pbfhogg roundtrip vs osmium roundtrip",
             "pbfhogg-vs-osmium",
-            &rt_pbfhogg,
-            &rt_osmium,
+            (rt_pbfhogg.as_path(), Origin::Pbfhogg),
+            (rt_osmium.as_path(), Origin::Other),
         ),
     ]
     .into_iter()
@@ -316,7 +316,12 @@ fn osmium_omission_explains(
 ) -> Result<Option<bool>, Error> {
     harness.msg("=== osmium derive-changes same-ID omission model ===");
     let expected = outdir.join("osmium-derive-model.opl");
-    let retained = opl_compare::osmium_derive_roundtrip(harness, old, new, &expected)?;
+    let retained = opl_compare::osmium_derive_roundtrip(
+        harness,
+        (old, Origin::Other),
+        (new, Origin::Pbfhogg),
+        &expected,
+    )?;
     if retained == 0 {
         harness.msg("  the model retains no old object: the failures stand");
         std::fs::remove_file(&expected)?;
@@ -324,7 +329,7 @@ fn osmium_omission_explains(
     }
     let merged = opl_compare::compare_with_opl(
         harness,
-        rt_osmium,
+        (rt_osmium, Origin::Other),
         &expected,
         &outdir.join("roundtrip-osmium-vs-model.diff.txt"),
         Policy::CONTENT,

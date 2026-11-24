@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
 
 /// Expression and output label pairs for the three test cases.
@@ -51,7 +51,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         let captured = harness.reference(
             &ToolRun::osmium("tags-filter.1")
                 .arg("tags-filter")
-                .input(&order.reference_input)
+                .input(&order.reference_input, Origin::Other)
                 .args(&[expr, "-R", "-o"])
                 .output(&osmium_out)
                 .arg("--overwrite"),

@@ -137,7 +137,10 @@ pub(crate) fn compare_outputs(
     // pbfhogg's is judged, so its own decode stays: folded into the
     // comparison, a pbfhogg header verdict or copy-sort failure could come
     // first and hide it.
-    if !harness.check_sorted(osmium_label, theirs)?.is_pass() {
+    if !harness
+        .check_sorted(osmium_label, (theirs, Origin::Other))?
+        .is_pass()
+    {
         return Err(Error::Tool(format!(
             "{osmium_label} output is not in strict order, so it cannot be compared with \
              pbfhogg's by ID"
@@ -185,13 +188,13 @@ pub(crate) fn compare_outputs(
     let policy = Policy::between((&compared, compared_origin), (theirs, Origin::Other))?;
     let (diff, _) = harness.same_elements_judged(
         (
-            &compared,
+            (&compared, compared_origin),
             Role::Judged {
                 label: &order_label,
                 record: &order_record,
             },
         ),
-        (theirs, Role::Required),
+        ((theirs, Origin::Other), Role::Required),
         &crate::harness::listing_beside(&compared),
         policy,
     )?;

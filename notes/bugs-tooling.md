@@ -54,23 +54,52 @@ promises that only a class with no candidate record on the input is named
 that way. Reading the pieces from `InputOrder::of(..).reference_input`, as
 geocode now does, would keep that promise.
 
-## TOOL-047 - A reference that cannot read the dataset input reports FAIL
+## TOOL-047 - A reference run over a pbfhogg output fails by presumption
 
-Reported by: the spar on the verifier's error classification (2026-11-24).
+Reported by: the spar on the verifier's error classification (2026-11-24);
+narrowed by the spar that gave every reference input its producer.
 
-The verifier's own frame reader now classifies a refusal by who wrote the
-file (`pbf_frames::Origin`), but a reference run is still judged by the
-reference-run rule alone: any unaccepted exit is `Error::Failed`, apart from
-SIGKILL and osmium's `bad_alloc` line. So a dataset input in a compression
-libosmium refuses (zstd: `PBF error: zstd blobs not supported`) fails
-`verify sort` with exit 1, because `osmium sort` reads the input before any
-verifier decode does. The same holds for every check whose first reference
-reads the input. A stderr match alone cannot fix this. An osmium run can also
-read a pbfhogg output, and there a zstd blob may be a writer defect: `repack`
-is contracted to re-encode with zlib. Classifying correctly needs per-operand
-provenance on `ToolRun` inputs, where `PbfArgv::writes()` already names
-pbfhogg's outputs. It also needs evidence tying the refusal to the dataset
-operand, not just to some input of a multi-input run.
+Every `ToolRun` input now names who wrote it, and an unaccepted reference
+exit that read no pbfhogg output is a verifier error (exit 2), so a dataset
+in a compression libosmium refuses no longer fails `verify sort` and its
+kin. A run that read any pbfhogg output still fails its check on any
+unaccepted exit, because osmium names no file in its refusal. Two cases
+remain misjudged. First, a mixed run can be the first osmium read of the
+dataset: `verify diff --format osc` on sorted input builds `new.osm.pbf`
+with pbfhogg apply-changes (which passes the base's blobs through), and its
+first osmium launch is `osmium derive-changes BASE NEW`, so a zstd base
+fails it as pbfhogg's. A full osmium decode of the base before that launch,
+as a run reading no pbfhogg output, would settle the prerequisite. Second,
+an osmium exit independent of every input (an output write error, a crash)
+on a run with a pbfhogg operand still reads as pbfhogg's; telling those
+apart needs evidence the exit alone does not carry.
+
+## TOOL-052 - verify merge blames pbfhogg when osmium disagrees with the model
+
+Reported by: lateral of the reference-provenance change (2026-11-24); read
+from source, not reproduced.
+
+In `judge` in `crates/verify/src/checks/merge_changes.rs`, an `osmium
+merge-changes -s` output that keeps other changes than the verifier's own
+model of it predicts returns `Error::Failed` (exit 1), with the message
+that the reading of the inputs cannot be trusted. Neither side of that
+comparison is pbfhogg's: it is the reference against the verifier's model
+over the dataset OSCs and verifier-written fixtures, so the outcome is a
+verifier error (`Error::Tool`), not a pbfhogg verdict.
+
+## TOOL-053 - A grouped OPL decode raises the first failure in plan order
+
+Reported by: the spar on the reference-provenance change (2026-11-24); read
+from source, not reproduced.
+
+`acquire_missing` in `crates/verify/src/opl_compare.rs` settles a launch
+group of osmium decodes, then propagates the first per-run error in plan
+order. When both operands of a comparison fail to decode, one as a verifier
+error (it read no pbfhogg output) and one as a check failure (a pbfhogg
+output), operand order decides whether the suite stops with exit 2 or
+records a FAIL. The contract gives a recorded failure precedence over
+ENVIRONMENT only, so either outcome is defensible, but it should be chosen
+explicitly and both diagnostics kept.
 
 ## TOOL-007 - verify sort never exercises the unindexed fallback
 

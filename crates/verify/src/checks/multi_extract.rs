@@ -161,7 +161,7 @@ pub fn run(
             // Its own decode, not folded into the region comparison below:
             // that comes only after the multi-extract run, whose failure
             // would otherwise lose this verdict.
-            let (unique, _) = harness.check_sorted_counted(&label, &copy)?;
+            let (unique, _) = harness.check_sorted_counted(&label, (&copy, Origin::Other))?;
             harness.record(&format!("{label} output repeats an ID"), unique);
             copy
         };
@@ -265,13 +265,13 @@ pub fn run(
                 crate::opl_compare::Policy::between((&compared, origin), (&seq.compared, origin))?;
             let (same, [counts, _]) = harness.same_elements_judged(
                 (
-                    &compared,
+                    (&compared, origin),
                     Role::Judged {
                         label: &label,
                         record: &order,
                     },
                 ),
-                (&seq.compared, Role::Required),
+                ((&seq.compared, origin), Role::Required),
                 &crate::harness::listing_beside(&compared),
                 policy,
             )?;

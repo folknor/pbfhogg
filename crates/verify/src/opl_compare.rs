@@ -29,7 +29,12 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 use crate::harness::Harness;
+use crate::pbf_frames::Origin;
 use crate::reference::ToolRun;
+
+/// A file osmium decodes and who wrote it, which decides how a failed
+/// decode is judged ([`crate::reference::RunArg::Input`]).
+pub(crate) type Operand<'a> = (&'a Path, Origin);
 use crate::reference_cache::{Key, Summary};
 
 /// What a comparison reads from each object.
@@ -377,10 +382,12 @@ fn acquire_hit(
 /// under `policy`, its output named `decoding.opl`. The launch writes a
 /// numbered name in the run's store instead; osmium picks the OPL writer
 /// from `-f`, never from the output's name, so both decode the same bytes.
+/// It is never launched and the origin is not keyed, so the origin it
+/// declares judges nothing.
 fn key_run(pbf: &Path, policy: Policy) -> ToolRun {
     ToolRun::osmium("opl-compare.1")
         .arg("cat")
-        .input(pbf)
+        .input(pbf, Origin::Other)
         .args(&["-f", &policy.format(), "-o"])
         .output(Path::new("decoding.opl"))
         .arg("--overwrite")
@@ -432,7 +439,7 @@ fn publish_summary(harness: &mut Harness, decoding: &Path, summary: &Summary) ->
 /// the scan meets a read or parse error; the full merge then reports it.
 fn scanned(
     harness: &mut Harness,
-    pbf: &Path,
+    pbf: Operand<'_>,
     policy: Policy,
     key: &Key,
 ) -> Result<Option<Summary>, Error> {
@@ -462,11 +469,12 @@ fn scanned(
 /// merge's to report. A pass writes an empty `listing`.
 fn by_summaries(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first_side: Operand<'_>,
+    second_side: Operand<'_>,
     listing: &Path,
     policy: Policy,
 ) -> Result<Option<Merged>, Error> {
+    let (first, second) = (first_side.0, second_side.0);
     harness.run.watch(first)?;
     harness.run.watch(second)?;
     let runs = [key_run(first, policy), key_run(second, policy)];
@@ -475,11 +483,11 @@ fn by_summaries(
     };
     let (a, b) = match (harness.summary(&keys[0]), harness.summary(&keys[1])) {
         (Some(a), Some(b)) => (a, b),
-        (Some(a), None) if a.ordered => match scanned(harness, second, policy, &keys[1])? {
+        (Some(a), None) if a.ordered => match scanned(harness, second_side, policy, &keys[1])? {
             Some(b) => (a, b),
             None => return Ok(None),
         },
-        (None, Some(b)) if b.ordered => match scanned(harness, first, policy, &keys[0])? {
+        (None, Some(b)) if b.ordered => match scanned(harness, first_side, policy, &keys[0])? {
             Some(a) => (a, b),
             None => return Ok(None),
         },
@@ -527,16 +535,18 @@ fn by_summaries(
 /// evidence, when a later one fails.
 fn acquire_missing(
     harness: &mut Harness,
-    sides: &[(&Path, Policy)],
+    sides: &[(Operand<'_>, Policy)],
     slots: &mut [Option<PathBuf>],
 ) -> Result<(), Error> {
-    // Each unique missing (source, policy), with the slots it fills.
-    let mut plan: Vec<(Source, Policy, &Path, Vec<usize>)> = Vec::new();
+    // Each unique missing (source, policy), with the slots it fills. One
+    // source is one file, written by one producer, so its operands share
+    // the origin the first of them names.
+    let mut plan: Vec<(Source, Policy, Operand<'_>, Vec<usize>)> = Vec::new();
     // Each missing operand's own planned source. The watch comes first, so
     // a replacement between it and the stat makes the next revalidation
     // fail rather than bless the new file.
     let mut planned: Vec<(usize, Source)> = Vec::new();
-    for (i, ((pbf, policy), slot)) in sides.iter().zip(slots.iter()).enumerate() {
+    for (i, (((pbf, origin), policy), slot)) in sides.iter().zip(slots.iter()).enumerate() {
         if slot.is_some() {
             continue;
         }
@@ -548,7 +558,7 @@ fn acquire_missing(
             .find(|(s, p, _, _)| *s == source && p == policy)
         {
             Some((_, _, _, fills)) => fills.push(i),
-            None => plan.push((source, *policy, pbf, vec![i])),
+            None => plan.push((source, *policy, (pbf, *origin), vec![i])),
         }
     }
     if plan.is_empty() {
@@ -571,18 +581,18 @@ fn acquire_missing(
     // made again once the group settled, still gives it.
     let key_runs: Vec<ToolRun> = plan
         .iter()
-        .map(|(_, policy, pbf, _)| key_run(pbf, *policy))
+        .map(|(_, policy, (pbf, _), _)| key_run(pbf, *policy))
         .collect();
     let planned_keys = harness.summary_keys(&key_runs, true)?;
     let dir = harness.run.dir.join("decodings");
     std::fs::create_dir_all(&dir)?;
     let mut runs = Vec::with_capacity(plan.len());
-    for (_, policy, pbf, _) in &plan {
+    for (_, policy, (pbf, origin), _) in &plan {
         harness.run.decodings.made += 1;
         let opl = dir.join(format!("{}.opl", harness.run.decodings.made));
         let run = ToolRun::osmium("opl-compare.1")
             .arg("cat")
-            .input(pbf)
+            .input(pbf, *origin)
             .args(&["-f", &policy.format(), "-o"])
             .output(&opl)
             .arg("--overwrite")
@@ -594,7 +604,7 @@ fn acquire_missing(
         .map(|(run, sink, _)| (run, sink.as_path()))
         .collect();
     let captured = harness.reference_group(&group)?;
-    for ((source, policy, pbf, fills), (captured, (_, sink, opl))) in
+    for ((source, policy, (pbf, _), fills), (captured, (_, sink, opl))) in
         plan.into_iter().zip(captured.into_iter().zip(runs.iter()))
     {
         let captured = captured?;
@@ -630,7 +640,7 @@ fn acquire_missing(
     // Aliases: every operand, not only the one osmium read, must still be
     // the source its slot's decoding was planned from.
     for (i, source) in planned {
-        let pbf = sides[i].0;
+        let pbf = sides[i].0.0;
         if Source::of(pbf)? != source {
             return Err(Error::Environment(format!(
                 "{} changed while osmium decoded it",
@@ -651,12 +661,12 @@ fn acquire_missing(
 /// whose decodings are kept too.
 fn with_decodings<T>(
     harness: &mut Harness,
-    sides: &[(&Path, Policy)],
+    sides: &[(Operand<'_>, Policy)],
     work: impl FnOnce(&mut Harness, &[PathBuf]) -> Result<(T, bool), Error>,
 ) -> Result<T, Error> {
     let mut slots: Vec<Option<PathBuf>> = vec![None; sides.len()];
     let mut outcome = Ok(None);
-    for ((pbf, policy), slot) in sides.iter().zip(&mut slots) {
+    for (((pbf, _), policy), slot) in sides.iter().zip(&mut slots) {
         match acquire_hit(harness, pbf, *policy) {
             Ok(path) => *slot = path,
             Err(e) => {
@@ -703,7 +713,7 @@ fn with_decodings<T>(
 /// store; kept on failure.
 pub(crate) fn decoded<T>(
     harness: &mut Harness,
-    pbf: &Path,
+    pbf: Operand<'_>,
     policy: Policy,
     read: impl FnOnce(&mut Harness, &Path) -> Result<T, Error>,
 ) -> Result<T, Error> {
@@ -720,8 +730,8 @@ pub(crate) fn decoded<T>(
 /// the file.
 pub(crate) fn compare(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(Group),
@@ -736,8 +746,8 @@ pub(crate) fn compare(
 /// a check whose subject is the merge itself (field-policies).
 pub(crate) fn compare_merged(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(Group),
@@ -754,8 +764,8 @@ pub(crate) fn compare_merged(
 /// first. Neither holds for a key-ordered reading of the counts beyond that.
 pub(crate) fn compare_sequence(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(Group),
@@ -767,8 +777,8 @@ pub(crate) fn compare_sequence(
 /// to `paired` in walk order with both records.
 pub(crate) fn compare_sequence_paired(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(Group),
@@ -785,8 +795,8 @@ pub(crate) fn compare_sequence_paired(
 /// decodings it walked ([`Harness::publish_summary_of`]).
 pub(crate) fn compare_paired(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(Group),
@@ -858,8 +868,8 @@ pub(crate) struct Walked {
 /// any step-down is raised as [`compare`] raises it, with no judgment.
 pub(crate) fn compare_judged(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     each: impl FnMut(Group),
@@ -914,8 +924,8 @@ fn log_merge(harness: &mut Harness, listing: &Path, merged: &Merged) {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     strict: bool,
@@ -931,8 +941,8 @@ fn walk(
 #[allow(clippy::too_many_arguments)]
 fn walk_keyed(
     harness: &mut Harness,
-    first: &Path,
-    second: &Path,
+    first: Operand<'_>,
+    second: Operand<'_>,
     listing: &Path,
     policy: Policy,
     strict: bool,
@@ -982,7 +992,7 @@ fn walk_keyed(
 /// `osmium fileinfo -e` cannot stand in: it refuses a file whose ways lack
 /// their nodes (an invalid-location geometry error), which every way-only or
 /// filtered output is.
-pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]), Error> {
+pub(crate) fn order(harness: &mut Harness, pbf: Operand<'_>) -> Result<(bool, [u64; 3]), Error> {
     order_as(harness, pbf, Policy::CONTENT)
 }
 
@@ -991,9 +1001,10 @@ pub(crate) fn order(harness: &mut Harness, pbf: &Path) -> Result<(bool, [u64; 3]
 /// `cold` next, which then reuses the run's decoding while it is retained.
 pub(crate) fn order_as(
     harness: &mut Harness,
-    pbf: &Path,
+    operand: Operand<'_>,
     cold: Policy,
 ) -> Result<(bool, [u64; 3]), Error> {
+    let pbf = operand.0;
     // Watched before the stat that picks a scan: a replacement between the
     // two fails the revalidation instead of being blessed.
     harness.run.watch(pbf)?;
@@ -1041,7 +1052,7 @@ pub(crate) fn order_as(
         .iter()
         .find(|e| e.source == source)
         .map_or(cold, |e| e.policy);
-    decoded(harness, pbf, policy, |harness, path| {
+    decoded(harness, operand, policy, |harness, path| {
         let (ordered, counts, summary) = harness.timed("opl order scan", || scan_order(path))?;
         harness
             .run
@@ -1076,8 +1087,8 @@ fn scan_order(opl: &Path) -> Result<(bool, [u64; 3], Summary), Error> {
 /// from the run's store and are kept there on failure.
 pub(crate) fn osmium_derive_roundtrip(
     harness: &mut Harness,
-    old: &Path,
-    new: &Path,
+    old: Operand<'_>,
+    new: Operand<'_>,
     expected: &Path,
 ) -> Result<u64, Error> {
     let sides = [(old, Policy::CONTENT), (new, Policy::CONTENT)];
@@ -1130,7 +1141,7 @@ fn retained_by_osmium_derive(old: &Path, new: &Path, expected: &Path) -> Result<
 /// written (`expected`); the decoding is the run's, kept on failure.
 pub(crate) fn compare_with_opl(
     harness: &mut Harness,
-    pbf: &Path,
+    pbf: Operand<'_>,
     expected: &Path,
     listing: &Path,
     policy: Policy,
@@ -1141,7 +1152,7 @@ pub(crate) fn compare_with_opl(
 /// [`compare_with_opl`], handing every [`Group`] to `each` in object order.
 pub(crate) fn compare_with_opl_each(
     harness: &mut Harness,
-    pbf: &Path,
+    pbf: Operand<'_>,
     expected: &Path,
     listing: &Path,
     policy: Policy,
@@ -1300,14 +1311,14 @@ pub(crate) fn compare_sequence_with_opl(
     harness: &mut Harness,
     expected: &Path,
     basis: Option<&Basis>,
-    pbf: &Path,
+    pbf: Operand<'_>,
     listing: &Path,
     policy: Policy,
     predict: impl FnOnce(&Path) -> Result<Option<Predicted>, Error>,
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
         && let Some(merged) =
-            sequence_by_summary(harness, basis, pbf, listing, policy, false, predict)?
+            sequence_by_summary(harness, basis, pbf.0, listing, policy, false, predict)?
     {
         return Ok(merged);
     }
@@ -1335,7 +1346,7 @@ pub(crate) fn compare_sequence_with_opl(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compare_with_projection_each<R: std::io::Read>(
     harness: &mut Harness,
-    pbf: &Path,
+    pbf: Operand<'_>,
     basis: Option<&Basis>,
     name: &Path,
     projection: impl FnOnce() -> Result<R, Error>,
@@ -1344,8 +1355,15 @@ pub(crate) fn compare_with_projection_each<R: std::io::Read>(
     each: impl FnMut(Group),
 ) -> Result<Merged, Error> {
     if let Some(basis) = basis
-        && let Some(merged) =
-            sequence_by_summary(harness, basis, pbf, listing, policy, true, unchanged(basis))?
+        && let Some(merged) = sequence_by_summary(
+            harness,
+            basis,
+            pbf.0,
+            listing,
+            policy,
+            true,
+            unchanged(basis),
+        )?
     {
         return Ok(merged);
     }

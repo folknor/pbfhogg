@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::argv::PbfArgv;
 use crate::error::Error;
-use crate::opl_compare::{self, Policy};
+use crate::opl_compare::{self, Operand, Policy};
 use crate::output::{self, Detail};
 use crate::pbf_frames::Origin;
 use crate::process::{Ended, Launch, Lifecycle};
@@ -431,16 +431,17 @@ impl Harness {
     }
 
     /// Run a declared reference run, its standard output in the file `sink`.
-    /// A tool killed by
-    /// SIGKILL, which the verifier never sends one while it waits, is an
-    /// environment outcome: commonly the kernel OOM killer, and it says
-    /// nothing about pbfhogg; so is an osmium exit reporting its own
-    /// allocation failure ([`OSMIUM_BAD_ALLOC`]). The run's inputs are revalidated before its
-    /// outcome is used. The run succeeds only as the cache settled it:
-    /// an accepted outcome whose declared outputs and stdout are all present
-    /// as regular files and placed. An accepted exit that left a declared
-    /// output missing fails here, naming the artifact, rather than at a later
-    /// read of the absent file.
+    /// A tool killed by SIGKILL, which the verifier never sends while it
+    /// waits, is an environment outcome: commonly the kernel OOM killer, and
+    /// it says nothing about pbfhogg; so is an osmium exit reporting its own
+    /// allocation failure ([`OSMIUM_BAD_ALLOC`]). Any other unaccepted exit
+    /// is a check failure only when the run read a pbfhogg output, and a
+    /// verifier error otherwise. The run's inputs are revalidated before its
+    /// outcome is used. The run succeeds only as the cache settled it: an
+    /// accepted outcome whose declared outputs and stdout are all present as
+    /// regular files and placed. An accepted exit that left a declared output
+    /// missing is a verifier error here, naming the artifact, rather than a
+    /// later read of the absent file.
     pub(crate) fn reference(&mut self, run: &ToolRun, sink: &Path) -> Result<Ended, Error> {
         use crate::reference_cache::Settled;
         let label = run.label();
@@ -580,13 +581,32 @@ impl Harness {
                     run.id, ended.status
                 )))
             }
+            // Blame follows who wrote what the run read. A run that read no
+            // pbfhogg bytes (the dataset input, osmium outputs, verifier-made
+            // files) cannot fail as a pbfhogg verdict, whatever osmium said:
+            // libosmium refusing a zstd dataset is the comparison's limit. A
+            // run with a pbfhogg operand fails its check, a presumption, not a
+            // proof: osmium names no file in its refusal, so a mixed run (such
+            // as derive-changes over the base and pbfhogg's new PBF) cannot
+            // tell which operand it rejected, and an exit independent of every
+            // input still reads as pbfhogg's.
+            Settled::Unaccepted { ended } if !run.reads_pbfhogg() => Err(Error::Tool(format!(
+                "{label} (reference run {}) failed: {}: {}; it read no pbfhogg output, so the \
+                 comparison cannot be made",
+                run.id,
+                ended.status,
+                ended.stderr_text().trim()
+            ))),
             Settled::Unaccepted { ended } => Err(Error::Failed(format!(
                 "{label} (reference run {}) failed: {}: {}",
                 run.id,
                 ended.status,
                 ended.stderr_text().trim()
             ))),
-            Settled::InvalidOutputs { ended, invalid } => Err(Error::Failed(format!(
+            // An accepted exit whose declared output is missing or not a
+            // regular file: the reference's own artifact failure, whatever it
+            // read, since nothing here inspects the contents.
+            Settled::InvalidOutputs { ended, invalid } => Err(Error::Tool(format!(
                 "{label} (reference run {}) exited with accepted status {} but its declared \
                  output {}: {}",
                 run.id,
@@ -637,8 +657,8 @@ impl Harness {
     /// not be made (an error).
     pub(crate) fn same_elements(
         &mut self,
-        a: &Path,
-        b: &Path,
+        a: Operand<'_>,
+        b: Operand<'_>,
         listing: &Path,
         policy: Policy,
     ) -> Result<Verdict, Error> {
@@ -674,7 +694,7 @@ impl Harness {
     /// Whether `pbf`'s objects strictly ascend by kind and then ID as osmium
     /// decodes them ([`opl_compare::order`]: no ID repeated), never the
     /// header claim, which can be blind to intra-blob disorder.
-    pub(crate) fn check_sorted(&mut self, label: &str, pbf: &Path) -> Result<Verdict, Error> {
+    pub(crate) fn check_sorted(&mut self, label: &str, pbf: Operand<'_>) -> Result<Verdict, Error> {
         Ok(self.check_sorted_counted(label, pbf)?.0)
     }
 
@@ -683,23 +703,26 @@ impl Harness {
     pub(crate) fn check_sorted_as(
         &mut self,
         label: &str,
-        pbf: &Path,
+        pbf: Operand<'_>,
         cold: Policy,
     ) -> Result<Verdict, Error> {
         let (ordered, counts) = opl_compare::order_as(self, pbf, cold)?;
         let scan = opl_compare::Scan { ordered, counts };
-        Ok(self.report_order(label, pbf, scan))
+        Ok(self.report_order(label, pbf.0, scan))
     }
 
     /// The same order verdict and osmium's counts from the same reading.
     pub(crate) fn check_sorted_counted(
         &mut self,
         label: &str,
-        pbf: &Path,
+        pbf: Operand<'_>,
     ) -> Result<(Verdict, crate::counts::Counts), Error> {
         let (ordered, counts) = opl_compare::order(self, pbf)?;
         let scan = opl_compare::Scan { ordered, counts };
-        Ok((self.report_order(label, pbf, scan), counts_of(scan.counts)))
+        Ok((
+            self.report_order(label, pbf.0, scan),
+            counts_of(scan.counts),
+        ))
     }
 
     /// Print `label`'s counts and order verdict from `scan`, a reading of
@@ -740,13 +763,13 @@ impl Harness {
     /// under its [`Role`]; returns the verdict and both sides' counts.
     pub(crate) fn same_elements_judged(
         &mut self,
-        a: (&Path, Role<'_>),
-        b: (&Path, Role<'_>),
+        a: (Operand<'_>, Role<'_>),
+        b: (Operand<'_>, Role<'_>),
         listing: &Path,
         policy: Policy,
     ) -> Result<(Verdict, [crate::counts::Counts; 2]), Error> {
         let walked = opl_compare::compare_judged(self, a.0, b.0, listing, policy, |_| {})?;
-        let (merged, counts) = self.judge_walk([a, b], walked)?;
+        let (merged, counts) = self.judge_walk([(a.0.0, a.1), (b.0.0, b.1)], walked)?;
         let verdict = Verdict::from_pass(merged.identical());
         if verdict == Verdict::Fail {
             self.replay_listing(listing)?;
@@ -938,6 +961,22 @@ mod tests {
         assert!(!reports_bad_alloc("Out of memory.\n"));
         assert!(!reports_bad_alloc(&format!("x {OSMIUM_BAD_ALLOC}")));
         assert!(!reports_bad_alloc("PBF error: zstd blobs not supported\n"));
+    }
+
+    #[test]
+    fn only_a_run_reading_a_pbfhogg_output_can_fail_as_pbfhoggs() {
+        use crate::reference::{Origin, ToolRun};
+        use std::path::Path;
+        let (input, ours) = (Path::new("in.osm.pbf"), Path::new("ours.osm.pbf"));
+        let dataset = ToolRun::osmium("t.1")
+            .arg("sort")
+            .input(input, Origin::Other);
+        assert!(!dataset.reads_pbfhogg());
+        let mixed = ToolRun::osmium("t.1")
+            .arg("derive-changes")
+            .input(input, Origin::Other)
+            .input_as("file=", ours, Origin::Pbfhogg);
+        assert!(mixed.reads_pbfhogg());
     }
 
     #[test]

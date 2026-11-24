@@ -311,7 +311,7 @@ pub(crate) struct Listing {
 /// to `outdir/<stem>.opl` (run id `osc-opl.1`) and the strict XML scan.
 pub(crate) fn listing(
     harness: &mut Harness,
-    osc: &Path,
+    (osc, origin): (&Path, crate::reference::Origin),
     outdir: &Path,
     stem: &str,
 ) -> Result<Listing, Error> {
@@ -319,7 +319,7 @@ pub(crate) fn listing(
     let captured = harness.reference(
         &ToolRun::osmium("osc-opl.1")
             .arg("cat")
-            .input(osc)
+            .input(osc, origin)
             .args(&["-f", "opl", "-o"])
             .output(&opl)
             .arg("--overwrite"),

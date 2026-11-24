@@ -200,10 +200,14 @@ fn verifier_command_exit_boundaries() {
     );
     let scratch = pbfhogg_test_scratch::scratch();
     let fail = scratch.cell().join("boundary-fixture");
+    // The reference fails reading only the dataset input (as libosmium does
+    // on zstd blobs): no pbfhogg byte was read, so a verifier error, never a
+    // pbfhogg verdict.
     let output = boundary_command(&fail, "fail").output().unwrap();
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("sort: FAIL"),
+        stdout.contains("sort: ERROR") && stdout.contains("read no pbfhogg output"),
         "{output:?}"
     );
     let bad = scratch.cell().join("boundary-fixture");

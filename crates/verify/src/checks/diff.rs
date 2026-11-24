@@ -42,6 +42,7 @@ use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::opl_compare::{self, Policy};
 use crate::osc::OscKind;
+use crate::pbf_frames::Origin;
 use crate::stream;
 use crate::verify_diff_detail::{self as detail, Coverage, Expected};
 use crate::verify_diff_opl::{DiffGroups, Object, kind_char, order_key};
@@ -376,8 +377,8 @@ fn against_osmium(
     // judge the same as NO_LOCATIONS.
     let merged = opl_compare::compare(
         harness,
-        pbf,
-        new_pbf,
+        (pbf, Origin::Other),
+        (new_pbf, Origin::Pbfhogg),
         &osmium_listing,
         Policy::NO_LOCATIONS,
         |_| {},

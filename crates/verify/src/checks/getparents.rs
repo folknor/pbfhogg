@@ -42,7 +42,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
 use crate::osc::OscKind;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_fileinfo::fileinfo;
 use crate::verify_input_order::{CLAIM_UNSORTED, InputOrder, compare_outputs};
 use crate::verify_opl::{self as opl, OplObject};
@@ -200,7 +200,7 @@ fn run_mode(
     let theirs = outdir.join(format!("osmium-{stem}.osm.pbf"));
     let mut run = ToolRun::osmium("getparents.1")
         .arg("getparents")
-        .input(&order.reference_input);
+        .input(&order.reference_input, Origin::Other);
     for id in &args {
         run = run.arg(id.as_str());
     }
@@ -215,7 +215,7 @@ fn run_mode(
     let captured = harness.reference(
         &ToolRun::osmium("getparents-opl.1")
             .arg("cat")
-            .input(&theirs)
+            .input(&theirs, Origin::Other)
             .args(&["-f", "opl", "-o"])
             .output(&listing)
             .arg("--overwrite"),
@@ -296,7 +296,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     harness.msg("--- getparents: reading the input osmium reads ---");
     let info = fileinfo(
         harness,
-        &order.reference_input,
+        (order.reference_input.as_path(), Origin::Other),
         &outdir.join("reference.fileinfo.json"),
     )?;
     // Both refusals hold the input to the comparison's domain, so are

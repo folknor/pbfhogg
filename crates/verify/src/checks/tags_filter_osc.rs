@@ -30,7 +30,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::osc::OscAction;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_change_listing::{self as listing, ListingReader};
 
 /// Each case's directory name and its expressions.
@@ -112,7 +112,7 @@ pub fn run(harness: &mut Harness, osc: &Path) -> Result<Option<String>, Error> {
     let outdir = harness.subdir("tags-filter-osc")?;
     harness.msg("=== verify tags-filter --input-kind osc ===");
     harness.msg(&format!("  input: {}", osc.display()));
-    let input = listing::listing(harness, osc, &outdir, "input")?;
+    let input = listing::listing(harness, (osc, Origin::Other), &outdir, "input")?;
     let mut kept = Kept::default();
 
     for (name, expressions) in CASES {
@@ -125,7 +125,7 @@ pub fn run(harness: &mut Harness, osc: &Path) -> Result<Option<String>, Error> {
         let captured = harness.reference(
             &ToolRun::osmium("tags-filter-osc.1")
                 .arg("tags-filter")
-                .input(&input.opl)
+                .input(&input.opl, Origin::Other)
                 .args(expressions)
                 .args(&["-R", "-F", "opl", "-f", "opl", "-o"])
                 .output(&osmium_out)
@@ -148,7 +148,7 @@ pub fn run(harness: &mut Harness, osc: &Path) -> Result<Option<String>, Error> {
         let out = dir.join("pbfhogg.osc.gz");
         let captured = harness.pbfhogg_discard(argv(&out, false)?)?;
         harness.require_success(&captured, "pbfhogg tags-filter --input-kind osc")?;
-        let actual = listing::listing(harness, &out, &dir, "pbfhogg")?;
+        let actual = listing::listing(harness, (&out, Origin::Pbfhogg), &dir, "pbfhogg")?;
         let cmp = listing::compare(&dir.join("expected.changes"), &actual.path)?;
         cmp.report(
             harness,

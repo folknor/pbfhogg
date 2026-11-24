@@ -24,13 +24,25 @@ pub(crate) struct Tools {
 }
 
 use crate::error::Error;
+pub(crate) use crate::pbf_frames::Origin;
 const MANIFEST: &str = "manifest.json";
 const STDOUT: &str = "stdout";
 const STDERR: &str = "stderr";
 pub(crate) enum RunArg {
     Lit(String),
-    Input { prefix: &'static str, path: PathBuf },
-    Output { prefix: &'static str, path: PathBuf },
+    /// An input and who wrote it, as the run consumes it: an unchanged copy
+    /// of a pbfhogg output is still `Pbfhogg`, an osmium rewrite of one is
+    /// `Other`. The origin decides how a failed run is judged and is not
+    /// part of the cache key.
+    Input {
+        prefix: &'static str,
+        path: PathBuf,
+        origin: Origin,
+    },
+    Output {
+        prefix: &'static str,
+        path: PathBuf,
+    },
 }
 
 /// What a run's stderr must show for an exit code accepted only on that
@@ -80,16 +92,17 @@ impl ToolRun {
         self
     }
 
-    /// An input path, passed as its own argument.
-    pub(crate) fn input(self, path: &Path) -> Self {
-        self.input_as("", path)
+    /// An input path and who wrote it, passed as its own argument.
+    pub(crate) fn input(self, path: &Path, origin: Origin) -> Self {
+        self.input_as("", path, origin)
     }
 
     /// An input path embedded after `prefix` in one argument (`file=`).
-    pub(crate) fn input_as(mut self, prefix: &'static str, path: &Path) -> Self {
+    pub(crate) fn input_as(mut self, prefix: &'static str, path: &Path, origin: Origin) -> Self {
         self.args.push(RunArg::Input {
             prefix,
             path: path.to_path_buf(),
+            origin,
         });
         self
     }
@@ -156,6 +169,19 @@ impl ToolRun {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Whether any input is bytes a pbfhogg run wrote.
+    pub(crate) fn reads_pbfhogg(&self) -> bool {
+        self.args.iter().any(|a| {
+            matches!(
+                a,
+                RunArg::Input {
+                    origin: Origin::Pbfhogg,
+                    ..
+                }
+            )
+        })
     }
 
     /// Each output's artifact name and the path the check reads it from.

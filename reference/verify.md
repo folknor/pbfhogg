@@ -397,9 +397,9 @@ are outside that identity.
 Only accepted exits with every declared output present can be published.
 The same probe settles the run for its check: a fresh run that exits with
 an accepted status but leaves a declared output or its stdout missing, or
-not a regular file, is a check failure naming each such artifact, exactly
-as an unaccepted exit is. A run that did not complete places nothing at the
-check's paths.
+not a regular file, is a verifier error naming each such artifact (see
+Results for how an unaccepted exit is judged). A run that did not complete
+places nothing at the check's paths.
 Inputs and tool identity are checked again after execution; input movement
 is ENVIRONMENT. After all children settle, cancellation, input identity and
 the tool binding (without a new probe) are checked immediately before the completed staging tree is renamed into
@@ -551,13 +551,24 @@ verifier errors. An unsettled tree also stops with exit 2.
 | 130 | interrupted |
 | 2 | the verifier could not do its own work (configuration, missing tool, unsettled launch) |
 
-A reference tool's own failure (a non-accepted exit) fails the check, as in
-brokkr; a reference tool killed by SIGKILL, which the verifier never sends
-while it waits, is ENVIRONMENT, and so is an osmium exit whose stderr
-carries osmium's own `std::bad_alloc` line (`Out of memory. Read the
-MEMORY USAGE section of the osmium(1) manpage.`): an allocation failure in
-the reference whose cause the verifier cannot tell, which says nothing
-about pbfhogg. A recorded failure still outranks it.
+A reference tool killed by SIGKILL, which the verifier never sends while it
+waits, is ENVIRONMENT, and so is an osmium exit whose stderr carries
+osmium's own `std::bad_alloc` line (`Out of memory. Read the MEMORY USAGE
+section of the osmium(1) manpage.`): an allocation failure in the reference
+whose cause the verifier cannot tell, which says nothing about pbfhogg. A
+recorded failure still outranks it. Any other non-accepted reference exit
+is judged by who wrote what the run read: every reference input is declared
+with its producer, as the frame reader below is told. A run that read no
+pbfhogg output (only the dataset input, osmium outputs or verifier-made
+files) is a verifier error, whatever osmium printed: libosmium refusing a
+dataset with zstd blobs is the comparison's limit, not a pbfhogg verdict.
+A run that read a pbfhogg output fails the check, as in brokkr. That is a
+presumption, not a proof: osmium names no file in its refusal, so a run
+over the dataset and a pbfhogg output together (derive-changes reads the
+base and pbfhogg's new PBF) cannot say which it rejected, and an exit
+independent of every input still reads as pbfhogg's. An accepted exit that
+leaves a declared output missing is a verifier error whatever the run read,
+since nothing inspects the output's contents there.
 
 The verifier's own frame reader (`pbf_frames`) is told who wrote each file
 it opens. A file a pbfhogg run wrote that it refuses, or cannot open, fails

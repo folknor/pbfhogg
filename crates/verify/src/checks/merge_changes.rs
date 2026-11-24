@@ -53,7 +53,7 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
 use crate::osc::{OscAction, OscKind};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_change_listing::{self as listing, ListingFile, ListingReader};
 use crate::verify_extsort::{Record, Sorter};
 
@@ -484,7 +484,7 @@ fn judge(
     let default_out = dir.join("default.osc.gz");
     let captured = harness.pbfhogg_discard(argv(inputs, &default_out, dir, false, false, None)?)?;
     harness.require_success(&captured, "pbfhogg merge-changes")?;
-    let actual = listing::listing(harness, &default_out, dir, "default")?;
+    let actual = listing::listing(harness, (&default_out, Origin::Pbfhogg), dir, "default")?;
     let cmp = listing::compare(&concatenated, &actual.path)?;
     cmp.report(
         harness,
@@ -544,7 +544,7 @@ fn judge(
             .arg("merge-changes")
             .arg("-s");
         for input in inputs {
-            run = run.input(input);
+            run = run.input(input, Origin::Other);
         }
         let run = run
             .args(&["-f", "opl", "-o"])
@@ -585,7 +585,7 @@ fn simplified_as_modelled(
     stem: &str,
     what: &str,
 ) -> Result<(), Error> {
-    let actual = listing::listing(harness, out, dir, stem)?;
+    let actual = listing::listing(harness, (out, Origin::Pbfhogg), dir, stem)?;
     let cmp = listing::compare(&model.simplified, &actual.path)?;
     cmp.report(
         harness,
@@ -769,7 +769,12 @@ fn judge_fixture(harness: &mut Harness, outdir: &Path, fixture: &Fixture) -> Res
     for (i, body) in fixture.files.iter().enumerate() {
         let path = dir.join(format!("{}-{i}.osc", fixture.name));
         std::fs::write(&path, format!("{HEAD}{body}</osmChange>\n"))?;
-        fixture_listings.push(listing::listing(harness, &path, &dir, &format!("in-{i}"))?);
+        fixture_listings.push(listing::listing(
+            harness,
+            (&path, Origin::Other),
+            &dir,
+            &format!("in-{i}"),
+        )?);
         files.push(path);
     }
     let fixture_paths: Vec<&Path> = fixture_listings.iter().map(|l| l.path.as_path()).collect();
@@ -818,7 +823,7 @@ pub fn run(harness: &mut Harness, oscs: &[PathBuf]) -> Result<Option<String>, Er
     for (i, osc) in oscs.iter().enumerate() {
         listings.push(listing::listing(
             harness,
-            osc,
+            (osc, Origin::Other),
             &inputs_dir,
             &format!("input-{i}"),
         )?);

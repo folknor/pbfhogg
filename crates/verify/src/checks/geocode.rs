@@ -97,7 +97,7 @@ use serde_json::Value;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::tunables::{
     GEOCODE_ADMIN_EXACT_BAND_M, GEOCODE_ADMIN_TOLERANCE_M, GEOCODE_ADMIN_WITNESS_REACH_M,
     GEOCODE_ADMIN_WITNESSES, GEOCODE_COARSE_RADIUS_M, GEOCODE_DISTANCE_TOLERANCE_M as TOL,
@@ -813,7 +813,7 @@ fn located_opl(
     let ended = harness.reference(
         &ToolRun::osmium(format!("{stem}-filter.1"))
             .arg("tags-filter")
-            .input(pbf)
+            .input(pbf, Origin::Other)
             .args(filters)
             .arg("-o")
             .output(&filtered)
@@ -830,7 +830,7 @@ fn located_opl(
             } else {
                 &[]
             })
-            .input(&filtered)
+            .input(&filtered, Origin::Other)
             .args(&["-f", "opl", "-o"])
             .output(&opl)
             .arg("--overwrite"),

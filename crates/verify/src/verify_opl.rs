@@ -52,7 +52,7 @@ pub(crate) fn input_relations(
     let captured = harness.reference(
         &crate::reference::ToolRun::osmium("getid-relations.1")
             .arg("cat")
-            .input(reference_input)
+            .input(reference_input, crate::reference::Origin::Other)
             .args(&["-t", "relation", "-f", "opl", "-o"])
             .output(&relations)
             .arg("--overwrite"),

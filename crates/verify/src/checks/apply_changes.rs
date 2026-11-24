@@ -39,7 +39,7 @@ use crate::harness::{Harness, Verdict};
 use crate::opl_compare::{self, Class, Group, Policy, parse_key, rank};
 use crate::osc::{self, OscKind};
 use crate::output;
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 use crate::verify_element_diff::PerType;
 use crate::verify_input_order;
 
@@ -126,8 +126,8 @@ pub fn run(
     harness.msg("--- osmium apply-changes ---");
     let mut osmium_run = ToolRun::osmium("apply-changes.1")
         .arg("apply-changes")
-        .input(pbf)
-        .input(osc)
+        .input(pbf, Origin::Other)
+        .input(osc, Origin::Other)
         .arg("-o")
         .output(&osmium_out)
         .arg("--overwrite");
@@ -147,7 +147,11 @@ pub fn run(
     // between, and an error in either would lose this verdict. Cold it
     // decodes under the element judgment's policy, whose merge then reuses
     // the run's decoding while it is retained.
-    let order = harness.check_sorted_as("pbfhogg apply-changes", &pbfhogg_out, POLICY)?;
+    let order = harness.check_sorted_as(
+        "pbfhogg apply-changes",
+        (pbfhogg_out.as_path(), Origin::Pbfhogg),
+        POLICY,
+    )?;
     harness.record("pbfhogg apply-changes output order", order);
 
     // --- Inline locations (-l only) ---
@@ -246,7 +250,7 @@ fn read_model(
     harness.msg("=== change model ===");
     let mut changes = Vec::new();
     osc::scan_osc_changes(osc, |change| changes.push(change))?;
-    let mut model = opl_compare::decoded(harness, osc, POLICY, |_, opl| {
+    let mut model = opl_compare::decoded(harness, (osc, Origin::Other), POLICY, |_, opl| {
         Model::build(&changes, opl_lines(opl)?)
     })?;
     let occurrences = changes.len();
@@ -255,9 +259,9 @@ fn read_model(
         let base_opl = outdir.join("base-touched.opl");
         let getid = ToolRun::osmium("apply-changes-base.1")
             .arg("getid")
-            .input(pbf)
+            .input(pbf, Origin::Other)
             .args(&["-H", "-I"])
-            .input(osc)
+            .input(osc, Origin::Other)
             .args(&["-f", &POLICY.format(), "-o"])
             .output(&base_opl)
             .arg("--overwrite");
@@ -400,30 +404,35 @@ fn judge_elements(
     harness.msg("=== pbfhogg vs the change model and osmium ===");
     let expectations = model.expectations(locations_on_ways);
     let listing = outdir.join("pbfhogg-vs-expected.diff.txt");
-    let report = opl_compare::decoded(harness, osmium_out, POLICY, |harness, opl| {
-        let projected = harness.timed("opl expected projection", || {
-            project(opl, model, &expectations)
-        })?;
-        let basis = opl_compare::decoding_key(harness, opl).map(|key| opl_compare::Basis {
-            source: osmium_out.to_path_buf(),
-            key,
-            counts: projected.counts,
-            digest: projected.digest.clone(),
-        });
-        let mut report = Report::default();
-        opl_compare::compare_with_projection_each(
-            harness,
-            pbfhogg_out,
-            basis.as_ref(),
-            opl,
-            || Projection::open(opl, model, &expectations),
-            &listing,
-            POLICY,
-            |g| report.classify(g, model.touches((g.kind, g.id))),
-        )?;
-        report.judge_osmium(&expectations, &projected.touched);
-        Ok(report)
-    })?;
+    let report = opl_compare::decoded(
+        harness,
+        (osmium_out, Origin::Other),
+        POLICY,
+        |harness, opl| {
+            let projected = harness.timed("opl expected projection", || {
+                project(opl, model, &expectations)
+            })?;
+            let basis = opl_compare::decoding_key(harness, opl).map(|key| opl_compare::Basis {
+                source: osmium_out.to_path_buf(),
+                key,
+                counts: projected.counts,
+                digest: projected.digest.clone(),
+            });
+            let mut report = Report::default();
+            opl_compare::compare_with_projection_each(
+                harness,
+                (pbfhogg_out, Origin::Pbfhogg),
+                basis.as_ref(),
+                opl,
+                || Projection::open(opl, model, &expectations),
+                &listing,
+                POLICY,
+                |g| report.classify(g, model.touches((g.kind, g.id))),
+            )?;
+            report.judge_osmium(&expectations, &projected.touched);
+            Ok(report)
+        },
+    )?;
 
     report.print(harness);
     if report.osmium_off_model.total() > 0 {

@@ -21,7 +21,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::reference::ToolRun;
+use crate::reference::{Origin, ToolRun};
 
 /// One report row: the count as printed (decimal digits, so no precision
 /// is lost) and the decoded key.
@@ -52,7 +52,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         let theirs_path = outdir.join(format!("osmium-{stem}.txt"));
         let mut run = ToolRun::osmium("inspect-tags.1")
             .arg("tags-count")
-            .input(pbf);
+            .input(pbf, Origin::Other);
         if way {
             run = run.args(&["-t", "way"]);
         }

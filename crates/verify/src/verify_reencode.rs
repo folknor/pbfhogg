@@ -90,7 +90,11 @@ impl Input {
 /// and, on an indexed input, `check --index`. A history header, or a claim
 /// its payload contradicts, is an error.
 pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Result<Input, Error> {
-    let info = fileinfo(harness, pbf, &outdir.join("input.fileinfo.json"))?;
+    let info = fileinfo(
+        harness,
+        (pbf, Origin::Other),
+        &outdir.join("input.fileinfo.json"),
+    )?;
     // Every refusal here is of the input, so a verifier error: the comparison
     // cannot be made on it, which says nothing about pbfhogg.
     if Claims::open(pbf, Origin::Other)?
@@ -420,13 +424,17 @@ impl<'a> References<'a> {
         ));
         let path = self.outdir.join(format!("{stem}.opl"));
         // Both strip variants read the run's one FULL decoding of the input.
-        let (written, key) =
-            opl_compare::decoded(harness, &self.input.path, Policy::FULL, |h, opl| {
+        let (written, key) = opl_compare::decoded(
+            harness,
+            (&self.input.path, Origin::Other),
+            Policy::FULL,
+            |h, opl| {
                 Ok((
                     partition(opl, &path, strip)?,
                     opl_compare::decoding_key(h, opl),
                 ))
-            })?;
+            },
+        )?;
         let coordinate_ways = written.coordinate_ways;
         harness.msg(&format!(
             "  {coordinate_ways} ways carry a defined coordinate in osmium's decoding"
@@ -611,7 +619,8 @@ pub(super) fn compare(
         harness,
         &expected.path,
         expected.basis.as_ref(),
-        output,
+        // Every output compared here is a pbfhogg run's.
+        (output, Origin::Pbfhogg),
         &listing,
         Policy::FULL,
         |staged| {
@@ -806,7 +815,7 @@ impl FrameIds {
     }
 }
 
-/// [`compare`] of two outputs, both decoded by osmium.
+/// [`compare`] of two pbfhogg outputs, both decoded by osmium.
 pub(super) fn compare_outputs(
     harness: &mut Harness,
     outdir: &Path,
@@ -815,8 +824,14 @@ pub(super) fn compare_outputs(
     second: &Path,
 ) -> Result<Compared, Error> {
     let listing = outdir.join(format!("{stem}.diff.opl"));
-    let merged =
-        opl_compare::compare_sequence(harness, first, second, &listing, Policy::FULL, |_| {})?;
+    let merged = opl_compare::compare_sequence(
+        harness,
+        (first, Origin::Pbfhogg),
+        (second, Origin::Pbfhogg),
+        &listing,
+        Policy::FULL,
+        |_| {},
+    )?;
     Ok(Compared { merged, listing })
 }
 

@@ -72,7 +72,11 @@ impl Case {
         (path, origin): (&Path, Origin),
     ) -> Result<Self, Error> {
         let stem = label.replace(' ', "-");
-        let info = fileinfo(harness, path, &outdir.join(format!("{stem}.fileinfo.json")))?;
+        let info = fileinfo(
+            harness,
+            (path, origin),
+            &outdir.join(format!("{stem}.fileinfo.json")),
+        )?;
         let framing = pbf_frames::framing(path, origin)?;
         Ok(Self {
             label: label.to_owned(),
@@ -376,7 +380,7 @@ fn build_fixture(
     let captured = harness.reference(
         &ToolRun::osmium("check-ids-fixture.1")
             .arg("cat")
-            .input(&source)
+            .input(&source, Origin::Other)
             .arg("-o")
             .output(&unindexed)
             .arg("--overwrite"),
@@ -482,7 +486,12 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let (repeat, repeat_indexed) = build_fixture(harness, &outdir, "repeat", REPEAT)?;
     let (_, empty_claim) = build_fixture(harness, &outdir, "empty-claim", ORDERED)?;
     // pbfhogg cat wrote the file and the verifier appends to it: its framing
-    // is held as pbfhogg's before the append, as the verifier's after.
+    // is held as pbfhogg's before the append, as the verifier's after. Only
+    // the framing is held before: a payload defect pbfhogg cat wrote would
+    // first surface in the post-append osmium fileinfo, which reads the file
+    // as the verifier's and so reports it as a verifier error, not a FAIL.
+    // Marking the edited file pbfhogg's instead would charge pbfhogg for a
+    // refusal the append caused.
     pbf_frames::framing(&empty_claim, Origin::Pbfhogg)?;
     pbf_frames::append_empty_claim(&empty_claim, 0)?;
     // The unindexed fixtures are osmium's, the indexed ones pbfhogg cat's.

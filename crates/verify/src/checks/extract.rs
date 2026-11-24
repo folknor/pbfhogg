@@ -189,7 +189,7 @@ pub fn run(
     // the input osmium reads: the osmium-sorted copy keeps every sign.
     let info = crate::verify_fileinfo::fileinfo(
         harness,
-        &osmium_input,
+        (osmium_input.as_path(), Origin::Other),
         &outdir.join("input.fileinfo.json"),
     )?;
     if let Some((kind, id)) = info.negative_id() {
@@ -279,7 +279,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         let osmium_out = outdir.join(format!("osmium-{strategy_name}.osm.pbf"));
         let mut tool = ToolRun::osmium("extract.1")
             .arg("extract")
-            .input(osmium_input);
+            .input(osmium_input, Origin::Other);
         tool = match region {
             // pbfhogg gets the typed text; osmium the same decimals in a
             // spelling its parser reads to the same columns (an exponent
@@ -288,7 +288,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
                 let text = osmium_bbox(bbox)?;
                 tool.args(&["-b", text.as_str()])
             }
-            Region::Polygon(polygon) => tool.arg("-p").input(&polygon.path),
+            Region::Polygon(polygon) => tool.arg("-p").input(&polygon.path, Origin::Other),
         };
         let mut osmium_args = osmium_strategy(*strategy);
         osmium_args.push("-o");
@@ -362,14 +362,14 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
         let [ours, theirs] = element_diff::scan_element_diff_judged(
             harness,
             (
-                &compared,
+                (&compared, compared_origin),
                 Role::Judged {
                     label: &label,
                     record: &order_failure,
                 },
             ),
             (
-                &osmium_out,
+                (&osmium_out, Origin::Other),
                 Role::Reference {
                     label: &osmium_label,
                 },
@@ -510,7 +510,7 @@ fn refuse_negative_refs(
         harness.checkpoint()?;
         stored
     } else {
-        crate::opl_compare::decoded(harness, osmium_out, policy, |h, opl| {
+        crate::opl_compare::decoded(harness, (osmium_out, Origin::Other), policy, |h, opl| {
             let mut first = None;
             crate::verify_opl::scan_objects(opl, |o| {
                 if first.is_some() {

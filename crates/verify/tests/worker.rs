@@ -481,7 +481,7 @@ fn incomplete_runs(
         std::fs::create_dir(&target).unwrap();
         let declared = reference::ToolRun::osmium(format!("{mode}.1"))
             .arg("cache-copy")
-            .input(input)
+            .input(input, reference::Origin::Other)
             .output(&target.join("out.pbf"))
             .arg(mode);
         settled.push(
@@ -517,7 +517,7 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
         let output = target.join("out.pbf");
         let declared = reference::ToolRun::osmium("copy.1")
             .arg("cache-copy")
-            .input(&input)
+            .input(&input, reference::Origin::Other)
             .output(&output);
         let settled = cache
             .execute(
@@ -558,7 +558,7 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     );
     let declared = reference::ToolRun::osmium("mutate.1")
         .arg("cache-copy")
-        .input(&input)
+        .input(&input, reference::Origin::Other)
         .output(&dir.join("moved.pbf"))
         .arg("mutate");
     assert!(matches!(
@@ -587,7 +587,7 @@ fn cache_driver(life: &mut process::Lifecycle, exe: &Path, dir: &Path) {
     let output = target.join("out.pbf");
     let declared = reference::ToolRun::osmium("copy.1")
         .arg("cache-copy")
-        .input(&input)
+        .input(&input, reference::Origin::Other)
         .output(&output);
     let settled = cache
         .execute(life, &mut later, &tools, &declared, &target.join("stdout"))

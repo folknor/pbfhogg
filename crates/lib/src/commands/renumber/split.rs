@@ -17,12 +17,14 @@
 //! # What a piece holds
 //!
 //! Every piece repeats the rewritten block's whole context: the string table
-//! ahead of the groups and the retained top-level fields after them (the
-//! rewriters write exactly that layout). The groups are cut between items.
-//! An item is an element (a `DenseNodes` message holding at least one node,
-//! a plain `Node`, a `Way`, a `Relation`) or a filler: any other group field
-//! the rewriter kept, an empty `DenseNodes`, or the empty body of a group
-//! with no fields. A `DenseNodes` message is indivisible (cutting it means
+//! ahead of the groups and the retained top-level fields (granularity, date
+//! granularity, offsets) after them (the rewriters write exactly that
+//! layout). The groups are cut between items. An item is an element (a
+//! `DenseNodes` message holding at least one node, a plain `Node`, a `Way`,
+//! a `Relation`) or a filler: an empty `DenseNodes`, the empty body of a
+//! group with no fields, or any other group field. The rewriters drop every
+//! non-element group field before the cut, so that last kind reaches this
+//! module only from a caller that keeps one; the cut handles it all the same. A `DenseNodes` message is indivisible (cutting it means
 //! rebasing every delta-coded column at a node boundary). Every piece holds
 //! at least one element, so it has a real index, and fillers stay once, in
 //! order, on whichever side of a cut makes the pieces fit.

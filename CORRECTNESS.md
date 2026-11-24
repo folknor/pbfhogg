@@ -704,6 +704,18 @@ rebuilds it. A way with no `refs` field has an empty list, as the encoders
 write it, and an explicitly empty `refs` comes out in that same form, so
 renumber output renumbers again.
 
+The rewrite emits only the fields it interprets, by one rule for node, way and
+relation blobs: the string table, the element fields of each group, and the
+block's granularity, date granularity and offsets. Every other PrimitiveBlock
+or PrimitiveGroup field, the obsolete group `changesets` (field 5) and unknown
+numbers alike, is dropped, as osmium renumber's re-encode drops them and as
+every reader skips them. Keeping one verbatim could carry element IDs renumber
+cannot rewrite, and a block-wide field would repeat into every piece of a cut
+block. An element field of the blob's own kind that is not length-delimited is
+refused, not skipped. Fields inside an element message are copied without
+interpretation, so an extension field there that names an element ID keeps
+the old ID.
+
 ## Sidecar comparison contracts
 
 The historical names `merge_scanner_to_drain_bytes_high_water` and

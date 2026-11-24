@@ -341,16 +341,25 @@ pub(super) struct Outcome {
 }
 
 /// Walk a PrimitiveBlock's top level once: return its StringTable and copy
-/// the top-level fields to keep into `scalars` (granularity / offsets for a
-/// node block, every non-group field otherwise). Groups are visited by a
-/// second walk in [`for_each_group`], so no offsets into the block are
-/// stored between the two.
-fn split_block<'a>(
-    block: &'a [u8],
-    keep_all: bool,
-    scalars: &mut Vec<u8>,
-    who: &str,
-) -> crate::Result<&'a [u8]> {
+/// the granularity, date granularity and offsets (fields 17 to 20) into
+/// `scalars`, in input order. Groups are visited by a second walk in
+/// [`for_each_group`], so no offsets into the block are stored between the
+/// two.
+///
+/// # One rule for fields renumber does not interpret
+///
+/// Every rewriter emits only what it interprets: the string table, the
+/// element fields of each group (renumbered) and fields 17 to 20. Any other
+/// PrimitiveBlock field and any other PrimitiveGroup field (the obsolete
+/// `changesets`, field 5, or an unknown number) is dropped, for node, way
+/// and relation blobs alike. Keeping such a field verbatim would carry bytes
+/// that may name element IDs renumber cannot rewrite into output that claims
+/// to be renumbered, and a block-wide field would be repeated into every
+/// piece when `split` cuts the block. No reader decodes them: pbfhogg and
+/// libosmium both skip them, and osmium renumber, re-encoding, writes none.
+/// Fields inside an element message are a different scope: they are copied
+/// unvalidated, as the module doc says.
+fn split_block<'a>(block: &'a [u8], scalars: &mut Vec<u8>, who: &str) -> crate::Result<&'a [u8]> {
     scalars.clear();
     let mut stringtable: Option<&[u8]> = None;
     let mut cursor = Cursor::new(block);
@@ -366,7 +375,6 @@ fn split_block<'a>(
             }
             (2, WIRE_LEN) => cursor.skip_field(wire_type).map_err(wire_err)?,
             (17..=20, WIRE_VARINT) => copy_field(&mut cursor, field, wire_type, scalars)?,
-            _ if keep_all => copy_field(&mut cursor, field, wire_type, scalars)?,
             _ => cursor.skip_field(wire_type).map_err(wire_err)?,
         }
     }
@@ -511,7 +519,7 @@ impl NodeSink<'_> {
 
 /// Rewrite a group of plain `Node` messages into `out` as a plain group:
 /// each node's `id` replaced, every other byte of the message copied.
-/// Non-element group fields are dropped, as the dense rewrite drops them.
+/// Non-element group fields are dropped (see [`split_block`]).
 fn rewrite_plain_group(
     group: &[u8],
     sink: &mut NodeSink<'_>,
@@ -591,7 +599,7 @@ pub(super) fn reframe_dense_with_new_ids(
     output: &mut Vec<u8>,
     s: &mut Scratch,
 ) -> crate::Result<Outcome> {
-    let stringtable = split_block(decompressed, false, &mut s.scalars, "reframe")?;
+    let stringtable = split_block(decompressed, &mut s.scalars, "reframe")?;
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
 
@@ -728,7 +736,7 @@ pub(super) fn reframe_ways_with_new_ids(
     output: &mut Vec<u8>,
     s: &mut Scratch,
 ) -> crate::Result<Outcome> {
-    let stringtable = split_block(decompressed, true, &mut s.scalars, "reframe_ways")?;
+    let stringtable = split_block(decompressed, &mut s.scalars, "reframe_ways")?;
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
 
@@ -758,11 +766,12 @@ pub(super) fn reframe_ways_with_new_ids(
                     protohoggr::encode_bytes_field_always(&mut s.group, 3, &s.element);
                     total = inc(total)?;
                 }
+                (3, _) => return Err(malformed_element_field(field)),
                 (1 | 2 | 4, _) => {
                     return Err(foreign_kind_error("way", field));
                 }
-                // Any other group field is copied verbatim.
-                _ => copy_field(&mut gr_cursor, field, wire_type, &mut s.group)?,
+                // Any other group field is dropped (see `split_block`).
+                _ => gr_cursor.skip_field(wire_type).map_err(wire_err)?,
             }
         }
         protohoggr::encode_bytes_field(output, 2, &s.group);
@@ -977,7 +986,7 @@ pub(super) fn reframe_relations_with_new_ids(
     output: &mut Vec<u8>,
     s: &mut Scratch,
 ) -> crate::Result<Outcome> {
-    let stringtable = split_block(decompressed, true, &mut s.scalars, "reframe_relations")?;
+    let stringtable = split_block(decompressed, &mut s.scalars, "reframe_relations")?;
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
 
@@ -1004,10 +1013,11 @@ pub(super) fn reframe_relations_with_new_ids(
                     protohoggr::encode_bytes_field_always(&mut s.group, 4, &s.element);
                     total = inc(total)?;
                 }
+                (4, _) => return Err(malformed_element_field(field)),
                 (1..=3, _) => {
                     return Err(foreign_kind_error("relation", field));
                 }
-                // Other group fields are dropped (only relations are emitted).
+                // Any other group field is dropped (see `split_block`).
                 _ => gr_cursor.skip_field(wire_type).map_err(wire_err)?,
             }
         }
@@ -1251,6 +1261,10 @@ mod tests {
     }
 
     fn run(block: &[u8]) -> crate::Result<Outcome> {
+        run_into(block, &mut Vec::new())
+    }
+
+    fn run_into(block: &[u8], out: &mut Vec<u8>) -> crate::Result<Outcome> {
         let mut node_ids = IdSet::new();
         node_ids.insert(7);
         let node_ids = node_ids.into_ranked();
@@ -1263,8 +1277,7 @@ mod tests {
             nodes: IdSpace::new(&node_ids, 100),
             ways: IdSpace::new(&way_ids, 500),
         };
-        let mut out = Vec::new();
-        reframe_relations_with_new_ids(block, &ids, &mut out, &mut Scratch::default())
+        reframe_relations_with_new_ids(block, &ids, out, &mut Scratch::default())
     }
 
     /// The splice copies one table, so it takes the decoder's rule: a second
@@ -1278,7 +1291,7 @@ mod tests {
         let mut accepted = prefix.clone();
         accepted.extend_from_slice(&relation_block(5, 7, true));
         let mut scalars = Vec::new();
-        let selected = split_block(&accepted, true, &mut scalars, "test").unwrap();
+        let selected = split_block(&accepted, &mut scalars, "test").unwrap();
         assert_eq!(selected, &table[..]);
         assert!(run(&accepted).is_ok());
 
@@ -1702,6 +1715,83 @@ mod tests {
             err.to_string().contains("also carries DenseNodes"),
             "got: {err}"
         );
+    }
+
+    /// Append a `changesets` (field 5) message and an unknown varint field to
+    /// a group, and an unknown field to the block's top level.
+    fn with_uninterpreted_fields(group: &[u8]) -> Vec<u8> {
+        let mut changeset = vec![0x08];
+        varint(42, &mut changeset);
+        let mut extended = group.to_vec();
+        len_delimited(5, &changeset, &mut extended);
+        varint(u64::from(9u32 << 3), &mut extended);
+        varint(3, &mut extended);
+        let mut block = block_of(&[extended]);
+        len_delimited(30, b"opaque", &mut block);
+        block
+    }
+
+    /// Every rewriter emits only the fields it interprets: a changeset or
+    /// unknown group field and an unknown block field are dropped for node,
+    /// way and relation blobs alike, so the output equals the rewrite of the
+    /// same block without them.
+    #[test]
+    fn uninterpreted_block_and_group_fields_are_dropped_by_every_rewriter() {
+        let mut dense = Vec::new();
+        len_delimited(1, &[20], &mut dense);
+        let mut node_group = Vec::new();
+        len_delimited(2, &dense, &mut node_group);
+        let (mut plain, mut extended) = (Vec::new(), Vec::new());
+        run_dense_into(&block_of(&[node_group.clone()]), &mut plain).unwrap();
+        run_dense_into(&with_uninterpreted_fields(&node_group), &mut extended).unwrap();
+        assert_eq!(plain, extended, "node blob");
+
+        let mut way_group = Vec::new();
+        len_delimited(3, &way_message(3, &[7], 1), &mut way_group);
+        let (mut plain, mut extended) = (Vec::new(), Vec::new());
+        run_ways_into(&block_of(&[way_group.clone()]), &mut plain).unwrap();
+        run_ways_into(&with_uninterpreted_fields(&way_group), &mut extended).unwrap();
+        assert_eq!(plain, extended, "way blob");
+
+        let rel_block = relation_block(5, 7, true);
+        // The block is a string table then one group; take the group back.
+        let mut cursor = Cursor::new(&rel_block);
+        let mut rel_group = Vec::new();
+        while let Some((field, wire_type)) = cursor.read_tag().unwrap() {
+            let data = cursor.read_len_delimited().unwrap();
+            assert_eq!(wire_type, WIRE_LEN);
+            if field == 2 {
+                rel_group = data.to_vec();
+            }
+        }
+        let (mut plain, mut extended) = (Vec::new(), Vec::new());
+        run_into(&rel_block, &mut plain).unwrap();
+        run_into(&with_uninterpreted_fields(&rel_group), &mut extended).unwrap();
+        assert_eq!(plain, extended, "relation blob");
+    }
+
+    /// An element field of the rewriter's own kind that is not
+    /// length-delimited is refused, as the node rewriter refuses one; the
+    /// reader would skip it, which the count check cannot see.
+    #[test]
+    fn a_mistyped_element_field_is_refused_by_every_rewriter() {
+        for (field, rewriter) in [(2u32, 0), (3, 1), (4, 2)] {
+            let mut group = Vec::new();
+            varint(u64::from(field << 3), &mut group);
+            varint(1, &mut group);
+            let block = block_of(&[group]);
+            let result = match rewriter {
+                0 => run_dense(&block),
+                1 => run_ways(&block),
+                _ => run(&block),
+            };
+            let err = result.err().expect("refused");
+            assert!(
+                err.to_string()
+                    .contains("is not a length-delimited message"),
+                "field {field}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -65,19 +65,20 @@ reported through `scan_meta_attrs` / `delete_coords` as a bare "malformed
 OSC XML" (`xml_err`), naming neither element nor attribute. The CHANGELOG
 entry for the trailing-attribute fix promises the first wording generally.
 
-## CMD-053 - renumber's group policy for non-element fields differs by kind
+## CMD-071 - renumber drops the LocationsOnWays declaration it keeps the data for
 
-Reported by: the renumber representation item (2026-11-20), while sparring
-plain-node support; not reproduced.
+Reported by: the renumber group-field item (2026-11-24), from the spar
+partner's source trace; not reproduced.
 
-`renumber/wire_rewrite.rs` rebuilds node groups (dense and plain) and
-relation groups from their element messages only, silently dropping every
-other `PrimitiveGroup` field, including field 5 (`changesets`, a known
-message the index scanner ignores), while way groups copy such fields
-through verbatim. No producer pbfhogg reads writes them, but the three
-rewriters disagree on one input shape. Pick one rule (refuse a `changesets`
-field in any data blob, or keep unknown fields everywhere) and apply it to
-all three.
+A sorted, indexed input declaring `LocationsOnWays` reaches renumber
+(neither `renumber/mod.rs` nor `schedule.rs` gates on the feature). The
+way splice keeps `Way.lat`/`Way.lon` (fields 9 and 10) paired with the
+renumbered refs and the block keeps granularity and offsets, so the
+coordinates survive, but `renumber/mod.rs` builds the output header with
+`Ways::Reencoded`, which in `output_header.rs` clears the declaration and
+warns of metadata loss. The output carries inline locations without the
+feature the schema requires for them. `Ways::ReencodedWithLocations`
+appears to be the matching policy; needs a test over an ALTW input.
 
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 

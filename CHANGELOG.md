@@ -566,6 +566,13 @@
 
 ### Changed
 
+- **`renumber` applies one rule to block and group fields it does not
+  interpret.** Way blobs used to carry unknown PrimitiveBlock and
+  PrimitiveGroup fields (including an obsolete `changesets` group field)
+  through verbatim while node and relation blobs dropped them; every blob
+  now drops them, as osmium renumber does. A way or relation field that is
+  not a length-delimited message is now refused instead of being copied or
+  dropped.
 - **`build-geocode-index` holds about 2 GB less memory after Pass 2 at
   planet.** Admin boundary way geometry is kept in two flat buffers that
   go back to the OS when assembly ends, instead of millions of small

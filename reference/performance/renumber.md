@@ -45,6 +45,19 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 
 ### Renumber
 
+#### One rule for uninterpreted block and group fields (planet, baseline `0a986fbc`, bygg, 2026-11-24)
+
+The way and relation group loops drop every non-element field (the way
+arm used to copy it) and refuse a mistyped element field of their own
+kind; one more arm in the per-group-field loop that runs once per way.
+Matched `id-remap` `--iterations 1` cells, A B B A, baseline built with
+`--commit 0a986fbc`, variant uncommitted on it: baseline 2m05s
+(`e621941c`) and 1m58s (`d24df488`), variant 1m57s (`2a27acb5`) and
+1m57s (`3034f3cd`). `stage2d_reframe_ns` 174.4 / 175.4 s baseline
+against 166.4 / 165.0 s variant; `pass1_reframe_ns` 59.1 / 58.8 s
+against 58.5 / 59.0 s. Neutral on the wall; the stage 2d CPU drop is
+within layout noise and not claimed.
+
 #### Cutting a rewritten block past the payload limit (planet, baseline `56869b08`, bygg, 2026-11-24)
 
 The ordered consumer compares each rewritten block's length with the

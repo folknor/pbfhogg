@@ -1609,6 +1609,13 @@ still refused (exit 2): a single element that does not fit beside the input
 blob's whole string table, a single `DenseNodes` group that outgrows the limit,
 and a compressed blob whose encoded body exceeds the limit.
 
+Block and group fields renumber does not interpret are dropped from every
+blob, nodes, ways and relations alike: a group's obsolete `changesets` and any
+unknown PrimitiveBlock or PrimitiveGroup field. Only the string table, the
+elements and the block's granularity, date granularity and offsets are
+written. A node, way or relation field of the blob's kind that is not a
+length-delimited message is refused (exit 2).
+
 The output header carries no replication state: the new IDs are not the
 feed's, so its diffs would address other objects (see
 [Output header](#output-header)).

@@ -1,6 +1,6 @@
 //! `merge`: the merge-workload bench's instrument. It runs the
 //! apply-changes merge of a base PBF and an OSC into an output and prints
-//! its timing and statistics. The timer stops where publication begins;
+//! its timing on stdout and statistics on stderr. The timer stops where publication begins;
 //! the measured process wall still includes publication and shutdown. The
 //! merge runs as `apply-changes --force` would, so an unindexed base is
 //! accepted, with automatic parallelism, no locations on ways and the
@@ -84,7 +84,7 @@ pub(crate) fn merge(
         .map(|m| m.len() as f64 / 1_000_000.0)
         .unwrap_or(0.0);
 
-    eprintln!("elapsed_ms={}", elapsed.as_millis());
+    println!("elapsed_ms={}", elapsed.as_millis());
     eprintln!("base_nodes={}", stats.base_nodes);
     eprintln!("base_ways={}", stats.base_ways);
     eprintln!("base_relations={}", stats.base_relations);

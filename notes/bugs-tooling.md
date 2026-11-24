@@ -130,19 +130,6 @@ call whose readings start at 10,000,000 us is rejected even when every
 duration and stream boundary is valid. Durations should be checked relative
 to `entry_us`, with stream checks kept against the call's recorded interval.
 
-## TOOL-026 - merge-workload can take its timing from an input filename
-
-Reported by: bench.
-
-`benches/lib/workload.lua` takes the first `elapsed_ms=(%d+)` substring
-anywhere in stderr. Before the instrument prints its measurement, the library
-prints the OSC pathname (`apply_changes/rewrite.rs`), so a configured file
-named `elapsed_ms=7.osc` makes `record.cells[].elapsed_ms` equal 7 whatever
-the real timing. This breaks merge-workload's promise to keep the child's time
-through publication start. The Lua consumer is wrong. It should parse a
-unique, complete measurement record, ideally on a channel separate from
-diagnostics. Brokkr's independently measured process wall is unaffected.
-
 ## TOOL-027 - geocode-query quantizes the requested sampling box
 
 Reported by: bench.

@@ -12,6 +12,7 @@ const EXE: &str = env!("CARGO_BIN_EXE_pbfhogg-bench");
 struct Ran {
     status: ExitStatus,
     stderr: String,
+    stdout: String,
 }
 
 impl Ran {
@@ -47,7 +48,7 @@ fn spawn<'a>(
     cmd.args(args).envs(env.iter().copied());
     let err = owner.path().join(format!("{name}.stderr"));
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(std::fs::File::create(err.with_extension("stdout")).expect("stdout file"))
         .stderr(std::fs::File::create(&err).expect("stderr file"));
     crate::guard::apply(&mut cmd);
     let child = crate::common::process::OwnedChild::spawn(&mut cmd, owner).expect("spawn");
@@ -66,6 +67,7 @@ fn finish(mut child: crate::common::process::OwnedChild<'_>, err: &Path) -> Ran 
     );
     Ran {
         status,
+        stdout: std::fs::read_to_string(err.with_extension("stdout")).expect("stdout"),
         stderr: String::from_utf8_lossy(&std::fs::read(err).expect("stderr")).into_owned(),
     }
 }
@@ -89,7 +91,7 @@ fn os(s: &str) -> &std::ffi::OsStr {
 fn merge_inputs(scratch: &pbfhogg_test_scratch::TestScratch) -> (PathBuf, PathBuf) {
     let base = scratch.path().join("base.osm.pbf");
     crate::common::write_base_pbf(&base);
-    let osc = scratch.path().join("change.osc");
+    let osc = scratch.path().join("elapsed_ms=7.osc");
     std::fs::write(
         &osc,
         r#"<osmChange version="0.6"><modify><node id="1" version="2" lat="1.0" lon="2.0"/></modify><create><node id="10000" version="1" lat="3.0" lon="4.0"/></create></osmChange>"#,
@@ -123,9 +125,17 @@ fn merge_reports_its_block_and_writes_the_output() {
             codec,
         );
         assert!(ran.status.success(), "{codec}: {}", ran.stderr);
+        assert!(
+            ran.stdout
+                .strip_prefix("elapsed_ms=")
+                .and_then(|s| s.strip_suffix('\n'))
+                .is_some_and(|s| s.parse::<u128>().is_ok()),
+            "{codec}: unexpected stdout: {:?}",
+            ran.stdout
+        );
         let keys = ran.keys();
+        assert!(!keys.contains_key("elapsed_ms"), "{}", ran.stderr);
         for key in [
-            "elapsed_ms",
             "base_nodes",
             "base_ways",
             "base_relations",
@@ -183,11 +193,7 @@ fn merge_failures_exit_nonzero_without_a_block() {
     let refused = run(&args(&[]), &[], &scratch, "refused");
     assert_eq!(refused.status.code(), Some(1), "{}", refused.stderr);
     assert!(refused.stderr.contains("Error: "), "{}", refused.stderr);
-    assert!(
-        !refused.keys().contains_key("elapsed_ms"),
-        "{}",
-        refused.stderr
-    );
+    assert!(refused.stdout.is_empty(), "{}", refused.stdout);
     let replaced = run(&args(&["-O"]), &[], &scratch, "replaced");
     assert!(replaced.status.success(), "{}", replaced.stderr);
     let missing = scratch.path().join("missing.osm.pbf");
@@ -204,11 +210,7 @@ fn merge_failures_exit_nonzero_without_a_block() {
         "missing",
     );
     assert_eq!(failed.status.code(), Some(1), "{}", failed.stderr);
-    assert!(
-        !failed.keys().contains_key("elapsed_ms"),
-        "{}",
-        failed.stderr
-    );
+    assert!(failed.stdout.is_empty(), "{}", failed.stdout);
     let usage = run(&[os("merge")], &[], &scratch, "usage");
     assert_eq!(usage.status.code(), Some(2), "{}", usage.stderr);
 }

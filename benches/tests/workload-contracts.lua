@@ -1,13 +1,15 @@
 -- Synthetic workload cells must preserve child evidence and stop semantics.
 local DATA = project_root .. "/data/"
+local OSC = "elapsed_ms=7.osc.gz"
+local DIAGNOSTIC = "Reading OSC: " .. DATA .. OSC .. "\n"
 local function invoke(name, args, calls)
     local params = { "--dataset", "fixture" }
     for _, arg in ipairs(args) do params[#params + 1] = arg end
     local files = { [DATA .. "base.pbf"] = "" }
-    if name == "merge-workload" then files[DATA .. "9.osc.gz"] = "" end
+    if name == "merge-workload" then files[DATA .. OSC] = "" end
     return run { bench = name, program = "pbfhogg-bench", params = params,
         host = { datasets = { fixture = {
-            pbf = { indexed = { file = "base.pbf" } }, osc = { ["9"] = { file = "9.osc.gz" } },
+            pbf = { indexed = { file = "base.pbf" } }, osc = { ["9"] = { file = OSC } },
         } } }, files = files, calls = calls }
 end
 local function has(argv, key, value)
@@ -24,16 +26,16 @@ for _, case in ipairs(cases) do
     test(case.name .. " retains elapsed evidence and argv", function()
         local outputs = {}
         if case.out then outputs[case.out] = "abc" end
-        local r = invoke(case.name, case.args, { { stderr = "elapsed_ms=17\n", outputs = outputs } })
+        local r = invoke(case.name, case.args, { { stdout = "elapsed_ms=17\n", stderr = DIAGNOSTIC, outputs = outputs } })
         assert(r.outcome == "completed", r.reason)
         assert(#r.calls == 1 and r.calls[1].measured)
         local argv = r.calls[1].argv
         assert(argv[1] == case.command and argv[2] == DATA .. "base.pbf")
         for _, flag in ipairs(case.flags) do assert(has(argv, table.unpack(flag)), table.concat(argv, " ")) end
         local cell = case.out and r.record.cells[1] or r.record.child
-        assert(cell.elapsed_ms == 17 and cell.summary == "elapsed_ms=17\n")
+        assert(cell.elapsed_ms == 17 and cell.summary == DIAGNOSTIC)
         if case.out then
-            assert(argv[3] == DATA .. "9.osc.gz")
+            assert(argv[3] == DATA .. OSC)
             assert(cell.io == "buffered" and cell.output_bytes == 3)
         end
     end)
@@ -45,12 +47,19 @@ for _, case in ipairs(cases) do
         assert(r.reason:find("stop_at marker WORK_POINT", 1, true), r.reason)
     end)
     test(case.name .. " rejects missing child timing", function()
-        local r = invoke(case.name, case.args, { { stderr = "no timing" } })
+        local r = invoke(case.name, case.args, { { stderr = DIAGNOSTIC } })
         assert(r.outcome == "failed", r.outcome)
-        assert(r.reason:find("did not report elapsed_ms", 1, true), r.reason)
+        assert(r.reason:find("did not report a single elapsed_ms line on stdout", 1, true), r.reason)
+    end)
+    test(case.name .. " rejects malformed or repeated child timing", function()
+        for _, stdout in ipairs({ "elapsed_ms=17junk\n", "elapsed_ms=17\nelapsed_ms=23\n" }) do
+            local r = invoke(case.name, case.args, { { stdout = stdout } })
+            assert(r.outcome == "failed", r.outcome)
+            assert(r.reason:find("did not report a single elapsed_ms line on stdout", 1, true), r.reason)
+        end
     end)
     test(case.name .. " rejects failed child even with timing", function()
-        local r = invoke(case.name, case.args, { { exit = 2, stderr = "elapsed_ms=17" } })
+        local r = invoke(case.name, case.args, { { exit = 2, stdout = "elapsed_ms=17\n" } })
         assert(r.outcome == "failed", r.outcome)
     end)
     test(case.name .. " accepts stopped child without timing or output", function()
@@ -72,8 +81,8 @@ end
 
 test("merge-workload records both backends but measures buffered only", function()
     local r = invoke("merge-workload", { "--osc-seq", "9", "--compressions", "none", "--uring", "yes" }, {
-        { stderr = "elapsed_ms=17", outputs = { ["buffered.osm.pbf"] = "abc" } },
-        { stderr = "elapsed_ms=23", outputs = { ["uring.osm.pbf"] = "abcd" } },
+        { stdout = "elapsed_ms=17\n", outputs = { ["buffered.osm.pbf"] = "abc" } },
+        { stdout = "elapsed_ms=23\n", outputs = { ["uring.osm.pbf"] = "abcd" } },
     })
     assert(r.outcome == "completed", r.reason)
     assert(#r.calls == 2 and r.calls[1].measured and not r.calls[2].measured)

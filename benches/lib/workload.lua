@@ -17,8 +17,8 @@ function M.result(r, params)
     if r.stopped_at then
         cell.stopped_at = r.stopped_at
     else
-        local elapsed = r.stderr:match("elapsed_ms=(%d+)")
-        if not elapsed then fail("synthetic workload did not report elapsed_ms") end
+        local elapsed = r.stdout:match("^elapsed_ms=(%d+)\n$")
+        if not elapsed then fail("synthetic workload did not report a single elapsed_ms line on stdout") end
         cell.elapsed_ms = tonumber(elapsed)
     end
     return cell

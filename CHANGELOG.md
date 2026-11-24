@@ -697,6 +697,11 @@
 
 ### Fixed
 
+- `diff --format osc -o changes.osc.gz` caps gzip compression workers at
+  the requested `--jobs` count when either input lacks indexdata.
+- The `merge-workload` bench reads timing from a dedicated stdout line,
+  so input paths in diagnostic output cannot supply a fake timing.
+
 - `renumber --compression zlib` and `--compression zlib:6` now use level
   6. Omitting the CLI flag still uses level 1. The library honors the
   compression in `WriteOptions`, whose default is level 6.

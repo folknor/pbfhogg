@@ -633,9 +633,10 @@ params.inputs = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", many = tr
 [bench.merge-workload]
 script_file = "../benches/merge/merge-workload.lua"
 description = "Apply an OSC with the synthetic merge workload across codecs and output backends"
-version = 2
-date = 2026-11-14
+version = 3
+date = 2026-11-24
 changelog = [
+  { version = 3, date = 2026-11-24, note = "Reads the timing line from stdout. Older instruments report timing on stderr and are incompatible" },
   { version = 2, date = 2026-11-14, note = "Runs the pbfhogg-bench merge instrument instead of the CLI's bench-merge, same output keys and timer boundary; the refusal-only direct-io, io-uring and compression params are gone. Revisions before pbfhogg-bench fail at the build" },
   { version = 1, date = 2026-11-09, note = "Ported typed merge: synthetic workload matrix, I/O refusals, marker stops and profiling" },
 ]

@@ -120,7 +120,7 @@ pub(crate) const MERGE_CHANGES_BATCH_BYTES: usize = 512 * 1024;
 pub(crate) const MERGE_CHANGES_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cores left out of the gzip worker count of the derive-changes OSC
-/// assembler. The count comes from host parallelism, not from `-j`.
+/// assembler before applying the requested worker cap.
 pub(crate) const DERIVE_GZIP_WORKERS_RESERVED: usize = 0;
 
 /// Floor of the gzip worker count of the derive-changes OSC assembler.

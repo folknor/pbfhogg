@@ -211,7 +211,7 @@ pub(crate) fn derive_changes_to(
         let stats = sink.stats();
 
         host.invocation.marker("DERIVECHANGES_WRITE_START");
-        assemble_osc(output, &sink, host)?;
+        assemble_osc(output, &sink, parallelism, host)?;
         host.invocation.marker("DERIVECHANGES_WRITE_END");
         Ok(stats)
     })();
@@ -1030,6 +1030,7 @@ fn derive_changes_element_stream(
 fn assemble_osc(
     output: &crate::output::BoundOutput,
     sink: &ChangeSink,
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     let creates_path = &sink.creates_path;
@@ -1065,16 +1066,6 @@ fn assemble_osc(
     // the unit workers in `DIFF_OUTPUT_CHUNK_BYTES` members (plus at most one
     // element). Each member's 18 B framing and dictionary reset cost a little
     // ratio either way.
-    // The gzip worker count comes from host parallelism (every available
-    // thread; 4 when the host reports none), not from `-j`: this assembler
-    // runs after the comparison has finished. A `-j 1` run therefore still
-    // compresses on every thread.
-    let worker_count = crate::host::sized_workers(
-        &*host.resources,
-        crate::tunables::DERIVE_GZIP_WORKERS_RESERVED,
-        crate::tunables::DERIVE_GZIP_WORKERS_MIN,
-        crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
-    );
     let paths = [creates_path, modifies_path, deletes_path];
     let counts = [create_count, modify_count, delete_count];
     // Deliberately not one output stage with merge-changes. Both already
@@ -1104,6 +1095,15 @@ fn assemble_osc(
             glue.finish()?.finish()
         }
         (true, Fragments::Raw) => {
+            let auto_workers = crate::host::sized_workers(
+                &*host.resources,
+                crate::tunables::DERIVE_GZIP_WORKERS_RESERVED,
+                crate::tunables::DERIVE_GZIP_WORKERS_MIN,
+                crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
+            );
+            let worker_count = parallelism
+                .fixed()
+                .map_or(auto_workers, |cap| cap.min(auto_workers));
             let gz =
                 ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count, &host.invocation);
             let gz = write_document(gz, paths, counts, &mut copy_raw)?;

@@ -60,17 +60,6 @@ the driver's per-event byte scan (`check_event_chars`), which already walks
 every start tag, and must be measured on planet merge-changes and OSC
 tags-filter.
 
-## CMD-011 - Unindexed gzip derive ignores the -j worker cap
-
-Reported by: diff [P2].
-
-`assemble_osc` (`diff/derive.rs`) sizes its gzip workers from host parallelism
-and never receives the requested `Parallelism`. When either input is
-unindexed, `diff --format osc -j 1 -o changes.osc.gz` can start a compression
-pool that uses every reported core. This contradicts the documented rule in
-`docs/cli/commands.md` that `N` caps worker pools at `N`. These are
-compression workers, not the separately exempted reader or drain threads.
-
 ## CMD-053 - renumber's group policy for non-element fields differs by kind
 
 Reported by: the renumber representation item (2026-11-20), while sparring

@@ -1,12 +1,16 @@
-//! Verify: geocode - the answers of `pbfhogg geocode-query` over an index `pbfhogg build-geocode-index` built from
-//! the input, against an exhaustive model of the documented query rules
-//! built from osmium's decoding of the same input.
+//! Check address, street, interpolation and admin answers from
+//! `pbfhogg geocode-query` against a model built from osmium's decoding
+//! of the input used to build the geocode index.
 //!
-//! The model reads `osmium tags-filter nw/addr:housenumber w/highway`
-//! (which keeps the nodes of matched ways), then `osmium
-//! add-locations-to-ways -f opl`, so every way carries its node
-//! coordinates. From that it takes, by the rules docs/cli/commands.md
-//! (build-geocode-index) states and the builder applies:
+//! Both osmium decodings use a sorted copy when the input header lacks
+//! `Sort.Type_then_ID`. Each runs `osmium tags-filter` followed by
+//! `osmium add-locations-to-ways -f opl`. The first filters for
+//! `nw/addr:housenumber w/highway w/addr:interpolation`. The second
+//! filters for `r/boundary=administrative,postal_code` and keeps the
+//! untagged node records needed to model boundaries.
+//!
+//! The first decoding supplies the following candidates under the
+//! build-geocode-index rules in docs/cli/commands.md.
 //!
 //! - an address point: a node, or a way with `building`, carrying
 //!   `addr:housenumber` and a non-empty `addr:street` or `addr:place`; a way
@@ -41,12 +45,9 @@
 //! present; a missing one is never read as `null`.
 //!
 //! Interpolation answers are a third nearest-candidate class, judged the
-//! same way over the ranges `interp` resolves (the filter adds
-//! `w/addr:interpolation`). On an input with no answering range only
-//! absence is judged, and the run says so. Admin answers come from a
-//! second decoding, `osmium tags-filter r/boundary=administrative,postal_code`
-//! (members and their nodes come along, untagged node records kept),
-//! modelled by `admin`, and are
+//! same way over the ranges `interp` resolves. On an input with no answering
+//! range only absence is judged, and the run says so. Admin answers are
+//! modelled by `admin` from the boundary decoding and are
 //! judged on two builds: at `--admin-tolerance 0`, and at a non-zero
 //! tolerance outside its band. Address, street and interpolation are judged
 //! on the non-zero build alone; the admin tolerance does not reach them.

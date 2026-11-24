@@ -221,7 +221,7 @@ enum Check {
     TagsFilter(TagsArgs),
     /// pbfhogg inspect tags vs osmium tags-count
     InspectTags(PbfArgs),
-    /// pbfhogg geocode-query address and street answers vs a model of the input
+    /// Check geocode-query address, street, interpolation and admin answers against an input model
     Geocode(PbfArgs),
     MergeChanges(MergeArgs),
     Getparents(PbfArgs),

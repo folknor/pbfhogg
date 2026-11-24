@@ -1121,9 +1121,15 @@ trade.
 
 ## PBF decoding: a declared Blob raw_size must match the payload length
 
-When pbfhogg decodes a blob, it compares any declared `Blob.raw_size` with
-the actual payload length and rejects a mismatch as corruption. The field may
-be absent. See [truncation handling](reference/truncation-handling.md).
+When pbfhogg decodes a raw, zlib or zstd blob, it compares any declared
+`Blob.raw_size` with the actual payload length and rejects a mismatch as
+corruption. The field may be absent. See
+[truncation handling](reference/truncation-handling.md).
+
+For raw blobs, libosmium's `decode_blob` returns the payload as soon as
+it encounters the raw field, after enforcing the payload size limit.
+It can accept a raw payload with an in-range declared size that differs
+from its length. A size declaration after the raw field is never read.
 
 For zlib blobs, libosmium's `decode_blob` passes the declared size to
 `zlib_uncompress_string`, which resizes an empty output string to that size

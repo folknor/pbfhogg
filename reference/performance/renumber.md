@@ -2,8 +2,9 @@
 
 ## Renumber (external mode)
 
-Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces
-the original 256-bucket radix partition). Wire-format splice rewriters
+Planet-scale renumber uses O(1) lookups in ranked ID sets
+(`RankedIdSet`), replacing the original 256-bucket radix partition.
+Wire-format splice rewriters
 for all three element types - pass 1 (dense and plain nodes), stage 2d (ways),
 and R2d (relations) - patch only the ID/ref fields and copy everything
 else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
@@ -23,9 +24,10 @@ Element counts: 10,447,738,627 nodes / 1,165,589,744 ways /
 
 ### Memory
 
-Peak anon 3.3 GB (commit `cb99106`). Single shared `IdSetDense` with
-`AtomicU8::fetch_or` for concurrent pass 1 writes (~1.5 GB node bitset
-+ rank index, ~200 MB way bitset + rank, ~20 MB relation bitset).
+Peak anon 3.3 GB (commit `cb99106`). Pass 1 populates a shared node ID
+set (now `IdSet`) using atomic writes. In that measurement, the node
+bitset and rank index used ~1.5 GB, the way bitset and rank index used
+~200 MB, and the relation bitset used ~20 MB.
 Zero temp disk. Renumber ran with glibc capped at two arenas until
 2026-11; without the cap the planet peak is 3.32 GB against 3.16 GB with
 it, at the same wall (see "The CLI no longer caps malloc arenas").

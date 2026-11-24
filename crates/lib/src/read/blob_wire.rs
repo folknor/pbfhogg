@@ -334,18 +334,14 @@ pub(crate) fn multiple_payload_fields() -> crate::error::Error {
 
 /// Cross-check a `Blob.raw_size` against the payload length actually produced.
 ///
-/// `raw_size` is the writer's declaration of the decompressed size. Every read
-/// path here used it only as a `Vec::reserve` hint, so a lying value was
-/// silently ignored; the reference implementation (libosmium) treats a
-/// mismatch as corruption, and so do we. An absent `raw_size` is legal - our
-/// own writer omits it on uncompressed blobs, as libosmium does - and is not
-/// checked.
+/// An absent declaration is legal. Both writers omit `raw_size` on raw blobs.
+/// If declared, the size must match for raw, zlib and zstd payloads.
 ///
-/// We are strictly stricter than libosmium in one direction. It sizes its
-/// output buffer to `raw_size` and calls `uncompress`, so an undersized
-/// `raw_size` fails with `Z_BUF_ERROR`, while an *oversized* one succeeds and
-/// silently yields a buffer padded with trailing zeros to the declared length.
-/// Both directions are rejected here.
+/// libosmium returns a raw payload without comparing its length to
+/// `raw_size`. For zlib it sizes the output buffer to `raw_size` before
+/// calling `uncompress`. An undersized declaration fails with
+/// `Z_BUF_ERROR`, while an oversized one can yield a buffer padded with
+/// trailing zeros. This check rejects both mismatches.
 pub(crate) fn check_raw_size(declared: Option<i32>, actual: usize) -> Result<()> {
     match declared {
         Some(d) if i64::from(d) != i64::try_from(actual).unwrap_or(i64::MAX) => {

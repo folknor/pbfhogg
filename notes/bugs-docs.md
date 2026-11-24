@@ -246,64 +246,18 @@ the current version), the doc comment in `json.rs`, nor CHANGELOG states it,
 so a JSON consumer cannot tell what a version change promises, and the next
 schema edit has nothing to follow.
 
-## DOC-037 - renumber's performance record names a set type pbfhogg no longer has
+## DOC-040 - Decide how to account for renumber copying invalid key indices
 
-Reported by: the spar accounting of the renumber block-split change, from its
-scout's lateral (2026-11-24).
+The rationale above `Outcome` in
+`crates/lib/src/commands/renumber/wire_rewrite.rs` says corrupt key indices
+pass through as on the read side. Renumber copies the fields without checking
+their indices, while `validate_tag_arrays` and `validate_dense_keys_vals`
+in `crates/lib/src/read/block.rs` reject out-of-range indices during block
+construction.
 
-`reference/performance/renumber.md` opens its current-baselines text with
-"Planet-scale renumber via IdSetDense rank-based O(1) lookup", and later
-paragraphs name a "single shared `IdSetDense`" and "`IdSetDense` rank fusion".
-pbfhogg has no type of that name any more: the set is `IdSet` (with its ranked
-form), and `IdSetDense` survives in `crates/lib/src/idset.rs` only as the name
-of the osmium structure `IdSet` mirrors. History entries may keep the name of
-their time, but the opening description should name the current type, or say
-"the ranked ID set" so the name cannot drift again.
-
-## DOC-038 - DEVIATIONS.md records the raw_size check only for zlib blobs
-
-Reported by: the spar accounting of the BlobReader seek and diff raw_size
-change, from its scout's lateral (2026-11-24).
-
-DEVIATIONS.md "PBF decoding: a declared Blob raw_size must match the payload
-length" compares pbfhogg with libosmium for zlib blobs only. Every pbfhogg
-decode route (`check_raw_size` in `read/blob_wire.rs`, called after raw,
-zlib and zstd payloads in `read/decompress.rs`) refuses a declared
-`raw_size` that disagrees with the produced length, raw blobs included.
-libosmium's `decode_blob` (`pbf_decoder.hpp`) returns a `raw` payload as
-soon as it meets the field, checks only that it is under 32 MiB and never
-compares it with `raw_size`, so a raw blob with a wrong declared size reads
-in osmium and is refused by pbfhogg. That direction of the deviation is
-unrecorded; the entry should name it beside the zlib case.
-
-## DOC-039 - The verify geocode help and module doc describe the first, two-class check
-
-Reported by: the spar accounting of the verify geocode input-order change,
-from its scout's lateral (2026-11-24).
-
-The `Geocode` subcommand's doc in `crates/verify/src/main.rs`, which clap
-prints as its `--help` line, reads "pbfhogg geocode-query address and street
-answers vs a model of the input". The check also judges interpolation and
-admin answers. The module doc of `crates/verify/src/checks/geocode.rs` still
-says the model reads `osmium tags-filter nw/addr:housenumber w/highway`,
-then `add-locations-to-ways`. `run` filters `w/addr:interpolation` too, runs
-a second decoding of boundary relations, and reads the osmium-sorted copy
-for claimless input. A later paragraph of the same doc says so. Both opening
-descriptions should name what the check judges now.
-
-## DOC-040 - A renumber rationale comment sits above an unrelated struct
-
-Reported by: the spar accounting of the renumber group-field change, from its
-scout's lateral (2026-11-24).
-
-In `crates/lib/src/commands/renumber/wire_rewrite.rs` the comment "Deliberately
-copy key string indices without bounds checks or key lists. Corrupt indices
-pass through as on the read side; per-key validation adds work to this
-measured rewrite loop and changes which inputs it accepts." sits directly
-above the `/// What a rewrite saw in one block.` doc of `Outcome`, not at any
-code that copies key indices. It records a measured-path decision, so a reader
-of the copying loops never sees it. It should move to the copy sites it
-explains.
+Decide whether to document this difference as intentional at the copy sites
+or to align renumber with the reader. Moving the existing rationale would
+carry its stale claim to the copy sites.
 
 ## DOC-041 - Versions below -1 are accepted with no DEVIATIONS.md entry
 

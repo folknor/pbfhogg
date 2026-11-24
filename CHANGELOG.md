@@ -4,6 +4,20 @@
 
 ### Breaking
 
+- **Geocode candidates are bound to their reader and rank like
+  `Reader::query`.** `Candidates` now holds `AddressCandidate`,
+  `StreetCandidate`, `AdminCandidate` and `InterpolationCandidate` values,
+  each borrowing the reader that produced it; the first three deref to the
+  old match types, and none can be built or edited by a caller.
+  `Candidates::into_result` takes no reader argument, and
+  `Reader::interpolate` is replaced by
+  `InterpolationCandidate::house_number`, so a candidate can no longer be
+  resolved against a different index. `into_result` used to keep the first
+  listed of two equal-area same-level admin polygons and compared rounded
+  meters, so it could disagree with `query()`; both now share one total
+  order. `query()` itself now breaks exact distance ties by record
+  identity instead of search order.
+
 - **cat's blob counts say what happened to each blob and what was
   opened.** `CatStats::blobs_decoded` is renamed `blobs_reencoded` (input
   blobs rebuilt from their elements), and `blobs_rewritten` and

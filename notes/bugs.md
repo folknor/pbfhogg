@@ -80,22 +80,6 @@ broken pipe can waste a planet traversal.
 Defect hunt 2026-11-17 (export) observed the same behaviour and notes it is
 already recorded as deferred work.
 
-## BUG-026 - Geocode candidate and ranked APIs break equal-area ties differently
-
-Reported by: geocode.
-
-`Candidates::into_result()` keeps the first equal-area admin match; ranked lookup
-picks the lower polygon index; an index with equal-area polygons in reverse
-order makes them disagree. Code reading, not executed.
-
-Defect hunt 2026-11-17 (geocode-reader, P2): `Candidates::into_result`
-(`reader.rs`) explicitly claims to match `query()` semantics. With two
-containing same-level polygons of equal stored area presented as `[1, 0]`,
-`query()` selects polygon 0 and `candidates().into_result(&reader)` selects
-polygon 1. This occurs with valid index data, and equal stored areas also
-arise through f32 rounding. `AdminMatch` discards polygon identity, so sharing
-the ranking needs that identity kept through collection.
-
 ## BUG-027 - Geocode building placement is a vertex mean
 
 Reported by: geocode.

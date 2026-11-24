@@ -23,7 +23,8 @@ priority is the hunter's own label. Findings that match an existing mechanism
 were added to `notes/bugs.md` instead of being filed here: builder tag
 truncation (since fixed: block validation refuses a tag string index past
 the table), candidate
-ranking ties (BUG-026) and building placement at the antimeridian (BUG-027).
+ranking ties (since fixed: candidates rank by the query's total order) and
+building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 
 ## GEO-026 - A collinear admin outer ring publishes and never contains a point
@@ -86,18 +87,6 @@ degrees away. This breaks the meaning of `snap_lat_e7` and `snap_lon_e7`, and
 the function's own requirement to interpolate in the distance calculation's
 frame. Projection should return the actual closest point, or both calculations
 should share one longitude-frame representation.
-
-## GEO-014 - Candidates carry no binding to the reader that produced them
-
-Reported by: geocode-reader (flagged as an API hazard).
-
-`Candidates::into_result(reader)` and `Reader::interpolate(candidate)` accept
-candidates from another reader or another index generation without detecting
-the mismatch. They can combine a street and distance from generation A with a
-house number computed from generation B's unrelated record at the same index.
-The required provenance relationship is neither encoded nor documented.
-Binding candidates to their originating reader would also keep the polygon
-identity that BUG-026 in `notes/bugs.md` needs.
 
 ## GEO-018 - Open ways sharing a side between two holes are refused as a theta
 

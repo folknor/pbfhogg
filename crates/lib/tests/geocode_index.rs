@@ -924,7 +924,7 @@ fn synthetic_build_query_matches_low_level_api() {
     let via_candidates = reader
         .candidates(55.70005, 12.5005)
         .expect("valid query")
-        .into_result(&reader);
+        .into_result();
     let cand_addr = via_candidates
         .address
         .as_ref()
@@ -2270,7 +2270,7 @@ fn fallback_fills_address_when_fine_street_exists() {
         !candidates.addresses.is_empty(),
         "coarse fill must add the address"
     );
-    let ranked = candidates.into_result(&reader);
+    let ranked = candidates.into_result();
     assert_eq!(
         ranked.address.and_then(|address| address.postcode),
         Some("1234")
@@ -2401,7 +2401,7 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
     let via_into_result = reader
         .candidates(query_lat, query_lon)
         .expect("valid query")
-        .into_result(&reader);
+        .into_result();
     let into_result_level8: Vec<_> = via_into_result
         .admin
         .iter()
@@ -2733,7 +2733,7 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
     let via_candidates = reader
         .candidates(query_lat, query_lon)
         .expect("valid query")
-        .into_result(&reader);
+        .into_result();
     let cand_interp = via_candidates
         .interpolation
         .as_ref()
@@ -2836,7 +2836,7 @@ fn wrong_parity_interpolation_neither_answers_nor_shadows_the_fallback() {
             .expect("valid query")
             .interpolations
             .iter()
-            .map(|c| c.street.map(str::to_owned))
+            .map(|c| c.street().map(str::to_owned))
             .collect();
         (answer, candidates)
     };
@@ -3119,7 +3119,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
         reader
             .candidates(query_lat, query_lon)
             .expect("valid query")
-            .into_result(&reader)
+            .into_result()
             .interpolation
             .is_none(),
         "candidates().into_result() should also hide unresolved interpolation"
@@ -3257,7 +3257,7 @@ fn antimeridian_interpolation_snaps_on_the_short_arc() {
         .into_iter()
         .next()
         .expect("segment should be a raw candidate too");
-    let snap_lon_deg = f64::from(candidate.snap_lon_e7) * 1e-7;
+    let snap_lon_deg = f64::from(candidate.snap_lon_e7()) * 1e-7;
     assert!(
         snap_lon_deg.abs() > 179.0,
         "snap longitude {snap_lon_deg} should sit on the antimeridian, not at 0"
@@ -3312,7 +3312,7 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
         candidates
             .interpolations
             .iter()
-            .all(|c| reader.interpolate(c).is_some()),
+            .all(|c| c.house_number().is_some()),
         "candidates() must not emit an interpolation it cannot resolve, or its \
          emptiness gate means something different from query()'s"
     );
@@ -3320,13 +3320,13 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
         candidates
             .interpolations
             .iter()
-            .any(|c| c.street == Some("Far Street")),
+            .any(|c| c.street() == Some("Far Street")),
         "coarse fallback should have run for candidates() too"
     );
     let ranked = reader
         .candidates(lat, lon)
         .expect("valid query")
-        .into_result(&reader);
+        .into_result();
     let ranked_interp = ranked
         .interpolation
         .as_ref()
@@ -3802,38 +3802,6 @@ fn reader_refuses_symlinked_index_files() {
         panic!("a symlinked index file is refused");
     };
     assert!(err.to_string().contains("strings.bin"), "{err}");
-}
-
-#[test]
-fn caller_built_interpolation_candidate_cannot_escape_its_way() {
-    use pbfhogg::geocode_index::{builder, reader::Reader};
-
-    let dir = crate::common::test_scratch();
-    let input = dir.path().join("input.osm.pbf");
-    let index_dir = dir.path().join("index");
-    write_synthetic_interpolation_input(&input);
-    build_index(
-        &input,
-        &builder::BuildConfig {
-            ..Default::default()
-        },
-        &index_dir,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("build interpolation fixture");
-    let reader = Reader::open(&index_dir).expect("open fixture");
-    let mut candidates = reader.candidates(55.7, 12.5030).expect("valid query");
-    let mut candidate = candidates.interpolations.pop().expect("interpolation hit");
-    assert!(reader.interpolate(&candidate).is_some());
-    // The fixture has two nodes: only segment zero belongs to the way.
-    for segment in [1, 2, u16::MAX] {
-        candidate.segment_index = segment;
-        assert_eq!(reader.interpolate(&candidate), None);
-    }
-    candidate.segment_index = 0;
-    candidate.way_index = u32::MAX;
-    assert_eq!(reader.interpolate(&candidate), None);
 }
 
 #[test]

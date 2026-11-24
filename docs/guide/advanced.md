@@ -174,6 +174,17 @@ reader's flat approximation: latitude and longitude differences in radians,
 longitude scaled by the cosine of the query's latitude and taken the short
 way around, times the Earth's mean radius.
 
+Ranking is a total order, so an answer never depends on the order the search
+meets records in. Among records at exactly the same distance the one stored
+first in the index wins (lowest address index, or lowest way and segment
+index), and among same-level admin polygons of equal stored area the lowest
+polygon index wins. `Candidates::into_result` applies the same ranking, so
+untouched candidates from one lookup give `Reader::query`'s answer at that
+point. Every candidate borrows the reader that produced it and cannot be built
+by a caller: `InterpolationCandidate::house_number` computes against that
+reader's records, so a candidate can never be paired with another index's
+data.
+
 The on-disk format carries a version number. Readers reject any version but
 their own outright with a message naming `build-geocode-index` as the remedy,
 so an index built by an earlier release must be rebuilt rather than migrated -

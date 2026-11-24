@@ -517,6 +517,26 @@ u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
 
+### Distance hits rank by a total order, inclusive winner bounds (bygg, 2026-11-24, variant uncommitted against `b7626a0c`)
+
+`query()` ranks address, street and interpolation hits by squared distance
+then record identity, and the search walk admits a cell whose lower bound
+equals the current winner's distance, so an exact tie can still be met.
+geocode-query, germany, country bbox `5.9,47.3,15.0,55.0`, 100k points, 3
+rounds, interleaved `--iterations 1` cells (base built with `--commit HEAD`):
+
+| Cell | us per query (best) | open_ms |
+|---|---:|---:|
+| base `5707f48c` | 19.50 | 857 |
+| variant `0d83fa69` | 18.44 | 830 |
+| base `cf2dbfcf` | 19.07 | 865 |
+| variant `f7c9b2c4` | 18.40 | 855 |
+
+The variant is not slower; the 3 to 5 percent in its favour has the same
+sign in both pairs but sits in the band not chased. The inclusive bound
+differs from the strict one only on exact float equality, so it reads no
+extra cells on this workload.
+
 ### Admin lookup reads the own cell and trusts its flag, format 9 (plantasjen, 2026-11-20, variant uncommitted against `a7946048`)
 
 The reader reads only the query's own admin cell instead of nine and accepts

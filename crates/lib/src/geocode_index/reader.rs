@@ -80,35 +80,171 @@ pub struct AdminMatch<'a> {
     pub country_code: Option<&'a str>,
     /// The outer ring's planar area in square decimicrodegrees (degrees
     /// times 1e7, squared; holes not subtracted), from the polygon record.
-    /// Used by `into_result()` to pick the smallest polygon per level.
+    /// The smallest per level is the ranked answer.
     pub area: f32,
 }
 
 /// Raw unranked candidates from [`Reader::candidates`].
+///
+/// Every candidate is bound to the reader that produced it: it borrows that
+/// reader, carries the index-local key [`Candidates::into_result`] ranks it
+/// by, and cannot be built outside this module, so a hit from one index can
+/// never be ranked by, or compute a house number from, another index's
+/// records. The vectors are public so a caller can filter them.
 #[derive(Debug)]
 pub struct Candidates<'a> {
-    pub addresses: Vec<AddressMatch<'a>>,
-    pub streets: Vec<StreetMatch<'a>>,
+    pub addresses: Vec<AddressCandidate<'a>>,
+    pub streets: Vec<StreetCandidate<'a>>,
     pub interpolations: Vec<InterpolationCandidate<'a>>,
     /// All admin polygons containing the query point (not collapsed per level).
-    pub admin: Vec<AdminMatch<'a>>,
+    pub admin: Vec<AdminCandidate<'a>>,
 }
 
-/// A raw interpolation hit (house number not yet computed).
+/// A raw address hit: the match and the key it ranks by.
 #[derive(Debug)]
+pub struct AddressCandidate<'a> {
+    hit: AddressMatch<'a>,
+    key: DistanceKey<u32>,
+}
+
+/// A raw street hit: the match and the key it ranks by.
+#[derive(Debug)]
+pub struct StreetCandidate<'a> {
+    hit: StreetMatch<'a>,
+    key: DistanceKey<(u32, u16)>,
+}
+
+/// A raw admin hit: the match and the polygon record it came from, the
+/// tie-break between equal areas.
+#[derive(Debug)]
+pub struct AdminCandidate<'a> {
+    hit: AdminMatch<'a>,
+    polygon_index: u32,
+}
+
+macro_rules! raw_candidate {
+    ($raw:ident, $hit:ident) => {
+        impl<'a> $raw<'a> {
+            /// The match this candidate reports.
+            pub fn hit(&self) -> &$hit<'a> {
+                &self.hit
+            }
+
+            /// The match, without its ranking key.
+            pub fn into_hit(self) -> $hit<'a> {
+                self.hit
+            }
+        }
+
+        impl<'a> std::ops::Deref for $raw<'a> {
+            type Target = $hit<'a>;
+            fn deref(&self) -> &$hit<'a> {
+                &self.hit
+            }
+        }
+    };
+}
+raw_candidate!(AddressCandidate, AddressMatch);
+raw_candidate!(StreetCandidate, StreetMatch);
+raw_candidate!(AdminCandidate, AdminMatch);
+
+/// A raw interpolation hit, its house number not yet computed. It borrows
+/// the reader that found it and computes against that reader only.
 pub struct InterpolationCandidate<'a> {
+    reader: &'a Reader,
+    street: Option<&'a str>,
+    place: Option<&'a str>,
+    way: InterpWay,
+    key: DistanceKey<(u32, u16)>,
+    snap_lat_e7: i32,
+    snap_lon_e7: i32,
+    /// The way length the search admitted the hit with.
+    total_len: f64,
+}
+
+impl<'a> InterpolationCandidate<'a> {
     /// As [`InterpolationMatch::street`].
-    pub street: Option<&'a str>,
+    pub fn street(&self) -> Option<&'a str> {
+        self.street
+    }
+
     /// As [`InterpolationMatch::place`].
-    pub place: Option<&'a str>,
+    pub fn place(&self) -> Option<&'a str> {
+        self.place
+    }
+
     /// Index of the interpolation record in `interp_ways.bin`. A record is
     /// one section of an OSM way between two of its address nodes, so this
     /// is not an OSM way identity: one way can own several records.
-    pub way_index: u32,
-    pub segment_index: u16,
-    pub snap_lat_e7: i32,
-    pub snap_lon_e7: i32,
-    pub distance_m: f64,
+    pub fn way_index(&self) -> u32 {
+        self.key.id.0
+    }
+
+    pub fn segment_index(&self) -> u16 {
+        self.key.id.1
+    }
+
+    pub fn snap_lat_e7(&self) -> i32 {
+        self.snap_lat_e7
+    }
+
+    pub fn snap_lon_e7(&self) -> i32 {
+        self.snap_lon_e7
+    }
+
+    pub fn distance_m(&self) -> f64 {
+        radians_sq_to_meters(self.key.dist_sq)
+    }
+
+    /// The interpolated house number at the snap point, computed from the
+    /// record this candidate was found in.
+    pub fn house_number(&self) -> Option<u32> {
+        self.reader.interpolated_number_at_length(
+            self.way,
+            self.segment_index(),
+            self.snap_lat_e7,
+            self.snap_lon_e7,
+            self.total_len,
+        )
+    }
+}
+
+impl fmt::Debug for InterpolationCandidate<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InterpolationCandidate")
+            .field("street", &self.street)
+            .field("place", &self.place)
+            .field("way_index", &self.way_index())
+            .field("segment_index", &self.segment_index())
+            .field("snap_lat_e7", &self.snap_lat_e7)
+            .field("snap_lon_e7", &self.snap_lon_e7)
+            .field("distance_m", &self.distance_m())
+            .finish()
+    }
+}
+
+/// The rank of a distance hit: nearer first, and on an exactly equal
+/// distance the lower record identity (an address index, or a way and
+/// segment index). A total order, shared by [`Reader::query`] and
+/// [`Candidates::into_result`], so neither answer depends on the order the
+/// search met the hits in, and the two agree.
+#[derive(Debug, Clone, Copy)]
+struct DistanceKey<I> {
+    dist_sq: f64,
+    id: I,
+}
+
+impl<I: Ord> DistanceKey<I> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist_sq
+            .total_cmp(&other.dist_sq)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+
+    /// Whether `self` ranks ahead of `best`, or `best` is empty.
+    fn beats(&self, best: Option<&Self>) -> bool {
+        best.is_none_or(|best| self.cmp(best).is_lt())
+    }
 }
 
 /// Why [`Reader::query`] or [`Reader::candidates`] failed: an invalid query
@@ -203,52 +339,58 @@ impl fmt::Display for QueryError {
 impl Error for QueryError {}
 
 impl<'a> Candidates<'a> {
-    /// Apply default ranking: nearest of each type and smallest admin per level.
-    pub fn into_result(self, reader: &'a Reader) -> ReverseResult<'a> {
-        let address = self.addresses.into_iter().min_by(|a, b| {
-            a.distance_m
-                .partial_cmp(&b.distance_m)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+    /// Apply the ranking [`Reader::query`] applies: the nearest of each
+    /// class and the smallest admin polygon per level, each by the same total
+    /// order the query ranks with. Untouched candidates from one successful
+    /// lookup on an index whose cell lists are complete give the query's
+    /// answer at the same point.
+    pub fn into_result(self) -> ReverseResult<'a> {
+        let address = self
+            .addresses
+            .into_iter()
+            .min_by(|a, b| a.key.cmp(&b.key))
+            .map(AddressCandidate::into_hit);
 
-        let street = self.streets.into_iter().min_by(|a, b| {
-            a.distance_m
-                .partial_cmp(&b.distance_m)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let street = self
+            .streets
+            .into_iter()
+            .min_by(|a, b| a.key.cmp(&b.key))
+            .map(StreetCandidate::into_hit);
 
         let interpolation = self
             .interpolations
             .iter()
-            .min_by(|a, b| {
-                a.distance_m
-                    .partial_cmp(&b.distance_m)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .min_by(|a, b| a.key.cmp(&b.key))
             .and_then(|c| {
-                let hn = reader.interpolate(c)?;
                 Some(InterpolationMatch {
                     street: c.street,
                     place: c.place,
-                    house_number: hn,
-                    distance_m: c.distance_m,
+                    house_number: c.house_number()?,
+                    distance_m: c.distance_m(),
                 })
             });
 
-        // Collapse admin to smallest-area per level (matches query() semantics)
-        let mut best_by_level: [Option<AdminMatch<'a>>; ADMIN_LEVEL_SLOTS] = Default::default();
+        let mut best_by_level: [Option<AdminCandidate<'a>>; ADMIN_LEVEL_SLOTS] = Default::default();
         for m in self.admin {
-            let level = m.admin_level as usize;
-            if level < ADMIN_LEVEL_SLOTS {
-                let dominated = best_by_level[level]
-                    .as_ref()
-                    .is_none_or(|existing| m.area < existing.area);
-                if dominated {
-                    best_by_level[level] = Some(m);
-                }
+            let level = usize::from(m.hit.admin_level);
+            let Some(slot) = best_by_level.get_mut(level) else {
+                continue;
+            };
+            let best = slot.as_ref();
+            if admin_ranks_before(
+                m.hit.area,
+                m.polygon_index,
+                best.map_or(f32::MAX, |b| b.hit.area),
+                best.map(|b| b.polygon_index),
+            ) {
+                *slot = Some(m);
             }
         }
-        let admin: Vec<_> = best_by_level.into_iter().flatten().collect();
+        let admin: Vec<_> = best_by_level
+            .into_iter()
+            .flatten()
+            .map(AdminCandidate::into_hit)
+            .collect();
 
         ReverseResult {
             address,
@@ -934,30 +1076,37 @@ impl Reader {
         let admin = self.search_admin_ranked(&ctx)?;
 
         // Assemble
-        let address = best.addr.map(|(pt, dist_sq)| AddressMatch {
+        let address = best.addr.map(|(pt, key)| AddressMatch {
             lat_e7: pt.lat_e7,
             lon_e7: pt.lon_e7,
             house_number: self.read_string(pt.housenumber_offset),
             street: self.pool_name(pt.street_offset),
             place: self.pool_name(pt.place_offset),
             postcode: nonzero_string(self, pt.postcode_offset),
-            distance_m: radians_sq_to_meters(dist_sq),
+            distance_m: radians_sq_to_meters(key.dist_sq),
         });
 
         let street = best
             .street
-            .map(|(way, snap_lat, snap_lon, dist_sq)| StreetMatch {
+            .map(|(way, snap_lat, snap_lon, key)| StreetMatch {
                 name: self.read_string(way.name_offset),
                 snap_lat_e7: snap_lat,
                 snap_lon_e7: snap_lon,
-                distance_m: radians_sq_to_meters(dist_sq),
+                distance_m: radians_sq_to_meters(key.dist_sq),
             });
 
-        let interpolation =
-            best.interp
-                .and_then(|(way, seg_idx, snap_lat, snap_lon, dist_sq, total_len)| {
-                    self.resolve_interpolation(way, seg_idx, snap_lat, snap_lon, dist_sq, total_len)
-                });
+        let interpolation = best
+            .interp
+            .and_then(|(way, snap_lat, snap_lon, key, total_len)| {
+                self.resolve_interpolation(
+                    way,
+                    key.id.1,
+                    snap_lat,
+                    snap_lon,
+                    key.dist_sq,
+                    total_len,
+                )
+            });
 
         Ok(ReverseResult {
             address,
@@ -1029,16 +1178,6 @@ impl Reader {
         })
     }
 
-    /// Compute the interpolated house number for a raw candidate.
-    pub fn interpolate(&self, candidate: &InterpolationCandidate<'_>) -> Option<u32> {
-        self.interpolated_number(
-            candidate.way_index,
-            candidate.segment_index,
-            candidate.snap_lat_e7,
-            candidate.snap_lon_e7,
-        )
-    }
-
     /// Return the total length for a way that has a usable house-number range.
     ///
     /// Keep this calculation candidate-driven. Building a table at open time
@@ -1064,23 +1203,6 @@ impl Reader {
         (total_len >= crate::tunables::INTERP_MIN_TOTAL_LEN).then_some(total_len)
     }
 
-    fn interpolated_number(
-        &self,
-        way_index: u32,
-        segment_index: u16,
-        snap_lat_e7: i32,
-        snap_lon_e7: i32,
-    ) -> Option<u32> {
-        let iw = self.read_interp_way(way_index)?;
-        // Candidates have public fields and may be constructed by callers.
-        // Reject an invalid segment before reading every node in its way.
-        if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
-            return None;
-        }
-        let total_len = self.interpolation_total_length(iw)?;
-        self.interpolated_number_at_length(iw, segment_index, snap_lat_e7, snap_lon_e7, total_len)
-    }
-
     fn interpolated_number_at_length(
         &self,
         iw: InterpWay,
@@ -1089,8 +1211,9 @@ impl Reader {
         snap_lon_e7: i32,
         total_len: f64,
     ) -> Option<u32> {
-        // Keep the segment bound at the calculation boundary as defense in
-        // depth; the public entry point checks it before reading the way.
+        // The search resolved this segment's endpoints before admitting the
+        // hit, and a raw candidate cannot be built or altered by a caller;
+        // the bound stays here as defense in depth at the calculation.
         if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
             return None;
         }
@@ -1217,15 +1340,19 @@ impl QueryContext {
     }
 }
 
-/// Tracks nearest candidate of each type for `query()` (allocation-free).
-/// The nearest hit of each class so far. Each keeps the record the search
-/// resolved, so assembling the answer reads nothing that could be missing.
+/// The nearest hit of each class so far for `query()` (allocation-free),
+/// by [`DistanceKey`]. Each keeps the record the search resolved, so
+/// assembling the answer reads nothing that could be missing.
 struct BestTracker {
-    addr: Option<(AddrPoint, f64)>,             // (point, dist_sq)
-    street: Option<(StreetWay, i32, i32, f64)>, // (way, snap_lat, snap_lon, dist_sq)
-    // (way, seg_idx, snap_lat, snap_lon, dist_sq, total way length)
-    interp: Option<(InterpWay, u16, i32, i32, f64, f64)>,
+    addr: Option<(AddrPoint, DistanceKey<u32>)>,
+    // (way, snap_lat, snap_lon, key)
+    street: Option<(StreetWay, i32, i32, SegmentKey)>,
+    // (way, snap_lat, snap_lon, key, total way length)
+    interp: Option<(InterpWay, i32, i32, SegmentKey, f64)>,
 }
+
+/// The rank of a segment hit: its distance, then its way and segment index.
+type SegmentKey = DistanceKey<(u32, u16)>;
 
 impl BestTracker {
     fn new() -> Self {
@@ -1238,8 +1365,8 @@ impl BestTracker {
 }
 
 struct CandidateCollector<'a> {
-    addresses: Vec<AddressMatch<'a>>,
-    streets: Vec<StreetMatch<'a>>,
+    addresses: Vec<AddressCandidate<'a>>,
+    streets: Vec<StreetCandidate<'a>>,
     interpolations: Vec<InterpolationCandidate<'a>>,
 }
 
@@ -1256,22 +1383,31 @@ impl SearchKinds {
     }
 }
 
+/// The distance (radians squared) of each class's current winner in a
+/// sink, `None` where it has none.
+#[derive(Clone, Copy)]
+struct Winners {
+    addr: Option<f64>,
+    street: Option<f64>,
+    interp: Option<f64>,
+}
+
 trait SearchSink<'a> {
-    /// Distances (radians squared) below which a candidate of each class can
-    /// still change this sink: the admitted best so far for a nearest-of
-    /// sink, unbounded for one that keeps every candidate. The search takes
-    /// the smaller of this and the level's radius, and only shrinks it.
-    fn bounds(&self) -> ClassBounds;
+    /// The winner of each class so far: a nearest-of sink's admitted best,
+    /// none for one that keeps every candidate. A hit at a winner's exact
+    /// distance can still change a nearest-of sink, by its identity.
+    fn winners(&self) -> Winners;
     /// The classes this sink holds a candidate of.
     fn found(&self) -> SearchKinds;
     // Each hit arrives with the record its entry names, already resolved by
     // the search: a sink never re-reads, so it has no missing record to
     // handle.
-    fn address(&mut self, reader: &'a Reader, point: AddrPoint, dist_sq: f64);
+    fn address(&mut self, reader: &'a Reader, index: u32, point: AddrPoint, dist_sq: f64);
     fn street(
         &mut self,
         reader: &'a Reader,
         way: StreetWay,
+        segment: SegmentRef,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
@@ -1287,17 +1423,24 @@ trait SearchSink<'a> {
     );
 }
 
+fn segment_key(segment: SegmentRef, dist_sq: f64) -> DistanceKey<(u32, u16)> {
+    DistanceKey {
+        dist_sq,
+        id: (segment.way_index, segment.segment_index),
+    }
+}
+
 // Both sinks apply the SAME admission test before recording anything: a
 // candidate the assembly step could not turn into a result must not be
 // recorded, because `query()` and `candidates()` gate the coarse fallback on
 // emptiness. Recording an unusable candidate produces no result AND suppresses
 // the fallback that would have produced one.
 impl SearchSink<'_> for BestTracker {
-    fn bounds(&self) -> ClassBounds {
-        ClassBounds {
-            addr: self.addr.map_or(f64::MAX, |best| best.1),
-            street: self.street.map_or(f64::MAX, |best| best.3),
-            interp: self.interp.map_or(f64::MAX, |best| best.4),
+    fn winners(&self) -> Winners {
+        Winners {
+            addr: self.addr.map(|best| best.1.dist_sq),
+            street: self.street.map(|best| best.3.dist_sq),
+            interp: self.interp.map(|best| best.3.dist_sq),
         }
     }
 
@@ -1309,9 +1452,10 @@ impl SearchSink<'_> for BestTracker {
         }
     }
 
-    fn address(&mut self, _reader: &Reader, point: AddrPoint, dist_sq: f64) {
-        if dist_sq < self.addr.map_or(f64::MAX, |best| best.1) {
-            self.addr = Some((point, dist_sq));
+    fn address(&mut self, _reader: &Reader, index: u32, point: AddrPoint, dist_sq: f64) {
+        let key = DistanceKey { dist_sq, id: index };
+        if key.beats(self.addr.as_ref().map(|best| &best.1)) {
+            self.addr = Some((point, key));
         }
     }
 
@@ -1319,12 +1463,14 @@ impl SearchSink<'_> for BestTracker {
         &mut self,
         _reader: &Reader,
         way: StreetWay,
+        segment: SegmentRef,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        if dist_sq < self.street.map_or(f64::MAX, |best| best.3) {
-            self.street = Some((way, snap_lat, snap_lon, dist_sq));
+        let key = segment_key(segment, dist_sq);
+        if key.beats(self.street.as_ref().map(|best| &best.3)) {
+            self.street = Some((way, snap_lat, snap_lon, key));
         }
     }
 
@@ -1337,31 +1483,25 @@ impl SearchSink<'_> for BestTracker {
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        if dist_sq < self.interp.map_or(f64::MAX, |best| best.4) {
+        let key = segment_key(segment, dist_sq);
+        if key.beats(self.interp.as_ref().map(|best| &best.3)) {
             // Only candidates that can improve the current result need a full
             // way-length scan. Retain the winner's length to avoid scanning it
             // again while assembling the final house number.
             let Some(total_len) = reader.interpolation_total_length(way) else {
                 return;
             };
-            self.interp = Some((
-                way,
-                segment.segment_index,
-                snap_lat,
-                snap_lon,
-                dist_sq,
-                total_len,
-            ));
+            self.interp = Some((way, snap_lat, snap_lon, key, total_len));
         }
     }
 }
 
 impl<'a> SearchSink<'a> for CandidateCollector<'a> {
-    fn bounds(&self) -> ClassBounds {
-        ClassBounds {
-            addr: f64::MAX,
-            street: f64::MAX,
-            interp: f64::MAX,
+    fn winners(&self) -> Winners {
+        Winners {
+            addr: None,
+            street: None,
+            interp: None,
         }
     }
 
@@ -1373,15 +1513,18 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
         }
     }
 
-    fn address(&mut self, reader: &'a Reader, point: AddrPoint, dist_sq: f64) {
-        self.addresses.push(AddressMatch {
-            lat_e7: point.lat_e7,
-            lon_e7: point.lon_e7,
-            house_number: reader.read_string(point.housenumber_offset),
-            street: reader.pool_name(point.street_offset),
-            place: reader.pool_name(point.place_offset),
-            postcode: nonzero_string(reader, point.postcode_offset),
-            distance_m: radians_sq_to_meters(dist_sq),
+    fn address(&mut self, reader: &'a Reader, index: u32, point: AddrPoint, dist_sq: f64) {
+        self.addresses.push(AddressCandidate {
+            hit: AddressMatch {
+                lat_e7: point.lat_e7,
+                lon_e7: point.lon_e7,
+                house_number: reader.read_string(point.housenumber_offset),
+                street: reader.pool_name(point.street_offset),
+                place: reader.pool_name(point.place_offset),
+                postcode: nonzero_string(reader, point.postcode_offset),
+                distance_m: radians_sq_to_meters(dist_sq),
+            },
+            key: DistanceKey { dist_sq, id: index },
         });
     }
 
@@ -1389,15 +1532,19 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
         &mut self,
         reader: &'a Reader,
         way: StreetWay,
+        segment: SegmentRef,
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        self.streets.push(StreetMatch {
-            name: reader.read_string(way.name_offset),
-            snap_lat_e7: snap_lat,
-            snap_lon_e7: snap_lon,
-            distance_m: radians_sq_to_meters(dist_sq),
+        self.streets.push(StreetCandidate {
+            hit: StreetMatch {
+                name: reader.read_string(way.name_offset),
+                snap_lat_e7: snap_lat,
+                snap_lon_e7: snap_lon,
+                distance_m: radians_sq_to_meters(dist_sq),
+            },
+            key: segment_key(segment, dist_sq),
         });
     }
 
@@ -1412,18 +1559,19 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
     ) {
         // This API returns every viable segment hit, so validate each one
         // before it can make the fine-level candidate list nonempty.
-        if reader.interpolation_total_length(way).is_none() {
+        let Some(total_len) = reader.interpolation_total_length(way) else {
             return;
-        }
+        };
         let (street, place) = reader.interp_parent(way);
         self.interpolations.push(InterpolationCandidate {
+            reader,
             street,
             place,
-            way_index: segment.way_index,
-            segment_index: segment.segment_index,
+            way,
+            key: segment_key(segment, dist_sq),
             snap_lat_e7: snap_lat,
             snap_lon_e7: snap_lon,
-            distance_m: radians_sq_to_meters(dist_sq),
+            total_len,
         });
     }
 }
@@ -1624,19 +1772,67 @@ fn block_reach_sq(ctx: &QueryContext, start: CellID, level: u8) -> f64 {
     r * r
 }
 
-/// Per-class distance bounds (radians squared) of one level's search: a
-/// candidate of a class is worth looking for only below its bound, and a
-/// class the search does not want has bound 0, below every distance.
+/// How far one class of one level's search still looks (radians squared).
+#[derive(Clone, Copy)]
+enum Bound {
+    /// The search does not want the class.
+    Off,
+    /// No winner yet: a hit counts only strictly inside the radius.
+    Open(f64),
+    /// A winner at this distance: a hit at exactly this distance can still
+    /// win on its identity ([`DistanceKey`]), so the bound is inclusive.
+    Closed(f64),
+}
+
+impl Bound {
+    /// Whether a hit at distance `lower_bound` or more can still matter.
+    /// Every geometric test of the search goes through this predicate, so
+    /// an open and a closed bound are never confused.
+    fn admits(self, lower_bound: f64) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Open(radius) => lower_bound < radius,
+            Self::Closed(winner) => lower_bound <= winner,
+        }
+    }
+}
+
+/// The per-class [`Bound`]s of one level's search.
 #[derive(Clone, Copy)]
 struct ClassBounds {
-    addr: f64,
-    street: f64,
-    interp: f64,
+    addr: Bound,
+    street: Bound,
+    interp: Bound,
 }
 
 impl ClassBounds {
-    fn reach(self) -> f64 {
-        self.addr.max(self.street).max(self.interp)
+    /// The bounds of a search wanting `kinds` within `radius`, given the
+    /// sink's winners so far. An admitted winner lies strictly inside the
+    /// radius, so a winner's bound is the tighter one.
+    fn of(kinds: SearchKinds, radius: f64, winners: Winners) -> Self {
+        let bound = |wanted: bool, winner: Option<f64>| match (wanted, winner) {
+            (false, _) => Bound::Off,
+            (true, None) => Bound::Open(radius),
+            (true, Some(w)) => Bound::Closed(w.min(radius)),
+        };
+        Self {
+            addr: bound(kinds.addr, winners.addr),
+            street: bound(kinds.street, winners.street),
+            interp: bound(kinds.interp, winners.interp),
+        }
+    }
+
+    /// The classes for which a hit at `lower_bound` or more can matter.
+    fn admitting(self, lower_bound: f64) -> SearchKinds {
+        SearchKinds {
+            addr: self.addr.admits(lower_bound),
+            street: self.street.admits(lower_bound),
+            interp: self.interp.admits(lower_bound),
+        }
+    }
+
+    fn any_admits(self, lower_bound: f64) -> bool {
+        self.admitting(lower_bound).any()
     }
 }
 
@@ -1694,7 +1890,7 @@ impl Reader {
     /// the query lists any, which is almost everywhere, so a query that found
     /// everything else needs no coarse search at all.
     fn coarse_missing(&self, ctx: &QueryContext, missing: SearchKinds) -> SearchKinds {
-        let radius = self.coarse_max_dist_sq;
+        let radius = Bound::Open(self.coarse_max_dist_sq);
         let bounds = ClassBounds {
             addr: radius,
             street: radius,
@@ -1744,14 +1940,18 @@ impl Reader {
             let cells = self.coarse_geo_cells.table();
             ranges().any(|(lo, hi)| cells.any_key_between(lo, hi, |cell| cell.cell_id))
         };
-        let interp = kinds.interp && (bounds.interp > reach_sq || interp_present());
-        let others = all_classes
-            && (kinds.addr || kinds.street)
-            && bounds.addr.max(bounds.street) <= reach_sq
-            && !any_present();
+        // Absence from the block proves a class empty only when every hit
+        // its bound admits lies strictly inside the block, that is when the
+        // bound admits nothing at the block's reach. A filter of `kinds`
+        // in every branch: a class the caller turned off stays off.
+        let beyond = bounds.admitting(reach_sq);
+        let interp = kinds.interp && (beyond.interp || interp_present());
+        let addr_testable = all_classes && kinds.addr && !beyond.addr;
+        let street_testable = all_classes && kinds.street && !beyond.street;
+        let absent = (addr_testable || street_testable) && !any_present();
         SearchKinds {
-            addr: kinds.addr && !others,
-            street: kinds.street && !others,
+            addr: kinds.addr && !(addr_testable && absent),
+            street: kinds.street && !(street_testable && absent),
             interp,
         }
     }
@@ -1765,11 +1965,14 @@ impl Reader {
     /// complete over a radius at least `max_dist_sq`.
     ///
     /// The 3x3 block around the query's own cell is read first. Past it no
-    /// point is nearer than [`block_reach_sq`], so a class whose bound is no
-    /// more than that is complete, which is the common case. Otherwise the
-    /// search walks outward from the block over edge neighbours, visiting a
-    /// cell only while its lower bound ([`cell_lower_bound_sq`]) is below some
-    /// wanted class's bound. That reaches every cell that can hold a
+    /// point is nearer than [`block_reach_sq`], so a class whose [`Bound`]
+    /// admits nothing at that distance is complete, which is the common case.
+    /// Otherwise the search walks outward from the block over edge
+    /// neighbours, visiting a cell only while some wanted class's bound
+    /// admits its lower bound ([`cell_lower_bound_sq`]): strictly below the
+    /// radius while the class has no winner, at or below the winner's
+    /// distance once it has one, since a hit at exactly that distance can
+    /// still win on its identity. That reaches every cell that can hold a
     /// candidate:
     ///
     /// - A candidate at distance `d` has a point on its geometry at `d` from
@@ -1779,15 +1982,16 @@ impl Reader {
     ///   under every cell its path meets; indexes built before the exact
     ///   cover can lack a cell a path clips near its corner), and that cell's
     ///   lower bound is at most `d`.
-    /// - The points nearer than a bound form a set that is connected and
-    ///   open in latitude and periodic longitude. Cells are closed, so the
+    /// - The points a bound admits (nearer than it, or no farther for a
+    ///   closed one) form a connected set in latitude and periodic
+    ///   longitude. Cells are closed, so the
     ///   cells meeting it are linked through cells meeting it by shared
     ///   points, and where two of them share only a corner, that corner is in
     ///   the set with every cell around it, which link up by edges. At a
     ///   pole, whose cells' bounds span all longitudes, every cell at the
     ///   pole is reached once the set reaches the pole, and they too link by
     ///   edges. So the walk, which starts from every block cell (the query's
-    ///   own among them) and follows edges out of every cell below the bound,
+    ///   own among them) and follows edges out of every cell the bound admits,
     ///   reaches each such cell.
     /// - Bounds only shrink as candidates arrive, so a cell skipped for its
     ///   bound earlier would be skipped now too.
@@ -1846,16 +2050,11 @@ impl Reader {
         } else {
             kinds
         };
-        let bounds_for = |kinds: SearchKinds, sink: &S| {
-            let own = sink.bounds();
-            let bound = |wanted: bool, own: f64| if wanted { own.min(max_dist_sq) } else { 0.0 };
-            ClassBounds {
-                addr: bound(kinds.addr, own.addr),
-                street: bound(kinds.street, own.street),
-                interp: bound(kinds.interp, own.interp),
-            }
-        };
-        if bounds_for(kinds, sink).reach() <= reach_sq {
+        // Every point past the block is at least `reach_sq` away, so the
+        // walk is needed only while some class admits a hit there.
+        let bounds_for =
+            |kinds: SearchKinds, sink: &S| ClassBounds::of(kinds, max_dist_sq, sink.winners());
+        if !bounds_for(kinds, sink).any_admits(reach_sq) {
             return Ok(());
         }
         let kinds = if presence {
@@ -1864,7 +2063,7 @@ impl Reader {
             kinds
         };
         let bounds = |sink: &S| bounds_for(kinds, sink);
-        if bounds(sink).reach() <= reach_sq {
+        if !bounds(sink).any_admits(reach_sq) {
             return Ok(());
         }
 
@@ -1881,8 +2080,8 @@ impl Reader {
         let mut cursor = 0;
         while let Some(cell) = walk.get(cursor) {
             cursor += 1;
-            let wanted = bounds(sink);
-            if cell.lower_bound >= wanted.reach() {
+            let wanted = bounds(sink).admitting(cell.lower_bound);
+            if !wanted.any() {
                 continue;
             }
             if !cell.searched
@@ -1895,15 +2094,11 @@ impl Reader {
                     addr_entries,
                     interp_entries,
                     max_dist_sq,
-                    SearchKinds {
-                        addr: cell.lower_bound < wanted.addr,
-                        street: cell.lower_bound < wanted.street,
-                        interp: cell.lower_bound < wanted.interp,
-                    },
+                    wanted,
                     sink,
                 )?;
             }
-            if cell.lower_bound >= bounds(sink).reach() {
+            if !bounds(sink).any_admits(cell.lower_bound) {
                 continue;
             }
             for neighbour in CellID(cell.id).edge_neighbors() {
@@ -1943,7 +2138,7 @@ impl Reader {
                     ctx.cos_lat,
                 );
                 if dist_sq < max_dist_sq {
-                    sink.address(self, pt, dist_sq);
+                    sink.address(self, entry.addr_index, pt, dist_sq);
                 }
             }
         }
@@ -1959,7 +2154,7 @@ impl Reader {
                 )?;
                 let (snap_lat, snap_lon, dist_sq) = segment_distance(ctx, ends);
                 if dist_sq < max_dist_sq {
-                    sink.street(self, way, snap_lat, snap_lon, dist_sq);
+                    sink.street(self, way, seg_ref, snap_lat, snap_lon, dist_sq);
                 }
             }
         }
@@ -2053,16 +2248,20 @@ impl Reader {
     fn search_admin_all<'a>(
         &'a self,
         ctx: &QueryContext,
-    ) -> std::result::Result<Vec<AdminMatch<'a>>, QueryError> {
+    ) -> std::result::Result<Vec<AdminCandidate<'a>>, QueryError> {
         let mut result = Vec::new();
         for entry in self.own_admin_entries(ctx).iter() {
-            let poly = self.admin_polygon_entry(entry.polygon_index())?;
+            let polygon_index = entry.polygon_index();
+            let poly = self.admin_polygon_entry(polygon_index)?;
             if self.admin_entry_contains(ctx, entry, &poly) {
-                result.push(AdminMatch {
-                    admin_level: poly.admin_level,
-                    name: self.read_string(poly.name_offset),
-                    country_code: nonzero_string(self, poly.country_code_offset),
-                    area: poly.area,
+                result.push(AdminCandidate {
+                    hit: AdminMatch {
+                        admin_level: poly.admin_level,
+                        name: self.read_string(poly.name_offset),
+                        country_code: nonzero_string(self, poly.country_code_offset),
+                        area: poly.area,
+                    },
+                    polygon_index,
                 });
             }
         }
@@ -2494,6 +2693,115 @@ mod tests {
         assert_eq!(pick(&[(5.0, 3), (5.0, 7)]), Some(3));
         assert_eq!(pick(&[(5.0, 3), (4.0, 9), (5.0, 1)]), Some(9));
         assert_eq!(pick(&[(f32::MAX, 2)]), Some(2));
+    }
+
+    fn admin_candidate(name: &str, area: f32, polygon_index: u32) -> AdminCandidate<'_> {
+        AdminCandidate {
+            hit: AdminMatch {
+                admin_level: 8,
+                name,
+                country_code: None,
+                area,
+            },
+            polygon_index,
+        }
+    }
+
+    fn address_candidate(house_number: &str, dist_sq: f64, index: u32) -> AddressCandidate<'_> {
+        AddressCandidate {
+            hit: AddressMatch {
+                lat_e7: 0,
+                lon_e7: 0,
+                house_number,
+                street: None,
+                place: None,
+                postcode: None,
+                distance_m: radians_sq_to_meters(dist_sq),
+            },
+            key: DistanceKey { dist_sq, id: index },
+        }
+    }
+
+    fn ranked<'a>(
+        addresses: Vec<AddressCandidate<'a>>,
+        admin: Vec<AdminCandidate<'a>>,
+    ) -> ReverseResult<'a> {
+        Candidates {
+            addresses,
+            streets: Vec::new(),
+            interpolations: Vec::new(),
+            admin,
+        }
+        .into_result()
+    }
+
+    /// Equal-area same-level polygons listed in either order collapse to
+    /// the lower polygon index, the rule `query()` ranks by.
+    #[test]
+    fn into_result_breaks_equal_area_ties_by_polygon_index() {
+        for order in [[1, 0], [0, 1]] {
+            let admin = order
+                .iter()
+                .map(|&i| admin_candidate(if i == 0 { "zero" } else { "one" }, 5.0, i))
+                .collect();
+            let result = ranked(Vec::new(), admin);
+            assert_eq!(result.admin.len(), 1);
+            assert_eq!(result.admin[0].name, "zero", "order {order:?}");
+        }
+    }
+
+    /// Two distinct squared distances that round to the same meters rank by
+    /// the squared distance, as the query does, whichever comes first; an
+    /// exact tie goes to the lower record index.
+    #[test]
+    fn into_result_ranks_distance_by_squared_distance_then_identity() {
+        let (near, far) = (9.999_999_999_999_998e-11, 9.999_999_999_999_999e-11);
+        assert!(near < far);
+        assert_eq!(radians_sq_to_meters(near), radians_sq_to_meters(far));
+        let result = ranked(
+            vec![
+                address_candidate("far", far, 0),
+                address_candidate("near", near, 1),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(result.address.map(|a| a.house_number), Some("near"));
+        let result = ranked(
+            vec![
+                address_candidate("seven", near, 7),
+                address_candidate("three", near, 3),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(result.address.map(|a| a.house_number), Some("three"));
+    }
+
+    /// An open bound excludes its radius, a closed one includes its
+    /// winner's distance, and a class that is off admits nothing, not even
+    /// the zero lower bound of the query's own block.
+    #[test]
+    fn bounds_admit_at_equality_only_when_closed() {
+        assert!(!Bound::Open(4.0).admits(4.0));
+        assert!(Bound::Open(4.0).admits(3.0));
+        assert!(Bound::Closed(4.0).admits(4.0));
+        assert!(!Bound::Closed(4.0).admits(4.5));
+        assert!(!Bound::Off.admits(0.0));
+        let bounds = ClassBounds::of(
+            SearchKinds {
+                addr: false,
+                street: true,
+                interp: false,
+            },
+            9.0,
+            Winners {
+                addr: Some(1.0),
+                street: None,
+                interp: Some(1.0),
+            },
+        );
+        let at_zero = bounds.admitting(0.0);
+        assert!(!at_zero.addr && at_zero.street && !at_zero.interp);
+        assert!(!bounds.any_admits(9.0));
     }
 
     /// A fixed pseudo-random sequence in `[0, 1)`, so every run checks the

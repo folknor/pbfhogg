@@ -8,6 +8,7 @@
 //! `PbfWriter` holds its own for the sync path.
 
 use std::cell::RefCell;
+use std::io;
 
 use crate::error::{Error, OversizePart, Result};
 use flate2::Compress;
@@ -15,6 +16,7 @@ use flate2::Compression as FlateCompression;
 use flate2::FlushCompress;
 use flate2::Status;
 use protohoggr::{encode_bytes_field, encode_int32_field};
+use zstd::zstd_safe::{self, CCtx, CParameter};
 
 use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
 use crate::write::metrics::WriterMetrics;
@@ -47,7 +49,7 @@ pub(super) struct FrameScratch {
     /// Reusable zlib compressor (lazy-initialized on first zlib blob).
     zlib_compressor: Option<(ZlibLevel, Compress)>,
     /// Reusable zstd compressor (lazy-initialized on first zstd blob).
-    zstd_compressor: Option<(ZstdLevel, zstd::bulk::Compressor<'static>)>,
+    zstd_compressor: Option<(ZstdLevel, CCtx<'static>)>,
 }
 
 impl FrameScratch {
@@ -533,14 +535,20 @@ fn encode_blob_body(
                 // found late. Built before it replaces the cached one, so a
                 // failure leaves that one in place.
                 slot => {
-                    let built = zstd::bulk::Compressor::new(level.get())?;
+                    let mut built = CCtx::try_create()
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                    built
+                        .set_parameter(CParameter::CompressionLevel(level.get()))
+                        .map_err(zstd_error)?;
                     &mut slot.insert((*level, built)).1
                 }
             };
-            let bound = zstd::zstd_safe::compress_bound(uncompressed.len());
+            let bound = zstd_safe::compress_bound(uncompressed.len());
             scratch.compress_buf.clear();
             scratch.compress_buf.reserve(bound);
-            compressor.compress_to_buffer(uncompressed, &mut scratch.compress_buf)?;
+            compressor
+                .compress2(&mut scratch.compress_buf, uncompressed)
+                .map_err(zstd_error)?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 Error::internal(format!(
                     "blob raw_size overflow: {} bytes",
@@ -558,6 +566,13 @@ fn encode_blob_body(
             Ok(PayloadSource::Compressed)
         }
     }
+}
+
+fn zstd_error(code: usize) -> Error {
+    Error::internal(format!(
+        "zstd compress error: {}",
+        zstd_safe::get_error_name(code)
+    ))
 }
 
 /// The tag and length of a Blob payload field (`raw`, `zlib_data`,

@@ -82,19 +82,6 @@ number of real decompressions. A file holding only extension blobs after its
 header yields a positive inferred decompression count with none performed. The
 counter and its documented interpretation disagree.
 
-## FMT-030 - zstd context allocation failure panics instead of erroring
-
-Reported by: spar partner during the checked-compression-level work.
-
-`zstd::bulk::Compressor::new` returns `io::Result`, but builds its context
-with `CCtx::default()` first, which calls `create()` and panics if zstd
-returns null. An allocation failure on a framing worker's first zstd blob
-therefore unwinds rather than returning the writer's `Result`. Levels can no
-longer cause a failure there (`ZstdLevel` is checked against the linked
-library's range). A fix would build the context with `CCtx::try_create()`
-and set the level through `zstd_safe` directly in `write/framing.rs`.
-Allocation-failure class; low priority.
-
 ## FMT-024 - path_guard same_file stringifies the original I/O error
 
 Reported by: filesystem-output [P2].

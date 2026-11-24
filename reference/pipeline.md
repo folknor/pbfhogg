@@ -303,16 +303,27 @@ page cache and a direct one reads again from the device.
 
 ### export
 
-Single sequential `ElementReader::for_each` pass, no parallelism. Rejects
-up front if way export is requested and the header lacks
-`LocationsOnWays`. Per element: tag filter → (for ways) geometry
-assembly and area/winding classification → property serialization →
-streamed to a `FeatureWriter` that reuses a single feature buffer.
-`geojsonseq` writes one Feature per line. `geojson` writes each Feature
-into a single FeatureCollection array, which the writer closes at the
-end. Untagged nodes/ways and nodes/ways with invalid geometry (including
-any emitted position outside the geographic domain) are skipped and
-counted, not errored.
+One pipelined read (`for_each_fused_blob`). Rejects up front if way
+export is requested and the header lacks `LocationsOnWays`. A data blob
+whose indexdata claims a kind export does not emit (relations always,
+the other kind under `--type`) is skipped undecoded, and a decoded block
+holding a kind its claim does not name is refused
+([indexdata-trust.md](indexdata-trust.md)). On the decode workers, per
+element: tag filter → (for ways) geometry assembly and area/winding
+classification, each position formatted once → property serialization,
+appended to the block's chunk of complete feature bodies. The ordered
+consumer on the calling thread writes each chunk's features in file
+order, one `write_all` per body and separator, so the writer sees the
+calls a serial walk made. A worker's refusal (a metadata claim export
+cannot print) rides in its chunk after the features before it, so those
+are written first; a write failure ends the read at once, behind only the
+work already admitted. A block whose text would pass
+`EXPORT_WORKER_CHUNK_CAP` is handed to the consumer, which formats and
+writes it a batch at a time. `geojsonseq` writes one Feature per line.
+`geojson` writes each Feature into a single FeatureCollection array,
+which the writer closes at the end. Untagged nodes/ways and nodes/ways
+with invalid geometry (including any emitted position outside the
+geographic domain) are skipped and counted, not errored.
 
 ### apply-changes (merge)
 

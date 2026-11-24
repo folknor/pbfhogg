@@ -55,12 +55,10 @@ admission and the regressions.
 
 - [ ] **GeoJSON export v2**
   ([notes/geojson-export-design.md](geojson-export-design.md)):
-  relations -> MultiPolygon, raw-PBF index fallback, verify + throughput
-  baseline (brokkr#139). Same `export` command GeoParquet extends, so
-  touch it once for both formats. brokkr#139 is blocked on us
-  (2026-11-09): brokkr builds no `export` command, so the throughput
-  baseline is a pbfhogg script bench in `brokkr.d/benches.toml`; and its
-  verify judges only the agreement surface (ways and nodes both tools
+  relations -> MultiPolygon, raw-PBF index fallback, verify. Same
+  `export` command GeoParquet extends, so touch it once for both formats.
+  The throughput baseline is the `geojson-export` script bench. The
+  verify, pbfhogg-verify's since brokkr#139 closed, judges only the agreement surface (ways and nodes both tools
   export, by ID, geometry within a tolerance, tags), which needs pbfhogg
   to state the contract first, in ADR-0010 or the design note: which
   divergences from `osmium export` are allowed and which are bugs.

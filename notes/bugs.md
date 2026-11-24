@@ -51,17 +51,6 @@ Reported by: apply-core.
 Samples are inserted only in the two passthrough arms; rewritten and create
 frames never contribute, though `stats.rs` labels the result blob sizes.
 
-## BUG-024 - Export keeps decoding after a write failure
-
-Reported by: spatial.
-
-The export callback records `first_err` and later callbacks return early, but
-sequential `for_each` still reads and decompresses the rest of the input, so a
-broken pipe can waste a planet traversal.
-
-Defect hunt 2026-11-17 (export) observed the same behaviour and notes it is
-already recorded as deferred work.
-
 ## BUG-027 - Geocode building placement is a vertex mean
 
 Reported by: geocode.

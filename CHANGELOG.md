@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **`export` runs on every core, stops at a failed write, and believes
+  kind claims.** Features are now formatted on the read's decode workers
+  and written in input order, so export is many times faster (Germany
+  about 3 minutes to under 10 seconds), with byte-identical output. A
+  failed write, such as a closed stdout pipe, now ends the run at once
+  instead of decoding the rest of the input. On indexed input a blob whose
+  indexdata claims relations, or under `--type` the kind not selected, is
+  skipped without decoding, and a decoded blob holding a kind its claim
+  does not name is refused (exit `2`); `cat --reindex` repairs such a file.
+  A refused element still leaves the features before it written.
+
 - **`extract --simple` decodes each blob once on sorted indexed input, and
   refuses an inexact ID range it relies on.** A single-region simple
   extract of a sorted input now reads, decompresses and decodes each blob

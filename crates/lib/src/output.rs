@@ -2953,10 +2953,13 @@ impl Output {
             .open(&self.target.write)
         {
             Ok(file) => Ok(OutputWriter {
-                inner: Some(io::BufWriter::new(CancellableFile {
-                    file,
-                    cancel: cancel.clone(),
-                })),
+                inner: Some(io::BufWriter::with_capacity(
+                    crate::write::IO_BUF_BYTES,
+                    CancellableFile {
+                        file,
+                        cancel: cancel.clone(),
+                    },
+                )),
                 completion,
                 cancel: cancel.clone(),
             }),

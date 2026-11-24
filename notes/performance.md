@@ -732,39 +732,23 @@ Risks: aggregate budget fairness.
 
 Kind: high conviction (as part of PERF-011); local change (output).
 
-## PERF-022 - Export decodes and formats on one thread
+## PERF-022 - Export's remaining per-feature work
 
 Reported by: spatial, decode.
 
-Mechanism: export calls `ElementReader::for_each`, which reads, decompresses,
-builds blocks and runs the callback sequentially; geometry, filtering,
-coordinate formatting, JSON escaping, metadata and writing are all serial.
-Unemittable relations and unwanted kinds are decoded. Features are built as a
-geometry string and a properties string then copied into `FeatureWriter`.
-Property serialization allocates a JSON string per key and value and builds
-hash sets per feature; metadata is read when disabled; `coord_fmt.rs` uses
-general float formatting; `is_area_way` scans refs before separate coordinate
-and geometry scans.
+Export formats on the decode workers and writes on one ordered consumer
+(landed 2026-11-24; numbers in `reference/performance/export.md`). What the
+original finding proposed and was not done:
 
-Redesign: read block -> worker validates and exports all features into a
-reusable chunk -> ordered sink writes (`for_each_fused_block`,
-`for_each_fused_buffer` already exist); FeatureCollection chunks carry counts
-and the sink handles commas; push type and conservative expression filters into
-scheduling via `BlobFilter` and the tags-filter expression logic (export accepts
-empty expressions, tags-filter does not); local changes: append escaped text
-directly and cache escaped string-table entries per block, skip metadata,
-integer decimal emission for e7 coordinates preserving rounding for non-default
-framing (`decimicro_*` truncation is not equivalent), fuse area and bbox
-summaries with coordinate decode. `text_quote.rs` is not in export's output
-path. Switching to `for_each_pipelined` alone leaves the work in one consumer.
+- An escaped string-table cache per block: every key and value occurrence is
+  still escaped through serde_json on its own.
+- Fusing the walks over a way: `is_area_way` walks the refs, `--bbox` walks
+  the locations, then formatting walks them again.
+- Expression and tag-key blob pruning was refused, not deferred: the summary
+  counts untagged elements of every selected kind before any expression, and
+  a blob skipped on its key set would drop them (comment at `ExportBlocks`).
 
-Payoff: removes a whole-command serial bottleneck; remaining serial part is
-mostly output bandwidth.
-
-Risks: chunks bounded by bytes, feature and property order, prompt stop on
-write failure, one very large way holding unbounded text.
-
-Kind: high conviction.
+Kind: local, low conviction once the consumer's write path is the bound.
 
 ## PERF-023 - Export should consume the ALTW join directly
 

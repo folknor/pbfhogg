@@ -50,21 +50,11 @@ enriched-input requirement) was resolved in ADR-0010 and the shipped code.
   coordinate scatter) would lift that requirement at a memory cost.
 - **GeoPackage / binary output.** Needs an SQLite dependency; the
   desktop-GIS standard but out of scope entirely for the text formats.
-- **Parallel / fused export.** v1 decodes sequentially. `is_area_way`
-  walks `refs()`/`tags()` while `collect_coords` walks `node_locations()`
-  - two passes per way plus `tags()` for expression matching; a future
-  parallel or fused rework should know those walks exist.
 - **Configurable coordinate precision.** Fixed at 7 dp (decimicrodegree),
   trailing zeros trimmed.
 - **Configurable area rules.** v1 uses the fixed `AREA_KEYS` list plus
   `area=yes`/`area=no`; osmium uses a config file. A config surface is
   deferred.
-- **Early-abort on a broken pipe.** `ElementReader::for_each`'s
-  `()`-returning closure cannot stop the decode, so v1 captures the first
-  write/serialize error and surfaces it only after decoding to EOF (a
-  consumer like `head` exiting does not abort the run early). A fallible
-  reader callback is the named follow-up; the output is staged and only
-  published on success, so no partial file survives regardless.
 - **True bbox overlap for ways.** v1's way bbox filter is vertex-only and
   lossy: a way whose edge crosses the box with no vertex inside, or a
   polygon that encloses the whole box, is dropped. Real overlap / clipping
@@ -85,16 +75,6 @@ These cannot be built from inside the pbfhogg workspace; they need the
   or an attributes config naming `id`/`type`). Additive confidence only -
   the in-tree golden-file tests already assert area / winding / collision
   strictly.
-- **Denmark ALTW artifact.** Denmark defines only `indexed` and `raw`
-  variants (only europe and planet have `altw`). A Denmark altw artifact
-  must be produced and registered in `brokkr.toml` before any
-  `--variant altw` Denmark export/verify resolves.
-- **Throughput baseline.** `brokkr export` is not a registered subcommand
-  and brokkr has no GeoJSON scratch output kind, so no bench cell can run
-  today. Once that plumbing and the Denmark altw artifact exist, establish
-  the v1 export throughput baseline (host + commit recorded) in
-  `reference/performance/README.md`. A first-ever baseline needs no
-  performance-history arc.
 
 ## Cross-references
 

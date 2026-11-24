@@ -1886,6 +1886,15 @@ rounds onto a pole is valid, and libosmium's undefined location, `214.7483647`
 on both axes, is not). An area way is also invalid when its ring has zero
 signed area at the emitted precision (collinear, or collapsed by rounding).
 
+Features are formatted on the read's decode workers and written in input
+order. A failed write (a closed stdout pipe included) stops the read at once
+rather than after the rest of the input; a refused element still leaves the
+features before it written. On indexed input, export skips without decoding a
+blob whose indexdata claims relations, or under `--type` the kind not
+selected, and refuses a decoded blob holding a kind its claim does not name
+(see the kind claim in
+[indexdata-trust](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md)).
+
 ### diff
 
 Compare two PBF files and show differences. Uses content equality (node coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](https://github.com/folknor/pbfhogg/blob/main/DEVIATIONS.md#diff-content-equality-vs-version-ordering)). Inline `LocationsOnWays` way coordinates are not content by default: two files whose ways differ only in them are identical.

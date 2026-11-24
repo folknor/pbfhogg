@@ -5,51 +5,25 @@ pub(super) const AREA_KEYS: &[&str] = &[
     "building", "landuse", "natural", "leisure", "amenity", "boundary", "waterway",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Geom {
-    Written,
-    Invalid,
+/// Emitted latitude bound, in 10^-7 degrees, inclusive.
+const MAX_LAT_E7: i128 = 900_000_000;
+/// Emitted longitude bound, in 10^-7 degrees, inclusive.
+const MAX_LON_E7: i128 = 1_800_000_000;
+
+/// One ordinate as the element reports it: the exact nanodegree value and
+/// the `f64` degrees of its `lon()` / `lat()` accessor.
+#[derive(Clone, Copy)]
+pub(super) struct Ordinate {
+    pub(super) nano: i128,
+    pub(super) deg: f64,
 }
 
-fn push_position(buf: &mut String, scratch: &mut String, lon: f64, lat: f64) {
-    buf.push('[');
-    format_coord(scratch, lon);
-    buf.push_str(scratch);
-    buf.push(',');
-    format_coord(scratch, lat);
-    buf.push_str(scratch);
-    buf.push(']');
-}
-
-/// Writes a Point, or returns `Invalid` when its emitted position is outside
-/// the geographic domain (see [`emitted_position`]).
-pub(super) fn write_point(buf: &mut String, scratch: &mut String, lon: f64, lat: f64) -> Geom {
-    if emitted_position(scratch, lon, lat).is_none() {
-        return Geom::Invalid;
-    }
-    buf.clear();
-    buf.push_str("{\"type\":\"Point\",\"coordinates\":");
-    push_position(buf, scratch, lon, lat);
-    buf.push('}');
-    Geom::Written
-}
-
-pub(super) fn collect_coords(way: &Way<'_>, coords: &mut Vec<(f64, f64)>) {
-    coords.clear();
-    coords.extend(
-        way.node_locations()
-            .map(|location| (location.lon(), location.lat())),
-    );
-}
-
-/// The coordinate `format_coord` writes for `deg`, as an exact count of
-/// 10^-7 degrees, parsed back from that same text. `None` for text that is
-/// not a plain decimal (`NaN`, `inf`) or does not fit.
-fn emitted_e7(scratch: &mut String, deg: f64) -> Option<i128> {
-    format_coord(scratch, deg);
-    let (negative, digits) = match scratch.strip_prefix('-') {
+/// The exact count of 10^-7 degrees `format_coord` text spells. `None` for
+/// text that is not a plain decimal (`NaN`, `inf`) or does not fit.
+fn parse_e7(text: &str) -> Option<i128> {
+    let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
-        None => (false, scratch.as_str()),
+        None => (false, text),
     };
     let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
     if int_part.is_empty() || frac_part.len() > 7 {
@@ -68,139 +42,277 @@ fn emitted_e7(scratch: &mut String, deg: f64) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
-/// Emitted latitude bound, in 10^-7 degrees, inclusive.
-const MAX_LAT_E7: i128 = 900_000_000;
-/// Emitted longitude bound, in 10^-7 degrees, inclusive.
-const MAX_LON_E7: i128 = 1_800_000_000;
+/// Appends `e7` spelled as `format_coord` spells a coordinate of exactly
+/// that many 10^-7 degrees: the sign, the whole degrees, then the fraction
+/// with its trailing zeros, and a bare point, trimmed.
+fn push_e7(out: &mut Vec<u8>, e7: i128) {
+    use std::io::Write;
 
-/// The position export writes for `(lon, lat)`, as exact 10^-7 degree
-/// counts parsed from the very text `format_coord` produces, or `None` when
-/// that text is not a plain decimal or lies outside -180..=180 longitude or
-/// -90..=90 latitude. RFC 7946 positions are WGS 84 degrees, so the domain
-/// is judged on what is printed: a value just past a pole that rounds to
-/// `90` is valid output, and libosmium's undefined location (`2147483647`
-/// on both axes, printed as `214.7483647`) is not. The readers do not check
-/// the geographic domain, so export enforces it at its own output. Points
-/// and LineStrings format each ordinate once more than writing does; export
-/// has no bench, and that was judged not worth a format-once restructure.
-fn emitted_position(scratch: &mut String, lon: f64, lat: f64) -> Option<(i128, i128)> {
-    let lon = emitted_e7(scratch, lon).filter(|v| v.abs() <= MAX_LON_E7)?;
-    let lat = emitted_e7(scratch, lat).filter(|v| v.abs() <= MAX_LAT_E7)?;
-    Some((lon, lat))
-}
-
-/// Twice the signed area of the ring export emits, in squared 10^-7 degrees,
-/// computed exactly. The orientation is judged on the emitted text, not on
-/// the input: an `f64` shoelace over absolute coordinates loses the sign to
-/// cancellation (a small clockwise ring near `(128, 64)` sums products near
-/// 8192 to recover a twice-area near `1e-14`), and exact input nanodegrees
-/// can disagree in sign with the rounded output when block offsets are not
-/// multiples of 100. Vertices are taken relative to the first, so the
-/// closing edge of an open ring contributes zero and needs no term. `None`
-/// when a coordinate does not format to a parseable decimal or the checked
-/// `i128` arithmetic overflows, which no geographically valid ring reaches,
-/// or when any emitted position is outside the geographic domain.
-fn emitted_twice_area(scratch: &mut String, coords: &[(f64, f64)]) -> Option<i128> {
-    let mut points = coords.iter();
-    let &(lon0, lat0) = points.next()?;
-    let origin = emitted_position(scratch, lon0, lat0)?;
-    let mut prev = (0_i128, 0_i128);
-    let mut twice_area: i128 = 0;
-    for &(lon, lat) in points {
-        let (lon, lat) = emitted_position(scratch, lon, lat)?;
-        let cur = (lon.checked_sub(origin.0)?, lat.checked_sub(origin.1)?);
-        let det = prev
-            .0
-            .checked_mul(cur.1)?
-            .checked_sub(cur.0.checked_mul(prev.1)?)?;
-        twice_area = twice_area.checked_add(det)?;
-        prev = cur;
+    if e7 < 0 {
+        out.push(b'-');
     }
-    Some(twice_area)
-}
-
-fn push_positions<'a, I>(
-    buf: &mut String,
-    scratch: &mut String,
-    positions: I,
-    wrote_position: &mut bool,
-) where
-    I: Iterator<Item = &'a (f64, f64)>,
-{
-    for &(lon, lat) in positions {
-        if *wrote_position {
-            buf.push(',');
+    let magnitude = e7.unsigned_abs();
+    let whole = magnitude / 10_000_000;
+    let mut frac = magnitude % 10_000_000;
+    write!(out, "{whole}").ok();
+    if frac != 0 {
+        let mut width = 7;
+        while frac % 10 == 0 {
+            frac /= 10;
+            width -= 1;
         }
-        push_position(buf, scratch, lon, lat);
-        *wrote_position = true;
+        write!(out, ".{frac:0width$}").ok();
     }
 }
 
-pub(super) fn write_way_geometry(
-    buf: &mut String,
+/// Appends the text export writes for one ordinate and returns its exact
+/// emitted value in 10^-7 degrees, or `None` when that text is not a plain
+/// decimal or lies past `bound`.
+///
+/// The text is `format_coord(deg)`: seven decimals correctly rounded from
+/// the `f64`, trailing zeros trimmed. When the exact value is a whole number
+/// `k` of 10^-7 degrees (every coordinate of a default-granularity file)
+/// and `|k|` is within the bound, that rounding is `k` itself: `deg` is
+/// `1e-9 * nano` evaluated in `f64`, within a few ulps (under 3e-14 at 180
+/// degrees) of `k * 1e-7`, far from the 5e-8 a rounding would have to
+/// cross, so the text is written from `k` with no float formatting. A
+/// whole `k` past the bound is outside the domain whichever text it would
+/// print: the nearest such value is a full 10^-7 degree past the edge and
+/// the conversion is monotone. Any other value (a non-default granularity
+/// or offset) can sit on or near a half-unit, where only the `f64` decides,
+/// and goes through `format_coord`, which also keeps a small negative
+/// value's `-0`.
+fn push_ordinate(
+    out: &mut Vec<u8>,
     scratch: &mut String,
-    coords: &[(f64, f64)],
-    is_area: bool,
-) -> Geom {
-    if !is_area && coords.len() < 2 {
-        return Geom::Invalid;
+    ord: Ordinate,
+    bound: i128,
+) -> Option<i128> {
+    if ord.nano % 100 == 0 {
+        let e7 = ord.nano / 100;
+        if e7.abs() > bound {
+            return None;
+        }
+        push_e7(out, e7);
+        return Some(e7);
     }
-    // Every emitted position must lie in the geographic domain; an area
-    // ring is held to it by `emitted_twice_area` below.
-    if !is_area
-        && coords
+    format_coord(scratch, ord.deg);
+    let e7 = parse_e7(scratch).filter(|v| v.abs() <= bound)?;
+    out.extend_from_slice(scratch.as_bytes());
+    Some(e7)
+}
+
+/// A feature's positions, each formatted once: the text of every position
+/// (`lon,lat`), its exact emitted value, which the domain, area and
+/// orientation checks read, and the first and last input pair, which decide
+/// whether a ring is closed. Emission copies the text.
+#[derive(Default)]
+pub(super) struct Positions {
+    text: Vec<u8>,
+    /// Byte end of each position's text; a position starts where the
+    /// previous one ends.
+    ends: Vec<usize>,
+    e7: Vec<(i128, i128)>,
+    first: Option<(f64, f64)>,
+    last: Option<(f64, f64)>,
+    scratch: String,
+}
+
+impl Positions {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.ends.clear();
+        self.e7.clear();
+        self.first = None;
+        self.last = None;
+    }
+
+    /// Adds one position, or returns `false` when its emitted text is not a
+    /// plain decimal or lies outside -180..=180 longitude or -90..=90
+    /// latitude. RFC 7946 positions are WGS 84 degrees, so the domain is
+    /// judged on what is printed: a value just past a pole that rounds to
+    /// `90` is valid output, and libosmium's undefined location
+    /// (`2147483647` on both axes, printed as `214.7483647`) is not. The
+    /// readers do not check the geographic domain, so export enforces it at
+    /// its own output.
+    fn push(&mut self, lon: Ordinate, lat: Ordinate) -> bool {
+        let Some(lon_e7) = push_ordinate(&mut self.text, &mut self.scratch, lon, MAX_LON_E7) else {
+            return false;
+        };
+        self.text.push(b',');
+        let Some(lat_e7) = push_ordinate(&mut self.text, &mut self.scratch, lat, MAX_LAT_E7) else {
+            return false;
+        };
+        self.ends.push(self.text.len());
+        self.e7.push((lon_e7, lat_e7));
+        if self.first.is_none() {
+            self.first = Some((lon.deg, lat.deg));
+        }
+        self.last = Some((lon.deg, lat.deg));
+        true
+    }
+
+    /// Formats one point; `false` when it is outside the domain.
+    pub(super) fn fill_point(&mut self, lon: Ordinate, lat: Ordinate) -> bool {
+        self.clear();
+        self.push(lon, lat)
+    }
+
+    /// Formats every position of `way`; `false` when one is invalid.
+    pub(super) fn fill_way(&mut self, way: &Way<'_>) -> bool {
+        self.clear();
+        way.node_locations().all(|location| {
+            self.push(
+                Ordinate {
+                    nano: location.nano_lon_exact(),
+                    deg: location.lon(),
+                },
+                Ordinate {
+                    nano: location.nano_lat_exact(),
+                    deg: location.lat(),
+                },
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn fill(&mut self, coords: &[(f64, f64)]) -> bool {
+        self.clear();
+        coords
             .iter()
-            .any(|&(lon, lat)| emitted_position(scratch, lon, lat).is_none())
-    {
-        return Geom::Invalid;
+            .all(|&(lon, lat)| self.push(test_ordinate(lon), test_ordinate(lat)))
     }
 
-    let closed = coords.first() == coords.last();
-    // An area ring is judged by one rule, on the coordinates it emits: a
-    // non-zero exact emitted twice-area. That rejects rings that are
-    // collinear or that rounding to seven decimals collapses, which a
-    // check on the unrounded input passes. It also implies every older
-    // guard: a non-zero determinant names two emitted positions distinct
-    // from the first and not collinear with it, so the ring has three
-    // distinct positions and, closed or with its closing position
-    // appended, at least four. A self-intersecting ring whose lobes cancel
-    // to exactly zero net area is rejected too; self-intersection is not
-    // otherwise checked.
-    let reverse = if is_area {
-        match emitted_twice_area(scratch, coords) {
-            None | Some(0) => return Geom::Invalid,
-            Some(twice_area) => twice_area < 0,
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// The bytes a geometry of these positions takes at most: every text,
+    /// its brackets and separators, the closing position and the frame.
+    pub(super) fn bound(&self) -> usize {
+        self.text.len() + self.ends.len() * 3 + self.ends.first().copied().unwrap_or(0) + 64
+    }
+
+    fn push_position(&self, out: &mut Vec<u8>, i: usize) {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] };
+        out.push(b'[');
+        out.extend_from_slice(&self.text[start..self.ends[i]]);
+        out.push(b']');
+    }
+
+    /// Twice the signed area of the ring export emits, in squared 10^-7
+    /// degrees, computed exactly. The orientation is judged on the emitted
+    /// values, not on the input: an `f64` shoelace over absolute coordinates
+    /// loses the sign to cancellation (a small clockwise ring near
+    /// `(128, 64)` sums products near 8192 to recover a twice-area near
+    /// `1e-14`), and exact input nanodegrees can disagree in sign with the
+    /// rounded output when block offsets are not multiples of 100. Vertices
+    /// are taken relative to the first, so the closing edge of an open ring
+    /// contributes zero and needs no term. `None` for no positions, or when
+    /// the checked `i128` arithmetic overflows, which no in-domain ring
+    /// reaches.
+    fn twice_area(&self) -> Option<i128> {
+        let mut points = self.e7.iter();
+        let &origin = points.next()?;
+        let mut prev = (0_i128, 0_i128);
+        let mut twice_area: i128 = 0;
+        for &(lon, lat) in points {
+            let cur = (lon.checked_sub(origin.0)?, lat.checked_sub(origin.1)?);
+            let det = prev
+                .0
+                .checked_mul(cur.1)?
+                .checked_sub(cur.0.checked_mul(prev.1)?)?;
+            twice_area = twice_area.checked_add(det)?;
+            prev = cur;
+        }
+        Some(twice_area)
+    }
+}
+
+/// How a valid way is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WayShape {
+    area: bool,
+    reverse: bool,
+    closed: bool,
+}
+
+/// Judges a way's formatted positions: `None` when its geometry is invalid.
+/// Every position already lies in the geographic domain
+/// ([`Positions::fill_way`]). A LineString needs two positions. An area ring
+/// is judged by one rule, on the coordinates it emits: a non-zero exact
+/// emitted twice-area. That rejects rings that are collinear or that
+/// rounding to seven decimals collapses, which a check on the unrounded
+/// input passes. It also implies every older guard: a non-zero determinant
+/// names two emitted positions distinct from the first and not collinear
+/// with it, so the ring has three distinct positions and, closed or with
+/// its closing position appended, at least four. A self-intersecting ring
+/// whose lobes cancel to exactly zero net area is rejected too;
+/// self-intersection is not otherwise checked. Whether the ring is closed
+/// is decided on the input pairs, so endpoints that print alike but differ
+/// still get the closing position appended.
+pub(super) fn way_shape(positions: &Positions, is_area: bool) -> Option<WayShape> {
+    let closed = positions.first == positions.last;
+    if !is_area {
+        return (positions.len() >= 2).then_some(WayShape {
+            area: false,
+            reverse: false,
+            closed,
+        });
+    }
+    match positions.twice_area() {
+        None | Some(0) => None,
+        Some(twice_area) => Some(WayShape {
+            area: true,
+            reverse: twice_area < 0,
+            closed,
+        }),
+    }
+}
+
+/// Writes a Point of the one formatted position.
+pub(super) fn write_point(out: &mut Vec<u8>, positions: &Positions) {
+    out.extend_from_slice(b"{\"type\":\"Point\",\"coordinates\":");
+    positions.push_position(out, 0);
+    out.push(b'}');
+}
+
+/// Writes a way's LineString, or its Polygon closed and counterclockwise.
+pub(super) fn write_way(out: &mut Vec<u8>, positions: &Positions, shape: WayShape) {
+    if shape.area {
+        out.extend_from_slice(b"{\"type\":\"Polygon\",\"coordinates\":[[");
+    } else {
+        out.extend_from_slice(b"{\"type\":\"LineString\",\"coordinates\":[");
+    }
+    let n = positions.len();
+    let mut push = |i: usize, first: bool| {
+        if !first {
+            out.push(b',');
+        }
+        positions.push_position(out, i);
+    };
+    if shape.reverse && !shape.closed {
+        push(0, true);
+        for i in (1..n).rev() {
+            push(i, false);
+        }
+    } else if shape.reverse {
+        for i in (0..n).rev() {
+            push(i, i == n - 1);
         }
     } else {
-        false
-    };
-
-    buf.clear();
-    if is_area {
-        buf.push_str("{\"type\":\"Polygon\",\"coordinates\":[[");
+        for i in 0..n {
+            push(i, i == 0);
+        }
+    }
+    if shape.area && !shape.closed {
+        push(0, false);
+    }
+    if shape.area {
+        out.extend_from_slice(b"]]}");
     } else {
-        buf.push_str("{\"type\":\"LineString\",\"coordinates\":[");
+        out.extend_from_slice(b"]}");
     }
-    let mut wrote_position = false;
-    if reverse && !closed {
-        push_positions(buf, scratch, coords[..1].iter(), &mut wrote_position);
-        push_positions(buf, scratch, coords[1..].iter().rev(), &mut wrote_position);
-    } else if reverse {
-        push_positions(buf, scratch, coords.iter().rev(), &mut wrote_position);
-    } else {
-        push_positions(buf, scratch, coords.iter(), &mut wrote_position);
-    }
-    if is_area && !closed {
-        buf.push(',');
-        let &(lon, lat) = &coords[0];
-        push_position(buf, scratch, lon, lat);
-    }
-    if is_area {
-        buf.push_str("]]}");
-    } else {
-        buf.push_str("]}");
-    }
-    Geom::Written
 }
 
 fn is_area_tags<'a, T>(tags: T) -> bool
@@ -245,72 +357,76 @@ pub(super) fn is_area_way(way: &Way<'_>) -> bool {
     is_area_tags(way.tags())
 }
 
+/// An ordinate as a test states it in degrees, with the nanodegree value
+/// the accessors would hold for it: exact where the degrees are a whole
+/// nanodegree count, otherwise one that is not a whole 10^-7 degree, so the
+/// `format_coord` path decides.
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+fn test_ordinate(deg: f64) -> Ordinate {
+    let nano = (deg * 1e9).round();
+    if deg.is_finite() && nano.abs() < 1e15 && (1e-9 * nano - deg).abs() <= f64::EPSILON * deg.abs()
+    {
+        Ordinate {
+            nano: nano as i128,
+            deg,
+        }
+    } else {
+        Ordinate { nano: 1, deg }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn point(lon: f64, lat: f64) -> Option<String> {
+        let mut positions = Positions::default();
+        if !positions.fill_point(test_ordinate(lon), test_ordinate(lat)) {
+            return None;
+        }
+        let mut out = Vec::new();
+        write_point(&mut out, &positions);
+        Some(String::from_utf8(out).expect("geometry is ASCII"))
+    }
+
+    fn way(coords: &[(f64, f64)], is_area: bool) -> Option<String> {
+        let mut positions = Positions::default();
+        if !positions.fill(coords) {
+            return None;
+        }
+        let shape = way_shape(&positions, is_area)?;
+        let mut out = Vec::new();
+        write_way(&mut out, &positions, shape);
+        assert!(out.len() <= positions.bound());
+        Some(String::from_utf8(out).expect("geometry is ASCII"))
+    }
+
     #[test]
     fn point_and_line_format() {
-        let mut buf = String::new();
-        let mut scratch = String::new();
         assert_eq!(
-            write_point(&mut buf, &mut scratch, 12.5, 55.123_456_7),
-            Geom::Written
+            point(12.5, 55.123_456_7).as_deref(),
+            Some("{\"type\":\"Point\",\"coordinates\":[12.5,55.1234567]}")
         );
         assert_eq!(
-            buf,
-            "{\"type\":\"Point\",\"coordinates\":[12.5,55.1234567]}"
-        );
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &[(1.0, 2.0), (3.0, 4.0)], false),
-            Geom::Written
-        );
-        assert_eq!(
-            buf,
-            "{\"type\":\"LineString\",\"coordinates\":[[1,2],[3,4]]}"
+            way(&[(1.0, 2.0), (3.0, 4.0)], false).as_deref(),
+            Some("{\"type\":\"LineString\",\"coordinates\":[[1,2],[3,4]]}")
         );
     }
 
     #[test]
     fn polygon_closes_and_reorients_clockwise_ring() {
-        let mut buf = String::new();
-        let mut scratch = String::new();
         assert_eq!(
-            write_way_geometry(
-                &mut buf,
-                &mut scratch,
-                &[(0.0, 0.0), (0.0, 1.0), (1.0, 0.0)],
-                true
-            ),
-            Geom::Written
+            way(&[(0.0, 0.0), (0.0, 1.0), (1.0, 0.0)], true).as_deref(),
+            Some("{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[0,1],[0,0]]]}")
         );
-        assert_eq!(
-            buf,
-            "{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[0,1],[0,0]]]}"
-        );
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &[(0.0, 0.0)], false),
-            Geom::Invalid
-        );
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &[(0.0, 0.0)], true),
-            Geom::Invalid
-        );
-        assert_eq!(
-            write_way_geometry(
-                &mut buf,
-                &mut scratch,
-                &[(0.0, 0.0), (0.0, 0.0), (1.0, 1.0)],
-                true
-            ),
-            Geom::Invalid
-        );
+        assert_eq!(way(&[(0.0, 0.0)], false), None);
+        assert_eq!(way(&[(0.0, 0.0)], true), None);
+        assert_eq!(way(&[(0.0, 0.0), (0.0, 0.0), (1.0, 1.0)], true), None);
     }
 
     #[test]
     fn clockwise_ring_far_from_origin_is_reoriented() {
-        let mut buf = String::new();
-        let mut scratch = String::new();
         let ring = [
             (128.0, 64.0),
             (128.0, 64.000_000_1),
@@ -318,13 +434,11 @@ mod tests {
             (128.0, 64.0),
         ];
         assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &ring, true),
-            Geom::Written
-        );
-        assert_eq!(
-            buf,
-            "{\"type\":\"Polygon\",\"coordinates\":[[[128,64],[128.0000001,64],\
-             [128,64.0000001],[128,64]]]}"
+            way(&ring, true).as_deref(),
+            Some(
+                "{\"type\":\"Polygon\",\"coordinates\":[[[128,64],[128.0000001,64],\
+                 [128,64.0000001],[128,64]]]}"
+            )
         );
     }
 
@@ -333,8 +447,6 @@ mod tests {
         // Exact nanodegrees (offset 50) wind counterclockwise, but the
         // seven-decimal output winds clockwise; the output is what must be
         // counterclockwise.
-        let mut buf = String::new();
-        let mut scratch = String::new();
         let ring = [
             (-5050e-9, 8350e-9),
             (-1950e-9, 11850e-9),
@@ -342,121 +454,124 @@ mod tests {
             (-5050e-9, 8350e-9),
         ];
         assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &ring, true),
-            Geom::Written
+            way(&ring, true).as_deref(),
+            Some(
+                "{\"type\":\"Polygon\",\"coordinates\":[[[-0.000005,0.0000083],\
+                 [0.0000012,0.0000154],[-0.0000019,0.0000119],[-0.000005,0.0000083]]]}"
+            )
         );
+    }
+
+    #[test]
+    fn endpoints_that_print_alike_still_close() {
+        // The last input position differs from the first below print
+        // precision, so the ring is open and the first position is appended.
+        let ring = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1e-9, 0.0)];
         assert_eq!(
-            buf,
-            "{\"type\":\"Polygon\",\"coordinates\":[[[-0.000005,0.0000083],\
-             [0.0000012,0.0000154],[-0.0000019,0.0000119],[-0.000005,0.0000083]]]}"
+            way(&ring, true).as_deref(),
+            Some("{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[0,1],[0,0],[0,0]]]}")
         );
     }
 
     #[test]
     fn zero_emitted_area_is_invalid() {
-        let mut buf = String::new();
-        let mut scratch = String::new();
         let collinear = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (0.0, 0.0)];
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &collinear, true),
-            Geom::Invalid
-        );
+        assert_eq!(way(&collinear, true), None);
         // Three distinct input positions that all round to [0,0].
         let collapsed = [(0.0, 0.0), (0.0, 1e-9), (1e-9, 0.0), (0.0, 0.0)];
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &collapsed, true),
-            Geom::Invalid
-        );
+        assert_eq!(way(&collapsed, true), None);
         // Distinct input that rounds to two distinct positions.
         let flattened = [(0.0, 0.0), (1e-9, 1.0), (0.0, 1.0), (0.0, 0.0)];
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &flattened, true),
-            Geom::Invalid
-        );
+        assert_eq!(way(&flattened, true), None);
         // Lobes of a bowtie cancel to zero net area.
         let bowtie = [(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &bowtie, true),
-            Geom::Invalid
-        );
+        assert_eq!(way(&bowtie, true), None);
         // An open ring needs no fourth input position.
-        assert_eq!(
-            write_way_geometry(
-                &mut buf,
-                &mut scratch,
-                &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
-                true
-            ),
-            Geom::Written
-        );
+        assert!(way(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], true).is_some());
     }
 
     #[test]
     fn unformattable_area_coordinate_is_invalid() {
-        let mut buf = String::new();
-        let mut scratch = String::new();
         assert_eq!(
-            write_way_geometry(
-                &mut buf,
-                &mut scratch,
-                &[(0.0, 0.0), (f64::NAN, 1.0), (1.0, 0.0), (0.0, 0.0)],
-                true
-            ),
-            Geom::Invalid
+            way(&[(0.0, 0.0), (f64::NAN, 1.0), (1.0, 0.0), (0.0, 0.0)], true),
+            None
         );
     }
 
     #[test]
     fn positions_outside_the_geographic_domain_are_invalid() {
-        let mut buf = String::new();
-        let mut scratch = String::new();
-        assert_eq!(
-            write_point(&mut buf, &mut scratch, 0.0, 100.0),
-            Geom::Invalid
-        );
-        assert_eq!(
-            write_point(&mut buf, &mut scratch, -180.000_000_1, 0.0),
-            Geom::Invalid
-        );
+        assert_eq!(point(0.0, 100.0), None);
+        assert_eq!(point(-180.000_000_1, 0.0), None);
         // Edges are inclusive, and a value that rounds onto a pole is valid.
         assert_eq!(
-            write_point(&mut buf, &mut scratch, -180.0, 90.000_000_04),
-            Geom::Written
+            point(-180.0, 90.000_000_04).as_deref(),
+            Some("{\"type\":\"Point\",\"coordinates\":[-180,90]}")
         );
-        assert_eq!(buf, "{\"type\":\"Point\",\"coordinates\":[-180,90]}");
         // libosmium's undefined location.
         let undefined = 214.748_364_7;
+        assert_eq!(way(&[(1.0, 2.0), (undefined, undefined)], false), None);
         assert_eq!(
-            write_way_geometry(
-                &mut buf,
-                &mut scratch,
-                &[(1.0, 2.0), (undefined, undefined)],
-                false
-            ),
-            Geom::Invalid
-        );
-        assert_eq!(
-            write_way_geometry(
-                &mut buf,
-                &mut scratch,
+            way(
                 &[(0.0, 0.0), (1.0, 0.0), (1.0, 90.000_000_1), (0.0, 0.0)],
                 true
             ),
-            Geom::Invalid
+            None
         );
-        assert_eq!(
-            write_way_geometry(&mut buf, &mut scratch, &[(0.0, 0.0), (0.0, 1e300)], false),
-            Geom::Invalid
-        );
+        assert_eq!(way(&[(0.0, 0.0), (0.0, 1e300)], false), None);
     }
 
     #[test]
-    fn emitted_e7_parses_formatted_text() {
+    fn parse_e7_reads_formatted_text() {
         let mut scratch = String::new();
-        assert_eq!(emitted_e7(&mut scratch, -0.000_000_01), Some(0));
-        assert_eq!(emitted_e7(&mut scratch, -0.000_000_1), Some(-1));
-        assert_eq!(emitted_e7(&mut scratch, 12.5), Some(125_000_000));
-        assert_eq!(emitted_e7(&mut scratch, f64::INFINITY), None);
+        for (deg, want) in [
+            (-0.000_000_01, Some(0)),
+            (-0.000_000_1, Some(-1)),
+            (12.5, Some(125_000_000)),
+            (f64::INFINITY, None),
+        ] {
+            format_coord(&mut scratch, deg);
+            assert_eq!(parse_e7(&scratch), want, "{deg}");
+        }
+    }
+
+    /// The whole-decimicrodegree path writes exactly the text and value the
+    /// `format_coord` path does, for the `f64` the accessors compute
+    /// (`1e-9 * nano`), across every magnitude in the domain.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn integer_text_matches_float_formatting() {
+        let mut scratch = String::new();
+        let mut check = |e7: i128| {
+            let nano = e7 * 100;
+            let deg = 1e-9 * nano as f64;
+            let mut fast = Vec::new();
+            let fast_e7 =
+                push_ordinate(&mut fast, &mut scratch, Ordinate { nano, deg }, MAX_LON_E7);
+            format_coord(&mut scratch, deg);
+            let slow_e7 = parse_e7(&scratch).filter(|v| v.abs() <= MAX_LON_E7);
+            assert_eq!(fast_e7, slow_e7, "{e7}");
+            if fast_e7.is_some() {
+                assert_eq!(fast, scratch.as_bytes(), "{e7}");
+            }
+        };
+        for e7 in -20_000..=20_000 {
+            check(e7);
+        }
+        for edge in [MAX_LAT_E7, MAX_LON_E7] {
+            for e7 in edge - 20_000..=edge + 20_000 {
+                check(e7);
+                check(-e7);
+            }
+        }
+        // A fixed linear congruential walk over the whole domain.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..400_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let e7 = i128::from(state >> 33) % (2 * MAX_LON_E7 + 1) - MAX_LON_E7;
+            check(e7);
+        }
     }
 
     #[test]

@@ -2,11 +2,14 @@ use std::io::{self, Write};
 
 use super::ExportFormat;
 
+/// Frames formatted feature bodies into the output. Every feature is
+/// offered to `out` as it always was: the body then its newline for a
+/// sequence, the separating comma then the body for a collection, so a
+/// caller's writer sees the same calls whichever thread formatted them.
 pub(super) struct FeatureWriter<W> {
     out: W,
     format: ExportFormat,
     wrote_any: bool,
-    buf: String,
 }
 
 impl<W: Write> FeatureWriter<W> {
@@ -18,32 +21,21 @@ impl<W: Write> FeatureWriter<W> {
             out,
             format,
             wrote_any: false,
-            buf: String::new(),
         })
     }
 
-    pub(super) fn write_feature_geometry_props(
-        &mut self,
-        geometry: &str,
-        properties: &str,
-    ) -> io::Result<()> {
-        self.buf.clear();
-        self.buf.push_str("{\"type\":\"Feature\",\"geometry\":");
-        self.buf.push_str(geometry);
-        self.buf.push_str(",\"properties\":");
-        self.buf.push_str(properties);
-        self.buf.push('}');
-
+    /// Writes one complete feature body.
+    pub(super) fn write_feature(&mut self, body: &[u8]) -> io::Result<()> {
         match self.format {
             ExportFormat::GeoJsonSeq => {
-                self.out.write_all(self.buf.as_bytes())?;
+                self.out.write_all(body)?;
                 self.out.write_all(b"\n")?;
             }
             ExportFormat::GeoJson => {
                 if self.wrote_any {
                     self.out.write_all(b",")?;
                 }
-                self.out.write_all(self.buf.as_bytes())?;
+                self.out.write_all(body)?;
             }
         }
         self.wrote_any = true;
@@ -62,13 +54,13 @@ impl<W: Write> FeatureWriter<W> {
 mod tests {
     use super::*;
 
+    const FEATURE: &[u8] = b"{\"type\":\"Feature\",\"geometry\":null,\"properties\":{}}";
+
     #[test]
     fn frames_sequence() {
         let mut out = Vec::new();
         let mut writer = FeatureWriter::new(&mut out, ExportFormat::GeoJsonSeq).expect("writer");
-        writer
-            .write_feature_geometry_props("null", "{}")
-            .expect("feature");
+        writer.write_feature(FEATURE).expect("feature");
         writer.finish().expect("finish");
         assert_eq!(
             out,
@@ -87,12 +79,8 @@ mod tests {
 
         out.clear();
         let mut writer = FeatureWriter::new(&mut out, ExportFormat::GeoJson).expect("writer");
-        writer
-            .write_feature_geometry_props("null", "{}")
-            .expect("first");
-        writer
-            .write_feature_geometry_props("null", "{}")
-            .expect("second");
+        writer.write_feature(FEATURE).expect("first");
+        writer.write_feature(FEATURE).expect("second");
         writer.finish().expect("finish");
         assert_eq!(
             out,

@@ -1587,7 +1587,8 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         time_filter_history,
         Mixed::RefusesPartial,
     ),
-    // export reads no indexdata either, and refuses.
+    // export reads only kind claims, decodes a blob without one, and
+    // refuses.
     ("export", export, Mixed::RefusesPartial),
     (
         "degrade --strip-indexdata",

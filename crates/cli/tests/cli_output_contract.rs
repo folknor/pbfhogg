@@ -129,6 +129,21 @@ impl Fx {
             &p.join("history.osm.pbf"),
             &p.join("history-corrupt.osm.pbf"),
         );
+        // export skips a blob claiming a kind it does not emit, so its
+        // damaged blob has to hold nodes.
+        crate::common::write_test_pbf_sorted(
+            &p.join("nodes.osm.pbf"),
+            &crate::common::generate_nodes(3, 1)
+                .into_iter()
+                .map(|n| crate::common::TestNode {
+                    tags: vec![("amenity", "bench")],
+                    ..n
+                })
+                .collect::<Vec<_>>(),
+            &[],
+            &[],
+        );
+        corrupt_last_blob(&p.join("nodes.osm.pbf"), &p.join("nodes-corrupt.osm.pbf"));
         std::fs::write(
             p.join("good.osc"),
             b"<osmChange version=\"0.6\"><create>\
@@ -166,6 +181,15 @@ impl Fx {
             Input::Good => self.path("history.osm.pbf"),
             Input::Missing => self.path(&format!("{MISSING_MARK}.osm.pbf")),
             Input::Corrupt => self.path("history-corrupt.osm.pbf"),
+        }
+    }
+
+    /// A PBF of nodes only.
+    fn nodes(&self, input: Input) -> PathBuf {
+        match input {
+            Input::Good => self.path("nodes.osm.pbf"),
+            Input::Missing => self.path(&format!("{MISSING_MARK}.osm.pbf")),
+            Input::Corrupt => self.path("nodes-corrupt.osm.pbf"),
         }
     }
 
@@ -551,7 +575,7 @@ fn tags_filter_osc(c: &Ctx, i: Input) -> Invocation {
 
 fn export(c: &Ctx, i: Input) -> Invocation {
     Invocation::new(&["export"])
-        .arg(c.fx.pbf(i))
+        .arg(c.fx.nodes(i))
         .words(&["--type", "node"])
         .out("-o", c.out.join("out.geojsonseq"))
 }

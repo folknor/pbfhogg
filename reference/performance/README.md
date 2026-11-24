@@ -214,6 +214,7 @@ Tables covering several commands stay intact in cross-command or subsystem files
 - [diff](diff.md)
 - [digest](digest.md)
 - [end-to-end](end-to-end.md)
+- [export](export.md)
 - [extract](extract.md)
 - [geocode](geocode.md)
 - [getid](getid.md)

@@ -1037,6 +1037,25 @@ pub(crate) const MEMBERSHIP_SPARSE_TABLE_MAX: usize = 256;
 pub(crate) const MAX_EXTRACTS: usize = 500;
 
 // ---------------------------------------------------------------------------
+// export
+// ---------------------------------------------------------------------------
+
+/// Bytes of GeoJSON a decode worker may format for one block. The read's
+/// admission window counts blocks, not bytes, and a block's text is not
+/// bounded by its payload: a long string-table value referenced by every
+/// element of a block is repeated, escaped, in every feature. A block whose
+/// text would pass this cap is handed to the ordered consumer instead, which
+/// formats and writes it a batch at a time, so the decode-ahead window holds
+/// at most about this much formatted text per block. The run's
+/// `export_oversize_blocks` counter says how many blocks took that path.
+pub(crate) const EXPORT_WORKER_CHUNK_CAP: usize = 64 << 20;
+
+/// Bytes of complete features the consumer formats before writing them,
+/// for a block a worker handed back past [`EXPORT_WORKER_CHUNK_CAP`]. One
+/// feature is always formatted whole, as the writer receives it whole.
+pub(crate) const EXPORT_CONSUMER_BATCH_BYTES: usize = 1 << 20;
+
+// ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
 

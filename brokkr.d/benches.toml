@@ -502,6 +502,28 @@ params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read 
 params.stop = { validated = true, help = "stop at a marker: FOO_END, FOO, -FOO or -FOO_END; also works with profiling" }
 params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
 
+# -- export
+
+[bench.geojson-export]
+script_file = "../benches/export/geojson-export.lua"
+description = "Export a LocationsOnWays dataset or snapshot to GeoJSON or GeoJSON sequence, to a file"
+version = 1
+date = 2026-11-24
+changelog = [
+  { version = 1, date = 2026-11-24, note = "First export bench: format, type, metadata and an optional expression" },
+]
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "altw-keep-untagged", help = "the input PBF variant; ways need a LocationsOnWays one" }
+params.format = { choices = ["geojsonseq", "geojson"], default = "geojsonseq", help = "the output format" }
+params.type = { choices = ["all", "node", "way"], default = "all", help = "the element kinds exported" }
+params.metadata = { choices = ["yes", "no"], default = "no", help = "yes: emit element metadata properties" }
+params.expression = { validated = true, help = "one tag expression, as export -e takes it; omitted exports every tagged element" }
+params.verbose = { choices = ["yes", "no"], default = "no", help = "yes: print the child's captured output" }
+
 # -- extract
 
 [bench.region-extract]

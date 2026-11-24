@@ -8,6 +8,18 @@ output. Two production code paths on the same lexical readers:
 (`--simplify`, collects every change as rendered XML, dedupes by a
 parallel sort and splices the survivors' bytes).
 
+### XML lexical checks: references, separators, names, document grammar (bygg, 2026-11-24, `b13a2c8d` + change)
+
+The change adds a `<` lane to the start-tag SWAR word test, a
+whitespace-before-key compare per attribute, `Name` checks on unmatched
+keys only, and checks on rare non-element events. Planet 7-OSC
+(`--osc 4914..4920`), `brokkr bench --iterations 1 merge-diffs`, baseline
+a `--commit HEAD` worktree, variant uncommitted, interleaved A B A B A B:
+baseline 3014 (`2e42fc6b`), 3109 (`ad5a257e`), 2997 ms (`f45e9446`);
+variant 3067 (`a8d55848`), 3095 (`c5dd2e83`), 3040 ms (`50bbd00c`).
+Medians 3014 against 3067 ms, +1.8 %, pair signs mixed: noise. The OSC
+tags-filter cells are in tags-filter.md.
+
 ### Hidden create or modify node may omit coordinates (bygg, 2026-11-23, `c37ad061` against `0b353eba`)
 
 `c37ad061` adds, per node, a hidden test on the decoded metadata and

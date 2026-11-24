@@ -431,6 +431,18 @@ reference XML 1.0 forbids; checking them would need a second grammar, for
 input that neither pbfhogg's nor osmium's OSC writers produce. `<!DOCTYPE osmChange>` and an external
 identifier (never loaded) are read as before.
 
+## OSC input: an undeclared entity is refused even with an external DTD
+
+**osmium behavior:** Expat refuses a reference to an undeclared entity
+(`&x;`) unless the document names an external DTD subset, which libosmium
+never loads; then Expat skips the reference, reading an attribute value or
+text without it.
+
+**pbfhogg behavior:** every OSC consumer refuses any named reference other
+than the five predefined entities, in attributes and text alike, whether or
+not a DOCTYPE names an external identifier. A value with a silently dropped
+part is a wrong answer; OSC writers never produce such references.
+
 ## derive-changes: changes are decided by content, not version
 
 **osmium behavior:** `osmium derive-changes` walks both inputs in

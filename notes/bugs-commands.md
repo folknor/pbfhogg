@@ -29,36 +29,41 @@ counting (BUG-022) and cat decode counters (since fixed: cat counts
 each blob's fate and the payloads it opened). Entries are in no
 order of importance.
 
-## CMD-052 - OSC readers accept undeclared entities and a misplaced DOCTYPE
+## CMD-068 - OSC readers do not check the XML declaration's pseudo-attributes
 
-Reported by: the XML 1.0 input character check (spar with codex).
+Reported by: the OSC lexical-checks item (spar with codex).
 
-The shared driver (`drive_osc`, `osc/xml_parse.rs`) now holds every event to
-XML 1.0 `Char`, but other well-formedness rules still pass where no sink
-looks. An undeclared named entity is refused only in an attribute a sink
-normalizes: `<osmChange x="&x;"/>` (root attributes are never read) and
-`<osmChange>&x;</osmChange>` (a named `GeneralRef` is ignored) are accepted,
-while Expat refuses both. A DOCTYPE after the root (`<osmChange/><!DOCTYPE
-osmChange>`) and a DOCTYPE with a malformed external identifier
-(`<!DOCTYPE osmChange SYSTEM>`) are accepted too; quick-xml does not check
-either. None can put a wrong value into a change, so this is parity, not a
-silent wrong answer. A fix would refuse every non-predefined named
-`GeneralRef`, scan the remaining attributes of each start tag for `&name;`
-outside the five predefined names, and refuse a DOCTYPE outside the prolog.
+The driver (`check_markup` and `drive_osc` in `osc/xml_parse.rs`) refuses an
+XML declaration that is not first, but never reads its body:
+`<?xml?>`, `<?xml encoding="x"?>` (no `version`), a misordered or
+unknown pseudo-attribute, or `standalone="maybe"` are read, where Expat
+refuses them. Parity only: input is decoded as UTF-8 whatever the
+declaration says. quick-xml's `BytesDecl` offers `version()`,
+`encoding()` and `standalone()`; a fix on the rare `Decl` event costs
+nothing on normal input. A BOM split across short first reads is also
+missed by quick-xml's BOM detection before this check runs.
 
-## CMD-061 - OSC readers accept attribute lexical errors quick-xml does not check
+## CMD-069 - OSC readers ignore the root's version, which libosmium requires
 
-Reported by: the OSC trailing-attribute fix (spar with codex).
+Reported by: the OSC lexical-checks item (scout lateral, not reproduced).
 
-Every admitted OSC start tag now has its attribute list walked to the end
-with quick-xml 0.42's checked iterator, which refuses a missing `=`, an
-unquoted or unterminated value and a duplicated key. It does not require
-whitespace between attributes (`<tag k="a"v="b"/>` reads as `k` and `v`)
-or check attribute name characters; Expat refuses both. Parity, not a wrong
-value, unless a producer relies on the run-together form. A fix belongs in
-the driver's per-event byte scan (`check_event_chars`), which already walks
-every start tag, and must be measured on planet merge-changes and OSC
-tags-filter.
+Root attributes are only lexically checked, so `<osmChange>` with no
+`version` or `version="0.7"` is read. libosmium's `top_level_element`
+(`xml_input_format.hpp`) throws `format_version_error` unless `version`
+is `0.6`. DEVIATIONS.md "OSC input: the root level is stricter than
+libosmium" does not record this. Either refuse a missing or other version
+or record the deviation.
+
+## CMD-070 - A malformed object-tag attribute is reported without its element
+
+Reported by: the OSC lexical-checks item (scout lateral).
+
+On `tag`, `nd`, `member`, the root, a section and `bbox`/`bounds` a
+malformed attribute reads "malformed attribute on <ELEMENT>"
+(`malformed_attr`), while on a `node`, `way` or `relation` start tag it is
+reported through `scan_meta_attrs` / `delete_coords` as a bare "malformed
+OSC XML" (`xml_err`), naming neither element nor attribute. The CHANGELOG
+entry for the trailing-attribute fix promises the first wording generally.
 
 ## CMD-053 - renumber's group policy for non-element fields differs by kind
 

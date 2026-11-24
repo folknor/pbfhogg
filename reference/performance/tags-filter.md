@@ -1,5 +1,17 @@
 # Tags Filter
 
+### OSC XML lexical checks (bygg, 2026-11-24, `b13a2c8d` + change)
+
+`tag-select --input-kind osc --input 4920` (planet, `w/highway=primary`),
+`--iterations 1`, baseline a `--commit HEAD` worktree, variant
+uncommitted, five interleaved pairs: baseline 1716 (`b79059c8`), 1727
+(`61436c68`), 1742 (`bbb6a56d`), 1716 (`17adc23d`), 1720 ms (`d0d5bead`);
+variant 1806 (`ed506525`), 1840 (`20676552`), 1717 (`4797032d`), 1719
+(`bb62f088`), 1745 ms (`b0a889be`). Medians 1720 against 1745 ms, +1.5 %.
+The two slow variant cells were the first two; the last three sit on the
+baseline. Noise; the change landed. Merge-changes cells are in
+merge-changes.md.
+
 ### OSC hidden node may omit coordinates (bygg, 2026-11-23, `c37ad061` against `0b353eba`)
 
 `c37ad061` adds, per node, a hidden test on the decoded metadata and

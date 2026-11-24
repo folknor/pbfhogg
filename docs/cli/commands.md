@@ -587,6 +587,16 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   and a reference inside a comment or CDATA are ordinary text and pass. A
   `<!DOCTYPE>` with an internal subset is refused; an external identifier is
   never loaded.
+- **An OSC input must follow XML's lexical rules** that osmium's Expat
+  enforces. The same commands refuse (exit `2`) a reference to any entity
+  other than `&lt;`, `&gt;`, `&amp;`, `&apos;` and `&quot;` (an external DTD
+  does not excuse it), a bare `&` or a literal `<` in any attribute value,
+  attributes with no whitespace between them (`k="a"v="b"`), an attribute or
+  unrecognised element name that is not an XML name, a DOCTYPE after the root,
+  repeated, misspelled (`<!doctype`) or with a malformed external identifier,
+  an XML declaration that is not first, text, CDATA or a reference outside the
+  root, `--` inside a comment, `]]>` in text, and a processing instruction
+  targeting `xml`.
 - **An OSC input may be a stream** (a FIFO, `/dev/stdin`) for
   `apply-changes`, `merge-changes` and `tags-filter --input-kind osc`: each
   is read front to back once, and the gzip sniff replays the bytes it took

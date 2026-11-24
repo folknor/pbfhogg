@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **OSC readers refuse what XML forbids lexically, as osmium does.**
+  `apply-changes`, `merge-changes` and `tags-filter --input-kind osc`
+  now refuse (exit `2`) an undeclared entity reference anywhere (also
+  with an external DTD, which osmium would skip), a bare `&` or literal
+  `<` in an attribute value, attributes run together (`k="a"v="b"`),
+  attribute and unknown element names that are not XML names, a DOCTYPE
+  after the root, repeated, lowercase or with a malformed external
+  identifier, an XML declaration that is not first, text, CDATA or a
+  reference outside the root, `--` in a comment, `]]>` in text and a
+  processing instruction targeting `xml`. Before, all of these were read.
+
 - **`check --ids` details come in a fixed order.** Under `--full` the
   duplicates of a kind used to sit among its order violations wherever the
   blob a worker happened to blame them on lay, so the list, and what

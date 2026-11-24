@@ -13,10 +13,13 @@
 //! [`drive_osc`] owns the *framing*: gzip sniffing, the element hierarchy
 //! (root, sections, objects, their children; anything misplaced is
 //! refused), self-closing elements, child routing, and the end-of-document
-//! completeness check. Text, comments and processing instructions are
-//! ignored wherever they appear, except that every event is held to XML
-//! 1.0's `Char` production ([`check_event_chars`]); beyond that this is a
-//! hierarchy check, not XML validation beyond what quick-xml does. An
+//! completeness check. Text, comments and processing instructions carry
+//! no data, but every event is held to XML 1.0's `Char` production and its
+//! references to the predefined entities ([`check_event_chars`]), the
+//! document grammar around the root ([`check_markup`]), and the attribute
+//! separators and names quick-xml skips ([`LexAttrs`]). What is still not
+//! checked: the XML declaration's own pseudo-attribute grammar, and
+//! element names that matched a literal OSC name. An
 //! [`OscSink`] owns the *data*:
 //! what an element turns into once the framing has identified it.
 
@@ -324,18 +327,136 @@ fn exact_decimal_e7(s: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
+/// A lexical attribute error quick-xml's checked iterator does not report.
+#[derive(Debug)]
+enum AttrLexError {
+    /// quick-xml's own refusal (no `=`, an unquoted or unterminated value,
+    /// a duplicated key).
+    Quick(quick_xml::events::attributes::AttrError),
+    /// An attribute that follows the previous one with no whitespace
+    /// between them (`k="a"v="b"`).
+    NoSeparator(String),
+    /// An attribute name that is not an XML `Name`.
+    BadName(String),
+}
+
+impl std::fmt::Display for AttrLexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quick(err) => err.fmt(f),
+            Self::NoSeparator(key) => write!(
+                f,
+                "attribute '{key}' follows the previous one with no whitespace between them"
+            ),
+            Self::BadName(key) => write!(f, "'{key}' is not an XML attribute name"),
+        }
+    }
+}
+
+impl std::error::Error for AttrLexError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Quick(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// quick-xml's checked attribute iterator plus the separator XML requires
+/// between attributes, which that iterator does not check: each key must
+/// follow XML whitespace. The first key always does, because quick-xml
+/// ends the element name at whitespace. Keys borrow from the tag's own
+/// buffer (only values can be owned), so the separator is the byte before
+/// the key's address. One compare per attribute; names are checked by the
+/// walk sites, and only for keys they did not match (a key equal to a
+/// literal name is a `Name` by construction), see [`check_name`].
+struct LexAttrs<'a> {
+    tag: &'a [u8],
+    inner: quick_xml::events::attributes::Attributes<'a>,
+}
+
+fn lex_attrs<'a>(e: &'a quick_xml::events::BytesStart<'_>) -> LexAttrs<'a> {
+    LexAttrs {
+        tag: e.as_bytes(),
+        inner: e.attributes(),
+    }
+}
+
+impl<'a> Iterator for LexAttrs<'a> {
+    type Item = Result<Attribute<'a>, AttrLexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let attr = match self.inner.next()? {
+            Ok(attr) => attr,
+            Err(err) => return Some(Err(AttrLexError::Quick(err))),
+        };
+        let key: &str = attr.key.as_ref();
+        let at = key.as_ptr().addr().wrapping_sub(self.tag.as_ptr().addr());
+        let separated = at
+            .checked_sub(1)
+            .and_then(|i| self.tag.get(i))
+            .is_some_and(|&b| is_xml_space(b));
+        if !separated {
+            return Some(Err(no_separator(key)));
+        }
+        Some(Ok(attr))
+    }
+}
+
+#[cold]
+fn no_separator(key: &str) -> AttrLexError {
+    AttrLexError::NoSeparator(key.to_owned())
+}
+
+/// Refuse a key no walk site matched unless it is an XML `Name`.
+fn check_name(key: &str) -> Result<(), AttrLexError> {
+    if is_xml_name(key) {
+        Ok(())
+    } else {
+        Err(AttrLexError::BadName(key.to_owned()))
+    }
+}
+
+fn is_xml_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// XML 1.0 (Fifth Edition) `NameStartChar`. Expat, libosmium's parser,
+/// keeps the older edition's narrower tables, so a few exotic non-ASCII
+/// names it refuses are read here.
+fn is_name_start(c: char) -> bool {
+    matches!(c,
+        ':' | 'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+}
+
+fn is_name_char(c: char) -> bool {
+    is_name_start(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// Whether `s` is an XML 1.0 `Name`.
+fn is_xml_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(is_name_start) && chars.all(is_name_char)
+}
+
 /// Walk the whole attribute list of a start tag whose attributes no reader
-/// otherwise visits in full, refusing the first one quick-xml's checked
-/// iterator reports malformed (no `=`, an unquoted or unterminated value)
-/// or duplicated. The iterator is lazy: a reader that stops at the
-/// attribute it wants never sees a malformed one after it, so every
-/// admitted start tag is walked to the end exactly once, by its reader or
-/// here. That is the iterator's checks only; it does not require
-/// whitespace between attributes, validate names, or resolve references in
-/// values nobody reads.
+/// otherwise visits in full, refusing the first one malformed (no `=`, an
+/// unquoted or unterminated value, no whitespace before it, a name that is
+/// not an XML `Name`) or duplicated. The iterator is lazy: a reader that
+/// stops at the attribute it wants never sees a malformed one after it, so
+/// every admitted start tag is walked to the end exactly once, by its reader
+/// or here. A reference in a value nobody reads is checked by
+/// [`check_chars`], which every start tag passes through.
 fn check_attrs(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()> {
-    for attr_result in e.attributes() {
-        attr_result.map_err(|err| malformed_attr(e, err))?;
+    for attr_result in lex_attrs(e) {
+        let attr = attr_result.map_err(|err| malformed_attr(e, err))?;
+        check_name(attr.key.as_ref()).map_err(|err| malformed_attr(e, err))?;
     }
     Ok(())
 }
@@ -363,7 +484,7 @@ fn child_attrs<'a, const N: usize>(
     names: [&str; N],
 ) -> ParseResult<[Option<Attribute<'a>>; N]> {
     let mut found: [Option<Attribute<'a>>; N] = std::array::from_fn(|_| None);
-    for attr_result in e.attributes() {
+    for attr_result in lex_attrs(e) {
         let attr = attr_result.map_err(|err| malformed_attr(e, err))?;
         // The iterator refuses a duplicated key, so each slot fills once.
         if let Some((_, slot)) = names
@@ -372,6 +493,8 @@ fn child_attrs<'a, const N: usize>(
             .find(|(name, _)| attr.key.as_ref() == **name)
         {
             *slot = Some(attr);
+        } else {
+            check_name(attr.key.as_ref()).map_err(|err| malformed_attr(e, err))?;
         }
     }
     Ok(found)
@@ -420,7 +543,7 @@ pub(crate) fn append_tag(
 /// and that generic form measured about 4 % slower on planet tags-filter
 /// OSC; this one is in the noise.
 pub(crate) fn parse_nd(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<i64> {
-    let mut attrs = e.attributes();
+    let mut attrs = lex_attrs(e);
     let mut ref_id = None;
     for attr_result in attrs.by_ref() {
         let attr = attr_result.map_err(|err| malformed_attr(e, err))?;
@@ -428,10 +551,12 @@ pub(crate) fn parse_nd(e: &quick_xml::events::BytesStart<'_>) -> ParseResult<i64
             ref_id = Some(i64_value(&attr, "ref")?);
             break;
         }
+        check_name(attr.key.as_ref()).map_err(|err| malformed_attr(e, err))?;
     }
     // The rest of the list, checked (see `child_attrs`).
     for attr_result in attrs {
-        attr_result.map_err(|err| malformed_attr(e, err))?;
+        let attr = attr_result.map_err(|err| malformed_attr(e, err))?;
+        check_name(attr.key.as_ref()).map_err(|err| malformed_attr(e, err))?;
     }
     ref_id.ok_or_else(|| missing_attr("ref"))
 }
@@ -572,9 +697,12 @@ where
     F: FnMut(MetaField, &Attribute<'_>) -> ParseResult<()>,
 {
     let mut any = false;
-    for attr_result in e.attributes() {
+    for attr_result in lex_attrs(e) {
         let attr = attr_result.map_err(xml_err)?;
         let field = match attr.key.as_ref() {
+            // Read elsewhere (geometry, identity); listed so their names
+            // are known without a `Name` check.
+            "id" | "lat" | "lon" => continue,
             "version" => MetaField::Version,
             "timestamp" => MetaField::Timestamp,
             "changeset" => MetaField::Changeset,
@@ -591,7 +719,10 @@ where
             // can name a blank user alongside a uid.
             "visible" if attr.value.is_empty() => continue,
             "visible" => MetaField::Visible,
-            _ => continue,
+            other => {
+                check_name(other).map_err(xml_err)?;
+                continue;
+            }
         };
         any = true;
         f(field, &attr)?;
@@ -716,6 +847,8 @@ pub(crate) fn open_osc_reader(
     };
     let mut reader = Reader::from_reader(BufReader::new(inner));
     reader.config_mut().trim_text(true);
+    // XML forbids `--` inside a comment; quick-xml checks it only on request.
+    reader.config_mut().check_comments = true;
     Ok((reader, total))
 }
 
@@ -764,6 +897,8 @@ struct DriveState {
     level: Level,
     section: OscAction,
     open: ElementKind,
+    /// A DOCTYPE has been read; a second one is refused.
+    doctype_seen: bool,
 }
 
 /// The root element name, whose close proves the document is whole.
@@ -918,7 +1053,17 @@ fn handle_open<S: OscSink>(
                 return Err(input_fault(path, misplaced(name, "inside <osmChange>")));
             } else {
                 // An unrecognised root-level element (`<bounds>`, `<note>`)
-                // is ignored, its attributes still checked.
+                // is ignored, its name and attributes still checked. Every
+                // other admitted element name matched a literal, so this is
+                // the one place a name needs the `Name` check.
+                if !is_xml_name(name) {
+                    return Err(input_fault(
+                        path,
+                        Error::invalid_data(format!(
+                            "malformed OSC XML: <{name}> is not an XML element name"
+                        )),
+                    ));
+                }
                 check_attrs(e).map_err(|err| input_fault(path, err))?;
                 if !is_empty {
                     state.level = Level::Other;
@@ -1035,14 +1180,18 @@ fn malformed_char_ref(body: &[u8]) -> Error {
 /// Refuse a literal scalar XML 1.0 forbids. `bytes` is valid UTF-8 (every
 /// quick-xml event payload is a `str`), so a byte below 0x20 is an ASCII
 /// scalar and `EF BF BE` / `EF BF BF` are exactly U+FFFE / U+FFFF. When
-/// `refs` is set, every `&#...;` is also decoded and checked: in a start
-/// or empty tag a raw `&` can only begin a reference in a quoted attribute
-/// value, so this covers every attribute, the ones no sink reads included,
-/// while `&amp;#1;` (a `&` followed by `amp;`) stays literal text.
+/// `refs` is set (start and empty tags), every reference is also checked:
+/// in a start tag a raw `&` can only begin a reference in a quoted
+/// attribute value, so this covers every attribute, the ones no sink reads
+/// included. A `&#...;` is decoded and held to `Char`; any other must name
+/// one of the five predefined entities (`&amp;#1;` stays literal text), so
+/// an undeclared `&x;` or a bare `&` is refused. A raw `<` is refused too:
+/// XML forbids it in an attribute value, and nowhere else in a tag can it
+/// appear.
 ///
 /// The fast path tests eight bytes at a time for any byte below 0x20, any
-/// 0xEF and (with `refs`) any `&`; only from the first word holding a
-/// candidate on is the event walked byte by byte. A tab, LF or CR is a
+/// 0xEF and (with `refs`) any `&` or `<`; only from the first word holding
+/// a candidate on is the event walked byte by byte. A tab, LF or CR is a
 /// candidate the walk then passes, which costs nothing on OSC as written:
 /// its whitespace sits between tags, where quick-xml trims it away.
 fn check_chars(bytes: &[u8], refs: bool) -> ParseResult<()> {
@@ -1052,19 +1201,20 @@ fn check_chars(bytes: &[u8], refs: bool) -> ParseResult<()> {
     let has_zero = |v: u64| v.wrapping_sub(LO) & !v & HI;
     // Without `refs`, repeat the 0xEF test rather than match nothing.
     let amp = LO * if refs { u64::from(b'&') } else { 0xEF };
+    let lt = LO * if refs { u64::from(b'<') } else { 0xEF };
     let (words, rest) = bytes.as_chunks::<8>();
     let mut start = 0;
     for word in words {
         let w = u64::from_le_bytes(*word);
         let below_space = w.wrapping_sub(LO * 0x20) & !w & HI;
-        if below_space | has_zero(w ^ (LO * 0xEF)) | has_zero(w ^ amp) != 0 {
+        if below_space | has_zero(w ^ (LO * 0xEF)) | has_zero(w ^ amp) | has_zero(w ^ lt) != 0 {
             return check_chars_slow(bytes, start, refs);
         }
         start += 8;
     }
     if rest
         .iter()
-        .any(|&b| b < 0x20 || b == 0xEF || (refs && b == b'&'))
+        .any(|&b| b < 0x20 || b == 0xEF || (refs && (b == b'&' || b == b'<')))
     {
         return check_chars_slow(bytes, start, refs);
     }
@@ -1085,6 +1235,12 @@ fn check_chars_slow(bytes: &[u8], from: usize, refs: bool) -> ParseResult<()> {
                 let cp = if bytes[i + 2] == 0xBE { 0xFFFE } else { 0xFFFF };
                 return Err(forbidden_char(cp, "literally"));
             }
+            b'<' if refs => {
+                return Err(Error::invalid_data(
+                    "malformed OSC XML: a start tag holds a literal '<', which XML forbids \
+                     in an attribute value (write &lt;)",
+                ));
+            }
             b'&' if refs && bytes.get(i + 1) == Some(&b'#') => {
                 let body = &bytes[i + 2..];
                 let end = body
@@ -1093,6 +1249,14 @@ fn check_chars_slow(bytes: &[u8], from: usize, refs: bool) -> ParseResult<()> {
                     .ok_or_else(|| malformed_char_ref(body))?;
                 check_char_ref(&body[..end])?;
                 i += 2 + end;
+            }
+            b'&' if refs => {
+                let body = &bytes[i + 1..];
+                let end = body.iter().position(|&b| b == b';');
+                match end {
+                    Some(end) if is_predefined_entity(&body[..end]) => i += 1 + end,
+                    _ => return Err(undeclared_entity(body, end)),
+                }
             }
             _ => {}
         }
@@ -1115,6 +1279,151 @@ fn has_internal_subset(payload: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// One of XML's five predefined entity names, case-sensitively.
+fn is_predefined_entity(name: &[u8]) -> bool {
+    matches!(name, b"lt" | b"gt" | b"amp" | b"apos" | b"quot")
+}
+
+/// A reference to an entity no declaration defines (OSC input refuses
+/// declarations, so only the five predefined ones exist), or a `&` that
+/// begins no reference. `body` follows the `&`; `end` is its `;`, if any.
+/// Refused even where the document names an external DTD: Expat then
+/// skips such a reference and reads the value without it, but nothing
+/// here loads that DTD, and a value with a silently dropped part is a
+/// wrong answer, not a reading.
+#[cold]
+fn undeclared_entity(body: &[u8], end: Option<usize>) -> Error {
+    match end {
+        Some(end) => Error::invalid_data(format!(
+            "malformed OSC XML: reference to undeclared entity &{};",
+            String::from_utf8_lossy(&body[..end])
+        )),
+        None => Error::invalid_data("malformed OSC XML: a '&' begins no reference (write &amp;)"),
+    }
+}
+
+/// Whether a DOCTYPE payload (after `<!DOCTYPE` and its whitespace, before
+/// `>`) is `Name (S ExternalID)? S?`, the internal subset already refused.
+/// The name is not matched against the root: that is validity, not
+/// well-formedness, and Expat reads a mismatch.
+fn is_doctype_payload(p: &[u8]) -> bool {
+    fn skip_space(p: &[u8]) -> &[u8] {
+        let n = p.iter().take_while(|&&b| is_xml_space(b)).count();
+        &p[n..]
+    }
+    fn space(p: &[u8]) -> Option<&[u8]> {
+        let rest = skip_space(p);
+        (rest.len() < p.len()).then_some(rest)
+    }
+    // A quoted literal whose bytes all satisfy `ok`; the rest after it.
+    fn literal(p: &[u8], ok: impl Fn(u8, u8) -> bool) -> Option<&[u8]> {
+        let (&q, body) = p.split_first()?;
+        if q != b'"' && q != b'\'' {
+            return None;
+        }
+        let end = body.iter().position(|&b| b == q)?;
+        body[..end]
+            .iter()
+            .all(|&b| ok(b, q))
+            .then(|| &body[end + 1..])
+    }
+    let pubid = |b: u8, q: u8| {
+        b.is_ascii_alphanumeric()
+            || matches!(b, b' ' | b'\r' | b'\n')
+            || b"-()+,./:=?;!*#@$_%".contains(&b)
+            || (b == b'\'' && q == b'"')
+    };
+    let name_end = p.iter().position(|&b| is_xml_space(b)).unwrap_or(p.len());
+    let Ok(name) = std::str::from_utf8(&p[..name_end]) else {
+        return false;
+    };
+    if !is_xml_name(name) {
+        return false;
+    }
+    let rest = skip_space(&p[name_end..]);
+    if rest.is_empty() {
+        return true;
+    }
+    let after = if let Some(r) = rest.strip_prefix(b"SYSTEM") {
+        space(r).and_then(|r| literal(r, |_, _| true))
+    } else if let Some(r) = rest.strip_prefix(b"PUBLIC") {
+        space(r)
+            .and_then(|r| literal(r, pubid))
+            .and_then(space)
+            .and_then(|r| literal(r, |_, _| true))
+    } else {
+        None
+    };
+    after.is_some_and(|r| skip_space(r).is_empty())
+}
+
+/// What the driver checks of an event outside the element hierarchy once
+/// the event's borrow of the read buffer has ended.
+enum RawCheck {
+    None,
+    /// An XML declaration: it must be the first thing in the document.
+    Decl,
+    /// A DOCTYPE: its keyword must be spelled `<!DOCTYPE` and followed by
+    /// whitespace, which quick-xml matches case-insensitively and strips.
+    DocType,
+}
+
+/// Hold an event the hierarchy does not interpret (text, CDATA, a
+/// reference, a comment, a declaration, a DOCTYPE, a processing
+/// instruction) to XML's document grammar, which quick-xml does not
+/// enforce: outside the root only whitespace, comments and processing
+/// instructions may appear, a DOCTYPE only once and before the root, and a
+/// processing instruction's target must be a `Name` other than `xml`.
+/// Character data may not hold `]]>`. These are rare events in OSC (its
+/// whitespace between tags is trimmed and never reaches here).
+fn check_markup(ev: &Event<'_>, state: &mut DriveState) -> ParseResult<RawCheck> {
+    let outside = matches!(state.level, Level::Doc | Level::Done);
+    let refuse = |what: &str| -> ParseResult<RawCheck> {
+        Err(Error::invalid_data(format!("malformed OSC XML: {what}")))
+    };
+    match ev {
+        Event::Text(t) => {
+            let raw = t.as_bytes();
+            if outside && !raw.iter().all(|&b| is_xml_space(b)) {
+                return refuse("text outside the <osmChange> root");
+            }
+            if raw.windows(3).any(|w| w == b"]]>") {
+                return refuse("character data holds ']]>'");
+            }
+        }
+        Event::CData(_) if outside => return refuse("CDATA outside the <osmChange> root"),
+        Event::GeneralRef(_) if outside => {
+            return refuse("a reference outside the <osmChange> root");
+        }
+        Event::DocType(d) => {
+            if state.level != Level::Doc || state.doctype_seen {
+                return refuse("a DOCTYPE after the root element or a second DOCTYPE");
+            }
+            state.doctype_seen = true;
+            if !is_doctype_payload(d.as_bytes()) {
+                return refuse("a malformed DOCTYPE declaration");
+            }
+            return Ok(RawCheck::DocType);
+        }
+        Event::PI(pi) => {
+            let raw = pi.as_bytes();
+            let end = raw
+                .iter()
+                .position(|&b| is_xml_space(b))
+                .unwrap_or(raw.len());
+            let target = std::str::from_utf8(&raw[..end]);
+            if !target.is_ok_and(|t| is_xml_name(t) && !t.eq_ignore_ascii_case("xml")) {
+                return refuse(
+                    "a processing instruction whose target is not a Name other than 'xml'",
+                );
+            }
+        }
+        Event::Decl(_) => return Ok(RawCheck::Decl),
+        _ => {}
+    }
+    Ok(RawCheck::None)
 }
 
 /// Hold one event to XML 1.0's `Char` production. The driver ignores most
@@ -1140,7 +1449,8 @@ fn check_event_chars(ev: &Event<'_>) -> ParseResult<()> {
             let name = r.as_bytes();
             match name.split_first() {
                 Some((b'#', body)) => check_char_ref(body),
-                _ => check_chars(name, false),
+                _ if is_predefined_entity(name) => Ok(()),
+                _ => Err(undeclared_entity(name, Some(name.len()))),
             }
         }
         Event::DocType(d) => {
@@ -1171,6 +1481,7 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
         level: Level::Doc,
         section: OscAction::Create,
         open: ElementKind::Node,
+        doctype_seen: false,
     };
     let mut buf = Vec::new();
 
@@ -1179,12 +1490,21 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
         if let Ok(ev) = &event {
             check_event_chars(ev).map_err(|e| input_fault(path, e))?;
         }
-        match event {
-            Ok(Event::Start(ref e)) => handle_open(e, false, &mut state, sink, path)?,
-            Ok(Event::Empty(ref e)) => handle_open(e, true, &mut state, sink, path)?,
-            Ok(Event::End(_)) => handle_close(&mut state, sink, path)?,
+        let raw = match event {
+            Ok(Event::Start(ref e)) => {
+                handle_open(e, false, &mut state, sink, path)?;
+                RawCheck::None
+            }
+            Ok(Event::Empty(ref e)) => {
+                handle_open(e, true, &mut state, sink, path)?;
+                RawCheck::None
+            }
+            Ok(Event::End(_)) => {
+                handle_close(&mut state, sink, path)?;
+                RawCheck::None
+            }
             Ok(Event::Eof) => break,
-            Ok(_) => {}
+            Ok(ref ev) => check_markup(ev, &mut state).map_err(|e| input_fault(path, e))?,
             Err(e) => {
                 // A read the input's cancellation check refused reaches here
                 // wrapped in quick-xml's `Io(Arc<io::Error>)`, which the
@@ -1200,6 +1520,31 @@ fn drive_osc<R: io::BufRead, S: OscSink>(
                 }
                 return Err(input_fault(path, xml_read_err(e)));
             }
+        };
+        // `buf` holds the event's whole markup, delimiters included.
+        let raw_ok = match raw {
+            RawCheck::None => true,
+            // First means nothing consumed before it: the reader's position
+            // counts skipped whitespace but not a UTF-8 BOM.
+            RawCheck::Decl => buf.len() as u64 == reader.buffer_position(),
+            RawCheck::DocType => {
+                buf.starts_with(b"<!DOCTYPE") && buf.get(9).is_some_and(|&b| is_xml_space(b))
+            }
+        };
+        if !raw_ok {
+            return Err(input_fault(
+                path,
+                Error::invalid_data(match raw {
+                    RawCheck::Decl => {
+                        "malformed OSC XML: the XML declaration is not at the very start \
+                         of the document"
+                    }
+                    _ => {
+                        "malformed OSC XML: a DOCTYPE keyword not spelled '<!DOCTYPE' or \
+                         not followed by whitespace"
+                    }
+                }),
+            ));
         }
         buf.clear();
     }

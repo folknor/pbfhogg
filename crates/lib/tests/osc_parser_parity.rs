@@ -761,6 +761,237 @@ fn every_consumer_admits_what_xml_allows() {
     }
 }
 
+/// The lexical rules quick-xml leaves unchecked and Expat enforces, held by
+/// every route wherever they sit: references to undeclared entities, a bare
+/// `&` or a literal `<` in any attribute, attributes run together or with a
+/// name that is not a `Name`, a DOCTYPE out of place or malformed, a
+/// declaration that is not first, content outside the root, `--` in a
+/// comment, `]]>` in text and a processing instruction targeting `xml`.
+#[test]
+fn every_consumer_refuses_what_xml_lexically_forbids() {
+    let dir = crate::common::test_scratch();
+    let doc = chars_doc;
+    let dropped = chars_dropped;
+    let tag_on_dropped =
+        |tag: &str| format!(r#"<node id="2" lat="1.0" lon="2.0" version="1">{tag}</node>"#);
+    let refused = [
+        (
+            "undeclared entity in an unread root attribute",
+            doc(r#" x="&x;""#, "", ""),
+            "undeclared entity &x;",
+        ),
+        (
+            "undeclared entity in root text",
+            doc("", "", "&x;"),
+            "undeclared entity &x;",
+        ),
+        (
+            "undeclared entity in a tag value",
+            doc("", &dropped("&nbsp;"), ""),
+            "undeclared entity &nbsp;",
+        ),
+        (
+            "predefined name in the wrong case",
+            doc("", &dropped("&AMP;"), ""),
+            "undeclared entity &AMP;",
+        ),
+        (
+            "bare ampersand in an unread attribute",
+            doc("", r#"<node id="3" lat="1" lon="2" x="a & b"/>"#, ""),
+            "begins no reference",
+        ),
+        (
+            "literal < in an unread attribute",
+            doc(r#" x="<""#, "", ""),
+            "literal '<'",
+        ),
+        (
+            "attributes run together on a tag",
+            doc("", &tag_on_dropped(r#"<tag k="a"v="b"/>"#), ""),
+            "malformed attribute on <tag>",
+        ),
+        (
+            "attributes run together on an object",
+            doc("", r#"<node id="3"lat="1" lon="2"/>"#, ""),
+            "malformed OSC XML",
+        ),
+        (
+            "attributes run together on an nd",
+            doc(
+                "",
+                r#"<way id="3" version="1"><nd ref="1"x="2"/></way>"#,
+                "",
+            ),
+            "malformed attribute on <nd>",
+        ),
+        (
+            "attribute name that is not a Name",
+            doc("", &tag_on_dropped(r#"<tag k="a" v="b" 1x="c"/>"#), ""),
+            "malformed attribute on <tag>",
+        ),
+        (
+            "unread root attribute name that is not a Name",
+            doc(r#" a,b="c""#, "", ""),
+            "malformed attribute on <osmChange>",
+        ),
+        (
+            "unrecognised root element name that is not a Name",
+            doc("", "", "<1bad/>"),
+            "not an XML element name",
+        ),
+    ];
+    for (case, xml, needle) in refused {
+        let input = dir.path().join("lexical.osc.gz");
+        write_gz(&input, &xml);
+        assert_all_refuse(dir.path(), &input, needle, case);
+    }
+}
+
+/// The document-level half of the lexical refusals: DOCTYPE, declaration,
+/// content outside the root, comments, character data and processing
+/// instructions.
+#[test]
+fn every_consumer_refuses_what_xml_forbids_around_the_root() {
+    let dir = crate::common::test_scratch();
+    let doc = chars_doc;
+    let refused = [
+        (
+            "DOCTYPE after the root",
+            format!("{}<!DOCTYPE osmChange>", doc("", "", "")),
+            "DOCTYPE after the root",
+        ),
+        (
+            "second DOCTYPE",
+            format!(
+                "<!DOCTYPE osmChange><!DOCTYPE osmChange>{}",
+                doc("", "", "")
+            ),
+            "second DOCTYPE",
+        ),
+        (
+            "DOCTYPE with no system literal",
+            format!("<!DOCTYPE osmChange SYSTEM>{}", doc("", "", "")),
+            "malformed DOCTYPE",
+        ),
+        (
+            "DOCTYPE with a bad public identifier",
+            format!(
+                "<!DOCTYPE osmChange PUBLIC \"a{{b\" \"x\">{}",
+                doc("", "", "")
+            ),
+            "malformed DOCTYPE",
+        ),
+        (
+            "lowercase doctype keyword",
+            format!("<!doctype osmChange>{}", doc("", "", "")),
+            "spelled '<!DOCTYPE'",
+        ),
+        (
+            "declaration after a comment",
+            format!("<!-- c --><?xml version=\"1.0\"?>{}", doc("", "", "")),
+            "not at the very start",
+        ),
+        (
+            "declaration after whitespace",
+            format!(" <?xml version=\"1.0\"?>{}", doc("", "", "")),
+            "not at the very start",
+        ),
+        (
+            "text before the root",
+            format!("junk{}", doc("", "", "")),
+            "text outside the <osmChange> root",
+        ),
+        (
+            "text after the root",
+            format!("{}junk", doc("", "", "")),
+            "text outside the <osmChange> root",
+        ),
+        (
+            "CDATA after the root",
+            format!("{}<![CDATA[]]>", doc("", "", "")),
+            "CDATA outside",
+        ),
+        (
+            "reference after the root",
+            format!("{} &#32;", doc("", "", "")),
+            "reference outside",
+        ),
+        (
+            "double hyphen in a comment",
+            doc("", "", "<!-- a -- b -->"),
+            "malformed OSC XML",
+        ),
+        ("]]> in text", doc("", "", "<note>a]]>b</note>"), "']]>'"),
+        (
+            "processing instruction targeting xml",
+            doc("", "", "<?XML x?>"),
+            "processing instruction",
+        ),
+    ];
+    for (case, xml, needle) in refused {
+        let input = dir.path().join("lexical.osc.gz");
+        write_gz(&input, &xml);
+        assert_all_refuse(dir.path(), &input, needle, case);
+    }
+}
+
+/// The counterpart: the legal spellings next to each lexical refusal.
+#[test]
+fn every_consumer_admits_what_xml_lexically_allows() {
+    let dir = crate::common::test_scratch();
+    let doc = chars_doc;
+    let dropped = chars_dropped;
+    let accepted = [
+        (
+            "the five predefined entities",
+            doc(
+                r#" x="&lt;&gt;&amp;&apos;&quot;""#,
+                &dropped("&amp;x;&lt;"),
+                "<note>&amp;&lt;]]&gt;</note>",
+            ),
+        ),
+        (
+            "a literal > and the other quote in values",
+            doc(r#" x="a>b'c""#, &dropped("'>"), ""),
+        ),
+        (
+            "attributes separated by tab and newline",
+            doc(" x=\"1\"\ty=\"2\"\nz=\"3\"", "", ""),
+        ),
+        (
+            "names with colon, hyphen, dot and non-ASCII",
+            doc(r#" xmlns:o="u" a-b.c="1" æ="2""#, "", "<o:note/>"),
+        ),
+        (
+            "declaration first after a BOM",
+            format!("\u{FEFF}<?xml version=\"1.0\"?>{}", doc("", "", "")),
+        ),
+        (
+            "public identifier and whitespace around the DOCTYPE",
+            format!(
+                "<?xml version=\"1.0\"?>\n<!DOCTYPE osmChange PUBLIC \"-//OSM//x 'q'\" 'https://e/[x]' >\n{}\n",
+                doc("", "", "")
+            ),
+        ),
+        (
+            "DOCTYPE naming another root",
+            format!("<!DOCTYPE other>{}", doc("", "", "")),
+        ),
+        (
+            "comments and processing instructions around the root",
+            format!(
+                "<!-- a - b --><?pi data & <?>{}<?xml-stylesheet x?><!-- c -->",
+                doc("", "", "")
+            ),
+        ),
+    ];
+    for (case, xml) in accepted {
+        let input = dir.path().join("lexical-ok.osc.gz");
+        write_gz(&input, &xml);
+        assert_all_accept(dir.path(), &input, case);
+    }
+}
+
 /// A created or modified node without usable coordinates. Two copies
 /// did `unwrap_or(0.0)` followed by a saturating `as i32`, which puts
 /// the node at 0/0 - the Gulf of Guinea, a real place - and clamps
@@ -927,7 +1158,9 @@ fn every_consumer_refuses_an_exotic_member_type() {
 /// so one file was silently altered by one command and refused by the
 /// others. Every sink refuses it in a create and in a modify, and the
 /// counterpart keeps a missing and an explicitly empty role valid, so
-/// the rule cannot pass by making roles mandatory.
+/// the rule cannot pass by making roles mandatory. The unreadable role is
+/// an undeclared entity, which the shared driver now refuses before any
+/// sink reads the role.
 #[test]
 fn every_consumer_refuses_a_malformed_member_role() {
     let dir = crate::common::test_scratch();
@@ -942,7 +1175,7 @@ fn every_consumer_refuses_a_malformed_member_role() {
                  </{section}>\n</osmChange>"
             ),
         );
-        assert_all_refuse(dir.path(), &input, "malformed 'role' attribute", section);
+        assert_all_refuse(dir.path(), &input, "undeclared entity &bogus;", section);
     }
 
     let input = dir.path().join("role-ok.osc.gz");
@@ -1044,7 +1277,7 @@ fn every_consumer_refuses_a_malformed_trailing_attribute() {
 #[test]
 fn every_consumer_refuses_a_malformed_child_of_a_deleted_object() {
     let dir = crate::common::test_scratch();
-    let cases: [(&str, &str, &str); 5] = [
+    let cases: [(&str, &str, &str); 4] = [
         (
             "tag without k",
             "<node id=\"1\" version=\"2\"><tag v=\"x\"/></node>",
@@ -1064,12 +1297,6 @@ fn every_consumer_refuses_a_malformed_child_of_a_deleted_object() {
             "member without ref",
             "<relation id=\"1\" version=\"2\"><member type=\"node\" role=\"r\"/></relation>",
             "missing attribute 'ref'",
-        ),
-        (
-            "member with a malformed role",
-            "<relation id=\"1\" version=\"2\">\
-             <member type=\"node\" ref=\"5\" role=\"&bogus;\"/></relation>",
-            "malformed 'role' attribute",
         ),
     ];
     for (case, object, needle) in cases {

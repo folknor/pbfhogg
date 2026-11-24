@@ -604,6 +604,22 @@ internal subset is refused outright (see DEVIATIONS.md); an external
 identifier is never loaded. Input is decoded as UTF-8 whatever its
 declaration says, and the check is on those scalars.
 
+The same driver also holds the lexical rules quick-xml leaves unchecked and
+Expat enforces. A reference in an attribute value (read or not) or in text
+must be a valid character reference or name one of the five predefined
+entities; an undeclared `&x;`, a bare `&` and a literal `<` in an attribute
+value are refused, even where the document names an external DTD (see
+DEVIATIONS.md). Attributes must be separated by whitespace, and an attribute
+name no reader matched, or the name of an unrecognised root-level element,
+must be an XML `Name` (Fifth Edition tables, a little wider than Expat's). A
+DOCTYPE must be spelled `<!DOCTYPE`, come before the root, appear once, and
+be a `Name` with an optional well-formed external identifier; its name need
+not match the root. The XML declaration must be the first thing in the
+document (after a BOM). Outside the root only whitespace, comments and
+processing instructions may appear; `--` inside a comment, `]]>` in text and
+a processing-instruction target that is not a `Name` or is `xml` in any case
+are refused. Not checked: the declaration's own pseudo-attributes.
+
 The re-emitting OSC paths (`merge-changes`, with or without `--simplify`, and
 `tags-filter --input-kind osc`) deliberately parse version but pass timestamp,
 changeset, uid and visible through as normalized XML attribute text without
@@ -642,10 +658,9 @@ read to its end, so an attribute quick-xml's checked iterator reports malformed
 (no `=`, an unquoted or unterminated value) or duplicated is refused wherever it
 sits, after the attributes read included; so is one on a start tag no sink reads
 (the root, a section, `<bbox>` or `<bounds>`, an unrecognised root-level
-element). Object start tags are read to the end by their metadata scan. Lexical
-rules that iterator does not check (whitespace between attributes, name
-characters, an undeclared entity in a value nothing reads) still pass, where
-libosmium's Expat refuses them. The children of an object in
+element). Object start tags are read to the end by their metadata scan. The
+lexical rules that iterator does not check are held as described above. The
+children of an object in
 `<delete>` get that same parse in the driver, so every command refuses the same
 malformed delete; apply-changes then keeps only the delete's identity and
 version, while the re-emitters keep and write the delete's body, as osmium

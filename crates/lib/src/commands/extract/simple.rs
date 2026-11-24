@@ -1,4 +1,6 @@
-//! Simple extraction strategy: single-pass for sorted inputs, two-pass fallback for unsorted.
+//! Simple extraction strategy: one phase per kind for sorted inputs (fused to
+//! one decode per blob where the ID ranges allow), two-pass fallback for
+//! unsorted.
 
 use rayon::prelude::*;
 
@@ -290,20 +292,16 @@ fn extract_simple_two_pass(
     Ok(stats)
 }
 
-/// 3-phase barrier pipeline for sorted simple extract.
+/// Sorted simple extract: one header-only schedule walk, then one phase per
+/// kind (nodes, ways, relations), each kind's ID set frozen before the next
+/// kind reads it.
 ///
-/// Exploits the sorted PBF guarantee (nodes → ways → relations) to parallelize
-/// both classification and writing. Each phase runs pread-from-workers:
-///
-/// Phase 1 (nodes): workers classify (bbox check, pure function) + write matches.
-///   Consumer collects bbox_node_ids. No shared mutable state needed by workers.
-/// Phase 2 (ways): workers check refs against frozen &bbox_node_ids + write matches.
-///   Consumer collects matched_way_ids.
-/// Phase 3 (relations): workers check members against frozen ID sets + write matches.
-///
-/// ID sets become read-only after each phase barrier. Workers share them via
-/// references in thread::scope. Single file scan (schedule built once from
-/// header-only pass), three execution phases.
+/// A kind whose blobs carry pairwise-disjoint indexdata ID ranges runs fused
+/// (`fused::fused_pass`): each blob is read, decompressed and decoded once,
+/// selected and framed on its worker. Any other kind (an unindexed blob, or
+/// ranges that overlap, as a history file's repeated IDs make them) runs a
+/// classify pool that fills the kind's ID set, then a write pool that
+/// rereads and writes by it.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_single_pass(
@@ -381,8 +379,9 @@ fn extract_simple_single_pass(
     // Non-indexed blobs (kind == None) are included in all three schedules
     // because we can't determine their type without decompressing. Each phase's
     // classify closure only processes its matching element type, so elements of
-    // other types are silently skipped. This means non-indexed blobs are
-    // decompressed up to 3 times - acceptable since indexed PBFs (production
+    // other types are silently skipped. An unindexed blob also keeps every
+    // kind off the fused pass, so it is decompressed twice per kind, a
+    // classify and a write - acceptable since indexed PBFs (production
     // path) always have kind set and this path is only reachable via --force.
     let way_schedule: Vec<&BlobDesc> = full_schedule
         .iter()
@@ -411,21 +410,133 @@ fn extract_simple_single_pass(
 
     let mut bbox_node_ids = IdSet::new();
     let mut matched_way_ids = IdSet::new();
-    let empty_relation_ids = IdSet::new(); // placeholder for node/way phases
-    let outside_way_node_ids = IdSet::new();
 
-    // --- Phase 1: Classify nodes (parallel pread + scanner) ---
+    // Each kind runs fused (one decode per blob, selecting and framing on
+    // the worker) when its schedule's ID ranges prove every ID's occurrences
+    // lie in one blob; otherwise classify, then write (see `fused`).
+    if super::fused::fusable(&node_schedule) {
+        host.invocation.marker("SIMPLE_NODE_FUSED_START");
+        super::fused::fused_pass(
+            input,
+            &node_schedule,
+            &super::fused::Select::Nodes {
+                region,
+                exact: &exact_bbox,
+            },
+            clean,
+            &mut writer,
+            &mut stats,
+            &mut bbox_node_ids,
+            host,
+        )?;
+        host.invocation.marker("SIMPLE_NODE_FUSED_END");
+    } else {
+        simple_nodes_two_phase(
+            input,
+            &node_schedule,
+            region,
+            &exact_bbox,
+            clean,
+            &mut writer,
+            &mut stats,
+            &mut bbox_node_ids,
+            host,
+        )?;
+    }
+
+    // --- Phase 2: ways ---
+    if super::fused::fusable(&way_schedule) {
+        host.invocation.marker("SIMPLE_WAY_FUSED_START");
+        super::fused::fused_pass(
+            input,
+            &way_schedule,
+            &super::fused::Select::Ways {
+                nodes: &bbox_node_ids,
+            },
+            clean,
+            &mut writer,
+            &mut stats,
+            &mut matched_way_ids,
+            host,
+        )?;
+        host.invocation.marker("SIMPLE_WAY_FUSED_END");
+    } else {
+        simple_ways_two_phase(
+            input,
+            &way_schedule,
+            &bbox_node_ids,
+            clean,
+            &mut writer,
+            &mut stats,
+            &mut matched_way_ids,
+            host,
+        )?;
+    }
+
+    // --- Phase 3: relations ---
+    if super::fused::fusable(&relation_schedule) {
+        host.invocation.marker("SIMPLE_REL_FUSED_START");
+        let mut unused = IdSet::new();
+        super::fused::fused_pass(
+            input,
+            &relation_schedule,
+            &super::fused::Select::Relations {
+                nodes: &bbox_node_ids,
+                ways: &matched_way_ids,
+            },
+            clean,
+            &mut writer,
+            &mut stats,
+            &mut unused,
+            host,
+        )?;
+        host.invocation.marker("SIMPLE_REL_FUSED_END");
+    } else {
+        simple_relations_two_phase(
+            input,
+            &relation_schedule,
+            &bbox_node_ids,
+            &matched_way_ids,
+            clean,
+            &mut writer,
+            &mut stats,
+            host,
+        )?;
+    }
+
+    writer.flush()?;
+    host.invocation.marker("EXTRACT_SCAN_END");
+    Ok(stats)
+}
+
+/// The node kind's classify-then-write form, for a node schedule
+/// [`fused::fusable`](super::fused::fusable) does not admit.
+#[allow(clippy::too_many_arguments)]
+fn simple_nodes_two_phase(
+    input: &PinnedInput,
+    node_schedule: &[&BlobDesc],
+    region: &Region,
+    exact_bbox: &BboxInt,
+    clean: &CleanAttrs,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+    bbox_node_ids: &mut IdSet,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    let matched_way_ids = &IdSet::new();
+    let empty_relation_ids = IdSet::new();
+    let outside_way_node_ids = IdSet::new();
     // Workers pread node blobs, decompress, scan with node-only scanner,
     // check bbox (pure function), send matching IDs to consumer.
     // Consumer merges into bbox_node_ids. No shared mutable state in workers.
     host.invocation.marker("SIMPLE_NODE_CLASSIFY_START");
     let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
     {
-        let classify_schedule = scheduled(&node_schedule)?;
+        let classify_schedule = scheduled(node_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
         let region_ref = region;
-        let exact_bbox_ref = &exact_bbox;
-        let node_schedule_ref = &node_schedule;
+        let exact_bbox_ref = exact_bbox;
+        let node_schedule_ref = node_schedule;
         // Per blob: the matching node ids, plus - for a passthrough candidate
         // - the observed node count if the blob verified (see `Passthrough`).
         // Positions index `node_schedule`, which `verified_nodes` follows.
@@ -475,19 +586,19 @@ fn extract_simple_single_pass(
     host.invocation.marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
     host.invocation.marker("SIMPLE_NODE_WRITE_START");
-    let node_descs = settle_passthrough_candidates(&node_schedule, &verified_nodes, host);
+    let node_descs = settle_passthrough_candidates(node_schedule, &verified_nodes, host);
     {
         let ids = ExtractPass2IdSets {
-            bbox_node_ids: &bbox_node_ids,
+            bbox_node_ids: &*bbox_node_ids,
             outside_way_node_ids: &outside_way_node_ids,
-            matched_way_ids: &matched_way_ids,
+            matched_way_ids,
             matched_relation_ids: &empty_relation_ids,
         };
         pread_execute(
             input,
             &node_descs,
-            &mut writer,
-            &mut stats,
+            writer,
+            stats,
             |block, bb, output| {
                 let s = extract_block_pass2(
                     block,
@@ -505,13 +616,29 @@ fn extract_simple_single_pass(
     }
 
     host.invocation.marker("SIMPLE_NODE_WRITE_END");
-    // --- Phase 2: Classify ways (scanner) + write ways (pread-from-workers) ---
+    Ok(())
+}
+
+/// The way kind's classify-then-write form.
+#[allow(clippy::too_many_arguments)]
+fn simple_ways_two_phase(
+    input: &PinnedInput,
+    way_schedule: &[&BlobDesc],
+    bbox_node_ids: &IdSet,
+    clean: &CleanAttrs,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+    matched_way_ids: &mut IdSet,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    let empty_relation_ids = IdSet::new();
+    let outside_way_node_ids = IdSet::new();
     host.invocation.marker("SIMPLE_WAY_CLASSIFY_START");
     {
-        let classify_schedule = scheduled(&way_schedule)?;
+        let classify_schedule = scheduled(way_schedule)?;
         let classify_input = crate::read::input::InputFile::open(input)?;
-        let bbox_ids_ref = &bbox_node_ids;
-        let way_schedule_ref = &way_schedule;
+        let bbox_ids_ref = bbox_node_ids;
+        let way_schedule_ref = way_schedule;
         crate::scan::classify::parallel_scan_blobs_raw(
             &classify_input,
             &classify_schedule,
@@ -563,16 +690,16 @@ fn extract_simple_single_pass(
         .collect();
     {
         let ids = ExtractPass2IdSets {
-            bbox_node_ids: &bbox_node_ids,
+            bbox_node_ids,
             outside_way_node_ids: &outside_way_node_ids,
-            matched_way_ids: &matched_way_ids,
+            matched_way_ids: &*matched_way_ids,
             matched_relation_ids: &empty_relation_ids,
         };
         pread_execute(
             input,
             &way_descs,
-            &mut writer,
-            &mut stats,
+            writer,
+            stats,
             |block, bb, output| {
                 let s = extract_block_pass2(
                     block,
@@ -590,14 +717,29 @@ fn extract_simple_single_pass(
     }
 
     host.invocation.marker("SIMPLE_WAY_WRITE_END");
-    // --- Phase 3: Classify relations + write (pread-from-workers) ---
+    Ok(())
+}
+
+/// The relation kind's classify-then-write form.
+#[allow(clippy::too_many_arguments)]
+fn simple_relations_two_phase(
+    input: &PinnedInput,
+    relation_schedule: &[&BlobDesc],
+    bbox_node_ids: &IdSet,
+    matched_way_ids: &IdSet,
+    clean: &CleanAttrs,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    let outside_way_node_ids = IdSet::new();
     // The classify is a block walk on purpose: about 0.3 s at planet, so
     // the re-parse a projection would remove sits under the command's
     // noise floor.
     host.invocation.marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
-        let rel_classify_schedule = scheduled(&relation_schedule)?;
+        let rel_classify_schedule = scheduled(relation_schedule)?;
         let rel_classify_file = crate::read::input::InputFile::open(input)?;
         crate::scan::classify::parallel_classify_accumulate(
             &rel_classify_file,
@@ -607,7 +749,7 @@ fn extract_simple_single_pass(
             |block, ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element
-                        && relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids)
+                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
                     {
                         ids.insert(r.id());
                     }
@@ -631,16 +773,16 @@ fn extract_simple_single_pass(
         .collect();
     {
         let ids = ExtractPass2IdSets {
-            bbox_node_ids: &bbox_node_ids,
+            bbox_node_ids,
             outside_way_node_ids: &outside_way_node_ids,
-            matched_way_ids: &matched_way_ids,
+            matched_way_ids,
             matched_relation_ids: &matched_relation_ids,
         };
         pread_execute(
             input,
             &rel_descs,
-            &mut writer,
-            &mut stats,
+            writer,
+            stats,
             |block, bb, output| {
                 let s = extract_block_pass2(
                     block,
@@ -658,9 +800,7 @@ fn extract_simple_single_pass(
     }
 
     host.invocation.marker("SIMPLE_REL_WRITE_END");
-    writer.flush()?;
-    host.invocation.marker("EXTRACT_SCAN_END");
-    Ok(stats)
+    Ok(())
 }
 
 /// The classify pools' schedule for `descs`, in the same order, so a pool

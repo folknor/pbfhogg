@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **`extract --simple` decodes each blob once on sorted indexed input, and
+  refuses an inexact ID range it relies on.** A single-region simple
+  extract of a sorted input now reads, decompresses and decodes each blob
+  of a kind once, rather than once to classify and again to write, when the
+  kind's indexdata ID ranges are pairwise disjoint: about 9 % faster at
+  planet with a continent box. Such a blob whose ID range or count is not
+  exact for what it holds is now refused (exit `2`, nothing published);
+  `cat --reindex` repairs it. Inputs whose ranges overlap (history files)
+  or carry no indexdata run as before. Multi-extract is unchanged.
+
 - **`sort` and `cat --dedupe` keep `LocationsOnWays` through a rewrite.**
   When every input declares `LocationsOnWays`, a way blob in an overlap run
   (or internally unsorted, or restructured) is now re-encoded with its inline

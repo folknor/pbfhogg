@@ -307,6 +307,73 @@ fn extract_simple_non_indexed_parity() {
     assert_elements_equivalent(&out_idx, &out_non);
 }
 
+/// Simple extract selects by ID: one in-region occurrence of a node ID
+/// writes every occurrence of it. On indexed sorted input each kind runs
+/// fused, one decode per blob, when the blobs' ID ranges are disjoint, and
+/// a repeated ID inside one blob takes the blob-local ID set; a repeat
+/// across blobs overlaps two ranges and sends the kind to classify then
+/// write. Both must match the non-indexed run, which always classifies
+/// first, and both write the out-of-region twin.
+#[cfg(feature = "commands")]
+#[test]
+fn extract_simple_repeated_ids_match_the_non_indexed_run() {
+    let inside = |id: i64| TestNode {
+        id,
+        lat: 1_000,
+        lon: 1_000,
+        tags: vec![],
+        meta: None,
+    };
+    let outside = |id: i64| TestNode {
+        id,
+        lat: 90_000,
+        lon: 90_000,
+        tags: vec![],
+        meta: None,
+    };
+    // Node 2 repeats inside the first blob; node 4's two occurrences sit
+    // on either side of the boundary at block size 3.
+    let nodes = vec![
+        outside(1),
+        outside(2),
+        inside(2),
+        outside(4),
+        inside(4),
+        inside(5),
+    ];
+    let ways = generate_ways(1, 1_000, 2, 1);
+    let bbox = pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.0006,0.0006").expect("parse bbox");
+    let region = pbfhogg::commands::extract::Region::Bbox(bbox);
+    for block_size in [3, 100] {
+        let dir = crate::common::test_scratch();
+        let in_idx = dir.path().join("in_idx.osm.pbf");
+        let in_non = dir.path().join("in_non.osm.pbf");
+        let out_idx = dir.path().join("out_idx.osm.pbf");
+        let out_non = dir.path().join("out_non.osm.pbf");
+        write_multi_block_test_pbf(&in_idx, &nodes, &ways, &[], block_size);
+        write_multi_block_non_indexed_pbf(&in_non, &nodes, &ways, &[], block_size);
+        let extract = |input: &Path, output: &Path| {
+            pbfhogg::commands::extract::extract(
+                input,
+                crate::common::out(output),
+                &region,
+                pbfhogg::commands::extract::ExtractStrategy::Simple,
+                true,
+                &pbfhogg::cat::CleanAttrs::default(),
+                &forced(),
+                &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
+            )
+            .expect("extract")
+        };
+        let stats = extract(&in_idx, &out_idx);
+        extract(&in_non, &out_non);
+        assert_elements_equivalent(&out_idx, &out_non);
+        // Both occurrences of 2 and of 4, and 5.
+        assert_eq!(stats.nodes_in_bbox, 5, "block size {block_size}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // getid (include mode)
 // ---------------------------------------------------------------------------

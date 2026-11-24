@@ -336,6 +336,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             size: meta.data_size,
             kind: kind_for_blob,
             bbox,
+            index: idx.copied(),
             passthrough: Passthrough::No,
         });
         // Kind and bbox are indexdata claims, believed without a decode: a

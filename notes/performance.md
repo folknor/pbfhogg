@@ -610,42 +610,25 @@ comparison, not a fingerprint.
 
 Kind: high potential for the stated workload.
 
-## PERF-017 - Simple extract has a classify then write barrier inside each kind
+## PERF-017 - Simple multi-extract has a classify then write barrier inside each kind
 
 Reported by: pipeline, indexdata, spatial.
 
-Mechanism: `extract_simple_single_pass` classifies nodes, completes the ID set,
-rereads nodes to write, then does the same for ways (another decompression and
-block construction) and relations (`simple.rs` node, way and relation phases;
-`common.rs` write executor). Multi-extract repeats it. The write schedule is not
-restricted to blobs with matches. The dependency is between kinds, not within
-one.
+Single-region sorted simple extract is fused (`extract/fused.rs`: one decode
+per blob for a kind whose indexdata ID ranges are pairwise disjoint, exact
+claim check at decode, blob-local ID set on a repeat; measured about -9 % at
+planet, `reference/performance/extract.md`). Multi-extract
+(`try_extract_multi_single_pass` in `extract/multi.rs`) still classifies each
+kind into the shared `Membership`, freezes it, then rereads, decompresses and
+decodes every blob of the kind again to write the N outputs. The same gate
+applies there: per blob, compute each element's region mask, emit into the
+per-region builders, and hand the masks to the consumer to install. Node
+classify there is a projection pool, so the selection walk may cost a larger
+share of the removed classify than it did for single extract; measure before
+landing. Interval components (preclassify only the blobs whose ranges
+overlap, fuse the rest) would keep history input off the slow form for both.
 
-Redesign: per kind, one worker task reads, decompresses, validates, selects,
-encodes and compresses, returning frames plus compact membership updates;
-membership is frozen before the dependent kind; verified raw-copy candidates
-verify while the body is present; simple relations need no membership table and
-emit directly. `BlockBuffer::project` and `ValidatedBlock::into_block` already
-support validate-once.
-
-Payoff: removes a second read and decompression of nearly every visited blob,
-tuple allocations and repeated decoding. Simple extract needs one source
-traversal on sorted input.
-
-Risks: selection is ID based, so one matching occurrence emits other
-occurrences of the same ID; duplicate runs, including across blobs, must be
-reconciled at ordered boundaries; dishonest ordering claims and sorted inputs
-without homogeneous indexed blocks need care.
-
-Kind: high conviction; the clearest concrete opportunity (pipeline).
-
-Defect hunt 2026-11-17 (extract) found the same two-pass shape and adds that
-it falsifies a documented claim: the public API says simple multi-extract
-reads the input once (`extract/mod.rs`), but node classification
-(`extract/multi.rs`) finishes before a separate node write pass, ways and
-relations repeat it, and single-extract simple does the same. Verified raw
-copies avoid the second decompression but still reread the frame. The
-documentation half is filed as DOC-018 in `notes/bugs-docs.md`.
+Kind: medium conviction; single extract measured the shape at -9 %.
 
 ## PERF-018 - Multi-region extract reruns whole extractions per region
 

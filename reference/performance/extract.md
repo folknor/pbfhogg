@@ -28,10 +28,34 @@ is its configured dataset bbox; planet's dataset bbox in `brokkr.toml` is a
 Berlin box chosen for `brokkr run --with pbfhogg pbfhogg-verify --` cost, so planet extract cells that
 want the continent box pass `--bbox` explicitly.
 
-Simple extract uses a 3-phase barrier pipeline with parallel classification
-and raw frame passthrough. Each phase (nodes, ways, relations) classifies
-blobs in parallel then writes matching raw frames via pread workers - no
-decode+re-encode.
+Sorted simple extract runs one phase per kind (nodes, ways, relations). On
+indexed input each phase is fused: one read, decompression and decode per
+blob, selected and re-encoded on its worker; only node blobs verified
+wholly inside the region are copied raw. A kind without disjoint ID ranges
+classifies, then rereads and writes.
+
+### Fused kind passes for sorted simple extract (bygg, 2026-11-24, variant uncommitted against `ac9b331b`)
+
+Each kind's classify pool and write pool replaced by one pool that decodes
+each blob once (selection walk, exact claim tally, emission walk on the same
+block). `region-extract --dataset planet --strategy simple
+--bbox=-25,34,45,72`, `--iterations 1`, interleaved variant first, baseline
+built with `--commit ac9b331b`; no fstrim before the suite. Verdict: about
+9 % faster, sign consistent in both pairs; landed. Peak anon unchanged
+within the run-to-run band (node phase 2.38 GB against 2.24/2.33 GB).
+
+| Span | baseline | variant |
+|------|----------|---------|
+| wall | 108.99 s (`71e0d208`), 107.99 s (`59f84ae9`) | 100.13 s (`bba8ee98`), 98.33 s (`2d84567e`) |
+| nodes (`SIMPLE_NODE_CLASSIFY` + `_WRITE` / `SIMPLE_NODE_FUSED`) | 16.07 + 50.13 s | 60.30 s |
+| ways (`SIMPLE_WAY_CLASSIFY` + `_WRITE` / `SIMPLE_WAY_FUSED`) | 7.54 + 27.65 s | 31.60 s |
+| relations | 0.30 + 0.88 s | 0.98 s |
+
+Per-kind numbers are the `71e0d208` and `2d84567e` pair. The saving is
+smaller than the removed classify spans: the fused selection walk over the
+decoded block costs most of what the scanner classify cost, and what goes
+is the second pread and decompression. Multi-extract keeps its classify and
+write passes per kind.
 
 Complete-ways and smart pass 1 (`collect_pass1_generic`) uses three-phase
 parallel pread classification (nodes → ways → relations) via a reusable

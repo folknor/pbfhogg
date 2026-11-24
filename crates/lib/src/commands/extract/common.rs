@@ -120,6 +120,10 @@ pub(super) struct BlobDesc {
     pub(super) kind: Option<crate::ElementKind>,
     /// Spatial bbox from indexdata (node blobs only, v2 format).
     pub(super) bbox: Option<crate::BlobBbox>,
+    /// The blob's whole indexdata claim (kind, ID range, count), `None` for
+    /// an unindexed blob. Sorted simple extract's fused kind passes rely on
+    /// the ID range and check it exactly at decode.
+    pub(super) index: Option<crate::blob_meta::BlobIndex>,
     /// Raw-passthrough state. See [`Passthrough`].
     pub(super) passthrough: Passthrough,
 }
@@ -296,6 +300,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
             size: meta.data_size,
             kind,
             bbox: idx.and_then(|i| i.bbox),
+            index: idx.copied(),
             passthrough: if candidate {
                 Passthrough::Candidate
             } else {

@@ -21,9 +21,11 @@ use super::{ExtractStats, Region};
 
 use crate::owned::{dense_node_metadata, element_metadata};
 
-/// Try single-pass multi-extract: read the PBF once, classify each element
-/// against all N regions, write to N output files. Returns `None` to fall
-/// back to sequential if the input isn't sorted.
+/// Try single-pass multi-extract: one run over the input for all N regions
+/// rather than one extract per region (each kind is visited twice, a
+/// classify pass into the shared membership and a write pass to the N
+/// outputs). Returns `None` to fall back to sequential if the input isn't
+/// sorted.
 ///
 /// Simple strategy only (no per-region way/relation ID tracking beyond what
 /// fits in memory). The pool workers compress and frame each region's blocks

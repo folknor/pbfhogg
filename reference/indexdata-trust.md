@@ -178,6 +178,16 @@ range hands a neighbour's upsert to the blob as well.
   the blob before it by its decoded first element (a mixed-sign range
   cannot name it): a descent is `Unsorted`. Sparse does not depend on order
   and does not check it.
+- **`extract --simple`**, single region, sorted header: a kind whose blobs
+  all carry ID ranges that are pairwise disjoint decodes each blob once and
+  decides its ID-selection rule (one selected occurrence writes every
+  occurrence of the ID) inside the blob, which is sound only if no ID
+  occurs in two blobs. Every blob of such a kind, a raw-copy candidate
+  included, is tallied over its elements of the kind and its claim must be
+  exact before the blob's output leaves the worker. Order is not required:
+  an equal or descending step inside the blob switches it to a blob-local
+  ID set. A kind with an unindexed blob or overlapping ranges reads no
+  range and is classified, then written, as before.
 - **`diff`** and `diff --format osc`, on the indexed route, every block a
   work unit decodes (both sides of an overlapping pair, every one-sided
   run, every drain and every re-decode of a carried blob), before the

@@ -14,8 +14,9 @@
 //! The opens, in order, per strategy (see `Strategy::opens`):
 //!
 //! - simple, sorted: the sortedness probe, the schedule walk, the header
-//!   read, then per kind (nodes, ways, relations) the classify descriptor
-//!   and the write pass's descriptor.
+//!   read, then per kind (nodes, ways, relations) the fused pass's
+//!   descriptor (these fixtures carry disjoint indexdata ID ranges; a kind
+//!   without them takes a classify and a write descriptor instead).
 //! - simple, unsorted: the probe, one reader per kind's classify sweep, the
 //!   write pass's reader.
 //! - complete and smart: the indexdata front read, pass 1's sortedness
@@ -65,7 +66,7 @@ impl Strategy {
     /// non-empty.
     fn opens(self, sorted: bool) -> u64 {
         match (self, sorted) {
-            (Self::Simple, true) => 9,
+            (Self::Simple, true) => 6,
             (Self::Simple, false) => 5,
             (Self::Complete, true) => 5,
             (Self::Complete, false) => 8,
@@ -114,7 +115,7 @@ impl Route {
     /// classify and write-pass preads buffered.
     fn transports(self) -> &'static str {
         match (self.multi, self.strategy, self.sorted) {
-            (false, Strategy::Simple, true) => "DBDBBBBBB",
+            (false, Strategy::Simple, true) => "DBDBBB",
             (false, Strategy::Complete, true) => "DDBDB",
             _ => panic!("{self:?}: no direct transport spec"),
         }

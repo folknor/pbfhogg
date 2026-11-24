@@ -128,16 +128,6 @@ sweep refuses lazy-cursor descents and checks the final count and range when a
 cursor is exhausted. The page should describe the current streaming
 validation.
 
-## DOC-018 - The extract API says simple multi-extract reads the input once
-
-Reported by: extract [P3].
-
-The public API in `extract/mod.rs` says simple multi-extract reads the input
-once. Node classification (`extract/multi.rs`) finishes before a separate node
-write pass, and ways and relations repeat that. Single-extract simple does the
-same. Verified raw copies avoid the second decompression but still reread the
-frame. The mechanism and its redesign are PERF-017 in `notes/performance.md`.
-
 ## DOC-019 - DEVIATIONS.md says export assembles boundary relations
 
 Reported by: export.

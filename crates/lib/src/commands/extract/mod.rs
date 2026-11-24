@@ -11,6 +11,7 @@ use super::{HeaderOverrides, Result};
 
 mod common;
 mod complete;
+mod fused;
 mod membership;
 mod multi;
 mod polygon;
@@ -620,8 +621,10 @@ fn parse_extract_geometry(
 /// Where a later open cannot reach the pinned file, an input replaced
 /// mid-run fails with `InputReplaced`.
 ///
-/// The simple strategy without cleaning reads the input once and holds a
-/// writer per region for the whole scan, so before the input is pinned the
+/// The simple strategy without cleaning serves every region from one run
+/// over the input rather than one extract per region (each kind is still
+/// visited twice, a classify pass and a write pass), and holds a writer per
+/// region for that whole run, so before the input is pinned the
 /// run asks the host for those descriptors (`ProcessActions::fd_allowance`),
 /// plus the pin and a fixed allowance; the other strategies run one region
 /// at a time and ask for the pin and the allowance alone. The library never

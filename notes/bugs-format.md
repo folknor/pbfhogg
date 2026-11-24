@@ -49,20 +49,6 @@ number of real decompressions. A file holding only extension blobs after its
 header yields a positive inferred decompression count with none performed. The
 counter and its documented interpretation disagree.
 
-## FMT-024 - path_guard same_file stringifies the original I/O error
-
-Reported by: filesystem-output [P2].
-
-The `named` closure in `path_guard.rs` formats the original error into a
-string and builds a replacement `io::Error`. A canonicalization failure with
-`EACCES` keeps `PermissionDenied` but loses the original error object and its
-errno, and later conversion into `pbfhogg::Error` cannot recover either. This
-breaks the error-provenance contract in `reference/pipeline.md`: typed errors
-keep their causes, and intermediate layers do not stringify them. The original
-error should be kept in a typed path wrapper. `path_guard::dir_holds`, the
-containment preflight `build-geocode-index` shares with the library, names
-its errors the same way and should move with it.
-
 ## FMT-025 - ParallelGzipWriter writes nothing for an empty stream
 
 Reported by: write-encoding (flagged as a surprise).

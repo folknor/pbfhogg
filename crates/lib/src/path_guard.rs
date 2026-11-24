@@ -99,14 +99,14 @@ fn remove_best_effort(path: &Path, kind: Kind) {
 /// # Errors
 /// Returns any canonicalization or metadata error other than not-found.
 #[doc(hidden)]
-pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+pub fn same_file(a: &Path, b: &Path) -> crate::Result<bool> {
     // Named: this runs on every input/output pair of a command line, and a
-    // bare "Permission denied" does not say which of them it was.
+    // bare "Permission denied" does not say which of them it was. The path
+    // goes in as context, so the original `io::Error` (and its OS errno)
+    // stays the error's `ErrorKind::Io`. Not a `Location`: that names an
+    // input, and either path here may be an output.
     let named = |what: &str, path: &Path, e: std::io::Error| {
-        std::io::Error::new(
-            e.kind(),
-            format!("failed to {what} {}: {e}", path.display()),
-        )
+        crate::Error::from(e).context(format!("failed to {what} {}", path.display()))
     };
     // Any error but not-found fails the check rather than answering "not the
     // same file": resolving and stat-ing need the same directory search
@@ -271,25 +271,27 @@ pub(crate) fn tree_links_to(dir: &Path, file: &fs::Metadata) -> std::io::Result<
 /// wrong with it.
 ///
 /// # Errors
-/// Any error but not-found, naming the path.
+/// Any error but not-found, as context over the original `io::Error`: the
+/// input stat names the input; a failure walking the tree names the check
+/// (which entry inside `dir` failed is not known here).
 #[doc(hidden)]
-pub fn dir_holds(dir: &Path, input: &Path) -> std::io::Result<bool> {
-    let named = |path: &Path, e: std::io::Error| {
-        std::io::Error::new(
-            e.kind(),
-            format!(
-                "failed to check whether {} holds {}: {e}",
-                dir.display(),
-                path.display()
-            ),
-        )
-    };
+pub fn dir_holds(dir: &Path, input: &Path) -> crate::Result<bool> {
     let file = match fs::metadata(input) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(named(input, e)),
+        Err(e) => {
+            return Err(
+                crate::Error::from(e).context(format!("failed to stat {}", input.display()))
+            );
+        }
     };
-    replacing_dir_deletes(dir, input, &file).map_err(|e| named(input, e))
+    replacing_dir_deletes(dir, input, &file).map_err(|e| {
+        crate::Error::from(e).context(format!(
+            "failed to check whether {} holds {}",
+            dir.display(),
+            input.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -356,6 +358,34 @@ pub(crate) mod tests {
         assert!(!same_file(&base, &other).expect("equal bytes, different file"));
         assert!(!same_file(&base, &absent).expect("absent output"));
         assert!(!same_file(&absent, &base).expect("absent input"));
+    }
+
+    /// A path that cannot be resolved fails the check with the original
+    /// `io::Error` as the error's kind, its OS errno intact, and the path
+    /// named as context. A symlink loop (`ELOOP`) refuses as root too.
+    #[test]
+    fn same_file_keeps_the_original_os_error() {
+        let dir = scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let looped = dir.path().join("loop");
+        fs::write(&base, b"base").expect("write base");
+        std::os::unix::fs::symlink(&looped, &looped).expect("create symlink loop");
+
+        let err = same_file(&looped, &base).expect_err("a symlink loop cannot be resolved");
+        let crate::ErrorKind::Io(io) = err.kind() else {
+            panic!("expected an Io kind, got {err:?}");
+        };
+        assert_eq!(io.raw_os_error(), Some(40), "ELOOP survives: {io:?}");
+        assert!(
+            err.to_string().contains(&looped.display().to_string()),
+            "{err}"
+        );
+
+        let held = dir_holds(dir.path(), &looped).expect_err("the input cannot be stat-ed");
+        let crate::ErrorKind::Io(io) = held.kind() else {
+            panic!("expected an Io kind, got {held:?}");
+        };
+        assert_eq!(io.raw_os_error(), Some(40), "ELOOP survives: {io:?}");
     }
 
     /// Replacing a directory deletes an input inside it, and the entry that

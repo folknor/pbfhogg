@@ -403,7 +403,7 @@ impl CommandPaths {
     }
 }
 
-fn paths_alias(input: &Path, output: &Path) -> std::io::Result<bool> {
+fn paths_alias(input: &Path, output: &Path) -> pbfhogg::Result<bool> {
     // An input that does not exist cannot alias anything, and reporting it
     // from here would replace the command's own "failed to open <path>"
     // with a bare aliasing-check IO error that never names the file. The
@@ -423,7 +423,7 @@ fn paths_alias(input: &Path, output: &Path) -> std::io::Result<bool> {
     let input_canonical = match std::fs::canonicalize(input) {
         Ok(path) => path,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
 
     let Some(planned) = planned_path(output)? else {

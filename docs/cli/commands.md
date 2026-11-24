@@ -2371,11 +2371,14 @@ geometry: inside a ring is decided by even-odd crossing parity, so a ring
 that crosses itself keeps the regions it encloses an odd number of times;
 outer rings of one relation that overlap are separate areas whose union
 matches; and a hole subtracts from each outer ring that owns it, wherever it
-touches or crosses that ring. One geometry is dropped with a warning: an
-area with a ring (outer or hole) whose longitudes, unwrapped across the
-antimeridian, pass 100,000 degrees (it winds round a pole hundreds of
-times) is left out of the index, so that area answers no query; the
-relation's other areas are kept. The PBF header's replication sequence and
+touches or crosses that ring. For a given set of assembled rings, which
+outer owns an inner ring does not depend on where the rings start or which
+way they run. A relation is also refused, with a warning, when any of its
+rings (outer or inner) is of a shape whose interior can depend on where
+its walk starts: a ring that winds round a pole, one whose longitudes,
+unwrapped across the antimeridian, span a full turn, or one with an edge
+spanning exactly 180 degrees of longitude (which way round it runs is
+ambiguous). Such a relation contributes no admin area. The PBF header's replication sequence and
 timestamp are stored in the geocode header exactly as the input holds them:
 each as a signed 64-bit value with its own presence, so a missing value stays
 missing, a zero stays zero and a negative timestamp stays negative; no value
@@ -2593,9 +2596,10 @@ degrees; the `_e7` coordinates are decimicrodegrees (degrees times 1e7),
 `distance_m` is the reader's flat distance in meters and `area` the
 polygon's stored ranking area: its outer ring's planar area in square
 decimicrodegrees, holes not subtracted. A ring across the antimeridian is
-measured with its longitudes unwrapped, as containment tests it, unless it
-winds around a pole; an index built before that rule keeps the raw-frame
-area of such a ring until it is rebuilt. When the street segment spans
+measured with its longitudes unwrapped, as containment tests it. An index
+built before that rule keeps the raw-frame area of such a ring, and one
+built before rings winding round a pole were refused keeps their
+raw-frame area too, until it is rebuilt. When the street segment spans
 exactly 180 degrees of longitude, the snap is the nearest point on either
 half-world path.
 

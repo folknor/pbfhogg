@@ -12,6 +12,17 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Hole ownership by one exact witness, start-dependent rings refused (bygg, 2026-11-24, variant uncommitted against `8d9fdaf9`)
+
+Planet, one variant and one `--commit HEAD` baseline cell with
+`--iterations 1`, variant first. Variant `fbd32849` 123.7 s, baseline
+`532145fb` 118.2 s. The whole gap is in Pass 2a (26.5 s against 20.1 s,
+96 GB against 64 GB read), a phase the change does not touch: page cache
+state, not code. The changed phase, `GEOCODE_PASS2_ADMIN_ASSEMBLY`, ran
+2.19 s against 2.16 s. Both cells dropped 3049 admin relations, so no
+planet relation has a ring the new start-invariance refusal catches.
+Verdict: no measured cost.
+
 ### Pass 2a returns the first node error (plantasjen, 2026-11-20, variant uncommitted against `e2387c31`)
 
 Germany, one baseline and one variant cell with `--iterations 1` and

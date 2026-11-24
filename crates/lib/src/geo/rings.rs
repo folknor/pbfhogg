@@ -496,10 +496,218 @@ fn outside(a: &WalkedRing, b: &WalkedRing) -> bool {
     false
 }
 
+/// Longitude change along the edge from `a` to `b` (E7): the raw difference,
+/// or that difference a turn the other way when it spans more than half a
+/// turn, as the antimeridian-aware frame lifts it. Antisymmetric in `a` and
+/// `b`. An exact half turn comes back as is, and is ambiguous: which way
+/// round it runs depends on how the vertex before it was lifted.
+#[cfg(feature = "commands")]
+fn lifted_delta(a: i64, b: i64) -> i64 {
+    let d = b - a;
+    if d > HALF_TURN_E7 {
+        d - FULL_TURN_E7
+    } else if d < -HALF_TURN_E7 {
+        d + FULL_TURN_E7
+    } else {
+        d
+    }
+}
+
+/// Whether the antimeridian-aware point-in-ring answer for `ring` (closed,
+/// `(lat_e7, lon_e7)`) is a property of the ring as a cyclic sequence, so
+/// that the vertex it starts at, which follows member order, cannot change
+/// it. True for a ring no edge of which spans a half turn or more (closing
+/// edge included): the frame is the ring as given. Otherwise the ring is
+/// lifted from its first vertex, and the answer is start-invariant when
+///
+/// - no edge spans exactly a half turn, so every lifted step is unique and
+///   the lift of any rotation is the same path shifted by whole turns;
+/// - the lift closes (zero net winding), so the planar ring is the whole
+///   boundary and no closing chord at the start vertex's latitude, which
+///   a ring winding round a pole has, enters the test;
+/// - the lift spans less than a full turn of longitude, so it lies within a
+///   turn and a half of zero, the point and its two retries a turn either
+///   way meet every image of the lift, and their union is the same set for
+///   every rotation.
+///
+/// The test is sufficient, not necessary: any ring with an exact half-turn
+/// edge fails it, also one the f64 frame would keep as given in every
+/// rotation (its raw edges compare at about 180 degrees, so whether f64
+/// calls it crossing is decided by conversion rounding, not by the data).
+/// The geocode builder withholds the relation of a ring that fails.
+#[cfg(feature = "commands")]
+pub(crate) fn frame_is_start_invariant(ring: &[(i32, i32)]) -> bool {
+    let n = ring.len();
+    if n < 2 {
+        return true;
+    }
+    let lon = |i: usize| i64::from(ring[i % n].1);
+    if (0..n).all(|i| (lon(i + 1) - lon(i)).abs() < HALF_TURN_E7) {
+        return true;
+    }
+    let (mut at, mut lo, mut hi) = (0_i64, 0_i64, 0_i64);
+    for i in 0..n {
+        let d = lifted_delta(lon(i), lon(i + 1));
+        if d.abs() == HALF_TURN_E7 {
+            return false;
+        }
+        at += d;
+        lo = lo.min(at);
+        hi = hi.max(at);
+    }
+    at == 0 && hi - lo < FULL_TURN_E7
+}
+
+/// An outer ring prepared for [`OuterFrame::owns`]: its antimeridian-aware
+/// frame in doubled E7 `(lon, lat)`, built once per outer.
+#[cfg(feature = "commands")]
+pub(crate) struct OuterFrame {
+    doubled: Vec<(i64, i64)>,
+    wraps: bool,
+}
+
+#[cfg(feature = "commands")]
+impl OuterFrame {
+    /// `ring` is closed `(lat_e7, lon_e7)`, as [`assemble_rings`] returns it.
+    pub(crate) fn new(ring: &[(i32, i32)]) -> Self {
+        let (frame, wraps) = frame(ring);
+        Self {
+            doubled: frame.iter().map(|&(x, y)| (2 * x, 2 * y)).collect(),
+            wraps,
+        }
+    }
+
+    /// Exact side of one doubled point: strictly inside if any image a turn
+    /// either way is strictly inside (the predicate is the union of the
+    /// images), on the boundary if none is inside and some image is on it,
+    /// otherwise outside. A ring that does not wrap meets only the point
+    /// itself, and at the seam its other spelling.
+    fn side(&self, px: i64, py: i64) -> Side {
+        let seam = 2 * HALF_TURN_E7;
+        let images: &[i64] = if self.wraps {
+            &[0, 2 * FULL_TURN_E7, -2 * FULL_TURN_E7]
+        } else if px == seam {
+            &[0, -2 * FULL_TURN_E7]
+        } else if px == -seam {
+            &[0, 2 * FULL_TURN_E7]
+        } else {
+            &[0]
+        };
+        let mut boundary = false;
+        for &shift in images {
+            match classify(px + shift, py, &self.doubled) {
+                Side::Inside => return Side::Inside,
+                Side::Boundary => boundary = true,
+                Side::Outside => {}
+            }
+        }
+        if boundary {
+            Side::Boundary
+        } else {
+            Side::Outside
+        }
+    }
+
+    /// Whether this outer owns `hole` (closed `(lat_e7, lon_e7)`): decided by
+    /// one witness point of the hole's trace, exactly classified. Witnesses
+    /// are tried in an order fixed by their coordinates alone, the hole's
+    /// distinct vertices and then its edge midpoints, each sorted by
+    /// (latitude, longitude) with the seam spelled +180; the first that is
+    /// strictly inside or strictly outside decides. A witness on the outer's
+    /// boundary (a node the rings share, or a vertex lying on an outer edge)
+    /// abstains. The answer therefore does not depend on where the hole's
+    /// walk starts or which way it runs.
+    ///
+    /// For a hole whose trace stays on one side of the outer apart from
+    /// contacts, every strict witness gives the same answer, so the first is
+    /// right. One whose every vertex and midpoint is on the outer has no
+    /// witness and is not owned; one that crosses the outer gets the answer
+    /// of its first witness. The CLI contract promises neither case.
+    pub(crate) fn owns(&self, hole: &[(i32, i32)]) -> bool {
+        let seam = 2 * HALF_TURN_E7;
+        let canonical = |mut x: i64| {
+            while x > seam {
+                x -= 2 * FULL_TURN_E7;
+            }
+            while x <= -seam {
+                x += 2 * FULL_TURN_E7;
+            }
+            x
+        };
+        let mut vertices: Vec<(i64, i64)> = hole
+            .iter()
+            .map(|&(lat, lon)| (2 * i64::from(lat), canonical(2 * i64::from(lon))))
+            .collect();
+        if let Some(decided) = self.first_strict(&mut vertices) {
+            return decided;
+        }
+        let mut midpoints: Vec<(i64, i64)> = hole
+            .windows(2)
+            .map(|w| {
+                let (a, b) = (w[0], w[1]);
+                let x = 2 * i64::from(a.1) + lifted_delta(i64::from(a.1), i64::from(b.1));
+                (i64::from(a.0) + i64::from(b.0), canonical(x))
+            })
+            .collect();
+        self.first_strict(&mut midpoints).unwrap_or(false)
+    }
+
+    /// The answer of the first strict witness among `points` (doubled
+    /// `(lat, lon)`) in sorted order.
+    fn first_strict(&self, points: &mut Vec<(i64, i64)>) -> Option<bool> {
+        points.sort_unstable();
+        points.dedup();
+        points.iter().find_map(|&(py, px)| match self.side(px, py) {
+            Side::Inside => Some(true),
+            Side::Outside => Some(false),
+            Side::Boundary => None,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Ring, RingMember, RingRefusal, assemble_rings};
+
+    /// `(lon, lat)` whole degrees to a closed `(lat_e7, lon_e7)` ring.
+    #[cfg(feature = "commands")]
+    fn closed(lonlat: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        let mut ring: Vec<(i32, i32)> = lonlat
+            .iter()
+            .map(|&(lon, lat)| (lat * 10_000_000, lon * 10_000_000))
+            .collect();
+        ring.push(ring[0]);
+        ring
+    }
+
+    /// Which framings have a start-independent answer: plain rings and
+    /// rings crossing the seam do; a ring winding a pole, a ring whose lift
+    /// spans a full turn without winding, and a crossing ring with an edge of
+    /// exactly half a turn do not, in every rotation.
+    #[cfg(feature = "commands")]
+    #[test]
+    fn start_invariant_frames() {
+        use super::frame_is_start_invariant as ok;
+        assert!(ok(&closed(&[(0, 0), (10, 0), (10, 10)])));
+        assert!(ok(&closed(&[(175, 0), (-175, 0), (-175, 5), (175, 5)])));
+        // A plain ring with a half-turn edge and no seam crossing.
+        assert!(!ok(&closed(&[(-90, 0), (90, 0), (90, 10)])));
+        let winding = [(0, 80), (120, 81), (-120, 80)];
+        // A narrow band lifted from 0 to 600 degrees and back.
+        let wide: Vec<(i32, i32)> = (0..6)
+            .map(|k| (k * 120, k * 10))
+            .chain((0..6).rev().map(|k| (k * 120, k * 10 + 2)))
+            .map(|(lon, lat)| (((lon + 180) % 360) - 180, lat))
+            .collect();
+        let half = [(170, 0), (-10, 0), (-10, 5), (-170, 5)];
+        for shape in [&winding[..], &wide[..], &half[..]] {
+            for k in 0..shape.len() {
+                let rotated: Vec<_> = shape[k..].iter().chain(&shape[..k]).copied().collect();
+                assert!(!ok(&closed(&rotated)), "{rotated:?}");
+            }
+        }
+    }
 
     type Member = (Vec<i64>, Vec<(i32, i32)>);
 

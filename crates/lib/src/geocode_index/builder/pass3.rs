@@ -1049,8 +1049,9 @@ fn run_stage_b(
 /// (`geo::pip_ring_frame`), within `ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG`, the
 /// range the cover's rounding is proven inside `PATH_COVER_UV_SLACK` for.
 /// The reader trusts the admin cover (format `AdminEntry`), so the builder
-/// drops a polygon failing this before it writes any admin record: a record
-/// left without its cells would break the cover rules.
+/// refuses a polygon failing this before it writes any admin record: a
+/// record left without its cells would break the cover rules. Ring assembly
+/// already withholds every ring that could fail it.
 pub(super) fn admin_frame_within_bound(poly: &AssembledPolygon) -> bool {
     let (ext, holes) = parse_polygon_rings(poly.vertices.iter().copied());
     let max_lon = crate::tunables::ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG;
@@ -1769,7 +1770,7 @@ mod tests {
         );
     }
 
-    /// The frame bound the builder drops polygons by: a ring whose unwrapped
+    /// The frame bound the builder checks polygons against: a ring whose unwrapped
     /// frame passes the longitude the cover's rounding is proven for fails
     /// it, a ring winding round the pole once passes. Ring assembly refuses
     /// the repeated coordinates of this fixture, so it tests the predicate

@@ -58,10 +58,13 @@ Reported by: spar on the longitude-unwrap termination fix (lateral).
 `unwrap_ring_longitudes` (`geo.rs`) keeps its shift-a-turn-at-a-time loops
 for in-range rings, because stored indexes were covered in exactly that
 rounding sequence (a closed-form turn count differs at rounding boundaries).
-Each vertex costs one iteration per turn the ring has drifted, so a legal ring
-repeating `[120, -120, 0]` 100,000 times costs about 15 billion shifts. Only
-reachable with an admin ring winding the pole thousands of times; a fix must
-keep the legacy frame bit-identical or bump the index format and rebuild covers.
+Each vertex costs one iteration per turn the ring has drifted, so a ring
+repeating `[120, -120, 0]` 100,000 times costs about 15 billion shifts. The
+geocode builder no longer reaches it: ring assembly withholds any relation
+with a winding ring before anything unwraps it. What remains is the public
+`geo` functions given such a ring, and the reader on an index built before
+that refusal; a fix must keep the legacy frame bit-identical for those
+indexes.
 
 ## GEO-029 - Interpolated house numbers are measured to the quantized snap
 
@@ -73,16 +76,29 @@ and the candidate paths, rather than as prefix length plus `t` times the
 segment length. The truncation can move a result across a house-number
 threshold. Passing `t` through would number the projected point itself.
 
-## GEO-030 - A polar winding admin ring ranks by its raw-frame area
+## GEO-031 - Ring assembly's disjointness check depends on ring start
 
-Reported by: the GEO-009/GEO-010 spar.
+Reported by: the GEO-019/GEO-020 spar (codex, source inspection, not run).
 
-The ranking score is taken in the containment frame only for a ring with
-zero net longitude winding. A ring winding a pole lifts to an open path
-whose closing chord, and so both its lifted area and its containment, depend
-on the start vertex (GEO-020), so it keeps the raw shoelace. A meaningful
-polar ranking needs the polar interior defined first, with containment,
-cover and ranking derived from it.
+`outside()` in `geo/rings.rs`, which decides whether two rings of one
+connected graph are disjoint or refused as nested, returns on the first
+eligible edge midpoint of the walk, even when that midpoint is on the other
+ring's boundary. The walk starts at the earliest source edge, so member
+order can choose between a boundary witness (refusal) and a strict one
+(acceptance). Example: a square `(0,0)-(4,4)` and a ring through `(0,4),
+(-1,1), (1,-1), (-3,-1), (-3,4)` sharing node `(0,4)`, split into open
+members. The hole-ownership witness rule (sorted witnesses, boundary
+abstains) would fix it the same way.
+
+## GEO-032 - Ranking area of a crossing ring varies with its start at roundoff
+
+Reported by: the GEO-019/GEO-020 spar (codex, reproduced arithmetic).
+
+`ranking_area` takes an unwrapped ring's shoelace in f64 degrees about its
+first vertex, so rotations of one ring can store areas a few square
+decimicrodegrees apart (a zero-area wrapped bow tie scored 2.84 or 0 by
+start), surviving the f32 cast. Equal-area ties then fall to polygon index.
+An i128 shoelace on the integer lift, rounded once, would make it exact.
 
 ## GEO-018 - Open ways sharing a side between two holes are refused as a theta
 
@@ -94,27 +110,6 @@ ambiguous, withholding the whole relation. The relation is well formed (two
 adjacent holes), so this is an over-refusal, the same trade as the other
 ambiguous-topology refusals. Face parity on a validated planar embedding
 would publish it; the current design deliberately refuses instead.
-
-## GEO-019 - hole_inside_outer is sensitive to tangency and ring start
-
-Reported by: the ring-assembly rewrite.
-
-The hole-ownership vote (`hole_inside_outer`, 2-2 vote among sampled
-vertices) can lose when a hole vertex lies on the outer ring's edge, and the
-outcome can depend on which vertex the hole ring starts at. Equal rings in a
-different rotation can then be assigned to a different outer or to none. Use
-a vote that excludes boundary vertices or a sample that is rotation
-invariant.
-
-## GEO-020 - Polar admin rings depend on member order through the closing edge
-
-Reported by: the ring-assembly rewrite.
-
-The reader frames a ring that winds around a pole by closing it with an edge
-that depends on where the ring starts, so member order still changes the
-answer for such rings. The assembler now keeps the start deterministic (the
-earliest source edge) but the dependence is in the reader's framing, which
-predates the rewrite. The framing should be start-invariant.
 
 ## GEO-023 - A tangent exclave drawn by open ways withholds the relation
 
@@ -143,8 +138,9 @@ contract and needs, per the `geo/rings.rs` module doc: a containment
 forest with alternating roles, cyclic edge order at shared nodes, seam
 normalisation for touching holes, a periodic frame for seam contacts and a
 subquadratic sweep, measured against the admin assembly phase. Maintainer's
-call. Valid topology already answers correctly apart from the ownership
-vote (GEO-019).
+call. Valid topology already answers correctly, except a hole whose every
+vertex and edge midpoint lies on its shell, which no witness can place and
+is not owned.
 
 ## GEO-025 - Holes sharing an edge can both miss a point at roundoff scale
 

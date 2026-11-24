@@ -667,8 +667,10 @@ record! {
         /// The outer ring's planar area in square decimicrodegrees, holes not
         /// subtracted (for smallest-polygon selection). The builder takes it
         /// in the containment frame (`geo::pip_ring_frame`) for a ring that
-        /// frame unwraps with zero net winding, raw otherwise; a reader
-        /// cannot tell which rule built a stored value.
+        /// frame unwraps with zero net winding, raw otherwise. The current
+        /// builder publishes no ring that winds, but an index built before
+        /// it stopped may hold one, and a reader cannot tell which rule
+        /// built a stored value.
         pub area: f32,
         /// Byte offset into admin_vertices.bin.
         /// Builder-produced exterior and hole rings repeat their first vertex at

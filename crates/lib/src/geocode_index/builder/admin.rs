@@ -26,11 +26,14 @@ pub(super) struct AssembledPolygon {
 /// Relations that produced no polygon. `ambiguous_topology` is the subset
 /// whose complete member ways do not determine their rings
 /// (`crate::geo::assemble_rings` lists the refusals; a way listed as both
-/// outer and inner is one more); it is included in `total`.
+/// outer and inner is one more), and `start_dependent_frame` the subset with
+/// a ring whose interior would depend on its start vertex
+/// (`crate::geo::frame_is_start_invariant`); both are included in `total`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct DroppedAdminRelations {
     pub(super) total: usize,
     pub(super) ambiguous_topology: usize,
+    pub(super) start_dependent_frame: usize,
     pub(super) sample_relation_ids: Vec<i64>,
 }
 
@@ -243,7 +246,7 @@ pub(super) fn assemble_admin_polygons(
     // A store fault (`Err` outside) fails the build; a ring refusal
     // (`Err` inside) drops only its relation.
     #[allow(clippy::type_complexity)]
-    let per_relation: Vec<Result<std::result::Result<Vec<AssembledPolygon>, RingRefusal>>> =
+    let per_relation: Vec<Result<std::result::Result<Vec<AssembledPolygon>, RelationRefusal>>> =
         executor.install(|| {
             relations
                 .par_iter()
@@ -259,9 +262,12 @@ pub(super) fn assemble_admin_polygons(
                 super::sample_id(&mut dropped.sample_relation_ids, rel.id);
             }
             Ok(assembled) => polygons.extend(assembled),
-            Err(_) => {
+            Err(refusal) => {
                 dropped.total += 1;
-                dropped.ambiguous_topology += 1;
+                match refusal {
+                    RelationRefusal::Topology => dropped.ambiguous_topology += 1,
+                    RelationRefusal::StartDependentFrame => dropped.start_dependent_frame += 1,
+                }
                 super::sample_id(&mut dropped.sample_relation_ids, rel.id);
             }
         }
@@ -269,41 +275,20 @@ pub(super) fn assemble_admin_polygons(
     Ok((polygons, dropped))
 }
 
-/// Decide whether `hole` belongs to the outer ring `outer_f64`.
-///
-/// Two things this must get right, both of which the previous
-/// `point_in_ring(hole[0])` did not:
-///
-/// 1. **Antimeridian.** Every other point-in-ring call in the codebase goes
-///    through `point_in_ring_with_antimeridian`. An admin boundary crossing
-///    +/-180 (Russia, Fiji, the Antarctic claims) has a longitude-
-///    discontinuous outer ring, and the plain ray cast assigns its holes to
-///    the wrong outer or drops them. This runs on planet data, so those
-///    relations are present.
-///
-/// 2. **Boundary vertices.** `hole[0]` for an admin boundary is very often a
-///    node shared with the outer ring, i.e. exactly on the boundary, where
-///    ray casting is undefined and answers either way. Sampling several
-///    vertices spread around the hole and taking the majority means one
-///    degenerate vertex no longer decides ownership. Vertices, not a
-///    centroid: the centroid of a non-convex hole can fall outside both the
-///    hole and its outer.
-fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
-    use crate::tunables::HOLE_OWNERSHIP_SAMPLES;
-    let step = (hole.len() / HOLE_OWNERSHIP_SAMPLES).max(1);
-    let mut inside = 0_usize;
-    let mut tested = 0_usize;
-    for &(lat, lon) in hole.iter().step_by(step).take(HOLE_OWNERSHIP_SAMPLES) {
-        tested += 1;
-        if crate::geo::point_in_ring_with_antimeridian(
-            e7_to_deg(lon as f64),
-            e7_to_deg(lat as f64),
-            outer_f64,
-        ) {
-            inside += 1;
-        }
+/// Why a relation with complete member geometry was withheld.
+enum RelationRefusal {
+    /// The member ways do not determine the rings (any `RingRefusal`).
+    Topology,
+    /// A ring has no interior independent of the vertex its walk starts at
+    /// (`geo::frame_is_start_invariant`): it winds round a pole, spans a
+    /// full turn of longitude, or has an edge spanning exactly a half turn.
+    StartDependentFrame,
+}
+
+impl From<RingRefusal> for RelationRefusal {
+    fn from(_: RingRefusal) -> Self {
+        Self::Topology
     }
-    tested > 0 && inside * 2 > tested
 }
 
 /// A kept vertex back in decimicrodegrees. `simplify_ring` only selects
@@ -352,7 +337,7 @@ fn assemble_one_relation(
     rel: &RawAdminRelation,
     way_geom: &WayGeometryMap,
     tolerance_m: f64,
-) -> Result<std::result::Result<Vec<AssembledPolygon>, RingRefusal>> {
+) -> Result<std::result::Result<Vec<AssembledPolygon>, RelationRefusal>> {
     let Some(outer) = RoleScratch::decode(&rel.outer_way_ids, way_geom)? else {
         return Ok(Ok(Vec::new()));
     };
@@ -373,33 +358,26 @@ fn assemble_one_relation(
 /// The area is taken in the frame containment tests the ring in
 /// (`geo::pip_ring_frame`): a ring the unwrapping rule applies to is measured
 /// with its longitudes unwrapped, so a narrow ring across the antimeridian
-/// scores its own width, not the width of the rest of the world. That holds
-/// only when the lifted ring has zero net longitude winding; a ring winding
-/// a pole lifts to an open path whose closing chord, and so whose area,
-/// depends on the vertex it starts at, and it keeps the raw-frame area.
-/// `outer_ring` is explicitly closed (`assemble_rings` repeats the first
-/// vertex), so its lifted last vertex is an image of the first a whole
-/// number of turns away, and less than half a turn means none.
-/// `outer_f64` is the same ring as `(lon, lat)` degrees.
+/// scores its own width, not the width of the rest of the world. Assembly
+/// has withheld every ring whose lift does not close
+/// (`geo::frame_is_start_invariant`), so the lifted ring is a closed polygon
+/// and its area does not depend on the vertex it starts at beyond f64
+/// rounding. A ring left as given is measured by `geo::signed_area`. `outer_f64` is the same closed
+/// ring as `(lon, lat)` degrees.
 fn ranking_area(outer_ring: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> f64 {
-    let raw = || crate::geo::signed_area(outer_ring).abs();
-    let std::borrow::Cow::Owned(lifted) = crate::geo::pip_ring_frame(outer_f64) else {
-        return raw();
+    let std::borrow::Cow::Owned(frame) = crate::geo::pip_ring_frame(outer_f64) else {
+        return crate::geo::signed_area(outer_ring).abs();
     };
-    let (Some(&(first_lon, first_lat)), Some(&(last_lon, _))) = (lifted.first(), lifted.last())
-    else {
-        return raw();
+    let Some(&(first_lon, first_lat)) = frame.first() else {
+        return 0.0;
     };
-    if outer_ring.first() != outer_ring.last() || (last_lon - first_lon).abs() >= 180.0 {
-        return raw();
-    }
     // Shoelace about the first vertex (cancellation stays local), then from
     // square degrees to square decimicrodegrees.
     let local = |&(lon, lat): &(f64, f64)| (lon - first_lon, lat - first_lat);
-    let twice: f64 = lifted
+    let twice: f64 = frame
         .iter()
         .map(local)
-        .zip(lifted.iter().cycle().skip(1).map(local))
+        .zip(frame.iter().cycle().skip(1).map(local))
         .map(|((xi, yi), (xj, yj))| xi * yj - xj * yi)
         .sum();
     (twice / 2.0).abs() * 1e14
@@ -412,7 +390,7 @@ fn assemble_decoded(
     outer_members: &[RingMember<'_>],
     inner_members: &[RingMember<'_>],
     tolerance_m: f64,
-) -> std::result::Result<Vec<AssembledPolygon>, RingRefusal> {
+) -> std::result::Result<Vec<AssembledPolygon>, RelationRefusal> {
     // Extracts may contain a relation but omit member ways, or keep a member
     // way while omitting some of its nodes. Such a relation contributes no
     // polygon at all. Assembling around the hole is not safe in any form:
@@ -429,7 +407,7 @@ fn assemble_decoded(
     // (`RoleScratch::decode` answers `None` for it).
     let inner_ids: rustc_hash::FxHashSet<i64> = rel.inner_way_ids.iter().copied().collect();
     if rel.outer_way_ids.iter().any(|id| inner_ids.contains(id)) {
-        return Err(RingRefusal::AmbiguousJunction);
+        return Err(RingRefusal::AmbiguousJunction.into());
     }
     let outer_rings = crate::geo::assemble_rings(outer_members)?;
     if outer_rings.is_empty() {
@@ -437,9 +415,21 @@ fn assemble_decoded(
     }
 
     let inner_rings = crate::geo::assemble_rings(inner_members)?;
+    // A ring whose interior depends on where its walk starts (it winds round
+    // a pole, among others) would give an answer that member order picks.
+    // An inner ring counts as much as an outer: dropping it alone would turn
+    // its hole into a match, and its owner cannot be judged either.
+    if !outer_rings
+        .iter()
+        .chain(&inner_rings)
+        .all(|ring| crate::geo::frame_is_start_invariant(ring))
+    {
+        return Err(RelationRefusal::StartDependentFrame);
+    }
 
     let mut result = Vec::with_capacity(outer_rings.len());
     for outer_ring in &outer_rings {
+        let outer_frame = crate::geo::OuterFrame::new(outer_ring);
         let outer_f64: Vec<(f64, f64)> = outer_ring
             .iter()
             .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
@@ -471,7 +461,7 @@ fn assemble_decoded(
             if hole.is_empty() {
                 continue;
             }
-            if !hole_inside_outer(hole, &outer_f64) {
+            if !outer_frame.owns(hole) {
                 continue;
             }
 
@@ -677,8 +667,7 @@ mod tests {
     use crate::coord_fmt::deg_to_e7;
 
     use super::{
-        DroppedAdminRelations, assemble_admin_polygons, hole_inside_outer,
-        missing_admin_way_geometry, ranking_area,
+        DroppedAdminRelations, assemble_admin_polygons, missing_admin_way_geometry, ranking_area,
     };
     use crate::geocode_index::builder::BuildConfig;
     use crate::geocode_index::builder::pass1::RawAdminRelation;
@@ -879,6 +868,7 @@ mod tests {
             DroppedAdminRelations {
                 total: 4,
                 ambiguous_topology: 0,
+                start_dependent_frame: 0,
                 sample_relation_ids: vec![1, 2, 4, 5],
             },
             "every relation without complete member geometry is dropped"
@@ -985,13 +975,14 @@ mod tests {
             DroppedAdminRelations {
                 total: 2,
                 ambiguous_topology: 2,
+                start_dependent_frame: 0,
                 sample_relation_ids: vec![1, 3],
             }
         );
     }
 
     /// Build a closed axis-aligned rectangle ring in `(lon, lat)` degrees,
-    /// which is the orientation `hole_inside_outer` expects for its outer.
+    /// the `(lon, lat)` order the point-in-ring functions take.
     fn rect_lonlat(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> Vec<(f64, f64)> {
         vec![
             (lon0, lat0),
@@ -1032,68 +1023,141 @@ mod tests {
         assert_eq!(twin, crate::geo::signed_area(&ring).abs());
     }
 
-    /// A ring winding a pole lifts to an open path whose area depends on its
-    /// start vertex, so it keeps the raw-frame score, which does not.
-    #[test]
-    fn ranking_area_of_a_polar_winding_ring_is_the_raw_score() {
-        let lonlat = [(0.0, 80.0), (120.0, 81.0), (-120.0, 80.0), (0.0, 80.0)];
-        #[allow(clippy::cast_possible_truncation)]
-        let ring: Vec<(i32, i32)> = lonlat
-            .iter()
-            .map(|&(lon, lat)| (deg_to_e7(lat) as i32, deg_to_e7(lon) as i32))
-            .collect();
-        assert_eq!(
-            ranking_area(&ring, &lonlat),
-            crate::geo::signed_area(&ring).abs()
-        );
+    /// Whether `outer` owns `hole`, both closed assembled rings.
+    fn owns(outer: &[(i32, i32)], hole: &[(i32, i32)]) -> bool {
+        crate::geo::OuterFrame::new(outer).owns(hole)
+    }
+
+    /// Every rotation and both directions of a closed ring.
+    fn rotations(ring: &[(i32, i32)]) -> Vec<Vec<(i32, i32)>> {
+        let open = &ring[..ring.len() - 1];
+        let mut out = Vec::new();
+        for reversed in [false, true] {
+            let mut base = open.to_vec();
+            if reversed {
+                base.reverse();
+            }
+            for k in 0..base.len() {
+                let mut r: Vec<_> = base[k..].iter().chain(&base[..k]).copied().collect();
+                r.push(r[0]);
+                out.push(r);
+            }
+        }
+        out
     }
 
     /// An outer ring crossing the antimeridian has discontinuous
-    /// longitudes, so the plain ray cast puts its holes outside it. Every
-    /// other point-in-ring call in the codebase is antimeridian-aware; this
-    /// one was not, and it runs on planet data where Russia and Fiji are.
+    /// longitudes, so the plain ray cast puts its holes outside it.
     #[test]
     fn hole_in_an_antimeridian_crossing_outer_is_owned_by_it() {
         // Outer spans 175E to 175W across the dateline.
-        let outer = rect_lonlat(175.0, -5.0, -175.0, 5.0);
+        let outer = rect_ring_e7(175.0, -5.0, -175.0, 5.0);
         let hole = rect_ring_e7(179.0, -1.0, 179.5, 1.0);
         assert!(
-            hole_inside_outer(&hole, &outer),
+            owns(&outer, &hole),
             "a hole inside an antimeridian-crossing outer must be owned by it"
         );
-
-        // Passing counterpart: a hole on the far side of the planet is not
-        // owned, so this is not satisfied by a function that always agrees.
+        // A hole on the far side of the planet is not owned, so this is not
+        // satisfied by a function that always agrees.
         let elsewhere = rect_ring_e7(0.0, -1.0, 0.5, 1.0);
-        assert!(!hole_inside_outer(&elsewhere, &outer));
+        assert!(!owns(&outer, &elsewhere));
+        // A hole drawn across the seam inside it, with a vertex at -180.
+        let across = ring_e7(&[
+            (-180.0, -1.0),
+            (-179.0, -1.0),
+            (-179.0, 1.0),
+            (179.0, 1.0),
+            (179.0, -1.0),
+            (-180.0, -1.0),
+        ]);
+        assert!(owns(&outer, &across));
     }
 
-    /// The hole's first vertex is very often a node shared with the outer
-    /// ring, i.e. exactly on the boundary, where ray casting is undefined.
-    /// Sampling several vertices means one degenerate vertex no longer
-    /// decides ownership on its own.
+    /// A hole whose vertices are all on the outer boundary, two of them
+    /// shared nodes and two on outer edges, is owned through an edge
+    /// midpoint; and whatever vertex its walk starts at, either way round.
     #[test]
-    fn a_hole_touching_the_outer_boundary_is_still_owned() {
-        let outer = rect_lonlat(0.0, 0.0, 10.0, 10.0);
-        // First vertex sits exactly on the outer's eastern edge, where the
-        // ray cast answers "outside"; the rest of the hole is unambiguously
-        // inside. Testing hole[0] alone therefore disowns the whole hole.
-        let mut hole = vec![(50_000_000_i32, 100_000_000_i32)];
-        hole.extend(rect_ring_e7(1.0, 4.0, 3.0, 6.0));
-        assert!(
-            hole_inside_outer(&hole, &outer),
-            "a hole sharing a vertex with the outer boundary must still be \
-             owned by it"
-        );
+    fn a_hole_touching_the_outer_at_every_vertex_is_owned_in_any_rotation() {
+        let outer = ring_e7(&[
+            (0.0, 0.0),
+            (5.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 5.0),
+            (0.0, 0.0),
+        ]);
+        let diamond = ring_e7(&[(0.0, 5.0), (5.0, 0.0), (10.0, 5.0), (5.0, 10.0), (0.0, 5.0)]);
+        for hole in rotations(&diamond) {
+            assert!(owns(&outer, &hole), "{hole:?}");
+        }
     }
 
-    /// Ordinary case, and the guard against a majority rule that always
-    /// says yes: a hole wholly outside the outer belongs to nobody.
+    /// A hole sharing a node with the outer, whose remaining vertices are
+    /// split by where the walk starts, gets one answer for every rotation.
+    /// The vertex at the shared node is on the boundary and abstains.
+    #[test]
+    fn a_hole_sharing_a_node_is_owned_in_any_rotation() {
+        let outer = rect_ring_e7(0.0, 0.0, 10.0, 10.0);
+        let hole = ring_e7(&[
+            (10.0, 5.0),
+            (8.0, 4.0),
+            (6.0, 4.5),
+            (4.0, 4.0),
+            (2.0, 5.0),
+            (4.0, 6.0),
+            (6.0, 5.5),
+            (8.0, 6.0),
+            (10.0, 5.0),
+        ]);
+        for rotated in rotations(&hole) {
+            assert!(owns(&outer, &rotated), "{rotated:?}");
+        }
+    }
+
+    /// Ordinary case, and the guard against a rule that always says yes: a
+    /// hole wholly outside the outer belongs to nobody.
     #[test]
     fn a_hole_outside_the_outer_is_not_owned() {
-        let outer = rect_lonlat(0.0, 0.0, 10.0, 10.0);
+        let outer = rect_ring_e7(0.0, 0.0, 10.0, 10.0);
         let hole = rect_ring_e7(20.0, 20.0, 22.0, 22.0);
-        assert!(!hole_inside_outer(&hole, &outer));
+        assert!(!owns(&outer, &hole));
+    }
+
+    /// A relation with a ring winding round a pole is withheld and counted,
+    /// outer or inner; one whose ring crosses the antimeridian without
+    /// winding publishes.
+    #[test]
+    fn a_ring_winding_a_pole_withholds_its_relation() {
+        let winding = ring_e7(&[(0.0, 80.0), (120.0, 81.0), (-120.0, 80.0), (0.0, 80.0)]);
+        let shell = rect_ring_e7(-170.0, 70.0, 170.0, 85.0);
+        let crossing = rect_ring_e7(175.0, -5.0, -175.0, 5.0);
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(1, located(winding));
+        way_geom.insert_test(2, located(shell));
+        way_geom.insert_test(3, located(crossing));
+        let relations = vec![
+            relation(1, vec![1], Vec::new()),
+            relation(2, vec![2], vec![1]),
+            relation(3, vec![3], Vec::new()),
+        ];
+        let (polygons, dropped) = assemble(
+            &relations,
+            &way_geom,
+            &BuildConfig::default(),
+            &crate::host::Executor::for_tests(),
+        );
+        let names: Vec<u32> = polygons.iter().map(|p| p.name_offset).collect();
+        assert_eq!(names, [3]);
+        assert_eq!(
+            dropped,
+            DroppedAdminRelations {
+                total: 2,
+                ambiguous_topology: 0,
+                start_dependent_frame: 2,
+                sample_relation_ids: vec![1, 2],
+            }
+        );
     }
 
     /// `(lon, lat)` degrees to an assembled `(lat_e7, lon_e7)` ring.

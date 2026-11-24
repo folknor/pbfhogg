@@ -1264,9 +1264,9 @@ pub(crate) const PATH_COVER_UV_SLACK: f64 = 1e-9;
 /// the cover's rounding grows with the frame's longitudes: interpolating and
 /// projecting a chord from endpoints of magnitude M errs by about
 /// 12 * 2^-53 * M degrees, which at 1e5 is some 5e-11 in face units against
-/// `PATH_COVER_UV_SLACK`'s 1e-9. A ring past it winds round a pole hundreds
-/// of times, which no boundary does; the builder leaves such a polygon out
-/// of the cover and reports it.
+/// `PATH_COVER_UV_SLACK`'s 1e-9. Ring assembly withholds every ring whose
+/// lift winds round a pole or spans a full turn, so no published frame comes
+/// near it; the builder refuses one past it as a broken invariant.
 pub(crate) const ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG: f64 = 1e5;
 
 /// Longest piece, in radians of the path's own (lat, lon) parameter
@@ -1297,10 +1297,6 @@ pub(crate) const GEOCODE_INTERP_CHUNK: usize = 100_000;
 /// bucketing and costs more RAM than the 15-byte scratch records because a
 /// decoded `BucketRecord` is 16 bytes.
 pub(crate) const GEOCODE_STAGE_B_SORT_WINDOW: usize = 8;
-
-/// Number of hole vertices sampled when deciding which outer ring owns the
-/// hole (majority vote).
-pub(crate) const HOLE_OWNERSHIP_SAMPLES: usize = 5;
 
 /// Total length (radians) under which an interpolation way is unusable to the
 /// reader.

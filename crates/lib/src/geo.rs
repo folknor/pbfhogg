@@ -374,6 +374,14 @@ pub fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
 /// retries are not periodic, so the answer can change across +/-180 where no
 /// edge runs. The geocode builder covers exactly that boundary.
 ///
+/// For a ring winding round a pole the unwrapped ring does not close, and
+/// the closing edge runs one turn of longitude per winding at the first
+/// vertex's latitude, so the answer depends on which vertex the ring starts
+/// at; a ring whose unwrapped longitudes span a full turn or more can depend
+/// on it too, and so can an unwrapped ring with an edge of exactly half a
+/// turn. The geocode builder stores none of these, nor any ring with a
+/// half-turn edge.
+///
 /// Coordinates are expected to be finite degrees in the WGS84 domain. Outside
 /// it the answer is unspecified, but the call always returns; the same holds
 /// for [`point_in_polygon`] and [`simplify_ring`].
@@ -954,6 +962,8 @@ fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, tolerance_sq: f64) -> 
 // ---------------------------------------------------------------------------
 
 mod rings;
+#[cfg(feature = "commands")]
+pub(crate) use rings::{OuterFrame, frame_is_start_invariant};
 pub use rings::{Ring, RingMember, RingRefusal, assemble_rings};
 
 /// Compute the signed area of a ring in decimicrodegree² units.

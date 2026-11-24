@@ -742,23 +742,20 @@ fn build_from_schedules(
     }
     drop(way_geom);
     // The reader trusts the admin cover, which is exact only while a ring's
-    // unwrapped frame stays within the bound; a polygon past it is dropped
-    // here, before the empty-index gate and before any admin record is
-    // written, so no published record lacks its cells.
-    let mut admin_polygons = admin_polygons;
-    let before_bound = admin_polygons.len();
-    admin_polygons.retain(pass3::admin_frame_within_bound);
-    let unbounded_admin = before_bound - admin_polygons.len();
-    if unbounded_admin > 0 {
-        crate::host::diag!(
-            host.diagnostics,
-            Warning,
-            "geocode.pass2.admin_unbounded_frame",
-            "{unbounded_admin} admin polygons dropped: a ring winds round a pole so often \
-             that its longitudes, unwrapped across the antimeridian, pass {} degrees, \
-             beyond what the admin cell cover is exact for",
+    // unwrapped frame stays within the bound. Assembly withholds every
+    // relation with a ring whose lift winds or spans a full turn, so every
+    // frame left lies within a turn and a half of zero; a polygon past the
+    // bound is a broken invariant, refused before any admin record is
+    // written.
+    if let Some(index) = admin_polygons
+        .iter()
+        .position(|poly| !pass3::admin_frame_within_bound(poly))
+    {
+        return Err(Error::internal(format!(
+            "admin polygon {index} has a ring frame past {} degrees, which ring \
+             assembly withholds",
             crate::tunables::ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG
-        );
+        )));
     }
     crate::host::diag!(
         host.diagnostics,
@@ -791,6 +788,18 @@ fn build_from_schedules(
              rings (branching junction, repeated segment, self-touching ring or \
              nested lobes; counted among the dropped relations above)",
             dropped_admin.ambiguous_topology
+        );
+    }
+    if dropped_admin.start_dependent_frame > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.admin_start_dependent_ring",
+            "{} admin relations refused: a ring winds round a pole, spans a full \
+             turn of longitude, or has an edge spanning exactly half a turn, \
+             where its interior can depend on where its walk starts (counted \
+             among the dropped relations above)",
+            dropped_admin.start_dependent_frame
         );
     }
     host.invocation.marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");

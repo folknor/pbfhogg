@@ -734,8 +734,23 @@
   frame.** A ring crossing the antimeridian stored the area of its raw
   longitudes, so a narrow dateline polygon could outrank a wider one the
   wrong way. `build-geocode-index` now measures it unwrapped, as
-  containment tests it (a ring winding a pole keeps the raw area). The
-  format is unchanged; rebuild an index to get the new scores.
+  containment tests it. The format is unchanged; rebuild an index to get
+  the new scores.
+- **Geocode hole ownership and polar rings no longer depend on member
+  order.** Which outer ring owned a hole was a majority vote over five
+  vertices sampled from wherever the assembled hole started, so reordering
+  a relation's members could move a hole to another outer or drop it,
+  notably when the hole shared nodes with its outer. Ownership is now decided by one exactly
+  classified point of the hole, chosen by coordinates alone, skipping
+  points on the outer's boundary. A ring winding round a pole was
+  contained through a closing edge at the latitude of whichever vertex it
+  started at; `build-geocode-index` now refuses its relation with a
+  `geocode.pass2.admin_start_dependent_ring` warning, as it does for a
+  ring whose unwrapped longitudes span a full turn or that has an edge of
+  exactly 180 degrees of longitude. The former
+  `geocode.pass2.admin_unbounded_frame` drop is gone: no ring it caught
+  survives assembly now. The format is unchanged; rebuild to get the new
+  answers.
 - **Geocode snap and distance agree on half-turn segments.** For a street
   or interpolation segment spanning exactly 180 degrees of longitude, the
   distance could be measured on one half-world path and `snap_lat_e7` /

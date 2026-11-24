@@ -29,12 +29,15 @@ format, and format 8 never promised the cover. The bump makes it a promise.
 
 The cover's rounding is proven inside `PATH_COVER_UV_SLACK` only while a
 ring's unwrapped frame stays within `ADMIN_FRAME_MAX_ABS_LONGITUDE_DEG`
-(1e5 degrees). The builder drops a polygon with any ring past that bound
-right after ring assembly, before the empty-index gate and before any
-admin record is written, and warns; a record left in the index without
-its cells would itself break the cover rules. Holes are rings of their
-polygon, so a hole past the bound drops its whole polygon, never just the
-hole.
+(1e5 degrees). Ring assembly withholds every relation with a ring, outer
+or hole, whose lift winds round a pole or spans a full turn of longitude,
+so every published frame stays within a turn and a half of zero. The
+builder still checks the bound right after ring assembly, before any
+admin record is written, and fails the build as a broken invariant if a
+polygon passes it; a record left in the index without its cells would
+itself break the cover rules. (The builder first dropped such polygons
+with a warning; that was the only defence while winding rings were
+published.)
 
 Measured on plantasjen at `a7946048` (germany, 100,000 points in the
 country box): about 130 us per query before, about 26 us after.

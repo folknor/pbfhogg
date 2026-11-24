@@ -58,18 +58,6 @@ compressed-byte budget. The sizes are derived from the representation, not
 measured. Keeping the guarantee would need admission that accounts for decoded
 storage, tables and worker scratch.
 
-## FMT-029 - The frame conformance matrix has no O_DIRECT FileReader source
-
-Reported by: implementer of the pinned direct-open and aligned-skip fixes.
-
-`reference/truncation-handling.md` says the full matrix, every truncation shape
-through every source, is `read/frame_conformance_tests.rs`. Its `Source` enum
-drives buffered `FileReader`, `BlobReader` and both header walkers, but no
-frame walk over `FileReader::Direct`, so `DirectReader::skip` (both its
-aligned and unaligned branches) is outside the matrix the document cites. Only
-the reader's own unit tests cover it. A direct source, skipping where the
-platform refuses O_DIRECT, would make the claim true.
-
 ## FMT-012 - pipeline_decode_tasks counts blobs that are never decompressed
 
 Reported by: read-pipeline [P3].

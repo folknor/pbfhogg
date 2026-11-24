@@ -619,9 +619,15 @@ The contract is pinned at several layers:
 **Frame conformance** (`crates/lib/src/read/frame_conformance_tests.rs`): every
 truncation shape, size guard and boundary case driven through every
 frame source (`BlobReader`'s read and skip paths, the raw-frame walk,
-the front probes' header-then-skip walk and `HeaderWalker`), each
+the front probes' header-then-skip walk and `HeaderWalker`, and, where
+the filesystem accepts `O_DIRECT`, the read path, the raw-frame walk,
+the header-then-skip walk and `HeaderWalker` over direct reads), each
 case held to one outcome, error kind, file, blob index and byte offset
-for all of them, and the error text compared across sources. The
+for all of them, and the error text compared across sources. Payloads
+wider than the direct reader's buffer take `DirectReader::skip` through
+its aligned and unaligned branches; its check of an aligned target
+against a file truncated after open is pinned by `DirectReader`'s own
+tests, since every matrix file is complete before it is opened. The
 envelope difference has its own test beside it.
 
 **Reader layer** (`crates/lib/tests/read_paths.rs`): unit tests on

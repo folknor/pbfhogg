@@ -7,8 +7,9 @@
 //! path (`next`) and its seek-and-sentinel skip path
 //! (`next_header_skip_blob`), the raw-frame walk over a buffered
 //! `FileReader` (`Frames::next_raw`), the front probes' header-then-skip
-//! over the same reader, and the pread `HeaderWalker`, buffered and
-//! `O_DIRECT`. They used to be
+//! over the same reader, and the pread `HeaderWalker`. Every one of them
+//! also runs over `O_DIRECT` (`FileReader::Direct`, whose reads and skips
+//! are `DirectReader`'s, and `HeaderWalker::open_direct`). They used to be
 //! separate decoders that disagreed about where an error was located,
 //! whether it named the blob and how a truncation was worded; this table is
 //! what keeps a source-specific path from bringing a disagreement back. A
@@ -58,13 +59,25 @@ enum Source {
     /// probe an aligned read of the blocks covering it.
     #[cfg(feature = "linux-direct-io")]
     DirectWalk,
+    /// `BlobReader::from_path_direct`, iterated: `Read` over
+    /// `FileReader::Direct`.
+    #[cfg(feature = "linux-direct-io")]
+    DirectRead,
+    /// `Raw` over `FileReader::Direct`: payloads appended by `DirectReader`.
+    #[cfg(feature = "linux-direct-io")]
+    DirectRaw,
+    /// `HeaderThenSkip` over `FileReader::Direct`: every payload passed by
+    /// `DirectReader::skip`, whose aligned and unaligned branches the long
+    /// cases reach.
+    #[cfg(feature = "linux-direct-io")]
+    DirectHeaderThenSkip,
 }
 
-/// Every source, less the direct walk where this filesystem refuses
+/// Every source, less the direct ones where this filesystem refuses
 /// `O_DIRECT` (the typed direct-io refusal, the one skip, announced; any
-/// other open failure fails the test). The direct walk needs no open
-/// counter: `HeaderWalker::open_direct` returns a walker over
-/// `DirectPositional` or an error, never a buffered walker.
+/// other open failure fails the test). The direct sources need no open
+/// counter: `HeaderWalker::open_direct` and `FileReader::direct` return a
+/// direct reader or an error, never a buffered one.
 fn sources(dir: &Path) -> Vec<Source> {
     let all = vec![
         Source::Read,
@@ -76,8 +89,13 @@ fn sources(dir: &Path) -> Vec<Source> {
     #[cfg(feature = "linux-direct-io")]
     let all = {
         let mut all = all;
-        if crate::test_support::direct_reads_supported(dir, "the direct-walk source") {
-            all.push(Source::DirectWalk);
+        if crate::test_support::direct_reads_supported(dir, "the direct frame sources") {
+            all.extend([
+                Source::DirectWalk,
+                Source::DirectRead,
+                Source::DirectRaw,
+                Source::DirectHeaderThenSkip,
+            ]);
         }
         all
     };
@@ -159,10 +177,10 @@ fn ended(frames: usize) -> Outcome {
 
 fn run(source: Source, path: &Path) -> Outcome {
     match source {
-        Source::Read => run_read(path),
+        Source::Read => run_read(BlobReader::from_path(path).unwrap(), path),
         Source::Skip => run_skip(path),
-        Source::Raw => run_raw(path),
-        Source::HeaderThenSkip => run_header_then_skip(path),
+        Source::Raw => run_raw(file_frames(path, false), path),
+        Source::HeaderThenSkip => run_header_then_skip(file_frames(path, false), path),
         Source::Walk => walk_all(
             HeaderWalker::open(path, &crate::host::Host::for_tests().entered()),
             path,
@@ -172,12 +190,18 @@ fn run(source: Source, path: &Path) -> Outcome {
             HeaderWalker::open_direct(path, &crate::host::Host::for_tests().entered()),
             path,
         ),
+        #[cfg(feature = "linux-direct-io")]
+        Source::DirectRead => run_read(BlobReader::from_path_direct(path).unwrap(), path),
+        #[cfg(feature = "linux-direct-io")]
+        Source::DirectRaw => run_raw(file_frames(path, true), path),
+        #[cfg(feature = "linux-direct-io")]
+        Source::DirectHeaderThenSkip => run_header_then_skip(file_frames(path, true), path),
     }
 }
 
-fn run_read(path: &Path) -> Outcome {
+fn run_read(reader: BlobReader<FileReader>, path: &Path) -> Outcome {
     let mut frames = 0;
-    for item in BlobReader::from_path(path).unwrap() {
+    for item in reader {
         match item {
             Ok(_) => frames += 1,
             Err(e) => return refused(frames, &e, path),
@@ -201,20 +225,21 @@ fn run_skip(path: &Path) -> Outcome {
 /// The command-input walks refuse a partially indexed file, which some
 /// fixtures here are by construction; the frame layer under test is the same
 /// with the refusal off, as on the public `BlobReader` sources.
-fn file_frames(path: &Path) -> Frames<FileReader> {
+fn file_frames(path: &Path, direct: bool) -> Frames<FileReader> {
     let host_owner = crate::host::Host::for_tests();
     let host = host_owner.entered();
-    let mut frames = Frames::of_file_input(
-        FileReader::buffered_in(path, &host.invocation).unwrap(),
-        path,
-        &host,
+    let reader = FileReader::open_in(path, direct, &host.invocation).unwrap();
+    assert_eq!(
+        !matches!(reader, FileReader::Buffered(_)),
+        direct,
+        "the reader's transport"
     );
+    let mut frames = Frames::of_file_input(reader, path, &host);
     frames.accept_partial_index();
     frames
 }
 
-fn run_raw(path: &Path) -> Outcome {
-    let mut walk = file_frames(path);
+fn run_raw(mut walk: Frames<FileReader>, path: &Path) -> Outcome {
     let mut frames = 0;
     loop {
         match walk.next_raw() {
@@ -225,8 +250,7 @@ fn run_raw(path: &Path) -> Outcome {
     }
 }
 
-fn run_header_then_skip(path: &Path) -> Outcome {
-    let mut walk = file_frames(path);
+fn run_header_then_skip(mut walk: Frames<FileReader>, path: &Path) -> Outcome {
     let mut frames = 0;
     loop {
         match walk.next_header() {
@@ -697,6 +721,79 @@ fn boundary_cases(fx: &Fixture) -> Vec<Case> {
     ]
 }
 
+/// A last frame whose payload, the intact one padded with an unknown
+/// `Blob` field (15), ends at file offset `end`: its header and its
+/// payload start.
+fn long_last_frame(fx: &Fixture, end: usize) -> (Vec<u8>, usize) {
+    // `end` and the payload size share a varint width across this range.
+    let header_len = blob_header("OSMData", Some(u(end))).len();
+    let p = fx.f + 4 + header_len;
+    let datasize = end - p;
+    let header = blob_header("OSMData", Some(u(datasize)));
+    assert_eq!(header.len(), header_len, "the datasize varint width");
+    let mut payload = fx.payload().to_vec();
+    // Tag byte plus a three-byte length varint, as in `padded_header`.
+    let pad = datasize - payload.len() - 4;
+    payload.push(0x7A);
+    push_varint(&mut payload, u(pad));
+    payload.resize(payload.len() + pad, 0);
+    assert_eq!(
+        payload.len(),
+        datasize,
+        "the pad length must take three bytes"
+    );
+    let bytes = fx.with_last_frame(&header, &payload);
+    assert_eq!(bytes.len(), end, "the long payload ends at its target");
+    (bytes, p)
+}
+
+/// Payloads wider than the `O_DIRECT` reader's buffer (`IO_BUF_BYTES`),
+/// so passing one leaves the buffer: every small case fits one fill and
+/// skips inside it. Each source holds the same expectation; the direct
+/// header-then-skip walk is what each row is shaped for. Twice the buffer
+/// is a multiple of every direct alignment the buffers accept (a power of
+/// two up to `IO_BUF_BYTES`), and 100 past it is a multiple of none. A
+/// successful skip is followed by a copy of data frame 1, so where the
+/// skip landed is checked by reading a whole frame there. The aligned
+/// skip's length check is against the file's length now; a truncation
+/// after open is pinned by `DirectReader`'s own tests, since every file
+/// here is cut before it is opened.
+fn long_payload_cases(fx: &Fixture) -> Vec<Case> {
+    let twice = 2 * crate::write::IO_BUF_BYTES;
+    let frame1 = frames_of(&fx.intact)[1];
+    let copy = &fx.intact[frame1.start..frame1.start + 4 + frame1.header_len + frame1.datasize];
+    let then_frame1 = |bytes: Vec<u8>| {
+        let mut bytes = bytes;
+        bytes.extend_from_slice(copy);
+        bytes
+    };
+    let (aligned, p) = long_last_frame(fx, twice);
+    let (unaligned, _) = long_last_frame(fx, twice + 100);
+    vec![
+        // An aligned target past the buffer: checked against the length.
+        case(
+            "long payload ending at an aligned offset, then a frame",
+            then_frame1(aligned.clone()),
+            Seen::End { frames: 4 },
+        ),
+        // The same target one byte past the end: refused by that check.
+        Case {
+            text: truncation("its BlobHeader", "Blob", twice - p, p),
+            ..case(
+                "long payload ending at an aligned offset, cut one byte short",
+                aligned[..twice - 1].to_vec(),
+                fx.refusal(Kind::Eof),
+            )
+        },
+        // An unaligned target past the buffer: refilled from below it.
+        case(
+            "long payload ending unaligned, then a frame",
+            then_frame1(unaligned),
+            Seen::End { frames: 4 },
+        ),
+    ]
+}
+
 /// Every truncation shape, guard and boundary through every frame source,
 /// with one expectation per case, and the same error text from every
 /// source that refuses. All mismatches are reported at once, as
@@ -708,6 +805,7 @@ fn every_frame_source_on_every_truncation_shape() {
     cases.extend(payload_cases(&fx));
     cases.extend(guard_cases(&fx));
     cases.extend(boundary_cases(&fx));
+    cases.extend(long_payload_cases(&fx));
 
     let sources = sources(fx.dir.path());
     let mut mismatches = Vec::new();
@@ -770,6 +868,8 @@ fn only_the_blob_reader_parses_the_envelope() {
     for source in sources(fx.dir.path()) {
         let expect = match source {
             Source::Read => fx.refusal(Kind::Wire),
+            #[cfg(feature = "linux-direct-io")]
+            Source::DirectRead => fx.refusal(Kind::Wire),
             _ => Seen::End { frames: 3 },
         };
         assert_eq!(run(source, &path).0, expect, "{source:?}");

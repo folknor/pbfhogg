@@ -120,6 +120,7 @@ mod pass1;
 mod pool;
 mod relations;
 mod schedule;
+mod split;
 mod stage2;
 mod wire_rewrite;
 

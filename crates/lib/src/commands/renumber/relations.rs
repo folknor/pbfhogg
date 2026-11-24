@@ -192,6 +192,7 @@ pub(super) fn relation_r2d_assembly(
                     blob_index: task.blob_index,
                     frame_offset: task.frame_offset,
                     block,
+                    numbering: super::split::Numbering::ReadBack,
                     span: outcome.span,
                     count: outcome.count,
                     orphans: outcome.orphans,

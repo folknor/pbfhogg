@@ -730,6 +730,14 @@
 
 ### Fixed
 
+- **`renumber` cuts a blob its new IDs grow past 32 MiB.** A far or
+  negative `--start-id` widens every ID, and refs alternating between live
+  and orphan elements widen their deltas, so a blob near the payload limit
+  could come out over it and the run failed with a size error. Such a blob
+  is now written as several blobs, cut between elements, each with its own
+  index; every other blob is written as before. A single element too large
+  for a blob beside its input's string table, or one `DenseNodes` group
+  that outgrows the limit, is still refused.
 - `diff --format osc -o changes.osc.gz` caps gzip compression workers at
   the requested `--jobs` count when either input lacks indexdata.
 - The `merge-workload` bench reads timing from a dedicated stdout line,

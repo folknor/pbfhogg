@@ -119,21 +119,26 @@ and no data blobs reaches a successful empty reference report. `--refs`
 promises only referential integrity, so its success does not certify that the
 header is readable.
 
-## CMD-041 - renumber refuses a block its rewrite grows past the raw size cap
+## CMD-041 - renumber still refuses a few blocks its rewrite grows past the limit
 
-Reported by: the negative-ID renumber item (2026-11-18), while sparring the
-negative start; not reproduced.
+Reported by: the negative-ID renumber item (2026-11-18); narrowed
+2026-11-24 after the split path landed (`renumber/split.rs`: a rewritten
+block over the payload limit is cut between elements by an exact
+cut-point search, each piece with its own index).
 
-Renumber writes exactly one output block per input block (`pool.rs`
-`run_rewrite_stage`), and the writer refuses a block over the raw size cap
-(`write/framing.rs`). The rewrite can grow a block: a way or relation ID of
-1 is a one-byte varint, a large start (`2^40`) or a negative one (`-1` is
-ten bytes) widens every ID, plain node messages included, and a way alternating between a live node and an
-orphan can widen its ref deltas. An input block close to the cap then fails
-with the size error instead of renumbering. It fails loudly and before
-publication, and is sign-neutral (a large positive start does it too). The
-fix is a split path: cut an oversized rewritten block between elements into
-two output blocks with their own indexes.
+What the split does not cure, each a loud refusal before publication.
+First, every piece repeats the input block's whole string table, so one way
+or relation that fits with only its own strings but not beside the whole
+table is refused (remapping a piece's string indices would close it).
+Second, a `DenseNodes` message is indivisible: a one-group node block within
+about ten bytes of 32 MiB whose first new ID is wider than its old one
+outgrows the limit (cutting it means rebasing every delta column at a node
+boundary). Third, the limit is checked on raw bytes; a near-limit block
+whose zlib or zstd body expands to 32 MiB is refused by the writer, and
+renumber cannot retry because the writer frames off the consumer thread.
+Each of these refusals prints the library's "fewer elements per blob" text,
+and renumber has no such flag (`element_cap_advice` in the CLI answers only
+repack and degrade).
 
 ## CMD-049 - apply-changes still refuses a few elements that fit a block
 

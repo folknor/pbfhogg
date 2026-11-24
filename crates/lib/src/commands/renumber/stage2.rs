@@ -99,6 +99,7 @@ pub(super) fn stage2d_parallel_way_assembly(
                     blob_index: task.blob_index,
                     frame_offset: task.frame_offset,
                     block,
+                    numbering: super::split::Numbering::From(base),
                     span: outcome.span,
                     count: outcome.count,
                     orphans: outcome.orphans,

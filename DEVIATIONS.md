@@ -684,8 +684,10 @@ output stays sorted), and 0 means 1, as in osmium. pbfhogg accepts both `i64`
 endpoints as starts, which osmium's ID parser rejects, and refuses a start
 whose last assigned id would leave the 64-bit range; osmium does not check
 that, and its offset arithmetic can overflow near either end before the last
-id does. (A rewritten block that grows past the format's size cap is refused
-too, whatever the start's sign.)
+id does. (A rewritten block that grows past the format's payload limit, which
+a far start or orphan refs can cause whatever the start's sign, is cut between
+elements into blocks that fit; see the renumber section of
+docs/cli/commands.md for what is still refused.)
 
 **Impact:** Downstream tools that assume output ids are contiguous in the
 live range must tolerate orphan refs outside it, below it as well as above

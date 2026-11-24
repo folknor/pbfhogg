@@ -24,6 +24,9 @@ pub(super) struct Rewritten {
     pub(super) frame_offset: u64,
     /// The block to write, or `None` for a blob that holds no elements.
     pub(super) block: Option<(Vec<u8>, BlobIndex)>,
+    /// How the block's new ids were assigned, for indexing its pieces if it
+    /// has to be cut (`super::split`).
+    pub(super) numbering: super::split::Numbering,
     /// First and last *input* ID the blob held, `None` when empty.
     pub(super) span: Option<(i64, i64)>,
     pub(super) count: u64,
@@ -95,6 +98,7 @@ where
         written: 0,
         orphans: 0,
     };
+    let limit = super::split::payload_limit(&writer.compression());
     let cancel = writer.cancel_token().permit();
     run_ordered(
         n_tasks,
@@ -130,12 +134,24 @@ where
                 // Deliberately write no tagdata: terminal renumber output is not
                 // tag-filtered. Carrying headers or rebuilding keys would add per-blob
                 // or per-tag work and change the historical output bytes.
-                writer.write_primitive_block_owned(crate::block_builder::OwnedBlock {
-                    bytes,
-                    index,
-                    tagdata: None,
-                    way_members: None,
-                })?;
+                let mut write = |bytes, index| {
+                    writer.write_primitive_block_owned(crate::block_builder::OwnedBlock {
+                        bytes,
+                        index,
+                        tagdata: None,
+                        way_members: None,
+                    })
+                };
+                if bytes.len() <= limit {
+                    write(bytes, index)?;
+                } else {
+                    // The rewrite grew the block past what the writer frames:
+                    // cut it between elements (`split`), one input blob still
+                    // one result for the order check and the totals.
+                    for (bytes, index) in super::split::fit(bytes, index, item.numbering, limit)? {
+                        write(bytes, index)?;
+                    }
+                }
                 t.record_ns(&counters.consumer_write_ns);
             }
             // Counted after the write, so on a mid-stream error the totals cover

@@ -1591,6 +1591,14 @@ numbers orphans on past the range in the order it meets them instead (see
 DEVIATIONS.md, "renumber: orphan-reference handling"). The run reports their
 count as a warning.
 
+Each input blob is written as one output blob unless the new IDs grow it past
+the 32 MiB payload limit (a far or negative start widens every ID; refs
+alternating between live and orphan targets widen their deltas). Such a blob
+is cut between elements into blobs that fit, each with its own index. What is
+still refused (exit 2): a single element that does not fit beside the input
+blob's whole string table, a single `DenseNodes` group that outgrows the limit,
+and a compressed blob whose encoded body exceeds the limit.
+
 The output header carries no replication state: the new IDs are not the
 feed's, so its diffs would address other objects (see
 [Output header](#output-header)).

@@ -45,6 +45,17 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 
 ### Renumber
 
+#### Cutting a rewritten block past the payload limit (planet, baseline `56869b08`, bygg, 2026-11-24)
+
+The ordered consumer compares each rewritten block's length with the
+writer's payload limit and cuts only a block over it, so the per-element
+rewrite loops are unchanged. Matched `id-remap` `--iterations 1` cells,
+A B B A, baseline built with `--commit 56869b08`, variant uncommitted on
+it: baseline 2m05s (`05b60b8a`) and 2m08s (`e3f7822d`), variant 2m04s
+(`ef5d6f46`) and 2m03s (`d38b538e`). Phase split (`05b60b8a` against
+`d38b538e`): pass 1 66.5 s against 66.3 s, stage 2d 47.0 s against
+47.0 s. Neutral; no planet block is cut.
+
 #### Plain node groups and ways without refs (planet, baseline `19f32e61`, plantasjen, 2026-11-20)
 
 Pass 1 classifies each node group (dense, plain, or no elements) and

@@ -1419,6 +1419,96 @@ fn increasing_ids_across_many_blobs_renumber_consistently() {
 }
 
 // ---------------------------------------------------------------------------
+// A block the rewrite grows past the payload limit
+// ---------------------------------------------------------------------------
+
+/// Data blobs in `path` holding ways.
+fn way_blobs(path: &Path) -> usize {
+    pbfhogg::BlobReader::from_path(path)
+        .expect("open")
+        .filter(|blob| {
+            matches!(
+                blob.as_ref().expect("blob").decode().expect("decode"),
+                pbfhogg::BlobDecode::OsmData(block)
+                    if block.elements().any(|e| matches!(e, pbfhogg::Element::Way(_)))
+            )
+        })
+        .count()
+}
+
+/// One way blob of a few MiB whose refs alternate between a live node and an
+/// orphan one id above it: one-byte deltas on input. From a node start of
+/// 2^40 the live node is renumbered far from the orphan (named 10, below the
+/// new range), every delta takes
+/// six bytes, and the rewritten block is several times the 32 MiB payload
+/// limit. Renumber must cut it into blocks that fit, each with an index the
+/// next renumber trusts, and lose nothing.
+#[test]
+fn a_way_block_the_rewrite_grows_past_the_limit_is_cut() {
+    const WAYS: i64 = 6;
+    const REFS: usize = 1_200_000;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let refs: Vec<i64> = (0..REFS)
+        .map(|k| if k % 2 == 0 { 10 } else { 11 })
+        .collect();
+    let ways: Vec<TestWay> = (1..=WAYS).map(|id| plain_way(id, refs.clone())).collect();
+    write_test_pbf_sorted(&input, &[plain_node(10)], &ways, &[]);
+    assert_eq!(way_blobs(&input), 1, "the fixture is one way blob");
+
+    let opts = RenumberOptions {
+        start_node_id: 1 << 40,
+        ..default_opts()
+    };
+    let write = WriteOptions {
+        compression: pbfhogg::writer::Compression::None,
+        ..WriteOptions::default()
+    };
+    let renumber = |from: &Path, to: &Path, opts: &RenumberOptions| {
+        renumber_external(
+            from,
+            crate::common::out(to),
+            opts,
+            &write,
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        )
+        .unwrap_or_else(|e| panic!("renumber: {}", e.report()))
+    };
+    let stats = renumber(&input, &output, &opts);
+    assert_eq!(stats.orphan_refs, WAYS as u64 * (REFS as u64 / 2));
+    assert!(
+        way_blobs(&output) >= 2,
+        "the grown block is cut into pieces"
+    );
+    assert_sorted_file(&output);
+
+    let expected: Vec<i64> = (0..REFS)
+        .map(|k| if k % 2 == 0 { 1 << 40 } else { 10 })
+        .collect();
+    let norm = read_normalized(&output);
+    assert_eq!(norm.ways.len(), 6);
+    for (k, way) in norm.ways.iter().enumerate() {
+        assert_eq!(way.id, i64::try_from(k).expect("small") + 1);
+        assert!(
+            way.refs == expected,
+            "way {} refs start {:?}",
+            way.id,
+            &way.refs[..4]
+        );
+    }
+
+    // The pieces' indexes hold: renumber assigns IDs from their counts and
+    // refuses a blob whose count disagrees.
+    let again = dir.path().join("again.osm.pbf");
+    renumber(&output, &again, &default_opts());
+    let norm = read_normalized(&again);
+    assert_eq!(norm.ways.len(), 6);
+    assert_eq!(norm.ways[5].id, 6);
+}
+
+// ---------------------------------------------------------------------------
 // Indexdata may not size the node pre-allocation
 // ---------------------------------------------------------------------------
 

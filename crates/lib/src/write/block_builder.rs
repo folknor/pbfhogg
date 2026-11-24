@@ -747,6 +747,11 @@ impl BlockBuilder {
     /// framed whatever is added next. O(1). apply-changes asks before adding
     /// an OSC element, so an attempt that is bound to overflow is cut there
     /// instead of growing without bound before framing would refuse it.
+    ///
+    /// It is a lower bound on the payload, not a fit test: it omits each
+    /// string-table entry's tag and length, the group and string-table
+    /// wrappers and the dense columns, so `false` does not mean the block
+    /// frames. apply-changes relies on its replay for that, not on this.
     #[inline]
     pub(crate) fn content_over_payload_limit(&self) -> bool {
         self.content_len() as u64 > crate::read::blob_wire::MAX_BLOB_MESSAGE_SIZE
@@ -781,7 +786,11 @@ impl BlockBuilder {
     /// Returns `true` if a node can be added to the current block.
     ///
     /// The `can_add_*` methods answer kind and capacity only, not whether the
-    /// builder has been poisoned. When one returns `false`, call
+    /// builder has been poisoned. Capacity is the element cap, not bytes: a
+    /// block within its cap can still hold more than a PBF blob payload may,
+    /// and is then refused when it is framed (`BlobTooLarge`). The `add_*`
+    /// guards use these same predicates, so a size rule added here would
+    /// also poison every caller that adds by count arithmetic. When one returns `false`, call
     /// [`take`](Self::take) (or flush however the caller flushes) before
     /// adding: an `add_*` the block cannot take is refused rather than
     /// encoded, and the builder is poisoned - the element is lost and every

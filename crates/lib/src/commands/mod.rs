@@ -286,6 +286,19 @@ pub(crate) fn flush_local<O: BlockSink + ?Sized>(
 
 /// Ensure the [`BlockBuilder`] has capacity for a node, flushing to local
 /// output if full. Used by rayon worker threads in parallel batch processing.
+///
+/// These helpers cut by element kind and count only, never by bytes. A
+/// block whose content passes the blob payload limit is refused when it is
+/// framed, with the typed `BlobTooLarge` error, and nothing is published.
+/// That is deliberate: repack's and degrade's output layouts are documented
+/// count rules (the verifier predicts them from claims, and degrade's
+/// unsort modes place their inversions by count), so a byte cut here would
+/// silently break them, and a pre-add threshold cannot be exact without the
+/// incoming element's size (a block under any threshold can still be
+/// pushed over by its next element). A command that needs to write such
+/// blocks recovers on the typed overflow with its records retained, as
+/// apply-changes does (`apply_changes/overflow.rs`), or cuts the finished
+/// wire bytes, as renumber does (`renumber/split.rs`).
 pub(crate) fn ensure_node_capacity_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
     output: &mut O,

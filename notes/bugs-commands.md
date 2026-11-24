@@ -164,19 +164,54 @@ shrink when two elements share a table, and `add_node_partial` writes a
 metadata-less node dense, two bytes larger than plain, so a node at exactly
 the payload limit fails. Both need blocks within bytes of 32 MiB.
 
-## CMD-050 - Re-encoding commands cut blocks only by element count
+## CMD-050 - History time-filter and the sort/dedupe sweep can refuse frameable input
 
-Reported by: the CMD-049 implementer (2026-11-19); not verified per command.
+Reported by: the CMD-049 implementer (2026-11-19); narrowed by its spar
+(2026-11-24).
 
-apply-changes now cuts an output block early when
-`BlockBuilder::content_over_payload_limit()` says its string content plus
-serialized groups would pass the blob payload limit, and recovers an
-overflowing block by replaying it in smaller pieces. The other `BlockBuilder`
-users (cat re-encode, sort, repack, extract) still cut only by element count,
-so two adjacent elements with large tag values can land in one block that the
-writer then refuses as too large. The input is valid; the command fails. The
-helper is available to them; adopting it needs a matched measurement per
-command, since the check runs per added element.
+Both pack records from many input blobs into one `BlockBuilder` with no
+user-set cap, cut by count only, so input whose blobs all frame can build an
+output block past the 32 MiB payload limit at the default 8000 cap: for
+example 1200 selected relations of 10000 members each (about 36 MB of member
+arrays) spread over input blobs of 600. The writer refuses it, typed, exit 2,
+nothing published, and no flag or repack of the input helps. Fix shape:
+recover on the typed payload or body overflow and re-emit the block's records
+in smaller pieces, as apply-changes does. Neither path retains them today:
+history time-filter drops each record once written, so it must hold the
+current output block's records and catch the overflow before the block
+reaches the writer pipeline; the sweep drains one ID group at a time while a
+block spans many, and retaining `Held` records can extend decoded source
+blobs' lifetimes, which the memory design must account for. Cover the final
+flush too.
+
+Ruled, not open: no byte threshold in `can_add_*` or the
+`ensure_*_capacity_local` funnel (any threshold is beaten by the next
+element, `content_len` is a lower bound, and repack's and degrade's layouts
+are count rules the verifier and the unsort modes depend on); repack and
+degrade refuse an over-limit block by design. Known limitation, below the
+fix above: input-blob-local re-encoders (cat re-encode, snapshot
+time-filter, tags-filter, extract, getid, getparents) have no cross-blob
+growth, but carry no byte guarantee either: a rebuilt string table can give
+common strings wider indices, and a codec change can push an unchanged
+payload's body past the limit.
+
+## CMD-066 - add-locations-to-ways writes one block per way blob, however large
+
+Reported by: the CMD-050 spar (2026-11-24).
+
+Both indexed engines (`altw/passthrough.rs` `decode_one`, and
+`altw/external/stage4.rs`) emit the reframed way payload as one block per
+input way blob, and the unindexed decode-all fallback (`altw/mod.rs`) adds
+locations through a count-cut `BlockBuilder`. Adding coordinates grows a
+block: 8000 ways of 1200 refs with metre-scale deltas carry about 38 MB of
+location arrays alone, so a frameable input blob comes out refused (exit 2)
+with no cap flag to lower. Fix shape: cut the finished payload between ways,
+reusing renumber's wire partition (`renumber/split.rs`), deriving each
+piece's ID range from the ways it holds (IDs keep their gaps), slicing the
+`WayMembers` bitmap and per-way pin data with them; no extra scan for a
+block that frames. The guarantee is scoped to pieces that fit with the
+repeated string table, and body-limit and `HeaderWayMembers` overflows need
+the same treatment if the fix promises recovery generally.
 
 ## CMD-060 - degrade --unsort may have slowed down, and is slow on planet
 

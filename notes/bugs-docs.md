@@ -292,3 +292,17 @@ session ledger. Neither `docs/cli/commands.md` (the `--json` row names only
 the current version), the doc comment in `json.rs`, nor CHANGELOG states it,
 so a JSON consumer cannot tell what a version change promises, and the next
 schema edit has nothing to follow.
+
+## DOC-037 - renumber's performance record names a set type pbfhogg no longer has
+
+Reported by: the spar accounting of the renumber block-split change, from its
+scout's lateral (2026-11-24).
+
+`reference/performance/renumber.md` opens its current-baselines text with
+"Planet-scale renumber via IdSetDense rank-based O(1) lookup", and later
+paragraphs name a "single shared `IdSetDense`" and "`IdSetDense` rank fusion".
+pbfhogg has no type of that name any more: the set is `IdSet` (with its ranked
+form), and `IdSetDense` survives in `crates/lib/src/idset.rs` only as the name
+of the osmium structure `IdSet` mirrors. History entries may keep the name of
+their time, but the opening description should name the current type, or say
+"the ranked ID set" so the name cannot drift again.

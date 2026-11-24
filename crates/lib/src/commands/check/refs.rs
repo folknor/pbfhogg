@@ -70,7 +70,7 @@ impl RefCheckResult {
 /// Per-way-blob classify result. Its retained references follow the contents
 /// of that input blob. Streamed back to the main thread for merge.
 #[derive(Default)]
-struct WayBlobResult {
+pub(super) struct WayBlobResult {
     way_count: u64,
     overflow_ids: Vec<i64>,
     way_refs_checked: u64,
@@ -87,7 +87,7 @@ struct WayBlobResult {
 /// and deduplicated like `WayBlobResult::missing_node_refs`, their
 /// occurrences counted first.
 #[derive(Default)]
-struct RelBlobResult {
+pub(super) struct RelBlobResult {
     relation_count: u64,
     overflow_ids: Vec<i64>,
     rel_node_members_checked: u64,
@@ -304,9 +304,9 @@ pub fn check_refs<'a>(
 
 /// What judging a blob's ways and relations needs besides the sets.
 #[derive(Clone, Copy)]
-struct Judge {
-    check_relations: bool,
-    show_ids: Option<ShowIds>,
+pub(super) struct Judge {
+    pub(super) check_relations: bool,
+    pub(super) show_ids: Option<ShowIds>,
 }
 
 impl Judge {
@@ -319,16 +319,64 @@ impl Judge {
 }
 
 /// The ID sets every judgement reads, and the phases write.
-struct Sets {
-    nodes: IdSet,
-    ways: IdSet,
-    relations: IdSet,
+pub(super) struct Sets {
+    pub(super) nodes: IdSet,
+    pub(super) ways: IdSet,
+    pub(super) relations: IdSet,
+}
+
+impl Sets {
+    /// The three sets, pre-allocated over the ranges `check::id_alloc_bound`
+    /// chooses from the walk's per-kind `max_ids` and the size of `file`
+    /// (the walk's own descriptor, the one every phase reads, so it
+    /// describes that file even when the input was a bare path a stat would
+    /// resolve again). The way and relation sets only under
+    /// `check_relations`.
+    pub(super) fn allocate(file: &InputFile, max_ids: [i64; 3], judge: Judge) -> Result<Self> {
+        let file_len = file
+            .file()
+            .metadata()
+            .map_err(|e| {
+                crate::Error::from(e).context(format!("failed to stat {}", file.path().display()))
+            })?
+            .len();
+        let mut sets = Sets {
+            nodes: IdSet::new(),
+            ways: IdSet::new(),
+            relations: IdSet::new(),
+        };
+        sets.nodes
+            .pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
+        if judge.check_relations {
+            sets.ways
+                .pre_allocate(super::id_alloc_bound(max_ids[1], WAY_ID_FLOOR, file_len));
+            sets.relations.pre_allocate(super::id_alloc_bound(
+                max_ids[2],
+                RELATION_ID_FLOOR,
+                file_len,
+            ));
+        }
+        Ok(sets)
+    }
+}
+
+/// The blobs each phase of a reference check read, for its structural
+/// counters.
+pub(super) struct PhaseBlobs {
+    pub(super) node: u64,
+    pub(super) unindexed: u64,
+    pub(super) way: u64,
+    pub(super) relation: u64,
 }
 
 /// Insert one accepted blob's node IDs into `node_ids`, returning how many
 /// there were and those the pre-allocation does not cover (above it, or
 /// negative), for the serial merge.
-fn replay_nodes(scratch: &IdScratch, bytes: &[u8], node_ids: &IdSet) -> Result<(u64, Vec<i64>)> {
+pub(super) fn replay_nodes(
+    scratch: &IdScratch,
+    bytes: &[u8],
+    node_ids: &IdSet,
+) -> Result<(u64, Vec<i64>)> {
     let mut count: u64 = 0;
     let mut overflow = Vec::new();
     scratch.each(bytes, |_, id| {
@@ -343,7 +391,12 @@ fn replay_nodes(scratch: &IdScratch, bytes: &[u8], node_ids: &IdSet) -> Result<(
 
 /// Judge one accepted blob's ways, in element-walk order: each way's ID into
 /// `way_ids` (under `check_relations`), then its refs against `node_ids`.
-fn judge_ways(ways: &[WaySpan], bytes: &[u8], sets: &Sets, judge: Judge) -> Result<WayBlobResult> {
+pub(super) fn judge_ways(
+    ways: &[WaySpan],
+    bytes: &[u8],
+    sets: &Sets,
+    judge: Judge,
+) -> Result<WayBlobResult> {
     let mut r = WayBlobResult::default();
     for way in ways {
         let wid = way.id;
@@ -375,7 +428,7 @@ fn judge_ways(ways: &[WaySpan], bytes: &[u8], sets: &Sets, judge: Judge) -> Resu
 /// Judge one accepted blob's relations, in element-walk order: each
 /// relation's ID into `relation_ids`, then its node and way members against
 /// their sets, its relation members deferred.
-fn judge_relations(
+pub(super) fn judge_relations(
     relations: &[RelationSpan],
     bytes: &[u8],
     sets: &Sets,
@@ -447,7 +500,7 @@ fn judge_relations(
 /// Everything the serial merges accumulate, and the side sets holding each
 /// kind's IDs above its pre-allocation until its phase ends.
 #[derive(Default)]
-struct Tally {
+pub(super) struct Tally {
     node_count: u64,
     way_count: u64,
     relation_count: u64,
@@ -469,21 +522,31 @@ struct Tally {
     rel_node_members_checked: u64,
     rel_way_members_checked: u64,
     rel_rel_members_deferred: u64,
-    node_overflow: IdSet,
-    way_overflow: IdSet,
-    relation_overflow: IdSet,
+    pub(super) node_overflow: IdSet,
+    pub(super) way_overflow: IdSet,
+    pub(super) relation_overflow: IdSet,
 }
 
 impl Tally {
     // Each phase inserts IDs above its pre-allocation into a side set from
     // its serial merge and moves it into the kind's own set after the join
     // (see `check::insert_overflow_ids`).
-    fn merge_nodes(&mut self, count: u64, overflow_ids: Vec<i64>, host: &crate::host::Entered<'_>) {
+    pub(super) fn merge_nodes(
+        &mut self,
+        count: u64,
+        overflow_ids: Vec<i64>,
+        host: &crate::host::Entered<'_>,
+    ) {
         super::insert_overflow_ids(&mut self.node_overflow, overflow_ids, host);
         self.node_count += count;
     }
 
-    fn merge_ways(&mut self, r: WayBlobResult, judge: Judge, host: &crate::host::Entered<'_>) {
+    pub(super) fn merge_ways(
+        &mut self,
+        r: WayBlobResult,
+        judge: Judge,
+        host: &crate::host::Entered<'_>,
+    ) {
         super::insert_overflow_ids(&mut self.way_overflow, r.overflow_ids, host);
         self.way_count += r.way_count;
         self.way_refs_checked += r.way_refs_checked;
@@ -496,7 +559,12 @@ impl Tally {
         }
     }
 
-    fn merge_relations(&mut self, r: RelBlobResult, judge: Judge, host: &crate::host::Entered<'_>) {
+    pub(super) fn merge_relations(
+        &mut self,
+        r: RelBlobResult,
+        judge: Judge,
+        host: &crate::host::Entered<'_>,
+    ) {
         super::insert_overflow_ids(&mut self.relation_overflow, r.overflow_ids, host);
         self.relation_count += r.relation_count;
         self.rel_node_members_checked += r.rel_node_members_checked;
@@ -712,7 +780,7 @@ fn unindexed_phase(
 }
 
 #[allow(clippy::too_many_lines)]
-fn check_refs_inner(
+pub(super) fn check_refs_inner(
     input: InputSource<'_>,
     opts: &CheckRefsOptions,
     host: &crate::host::Entered<'_>,
@@ -743,29 +811,7 @@ fn check_refs_inner(
     // The size is an fstat of the walk's own descriptor, the one every phase
     // reads, so it describes that file even when `input` is a bare path a
     // stat would resolve again.
-    let file_len = shared_file
-        .file()
-        .metadata()
-        .map_err(|e| {
-            crate::Error::from(e).context(format!("failed to stat {}", input.path().display()))
-        })?
-        .len();
-    let mut sets = Sets {
-        nodes: IdSet::new(),
-        ways: IdSet::new(),
-        relations: IdSet::new(),
-    };
-    sets.nodes
-        .pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
-    if judge.check_relations {
-        sets.ways
-            .pre_allocate(super::id_alloc_bound(max_ids[1], WAY_ID_FLOOR, file_len));
-        sets.relations.pre_allocate(super::id_alloc_bound(
-            max_ids[2],
-            RELATION_ID_FLOOR,
-            file_len,
-        ));
-    }
+    let mut sets = Sets::allocate(&shared_file, max_ids, judge)?;
 
     let mut tally = Tally::default();
 
@@ -833,6 +879,28 @@ fn check_refs_inner(
         crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_after_relations");
     }
 
+    let blobs = PhaseBlobs {
+        node: node_blobs,
+        unindexed: unindexed_blobs,
+        way: way_schedule.len() as u64,
+        relation: relation_blobs,
+    };
+    let result = finish(tally, &sets, judge, &blobs, host);
+    host.invocation.marker("CHECKREFS_SCAN_END");
+    Ok(result)
+}
+
+/// The report of a reference check whose phases have all run and merged
+/// into `tally` and `sets`: the unique-missing counts, the deferred
+/// relation-to-relation references resolved against the complete relation
+/// set, and the check's counters.
+pub(super) fn finish(
+    mut tally: Tally,
+    sets: &Sets,
+    judge: Judge,
+    blobs: &PhaseBlobs,
+    host: &crate::host::Entered<'_>,
+) -> RefCheckResult {
     let mut result = RefCheckResult {
         node_count: tally.node_count,
         way_count: tally.way_count,
@@ -886,7 +954,6 @@ fn check_refs_inner(
 
     result.missing_refs = missing_refs;
 
-    host.invocation.marker("CHECKREFS_SCAN_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the invocation has a sink.
     crate::debug::emit_mallinfo2(&host.invocation, "checkrefs_final");
@@ -918,13 +985,12 @@ fn check_refs_inner(
     // Structural counters: the blobs each phase read. On an unindexed file
     // the combined phase read every blob once and the way and relation
     // phases only the blobs it could not judge.
-    host.invocation.counter("checkrefs_node_blobs", node_blobs);
+    host.invocation.counter("checkrefs_node_blobs", blobs.node);
     host.invocation
-        .counter("checkrefs_unindexed_blobs", unindexed_blobs);
+        .counter("checkrefs_unindexed_blobs", blobs.unindexed);
+    host.invocation.counter("checkrefs_way_blobs", blobs.way);
     host.invocation
-        .counter("checkrefs_way_blobs", way_schedule.len() as u64);
-    host.invocation
-        .counter("checkrefs_relation_blobs", relation_blobs);
+        .counter("checkrefs_relation_blobs", blobs.relation);
     host.invocation
         .counter("checkrefs_way_refs_checked", tally.way_refs_checked);
     host.invocation.counter(
@@ -952,5 +1018,5 @@ fn check_refs_inner(
         tally.missing_node_members_occurrences,
     );
 
-    Ok(result)
+    result
 }

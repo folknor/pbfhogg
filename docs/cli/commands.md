@@ -1031,7 +1031,10 @@ format's invariants, exiting 1 on a violation. Describing a file - what it
 claims, cheaply - is [`inspect`](#inspect)'s job.
 
 Validate PBF integrity along four independent axes, selected by flag. With no
-flag, the ID and referential integrity checks both run.
+flag, the ID and referential integrity checks both run. Together they read
+an indexed file once: each blob is decompressed and validated once for both
+checks, and each check still reports, stops or fails on its own, exactly as
+when run alone. On an unindexed file they read it in turn.
 
 `--index` and `--locations` are selectors like the other two but are
 deliberately **not** in the default set: each decompresses every blob in the

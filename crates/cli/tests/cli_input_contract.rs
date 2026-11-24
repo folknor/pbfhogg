@@ -2145,13 +2145,14 @@ fn inspect_pins_its_input_wherever_it_reads_it_twice() {
 
 /// The `check` selector sets that compose more than one library call on the
 /// input, with the pinned opens each run takes: `--ids` opens twice (its
-/// probe and its schedule walk), `--index` and `--refs` once each.
+/// probe and its schedule walk), `--index` and `--refs` once each, and
+/// `--ids` with `--refs` twice, since the pair shares the ID check's walk.
 const CHECK_COMPOSITIONS: [(&[&str], u64); 5] = [
-    (&[], 3),
-    (&["--ids", "--refs"], 3),
+    (&[], 2),
+    (&["--ids", "--refs"], 2),
     (&["--ids", "--index"], 3),
     (&["--index", "--refs"], 2),
-    (&["--ids", "--index", "--refs"], 4),
+    (&["--ids", "--index", "--refs"], 3),
 ];
 
 /// A check run composing several checks pins its input once, before the

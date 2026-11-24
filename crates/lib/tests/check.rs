@@ -1598,3 +1598,217 @@ fn an_unsupported_required_feature_refuses_every_reader() {
         "has_tagdata",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The default pair over one read
+// ---------------------------------------------------------------------------
+
+/// An ID outcome as a comparable string: where it stopped, or its counts,
+/// totals and details in report order.
+fn ids_key(
+    outcome: &pbfhogg::check::CheckOutcome<pbfhogg::check::verify_ids::VerifyIdsReport>,
+) -> String {
+    match outcome {
+        pbfhogg::check::CheckOutcome::Stopped(s) => format!("stopped {:?} {:?}", s.reason, s.blob),
+        pbfhogg::check::CheckOutcome::Complete(r) => format!(
+            "{} {} {} {} {} {} {} {:?}",
+            r.header_sorted,
+            r.indexed,
+            r.node_count,
+            r.way_count,
+            r.relation_count,
+            r.total_violations,
+            r.has_negative_ids,
+            id_details(r)
+        ),
+    }
+}
+
+/// A reference outcome as a comparable string: its error, where it
+/// stopped, or its counts and sorted details.
+fn refs_key(
+    result: &pbfhogg::Result<pbfhogg::check::CheckOutcome<pbfhogg::check::refs::RefCheckResult>>,
+) -> String {
+    match result {
+        Err(e) => format!("error {e}"),
+        Ok(pbfhogg::check::CheckOutcome::Stopped(s)) => {
+            format!("stopped {:?} {:?}", s.reason, s.blob)
+        }
+        Ok(pbfhogg::check::CheckOutcome::Complete(r)) => format!("{:?}", refs_summary(r)),
+    }
+}
+
+/// Run the pair and the two separate calls with the same options and
+/// compare: an ID error ends both runs with the same message, otherwise
+/// each check's outcome is the one its own call returns.
+fn assert_pair_matches_the_two_calls(
+    path: &std::path::Path,
+    full: bool,
+    type_filter: Option<pbfhogg::TypeFilter>,
+    check_relations: bool,
+) {
+    let host = crate::common::test_host();
+    let ids_opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        max_errors: 0,
+        direct_io: false,
+        full,
+        type_filter,
+    };
+    let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
+        direct_io: false,
+        check_relations,
+        show_ids: Some(pbfhogg::check::refs::ShowIds { max_errors: 0 }),
+    };
+    let what = format!(
+        "{}, full {full}, filter {}, relations {check_relations}",
+        path.display(),
+        type_filter.is_some()
+    );
+    let pair = pbfhogg::check::pair::check_ids_and_refs(path, &ids_opts, &refs_opts, &host);
+    let ids = pbfhogg::check::verify_ids::verify_ids(path, &ids_opts, &host);
+    match (ids, pair) {
+        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{what}"),
+        (Ok(ids), Ok(pair)) => {
+            assert_eq!(ids_key(&pair.ids), ids_key(&ids), "{what}");
+            let refs = pbfhogg::check::refs::check_refs(path, &refs_opts, &host);
+            assert_eq!(refs_key(&pair.refs), refs_key(&refs), "{what}");
+        }
+        (ids, pair) => panic!(
+            "{what}: the ID call {} but the pair {}",
+            if ids.is_ok() { "ran" } else { "failed" },
+            if pair.is_ok() { "ran" } else { "failed" }
+        ),
+    }
+}
+
+/// Every mode the pair takes on `path`: each check reports what its own
+/// call reports.
+fn assert_pair_matches_everywhere(path: &std::path::Path) {
+    let filters = [
+        None,
+        Some(pbfhogg::TypeFilter {
+            nodes: false,
+            ways: false,
+            relations: true,
+        }),
+        Some(pbfhogg::TypeFilter {
+            nodes: false,
+            ways: true,
+            relations: false,
+        }),
+    ];
+    for full in [false, true] {
+        for type_filter in filters {
+            for check_relations in [false, true] {
+                assert_pair_matches_the_two_calls(path, full, type_filter, check_relations);
+            }
+        }
+    }
+}
+
+/// An honest file failing both checks, and the same file with its way blob
+/// claiming nodes or relations: a relation claim stops the ID check but
+/// passes the reference check without `check_relations`, and `-t` keeps the
+/// ID check off a node-claimed lie.
+#[test]
+fn the_pair_reports_each_check_as_its_own_call_on_lying_claims() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_relabel_fixture(&honest);
+    assert_pair_matches_everywhere(&honest);
+    assert_pair_matches_everywhere(&relabelled_way_blob(dir.path(), 0));
+    assert_pair_matches_everywhere(&relabelled_way_blob(dir.path(), 2));
+}
+
+/// A member type no set resolves fails the reference check alone; the ID
+/// check completes beside it.
+#[test]
+fn the_pair_reports_each_check_as_its_own_call_on_an_unknown_member() {
+    use crate::common::adversarial;
+
+    let dir = crate::common::test_scratch();
+    let unknown = dir.path().join("unknown-member.osm.pbf");
+    write_test_pbf_sorted(
+        &unknown,
+        &[node(1)],
+        &[way(5, &[1])],
+        &[relation(3, MemberId::Node(99))],
+    );
+    let bytes = std::fs::read(&unknown).expect("read fixture");
+    let last = adversarial::locate_blobs(&bytes).len() - 1;
+    let mutated = adversarial::set_relation_last_member_type(&bytes, last, 0, 7);
+    std::fs::write(&unknown, mutated).expect("write fixture");
+    assert_pair_matches_everywhere(&unknown);
+}
+
+/// Negative IDs, a disordered indexed file, its unindexed twin and a header
+/// the readers refuse.
+#[test]
+fn the_pair_reports_each_check_as_its_own_call_on_order_and_headers() {
+    let dir = crate::common::test_scratch();
+    let negative = dir.path().join("negative.osm.pbf");
+    write_test_pbf_sorted(
+        &negative,
+        &[node(-5), node(1), node(2)],
+        &[way(-10, &[-5, 1, 7]), way(4, &[2])],
+        &[
+            relation(-3, MemberId::Way(-10)),
+            relation(3, MemberId::Relation(-4)),
+        ],
+    );
+    assert_pair_matches_everywhere(&negative);
+
+    let nodes = [node(2), node(1), node(3)];
+    let ways = [way(10, &[1, 99]), way(10, &[2])];
+    let relations = [relation(30, MemberId::Way(10))];
+    let blobs = [
+        Blob::Ways(&ways),
+        Blob::Nodes(&nodes),
+        Blob::Relations(&relations),
+    ];
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    write_unindexed_blobs(&unindexed, &blobs);
+    assert_pair_matches_everywhere(&unindexed);
+    let disordered = dir.path().join("disordered.osm.pbf");
+    write_blobs(&disordered, &blobs, true);
+    assert_pair_matches_everywhere(&disordered);
+
+    let unsupported = dir.path().join("unsupported.osm.pbf");
+    write_header_requiring(&unsupported, "UnsupportedExtension");
+    assert_pair_matches_everywhere(&unsupported);
+}
+
+/// The pair reads each blob of an indexed file once, the node and way blobs
+/// for both checks; the reference check's counters still describe what it
+/// consumed.
+#[test]
+fn the_pair_reads_an_indexed_file_once() {
+    let dir = crate::common::test_scratch();
+    let path = dir.path().join("honest.osm.pbf");
+    write_relabel_fixture(&path);
+    let counters = std::sync::Arc::new(Counters::default());
+    let mut host = crate::common::test_host();
+    host.invocation = pbfhogg::host::Invocation::with_sink(
+        std::sync::Arc::clone(&counters) as std::sync::Arc<dyn pbfhogg::debug::InstrumentSink>
+    );
+    let ids_opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        max_errors: 0,
+        direct_io: false,
+        full: false,
+        type_filter: None,
+    };
+    let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
+        direct_io: false,
+        check_relations: false,
+        show_ids: None,
+    };
+    let pair = pbfhogg::check::pair::check_ids_and_refs(&path, &ids_opts, &refs_opts, &host)
+        .expect("the pair runs");
+    assert!(pair.ids.complete().is_some());
+    assert!(pair.refs.expect("refs runs").complete().is_some());
+    // One blob per kind, each read once.
+    assert_eq!(counters.get("checkpair_physical_blobs"), 3);
+    assert_eq!(counters.get("checkrefs_node_blobs"), 1);
+    assert_eq!(counters.get("checkrefs_way_blobs"), 1);
+    assert_eq!(counters.get("checkrefs_relation_blobs"), 0);
+}

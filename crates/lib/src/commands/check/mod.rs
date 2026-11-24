@@ -9,9 +9,13 @@
 //! - `--locations`: a LocationsOnWays file's inline way-node coordinates
 //!   against its node records, via [`locations::check_locations`]. Opt-in for
 //!   the same reason, and because it only applies to such files.
+//!
+//! The default pair, `--ids` with `--refs`, reads an indexed file once for
+//! both through [`pair::check_ids_and_refs`].
 
 pub mod index;
 pub mod locations;
+pub mod pair;
 pub mod refs;
 pub mod verify_ids;
 

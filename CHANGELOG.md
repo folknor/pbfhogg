@@ -606,6 +606,11 @@
 
 ### Changed
 
+- **A bare `check` reads an indexed file once.** The ID and reference
+  checks used to read every node and way blob each; they now share one
+  header walk and one read per blob, each check still reporting, stopping
+  or failing on its own. Planet fell from about 37-44 s to 21 s. Library:
+  `check::pair::check_ids_and_refs` runs the pair.
 - **Default `tags-filter` reads relation blobs at most twice, however
   deeply relations nest.** The relation-membership closure used to decode
   every relation blob once per nesting level; it now builds the

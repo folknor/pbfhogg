@@ -243,6 +243,25 @@ params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default 
 params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs with per-type signed ID sets" }
 params.direct-io = { choices = ["yes", "no"], default = "no", help = "yes: read with O_DIRECT" }
 
+# -- check
+
+[bench.default-integrity]
+script_file = "../benches/check/default-integrity.lua"
+description = "Run a bare check, the ID and reference checks together, on a dataset or snapshot"
+version = 1
+date = 2026-11-24
+changelog = [
+  { version = 1, date = 2026-11-24, note = "A bare check, for the pair reading the file once" },
+]
+profile = "release"
+hotpath_features = ["hotpath"]
+alloc_features = ["hotpath-alloc"]
+params.dataset = { from = "datasets", default = "denmark", help = "the dataset" }
+params.snapshot = { from = "datasets.{dataset}.snapshot", default = "base", help = "base for primary data, or a named snapshot" }
+params.variant = { from = "datasets.{dataset}.snapshot.{snapshot}.pbf", default = "indexed", help = "the input PBF variant" }
+params.check-relations = { choices = ["yes", "no"], default = "no", help = "yes: also check relation members" }
+params.full = { choices = ["yes", "no"], default = "no", help = "yes: also detect duplicate IDs" }
+
 # -- check-index
 
 [bench.index-integrity]

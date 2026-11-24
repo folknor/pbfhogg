@@ -1331,30 +1331,28 @@ serial inflate.
 
 Kind: unmeasured, moderate conviction.
 
-## PERF-045 - Checks re-decode payload per check
+## PERF-045 - Unindexed check pair and combined inspect modes read twice
 
 Reported by: check.
 
-Mechanism: `run_check` runs locations, IDs, index verification and references
-as separate library calls; bare `check` runs IDs and references separately, so
-node and way blobs are decoded twice, and `--index` adds a scan. Inspect report
-and node statistics run separately (`run_inspect`). Unindexed
-`unindexed_phase` discards a whole way or relation verdict on any miss and
-rereads the blob.
+The indexed default pair (`--ids` with `--refs`) reads once through
+`check::pair` (planet about -45 %, reference/performance/check.md). Residue:
 
-Redesign: an audit execution reading and decompressing each blob once and
-computing ID order, membership, references and index observations from the same
-fields, sharing membership between reference and duplicate checks, separate
-results and policies; deferred misses as compact unresolved requests (a hit is
-final since membership grows) with bounded spill. Combined inspect modes share
-payload work while keeping claim descriptions distinct from measurements.
-Per-mode projection table in the check report.
+- On an unindexed file `check::pair` runs the two engines in turn, so the
+  file is read twice. One combined pass is possible: a projection carrying
+  node IDs (and relation IDs when `--check-relations` is off), way spans,
+  relation spans under `--check-relations` and `GroupKinds`, with
+  `replay_nodes` filtering by kind, then the reference check's re-reads.
+- `run_inspect` runs the report and node statistics as separate calls with
+  `--nodes` plus a report flag. node_stats requires indexdata and the report
+  may be index-only, so sharing payload work applies only to the full-decode
+  report.
 
-Risks: policy differences (index checking's narrower acceptance, inspect's
-partial coverage, kind-claim stops, type filters); refusal scope must not widen;
-error precedence and capped-detail order.
-
-Kind: highest conviction in the check scope.
+Ruled out, with the reasoning at the code: folding `--index` into the pair
+(pair.rs module doc: it would inherit the claim routing and partial-index
+stop it judges), and replacing `unindexed_phase`'s whole-judgement re-read
+with deferred unresolved requests (refs.rs "Unindexed input"; sorted
+unindexed planet re-reads 2 of 50,816 blobs).
 
 ## PERF-046 - Location checking rereads every way blob per partition
 
@@ -2368,3 +2366,22 @@ with the 8 KiB OPL readers exists to set against it; the readers are now
 1 MiB.
 
 Kind: local.
+
+## PERF-084 - Unsorted simple extract decodes every blob on one thread in pass 2
+
+Reported by: the spar accounting of the fused sorted simple extract change,
+from its scout's lateral (2026-11-24).
+
+`extract_simple_two_pass` (`extract/simple.rs`, input whose header does not
+claim Sort.Type_then_ID) writes in a final sequential `BlobReader` sweep
+that decompresses and builds a `PrimitiveBlock` for every OsmData blob on
+the calling thread, then hands batches of `EXTRACT_SIMPLE_BATCH_SIZE`
+blocks to `process_extract_pass2_batch`. The sweep applies no skip: node
+blobs whose indexdata bbox misses the region, which the pass-1 sweeps
+already skip, are decoded again here, and so is every blob of a kind whose
+ID set is empty. Decode is serialized ahead of each parallel batch write.
+Possible shape: the same bbox and empty-set skips as pass 1, and decode on
+the workers as the sorted route does. Unmeasured; the unsorted route has no
+recorded cell.
+
+Kind: local, unmeasured.

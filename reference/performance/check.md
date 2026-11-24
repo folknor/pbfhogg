@@ -1,5 +1,30 @@
 # Check
 
+## A bare check reads an indexed file once (bygg, 2026-11-24, against `3c729629`)
+
+`check` with no selector (`--ids` with `--refs`) used to be two library
+calls, each walking the header chain and reading every node and way blob.
+It is now one call (`check::pair`) that walks once and reads each kind's
+blobs once for both checks. Planet indexed, `default-integrity --dataset
+planet`, interleaved `--iterations 1`, base `3c729629` (`--commit`)
+against the working tree on it (dirty, stored as such):
+
+| Arm | Wall | UUID |
+|---|---:|---|
+| base | 44.1 s | `f06ab0cd` |
+| pair | 21.1 s | `d2ad34b3` |
+| base | 37.0 s | `a8f2a0c5` |
+| pair | 21.2 s | `9a25b81d` |
+
+About -45 %. The phase split (`a8f2a0c5` against `9a25b81d`): the base
+ran `VERIFYIDS_NODES` 9.1 s, `VERIFYIDS_WAYS` 7.7 s, `CHECKREFS_NODES`
+9.3 s and `CHECKREFS_WAYS` 10.5 s; the pair ran `CHECKPAIR_NODES` 10.2 s
+and `CHECKPAIR_WAYS` 10.7 s, each at about 30 cores, about 57 GB and 24 GB
+read once instead of twice. Peak anon about 2.16 GB in both, the reference
+check's node set. The standalone `check --refs`, whose code was only
+refactored, is unchanged: `ref-integrity` 19.9 s base (`12461e5e`), 20.1 s
+working tree (`058daf33`).
+
 ### check --refs: missing references in ID sets (bygg, 2026-10-27)
 
 `23c53a0b` counts missing references into one `IdSet` per category

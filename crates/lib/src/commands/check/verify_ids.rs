@@ -49,7 +49,7 @@ pub struct VerifyIdsOptions {
     pub type_filter: Option<TypeFilter>,
 }
 
-fn effective_error_limit(max_errors: usize) -> Option<usize> {
+pub(super) fn effective_error_limit(max_errors: usize) -> Option<usize> {
     if max_errors == 0 {
         None
     } else {
@@ -352,7 +352,7 @@ pub fn verify_ids<'a>(
         .decided(|| super::CheckOutcome::stop_on_finding(verify_ids_inner(input, opts, host)))
 }
 
-fn verify_ids_inner(
+pub(super) fn verify_ids_inner(
     input: InputSource<'_>,
     opts: &VerifyIdsOptions,
     host: &crate::host::Entered<'_>,
@@ -383,7 +383,8 @@ fn verify_ids_inner(
 // workers report `BlobVerifyResult` with `duplicate_ids` and `overflow_ids`
 // always empty.
 
-const KINDS: [ElementKind; 3] = [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
+pub(super) const KINDS: [ElementKind; 3] =
+    [ElementKind::Node, ElementKind::Way, ElementKind::Relation];
 
 /// The phase start and end markers of each kind, indexed by ordinal.
 const KIND_MARKERS: [(&str, &str); 3] = [
@@ -393,7 +394,7 @@ const KIND_MARKERS: [(&str, &str); 3] = [
 ];
 
 /// Whether `filter` selects `kind`.
-fn selects(filter: &TypeFilter, kind: ElementKind) -> bool {
+pub(super) fn selects(filter: &TypeFilter, kind: ElementKind) -> bool {
     match kind {
         ElementKind::Node => filter.nodes,
         ElementKind::Way => filter.ways,
@@ -404,7 +405,7 @@ fn selects(filter: &TypeFilter, kind: ElementKind) -> bool {
 /// One selected kind's merged findings: its element count, its violations in
 /// file order (stored up to `max_errors`, all counted), and how many of them
 /// are order violations, which decides whether `--full` needs its ID set.
-struct KindScan {
+pub(super) struct KindScan {
     count: u64,
     violations: Vec<IdViolation>,
     total: u64,
@@ -415,10 +416,10 @@ struct KindScan {
 
 /// What both modes scan: the type-order findings and each selected kind's,
 /// assembled into report order by [`Scanned::into_report`].
-struct Scanned {
-    type_order: Vec<IdViolation>,
-    type_order_total: u64,
-    kinds: [Option<KindScan>; 3],
+pub(super) struct Scanned {
+    pub(super) type_order: Vec<IdViolation>,
+    pub(super) type_order_total: u64,
+    pub(super) kinds: [Option<KindScan>; 3],
 }
 
 impl Scanned {
@@ -427,7 +428,7 @@ impl Scanned {
     /// counted. Each component already holds a prefix of at most
     /// `max_errors`, so truncating the concatenation once stores what a
     /// running remaining-limit would.
-    fn into_report(self, max_errors: usize) -> Findings {
+    pub(super) fn into_report(self, max_errors: usize) -> Findings {
         let mut counts = [0; 3];
         let mut violations = self.type_order;
         let mut total = self.type_order_total;
@@ -453,7 +454,7 @@ impl Scanned {
 }
 
 /// What [`Scanned::into_report`] assembles for the report.
-struct Findings {
+pub(super) struct Findings {
     counts: [u64; 3],
     violations: Vec<IdViolation>,
     total: u64,
@@ -461,7 +462,12 @@ struct Findings {
 }
 
 impl Findings {
-    fn into_report(self, header_sorted: bool, indexed: bool, full: bool) -> VerifyIdsReport {
+    pub(super) fn into_report(
+        self,
+        header_sorted: bool,
+        indexed: bool,
+        full: bool,
+    ) -> VerifyIdsReport {
         let [node_count, way_count, relation_count] = self.counts;
         VerifyIdsReport {
             header_sorted,
@@ -598,14 +604,14 @@ fn verify_ids_streaming_parallel(
 /// the blob's first and last ID, count and order violations, and with the
 /// kind's `IdSet` (`--full`) its duplicates and the IDs outside the set's
 /// allocation, every negative among them.
-struct KindJudge {
+pub(super) struct KindJudge {
     elem_type: &'static str,
     prev: Option<i64>,
-    r: BlobVerifyResult,
+    pub(super) r: BlobVerifyResult,
 }
 
 impl KindJudge {
-    fn new(kind: ElementKind) -> Self {
+    pub(super) fn new(kind: ElementKind) -> Self {
         Self {
             elem_type: kind.as_str(),
             prev: None,
@@ -614,7 +620,7 @@ impl KindJudge {
     }
 
     #[inline]
-    fn push(&mut self, id: i64, atomic_ids: Option<&IdSet>) {
+    pub(super) fn push(&mut self, id: i64, atomic_ids: Option<&IdSet>) {
         let r = &mut self.r;
         r.count += 1;
         r.negative |= id < 0;
@@ -760,7 +766,7 @@ type PerKind = [Vec<Option<BlobVerifyResult>>; 3];
 
 /// Where each kind's elements first and last appear, as positions under some
 /// order of the file (`None`: the kind is absent), indexed by ordinal.
-type KindSpans<K> = [Option<(K, K)>; 3];
+pub(super) type KindSpans<K> = [Option<(K, K)>; 3];
 
 /// Widen `span` to cover `first..=last`. Results arrive in completion order,
 /// so the bounds are a minimum and a maximum, never the latest arrival.
@@ -772,7 +778,9 @@ fn widen<K: Ord + Copy>(span: &mut Option<(K, K)>, first: K, last: K) {
 }
 
 /// The frame offsets of a claimed schedule's first and last blob.
-fn schedule_span(schedule: &[crate::scan::classify::ScheduledBlob]) -> Option<(u64, u64)> {
+pub(super) fn schedule_span(
+    schedule: &[crate::scan::classify::ScheduledBlob],
+) -> Option<(u64, u64)> {
     let mut span = None;
     for blob in schedule {
         let offset = blob.frame_start();
@@ -822,7 +830,7 @@ impl crate::read::block::GroupProjection for GroupKinds {
 /// canonically smallest first, and the details a cap keeps do not depend on
 /// the schedule. Attributing each to its true file position would need an
 /// ordered replay of every ID, serialising the duplicate pass.
-fn merge_kind(
+pub(super) fn merge_kind(
     per_blob: Vec<Option<BlobVerifyResult>>,
     kind: ElementKind,
     max_errors_remaining: Option<usize>,
@@ -907,7 +915,7 @@ fn merge_kind(
 // and budget retained examples across blobs while preserving merge order.
 // Replacing the measured classify/merge path needs throughput validation;
 // max_errors is a display-detail limit, not a whole-check memory guarantee.
-struct BlobVerifyResult {
+pub(super) struct BlobVerifyResult {
     first_id: Option<i64>,
     last_id: Option<i64>,
     count: u64,
@@ -980,11 +988,36 @@ fn verify_ids_full_parallel(
         opts.max_errors,
         host,
     )?;
+    duplicate_pass(
+        &mut scanned,
+        &shared_file,
+        &schedules,
+        max_ids,
+        pin,
+        opts.max_errors,
+        host,
+    )?;
 
-    // The duplicate pass, over the kinds the proof pass found out of order
-    // only, each read again with its ID set. Its findings replace that
-    // kind's wholesale: they include the order violations the proof pass
-    // found, so combining the two would count them twice.
+    host.invocation.marker("VERIFYIDS_SCAN_END");
+
+    Ok(scanned
+        .into_report(opts.max_errors)
+        .into_report(header_sorted, indexed, true))
+}
+
+/// `--full`'s duplicate pass, over the kinds the proof pass in `scanned`
+/// found out of order only, each read again with its ID set. Its findings
+/// replace that kind's wholesale: they include the order violations the
+/// proof pass found, so combining the two would count them twice.
+pub(super) fn duplicate_pass(
+    scanned: &mut Scanned,
+    shared_file: &crate::read::input::InputFile,
+    schedules: &KindSchedules,
+    max_ids: [i64; 3],
+    pin: &PinnedInput,
+    max_errors: usize,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
     let mut dup_filter = TypeFilter {
         nodes: false,
         ways: false,
@@ -1025,15 +1058,15 @@ fn verify_ids_full_parallel(
         }
         let [nodes, ways, relations] = &mut sets;
         let dup = scan_kinds(
-            &shared_file,
-            &schedules,
+            shared_file,
+            schedules,
             &dup_filter,
             [
                 dup_filter.nodes.then_some(nodes),
                 dup_filter.ways.then_some(ways),
                 dup_filter.relations.then_some(relations),
             ],
-            opts.max_errors,
+            max_errors,
             host,
         )?;
         drop(sets);
@@ -1044,12 +1077,7 @@ fn verify_ids_full_parallel(
         }
         host.invocation.marker("VERIFYIDS_DUPLICATES_END");
     }
-
-    host.invocation.marker("VERIFYIDS_SCAN_END");
-
-    Ok(scanned
-        .into_report(opts.max_errors)
-        .into_report(header_sorted, indexed, true))
+    Ok(())
 }
 
 /// Settle the IDs one blob found outside the phase's pre-allocation (above
@@ -1063,7 +1091,7 @@ fn verify_ids_full_parallel(
 /// it, as it already does for duplicates the atomic setters find; neither the
 /// totals nor the report do, since `merge_kind` orders duplicates by ID, not
 /// by blob. Test builds count the insertions on the run's token.
-fn settle_overflow(
+pub(super) fn settle_overflow(
     overflow: &mut IdSet,
     r: &mut BlobVerifyResult,
     host: &crate::host::Entered<'_>,
@@ -1095,7 +1123,7 @@ fn settle_overflow(
 /// Emits one `TypeOrder` violation per inversion found (bounded at three:
 /// node-way, node-relation, way-relation), each counted whether or not it
 /// is stored.
-fn check_type_order<K: Ord + Copy>(
+pub(super) fn check_type_order<K: Ord + Copy>(
     spans: &KindSpans<K>,
     violations: &mut Vec<IdViolation>,
     total_violations: &mut u64,

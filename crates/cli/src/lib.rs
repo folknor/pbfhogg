@@ -3868,15 +3868,33 @@ fn run_check(
         None
     };
 
+    let ids_opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        max_errors,
+        direct_io,
+        full,
+        type_filter,
+    };
+    // Without --show-ids refs retains no details, so --max-errors (still
+    // read by the other checks a run may select) does not reach it.
+    let refs_opts = pbfhogg::check::refs::CheckRefsOptions {
+        direct_io,
+        check_relations,
+        show_ids: show_ids.then_some(pbfhogg::check::refs::ShowIds { max_errors }),
+    };
+    // The ID and reference checks together read the file once. Their
+    // outcomes are consumed where the two separate calls stood, so an ID
+    // check error still ends the run before the index check, and a
+    // reference check error still surfaces after it.
+    let mut paired_refs = None;
     let ids_report = if run_ids {
-        use pbfhogg::check::verify_ids::VerifyIdsOptions;
-        let opts = VerifyIdsOptions {
-            max_errors,
-            direct_io,
-            full,
-            type_filter,
+        let report = if run_refs {
+            let pair =
+                pbfhogg::check::pair::check_ids_and_refs(input, &ids_opts, &refs_opts, host)?;
+            paired_refs = Some(pair.refs);
+            pair.ids
+        } else {
+            pbfhogg::check::verify_ids::verify_ids(input, &ids_opts, host)?
         };
-        let report = pbfhogg::check::verify_ids::verify_ids(input, &opts, host)?;
         if !report.passed(|r| r.passed) {
             failed = true;
         }
@@ -3900,14 +3918,10 @@ fn run_check(
     };
 
     let refs_result = if run_refs {
-        // Without --show-ids refs retains no details, so --max-errors (still
-        // read by the other checks a run may select) does not reach it.
-        let opts = pbfhogg::check::refs::CheckRefsOptions {
-            direct_io,
-            check_relations,
-            show_ids: show_ids.then_some(pbfhogg::check::refs::ShowIds { max_errors }),
+        let result = match paired_refs {
+            Some(result) => result?,
+            None => pbfhogg::check::refs::check_refs(input, &refs_opts, host)?,
         };
-        let result = pbfhogg::check::refs::check_refs(input, &opts, host)?;
         if !result.passed(pbfhogg::check::refs::RefCheckResult::is_valid) {
             failed = true;
         }

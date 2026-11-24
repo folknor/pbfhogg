@@ -444,7 +444,8 @@ fn check_ids_full_finds_a_duplicate_above_the_allocation() {
     // Every copy of the high node lay above the pre-allocation, so the
     // duplicates were found by the serial overflow insertion. Its blobs
     // settle in completion order, which may decide which copy counts as the
-    // first, but never how many duplicates there are.
+    // first, but never how many duplicates there are, nor where the report
+    // puts them.
     #[cfg(pbfhogg_test_hooks)]
     assert_eq!(
         host.invocation
@@ -579,6 +580,76 @@ fn check_ids_full_duplicate_pass_replaces_the_order_pass_findings() {
     let capped = verify_ids_full(&input, 1, &crate::common::test_host());
     assert_eq!(capped.total_violations, 2);
     assert_eq!(capped.violations.len(), 1);
+}
+
+/// The ID check's details as short strings, in report order.
+fn id_details(report: &pbfhogg::check::verify_ids::VerifyIdsReport) -> Vec<String> {
+    use pbfhogg::check::verify_ids::IdViolation;
+    report
+        .violations
+        .iter()
+        .map(|v| match v {
+            IdViolation::NonMonotonic { id, prev_id, .. } => format!("{id} after {prev_id}"),
+            IdViolation::Duplicate { id, .. } => format!("dup {id}"),
+            IdViolation::TypeOrder { found, after } => format!("{found} after {after}"),
+        })
+        .collect()
+}
+
+/// Duplicates follow their kind's order violations, canonically smallest
+/// first, whichever blob a worker attributed them to: blobs `[-1] | [-2] |
+/// [-1]` report the step down before the duplicate on every schedule, and a
+/// cap of one keeps the step down.
+#[test]
+fn check_ids_full_reports_duplicates_after_the_order_violations() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("witness.osm.pbf");
+    let nodes = [node(-1), node(-2), node(-1)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+
+    let report = verify_ids_full(&input, 0, &crate::common::test_host());
+    assert_eq!(id_details(&report), ["-1 after -2", "dup -1"]);
+    let capped = verify_ids_full(&input, 1, &crate::common::test_host());
+    assert_eq!(capped.total_violations, 2);
+    assert_eq!(id_details(&capped), ["-1 after -2"]);
+}
+
+/// A cap that cuts through the duplicates keeps the canonically smallest,
+/// which for negatives is not the smallest signed ID: `-1` before `-2`.
+#[test]
+fn check_ids_full_keeps_the_canonically_smallest_duplicates() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("two_dups.osm.pbf");
+    let nodes = [node(-2), node(-1), node(-2), node(-1)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+
+    let report = verify_ids_full(&input, 0, &crate::common::test_host());
+    // Canonically -1 precedes -2, so each -2 -> -1 is a step down.
+    assert_eq!(
+        id_details(&report),
+        ["-1 after -2", "-1 after -2", "dup -1", "dup -2"]
+    );
+    let capped = verify_ids_full(&input, 3, &crate::common::test_host());
+    assert_eq!(capped.total_violations, 4);
+    assert_eq!(
+        id_details(&capped),
+        ["-1 after -2", "-1 after -2", "dup -1"]
+    );
+}
+
+/// A blob's step down from the previous blob comes at its first element, so
+/// it precedes the blob's own order violations: blobs `[3, 4] | [1, 0]`.
+#[test]
+fn check_ids_reports_a_blob_step_down_before_its_own_violations() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("step.osm.pbf");
+    let nodes = [node(3), node(4), node(1), node(0)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 2);
+
+    let report = verify_ids_full(&input, 0, &crate::common::test_host());
+    assert_eq!(id_details(&report), ["1 after 4", "0 after 1"]);
+    let capped = verify_ids_full(&input, 1, &crate::common::test_host());
+    assert_eq!(id_details(&capped), ["1 after 4"]);
 }
 
 #[test]
@@ -1198,17 +1269,15 @@ fn check_ids_reports_an_unindexed_file_as_its_indexed_twin() {
                 let r = verify_ids_outcome(path, full, filter)
                     .complete()
                     .expect("verify_ids completes");
-                // Which copy of a duplicate is reported, and so where it sits
-                // among its kind's violations, follows completion order on
-                // either file; the violations themselves do not.
+                // Compared in report order: no detail's place follows
+                // completion order on either file.
                 let json = r.to_json_value("f");
-                let mut violations: Vec<String> = json["violations"]
+                let violations: Vec<String> = json["violations"]
                     .as_array()
                     .expect("violations")
                     .iter()
                     .map(ToString::to_string)
                     .collect();
-                violations.sort_unstable();
                 (
                     [
                         r.node_count,

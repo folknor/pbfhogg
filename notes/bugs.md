@@ -101,22 +101,3 @@ Reported by: indexdata.
 bbox; `parallel_scan_blobs_raw` does not enforce the schedule's kind claim.
 Callers compensate today; the hunter calls these API hazards, not demonstrated
 wrong results.
-
-## BUG-031 - check --ids --full duplicate details depend on completion order
-
-Reported by: the codex spar of the check negative-ID work.
-
-The duplicate pass attributes a duplicate to whichever blob reaches the
-set second: the atomic setters in the workers, and `settle_overflow` in
-the phase's merge, which takes results in completion order
-(`check/verify_ids.rs`). Totals are exact, but the order of the stored
-violations is not, so `--max-errors` can keep a different finding from run
-to run, and even the uncapped list can be ordered differently. Witness:
-node blobs `[-1] | [-2] | [-1]`, one per blob. Both schedules report two
-violations, `Duplicate -1` and `NonMonotonic -1 after -2`, but in either
-order, and `--max-errors 1` keeps whichever came first. Positive IDs above
-the allocation and atomic duplicates already behaved this way; since
-negatives took the same path they do too. Fix: give duplicates a fixed place
-in report order and pick their examples by canonical ID, or settle every
-occurrence in one ordered consumer. Neighbour of PERF-048, which plans a
-redesign of the same per-blob retention.

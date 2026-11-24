@@ -1116,6 +1116,12 @@ plain `i64` order; on a file carrying negative IDs the two differ, and the
 canonical one is the definition. `--full` judges duplicates by the same
 signed IDs: `n-7` repeated is a duplicate, and `n-7` beside `n7` is not.
 
+The ID check lists its details in a fixed order, the same on every run and
+for a file with or without indexdata: kind-order findings first, then each
+kind in turn (nodes, ways, relations), its order violations in file order
+followed by its duplicates in canonical ID order, one per extra copy.
+`--max-errors` keeps the first N of that list.
+
 #### Index verification
 
 `check --index` is the metadata trust boundary. `BlobHeader.indexdata` (element kind, ID range, element count, spatial bbox) and

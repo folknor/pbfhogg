@@ -808,9 +808,20 @@ impl crate::read::block::GroupProjection for GroupKinds {
     }
 }
 
-/// Merge one kind's per-blob results in file order: counts summed, each
-/// blob's own violations, then a step down from the previous blob's last ID,
-/// then its duplicates, stored up to `max_errors_remaining` and all counted.
+/// Merge one kind's per-blob results: counts summed, the order violations in
+/// file order (each blob's step down from the previous blob's last ID, at its
+/// first element, then the blob's own), then every duplicate in canonical ID
+/// order, stored up to `max_errors_remaining` and all counted.
+///
+/// Which occurrence of a repeated ID a worker calls the duplicate follows
+/// completion order: the atomic setters let whichever blob inserts second
+/// lose, and `settle_overflow` takes spilled IDs as results arrive. The
+/// multiset is fixed, though: an ID seen `m` times yields `m - 1` equal
+/// `Duplicate` details whichever copies they came from. So duplicates take
+/// no position from their blob; they follow the kind's order violations,
+/// canonically smallest first, and the details a cap keeps do not depend on
+/// the schedule. Attributing each to its true file position would need an
+/// ordered replay of every ID, serialising the duplicate pass.
 fn merge_kind(
     per_blob: Vec<Option<BlobVerifyResult>>,
     kind: ElementKind,
@@ -823,6 +834,7 @@ fn merge_kind(
     let mut non_monotonic: u64 = 0;
     let mut prev_last: Option<i64> = None;
     let mut negative = false;
+    let mut duplicates: Vec<i64> = Vec::new();
     for slot in per_blob {
         let Some(r) = slot else {
             return Err(crate::error::Error::internal(
@@ -831,13 +843,6 @@ fn merge_kind(
         };
         count += r.count;
         negative |= r.negative;
-        for v in r.within_violations {
-            total_violations += 1;
-            non_monotonic += 1;
-            if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(v);
-            }
-        }
         if let (Some(pl), Some(fi)) = (prev_last, r.first_id)
             && not_after(fi, pl)
         {
@@ -851,16 +856,32 @@ fn merge_kind(
                 });
             }
         }
-        for id in r.duplicate_ids {
+        for v in r.within_violations {
             total_violations += 1;
+            non_monotonic += 1;
             if should_store_violation(violations.len(), max_errors_remaining) {
-                violations.push(IdViolation::Duplicate { elem_type, id });
+                violations.push(v);
             }
         }
+        duplicates.extend(r.duplicate_ids);
         if r.last_id.is_some() {
             prev_last = r.last_id;
         }
     }
+    total_violations += duplicates.len() as u64;
+    let room = max_errors_remaining.map_or(duplicates.len(), |limit| {
+        limit.saturating_sub(violations.len()).min(duplicates.len())
+    });
+    if room < duplicates.len() && room > 0 {
+        duplicates.select_nth_unstable_by(room - 1, |a, b| osm_id_cmp(*a, *b));
+    }
+    duplicates.truncate(room);
+    duplicates.sort_unstable_by(|a, b| osm_id_cmp(*a, *b));
+    violations.extend(
+        duplicates
+            .into_iter()
+            .map(|id| IdViolation::Duplicate { elem_type, id }),
+    );
     Ok(KindScan {
         count,
         violations,
@@ -1039,8 +1060,9 @@ fn verify_ids_full_parallel(
 /// taken and dropped here, so a saved result holds no allocation for it
 /// until the ordered merge. Results arrive in
 /// completion order, so which blob a duplicate is attributed to depends on
-/// it, as it already does for duplicates the atomic setters find; the totals
-/// do not. Test builds count the insertions on the run's token.
+/// it, as it already does for duplicates the atomic setters find; neither the
+/// totals nor the report do, since `merge_kind` orders duplicates by ID, not
+/// by blob. Test builds count the insertions on the run's token.
 fn settle_overflow(
     overflow: &mut IdSet,
     r: &mut BlobVerifyResult,

@@ -252,8 +252,8 @@ reader.for_each(|element| {
             for node_id in way.refs() {
                 // ...
             }
-            // Node locations (if the PBF has LocationsOnWays)
-            for (lat, lon) in way.node_locations() {
+            // Inline node locations, one per ref, if the way stores them
+            for location in way.node_locations() {
                 // ...
             }
         }
@@ -305,7 +305,7 @@ accessors checks the geographic domain; judge `nano_lat_exact()` /
 | `id()` | Element ID |
 | `tags()` | Iterator over `(key, value)` string pairs |
 | `refs()` | Iterator over referenced node IDs (`i64`) |
-| `node_locations()` | Iterator over `(lat, lon)` pairs if the PBF has LocationsOnWays |
+| `node_locations()` | Iterator over `WayNodeLocation` items in `refs()` order when the way stores inline coordinates; read from the payload, not the header (`HeaderBlock::has_locations_on_ways()` reports the declaration) |
 
 ### Relation methods
 

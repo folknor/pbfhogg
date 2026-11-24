@@ -22,14 +22,6 @@ source at `63d4ec1d`. Where a hunter judged the code wrong instead, the
 finding is filed in the matching `notes/bugs-*.md` document. Entries are in no
 order of importance.
 
-## DOC-005 - Way::node_locations claims to consult the header
-
-Reported by: read-block-decoding.
-
-The doc on `Way::node_locations()` (`read/elements.rs`) promises an empty
-iterator without `LocationsOnWays`. The implementation reads whatever
-coordinate arrays the way carries. The doc should describe payload presence.
-
 ## DOC-007 - Rebuild metadata docs describe behaviour the encoder dropped
 
 Reported by: write-encoding, sort-renumber, passthrough-rewrite.
@@ -169,7 +161,8 @@ explicitly pins that behaviour.
 Reported by: check-inspect.
 
 `check --locations` now verifies the LocationsOnWays claim within its
-documented limits.
+documented limits. `docs/guide/indexdata.md` repeats the same stale claim
+("the header's feature flags ... are not checked at all").
 
 ## DOC-024 - diff test comments still describe a header walk and ID-range shards
 
@@ -324,3 +317,14 @@ encodings also differ on re-encode: plain Info maps only -1 to absent
 (`WireInfo::parse`), so -2 stays raw behind `claimed_version`, while the
 dense re-encode (`reencoded_version` in `owned.rs`) writes -2 as decoded.
 Either the deviation is recorded, or the input is refused as libosmium does.
+
+## DOC-042 - Partial way coordinate arrays are refused with no DEVIATIONS.md entry
+
+Reported by: the scout of the node_locations doc fix, verified 2026-11-24.
+
+libosmium's `decode_way` (`pbf_decoder.hpp`) decodes refs and inline
+coordinates while all three arrays still have entries, so a way with lat
+present and lon missing or shorter yields a shortened (possibly empty) node
+list. pbfhogg refuses such a block at construction
+(`validate_way_geometry_arrays`, `read/block.rs`). DEVIATIONS.md has no
+entry for this difference.

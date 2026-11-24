@@ -199,8 +199,8 @@ pub(crate) struct OwnedWay {
     pub(crate) refs: Vec<i64>,
     /// Inline node coordinates (decimicro lat/lon), one per ref, for
     /// LocationsOnWays preservation. Empty when the source way carried no
-    /// inline coordinates (the common case: input header lacks the
-    /// `LocationsOnWays` feature). `read_way` always leaves this empty;
+    /// inline coordinates (the common case; the reader goes by the way's
+    /// payload, not the header's `LocationsOnWays` declaration). `read_way` always leaves this empty;
     /// only `read_way_with_locations` populates it, so existing consumers
     /// (sort, cat dedupe, degrade, time_filter) that go through `read_way`
     /// keep re-encoding via the plain `add_way` path unchanged. The

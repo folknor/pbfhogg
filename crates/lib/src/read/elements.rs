@@ -316,9 +316,21 @@ impl<'a> Way<'a> {
         WayRefIter::delta_decoded(self.way.refs_data)
     }
 
-    /// Returns an iterator over the way's node locations (latitude, longitude).
-    /// Only available if the optional `LocationsOnWays` feature is included in the
-    /// [`HeaderBlock`](crate::block::HeaderBlock) and should return an empty iterator otherwise.
+    /// Iterates over the [`WayNodeLocation`] values stored inline in this way.
+    ///
+    /// When the way stores coordinate entries, the iterator yields exactly one
+    /// location per node reference, in [`Self::refs`] order: the *n*th
+    /// location belongs to the *n*th reference, repeated references included.
+    /// Block construction refuses a way whose latitude, longitude and
+    /// reference counts disagree. When both coordinate arrays have zero
+    /// entries, the iterator is empty.
+    ///
+    /// This reads the way payload and never consults the file header, so a
+    /// way can carry locations its file does not declare. Use
+    /// [`HeaderBlock::has_locations_on_ways`](crate::block::HeaderBlock::has_locations_on_ways)
+    /// for whether the header declares `LocationsOnWays`. An item says
+    /// nothing about the referenced node itself: not that it exists, nor that
+    /// its own coordinates agree, nor that the value is geographically valid.
     pub fn node_locations(&self) -> WayNodeLocationsIter<'a> {
         WayNodeLocationsIter {
             dlats: PackedSint64Iter::new(self.way.lat_data),

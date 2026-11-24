@@ -537,11 +537,25 @@ impl<R: Read + Send> ElementReader<R> {
     /// against a fixed 256 MiB in-flight byte budget before reading further.
     /// Long-lived decode/map workers each fold into a
     /// single worker-local `T`; the caller then reduces at most one partial per
-    /// worker. Total reader working set stays well under 2 GiB regardless of
-    /// file size - even with pathological 32 MiB blobs - because nothing
-    /// accumulates the whole file. This is the key difference from a
-    /// collect-everything-then-decode design, which pinned ~1x the file size in
-    /// compressed blobs and OOM-killed at planet scale.
+    /// worker. For a given worker count, the reader's own buffering does not
+    /// grow with file size, because nothing accumulates the whole file. This
+    /// is the key difference from a collect-everything-then-decode design,
+    /// which pinned ~1x the file size in compressed blobs and OOM-killed at
+    /// planet scale.
+    ///
+    /// There is no global byte ceiling. The 256 MiB budget counts admitted
+    /// serialized Blob bodies only (one lone body larger than the budget is
+    /// still admitted), and the decompression pool caps the idle buffers it
+    /// keeps. On top of that each worker holds one decoded block at a time:
+    /// its decompressed payload with the string-table and group offset tables
+    /// appended, the codec's working state, and two offset-table scratch
+    /// lists that keep their largest capacity for the life of the read. These
+    /// scale with the block, not the file: a legal 32 MiB block of empty
+    /// strings needs 8 bytes of table per 2 wire bytes, so one worker can
+    /// reach several hundred MiB, and the total multiplies by the worker
+    /// count (`decode_threads`, else one fewer than the available cores).
+    /// Memory held by `T`, the closures or the underlying reader is the
+    /// caller's and is not bounded here.
     ///
     /// # Errors
     /// Returns the first Error encountered while parsing the PBF structure.
@@ -964,6 +978,12 @@ where
 {
     // Armed before `identity()` so even a panic there cancels cleanly.
     let mut cancel = CancelGuard::new(queue, budget);
+    // Decoded storage (payload, appended tables, this scratch) is not charged
+    // to the budget, which counts compressed bodies only. Admission after
+    // decompression or scan would come after the allocations it means to
+    // prevent, and sharing the body budget would make a worker wait on bytes
+    // only workers release; the per-worker decode peak is documented on
+    // `par_map_reduce` instead.
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     // `identity` runs once per worker, but only once the worker holds a batch

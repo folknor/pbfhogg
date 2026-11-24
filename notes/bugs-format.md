@@ -23,19 +23,17 @@ the scope or scopes, and the bracketed priority is the hunter's own label.
 Findings that match an existing mechanism were added to `notes/bugs.md`
 instead of being filed here. Entries are in no order of importance.
 
-## FMT-009 - par_map_reduce's sub-2-GiB working-set guarantee is false
+## FMT-031 - par_map_reduce worker scratch keeps its peak for the whole read
 
-Reported by: read-pipeline [P2].
+Reported by: spar on the par_map_reduce memory promise (lateral).
 
-`par_map_reduce` (`read/reader.rs`) promises a working set well under 2 GiB
-even with pathological 32 MiB blobs. Its admission weight counts only the
-compressed Blob body. A legal block near 32 MiB holding millions of empty
-string-table entries expands to about 128 MiB of entry scratch plus another
-128 MiB of appended offset tables (`read/wire.rs`), on top of the payload.
-Several workers on such blocks exceed the bound while staying well inside the
-compressed-byte budget. The sizes are derived from the representation, not
-measured. Keeping the guarantee would need admission that accounts for decoded
-storage, tables and worker scratch.
+`run_par_worker` (`read/reader.rs`) never releases `st_scratch` or
+`gr_scratch`. One block of empty groups followed by one of empty strings
+leaves a worker holding about 128 MiB in each list until the read ends, so an
+outlier block raises that worker's footprint for the rest of the file. The
+`commands`-gated `release_scratch` helper is not reachable from the core
+reader; a fix would move it into shared code. It does not lower the
+concurrent peak of a wave of such blocks.
 
 ## FMT-012 - pipeline_decode_tasks counts blobs that are never decompressed
 

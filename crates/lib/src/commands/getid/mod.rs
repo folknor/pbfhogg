@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::idset::IdSet;
 
 use super::output_header::{Declared, OutputFacts, Ways};
+use super::relation_closure::{EdgeStore, relation_phase};
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
@@ -16,12 +17,12 @@ use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::block::BlockBuffer;
 use crate::read::header_walker::ScanArm;
 use crate::read::input::{InputFile, InputSource, PinnedInput};
-use crate::read::project_ids::{RelationSpans, WaySpans};
+use crate::read::project_ids::WaySpans;
 use crate::scan::classify::ScheduledBlob;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
-use crate::{BlobFilter, Element, ElementKind, ElementReader, MemberId, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
 
@@ -1239,19 +1240,6 @@ fn getid_with_refs(
     Ok(stats)
 }
 
-/// What one relation blob contributes to the reference closure.
-#[derive(Default)]
-struct RelationRefs {
-    /// Node and way members of the relations the phase collects from.
-    nodes: Vec<i64>,
-    ways: Vec<i64>,
-    /// Relation members of the requested relations: the closure's seeds.
-    relations: Vec<i64>,
-    /// `(parent, child)` for every relation member of a relation that was
-    /// not requested, of either sign: the edges the closure walks.
-    edges: Vec<(i64, i64)>,
-}
-
 /// Close the requested relations over their members into `pulled`: node
 /// and way members of every relation reached, and the reached relations
 /// themselves (any not requested), recursively through relations in
@@ -1274,17 +1262,11 @@ struct RelationRefs {
 ///
 /// The edge store holds one pair per relation member of a relation, file
 /// wide, which is the price of the two-read bound (a fixed-point loop over
-/// the relation blobs, as tags-filter's closure runs, stores nothing but
-/// reads them once per nesting level). At planet it is about a million
-/// pairs, some 17 MB. It lives in its own anonymous mapping
-/// ([`EdgeStore`]), released as soon as the closure is walked, not in a
-/// `Vec`: glibc raises its dynamic mmap threshold when a large mmapped
-/// block goes back through `free`, after which the decompress buffers of
-/// every later phase came from the malloc arenas instead of mmap and stayed
-/// resident once freed. Measured at planet (bygg, 2026-11-03), peak
-/// anonymous memory: 402 MB without a relation read, 572 to 591 MB with
-/// the store a `Vec` dropped here. The per-blob edge vectors the workers
-/// hand over are still `Vec`s, each bounded by one blob.
+/// the relation blobs stores nothing but reads them once per nesting
+/// level). It lives in its own anonymous mapping ([`EdgeStore`], which says
+/// why), released as soon as the closure is walked. The per-blob edge
+/// vectors the workers hand over are still `Vec`s, each bounded by one
+/// blob.
 ///
 /// Every member is followed by its exact signed ID, negative ones
 /// included; osmium abs-folds a negative member (`positive_ref`), so for
@@ -1304,6 +1286,7 @@ fn close_relations(
         schedule,
         &ids.relation_ids,
         true,
+        None,
         |refs| {
             insert_all(&mut pulled.node_ids, refs.nodes);
             insert_all(&mut pulled.way_ids, refs.ways);
@@ -1341,6 +1324,7 @@ fn close_relations(
             schedule,
             &pulled.relation_ids,
             false,
+            None,
             |refs| {
                 insert_all(&mut pulled.node_ids, refs.nodes);
                 insert_all(&mut pulled.way_ids, refs.ways);
@@ -1349,150 +1333,6 @@ fn close_relations(
         )?;
     }
     Ok(())
-}
-
-/// The relation closure's `(parent, child)` edges, in an anonymous mapping
-/// of its own, grown geometrically by moving to a larger mapping, so that
-/// neither its growth nor its release goes through the malloc arenas (see
-/// [`close_relations`] for why). Each edge is 16 bytes, parent then child,
-/// both big-endian two's complement. The records sort as byte arrays with
-/// no unsafe view of the mapping; that order is numeric only among
-/// non-negative IDs (a negative ID sorts after every non-negative one), but
-/// [`Self::children`] searches by the same byte order and needs only that
-/// equal parents are contiguous, which holds for every `i64`.
-#[derive(Default)]
-struct EdgeStore {
-    map: Option<memmap2::MmapMut>,
-    len: usize,
-}
-
-/// One stored edge.
-type EdgeRecord = [u8; 16];
-
-impl EdgeStore {
-    const FIRST_CAPACITY: usize = crate::tunables::GETID_EDGE_STORE_FIRST_RECORDS;
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Bytes mapped, used or not.
-    fn mapped_bytes(&self) -> usize {
-        self.map.as_ref().map_or(0, |m| m.len())
-    }
-
-    fn records(&self) -> &[EdgeRecord] {
-        let bytes = self.map.as_deref().unwrap_or(&[]);
-        &bytes.as_chunks::<16>().0[..self.len]
-    }
-
-    /// Append `edges`, growing the mapping when they do not fit.
-    fn extend(&mut self, edges: &[(i64, i64)]) -> Result<()> {
-        let needed = self
-            .len
-            .checked_add(edges.len())
-            .ok_or_else(|| Error::internal("getid edge store: record count overflows"))?;
-        let capacity = self.mapped_bytes() / size_of::<EdgeRecord>();
-        if needed > capacity {
-            let grown = needed
-                .max(capacity.saturating_mul(2))
-                .max(Self::FIRST_CAPACITY);
-            let bytes = grown
-                .checked_mul(size_of::<EdgeRecord>())
-                .ok_or_else(|| Error::internal("getid edge store: size overflows"))?;
-            let mut map = memmap2::MmapMut::map_anon(bytes)?;
-            let used = self.len * size_of::<EdgeRecord>();
-            if let Some(old) = &self.map {
-                map[..used].copy_from_slice(&old[..used]);
-            }
-            // The old mapping is unmapped here, not freed into an arena.
-            self.map = Some(map);
-        }
-        let Some(map) = self.map.as_mut() else {
-            return Ok(());
-        };
-        let records = &mut map.as_chunks_mut::<16>().0[self.len..needed];
-        for (record, &(parent, child)) in records.iter_mut().zip(edges) {
-            record[..8].copy_from_slice(&parent.to_be_bytes());
-            record[8..].copy_from_slice(&child.to_be_bytes());
-        }
-        self.len = needed;
-        Ok(())
-    }
-
-    /// The store sorted by parent, ready for [`Self::children`].
-    fn sorted(mut self) -> Self {
-        if let Some(map) = self.map.as_mut() {
-            map.as_chunks_mut::<16>().0[..self.len].sort_unstable();
-        }
-        self
-    }
-
-    /// The children of `parent`, from a [`Self::sorted`] store.
-    fn children(&self, parent: i64) -> impl Iterator<Item = i64> + '_ {
-        let key = parent.to_be_bytes();
-        let records = self.records();
-        let from = records.partition_point(|r| r[..8] < key[..]);
-        records[from..]
-            .iter()
-            .take_while(move |r| r[..8] == key[..])
-            .map(|r| {
-                let mut child = [0_u8; 8];
-                child.copy_from_slice(&r[8..]);
-                i64::from_be_bytes(child)
-            })
-    }
-}
-
-/// One read of the relation blobs: for each relation in `collect`, its
-/// node and way members, and with `seed_edges` also its relation members
-/// (as seeds) and every other relation's relation members (as edges).
-///
-/// Each blob is validated through `RelationSpans` (no block built; refused
-/// exactly as construction refuses, and a relation blob whose claim its
-/// contents contradict is refused) before anything it recorded is read.
-fn relation_phase(
-    shared_file: &InputFile,
-    schedule: &[ScheduledBlob],
-    collect: &IdSet,
-    seed_edges: bool,
-    mut merge: impl FnMut(RelationRefs),
-    host: &crate::host::Entered<'_>,
-) -> Result<()> {
-    crate::scan::classify::parallel_project_phase(
-        shared_file,
-        schedule,
-        None,
-        Vec::new,
-        |_, buffer, relations| -> Result<RelationRefs> {
-            let (RelationSpans { .. }, accepted) =
-                buffer.project(|_, _| RelationSpans::new(&mut *relations))?;
-            let mut refs = RelationRefs::default();
-            for relation in relations.iter() {
-                let collected = collect.get(relation.id);
-                if !collected && !seed_edges {
-                    continue;
-                }
-                for member in relation.members(accepted.bytes())? {
-                    match member {
-                        MemberId::Node(id) if collected => refs.nodes.push(id),
-                        MemberId::Way(id) if collected => refs.ways.push(id),
-                        MemberId::Relation(id) if seed_edges => {
-                            if collected {
-                                refs.relations.push(id);
-                            } else {
-                                refs.edges.push((relation.id, id));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(refs)
-        },
-        |_seq, refs| merge(refs),
-        host,
-    )
 }
 
 /// Add the node refs of every way in `pulled.way_ids` to `pulled.node_ids`.
@@ -1790,6 +1630,7 @@ fn process_block(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::MemberId;
     use crate::writer::Compression;
 
     #[test]
@@ -2686,68 +2527,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The edge store keeps every pair across its growth (several moves
-    /// past the first mapping) and, sorted, answers each parent with
-    /// exactly its children, an unknown parent with none.
-    #[test]
-    fn edge_store_grows_sorts_and_answers_children() {
-        let mut store = EdgeStore::default();
-        assert_eq!(store.len(), 0);
-        let total = EdgeStore::FIRST_CAPACITY * 3 + 7;
-        let last = i64::try_from(total).unwrap();
-        // Parents descending, so sorting has work to do; parent p holds
-        // children 2p and 2p + 1. Appended in uneven batches.
-        let edges: Vec<(i64, i64)> = (0..last)
-            .rev()
-            .map(|i| (i / 2 + (1_i64 << 40), i))
-            .collect();
-        for batch in edges.chunks(10_007) {
-            store.extend(batch).unwrap();
-        }
-        assert_eq!(store.len(), total);
-        assert!(store.mapped_bytes() >= total * 16);
-        let store = store.sorted();
-        for parent in [0_i64, 1, 5_000, (last - 1) / 2] {
-            let mut got: Vec<i64> = store.children(parent + (1 << 40)).collect();
-            got.sort_unstable();
-            let want: Vec<i64> = [2 * parent, 2 * parent + 1]
-                .into_iter()
-                .filter(|&c| c < last)
-                .collect();
-            assert_eq!(got, want, "parent {parent}");
-        }
-        assert_eq!(store.children(7).count(), 0);
-        assert_eq!(EdgeStore::default().sorted().children(1).count(), 0);
-    }
-
-    /// Negative parents and children, the extremes and magnitude twins
-    /// included, each answer with exactly their own children.
-    #[test]
-    fn edge_store_answers_signed_parents() {
-        let mut store = EdgeStore::default();
-        let edges = [
-            (-1, 5),
-            (1, -5),
-            (-1, -6),
-            (i64::MIN, i64::MAX),
-            (0, -1),
-            (i64::MAX, i64::MIN),
-            (-1, 0),
-        ];
-        store.extend(&edges).unwrap();
-        let store = store.sorted();
-        let children = |parent| {
-            let mut got: Vec<i64> = store.children(parent).collect();
-            got.sort_unstable();
-            got
-        };
-        assert_eq!(children(-1), vec![-6, 0, 5]);
-        assert_eq!(children(1), vec![-5]);
-        assert_eq!(children(0), vec![-1]);
-        assert_eq!(children(i64::MIN), vec![i64::MAX]);
-        assert_eq!(children(i64::MAX), vec![i64::MIN]);
-        assert!(children(-5).is_empty());
     }
 }

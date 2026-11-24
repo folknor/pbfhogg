@@ -12,7 +12,7 @@ use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::input::{InputSource, PinnedInput};
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
 use crate::write::WriteOptions;
-use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use super::Result;
 
@@ -981,9 +981,10 @@ fn tags_filter_two_pass(
         if !distrust_metadata && has_unindexed {
             walker.observe_filter_index(None);
         }
-        let closure = collect_relation_member_closure(
+        collect_relation_member_closure(
             &input_file,
             &kind_schedule(&catalog, crate::ElementKind::Relation, distrust_metadata),
+            &direct_relation_ids,
             &mut included_relation_ids,
             &direct_way_ids,
             &mut member_way_ids,
@@ -991,8 +992,7 @@ fn tags_filter_two_pass(
             jobs,
             host,
         )?;
-        has_included_way |= closure.has_way;
-        has_included_relation |= closure.has_relation;
+        has_included_way |= !member_way_ids.is_empty();
     }
     host.invocation.marker("TAGSFILTER_CLOSURE_END");
 
@@ -1228,17 +1228,33 @@ fn tags_filter_two_pass(
 // Helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Default)]
-struct RelationClosureSummary {
-    has_way: bool,
-    has_relation: bool,
-}
-
-/// Expand relation membership transitively for default tags-filter mode.
+/// Expand relation membership transitively for default tags-filter mode:
+/// every relation reachable from a direct match through relation members
+/// joins `included_relation_ids` (which holds the direct matches on entry),
+/// and the node and way members of every included relation are collected.
 ///
-/// Starts from already-included relation IDs and repeatedly scans relation blobs:
-/// included relation -> include member nodes/ways/relations.
-/// Recursion terminates when no new relation IDs are discovered.
+/// At most two reads of the relation blobs, whatever the nesting depth
+/// (see [`super::relation_closure`]). The first collects the direct
+/// matches' members and every other relation's relation-to-relation edges;
+/// only `direct_relation_ids`, which nobody mutates during the read,
+/// decides which records are collected. The closure is then walked in
+/// memory with an explicit worklist, an ID entering `reached` when it is
+/// queued, so a cycle, a self-loop or a shared descendant is expanded once,
+/// and a direct match reached again is not (the first read took all its
+/// members). The second read runs only when the walk reached a relation
+/// that is not direct, and collects the node and way members of exactly
+/// those. Every record of a collected ID is expanded, so a repeated
+/// relation ID contributes the members of each of its records. A reached
+/// ID the file does not hold contributes nothing.
+///
+/// Provenance stays with pass 2: a direct match keeps its direct
+/// attribution however it was reached, a way already in `direct_way_ids`
+/// never becomes a member way (its refs were collected in pass 1), and
+/// every relation member node lands in `relation_dep_node_ids`.
+///
+/// The fixed point this replaced decoded every relation blob once per
+/// nesting level and held each worker's member vectors for a whole
+/// iteration; this streams per-blob vectors to the consumer.
 ///
 /// `schedule` comes from [`kind_schedule`], which widens it to every OsmData
 /// blob under `--distrust-metadata`.
@@ -1246,103 +1262,99 @@ struct RelationClosureSummary {
 #[allow(clippy::too_many_arguments)]
 fn collect_relation_member_closure(
     shared_file: &crate::read::input::InputFile,
-    // Reused across convergence iterations.
     schedule: &[crate::scan::classify::ScheduledBlob],
+    direct_relation_ids: &IdSet,
     included_relation_ids: &mut IdSet,
     direct_way_ids: &IdSet,
     member_way_ids: &mut IdSet,
     relation_dep_node_ids: &mut IdSet,
     jobs: Option<usize>,
     host: &crate::host::Entered<'_>,
-) -> Result<RelationClosureSummary> {
-    let mut summary = RelationClosureSummary::default();
+) -> Result<()> {
+    use super::relation_closure::{EdgeStore, RelationRefs, relation_phase};
 
-    struct ClosureResult {
-        node_ids: Vec<i64>,
-        way_ids: Vec<i64>,
-        relation_ids: Vec<i64>,
-    }
-
-    loop {
-        let mut added_relations = 0_u64;
-
-        // Classify phase: workers read included_relation_ids (immutable).
-        // Results collected into a Vec - merge phase runs after with mutable access.
-        // Note: this uses parallel_classify_accumulate (per-worker
-        // accumulation) rather than parallel_classify_phase. The merge
-        // step needs `&mut included_relation_ids` while the classify
-        // step needs `&included_relation_ids`, so they cannot co-exist
-        // in the same parallel_classify_phase call. Per-worker
-        // accumulation is fine here at planet (per-worker Vec<i64>
-        // tops at ~80 MB even in the worst invert-match case;
-        // measured 6.8 GB total for this phase). collect_way_node_deps
-        // is the one that hit 24 GB and needed the per-blob shape.
-        //
-        // A block walk on purpose, an estimate rather than a measurement
-        // (no planet cell matches relations): one iteration reads only the
-        // relation blobs, which extract's relation classify reads in about
-        // 1 s at planet, so the re-parse a projection would remove sits
-        // under the noise floor even over a few iterations.
-        let mut results: Vec<ClosureResult> = Vec::new();
-        crate::scan::classify::parallel_classify_accumulate(
-            shared_file,
-            schedule,
-            jobs,
-            || ClosureResult {
-                node_ids: Vec::new(),
-                way_ids: Vec::new(),
-                relation_ids: Vec::new(),
-            },
-            |block, result| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element {
-                        if !included_relation_ids.get(r.id()) {
-                            continue;
-                        }
-                        for member in r.members() {
-                            match member.id {
-                                MemberId::Node(id) => result.node_ids.push(id),
-                                MemberId::Way(id) => result.way_ids.push(id),
-                                MemberId::Relation(id) => result.relation_ids.push(id),
-                                MemberId::Unknown(..) => {}
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            },
-            |cr| results.push(cr),
-            host,
-        )?;
-
-        // Merge phase: mutate included sets.
-        for cr in results {
-            if !cr.node_ids.is_empty() || !cr.way_ids.is_empty() || !cr.relation_ids.is_empty() {
-                summary.has_relation = true;
-            }
-            for id in cr.node_ids {
-                relation_dep_node_ids.insert(id);
-            }
-            for id in cr.way_ids {
-                // A direct match is already included and its refs already
-                // collected; only a new non-direct way is a member way.
-                if !direct_way_ids.get(id) && member_way_ids.insert_if_new(id) {
-                    summary.has_way = true;
-                }
-            }
-            for id in cr.relation_ids {
-                if included_relation_ids.insert_if_new(id) {
-                    added_relations += 1;
-                }
+    // Non-direct relations reached by the walk: the second read's set.
+    let mut reached = IdSet::new();
+    let mut worklist: Vec<i64> = Vec::new();
+    let mut edges = EdgeStore::default();
+    let mut store_failed: Option<crate::Error> = None;
+    let mut merge_members = |refs: &RelationRefs| {
+        for &id in &refs.nodes {
+            relation_dep_node_ids.insert(id);
+        }
+        for &id in &refs.ways {
+            if !direct_way_ids.get(id) {
+                member_way_ids.insert(id);
             }
         }
+    };
+    relation_phase(
+        shared_file,
+        schedule,
+        direct_relation_ids,
+        true,
+        jobs,
+        |refs| {
+            // After a store failure the run fails; drain without growing.
+            if store_failed.is_some() {
+                return;
+            }
+            merge_members(&refs);
+            for &id in &refs.relations {
+                if !direct_relation_ids.get(id) && reached.insert_if_new(id) {
+                    worklist.push(id);
+                }
+            }
+            if let Err(e) = edges.extend(&refs.edges) {
+                store_failed = Some(e);
+            }
+        },
+        host,
+    )?;
+    if let Some(e) = store_failed {
+        return Err(e);
+    }
+    host.invocation
+        .counter("tagsfilter_relation_edges", edges.len());
 
-        if added_relations == 0 {
-            break;
+    if worklist.is_empty() {
+        return Ok(());
+    }
+    host.invocation.check()?;
+    let edges = edges.sorted();
+    host.invocation.check()?;
+    // Pops and examined edges both count toward the next cancellation
+    // check: one pop can scan a long child list of known relations.
+    let mut steps: u32 = 0;
+    let mut step = || -> Result<()> {
+        steps += 1;
+        if steps >= crate::tunables::RELATION_CLOSURE_CHECK_EVERY {
+            steps = 0;
+            host.invocation.check()?;
+        }
+        Ok(())
+    };
+    while let Some(id) = worklist.pop() {
+        step()?;
+        included_relation_ids.insert(id);
+        for child in edges.children(id) {
+            step()?;
+            if !direct_relation_ids.get(child) && reached.insert_if_new(child) {
+                worklist.push(child);
+            }
         }
     }
+    drop(edges);
 
-    Ok(summary)
+    relation_phase(
+        shared_file,
+        schedule,
+        &reached,
+        false,
+        jobs,
+        |refs| merge_members(&refs),
+        host,
+    )
 }
 
 /// One OsmData blob from pass 1's header walk: its schedule entry (with the
@@ -1461,9 +1473,9 @@ fn collect_way_node_dependencies(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::ElementKind;
     use crate::owned::TypeFilter;
     use crate::writer::{Compression, PbfWriter};
+    use crate::{ElementKind, MemberId};
     use std::path::Path;
 
     fn filter_for(expressions: &[&str]) -> Option<BlobFilter> {

@@ -1417,10 +1417,11 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
 // Parallel classify parity: jobs=1 vs jobs=4 across multiple blobs
 // ---------------------------------------------------------------------------
 //
-// Two-pass `tags-filter` routes blob scanning through
-// `parallel_classify_phase` and the follow-up relation/way-node
-// dependency closures through two `parallel_classify_accumulate`
-// calls. `-j N` caps the worker-pool size for all three calls. With
+// Two-pass `tags-filter` routes every blob scan through a worker pool
+// that `-j N` caps: pass 1, the relation closure's reads, the way-node
+// dependency walk and pass 2. The filter here selects ways only, so the
+// closure and the way-node walk do not run: this checks pass 1 and
+// pass 2 parity only. With
 // single-blob fixtures the sharding is trivial; this test forces
 // multiple blobs and asserts that jobs=1 and jobs=4 produce the same
 // element set and identical stats. The full stderr summary line is

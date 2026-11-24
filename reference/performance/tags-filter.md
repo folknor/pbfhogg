@@ -1,5 +1,25 @@
 # Tags Filter
 
+### Relation closure in two reads (bygg, 2026-11-24, `2a367d6a` + change)
+
+Default tags-filter's relation closure moved from a fixed point (every
+relation blob decoded once per nesting level) to getid's shape: one read
+collecting the direct matches' members and every relation-to-relation
+edge, an in-memory worklist, and a second read for the reached
+non-direct relations only. `tag-select --dataset planet`, `--iterations
+1`, baseline a `--commit 2a367d6a` worktree, variant uncommitted,
+interleaved.
+
+| Filter | Baseline | Variant | Closure span |
+|---|---|---|---|
+| `r/type=route` | 58.9 s (`018fe041`), 58.7 s (`72a2076f`) | 55.6 s (`34f26d78`), 55.7 s (`7e541a82`) | 3885 to 937 ms |
+| `r/route=bus` | 53.9 s (`860d83f9`) | 52.8 s (`a920b0d4`) | 1664 to 667 ms |
+
+`r/type=route` is about 5 % faster, sign consistent over both pairs;
+the other phases are equal and the summary line is identical. On
+`r/route=bus` the wall delta is noise; the closure span and the RSS at
+its end (2.22 to 1.87 GB) fell. Invert-match was not measured.
+
 ### OSC XML lexical checks (bygg, 2026-11-24, `b13a2c8d` + change)
 
 `tag-select --input-kind osc --input 4920` (planet, `w/highway=primary`),

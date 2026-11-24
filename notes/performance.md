@@ -1286,42 +1286,35 @@ by text. Medium-confidence: partition-owner counting instead of mutex shards.
 
 Kind: high conviction.
 
-## PERF-043 - tags-filter closure rescans relations to a fixed point
+## PERF-043 - tags-filter two-pass dependency scans beyond the relation closure
 
 Reported by: tags, framing, decode, indexdata.
 
-Mechanism: `collect_relation_member_closure` rescans every relation blob each
-iteration and expands every included relation again; workers retain member
-vectors and one thread inserts IDs. `collect_way_node_dependencies` scans the
-whole way schedule though it needs relation-selected ways; matched ways decode
-refs in classification and again in output. `CatalogEntry` keeps kind but drops
-`min_id` / `max_id`, so `IdSet::any_in_range` cannot prune (getid does). Pass
-2 sets `want_nodes = true` even when node inclusion sets are empty. Substring and
-wildcard keys disable key-based blob filtering though the stored key set could
-answer conservatively.
+The relation closure itself is done: it now takes at most two relation reads
+(shared `commands/relation_closure.rs` with getid), planet `r/type=route`
+closure span 3.9 to 0.9 s, about 5 % of wall (reference/performance/
+tags-filter.md, 2026-11-24). What remains, all unmeasured:
 
-Redesign: dependency order - relations read once into adjacency and packed
-typed member lists, worklist closure (as `getid::close_relations`), ways after
-closure combining direct match and inclusion with one ref collection, nodes
-after all dependencies, output assembled by source ordinals from bounded buffers
-or compressed scratch; route requested way IDs to blobs instead of a planet
-way-to-node graph; partitioned reference insertion (PERF-025); local: keep ID
-ranges, skip empty node pass, wider tag-index use.
+- `collect_way_node_dependencies` scans the whole way schedule for the member
+  ways (WaySpans projection was already measured at 2.3 %, under the floor;
+  routing requested way IDs to blobs is the untried shape).
+- Matched ways decode refs in pass 1 classification and again in pass 2.
+- `CatalogEntry` keeps kind but drops `min_id` / `max_id`, so
+  `IdSet::any_in_numeric_range` cannot prune the way-deps or pass-2
+  schedules; closure members scatter over the ID space, so expect little.
+- Pass 2 schedules node blobs (`BlobFilter::new(true, ..)`) even when every
+  node inclusion set is empty.
+- Substring and wildcard keys disable key-based blob filtering in pass 1,
+  though the stored key set could answer conservatively.
+- The closure's second read scans every relation blob; a replay of only the
+  blobs that hold reached IDs (positions recorded in read 1, every record
+  of a repeated ID kept) would save it for sparse nested queries.
+- One consumer inserts every reference (PERF-025).
 
-Payoff: closure becomes one graph build and one traversal; concentrated in
-relation-heavy queries.
+Invert-match at planet (closure over nearly every relation) was not
+re-measured after the change.
 
-Risks: spooling cost may exceed saved decode; cycles, missing refs, duplicate
-IDs and versions, source order, provenance (direct matches, way nodes, closure
-objects affect tag removal and stats differently); stored spans must not point
-into pooled decompression buffers.
-
-Kind: high conviction (fixed-point removal).
-
-Defect hunt 2026-11-17 (id-filter-selection) independently observed the
-per-nesting-level rescan and repeated collection of already reached members,
-pointing to `getid` as the existing explicit worklist; it labels this an
-unmeasured optimization, not a correctness finding.
+Kind: local changes, low to moderate conviction.
 
 ## PERF-044 - tags-filter OSC formats every element before deciding to keep it
 

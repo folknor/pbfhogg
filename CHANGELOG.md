@@ -606,6 +606,13 @@
 
 ### Changed
 
+- **Default `tags-filter` reads relation blobs at most twice, however
+  deeply relations nest.** The relation-membership closure used to decode
+  every relation blob once per nesting level; it now builds the
+  relation-to-relation graph in one read and walks it in memory, as
+  `getid --add-referenced` does. The closure phase of a planet
+  `r/type=route` filter fell from about 3.9 s to 0.9 s (about 5 % of the
+  run); output is unchanged.
 - **An oversize-blob refusal no longer advises fewer elements per blob
   where the command offers no way to do that.** The error states the size
   and the limit; `repack` and `degrade` still add `; lower

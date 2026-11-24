@@ -1066,13 +1066,17 @@ pub(crate) const EXPORT_CONSUMER_BATCH_BYTES: usize = 1 << 20;
 pub(crate) const DEGENERATE_SEGMENT_EPSILON: f64 = 1e-30;
 
 // ---------------------------------------------------------------------------
-// getid
+// Relation closure (getid --add-referenced, default tags-filter)
 // ---------------------------------------------------------------------------
 
-/// `getid --add-referenced`: records (16 bytes each) in the relation-closure
-/// edge store's first anonymous mapping, 1 MiB. The store doubles from
-/// there; a file without relations in relations never maps it at all.
-pub(crate) const GETID_EDGE_STORE_FIRST_RECORDS: usize = 1 << 16;
+/// Records (16 bytes each) in the relation-closure edge store's first
+/// anonymous mapping, 1 MiB. The store doubles from there; a file without
+/// relations in relations never maps it at all.
+pub(crate) const RELATION_EDGE_STORE_FIRST_RECORDS: usize = 1 << 16;
+
+/// Worklist steps (pops plus edges examined) between cancellation checks
+/// in the in-memory walk of a relation closure.
+pub(crate) const RELATION_CLOSURE_CHECK_EVERY: u32 = 1 << 14;
 
 // ---------------------------------------------------------------------------
 // Check and inspect

@@ -1645,10 +1645,9 @@ impl Drop for StopOnUnwind<'_> {
 /// bound on per-worker `S` memory at the largest scale you support,
 /// multiplied by the number of decode threads.
 ///
-/// Safe: relation classify (~68 MB per worker at planet) and relation
-/// closure members (~13 MB per worker, e.g.
-/// `tags_filter::collect_relation_member_closure`). These are sparse paths
-/// where `S` is dominated by a small set of relation-local IDs or metadata.
+/// Safe: relation classify (~68 MB per worker at planet). This is a sparse
+/// path where `S` is dominated by a small set of relation-local IDs or
+/// metadata.
 ///
 /// Unsafe in practice: per-worker `IdSet` accumulation of node IDs during
 /// way classify. A worker can touch node IDs across the full planet range,
@@ -1684,15 +1683,12 @@ impl Drop for StopOnUnwind<'_> {
 /// (mutable borrow). They run concurrently - classify on workers,
 /// merge on the consumer thread. If your classify needs `&X` while
 /// merge needs `&mut X` for the same `X`, the borrow checker correctly
-/// rejects the closure pair. This is exactly the case in
-/// `tags_filter::collect_relation_member_closure`'s convergence loop:
-/// classify reads `&included_relation_ids`, merge calls
-/// `included_relation_ids.set_if_new(id)`. Stay on
-/// `parallel_classify_accumulate` for those - the merge runs after
-/// the parallel scope, so there's no read/write conflict, and
-/// per-worker `Vec<i64>` member-list state is bounded by member counts
-/// (relation closure: ~tens of MB / worker at planet) rather than by
-/// ID space.
+/// rejects the closure pair. A fixed-point loop that reads a set in
+/// classify and grows it in merge is the shape; staying here works
+/// because the merge runs after the parallel scope. Often the better
+/// answer is to freeze the set the workers read and grow a separate one,
+/// as the relation closures of getid and tags-filter do
+/// (`commands::relation_closure`).
 ///
 /// # Failure
 ///

@@ -22,6 +22,7 @@ pub(crate) mod input_front;
 pub mod inspect;
 pub mod merge_changes;
 pub(crate) mod output_header;
+pub(crate) mod relation_closure;
 pub mod renumber;
 pub mod repack;
 pub mod sort;

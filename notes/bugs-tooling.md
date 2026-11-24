@@ -88,6 +88,17 @@ records a FAIL. The contract gives a recorded failure precedence over
 ENVIRONMENT only, so either outcome is defensible, but it should be chosen
 explicitly and both diagnostics kept.
 
+## TOOL-054 - verify never cross-checks default tags-filter
+
+Reported by: the relation-closure rewrite (2026-11-24).
+
+`crates/verify/src/checks/tags_filter.rs` runs only `--omit-referenced`
+against `osmium tags-filter -R`, plus the OSC path. Default mode (relation
+closure, way dependencies, provenance) has synthetic tests only and no
+real-data oracle. osmium's default mode abs-folds negative IDs, which
+pbfhogg deliberately does not (DEVIATIONS.md), so a check needs inputs
+without negative IDs or a comparison that accounts for it.
+
 ## TOOL-007 - verify sort never exercises the unindexed fallback
 
 Reported by: verify (flagged as a coverage limitation).

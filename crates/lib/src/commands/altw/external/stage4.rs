@@ -508,6 +508,7 @@ pub(super) fn stage4_assembly(
         crate::ordered_pool::DecodeSchedule::from_items(&schedule, |d| !d.is_passthrough);
     let decode_at = &decode_at;
     let schedule = &schedule;
+    let limits = &crate::commands::split::Limits::new(writer.compression());
 
     // Worker-side cumulative counters.
     let worker_counters = Stage4WorkerCounters::new();
@@ -715,15 +716,20 @@ pub(super) fn stage4_assembly(
                             index,
                             tagdata: None,
                             way_members: inject_prepass.then(|| {
-                                let payload = crate::commands::altw::reframe::way_members_payload(
+                                crate::commands::altw::reframe::way_members_payload(
                                     way_count,
                                     &way_reframe_scratch.member_ways,
-                                );
-                                inject_metrics
-                                    .record_blob(way_reframe_scratch.pin_tally, payload.len());
-                                payload
+                                )
                             }),
                         });
+                        let (blocks, field5_bytes) = crate::commands::altw::fit_output(
+                            std::mem::take(output_blocks),
+                            limits,
+                        )
+                        .map_err(at_frame)?;
+                        if inject_prepass {
+                            inject_metrics.record_blob(way_reframe_scratch.pin_tally, field5_bytes);
+                        }
 
                         let block_stats = Stats {
                             ways_written: way_count,
@@ -736,7 +742,7 @@ pub(super) fn stage4_assembly(
                         c.way_reframe_ms.fetch_add(elapsed, Relaxed);
                         c.blobs.fetch_add(1, Relaxed);
                         c.way_blobs_processed.fetch_add(1, Relaxed);
-                        return Ok((std::mem::take(output_blocks), block_stats));
+                        return Ok((blocks, block_stats));
                     }
 
                     // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
@@ -797,7 +803,10 @@ pub(super) fn stage4_assembly(
                     c.nonway_blobs_processed.fetch_add(1, Relaxed);
                     c.blobs.fetch_add(1, Relaxed);
 
-                    Ok((std::mem::take(output_blocks), block_stats))
+                    let (blocks, _) =
+                        crate::commands::altw::fit_output(std::mem::take(output_blocks), limits)
+                            .map_err(at_frame)?;
+                    Ok((blocks, block_stats))
                 })();
 
             // Track max live buffer bytes for this worker.

@@ -845,6 +845,16 @@
   blobs that fit, each indexed from its own content, as `renumber` cuts
   its blobs; every other block is written as before. Still refused: a
   single element too large for a blob with only its own strings.
+- **`add-locations-to-ways` cuts a way blob its coordinates grow past 32
+  MiB.** Each way blob was written as one output blob, so long ways whose
+  nodes lie far apart could take an input blob that fit over the payload
+  limit, and the run failed with a size error, nothing published. Such a
+  blob is now cut between ways into blobs that fit, each indexed from its
+  own content, under every index strategy. Under `--inject-prepass` each
+  piece carries the `pbfhogg.WayMembers-v1` bits of its own ways, and a way
+  blob with more ways than one blob header holds bits for is cut by way
+  count instead of failing on the header. Still refused: a single way too
+  large for a blob with only its own strings.
 - **An incompressible block near 32 MiB gets the typed size refusal under
   zlib.** The zlib encoder reserved about 0.1 % over the input and failed
   with an internal "did not complete in one call" error when level 1's

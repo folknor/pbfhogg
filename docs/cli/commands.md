@@ -2085,6 +2085,19 @@ whole, undecoded, on its tagdata and ID range when removing untagged nodes.
 Sparse does not depend on order and joins such a file. See
 [indexdata-trust.md](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
 
+Each way blob is written as one output blob unless the coordinates grow it
+past what a blob can hold: the 32 MiB payload limit, or, compressed, a body
+that expands past the 32 MiB blob size (long ways whose consecutive nodes lie
+far apart carry the widest deltas). Such a blob is cut between ways into blobs
+that fit, each with its own index, under every index strategy and the
+`--force` fallback alike; the same holds for any node blob a run re-encodes.
+Under `--inject-prepass` each piece carries the `pbfhogg.WayMembers-v1` bits
+of its own ways, and a way blob holding more ways than one blob header has
+room bits for (about 523,000) is cut by way count even when its payload fits.
+Nothing a way carries changes. What is still refused (exit 2): a single way
+that does not fit even with only its own strings, and a cut that needs the
+last few bytes below the limit.
+
 ```
 pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 ```

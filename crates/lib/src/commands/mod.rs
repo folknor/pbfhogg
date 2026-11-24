@@ -300,7 +300,8 @@ pub(crate) fn flush_local<O: BlockSink + ?Sized>(
 /// blocks recovers on the typed overflow with its records retained, as
 /// apply-changes does (`apply_changes/overflow.rs`), or cuts the finished
 /// wire bytes with the shared cut (`commands/split.rs`), as renumber, the
-/// history time-filter and the sort / `cat --dedupe` sweep do. A command
+/// history time-filter, the sort / `cat --dedupe` sweep and
+/// add-locations-to-ways do. A command
 /// that frames inside [`FramedBlocks`] (cat re-encode, snapshot
 /// time-filter, extract) or writes its owned blocks directly (tags-filter,
 /// getid, getparents) has not opted in and still refuses such a block.

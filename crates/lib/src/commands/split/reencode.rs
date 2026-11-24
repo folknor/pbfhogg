@@ -159,11 +159,12 @@ pub(super) fn plan<'b>(
     block: &'b [u8],
     layout: &'b Layout,
     limit: usize,
+    max_count: u64,
 ) -> Option<(Cut<'b>, Vec<usize>)> {
     let c = Cut::new(block, layout);
     let counts: Vec<u64> = c.units.iter().map(|u| u.count).collect();
     let mut window = Window::new(&c);
-    let cuts = partition(&counts, |i, j| window.size(i, j), limit)?;
+    let cuts = partition(&counts, |i, j| window.size(i, j), limit, max_count)?;
     Some((c, cuts))
 }
 

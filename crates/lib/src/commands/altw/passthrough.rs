@@ -231,6 +231,7 @@ fn decode_one(
     inject_metrics: &InjectMetrics,
     scratch: &mut WorkerScratch,
     counters: &Pass2Counters,
+    limits: &crate::commands::split::Limits,
 ) -> crate::Result<(Vec<OwnedBlock>, Stats)> {
     let t_pread = crate::counters::Stopwatch::start();
     scratch
@@ -278,14 +279,17 @@ fn decode_one(
             index,
             tagdata: None,
             way_members: inject_prepass.then(|| {
-                let payload = crate::commands::altw::reframe::way_members_payload(
+                crate::commands::altw::reframe::way_members_payload(
                     stats.way_count,
                     &scratch.way_scratch.member_ways,
-                );
-                inject_metrics.record_blob(scratch.way_scratch.pin_tally, payload.len());
-                payload
+                )
             }),
         });
+        let (blocks, field5_bytes) =
+            super::fit_output(std::mem::take(&mut scratch.output), limits)?;
+        if inject_prepass {
+            inject_metrics.record_blob(scratch.way_scratch.pin_tally, field5_bytes);
+        }
         let block_stats = Stats {
             ways_written: stats.way_count,
             missing_locations: stats.missing_locations,
@@ -294,7 +298,7 @@ fn decode_one(
         };
         t_reframe.record_ns(&counters.way_reframe_ns);
         counters.way_blobs.fetch_add(1, Relaxed);
-        return Ok((std::mem::take(&mut scratch.output), block_stats));
+        return Ok((blocks, block_stats));
     }
 
     // Non-way decode (Node decode when keep_untagged_nodes=false; Unknown).
@@ -340,7 +344,8 @@ fn decode_one(
     block_stats.blobs_decoded = 1;
     t_nonway.record_ns(&counters.nonway_ns);
     counters.nonway_blobs.fetch_add(1, Relaxed);
-    Ok((std::mem::take(&mut scratch.output), block_stats))
+    let (blocks, _) = super::fit_output(std::mem::take(&mut scratch.output), limits)?;
+    Ok((blocks, block_stats))
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -410,6 +415,7 @@ pub(super) fn write_output_passthrough(
         .counter("altw_pass2_decode_threads", decode_threads);
     let decode_at = &decode_at;
     let schedule = &schedule;
+    let limits = &crate::commands::split::Limits::new(writer.compression());
 
     // Worker-side cumulative counters + the depth-gated WAIT span for
     // workers blocked handing results to the consumer (same StallGauge
@@ -475,6 +481,7 @@ pub(super) fn write_output_passthrough(
                 inject_metrics,
                 scratch,
                 p2_counters_ref,
+                limits,
             )
             // Cold: only a failure builds the location, from the true
             // blob index and frame start the walker handed out.

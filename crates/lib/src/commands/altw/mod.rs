@@ -27,6 +27,29 @@ use crate::error::Error;
 use self::passthrough::write_output_passthrough;
 use self::sparse::{SparseArrayIndex, build_node_index_sparse};
 
+/// Every block produced for one input blob, with each the writer would
+/// refuse cut between elements by the shared cut (`commands/split.rs`).
+/// Splicing coordinates grows a way block, so a way blob that framed can
+/// come out too large for one blob, and a block carrying a field-5 bitmap
+/// can hold more ways than its BlobHeader has room for. A block that fits
+/// costs one length comparison. Returns the field-5 bytes written, summed
+/// over the final blocks, for the injected-prepass counter.
+pub(super) fn fit_output(
+    blocks: Vec<OwnedBlock>,
+    limits: &crate::commands::split::Limits,
+) -> Result<(Vec<OwnedBlock>, usize)> {
+    let mut out = Vec::with_capacity(blocks.len());
+    let mut field5_bytes = 0usize;
+    for block in blocks {
+        crate::commands::split::fit_scanned(block, limits, |piece, _| {
+            field5_bytes += piece.way_members.as_ref().map_or(0, Vec::len);
+            out.push(piece);
+            Ok(())
+        })?;
+    }
+    Ok((out, field5_bytes))
+}
+
 /// Bytes available to an unprivileged writer on the filesystem holding `dir`
 /// (`statvfs` `f_bavail * f_frsize`). `purpose` names the caller in the
 /// error text. The one free-space probe for both backends: sparse checks it
@@ -1381,6 +1404,7 @@ fn write_output_decode_all(
     )?;
 
     let mut decoded_blocks = 0_u64;
+    let limits = &crate::commands::split::Limits::new(writer.compression());
     reader.for_each_fused_block(
         |block| {
             let mut bb = BlockBuilder::new();
@@ -1398,6 +1422,7 @@ fn write_output_decode_all(
                 &mut locations_buf,
             )?;
             flush_local(&mut bb, &mut output)?;
+            let (output, _) = fit_output(output, limits)?;
             Ok((output, block_stats))
         },
         |(blocks, block_stats)| {

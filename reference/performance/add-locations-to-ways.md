@@ -1,5 +1,28 @@
 # Add Locations To Ways
 
+### Output blocks pass through the shared cut (bygg, 2026-11-24, baseline `bce05b91`)
+
+Every block a pass-2 or stage-4 worker produces now goes through
+`commands/split.rs` `fit_scanned` (one length comparison for a block that
+fits) and is collected into a fresh `Vec` per input blob. Planet,
+`embed-locations --index-type external`, `--iterations 1`, interleaved
+baseline (`--commit HEAD` at `bce05b91`) and uncommitted variant cells,
+bygg, untrimmed. `EXTJOIN_STREAMING` (stages 3 and 4, the only code
+touched) from `--durations`:
+
+| Cell | Arm | UUID | Wall | EXTJOIN_STREAMING |
+|---|---|---|---|---|
+| 1 | baseline | `bf4be05e` | 334.5 s | 135.7 s |
+| 2 | variant | `bf76913e` | 312.0 s | 135.1 s |
+| 3 | baseline | `64b436ce` | 332.5 s | 125.8 s |
+| 4 | variant | `99a2becd` | 341.7 s | 131.4 s |
+
+Wall deltas change sign between pairs and are carried by stage 2, which
+the change does not touch (167.0 s against 144.8 s in the first pair).
+The streaming span moves -0.5 % and +4.4 %, opposite signs: no cost
+measurable on normal input. Sparse was not measured; its pass 2 gained the
+same per-blob call.
+
 ### Sparse pass 1 swaps instead of storing (plantasjen, 2026-11-21, baseline `59bfcae3`)
 
 The sparse store's per-slot write became `AtomicU64::swap`, so a duplicate

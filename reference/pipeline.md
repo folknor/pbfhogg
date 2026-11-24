@@ -186,7 +186,7 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 - Default element cap from `block_builder::DEFAULT_ELEMENT_CAP`, one element type per block
 - `StringTable` over one byte arena, deduplicated with FxHash
 - Reusable wire scratch buffers (`wire.rs` encoding primitives)
-- Output: `OwnedBlock { bytes: Vec<u8>, index: BlobIndex, tagdata: Option<Vec<u8>>, way_members: Option<Vec<u8>> }` - serialized data + index + optional tagdata + optional BlobHeader field-5 way-member payload (`None` from every current producer)
+- Output: `OwnedBlock { bytes: Vec<u8>, index: BlobIndex, tagdata: Option<Vec<u8>>, way_members: Option<Vec<u8>> }` - serialized data + index + optional tagdata + optional BlobHeader field-5 way-member payload (`None` from the builder; add-locations-to-ways `--inject-prepass` sets it on the way blocks it reframes, and the shared cut in `commands/split.rs` gives each piece of such a block the bits of its own ways)
 
 Used by all commands that produce PBF output.
 

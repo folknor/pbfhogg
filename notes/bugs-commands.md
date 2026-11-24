@@ -185,24 +185,6 @@ only by a single element too large for a blob or a missed partition. Fix
 shape: locate the refusal at the input and frame of the block's first or
 offending element.
 
-## CMD-066 - add-locations-to-ways writes one block per way blob, however large
-
-Reported by: the CMD-050 spar (2026-11-24).
-
-Both indexed engines (`altw/passthrough.rs` `decode_one`, and
-`altw/external/stage4.rs`) emit the reframed way payload as one block per
-input way blob, and the unindexed decode-all fallback (`altw/mod.rs`) adds
-locations through a count-cut `BlockBuilder`. Adding coordinates grows a
-block: 8000 ways of 1200 refs with metre-scale deltas carry about 38 MB of
-location arrays alone, so a frameable input blob comes out refused (exit 2)
-with no cap flag to lower. Fix shape: cut the finished payload between ways,
-reusing the shared wire partition (`commands/split.rs`), deriving each
-piece's ID range from the ways it holds (IDs keep their gaps), slicing the
-`WayMembers` bitmap and per-way pin data with them; no extra scan for a
-block that frames. The guarantee is scoped to pieces that fit with the
-repeated string table, and body-limit and `HeaderWayMembers` overflows need
-the same treatment if the fix promises recovery generally.
-
 ## CMD-067 - The oversize refusal advises fewer elements per blob where no flag exists
 
 Reported by: the spar accounting of the block-size items (2026-11-24), from

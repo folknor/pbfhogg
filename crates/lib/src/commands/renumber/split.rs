@@ -100,7 +100,8 @@ fn cut(
     limit: usize,
 ) -> crate::Result<Option<Vec<Indexed>>> {
     let layout = layout(block)?;
-    let Some(plan) = plan(block, &layout, limit) else {
+    // Renumber writes no field-5 payload, so no piece has an element ceiling.
+    let Some(plan) = plan(block, &layout, limit, u64::MAX) else {
         return Ok(None);
     };
     let mut pieces = Vec::with_capacity(plan.len());

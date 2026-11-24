@@ -2,10 +2,13 @@
 //! blocks that each fit, between elements, on its wire bytes.
 //!
 //! A block can pass the blob payload limit while every input blob it came
-//! from framed: renumber's id splice widens varints, and a command that
-//! packs records from many input blobs into one builder cut by count (the
-//! history `time-filter`, the `sort` / `cat --dedupe` overlap sweep) can
-//! gather more bytes than one blob holds. The block's own bytes are the
+//! from framed: renumber's id splice widens varints,
+//! add-locations-to-ways splices coordinates into every way, and a command
+//! that packs records from many input blobs into one builder cut by count
+//! (the history `time-filter`, the `sort` / `cat --dedupe` overlap sweep)
+//! can gather more bytes than one blob holds. A block carrying a field-5
+//! way-member bitmap is also cut to keep its BlobHeader under its cap (see
+//! [`fit_scanned`]). The block's own bytes are the
 //! record of what it holds, so nothing is retained to recover it: the cut
 //! reads the finished block, plans its pieces, and assembles them one at a
 //! time. A block that fits is never touched beyond one length comparison;
@@ -341,16 +344,27 @@ impl<'a> Sizes<'a> {
 }
 
 /// Cut points `0 = c0 < c1 < ... = n` over items whose element counts are
-/// `counts`, such that every piece `[c_k, c_k+1)` fits `limit` by `size`
-/// and holds an element, or `None` when no such cut exists. `size(i, j)`
-/// must be monotone in both ends; it is called with both ends
-/// non-decreasing from one call to the next, `i < j`.
+/// `counts`, such that every piece `[c_k, c_k+1)` fits `limit` by `size`,
+/// holds at most `max_count` elements and holds an element, or `None` when
+/// no such cut exists. `size(i, j)` must be monotone in both ends; it is
+/// called with both ends non-decreasing from one call to the next, `i < j`.
+/// The element count is monotone too, so both bounds move the same lower
+/// end before a predecessor is chosen.
 fn partition(
     counts: &[u64],
     mut size: impl FnMut(usize, usize) -> usize,
     limit: usize,
+    max_count: u64,
 ) -> Option<Vec<usize>> {
     let n = counts.len();
+    let mut held = Vec::with_capacity(n + 1);
+    held.push(0u64);
+    for &c in counts {
+        held.push(held[held.len() - 1].saturating_add(c));
+    }
+    let over = |i: usize, j: usize, size: &mut dyn FnMut(usize, usize) -> usize| {
+        held[j] - held[i] > max_count || size(i, j) > limit
+    };
     // `pred[j]`: the cut a piece ending at reachable cut `j` starts from.
     let mut pred: Vec<Option<usize>> = vec![None; n + 1];
     let mut reachable: Vec<usize> = vec![0];
@@ -360,7 +374,7 @@ fn partition(
         if counts[j - 1] > 0 {
             last_element = Some(j - 1);
         }
-        while lo < j && size(lo, j) > limit {
+        while lo < j && over(lo, j, &mut size) {
             lo += 1;
         }
         let Some(e) = last_element else { continue };
@@ -444,19 +458,24 @@ impl Plan<'_> {
 }
 
 /// A plan cutting `block` (taken apart as `layout`) into pieces of at most
-/// `limit` bytes: the first cut where it finds a partition, else the
-/// re-encoding cut, else `None`.
-pub(crate) fn plan<'b>(block: &'b [u8], layout: &'b Layout, limit: usize) -> Option<Plan<'b>> {
+/// `limit` bytes and `max_count` elements: the first cut where it finds a
+/// partition, else the re-encoding cut, else `None`.
+pub(crate) fn plan<'b>(
+    block: &'b [u8],
+    layout: &'b Layout,
+    limit: usize,
+    max_count: u64,
+) -> Option<Plan<'b>> {
     let counts: Vec<u64> = layout.items.iter().map(|it| it.count).collect();
     let sizes = Sizes::new(layout);
-    if let Some(cuts) = partition(&counts, |i, j| sizes.size(i, j), limit) {
+    if let Some(cuts) = partition(&counts, |i, j| sizes.size(i, j), limit, max_count) {
         return Some(Plan {
             how: How::Whole { block, layout },
             cuts,
             limit,
         });
     }
-    let (cut, cuts) = reencode::plan(block, layout, limit)?;
+    let (cut, cuts) = reencode::plan(block, layout, limit, max_count)?;
     Some(Plan {
         how: How::Reencode(cut),
         cuts,
@@ -470,21 +489,87 @@ pub(crate) fn plan<'b>(block: &'b [u8], layout: &'b Layout, limit: usize) -> Opt
 /// module documentation). `emit`'s second argument is what the caller
 /// holds besides the block it is given: 0 for a block passed whole, the
 /// cut block's length for a piece. A block the cut finds no fitting plan
-/// for goes to `emit` whole, for the writer to refuse with its typed size
-/// error; a plan is chosen and checked before its first piece is emitted.
+/// for goes to `emit` whole and the writer decides: it refuses with its
+/// typed size error a block over a hard limit, and frames one the cut's
+/// conservative bounds only suspected; a plan is chosen and checked before
+/// its first piece is emitted.
 ///
-/// The cut takes a block with no `way_members`: that header field is not
-/// derived from the payload, so a producer that sets one must say what each
-/// piece carries before it may come here.
+/// A block carrying a `pbfhogg.WayMembers-v1` payload (BlobHeader field 5,
+/// one bit per way in file order) is held to one more bound: the header
+/// must stay under its cap, and the bitmap cannot be dropped, so a block
+/// with more than [`MAX_WAY_MEMBER_WAYS`] ways is cut even when its payload
+/// fits. Each piece's ways are a contiguous run of the block's, in order,
+/// so each piece carries the bits of its own run, repacked from bit zero.
+/// The pin bitmaps (way field 20) sit inside the way messages and travel
+/// with their bytes.
 pub(crate) fn fit_scanned(
     block: OwnedBlock,
     limits: &Limits,
     mut emit: impl FnMut(OwnedBlock, usize) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    if limits.frames(&block.bytes)? {
+    let count_fits = block.way_members.is_none() || block.index.count <= MAX_WAY_MEMBER_WAYS;
+    if count_fits && limits.frames(&block.bytes)? {
         return emit(block, 0);
     }
     fit_scanned_cold(block, limits, &mut emit)
+}
+
+/// The most ways a block carrying a field-5 payload may hold. The
+/// BlobHeader must stay strictly under `MAX_BLOB_HEADER_SIZE` (64 KiB), and
+/// besides the bitmap it holds the `OSMData` type field (9 bytes), the
+/// datasize field (at most 6), the indexdata field (44) and the field-5
+/// head (tag, length varint, version, count varint: at most 8); tagdata is
+/// dropped by the writer when it does not fit. 128 bytes of the cap are
+/// kept for those, the rest is bitmap.
+pub(crate) const MAX_WAY_MEMBER_WAYS: u64 =
+    (crate::read::blob_wire::MAX_BLOB_HEADER_SIZE - 128) * 8;
+
+/// A block's own field-5 payload, read back: its bitmap, after checking it
+/// is version 1, counts `count` ways, and is `ceil(count / 8)` bytes with
+/// no bit set past the last way. The payload is this crate's, so anything
+/// else is an encoder bug.
+fn way_member_bits(payload: &[u8], count: u64) -> crate::Result<&[u8]> {
+    let bad = |why: &str| {
+        Err(Error::internal(format!(
+            "block cut: way members payload {why}"
+        )))
+    };
+    if payload.first() != Some(&1) {
+        return bad("is not version 1");
+    }
+    let mut cursor = Cursor::new(&payload[1..]);
+    let declared = cursor.read_varint().map_err(wire_err)?;
+    if declared != count {
+        return bad("counts other than the block's ways");
+    }
+    let bits = &payload[1 + cursor.position()..];
+    if usize::try_from(count.div_ceil(8)) != Ok(bits.len()) {
+        return bad("has a bitmap of the wrong length");
+    }
+    if count % 8 != 0 && bits.last().is_some_and(|&b| b >> (count % 8) != 0) {
+        return bad("sets a bit past the last way");
+    }
+    Ok(bits)
+}
+
+/// The field-5 payload for ways `[start, start + count)` of `bits`.
+fn way_member_slice(bits: &[u8], start: u64, count: u64) -> Vec<u8> {
+    let mut payload = vec![1];
+    protohoggr::encode_varint(&mut payload, count);
+    let first = payload.len();
+    payload.resize(first + usize::try_from(count.div_ceil(8)).unwrap_or(0), 0);
+    for k in 0..count {
+        let at = start + k;
+        let set = usize::try_from(at / 8)
+            .ok()
+            .and_then(|byte| bits.get(byte))
+            .is_some_and(|&b| b >> (at % 8) & 1 == 1);
+        if set {
+            let k = usize::try_from(k).unwrap_or(usize::MAX);
+            payload[first + k / 8] |= 1 << (k % 8);
+        }
+    }
+    payload
 }
 
 #[cold]
@@ -494,21 +579,31 @@ fn fit_scanned_cold(
     limits: &Limits,
     emit: &mut dyn FnMut(OwnedBlock, usize) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    if block.way_members.is_some() {
-        return Err(Error::internal(
-            "block cut: a block carrying way members reached the cut",
-        ));
-    }
+    let (bits, max_count) = match block.way_members.as_deref() {
+        Some(payload) => {
+            if block.index.kind != crate::ElementKind::Way {
+                return Err(Error::internal(
+                    "block cut: a block of other elements carries way members",
+                ));
+            }
+            (
+                Some(way_member_bits(payload, block.index.count)?),
+                MAX_WAY_MEMBER_WAYS,
+            )
+        }
+        None => (None, u64::MAX),
+    };
     let held = block.bytes.len();
     let chosen = {
         let layout = layout(&block.bytes)?;
-        match choose(&block.bytes, &layout, limits)? {
+        match choose(&block.bytes, &layout, limits, max_count)? {
             Some(plan) => {
                 let mut total = 0u64;
                 for k in 0..plan.len() {
                     let piece = plan.piece(k)?;
+                    let members = bits.map(|bits| way_member_slice(bits, total, piece.count));
                     total += piece.count;
-                    emit(scanned(piece, block.index.kind)?, held)?;
+                    emit(scanned(piece, block.index.kind, members)?, held)?;
                 }
                 if total != block.index.count {
                     return Err(Error::internal(format!(
@@ -531,14 +626,15 @@ fn choose<'b>(
     block: &'b [u8],
     layout: &'b Layout,
     limits: &Limits,
+    max_count: u64,
 ) -> crate::Result<Option<Plan<'b>>> {
-    if let Some(plan) = plan(block, layout, limits.sure) {
+    if let Some(plan) = plan(block, layout, limits.sure, max_count) {
         return Ok(Some(plan));
     }
     if limits.sure >= limits.raw {
         return Ok(None);
     }
-    let Some(plan) = plan(block, layout, limits.raw) else {
+    let Some(plan) = plan(block, layout, limits.raw, max_count) else {
         return Ok(None);
     };
     for k in 0..plan.len() {
@@ -549,8 +645,13 @@ fn choose<'b>(
     Ok(Some(plan))
 }
 
-/// A piece with the index and tagdata its own bytes scan to.
-fn scanned(piece: Piece, kind: crate::ElementKind) -> crate::Result<OwnedBlock> {
+/// A piece with the index and tagdata its own bytes scan to, and its slice
+/// of the block's field-5 payload.
+fn scanned(
+    piece: Piece,
+    kind: crate::ElementKind,
+    way_members: Option<Vec<u8>>,
+) -> crate::Result<OwnedBlock> {
     let (index, tags) = crate::blob_meta::scan_block_ids_and_tags(&piece.bytes)?;
     let index: BlobIndex =
         index.ok_or_else(|| Error::internal("block cut: a piece no single index describes"))?;
@@ -568,7 +669,7 @@ fn scanned(piece: Piece, kind: crate::ElementKind) -> crate::Result<OwnedBlock> 
         bytes: piece.bytes,
         index,
         tagdata,
-        way_members: None,
+        way_members,
     })
 }
 
@@ -753,13 +854,150 @@ mod tests {
     }
 
     #[test]
-    fn a_block_carrying_way_members_is_refused_at_the_cut() {
+    fn a_block_of_other_elements_carrying_way_members_is_refused_at_the_cut() {
         let mut block = relations(&[(1, 300), (2, 300)]);
-        block.way_members = Some(vec![1]);
+        block.way_members = Some(way_member_slice(&[0], 0, 2));
         let limit = block.bytes.len() / 2;
         let err = fit_scanned(block, &small(limit), |_, _| Ok(()))
             .err()
             .unwrap();
         assert!(err.to_string().contains("way members"), "{err}");
+    }
+
+    /// A field-5 payload whose bit `k` is `member(k)`.
+    fn members_payload(count: u64, member: impl Fn(u64) -> bool) -> Vec<u8> {
+        let mut bits = vec![0u8; usize::try_from(count.div_ceil(8)).unwrap()];
+        for k in 0..count {
+            if member(k) {
+                bits[(k / 8) as usize] |= 1 << (k % 8);
+            }
+        }
+        way_member_slice(&bits, 0, count)
+    }
+
+    /// The membership bits of a sequence of pieces, concatenated.
+    fn piece_bits(out: &[(OwnedBlock, usize)]) -> Vec<bool> {
+        let mut seen = Vec::new();
+        for (piece, _) in out {
+            let payload = piece.way_members.as_deref().unwrap();
+            let bits = way_member_bits(payload, piece.index.count).unwrap();
+            for k in 0..piece.index.count {
+                seen.push(bits[(k / 8) as usize] >> (k % 8) & 1 == 1);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn an_oversized_way_block_carries_each_piece_its_own_member_bits() {
+        let mut bb = BlockBuilder::new();
+        let pad = "w".repeat(200);
+        for id in 1..=11i64 {
+            let value = format!("{pad}{id}");
+            bb.add_way(
+                id,
+                [("name", value.as_str())],
+                &[id * 10, id * 10 + 1],
+                None,
+            );
+        }
+        let mut block = bb.take_owned().unwrap().unwrap();
+        let member = |k: u64| k % 3 == 0 || k == 10;
+        block.way_members = Some(members_payload(11, member));
+        let limit = block.bytes.len() / 4;
+        let out = fit_all(block, &small(limit));
+        assert!(out.len() >= 4, "{} pieces", out.len());
+        assert!(
+            out.iter().any(|(p, _)| p.index.count % 8 != 0),
+            "a piece boundary that is not byte-aligned"
+        );
+        let want: Vec<bool> = (0..11).map(member).collect();
+        assert_eq!(piece_bits(&out), want);
+    }
+
+    /// A way block of `count` bare ways, ids 1..=count, in one group.
+    fn bare_ways(count: u64) -> Vec<u8> {
+        let mut group = Vec::new();
+        let mut way = Vec::new();
+        for id in 1..=count {
+            way.clear();
+            protohoggr::encode_tag(&mut way, 1, protohoggr::WIRE_VARINT);
+            protohoggr::encode_varint(&mut way, id);
+            protohoggr::encode_tag(&mut group, 3, WIRE_LEN);
+            protohoggr::encode_varint(&mut group, way.len() as u64);
+            group.extend_from_slice(&way);
+        }
+        let mut block = Vec::new();
+        // An empty string table: one empty string.
+        protohoggr::encode_tag(&mut block, 1, WIRE_LEN);
+        protohoggr::encode_varint(&mut block, 2);
+        protohoggr::encode_tag(&mut block, 1, WIRE_LEN);
+        protohoggr::encode_varint(&mut block, 0);
+        protohoggr::encode_tag(&mut block, 2, WIRE_LEN);
+        protohoggr::encode_varint(&mut block, group.len() as u64);
+        block.extend_from_slice(&group);
+        block
+    }
+
+    fn frames_header(piece: &OwnedBlock) -> bool {
+        let mut buf = Vec::new();
+        crate::write::encode_blob_header_into(
+            "OSMData",
+            i32::MAX,
+            Some(&piece.index.serialize()),
+            None,
+            piece.way_members.as_deref(),
+            &mut buf,
+        )
+        .is_ok()
+    }
+
+    /// The header bound alone: a body far under the payload limit whose
+    /// bitmap would not fit one BlobHeader is cut by way count.
+    #[test]
+    fn a_block_whose_bitmap_overflows_the_header_is_cut_by_way_count() {
+        let count = MAX_WAY_MEMBER_WAYS + 1001;
+        let bytes = bare_ways(count);
+        let (index, _) = crate::blob_meta::scan_block_ids_and_tags(&bytes).unwrap();
+        let member = |k: u64| k % 7 == 2;
+        let block = OwnedBlock {
+            bytes,
+            index: index.unwrap(),
+            tagdata: None,
+            way_members: Some(members_payload(count, member)),
+        };
+        assert!(
+            !frames_header(&block),
+            "the fixture must overflow the header"
+        );
+        let limits = Limits::new(Compression::None);
+        assert!(limits.frames(&block.bytes).unwrap());
+        let out = fit_all(block, &limits);
+        assert!(out.len() >= 2, "{} pieces", out.len());
+        for (piece, _) in &out {
+            assert!(piece.index.count <= MAX_WAY_MEMBER_WAYS);
+            assert!(frames_header(piece));
+        }
+        let want: Vec<bool> = (0..count).map(member).collect();
+        assert_eq!(piece_bits(&out), want);
+    }
+
+    /// The ceiling is safe: a header at it, with the widest datasize and
+    /// indexdata, frames.
+    #[test]
+    fn a_header_at_the_way_ceiling_frames() {
+        let piece = OwnedBlock {
+            bytes: Vec::new(),
+            index: BlobIndex {
+                kind: crate::ElementKind::Way,
+                min_id: i64::MIN,
+                max_id: i64::MAX,
+                count: MAX_WAY_MEMBER_WAYS,
+                bbox: None,
+            },
+            tagdata: None,
+            way_members: Some(members_payload(MAX_WAY_MEMBER_WAYS, |_| true)),
+        };
+        assert!(frames_header(&piece));
     }
 }

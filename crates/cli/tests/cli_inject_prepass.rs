@@ -212,6 +212,79 @@ fn backend_parity_inject_prepass() {
     assert_eq!(sparse.1, external.1, "way_members differ between backends");
 }
 
+/// One input way blob that frames, whose ways grow past one blob's payload
+/// limit once coordinates are spliced in: 8000 ways alternating between two
+/// nodes at opposite corners of the map, so each ref's two coordinate
+/// deltas take five bytes each against the ref delta's one. Both backends
+/// cut the output between ways, and each piece carries the field-5 bits of
+/// its own ways, in file order.
+#[test]
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn a_way_blob_grown_past_the_limit_is_cut_with_its_member_bits() {
+    const WAYS: i64 = 8_000;
+    const REFS: usize = 420;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let corner = |id: i64, sign: i32| TestNode {
+        id,
+        lat: sign * 800_000_000,
+        lon: sign * 1_700_000_000,
+        tags: vec![],
+        meta: None,
+    };
+    let nodes = vec![corner(1, -1), corner(2, 1)];
+    let refs: Vec<i64> = (0..REFS).map(|k| 1 + (k % 2) as i64).collect();
+    let ways: Vec<TestWay> = (1..=WAYS).map(|id| way(100 + id, refs.clone())).collect();
+    let member_ids = [101, 109, 4_000, 4_003, 8_100];
+    let relations: Vec<TestRelation> = member_ids
+        .iter()
+        .enumerate()
+        .map(|(k, &w)| mp_relation(1 + k as i64, w))
+        .collect();
+    write_indexed_pbf(&input, &nodes, &ways, &relations);
+    assert_eq!(
+        way_blob_count(&input),
+        1,
+        "the fixture's ways sit in one input blob"
+    );
+
+    let expected: Vec<bool> = (1..=WAYS)
+        .map(|id| member_ids.contains(&(100 + id)))
+        .collect();
+    let mut seen = Vec::new();
+    for backend in ["sparse", "external"] {
+        let output = dir.path().join(format!("{backend}.osm.pbf"));
+        run_inject(&input, &output, backend);
+        assert!(
+            way_blob_count(&output) >= 2,
+            "{backend}: the way blob was not cut"
+        );
+        let (ways_out, members) = read_inject_artifacts(&output);
+        assert_eq!(ways_out.len(), WAYS as usize, "{backend}");
+        let mut bits = Vec::new();
+        for (bitmap, count) in &members {
+            for k in 0..*count as usize {
+                bits.push(bitmap[k / 8] >> (k % 8) & 1 == 1);
+            }
+        }
+        assert_eq!(bits, expected, "{backend}: member bits out of place");
+        seen.push((ways_out, members));
+    }
+    assert_eq!(seen[0], seen[1], "the backends cut differently");
+}
+
+fn way_blob_count(path: &Path) -> usize {
+    let mut count = 0;
+    for blob in BlobReader::from_path(path).expect("open") {
+        if let BlobDecode::OsmData(block) = blob.expect("read").decode().expect("decode")
+            && block.elements().any(|e| matches!(e, Element::Way(_)))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
 // ---------------------------------------------------------------------------
 // Oracle roundtrip (Brick 2 contract gate)
 // ---------------------------------------------------------------------------

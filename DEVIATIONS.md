@@ -1103,6 +1103,20 @@ otherwise keeps the last supported compressed field. No known writer produces
 the shape. `reference/truncation-handling.md` records the
 trade.
 
+## PBF decoding: a declared Blob raw_size must match the payload length
+
+When pbfhogg decodes a blob, it compares any declared `Blob.raw_size` with
+the actual payload length and rejects a mismatch as corruption. The field may
+be absent. See [truncation handling](reference/truncation-handling.md).
+
+For zlib blobs, libosmium's `decode_blob` passes the declared size to
+`zlib_uncompress_string`, which resizes an empty output string to that size
+before calling `uncompress`. A declaration too small for the output causes
+`Z_BUF_ERROR`. If the declaration is too large but within libosmium's size
+limit, `uncompress` can succeed and report the shorter length. The helper
+returns a view of the entire string, including the trailing zero bytes.
+pbfhogg rejects the blob before passing its payload to the block decoder.
+
 ## add-locations-to-ways: nodes in a non-default-framed way blob are refused
 
 A way blob is spliced, not rebuilt: its way coordinates are written in

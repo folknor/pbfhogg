@@ -225,8 +225,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                     &mut st_scratch,
                     &mut gr_scratch,
                 )?;
-                crate::commands::release_scratch(&mut st_scratch);
-                crate::commands::release_scratch(&mut gr_scratch);
+                crate::retention::release_scratch(&mut st_scratch);
+                crate::retention::release_scratch(&mut gr_scratch);
                 super::common::refuse_blob_foreign_kind(&blob, &block, source.as_ref())?;
                 for element in block.elements_skip_metadata() {
                     match (phase, &element) {

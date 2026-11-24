@@ -1263,7 +1263,7 @@ fn run_filtered_pass(
         let mut output = super::FramedBlocks::new(compression, &host.invocation.metrics().writer);
         let count = process_block(block, bb, &mut output, &tf, clean, refs_buf)?;
         flush_local(bb, &mut output)?;
-        super::release_scratch(refs_buf);
+        crate::retention::release_scratch(refs_buf);
         Ok((output.frames, count))
     };
     // Called in schedule order; a write error ends the pass at once.

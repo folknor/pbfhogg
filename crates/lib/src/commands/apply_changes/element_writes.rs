@@ -250,11 +250,11 @@ pub(super) struct RefreshScratch {
 
 impl RefreshScratch {
     /// Clear every buffer for the next blob, releasing one a blob grew past
-    /// the retention limit (`commands::release_scratch`). Each holds one way's
+    /// the retention limit (`retention::release_scratch`). Each holds one way's
     /// worth, so on real data the limit never engages; it bounds a hostile
     /// way with a huge ref list.
     pub(super) fn release_outliers(&mut self) {
-        use crate::commands::release_scratch;
+        use crate::retention::release_scratch;
         release_scratch(&mut self.info);
         release_scratch(&mut self.lats);
         release_scratch(&mut self.lons);

@@ -257,26 +257,25 @@ thread_local! {
     // `into_blocks_pipelined` that read runs in the background, so it lasts
     // while a paused iterator holds the read open.
     //
-    // They deliberately do not follow the release rule
-    // (`commands::release_scratch` against `MAX_RETAINED_SCRATCH_CAPACITY`)
-    // that apply-changes' worker scratch applies to its own copies of the
+    // They follow the retention rule (`retention::release_scratch` against
+    // `MAX_RETAINED_SCRATCH_CAPACITY`) after every blob (`ScratchGrowth`), as
+    // `ElementReader`'s sequential and `par_map_reduce` loops and
+    // apply-changes, extract and altw stage 4 do with their copies of the
     // same two lists. On the measured planet file the largest any worker
     // reached was 2 MiB for the string table and 4 KiB for the groups
     // (`pipeline_scratch_*_capacity_peak_bytes` of a planet pipelined read,
     // bygg, 30 decode workers, at 82be10a4; table sizes are the data's),
-    // so the 4 MiB line would never fire there: the rule frees nothing on
-    // that input and the check would only be measured for its own cost.
-    // What each worker keeps below the line is the working set the next
-    // large block needs. Above the line, inputs the planet file does not
-    // contain (an entry is at least two wire bytes, so a 32 MiB block can
-    // grow the table to 128 MiB, four times its payload; hostile input, or
-    // a writer packing far more strings per block) would leave each worker
-    // that parsed one holding it for the rest of the read. Releasing would
-    // narrow that from workers x size to min(workers, decode_ahead) x size,
-    // a real gain only where decode_ahead is below the worker count (a
-    // caller's setting, or a host with more than decode_ahead + 2 CPUs).
-    // That is the cheap partial step if a bound on such input is wanted;
-    // a whole-read memory budget would be the stronger control.
+    // so the 4 MiB line never fires there and costs one capacity compare
+    // per list per blob. What each worker keeps below the line is the
+    // working set the next large block needs. Above it, inputs the planet
+    // file does not contain (an entry is at least two wire bytes, so a
+    // 32 MiB block can grow the table to 128 MiB, four times its payload;
+    // hostile input, or a writer packing far more strings per block) would
+    // otherwise leave every worker that ever parsed one holding it for the
+    // rest of the read, including while a paused `into_blocks_pipelined`
+    // iterator holds the read open. Releasing bounds that to the workers
+    // holding such a block at once; it does not lower the peak of a wave of
+    // them, for which a whole-read memory budget would be the control.
     //
     // What the whole pool holds is `pipeline_scratch_pool_capacity_peak_bytes`
     // (the per-worker maxima above bound one worker only). Planet
@@ -289,8 +288,9 @@ thread_local! {
     // that measured run, so it would remove none of those 31.6 MiB there.
     // On the block-building paths (plain pipelined reads, geocode pass 1,
     // time-filter, the fused altw and tags-filter transforms, getid's
-    // accepted projections) it would stop a large table staying on every
-    // worker that met one, but no peak there is set by this scratch, and it
+    // accepted projections) it would save the list's working set, which the
+    // retention rule already caps between blocks, no peak there is set by
+    // this scratch, and it
     // would cost a count pass or extra payload growth on every block plus a
     // validator that reads the tables from two representations. Declined
     // on that evidence, not as impossible: a workload whose peak is this
@@ -320,8 +320,8 @@ fn scratch_bytes(list: &Vec<(u32, u32)>) -> usize {
 
 /// Records a worker's scratch growth over one blob when dropped, so growth
 /// made before a transform panics (which the task's `catch_unwind` turns
-/// into an error) is counted like any other: the lists keep that capacity
-/// for the rest of the read.
+/// into an error) is counted like any other, then applies the retention
+/// rule to both lists and records what it released.
 struct ScratchGrowth<'s> {
     st: &'s mut Vec<(u32, u32)>,
     gr: &'s mut Vec<(u32, u32)>,
@@ -332,10 +332,20 @@ struct ScratchGrowth<'s> {
 
 impl Drop for ScratchGrowth<'_> {
     fn drop(&mut self) {
-        let after = (scratch_bytes(self.st), scratch_bytes(self.gr));
-        if after != self.before {
+        let grown = (scratch_bytes(self.st), scratch_bytes(self.gr));
+        if grown != self.before {
             self.metrics
-                .record_scratch_growth(self.scratch_pool, self.before, after);
+                .record_scratch_growth(self.scratch_pool, self.before, grown);
+        }
+        // The blob is done with both lists (whatever it built owns its
+        // tables), so an outlier is released here, after its growth counted.
+        crate::retention::release_scratch(self.st);
+        crate::retention::release_scratch(self.gr);
+        let kept = scratch_bytes(self.st).saturating_add(scratch_bytes(self.gr));
+        let released = grown.0.saturating_add(grown.1).saturating_sub(kept);
+        if released != 0 {
+            self.metrics
+                .record_scratch_release(self.scratch_pool, released);
         }
     }
 }
@@ -1374,8 +1384,50 @@ mod tests {
         assert_eq!(peak(&metrics.scratch_gr_capacity_peak_bytes), 8);
     }
 
-    /// Growth made before a transform panics is still counted: the worker
-    /// keeps that capacity for the rest of the read.
+    /// An outlier list is counted at its peak, then released after its
+    /// blob, and leaves the read's running sum: a second outlier on another
+    /// worker afterwards does not raise the pool peak above one of them.
+    #[test]
+    fn an_outlier_scratch_list_counts_then_leaves_the_pool() {
+        let metrics = PipelineMetrics::new();
+        let pool = AtomicU64::new(0);
+        let pair = size_of::<(u32, u32)>();
+        let outlier = crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY / pair + 1;
+        let mut peaks = Vec::new();
+        for _ in 0..2 {
+            let mut st = Vec::new();
+            let mut gr = Vec::new();
+            {
+                let growth = ScratchGrowth {
+                    st: &mut st,
+                    gr: &mut gr,
+                    before: (0, 0),
+                    metrics: &metrics,
+                    scratch_pool: &pool,
+                };
+                growth.st.reserve_exact(outlier);
+                peaks.push(growth.st.capacity() * pair);
+            }
+            assert_eq!(st.capacity(), 0, "the outlier list was released");
+            assert_eq!(pool.load(Ordering::Relaxed), 0);
+        }
+        let largest = peaks.iter().copied().max().unwrap() as u64;
+        assert_eq!(
+            metrics
+                .scratch_pool_capacity_peak_bytes
+                .load(Ordering::Relaxed),
+            largest
+        );
+        assert_eq!(
+            metrics
+                .scratch_st_capacity_peak_bytes
+                .load(Ordering::Relaxed),
+            largest
+        );
+    }
+
+    /// Growth made before a transform panics is still counted, and a list
+    /// below the retention line is kept for the next blob.
     #[test]
     fn scratch_growth_before_a_panic_is_counted() {
         let metrics = PipelineMetrics::new();

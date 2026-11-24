@@ -262,18 +262,6 @@ impl WorkerBuilder {
     }
 }
 
-/// Clear a worker scratch vector for the next task, releasing it if one
-/// task grew it past the retention limit, so it does not pin an outlier for
-/// the run (the rule `BlockBuilder` applies to its own buffers).
-pub(crate) fn release_scratch<T>(v: &mut Vec<T>) {
-    v.clear();
-    if v.capacity().saturating_mul(std::mem::size_of::<T>())
-        > crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY
-    {
-        drop(std::mem::take(v));
-    }
-}
-
 /// Flush the current block from a [`BlockBuilder`] into a worker's
 /// [`BlockSink`].
 ///

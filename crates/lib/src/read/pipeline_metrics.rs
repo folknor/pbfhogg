@@ -65,19 +65,22 @@ crate::counters::counter_set! {
         /// invocation has reached, including gaps. This preserves the old
         /// `reorder_high_water` meaning as a completion-skew diagnostic.
         pub reorder_window_high_water => "pipeline_reorder_window_high_water",
-        /// Maximum retained capacity (bytes) of the per-decode-thread
-        /// `ST_SCRATCH` Vec (string-table entries in `scan_block_fields`):
-        /// the largest any one decode thread has retained, not a sum across
+        /// Maximum capacity (bytes) of the per-decode-thread `ST_SCRATCH`
+        /// Vec (string-table entries in `scan_block_fields`), observed at
+        /// the end of a blob before the retention rule may release it: the
+        /// largest any one decode thread has reached, not a sum across
         /// threads (that is `scratch_pool_capacity_peak_bytes`).
         pub scratch_st_capacity_peak_bytes => "pipeline_scratch_st_capacity_peak_bytes",
-        /// Maximum retained capacity (bytes) of the per-decode-thread
-        /// `GR_SCRATCH` Vec (group-range kv pairs).
+        /// Maximum capacity (bytes) of the per-decode-thread `GR_SCRATCH`
+        /// Vec (group-range kv pairs), observed as for the string table.
         pub scratch_gr_capacity_peak_bytes => "pipeline_scratch_gr_capacity_peak_bytes",
-        /// What one read's decode pool retains in scratch: the sum over
-        /// that read's decode workers of both lists' capacity (bytes), the
-        /// maximum over the invocation's pipelined reads. The scratch never
-        /// shrinks during a read, so the sum is what the pool holds just
-        /// before it is joined. It is the largest single read's pool, not
+        /// Maximum accounted scratch capacity (bytes) of one read's decode
+        /// pool: the sum over its workers of both lists' capacity, sampled
+        /// as each blob ends its scratch use, before the retention rule
+        /// releases an outlier list (which then leaves the sum); the maximum
+        /// over the invocation's pipelined reads. Being sampled, it can miss
+        /// two outliers live at once on different workers whose blobs end
+        /// apart. It is the largest single read's pool, not
         /// what overlapping reads of one invocation hold together, and it is
         /// allocated capacity, not resident memory: pages past the most
         /// entries a list has held need not be touched.
@@ -106,9 +109,8 @@ impl PipelineMetrics {
     /// maxima take `after`; `read_pool` is the read's own running sum of
     /// its workers' capacities, which this moves by the change and whose
     /// new total raises the invocation's pool peak. Each read's workers
-    /// start empty, so the largest total is the read's final pool sum, and
-    /// a maximum (not a sum) across reads never counts a pool already
-    /// joined.
+    /// start empty, and a maximum (not a sum) across reads never counts a
+    /// pool already joined.
     pub fn record_scratch_growth(
         &self,
         read_pool: &AtomicU64,
@@ -117,7 +119,8 @@ impl PipelineMetrics {
     ) {
         record_max(&self.scratch_st_capacity_peak_bytes, after.0 as u64);
         record_max(&self.scratch_gr_capacity_peak_bytes, after.1 as u64);
-        // The scratch never shrinks during a read, so the delta is a growth.
+        // The scratch never shrinks within a blob (release comes after this
+        // record, through `record_scratch_release`), so the delta is a growth.
         // Wrapping arithmetic would keep the running balance right if a
         // capacity ever fell (the delta a two's-complement negative), but a
         // list that grew and shrank within one blob would then peak unseen.
@@ -126,6 +129,15 @@ impl PipelineMetrics {
         let delta = after.wrapping_sub(before);
         let total = read_pool.fetch_add(delta, Relaxed).wrapping_add(delta);
         record_max(&self.scratch_pool_capacity_peak_bytes, total);
+    }
+
+    /// Record that a decode worker released `released` bytes of scratch
+    /// capacity after a blob (the retention rule dropping an outlier list):
+    /// the read's running sum falls by it, so successive outliers on
+    /// different workers are not counted as held at once. The peaks are
+    /// untouched; the growth before the release already raised them.
+    pub fn record_scratch_release(&self, read_pool: &AtomicU64, released: usize) {
+        read_pool.fetch_sub(released as u64, Relaxed);
     }
 
     /// Emit the invocation totals so far (see the module docs), after every

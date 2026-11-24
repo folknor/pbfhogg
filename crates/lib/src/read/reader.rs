@@ -7,6 +7,7 @@ use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
 use crate::blob_meta::BlobFilter;
 use crate::error::{Error, Result, new_missing_header_in};
+use crate::retention::release_scratch;
 use crate::tunables::{
     BLOCK_QUEUE, PAR_BATCH_MAX_BLOBS, PAR_BATCH_MAX_BYTES, PAR_INFLIGHT_BUDGET,
     PAR_READER_WORKERS_FALLBACK, PAR_READER_WORKERS_MIN, PAR_READER_WORKERS_RESERVED,
@@ -260,7 +261,8 @@ impl<R: Read + Send> ElementReader<R> {
         // The genuinely reused buffers are `st_scratch` and `gr_scratch`: the
         // `from_vec_with_scratch` route borrows them per block and hands
         // back their retained capacity, eliminating the per-block
-        // `Vec<(u32, u32)>` allocation. `buf` deliberately is not pooled here
+        // `Vec<(u32, u32)>` allocation, up to the retention line, past which
+        // an outlier block's list is released. `buf` deliberately is not pooled here
         // because the block takes ownership of it.
         let mut buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
@@ -284,6 +286,10 @@ impl<R: Read + Send> ElementReader<R> {
                 &mut gr_scratch,
             )
             .map_err(|e| blob.locate_error(source.as_ref(), e))?;
+            // The block owns copies of both tables, so an outlier list is
+            // released before the caller's closure runs, not after.
+            release_scratch(&mut st_scratch);
+            release_scratch(&mut gr_scratch);
             block.for_each_element(&mut f);
         }
 
@@ -530,7 +536,8 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// # Memory
     ///
-    /// One-pass and byte-bounded: the calling thread pumps compressed blobs
+    /// One pass, with in-flight serialized Blob bodies limited to 256 MiB:
+    /// the calling thread pumps compressed blobs
     /// from the file into count- and byte-bounded batches, admitting each blob
     /// against a fixed 256 MiB in-flight byte budget before reading further.
     /// Long-lived decode/map workers each fold into a
@@ -542,16 +549,18 @@ impl<R: Read + Send> ElementReader<R> {
     /// planet scale.
     ///
     /// There is no global byte ceiling. The 256 MiB budget counts admitted
-    /// serialized Blob bodies only (one lone body larger than the budget is
-    /// still admitted), and the decompression pool caps the idle buffers it
-    /// keeps. On top of that each worker holds one decoded block at a time:
-    /// its decompressed payload with the string-table and group offset tables
-    /// appended, the codec's working state, and two offset-table scratch
-    /// lists that keep their largest capacity for the life of the read. These
-    /// scale with the block, not the file: a legal 32 MiB block of empty
-    /// strings needs 8 bytes of table per 2 wire bytes, so one worker can
-    /// reach several hundred MiB, and the total multiplies by the worker
-    /// count (`decode_threads`, else one fewer than the available cores).
+    /// serialized Blob bodies only, and the decompression pool caps the idle
+    /// buffers it keeps. On top of that each worker holds one decoded block
+    /// at a time: its decompressed payload with the string-table and group
+    /// offset tables appended, the codec's working state, and two
+    /// offset-table scratch lists. These scale with the block, not the file:
+    /// a legal 32 MiB block of empty strings needs 8 bytes of table per 2
+    /// wire bytes, so one worker decoding one can reach several hundred MiB,
+    /// and blocks like it decoding at once multiply that by the worker count
+    /// (`decode_threads`, else one fewer than the available cores). Once a
+    /// block is built, and before the callbacks see its elements, the worker
+    /// releases a scratch list grown past 4 MiB, so between blocks a worker
+    /// keeps at most that much per list rather than its largest block's.
     /// Memory held by `T`, the closures or the underlying reader is the
     /// caller's and is not bounded here.
     ///
@@ -981,7 +990,9 @@ where
     // decompression or scan would come after the allocations it means to
     // prevent, and sharing the body budget would make a worker wait on bytes
     // only workers release; the per-worker decode peak is documented on
-    // `par_map_reduce` instead.
+    // `par_map_reduce` instead. The scratch follows the retention rule after
+    // every block, which bounds what an idle worker keeps, not the peak of
+    // workers decoding outlier blocks at once.
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     // `identity` runs once per worker, but only once the worker holds a batch
@@ -1003,6 +1014,11 @@ where
             match blob.to_primitiveblock_inline_with_scratch(pool, &mut st_scratch, &mut gr_scratch)
             {
                 Ok(block) => {
+                    // The block owns copies of both tables: release an
+                    // outlier list before the fold, so it is held only
+                    // while its block decodes.
+                    release_scratch(&mut st_scratch);
+                    release_scratch(&mut gr_scratch);
                     for element in block.elements() {
                         folded = reduce_op(folded, map_op(element));
                     }

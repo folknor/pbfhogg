@@ -770,8 +770,8 @@ fn worker_split_blob(
         }
     }
     flush_local(bb, &mut framed)?;
-    crate::commands::release_scratch(&mut scratch.refs);
-    crate::commands::release_scratch(&mut scratch.locations);
+    crate::retention::release_scratch(&mut scratch.refs);
+    crate::retention::release_scratch(&mut scratch.locations);
     let frames: Vec<Vec<u8>> = framed.frames.into_iter().map(|(_, frame)| frame).collect();
 
     Ok(WorkerOutput::Framed {

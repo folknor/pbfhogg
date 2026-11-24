@@ -1640,7 +1640,7 @@ fn worker_decode_kind(
 
     // The final block, framed under the same strip flags as every other.
     flush_local(bb, &mut framed)?;
-    crate::commands::release_scratch(refs_buf);
+    crate::retention::release_scratch(refs_buf);
     let frames = framed.frames.into_iter().map(|(_, frame)| frame).collect();
 
     Ok(WorkerOutput::Framed { frames, elements })

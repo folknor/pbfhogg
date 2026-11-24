@@ -23,17 +23,23 @@ the scope or scopes, and the bracketed priority is the hunter's own label.
 Findings that match an existing mechanism were added to `notes/bugs.md`
 instead of being filed here. Entries are in no order of importance.
 
-## FMT-031 - par_map_reduce worker scratch keeps its peak for the whole read
+## FMT-032 - Block-decode loops outside ElementReader keep scratch peaks
 
-Reported by: spar on the par_map_reduce memory promise (lateral).
+Reported by: spar on the reader scratch retention rule (lateral).
 
-`run_par_worker` (`read/reader.rs`) never releases `st_scratch` or
-`gr_scratch`. One block of empty groups followed by one of empty strings
-leaves a worker holding about 128 MiB in each list until the read ends, so an
-outlier block raises that worker's footprint for the rest of the file. The
-`commands`-gated `release_scratch` helper is not reachable from the core
-reader; a fix would move it into shared code. It does not lower the
-concurrent peak of a wave of such blocks.
+The three `ElementReader` engines and apply-changes, extract simple/smart
+and altw stage 4 release a string-table or group list grown past
+`MAX_RETAINED_SCRATCH_CAPACITY` after each block
+(`crate::retention::release_scratch`). Other loops that reuse the same
+pair across blocks keep their largest capacity until the loop ends, so one
+outlier block (a legal 32 MiB block of empty strings grows the table list
+to about 128 MiB) stays pinned on that worker: `scan/classify.rs` (three
+sites), `osc/merge_join.rs`, `commands/altw/external/relation_scan.rs`,
+`commands/altw/passthrough.rs`, `commands/extract/common.rs` and
+`extract/multi.rs`, `commands/getid/mod.rs`,
+`commands/inspect/show_element.rs` and one loop in `commands/cat/mod.rs`.
+Not measured; inventory from a grep of the pair names, not re-verified
+site by site.
 
 ## FMT-012 - pipeline_decode_tasks counts blobs that are never decompressed
 

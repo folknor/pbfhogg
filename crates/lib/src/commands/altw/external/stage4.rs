@@ -819,8 +819,8 @@ pub(super) fn stage4_assembly(
             // After the sample above, so the peak still sees the outlier.
             read_buf.release_outlier(&host.invocation);
             crate::blob::release_decode_outlier(decompress_buf, &host.invocation);
-            crate::commands::release_scratch(st_scratch);
-            crate::commands::release_scratch(gr_scratch);
+            crate::retention::release_scratch(st_scratch);
+            crate::retention::release_scratch(gr_scratch);
 
             guard.disarm();
             // The pool times the send (`s4_send_ms`), opens the

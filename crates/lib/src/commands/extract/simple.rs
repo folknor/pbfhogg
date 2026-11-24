@@ -9,10 +9,9 @@ use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
 use crate::{Element, ElementKind, PrimitiveBlock};
 
-use super::super::{
-    HeaderOverrides, Result, drain_batch_results, flush_local, release_scratch, writer_from_header,
-};
+use super::super::{HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header};
 use crate::idset::IdSet;
+use crate::retention::release_scratch;
 
 use super::common::{
     BboxInt, BlobDesc, ExtractPass2IdSets, Passthrough, build_blob_schedule_with_passthrough,

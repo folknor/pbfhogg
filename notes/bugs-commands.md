@@ -188,6 +188,27 @@ only by a single element too large for a blob or a missed partition. Fix
 shape: locate the refusal at the input and frame of the block's first or
 offending element.
 
+## CMD-075 - add-locations-to-ways' writer-side size refusal names no input blob
+
+Reported by: the spar accounting of the add-locations-to-ways cut, from
+its scout's lateral (2026-11-24); read from source, not run.
+
+The altw cut (`fit_output` in `altw/mod.rs`, over `fit_scanned`) runs in
+the pass-2 and stage-4 workers, so a failure inside the cut is located at
+the input blob. But a block for which the cut finds no plan (a single way
+too large for a blob, or a partition the size bound over-counts) is handed
+on whole, and the writer refuses it: `Pass2Consumer::consume`
+(`altw/passthrough.rs`), `S4Consumer::consume_inner`
+(`altw/external/stage4.rs`) and the unindexed fallback (`altw/mod.rs`) call
+`write_primitive_block_owned(block)?` with no `locate`, and the pipelined
+writer returns the framing failure as a later slot's ordered result, so the
+`BlobTooLarge` can surface on a later write or at `flush` and names no
+input blob. The history time-filter's `write_block` has the same shape
+(its pipelined callback locates order refusals at the input file only).
+Fix shape: carry the input blob's location with the block to the consumer,
+or check the whole-block hand-off where the cut already knows it found no
+plan, and locate the refusal there.
+
 ## CMD-060 - degrade --unsort may have slowed down, and is slow on planet
 
 Reported by: the CMD-056 follow-up measurement (2026-11-21, plantasjen).

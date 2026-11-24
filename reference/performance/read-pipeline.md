@@ -480,8 +480,10 @@ appends like cat `--clean`; it was not measured separately.
 
 ## What the read pipeline's decode scratch holds (bygg, 2026-11-03, on `26db96fe`)
 
-The pipelined reader's decode workers each keep a string-table and a
-group-range scratch list for the whole read. Planet
+The pipelined reader's decode workers each kept a string-table and a
+group-range scratch list for the whole read when this was measured; they
+now release a list grown past `MAX_RETAINED_SCRATCH_CAPACITY` after its
+blob, which these planet sizes never reach. Planet
 `planet-20260223-with-indexdata`, `inspect --extended --bench 1`, one
 unstored `--force` cell on `26db96fe` plus the
 `pipeline_scratch_pool_capacity_peak_bytes` counter (30 decode workers,
@@ -503,6 +505,22 @@ that is at the thread-locals in `crates/lib/src/read/pipeline.rs`. The wall is i
 line with the stored 26.80 s cell `5b8e6c29` (`179f1b7e`, not a matched
 pair); the counters record only when a list grows, a few dozen times per
 worker at most, instead of on every blob.
+
+## Reader scratch follows the retention rule (bygg, 2026-11-24, baseline `f0f4e9f0`)
+
+Releasing an outlier string-table or group list after each blob in all
+three `ElementReader` engines adds two capacity compares per blob and never
+fires on planet. Planet `file-info --mode extended`, `--iterations 1`,
+interleaved baseline (`--commit HEAD`) and variant (uncommitted on
+`f0f4e9f0`) cells:
+
+| Pair | Baseline | Variant |
+|---|---:|---:|
+| 1 | 28.9 s (`99c8f7c9`) | 28.9 s (`97d28ee7`) |
+| 2 | 27.8 s (`9b6148f1`) | 27.7 s (`1facd228`) |
+
+Neutral; landed. `par_map_reduce` has no CLI caller and was not measured
+separately; its loop gains the same per-blob compare.
 
 ## Header walk read-ahead on cold dense files (bygg, 2026-11-08, baseline `bb414882`)
 

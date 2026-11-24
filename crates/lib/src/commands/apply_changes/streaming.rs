@@ -567,7 +567,7 @@ impl WorkerScratch {
         counters: &WorkerCounters,
         invocation: &crate::host::Recorder,
     ) -> Result<()> {
-        use crate::commands::release_scratch;
+        use crate::retention::release_scratch;
 
         if !self.local_coords.is_empty() {
             return Err(Error::internal(format!(

@@ -205,6 +205,7 @@ pub mod path_guard;
 pub mod publication;
 pub mod read;
 pub(crate) mod reorder_buffer;
+pub(crate) mod retention;
 pub(crate) mod scan;
 pub mod scratch;
 #[doc(hidden)]

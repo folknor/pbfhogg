@@ -818,9 +818,19 @@
   and orphan elements widen their deltas, so a blob near the payload limit
   could come out over it and the run failed with a size error. Such a blob
   is now written as several blobs, cut between elements, each with its own
-  index; every other blob is written as before. A single element too large
-  for a blob beside its input's string table, or one `DenseNodes` group
-  that outgrows the limit, is still refused.
+  index; every other blob is written as before. Where keeping the input's
+  string table in every piece cannot fit, a dense node group is cut between
+  nodes and each piece carries only the strings it uses; a compressed blob
+  whose body would expand past 32 MiB is cut too. Still refused: a single
+  element too large for a blob with only its own strings, and a blob whose
+  elements carry fields outside the format where cutting needs those
+  changes.
+- **An incompressible block near 32 MiB gets the typed size refusal under
+  zlib.** The zlib encoder reserved about 0.1 % over the input and failed
+  with an internal "did not complete in one call" error when level 1's
+  output grew past that, before the blob-size check could name the
+  problem. It now reserves the backend's worst case and continues when
+  short, so such a block is refused as too large, or written when it fits.
 - `diff --format osc -o changes.osc.gz` caps gzip compression workers at
   the requested `--jobs` count when either input lacks indexdata.
 - The `merge-workload` bench reads timing from a dedicated stdout line,

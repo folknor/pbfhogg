@@ -1602,12 +1602,18 @@ DEVIATIONS.md, "renumber: orphan-reference handling"). The run reports their
 count as a warning.
 
 Each input blob is written as one output blob unless the new IDs grow it past
-the 32 MiB payload limit (a far or negative start widens every ID; refs
-alternating between live and orphan targets widen their deltas). Such a blob
-is cut between elements into blobs that fit, each with its own index. What is
-still refused (exit 2): a single element that does not fit beside the input
-blob's whole string table, a single `DenseNodes` group that outgrows the limit,
-and a compressed blob whose encoded body exceeds the limit.
+what a blob can hold: the 32 MiB payload limit, or, compressed, a body that
+expands past the 32 MiB blob size (a far or negative start widens every ID;
+refs alternating between live and orphan targets widen their deltas). Such a
+blob is cut between elements into blobs that fit, each with its own index:
+first with every piece keeping the input blob's string table and elements as
+they are, and where that cannot fit, with a dense node group cut between nodes
+and each piece's string table holding only the strings it uses. Nothing an
+element carries changes. What is still refused (exit 2): a single element that
+does not fit even with only its own strings, a block whose content renumber
+cannot read in full (an element or dense group with fields outside the format,
+which keep the whole table, and a dense group of such shape is not cut), and a
+cut that needs the last few bytes below the limit.
 
 Block and group fields renumber does not interpret are dropped from every
 blob, nodes, ways and relations alike: a group's obsolete `changesets` and any

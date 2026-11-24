@@ -47,6 +47,18 @@ it, at the same wall (see "The CLI no longer caps malloc arenas").
 
 ### Renumber
 
+#### Compressed-body trial, re-encoding cut and the zlib worst-case reserve (planet, baseline `62a911d7`, bygg, 2026-11-24)
+
+The ordered consumer now compares each block with the largest payload
+whose worst-case compressed body fits (about 29.8 MB under zlib) instead
+of the raw limit, and the zlib encoder reserves an eighth over its input
+up front (capacity only) and continues a call that stops short. Matched
+`id-remap` `--iterations 1` cells, A B B A, baseline built with
+`--commit 62a911d7`, variant uncommitted on it: baseline 2m04s
+(`b0c42038`) and 2m14s (`1f5eef92`), variant 2m03s (`a71bfc84`) and
+2m12s (`06296e15`). Each pair is within 2 s; the second pair's drift is
+shared by both arms. Neutral; no planet block reaches the trial.
+
 #### One rule for uninterpreted block and group fields (planet, baseline `0a986fbc`, bygg, 2026-11-24)
 
 The way and relation group loops drop every non-element field (the way

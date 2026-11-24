@@ -1508,6 +1508,64 @@ fn a_way_block_the_rewrite_grows_past_the_limit_is_cut() {
     assert_eq!(norm.ways[5].id, 6);
 }
 
+/// Two ways in one blob, each with an 11 MB tag value of its own and refs
+/// that grow sixfold, as in the test above. Renumbered, one way beside the
+/// whole string table (both values) is over the payload limit, so the first
+/// cut finds no partition; each fits with only its own value, so the
+/// re-encoding cut gives each piece a table of its own. Under zlib the
+/// pieces must also pass the compressed-body check.
+#[test]
+fn a_way_that_fits_only_with_its_own_strings_is_cut_with_its_own_table() {
+    const REFS: usize = 2_400_000;
+    const VALUE: usize = 11_000_000;
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let refs: Vec<i64> = (0..REFS)
+        .map(|k| if k % 2 == 0 { 10 } else { 11 })
+        .collect();
+    let a = "a".repeat(VALUE);
+    let b = "b".repeat(VALUE);
+    let mut ways: Vec<TestWay> = (1..=2).map(|id| plain_way(id, refs.clone())).collect();
+    ways[0].tags = vec![("note", a.as_str())];
+    ways[1].tags = vec![("note", b.as_str())];
+    write_test_pbf_sorted(&input, &[plain_node(10)], &ways, &[]);
+    assert_eq!(way_blobs(&input), 1, "the fixture is one way blob");
+
+    let opts = RenumberOptions {
+        start_node_id: 1 << 40,
+        ..default_opts()
+    };
+    for (name, compression) in [
+        ("none", pbfhogg::writer::Compression::None),
+        ("zlib", pbfhogg::writer::Compression::default()),
+    ] {
+        let output = dir.path().join(format!("output-{name}.osm.pbf"));
+        let write = WriteOptions {
+            compression,
+            ..WriteOptions::default()
+        };
+        renumber_external(
+            &input,
+            crate::common::out(&output),
+            &opts,
+            &write,
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        )
+        .unwrap_or_else(|e| panic!("renumber {name}: {}", e.report()));
+        assert_eq!(way_blobs(&output), 2, "{name}: one piece per way");
+        assert_sorted_file(&output);
+        let norm = read_normalized(&output);
+        assert_eq!(norm.ways.len(), 2);
+        for (way, value) in norm.ways.iter().zip([&a, &b]) {
+            assert_eq!(way.tags, vec![("note".to_owned(), value.clone())], "{name}");
+            assert_eq!(way.refs.len(), REFS);
+            assert_eq!(way.refs[0], 1 << 40);
+            assert_eq!(way.refs[1], 10);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Indexdata may not size the node pre-allocation
 // ---------------------------------------------------------------------------

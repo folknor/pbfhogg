@@ -98,7 +98,8 @@ where
         written: 0,
         orphans: 0,
     };
-    let limit = super::split::payload_limit(&writer.compression());
+    let limits = super::split::Limits::new(writer.compression());
+    let sure = limits.sure();
     let cancel = writer.cancel_token().permit();
     run_ordered(
         n_tasks,
@@ -142,13 +143,14 @@ where
                         way_members: None,
                     })
                 };
-                if bytes.len() <= limit {
+                if bytes.len() <= sure {
                     write(bytes, index)?;
                 } else {
-                    // The rewrite grew the block past what the writer frames:
-                    // cut it between elements (`split`), one input blob still
-                    // one result for the order check and the totals.
-                    for (bytes, index) in super::split::fit(bytes, index, item.numbering, limit)? {
+                    // The block may be past what the writer frames: `split`
+                    // checks it and cuts it between elements if so, one input
+                    // blob still one result for the order check and the totals.
+                    for (bytes, index) in super::split::fit(bytes, index, item.numbering, &limits)?
+                    {
                         write(bytes, index)?;
                     }
                 }

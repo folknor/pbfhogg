@@ -30,6 +30,7 @@ pub mod direct_writer;
 mod encode;
 pub mod file_writer;
 mod framing;
+pub(crate) use framing::{encoded_body_len, worst_case_body_len};
 pub mod header_builder;
 pub(crate) mod parallel_gzip;
 pub(crate) mod parallel_writer;

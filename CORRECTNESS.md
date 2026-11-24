@@ -692,6 +692,13 @@ not tag-filtered. Its payload-only pread and byte rewrite do not read tagdata
 headers, parse key lists, or bounds-check copied key string indices. Corrupt
 indices pass through as on the read side. Adding those operations changes the
 historical output or adds per-blob or per-tag work to the measured hot path.
+The one exception is off that path: when a rewritten block cannot be cut to
+fit with its whole string table in every piece, the re-encoding cut
+(`renumber/split/reencode.rs`) reads every string reference of the block and
+gives each piece a table of only the strings it uses, and only when every
+element field is one the format defines and every index lies within the
+table. Otherwise every piece keeps the whole table and every index as it is,
+corrupt ones included.
 
 The byte rewrite takes every element representation the library writes. A
 node group is one `DenseNodes` or plain `Node` messages (written where a
@@ -714,7 +721,8 @@ cannot rewrite, and a block-wide field would repeat into every piece of a cut
 block. An element field of the blob's own kind that is not length-delimited is
 refused, not skipped. Fields inside an element message are copied without
 interpretation, so an extension field there that names an element ID keeps
-the old ID.
+the old ID; such a field also keeps a cut block's whole string table, since
+it might name a string the cut cannot remap.
 
 ## Sidecar comparison contracts
 

@@ -551,13 +551,6 @@ pub(crate) const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
 /// buffer, measured neutral there (`MAX_RETAINED_SCRATCH_CAPACITY`).
 pub(crate) const READ_BUF_MAX_RETAINED_CAPACITY: usize = DECOMPRESS_POOL_MAX_RETAINED_CAPACITY;
 
-/// Zlib worst-case output bound reserved up front: input + input >> this
-/// shift (~0.1%) + [`ZLIB_RESERVE_SLACK`] header/trailer bytes.
-pub(crate) const ZLIB_RESERVE_SHIFT: u32 = 10;
-
-/// Header/trailer slack of the zlib worst-case output bound.
-pub(crate) const ZLIB_RESERVE_SLACK: usize = 64;
-
 // ---------------------------------------------------------------------------
 // Apply-changes
 // ---------------------------------------------------------------------------

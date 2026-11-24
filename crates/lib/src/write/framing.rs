@@ -26,7 +26,15 @@ use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, Tag, blob, blo
 
 use super::compression::{Compression, ZlibLevel, ZstdLevel};
 
-use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
+use crate::tunables::MAX_RETAINED_SCRATCH_CAPACITY;
+
+/// [`zlib_bound`]'s overhead over the input: input >> this shift, an eighth
+/// (zlib-rs's fixed-code worst case, see `zlib_bound`).
+const ZLIB_BOUND_SHIFT: u32 = 3;
+
+/// [`zlib_bound`]'s header, trailer and block-framing slack: above
+/// zlib-rs's own constant terms (zlib wrapper and final block bits).
+const ZLIB_BOUND_SLACK: usize = 64;
 
 /// The `BlobHeader.type` of the header blob, whose size refusals are named
 /// apart from a data blob's.
@@ -584,6 +592,48 @@ fn encode_payload_field_head(head: &mut Vec<u8>, field: u32, len: usize) {
     protohoggr::encode_varint(head, len as u64);
 }
 
+/// The most bytes zlib output of `len` input bytes can take at any level the
+/// backend runs: zlib-rs level 1 encodes with fixed Huffman codes, where an
+/// unmatched high literal costs nine bits, so its own bound allows an eighth
+/// over the input plus framing, far above stock zlib's `compressBound`.
+pub(crate) fn zlib_bound(len: usize) -> usize {
+    len.saturating_add(len >> ZLIB_BOUND_SHIFT)
+        .saturating_add(ZLIB_BOUND_SLACK)
+}
+
+/// The largest Blob body `uncompressed_len` payload bytes can produce under
+/// `compression`: the `raw_size` field (compressed only), the payload
+/// field's tag and length, and the payload at its worst case.
+pub(crate) fn worst_case_body_len(uncompressed_len: usize, compression: &Compression) -> usize {
+    let field = |len: usize| 1 + super::encode::varint_len(len as u64) + len;
+    let raw_size = 1 + super::encode::varint_len(uncompressed_len as u64);
+    match compression {
+        Compression::None => field(uncompressed_len),
+        Compression::Zlib(_) => raw_size + field(zlib_bound(uncompressed_len)),
+        Compression::Zstd(_) => raw_size + field(zstd_safe::compress_bound(uncompressed_len)),
+    }
+}
+
+/// The length of the Blob body the writer frames `uncompressed` into under
+/// `compression`, by running the same encoder at the same level with the
+/// same up-front reserve. For a caller deciding whether a block within the
+/// raw limit will frame; the writer's own refusal remains the authority.
+/// Errors as `encode_blob_body` does, a payload over the raw limit included.
+pub(crate) fn encoded_body_len(uncompressed: &[u8], compression: &Compression) -> Result<usize> {
+    let mut scratch = FrameScratch::new();
+    let source = encode_blob_body(
+        uncompressed,
+        compression,
+        OversizePart::Payload,
+        &mut scratch,
+    )?;
+    let payload = match source {
+        PayloadSource::Input => uncompressed.len(),
+        PayloadSource::Compressed => scratch.compress_buf.len(),
+    };
+    Ok(scratch.body_head.len() + payload)
+}
+
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
 fn compress_zlib(uncompressed: &[u8], level: ZlibLevel, scratch: &mut FrameScratch) -> Result<()> {
     let compressor = match &mut scratch.zlib_compressor {
@@ -598,21 +648,30 @@ fn compress_zlib(uncompressed: &[u8], level: ZlibLevel, scratch: &mut FrameScrat
         }
     };
     scratch.compress_buf.clear();
-    // Zlib worst-case bound: input + ~0.1% + header/trailer.
-    scratch.compress_buf.reserve(
-        uncompressed.len() + (uncompressed.len() >> ZLIB_RESERVE_SHIFT) + ZLIB_RESERVE_SLACK,
-    );
-    let status = compressor
-        .compress_vec(
-            uncompressed,
-            &mut scratch.compress_buf,
-            FlushCompress::Finish,
-        )
-        .map_err(|e| Error::internal_with("zlib compress error", e))?;
-    if !matches!(status, Status::StreamEnd) {
-        return Err(Error::internal(
-            "zlib compress did not complete in one call",
-        ));
+    // The backend's worst case, so one call normally finishes. Capacity
+    // only: nothing is written until the compressor writes it.
+    scratch.compress_buf.reserve(zlib_bound(uncompressed.len()));
+    // `compress_vec` consumes only as much input as the spare capacity lets
+    // it encode, so a call that stops short continues from where it stopped
+    // with more room, and an incompressible payload always reaches the typed
+    // body-size check instead of failing here.
+    let start_in = compressor.total_in();
+    loop {
+        let consumed = usize::try_from(compressor.total_in() - start_in).unwrap_or(usize::MAX);
+        let rest = uncompressed.get(consumed..).unwrap_or_default();
+        let status =
+            match compressor.compress_vec(rest, &mut scratch.compress_buf, FlushCompress::Finish) {
+                Ok(status) => status,
+                Err(e) => {
+                    compressor.reset();
+                    return Err(Error::internal_with("zlib compress error", e));
+                }
+            };
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        let more = (scratch.compress_buf.capacity() >> ZLIB_BOUND_SHIFT).max(ZLIB_BOUND_SLACK);
+        scratch.compress_buf.reserve(more);
     }
     compressor.reset();
     let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
@@ -976,6 +1035,36 @@ mod tests {
                 &WriterMetrics::new(),
             )
             .expect("raw limit is inclusive when the encoded body fits");
+        }
+    }
+
+    /// Incompressible bytes grow under every zlib level the backend runs,
+    /// by up to an eighth at level 1. The encoder must finish them (it once
+    /// reserved a thousandth over the input and failed internally), stay
+    /// within its own worst-case bound, and agree with `encoded_body_len`.
+    #[test]
+    fn incompressible_payloads_compress_within_the_zlib_bound() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let noise: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[3]
+            })
+            .collect();
+        for level in 0..=ZlibLevel::MAX {
+            let compression = Compression::Zlib(ZlibLevel::new(level).expect("level"));
+            let mut scratch = FrameScratch::new();
+            encode_blob_body(&noise, &compression, OversizePart::Payload, &mut scratch)
+                .expect("incompressible input compresses");
+            let body = scratch.body_head.len() + scratch.compress_buf.len();
+            assert!(
+                scratch.compress_buf.len() <= zlib_bound(noise.len()),
+                "level {level}"
+            );
+            assert!(body <= worst_case_body_len(noise.len(), &compression));
+            assert_eq!(encoded_body_len(&noise, &compression).expect("trial"), body);
         }
     }
 

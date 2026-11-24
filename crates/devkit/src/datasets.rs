@@ -26,9 +26,18 @@ pub struct ResolvedInput {
 /// driver before the check; registrations are operator-written, and only
 /// an `O_PATH` reopen through procfs would close that.
 pub fn file_digest(path: &Path) -> Result<String, Error> {
+    let mut file = open_regular(path)?;
+    Ok(digest_open(&mut file, path)?.0)
+}
+
+/// Open `path` for reading the way `file_digest` does: nonblocking, with
+/// the regular-file check made on the descriptor. A caller that hashes and
+/// then reads the same bytes keeps this descriptor, so nothing swapped in
+/// at the name afterwards (a FIFO among them) is ever opened.
+pub fn open_regular(path: &Path) -> Result<std::fs::File, Error> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let at = |e| Error::message(format!("{}: {e}", path.display()));
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
@@ -39,8 +48,21 @@ pub fn file_digest(path: &Path) -> Result<String, Error> {
             path.display()
         )));
     }
+    Ok(file)
+}
+
+/// Hash a descriptor from `open_regular` from its first byte, returning the
+/// digest and the number of bytes hashed. The stamp checks are
+/// `file_digest`'s: the descriptor must not change while it is read, and
+/// `path` must still name the same unchanged file (checked by `stat`, which
+/// never opens what is there).
+pub fn digest_open(file: &mut std::fs::File, path: &Path) -> Result<(String, u64), Error> {
+    use std::io::Seek as _;
+    let at = |e| Error::message(format!("{}: {e}", path.display()));
+    file.rewind().map_err(at)?;
     let before = stamp(&file.metadata().map_err(at)?);
     let mut hash = xxhash_rust::xxh3::Xxh3::new();
+    let mut total = 0u64;
     let mut buffer = vec![0; crate::tunables::DIGEST_BUFFER_BYTES];
     loop {
         let count = match file.read(&mut buffer) {
@@ -51,6 +73,7 @@ pub fn file_digest(path: &Path) -> Result<String, Error> {
             break;
         }
         hash.update(&buffer[..count]);
+        total += count as u64;
     }
     let after = stamp(&file.metadata().map_err(at)?);
     let named = stamp(&std::fs::metadata(path).map_err(at)?);
@@ -60,7 +83,7 @@ pub fn file_digest(path: &Path) -> Result<String, Error> {
             path.display()
         )));
     }
-    Ok(format!("{:032x}", hash.digest128()))
+    Ok((format!("{:032x}", hash.digest128()), total))
 }
 
 impl Config {

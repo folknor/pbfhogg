@@ -182,18 +182,6 @@ tests holding bare `is_err()`, discarded `unwrap_err`/`expect_err`, or
 ones out. The settled rulings and the remaining links (CLI refusal bar,
 source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
 
-## TOOL-049 - Promotion reopens its input by name after hashing it
-
-Reported by: the spar partner on the digest-open work (2026-11-24); not
-reproduced.
-
-`promote` hashes `--file` through the devkit digest, whose open no longer
-blocks on a FIFO and checks the type on the descriptor, then copies the
-file with `std::fs::copy` by name. A FIFO or other file swapped in between
-can hang the copy, under brokkr's machine lock (different bytes are caught
-by the later re-hash of the staged copy, a hang is not). Holding the checked
-descriptor through the copy would close it.
-
 ## TOOL-050 - The library verifier computes call phases and tail markers nobody reads
 
 Reported by: the scout of the library call-stream verdict work (2026-11-24),

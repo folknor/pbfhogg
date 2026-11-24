@@ -9,7 +9,7 @@ mod selection;
 mod tunables;
 
 pub use compose::{Config, user_config_path};
-pub use datasets::{ResolvedInput, file_digest};
+pub use datasets::{ResolvedInput, digest_open, file_digest, open_regular};
 pub use registry::{DatasetEdit, DatasetView, FileEntry, Generation, replace_file};
 pub use selection::Bbox;
 

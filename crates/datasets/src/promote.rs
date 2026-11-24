@@ -3,7 +3,7 @@
 //! Neither the caller's file nor displaced snapshot files are deleted.
 use std::path::Path;
 
-use pbfhogg_devkit::{Config, FileEntry, file_digest};
+use pbfhogg_devkit::{Config, FileEntry, digest_open, file_digest, open_regular};
 
 use crate::{date::CivilDate, layout, lock::DatasetLock, output};
 
@@ -70,17 +70,21 @@ pub(crate) fn run(req: &Request<'_>) -> Result<(), String> {
     } else {
         "indexed"
     };
-    let meta = std::fs::metadata(req.file).map_err(|e| format!("{}: {e}", req.file.display()))?;
-    if !meta.is_file() || meta.len() == 0 {
+    // One descriptor serves the digest, the copy and the re-check, so a file
+    // swapped in at the name afterwards (a FIFO would hang a by-name copy
+    // under brokkr's machine lock) is never opened. Nonemptiness is counted
+    // in the hashed bytes, not stat'ed beside them.
+    let mut input = open_regular(req.file).map_err(|e| e.to_string())?;
+    let (digest, bytes) = digest_open(&mut input, req.file).map_err(|e| e.to_string())?;
+    if bytes == 0 {
         return Err("promotion requires a nonempty regular output file".into());
     }
-    let digest = file_digest(req.file).map_err(|e| e.to_string())?;
     let name = format!(
         "{}-{}-{variant}-{digest}.osm.pbf",
         req.dataset, req.snapshot
     );
     let dest = dir.join(&name);
-    publish_output(req, &dir, &dest, &digest)?;
+    publish_output(req, &mut input, &dir, &dest, &digest)?;
     let date = CivilDate::parse_yyyymmdd(req.snapshot).unwrap_or_else(CivilDate::today);
     edit.set_snapshot_header(req.snapshot, &date.iso())
         .map_err(|e| e.to_string())?;
@@ -100,7 +104,13 @@ pub(crate) fn run(req: &Request<'_>) -> Result<(), String> {
     Ok(())
 }
 
-fn publish_output(req: &Request<'_>, dir: &Path, dest: &Path, digest: &str) -> Result<(), String> {
+fn publish_output(
+    req: &Request<'_>,
+    input: &mut std::fs::File,
+    dir: &Path,
+    dest: &Path,
+    digest: &str,
+) -> Result<(), String> {
     // An existing final file is reusable only if its bytes match. Never
     // follow or overwrite a pre-existing symlink, including dangling ones.
     match std::fs::symlink_metadata(dest) {
@@ -121,11 +131,12 @@ fn publish_output(req: &Request<'_>, dir: &Path, dest: &Path, digest: &str) -> R
             // Even an unusual manually configured staging name belongs to
             // the registry, and the output must survive its staging.
             let staged = layout::stage(req.config, req.host, dir, req.dataset, dest, &[req.file])?;
-            std::fs::copy(req.file, &staged).map_err(|e| format!("copy output: {e}"))?;
-            // Hash both names after copying: concurrent input changes must
-            // never turn the registered pin into a claim about other bytes.
+            copy_staged(input, &staged).map_err(|e| format!("copy output: {e}"))?;
+            // Hash the staged copy and the input descriptor again after
+            // copying: concurrent input changes must never turn the
+            // registered pin into a claim about other bytes.
             if file_digest(&staged).map_err(|e| e.to_string())? != digest
-                || file_digest(req.file).map_err(|e| e.to_string())? != digest
+                || digest_open(input, req.file).map_err(|e| e.to_string())?.0 != digest
             {
                 return Err("output changed during promotion".into());
             }
@@ -134,6 +145,20 @@ fn publish_output(req: &Request<'_>, dir: &Path, dest: &Path, digest: &str) -> R
         Err(e) => return Err(format!("{}: {e}", dest.display())),
     }
     Ok(())
+}
+
+/// Copy the hashed input descriptor into the freshly cleared staging name.
+/// `create_new` refuses anything planted there since, a symlink included;
+/// the input's permissions carry over as `std::fs::copy` carried them.
+fn copy_staged(input: &mut std::fs::File, staged: &Path) -> std::io::Result<()> {
+    use std::io::Seek as _;
+    input.rewind()?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)?;
+    std::io::copy(input, &mut out)?;
+    out.set_permissions(input.metadata()?.permissions())
 }
 
 #[cfg(test)]
@@ -481,5 +506,45 @@ mod tests {
         std::fs::write(&input, b"").unwrap();
         assert!(run(&req).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+    }
+
+    #[test]
+    fn a_fifo_swapped_in_after_hashing_refuses_without_opening_it() {
+        let scratch = pbfhogg_test_scratch::scratch();
+        let root = scratch.path();
+        let path = root.join("brokkr.toml");
+        std::fs::write(
+            &path,
+            "[h]\ndata = 'data'\n[h.datasets.tiny]\norigin = 'local'\n",
+        )
+        .unwrap();
+        let config = Config::load(&path, None).unwrap();
+        let dir = root.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = root.join("output.osm.pbf");
+        std::fs::write(&input, b"generated").unwrap();
+        let req = Request {
+            config: &config,
+            host: "h",
+            dataset: "tiny",
+            file: &input,
+            snapshot: "ok",
+            replace: false,
+            producer: Producer::Cat,
+            strip_indexdata: false,
+        };
+        let mut held = open_regular(&input).unwrap();
+        let (digest, _) = digest_open(&mut held, &input).unwrap();
+        // Replace the name with a FIFO that has no writer: a by-name open
+        // of it would block forever.
+        let fifo = root.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a scalar mode.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        std::fs::rename(&fifo, &input).unwrap();
+        let dest = dir.join(format!("tiny-ok-indexed-{digest}.osm.pbf"));
+        let err = publish_output(&req, &mut held, &dir, &dest, &digest).unwrap_err();
+        assert!(err.contains("changed while it was hashed"), "{err}");
+        assert!(!dest.exists());
     }
 }

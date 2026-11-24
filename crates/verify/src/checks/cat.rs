@@ -25,12 +25,14 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     // content pbfhogg promises (copied blobs keep them as bytes), and its
     // output never declares them, so the comparison reads no coordinates
     // there whatever option the reference got.
-    let declares = crate::pbf_frames::header(pbf)?.optional_feature("LocationsOnWays");
-    let locations = if crate::pbf_frames::first_data_blob_indexed(pbf)? {
-        WayLocations::Kept
-    } else {
-        WayLocations::Dropped
-    };
+    let declares = crate::pbf_frames::header(pbf, crate::pbf_frames::Origin::Other)?
+        .optional_feature("LocationsOnWays");
+    let locations =
+        if crate::pbf_frames::first_data_blob_indexed(pbf, crate::pbf_frames::Origin::Other)? {
+            WayLocations::Kept
+        } else {
+            WayLocations::Dropped
+        };
 
     for elem_type in &["node", "way", "relation"] {
         harness.msg(&format!("=== verify cat -t {elem_type} ==="));

@@ -111,14 +111,19 @@ fn payload(path: &Path, blob: &pbf_frames::ClaimedBlob) -> Vec<u8> {
 
 /// A raw indexed node blob holding `ids` decoded from `path`'s `blob`.
 fn node_ids(path: &Path, blob: &pbf_frames::ClaimedBlob) -> Vec<i64> {
-    pbf_frames::blob_ids(path, blob.payload_offset, blob.datasize)
-        .unwrap()
-        .into_iter()
-        .map(|(kind, id)| {
-            assert_eq!(kind, 0, "the dedupe fixture holds node blobs only");
-            id
-        })
-        .collect()
+    pbf_frames::blob_ids(
+        path,
+        pbf_frames::Origin::Other,
+        blob.payload_offset,
+        blob.datasize,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|(kind, id)| {
+        assert_eq!(kind, 0, "the dedupe fixture holds node blobs only");
+        id
+    })
+    .collect()
 }
 
 /// Assert an osmium run writing PBF asks to keep inline locations exactly

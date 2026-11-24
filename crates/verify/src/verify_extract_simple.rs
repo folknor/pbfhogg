@@ -52,6 +52,8 @@ pub(super) struct SimpleRelations<'a> {
     pub label: &'a str,
     pub outdir: &'a Path,
     pub pbfhogg_simple: &'a Path,
+    /// Who wrote `pbfhogg_simple`: pbfhogg, or osmium sorting it.
+    pub pbfhogg_simple_origin: crate::pbf_frames::Origin,
     pub osmium_simple: &'a Path,
     pub osmium_complete: &'a Path,
     pub complete_relations: u64,
@@ -130,7 +132,10 @@ fn simple_vs_complete(
     let mut only_simple = PerType::default();
     let mut content = PerType::default();
     let mut left_out = Vec::new();
-    let policy = crate::opl_compare::Policy::between(input.pbfhogg_simple, input.osmium_complete)?;
+    let policy = crate::opl_compare::Policy::between(
+        (input.pbfhogg_simple, input.pbfhogg_simple_origin),
+        (input.osmium_complete, crate::pbf_frames::Origin::Other),
+    )?;
     element_diff::scan_element_diff(
         harness,
         input.pbfhogg_simple,
@@ -329,7 +334,10 @@ fn present_members(
     )?;
     harness.require_success(&captured, "osmium removeid")?;
     let mut stray: Option<String> = None;
-    let policy = crate::opl_compare::Policy::between(osmium_simple, &without)?;
+    let policy = crate::opl_compare::Policy::between(
+        (osmium_simple, crate::pbf_frames::Origin::Other),
+        (&without, crate::pbf_frames::Origin::Other),
+    )?;
     element_diff::scan_element_diff(
         harness,
         osmium_simple,

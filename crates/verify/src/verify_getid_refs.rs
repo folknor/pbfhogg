@@ -240,7 +240,7 @@ pub(crate) fn refuse_negative_ids(summary: &IndexSummary, pbf: &Path) -> Result<
         if let Some(claim) = claim
             && claim.min_id < 0
         {
-            return Err(Error::Failed(format!(
+            return Err(Error::Tool(format!(
                 "{} claims {} ID {}; osmium getid -r and osmium removeid match an ID by its \
                  absolute value and pbfhogg does not, so getid cannot be compared on it",
                 pbf.display(),
@@ -293,8 +293,10 @@ fn choose_relation(harness: &mut Harness, input: &RefsInput<'_>) -> Result<Choic
         }
         nesting.add(r);
     })?;
+    // Each refusal here is of the input (a sign osmium folds, or indexdata
+    // its own records contradict), so a verifier error, never a verdict.
     if let Some(id) = negative {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "{} holds relation {id}, which the input's indexdata did not claim; osmium getid -r \
              and osmium removeid match an ID by its absolute value and pbfhogg does not, so \
              getid cannot be compared on it",
@@ -303,7 +305,7 @@ fn choose_relation(harness: &mut Harness, input: &RefsInput<'_>) -> Result<Choic
     }
     let claimed = input.summary.count(2);
     if records != claimed {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "{} holds {records} relation records, but the input's indexdata claims {claimed} \
              relations",
             relations.display()
@@ -530,8 +532,10 @@ fn exercised(
     // The reader admits signed IDs; osmium's lookup by magnitude can return a
     // negative object the indexdata's claimed minimum hid, so a decoded one
     // is refused here rather than counted as an object the request pulled.
+    // Both refusals read osmium's selection from the input: the comparison
+    // cannot be made, a verifier error.
     if let Some(o) = objects.iter().find(|o| o.id < 0) {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "{} holds {} {}, which the input's indexdata did not claim; getid \
              --add-referenced cannot be compared on it",
             listing.display(),
@@ -541,7 +545,7 @@ fn exercised(
     }
     let requested: BTreeSet<(usize, i64)> = request.iter().copied().collect();
     judge_exercised(&objects, &requested, chain.map(|(_, r3)| r3)).map_err(|why| {
-        Error::Failed(format!(
+        Error::Tool(format!(
             "{}: {why}; getid --add-referenced cannot be compared on it",
             listing.display()
         ))

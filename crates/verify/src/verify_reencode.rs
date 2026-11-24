@@ -41,7 +41,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use super::pbf_frames::{self, BlobClaim, ClaimedBlob, Claims, Framing};
+use super::pbf_frames::{self, BlobClaim, ClaimedBlob, Claims, Framing, Origin};
 use super::verify_fileinfo::{FileInfo, fileinfo};
 use crate::argv::PbfArgv;
 use crate::error::Error;
@@ -91,22 +91,27 @@ impl Input {
 /// its payload contradicts, is an error.
 pub(super) fn read_input(harness: &mut Harness, outdir: &Path, pbf: &Path) -> Result<Input, Error> {
     let info = fileinfo(harness, pbf, &outdir.join("input.fileinfo.json"))?;
-    if Claims::open(pbf)?
+    // Every refusal here is of the input, so a verifier error: the comparison
+    // cannot be made on it, which says nothing about pbfhogg.
+    if Claims::open(pbf, Origin::Other)?
         .required_features()
         .iter()
         .any(|f| f == HISTORY)
     {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "{} declares {HISTORY}: the comparison needs one object per kind and ID",
             pbf.display()
         )));
     }
     let header = super::verify_input_order::input_header(harness, pbf, outdir)?;
-    let indexed = matches!(pbf_frames::framing(pbf)?, Framing::Indexed { .. });
+    let indexed = matches!(
+        pbf_frames::framing(pbf, Origin::Other)?,
+        Framing::Indexed { .. }
+    );
     if indexed {
-        let truth = pbf_frames::index_truth(pbf)?;
+        let truth = pbf_frames::index_truth(pbf, Origin::Other)?;
         if !truth.passed() {
-            return Err(Error::Failed(format!(
+            return Err(Error::Tool(format!(
                 "the verifier's blob decode finds {} claims of {} false ({}): its blob layout \
                  cannot be predicted from them",
                 truth.violations,
@@ -233,7 +238,7 @@ pub(super) fn judge_index(
     label: &str,
     output: &Path,
 ) -> Result<(), Error> {
-    let truth = pbf_frames::index_truth(output)?;
+    let truth = pbf_frames::index_truth(output, Origin::Pbfhogg)?;
     let ok = truth.passed() && truth.blobs_with_indexdata == truth.blobs;
     for line in &truth.shown {
         harness.msg(&format!("  {label}: blob decode: {line}"));
@@ -316,7 +321,7 @@ pub(super) fn judge_header(
     sorted: bool,
     locations: bool,
 ) -> Result<(), Error> {
-    let header = pbf_frames::header(output)?;
+    let header = pbf_frames::header(output, Origin::Pbfhogg)?;
     for (feature, want, got) in [
         (
             pbf_frames::SORT_TYPE_THEN_ID,
@@ -773,7 +778,7 @@ impl FrameIds {
     fn open(path: &Path) -> Result<Self, Error> {
         Ok(Self {
             path: path.to_path_buf(),
-            claims: pbf_frames::Claims::open(path)?,
+            claims: pbf_frames::Claims::open(path, Origin::Pbfhogg)?,
             blob: Vec::new().into_iter(),
             pending: None,
         })
@@ -789,8 +794,13 @@ impl FrameIds {
             let Some(blob) = self.claims.next_blob()? else {
                 return Ok(None);
             };
-            self.blob =
-                pbf_frames::blob_ids(&self.path, blob.payload_offset, blob.datasize)?.into_iter();
+            self.blob = pbf_frames::blob_ids(
+                &self.path,
+                Origin::Pbfhogg,
+                blob.payload_offset,
+                blob.datasize,
+            )?
+            .into_iter();
         }
         Ok(self.pending)
     }
@@ -1102,7 +1112,8 @@ pub(super) fn each_claim(
     kind: usize,
     mut f: impl FnMut(BlobClaim) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let mut claims = Claims::open(path)?;
+    // An input's claims, never a pbfhogg output's.
+    let mut claims = Claims::open(path, Origin::Other)?;
     while let Some(blob) = claims.next_blob()? {
         let claim = blob.claim.ok_or_else(|| {
             Error::Failed(format!(
@@ -1129,7 +1140,7 @@ pub(super) struct LayoutCheck {
 impl LayoutCheck {
     pub fn open(output: &Path) -> Result<Self, Error> {
         Ok(Self {
-            claims: Claims::open(output)?,
+            claims: Claims::open(output, Origin::Pbfhogg)?,
             position: 0,
             mismatch: None,
         })
@@ -1202,7 +1213,7 @@ pub(super) struct KindBlobs {
 pub(super) fn output_blobs(output: &Path, cap: u64) -> Result<OutputBlobs, Error> {
     let mut out = OutputBlobs::default();
     let mut highest: Option<usize> = None;
-    let mut claims = Claims::open(output)?;
+    let mut claims = Claims::open(output, Origin::Pbfhogg)?;
     while let Some(blob) = claims.next_blob()? {
         let claim = blob.claim.ok_or_else(|| {
             Error::Failed(format!(
@@ -1250,7 +1261,8 @@ pub(super) fn located_ids(
     kind: usize,
 ) -> Result<Vec<i64>, Error> {
     let (blob, claim) = located;
-    let elements = pbf_frames::blob_ids(output, blob.payload_offset, blob.datasize)?;
+    let elements =
+        pbf_frames::blob_ids(output, Origin::Pbfhogg, blob.payload_offset, blob.datasize)?;
     if elements.len() as u64 != claim.count || elements.iter().any(|&(k, _)| k != kind) {
         return Err(Error::Failed(format!(
             "data blob {} of {} decodes to {} elements, not the {} {}s its claim checked by \

@@ -38,7 +38,7 @@ use crate::checks::sort;
 use crate::error::Error;
 use crate::harness::{Harness, Role, Verdict};
 use crate::opl_compare::Policy;
-use crate::pbf_frames::{self, Header, SORT_TYPE_THEN_ID};
+use crate::pbf_frames::{self, Header, Origin, SORT_TYPE_THEN_ID};
 
 /// The input's header features, read by the verifier itself.
 pub(crate) fn input_header(
@@ -46,7 +46,7 @@ pub(crate) fn input_header(
     pbf: &Path,
     _outdir: &Path,
 ) -> Result<Header, Error> {
-    let header = pbf_frames::header(pbf)?;
+    let header = pbf_frames::header(pbf, Origin::Other)?;
     harness.msg(&format!(
         "  input header: required {:?}, optional {:?}",
         header.required, header.optional
@@ -65,7 +65,12 @@ pub(crate) fn osmium_sorted_copy(
     let dir = outdir.join("osmium-sorted-input");
     std::fs::create_dir_all(&dir)?;
     let copy = dir.join(sort::OSMIUM_SORTED);
-    sort::osmium_sort(harness, pbf, &copy, &dir.join("osmium.sink"))?;
+    sort::osmium_sort(
+        harness,
+        (pbf, Origin::Other),
+        &copy,
+        &dir.join("osmium.sink"),
+    )?;
     Ok(copy)
 }
 
@@ -132,7 +137,7 @@ pub(crate) fn compare_outputs(
     // comparison, a pbfhogg header verdict or copy-sort failure could come
     // first and hide it.
     if !harness.check_sorted(osmium_label, theirs)?.is_pass() {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "{osmium_label} output is not in strict order, so it cannot be compared with \
              pbfhogg's by ID"
         )));
@@ -147,7 +152,7 @@ pub(crate) fn compare_outputs(
             format!("{pbfhogg_label} output order"),
         )
     } else {
-        let claims = harness.has_sort_flag(ours)?;
+        let claims = harness.has_sort_flag(ours, Origin::Pbfhogg)?;
         harness.msg(&format!(
             "  {pbfhogg_label}: header {} {SORT_TYPE_THEN_ID} on unsorted input {}",
             if claims { "claims" } else { "does not claim" },
@@ -158,14 +163,25 @@ pub(crate) fn compare_outputs(
             Verdict::from_pass(!claims),
         );
         let copy = ours.with_extension("sorted.pbf");
-        sort::osmium_sort(harness, ours, &copy, &ours.with_extension("sorted.sink"))?;
+        sort::osmium_sort(
+            harness,
+            (ours, Origin::Pbfhogg),
+            &copy,
+            &ours.with_extension("sorted.sink"),
+        )?;
         (
             copy,
             format!("{pbfhogg_label} (osmium-sorted)"),
             format!("{pbfhogg_label} output repeats an ID"),
         )
     };
-    let policy = Policy::between(&compared, theirs)?;
+    // pbfhogg's own output on sorted input, osmium's copy of it otherwise.
+    let compared_origin = if order.sorted {
+        Origin::Pbfhogg
+    } else {
+        Origin::Other
+    };
+    let policy = Policy::between((&compared, compared_origin), (theirs, Origin::Other))?;
     let (diff, _) = harness.same_elements_judged(
         (
             &compared,
@@ -231,8 +247,8 @@ pub(crate) fn sorted_counterpart(
     outdir: &Path,
 ) -> Result<PathBuf, Error> {
     let copy = osmium_sorted_copy(harness, pbf, outdir)?;
-    if !pbf_frames::header(&copy)?.optional_sorted() {
-        return Err(Error::Failed(format!(
+    if !pbf_frames::header(&copy, Origin::Other)?.optional_sorted() {
+        return Err(Error::Tool(format!(
             "the osmium-sorted copy {} does not declare {SORT_TYPE_THEN_ID} among its optional \
              features, so it cannot stand as the sorted side of a refused diff",
             copy.display()

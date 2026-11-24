@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use crate::error::Error;
-use crate::pbf_frames::{self, ClaimedBlob};
+use crate::pbf_frames::{self, ClaimedBlob, Origin};
 
 /// One data blob of one input, as decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +27,8 @@ pub(crate) struct Entry {
     pub max: i64,
 }
 
-/// Every data blob of `path`, decoded and held to the domain.
+/// Every data blob of `path`, decoded and held to the domain. `path` is an
+/// operand the check derived, never a pbfhogg output.
 pub(crate) fn entries(path: &Path) -> Result<Vec<Entry>, Error> {
     let outside = |blob: &ClaimedBlob, why: String| {
         Error::tool(format!(
@@ -37,10 +38,14 @@ pub(crate) fn entries(path: &Path) -> Result<Vec<Entry>, Error> {
         ))
     };
     let mut out = Vec::new();
-    let mut claims = pbf_frames::Claims::open(path)?;
+    let mut claims = pbf_frames::Claims::open(path, Origin::Other)?;
     while let Some(blob) = claims.next_blob()? {
-        let (ids, single_field) =
-            pbf_frames::blob_ids_and_shape(path, blob.payload_offset, blob.datasize)?;
+        let (ids, single_field) = pbf_frames::blob_ids_and_shape(
+            path,
+            Origin::Other,
+            blob.payload_offset,
+            blob.datasize,
+        )?;
         let Some(&(kind, min)) = ids.first() else {
             return Err(outside(&blob, "holds no element".into()));
         };
@@ -172,13 +177,14 @@ pub(crate) fn shape(plan: &[Segment]) -> Shape {
 }
 
 /// Hold `out`'s data blobs to `plan` over `inputs` (paths in argument
-/// order). `Ok(Err(why))` names the first departure.
+/// order): `out` is pbfhogg's, the inputs are not. `Ok(Err(why))` names
+/// the first departure.
 pub(crate) fn judge(
     out: &Path,
     inputs: &[&Path],
     plan: &[Segment],
 ) -> Result<Result<(), String>, Error> {
-    let mut blobs = pbf_frames::Claims::open(out)?;
+    let mut blobs = pbf_frames::Claims::open(out, Origin::Pbfhogg)?;
     let mut next = blobs.next_blob()?;
     for (n, seg) in plan.iter().enumerate() {
         match seg {
@@ -190,7 +196,12 @@ pub(crate) fn judge(
                         entry.blob.index
                     )));
                 };
-                if !pbf_frames::same_payload(out, &got, inputs[*input], &entry.blob)? {
+                if !pbf_frames::same_payload(
+                    (out, Origin::Pbfhogg),
+                    &got,
+                    (inputs[*input], Origin::Other),
+                    &entry.blob,
+                )? {
                     return Ok(Err(format!(
                         "output data blob {} is not input {} data blob {} copied through \
                          (segment {n})",
@@ -212,7 +223,12 @@ pub(crate) fn judge(
                     // the boundary is read from the output rather than
                     // assumed from the plan. One blob per run end, negligible
                     // beside osmium's whole-file decodes.
-                    let ids = pbf_frames::blob_ids(out, got.payload_offset, got.datasize)?;
+                    let ids = pbf_frames::blob_ids(
+                        out,
+                        Origin::Pbfhogg,
+                        got.payload_offset,
+                        got.datasize,
+                    )?;
                     let Some(&(k, first)) = ids.first() else {
                         return Ok(Err(format!("output data blob {} is empty", got.index)));
                     };

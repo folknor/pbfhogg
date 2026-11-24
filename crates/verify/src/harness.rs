@@ -14,10 +14,23 @@ use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::opl_compare::{self, Policy};
 use crate::output::{self, Detail};
+use crate::pbf_frames::Origin;
 use crate::process::{Ended, Launch, Lifecycle};
 use crate::reference::{ToolRun, Tools};
 use crate::run::Run;
 use crate::{pbf_frames, stream, tunables};
+
+/// The line osmium-tool's `main` prints for a `std::bad_alloc` before its
+/// error exit (osmium-tool's `main`, catching `std::bad_alloc`).
+const OSMIUM_BAD_ALLOC: &str =
+    "Out of memory. Read the MEMORY USAGE section of the osmium(1) manpage.";
+
+/// Whether `stderr` holds [`OSMIUM_BAD_ALLOC`] as a whole line.
+fn reports_bad_alloc(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim_end() == OSMIUM_BAD_ALLOC)
+}
 
 /// The outcome of one comparison inside a check.
 #[must_use = "a discarded verdict is a silent PASS - record it on the harness"]
@@ -354,17 +367,18 @@ impl Harness {
     /// Whether `pbf`'s header declares `Sort.Type_then_ID`, read by the
     /// verifier's own header reader. Only the optional list can hold it: the
     /// reader refuses it as a required feature, as pbfhogg and libosmium do.
-    pub(crate) fn has_sort_flag(&mut self, pbf: &Path) -> Result<bool, Error> {
-        Ok(pbf_frames::header(pbf)?.optional_sorted())
+    pub(crate) fn has_sort_flag(&mut self, pbf: &Path, origin: Origin) -> Result<bool, Error> {
+        Ok(pbf_frames::header(pbf, origin)?.optional_sorted())
     }
 
+    /// `ours` is the file pbfhogg wrote, `theirs` the reference's.
     pub(crate) fn compare_sort_feature(
         &mut self,
         ours: &Path,
         theirs: &Path,
     ) -> Result<Verdict, Error> {
-        let a = self.has_sort_flag(ours)?;
-        let b = self.has_sort_flag(theirs)?;
+        let a = self.has_sort_flag(ours, Origin::Pbfhogg)?;
+        let b = self.has_sort_flag(theirs, Origin::Other)?;
         self.msg(&format!("  sort feature: pbfhogg {a}, reference {b}"));
         Ok(Verdict::from_pass(!b || a))
     }
@@ -388,8 +402,8 @@ impl Harness {
         expect: WayLocations,
     ) -> Result<(), Error> {
         const LOW: &str = "LocationsOnWays";
-        let had = pbf_frames::header(input)?.optional_feature(LOW);
-        let has = pbf_frames::header(ours)?.optional_feature(LOW);
+        let had = pbf_frames::header(input, Origin::Other)?.optional_feature(LOW);
+        let has = pbf_frames::header(ours, Origin::Pbfhogg)?.optional_feature(LOW);
         let warned = warns_locations_loss(&ended.stderr_text());
         let (ok, why) = match (had, has, expect) {
             (false, true, _) => (false, "declared, but the input does not declare it"),
@@ -420,7 +434,8 @@ impl Harness {
     /// A tool killed by
     /// SIGKILL, which the verifier never sends one while it waits, is an
     /// environment outcome: commonly the kernel OOM killer, and it says
-    /// nothing about pbfhogg. The run's inputs are revalidated before its
+    /// nothing about pbfhogg; so is an osmium exit reporting its own
+    /// allocation failure ([`OSMIUM_BAD_ALLOC`]). The run's inputs are revalidated before its
     /// outcome is used. The run succeeds only as the cache settled it:
     /// an accepted outcome whose declared outputs and stdout are all present
     /// as regular files and placed. An accepted exit that left a declared
@@ -552,6 +567,19 @@ impl Harness {
         self.run.revalidate()?;
         match settled {
             Settled::Complete { ended, .. } => Ok(ended),
+            // osmium's `main` reports a `std::bad_alloc` with this exact line
+            // and its ordinary error exit: an allocation failure in the
+            // reference, the same class as the OOM killer's SIGKILL above. Its
+            // cause is not known here (memory, or a request no host can serve,
+            // such as a negative ref libosmium sets into an unsigned ID set),
+            // and neither says anything about pbfhogg.
+            Settled::Unaccepted { ended } if reports_bad_alloc(&ended.stderr_text()) => {
+                Err(Error::Environment(format!(
+                    "{label} (reference run {}) failed: {}: osmium could not allocate memory \
+                     (cause unknown); the comparison could not be made",
+                    run.id, ended.status
+                )))
+            }
             Settled::Unaccepted { ended } => Err(Error::Failed(format!(
                 "{label} (reference run {}) failed: {}: {}",
                 run.id,
@@ -686,7 +714,9 @@ impl Harness {
             self.msg(&format!("  {label}: in strict order (osmium OPL) PASS"));
             return Verdict::Pass;
         }
-        let hint = match pbf_frames::header(pbf) {
+        // A context read whose refusal is only narrated: the origin decides
+        // no verdict.
+        let hint = match pbf_frames::header(pbf, Origin::Other) {
             Ok(header) if header.optional_sorted() => format!(
                 " - header declares {} but element order disagrees",
                 pbf_frames::SORT_TYPE_THEN_ID
@@ -761,7 +791,9 @@ impl Harness {
                 }
                 Role::Reference { label } => {
                     if !self.report_order(label, pbf, scan).is_pass() && reference.is_none() {
-                        reference = Some(Error::Failed(format!(
+                        // The reference's disorder says nothing about
+                        // pbfhogg: an unsupported comparison domain.
+                        reference = Some(Error::Tool(format!(
                             "{label} output is not in strict order, so it cannot be compared \
                              with pbfhogg's by ID"
                         )));
@@ -897,7 +929,16 @@ pub(crate) fn listing_beside(output: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckStatus, Error, conclude};
+    use super::{CheckStatus, Error, OSMIUM_BAD_ALLOC, conclude, reports_bad_alloc};
+
+    #[test]
+    fn only_osmiums_whole_bad_alloc_line_is_an_allocation_failure() {
+        assert!(reports_bad_alloc(&format!("Started\n{OSMIUM_BAD_ALLOC}\n")));
+        assert!(reports_bad_alloc(&format!("{OSMIUM_BAD_ALLOC}\r")));
+        assert!(!reports_bad_alloc("Out of memory.\n"));
+        assert!(!reports_bad_alloc(&format!("x {OSMIUM_BAD_ALLOC}")));
+        assert!(!reports_bad_alloc("PBF error: zstd blobs not supported\n"));
+    }
 
     #[test]
     fn a_recorded_failure_outlives_ok_and_environment() {

@@ -200,7 +200,9 @@ pub fn alter(src: &Path, dst: &Path, suffix: &str) {
 
 /// The optional features of a fixture written by [`write()`].
 pub fn features(path: &Path) -> Vec<String> {
-    crate::pbf_frames::header(path).unwrap().optional
+    crate::pbf_frames::header(path, crate::pbf_frames::Origin::Other)
+        .unwrap()
+        .optional
 }
 
 /// Copy `src`'s features to a new fixture at `dst` with `marker`.

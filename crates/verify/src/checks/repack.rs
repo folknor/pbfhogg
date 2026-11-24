@@ -25,7 +25,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::Harness;
-use crate::pbf_frames::{self, Framing};
+use crate::pbf_frames::{self, Framing, Origin};
 use crate::verify_reencode::{
     self as reencode, DEFAULT_CAP, LayoutCheck, Ran, References, RepackBuilder, Witnesses,
 };
@@ -86,14 +86,16 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     if input.indexed {
         harness.msg("--- repack: deriving the input stripped of indexdata ---");
         harness.strip_indexdata(pbf, &stripped)?;
-        if pbf_frames::framing(&stripped)? != Framing::Unindexed {
+        if pbf_frames::framing(&stripped, Origin::Pbfhogg)? != Framing::Unindexed {
             return Err(Error::Failed(format!(
                 "the stripped copy {} still carries indexdata, so it cannot stand for an \
                  unindexed input",
                 stripped.display()
             )));
         }
-        if let Err(why) = pbf_frames::same_data_payloads(pbf, &stripped)? {
+        if let Err(why) =
+            pbf_frames::same_data_payloads((pbf, Origin::Other), (&stripped, Origin::Pbfhogg))?
+        {
             return Err(Error::Failed(format!(
                 "the stripped copy {} does not hold the input's data payloads ({why}), so the \
                  input's claims cannot predict its layout",

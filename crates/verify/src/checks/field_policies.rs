@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::harness::Harness;
 use crate::opl_compare::{self, Class, Group, Merged, Policy};
-use crate::pbf_frames;
+use crate::pbf_frames::{self, Origin};
 use crate::reference::ToolRun;
 use crate::verify_getid_refs::osmium_completed;
 
@@ -476,7 +476,7 @@ fn first_ids(pbf: &Path, per_kind: usize) -> Result<[Vec<i64>; 3], Error> {
     let mut ids: [Vec<i64>; 3] = Default::default();
     // A kind is taken from the first blob it appears in, and only that one.
     let mut seen = [false; 3];
-    let mut claims = pbf_frames::Claims::open(pbf)?;
+    let mut claims = pbf_frames::Claims::open(pbf, Origin::Other)?;
     while let Some(blob) = claims.next_blob()? {
         if seen.iter().all(|s| *s) {
             break;
@@ -486,7 +486,8 @@ fn first_ids(pbf: &Path, per_kind: usize) -> Result<[Vec<i64>; 3], Error> {
         {
             continue;
         }
-        let elements = pbf_frames::blob_ids(pbf, blob.payload_offset, blob.datasize)?;
+        let elements =
+            pbf_frames::blob_ids(pbf, Origin::Other, blob.payload_offset, blob.datasize)?;
         let mut here = [false; 3];
         for &(kind, id) in &elements {
             here[kind] = true;
@@ -685,7 +686,7 @@ fn run_control(
     let altered_full = full_records(harness, &altered)?;
     isolate(harness, name, class, &token, base_full, &altered_full);
 
-    let between = Policy::between(base, &altered)?;
+    let between = Policy::between((base, Origin::Other), (&altered, Origin::Other))?;
     if between != Policy::FULL {
         harness.fail(format!(
             "{name}: between two LocationsOnWays files is {}, not full",
@@ -890,7 +891,7 @@ fn run_between(
         (undeclared, declared, Policy::NO_LOCATIONS),
         (undeclared, undeclared, Policy::NO_LOCATIONS),
     ] {
-        let got = Policy::between(a, b)?;
+        let got = Policy::between((a, Origin::Other), (b, Origin::Other))?;
         let ok = got == want;
         harness.msg(&format!(
             "  between {} and {}: {} {}",
@@ -958,7 +959,7 @@ fn run_between(
         ("between", declared, undeclared),
         ("between-reversed", undeclared, declared),
     ] {
-        let policy = Policy::between(a, b)?;
+        let policy = Policy::between((a, Origin::Other), (b, Origin::Other))?;
         for (name, policy) in [
             (label, policy),
             ("no-locations", Policy::NO_LOCATIONS),

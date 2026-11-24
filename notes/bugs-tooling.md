@@ -49,24 +49,23 @@ rejects the model for containing an unlocated street way, although the source
 has every required node. This breaks the check's claim to model the input's
 geometry, because the missing locations come from reference construction.
 
-## TOOL-006 - Unsupported comparison domains are reported as pbfhogg failures
+## TOOL-047 - A reference that cannot read the dataset input reports FAIL
 
-Reported by: verify [P2].
+Reported by: the spar on the verifier's error classification (2026-11-24).
 
-The contract (`reference/verify.md`) assigns unsupported comparison domains to
-`ERROR`, exit 2. The independent blob decoder (`pbf_frames.rs`) builds
-`Error::Failed` for every decoding refusal. For example, sorting a claimless
-indexed `LocationsOnWays` input with zstd data can succeed correctly and then
-fail the verifier's planner prediction, because its decoder supports only raw
-and zlib. That becomes `FAIL`, exit 1, blaming pbfhogg for a verifier
-limitation. Repeated scalar IDs and wrapping dense deltas hit the same
-misclassification, although both are documented comparison-domain exclusions.
-`checks/getparents.rs` refuses an input holding a negative ID as
-`Error::Failed` while its own message says getparents "cannot be compared on
-it"; `checks/extract.rs` and `verify_extract_simple.rs` raise the same kind of
-refusal as `Error::Tool`. A related open question: a reference run that dies
-on an osmium limit (extract's "Out of memory" on a negative outside way ref,
-VER-155) is `Error::Failed` by the reference-run contract in `error.rs`.
+The verifier's own frame reader now classifies a refusal by who wrote the
+file (`pbf_frames::Origin`), but a reference run is still judged by the
+reference-run rule alone: any unaccepted exit is `Error::Failed`, apart from
+SIGKILL and osmium's `bad_alloc` line. So a dataset input in a compression
+libosmium refuses (zstd: `PBF error: zstd blobs not supported`) fails
+`verify sort` with exit 1, because `osmium sort` reads the input before any
+verifier decode does. The same holds for every check whose first reference
+reads the input. A stderr match alone cannot fix this. An osmium run can also
+read a pbfhogg output, and there a zstd blob may be a writer defect: `repack`
+is contracted to re-encode with zlib. Classifying correctly needs per-operand
+provenance on `ToolRun` inputs, where `PbfArgv::writes()` already names
+pbfhogg's outputs. It also needs evidence tying the refusal to the dataset
+operand, not just to some input of a multi-input run.
 
 ## TOOL-007 - verify sort never exercises the unindexed fallback
 

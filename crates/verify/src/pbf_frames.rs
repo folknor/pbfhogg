@@ -56,6 +56,37 @@ use std::path::Path;
 
 use crate::error::Error;
 
+/// Who wrote the file a reader opens, which decides what its refusal says.
+///
+/// The same reader judges a pbfhogg output and reads the files a comparison
+/// stands on, so every entry point that opens a file is told which it is.
+/// On a pbfhogg output a refusal (or a file that cannot be opened) is a
+/// check failure: verify's pbfhogg runs are fresh writes, whose every
+/// refusal breaks the writer's contract (zlib by default, `raw_size` always
+/// written, one ID per element), or passthroughs of input blobs the
+/// comparison already read. On any other file - the dataset input, an
+/// osmium output or copy, a fixture the verifier changed - the reader's
+/// refusal says the comparison cannot be made on it, a verifier error, never
+/// a pbfhogg verdict. A file two producers wrote is read as each before and
+/// after the other's change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Bytes a pbfhogg run under test wrote.
+    Pbfhogg,
+    /// The dataset input, a reference tool's output, or a verifier-made file.
+    Other,
+}
+
+impl Origin {
+    /// The error a refusal or I/O failure on a file of this origin is.
+    pub(crate) fn refuse(self, why: String) -> Error {
+        match self {
+            Self::Pbfhogg => Error::Failed(why),
+            Self::Other => Error::Tool(format!("{why}; the comparison cannot be made on it")),
+        }
+    }
+}
+
 /// pbfhogg refuses a `BlobHeader` length of zero or of 64 KiB and above.
 const MAX_HEADER_LEN: u32 = 64 * 1024;
 /// pbfhogg refuses a blob payload (`datasize`) of 32 MiB and above, and the
@@ -96,19 +127,25 @@ impl IndexSummary {
 
 /// Walk `path`'s framing; refuse anything pbfhogg would not read through its
 /// indexdata. Errors name the blob ordinal and offset.
-pub(crate) fn walk(path: &Path) -> Result<IndexSummary, Error> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-    let len = file
-        .metadata()
-        .map_err(|e| Error::Failed(format!("cannot stat {}: {e}", path.display())))?
-        .len();
+pub(crate) fn walk(path: &Path, origin: Origin) -> Result<IndexSummary, Error> {
+    let (mut file, len) = open(path, origin)?;
     walk_reader(&mut file, len).map_err(|why| {
-        Error::Failed(format!(
+        origin.refuse(format!(
             "{} is not a fully indexed PBF this check can select IDs from: {why}",
             path.display()
         ))
     })
+}
+
+/// Open `path` and read its length, an error of `origin` if either fails.
+fn open(path: &Path, origin: Origin) -> Result<(std::fs::File, u64), Error> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| origin.refuse(format!("cannot open {}: {e}", path.display())))?;
+    let len = file
+        .metadata()
+        .map_err(|e| origin.refuse(format!("cannot stat {}: {e}", path.display())))?
+        .len();
+    Ok((file, len))
 }
 
 fn walk_reader(r: &mut (impl Read + Seek), len: u64) -> Result<IndexSummary, String> {
@@ -143,15 +180,10 @@ pub(crate) enum Framing {
 /// Read `path`'s [`Framing`], refusing what pbfhogg could not read through
 /// its indexdata (as [`walk`] does) and a file mixing data blobs with and
 /// without indexdata, which pbfhogg classifies by its first blob alone.
-pub(crate) fn framing(path: &Path) -> Result<Framing, Error> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-    let len = file
-        .metadata()
-        .map_err(|e| Error::Failed(format!("cannot stat {}: {e}", path.display())))?
-        .len();
+pub(crate) fn framing(path: &Path, origin: Origin) -> Result<Framing, Error> {
+    let (mut file, len) = open(path, origin)?;
     framing_reader(&mut file, len).map_err(|why| {
-        Error::Failed(format!(
+        origin.refuse(format!(
             "cannot read the framing of {}: {why}",
             path.display()
         ))
@@ -366,6 +398,7 @@ pub(crate) struct ClaimedBlob {
 /// fields, or with one that does not decode, is an error.
 pub(crate) struct Claims {
     path: std::path::PathBuf,
+    origin: Origin,
     file: std::io::BufReader<std::fs::File>,
     len: u64,
     offset: u64,
@@ -375,19 +408,16 @@ pub(crate) struct Claims {
 }
 
 impl Claims {
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-        let len = file
-            .metadata()
-            .map_err(|e| Error::Failed(format!("cannot stat {}: {e}", path.display())))?
-            .len();
+    pub(crate) fn open(path: &Path, origin: Origin) -> Result<Self, Error> {
+        let (file, len) = open(path, origin)?;
         let mut file = std::io::BufReader::new(file);
-        let walk = FrameWalk::open(&mut file, len).map_err(|why| Self::error_at(path, &why))?;
+        let walk =
+            FrameWalk::open(&mut file, len).map_err(|why| Self::error_at(path, origin, &why))?;
         let (offset, ordinal, required_features) =
             (walk.offset, walk.ordinal, walk.required_features);
         Ok(Self {
             path: path.to_path_buf(),
+            origin,
             file,
             len,
             offset,
@@ -397,8 +427,13 @@ impl Claims {
         })
     }
 
-    fn error_at(path: &Path, why: &str) -> Error {
-        Error::Failed(format!(
+    /// The file's origin, which the per-blob readers it names are read under.
+    pub(crate) fn origin(&self) -> Origin {
+        self.origin
+    }
+
+    fn error_at(path: &Path, origin: Origin, why: &str) -> Error {
+        origin.refuse(format!(
             "cannot read the blob claims of {}: {why}",
             path.display()
         ))
@@ -421,7 +456,7 @@ impl Claims {
         };
         let frame = walk
             .next_data()
-            .map_err(|why| Self::error_at(&self.path, &why))?;
+            .map_err(|why| Self::error_at(&self.path, self.origin, &why))?;
         self.offset = walk.offset;
         self.ordinal = walk.ordinal;
         let Some(frame) = frame else {
@@ -432,12 +467,14 @@ impl Claims {
             Indexdata::Conflicting => {
                 return Err(Self::error_at(
                     &self.path,
+                    self.origin,
                     &format!("{}: data blob has two indexdata fields", frame.at()),
                 ));
             }
             Indexdata::Present(bytes) => {
-                let index = decode_index(bytes)
-                    .map_err(|why| Self::error_at(&self.path, &format!("{}: {why}", frame.at())))?;
+                let index = decode_index(bytes).map_err(|why| {
+                    Self::error_at(&self.path, self.origin, &format!("{}: {why}", frame.at()))
+                })?;
                 Some(BlobClaim {
                     kind: index.kind,
                     min_id: index.min_id,
@@ -461,8 +498,8 @@ impl Claims {
 /// raw-copying `cat` paths decide their way handling from. A file without
 /// a data blob answers false here, where pbfhogg's probe answers true
 /// (vacuously indexed); such a file has no ways for the answer to govern.
-pub(crate) fn first_data_blob_indexed(path: &Path) -> Result<bool, Error> {
-    Ok(Claims::open(path)?
+pub(crate) fn first_data_blob_indexed(path: &Path, origin: Origin) -> Result<bool, Error> {
+    Ok(Claims::open(path, origin)?
         .next_blob()?
         .is_some_and(|blob| blob.claim.is_some()))
 }
@@ -475,10 +512,11 @@ pub(crate) fn first_data_blob_indexed(path: &Path) -> Result<bool, Error> {
 /// it. Changesets are skipped. Bounded by one blob.
 pub(crate) fn blob_ids(
     path: &Path,
+    origin: Origin,
     payload_offset: u64,
     datasize: u64,
 ) -> Result<Vec<(usize, i64)>, Error> {
-    let (block, fail) = read_block(path, payload_offset, datasize)?;
+    let (block, fail) = read_block(path, origin, payload_offset, datasize)?;
     block_ids(&block).map_err(fail)
 }
 
@@ -487,10 +525,11 @@ pub(crate) fn blob_ids(
 /// two is a block no single index describes, whatever its IDs decode to.
 pub(crate) fn blob_ids_and_shape(
     path: &Path,
+    origin: Origin,
     payload_offset: u64,
     datasize: u64,
 ) -> Result<(Vec<(usize, i64)>, bool), Error> {
-    let (block, fail) = read_block(path, payload_offset, datasize)?;
+    let (block, fail) = read_block(path, origin, payload_offset, datasize)?;
     let ids = block_ids(&block).map_err(&fail)?;
     let mut single = true;
     for field in Fields::new(&block) {
@@ -516,12 +555,13 @@ pub(crate) fn blob_ids_and_shape(
 /// with the error constructor naming that blob.
 fn read_block(
     path: &Path,
+    origin: Origin,
     payload_offset: u64,
     datasize: u64,
 ) -> Result<(Vec<u8>, impl Fn(String) -> Error), Error> {
     let display = path.display().to_string();
     let fail = move |why: String| {
-        Error::Failed(format!(
+        origin.refuse(format!(
             "cannot read the data blob at byte {payload_offset} of {display}: {why}"
         ))
     };
@@ -563,15 +603,15 @@ impl IndexTruth {
 /// indexdata is counted, not decoded) and hold each claim to the blob's
 /// elements: every element of the claimed kind, the claimed count,
 /// and, for a nonempty blob, the claimed minimum and maximum ID exactly.
-pub(crate) fn index_truth(path: &Path) -> Result<IndexTruth, Error> {
+pub(crate) fn index_truth(path: &Path, origin: Origin) -> Result<IndexTruth, Error> {
     const SHOWN: usize = 10;
     let mut truth = IndexTruth::default();
-    let mut claims = Claims::open(path)?;
+    let mut claims = Claims::open(path, origin)?;
     while let Some(blob) = claims.next_blob()? {
         truth.blobs += 1;
         let Some(claim) = blob.claim else { continue };
         truth.blobs_with_indexdata += 1;
-        let ids = blob_ids(path, blob.payload_offset, blob.datasize)?;
+        let ids = blob_ids(path, origin, blob.payload_offset, blob.datasize)?;
         let mut found = Vec::new();
         if let Some((kind, id)) = ids.iter().find(|(kind, _)| *kind != claim.kind) {
             found.push(format!(
@@ -727,13 +767,14 @@ fn int64(v: u64) -> i64 {
 /// same sequence, whatever their blob headers say: what a header-only
 /// rewrite (`degrade --strip-indexdata`) must keep. `Err` names the first
 /// blob that differs; I/O and framing failures are the outer error.
-pub(crate) fn same_data_payloads(a: &Path, b: &Path) -> Result<Result<(), String>, Error> {
-    let mut left = Claims::open(a)?;
-    let mut right = Claims::open(b)?;
-    let mut fa = std::fs::File::open(a)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", a.display())))?;
-    let mut fb = std::fs::File::open(b)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", b.display())))?;
+pub(crate) fn same_data_payloads(
+    (a, a_origin): (&Path, Origin),
+    (b, b_origin): (&Path, Origin),
+) -> Result<Result<(), String>, Error> {
+    let mut left = Claims::open(a, a_origin)?;
+    let mut right = Claims::open(b, b_origin)?;
+    let (mut fa, _) = open(a, a_origin)?;
+    let (mut fb, _) = open(b, b_origin)?;
     let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
         let (x, y) = match (left.next_blob()?, right.next_blob()?) {
@@ -772,18 +813,16 @@ pub(crate) fn same_data_payloads(a: &Path, b: &Path) -> Result<Result<(), String
 /// serialized `Blob` payload, compression included, whatever their blob
 /// headers say.
 pub(crate) fn same_payload(
-    a: &Path,
+    (a, a_origin): (&Path, Origin),
     x: &ClaimedBlob,
-    b: &Path,
+    (b, b_origin): (&Path, Origin),
     y: &ClaimedBlob,
 ) -> Result<bool, Error> {
     if x.datasize != y.datasize {
         return Ok(false);
     }
-    let mut fa = std::fs::File::open(a)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", a.display())))?;
-    let mut fb = std::fs::File::open(b)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", b.display())))?;
+    let (mut fa, _) = open(a, a_origin)?;
+    let (mut fb, _) = open(b, b_origin)?;
     fa.seek(SeekFrom::Start(x.payload_offset))?;
     fb.seek(SeekFrom::Start(y.payload_offset))?;
     let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
@@ -835,7 +874,7 @@ pub(crate) fn append_empty_claim(path: &Path, kind: usize) -> Result<(), Error> 
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
+        .map_err(|e| Error::tool(format!("cannot open {}: {e}", path.display())))?;
     file.write_all(&frame)?;
     file.sync_all()?;
     Ok(())
@@ -1182,16 +1221,11 @@ impl Header {
 }
 
 /// Read `path`'s leading `OSMHeader` (and the framing up to it).
-pub(crate) fn header(path: &Path) -> Result<Header, Error> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
-    let len = file
-        .metadata()
-        .map_err(|e| Error::Failed(format!("cannot stat {}: {e}", path.display())))?
-        .len();
+pub(crate) fn header(path: &Path, origin: Origin) -> Result<Header, Error> {
+    let (file, len) = open(path, origin)?;
     let mut file = std::io::BufReader::new(file);
     let walk = FrameWalk::open(&mut file, len).map_err(|why| {
-        Error::Failed(format!(
+        origin.refuse(format!(
             "cannot read the header of {}: {why}",
             path.display()
         ))
@@ -1730,7 +1764,7 @@ mod tests {
         let path = dir.join("f.osm.pbf");
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut claims = super::Claims::open(&path).unwrap();
+        let mut claims = super::Claims::open(&path, super::Origin::Other).unwrap();
         let first = claims.next_blob().unwrap().unwrap();
         assert_eq!(
             first.claim,
@@ -1745,11 +1779,23 @@ mod tests {
         assert_eq!((second.index, second.claim), (1, None));
         assert!(claims.next_blob().unwrap().is_none());
         assert_eq!(
-            super::blob_ids(&path, first.payload_offset, first.datasize).unwrap(),
+            super::blob_ids(
+                &path,
+                super::Origin::Other,
+                first.payload_offset,
+                first.datasize
+            )
+            .unwrap(),
             [(0, 5), (0, 7), (0, 9)]
         );
         assert_eq!(
-            super::blob_ids(&path, second.payload_offset, second.datasize).unwrap(),
+            super::blob_ids(
+                &path,
+                super::Origin::Other,
+                second.payload_offset,
+                second.datasize
+            )
+            .unwrap(),
             [(1, 10), (1, 11)]
         );
         assert_eq!(super::zigzag(3), -2);
@@ -1761,13 +1807,49 @@ mod tests {
         frame("OSMData", &[], &data_blob(&ways), &mut stripped);
         let other = dir.join("g.osm.pbf");
         std::fs::write(&other, &stripped).unwrap();
-        assert_eq!(super::same_data_payloads(&path, &other).unwrap(), Ok(()));
+        assert_eq!(
+            super::same_data_payloads(
+                (&path, super::Origin::Other),
+                (&other, super::Origin::Other)
+            )
+            .unwrap(),
+            Ok(())
+        );
         let mut changed = Vec::new();
         frame("OSMHeader", &[], &header_payload(&[], false), &mut changed);
         frame("OSMData", &[], &data_blob(&nodes), &mut changed);
         frame("OSMData", &[], &data_blob(&nodes), &mut changed);
         std::fs::write(&other, &changed).unwrap();
-        assert!(super::same_data_payloads(&path, &other).unwrap().is_err());
+        assert!(
+            super::same_data_payloads(
+                (&path, super::Origin::Other),
+                (&other, super::Origin::Other)
+            )
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_refusal_fails_only_a_pbfhogg_output() {
+        let scratch_dir = pbfhogg_test_scratch::scratch();
+        let path = scratch_dir.path().join("bad.osm.pbf");
+        std::fs::write(&path, [0u8, 0, 0, 0]).unwrap();
+        let missing = scratch_dir.path().join("missing.osm.pbf");
+        for p in [&path, &missing] {
+            assert!(matches!(
+                super::header(p, super::Origin::Pbfhogg),
+                Err(crate::error::Error::Failed(_))
+            ));
+            assert!(matches!(
+                super::header(p, super::Origin::Other),
+                Err(crate::error::Error::Tool(why)) if why.contains("cannot be made on it")
+            ));
+            assert!(matches!(
+                super::Claims::open(p, super::Origin::Other),
+                Err(crate::error::Error::Tool(_))
+            ));
+        }
     }
 
     #[test]
@@ -1779,12 +1861,12 @@ mod tests {
         std::fs::write(&path, file(&[vec![index(3, 1, 5, 5, 1)]], &[])).unwrap();
         super::append_empty_claim(&path, 0).unwrap();
         assert_eq!(
-            super::framing(&path).unwrap(),
+            super::framing(&path, super::Origin::Other).unwrap(),
             Framing::Indexed {
                 claims_in_kind_order: false
             }
         );
-        let summary = super::walk(&path).unwrap();
+        let summary = super::walk(&path, super::Origin::Other).unwrap();
         assert_eq!(summary.count(0), 0);
         assert_eq!(summary.count(1), 1);
         assert!(super::append_empty_claim(&path, 3).is_err());

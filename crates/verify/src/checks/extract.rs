@@ -60,7 +60,7 @@ use crate::extract_config::Region;
 use crate::extract_config::{ExtractStrategy, PbfhoggCommand};
 use crate::harness::{Harness, Role, Verdict};
 use crate::osc::{OscAction, OscKind};
-use crate::pbf_frames::SORT_TYPE_THEN_ID;
+use crate::pbf_frames::{Origin, SORT_TYPE_THEN_ID};
 use crate::reference::ToolRun;
 use crate::verify_element_diff::{self as element_diff, PerType};
 use crate::verify_extract_simple::{self as simple_relations, SimpleRelations};
@@ -289,13 +289,22 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             let sorted = outdir.join(format!("pbfhogg-{strategy_name}.sorted.osm.pbf"));
             verify_sort::osmium_sort(
                 harness,
-                &pbfhogg_out,
+                (&pbfhogg_out, Origin::Pbfhogg),
                 &sorted,
                 &outdir.join(format!("pbfhogg-{strategy_name}.sorted.stdout")),
             )?;
             (sorted, format!("{label} output repeats an ID"))
         };
-        let policy = crate::opl_compare::Policy::between(&compared, &osmium_out)?;
+        // pbfhogg's output on sorted input, osmium's copy of it otherwise.
+        let compared_origin = if input_sorted {
+            Origin::Pbfhogg
+        } else {
+            Origin::Other
+        };
+        let policy = crate::opl_compare::Policy::between(
+            (&compared, compared_origin),
+            (&osmium_out, Origin::Other),
+        )?;
         // Before any verdict of this arm, under the policy the diff reads:
         // a negative reference osmium wrote makes its membership a possible
         // magnitude fold, which the comparison cannot tell from a pbfhogg
@@ -309,7 +318,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             crate::harness::WayLocations::Dropped,
         )?;
         if !input_sorted {
-            let claims = harness.has_sort_flag(&pbfhogg_out)?;
+            let claims = harness.has_sort_flag(&pbfhogg_out, Origin::Pbfhogg)?;
             let verdict = Verdict::from_pass(!claims);
             harness.msg(&format!(
                 "  {label}: header {} {SORT_TYPE_THEN_ID} on unsorted input {}",
@@ -397,6 +406,11 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
                         label: &format!("pbfhogg extract --simple{suffix}"),
                         outdir,
                         pbfhogg_simple: &simple.compared,
+                        pbfhogg_simple_origin: if input_sorted {
+                            Origin::Pbfhogg
+                        } else {
+                            Origin::Other
+                        },
                         osmium_simple: &simple.osmium_out,
                         osmium_complete: &osmium_complete,
                         complete_relations,
@@ -448,10 +462,16 @@ struct NegativeRefs {
 /// only the differing ones. The reading is stored under the output's decoding
 /// key, so a warm rerun neither decodes nor scans.
 ///
-/// Not covered: osmium complete_ways and smart record a matched way's outside
-/// refs signed into an unsigned set, so a negative one there can end the run
-/// "Out of memory" with no output to read; that is a reference run that did
-/// not complete, which fails its check like any other.
+/// osmium complete_ways and smart record a matched way's outside refs signed
+/// into an unsigned ID set, so a negative one asks for an allocation no host
+/// serves and the run ends "Out of memory" with no output to read. For
+/// complete_ways that path is screened out here first: the strategies run
+/// simple first, simple matches a way exactly as complete_ways does (by
+/// `positive_ref`) and writes it with all its refs, so this refusal fires on
+/// simple's output before complete_ways runs. Smart also records the refs of
+/// ways it adds through multipolygon and boundary relations, which simple
+/// need not write; such a run reaches the harness's rule for osmium's
+/// allocation-failure exit (ENVIRONMENT, cause unknown), never a FAIL.
 fn refuse_negative_refs(
     harness: &mut Harness,
     osmium_out: &Path,

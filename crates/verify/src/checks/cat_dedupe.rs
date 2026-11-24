@@ -49,7 +49,7 @@ use crate::checks::dedupe_plan::{self, Entry, Segment};
 use crate::error::Error;
 use crate::harness::{Harness, Verdict, WayLocations, listing_beside};
 use crate::opl_compare::{self, Policy};
-use crate::pbf_frames::{self, Framing};
+use crate::pbf_frames::{self, Framing, Origin};
 use crate::reference::ToolRun;
 use crate::verify_input_order::{self, Refusal};
 
@@ -60,7 +60,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let outdir = harness.subdir("cat-dedupe")?;
     harness.msg("=== verify cat --dedupe ===");
     let header = verify_input_order::input_header(harness, pbf, &outdir)?;
-    let unindexed = pbf_frames::framing(pbf)? == Framing::Unindexed;
+    let unindexed = pbf_frames::framing(pbf, Origin::Other)? == Framing::Unindexed;
 
     if !header.optional_sorted() {
         let argv = PbfArgv::new("cat")
@@ -259,7 +259,8 @@ fn window(pbf: &Path, entries: &[Entry]) -> Result<(Vec<String>, Vec<usize>), Er
         };
         for (at, tail) in picks {
             let blob = of_kind[at].blob;
-            let decoded = pbf_frames::blob_ids(pbf, blob.payload_offset, blob.datasize)?;
+            let decoded =
+                pbf_frames::blob_ids(pbf, Origin::Other, blob.payload_offset, blob.datasize)?;
             let half = decoded.len() / 2;
             let span = match tail {
                 None => &decoded[..],
@@ -314,13 +315,18 @@ fn derive(
     if locations {
         crate::checks::sort::require_declared_locations(&filtered, &what)?;
     }
-    let operand = if pbf_frames::header(&filtered)?.optional_sorted() {
+    let operand = if pbf_frames::header(&filtered, Origin::Other)?.optional_sorted() {
         filtered
     } else {
         let dir = outdir.join(format!("{name}-sorted"));
         std::fs::create_dir_all(&dir)?;
         let sorted = dir.join(crate::checks::sort::OSMIUM_SORTED);
-        crate::checks::sort::osmium_sort(harness, &filtered, &sorted, &dir.join("osmium.sink"))?;
+        crate::checks::sort::osmium_sort(
+            harness,
+            (&filtered, Origin::Other),
+            &sorted,
+            &dir.join("osmium.sink"),
+        )?;
         sorted
     };
     let (ordered, counts) = opl_compare::order(harness, &operand)?;
@@ -430,7 +436,7 @@ fn judge_merge(
         Verdict::from_pass(counted),
     );
 
-    let claims = harness.has_sort_flag(&out)?;
+    let claims = harness.has_sort_flag(&out, Origin::Pbfhogg)?;
     harness.msg(&format!(
         "  {name}: header {} Sort.Type_then_ID {}",
         if claims { "claims" } else { "does not claim" },
@@ -440,7 +446,7 @@ fn judge_merge(
         &format!("{name} output claims Sort.Type_then_ID"),
         Verdict::from_pass(claims),
     );
-    let policy = Policy::between(&out, pbf)?;
+    let policy = Policy::between((&out, Origin::Pbfhogg), (pbf, Origin::Other))?;
     let diff = harness.same_elements(&out, pbf, &listing_beside(&out), policy)?;
     harness.msg(&format!(
         "  {name}: {}",

@@ -769,7 +769,10 @@ pub fn run(
     ));
 
     // --- The element comparison, classified by kind ---------------------
-    let policy = Policy::between(&osmium_out, &pbfhogg_out)?;
+    let policy = Policy::between(
+        (&osmium_out, crate::pbf_frames::Origin::Other),
+        (&pbfhogg_out, crate::pbf_frames::Origin::Pbfhogg),
+    )?;
     let start = start_ids(start_id)?;
     let publish = match by_canonical(harness, &osmium_out, &pbfhogg_out, policy, start)? {
         Decision::Decided => return Ok(Some(CLAIM.into())),

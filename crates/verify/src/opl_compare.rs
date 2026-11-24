@@ -79,9 +79,14 @@ impl Policy {
     /// drop (sort rewriting a way blob re-encodes it without coordinates),
     /// so a lost declaration is caught by `Harness::judge_way_locations`,
     /// which holds each output's declaration to its command's header rule.
-    pub(crate) fn between(a: &Path, b: &Path) -> Result<Self, Error> {
-        let declares = |p: &Path| -> Result<bool, Error> {
-            Ok(crate::pbf_frames::header(p)?.optional_feature("LocationsOnWays"))
+    /// Each file comes with its origin, which decides what a header the
+    /// verifier's reader refuses says ([`crate::pbf_frames::Origin`]).
+    pub(crate) fn between(
+        a: (&Path, crate::pbf_frames::Origin),
+        b: (&Path, crate::pbf_frames::Origin),
+    ) -> Result<Self, Error> {
+        let declares = |(p, origin): (&Path, crate::pbf_frames::Origin)| -> Result<bool, Error> {
+            Ok(crate::pbf_frames::header(p, origin)?.optional_feature("LocationsOnWays"))
         };
         Ok(if declares(a)? && declares(b)? {
             Self::FULL

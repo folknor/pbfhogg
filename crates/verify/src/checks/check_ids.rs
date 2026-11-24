@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, Verdict};
-use crate::pbf_frames::{self, Framing};
+use crate::pbf_frames::{self, Framing, Origin};
 use crate::reference::ToolRun;
 use crate::verify_fileinfo::{FileInfo, fileinfo};
 
@@ -63,10 +63,17 @@ struct Case {
 }
 
 impl Case {
-    fn read(harness: &mut Harness, outdir: &Path, label: &str, path: &Path) -> Result<Self, Error> {
+    /// `origin` says who wrote `path`, which decides what a framing the
+    /// verifier's reader refuses says.
+    fn read(
+        harness: &mut Harness,
+        outdir: &Path,
+        label: &str,
+        (path, origin): (&Path, Origin),
+    ) -> Result<Self, Error> {
         let stem = label.replace(' ', "-");
         let info = fileinfo(harness, path, &outdir.join(format!("{stem}.fileinfo.json")))?;
-        let framing = pbf_frames::framing(path)?;
+        let framing = pbf_frames::framing(path, origin)?;
         Ok(Self {
             label: label.to_owned(),
             path: path.to_path_buf(),
@@ -248,7 +255,8 @@ fn derived(
     indexed: bool,
     disordered: bool,
 ) -> Result<Case, Error> {
-    let case = Case::read(harness, outdir, label, path)?;
+    // Every derived case is a pbfhogg output.
+    let case = Case::read(harness, outdir, label, (path, Origin::Pbfhogg))?;
     let why = if case.info.counts != input.info.counts {
         Some(format!(
             "holds {:?} objects per kind where the input holds {:?}",
@@ -337,11 +345,11 @@ fn fixture_case(
     harness: &mut Harness,
     outdir: &Path,
     label: &str,
-    path: &Path,
+    (path, origin): (&Path, Origin),
     shape: Shape,
     indexed: bool,
 ) -> Result<Case, Error> {
-    let case = Case::read(harness, outdir, label, path)?;
+    let case = Case::read(harness, outdir, label, (path, origin))?;
     if !shape.holds(&case) || case.indexed() != indexed {
         return Err(Error::Failed(format!(
             "fixture {label} ({}) does not show {}{}, so it cannot stand for that case",
@@ -451,7 +459,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let mut gaps: Vec<String> = Vec::new();
 
     harness.msg("--- check --ids: reading the input ---");
-    let input = Case::read(harness, &outdir, "input", pbf)?;
+    let input = Case::read(harness, &outdir, "input", (pbf, Origin::Other))?;
 
     let mut cases = vec![];
     if input.info.counts.iter().all(|&n| n == 0) {
@@ -473,18 +481,37 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let (inversion, inversion_indexed) = build_fixture(harness, &outdir, "inversion", INVERSION)?;
     let (repeat, repeat_indexed) = build_fixture(harness, &outdir, "repeat", REPEAT)?;
     let (_, empty_claim) = build_fixture(harness, &outdir, "empty-claim", ORDERED)?;
+    // pbfhogg cat wrote the file and the verifier appends to it: its framing
+    // is held as pbfhogg's before the append, as the verifier's after.
+    pbf_frames::framing(&empty_claim, Origin::Pbfhogg)?;
     pbf_frames::append_empty_claim(&empty_claim, 0)?;
+    // The unindexed fixtures are osmium's, the indexed ones pbfhogg cat's.
     for (label, path, shape, indexed) in [
-        ("inversion", &inversion, Shape::Inversion, false),
+        (
+            "inversion",
+            (&*inversion, Origin::Other),
+            Shape::Inversion,
+            false,
+        ),
         (
             "inversion indexed",
-            &inversion_indexed,
+            (&*inversion_indexed, Origin::Pbfhogg),
             Shape::Inversion,
             true,
         ),
-        ("repeat", &repeat, Shape::Repeat, false),
-        ("repeat indexed", &repeat_indexed, Shape::Repeat, true),
-        ("empty claim", &empty_claim, Shape::EmptyClaim, true),
+        ("repeat", (&*repeat, Origin::Other), Shape::Repeat, false),
+        (
+            "repeat indexed",
+            (&*repeat_indexed, Origin::Pbfhogg),
+            Shape::Repeat,
+            true,
+        ),
+        (
+            "empty claim",
+            (&*empty_claim, Origin::Other),
+            Shape::EmptyClaim,
+            true,
+        ),
     ] {
         cases.push(fixture_case(harness, &outdir, label, path, shape, indexed)?);
     }

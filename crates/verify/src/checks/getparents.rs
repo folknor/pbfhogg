@@ -233,7 +233,7 @@ fn run_mode(
         });
     })?;
     let shown = judge(&objects, request).map_err(|why| {
-        Error::Failed(format!(
+        Error::Tool(format!(
             "{}: {why}; osmium matches a reference by its absolute value and pbfhogg does not, \
              so getparents cannot be compared on this input",
             listing.display()
@@ -299,8 +299,10 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         &order.reference_input,
         &outdir.join("reference.fileinfo.json"),
     )?;
+    // Both refusals hold the input to the comparison's domain, so are
+    // verifier errors, never a pbfhogg verdict.
     if let Some((kind, id)) = info.negative_id() {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "{} holds {} ID {id}; osmium getparents matches an ID by its absolute value and \
              pbfhogg does not, so getparents cannot be compared on it",
             order.reference_input.display(),
@@ -308,7 +310,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         )));
     }
     if !info.strictly_ordered() {
-        return Err(Error::Failed(format!(
+        return Err(Error::Tool(format!(
             "osmium reads {} out of strict order or with an ID repeated; getparents outputs are \
              compared by ID, which needs one object per kind and ID",
             order.reference_input.display()

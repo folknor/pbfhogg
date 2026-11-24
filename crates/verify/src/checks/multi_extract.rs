@@ -56,7 +56,7 @@ use crate::error::Error;
 use crate::extract_config::PolygonInput;
 use crate::extract_config::{ExtractStrategy, NamedRegion, PbfhoggCommand};
 use crate::harness::{Harness, Role, Verdict};
-use crate::pbf_frames::SORT_TYPE_THEN_ID;
+use crate::pbf_frames::{Origin, SORT_TYPE_THEN_ID};
 use pbfhogg_devkit::Bbox;
 
 /// The claim a passing multi-extract check's summary line carries.
@@ -254,7 +254,15 @@ pub fn run(
             let seq = sequential
                 .get(&named.stem)
                 .ok_or_else(|| Error::Tool(format!("no sequential extract for {}", named.stem)))?;
-            let policy = crate::opl_compare::Policy::between(&compared, &seq.compared)?;
+            // Both sides are pbfhogg's outputs on sorted input, osmium's
+            // sorted copies of them otherwise.
+            let origin = if input_sorted {
+                Origin::Pbfhogg
+            } else {
+                Origin::Other
+            };
+            let policy =
+                crate::opl_compare::Policy::between((&compared, origin), (&seq.compared, origin))?;
             let (same, [counts, _]) = harness.same_elements_judged(
                 (
                     &compared,
@@ -323,7 +331,7 @@ impl Route {
 
 /// On unsorted input, `output` must not claim the sort flag.
 fn record_no_sort_claim(harness: &mut Harness, label: &str, output: &Path) -> Result<(), Error> {
-    let claims = harness.has_sort_flag(output)?;
+    let claims = harness.has_sort_flag(output, Origin::Pbfhogg)?;
     harness.msg(&format!(
         "  {label}: header {} {SORT_TYPE_THEN_ID} on unsorted input {}",
         if claims { "claims" } else { "does not claim" },
@@ -346,7 +354,7 @@ fn sorted_copy(harness: &mut Harness, output: &Path) -> Result<PathBuf, Error> {
     let copy = output.with_file_name(format!("{stem}.sorted.osm.pbf"));
     verify_sort::osmium_sort(
         harness,
-        output,
+        (output, Origin::Pbfhogg),
         &copy,
         &output.with_file_name(format!("{stem}.sorted.stdout")),
     )?;

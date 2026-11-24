@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::argv::PbfArgv;
 use crate::error::Error;
 use crate::harness::{Harness, listing_beside};
+use crate::pbf_frames::Origin;
 use crate::reference::ToolRun;
 
 /// The file name of this check's osmium output. Part of a reference run's
@@ -22,11 +23,11 @@ pub(crate) const OSMIUM_SORTED: &str = "osmium.osm.pbf";
 /// decodes survive the sort and stay comparable.
 pub(crate) fn osmium_sort(
     h: &mut Harness,
-    input: &Path,
+    (input, origin): (&Path, Origin),
     output: &Path,
     sink: &Path,
 ) -> Result<(), Error> {
-    osmium_sort_as(h, input, output, sink, false)
+    osmium_sort_as(h, (input, origin), output, sink, false)
 }
 
 /// `osmium_sort`, optionally with `-s multipass`. The simple strategy holds
@@ -36,7 +37,7 @@ pub(crate) fn osmium_sort(
 /// sort and neither deduplicates, so the elements and their order agree.
 fn osmium_sort_as(
     h: &mut Harness,
-    input: &Path,
+    (input, origin): (&Path, Origin),
     output: &Path,
     sink: &Path,
     multipass: bool,
@@ -45,7 +46,7 @@ fn osmium_sort_as(
     // are not content pbfhogg promises, and its output never declares them,
     // so Policy::between reads no coordinates on such an input whatever
     // option the copy got (reference/verify.md, "Element equality").
-    let locations = crate::pbf_frames::header(input)?.optional_feature("LocationsOnWays");
+    let locations = crate::pbf_frames::header(input, origin)?.optional_feature("LocationsOnWays");
     let mut run = ToolRun::osmium("sort.1").arg("sort").input(input);
     if multipass {
         run = run.args(&["-s", "multipass"]);
@@ -69,10 +70,10 @@ fn osmium_sort_as(
 ///
 /// [`Policy::between`]: crate::opl_compare::Policy::between
 pub(crate) fn require_declared_locations(output: &Path, tool: &str) -> Result<(), Error> {
-    if crate::pbf_frames::header(output)?.optional_feature("LocationsOnWays") {
+    if crate::pbf_frames::header(output, Origin::Other)?.optional_feature("LocationsOnWays") {
         return Ok(());
     }
-    Err(Error::Failed(format!(
+    Err(Error::Tool(format!(
         "{tool} was asked for -f pbf,locations_on_ways=true, but {} does not declare \
          LocationsOnWays, so its inline coordinates cannot be compared",
         output.display()
@@ -95,14 +96,18 @@ pub(crate) enum SortBlob {
 /// `HeaderBlock::is_sorted` reads) and indexdata allow, decoded otherwise.
 /// So the sorted, fully indexed path stays header-only, as pbfhogg's does.
 fn sort_blobs(pbf: &Path, sorted: bool) -> Result<Vec<SortBlob>, Error> {
-    let mut walk = crate::pbf_frames::Claims::open(pbf)?;
+    let mut walk = crate::pbf_frames::Claims::open(pbf, Origin::Other)?;
     let mut blobs = Vec::new();
     while let Some(blob) = walk.next_blob()? {
         blobs.push(match blob.claim {
             Some(claim) if sorted => SortBlob::Believed(claim),
             _ => {
-                let (ids, single) =
-                    crate::pbf_frames::blob_ids_and_shape(pbf, blob.payload_offset, blob.datasize)?;
+                let (ids, single) = crate::pbf_frames::blob_ids_and_shape(
+                    pbf,
+                    Origin::Other,
+                    blob.payload_offset,
+                    blob.datasize,
+                )?;
                 SortBlob::Scanned(ids, single)
             }
         });
@@ -216,7 +221,7 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // tie by timestamp, pbfhogg keeps input order). So the input is held to
     // the domain before anything pbfhogg did is judged: a declared history
     // file up front, and an undeclared repeat by the reference sort below.
-    let header = crate::pbf_frames::header(pbf)?;
+    let header = crate::pbf_frames::header(pbf, Origin::Other)?;
     if header.required.iter().any(|f| f == "HistoricalInformation") {
         return Err(Error::Tool(format!(
             "{} declares HistoricalInformation; the sort check compares one object per \
@@ -228,13 +233,19 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     // Multipass: this check judges elements and pbfhogg's order, never the
     // reference's header, so the claim multipass omits is not needed here.
     // Run first, so its order scan settles the domain before pbfhogg runs.
-    osmium_sort_as(h, pbf, &theirs, &outdir.join("osmium.stdout"), true)?;
+    osmium_sort_as(
+        h,
+        (pbf, Origin::Other),
+        &theirs,
+        &outdir.join("osmium.stdout"),
+        true,
+    )?;
     // osmium sorts without deduplicating, so its output out of strict order
     // means the input holds an object more than once (or osmium misordered
     // it): a verifier error either way, never a pbfhogg verdict. The policy
     // is a decoding cache hint for the comparison below; the scan reads
     // keys only.
-    let hint = crate::opl_compare::Policy::between(pbf, &theirs)?;
+    let hint = crate::opl_compare::Policy::between((pbf, Origin::Other), (&theirs, Origin::Other))?;
     let (ordered, _) = crate::opl_compare::order_as(h, &theirs, hint)?;
     if !ordered {
         return Err(Error::Tool(format!(
@@ -267,7 +278,8 @@ pub(crate) fn run(h: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option
     };
     h.judge_way_locations("pbfhogg sort", pbf, &ours, &ended, expect)?;
 
-    let policy = crate::opl_compare::Policy::between(&ours, &theirs)?;
+    let policy =
+        crate::opl_compare::Policy::between((&ours, Origin::Pbfhogg), (&theirs, Origin::Other))?;
     // pbfhogg's order is judged from the comparison's own decoding: a
     // separate order decode after the strict comparison could only pass.
     let (diff, _) = h.same_elements_judged(

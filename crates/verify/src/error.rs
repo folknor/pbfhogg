@@ -7,11 +7,12 @@ pub(crate) enum Error {
     /// SIGTERM, SIGINT or SIGHUP reached the verifier: neither PASS nor FAIL.
     Interrupted,
     /// Outside the code under test: a reference tool killed by SIGKILL, an
-    /// input that moved during the check, a descendant that outlived its
-    /// launch.
+    /// osmium exit reporting its own allocation failure, an input that moved
+    /// during the check, a descendant that outlived its launch.
     Environment(String),
     /// A comparison found pbfhogg wrong, or pbfhogg failed a run it had to
-    /// complete. A reference run that did not complete (an unaccepted exit,
+    /// complete, or a file pbfhogg wrote is one the verifier's reader
+    /// refuses. A reference run that did not complete (an unaccepted exit,
     /// or an accepted one missing a declared output) also fails its check
     /// here, since no comparison stands without it.
     Failed(String),
@@ -20,7 +21,10 @@ pub(crate) enum Error {
     /// suite stops here and keeps its run directory.
     Unsettled(String),
     /// The verifier could not do its own work: configuration, I/O, an
-    /// unsupported comparison domain. Malformed tool reports are `Failed`.
+    /// unsupported comparison domain - an input, reference output or
+    /// verifier-made file outside what the comparison or the verifier's
+    /// reader can take, whoever's limit that is. Malformed tool reports are
+    /// `Failed`.
     Tool(String),
 }
 

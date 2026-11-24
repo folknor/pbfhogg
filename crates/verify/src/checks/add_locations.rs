@@ -139,8 +139,10 @@ pub fn run(
     harness.require_success(&captured, "osmium add-locations-to-ways")?;
     // The element comparison reads inline coordinates because osmium's
     // output declares them; one that did not would silently drop them.
-    if !crate::pbf_frames::header(&osmium_out)?.optional_feature("LocationsOnWays") {
-        return Err(Error::Failed(format!(
+    if !crate::pbf_frames::header(&osmium_out, crate::pbf_frames::Origin::Other)?
+        .optional_feature("LocationsOnWays")
+    {
+        return Err(Error::Tool(format!(
             "osmium add-locations-to-ways output {} does not declare LocationsOnWays, so its \
              inline coordinates cannot be compared",
             osmium_out.display()
@@ -275,7 +277,8 @@ fn check_output(
     let name = engine.name();
     // Coordinates are what the command adds, so its output must declare
     // them; the element comparison then reads them on both sides.
-    let declares = crate::pbf_frames::header(out_path)?.optional_feature("LocationsOnWays");
+    let declares = crate::pbf_frames::header(out_path, crate::pbf_frames::Origin::Pbfhogg)?
+        .optional_feature("LocationsOnWays");
     harness.msg(&format!(
         "  pbfhogg ({name}): header {} LocationsOnWays {}",
         if declares {

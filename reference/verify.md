@@ -191,8 +191,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   add-locations-to-ways), both sides of each extract strategy, and each
   multi-extract region. At the first step-down the merge stops pairing,
   reads each side to its end for its order and counts, records the order
-  verdicts (a reference side's disorder is the error that it cannot be
-  compared by ID), then raises the error the strict merge raises at that
+  verdicts (a reference side's disorder is the verifier error that it
+  cannot be compared by ID), then raises the error the strict merge raises at that
   cursor; the listing is then a prefix and both OPL files are kept. A read
   or parse error before any step-down is raised with no order verdict.
   Elsewhere (the reference side of the input-order family, apply-changes'
@@ -553,7 +553,19 @@ verifier errors. An unsettled tree also stops with exit 2.
 
 A reference tool's own failure (a non-accepted exit) fails the check, as in
 brokkr; a reference tool killed by SIGKILL, which the verifier never sends
-while it waits, is ENVIRONMENT.
+while it waits, is ENVIRONMENT, and so is an osmium exit whose stderr
+carries osmium's own `std::bad_alloc` line (`Out of memory. Read the
+MEMORY USAGE section of the osmium(1) manpage.`): an allocation failure in
+the reference whose cause the verifier cannot tell, which says nothing
+about pbfhogg. A recorded failure still outranks it.
+
+The verifier's own frame reader (`pbf_frames`) is told who wrote each file
+it opens. A file a pbfhogg run wrote that it refuses, or cannot open, fails
+the check. Any other file it refuses - the dataset input, a reference
+output, an osmium-sorted copy, a fixture the verifier changed - is an
+unsupported comparison domain, a verifier error. A file with two producers
+is read as each: pbfhogg's before the verifier's change, the verifier's
+after.
 
 Deliberate legacy exit difference: brokkr reports runtime configuration refusals and
 its catch-all check errors as exit 1. This verifier reserves exit 1 for an
@@ -761,9 +773,13 @@ interpretations differ. osmium extract matches IDs, way refs and members
 by absolute value in every strategy, so an input osmium reads with a
 negative ID is refused before any run, and an osmium output holding a
 negative way ref or relation member is refused before that strategy's
-verdicts; both are verifier errors. An osmium complete_ways or smart run
-that dies "Out of memory" on a negative outside way ref is a reference run
-that did not complete and fails the check. On input without the optional
+verdicts; both are verifier errors. osmium complete_ways and smart record
+a matched way's outside refs signed into an unsigned set, so a negative
+one makes the run die "Out of memory". complete_ways never gets there: it
+matches ways as simple does, and simple, which runs first, writes such a
+way with its refs and is refused. A smart run can still die so on a way it
+adds through a multipolygon or boundary relation; that is osmium's
+allocation-failure exit, ENVIRONMENT. On input without the optional
 sort feature, osmium extracts a sorted copy; pbfhogg output must have no sort claim and
 is compared through a strictly ordered sorted copy. PASS names the regions
 and membership differences, including the simple relation deviation.

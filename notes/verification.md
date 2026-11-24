@@ -82,22 +82,3 @@ Same-level competition is judged only by chance (germany judges one or two queri
 several containing areas); witnesses aimed at overlaps would need an overlap search over edge
 crossings and interiors, not only vertices, since two areas can overlap with no vertex of
 either inside the other.
-
-## VER-155 - verify extract fails pbfhogg when osmium dies on a negative way ref
-
-Reported by: spar partner during the OPL reader signed-ID work.
-
-osmium's complete_ways and smart strategies record a matched way's outside
-node refs signed into an unsigned set
-(`research/osmium-tool/src/extract/strategy_complete_ways.cpp`,
-`strategy_smart.cpp`), so an input whose matched way references a dangling
-negative node (no negative element ID, which `checks/extract.rs` refuses
-before any run) can make osmium exit "Out of memory" with no output. The
-negative-reference refusal reads only completed osmium outputs, so this run
-reaches `settled_reference` as an unaccepted exit, `Error::Failed`, and
-the check reports FAIL (exit 1) against a pbfhogg that answered correctly.
-Classifying it as the verifier's error needs the reference-run failure
-contract (`crates/verify/src/error.rs`, `reference/verify.md` Results) to
-distinguish an osmium limit from an incomplete reference, the open question
-TOOL-006 also raises; a local stderr match in extract alone was rejected as
-an exception to that contract. No verified dataset holds negative refs.

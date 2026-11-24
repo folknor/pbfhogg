@@ -185,18 +185,6 @@ only by a single element too large for a blob or a missed partition. Fix
 shape: locate the refusal at the input and frame of the block's first or
 offending element.
 
-## CMD-073 - The sort / dedupe sweep may drop a way's inline locations
-
-Reported by: the CMD-050 spar partner (2026-11-24); not verified.
-
-`Output::encode` re-adds a held way with `add_way_partial` from its refs
-alone, and the history time-filter clones ways with `read_way`, which drops
-`node_locations`. An input declaring `LocationsOnWays` whose way blobs are
-swept or filtered would come out with ways without coordinates. Verify
-whether the output header still declares the feature (a silent wrong
-answer) or the input is refused earlier; if neither, re-add with
-`add_way_with_locations_partial` when the way carries locations.
-
 ## CMD-066 - add-locations-to-ways writes one block per way blob, however large
 
 Reported by: the CMD-050 spar (2026-11-24).

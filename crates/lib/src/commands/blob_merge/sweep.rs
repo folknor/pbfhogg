@@ -128,9 +128,10 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Result;
 use crate::osm_id::{OsmIdKey, osm_id_cmp, osm_id_key};
 use crate::owned::{
-    OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
-    read_dense_node, read_node, read_relation, read_way, write_single_node_local,
-    write_single_relation_local, write_single_way_local,
+    OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, declared_way_locations, dense_node_metadata,
+    element_metadata, read_declared_way, read_dense_node, read_node, read_relation, read_way,
+    write_declared_way_local, write_single_node_local, write_single_relation_local,
+    write_single_way_local,
 };
 use crate::read::block::BlockElementsIter;
 use crate::write::metrics::WriterMetrics;
@@ -149,6 +150,10 @@ pub(super) struct Sweep<'a, 'e> {
     pub(super) sources: &'a Sources,
     pub(super) kind: ElementKind,
     pub(super) dedupe: bool,
+    /// The plan's `keep_locations`: ways are re-encoded with their inline
+    /// coordinates, because every input declares `LocationsOnWays` and the
+    /// output keeps the declaration.
+    pub(super) keep_locations: bool,
     pub(super) cancel: &'a crate::host::Recorder,
     pub(super) emitter: &'a crate::ordered_pool::Emitter<'e, Chunk, RunCounts>,
     pub(super) compression: &'a Compression,
@@ -210,14 +215,16 @@ impl Item {
 
     /// Own a borrowed item (demotion); an owned one is returned unchanged.
     /// Resolves the user and roles, so it refuses what a written element
-    /// would.
-    fn into_owned(self) -> Result<Item> {
+    /// would. Under `keep_locations` a way is owned with its inline
+    /// coordinates, refused where they do not give one per ref.
+    fn into_owned(self, keep_locations: bool) -> Result<Item> {
         let Item::Held(h) = self else {
             return Ok(self);
         };
         Ok(match &h.elem {
             Element::DenseNode(dn) => Item::Node(read_dense_node(dn)?),
             Element::Node(n) => Item::Node(read_node(n)?),
+            Element::Way(w) if keep_locations => Item::Way(read_declared_way(w)?),
             Element::Way(w) => Item::Way(read_way(w)?),
             Element::Relation(r) => Item::Relation(read_relation(r)?),
         })
@@ -397,7 +404,7 @@ impl Cursor {
 
     /// Validate and own the rest of the feed, the head included, and
     /// release the block.
-    fn demote(&mut self) -> Result<()> {
+    fn demote(&mut self, keep_locations: bool) -> Result<()> {
         let mut rest = VecDeque::new();
         loop {
             let next = match &mut self.feed {
@@ -419,10 +426,10 @@ impl Cursor {
                 elem,
                 _owner: Rc::clone(owner),
             });
-            rest.push_back(held.into_owned()?);
+            rest.push_back(held.into_owned(keep_locations)?);
         }
         if let Some(head) = self.head.take() {
-            self.head = Some(head.into_owned()?);
+            self.head = Some(head.into_owned(keep_locations)?);
         }
         self.release()?;
         self.feed = Feed::Owned(rest);
@@ -451,6 +458,9 @@ struct Output<'s> {
     /// The frame being packed, in pieces (reused, so it grows only when a frame needs more pieces than any before).
     pieces: Vec<Vec<u8>>,
     refs: Vec<i64>,
+    locations: Vec<(i32, i32)>,
+    /// The sweep's [`Sweep::keep_locations`].
+    keep_locations: bool,
     compression: &'s Compression,
     /// What `compression` lets a block hold, for the cut in `ship`.
     limits: crate::commands::split::Limits,
@@ -493,8 +503,19 @@ impl Output<'_> {
                     let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                     self.refs.clear();
                     self.refs.extend(w.refs());
-                    self.bb
-                        .add_way_partial(w.id(), w.tags(), &self.refs, meta.as_ref());
+                    if self.keep_locations {
+                        declared_way_locations(w, self.refs.len(), &mut self.locations)?;
+                        self.bb.add_way_with_locations_partial(
+                            w.id(),
+                            w.tags(),
+                            &self.refs,
+                            &self.locations,
+                            meta.as_ref(),
+                        );
+                    } else {
+                        self.bb
+                            .add_way_partial(w.id(), w.tags(), &self.refs, meta.as_ref());
+                    }
                 }
                 Element::Relation(r) => {
                     crate::commands::ensure_relation_capacity_local(
@@ -509,6 +530,11 @@ impl Output<'_> {
                 }
             },
             Item::Node(n) => write_single_node_local(n, &mut self.bb, &mut self.filled)?,
+            // Owned by `into_owned` under the same flag, so its locations
+            // already give one per ref.
+            Item::Way(w) if self.keep_locations => {
+                write_declared_way_local(w, &mut self.bb, &mut self.filled)?;
+            }
             Item::Way(w) => write_single_way_local(w, &mut self.bb, &mut self.filled)?,
             Item::Relation(r) => write_single_relation_local(r, &mut self.bb, &mut self.filled)?,
         }
@@ -622,8 +648,10 @@ fn frame_owned(
 }
 
 /// Validate a dropped duplicate as a written element would be: its user, and
-/// a relation's roles, resolved. An owned item was validated when owned.
-fn validate_loser(item: &Item) -> Result<()> {
+/// a relation's roles, resolved, and under `keep_locations` a way's inline
+/// coordinates, so a bad loser fails the run whether or not its cursor was
+/// demoted. An owned item was validated when owned.
+fn validate_loser(item: &Item, keep_locations: bool) -> Result<()> {
     let Item::Held(h) = item else {
         return Ok(());
     };
@@ -636,6 +664,10 @@ fn validate_loser(item: &Item) -> Result<()> {
         }
         Element::Way(w) => {
             element_metadata(ElementKind::Way, w.id(), &w.info())?;
+            if keep_locations {
+                let refs = w.refs().count();
+                declared_way_locations(w, refs, &mut Vec::new())?;
+            }
         }
         Element::Relation(r) => {
             element_metadata(ElementKind::Relation, r.id(), &r.info())?;
@@ -700,6 +732,8 @@ impl Sweep<'_, '_> {
             chunk_bytes: 0,
             pieces: Vec::new(),
             refs: Vec::new(),
+            locations: Vec::new(),
+            keep_locations: self.keep_locations,
             compression: self.compression,
             limits: crate::commands::split::Limits::new(*self.compression),
             metrics: self.metrics,
@@ -963,7 +997,8 @@ impl Sweep<'_, '_> {
             } else {
                 member
             };
-            validate_loser(&loser.item).map_err(|e| self.locate(loser.tie.0, loser.tie.1, e))?;
+            validate_loser(&loser.item, self.keep_locations)
+                .map_err(|e| self.locate(loser.tie.0, loser.tie.1, e))?;
             counts.duplicates += 1;
             return Ok(());
         }
@@ -987,7 +1022,7 @@ impl Sweep<'_, '_> {
             if cursor.demotable() {
                 let (source, offset, pinned) = (cursor.source, cursor.offset, cursor.pinned);
                 cursor
-                    .demote()
+                    .demote(self.keep_locations)
                     .map_err(|e| self.locate(source, offset, e))?;
                 merge.pinned -= pinned;
                 merge.demoted += 1;
@@ -1046,7 +1081,7 @@ mod tests {
             cursor.advance().expect("advance");
         }
         assert!(cursor.demotable(), "95 of 100 pulled is mostly consumed");
-        cursor.demote().expect("demote");
+        cursor.demote(false).expect("demote");
         assert!(
             cursor.owner.is_none() && cursor.pinned == 0,
             "block released"
@@ -1069,7 +1104,7 @@ mod tests {
         )
         .expect("open");
         assert!(
-            cursor.demote().is_err(),
+            cursor.demote(false).is_err(),
             "the claim says 4 elements, the block holds 3"
         );
     }

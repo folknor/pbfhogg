@@ -268,8 +268,9 @@ fn dedupe(fault: &str, root: &Path, inputs: [&Path; 2], output: &Path) {
     let declared = inputs
         .iter()
         .all(|p| fake_pbf::features(p).iter().any(|f| f == LOW));
-    let kept = declared && !shape.way_rewritten;
-    let features: &[&str] = if kept { &[SORTED, LOW] } else { &[SORTED] };
+    // pbfhogg keeps the declaration when every input has it, re-encoding
+    // rewritten ways with their coordinates.
+    let features: &[&str] = if declared { &[SORTED, LOW] } else { &[SORTED] };
     let mut marker = fake_pbf::full_marker(inputs[0]);
     if fault == "coords" {
         marker.push_str(" @w2");

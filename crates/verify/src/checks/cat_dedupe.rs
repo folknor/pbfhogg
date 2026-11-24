@@ -405,12 +405,12 @@ fn judge_merge(
     let out = merge_output(outdir, label);
     let name = format!("pbfhogg cat --dedupe {label}");
     harness.require_success(captured, &name)?;
-    let expect = if shape.way_rewritten {
-        WayLocations::Dropped
-    } else {
-        WayLocations::Kept
-    };
-    harness.judge_way_locations(&name, pbf, &out, captured, expect)?;
+    // Every operand is derived from `pbf` and carries its header, so either
+    // all declare LocationsOnWays or none does; with all, the merge keeps it,
+    // re-encoding rewritten ways with their coordinates. A merge of operands
+    // that disagree is outside this check (`judge_way_locations` reads one
+    // input header).
+    harness.judge_way_locations(&name, pbf, &out, captured, WayLocations::Kept)?;
 
     let layout = dedupe_plan::judge(&out, &[inputs[0].0, inputs[1].0], &plan)?;
     harness.msg(&format!(

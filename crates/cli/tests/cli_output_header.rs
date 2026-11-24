@@ -419,12 +419,15 @@ const ROWS: &[Row] = &[
         command: "cat",
         label: "cat --dedupe of two inputs",
         build: |fx, f| simple(fx, "cat", &[fx.path(f), fx.path(f)], &["--dedupe"]),
-        // Every blob overlaps its twin, so every way is re-encoded.
+        // Every blob overlaps its twin, so every way is re-encoded: with its
+        // coordinates, as both inputs declare them, and without the prepass
+        // features.
         expect: |f| {
             sorted_only(
                 f,
                 Exp {
                     sorted: true,
+                    low: f.low(),
                     ..Exp::reencoded(f)
                 },
             )
@@ -435,7 +438,8 @@ const ROWS: &[Row] = &[
         label: "sort",
         build: |fx, f| simple(fx, "sort", &[fx.path(f)], &[]),
         // Sorted input passes through blob by blob; the unsorted fixture
-        // carries no enrichment for the rewrite to drop.
+        // carries no enrichment. A rewrite keeps LocationsOnWays (the
+        // `cat --dedupe` row is the rewriting case).
         expect: |f| {
             Outcome::Writes(Exp {
                 sorted: true,

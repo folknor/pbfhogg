@@ -30,12 +30,11 @@ importance.
 
 Reported by: encoding, sort, spatial.
 
-Extract, tags-filter and the sort sweep (borrowed way output and `read_way`
-owned demotion) encode ways without their locations, so in sort whether a way
-keeps coordinates depends on overlap routing. Some callers classify output as
-re-encoded without enrichments, so the hunters flag it for judgement against
-each command's promise. `notes/verification.md` VER-135 describes sort's drop
-as required and lacking a real-data witness.
+Extract and tags-filter encode ways without their locations and classify the
+output as re-encoded without enrichments (drop and warn), so the hunters flag it
+for judgement against each command's promise. The sort and `cat --dedupe` sweep
+now keeps them when every input declares `LocationsOnWays`; time-filter drops
+them deliberately (they are not as of the cutoff).
 
 ## BUG-007 - add_owned_way silently drops mismatched locations
 

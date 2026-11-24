@@ -159,6 +159,15 @@ pub(crate) fn time_filter_to(
         // Both paths write at most one version of each object, the one at
         // the cutoff, so a history input's declaration is not carried: the
         // output is a snapshot, which is what apply-changes takes as a base.
+        //
+        // Ways are written from their refs alone, and a `LocationsOnWays`
+        // declaration is dropped and warned, on both paths, on purpose:
+        // inline coordinates are as of when the input was written, not as of
+        // the cutoff. A kept way whose node moved after the cutoff would carry
+        // the later position, against the earlier node version a history
+        // input writes, or against a node a snapshot input drops because its
+        // only version is newer than the cutoff. sort and `cat --dedupe`
+        // re-time nothing, so they keep the arrays; this command cannot.
         &super::output_header::OutputFacts {
             replication: super::output_header::Replication::AsOf(cutoff_timestamp),
             history: super::output_header::History::Snapshot,
@@ -598,6 +607,9 @@ fn filter_block_snapshot(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
+                // Refs only, never the inline coordinates: they are not as of
+                // the cutoff (see `time_filter_to`, where the header drops
+                // the declaration).
                 bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                 stats.elements_written += 1;
             }
@@ -895,6 +907,8 @@ fn clone_owned_element(element: &Element<'_>) -> crate::Result<OwnedElement> {
     Ok(match element {
         Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)?),
         Element::Node(n) => OwnedElement::Node(read_node(n)?),
+        // Without inline coordinates on purpose: they are not as of the
+        // cutoff (see `time_filter_to`).
         Element::Way(w) => OwnedElement::Way(read_way(w)?),
         Element::Relation(r) => OwnedElement::Relation(read_relation(r)?),
     })

@@ -1787,3 +1787,117 @@ fn sort_distrust_metadata_needs_no_indexdata() {
         .assert_success();
     assert_eq!(node_ids(&output), vec![1, 2]);
 }
+
+// ---------------------------------------------------------------------------
+// LocationsOnWays through the rewrite
+// ---------------------------------------------------------------------------
+
+/// The inline location of node ref `r`, distinct per ref.
+fn low_location(r: i64) -> (i32, i32) {
+    let base = i32::try_from(r * 1000).expect("coordinate fits in i32");
+    (base, base + 7)
+}
+
+/// Write a PBF declaring `LocationsOnWays` whose two way blobs overlap
+/// (ways 1 and 3, then 2 and 4), so sort rewrites both. Each way carries a
+/// location per ref, except a way listed in `refs_only`.
+fn write_overlapping_low_ways(path: &Path, refs_only: &[i64]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for id in 10..=49 {
+        let (lat, lon) = low_location(id);
+        bb.add_node(id, lat, lon, std::iter::empty::<(&str, &str)>(), None);
+    }
+    writer
+        .write_primitive_block(bb.take().expect("take").expect("nodes"))
+        .expect("write block");
+    for blob in [[1i64, 3], [2, 4]] {
+        for id in blob {
+            let refs: Vec<i64> = (0..3).map(|r| id * 10 + r).collect();
+            if refs_only.contains(&id) {
+                bb.add_way(id, [("highway", "residential")], &refs, None);
+            } else {
+                let locs: Vec<(i32, i32)> = refs.iter().map(|&r| low_location(r)).collect();
+                bb.add_way_with_locations(id, [("highway", "residential")], &refs, &locs, None);
+            }
+        }
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("ways"))
+            .expect("write block");
+    }
+    writer.flush().expect("flush");
+}
+
+/// A rewritten way of an input declaring `LocationsOnWays` keeps its
+/// coordinates, so the output keeps the declaration and warns of no loss.
+#[test]
+fn sort_rewrite_keeps_inline_way_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("low.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_overlapping_low_ways(&input, &[]);
+    let out = CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+    let stderr = out.stderr_str();
+    assert!(
+        !stderr.contains("which the output does not declare"),
+        "sort warned of a loss: {stderr}"
+    );
+    assert!(read_header(&output).has_locations_on_ways());
+    let mut ways = Vec::new();
+    for blob in pbfhogg::BlobReader::from_path(&output).expect("open") {
+        let blob = blob.expect("blob");
+        let decoded = blob.decode().expect("decode");
+        let pbfhogg::BlobDecode::OsmData(block) = decoded else {
+            continue;
+        };
+        for element in block.elements() {
+            if let pbfhogg::Element::Way(w) = element {
+                let locs: Vec<(i32, i32)> = w
+                    .node_locations()
+                    .map(|l| {
+                        (
+                            l.decimicro_lat().expect("representable"),
+                            l.decimicro_lon().expect("representable"),
+                        )
+                    })
+                    .collect();
+                let want: Vec<(i32, i32)> = w.refs().map(low_location).collect();
+                assert_eq!(locs, want, "way {}", w.id());
+                ways.push(w.id());
+            }
+        }
+    }
+    assert_eq!(ways, vec![1, 2, 3, 4]);
+}
+
+/// A rewritten way with refs and no coordinates, in an input declaring
+/// `LocationsOnWays`, is refused: re-encoding it would write a way the kept
+/// declaration misdescribes.
+#[test]
+fn sort_refuses_a_rewritten_way_without_the_declared_locations() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("low.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    write_overlapping_low_ways(&input, &[4]);
+    CliInvoker::new(&invocation_scratch)
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_failure()
+        .assert_stderr_contains("0 inline location(s)");
+}

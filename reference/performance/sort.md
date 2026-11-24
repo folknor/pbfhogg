@@ -178,6 +178,25 @@ variant the uncommitted change on that base.
   only one comparison per output block, and Denmark's dedupe-self sweeps
   every blob.
 
+## Sweep keeps declared way locations (bygg, 2026-11-24)
+
+The overlap sweep re-encodes ways with their inline coordinates when every
+input declares `LocationsOnWays`; on any other input the added work is one
+branch per swept way. `dedupe-self --dataset denmark --cache warm`
+(Denmark's indexed primary, which does not declare the feature and sweeps
+every blob), `--iterations 1` cells alternated, baseline `042871e6` through
+`--commit`, variant the uncommitted change on that base.
+
+| Pair | `042871e6` | variant |
+|---|---|---|
+| 1 | 1.2 s (`d9912d51`, first after a worktree build) | 1.2 s (`b1376a0e`) |
+| 2 | 1.2 s (`ab82ef46`) | 1.2 s (`2eaae53f`) |
+
+- Verdict: no cost on normal input. No planet cell: the planet sort input is
+  sorted and indexed, so it sweeps nothing. A declaring input pays for
+  decoding its coordinates only where it is rewritten, which is the work the
+  change exists to do.
+
 ## History
 
 ### Sort

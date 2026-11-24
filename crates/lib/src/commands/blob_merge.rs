@@ -1005,6 +1005,12 @@ pub(crate) struct Plan {
     /// Passthrough blobs reframed because their indexdata was false.
     pub(crate) false_claims_replaced: u64,
     pub(crate) runs: Vec<Run>,
+    /// Every input header declares `LocationsOnWays`, so the sweep re-encodes
+    /// each way with its inline coordinates and refuses one whose arrays do
+    /// not give a location per ref. Otherwise rewritten ways are encoded from
+    /// their refs alone: what a partly declaring merge would do with arrays
+    /// the header cannot vouch for is not this rule's to decide.
+    pub(crate) keep_locations: bool,
 }
 
 impl Plan {
@@ -1020,7 +1026,11 @@ impl Plan {
 /// The sort is stable, so entries with equal keys keep input then file
 /// order, which the sweep's heap pushes (and so which of two exact
 /// duplicates survives) depend on.
-pub(crate) fn plan(indexed: Indexed) -> Plan {
+pub(crate) fn plan(indexed: Indexed, headers: &[crate::HeaderBlock]) -> Plan {
+    let keep_locations = !headers.is_empty()
+        && headers
+            .iter()
+            .all(crate::HeaderBlock::has_locations_on_ways);
     let Indexed {
         mut frames,
         mut entries,
@@ -1106,22 +1116,29 @@ pub(crate) fn plan(indexed: Indexed) -> Plan {
         entries,
         rewrite,
         runs,
+        keep_locations,
     }
 }
 
 impl Plan {
     /// What the output's way blobs are, for the output header: a way blob in
-    /// a rewrite run is re-encoded without enrichments; every other way blob
-    /// keeps its payload and every header field but its index and tag keys,
-    /// which a reframed passthrough replaces (`write_passthrough`), so its
-    /// field 5 still describes its ways.
+    /// a rewrite run is re-encoded without the prepass enrichments, and with
+    /// its inline coordinates exactly when [`Plan::keep_locations`]; every
+    /// other way blob keeps its payload and every header field but its index
+    /// and tag keys, which a reframed passthrough replaces
+    /// (`write_passthrough`), so its field 5 still describes its ways.
     pub(crate) fn ways(&self) -> crate::commands::output_header::Ways {
+        use crate::commands::output_header::Ways;
         let any_way_rewritten = self
             .entries
             .iter()
             .zip(&self.rewrite)
             .any(|(e, &r)| r && e.index.kind == ElementKind::Way);
-        crate::commands::output_header::Ways::from_copy(any_way_rewritten, false)
+        if any_way_rewritten && self.keep_locations {
+            Ways::ReencodedWithLocations
+        } else {
+            Ways::from_copy(any_way_rewritten, false)
+        }
     }
 }
 
@@ -1488,6 +1505,7 @@ pub(crate) fn write_plan(
                     sources,
                     kind: run.kind,
                     dedupe,
+                    keep_locations: plan.keep_locations,
                     cancel: &host.invocation,
                     emitter,
                     compression: &compression,
@@ -1888,7 +1906,7 @@ mod tests {
         ];
         entries[1].intra_unsorted = true;
         entries[4].intra_unsorted = true;
-        let plan = plan(indexed(entries));
+        let plan = plan(indexed(entries), &[]);
         let runs: Vec<_> = plan.runs.iter().map(|r| (r.start, r.end, r.kind)).collect();
         assert_eq!(
             runs,
@@ -1932,7 +1950,7 @@ mod tests {
             replaces_false_claim: true,
         });
         indexed.omitted = 4;
-        let plan = plan(indexed);
+        let plan = plan(indexed, &[]);
 
         let runs: Vec<_> = plan.runs.iter().map(|r| (r.start, r.end, r.kind)).collect();
         assert_eq!(

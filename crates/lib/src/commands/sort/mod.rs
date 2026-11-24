@@ -234,7 +234,7 @@ pub(crate) fn sort_to<'a>(
     host.invocation.counter("sort_blobs_total", blobs_total);
 
     host.invocation.marker("SORT_OVERLAP_DETECT_START");
-    let plan = blob_merge::plan(indexed);
+    let plan = blob_merge::plan(indexed, &headers);
     host.invocation.marker("SORT_OVERLAP_DETECT_END");
     // `sort_blobs_overlap` counts blobs whose range overlaps a same-kind
     // neighbour; blobs rewritten only for intra-blob disorder are counted

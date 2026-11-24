@@ -141,8 +141,7 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   that keeps the declaration. cat `--dedupe` is driven on four indexed
   node blobs whose way exists only in the fake decoding, so every merge
   keeps the declaration and the same change fails each merge's element
-  comparison; no real way blob is in that fixture, since one would always
-  be in the self-merge's run and drop the declaration. Its fake writes the
+  comparison; no real way blob is in that fixture. Its fake writes the
   layout the verifier's own plan predicts, so each merge's plan is also
   held to a hand-written segment trace, and a blob after the last segment
   and a wrong summary count each fail their arm in every merge. Each of these field-policy witnesses names the comparisons a fault fails, in
@@ -156,22 +155,16 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   declaration cannot switch the element comparison to one without
   coordinates and pass. An output never declares it when the input does
   not. On an input that declares it: `cat --type` on an input whose first
-  data blob carries indexdata, `getid --invert` without a way ID, and
-  `apply-changes --locations-on-ways`, must keep it; `getid --invert` with
-  a way ID must drop it with the loss warning. sort is decided exactly by
-  predicting its blob planner (the one `cat --dedupe` shares): under the
-  sort claim an indexed blob is believed from its claim and not decoded,
-  every other blob is decoded by the verifier, and the declaration must be
-  dropped with the warning when a way entry falls in an overlap component
-  (canonical ID order, conservative mixed-sign range keys), sits in a
-  decoded blob that is internally out of order, or sits in a decoded block
-  no single index describes; otherwise it must be kept. The domain is true
-  believed claims; a decoded blob the verifier's decoder refuses (a repeated
-  or absent scalar ID, a wrapping dense delta, compression other than raw or
-  zlib) is a verifier error. The domain also holds each `(kind, id)` once:
-  sort also rewrites a decoded blob whose versions of a repeated ID descend,
-  which the prediction does not read. The sort check holds its input to that
-  domain before judging anything pbfhogg did: a `HistoricalInformation`
+  data blob carries indexdata, `getid --invert` without a way ID,
+  `apply-changes --locations-on-ways`, sort and `cat --dedupe` (whose
+  operands all carry the input's header) must keep it, sort and
+  `cat --dedupe` because a rewritten way is re-encoded with its
+  coordinates; `getid --invert` with a way ID must drop it with the loss
+  warning. The kept declaration is what makes the element comparison read
+  every coordinate. A `cat --dedupe` of operands that disagree on the
+  declaration is not driven: the judgement reads one input header. The sort
+  check holds its input to its domain of one object per kind and ID before
+  judging anything pbfhogg did: a `HistoricalInformation`
   header is refused, and osmium's reference sort runs first, its output's
   strict order scanned, so a repeated object anywhere in the input (across
   blobs included) is a verifier error, never a pbfhogg verdict. The domain
@@ -694,7 +687,8 @@ Every merge is also held to the blob layout the documented plan
 payload bytes in place, each run's re-encoded blobs wholly within its ID
 span and ascending, nothing after the last segment; the summary's blob
 counts equal the prediction (pbfhogg's own account, beside the layout); and
-`LocationsOnWays` is dropped exactly when a way blob is in a run. The
+`LocationsOnWays` is kept when the input declares it, a way blob in a run
+included. The
 prediction's domain is every blob nonempty, single-kind, one element field
 per group, strictly ascending non-negative IDs, and indexdata, where
 present, equal to the decode; else a verifier error. The window must yield
@@ -1203,14 +1197,24 @@ and getid-removeid (invert with way IDs dropped with the warning, invert
 without way IDs kept, 59152278 records equal to osmium removeid with
 coordinates) PASS; getid-removeid and sort on the `unsorted` snapshot PASS.
 No configured input both declares `LocationsOnWays` and has overlapping
-way ranges, so sort's required drop is witnessed by unit tests only.
+way ranges.
 
 On 2026-11-16, host bygg, parent `20ad8323` with the uncommitted change that
 predicts sort's blob planner for the declaration (CLI xxh3-128
 `ce49884cb647ef14e40a20a66db25abc`): sort on Denmark `altw-keep-untagged`
 PASS in 28.5s (kept, every blob believed from its claim). No configured
-input makes sort rewrite a way blob of a `LocationsOnWays` input, so every
-drop branch is still witnessed by unit tests only.
+input makes sort rewrite a way blob of a `LocationsOnWays` input. That
+prediction is retired: sort now keeps the declaration through a rewrite.
+
+On 2026-11-24, host bygg, parent `042871e6` with the uncommitted change that
+keeps declared coordinates through the shared sweep (CLI xxh3-128
+`b6deea6606a172071170044a674692bc`): on Denmark `altw-keep-untagged`, sort
+PASS (every blob copied) and `cat --dedupe` PASS. The dedupe self-merge
+rewrites every real way blob, so its element comparison, which read
+coordinates because both files declare them, is the real-data witness of
+the sweep re-encoding ways with their coordinates. sort's own rewrite
+branches share that sweep and are witnessed by CLI tests
+(`crates/cli/tests/cli_sort.rs`).
 
 On 2026-11-15, host bygg, on the uncommitted change that added the
 locations degrade entry (parent `d5aacbff`): `degrade --locations-on-ways

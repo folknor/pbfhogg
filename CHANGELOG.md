@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **`sort` and `cat --dedupe` keep `LocationsOnWays` through a rewrite.**
+  When every input declares `LocationsOnWays`, a way blob in an overlap run
+  (or internally unsorted, or restructured) is now re-encoded with its inline
+  coordinates, and the output keeps the declaration; before, the coordinates
+  were dropped, the declaration removed and `header.way_metadata_loss`
+  warned. The prepass features are still dropped and warned. A rewritten way
+  that has refs but no coordinates in such an input is now refused (exit
+  `2`) rather than written into a file that declares it located. A merge of
+  inputs that do not all declare the feature, and `time-filter` (whose
+  coordinates would not be as of the cutoff), drop them as before.
+
 - **OSC readers refuse what XML forbids lexically, as osmium does.**
   `apply-changes`, `merge-changes` and `tags-filter --input-kind osc`
   now refuse (exit `2`) an undeclared entity reference anywhere (also

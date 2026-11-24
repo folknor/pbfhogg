@@ -214,7 +214,7 @@ fn plan_merge(
         inputs.len()
     );
 
-    let plan = blob_merge::plan(indexed);
+    let plan = blob_merge::plan(indexed, &headers);
     if plan.blobs_rewritten > 0 {
         crate::host::diag!(
             host.diagnostics,

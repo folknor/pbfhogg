@@ -397,7 +397,13 @@ header follows from them.
   `LocationsOnWays` and `SharedNodePins-v1` and drops `WayMembers-v1` (field
   5 lives in the `BlobHeader`); one that re-encodes ways with their
   coordinates keeps `LocationsOnWays` only; one that re-encodes ways
-  otherwise keeps none. The two prepass features are facts about the whole
+  otherwise keeps none. `sort` and `cat --dedupe` re-encode a rewritten way
+  with its coordinates when every input declares `LocationsOnWays`, and
+  refuse a rewritten way that has refs but no coordinates there, since the
+  kept declaration would misdescribe it; a way blob they copy is not
+  decoded, so its arrays are believed. time-filter keeps no coordinates:
+  they record node positions as of when the input was written, not as of
+  the cutoff. The two prepass features are facts about the whole
   file (relation membership, nodes shared between way positions), so they are
   kept only from a single input whose ways and relations reach the output
   with their content unchanged, all of them or a subset; a subset only
@@ -469,8 +475,8 @@ fails with an error rather than write a header that lies.
 | `cat` (several inputs) | not sorted | `LocationsOnWays` when every input declares it |
 | `cat --type` | input's | all, none when the first data blob carries no indexdata |
 | `cat --clean` | input's | none |
-| `cat --dedupe` | sorted | as copied, none when a way blob is in an overlap run |
-| `sort` | sorted | all, none when a way blob is rewritten |
+| `cat --dedupe` | sorted | as copied; when a way blob is rewritten, `LocationsOnWays` only, when every input declares it |
+| `sort` | sorted | all; when a way blob is rewritten, `LocationsOnWays` only |
 | `repack` | input's | `LocationsOnWays` |
 | `degrade` (header-only flags) | input header, verbatim | input header, verbatim |
 | `degrade` (re-encoding flags) | input's, not sorted under `--unsort*` | none |
@@ -1458,8 +1464,9 @@ same way where it can: a blob one index describes passes through under
 indexdata and tag keys scanned from its payload, and one holding no element
 is omitted. A block no single index describes is not split in input order
 but merged: each kind's elements join that kind's merge, are re-encoded as
-the overlap runs are (the way blobs among them losing their enrichments, so
-the output header declares none), and come out in type-then-ID order, with
+the overlap runs are (the way blobs among them losing the prepass
+enrichments, and their inline coordinates unless every input declares
+`LocationsOnWays`), and come out in type-then-ID order, with
 exact duplicates dropped under `--dedupe`. A `Note:` line says how many blobs
 were restructured and how many omitted, and the summary counts a
 restructured blob once, as rewritten, and an omitted one as omitted.
@@ -1469,7 +1476,8 @@ payloads whole and `--type` copies indexed way blobs whole, so the way
 enrichments the input declares are kept (a rebuilt block keeps inline
 locations and refuses the rest, as above; `--clean` re-encodes, and drops
 them); `--dedupe` re-encodes the way
-blobs in its overlap runs. With several inputs the header is reconciled across
+blobs in its overlap runs, keeping their coordinates when every input
+declares `LocationsOnWays`. With several inputs the header is reconciled across
 all of them, the output is not declared sorted (`--dedupe` excepted), and the
 prepass features are never declared. osmium writes a wholly blank header for
 multiple inputs - the same honesty rule, applied bluntly - so keeping the
@@ -2133,6 +2141,13 @@ is refused once a read has met both kinds of data blob.
 
 The output holds at most one version of each object and never declares
 `HistoricalInformation`, so it can serve as an apply-changes base.
+
+Ways are written without inline coordinates, and an input's
+`LocationsOnWays` is dropped with the `header.way_metadata_loss` warning:
+the coordinates record node positions as of when the input was written, so
+a way whose node moved after the cutoff would carry the later position,
+against the node version the snapshot keeps or a node it drops. Run
+`add-locations-to-ways` on the output to locate its ways as of the cutoff.
 
 A history input's surviving versions, gathered from many input blobs, are
 written in new blocks of up to 8000 elements. One that would be too large

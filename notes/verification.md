@@ -31,17 +31,32 @@ join requests only stage 1, so two joins on one unit overlapping after stage 1 p
 test-local providers that answer `fd_allowance` outright (`fault_cat_input.rs`
 `Grant` and `Fixed`) are light by convention.
 
-## VER-135 - sort's required LocationsOnWays drop has no real-data witness
+## VER-135 - sort's rewrite of a LocationsOnWays way blob has no real-data witness
 
-sort's declaration verdict is exact (`checks::sort::sort_way_locations` predicts the
-blob planner, decoding every blob pass 1 would scan), but every drop branch (overlap
+sort and `cat --dedupe` re-encode a rewritten way with its coordinates when every
+input declares `LocationsOnWays`, and the verifier expects the declaration kept, so
+the osmium comparison reads every rewritten coordinate. The shared sweep is
+witnessed on real data by the `cat --dedupe` self-merge of Denmark
+`altw-keep-untagged` (reference/verify.md), but sort's own rewrite (overlap
 component, internally unsorted or restructured way blob on a `LocationsOnWays` input)
-is witnessed by unit tests only: no configured dataset both declares
+is witnessed by CLI tests only: no configured dataset both declares
 `LocationsOnWays` and makes sort rewrite a way blob. No producer makes one:
 re-encoding `degrade` drops the declaration, and `cat A A` keeps it but duplicates
 every identity, which the strict element comparison and order check refuse. A
 witness needs overlapping way blobs with disjoint identities that keep inline
 coordinates and true indexdata.
+
+## VER-157 - cat-dedupe never judges a merge of operands that disagree on LocationsOnWays
+
+Reported by: the CMD-073 spar partner (2026-11-24).
+
+`judge_merge` (`crates/verify/src/checks/cat_dedupe.rs`) passes the original
+input to `Harness::judge_way_locations`, which reads that one header. Every
+operand today is derived from it and carries its header, so all declare or
+none does. A merge where only some operands declare `LocationsOnWays` would
+be judged against the wrong baseline: pbfhogg declares only when every input
+does and warns when any does, so the judge would need both facts. No such
+scenario is driven.
 
 ## VER-018 - Direct-route transports are attributed only where a fault cell drives the route
 

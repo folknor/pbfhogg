@@ -142,8 +142,6 @@ pub(crate) struct Shape {
     pub total: u64,
     pub passthrough: u64,
     pub rewritten: u64,
-    /// A way blob is in a run, so ways lose their enrichments.
-    pub way_rewritten: bool,
     /// A run with a passthrough of its own kind on both sides.
     pub bounded_runs: usize,
 }
@@ -153,7 +151,6 @@ pub(crate) fn shape(plan: &[Segment]) -> Shape {
         total: 0,
         passthrough: 0,
         rewritten: 0,
-        way_rewritten: false,
         bounded_runs: 0,
     };
     for (i, seg) in plan.iter().enumerate() {
@@ -165,7 +162,6 @@ pub(crate) fn shape(plan: &[Segment]) -> Shape {
             Segment::Run { kind, members, .. } => {
                 s.total += members.len() as u64;
                 s.rewritten += members.len() as u64;
-                s.way_rewritten |= *kind == 1;
                 let pass_of = |seg: Option<&Segment>| matches!(seg, Some(Segment::Pass { entry, .. }) if entry.kind == *kind);
                 if i > 0 && pass_of(plan.get(i - 1)) && pass_of(plan.get(i + 1)) {
                     s.bounded_runs += 1;
@@ -343,7 +339,6 @@ mod tests {
         let s = shape(&plan);
         assert_eq!((s.total, s.passthrough, s.rewritten), (7, 2, 5));
         assert_eq!(s.bounded_runs, 1);
-        assert!(s.way_rewritten);
     }
 
     /// Equal first IDs keep argument order, so a self-merge pairs each blob

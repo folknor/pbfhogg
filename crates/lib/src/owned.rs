@@ -200,12 +200,12 @@ pub(crate) struct OwnedWay {
     /// Inline node coordinates (decimicro lat/lon), one per ref, for
     /// LocationsOnWays preservation. Empty when the source way carried no
     /// inline coordinates (the common case; the reader goes by the way's
-    /// payload, not the header's `LocationsOnWays` declaration). `read_way` always leaves this empty;
-    /// only `read_way_with_locations` populates it, so existing consumers
-    /// (sort, cat dedupe, degrade, time_filter) that go through `read_way`
-    /// keep re-encoding via the plain `add_way` path unchanged. The
-    /// `write_single_way*` helpers switch to `add_way_with_locations` only
-    /// when this is non-empty and its length matches `refs`.
+    /// payload, not the header's `LocationsOnWays` declaration). `read_way`
+    /// always leaves this empty; `read_way_with_locations` (repack) and
+    /// `read_declared_way` (the sort and `cat --dedupe` sweep over declaring
+    /// inputs) populate it. The `write_single_way*` helpers switch to
+    /// `add_way_with_locations` only when this is non-empty and its length
+    /// matches `refs`.
     pub(crate) locations: Vec<(i32, i32)>,
     pub(crate) metadata: Option<OwnedMetadata>,
 }
@@ -872,6 +872,56 @@ pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> Result<OwnedWay> {
         .map(|loc| Ok((loc.decimicro_lat()?, loc.decimicro_lon()?)))
         .collect::<Result<_>>()?;
     Ok(way)
+}
+
+/// A way's inline coordinates, into `out`, for a writer whose output header
+/// declares `LocationsOnWays` because its inputs do: one location per ref,
+/// or the run is refused. A declaring input whose way carries refs without
+/// coordinates would otherwise be re-encoded into a way the output header
+/// misdescribes. The decoder already refuses arrays whose lengths disagree
+/// with each other or with the refs, so the one case left is a way with
+/// refs and no arrays. `refs` is the way's ref count, which the caller has
+/// already decoded.
+pub(crate) fn declared_way_locations(
+    w: &crate::Way<'_>,
+    refs: usize,
+    out: &mut Vec<(i32, i32)>,
+) -> Result<()> {
+    out.clear();
+    for loc in w.node_locations() {
+        out.push((loc.decimicro_lat()?, loc.decimicro_lon()?));
+    }
+    if out.len() != refs {
+        return Err(crate::Error::invalid_data(format!(
+            "way {}: the input declares LocationsOnWays, but the way has {refs} node ref(s) \
+             and {} inline location(s)",
+            w.id(),
+            out.len()
+        )));
+    }
+    Ok(())
+}
+
+/// [`read_way`] with [`declared_way_locations`]: the owned form of a way
+/// whose output keeps the `LocationsOnWays` declaration.
+pub(crate) fn read_declared_way(w: &crate::Way<'_>) -> Result<OwnedWay> {
+    let mut way = read_way(w)?;
+    declared_way_locations(w, way.refs.len(), &mut way.locations)?;
+    Ok(way)
+}
+
+/// Write an owned way read by [`read_declared_way`]: with its locations
+/// always, never falling back to a plain way.
+pub(crate) fn write_declared_way_local(
+    way: &OwnedWay,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> crate::Result<()> {
+    crate::commands::ensure_way_capacity_local(bb, output)?;
+    let tags = way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let meta = way.metadata.as_ref().map(OwnedMetadata::as_partial);
+    bb.add_way_with_locations_partial(way.id, tags, &way.refs, &way.locations, meta.as_ref());
+    Ok(())
 }
 
 /// A bad role string index is an error naming the relation and member, as in

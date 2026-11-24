@@ -37,7 +37,7 @@ mod tests {
 
     fn completed() -> process::Completed {
         process::Completed {
-            elapsed: tunables::DESCRIBE_DEADLINE,
+            clock_wall: tunables::DESCRIBE_DEADLINE,
             status: std::process::ExitStatus::from_raw(0), timed_out: false, residual_children: false,
             out: process::Capture { bytes: br#"{"protocol":1,"scenarios":[{"id":"s","description":"d","deadline_s":1,"roles":[],"calls":[{"id":"a","label":"a"}],"assertions":[]}]}"#.to_vec(), overflow: false },
             err: process::Capture::default(), markers: process::Capture::default(),

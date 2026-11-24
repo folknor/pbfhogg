@@ -105,7 +105,8 @@ fn supervisor_lifecycle() {
         assert_eq!(result.timed_out, timeout, "{mode}: {result:?}");
         assert_eq!(result.residual_children, residual, "{mode}: {result:?}");
         if timeout {
-            assert!(result.elapsed >= deadline);
+            // The boot clock never runs slower than the monotonic deadline.
+            assert!(result.clock_wall >= deadline);
         } else {
             assert!(result.status.success(), "{mode}: {result:?}");
         }

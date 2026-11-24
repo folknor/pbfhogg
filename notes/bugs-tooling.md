@@ -101,18 +101,6 @@ ownership inventory and one shared acquisition and recovery protocol, because
 parsing pins, sequence keys, aliases and ownership separately in each path is
 already producing contradictory answers.
 
-## TOOL-022 - Clock validation uses absolute times where the contract says relative
-
-Reported by: library-protocol [P2].
-
-`run.rs` compares absolute `entry_us`, `return_us`, `seal_us` and diagnostic
-timestamps with process wall time plus a tolerance, and FIFO validation makes
-the same comparison. The contract in `reference/library-protocol.md` requires
-elapsed differences, because the FIFO clock's origin is unreliable. A short
-call whose readings start at 10,000,000 us is rejected even when every
-duration and stream boundary is valid. Durations should be checked relative
-to `entry_us`, with stream checks kept against the call's recorded interval.
-
 ## TOOL-027 - geocode-query quantizes the requested sampling box
 
 Reported by: bench.

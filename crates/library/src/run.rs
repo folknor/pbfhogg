@@ -205,7 +205,7 @@ fn judge_completed(
     match run.status.code() {
         Some(code @ (0 | 1)) => {
             if let Some(judged) = judge_artefacts(
-                run.elapsed,
+                run.clock_wall,
                 code,
                 &prepared.artefacts,
                 scenario,
@@ -275,8 +275,12 @@ fn collect(
         run.markers.overflow,
         scenario.calls.len().saturating_add(1),
     );
+    // Absolute, as for the call readings: every record shares the worker
+    // clock, whose zero is the worker's start, so none can be later than its
+    // boot-clock lifetime. Untagged records have no call reading to anchor a
+    // relative bound.
     let limit = run
-        .elapsed
+        .clock_wall
         .saturating_add(crate::tunables::CLOCK_TOLERANCE)
         .as_micros();
     if records
@@ -666,7 +670,7 @@ struct Judged {
 }
 
 fn judge_artefacts(
-    elapsed: std::time::Duration,
+    clock_wall: std::time::Duration,
     code: i32,
     artefacts: &Path,
     scenario: &Scenario,
@@ -712,8 +716,12 @@ fn judge_artefacts(
     let complete = inventory.is_empty();
     report.failures.extend(inventory.iter().cloned());
 
-    // Each reading shares the worker clock and must fit the observed wall.
-    let limit_us = u64::try_from(elapsed.as_micros())
+    // Each reading shares the worker clock, whose zero is the worker's start,
+    // and must fit the worker's boot-clock lifetime. The bound is absolute on
+    // purpose: it implies the bound on every difference from entry_us, and
+    // also refuses a clock shifted away from that zero, which a relative
+    // bound would accept.
+    let limit_us = u64::try_from(clock_wall.as_micros())
         .unwrap_or(u64::MAX)
         .saturating_add(
             u64::try_from(crate::tunables::CLOCK_TOLERANCE.as_micros()).unwrap_or(u64::MAX),

@@ -87,7 +87,11 @@ impl Capture {
 
 #[derive(Debug)]
 pub(crate) struct Completed {
-    pub(crate) elapsed: Duration,
+    /// Pre-spawn to post-reap on `CLOCK_BOOTTIME`, the clock the worker's
+    /// procfs process age is counted on. It encloses every honest worker
+    /// clock reading even across a suspend, which the monotonic `Instant`
+    /// the deadline runs on leaves out.
+    pub(crate) clock_wall: Duration,
     pub(crate) status: ExitStatus,
     pub(crate) timed_out: bool,
     pub(crate) residual_children: bool,
@@ -116,6 +120,20 @@ pub(crate) fn command(executable: &Path) -> Command {
     cmd
 }
 
+fn boottime() -> io::Result<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one timespec through a live, exclusive pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let secs = u64::try_from(ts.tv_sec).map_err(io::Error::other)?;
+    let nanos = u32::try_from(ts.tv_nsec).map_err(io::Error::other)?;
+    Ok(Duration::new(secs, nanos))
+}
+
 fn nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
     // SAFETY: fcntl operates on a borrowed, live descriptor, with scalar flags.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
@@ -138,6 +156,8 @@ pub(crate) fn run(
         nonblocking(file).map_err(|e| Failure::refused(e.to_string()))?;
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let clock_start =
+        boottime().map_err(|e| Failure::refused(format!("read CLOCK_BOOTTIME: {e}")))?;
     let start = Instant::now();
     let mut child = cmd
         .spawn()
@@ -207,13 +227,22 @@ pub(crate) fn run(
         Ok(result) => result,
         Err(e) => return Err(Failure::unestablished(e.to_string()).with_captures(captures)),
     };
+    // The worker is reaped: its whole life on the boot clock lies between the
+    // two samples, suspend included, which `Instant` would leave out.
+    let clock_end =
+        boottime().map_err(|e| io::Error::other(format!("read CLOCK_BOOTTIME after reap: {e}")));
     // All writers are dead. Capture even a pipe larger than one drain turn.
     if can_drain && let Err(e) = drain_remaining(&mut drain) {
         drain_fault = Some(e);
     }
-    if let Some(e) = fault.or(drain_fault) {
-        return Err(Failure::refused(format!("worker capture/wait: {e}")).with_captures(captures));
-    }
+    let clock_wall = match (fault.or(drain_fault), clock_end) {
+        (None, Ok(end)) => end.saturating_sub(clock_start),
+        (Some(e), _) | (None, Err(e)) => {
+            return Err(
+                Failure::refused(format!("worker capture/wait: {e}")).with_captures(captures)
+            );
+        }
+    };
     // cleanup may have reaped the worker through waitpid; its status must be
     // retained there rather than fabricated from Child::wait's ECHILD.
     let Some(status) = status.or(residual_children.worker_status) else {
@@ -222,7 +251,7 @@ pub(crate) fn run(
         );
     };
     Ok(Completed {
-        elapsed: start.elapsed(),
+        clock_wall,
         status,
         timed_out,
         residual_children: residual_children.adopted,

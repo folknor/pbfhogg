@@ -267,19 +267,25 @@ Documents above.
 `assertions` (the scenario-level results) and `diagnostics`, setup's and the
 harness's own events (never a call's), in the call documents' shape. Its
 collection closes after setup and every call document; its `at_us` readings
-are held to their range only, since no call reading anchors them.
+are held to their range only.
 
 **`calls/<id>.json`**:
 
 - `protocol`; `call`, the file's call id.
 - `entry_us`, `return_us`, `seal_us`: `MarkerFifo::now_us()` at command
   entry, at return, and when sealing ended; each 0 to 2^63-1, with
-  `entry_us <= return_us <= seal_us`. `return_us - entry_us` and
-  `seal_us - entry_us` must each be at most the process wall the driver observed
-  (spawn to the ending it saw) plus one second. The bound is relative on
-  purpose: readings of one opened FIFO share its clock, whose origin is not
-  reliable. That the readings sit at those boundaries is the harness's
-  obligation.
+  `entry_us <= return_us <= seal_us`. Each must be at most the worker's
+  clock wall plus one second, where the clock wall is the driver's
+  pre-spawn to post-reap interval on `CLOCK_BOOTTIME`. The bound is absolute
+  on purpose: the FIFO clock's intended zero is the worker's process start
+  (brokkr's marker clock contract), estimated from procfs process age, which
+  counts on the boot clock and so includes any suspend; the monotonic wall
+  would not, and could fall short of an honest reading. The estimate can only
+  stamp early (a procfs failure gives zero age; a suspend after the age
+  sample is left out), and the second covers its tick quantization. An
+  absolute bound implies the same bound on every difference from `entry_us`,
+  and also refuses a clock shifted away from that zero. That the readings sit
+  at those boundaries is the harness's obligation.
 - `outcome`: `{"status": "ok"}`, `{"status": "cancelled"}`, or
   `{"status": "error", "kind": ID, "message": ONE_LINE}` (an identifier,
   and 0 to 1000 bytes). Reported; the harness's assertions judge it. An
@@ -331,8 +337,8 @@ are held to their range only, since no call reading anchors them.
   order, each `{"at_us", "kind", "key", "message", "truncated"}`. `at_us`
   is `MarkerFifo::now_us()` when it was captured, 0 to 2^63-1, never before
   `entry_us` (an earlier event is setup's, which goes in `scenario.json`),
-  and `at_us - entry_us` within the process wall the driver observed plus one
-  second, as for the other readings. `kind` is an identifier, the event
+  and at most the worker's clock wall plus one second, as for the other
+  readings. `kind` is an identifier, the event
   kind's name in lower case (any kind, so a new one needs no driver
   change); `key` is 1 to 200 bytes; `message` is at most 4000 bytes, and a
   longer one is cut by the harness at a character boundary with `truncated`
@@ -411,6 +417,10 @@ nothing of the call follows the terminal record.
 A tagged record naming a call id the describe document does not declare
 fails the run, whatever its exit: lines arrive whole or not at all, so no
 loss can make one.
+
+Every retained FIFO record, tagged or untagged, must be stamped at most the
+worker's clock wall plus one second (see `calls/<id>.json`); a later one
+fails the run.
 
 The driver judges each call's records, in the order they arrived, against its
 call document:

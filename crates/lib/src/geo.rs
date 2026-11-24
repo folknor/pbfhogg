@@ -187,8 +187,9 @@ pub(crate) fn quantize_decimal_text(token: &str) -> Option<i32> {
         Some(b'+') => (false, &s[1..]),
         _ => (false, s),
     };
+    let cap = i64::try_from(s.len()).ok()?.saturating_add(20);
     let (mantissa, exponent) = match s.find(['e', 'E']) {
-        Some(at) => (&s[..at], parse_exponent(&s[at + 1..])?),
+        Some(at) => (&s[..at], parse_exponent(&s[at + 1..], cap)?),
         None => (s, 0),
     };
     let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -246,11 +247,17 @@ fn digits_value(digits: &[u8]) -> u64 {
     digits.iter().fold(0_u64, |acc, &d| acc * 10 + u64::from(d))
 }
 
-/// A decimal exponent, saturated far beyond any coordinate's range so an
-/// absurd exponent still means "zero" or "out of range" rather than "not a
-/// number".
+/// A decimal exponent, saturated at `cap` in magnitude so an absurd exponent
+/// still means "zero" or "out of range" rather than "not a number".
+///
+/// The caller derives `cap` from the token's length: a mantissa of `n`
+/// characters shifts the scale by at most `n`, so an exponent saturated past
+/// `n + 20` can never be cancelled back into the ten-digit window, and the
+/// saturated value decides exactly as the true one would. A fixed cap does
+/// not: `1` followed by more zeros than the cap, then `e-` that many, is
+/// exactly `1` but would read as `10`.
 #[cfg(feature = "commands")]
-fn parse_exponent(s: &str) -> Option<i64> {
+fn parse_exponent(s: &str, cap: i64) -> Option<i64> {
     let (negative, digits) = match s.as_bytes().first() {
         Some(b'-') => (true, &s[1..]),
         Some(b'+') => (false, &s[1..]),
@@ -259,9 +266,9 @@ fn parse_exponent(s: &str) -> Option<i64> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let value = digits.bytes().fold(0_i64, |acc, b| {
-        (acc * 10 + i64::from(b - b'0')).min(100_000)
-    });
+    let value = digits
+        .bytes()
+        .fold(0_i64, |acc, b| (acc * 10 + i64::from(b - b'0')).min(cap));
     Some(if negative { -value } else { value })
 }
 
@@ -1760,6 +1767,23 @@ mod tests {
         ] {
             assert_eq!(quantize_decimal_text(token), expected, "token {token:?}");
         }
+        // A mantissa longer than any fixed exponent cap cancels the exponent
+        // exactly: both tokens are exactly 1.
+        for zeros in [100_001_usize, 200_000] {
+            let token = format!("1{}e-{zeros}", "0".repeat(zeros));
+            assert_eq!(
+                quantize_decimal_text(&token),
+                Some(10_000_000),
+                "{zeros} zeros"
+            );
+            let token = format!("0.{}1e{}", "0".repeat(zeros), zeros + 1);
+            assert_eq!(
+                quantize_decimal_text(&token),
+                Some(10_000_000),
+                "{zeros} zeros"
+            );
+        }
+        assert_eq!(quantize_decimal_text("0e1000000000000000000"), Some(0));
     }
 
     /// The f64 rule rounds the exact binary value, so it can disagree with

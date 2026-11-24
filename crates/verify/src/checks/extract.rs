@@ -128,6 +128,18 @@ struct RegionPass<'a> {
     direct_io: bool,
 }
 
+/// The bbox as osmium is given it (`Bbox::to_osmium_text`); a box with no
+/// such spelling is a comparison that cannot be made.
+fn osmium_bbox(bbox: &Bbox) -> Result<String, Error> {
+    bbox.to_osmium_text().ok_or_else(|| {
+        Error::Tool(format!(
+            "bbox {} has an edge of more than ten integer digits, which osmium cannot read as a \
+             coordinate",
+            bbox.as_str()
+        ))
+    })
+}
+
 /// Cross-validate `pbfhogg extract` against `osmium extract` for
 /// simple, complete-ways, and smart strategies, on the bbox and on every
 /// dataset polygon.
@@ -149,6 +161,9 @@ pub fn run(
     // comparison.
     for polygon in polygons {
         crate::verify_polygon::osmium_reads_alike(&polygon.path).map_err(Error::Tool)?;
+    }
+    if let Some(bbox) = bbox {
+        osmium_bbox(bbox)?;
     }
     let outdir = harness.subdir("extract")?;
 
@@ -266,7 +281,13 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             .arg("extract")
             .input(osmium_input);
         tool = match region {
-            Region::Bbox(bbox) => tool.args(&["-b", bbox.as_str()]),
+            // pbfhogg gets the typed text; osmium the same decimals in a
+            // spelling its parser reads to the same columns (an exponent
+            // or a `+` would otherwise name another box there).
+            Region::Bbox(bbox) => {
+                let text = osmium_bbox(bbox)?;
+                tool.args(&["-b", text.as_str()])
+            }
             Region::Polygon(polygon) => tool.arg("-p").input(&polygon.path),
         };
         let mut osmium_args = osmium_strategy(*strategy);

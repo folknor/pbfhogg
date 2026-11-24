@@ -730,6 +730,12 @@
 
 ### Fixed
 
+- **A bbox edge's exponent is never capped.** `extract` and `export` bbox
+  edges saturated their exponent at 100000, so a mantissa padded with
+  more digits than that (`1` with 100001 zeros, then `e-100001`, exactly
+  `1`) read ten times too large. The cap now grows with the token, so every
+  spelling is read at its exact value.
+
 - **Geocode admin rings on one line no longer publish as areas.** A
   boundary ring whose points all lay on one line (all at one latitude, say)
   encloses nothing, yet was stored, counted towards the empty-index check

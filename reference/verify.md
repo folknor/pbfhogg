@@ -761,7 +761,14 @@ same sorted-copy route as cat.
 
 Extract accepts `--bbox` (otherwise the dataset's bbox), and runs simple,
 complete_ways and smart on that box and every dataset polygon in name order.
-At least one region is required. Smart uses osmium's
+At least one region is required. pbfhogg gets the bbox as typed; osmium
+gets each edge restated as a plain decimal (exponent applied exactly to
+the digits, no `+` or whitespace, leading integer zeros dropped, the
+fraction truncated after eight digits), which libosmium's coordinate
+parser reads to the column pbfhogg reads from the typed text: libosmium
+would otherwise truncate an exponent spelling's mantissa before scaling
+and refuse `+` and whitespace. An edge with more than ten integer digits
+is refused before any run as a verifier error. Smart uses osmium's
 `-S types=multipolygon,boundary`. Complete and smart require identical
 membership; simple requires identical nodes and ways, and relations holding
 any direct node or way member in those sets. Relations present only in

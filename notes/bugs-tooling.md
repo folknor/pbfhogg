@@ -23,18 +23,18 @@ None was built, run or reproduced, and the bracketed priority is the hunter's
 own label. The geocode-query optimizer sink is recorded under BUG-028.
 Entries are in no order of importance.
 
-## TOOL-002 - verify extract compares different regions for some bbox spellings
+## TOOL-048 - verify extract blames pbfhogg for a bbox only pbfhogg refuses
 
-Reported by: verify [P2].
+Reported by: the scout and spar on the verify extract bbox spelling
+(2026-11-24).
 
-`checks/extract.rs` passes the original bbox text straight to osmium.
-`DEVIATIONS.md` records a deliberate difference in exponent quantization:
-`0.000000001e2` becomes coordinate column 1 in pbfhogg and column 0 in
-libosmium. With `--bbox=0.000000001e2,-1,1,1`, a node at longitude zero is
-correctly excluded by pbfhogg and included by osmium, and verify reports a
-membership failure. This breaks the claim that extract compares membership in
-the same region. The verifier must translate the intended integer edges into
-an equivalent reference bbox, or explicitly refuse that comparison domain.
+`devkit::Bbox` takes any four finite numbers, in any order. pbfhogg's
+`Bbox::try_new` refuses swapped or equal edges and edges outside WGS84;
+osmium's `box.extend` accepts swapped and equal pairs. So `verify extract
+--bbox=1,1,0,0` reaches `require_success` on the pbfhogg run, and the
+verifier's misuse reads as a pbfhogg failure. Such a box is not a comparison
+domain and should be refused before any run as a verifier error, as an edge
+with more than ten integer digits now is.
 
 ## TOOL-047 - A reference that cannot read the dataset input reports FAIL
 
@@ -87,19 +87,6 @@ same hunter's structural note: give publication one complete registry
 ownership inventory and one shared acquisition and recovery protocol, because
 parsing pins, sequence keys, aliases and ownership separately in each path is
 already producing contradictory answers.
-
-## TOOL-027 - geocode-query quantizes the requested sampling box
-
-Reported by: bench.
-
-The instrument's bbox argument (`crates/bench/src/main.rs`) goes through the
-extraction bbox parser, which deliberately rounds every edge to
-decimicrodegrees (`extract/mod.rs`). The valid box
-`0.00000001,0.00000001,0.00000002,0.00000002` becomes four zeroes, every
-generated query targets `(0, 0)` outside the supplied box, and the Lua record
-keeps the original bbox text. This breaks the instrument's promise to draw
-points uniformly from the supplied box. Query sampling needs validation
-without quantization.
 
 ## TOOL-028 - diff-text accepts raw inputs that bypass its advertised engine
 

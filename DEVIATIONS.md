@@ -549,7 +549,9 @@ polygon regions osmium reads the same way (see the next section for the
 polygon input pbfhogg reads differently). A bbox edge token written with an
 exponent is quantized from its exact value, where libosmium truncates the
 mantissa after eight decimals before applying the exponent;
-`0.000000001e2` is column 1 here and 0 there. Polygon membership was
+`0.000000001e2` is column 1 here and 0 there. `pbfhogg-verify` therefore
+hands osmium each edge restated as the plain decimal it names, so the two
+tools compare one region. Polygon membership was
 measured on bygg, 2026-11-03, against osmium on denmark-20260220 with four
 municipality boundaries exported from the same file (Copenhagen with its
 Frederiksberg hole, Frederiksberg, Aarhus, Odense; 814 to 9694 vertices, every

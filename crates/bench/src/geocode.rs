@@ -192,11 +192,41 @@ where
     })
 }
 
+/// The sampling box as typed: four f64 edges validated for WGS84 range and
+/// strict order, never quantized. `pbfhogg::extract::parse_bbox` rounds each
+/// edge to a decimicrodegree because that is extraction's membership rule;
+/// a sampling box is not a membership test, and quantizing it would collapse
+/// a box finer than one column to a single point outside what was asked.
+pub(crate) fn parse_sampling_bbox(text: &str) -> Result<pbfhogg::extract::Bbox, String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    let [min_lon, min_lat, max_lon, max_lat] = parts.as_slice() else {
+        return Err(format!(
+            "bbox needs four comma-separated values, got {}",
+            parts.len()
+        ));
+    };
+    let edge = |s: &str| {
+        s.trim()
+            .parse::<f64>()
+            .map_err(|_| format!("invalid bbox value: {s}"))
+    };
+    pbfhogg::extract::Bbox::try_new(
+        edge(min_lon)?,
+        edge(min_lat)?,
+        edge(max_lon)?,
+        edge(max_lat)?,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// `queries` (lat, lon) points uniform in `bbox`, a pure function of bbox
 /// and seed (splitmix64). Each coordinate is clamped to its bbox interval,
 /// since the scaling can round an ulp past the upper bound, and at a world
 /// bound that point would be out of range; the clamp moves only such edge
-/// points, so revisions query the same points.
+/// points, so revisions query the same points. Before registry version 5
+/// the box was quantized to decimicrodegrees first, so the points agree
+/// across that change only for a box whose edges all lie on the `1e-7`
+/// grid.
 #[allow(
     clippy::cast_precision_loss,
     reason = "the top 53 bits are exact in an f64"
@@ -336,6 +366,24 @@ mod tests {
         assert_eq!(calls.get(), POINTS.len() * 3);
     }
 
+    /// A box finer than one decimicrodegree is sampled as typed, not
+    /// collapsed onto the column its edges round to.
+    #[test]
+    fn a_sub_column_box_is_not_quantized() {
+        let bbox =
+            super::parse_sampling_bbox("0.00000001,0.00000001,0.00000002,0.00000002").unwrap();
+        assert_eq!(bbox.min_lon, 0.000_000_01);
+        assert_eq!(bbox.max_lat, 0.000_000_02);
+        assert!(
+            points(&bbox, 100, 3)
+                .iter()
+                .all(|&(lat, lon)| lat > 0.0 && lon > 0.0)
+        );
+        assert!(super::parse_sampling_bbox("1,1,0,2").is_err());
+        assert!(super::parse_sampling_bbox("0,0,1").is_err());
+        assert!(super::parse_sampling_bbox("0,0,1,91").is_err());
+    }
+
     #[test]
     fn points_stay_inside_world_and_tight_bboxes() {
         let boxes = [
@@ -343,9 +391,10 @@ mod tests {
             "179.9999999,89.9999999,180,90",
             "-180,-90,-179.9999999,-89.9999999",
             "5.9,47.3,15.0,55.0",
+            "0.00000001,0.00000001,0.00000002,0.00000002",
         ];
         for b in boxes {
-            let bbox = pbfhogg::extract::parse_bbox(b).unwrap();
+            let bbox = super::parse_sampling_bbox(b).unwrap();
             for (lat, lon) in points(&bbox, 10_000, 7) {
                 assert!(
                     (bbox.min_lat..=bbox.max_lat).contains(&lat),

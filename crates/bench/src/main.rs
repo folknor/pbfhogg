@@ -56,7 +56,7 @@ enum Instrument {
         index_dir: PathBuf,
         /// Points are drawn uniformly from this box:
         /// min_lon,min_lat,max_lon,max_lat
-        #[arg(long, value_parser = pbfhogg::extract::parse_bbox)]
+        #[arg(long, value_parser = geocode::parse_sampling_bbox)]
         bbox: pbfhogg::extract::Bbox,
         /// Points per round
         #[arg(long, default_value = "100000")]

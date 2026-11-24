@@ -53,6 +53,120 @@ impl Bbox {
     pub fn to_pbfhogg_arg(&self) -> String {
         format!("-b={}", self.source)
     }
+
+    /// The same four decimals spelled so libosmium's coordinate parser reads
+    /// each as the column pbfhogg reads from the original text, or `None`
+    /// when an edge has more than ten integer digits (no coordinate does).
+    ///
+    /// pbfhogg rounds an edge's exact decimal value half away from zero to a
+    /// decimicrodegree, deciding on the eighth decimal. libosmium reads at
+    /// most eight fraction digits and rounds the same way, but applies an
+    /// exponent to the already truncated mantissa, and refuses a `+`,
+    /// whitespace and long leading-zero runs. So each edge is restated as a
+    /// plain decimal: the exponent applied exactly to the digit string, the
+    /// fraction truncated (never rounded) after its eighth digit. That is the
+    /// same decimal for every decision either parser makes, so no column is
+    /// computed here. A plain edge with at most eight decimals keeps its
+    /// spelling, apart from leading integer zeros.
+    pub fn to_osmium_text(&self) -> Option<String> {
+        let edges: Option<Vec<String>> = self.source.split(',').map(osmium_coordinate).collect();
+        Some(edges?.join(","))
+    }
+}
+
+/// One edge as a plain decimal libosmium reads exactly; see
+/// [`Bbox::to_osmium_text`]. The token already parsed as a finite f64.
+fn osmium_coordinate(token: &str) -> Option<String> {
+    let s = token.trim();
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    // Saturated past the token's own length, which no mantissa can cancel.
+    let cap = i64::try_from(s.len()).ok()?.saturating_add(20);
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(at) => {
+            let e = &s[at + 1..];
+            let (e_negative, e) = match e.as_bytes().first() {
+                Some(b'-') => (true, &e[1..]),
+                Some(b'+') => (false, &e[1..]),
+                _ => (false, e),
+            };
+            if e.is_empty() || !e.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let value = e
+                .bytes()
+                .fold(0_i64, |acc, b| (acc * 10 + i64::from(b - b'0')).min(cap));
+            (&s[..at], if e_negative { -value } else { value })
+        }
+        None => (s, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .skip_while(|&b| b == b'0')
+        .collect();
+    if digits.is_empty() {
+        // Zero, however large its exponent.
+        return Some("0".to_owned());
+    }
+    let len = i64::try_from(digits.len()).ok()?;
+    let frac_len = i64::try_from(frac_part.len()).ok()?;
+    // Digits before the point once the exponent is applied.
+    let point = len - frac_len + exponent;
+    if point > 10 {
+        return None;
+    }
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if point <= -8 {
+        out.push('0');
+        return Some(out);
+    }
+    let (int_digits, frac_digits): (String, String) = if point >= 0 {
+        let point = usize::try_from(point).ok()?;
+        let mut int: String = digits.iter().take(point).map(|&b| char::from(b)).collect();
+        while int.len() < point {
+            int.push('0');
+        }
+        let frac = digits
+            .iter()
+            .skip(point)
+            .take(8)
+            .map(|&b| char::from(b))
+            .collect();
+        (int, frac)
+    } else {
+        let zeros = usize::try_from(-point).ok()?;
+        let frac = std::iter::repeat_n(b'0', zeros)
+            .chain(digits.iter().copied())
+            .take(8)
+            .map(char::from)
+            .collect();
+        (String::new(), frac)
+    };
+    if int_digits.is_empty() {
+        out.push('0');
+    } else {
+        out.push_str(&int_digits);
+    }
+    if !frac_digits.is_empty() {
+        out.push('.');
+        out.push_str(&frac_digits);
+    }
+    Some(out)
 }
 
 impl std::str::FromStr for Bbox {

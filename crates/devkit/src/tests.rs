@@ -464,6 +464,7 @@ file = 'b.osc'
     let bbox = c.select_bbox("m", "d").unwrap().unwrap();
     assert_eq!(bbox.coordinates(), [-1.0, 2.0, 3.0, 4.0]);
     assert_eq!(bbox.to_pbfhogg_arg(), "-b=-1, 2,3,4");
+    assert_eq!(bbox.to_osmium_text().unwrap(), "-1,2,3,4");
     let polygons = c.select_polygons("m", "d").unwrap().unwrap();
     assert_eq!(
         polygons
@@ -476,6 +477,44 @@ file = 'b.osc'
     for bad in ["1,2,3", "1,2,3,NaN", "1,2,inf,4", "a,2,3,4"] {
         assert!(crate::Bbox::parse(bad).is_err());
     }
+}
+
+/// Each edge reaches osmium as the decimal pbfhogg reads from the typed
+/// text, in a spelling libosmium's parser takes as that same column: the
+/// exponent applied exactly, the fraction truncated after eight digits.
+#[test]
+fn osmium_text_restates_each_edge_as_a_plain_decimal() {
+    let one = |edge: &str| {
+        crate::Bbox::parse(&format!("{edge},0,1,1"))
+            .unwrap()
+            .to_osmium_text()
+            .map(|text| text.split(',').next().unwrap().to_owned())
+    };
+    for (edge, expected) in [
+        ("12.4", "12.4"),
+        ("13.0", "13.0"),
+        ("-25.0", "-25.0"),
+        ("180", "180"),
+        ("0.000000001e2", "0.0000001"),
+        ("5e-8", "0.00000005"),
+        ("-5e-8", "-0.00000005"),
+        ("5e-9", "0"),
+        ("1.24e1", "12.4"),
+        ("+12.", "12"),
+        (" 2", "2"),
+        (".5", "0.5"),
+        ("00012.40", "12.40"),
+        ("1.0000000499999999", "1.00000004"),
+        ("0e1000000000000000000", "0"),
+        ("1e-99999999999", "0"),
+        ("1e9", "1000000000"),
+    ] {
+        assert_eq!(one(edge).as_deref(), Some(expected), "edge {edge:?}");
+    }
+    assert_eq!(one("1e10"), None);
+    // A mantissa longer than any fixed exponent cap still cancels exactly.
+    let long = format!("1{}e-100001", "0".repeat(100_001));
+    assert_eq!(one(&long).as_deref(), Some("1.00000000"));
 }
 
 #[test]

@@ -23,6 +23,8 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         path: polygon.clone(),
     }];
     let bbox = pbfhogg_devkit::Bbox::parse("0,0,1,1").unwrap();
+    std::fs::write(dir.join("pbfhogg-bbox"), "0,0,1,1").unwrap();
+    std::fs::write(dir.join("osmium-bbox"), "0,0,1,1").unwrap();
     let run = run::Run::create(&dir, exe, true).unwrap();
     let cache =
         reference_cache::ReferenceCache::new(&dir, "extract-fixture".into(), false).unwrap();
@@ -104,11 +106,35 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
         }
     }
     std::fs::write(dir.join("fault"), "").unwrap();
+    bbox_spellings(&mut h, exe, &dir, &input);
     // Gate a polygon with a known different interpretation before launching.
     h.run = run::Run::create(&dir, exe, true).unwrap();
     std::fs::write(&polygon, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
     let error = checks::extract::run(&mut h, &input, None, &polygons, false).unwrap_err();
     assert!(error.to_string().contains("cannot be compared with osmium"));
+}
+
+/// An exponent edge libosmium would truncate before scaling reaches osmium
+/// as the plain decimal pbfhogg reads (1e-7, column 1), and an edge no
+/// coordinate parser takes is refused before any run.
+fn bbox_spellings(h: &mut harness::Harness, exe: &Path, dir: &Path, input: &Path) {
+    fake_pbf::write(input, &[SORTED], "exponent-bbox");
+    let typed = "0.000000001e2,0,1,1";
+    std::fs::write(dir.join("pbfhogg-bbox"), typed).unwrap();
+    std::fs::write(dir.join("osmium-bbox"), "0.0000001,0,1,1").unwrap();
+    h.run = run::Run::create(dir, exe, true).unwrap();
+    h.run.watch(input).unwrap();
+    let spelled = pbfhogg_devkit::Bbox::parse(typed).unwrap();
+    let judged = super::judge(h, "fixture", |h| {
+        checks::extract::run(h, input, Some(&spelled), &[], true)
+    });
+    assert_eq!(judged.status, harness::CheckStatus::Passed, "{judged:?}");
+    let wide = pbfhogg_devkit::Bbox::parse("1e10,0,1,1").unwrap();
+    h.run = run::Run::create(dir, exe, true).unwrap();
+    match checks::extract::run(h, input, Some(&wide), &[], true) {
+        Err(crate::error::Error::Tool(why)) => assert!(why.contains("ten integer digits"), "{why}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 /// The extract comparisons a content or version fault fails, in order.
@@ -138,6 +164,22 @@ const ROUTE_ARMS: [&str; 2] = [
     "multi-extract mixed took route sequential fallback where the input header predicts single-pass",
 ];
 
+/// pbfhogg gets the typed bbox, osmium its plain restatement;
+/// multi-extract's sequential strips are its own boxes.
+fn assert_bbox_spelling(args: &[&str], root: &Path, output: &Path) {
+    let expected = |name| std::fs::read_to_string(root.join(name)).unwrap();
+    let strip = output
+        .ancestors()
+        .any(|a| a.file_name().is_some_and(|n| n == "sequential"));
+    let typed = args.iter().find_map(|a| a.strip_prefix("-b="));
+    if let (false, Some(typed)) = (strip, typed) {
+        assert_eq!(typed, expected("pbfhogg-bbox"));
+    } else if let Some(at) = args.iter().position(|a| *a == "-b") {
+        assert_eq!(args[at + 1], expected("osmium-bbox"));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub fn tool(args: &[OsString]) -> i32 {
     let args: Vec<_> = args.iter().map(|a| a.to_str().unwrap()).collect();
     let path = args
@@ -219,6 +261,7 @@ pub fn tool(args: &[OsString]) -> i32 {
                     }
                 }
             } else {
+                assert_bbox_spelling(&args, root, output());
                 if args.contains(&"--output") {
                     assert!(args.contains(&"--staging-dir"));
                     let sequential = output()

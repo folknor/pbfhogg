@@ -74,7 +74,6 @@ impl StringTable {
     }
 
     /// Number of slots, slot zero included.
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.slots.len()
     }

@@ -11,36 +11,54 @@
 //! Nothing is sized up front, so normal input pays nothing: an overflowing
 //! block's framing refusal is recorded with the range of operations it held
 //! ([`RewriteSink`]), and [`Replay`] writes that range again into fresh
-//! blocks. Its first attempt cuts where the ordinary rules cut, with one
-//! difference that is the whole point: the attempt starts unseeded, so OSC
-//! elements before the first survivor go into a block without the source
-//! table. A range that still overflows as one block is halved, and a single
-//! element that overflows alone is refused with its framing error.
+//! blocks, by one of two strategies.
+//!
+//! The compact one comes first: an attempt's survivors are written with
+//! their string indices translated into a table holding only the source
+//! strings that attempt's survivors use
+//! (`BlockBuilder::pre_seed_subset_string_table`), with the OSC elements'
+//! strings beside them. An attempt that overflows anywhere is dropped and
+//! each half tried with its own strings, so a single element is tried with
+//! exactly its own: a survivor that grew (refreshed `--locations-on-ways`
+//! coordinates) beside a large string the diff removed, or survivors
+//! alternating with large OSC values, no longer carry the dead string into
+//! every frame.
+//!
+//! Where the compact strategy ends in a framing refusal (a single element,
+//! or the budget), the whole-table one runs from scratch: survivors' blocks
+//! carry the source table as in the first pass, the attempt starts
+//! unseeded so OSC elements before the first survivor go into a block
+//! without it, and a block that still overflows is halved. Compact output
+//! is smaller for the same partition but its cuts and index widths differ
+//! (strings are interned by content, so an index can land wider than its
+//! source slot, and a smaller payload can compress to a larger body), so
+//! it is not a superset of what the whole table recovers; the fallback
+//! keeps every recovery that strategy finds.
 //!
 //! What this does not cure, and stays a loud refusal before publication: an
-//! element that does not fit a block alone in its output form (a surviving
-//! element always carries its source block's whole table, so one whose
-//! refreshed coordinates grew it, beside a table near the limit, can fail
-//! where it alone with only its own strings would fit), and an input whose
-//! recovery would produce more than `APPLY_CHANGES_OVERFLOW_REPLAY_BYTES` of
-//! frames for one blob. Halving finds a fitting partition whenever every
-//! element fits alone; it can miss one that exists only because string
-//! index widths shrink when two elements share a table, which needs blocks
-//! within bytes of the limit.
+//! element that does not fit a block alone with only its own strings, and
+//! an input whose recovery under both strategies needs more than
+//! `APPLY_CHANGES_OVERFLOW_REPLAY_BYTES` of frames for one blob (as when its
+//! changes carry that many bytes of large values between them, or one large
+//! string is shared by many changed elements that must be cut apart: the
+//! worker holds a blob's frames until its rewrite ends). Halving finds a
+//! fitting partition whenever every element fits alone; it can miss one
+//! that exists only because string index widths shrink when two elements
+//! share a table, which needs blocks within bytes of the limit.
 
 use std::ops::Range;
 
 use crate::ElementKind;
 use crate::PrimitiveBlock;
 use crate::block_builder::BlockBuilder;
-use crate::commands::{BlockSink, FramedBlocks, flush_local};
+use crate::commands::{BlockSink, FramedBlocks, flush_local, is_block_overflow};
 use crate::error::Error;
 use crate::osc::sorted::SortedDiff;
 use crate::tunables::APPLY_CHANGES_OVERFLOW_REPLAY_BYTES;
 use crate::writer::Compression;
 
 use super::Result;
-use super::element_writes::{BaseWrites, RefreshScratch};
+use super::element_writes::{BaseWrites, RefreshScratch, SourceSeed, mark_used_slots};
 use super::loc_mode::LocMode;
 use super::refresh::StaleProbe;
 use super::rewrite_block::{Op, OpContext, Step, Steps, write_op};
@@ -142,7 +160,7 @@ impl Replay<'_, '_> {
     /// Returns the frames and the framing time the recovery spent.
     pub(super) fn run(
         mut self,
-        overflows: Vec<Overflow>,
+        overflows: &[Overflow],
         frames: Vec<Frame>,
     ) -> Result<(Vec<Frame>, u64)> {
         let end = overflows.last().map_or(0, |o| o.ops.end);
@@ -163,25 +181,108 @@ impl Replay<'_, '_> {
                 ops.len()
             )));
         }
-        let mut out = Vec::with_capacity(frames.len() + overflows.len());
+        let mut frame_ns = 0;
+        // The compact strategy first; where it ends in a framing refusal
+        // (a single element, or the budget), the whole-table one, which
+        // refuses only what this replay refused before the compact one
+        // existed. Neither touches `frames` until one has succeeded, so a
+        // failed strategy leaves nothing behind.
+        let pieces = match self.recover(&ops, overflows, Strategy::Compact, &mut frame_ns) {
+            Ok(pieces) => pieces,
+            Err(e) if is_block_overflow(&e) => {
+                self.recover(&ops, overflows, Strategy::WholeTable, &mut frame_ns)?
+            }
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::with_capacity(frames.len() + pieces.iter().map(Vec::len).sum::<usize>());
+        let mut kept = frames.into_iter();
+        let mut taken = 0;
+        for (overflow, piece) in overflows.iter().zip(pieces) {
+            out.extend(kept.by_ref().take(overflow.at - taken));
+            taken = overflow.at;
+            out.extend(piece);
+        }
+        out.extend(kept);
+        Ok((out, frame_ns))
+    }
+
+    /// Every overflowed block's replacement frames under `strategy`, in
+    /// order, with a budget of its own.
+    fn recover(
+        &mut self,
+        ops: &[Op<'_>],
+        overflows: &[Overflow],
+        strategy: Strategy,
+        frame_ns: &mut u64,
+    ) -> Result<Vec<Vec<Frame>>> {
         let mut budget = Budget {
             left: APPLY_CHANGES_OVERFLOW_REPLAY_BYTES,
             frame_ns: 0,
         };
-        let mut kept = frames.into_iter();
-        let mut taken = 0;
+        let mut pieces = Vec::with_capacity(overflows.len());
+        let mut result = Ok(());
         for overflow in overflows {
-            out.extend(kept.by_ref().take(overflow.at - taken));
-            taken = overflow.at;
-            self.encode_range(&ops[overflow.ops], &overflow.error, &mut budget, &mut out)?;
+            let ops = &ops[overflow.ops.clone()];
+            let mut out = Vec::new();
+            result = match strategy {
+                Strategy::Compact => {
+                    self.encode_compact(ops, &overflow.error, &mut budget, &mut out)
+                }
+                Strategy::WholeTable => {
+                    self.encode_range(ops, &overflow.error, &mut budget, &mut out)
+                }
+            };
+            if result.is_err() {
+                break;
+            }
+            pieces.push(out);
         }
-        out.extend(kept);
-        Ok((out, budget.frame_ns))
+        *frame_ns += budget.frame_ns;
+        result.map(|()| pieces)
     }
 
-    /// Write `ops` into fresh blocks, appending their frames to `out`: one
-    /// attempt with the ordinary cuts, then each block of it that overflowed
-    /// again on its own, halved when it was the whole attempt.
+    /// The compact strategy for `ops`: one attempt whose survivors' blocks
+    /// carry only the source strings `ops`' survivors use; kept whole if
+    /// nothing in it overflowed, otherwise dropped and each half tried the
+    /// same way with its own strings, so a single element is tried with
+    /// exactly its own. A single element that still overflows is refused
+    /// with its framing error.
+    fn encode_compact(
+        &mut self,
+        ops: &[Op<'_>],
+        original: &Error,
+        budget: &mut Budget,
+        out: &mut Vec<Frame>,
+    ) -> Result<()> {
+        let mut used = vec![false; self.block.string_table_len()];
+        for op in ops {
+            if let Op::Base(element) = op {
+                mark_used_slots(element, &mut used)?;
+            }
+        }
+        let seed = SourceSeed::Subset(&used);
+        let (frames, overflows, held) = self.attempt(ops, original, budget, seed)?;
+        if overflows.is_empty() {
+            // Only kept frames are charged: a dropped attempt's are freed.
+            budget.left = budget.left.saturating_sub(held);
+            out.extend(frames);
+            return Ok(());
+        }
+        drop(frames);
+        if let [_] = ops {
+            return Err(overflows
+                .into_iter()
+                .next()
+                .map_or_else(|| original.clone(), |o| o.error));
+        }
+        let (left, right) = ops.split_at(ops.len() / 2);
+        self.encode_compact(left, original, budget, out)?;
+        self.encode_compact(right, original, budget, out)
+    }
+
+    /// The whole-table strategy for `ops`, appending their frames to `out`:
+    /// one attempt with the ordinary cuts, then each block of it that
+    /// overflowed again on its own, halved when it was the whole attempt.
     fn encode_range(
         &mut self,
         ops: &[Op<'_>],
@@ -189,7 +290,10 @@ impl Replay<'_, '_> {
         budget: &mut Budget,
         out: &mut Vec<Frame>,
     ) -> Result<()> {
-        let (frames, overflows) = self.attempt(ops, original, budget)?;
+        let (frames, overflows, held) = self.attempt(ops, original, budget, SourceSeed::Whole)?;
+        // Charged now, before any recursion: these frames are held until
+        // the recovery ends. The cap kept the charge within what was left.
+        budget.left = budget.left.saturating_sub(held);
         let mut kept = frames.into_iter();
         let mut taken = 0;
         for overflow in overflows {
@@ -210,22 +314,34 @@ impl Replay<'_, '_> {
         Ok(())
     }
 
-    /// One attempt at `ops`: a fresh, unseeded builder, the rewrite's own
-    /// write rules, and the frames and overflows that came of it. Stats and
+    /// One attempt at `ops`: a fresh builder, the rewrite's own write rules
+    /// with survivors' blocks seeded by `seed`, and the frames, overflows
+    /// and framed bytes that came of it (the caller charges the bytes it
+    /// keeps). Under the whole table the builder starts unseeded, so OSC
+    /// elements before the first survivor go into a block without the
+    /// source table; under a subset it starts seeded when any survivor is
+    /// among `ops`, so OSC elements and survivors share blocks. Stats and
     /// refresh counts are discarded: the first pass counted these elements.
     fn attempt(
         &mut self,
         ops: &[Op<'_>],
         original: &Error,
         budget: &mut Budget,
-    ) -> Result<(Vec<Frame>, Vec<Overflow>)> {
+        seed: SourceSeed<'_>,
+    ) -> Result<(Vec<Frame>, Vec<Overflow>, usize)> {
         let mut bb = BlockBuilder::new();
+        if let SourceSeed::Subset(used) = seed
+            && ops.iter().any(|op| matches!(op, Op::Base(_)))
+        {
+            bb.pre_seed_subset_string_table(self.block, used)?;
+        }
         let mut sink = RewriteSink::new(FramedBlocks::new(*self.compression, self.metrics));
         // The attempt holds its frames until it returns, so the budget
         // stops it as it goes, not only once they are charged.
         sink.cap = Some((budget.left, original.clone()));
         let mut stats = MergeStats::new();
         let mut base_writes = BaseWrites::new(self.block, self.probe, self.scratch);
+        base_writes.seed = seed;
         let mut cx = OpContext {
             block: self.block,
             diff: self.diff,
@@ -238,12 +354,20 @@ impl Replay<'_, '_> {
             sink.op_written();
         }
         flush_local(&mut bb, &mut sink)?;
-        // Charged now, before any recursion: these frames are held until
-        // the recovery ends. The cap kept the charge within what was left.
-        budget.left = budget.left.saturating_sub(sink.held);
         budget.frame_ns += sink.framed.frame_ns;
-        Ok((sink.framed.frames, sink.overflows))
+        Ok((sink.framed.frames, sink.overflows, sink.held))
     }
+}
+
+/// How a replay writes an overflowed block's elements again.
+#[derive(Clone, Copy)]
+enum Strategy {
+    /// Blocks of survivors carry only the source strings their slice uses
+    /// ([`Replay::encode_compact`]).
+    Compact,
+    /// Blocks of survivors carry the source block's whole table, as the
+    /// first pass's do ([`Replay::encode_range`]).
+    WholeTable,
 }
 
 /// The bytes of frames a blob's recovery may still produce, and the

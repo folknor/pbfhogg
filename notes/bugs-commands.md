@@ -144,25 +144,24 @@ repack and degrade).
 
 Reported by: the derive OSC domain item (2026-11-19); narrowed 2026-11-19
 after overflow recovery landed (an overflowing output block is re-cut,
-`apply_changes/overflow.rs` and `stream_output.rs::settle`).
+`apply_changes/overflow.rs` and `stream_output.rs::settle`), and again
+2026-11-24 after the replay's blocks began carrying only the strings their
+survivors use, with the whole-table replay as fallback.
 
-What recovery does not cure, each a loud refusal before publication. First,
-a surviving base element is always written with its source block's whole
-string table, so a survivor that grew past its source bytes (refreshed
-`--locations-on-ways` coordinates on a long way), beside a large dead string
-in the table, fails alone where its own strings would fit. The same seed
-makes a blob alternating survivors and large OSC values fan out into many
-table-sized frames; past `APPLY_CHANGES_OVERFLOW_REPLAY_BYTES` (256 MiB of
-frames per blob) the worker refuses. Rebuilding survivors' tables from the
-strings they use (remap their raw indices) on replay closes both. The
-budget also refuses legitimate output: more than 256 MiB of large values
-changed in one base blob, or one large role shared by many relation creates
-that must be cut apart. Closing that means streaming a worker's recovered
-frames to the drain instead of holding them until the rewrite ends. Second,
-halving misses a partition that exists only because string index widths
-shrink when two elements share a table, and `add_node_partial` writes a
-metadata-less node dense, two bytes larger than plain, so a node at exactly
-the payload limit fails. Both need blocks within bytes of 32 MiB.
+What recovery does not cure, each a loud refusal before publication. The
+replay budget (`APPLY_CHANGES_OVERFLOW_REPLAY_BYTES`, 256 MiB of frames per
+blob, per strategy) refuses legitimate output: more than 256 MiB of large
+values changed in one base blob, or one large role shared by many relation
+creates that must be cut apart (each piece repeats the role). Closing that
+means streaming a worker's recovered frames to the drain instead of holding
+them until the rewrite ends; `DrainItem::Rewritten` carries one blob's
+frames as one item today, so this needs an ordered frame stream or a spill
+behind that item, delivered without letting later sequences block the next
+one. Second, halving misses a partition that exists only because string
+index widths shrink when two elements share a table, and `add_node_partial`
+writes a metadata-less node dense, which the entry's reporter put at two
+bytes larger than plain (not measured), so a node at exactly the payload
+limit fails. Both need blocks within bytes of 32 MiB.
 
 ## CMD-050 - History time-filter and the sort/dedupe sweep can refuse frameable input
 

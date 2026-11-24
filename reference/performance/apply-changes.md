@@ -38,6 +38,17 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### Compact overflow replay: subset-seeded raw adds (bygg, 2026-11-24, `84088fed` + change)
+
+The raw adds gained a subset-seed branch (one match per surviving
+element on the first pass; the translation runs only in the overflow
+replay). Planet apply-diff of OSC 4913, `--iterations 1`, interleaved,
+baseline `--commit HEAD`, variant uncommitted: baseline 195.9 s
+(`1bef734c`) and 199.0 s (`ca900659`), variant 199.5 s (`9bd9bc50`) and
+199.2 s (`8cbf319d`). The second pair is within 0.1 %, and the first
+pair's 2 % gap sits inside the drift between the two baseline cells.
+Neutral.
+
 ### `--direct-io` reaching the scanner, pool and splice reads (bygg, 2026-11-23, `fc3b6b79` + change)
 
 Before the change `--direct-io` read only the front read `O_DIRECT`; the

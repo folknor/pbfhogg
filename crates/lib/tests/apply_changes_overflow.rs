@@ -170,6 +170,153 @@ fn a_large_value_beside_a_surviving_large_value_applies() {
     crate::common::assert_sorted_file(&output);
 }
 
+/// A large string the diff removes no longer rides along with every block
+/// of survivors. Node 1's 28 MiB value is modified away while survivors
+/// alternate with 5 MiB values: re-cut blocks that each carried the source
+/// table would hold more than the replay's 256 MiB budget between them,
+/// so the run was refused; blocks carrying only the strings they use come
+/// to about the size of the values.
+#[test]
+fn a_removed_large_value_is_not_repeated_across_recovered_blocks() {
+    let dir = crate::common::test_scratch();
+    let (base, osc, output) = (
+        dir.path().join("base.osm.pbf"),
+        dir.path().join("diff.osc"),
+        dir.path().join("out.osm.pbf"),
+    );
+    let dead: String = std::iter::repeat_n('d', 28 << 20).collect();
+    write_base(&base, &[(1, &dead)], &[]);
+    let values: Vec<(i64, String)> = (0..12)
+        .map(|i| {
+            let fill = char::from(b'a' + u8::try_from(i).unwrap());
+            (3 + 2 * i, std::iter::repeat_n(fill, 5 << 20).collect())
+        })
+        .collect();
+    let mut modify: Vec<(i64, Option<&str>)> = vec![(1, None)];
+    modify.extend(values.iter().map(|(id, v)| (*id, Some(v.as_str()))));
+    write_osc(&osc, &[], &modify);
+    let stats = merge(&base, &osc, &output);
+
+    assert_eq!(node_notes(&output), values);
+    let c = read_all_elements_id_only(&output);
+    assert_eq!(node_ids_id_only(&c), (1..=50).collect::<Vec<i64>>());
+    assert_eq!(stats.diff_nodes, 13);
+    assert_eq!(stats.base_nodes, 37);
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
+}
+
+/// A surviving way whose refreshed coordinates grew it is written with
+/// only its own strings, not beside a large one the diff deleted. The way
+/// blob holds way 1, tagged with a value just short of the payload limit,
+/// and way 2, whose 20000 nodes all sit at one point (one-byte deltas). The
+/// diff deletes way 1 and scatters way 2's nodes, so its location deltas
+/// grow by about 160 KB: beside the source table it no longer fits a block,
+/// alone it is a fraction of one.
+#[test]
+fn a_grown_survivor_beside_a_deleted_large_value_applies() {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    const NODES: i64 = 20_000;
+    let dir = crate::common::test_scratch();
+    let (base, osc, output) = (
+        dir.path().join("base.osm.pbf"),
+        dir.path().join("diff.osc"),
+        dir.path().join("out.osm.pbf"),
+    );
+    let refs: Vec<i64> = (1..=NODES).collect();
+    {
+        let file = std::fs::File::create(&base).unwrap();
+        let mut writer = PbfWriter::new(file, Compression::None);
+        let header = HeaderBuilder::new()
+            .sorted()
+            .optional_feature("LocationsOnWays")
+            .build()
+            .unwrap();
+        writer.write_header(&header).unwrap();
+        let mut bb = BlockBuilder::new();
+        for chunk in refs.chunks(8000) {
+            for &id in chunk {
+                bb.add_node(id, 0, 0, std::iter::empty(), None);
+            }
+            writer
+                .write_primitive_block(bb.take().unwrap().unwrap())
+                .unwrap();
+        }
+        let dead: String = std::iter::repeat_n('d', (32 << 20) - 100_000).collect();
+        bb.add_way_with_locations(1, [("note", dead.as_str())], &[1, 2], &[(0, 0); 2], None);
+        let zeros = vec![(0, 0); refs.len()];
+        bb.add_way_with_locations(2, [("highway", "road")], &refs, &zeros, None);
+        writer
+            .write_primitive_block(bb.take().unwrap().unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+    }
+    // Node i moves to an alternating far corner.
+    let corner = |id: i64| if id % 2 == 0 { (80, 170) } else { (-80, -170) };
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\n<modify>\n",
+    );
+    for &id in &refs {
+        let (lat, lon) = corner(id);
+        writeln!(
+            xml,
+            "<node id=\"{id}\" lat=\"{lat}.0\" lon=\"{lon}.0\" version=\"2\"/>"
+        )
+        .unwrap();
+    }
+    xml.push_str("</modify>\n<delete>\n<way id=\"1\" version=\"2\"/>\n</delete>\n</osmChange>\n");
+    std::fs::write(&osc, xml).unwrap();
+
+    let opts = pbfhogg::apply_changes::MergeOptions {
+        write: pbfhogg::write::WriteOptions {
+            compression: pbfhogg::writer::Compression::None,
+            ..pbfhogg::write::WriteOptions::default()
+        },
+        locations_on_ways: Some(pbfhogg::apply_changes::LocationsOnWays::default()),
+        parallelism: pbfhogg::Parallelism::Auto,
+        allow_version_regression: false,
+    };
+    pbfhogg::apply_changes::merge(
+        &base,
+        &osc,
+        crate::common::out(&output),
+        &opts,
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+    )
+    .unwrap_or_else(|e| panic!("merge: {}", e.report()));
+
+    let mut ways = Vec::new();
+    for blob in BlobReader::from_path(&output).unwrap() {
+        if let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locations: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|l| (l.decimicro_lat().unwrap(), l.decimicro_lon().unwrap()))
+                        .collect();
+                    ways.push((w.id(), w.refs().collect::<Vec<i64>>(), locations));
+                }
+            }
+        }
+    }
+    let expected: Vec<(i32, i32)> = refs
+        .iter()
+        .map(|&id| {
+            let (lat, lon) = corner(id);
+            (lat * 10_000_000, lon * 10_000_000)
+        })
+        .collect();
+    assert_eq!(ways.len(), 1, "way 1 is deleted");
+    assert_eq!(ways[0].0, 2);
+    assert_eq!(ways[0].1, refs);
+    assert!(ways[0].2 == expected, "way 2 carries the moved coordinates");
+    crate::common::assert_every_data_blob_indexed(&output);
+    crate::common::assert_sorted_file(&output);
+}
+
 /// Two large creates inside the base blob's id range are written by the
 /// worker's rewrite, side by side.
 #[test]

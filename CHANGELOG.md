@@ -730,6 +730,17 @@
 
 ### Fixed
 
+- **`apply-changes` re-cuts oversize blocks without the strings the
+  changes removed.** When a rewritten block outgrew 32 MiB, the blocks it
+  was cut into each carried the source block's whole string table. A
+  surviving element that grew (refreshed `--locations-on-ways` coordinates)
+  beside a large string the changes deleted was refused although it fit a
+  block with its own strings, and survivors alternating with large changed
+  values could repeat that table past the 256 MiB recovery budget and be
+  refused too. Re-cut blocks now carry only the strings their elements use;
+  whatever the old re-cut recovered is still recovered. An element too large
+  for a block with only its own strings, or a blob whose changes need more
+  than 256 MiB of blocks, is still refused before publication.
 - **`renumber` cuts a blob its new IDs grow past 32 MiB.** A far or
   negative `--start-id` widens every ID, and refs alternating between live
   and orphan elements widen their deltas, so a blob near the payload limit

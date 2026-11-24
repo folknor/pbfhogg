@@ -97,7 +97,11 @@ copies against the source block's table and refuses one past it, naming the
 element, the field and the index: such an index would otherwise name one of
 the strings the diff's own elements add behind the copied table. It also
 refuses a rewritten block whose string table does not begin with the empty
-string. Blobs it copies unchanged are not decoded and not checked.
+string. Blobs it copies unchanged are not decoded and not checked. When an
+output block overflowed the blob limit and is written again, its survivors'
+blocks hold only the source strings they use, and each copied index is
+translated to its slot there; it is checked against the source block's table
+first, with the same refusals.
 
 ## Osmosis -1 sentinel for absent metadata
 

@@ -269,12 +269,12 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
     match op {
         Op::Osc(kind, i) => write_osc_local(*i, *kind, cx.diff, bb, output, cx.stats, cx.loc),
         Op::Base(Element::DenseNode(dn)) => {
-            write_base_dense_node_local(bb, output, dn, block)?;
+            write_base_dense_node_local(bb, output, dn, block, cx.base_writes.seed)?;
             cx.stats.base_nodes += 1;
             Ok(())
         }
         Op::Base(Element::Node(n)) => {
-            write_base_node_local(bb, output, n, block)?;
+            write_base_node_local(bb, output, n, block, cx.base_writes.seed)?;
             cx.stats.base_nodes += 1;
             Ok(())
         }
@@ -327,8 +327,9 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
 /// the PBF blob limit although the source block and every changed element
 /// fit: a 17 MiB tag value modified to another 17 MiB value. Such a block's
 /// framing refusal is recorded, not returned, and once the walk has ended
-/// its elements are written again in smaller blocks (`overflow.rs`); only a
-/// single element that still overflows, or a recovery past its byte budget,
+/// its elements are written again in smaller blocks that carry only the
+/// strings they use (`overflow.rs`); only a single element that overflows
+/// even with its own strings alone, or a recovery past its byte budget,
 /// fails the rewrite, with that framing error. A recorded overflow outranks
 /// any later error of the walk, as it would have had it been returned at
 /// its flush.
@@ -388,7 +389,7 @@ pub(super) fn rewrite_block_parallel(
             compression,
             metrics,
         };
-        let (recovered, ns) = replay.run(overflows, frames)?;
+        let (recovered, ns) = replay.run(&overflows, frames)?;
         frames = recovered;
         frame_ns += ns;
     }

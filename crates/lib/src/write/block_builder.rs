@@ -500,12 +500,18 @@ pub struct BlockBuilder {
     // last owned block's length plus slack, never above the retention limit.
     encode_reserve: usize,
 
-    // The source block's string table length while the table is pre-seeded
-    // from it (`pre_seed_string_table`), so a raw string index can be checked
-    // against the slots it was copied with rather than the grown table.
-    // Cleared by every flush (`reset`); apply-changes' raw writers re-seed
-    // after a mid-block flush.
-    seeded: Option<usize>,
+    // How the table of the block in progress was seeded from a source block,
+    // with that table's length, so a raw string index can be checked against
+    // the source slots rather than the grown table. Cleared by every flush
+    // (`reset`); apply-changes' raw writers re-seed after a mid-block flush.
+    seeded: Option<Seed>,
+    // Under `Seed::Subset`, the output slot of each source slot, or
+    // `UNSEEDED_SLOT` for one the seed did not take. Stale (and unread) once
+    // a flush clears `seeded`; kept for its allocation.
+    subset_map: Vec<u32>,
+    // Under `Seed::Subset`, a raw element's indices translated to output
+    // slots, handed to the identity bodies in place of the source's.
+    subset_scratch: SubsetScratch,
 
     // Sticky poison. Set by an `add_*` method that was handed input it cannot
     // encode without corrupting the output (a way whose ref and location
@@ -631,6 +637,8 @@ impl BlockBuilder {
             encode_reserve: 0,
 
             seeded: None,
+            subset_map: Vec::new(),
+            subset_scratch: SubsetScratch::default(),
             poison: None,
         }
     }
@@ -1475,6 +1483,16 @@ impl BlockBuilder {
     // indices decoded; a way or relation costs one varint pass over its
     // values and roles, a scan of its `Info` for the user, and the key pass
     // the tag key tracking already made.
+    //
+    // A second seed serves apply-changes' overflow replay
+    // (`pre_seed_subset_string_table`): the table takes only the source
+    // slots the caller names, interned by content, so an output block need
+    // not carry a large string none of its elements uses. Every raw index is
+    // then checked against the source table exactly as above (same errors,
+    // same poison) and translated once, at the public raw add, to its output
+    // slot; the identity bodies below run on the translated indices with the
+    // output table as their bound. Slot zero maps to zero, so a plain node's
+    // empty key and the empty user keep their meaning.
 
     /// Pre-seed the string table from an input block for index passthrough.
     ///
@@ -1504,17 +1522,203 @@ impl BlockBuilder {
         }
         self.reset();
         self.string_table.pre_seed(block);
-        self.seeded = Some(block.string_table_len());
+        self.seeded = Some(Seed::Identity(block.string_table_len()));
         Ok(())
     }
 
-    /// The source table length a raw index is checked against.
+    /// Pre-seed the string table with only the source slots `used` marks
+    /// (`used[i]` for source slot `i`; slots past `used` are not taken),
+    /// for raw string indices from `block` written by the `add_*_raw*`
+    /// methods, which translate each to its output slot.
+    ///
+    /// The slots are interned by content in source order, so duplicates
+    /// share one output slot and the table is an ordinary one that later
+    /// strings join; slot zero maps to slot zero. A raw index past `block`'s
+    /// table is refused as under an identity seed; one inside it that `used`
+    /// does not mark is an internal error, since the caller collected the
+    /// slots from the elements it writes. The same emptiness and slot-zero
+    /// rules apply.
+    /// The raw adds must be given elements of `block` only: the translation
+    /// cannot tell another block's indices apart.
+    pub(crate) fn pre_seed_subset_string_table(
+        &mut self,
+        block: &PrimitiveBlock,
+        used: &[bool],
+    ) -> Result<()> {
+        if !self.is_empty() {
+            return Err(crate::error::Error::internal(
+                "a block builder holding elements was pre-seeded from another block",
+            ));
+        }
+        if block.string_table_entry(0) != Some("") {
+            return Err(crate::error::Error::invalid_data(
+                "a rewritten block's string table does not begin with the empty string",
+            ));
+        }
+        self.reset();
+        let len = block.string_table_len();
+        self.subset_map.clear();
+        self.subset_map.resize(len, UNSEEDED_SLOT);
+        if let Some(zero) = self.subset_map.first_mut() {
+            *zero = 0;
+        }
+        for (i, slot) in self.subset_map.iter_mut().enumerate().skip(1) {
+            if used.get(i) == Some(&true)
+                && let Some(s) = block.string_table_entry(i)
+            {
+                *slot = self.string_table.add(s);
+            }
+        }
+        self.seeded = Some(Seed::Subset(len));
+        Ok(())
+    }
+
+    /// The bound a raw index is checked against in the identity bodies: the
+    /// source table under an identity seed; under a subset seed, whose
+    /// indices the public raw adds have already checked and translated, the
+    /// output table.
     fn seeded_len(&self) -> Result<usize> {
-        self.seeded.ok_or_else(|| {
-            crate::error::Error::internal(
+        match self.seeded {
+            Some(Seed::Identity(len)) => Ok(len),
+            Some(Seed::Subset(_)) => Ok(self.string_table.len()),
+            None => Err(crate::error::Error::internal(
                 "a raw string index was added to a block builder that is not pre-seeded",
-            )
-        })
+            )),
+        }
+    }
+
+    /// The source table length under a subset seed, `None` otherwise: the
+    /// public raw adds translate when this is `Some`.
+    #[inline]
+    fn subset_len(&self) -> Option<usize> {
+        match self.seeded {
+            Some(Seed::Subset(len)) => Some(len),
+            _ => None,
+        }
+    }
+
+    /// The output slot of checked source slot `sid` under a subset seed.
+    fn subset_slot(&self, sid: usize) -> Result<u32> {
+        match self.subset_map.get(sid) {
+            Some(&slot) if slot != UNSEEDED_SLOT => Ok(slot),
+            _ => Err(crate::error::Error::internal(format!(
+                "raw string index {sid} names a source slot the subset seed did not take"
+            ))),
+        }
+    }
+
+    /// Check an unsigned raw index (a tag key or value) against the source
+    /// table of length `len` and translate it; a bad one poisons.
+    fn translate_unsigned(
+        &mut self,
+        kind: &'static str,
+        id: i64,
+        field: &'static str,
+        sid: u32,
+        len: usize,
+    ) -> Result<u32> {
+        if !index_in(sid, len) {
+            let e = bad_unsigned_sid(kind, id, field, sid);
+            return Err(self.refuse_raw_index(e));
+        }
+        self.subset_slot(sid as usize)
+    }
+
+    /// Check a signed raw index (a user) against the source table of length
+    /// `len` and translate it; a bad one poisons, its error carrying
+    /// `context`'s text.
+    fn translate_signed(
+        &mut self,
+        sid: i32,
+        len: usize,
+        context: impl FnOnce() -> String,
+    ) -> Result<i32> {
+        if let Err(e) = check_signed_sid(sid, len) {
+            let e = e.context(context());
+            return Err(self.refuse_raw_index(e));
+        }
+        // Checked nonnegative and below a table length.
+        let slot = self.subset_slot(sid.unsigned_abs() as usize)?;
+        Ok(slot.cast_signed())
+    }
+
+    /// Translate a raw node's tags into the `subset_scratch.tags` buffer,
+    /// handed back for the caller to return once the node is added.
+    fn translate_node_tags(
+        &mut self,
+        id: i64,
+        raw_tags: impl Iterator<Item = (u32, u32)>,
+        len: usize,
+    ) -> Result<Vec<(u32, u32)>> {
+        let mut tags = std::mem::take(&mut self.subset_scratch.tags);
+        tags.clear();
+        for (key, val) in raw_tags {
+            let translated = self
+                .translate_unsigned("node", id, "tag key", key, len)
+                .and_then(|k| {
+                    self.translate_unsigned("node", id, "tag value", val, len)
+                        .map(|v| (k, v))
+                });
+            match translated {
+                Ok(pair) => tags.push(pair),
+                Err(e) => {
+                    self.subset_scratch.tags = tags;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(tags)
+    }
+
+    /// Translate a raw way's or relation's keys, values, roles and `Info`
+    /// user into `subset_scratch`, checked in the identity bodies' order
+    /// (values, roles, user, keys) with their errors.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_raw_strings(
+        &mut self,
+        kind: &'static str,
+        id: i64,
+        keys: &[u8],
+        vals: &[u8],
+        roles: &[u8],
+        info: Option<&[u8]>,
+        len: usize,
+    ) -> Result<SubsetScratch> {
+        use crate::read::wire::{PackedInt32Iter, PackedUint32Iter};
+        let mut out = std::mem::take(&mut self.subset_scratch);
+        out.keys.clear();
+        out.vals.clear();
+        out.roles.clear();
+        out.info.clear();
+        let result = (|| {
+            for sid in PackedUint32Iter::new(vals) {
+                let slot = self.translate_unsigned(kind, id, "tag value", sid, len)?;
+                protohoggr::encode_varint(&mut out.vals, u64::from(slot));
+            }
+            for (position, sid) in PackedInt32Iter::new(roles).enumerate() {
+                let slot = self.translate_signed(sid, len, || {
+                    format!("relation {id} member {position}: role string index {sid}")
+                })?;
+                protohoggr::encode_varint(&mut out.roles, i64::from(slot).cast_unsigned());
+            }
+            if let Some(info) = info {
+                translate_info_user(info, &mut out.info, |sid| {
+                    self.translate_signed(sid, len, || raw_sid_context(kind, id, "user name", sid))
+                })?;
+            }
+            for sid in PackedUint32Iter::new(keys) {
+                let slot = self.translate_unsigned(kind, id, "tag key", sid, len)?;
+                protohoggr::encode_varint(&mut out.keys, u64::from(slot));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                self.subset_scratch = out;
+                Err(e)
+            }
+        }
     }
 
     /// A raw add the current block cannot take (another kind, or full): an
@@ -1556,10 +1760,50 @@ impl BlockBuilder {
         raw_tags: impl Iterator<Item = (u32, u32)>,
         metadata: Option<&RawMetadata>,
     ) -> Result<()> {
+        let Some(len) = self.subset_len() else {
+            return self.node_raw_body(id, decimicro_lat, decimicro_lon, raw_tags, metadata);
+        };
+        if !self.can_add_node() {
+            return Err(self.raw_refusal(BlockType::DenseNodes, id));
+        }
+        // The identity body's order: the user, then the tags.
+        let meta = match metadata {
+            Some(m) => {
+                let mut m = *m;
+                m.user_sid = self.translate_signed(m.user_sid, len, || {
+                    raw_sid_context("node", id, "user name", m.user_sid)
+                })?;
+                Some(m)
+            }
+            None => None,
+        };
+        let tags = self.translate_node_tags(id, raw_tags, len)?;
+        let added = self.node_raw_body(
+            id,
+            decimicro_lat,
+            decimicro_lon,
+            tags.iter().copied(),
+            meta.as_ref(),
+        );
+        self.subset_scratch.tags = tags;
+        added
+    }
+
+    /// [`add_node_raw`](Self::add_node_raw) on indices the seed's bound
+    /// checks: source indices under an identity seed, translated ones under
+    /// a subset seed.
+    fn node_raw_body(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        raw_tags: impl Iterator<Item = (u32, u32)>,
+        metadata: Option<&RawMetadata>,
+    ) -> Result<()> {
         if let Some(m) = metadata
             && m.writes_plain()
         {
-            return self.add_node_raw_partial(
+            return self.node_raw_partial_body(
                 id,
                 decimicro_lat,
                 decimicro_lon,
@@ -1641,14 +1885,60 @@ impl BlockBuilder {
         raw_tags: impl Iterator<Item = (u32, u32)>,
         metadata: Option<&RawPartialMetadata>,
     ) -> Result<()> {
+        let Some(len) = self.subset_len() else {
+            return self.node_raw_partial_body(
+                id,
+                decimicro_lat,
+                decimicro_lon,
+                raw_tags,
+                metadata,
+            );
+        };
+        if !self.can_add_node() {
+            return Err(self.raw_refusal(BlockType::DenseNodes, id));
+        }
         let meta = match metadata {
-            None => return self.add_node_raw(id, decimicro_lat, decimicro_lon, raw_tags, None),
+            Some(m) => {
+                let mut m = *m;
+                if let Some(sid) = m.user_sid {
+                    m.user_sid = Some(self.translate_signed(sid, len, || {
+                        raw_sid_context("node", id, "user name", sid)
+                    })?);
+                }
+                Some(m)
+            }
+            None => None,
+        };
+        let tags = self.translate_node_tags(id, raw_tags, len)?;
+        let added = self.node_raw_partial_body(
+            id,
+            decimicro_lat,
+            decimicro_lon,
+            tags.iter().copied(),
+            meta.as_ref(),
+        );
+        self.subset_scratch.tags = tags;
+        added
+    }
+
+    /// [`add_node_raw_partial`](Self::add_node_raw_partial) on indices the
+    /// seed's bound checks (see [`node_raw_body`](Self::node_raw_body)).
+    fn node_raw_partial_body(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        raw_tags: impl Iterator<Item = (u32, u32)>,
+        metadata: Option<&RawPartialMetadata>,
+    ) -> Result<()> {
+        let meta = match metadata {
+            None => return self.node_raw_body(id, decimicro_lat, decimicro_lon, raw_tags, None),
             Some(meta) if *meta == RawPartialMetadata::default() => {
-                return self.add_node_raw(id, decimicro_lat, decimicro_lon, raw_tags, None);
+                return self.node_raw_body(id, decimicro_lat, decimicro_lon, raw_tags, None);
             }
             Some(meta) => match meta.dense_route() {
                 Some(full) => {
-                    return self.add_node_raw(
+                    return self.node_raw_body(
                         id,
                         decimicro_lat,
                         decimicro_lon,
@@ -1809,6 +2099,25 @@ impl BlockBuilder {
         if !self.can_add_way() {
             return Err(self.raw_refusal(BlockType::Ways, id));
         }
+        if let Some(len) = self.subset_len() {
+            let t =
+                self.translate_raw_strings("way", id, keys_data, vals_data, &[], info_data, len)?;
+            let info = info_data.map(|_| t.info.as_slice());
+            let added = self.add_way_raw_bytes_body(id, &t.keys, &t.vals, refs_data, info);
+            self.subset_scratch = t;
+            return added;
+        }
+        self.add_way_raw_bytes_body(id, keys_data, vals_data, refs_data, info_data)
+    }
+
+    fn add_way_raw_bytes_body(
+        &mut self,
+        id: i64,
+        keys_data: &[u8],
+        vals_data: &[u8],
+        refs_data: &[u8],
+        info_data: Option<&[u8]>,
+    ) -> Result<()> {
         self.check_raw_strings("way", id, keys_data, vals_data, &[], info_data)?;
         self.block_type = Some(BlockType::Ways);
         encode_way_raw_bytes(
@@ -1843,6 +2152,32 @@ impl BlockBuilder {
         if !self.can_add_way() {
             return Err(self.raw_refusal(BlockType::Ways, id));
         }
+        if let Some(len) = self.subset_len() {
+            let t =
+                self.translate_raw_strings("way", id, keys_data, vals_data, &[], info_data, len)?;
+            let info = info_data.map(|_| t.info.as_slice());
+            let added = self.add_way_raw_bytes_with_locations_body(
+                id, &t.keys, &t.vals, refs_data, lat_data, lon_data, info,
+            );
+            self.subset_scratch = t;
+            return added;
+        }
+        self.add_way_raw_bytes_with_locations_body(
+            id, keys_data, vals_data, refs_data, lat_data, lon_data, info_data,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_way_raw_bytes_with_locations_body(
+        &mut self,
+        id: i64,
+        keys_data: &[u8],
+        vals_data: &[u8],
+        refs_data: &[u8],
+        lat_data: &[u8],
+        lon_data: &[u8],
+        info_data: Option<&[u8]>,
+    ) -> Result<()> {
         self.check_raw_strings("way", id, keys_data, vals_data, &[], info_data)?;
         self.block_type = Some(BlockType::Ways);
         encode_way_raw_bytes_with_locations(
@@ -1881,6 +2216,51 @@ impl BlockBuilder {
         if !self.can_add_relation() {
             return Err(self.raw_refusal(BlockType::Relations, id));
         }
+        if let Some(len) = self.subset_len() {
+            let t = self.translate_raw_strings(
+                "relation",
+                id,
+                keys_data,
+                vals_data,
+                roles_sid_data,
+                info_data,
+                len,
+            )?;
+            let info = info_data.map(|_| t.info.as_slice());
+            let added = self.add_relation_raw_bytes_body(
+                id,
+                &t.keys,
+                &t.vals,
+                &t.roles,
+                memids_data,
+                types_data,
+                info,
+            );
+            self.subset_scratch = t;
+            return added;
+        }
+        self.add_relation_raw_bytes_body(
+            id,
+            keys_data,
+            vals_data,
+            roles_sid_data,
+            memids_data,
+            types_data,
+            info_data,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_relation_raw_bytes_body(
+        &mut self,
+        id: i64,
+        keys_data: &[u8],
+        vals_data: &[u8],
+        roles_sid_data: &[u8],
+        memids_data: &[u8],
+        types_data: &[u8],
+        info_data: Option<&[u8]>,
+    ) -> Result<()> {
         self.check_raw_strings(
             "relation",
             id,
@@ -2455,6 +2835,112 @@ impl BlockBuilder {
         }
         self.string_table.release_outliers(LIMIT);
     }
+}
+
+/// How a builder's string table was seeded from a source block, with the
+/// source table's length.
+#[derive(Clone, Copy, Debug)]
+enum Seed {
+    /// Slot for slot (`pre_seed_string_table`): source index N is output
+    /// slot N.
+    Identity(usize),
+    /// Only the slots a caller named (`pre_seed_subset_string_table`),
+    /// reached through `subset_map`.
+    Subset(usize),
+}
+
+/// A `subset_map` entry for a source slot the subset seed did not take.
+const UNSEEDED_SLOT: u32 = u32::MAX;
+
+/// One raw element's indices translated to output slots under a subset
+/// seed, the buffers kept across elements.
+#[derive(Debug, Default)]
+struct SubsetScratch {
+    tags: Vec<(u32, u32)>,
+    keys: Vec<u8>,
+    vals: Vec<u8>,
+    roles: Vec<u8>,
+    info: Vec<u8>,
+}
+
+/// Copy a raw `Info` message into `out` with its user index passed through
+/// `translate`, under the reader's semantics (`WireInfo::parse`, which
+/// validates the message first and so decides every error): the user is
+/// the last varint field 5, narrowed to `i32`. That one entry is rewritten
+/// in place, keeping its tag bytes; earlier varint field-5 entries, which
+/// the reader never sees, are dropped; every other field, a field 5 of
+/// another wire type included, is copied byte for byte. A message with no
+/// user is copied whole.
+fn translate_info_user(
+    info: &[u8],
+    out: &mut Vec<u8>,
+    mut translate: impl FnMut(i32) -> Result<i32>,
+) -> Result<()> {
+    out.clear();
+    let Some(user) = crate::read::wire::WireInfo::parse(info)?.user_sid else {
+        out.extend_from_slice(info);
+        return Ok(());
+    };
+    let translated = translate(user)?;
+    let mut spans = Vec::new();
+    let mut last_user = None;
+    let mut i = 0;
+    while i < info.len() {
+        let start = i;
+        let (tag, tag_len) = read_raw_varint(&info[i..])?;
+        i += tag_len;
+        let rest = &info[i..];
+        let value_len = match tag & 7 {
+            0 => read_raw_varint(rest)?.1,
+            1 => 8,
+            2 => {
+                let (len, n) = read_raw_varint(rest)?;
+                usize::try_from(len)
+                    .ok()
+                    .and_then(|len| len.checked_add(n))
+                    .ok_or_else(|| crate::error::new_wire_error("Info field length overflows"))?
+            }
+            5 => 4,
+            _ => {
+                return Err(crate::error::new_wire_error(
+                    "Info field of an unsupported wire type",
+                ));
+            }
+        };
+        if value_len > rest.len() {
+            return Err(crate::error::new_wire_error(
+                "Info field runs past its message",
+            ));
+        }
+        i += value_len;
+        if tag == 5 << 3 {
+            last_user = Some(spans.len());
+        }
+        spans.push((start, start + tag_len, i, tag == 5 << 3));
+    }
+    for (n, &(start, value_start, end, is_user)) in spans.iter().enumerate() {
+        if !is_user {
+            out.extend_from_slice(&info[start..end]);
+        } else if last_user == Some(n) {
+            out.extend_from_slice(&info[start..value_start]);
+            protohoggr::encode_varint(out, i64::from(translated).cast_unsigned());
+        }
+    }
+    Ok(())
+}
+
+/// One varint at the start of `data`: its value and its length in bytes.
+fn read_raw_varint(data: &[u8]) -> Result<(u64, usize)> {
+    let mut value = 0u64;
+    for (n, &byte) in data.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7F) << (7 * n);
+        if byte & 0x80 == 0 {
+            return Ok((value, n + 1));
+        }
+    }
+    Err(crate::error::new_wire_error(
+        "truncated or overlong varint in Info",
+    ))
 }
 
 /// Whether an unsigned raw string index (a tag key or value) names a slot of
@@ -3309,10 +3795,17 @@ mod tests {
                 _ => bb.add_relation(1, tags, &members, None),
             }
         };
-        for diff_first in [true, false] {
+        for (subset, diff_first) in [(false, true), (false, false), (true, true), (true, false)] {
             for case in 0..8 {
                 let mut bb = BlockBuilder::new();
-                bb.pre_seed_string_table(&source).expect("pre-seed");
+                if subset {
+                    // A subset seed checks against the source table the same
+                    // way, whatever it took.
+                    bb.pre_seed_subset_string_table(&source, &[true; 3])
+                        .expect("pre-seed");
+                } else {
+                    bb.pre_seed_string_table(&source).expect("pre-seed");
+                }
                 if diff_first {
                     add_diff(&mut bb, case);
                 }
@@ -3363,6 +3856,145 @@ mod tests {
                     "case {case}: the poison carries the refusal, got {poisoned}"
                 );
             }
+        }
+    }
+
+    /// A subset seed carries only the slots it was given, interned by
+    /// content, and every raw field reads back as the string its source
+    /// index named: dense and plain node tags and users, way and relation
+    /// keys, values, roles and `Info` users (the effective one, rewritten in
+    /// place, every other `Info` byte kept), and a plain node's empty key.
+    #[test]
+    fn a_subset_seed_translates_every_raw_index_to_its_string() {
+        use crate::Element;
+        // Slot 1 is a large string nobody uses; 6 duplicates 2.
+        let big = "x".repeat(1 << 16);
+        let source = source_table(&["", &big, "k", "v", "alice", "role", "k", ""]);
+        let mut used = [false; 8];
+        for slot in [2, 3, 4, 5, 6, 7] {
+            used[slot] = true;
+        }
+        let user = |user_sid| RawMetadata {
+            version: 1,
+            timestamp: 0,
+            changeset: 0,
+            uid: 7,
+            user_sid,
+            visible: true,
+            columns: crate::DenseColumns::ALL,
+            zero_timestamp_claim: false,
+        };
+        // version 1, a shadowed user 1 (dropped), an unknown field 9, the
+        // effective user 4.
+        let mut info = Vec::new();
+        for (field, value) in [(1u32, 1u64), (5, 1), (9, 42), (5, 4)] {
+            protohoggr::encode_tag(&mut info, field, protohoggr::WIRE_VARINT);
+            protohoggr::encode_varint(&mut info, value);
+        }
+        let blocks: Vec<PrimitiveBlock> = (0..4)
+            .map(|case| {
+                let mut bb = BlockBuilder::new();
+                bb.pre_seed_subset_string_table(&source, &used)
+                    .expect("pre-seed");
+                match case {
+                    0 => bb.add_node_raw(1, 0, 0, [(6, 3), (2, 7)].into_iter(), Some(&user(4))),
+                    1 => bb.add_node_raw_partial(
+                        1,
+                        0,
+                        0,
+                        [(0, 3)].into_iter(),
+                        Some(&RawPartialMetadata {
+                            version: Some(1),
+                            user_sid: Some(4),
+                            ..RawPartialMetadata::default()
+                        }),
+                    ),
+                    2 => bb.add_way_raw_bytes(1, &[2, 6], &[3, 7], &[2], Some(&info)),
+                    _ => bb.add_relation_raw_bytes(
+                        1,
+                        &[2],
+                        &[3],
+                        &[5, 5],
+                        &[2, 2],
+                        &[0, 0],
+                        Some(&info),
+                    ),
+                }
+                .expect("raw add");
+                // A diff string joins the table behind the subset.
+                let tags = [("k", "new")];
+                match case {
+                    0 | 1 => bb.add_node(2, 0, 0, tags, None),
+                    2 => bb.add_way(2, tags, &[1], None),
+                    _ => bb.add_relation(2, tags, &[], None),
+                }
+                PrimitiveBlock::from_vec(bb.take().unwrap().expect("block").to_vec()).unwrap()
+            })
+            .collect();
+        for (case, block) in blocks.iter().enumerate() {
+            assert!(
+                (0..block.string_table_len()).all(|i| block.string_table_entry(i) != Some(&big)),
+                "case {case}: the unused string stays out"
+            );
+            let element = block.elements().next().expect("the raw element");
+            let (tags, user, roles) = element_strings(&element);
+            if case == 3 {
+                assert_eq!(roles, ["role", "role"], "case {case}");
+            }
+            let expected_tags: Vec<(String, String)> = match case {
+                0 => vec![("k".into(), "v".into()), ("k".into(), String::new())],
+                1 => vec![(String::new(), "v".into())],
+                2 => vec![("k".into(), "v".into()), ("k".into(), String::new())],
+                _ => vec![("k".into(), "v".into())],
+            };
+            assert_eq!(tags, expected_tags, "case {case}");
+            assert_eq!(user.as_deref(), Some("alice"), "case {case}");
+        }
+        // The rewritten Info keeps its other fields' bytes, in order.
+        let Some(Element::Way(w)) = blocks[2].elements().next() else {
+            panic!("a way");
+        };
+        let alice = (0..blocks[2].string_table_len())
+            .find(|&i| blocks[2].string_table_entry(i) == Some("alice"))
+            .unwrap();
+        let mut expected = Vec::new();
+        for (field, value) in [(1u32, 1u64), (9, 42), (5, alice as u64)] {
+            protohoggr::encode_tag(&mut expected, field, protohoggr::WIRE_VARINT);
+            protohoggr::encode_varint(&mut expected, value);
+        }
+        assert_eq!(w.info_data(), Some(expected.as_slice()));
+    }
+
+    /// An element's tags, user and member roles, as strings.
+    #[allow(clippy::type_complexity)]
+    fn element_strings(
+        element: &crate::Element<'_>,
+    ) -> (Vec<(String, String)>, Option<String>, Vec<String>) {
+        use crate::Element;
+        let pairs = |tags: &mut dyn Iterator<Item = (&str, &str)>| -> Vec<(String, String)> {
+            tags.map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+        };
+        match element {
+            Element::DenseNode(n) => (
+                pairs(&mut n.tags()),
+                n.info().map(|i| i.user().unwrap().to_owned()),
+                Vec::new(),
+            ),
+            Element::Node(n) => (
+                pairs(&mut n.tags()),
+                n.info().user().transpose().unwrap().map(str::to_owned),
+                Vec::new(),
+            ),
+            Element::Way(w) => (
+                pairs(&mut w.tags()),
+                w.info().user().transpose().unwrap().map(str::to_owned),
+                Vec::new(),
+            ),
+            Element::Relation(r) => (
+                pairs(&mut r.tags()),
+                r.info().user().transpose().unwrap().map(str::to_owned),
+                r.members().map(|m| m.role().unwrap().to_owned()).collect(),
+            ),
         }
     }
 

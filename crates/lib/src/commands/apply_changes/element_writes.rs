@@ -77,17 +77,114 @@ pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactR
 // Writing base elements for parallel rewrite (local flush, no PbfWriter)
 // ---------------------------------------------------------------------------
 
+/// The string table a block holding surviving base elements starts from.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SourceSeed<'a> {
+    /// The source block's whole table, slot for slot: the rewrite's first
+    /// pass, whose survivors copy their indices unchanged.
+    Whole,
+    /// Only the source slots marked (by source index): the overflow
+    /// replay's, whose survivors' indices are translated so a block carries
+    /// only the strings its elements use (`overflow.rs`).
+    Subset(&'a [bool]),
+}
+
+/// Mark in `used` (one entry per source slot) every source string slot the
+/// raw writers below copy for surviving base `element`: its tag keys and
+/// values, a relation's member roles, and its user, read with the
+/// conversions the writers apply (`dense_node_raw_metadata`, which can
+/// write a user naming the empty string as 0, and
+/// `element_raw_partial_metadata`; the effective `Info` user of a way or
+/// relation). An index outside the table is skipped: the raw add refuses
+/// it with its own error.
+pub(super) fn mark_used_slots(element: &crate::Element<'_>, used: &mut [bool]) -> Result<()> {
+    use crate::read::wire::{PackedInt32Iter, PackedUint32Iter, WireInfo};
+    let mut mark = |sid: u32| {
+        if let Some(slot) = used.get_mut(sid as usize) {
+            *slot = true;
+        }
+    };
+    match element {
+        crate::Element::DenseNode(dn) => {
+            for (k, v) in dn.raw_tags() {
+                mark(k.cast_unsigned());
+                mark(v.cast_unsigned());
+            }
+            if let Some(meta) = dense_node_raw_metadata(dn)? {
+                mark(meta.user_sid.cast_unsigned());
+            }
+        }
+        crate::Element::Node(n) => {
+            for (k, v) in n.raw_tags() {
+                mark(k);
+                mark(v);
+            }
+            let meta = element_raw_partial_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
+            if let Some(sid) = meta.and_then(|m| m.user_sid) {
+                mark(sid.cast_unsigned());
+            }
+        }
+        crate::Element::Way(w) => {
+            PackedUint32Iter::new(w.keys_data()).for_each(&mut mark);
+            PackedUint32Iter::new(w.vals_data()).for_each(&mut mark);
+            if let Some(sid) = w
+                .info_data()
+                .map(WireInfo::user_sid_of)
+                .transpose()?
+                .flatten()
+            {
+                mark(sid.cast_unsigned());
+            }
+        }
+        crate::Element::Relation(r) => {
+            PackedUint32Iter::new(r.keys_data()).for_each(&mut mark);
+            PackedUint32Iter::new(r.vals_data()).for_each(&mut mark);
+            for sid in PackedInt32Iter::new(r.roles_sid_data()) {
+                mark(sid.cast_unsigned());
+            }
+            if let Some(sid) = r
+                .info_data()
+                .map(WireInfo::user_sid_of)
+                .transpose()?
+                .flatten()
+            {
+                mark(sid.cast_unsigned());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Seed `bb` from `block` for a surviving base element, unless the block in
+/// progress already is: a block started by diff elements is flushed first
+/// under a whole-table seed, which needs an empty builder; a subset seed
+/// is set on an empty builder too (after any flush), so the same rule
+/// serves both.
+fn ensure_seeded<O: BlockSink + ?Sized>(
+    bb: &mut BlockBuilder,
+    output: &mut O,
+    block: &PrimitiveBlock,
+    seed: SourceSeed<'_>,
+) -> Result<()> {
+    if !bb.is_pre_seeded() {
+        flush_local(bb, output)?;
+        match seed {
+            SourceSeed::Whole => bb.pre_seed_string_table(block)?,
+            SourceSeed::Subset(used) => bb.pre_seed_subset_string_table(block, used)?,
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn write_base_dense_node_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
     output: &mut O,
     dn: &crate::DenseNode<'_>,
     block: &PrimitiveBlock,
+    seed: SourceSeed<'_>,
 ) -> Result<()> {
     ensure_node_capacity_local(bb, output)?;
-    if !bb.is_pre_seeded() {
-        flush_local(bb, output)?;
-        bb.pre_seed_string_table(block)?;
-    }
+    ensure_seeded(bb, output, block, seed)?;
     let meta = dense_node_raw_metadata(dn)?;
     // Block construction keeps every dense index a nonnegative int32, so the
     // cast is the identity.
@@ -106,16 +203,14 @@ pub(super) fn write_base_node_local<O: BlockSink + ?Sized>(
     output: &mut O,
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
+    seed: SourceSeed<'_>,
 ) -> Result<()> {
     // The coordinate accessors scale exactly and refuse a value that does
     // not fit an i32 decimicrodegree, as write_base_dense_node_local does: a
     // re-encoded base node is never written at a wrapped position. A blob
     // spliced through untouched is not decoded and so not judged here.
     ensure_node_capacity_local(bb, output)?;
-    if !bb.is_pre_seeded() {
-        flush_local(bb, output)?;
-        bb.pre_seed_string_table(block)?;
-    }
+    ensure_seeded(bb, output, block, seed)?;
     // Partial source metadata keeps its field presence (a plain node out);
     // complete or absent metadata goes dense, as before.
     let meta = element_raw_partial_metadata(crate::ElementKind::Node, node.id(), &node.info())?;
@@ -139,6 +234,8 @@ pub(super) struct BaseWrites<'a> {
     probe: &'a StaleProbe,
     scratch: &'a mut RefreshScratch,
     pub(super) tally: RefreshTally,
+    /// The table a block of survivors starts from.
+    pub(super) seed: SourceSeed<'a>,
 }
 
 /// Buffers the surviving-base-way writers and staleness detection reuse,
@@ -196,6 +293,7 @@ impl<'a> BaseWrites<'a> {
             probe,
             scratch,
             tally: RefreshTally::default(),
+            seed: SourceSeed::Whole,
         }
     }
 }
@@ -259,10 +357,7 @@ pub(super) fn write_base_way_local<O: BlockSink + ?Sized>(
     ctx: &mut BaseWrites<'_>,
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
-    if !bb.is_pre_seeded() {
-        flush_local(bb, output)?;
-        bb.pre_seed_string_table(block)?;
-    }
+    ensure_seeded(bb, output, block, ctx.seed)?;
     let info = output_info(
         crate::ElementKind::Way,
         way.id(),
@@ -297,16 +392,14 @@ pub(super) fn write_base_way_local_with_locations<O: BlockSink + ?Sized>(
     ctx: &mut BaseWrites<'_>,
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
-    if !bb.is_pre_seeded() {
-        flush_local(bb, output)?;
-        bb.pre_seed_string_table(block)?;
-    }
+    ensure_seeded(bb, output, block, ctx.seed)?;
     let BaseWrites {
         framing,
         date_granularity,
         probe,
         scratch,
         tally,
+        ..
     } = ctx;
     let RefreshScratch {
         info,
@@ -392,10 +485,7 @@ pub(super) fn write_base_relation_local<O: BlockSink + ?Sized>(
     ctx: &mut BaseWrites<'_>,
 ) -> Result<()> {
     ensure_relation_capacity_local(bb, output)?;
-    if !bb.is_pre_seeded() {
-        flush_local(bb, output)?;
-        bb.pre_seed_string_table(block)?;
-    }
+    ensure_seeded(bb, output, block, ctx.seed)?;
     let info = output_info(
         crate::ElementKind::Relation,
         rel.id(),

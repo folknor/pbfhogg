@@ -141,6 +141,21 @@ on planet; at the 2-3 % edge on warm germany with no per-blob or
 core-second cost behind it, so not a regression. `export --metadata`,
 the commit's other path, has no registered bench and was not measured.
 
+## inspect --nodes closes FOR windows per blob (bygg, 2026-11-24, against `ebb34e4b`)
+
+FOR windows close at every blob boundary, one extra partial-window flush
+per node blob, and the size estimate sums a per-window packed byte count.
+Planet, default `-j`, `brokkr bench --iterations 1 file-info --mode
+nodes`, baseline via `--commit ebb34e4b`, change as the uncommitted tree:
+
+| Pair | Baseline | Change |
+|---|---:|---:|
+| 1 (baseline first, cold) | 18.9 s (`14093c72`) | 12.7 s (`229aaada`) |
+| 2 (change first) | 12.0 s (`b37547d6`) | 12.0 s (`4f62a524`) |
+
+The 18.9 s cell is the first read after a build and a cold page cache;
+the warm pair is identical. No cost.
+
 ## inspect --nodes reads through a projection (bygg, 2026-11-02, against `5ec5eefc`)
 
 `inspect --nodes` reads each node blob through a projection on the block

@@ -45,23 +45,6 @@ Reported by: encoding.
 locations vector disagrees with refs; the direct builder location API refuses
 the mismatch. The fallback can hide an internal transformation error.
 
-## BUG-011 - Node-statistics histograms depend on worker scheduling
-
-Reported by: check.
-
-`WorkerAccum` (`inspect/node_stats.rs`) carries a partial 128-coordinate window
-across whichever blobs a worker receives, so adjacency, buckets and window count
-vary with scheduling; the parity test excludes histogram equality. Fixing needs
-a contract decision.
-
-Defect hunt 2026-11-17 (check-inspect, P2): witness - two blobs of 64 nodes,
-the first at latitude 0 throughout, the second at 900,000,000 throughout. In
-file order they form one 128-value window needing 30 bits; on separate workers
-they become two constant windows needing zero bits. Histogram, block count and
-compression estimate change with scheduling or `-j`. The comment claiming the
-histogram shape is preserved is false. Proposed: order coordinate batches
-before forming windows.
-
 ## BUG-019 - apply-changes blob-size percentiles sample passthrough only
 
 Reported by: apply-core.

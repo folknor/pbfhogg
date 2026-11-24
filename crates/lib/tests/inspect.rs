@@ -651,13 +651,91 @@ fn inspect_get_value() {
 // Parallel classify parity for inspect::node_stats
 // ---------------------------------------------------------------------------
 //
-// `node_stats` (crates/lib/src/commands/inspect/node_stats.rs:220) dispatches
-// per-node scanning through `parallel_classify_accumulate` with a
-// `jobs` override (jobs=0 -> auto, jobs>0 -> exact worker count). Each
-// worker maintains per-blob `CoordStats` that get merged at the end.
-// With a single-blob fixture every worker except one is idle; this
-// test forces 4 node blobs and asserts jobs=1 and jobs=4 produce the
-// same summary numbers.
+// `node_stats` scans node blobs on the classify pool with a `jobs`
+// override (jobs=0 -> auto, jobs>0 -> exact worker count). FOR windows
+// close at every blob boundary, so the whole report, histograms
+// included, is independent of which worker read which blob.
+
+fn node_stats_at(
+    input: &std::path::Path,
+    jobs: usize,
+) -> pbfhogg::inspect::node_stats::NodeStatsReport {
+    pbfhogg::inspect::node_stats::node_stats(
+        input,
+        false,
+        true,
+        pbfhogg::Parallelism::from_jobs(jobs),
+        &crate::common::test_host(),
+    )
+    .expect("node_stats")
+}
+
+fn assert_coord_stats_eq(
+    a: &pbfhogg::inspect::node_stats::CoordStats,
+    b: &pbfhogg::inspect::node_stats::CoordStats,
+    what: &str,
+) {
+    assert_eq!(a.bucket_counts, b.bucket_counts, "{what} buckets");
+    assert_eq!(a.total_blocks, b.total_blocks, "{what} blocks");
+    assert_eq!(a.total_bits_weighted, b.total_bits_weighted, "{what} bits");
+    assert_eq!(a.packed_bytes, b.packed_bytes, "{what} bytes");
+}
+
+fn node_at(id: i64, lat: i32, lon: i32) -> TestNode<'static> {
+    TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+/// Two 64-node blobs, each constant, at latitudes 0 and 90 degrees: in
+/// file order across the boundary they would make one 30-bit window, but
+/// windows close per blob, so every worker count reports two zero-width
+/// windows.
+#[test]
+fn node_stats_windows_close_at_blob_boundaries() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let nodes: Vec<_> = (1..=128)
+        .map(|id| node_at(id, if id <= 64 { 0 } else { 900_000_000 }, 0))
+        .collect();
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 64);
+    for jobs in [1, 2] {
+        let r = node_stats_at(&input, jobs);
+        for (stats, axis) in [(&r.lat_stats, "lat"), (&r.lon_stats, "lon")] {
+            assert_eq!(stats.total_blocks, 2, "{axis} at -j {jobs}");
+            assert_eq!(
+                stats.bucket_counts,
+                [2, 0, 0, 0, 0, 0],
+                "{axis} at -j {jobs}"
+            );
+            assert_eq!(stats.total_bits_weighted, 0, "{axis} at -j {jobs}");
+            assert_eq!(stats.packed_bytes, 8, "{axis} at -j {jobs}");
+        }
+    }
+}
+
+/// A partial window pays for the values it holds: 128 constant nodes then
+/// a two-node tail with a latitude range of 16 (5 bits, 10 bits packed, 2
+/// bytes) and a longitude range of 1 (1 bit, 2 bits packed, 1 byte).
+#[test]
+fn node_stats_packs_a_partial_window_by_its_length() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let mut nodes: Vec<_> = (1..=128).map(|id| node_at(id, 0, 0)).collect();
+    nodes.push(node_at(129, 0, 0));
+    nodes.push(node_at(130, 16, 1));
+    write_multi_block_test_pbf(&input, &nodes, &[], &[], 8000);
+    let r = node_stats_at(&input, 1);
+    assert_eq!(r.lat_stats.total_blocks, 2);
+    assert_eq!(r.lat_stats.total_bits_weighted, 5);
+    assert_eq!(r.lat_stats.packed_bytes, 4 + (2 + 4));
+    assert_eq!(r.lon_stats.total_bits_weighted, 1);
+    assert_eq!(r.lon_stats.packed_bytes, 4 + (1 + 4));
+}
 
 #[test]
 fn node_stats_parallel_classify_parity() {
@@ -669,22 +747,8 @@ fn node_stats_parallel_classify_parity() {
     let nodes = generate_nodes(40, 1);
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
-    let seq = pbfhogg::inspect::node_stats::node_stats(
-        &input,
-        false,
-        true,
-        pbfhogg::Parallelism::from_jobs(1),
-        &crate::common::test_host(),
-    )
-    .expect("node_stats seq");
-    let par = pbfhogg::inspect::node_stats::node_stats(
-        &input,
-        false,
-        true,
-        pbfhogg::Parallelism::from_jobs(4),
-        &crate::common::test_host(),
-    )
-    .expect("node_stats par");
+    let seq = node_stats_at(&input, 1);
+    let par = node_stats_at(&input, 4);
 
     // Raw totals must match exactly. These are simple sums /
     // min-reductions over blobs; if workers double-count or drop a
@@ -696,14 +760,9 @@ fn node_stats_parallel_classify_parity() {
     assert_eq!(seq.max_lon, par.max_lon, "max_lon parity");
     assert_eq!(seq.node_count, 40, "sanity: all 40 nodes scanned");
 
-    // `avg_bits` intentionally NOT asserted for parity: with a tiny
-    // fixture (1 blob per worker at jobs=4) the jobs=1 path sees all
-    // 4 blobs on one worker vs the jobs=4 path where each worker sees
-    // one blob, and the sub-block scalar bucketing resolution inside
-    // CoordStats can produce a different weighted mean on two
-    // independent 14-15 bit buckets versus a single merged scan. The
-    // node_count / min / max assertions above already pin that every
-    // blob's bytes were classified exactly once.
+    assert_coord_stats_eq(&seq.lat_stats, &par.lat_stats, "lat");
+    assert_coord_stats_eq(&seq.lon_stats, &par.lon_stats, "lon");
+    assert_eq!(seq.lat_stats.total_blocks, 4, "one partial window per blob");
 }
 
 /// `inspect --nodes` schedules node blobs on the claim, so a way blob

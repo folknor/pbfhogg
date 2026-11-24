@@ -31,6 +31,13 @@ fn bits_needed(range: u32) -> u32 {
 }
 
 /// Statistics for one coordinate dimension (lat or lon).
+///
+/// A FOR block is up to 128 consecutive values of one blob, in element
+/// order. Blocks never span blobs: a blob is PBF's independent decode
+/// unit, so a codec packing a file's coordinates packs each blob on its
+/// own, and a blob's last block is partial unless its node count is a
+/// multiple of 128. That also makes every field independent of which
+/// worker read which blob, so the report is the same at any `-j`.
 pub struct CoordStats {
     /// Histogram: count of FOR blocks per bit-width bucket.
     pub bucket_counts: [u64; 6],
@@ -38,6 +45,11 @@ pub struct CoordStats {
     pub total_blocks: u64,
     /// Sum of bits_needed across all blocks (for weighted average).
     pub total_bits_weighted: u64,
+    /// Estimated FOR bytes: per block, its values' offsets packed at the
+    /// block's bit width and rounded up to a byte (`ceil(len * bits / 8)`,
+    /// so a partial block pays for the values it holds, not for 128), plus
+    /// a 4-byte base. Bit-width and framing metadata are not counted.
+    pub packed_bytes: u64,
 }
 
 impl CoordStats {
@@ -46,6 +58,26 @@ impl CoordStats {
             bucket_counts: [0; 6],
             total_blocks: 0,
             total_bits_weighted: 0,
+            packed_bytes: 0,
+        }
+    }
+
+    /// Add another accumulator's blocks; every field is a sum.
+    fn merge(&mut self, other: &Self) {
+        for (dst, src) in self.bucket_counts.iter_mut().zip(other.bucket_counts) {
+            *dst += src;
+        }
+        self.total_blocks += other.total_blocks;
+        self.total_bits_weighted += other.total_bits_weighted;
+        self.packed_bytes += other.packed_bytes;
+    }
+
+    /// Mean estimated bytes per block, 0 with no blocks.
+    pub fn bytes_per_block(&self) -> f64 {
+        if self.total_blocks == 0 {
+            0.0
+        } else {
+            self.packed_bytes as f64 / self.total_blocks as f64
         }
     }
 
@@ -62,6 +94,9 @@ impl CoordStats {
         self.bucket_counts[bucket_index(bits)] += 1;
         self.total_blocks += 1;
         self.total_bits_weighted += u64::from(bits);
+        // At most 128 values, so the length always fits a u64.
+        let len = values.len() as u64;
+        self.packed_bytes += (len * u64::from(bits)).div_ceil(8) + 4;
     }
 
     pub fn avg_bits(&self) -> f64 {
@@ -119,18 +154,20 @@ impl NodeStatsReport {
         writeln!(out, "  lon: {lon_avg:.2} bits")?;
         writeln!(out)?;
 
+        // Both axes see the same blocks, so lat's count is the block count.
         let num_blocks = self.lat_stats.total_blocks;
-        // per block: avg_bits * 128 / 8 bytes for packed values + 4 bytes for min_value
-        // two dimensions (lat + lon)
-        let lat_bytes_per_block = lat_avg * BLOCK_SIZE as f64 / 8.0 + 4.0;
-        let lon_bytes_per_block = lon_avg * BLOCK_SIZE as f64 / 8.0 + 4.0;
-        let total_bytes = num_blocks as f64 * (lat_bytes_per_block + lon_bytes_per_block);
+        let lat_bytes_per_block = self.lat_stats.bytes_per_block();
+        let lon_bytes_per_block = self.lon_stats.bytes_per_block();
+        let total_bytes = (self.lat_stats.packed_bytes + self.lon_stats.packed_bytes) as f64;
         let uncompressed_bytes = self.node_count as f64 * 8.0;
 
-        writeln!(out, "Estimated compressed size:")?;
         writeln!(
             out,
-            "  {:.2} GB ({} blocks x ({:.1} + {:.1}) bytes/block)",
+            "Estimated FOR coordinate bytes (packed offsets + 4-byte base per block and axis):"
+        )?;
+        writeln!(
+            out,
+            "  {:.2} GiB ({} blocks x ({:.1} + {:.1}) bytes/block)",
             total_bytes / 1_073_741_824.0,
             num_blocks,
             lat_bytes_per_block,
@@ -138,7 +175,7 @@ impl NodeStatsReport {
         )?;
         writeln!(
             out,
-            "  vs {:.2} GB uncompressed ({} nodes x 8 bytes)",
+            "  vs {:.2} GiB uncompressed ({} nodes x 8 bytes)",
             uncompressed_bytes / 1_073_741_824.0,
             self.node_count,
         )?;
@@ -178,15 +215,15 @@ fn write_histogram(
 /// processes and merged into the global report at completion.
 ///
 /// `lat_block` / `lon_block` are the in-flight 128-value windows that
-/// feed [`CoordStats::record_block`]; they persist across blobs within a
-/// worker and are flushed once at merge time. Cross-blob carry is kept
-/// deliberately - the FOR block stat is about locality of consecutive
-/// coordinate values, not blob-level grouping, and matching the
-/// sequential behaviour of "only the last block is partial" keeps the
-/// output closest to the pre-parallel path. Ordering is still different
-/// in the parallel path (workers see blobs out of file order), so the
-/// final block distribution is not byte-identical between runs but the
-/// histogram shape is preserved.
+/// feed [`CoordStats::record_block`]; [`WorkerAccum::end_blob`] flushes
+/// them after every blob, so a window never holds two blobs' values (see
+/// [`CoordStats`]). They used to carry across whichever blobs the
+/// scheduler handed one worker, which made the histogram, the block count
+/// and the size estimate depend on scheduling and `-j`: two 64-node blobs
+/// at different latitudes formed one wide window on one worker and two
+/// zero-width ones on two. Forming windows in file order instead would
+/// need every coordinate shipped to one ordered stage, or per-blob offsets
+/// from node counts the unindexed `--force` path does not have.
 struct WorkerAccum {
     node_count: u64,
     min_lat: i32,
@@ -214,7 +251,8 @@ impl WorkerAccum {
         }
     }
 
-    fn finalize(&mut self) {
+    /// Close the current blob's partial window.
+    fn end_blob(&mut self) {
         if !self.lat_block.is_empty() {
             self.lat_stats.record_block(&self.lat_block);
             self.lon_stats.record_block(&self.lon_block);
@@ -446,38 +484,18 @@ fn node_stats_inner(
         |buffer, WorkerState { accum, coords }| {
             let (NodeCoords { .. }, accepted) =
                 buffer.project(|fields, _| NodeCoords::new(fields, coords))?;
-            coords.each(accepted.bytes(), |lat, lon| accum.record(lat, lon))
+            coords.each(accepted.bytes(), |lat, lon| accum.record(lat, lon))?;
+            accum.end_blob();
+            Ok(())
         },
-        |WorkerState {
-             accum: mut worker, ..
-         }| {
-            worker.finalize();
+        |WorkerState { accum: worker, .. }| {
             global.node_count += worker.node_count;
             global.min_lat = global.min_lat.min(worker.min_lat);
             global.max_lat = global.max_lat.max(worker.max_lat);
             global.min_lon = global.min_lon.min(worker.min_lon);
             global.max_lon = global.max_lon.max(worker.max_lon);
-            // CoordStats merge is additive on every field.
-            for (dst, src) in global
-                .lat_stats
-                .bucket_counts
-                .iter_mut()
-                .zip(worker.lat_stats.bucket_counts.iter())
-            {
-                *dst += src;
-            }
-            global.lat_stats.total_blocks += worker.lat_stats.total_blocks;
-            global.lat_stats.total_bits_weighted += worker.lat_stats.total_bits_weighted;
-            for (dst, src) in global
-                .lon_stats
-                .bucket_counts
-                .iter_mut()
-                .zip(worker.lon_stats.bucket_counts.iter())
-            {
-                *dst += src;
-            }
-            global.lon_stats.total_blocks += worker.lon_stats.total_blocks;
-            global.lon_stats.total_bits_weighted += worker.lon_stats.total_bits_weighted;
+            global.lat_stats.merge(&worker.lat_stats);
+            global.lon_stats.merge(&worker.lon_stats);
         },
         host,
     )?;

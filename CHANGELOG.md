@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **`inspect --nodes` is the same at every `-j`.** FOR windows used to
+  carry across whichever blobs the scheduler gave one worker, so the
+  bit-width histograms, block count and size estimate changed with
+  scheduling and `-j`. Windows now close at every blob boundary, a blob's
+  tail being its own partial block, which is what a per-blob codec would
+  pay; expect about one more block per node blob. The size estimate now
+  packs a partial block at its own length instead of charging 128 values,
+  is labelled `Estimated FOR coordinate bytes`, and prints GiB, as it
+  always computed, instead of GB. `CoordStats` gains `packed_bytes` and
+  `bytes_per_block()`.
+
 - **Geocode candidates are bound to their reader and rank like
   `Reader::query`.** `Candidates` now holds `AddressCandidate`,
   `StreetCandidate`, `AdminCandidate` and `InterpolationCandidate` values,

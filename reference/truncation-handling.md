@@ -336,11 +336,9 @@ express are covered as well. `keys_vals` is a single flat array of
 zero-terminated per-node tag runs, so it is walked once per block
 and must yield exactly as many runs as the `id` array has entries;
 this is the only check in the pass that is not a byte scan. Every
-`denseinfo` array must be either absent or exactly as long as the
-`id` array, and a `denseinfo` carrying only some of its five
-metadata arrays is rejected, because `DenseNodeInfoIter` zips them
-and stops at the shortest - which blanks metadata from that point
-on while reporting success.
+`denseinfo` column must be either empty or exactly as long as the
+`id` array. Any subset of the six columns, including `visible`, is
+allowed. Empty columns are treated as absent.
 
 Two encodings stay legal and are not truncation: an absent
 `keys_vals`, meaning no node in the group has tags; and a final

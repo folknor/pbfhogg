@@ -442,8 +442,8 @@ impl BlobFilter {
     /// Add a spatial bbox filter for node blobs. Node blobs whose coordinate
     /// bbox does not intersect the given bbox are skipped (no decompression).
     ///
-    /// Only effective on files with v2 indexdata. Blobs without spatial
-    /// indexdata always pass through (conservative).
+    /// The spatial filter uses node bounds from v2 or v3 indexdata.
+    /// Blobs without spatial bounds pass the spatial check.
     ///
     /// The kind and bbox are the blob's own indexdata claims and are not
     /// checked: a blob whose bbox understates its nodes, or that is

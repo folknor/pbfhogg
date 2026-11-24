@@ -22,14 +22,6 @@ source at `63d4ec1d`. Where a hunter judged the code wrong instead, the
 finding is filed in the matching `notes/bugs-*.md` document. Entries are in no
 order of importance.
 
-## DOC-002 - truncation-handling.md says partial DenseInfo column sets are rejected
-
-Reported by: read-framing, read-block-decoding.
-
-The paragraph in `reference/truncation-handling.md` is stale. The validator
-(`read/block.rs`), its tests and the current deviation entry deliberately
-accept arbitrary column subsets. Both hunters say the code is correct.
-
 ## DOC-003 - claims.rs says negative versions yield no claims
 
 Reported by: read-framing.
@@ -44,15 +36,6 @@ Reported by: read-block-decoding.
 The doc on `Way::node_locations()` (`read/elements.rs`) promises an empty
 iterator without `LocationsOnWays`. The implementation reads whatever
 coordinate arrays the way carries. The doc should describe payload presence.
-
-## DOC-006 - The block APIs point to an ordering assertion that does not exist
-
-Reported by: read-pipeline.
-
-Their documentation (`read/reader.rs`) directs callers to `for_each_pipelined`
-for a debug monotonicity assertion, and that method performs no ordering
-check. The earlier statement in the same doc, that callers must verify
-ordering, is accurate.
 
 ## DOC-007 - Rebuild metadata docs describe behaviour the encoder dropped
 
@@ -111,14 +94,6 @@ from replicated unindexed blobs at the worker boundary. The schedule now keeps
 that distinction, and `ScheduledBlob::buffer` (`scan/classify.rs`) passes the
 claim into block validation, which refuses foreign kinds. The explanation is
 obsolete and contradicts `reference/indexdata-trust.md`.
-
-## DOC-012 - BlobFilter::with_node_bbox says spatial filtering needs v2 indexdata
-
-Reported by: shared-primitives.
-
-The doc (`blob_meta/mod.rs`) says spatial filtering is effective only with v2
-indexdata. Deserialization also supplies spatial bounds from v3, which is what
-current writers emit. It should say v2 and v3.
 
 ## DOC-013 - CORRECTNESS.md says every OSC consumer drops delete children
 
@@ -186,14 +161,6 @@ Export's element dispatch (`export/mod.rs`) ignores every relation, which
 matches the CLI documentation and the deferred-work notes. The deviation
 rationale is wrong, and missing relation support is not an implementation
 defect.
-
-## DOC-020 - pipeline.md says geojson is buffered into one FeatureCollection
-
-Reported by: export.
-
-`FeatureWriter` (`export/writer.rs`) writes each feature immediately and keeps
-only the current feature buffer. The architectural description in
-`reference/pipeline.md` is wrong.
 
 ## DOC-021 - check --index partial-index exceptions are documented as passing
 

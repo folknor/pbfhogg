@@ -307,10 +307,12 @@ Single sequential `ElementReader::for_each` pass, no parallelism. Rejects
 up front if way export is requested and the header lacks
 `LocationsOnWays`. Per element: tag filter → (for ways) geometry
 assembly and area/winding classification → property serialization →
-streamed to a `FeatureWriter` (`geojsonseq`: one Feature per line;
-`geojson`: buffered into one FeatureCollection). Untagged nodes/ways and
-nodes/ways with invalid geometry (including any emitted position outside
-the geographic domain) are skipped and counted, not errored.
+streamed to a `FeatureWriter` that reuses a single feature buffer.
+`geojsonseq` writes one Feature per line. `geojson` writes each Feature
+into a single FeatureCollection array, which the writer closes at the
+end. Untagged nodes/ways and nodes/ways with invalid geometry (including
+any emitted position outside the geographic domain) are skipped and
+counted, not errored.
 
 ### apply-changes (merge)
 

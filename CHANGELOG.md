@@ -730,6 +730,17 @@
 
 ### Fixed
 
+- **Geocode admin ranking measures antimeridian rings in their own
+  frame.** A ring crossing the antimeridian stored the area of its raw
+  longitudes, so a narrow dateline polygon could outrank a wider one the
+  wrong way. `build-geocode-index` now measures it unwrapped, as
+  containment tests it (a ring winding a pole keeps the raw area). The
+  format is unchanged; rebuild an index to get the new scores.
+- **Geocode snap and distance agree on half-turn segments.** For a street
+  or interpolation segment spanning exactly 180 degrees of longitude, the
+  distance could be measured on one half-world path and `snap_lat_e7` /
+  `snap_lon_e7` placed on the other. The reader now projects onto both
+  paths and reports the nearer one's point and distance.
 - **`BlobReader::seek` resumes a reader a failed read stopped.** After
   `next()` or `next_header_skip_blob()` returned an error, a successful
   `seek` still left both returning `None`, while `seek_raw` and

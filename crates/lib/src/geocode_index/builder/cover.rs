@@ -6,8 +6,9 @@
 //! degrees, in one continuous longitude frame chosen by the caller (any
 //! longitude delta is a legal path; the points on it are placed on the sphere
 //! through sin and cos). This is the geometry the geocode reader uses: a
-//! street or interpolation segment is the path `geo::point_to_segment_distance_sq`
-//! measures to, with the far longitude unwrapped around the near one, and an
+//! street or interpolation segment is the path the reader projects onto with
+//! `geo::point_to_framed_segment_distance_sq`, the far longitude unwrapped
+//! around the near one by the integer delta (both ways at a half turn), and an
 //! admin ring edge is the planar edge `geo::point_in_ring_with_antimeridian`
 //! ray-casts against, in the ring frame `geo::pip_ring_frame` gives it.
 //!
@@ -467,11 +468,10 @@ fn walk_face(
 /// The segment is the path `geo::point_to_segment_distance_sq` measures to:
 /// the far longitude is unwrapped around the near one in the integer domain.
 /// When the longitude delta is exactly 180 degrees the two half-world paths
-/// are equally short, and the reader's radian wrapping can pick either
-/// (rounding of the independently converted ends decides), so both are
-/// covered, each budgeted and deduplicated on its own and then merged. Any
-/// other delta is at least 1e-7 degree from the tie, far beyond that
-/// rounding, so both sides agree on the branch.
+/// are equally short and both are the segment: the reader projects the query
+/// onto each and keeps the nearer, so both are covered, each budgeted and
+/// deduplicated on its own and then merged. Any other delta frames the path
+/// one way, the same integer way on both sides.
 ///
 /// `level` must have passed [`level_exceeds_segment_cell_budget`], which
 /// `BuildConfig::validate` enforces for the street and coarse levels; given

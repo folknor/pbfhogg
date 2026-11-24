@@ -306,3 +306,19 @@ form), and `IdSetDense` survives in `crates/lib/src/idset.rs` only as the name
 of the osmium structure `IdSet` mirrors. History entries may keep the name of
 their time, but the opening description should name the current type, or say
 "the ranked ID set" so the name cannot drift again.
+
+## DOC-038 - DEVIATIONS.md records the raw_size check only for zlib blobs
+
+Reported by: the spar accounting of the BlobReader seek and diff raw_size
+change, from its scout's lateral (2026-11-24).
+
+DEVIATIONS.md "PBF decoding: a declared Blob raw_size must match the payload
+length" compares pbfhogg with libosmium for zlib blobs only. Every pbfhogg
+decode route (`check_raw_size` in `read/blob_wire.rs`, called after raw,
+zlib and zstd payloads in `read/decompress.rs`) refuses a declared
+`raw_size` that disagrees with the produced length, raw blobs included.
+libosmium's `decode_blob` (`pbf_decoder.hpp`) returns a `raw` payload as
+soon as it meets the field, checks only that it is under 32 MiB and never
+compares it with `raw_size`, so a raw blob with a wrong declared size reads
+in osmium and is refused by pbfhogg. That direction of the deviation is
+unrecorded; the entry should name it beside the zlib case.

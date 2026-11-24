@@ -546,11 +546,14 @@ pub const LON_FULL_TURN_E7: i64 = 3_600_000_000;
 /// The radian twin of this is [`point_to_segment_distance_sq`]'s internal
 /// unwrapping. Any caller that interpolates along a segment in the E7 domain
 /// must unwrap with this first, otherwise a segment spanning ±180° is
-/// interpolated the long way around the globe.
-#[inline]
+/// interpolated the long way around the globe. The two agree except at an
+/// exact half turn, where this one is always west and the radian one
+/// follows rounding; a caller needing both to agree frames the segment from
+/// this delta and calls [`point_to_framed_segment_distance_sq`].
 ///
 /// Total over `i64`, in `[-180°, +180°)`: the delta is reduced modulo a
 /// turn before any half turn is subtracted, so no step can overflow.
+#[inline]
 pub fn wrapped_longitude_delta_e7(delta_e7: i64) -> i64 {
     let r = delta_e7.rem_euclid(LON_FULL_TURN_E7);
     if r >= LON_FULL_TURN_E7 / 2 {
@@ -609,7 +612,28 @@ pub fn point_to_segment_distance_sq(
 ) -> (f64, f64) {
     // Work in a longitude frame unwrapped around A. Without this, a short
     // segment crossing +/-180 degrees is treated as almost a full world wide.
+    // At exactly half a turn the rounding of the two radian ends decides the
+    // direction; a caller that has to know it frames B itself and calls
+    // [`point_to_framed_segment_distance_sq`].
     let bx = ax + wrapped_longitude_delta(bx - ax);
+    point_to_framed_segment_distance_sq(px, py, ax, ay, bx, by, cos_lat)
+}
+
+/// [`point_to_segment_distance_sq`] for a segment whose far end is already
+/// in A's longitude frame: `bx` is A's longitude plus the segment's signed
+/// longitude extent, at most half a turn either way, so the caller decides
+/// which way the segment runs (both directions at an exact half turn are
+/// legal and give different paths). Only the query is unwrapped here.
+#[inline]
+pub fn point_to_framed_segment_distance_sq(
+    px: f64,
+    py: f64,
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
+    cos_lat: f64,
+) -> (f64, f64) {
     let px = ax + wrapped_longitude_delta(px - ax);
     let near = project_on_segment(px, py, ax, ay, bx, by, cos_lat);
 

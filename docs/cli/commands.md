@@ -2592,7 +2592,12 @@ Every key is always present. `lat` and `lon` echo the query in decimal
 degrees; the `_e7` coordinates are decimicrodegrees (degrees times 1e7),
 `distance_m` is the reader's flat distance in meters and `area` the
 polygon's stored ranking area: its outer ring's planar area in square
-decimicrodegrees, holes not subtracted.
+decimicrodegrees, holes not subtracted. A ring across the antimeridian is
+measured with its longitudes unwrapped, as containment tests it, unless it
+winds around a pole; an index built before that rule keeps the raw-frame
+area of such a ring until it is rebuilt. When the street segment spans
+exactly 180 degrees of longitude, the snap is the nearest point on either
+half-world path.
 
 ---
 

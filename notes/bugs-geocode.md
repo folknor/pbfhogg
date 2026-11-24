@@ -63,30 +63,26 @@ repeating `[120, -120, 0]` 100,000 times costs about 15 billion shifts. Only
 reachable with an admin ring winding the pole thousands of times; a fix must
 keep the legacy frame bit-identical or bump the index format and rebuild covers.
 
-## GEO-009 - Admin ranking area and containment use different longitude frames
+## GEO-029 - Interpolated house numbers are measured to the quantized snap
 
-Reported by: geocode-builder (flagged as surprising; the documented policy
-defines ranking by stored planar area, so the hunter notes that changing it
-would change policy).
+Reported by: the GEO-009/GEO-010 spar.
 
-The area calculation (`builder/admin.rs`) uses raw longitudes, while
-containment unwraps antimeridian crossings. A wider dateline-crossing
-rectangle can therefore store a smaller ranking area than a narrower one.
+`reader.rs` computes an interpolation way's partial length up to the snap
+point after it has been truncated to decimicrodegrees, in both the ranked
+and the candidate paths, rather than as prefix length plus `t` times the
+segment length. The truncation can move a result across a house-number
+threshold. Passing `t` through would number the projected point itself.
 
-## GEO-010 - Snap and distance can describe opposite half-world paths
+## GEO-030 - A polar winding admin ring ranks by its raw-frame area
 
-Reported by: geocode-reader [P2].
+Reported by: the GEO-009/GEO-010 spar.
 
-`reader.rs` rebuilds the snap point from an integer longitude delta, which
-always resolves an exact 180-degree separation westward. The distance
-calculation wraps independently converted radians and can resolve the same
-separation eastward. The builder (`builder/cover.rs`) explicitly acknowledges
-this difference and covers both paths. In an eastward case, a query at the
-segment midpoint can get a distance of about zero but a reported snap 180
-degrees away. This breaks the meaning of `snap_lat_e7` and `snap_lon_e7`, and
-the function's own requirement to interpolate in the distance calculation's
-frame. Projection should return the actual closest point, or both calculations
-should share one longitude-frame representation.
+The ranking score is taken in the containment frame only for a ring with
+zero net longitude winding. A ring winding a pole lifts to an open path
+whose closing chord, and so both its lifted area and its containment, depend
+on the start vertex (GEO-020), so it keeps the raw shoelace. A meaningful
+polar ranking needs the polar interior defined first, with containment,
+cover and ranking derived from it.
 
 ## GEO-018 - Open ways sharing a side between two holes are refused as a theta
 

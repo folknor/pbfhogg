@@ -212,6 +212,25 @@ block that frames. The guarantee is scoped to pieces that fit with the
 repeated string table, and body-limit and `HeaderWayMembers` overflows need
 the same treatment if the fix promises recovery generally.
 
+## CMD-067 - The oversize refusal advises fewer elements per blob where no flag exists
+
+Reported by: the spar accounting of the block-size items (2026-11-24), from
+the CMD-050 and CMD-049 scouts' laterals.
+
+Every `BlobTooLarge` refusal (`OversizePart` messages in `error.rs`) ends in
+"fewer elements per blob shrink it", and the CLI's `element_cap_advice`
+(`crates/cli/src/lib.rs`) adds a flag only for repack and degrade. On every
+other command that can refuse an oversize output block (time-filter, sort,
+`cat --dedupe`, add-locations-to-ways, cat re-encode, tags-filter, extract,
+getid, getparents, apply-changes) the user is told to use fewer elements per
+blob and has no way to. apply-changes makes it worse when its overflow replay
+budget (`APPLY_CHANGES_OVERFLOW_REPLAY_BYTES`) runs out: the replay returns
+the first block's original oversize error (`apply_changes/overflow.rs`), so
+the message names neither the budget nor anything the user can change.
+renumber's case is recorded in its own entry above. A fix would keep the
+library text free of advice the caller cannot act on (the CLI already adds
+the flag where one exists) and give the budget refusal its own wording.
+
 ## CMD-060 - degrade --unsort may have slowed down, and is slow on planet
 
 Reported by: the CMD-056 follow-up measurement (2026-11-21, plantasjen).

@@ -517,6 +517,24 @@ u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
 and no coarse fallback. Our format trades size for query precision (segment-
 level reads, i32 coords, wider offsets) and rural coverage (coarse index).
 
+### Segment projection framed by the integer longitude delta (bygg, 2026-11-24, variant uncommitted against `7f2024af`)
+
+The reader frames each street and interpolation segment from the integer
+longitude delta and projects onto both half-world paths only at an exact
+half turn; the builder's ranking area changes only for rings across the
+antimeridian. geocode-query, germany, country bbox `5.9,47.3,15.0,55.0`,
+100k points, 3 rounds, one `--iterations 1` pair (base built with
+`--commit HEAD`):
+
+| Cell | us per query (best) | open_ms |
+|---|---:|---:|
+| base `d3884255` | 19.04 | 849 |
+| variant `65cd7e28` | 18.46 | 851 |
+
+Not slower; the 3 percent in the variant's favour matches the sign every
+`--commit HEAD` base in this file shows against a dirty variant and is not
+chased.
+
 ### Distance hits rank by a total order, inclusive winner bounds (bygg, 2026-11-24, variant uncommitted against `b7626a0c`)
 
 `query()` ranks address, street and interpolation hits by squared distance

@@ -79,8 +79,9 @@ pub struct AdminMatch<'a> {
     /// ISO 3166-1 alpha2, only populated for admin_level=2.
     pub country_code: Option<&'a str>,
     /// The outer ring's planar area in square decimicrodegrees (degrees
-    /// times 1e7, squared; holes not subtracted), from the polygon record.
-    /// The smallest per level is the ranked answer.
+    /// times 1e7, squared; holes not subtracted), from the polygon record;
+    /// a ring across the antimeridian is measured unwrapped unless it winds
+    /// a pole. The smallest per level is the ranked answer.
     pub area: f32,
 }
 
@@ -1977,7 +1978,7 @@ impl Reader {
     ///
     /// - A candidate at distance `d` has a point on its geometry at `d` from
     ///   the query (an address point; for a segment, the closest point of the
-    ///   path `geo::point_to_segment_distance_sq` measures to). The builder
+    ///   path or paths `segment_distance` projects onto). The builder
     ///   lists the record under every cell that point lies in (a segment
     ///   under every cell its path meets; indexes built before the exact
     ///   cover can lack a cell a path clips near its corner), and that cell's
@@ -2523,32 +2524,59 @@ fn segment_endpoints_in_span(
 }
 
 /// Distance from the query to the segment `a` -> `b`, with the snap point.
+///
+/// The distance and the snap share one longitude frame: the integer delta
+/// from `a` to `b` decides which way the segment runs, the projection is made
+/// on that path, and the snap is interpolated along the same delta. At an
+/// exact half turn both half-world paths are the segment (the builder covers
+/// both), so both are projected onto and the nearer wins; on an exact tie the
+/// path running east from the lesser endpoint wins, so the answer does not
+/// depend on the order of the way's nodes.
 fn segment_distance(ctx: &QueryContext, [a, b]: [NodeCoord; 2]) -> (i32, i32, f64) {
-    let (t, dist_sq) = geo::point_to_segment_distance_sq(
-        ctx.lon_rad,
-        ctx.lat_rad,
-        geo::e7_to_rad(a.lon_e7),
-        geo::e7_to_rad(a.lat_e7),
-        geo::e7_to_rad(b.lon_e7),
-        geo::e7_to_rad(b.lat_e7),
-        ctx.cos_lat,
-    );
-    let (snap_lat, snap_lon) = interpolate_coord(&a, &b, t);
+    const HALF_TURN_E7: i64 = geo::LON_FULL_TURN_E7 / 2;
+    let dlon = geo::wrapped_longitude_delta_e7(i64::from(b.lon_e7) - i64::from(a.lon_e7));
+    let project = |dlon: i64| {
+        let ax = geo::e7_to_rad(a.lon_e7);
+        #[allow(clippy::cast_precision_loss)]
+        let bx = ax + crate::coord_fmt::e7_to_deg(dlon as f64) * std::f64::consts::PI / 180.0;
+        geo::point_to_framed_segment_distance_sq(
+            ctx.lon_rad,
+            ctx.lat_rad,
+            ax,
+            geo::e7_to_rad(a.lat_e7),
+            bx,
+            geo::e7_to_rad(b.lat_e7),
+            ctx.cos_lat,
+        )
+    };
+    let (dlon, (t, dist_sq)) = if dlon == -HALF_TURN_E7 {
+        let west = project(-HALF_TURN_E7);
+        let east = project(HALF_TURN_E7);
+        let east_from_a = (a.lon_e7, a.lat_e7) < (b.lon_e7, b.lat_e7);
+        match east.1.total_cmp(&west.1) {
+            std::cmp::Ordering::Less => (HALF_TURN_E7, east),
+            std::cmp::Ordering::Equal if east_from_a => (HALF_TURN_E7, east),
+            _ => (-HALF_TURN_E7, west),
+        }
+    } else {
+        (dlon, project(dlon))
+    };
+    let (snap_lat, snap_lon) = interpolate_coord(&a, &b, dlon, t);
     (snap_lat, snap_lon, dist_sq)
 }
 
-/// Interpolate a point at parameter `t` along the segment `a` -> `b`.
+/// Interpolate a point at parameter `t` along the segment `a` -> `b`, whose
+/// longitude extent is `dlon` decimicrodegrees in `a`'s frame.
 ///
-/// `point_to_segment_distance_sq` computes `t` in a longitude frame unwrapped
-/// around `a`, so the interpolation has to happen in that same frame: a
-/// segment from 179.9 to -179.9 with `t = 0.5` is at ±180, not at 0. The
-/// result is folded back into the legal longitude domain afterwards.
+/// The projection computes `t` in a longitude frame unwrapped around `a`, so
+/// the interpolation has to happen in that same frame: a segment from 179.9
+/// to -179.9 with `t = 0.5` is at ±180, not at 0. The result is folded back
+/// into the legal longitude domain afterwards.
 #[allow(clippy::cast_possible_truncation)]
-fn interpolate_coord(a: &NodeCoord, b: &NodeCoord, t: f64) -> (i32, i32) {
+fn interpolate_coord(a: &NodeCoord, b: &NodeCoord, dlon: i64, t: f64) -> (i32, i32) {
     let dlat = i64::from(b.lat_e7) - i64::from(a.lat_e7);
     let snap_lat = (f64::from(a.lat_e7) + t * dlat as f64) as i64;
 
-    let dlon = geo::wrapped_longitude_delta_e7(i64::from(b.lon_e7) - i64::from(a.lon_e7));
     let unwrapped = (f64::from(a.lon_e7) + t * dlon as f64) as i64;
     let snap_lon = geo::normalize_longitude_e7(unwrapped);
 
@@ -2675,6 +2703,35 @@ fn admin_ranks_before(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A segment spanning exactly half a turn is both half-world paths. A
+    /// query on either path's midpoint is at distance zero with its snap on
+    /// that midpoint, whichever order the ends come in.
+    #[test]
+    fn half_turn_segment_snaps_to_the_nearer_path() {
+        let zero = NodeCoord {
+            lat_e7: 0,
+            lon_e7: 0,
+        };
+        let half = NodeCoord {
+            lat_e7: 0,
+            lon_e7: 1_800_000_000,
+        };
+        for ends in [[zero, half], [half, zero]] {
+            for lon in [90.0, -90.0] {
+                let ctx = QueryContext::new(0.0, lon).expect("legal query");
+                let (snap_lat, snap_lon, dist_sq) = segment_distance(&ctx, ends);
+                assert!(dist_sq < 1e-20, "query {lon}: distance {dist_sq}");
+                assert_eq!(snap_lat, 0);
+                #[allow(clippy::cast_possible_truncation)]
+                let expected = (lon * 1e7) as i32;
+                assert!(
+                    (snap_lon - expected).abs() <= 1,
+                    "query {lon}: snap {snap_lon}"
+                );
+            }
+        }
+    }
 
     /// Equal-area candidates resolve to the lower polygon index whichever is
     /// presented first, so the ranked answer is independent of traversal.

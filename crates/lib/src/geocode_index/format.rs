@@ -665,7 +665,10 @@ record! {
     #[derive(Debug, Clone, Copy)]
     pub struct AdminPolygon {
         /// The outer ring's planar area in square decimicrodegrees, holes not
-        /// subtracted (for smallest-polygon selection).
+        /// subtracted (for smallest-polygon selection). The builder takes it
+        /// in the containment frame (`geo::pip_ring_frame`) for a ring that
+        /// frame unwraps with zero net winding, raw otherwise; a reader
+        /// cannot tell which rule built a stored value.
         pub area: f32,
         /// Byte offset into admin_vertices.bin.
         /// Builder-produced exterior and hole rings repeat their first vertex at

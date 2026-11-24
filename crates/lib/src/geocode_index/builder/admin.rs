@@ -367,6 +367,44 @@ fn assemble_one_relation(
     ))
 }
 
+/// The stored ranking score of an outer ring: the absolute shoelace area of
+/// the unsimplified ring in square decimicrodegrees, holes not subtracted.
+///
+/// The area is taken in the frame containment tests the ring in
+/// (`geo::pip_ring_frame`): a ring the unwrapping rule applies to is measured
+/// with its longitudes unwrapped, so a narrow ring across the antimeridian
+/// scores its own width, not the width of the rest of the world. That holds
+/// only when the lifted ring has zero net longitude winding; a ring winding
+/// a pole lifts to an open path whose closing chord, and so whose area,
+/// depends on the vertex it starts at, and it keeps the raw-frame area.
+/// `outer_ring` is explicitly closed (`assemble_rings` repeats the first
+/// vertex), so its lifted last vertex is an image of the first a whole
+/// number of turns away, and less than half a turn means none.
+/// `outer_f64` is the same ring as `(lon, lat)` degrees.
+fn ranking_area(outer_ring: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> f64 {
+    let raw = || crate::geo::signed_area(outer_ring).abs();
+    let std::borrow::Cow::Owned(lifted) = crate::geo::pip_ring_frame(outer_f64) else {
+        return raw();
+    };
+    let (Some(&(first_lon, first_lat)), Some(&(last_lon, _))) = (lifted.first(), lifted.last())
+    else {
+        return raw();
+    };
+    if outer_ring.first() != outer_ring.last() || (last_lon - first_lon).abs() >= 180.0 {
+        return raw();
+    }
+    // Shoelace about the first vertex (cancellation stays local), then from
+    // square degrees to square decimicrodegrees.
+    let local = |&(lon, lat): &(f64, f64)| (lon - first_lon, lat - first_lat);
+    let twice: f64 = lifted
+        .iter()
+        .map(local)
+        .zip(lifted.iter().cycle().skip(1).map(local))
+        .map(|((xi, yi), (xj, yj))| xi * yj - xj * yi)
+        .sum();
+    (twice / 2.0).abs() * 1e14
+}
+
 /// Assemble a relation from its decoded member ways, outer and inner
 /// each in first-occurrence order.
 fn assemble_decoded(
@@ -414,7 +452,7 @@ fn assemble_decoded(
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        let area = crate::geo::signed_area(outer_ring).abs() as f32;
+        let area = ranking_area(outer_ring, &outer_f64) as f32;
 
         let mut vertices = Vec::new();
         for &(lon_deg, lat_deg) in &simplified {
@@ -640,7 +678,7 @@ mod tests {
 
     use super::{
         DroppedAdminRelations, assemble_admin_polygons, hole_inside_outer,
-        missing_admin_way_geometry,
+        missing_admin_way_geometry, ranking_area,
     };
     use crate::geocode_index::builder::BuildConfig;
     use crate::geocode_index::builder::pass1::RawAdminRelation;
@@ -971,6 +1009,43 @@ mod tests {
             .into_iter()
             .map(|(lon, lat)| (deg_to_e7(lat) as i32, deg_to_e7(lon) as i32))
             .collect()
+    }
+
+    /// The ranking score of a ring across the antimeridian is its own area,
+    /// in the frame containment tests it in: a 2-degree-wide rectangle
+    /// scores less than a 10-degree-wide one, and the same as its twin away
+    /// from the seam. A non-crossing ring keeps the exact raw shoelace.
+    #[test]
+    fn ranking_area_is_taken_in_the_containment_frame() {
+        let score = |lon0, lat0, lon1, lat1| {
+            ranking_area(
+                &rect_ring_e7(lon0, lat0, lon1, lat1),
+                &rect_lonlat(lon0, lat0, lon1, lat1),
+            )
+        };
+        let narrow = score(179.0, -1.0, -179.0, 1.0);
+        let wide = score(175.0, -1.0, -175.0, 1.0);
+        let twin = score(10.0, -1.0, 12.0, 1.0);
+        assert!(narrow < wide, "{narrow} !< {wide}");
+        assert!((narrow - twin).abs() <= twin * 1e-9, "{narrow} != {twin}");
+        let ring = rect_ring_e7(10.0, -1.0, 12.0, 1.0);
+        assert_eq!(twin, crate::geo::signed_area(&ring).abs());
+    }
+
+    /// A ring winding a pole lifts to an open path whose area depends on its
+    /// start vertex, so it keeps the raw-frame score, which does not.
+    #[test]
+    fn ranking_area_of_a_polar_winding_ring_is_the_raw_score() {
+        let lonlat = [(0.0, 80.0), (120.0, 81.0), (-120.0, 80.0), (0.0, 80.0)];
+        #[allow(clippy::cast_possible_truncation)]
+        let ring: Vec<(i32, i32)> = lonlat
+            .iter()
+            .map(|&(lon, lat)| (deg_to_e7(lat) as i32, deg_to_e7(lon) as i32))
+            .collect();
+        assert_eq!(
+            ranking_area(&ring, &lonlat),
+            crate::geo::signed_area(&ring).abs()
+        );
     }
 
     /// An outer ring crossing the antimeridian has discontinuous

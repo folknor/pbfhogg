@@ -23,27 +23,6 @@ the scope or scopes, and the bracketed priority is the hunter's own label.
 Findings that match an existing mechanism were added to `notes/bugs.md`
 instead of being filed here. Entries are in no order of importance.
 
-## FMT-005 - BlobReader::seek does not resume a failed reader
-
-Reported by: read-framing.
-
-After a malformed frame produces `Err`, a successful `BlobReader::seek`
-(`read/blob.rs`) to a valid frame still leaves `next()` and
-`next_header_skip_blob()` returning `None`: the source moved but the sticky
-failure remains. `seek_raw` and `blob_from_offset` do resume. This contradicts
-the internal statement in the same file that iteration stops "until a seek
-resumes it". The public docs should either distinguish the behaviours, or the
-public seek operations should share recovery semantics.
-
-## FMT-006 - raw_blob_payload promises refusals it does not make
-
-Reported by: read-framing.
-
-Its documentation (`read/decompress.rs`) promises the same refusals as
-`decompress_blob_raw`. It discards `raw_size` and accepts envelopes the
-decompressor rejects for size mismatch. Diff's documented byte-equality
-shortcut explains why. The hunter says the helper's promise is what is wrong.
-
 ## FMT-009 - par_map_reduce's sub-2-GiB working-set guarantee is false
 
 Reported by: read-pipeline [P2].

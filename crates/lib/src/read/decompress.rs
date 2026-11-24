@@ -533,23 +533,35 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
     crate::read::blob_wire::check_raw_size(raw_size, buf.len())
 }
 
-/// The payload of raw blob bytes (from pread), undecompressed, for a blob
-/// equality test: the compression kind (0 raw, 1 zlib, 2 zstd) and the
-/// payload bytes, or `None` when the envelope carries no payload. Two blobs
-/// with the same kind and identical payload bytes hold identical elements.
-/// Parsed by the same rules as
-/// [`decompress_blob_raw`], so an envelope one refuses the other refuses, and
-/// borrowed, so a failed comparison costs no copy.
-pub(crate) fn raw_blob_payload(raw_blob: &[u8]) -> Result<Option<(u8, &[u8])>> {
-    let envelope = BlobEnvelope::parse(raw_blob)?;
-    Ok(envelope.payload.map(|(kind, slice)| {
-        let kind = match kind {
-            PayloadKind::Raw => 0,
-            PayloadKind::Zlib => 1,
-            PayloadKind::Zstd => 2,
-        };
-        (kind, slice)
+/// The decode inputs of raw blob bytes (from pread), undecompressed, for a
+/// blob equality test, or `None` when the envelope carries no payload.
+///
+/// The key is everything [`decompress_blob_raw`] reads from the envelope:
+/// the compression kind, the declared `raw_size` and the payload bytes. Two
+/// blobs with equal keys decode to the same bytes or fail the same way, so a
+/// caller may treat them as one blob without decoding either. That is all
+/// it promises: this is a comparison, not a validation. It shares
+/// [`BlobEnvelope::parse`] with the decoder, so an envelope that does not
+/// parse is refused here too, but nothing after the parse runs - not the
+/// empty-envelope refusal, the raw payload size cap, decompression or the
+/// `raw_size` cross-check. A corrupt blob compared equal to another is
+/// believed (diff's byte-equality shortcut documents that). Borrowed, so a
+/// failed comparison costs no copy.
+pub(crate) fn raw_blob_payload(raw_blob: &[u8]) -> Result<Option<BlobDecodeKey<'_>>> {
+    let BlobEnvelope { payload, raw_size } = BlobEnvelope::parse(raw_blob)?;
+    Ok(payload.map(|(kind, bytes)| BlobDecodeKey {
+        kind,
+        raw_size,
+        bytes,
     }))
+}
+
+/// What [`raw_blob_payload`] compares: every envelope input to the decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlobDecodeKey<'a> {
+    kind: PayloadKind,
+    raw_size: Option<i32>,
+    bytes: &'a [u8],
 }
 
 /// Decompress a parsed WireBlob into an owned `Bytes`.
@@ -894,8 +906,9 @@ mod tests {
 
     /// Run a serialized Blob through every envelope route: direct
     /// decompression, the payload comparison helper and the owned parser.
-    /// Returns the direct route's output, or the three verdicts must agree
-    /// on refusal.
+    /// Returns the direct route's output, or `None` when both decoding routes
+    /// refuse. The comparison must accept whatever decode accepts; it may
+    /// accept what decode refuses, since it validates nothing past the parse.
     fn every_route(blob: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         let direct = super::decompress_blob_raw(blob, &mut out);
@@ -1047,6 +1060,34 @@ mod tests {
     /// A `raw_size` that disagrees with the payload actually produced is
     /// corruption, and is rejected rather than silently ignored as a stale
     /// capacity hint. libosmium cross-checks the same field.
+    #[test]
+    fn the_comparison_key_carries_raw_size_and_validates_nothing() {
+        // A raw payload (field 1), then raw_size (field 2, a one-byte varint).
+        let payload = b"exactly-fifteen";
+        let blob = |raw_size: Option<u8>| {
+            let mut b = encode_blob(&[(1, payload)]);
+            if let Some(size) = raw_size {
+                b.extend_from_slice(&[0x10, size]);
+            }
+            b
+        };
+        let honest = u8::try_from(payload.len()).unwrap();
+        let honest_blob = blob(Some(honest));
+        let lying_blob = blob(Some(honest + 1));
+        assert!(super::decompress_blob_raw(&honest_blob, &mut Vec::new()).is_ok());
+        fn key(b: &[u8]) -> super::BlobDecodeKey<'_> {
+            super::raw_blob_payload(b).unwrap().unwrap()
+        }
+        // A lying raw_size is refused by decode but accepted by the
+        // comparison, which promises no validation ...
+        assert!(super::decompress_blob_raw(&lying_blob, &mut Vec::new()).is_err());
+        assert_eq!(key(&lying_blob), key(&lying_blob));
+        // ... yet it never compares equal to the honest blob, so a pair
+        // differing only there is decoded and the refusal surfaces.
+        assert_ne!(key(&honest_blob), key(&lying_blob));
+        assert_ne!(key(&honest_blob), key(&blob(None)));
+    }
+
     #[test]
     fn a_lying_raw_size_is_rejected() {
         let payload = b"exactly-fifteen";

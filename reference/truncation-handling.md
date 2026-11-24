@@ -199,7 +199,10 @@ The other contract sites are:
   more than one of the schema's six payload fields, and refuses a lone
   `lzma_data`, `OBSOLETE_bzip2_data` or `lz4_data` as unsupported. Both
   decoding routes cross-check a declared `Blob.raw_size` against the
-  payload they produced.
+  payload they produced. `raw_blob_payload` (diff's byte-equality
+  comparison) runs only the parse: it compares kind, declared `raw_size`
+  and payload bytes and validates nothing further, so a corrupt blob it
+  finds equal to another is believed.
 - `validate_block` (`crates/lib/src/read/block.rs`) for the
   block-layer contract below. Every `PrimitiveBlock` constructor -
   `from_vec`, `from_vec_with_scratch`,

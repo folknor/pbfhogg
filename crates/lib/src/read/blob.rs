@@ -15,7 +15,7 @@ use std::sync::Arc;
 // `crate::blob::DecompressPool` keep resolving.
 use super::decompress::decompress_parsed_blob_into;
 pub(crate) use super::decompress::{
-    DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
+    BlobDecodeKey, DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
     decompress_wire_blob_into, pool_get, pool_wrap, raw_blob_payload, release_decode_outlier,
 };
 
@@ -1055,11 +1055,9 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// ```
     pub fn blob_from_offset(&mut self, pos: ByteOffset) -> Result<Blob> {
         let _call = self.frames.cancel_token().call()?;
+        // The successful seek clears any earlier failure, so a valid frame
+        // at `pos` is read rather than reported as no blob there.
         self.seek(pos)?;
-        // A read at an explicit offset is a fresh start, as after `seek_raw`:
-        // an earlier failed read must not make `next` stop before reading,
-        // or a valid frame at `pos` would be reported as no blob there.
-        self.frames.clear_failure();
         let at = self.frames.location(self.frames.next_id());
         self.next().unwrap_or_else(|| {
             Err(Error::io_kind(
@@ -1071,6 +1069,12 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     }
 
     /// Seek to an offset in bytes from the start of the stream.
+    ///
+    /// A successful seek clears the sticky error state set by a previous
+    /// failing `next()` or `next_header_skip_blob()`, so a caller that
+    /// recovers from a parse error by seeking to a valid frame can resume
+    /// iteration. A failed seek clears nothing. Every repositioning method
+    /// ([`Self::seek_raw`], [`Self::blob_from_offset`]) shares this rule.
     ///
     /// # Example
     /// ```
@@ -1113,12 +1117,10 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// buffer when the target lies inside it.
     ///
     /// A successful seek clears the sticky error state set by a previous
-    /// failing `next()`, so callers that recover from a parse error by
-    /// seeking past the bad blob can resume iteration.
+    /// failing `next()`, as [`Self::seek`] does, so callers that recover
+    /// from a parse error by seeking past the bad blob can resume iteration.
     pub fn seek_raw(&mut self, pos: SeekFrom) -> Result<u64> {
-        let offset = self.frames.seek(pos)?;
-        self.frames.clear_failure();
-        Ok(offset)
+        self.frames.seek(pos)
     }
 
     /// Read and return next [`BlobHeader`] but skip the following [`Blob`]. This allows really fast

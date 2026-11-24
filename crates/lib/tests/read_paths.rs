@@ -929,6 +929,49 @@ fn blobreader_seek_raw_clears_error_state() {
     assert_eq!(blob.get_type(), BlobType::OsmHeader);
 }
 
+/// Every repositioning method shares one recovery rule: a successful seek
+/// after a failure resumes both `next` and `next_header_skip_blob`.
+#[test]
+fn every_blobreader_seek_resumes_a_failed_reader() {
+    let dir = crate::common::test_scratch();
+    let good_path = dir.path().join("good.osm.pbf");
+    write_test_pbf(&good_path);
+    let mut bytes = std::fs::read(&good_path).unwrap();
+    bytes.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]);
+
+    let failed = || {
+        let mut reader = BlobReader::new_seekable(std::io::Cursor::new(bytes.clone())).unwrap();
+        while let Ok(_blob) = reader.next().unwrap() {}
+        assert!(
+            reader.next().is_none(),
+            "reader must stay dead until a seek"
+        );
+        assert!(reader.next_header_skip_blob().is_none());
+        reader
+    };
+
+    let mut reader = failed();
+    reader.seek(ByteOffset(0)).unwrap();
+    assert_eq!(
+        reader.next().unwrap().unwrap().get_type(),
+        BlobType::OsmHeader
+    );
+
+    let mut reader = failed();
+    reader.seek(ByteOffset(0)).unwrap();
+    let (header, offset) = reader.next_header_skip_blob().unwrap().unwrap();
+    assert_eq!(header.blob_type(), BlobType::OsmHeader);
+    assert_eq!(offset, Some(ByteOffset(0)));
+
+    let mut reader = failed();
+    reader.seek_raw(SeekFrom::Start(0)).unwrap();
+    assert!(reader.next_header_skip_blob().unwrap().is_ok());
+
+    let mut reader = failed();
+    let blob = reader.blob_from_offset(ByteOffset(0)).unwrap();
+    assert_eq!(blob.get_type(), BlobType::OsmHeader);
+}
+
 /// next_header_skip_blob scans all headers without decoding blob content.
 #[test]
 fn blobreader_next_header_skip_blob() {

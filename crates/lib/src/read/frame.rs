@@ -266,7 +266,7 @@ pub(crate) fn partial_index_error() -> Error {
 /// Dropping the walk with a payload pending is fine (a probe that stops at a
 /// header); asking for another header first is a bug and an error. Any
 /// located failure ends the walk: every later call is an error until
-/// [`Self::reposition`] and [`Self::clear_failure`], because a source that
+/// a successful [`Self::seek`], because a source that
 /// failed partway through a frame would otherwise have the rest of that frame
 /// read as the next one.
 #[derive(Clone, Debug)]
@@ -454,7 +454,8 @@ impl<S> Frames<S> {
     /// error would name the wrong frame. A failed move loses both the
     /// position and the count: the walk goes on as a positionless one, which
     /// names no offset and no blob and never takes an OSMHeader as leading.
-    /// A failure is not cleared: see [`Self::clear_failure`].
+    /// A failure is not cleared here: [`Self::seek`] clears it on success,
+    /// and a failed move keeps whatever failure the walk already carried.
     pub(crate) fn reposition(&mut self, pos: Option<u64>) {
         self.pending = None;
         // A refusing walk stays refusing, but what it saw before the move is
@@ -465,11 +466,6 @@ impl<S> Frames<S> {
         }
         self.pos = pos;
         self.next_ordinal = pos.and_then(|pos| (pos == 0 && self.stream_start == 0).then_some(0));
-    }
-
-    /// Resume a walk that a failure ended, after the caller repositioned it.
-    pub(crate) fn clear_failure(&mut self) {
-        self.failed = false;
     }
 
     /// The location of frame `id` in this walk's input.
@@ -721,13 +717,21 @@ impl<S: FrameSkip> Frames<S> {
 }
 
 impl<S: Read + std::io::Seek> Frames<S> {
-    /// Seek the source to `pos` and reposition the walk there. A failure
-    /// leaves the position unknown and is located at the target when the
-    /// target is absolute.
+    /// Seek the source to `pos` and reposition the walk there. A successful
+    /// seek resumes a walk an earlier failure ended: the source now stands
+    /// at a position the caller chose, so what failed before no longer
+    /// governs what is read next. This is the one place a failure is
+    /// cleared, so every public seek of every reader shares it. (A sealed
+    /// invocation is not resurrected: the public iteration methods take
+    /// admission before every read, and a sealed one fails again there.)
+    /// A failed seek leaves the position unknown, keeps any failure the
+    /// walk carried, and is located at the target when the target is
+    /// absolute.
     pub(crate) fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
         match std::io::Seek::seek(&mut self.src, pos) {
             Ok(offset) => {
                 self.reposition(Some(offset));
+                self.failed = false;
                 Ok(offset)
             }
             Err(e) => {
@@ -1025,7 +1029,7 @@ mod tests {
         assert!(walk.failed());
         assert!(walk.next_header().is_err(), "a failed walk stays failed");
         walk.seek(std::io::SeekFrom::Start(0)).unwrap();
-        walk.clear_failure();
+        assert!(!walk.failed(), "a successful seek resumes the walk");
         assert_eq!(walk.next_header().unwrap().unwrap().id.ordinal, Some(0));
     }
 

@@ -954,7 +954,7 @@ impl<'a> BlockPairSide<'a> {
     }
 
     /// The payload of the current blob, for the byte comparison.
-    fn payload(&self, desc: &BlobDesc) -> Result<Option<(u8, &[u8])>> {
+    fn payload(&self, desc: &BlobDesc) -> Result<Option<crate::blob::BlobDecodeKey<'_>>> {
         crate::blob::raw_blob_payload(self.body()).map_err(|e| self.locate(desc, e))
     }
 
@@ -1415,8 +1415,11 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
     Ok(())
 }
 
-/// Whether a fresh pending pair has identical index claims, compression kind
-/// and compressed bytes. Two such blobs hold identical elements. Never for a
+/// Whether a fresh pending pair has identical index claims, compression kind,
+/// declared `raw_size` and compressed bytes - every envelope input the
+/// decoder reads, so the two decode alike or fail alike, and the pair is
+/// believed without decoding either (a corrupt payload or a false claim in a
+/// skipped pair goes unseen; nothing here validates). Never for a
 /// pair crossing the window: a clipped block's count is not its claim.
 /// The envelopes are parsed (and a malformed one refused) only for a pair
 /// whose claims match.
@@ -1447,7 +1450,7 @@ fn blobs_byte_equal(
     let a = old.payload(op)?;
     let b = new.payload(np)?;
     Ok(match (a, b) {
-        (Some((ak, ab)), Some((bk, bb))) => ak == bk && ab == bb,
+        (Some(a), Some(b)) => a == b,
         _ => false,
     })
 }

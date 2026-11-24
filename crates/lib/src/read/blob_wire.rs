@@ -372,7 +372,9 @@ pub(crate) enum PayloadKind {
 /// A `Blob` envelope, borrowed: the payload's encoding and bytes, and the
 /// declared `raw_size`. The one parser of the `Blob` message, shared by the
 /// owned [`WireBlob`], direct decompression and blob payload comparison, so
-/// an envelope one route refuses every route refuses.
+/// an envelope that does not parse is refused by every route. What follows
+/// the parse differs: the decoding routes also decompress and cross-check
+/// `raw_size`, the comparison does neither.
 pub(crate) struct BlobEnvelope<'a> {
     pub payload: Option<(PayloadKind, &'a [u8])>,
     pub raw_size: Option<i32>,

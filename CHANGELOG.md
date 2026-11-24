@@ -730,6 +730,17 @@
 
 ### Fixed
 
+- **`BlobReader::seek` resumes a reader a failed read stopped.** After
+  `next()` or `next_header_skip_blob()` returned an error, a successful
+  `seek` still left both returning `None`, while `seek_raw` and
+  `blob_from_offset` resumed. Every successful seek now clears the sticky
+  error; a failed seek clears nothing.
+- **`diff`'s byte-equality shortcut also compares the declared
+  `raw_size`.** Two blobs with identical compression and compressed bytes
+  but different declared sizes were skipped as equal, though decoding
+  refuses at least one of them, or treats them alike only when one
+  declares no size. Such a pair is now decoded, so the refusal surfaces.
+
 - **`apply-changes` re-cuts oversize blocks without the strings the
   changes removed.** When a rewritten block outgrew 32 MiB, the blocks it
   was cut into each carried the source block's whole string table. A

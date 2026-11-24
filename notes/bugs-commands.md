@@ -29,19 +29,6 @@ counting (BUG-022) and cat decode counters (since fixed: cat counts
 each blob's fate and the payloads it opened). Entries are in no
 order of importance.
 
-## CMD-065 - renumber overrides an explicit zlib level 6 with level 1
-
-Reported by: spar partner during the checked-compression-level work.
-
-`renumber` (`commands/renumber/mod.rs`) substitutes zlib level 1 whenever
-`WriteOptions.compression == Compression::default()`, because the CLI
-flattens the shared `--compression` argument and cannot tell omission from an
-explicit `zlib` or `zlib:6`. `docs/cli/commands.md` documents the wart. A
-library caller asking for level 6 also silently gets level 1. Proposed fix:
-give renumber a command-specific CLI default of `zlib:1` and have the library
-honour `WriteOptions.compression` verbatim; update the docs and CHANGELOG, and
-test the chosen level directly (a decode round trip passes at either level).
-
 ## CMD-052 - OSC readers accept undeclared entities and a misplaced DOCTYPE
 
 Reported by: the XML 1.0 input character check (spar with codex).
@@ -83,16 +70,6 @@ unindexed, `diff --format osc -j 1 -o changes.osc.gz` can start a compression
 pool that uses every reported core. This contradicts the documented rule in
 `docs/cli/commands.md` that `N` caps worker pools at `N`. These are
 compression workers, not the separately exempted reader or drain threads.
-
-## CMD-017 - wait_ready emits a WAIT span before confirming it parked
-
-Reported by: altw (lateral observation).
-
-`wait_ready` (`altw/external/coord_payloads.rs`) starts its `WAIT_*` span
-before confirming a Condvar park, so a publication racing the first check
-emits a wait span without blocking. The nanosecond stall counter is correctly
-gated, but the marker span is not. The repository's convention is to emit
-`WAIT_*` pairs only on genuine blocks.
 
 ## CMD-053 - renumber's group policy for non-element fields differs by kind
 

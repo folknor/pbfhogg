@@ -233,6 +233,48 @@ fn cli_renumber() {
 }
 
 #[test]
+fn cli_renumber_honors_explicit_zlib_level_six() {
+    use crate::common::adversarial::{locate_blobs, read_bytes_field};
+
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_minimal_sorted_pbf(&input);
+
+    for (args, expected_flevel) in [
+        (&[][..], 0),
+        (&["--compression", "zlib"][..], 2),
+        (&["--compression", "zlib:6"][..], 2),
+    ] {
+        let output = dir.path().join("output.osm.pbf");
+        let result = CliInvoker::new(&invocation_scratch)
+            .arg("renumber")
+            .arg(input.as_os_str())
+            .arg("-o")
+            .arg(output.as_os_str())
+            .args(args.iter().copied())
+            .run();
+        assert!(
+            result.status.success(),
+            "renumber {args:?} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let bytes = std::fs::read(&output).expect("output");
+        let frames = locate_blobs(&bytes);
+        assert!(frames.len() > 1, "expected data frames");
+        for frame in frames {
+            let zlib =
+                read_bytes_field(&bytes[frame.blob_start..frame.blob_end], 3).expect("zlib_data");
+            // The writer's zlib backend emits FLEVEL 0 for level 1 and
+            // FLEVEL 2 for level 6, in the high two bits of FLG.
+            assert_eq!(zlib[1] >> 6, expected_flevel, "{args:?}");
+        }
+        std::fs::remove_file(output).expect("remove tested output");
+    }
+}
+
+#[test]
 fn cli_renumber_custom_start_id() {
     let invocation_scratch = pbfhogg_test_scratch::scratch();
     let dir = crate::common::test_scratch();

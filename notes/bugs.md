@@ -69,13 +69,6 @@ Reported by: apply-core.
 Samples are inserted only in the two passthrough arms; rewritten and create
 frames never contribute, though `stats.rs` labels the result blob sizes.
 
-## BUG-021 - renumber turns explicit zlib:6 into zlib:1
-
-Reported by: sort.
-
-Compression selection (`renumber/mod.rs`) maps explicit `zlib:6` to `zlib:1`;
-disclosed in CLI source but an observable trap for any pipeline rewrite.
-
 ## BUG-024 - Export keeps decoding after a write failure
 
 Reported by: spatial.

@@ -1007,7 +1007,9 @@ impl<W: Write> PbfWriter<W> {
     /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).
     pub fn write_header(&mut self, header_block_bytes: &[u8]) -> Result<()> {
         let _call = self.cancel.call();
-        let result = self.write_blob("OSMHeader", header_block_bytes);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_blob("OSMHeader", header_block_bytes));
         let result = self.poison_on_error(result);
         if result.is_ok() {
             self.mark_pending();

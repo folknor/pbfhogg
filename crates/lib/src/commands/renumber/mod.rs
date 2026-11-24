@@ -57,7 +57,6 @@ use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
 use crate::error::Error;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::write::WriteOptions;
-use crate::writer::{Compression, ZlibLevel};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -377,7 +376,7 @@ fn effective_start(start: i64) -> i64 {
 /// stage 2d rewrites ways with resolved refs (parallel wire-format
 /// splice), R1 collects relation IDs into an IdSet, R2d rewrites
 /// relations with resolved member refs (parallel wire-format splice).
-/// No temp files.
+/// No temp files. Output uses the compression in `WriteOptions`.
 ///
 /// Refuses input whose node, way or relation IDs do not strictly ascend in
 /// canonical order in file order (see the module docs), and a start from
@@ -450,19 +449,6 @@ pub(crate) fn renumber_external_to<'a>(
         "Input PBF",
         "Renumber assigns IDs by file position and resolves references by rank.",
     )?;
-    // Preserve the external-renumber zlib:1 default documented in
-    // reference/performance/renumber.md. This legacy value-based API cannot distinguish
-    // omitted compression from an explicit Zlib(6): both arrive as the same
-    // Compression value and both select level 1 here. Other values pass through.
-    // Removing this branch would change the default on the measured write path.
-    // Honoring explicit level 6 while retaining the default requires carrying
-    // omission separately (for example Option<Compression>) from CLI parsing
-    // through this entry point and migrating its library callers together.
-    let effective_compression = if compression == Compression::default() {
-        Compression::Zlib(ZlibLevel::FAST)
-    } else {
-        compression
-    };
     // The writer fills the output's staging file; `renumber_external`
     // publishes it only after this function has succeeded.
     // Renumbered content has left the feed's ID space: the feed's diffs
@@ -470,7 +456,7 @@ pub(crate) fn renumber_external_to<'a>(
     // field is carried (osmium renumber writes a fresh header too).
     let mut writer = writer_from_header(
         output,
-        effective_compression,
+        compression,
         &header,
         &super::output_header::OutputFacts {
             replication: super::output_header::Replication::Drop,

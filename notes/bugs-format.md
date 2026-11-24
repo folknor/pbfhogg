@@ -95,17 +95,6 @@ library's range). A fix would build the context with `CCtx::try_create()`
 and set the level through `zstd_safe` directly in `write/framing.rs`.
 Allocation-failure class; low priority.
 
-## FMT-018 - PbfWriter::write_header skips the cancellation checkpoint
-
-Reported by: write-backends [P2].
-
-Every other public write entry in `write/writer.rs` checks cancellation, but
-`write_header` frames and writes directly. A synchronous writer created with
-`PbfWriter::new_in` accepts and writes a header after its invocation is
-cancelled, and returns success. This contradicts the per-write cancellation
-contract documented next to it. Publication still prevents a cancelled staged
-output from being published. The defect is in the write method's behaviour.
-
 ## FMT-024 - path_guard same_file stringifies the original I/O error
 
 Reported by: filesystem-output [P2].

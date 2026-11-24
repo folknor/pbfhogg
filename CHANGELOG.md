@@ -697,6 +697,13 @@
 
 ### Fixed
 
+- `renumber --compression zlib` and `--compression zlib:6` now use level
+  6. Omitting the CLI flag still uses level 1. The library honors the
+  compression in `WriteOptions`, whose default is level 6.
+
+- `PbfWriter::write_header` now returns a cancellation error before
+  writing any bytes when its invocation is already cancelled.
+
 - Corrected the osmium parity guides to use `inspect --extended` and
   osmium's `header.boxes` key, and to distinguish osmium's whole-file
   `show` pager from the single-element lookup in `inspect --show`.

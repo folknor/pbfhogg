@@ -128,8 +128,7 @@ pub(super) struct ConcurrentBlobLocationRouter {
     // Depth-gated WAIT span for stage-4 threads waiting in `wait_ready`
     // (stage 3 behind stage 4). Its marker pair appears in
     // `brokkr sidecar --durations`; `--stalls` reads `*_wait_ns` counters.
-    // Only the slow path below touches it, so the already-published fast
-    // path stays lock-free.
+    // Only a waiter that reaches the Condvar touches the gauge.
     wait_gauge: crate::counters::StallGauge,
     // Emitted as `s4_readiness_wait_ns`, the `--stalls` view of the stage 3
     // to stage 4 handoff: nanoseconds from a `wait_ready` caller's first
@@ -451,13 +450,9 @@ impl ConcurrentBlobLocationRouter {
             }
         }
         // Slow path: wait on the global Condvar, re-checking predicates.
-        // The initial published-slot fast path returned, so only the
-        // readiness-wait path below enters the WAIT_S4_ROUTER duration span.
-        let _stall = self.wait_gauge.track();
-        // Started at the first real Condvar park, not at the fast-path miss:
-        // a publication racing the miss, or an abort or producer-done seen on
-        // the first recheck, returns without waiting and records nothing.
-        let mut blocked: Option<crate::counters::Stopwatch> = None;
+        // A publication, abort or completion seen on the first recheck
+        // returns without waiting and records neither a span nor stall time.
+        let mut blocked = None;
         // loop-ends: parks on `notify` under notify_mu; every publication,
         // abort and producer-done notifies under that lock, rechecked here
         let outcome = loop {
@@ -486,7 +481,7 @@ impl ConcurrentBlobLocationRouter {
                 }
             }
             if blocked.is_none() {
-                blocked = Some(crate::counters::Stopwatch::start());
+                blocked = Some((self.wait_gauge.track(), crate::counters::Stopwatch::start()));
             }
             // Test-only: the gate is still held, so a terminal change the
             // witness lets through must notify after this thread parks.
@@ -498,8 +493,8 @@ impl ConcurrentBlobLocationRouter {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
         };
-        if let Some(blocked) = blocked {
-            blocked.record_ns(&self.readiness_wait_ns);
+        if let Some((_stall, stopwatch)) = blocked {
+            stopwatch.record_ns(&self.readiness_wait_ns);
         }
         outcome
     }

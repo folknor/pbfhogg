@@ -592,7 +592,7 @@ fn locate_indexdata(header: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn read_bytes_field(msg: &[u8], target_field: u64) -> Option<Vec<u8>> {
+pub fn read_bytes_field(msg: &[u8], target_field: u64) -> Option<Vec<u8>> {
     let mut pos = 0;
     while pos < msg.len() {
         let (tag, np) = read_varint(&msg[pos..])?;

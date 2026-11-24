@@ -4,8 +4,8 @@
 -- No cache preparation. Child wall matches the typed workload; iteration
 -- wall also includes Lua bookkeeping. Output is iteration-owned under
 -- bench-iterations on the host's resolved scratch. Compression is omitted by
--- default so the built revision chooses its own default. Current renumber
--- also maps explicit zlib and zlib:6 to zlib:1; forward them unchanged.
+-- default so the built revision chooses its own default. Explicit
+-- compression values are forwarded unchanged.
 -- Profiling and marker stops combine; a stop makes no complete-run claim.
 -- io_uring is absent because the typed command refuses it. Build features,
 -- commit selection and iteration counts belong to the bench runner.

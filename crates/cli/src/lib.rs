@@ -1701,11 +1701,6 @@ enum Command {
     /// canonical order (0, then -1, -2, ..., then 1, 2, ...). A reference to
     /// an element absent from the input gets an ID outside its kind's
     /// renumbered range, one per absent ID.
-    ///
-    /// Unlike the other commands, the --compression default here is zlib:1
-    /// (the measured external-renumber write path), not zlib:6. An explicit
-    /// `--compression zlib` or `zlib:6` also yields level 1; any other
-    /// value is honoured as given.
     Renumber {
         /// Input PBF file (must be sorted)
         file: PathBuf,
@@ -1720,8 +1715,9 @@ enum Command {
             value_parser = parse_start_ids
         )]
         start_id: StartIds,
-        #[command(flatten)]
-        compression: CompressionArg,
+        /// Compression: none, zlib (level 6), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib:1", value_parser = parse_compression)]
+        compression: Compression,
         #[command(flatten)]
         io: DirectIoArg,
         #[command(flatten)]
@@ -3034,7 +3030,7 @@ pub fn run() -> process::ExitCode {
                 } => {
                     let overrides = header.overrides();
                     let write = WriteOptions {
-                        compression: compression.compression,
+                        compression,
                         backend: OutputBackend::from_flags(io.direct_io, false),
                         direct_reads: io.direct_io,
                         force: false,

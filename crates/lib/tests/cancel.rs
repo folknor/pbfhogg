@@ -1473,6 +1473,22 @@ fn publication_refuses_once_the_token_is_tripped() {
     assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
 }
 
+#[test]
+fn a_cancelled_pbf_writer_refuses_to_write_the_header() {
+    use pbfhogg::block_builder::HeaderBuilder;
+    use pbfhogg::writer::PbfWriter;
+
+    let invocation = pbfhogg::host::Invocation::new();
+    let mut writer =
+        PbfWriter::new_in(Vec::new(), Default::default(), invocation.clone()).expect("writer");
+    let header = HeaderBuilder::new().build().expect("header");
+    invocation.cancel();
+
+    let err = writer.write_header(&header).expect_err("cancelled write");
+    assert!(err.is_cancelled(), "{err}");
+    assert!(writer.into_inner().expect("synchronous sink").is_empty());
+}
+
 /// A write through a cancelled `OutputWriter` fails the session, so even a
 /// caller that ignores the error cannot publish what it wrote.
 #[test]

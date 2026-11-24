@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::artefact::{CallOutcome, StreamAccount};
 use crate::describe;
-use crate::sidecar::{Counter, Sealing, Terminal};
+use crate::sidecar::{Counter, Marker, Sealing, Terminal};
 
 /// A sealed call: entry 10, return 50, seal 100, snapshot `{n: 3}`, the sink
 /// sealed with no drops.
@@ -33,8 +33,7 @@ fn doc() -> CallDoc {
 fn records(lines: &[&str]) -> Vec<Record> {
     lines
         .iter()
-        .enumerate()
-        .map(|(i, line)| {
+        .map(|line| {
             let parts: Vec<&str> = line.split(' ').collect();
             let (kind, call) = match parts[0].strip_prefix('X') {
                 Some(kind) => (kind, "b"),
@@ -43,7 +42,6 @@ fn records(lines: &[&str]) -> Vec<Record> {
             let ts: i64 = parts[1].parse().unwrap();
             match kind {
                 "M" => Record::Marker(Marker {
-                    marker_idx: i32::try_from(i).unwrap(),
                     timestamp_us: ts,
                     name: parts[2].to_owned(),
                     call: Some(call.to_owned()),
@@ -98,21 +96,16 @@ const GOOD: &[&str] = &[
 ];
 
 #[test]
-fn a_complete_stream_passes_with_its_phases_and_tail() {
+fn a_complete_stream_passes() {
+    // GOOD carries FLUSH after return_us: a legal post-return marker.
     let stream = judged(&doc(), GOOD, &CaptureLoss::default());
     assert_eq!(stream.status, Status::Pass, "{}", stream.detail);
-    assert_eq!(
-        stream.phases,
-        [("READ".to_owned(), 20), ("WRITE".to_owned(), 20)],
-        "the last phase ends at return_us"
-    );
-    assert_eq!(stream.tail, ["FLUSH"]);
-    // A marker stamped before entry fails the stream and is no phase.
+    // A marker stamped before entry fails the stream.
     let mut early = GOOD.to_vec();
     early.insert(0, "M 5 EARLY");
     let stream = judged(&doc(), &early, &CaptureLoss::default());
     assert_eq!(stream.status, Status::Fail);
-    assert_eq!(stream.phases[0].0, "READ");
+    assert_eq!(stream.detail, "`5 %a EARLY` lies outside entry_us..seal_us");
 }
 
 /// brokkr#62: only a sealing emission may not repeat a name; a marker

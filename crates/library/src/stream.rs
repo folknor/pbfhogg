@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::artefact::{CallDoc, Seal, SinkState, Status};
 use super::describe::Scenario;
-use crate::sidecar::{CallCensus, CaptureLoss, Marker, Record, SinkEnd, Timeline};
+use crate::sidecar::{CallCensus, CaptureLoss, Record, SinkEnd};
 
 /// Violations named in full before the rest are counted.
 use crate::tunables::VIOLATIONS_SHOWN;
@@ -21,10 +21,6 @@ pub(crate) struct CallStream {
     pub(crate) status: Status,
     /// Why it is not a pass; empty on a pass.
     pub(crate) detail: String,
-    /// Each phase's name and length in microseconds, in time order.
-    pub(crate) phases: Vec<(String, i64)>,
-    /// The markers after return, in time order.
-    pub(crate) tail: Vec<String>,
 }
 
 /// The failure a run's census proves: a tagged record named a call the
@@ -55,12 +51,8 @@ pub(crate) fn undeclared_failure(scenario: &Scenario, census: &CallCensus) -> Op
         .then(|| "the FIFO carried records of more call ids than describe declares".to_owned())
 }
 
-/// A u64 counter value as the wire carries it.
+/// A u64 counter value or timestamp as the wire carries it.
 fn saturated(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn to_ts(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
@@ -96,12 +88,7 @@ pub(crate) fn judge(
                         .to_owned(),
                 );
             }
-            return finish(
-                &order.violations,
-                Some("the call did not seal".to_owned()),
-                &mine,
-                doc,
-            );
+            return finish(&order.violations, Some("the call did not seal".to_owned()));
         }
     };
     snapshot_violations(&mut order, &mine, snapshot, doc, loss);
@@ -136,7 +123,7 @@ pub(crate) fn judge(
     }
     let unevaluated =
         (!incomplete.is_empty()).then(|| format!("incomplete: {}", incomplete.join("; ")));
-    finish(&order.violations, unevaluated, &mine, doc)
+    finish(&order.violations, unevaluated)
 }
 
 /// The sealing emissions and ordinary counters against the snapshot, and
@@ -203,9 +190,9 @@ fn snapshot_violations(
 /// The checks of arrival order and time a call's records must meet.
 fn order<'a>(mine: &[&'a Record], doc: &CallDoc) -> Order<'a> {
     let (entry, ret, seal_end) = (
-        to_ts(doc.entry_us),
-        to_ts(doc.return_us),
-        to_ts(doc.seal_us),
+        saturated(doc.entry_us),
+        saturated(doc.return_us),
+        saturated(doc.seal_us),
     );
     let mut found = Order::default();
     let mut terminals = 0usize;
@@ -273,14 +260,10 @@ fn order<'a>(mine: &[&'a Record], doc: &CallDoc) -> Order<'a> {
     found
 }
 
-/// The verdict from what was found, with the call's phases and tail.
-fn finish(
-    violations: &[String],
-    unevaluated: Option<String>,
-    mine: &[&Record],
-    doc: &CallDoc,
-) -> CallStream {
-    let (entry, ret) = (to_ts(doc.entry_us), to_ts(doc.return_us));
+/// The verdict from what was found. The verifier reports verdicts only:
+/// per-call timing views of the same FIFO are brokkr's sidecar views
+/// (`--durations`), so no phase or post-return summary is built here.
+fn finish(violations: &[String], unevaluated: Option<String>) -> CallStream {
     let (status, detail) = if violations.is_empty() {
         match unevaluated {
             Some(why) => (Status::Unevaluated, why),
@@ -301,36 +284,7 @@ fn finish(
         }
         (Status::Fail, detail)
     };
-    // A marker stamped before entry is neither a phase nor the tail (its
-    // time is a violation already).
-    let markers: Vec<Marker> = mine
-        .iter()
-        .filter_map(|r| match r {
-            Record::Marker(m) if m.timestamp_us >= entry => Some(m.clone()),
-            _ => None,
-        })
-        .collect();
-    let (phase_markers, tail_markers): (Vec<Marker>, Vec<Marker>) =
-        markers.into_iter().partition(|m| m.timestamp_us <= ret);
-    let phases = Timeline::closed(&phase_markers, ret)
-        .segments()
-        .into_iter()
-        .map(|s| {
-            let len = s.end_us.unwrap_or(s.start_us).saturating_sub(s.start_us);
-            (s.name, len)
-        })
-        .collect();
-    let tail = Timeline::open(&tail_markers)
-        .marker_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    CallStream {
-        status,
-        detail,
-        phases,
-        tail,
-    }
+    CallStream { status, detail }
 }
 
 #[cfg(test)]

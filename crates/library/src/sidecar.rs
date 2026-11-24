@@ -2,8 +2,6 @@
 /// A phase marker emitted by the target process.
 #[derive(Debug, Clone)]
 pub struct Marker {
-    /// Arrival order across every stream of one run.
-    pub marker_idx: i32,
     pub timestamp_us: i64,
     pub name: String,
     /// The call stream (`%<call_id>` on the wire), or `None` for the
@@ -86,13 +84,11 @@ impl FifoRecord<'_> {
         }
     }
 
-    /// The record to keep; a marker takes `marker_idx`. `None` for a line
-    /// that carries none.
-    fn into_record(self, marker_idx: i32) -> Option<Record> {
+    /// The record to keep. `None` for a line that carries none.
+    fn into_record(self) -> Option<Record> {
         Some(match self {
             Self::Blank | Self::Rejected => return None,
             Self::Marker { ts, call, name } => Record::Marker(Marker {
-                marker_idx,
                 timestamp_us: ts,
                 name: name.to_owned(),
                 call: call.map(str::to_owned),
@@ -388,54 +384,11 @@ pub(crate) fn parse(
         if let Some(call) = parsed.call() {
             census.note(call, census_limit);
         }
-        if let Some(record) = parsed.into_record(i32::try_from(records.len()).unwrap_or(i32::MAX)) {
+        if let Some(record) = parsed.into_record() {
             records.push(record);
         }
     }
     (records, loss, census)
-}
-
-pub(crate) struct Timeline<'a> {
-    markers: Vec<&'a Marker>,
-    final_us: Option<i64>,
-}
-pub(crate) struct Segment {
-    pub name: String,
-    pub start_us: i64,
-    pub end_us: Option<i64>,
-}
-impl<'a> Timeline<'a> {
-    pub(crate) fn open(markers: &'a [Marker]) -> Self {
-        let mut markers: Vec<_> = markers.iter().collect();
-        markers.sort_by_key(|m| (m.timestamp_us, m.marker_idx));
-        Self {
-            markers,
-            final_us: None,
-        }
-    }
-    pub(crate) fn closed(markers: &'a [Marker], end: i64) -> Self {
-        let mut value = Self::open(markers);
-        value.final_us = Some(end);
-        value
-    }
-    pub(crate) fn marker_names(&self) -> Vec<&str> {
-        self.markers.iter().map(|m| m.name.as_str()).collect()
-    }
-    pub(crate) fn segments(&self) -> Vec<Segment> {
-        self.markers
-            .iter()
-            .enumerate()
-            .map(|(i, m)| Segment {
-                name: m.name.clone(),
-                start_us: m.timestamp_us,
-                end_us: self
-                    .markers
-                    .get(i + 1)
-                    .map(|n| n.timestamp_us)
-                    .or(self.final_us),
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]

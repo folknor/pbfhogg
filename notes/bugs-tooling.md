@@ -182,19 +182,6 @@ tests holding bare `is_err()`, discarded `unwrap_err`/`expect_err`, or
 ones out. The settled rulings and the remaining links (CLI refusal bar,
 source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
 
-## TOOL-050 - The library verifier computes call phases and tail markers nobody reads
-
-Reported by: the scout of the library call-stream verdict work (2026-11-24),
-verified at the code by the spar accountant; not a correctness defect.
-
-`stream::judge` (`crates/library/src/stream.rs`) fills `CallStream.phases`
-(each phase's name and length) and `CallStream.tail` (markers after the
-call returned) for every call, but `collect` in `crates/library/src/run.rs`
-reads only `status` and `detail`; the two fields are read only by
-`stream_tests.rs`, and reference/library-protocol.md says nothing about
-phases. Either the fields were meant to reach a report and that wiring is
-missing, or they are dead work to remove. Decide which.
-
 # From the 2026-11-21 verifier performance hunt
 
 Defects the performance hunters found while reading the code at `e8377a78`

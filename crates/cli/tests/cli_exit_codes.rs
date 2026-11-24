@@ -634,6 +634,7 @@ fn inspect_show_rejects_every_other_mode_flag() {
         vec!["--indexed"],
         vec!["--nodes"],
         vec!["--get", "header.bbox"],
+        vec!["--distrust-metadata"],
         vec!["-j", "2"],
         vec!["--force"],
     ] {

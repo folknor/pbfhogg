@@ -101,18 +101,3 @@ contract (`crates/verify/src/error.rs`, `reference/verify.md` Results) to
 distinguish an osmium limit from an incomplete reference, the open question
 TOOL-006 also raises; a local stderr match in extract alone was rejected as
 an exception to that contract. No verified dataset holds negative refs.
-
-## VER-156 - inspect --show beside --distrust-metadata is refused by no test
-
-Reported by: the spar accounting of the inspect --distrust-metadata refusal.
-
-`inspect --show` is a mode of its own: clap's `conflicts_with_all` on `show`
-in `crates/cli/src/lib.rs` lists `distrust_metadata` with every other
-inspect flag. The test that pins this,
-`inspect_show_rejects_every_other_mode_flag` in
-`crates/cli/tests/cli_exit_codes.rs`, loops over the other mode flags but
-leaves `--distrust-metadata` out, and the flag contract table `REFUSALS` in
-`crates/cli/tests/cli_flag_contract.rs` has no `--show` row for it, so
-dropping that conflict would go unnoticed. The `--show` row of
-`docs/cli/commands.md` also omits `--distrust-metadata` from its list of
-excluded flags, though it says "every other `inspect` flag".

@@ -697,6 +697,8 @@
 
 ### Fixed
 
+- Documented that `inspect --show` refuses `--distrust-metadata`.
+
 - **`add-locations-to-ways` accepts indexed way blocks in a non-default
   coordinate framing.** A way block whose `granularity` was not 100 or
   whose coordinate offsets were nonzero failed the run on indexed input,

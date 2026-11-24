@@ -587,6 +587,10 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["inspect", "IN", "--indexed", "--distrust-metadata"],
         "cannot be used with",
     ),
+    (
+        &["inspect", "IN", "--show", "n1", "--distrust-metadata"],
+        "cannot be used with",
+    ),
     // No blob metadata can change a header or file value, on either route.
     (
         &["inspect", "IN", "--get", "file.size", "--distrust-metadata"],

@@ -156,10 +156,13 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   coordinates and pass. An output never declares it when the input does
   not. On an input that declares it: `cat --type` on an input whose first
   data blob carries indexdata, `getid --invert` without a way ID,
-  `apply-changes --locations-on-ways`, sort and `cat --dedupe` (whose
-  operands all carry the input's header) must keep it, sort and
+  `apply-changes --locations-on-ways`, renumber, sort and `cat --dedupe`
+  (whose operands all carry the input's header) must keep it, sort and
   `cat --dedupe` because a rewritten way is re-encoded with its
-  coordinates; `getid --invert` with a way ID must drop it with the loss
+  coordinates, renumber because its splice copies them beside the
+  renumbered refs. osmium renumber's output never declares it, so the
+  renumber check judges the declaration only, never a coordinate value;
+  the CLI suite holds the values; `getid --invert` with a way ID must drop it with the loss
   warning. The kept declaration is what makes the element comparison read
   every coordinate. A `cat --dedupe` of operands that disagree on the
   declaration is not driven: the judgement reads one input header. The sort

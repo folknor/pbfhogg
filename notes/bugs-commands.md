@@ -65,20 +65,23 @@ reported through `scan_meta_attrs` / `delete_coords` as a bare "malformed
 OSC XML" (`xml_err`), naming neither element nor attribute. The CHANGELOG
 entry for the trailing-attribute fix promises the first wording generally.
 
-## CMD-071 - renumber drops the LocationsOnWays declaration it keeps the data for
+## CMD-074 - renumber could keep SharedNodePins-v1 it already carries
 
-Reported by: the renumber group-field item (2026-11-24), from the spar
-partner's source trace; not reproduced.
+Reported by: the renumber LocationsOnWays item (2026-11-24), spar
+session 01a20ea3-2302-7893-b81b-e3d577f46209.
 
-A sorted, indexed input declaring `LocationsOnWays` reaches renumber
-(neither `renumber/mod.rs` nor `schedule.rs` gates on the feature). The
-way splice keeps `Way.lat`/`Way.lon` (fields 9 and 10) paired with the
-renumbered refs and the block keeps granularity and offsets, so the
-coordinates survive, but `renumber/mod.rs` builds the output header with
-`Ways::Reencoded`, which in `output_header.rs` clears the declaration and
-warns of metadata loss. The output carries inline locations without the
-feature the schema requires for them. `Ways::ReencodedWithLocations`
-appears to be the matching policy; needs a test over an ALTW input.
+Renumber now keeps `LocationsOnWays` (`Ways::ReencodedWithLocations`) but
+drops and warns `pbfhogg.SharedNodePins-v1`, although its way splice
+copies field 20 byte for byte and the bitmap's meaning survives: live IDs
+map by rank onto one interval and orphans bijectively onto its
+complement (`IdSpace` in `renumber/wire_rewrite.rs`), so two ref
+positions name one node after renumbering exactly when they did before,
+and no node is dropped. `WayMembers-v1` must still go (field 5 is not
+written). Keeping pins needs an amendment to ADR-0007's producer rule
+(prepass features only on whole-blob copies from one input) and a header
+test that tracks pins through the way-ID mapping and expects pins and
+members separately. Maintainer decision: is a renumbered prepass file
+worth declaring pins on?
 
 ## CMD-024 - Polygon ring-area validation runs before antimeridian unwrapping
 

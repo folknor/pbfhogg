@@ -759,7 +759,7 @@ pub fn run(
         pbf,
         &pbfhogg_out,
         &captured,
-        crate::harness::WayLocations::Dropped,
+        crate::harness::WayLocations::Kept,
     )?;
 
     let pbfhogg_size = fs::metadata(&pbfhogg_out).map(|m| m.len()).unwrap_or(0);

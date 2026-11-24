@@ -455,13 +455,24 @@ pub(crate) fn renumber_external_to<'a>(
     // Renumbered content has left the feed's ID space: the feed's diffs
     // address other objects than the ones in this file, so no replication
     // field is carried (osmium renumber writes a fresh header too).
+    // The way splice rewrites only the ID and the refs, one new ref per old
+    // ref in place, and copies the inline coordinates (fields 9 and 10)
+    // beside them, as does every cut piece; the block keeps its granularity
+    // and offsets. So a declared `LocationsOnWays` stays true and is kept,
+    // trusted from the input like any copied way (osmium drops both the
+    // arrays and the declaration). Field 20 bytes ride along undeclared:
+    // the pin meaning survives the bijective renumbering, but ADR-0007
+    // declares the prepass features only on whole-blob copies, and field 5
+    // is not written at all.
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
         &super::output_header::OutputFacts {
             replication: super::output_header::Replication::Drop,
-            ..super::output_header::OutputFacts::sorted(super::output_header::Ways::Reencoded)
+            ..super::output_header::OutputFacts::sorted(
+                super::output_header::Ways::ReencodedWithLocations,
+            )
         },
         overrides,
         backend,

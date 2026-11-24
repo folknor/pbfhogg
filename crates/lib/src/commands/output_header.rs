@@ -78,9 +78,11 @@ pub(crate) enum Ways {
     /// (`degrade --strip-locations`), so it is not warned.
     Stripped,
     /// Ways are re-encoded with their inline coordinates (repack,
-    /// `apply-changes -l`, and sort and `cat --dedupe` when a way blob is
-    /// rewritten and every input declares `LocationsOnWays`); the prepass
-    /// fields are not written.
+    /// `apply-changes -l`, sort and `cat --dedupe` when a way blob is
+    /// rewritten and every input declares `LocationsOnWays`, and renumber,
+    /// whose splice rewrites only IDs and refs); the prepass features are
+    /// not declared. Renumber carries field 20 bytes undeclared, which
+    /// ADR-0007 leaves non-authoritative.
     ReencodedWithLocations,
     /// Every way payload is copied byte for byte, but some way blob headers
     /// are rebuilt (indexdata added to an unindexed blob), which drops field 5.

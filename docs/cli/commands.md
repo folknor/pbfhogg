@@ -480,7 +480,8 @@ fails with an error rather than write a header that lies.
 | `repack` | input's | `LocationsOnWays` |
 | `degrade` (header-only flags) | input header, verbatim | input header, verbatim |
 | `degrade` (re-encoding flags) | input's, not sorted under `--unsort*` | none |
-| `renumber`, `time-filter` | sorted (both require sorted input) | none |
+| `renumber` | sorted (requires sorted input) | `LocationsOnWays` |
+| `time-filter` | sorted (requires sorted input) | none |
 | `tags-filter`, `getid`, `getparents`, `extract` | input's | none |
 | `getid --invert` | input's | all when no way ID is requested, else none (even when no requested way exists) |
 | `add-locations-to-ways` | input's | `LocationsOnWays`, plus the prepass features with `--inject-prepass` |
@@ -1646,6 +1647,15 @@ length-delimited message is refused (exit 2).
 The output header carries no replication state: the new IDs are not the
 feed's, so its diffs would address other objects (see
 [Output header](#output-header)).
+
+A way keeps its inline coordinates: renumber rewrites only a way's ID and
+refs, one new ref in place of each old one, so the coordinates stay paired
+with their refs, and an input declaring `LocationsOnWays` yields an output
+declaring it. osmium renumber drops both the coordinates and the
+declaration. The prepass features (`pbfhogg.WayMembers-v1`,
+`pbfhogg.SharedNodePins-v1`) are not declared and are warned
+(`header.way_metadata_loss`); a way's field-20 bytes are carried, but
+without the declaration nothing vouches for them.
 
 ```
 pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>

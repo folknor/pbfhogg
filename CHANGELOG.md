@@ -15,6 +15,14 @@
   inputs that do not all declare the feature, and `time-filter` (whose
   coordinates would not be as of the cutoff), drop them as before.
 
+- **`renumber` keeps the `LocationsOnWays` declaration.** Renumber always
+  carried each way's inline coordinates beside its renumbered refs, but
+  wrote a header without `LocationsOnWays` and warned
+  `header.way_metadata_loss`. An input declaring it now yields an output
+  declaring it, with no warning for it, so way export, `diff --locations`
+  and `digest --form content-locations` accept the output. The prepass
+  features are still dropped and warned.
+
 - **OSC readers refuse what XML forbids lexically, as osmium does.**
   `apply-changes`, `merge-changes` and `tags-filter --input-kind osc`
   now refuse (exit `2`) an undeclared entity reference anywhere (also

@@ -536,10 +536,13 @@ const ROWS: &[Row] = &[
         label: "renumber",
         build: |fx, f| simple(fx, "renumber", &[fx.path(f)], &[]),
         // New IDs leave the feed's ID space: no replication field survives.
+        // The splice keeps each way's inline coordinates, so a declared
+        // LocationsOnWays is kept; the prepass features are not.
         expect: |f| {
             sorted_only(
                 f,
                 Exp {
+                    low: f.low(),
                     ts: None,
                     seq: None,
                     url: None,
@@ -1300,6 +1303,50 @@ fn raw_copying_commands_keep_the_enrichment_their_blobs_carry() {
             assert_eq!(pins.get(id), Some(p), "{args:?}: way {id}");
         }
     }
+}
+
+/// Each way's inline coordinates, in file order, as decimicrodegree pairs.
+fn way_coordinates(path: &Path) -> Vec<Vec<(i32, i32)>> {
+    let mut ways = Vec::new();
+    for blob in BlobReader::from_path(path).unwrap() {
+        let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() else {
+            continue;
+        };
+        for element in block.elements() {
+            if let Element::Way(w) = element {
+                ways.push(
+                    w.node_locations()
+                        .map(|l| (l.decimicro_lat().unwrap(), l.decimicro_lon().unwrap()))
+                        .collect(),
+                );
+            }
+        }
+    }
+    ways
+}
+
+/// Renumber's splice rewrites a way's ID and refs only, so the header row's
+/// coverage check is not enough: every way must come out at its rank with the
+/// very coordinates it went in with, and the kept declaration is not warned.
+#[test]
+fn renumber_keeps_every_inline_coordinate_of_a_located_input() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let fx = Fx::new(&[Fixture::Low]);
+    let input = fx.path(Fixture::Low);
+    let (args, outputs) = simple(&fx, "renumber", std::slice::from_ref(&input), &[]);
+    let out = CliInvoker::new(&invocation_scratch)
+        .args(&args)
+        .assert_success();
+    assert!(
+        !out.stderr_str().contains("LocationsOnWays"),
+        "renumber warned about a declaration it keeps: {}",
+        out.stderr_str()
+    );
+    assert!(read_header(&outputs[0]).has_locations_on_ways());
+    let before = way_coordinates(&input);
+    assert_eq!(before.len(), usize::try_from(WAYS).unwrap());
+    assert!(before.iter().all(|w| !w.is_empty()));
+    assert_eq!(way_coordinates(&outputs[0]), before);
 }
 
 /// The raw-copying paths decide their header from the first data blob's

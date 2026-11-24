@@ -282,3 +282,17 @@ present and lon missing or shorter yields a shortened (possibly empty) node
 list. pbfhogg refuses such a block at construction
 (`validate_way_geometry_arrays`, `read/block.rs`). DEVIATIONS.md has no
 entry for this difference.
+
+## DOC-043 - The reading guide implies field 20 needs an opt-in
+
+Reported by: the renumber LocationsOnWays item (2026-11-24), spar
+session 01a20ea3-2302-7893-b81b-e3d577f46209.
+
+`docs/guide/reading.md` "WayMembers-v1 / SharedNodePins-v1 (opt-in)" says
+reading the two extensions back requires opting in. `set_parse_waymembers`
+gates only BlobHeader field 5; `Way::shared_node_pins()` returns field 20
+whenever the bytes are present, whatever the header declares. ADR-0007
+makes field 20 authoritative only where `pbfhogg.SharedNodePins-v1` is
+declared, and splice outputs (apply-changes, renumber) carry it
+undeclared, so the guide should tell a caller to check
+`HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.

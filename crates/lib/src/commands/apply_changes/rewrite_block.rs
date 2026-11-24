@@ -329,8 +329,9 @@ pub(super) fn write_op<O: BlockSink + ?Sized>(
 /// framing refusal is recorded, not returned, and once the walk has ended
 /// its elements are written again in smaller blocks that carry only the
 /// strings they use (`overflow.rs`); only a single element that overflows
-/// even with its own strings alone, or a recovery past its byte budget,
-/// fails the rewrite, with that framing error. A recorded overflow outranks
+/// even with its own strings alone fails the rewrite, with its framing
+/// error, and so does a recovery past its byte budget, with the budget
+/// error (`ErrorKind::OverflowReplayBudget`). A recorded overflow outranks
 /// any later error of the walk, as it would have had it been returned at
 /// its flush.
 #[allow(clippy::too_many_arguments)]

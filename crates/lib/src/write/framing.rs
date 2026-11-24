@@ -1842,7 +1842,11 @@ mod tests {
             ),
             "the writer must refuse with BlobTooLarge, got: {err}"
         );
-        assert!(err.to_string().contains("fewer elements per blob"), "{err}");
+        // The fact, never a remedy: most callers cannot lower their cap, and
+        // the front end that can adds its own advice.
+        let text = err.to_string();
+        assert!(text.contains("must be"), "{text}");
+        assert!(!text.contains("fewer elements"), "{text}");
     }
 
     /// An oversize `WayMembers-v1` bitmap is a hard error, and the message

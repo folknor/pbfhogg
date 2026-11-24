@@ -24,8 +24,8 @@
 //! alternating with large OSC values, no longer carry the dead string into
 //! every frame.
 //!
-//! Where the compact strategy ends in a framing refusal (a single element,
-//! or the budget), the whole-table one runs from scratch: survivors' blocks
+//! Where the compact strategy ends in a framing refusal (a single element)
+//! or passes its budget, the whole-table one runs from scratch: survivors' blocks
 //! carry the source table as in the first pass, the attempt starts
 //! unseeded so OSC elements before the first survivor go into a block
 //! without it, and a block that still overflows is halved. Compact output
@@ -41,7 +41,10 @@
 //! `APPLY_CHANGES_OVERFLOW_REPLAY_BYTES` of frames for one blob (as when its
 //! changes carry that many bytes of large values between them, or one large
 //! string is shared by many changed elements that must be cut apart: the
-//! worker holds a blob's frames until its rewrite ends). Halving finds a
+//! worker holds a blob's frames until its rewrite ends). The first is
+//! refused with that element's own framing error; the second with
+//! `ErrorKind::OverflowReplayBudget`, which names the allowance and carries
+//! the overflowed block's framing refusal as its source. Halving finds a
 //! fitting partition whenever every element fits alone; it can miss one
 //! that exists only because string index widths shrink when two elements
 //! share a table, which needs blocks within bytes of the limit.
@@ -88,8 +91,10 @@ pub(super) struct RewriteSink<'a> {
     next_op: usize,
     block_start: usize,
     pub(super) overflows: Vec<Overflow>,
-    /// A recovery attempt's byte allowance for the frames it holds, and the
-    /// error refusing past it; `None` for a rewrite's first pass.
+    /// A recovery attempt's byte allowance for the frames it holds (what the
+    /// blob's budget has left), and the block refusal that started the
+    /// recovery, carried by the budget error raised past it; `None` for a
+    /// rewrite's first pass.
     cap: Option<(usize, Error)>,
     held: usize,
 }
@@ -133,7 +138,10 @@ impl BlockSink for RewriteSink<'_> {
                 self.held = self.held.saturating_add(frame.1.len());
             }
             if self.held > *cap {
-                return Err(refusal.clone());
+                return Err(crate::error::new_overflow_replay_budget(
+                    APPLY_CHANGES_OVERFLOW_REPLAY_BYTES as u64,
+                    refusal.clone(),
+                ));
             }
         }
         Ok(())
@@ -183,13 +191,13 @@ impl Replay<'_, '_> {
         }
         let mut frame_ns = 0;
         // The compact strategy first; where it ends in a framing refusal
-        // (a single element, or the budget), the whole-table one, which
+        // (a single element) or its budget, the whole-table one, which
         // refuses only what this replay refused before the compact one
         // existed. Neither touches `frames` until one has succeeded, so a
         // failed strategy leaves nothing behind.
         let pieces = match self.recover(&ops, overflows, Strategy::Compact, &mut frame_ns) {
             Ok(pieces) => pieces,
-            Err(e) if is_block_overflow(&e) => {
+            Err(e) if is_block_overflow(&e) || is_budget_refusal(&e) => {
                 self.recover(&ops, overflows, Strategy::WholeTable, &mut frame_ns)?
             }
             Err(e) => return Err(e),
@@ -359,6 +367,12 @@ impl Replay<'_, '_> {
     }
 }
 
+/// Whether `error` is a strategy passing its replay budget
+/// ([`ErrorKind::OverflowReplayBudget`](crate::ErrorKind::OverflowReplayBudget)).
+fn is_budget_refusal(error: &Error) -> bool {
+    matches!(error.kind(), crate::ErrorKind::OverflowReplayBudget { .. })
+}
+
 /// How a replay writes an overflowed block's elements again.
 #[derive(Clone, Copy)]
 enum Strategy {
@@ -375,4 +389,55 @@ enum Strategy {
 struct Budget {
     left: usize,
     frame_ns: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RewriteSink, is_budget_refusal};
+    use crate::block_builder::BlockBuilder;
+    use crate::commands::{BlockSink, FramedBlocks, is_block_overflow};
+    use crate::write::metrics::WriterMetrics;
+    use crate::writer::Compression;
+    use crate::{ErrorKind, OversizePart};
+
+    /// A recovery attempt past what its blob's budget has left is refused
+    /// with the budget's own error, naming the whole allowance and carrying
+    /// the block refusal that started the recovery as its source; it is not
+    /// a block overflow, so no sink records it as one.
+    #[test]
+    fn an_attempt_past_its_allowance_is_refused_with_the_budget_error() {
+        let trigger = crate::error::new_blob_too_large(OversizePart::Payload, 40, 32);
+        let metrics = WriterMetrics::new();
+        let mut sink = RewriteSink::new(FramedBlocks::new(Compression::None, &metrics));
+        sink.cap = Some((1, trigger));
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 10, 20, [("name", "a")], None);
+        let Err(err) = sink.flush(&mut bb) else {
+            panic!("a frame past a one-byte allowance must be refused");
+        };
+        assert!(is_budget_refusal(&err), "{err}");
+        assert!(!is_block_overflow(&err), "{err}");
+        let ErrorKind::OverflowReplayBudget { limit, trigger } = err.kind() else {
+            panic!("expected the budget error, got {err}");
+        };
+        assert_eq!(
+            *limit,
+            super::APPLY_CHANGES_OVERFLOW_REPLAY_BYTES as u64,
+            "the whole allowance, not what was left of it"
+        );
+        assert!(matches!(
+            trigger.kind(),
+            ErrorKind::BlobTooLarge {
+                part: OversizePart::Payload,
+                ..
+            }
+        ));
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<crate::Error>())
+            .map(crate::Error::kind);
+        assert!(matches!(source, Some(ErrorKind::BlobTooLarge { .. })));
+        let report = err.report();
+        assert!(report.contains("allowance"), "{report}");
+        assert!(report.contains("must be at most 32"), "{report}");
+    }
 }

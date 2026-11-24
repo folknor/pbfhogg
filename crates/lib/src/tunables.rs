@@ -633,9 +633,10 @@ pub(crate) const APPLY_CHANGES_CREATE_BATCH_BLOCKS: std::num::NonZeroUsize =
 /// gigabytes. The budget also bounds legitimate recovery: one blob's
 /// changed elements needing more than this many bytes of frames between
 /// them are refused.
-/// Past this budget under both strategies the worker gives up and returns
-/// the original oversize error, the loud refusal before publication that
-/// the run gave before overflow recovery existed. Real data never overflows (blocks are a few
+/// Past this budget under the whole-table strategy, the last to run, the
+/// worker gives up with `ErrorKind::OverflowReplayBudget`, which names this
+/// allowance and carries the overflowed block's oversize error as its
+/// source: a loud refusal before publication. Real data never overflows (blocks are a few
 /// MiB at most), so the value only decides how hostile an input is still
 /// recovered: eight blob limits' worth.
 pub(crate) const APPLY_CHANGES_OVERFLOW_REPLAY_BYTES: usize = 256 * 1024 * 1024;

@@ -2251,15 +2251,19 @@ Output blocks are cut at 8000 elements, and also wherever a block would pass
 the 32 MiB PBF payload limit: a rewritten block carries its source block's
 whole string table plus the strings of the changed elements written into it,
 so a large value modified to another large value, or two large creates side by
-side, is written as more blocks rather than refused. The blocks a re-cut
-writes carry only the strings their own elements use, so a surviving element
-that grew past its source (refreshed `--locations-on-ways` coordinates, say)
-is not held back by a large string the changes removed. An element that does
-not fit a block alone with its own strings fails the run (exit 2) with the
-oversize error and publishes nothing. So does an input blob whose re-cut output
-would pass 256 MiB of frames, as when its changes carry more than 256 MiB of
-large values between them, or a large string is shared by many changed elements
-that must be cut apart.
+side, is written as more blocks rather than refused. A re-cut first writes
+blocks that carry only the strings their own elements use, so a surviving
+element that grew past its source (refreshed `--locations-on-ways`
+coordinates, say) is not held back by a large string the changes removed;
+where that fails it tries again with blocks that carry the source table. An
+element that does not fit a block alone with its own strings fails the run
+(exit 2) with the oversize error and publishes nothing. The re-cut of one
+input blob may produce at most 256 MiB of blocks, as when its changes carry
+more than 256 MiB of large values between them, or a large string is shared
+by many changed elements that must be cut apart. Past that the run fails
+(exit 2) with an error naming that allowance, followed by the oversize error
+that started the re-cut, and publishes nothing; apply-changes has no option
+that changes either limit.
 
 The output header declares no bbox (the OSC can place a node outside the
 base's). Of the base's replication state it keeps the base URL and drops the

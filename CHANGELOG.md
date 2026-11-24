@@ -585,6 +585,16 @@
 
 ### Changed
 
+- **An oversize-blob refusal no longer advises fewer elements per blob
+  where the command offers no way to do that.** The error states the size
+  and the limit; `repack` and `degrade` still add `; lower
+  --elements-per-blob`. Library callers matching `ErrorKind::BlobTooLarge`
+  see the same kind, with the remedy clause gone from its text.
+- **`apply-changes` names its re-cut allowance when it runs out.** An input
+  blob whose oversize-block re-cut passes 256 MiB of blocks used to be
+  refused with the first oversize error alone; it is now refused (exit `2`,
+  as before) with a new `ErrorKind::OverflowReplayBudget` naming the
+  allowance, whose source is that oversize error.
 - **`renumber` applies one rule to block and group fields it does not
   interpret.** Way blobs used to carry unknown PrimitiveBlock and
   PrimitiveGroup fields (including an obsolete `changesets` group field)

@@ -36,19 +36,6 @@ membership failure. This breaks the claim that extract compares membership in
 the same region. The verifier must translate the intended integer edges into
 an equivalent reference bbox, or explicitly refuse that comparison domain.
 
-## TOOL-005 - verify geocode builds its osmium reference from unsorted input
-
-Reported by: verify [P2].
-
-`checks/geocode.rs` filters the original input and feeds the result straight
-to osmium add-locations-to-ways without sorting it. For a valid indexed file
-with a named highway way before its node blobs, pbfhogg's separate builder
-passes can resolve the nodes. Osmium's location handler meets the way first,
-and `--ignore-missing-nodes` leaves its coordinates absent. The verifier then
-rejects the model for containing an unlocated street way, although the source
-has every required node. This breaks the check's claim to model the input's
-geometry, because the missing locations come from reference construction.
-
 ## TOOL-047 - A reference that cannot read the dataset input reports FAIL
 
 Reported by: the spar on the verifier's error classification (2026-11-24).

@@ -51,7 +51,17 @@
 //! tolerance outside its band. Address, street and interpolation are judged
 //! on the non-zero build alone; the admin tolerance does not reach them.
 //!
+//! Both builds read the input itself. osmium locates a way's refs as it
+//! passes the way, so on input whose header does not claim
+//! `Sort.Type_then_ID` both decodings read the osmium-sorted copy
+//! (`InputOrder`), where every node precedes the ways; the check trusts a
+//! claim that is present, so a file falsely claiming its order can still
+//! leave a way unlocated (a verifier error, or an interpolation way the model
+//! silently refuses), and a pass does not validate the claim.
+//!
 //! Comparison domain, refused as a verifier error rather than judged: an
+//! object repeated in a decoding (the builder keeps the last occurrence in
+//! file order, osmium's sort orders repeats by version), an
 //! address or street way with a node osmium could not locate (the model
 //! would have to guess how the builder shortens it), any modelled
 //! coordinate within 10 degrees of the antimeridian or beyond 85 degrees of
@@ -94,6 +104,7 @@ use crate::tunables::{
     GEOCODE_WITNESS_ATTEMPTS, GEOCODE_WITNESS_QUOTA, GEOCODE_WITNESS_REACH_M,
 };
 use crate::verify_diff_opl::{decode, parse_decimicro};
+use crate::verify_input_order::InputOrder;
 
 /// The mean Earth radius the reader converts radians to meters with.
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
@@ -483,14 +494,37 @@ fn build_model(path: &Path) -> Result<Model, Error> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
     let mut model = Model::default();
+    let mut previous = None;
     for (n, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
         let at = |why: String| Error::Failed(format!("{} line {}: {why}", path.display(), n + 1));
         let record = parse_record(&line).map_err(at)?;
+        refuse_repeat(&mut previous, &record).map_err(Error::Tool)?;
         model_record(&mut model, &record).map_err(Error::Tool)?;
     }
     model.finish().map_err(Error::Tool)?;
     Ok(model)
+}
+
+/// Refuse a record repeating the previous one's type and ID. The decodings
+/// read input in some type-then-ID order (the input under its sort claim, or
+/// osmium's sorted copy), so repeats that survive selection are adjacent; the
+/// builder keeps the last occurrence in file order while osmium's sort orders
+/// them by version, so a repeat is outside the compared domain. This does not
+/// certify the input's uniqueness: a non-adjacent repeat in a file falsely
+/// claiming its sort order is not seen.
+fn refuse_repeat(previous: &mut Option<(u8, String)>, r: &Record) -> Result<(), String> {
+    if previous
+        .as_ref()
+        .is_some_and(|(kind, id)| *kind == r.kind && *id == r.id)
+    {
+        return Err(format!(
+            "{}: the decoding repeats this object, outside the compared domain",
+            r.id
+        ));
+    }
+    *previous = Some((r.kind, r.id.clone()));
+    Ok(())
 }
 
 fn model_record(model: &mut Model, r: &Record) -> Result<(), String> {
@@ -807,22 +841,24 @@ fn located_opl(
 
 /// The admin model of osmium's decoding of the input's boundary relations.
 ///
-/// The decoding keeps every node record (`located_opl` with `keep_nodes`):
-/// osmium locates a way's refs as it passes the way, so a node stored after
-/// the way is left unlocated though the input holds it, while the builder
-/// resolves refs after its whole node pass. Each node record is therefore
-/// recorded, and the model tells a ref the input lacks (no record) from
-/// one whose record carries no location.
+/// The decoding keeps every node record (`located_opl` with `keep_nodes`),
+/// and each is recorded, so the model tells a ref the input lacks (no
+/// record) from one whose record carries no location. The decoding reads
+/// sorted input (see `run`), so a ref osmium left unlocated is joined
+/// against its record; only a file falsely claiming its sort order can
+/// still store a node after its way.
 fn admin_model(path: &Path) -> Result<admin::AdminModel, Error> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Failed(format!("cannot open {}: {e}", path.display())))?;
     let mut ways: HashMap<i64, admin::Way> = HashMap::new();
     let mut node_records: admin::NodeRecords = HashMap::new();
     let mut relations = Vec::new();
+    let mut previous = None;
     for (n, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| Error::Failed(format!("{}: {e}", path.display())))?;
         let at = |why: String| Error::Failed(format!("{} line {}: {why}", path.display(), n + 1));
         let record = parse_record(&line).map_err(at)?;
+        refuse_repeat(&mut previous, &record).map_err(Error::Tool)?;
         match record.kind {
             b'w' => {
                 let id = record.id[1..]
@@ -1023,9 +1059,14 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     let exact_index = outdir.join("index-tolerance-0");
     build_index(harness, pbf, &exact_index, 0.0, direct_io)?;
 
+    // osmium locates a way's refs as it passes the way, so on claimless input
+    // a way stored before its nodes would come out unlocated though the
+    // builder resolves it; the decodings read an osmium-sorted copy there.
+    let order = InputOrder::of(harness, pbf, &outdir)?;
+    let reference = order.reference_input.as_path();
     let model = build_model(&located_opl(
         harness,
-        pbf,
+        reference,
         &outdir,
         "geocode",
         &["nw/addr:housenumber", "w/highway", "w/addr:interpolation"],
@@ -1033,7 +1074,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     )?)?;
     let admin = admin_model(&located_opl(
         harness,
-        pbf,
+        reference,
         &outdir,
         "geocode-admin",
         &["r/boundary=administrative,postal_code"],
@@ -1336,6 +1377,16 @@ mod tests {
         let r =
             parse_record("w3 v1 Thighway=residential,name=A Nn1x-100.0y0.0,n2x100.0y0.0").unwrap();
         assert!(model_record(&mut m, &r).is_err());
+    }
+
+    #[test]
+    fn a_repeated_object_is_outside_the_domain() {
+        let mut previous = None;
+        for line in ["n42 v1 x1.0 y1.0", "w42 v1 Nn42", "w43 v1 Nn42"] {
+            assert!(refuse_repeat(&mut previous, &parse_record(line).unwrap()).is_ok());
+        }
+        let r = parse_record("w43 v2 Nn42").unwrap();
+        assert!(refuse_repeat(&mut previous, &r).is_err());
     }
 
     #[test]

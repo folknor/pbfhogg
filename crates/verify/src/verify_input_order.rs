@@ -54,9 +54,10 @@ pub(crate) fn input_header(
     Ok(header)
 }
 
-/// An osmium-sorted copy of `pbf` in `outdir/osmium-sorted-input/`. The
-/// sort's artifact name and argv are verify sort's, so one cached run of the
-/// same input serves every check.
+/// An osmium-sorted copy of `pbf` in `outdir/osmium-sorted-input/`, by
+/// osmium's default simple strategy. Every check taking a copy here runs the
+/// same argv, so one cached run of the same input serves them all; verify
+/// sort's own `-s multipass` reference is a different cache entry.
 pub(crate) fn osmium_sorted_copy(
     harness: &mut Harness,
     pbf: &Path,

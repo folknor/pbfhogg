@@ -130,7 +130,7 @@ struct RegionPass<'a> {
 
 /// The bbox as osmium is given it (`Bbox::to_osmium_text`); a box with no
 /// such spelling is a comparison that cannot be made.
-fn osmium_bbox(bbox: &Bbox) -> Result<String, Error> {
+pub(crate) fn osmium_bbox(bbox: &Bbox) -> Result<String, Error> {
     bbox.to_osmium_text().ok_or_else(|| {
         Error::Tool(format!(
             "bbox {} has an edge of more than ten integer digits, which osmium cannot read as a \
@@ -164,6 +164,7 @@ pub fn run(
     }
     if let Some(bbox) = bbox {
         osmium_bbox(bbox)?;
+        crate::extract_config::pbfhogg_box(bbox)?;
     }
     let outdir = harness.subdir("extract")?;
 

@@ -23,19 +23,6 @@ None was built, run or reproduced, and the bracketed priority is the hunter's
 own label. The geocode-query optimizer sink is recorded under BUG-028.
 Entries are in no order of importance.
 
-## TOOL-048 - verify extract blames pbfhogg for a bbox only pbfhogg refuses
-
-Reported by: the scout and spar on the verify extract bbox spelling
-(2026-11-24).
-
-`devkit::Bbox` takes any four finite numbers, in any order. pbfhogg's
-`Bbox::try_new` refuses swapped or equal edges and edges outside WGS84;
-osmium's `box.extend` accepts swapped and equal pairs. So `verify extract
---bbox=1,1,0,0` reaches `require_success` on the pbfhogg run, and the
-verifier's misuse reads as a pbfhogg failure. Such a box is not a comparison
-domain and should be refused before any run as a verifier error, as an edge
-with more than ten integer digits now is.
-
 ## TOOL-051 - verify field-policies locates its slice from input order
 
 Reported by: the spar accounting of the verify geocode input-order change,

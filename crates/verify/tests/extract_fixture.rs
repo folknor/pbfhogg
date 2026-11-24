@@ -135,6 +135,18 @@ fn bbox_spellings(h: &mut harness::Harness, exe: &Path, dir: &Path, input: &Path
         Err(crate::error::Error::Tool(why)) => assert!(why.contains("ten integer digits"), "{why}"),
         other => panic!("expected a refusal, got {other:?}"),
     }
+    // A box pbfhogg refuses is the verifier's misuse, refused before any run
+    // (the fake pbfhogg would accept it), never a pbfhogg failure.
+    for bad in ["1,1,0,0", "0,0,0,1", "0,0,1,91"] {
+        let bbox = pbfhogg_devkit::Bbox::parse(bad).unwrap();
+        h.run = run::Run::create(dir, exe, true).unwrap();
+        match checks::extract::run(h, input, Some(&bbox), &[], true) {
+            Err(crate::error::Error::Tool(why)) => {
+                assert!(why.contains("not a box pbfhogg extract takes"), "{why}");
+            }
+            other => panic!("expected a refusal of {bad}, got {other:?}"),
+        }
+    }
 }
 
 /// The extract comparisons a content or version fault fails, in order.

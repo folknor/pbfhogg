@@ -167,11 +167,16 @@ fn utf8(path: &Path) -> Result<&str, Error> {
 /// edge exactly, and bbox containment is inclusive (as osmium's
 /// `Box::contains`), so a node on a seam belongs to both strips; any
 /// classifier serving several regions at once must keep that.
+///
+/// The parent and every strip must be boxes pbfhogg extract takes
+/// ([`pbfhogg_box`]): rounding can close a strip of a valid parent too narrow
+/// for its seams, and such a strip is the verifier's, never pbfhogg's.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn strips(bbox: &Bbox, regions: usize) -> Result<Vec<Bbox>, Error> {
     if regions == 0 {
         return Err(Error::tool("multi-extract requires at least 1 region"));
     }
+    pbfhogg_box(bbox)?;
     let [west, south, east, north] = bbox.coordinates();
     let width = (east - west) / regions as f64;
     (0..regions)
@@ -182,9 +187,48 @@ pub(crate) fn strips(bbox: &Bbox, regions: usize) -> Result<Vec<Bbox>, Error> {
             } else {
                 west + width * (i + 1) as f64
             };
-            Ok(Bbox::parse(&format!("{left},{south},{right},{north}"))?)
+            let strip = Bbox::parse(&format!("{left},{south},{right},{north}"))?;
+            pbfhogg_box(&strip)?;
+            Ok(strip)
         })
         .collect()
+}
+
+/// Refuse, as a verifier error, a box pbfhogg extract refuses by contract.
+///
+/// pbfhogg's `Bbox::try_new` takes each edge as the f64 its trimmed token
+/// parses to (the value `Bbox::coordinates` holds), requires it within WGS84
+/// inclusive (longitude -180..180, latitude -90..90) and each minimum strictly
+/// below its maximum. osmium is no tiebreaker: its `Box::extend` reorders a
+/// swapped pair, accepts an equal one and drops an out-of-range corner. A box
+/// outside that domain names no region both tools select, so running pbfhogg
+/// on it would only report the verifier's misuse as a pbfhogg failure.
+pub(crate) fn pbfhogg_box(bbox: &Bbox) -> Result<(), Error> {
+    let [min_lon, min_lat, max_lon, max_lat] = bbox.coordinates();
+    let refuse = |why: String| {
+        Err(Error::tool(format!(
+            "bbox {} is not a box pbfhogg extract takes ({why}), so extract cannot be compared \
+             on it",
+            bbox.as_str()
+        )))
+    };
+    for (name, value, limit) in [
+        ("min_lon", min_lon, 180.0),
+        ("min_lat", min_lat, 90.0),
+        ("max_lon", max_lon, 180.0),
+        ("max_lat", max_lat, 90.0),
+    ] {
+        if !(-limit..=limit).contains(&value) {
+            return refuse(format!("{name} {value} is outside -{limit}..{limit}"));
+        }
+    }
+    if min_lon >= max_lon {
+        return refuse(format!("min_lon {min_lon} is not below max_lon {max_lon}"));
+    }
+    if min_lat >= max_lat {
+        return refuse(format!("min_lat {min_lat} is not below max_lat {max_lat}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -232,5 +276,29 @@ mod tests {
         assert!(!args.contains(&"--tmp-dir".into()));
         assert_eq!(private, [dir.join("launch/staging")]);
         assert!(multi_extract_config(&dir, &[]).is_err());
+    }
+
+    #[test]
+    fn a_box_pbfhogg_refuses_is_a_verifier_error() {
+        for ok in ["-180,-90,180,90", "12.4,55.6,12.7,55.8"] {
+            pbfhogg_box(&Bbox::parse(ok).unwrap()).unwrap();
+        }
+        for bad in [
+            "1,1,0,0",
+            "0,0,0,1",
+            "0,0,1,0",
+            "-180.5,0,1,1",
+            "0,-91,1,1",
+            "0,0,181,1",
+            "0,0,1,90.1",
+        ] {
+            let err = pbfhogg_box(&Bbox::parse(bad).unwrap()).unwrap_err();
+            assert!(matches!(err, Error::Tool(_)), "{bad}: {err:?}");
+            assert!(strips(&Bbox::parse(bad).unwrap(), 2).is_err(), "{bad}");
+        }
+        // A valid parent whose split rounds a seam onto an edge.
+        let narrow = Bbox::parse("1,0,1.0000000000000002,1").unwrap();
+        pbfhogg_box(&narrow).unwrap();
+        assert!(matches!(strips(&narrow, 2), Err(Error::Tool(_))));
     }
 }

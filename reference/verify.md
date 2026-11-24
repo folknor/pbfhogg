@@ -776,7 +776,14 @@ fraction truncated after eight digits), which libosmium's coordinate
 parser reads to the column pbfhogg reads from the typed text: libosmium
 would otherwise truncate an exponent spelling's mantissa before scaling
 and refuse `+` and whitespace. An edge with more than ten integer digits
-is refused before any run as a verifier error. Smart uses osmium's
+is refused before any run as a verifier error, and so is a box pbfhogg
+extract refuses by contract: an edge outside WGS84 (longitude -180..180,
+latitude -90..90, inclusive) or a minimum not strictly below its maximum,
+judged on each edge's floating-point value as pbfhogg judges it. osmium
+reorders a swapped pair, accepts an equal one and drops an out-of-range
+corner, so such a box names no region both tools select. `all` applies
+both refusals, and the multi-extract strip refusal below, before its first
+check launches a tool. Smart uses osmium's
 `-S types=multipolygon,boundary`. Complete and smart require identical
 membership; simple requires identical nodes and ways, and relations holding
 any direct node or way member in those sets. Relations present only in
@@ -800,7 +807,9 @@ is compared through a strictly ordered sorted copy. PASS names the regions
 and membership differences, including the simple relation deviation.
 
 Multi-extract needs a bbox and accepts `--regions` (default five, positive)
-for adjacent longitude strips. Its sequential simple extracts run buffered;
+for adjacent longitude strips. The bbox and every strip must be a box
+pbfhogg extract takes, as for extract; a strip that rounding closes is
+refused as a verifier error before any run. Its sequential simple extracts run buffered;
 `--direct-io` reaches config runs only. With polygons it also runs a mixed
 strip/polygon config. Adjacent strips share an inclusive edge, so a node on
 it belongs to both. This does not establish osmium membership. Fallback

@@ -33,6 +33,15 @@ impl Counts {
     }
 }
 
+/// Before any check launches a tool: a bbox, or a multi-extract strip of it,
+/// that one of the tools cannot take is a verifier error, and refusing it only
+/// when extract is reached would spend the checks before it.
+fn comparable_bbox(bbox: &pbfhogg_devkit::Bbox) -> Result<(), Error> {
+    checks::extract::osmium_bbox(bbox)?;
+    crate::extract_config::strips(bbox, crate::tunables::MULTI_EXTRACT_REGIONS)?;
+    Ok(())
+}
+
 pub(crate) fn run(
     h: &mut Harness,
     pbf: &Path,
@@ -44,6 +53,9 @@ pub(crate) fn run(
 ) -> Result<Counts, Error> {
     let start = Instant::now();
     let mut counts = Counts::default();
+    if let Some(bbox) = bbox {
+        comparable_bbox(bbox)?;
+    }
     // First: every element comparison below rests on what it establishes.
     counts.add(h.run_check("field-policies", |h| {
         checks::field_policies::run(h, pbf, direct_io)

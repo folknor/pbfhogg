@@ -6,7 +6,9 @@ use crate::registry::osc_entries;
 use crate::{Config, Error, ResolvedInput};
 
 /// Four finite coordinates, preserving the spelling used on command lines.
-/// As in brokkr, coordinate ranges and min/max ordering are not constrained.
+/// Coordinate ranges and min/max ordering are not constrained here: brokkr
+/// range-checks a dataset bbox at config load and allows equal edges, and a
+/// consumer whose tools need a stricter domain refuses outside it itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bbox {
     coordinates: [f64; 4],

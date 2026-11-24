@@ -2366,7 +2366,11 @@ ring's boundary;
 where an inner ring touches or crosses an outer ring, which outer it
 belongs to is not promised. A point is in the area when it is inside the
 outer ring and inside none of its holes. Relations refused during ring
-assembly contribute no admin area. Rings are not otherwise validated as
+assembly contribute no admin area; among them is any relation with a ring
+(outer or inner) whose points all lie on one line, judged with longitudes
+unwrapped across the antimeridian, since such a ring encloses nothing.
+A ring that simplification would flatten onto a line is stored
+unsimplified. Rings are not otherwise validated as
 geometry: inside a ring is decided by even-odd crossing parity, so a ring
 that crosses itself keeps the regions it encloses an odd number of times;
 outer rings of one relation that overlap are separate areas whose union

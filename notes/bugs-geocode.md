@@ -27,19 +27,6 @@ ranking ties (since fixed: candidates rank by the query's total order) and
 building placement at the antimeridian (BUG-027).
 Entries are in no order of importance.
 
-## GEO-026 - A collinear admin outer ring publishes and never contains a point
-
-Reported by: spar on the empty-index gate (source inspection, not run).
-
-A named admin relation with one closed outer way `A-B-C-A` whose three nodes
-share latitude 0 at distinct longitudes, built with `--admin-tolerance 0`,
-passes ring assembly (`geo/rings.rs`) and admin assembly (`builder/admin.rs`),
-and the reader accepts its zero area. Every edge is horizontal, so the
-containment test never toggles: the polygon counts toward the empty-index
-gate and is listed in cells, yet answers no query. A plain zero-signed-area
-filter is not the fix, since an accepted self-crossing ring whose lobes cancel
-also has zero signed area but queryable lobes.
-
 ## GEO-027 - Zero search radii disable every distance match
 
 Reported by: spar on the empty-index gate (source inspection, not run).

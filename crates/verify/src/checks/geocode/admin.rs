@@ -13,7 +13,8 @@
 //! Withheld, as the builder withholds it, and judged as contributing no
 //! area: a relation with an outer or inner member way absent from the
 //! decoding, present with no nodes, or referring to a node the decoding
-//! holds no record of, and a relation listing one way in both roles. The
+//! holds no record of, a relation listing one way in both roles, and a
+//! relation with an assembled ring whose points all lie on one line. The
 //! decoding is `tags-filter` without `-R`, which copies every member way
 //! and every node of one, so absence there is absence in the input.
 //!
@@ -308,6 +309,27 @@ fn rings(ways: &[&[Node]]) -> Option<Vec<Vec<Pt>>> {
     Some(out)
 }
 
+/// Whether every point of `ring` lies on one line, exactly.
+fn collinear(ring: &[Pt]) -> bool {
+    let Some(&a) = ring.first() else {
+        return true;
+    };
+    let Some(&b) = ring.iter().find(|&&p| p != a) else {
+        return true;
+    };
+    let d = |p: Pt| {
+        (
+            i128::from(p.0) - i128::from(a.0),
+            i128::from(p.1) - i128::from(a.1),
+        )
+    };
+    let (d0, d1) = d(b);
+    ring.iter().all(|&p| {
+        let (e0, e1) = d(p);
+        d0 * e1 == d1 * e0
+    })
+}
+
 /// The closed walk of a group whose every endpoint has degree two.
 fn walk(ways: &[&[Node]], group: &[usize], ends: &HashMap<i64, Vec<usize>>) -> Option<Vec<Pt>> {
     let mut used = std::collections::HashSet::new();
@@ -566,6 +588,13 @@ impl AdminModel {
                     .push((r.id.clone(), b.level, Unmodelled::Junction));
                 continue;
             };
+            // A ring whose points all lie on one line has no interior, and
+            // the builder refuses its relation whole. No edge spans half a
+            // turn here, so the raw ring is the reader's frame.
+            if outers.iter().chain(&inners).any(|ring| collinear(ring)) {
+                model.withheld += 1;
+                continue;
+            }
             model.add_polygons(&r.id, &b, outers, &inners);
         }
         model.index_edges()?;

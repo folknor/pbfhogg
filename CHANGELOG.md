@@ -730,6 +730,17 @@
 
 ### Fixed
 
+- **Geocode admin rings on one line no longer publish as areas.** A
+  boundary ring whose points all lay on one line (all at one latitude, say)
+  encloses nothing, yet was stored, counted towards the empty-index check
+  and listed in cells while answering no query. `build-geocode-index` now
+  refuses such a relation as a ring-topology refusal
+  (`geocode.pass2.admin_ring_topology`), judging collinearity with
+  longitudes unwrapped across the antimeridian, where `+180` and `-180`
+  are then one point. A ring that simplification would flatten onto a
+  line is stored unsimplified. The library's `geo::assemble_rings` refuses
+  these rings with `RingRefusal::DegenerateRing`. The format is unchanged;
+  rebuild to get the new answers.
 - **Geocode admin ranking measures antimeridian rings in their own
   frame.** A ring crossing the antimeridian stored the area of its raw
   longitudes, so a narrow dateline polygon could outrank a wider one the

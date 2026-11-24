@@ -963,7 +963,7 @@ fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, tolerance_sq: f64) -> 
 
 mod rings;
 #[cfg(feature = "commands")]
-pub(crate) use rings::{OuterFrame, frame_is_start_invariant};
+pub(crate) use rings::{OuterFrame, frame_is_start_invariant, ring_is_collinear};
 pub use rings::{Ring, RingMember, RingRefusal, assemble_rings};
 
 /// Compute the signed area of a ring in decimicrodegree² units.

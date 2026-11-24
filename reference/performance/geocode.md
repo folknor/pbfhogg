@@ -12,6 +12,17 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
+### Rings on one line refused, flattened rings stored whole (bygg, 2026-11-24, variant uncommitted against `3b534693`)
+
+Planet, one `--commit HEAD` baseline cell and one variant cell with
+`--iterations 1`, baseline first. Baseline `dae479f3` 125.2 s, variant
+`6909ca6d` 119.1 s. The gap is mostly in `GEOCODE_PASS3_ADMIN_CELLS`
+(13.4 s against 8.4 s, 134 against 83 samples), which the change does
+not touch: cache state, not code. The changed phase,
+`GEOCODE_PASS2_ADMIN_ASSEMBLY`, ran 2.19 s against 2.18 s. Both cells
+dropped 3049 admin relations, so no planet relation has a ring the
+collinearity refusal catches. Verdict: no measured cost.
+
 ### Hole ownership by one exact witness, start-dependent rings refused (bygg, 2026-11-24, variant uncommitted against `8d9fdaf9`)
 
 Planet, one variant and one `--commit HEAD` baseline cell with

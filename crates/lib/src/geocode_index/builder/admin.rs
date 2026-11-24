@@ -305,6 +305,43 @@ fn vertex_e7(lon_deg: f64, lat_deg: f64) -> NodeCoord {
     }
 }
 
+/// The stored vertices of one assembled ring (`ring` in `(lat_e7, lon_e7)`,
+/// `ring_f64` the same as `(lon, lat)` degrees): its simplification to
+/// `tolerance_m`, or `None` when that keeps fewer than three vertices.
+///
+/// Assembly refused every ring lying on one line, so `ring` has an even-odd
+/// interior. Simplification may still flatten it onto a line (cancelling
+/// lobes keep a zero signed area, which the simplifier does not count as
+/// collapse); the tolerance contract would allow that, but a stored ring
+/// with no interior answers nothing, so the unsimplified ring is stored
+/// instead.
+fn simplified_e7(
+    ring: &[(i32, i32)],
+    ring_f64: &[(f64, f64)],
+    tolerance_m: f64,
+) -> Option<Vec<NodeCoord>> {
+    let simplified = crate::geo::simplify_ring(ring_f64, tolerance_m);
+    if simplified.len() < 3 {
+        return None;
+    }
+    let vertices: Vec<NodeCoord> = simplified
+        .iter()
+        .map(|&(lon_deg, lat_deg)| vertex_e7(lon_deg, lat_deg))
+        .collect();
+    if vertices.len() < ring.len()
+        && crate::geo::ring_is_collinear(vertices.len(), |i| {
+            (vertices[i].lat_e7, vertices[i].lon_e7)
+        })
+    {
+        return Some(
+            ring.iter()
+                .map(|&(lat_e7, lon_e7)| NodeCoord { lat_e7, lon_e7 })
+                .collect(),
+        );
+    }
+    Some(vertices)
+}
+
 /// Assemble all `AssembledPolygon`s produced by a single relation
 /// (one per outer ring, each carrying any inner rings that fall inside
 /// it). Pure function - no shared mutable state, safe to call from
@@ -435,19 +472,12 @@ fn assemble_decoded(
             .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
             .collect();
 
-        let simplified = crate::geo::simplify_ring(&outer_f64, tolerance_m);
-
-        if simplified.len() < 3 {
+        let Some(mut vertices) = simplified_e7(outer_ring, &outer_f64, tolerance_m) else {
             continue;
-        }
+        };
 
         #[allow(clippy::cast_possible_truncation)]
         let area = ranking_area(outer_ring, &outer_f64) as f32;
-
-        let mut vertices = Vec::new();
-        for &(lon_deg, lat_deg) in &simplified {
-            vertices.push(vertex_e7(lon_deg, lat_deg));
-        }
 
         // Add inner rings (holes) that fall inside this outer ring.
         //
@@ -469,13 +499,9 @@ fn assemble_decoded(
                 .iter()
                 .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
                 .collect();
-            let sh = crate::geo::simplify_ring(&hole_f64, tolerance_m);
-
-            if sh.len() >= 3 {
+            if let Some(sh) = simplified_e7(hole, &hole_f64, tolerance_m) {
                 vertices.push(RING_SENTINEL);
-                for &(lon_deg, lat_deg) in &sh {
-                    vertices.push(vertex_e7(lon_deg, lat_deg));
-                }
+                vertices.extend(sh);
             }
         }
 
@@ -664,7 +690,7 @@ pub(super) fn write_admin_index(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::coord_fmt::deg_to_e7;
+    use crate::coord_fmt::{deg_to_e7, e7_to_deg};
 
     use super::{
         DroppedAdminRelations, assemble_admin_polygons, missing_admin_way_geometry, ranking_area,
@@ -913,6 +939,88 @@ mod tests {
             .map(|v| (v.lat_e7, v.lon_e7))
             .collect();
         assert_eq!(stored, ring);
+    }
+
+    /// Cancelling lobes keep a zero signed area, so the simplifier may
+    /// flatten them onto a line; the ring had an interior, so it is stored
+    /// unsimplified instead of as a line that answers nothing.
+    #[test]
+    fn a_ring_simplified_onto_a_line_is_stored_whole() {
+        let ring = vec![
+            (0, 0),
+            (0, -6_250_000),
+            (2_500_000, 2_500_000),
+            (0, 12_500_000),
+            (3_750_000, 5_000_000),
+            (0, 0),
+        ];
+        let ring_f64: Vec<(f64, f64)> = ring
+            .iter()
+            .map(|&(lat, lon)| (e7_to_deg(f64::from(lon)), e7_to_deg(f64::from(lat))))
+            .collect();
+        let flattened = crate::geo::simplify_ring(&ring_f64, 55_600.0);
+        assert!(
+            flattened.len() < ring.len() && flattened.iter().all(|&(_, lat)| lat == 0.0),
+            "the fixture must flatten: {flattened:?}"
+        );
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(7, located(ring.clone()));
+        let relations = vec![RawAdminRelation {
+            id: 1,
+            admin_level: 8,
+            name_offset: 1,
+            country_code_offset: 0,
+            outer_way_ids: vec![7],
+            inner_way_ids: Vec::new(),
+        }];
+        let config = BuildConfig {
+            admin_tolerance_m: 55_600.0,
+            ..BuildConfig::default()
+        };
+        let (polygons, _) = assemble(
+            &relations,
+            &way_geom,
+            &config,
+            &crate::host::Executor::for_tests(),
+        );
+        let stored: Vec<(i32, i32)> = polygons[0]
+            .vertices
+            .iter()
+            .map(|v| (v.lat_e7, v.lon_e7))
+            .collect();
+        assert_eq!(stored, ring);
+    }
+
+    /// A relation whose only ring lies on one line has no area to publish:
+    /// it is refused as topology and counted, not stored as a polygon that
+    /// answers no query.
+    #[test]
+    fn a_collinear_ring_withholds_its_relation() {
+        let mut way_geom = super::WayGeometryMap::for_tests();
+        way_geom.insert_test(
+            7,
+            located(vec![(0, 0), (0, 10_000_000), (0, 20_000_000), (0, 0)]),
+        );
+        let relations = vec![RawAdminRelation {
+            id: 1,
+            admin_level: 8,
+            name_offset: 1,
+            country_code_offset: 0,
+            outer_way_ids: vec![7],
+            inner_way_ids: Vec::new(),
+        }];
+        let config = BuildConfig {
+            admin_tolerance_m: 0.0,
+            ..BuildConfig::default()
+        };
+        let (polygons, dropped) = assemble(
+            &relations,
+            &way_geom,
+            &config,
+            &crate::host::Executor::for_tests(),
+        );
+        assert!(polygons.is_empty());
+        assert_eq!((dropped.total, dropped.ambiguous_topology), (1, 1));
     }
 
     /// Complete member ways whose rings are not determined refuse their

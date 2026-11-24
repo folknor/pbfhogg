@@ -177,8 +177,9 @@ pub struct BuildStats {
     pub admin_polygons: u64,
     /// Relations that produced no polygon because their boundary geometry was
     /// missing, unclosed, or degenerated during simplification, or because
-    /// their complete member ways do not determine their rings (reported as a
-    /// warning).
+    /// assembly refused their rings (reported as a warning per kind): member
+    /// ways that do not determine the rings, a ring on one line, or a ring
+    /// whose interior depends on where its walk starts.
     pub dropped_admin_relations: u64,
     pub fine_cells: u64,
     pub coarse_cells: u64,
@@ -785,8 +786,8 @@ fn build_from_schedules(
             Warning,
             "geocode.pass2.admin_ring_topology",
             "{} admin relations refused: their member ways do not determine their \
-             rings (branching junction, repeated segment, self-touching ring or \
-             nested lobes; counted among the dropped relations above)",
+             rings (branching junction, repeated segment, self-touching ring, \
+             ring on one line or nested lobes; counted among the dropped relations above)",
             dropped_admin.ambiguous_topology
         );
     }

@@ -18,7 +18,10 @@
 //! A ring that touches itself only at a node is therefore split at that node
 //! into its lobes. The rest is refused rather than guessed: a repeated
 //! segment (a retrace or spike), a ring that revisits a coordinate through
-//! distinct nodes, a ring of fewer than three distinct coordinates, and two
+//! distinct nodes, a ring whose points all lie on one line (fewer than three
+//! distinct points among them), both judged in the frame containment uses,
+//! where a ring that unwraps across the antimeridian has `+180` and `-180`
+//! as one point, and two
 //! rings of one connected graph whose interiors are not provably disjoint
 //! (splitting a nested lobe off its walk would turn the walk's even-odd hole
 //! into an area of its own).
@@ -64,9 +67,10 @@ pub enum RingRefusal {
     /// members along one segment) inside a larger block lands here; a block
     /// of only the two copies is a [`RingRefusal::DegenerateRing`].
     AmbiguousJunction,
-    /// A ring revisits a coordinate through a distinct node.
+    /// A ring revisits a point through a distinct node.
     SelfTouchingRing,
-    /// A ring has fewer than three distinct coordinates.
+    /// A ring's points all lie on one line (fewer than three distinct
+    /// points included), so it has no even-odd interior.
     DegenerateRing,
     /// Two rings of one connected graph are not provably disjoint.
     NestedRings,
@@ -349,33 +353,108 @@ struct WalkedRing {
     coords: Vec<(i32, i32)>,
 }
 
-/// A closed ring must visit each coordinate in one cyclic run: distinct
-/// nodes at one coordinate are allowed only next to each other. It must
-/// also have at least three distinct coordinates.
+/// A closed ring must visit each point in one cyclic run: distinct nodes at
+/// one point are allowed only next to each other. Its points must not all
+/// lie on one line, which also covers fewer than three distinct points.
+///
+/// Points are judged in the frame containment tests the ring in
+/// ([`frame`]), not as raw coordinates: when the ring unwraps, `+180` and
+/// `-180` (or any longitudes a whole turn apart) spelling one lifted point
+/// are one point, and collinearity is that of the lifted walk.
+///
+/// The collinearity rule is what makes an accepted ring have an even-odd
+/// interior. The interior is empty exactly when the walk covers every
+/// segment an even number of times. A walk not on one line turns somewhere,
+/// a turn needs a vertex, and making both turning rays even needs a second,
+/// non-adjacent visit to that point, which the run rule refuses. So among
+/// rings passing the run rule, an empty interior is a collinear one, and
+/// that is refused rather than published as an area that answers nothing.
+/// (Floating-point containment can still toggle along an exact E7 line, as
+/// it can on any boundary; that is not an interior.)
 fn check_coordinate_runs(closed: &[(i32, i32)]) -> Result<(), RingRefusal> {
-    let open = &closed[..closed.len().saturating_sub(1)];
-    let n = open.len();
+    let unwraps = closed
+        .windows(2)
+        .any(|w| (i64::from(w[1].1) - i64::from(w[0].1)).abs() > HALF_TURN_E7)
+        || match (closed.first(), closed.last()) {
+            (Some(a), Some(b)) => (i64::from(b.1) - i64::from(a.1)).abs() > HALF_TURN_E7,
+            _ => false,
+        };
+    // A ring that does not unwrap is its own frame: read it raw, with no
+    // allocation, as the usual closed-member fast path does.
+    if unwraps {
+        let (lifted, _) = frame(closed);
+        check_points(lifted.len(), |i| lifted[i])
+    } else {
+        check_points(closed.len(), |i| {
+            (i64::from(closed[i].1), i64::from(closed[i].0))
+        })
+    }
+}
+
+/// [`check_coordinate_runs`] over the closed walk `at(0..len)` in frame
+/// `(x, y)`. The last point is dropped for the run rule (it is the first
+/// raw coordinate), but kept for collinearity: when the lift does not close
+/// it is a real vertex the predicate joins back to the first by a chord.
+fn check_points(len: usize, at: impl Fn(usize) -> (i64, i64)) -> Result<(), RingRefusal> {
+    let n = len.saturating_sub(1);
     // Rotate to begin a run, so no run wraps the end of the slice.
-    let Some(first_break) = (0..n).find(|&i| open[i] != open[(i + n - 1) % n]) else {
+    let Some(first_break) = (0..n).find(|&i| at(i) != at((i + n - 1) % n)) else {
         return Err(RingRefusal::DegenerateRing);
     };
-    let mut seen: FxHashSet<(i32, i32)> =
+    let mut seen: FxHashSet<(i64, i64)> =
         FxHashSet::with_capacity_and_hasher(n, Default::default());
-    let mut previous: Option<(i32, i32)> = None;
+    let mut previous: Option<(i64, i64)> = None;
     for offset in 0..n {
-        let coord = open[(first_break + offset) % n];
-        if previous == Some(coord) {
+        let point = at((first_break + offset) % n);
+        if previous == Some(point) {
             continue;
         }
-        if !seen.insert(coord) {
+        if !seen.insert(point) {
             return Err(RingRefusal::SelfTouchingRing);
         }
-        previous = Some(coord);
+        previous = Some(point);
     }
-    if seen.len() < 3 {
+    if points_are_collinear(len, &at) {
         return Err(RingRefusal::DegenerateRing);
     }
     Ok(())
+}
+
+/// Whether every point of `at(0..len)` lies on one line, exactly.
+fn points_are_collinear(len: usize, at: &impl Fn(usize) -> (i64, i64)) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let first = at(0);
+    let Some(second) = (0..len).map(at).find(|&p| p != first) else {
+        return true;
+    };
+    let (dx, dy) = (
+        i128::from(second.0 - first.0),
+        i128::from(second.1 - first.1),
+    );
+    (0..len)
+        .map(at)
+        .all(|(x, y)| dx * i128::from(y - first.1) == dy * i128::from(x - first.0))
+}
+
+/// Whether the closed `(lat_e7, lon_e7)` ring lies on one line in its
+/// containment frame, so it has no even-odd interior. Simplification can
+/// flatten a ring that had one; the geocode builder stores the unsimplified
+/// ring then.
+#[cfg(feature = "commands")]
+pub(crate) fn ring_is_collinear(len: usize, at: impl Fn(usize) -> (i32, i32)) -> bool {
+    let lon = |i: usize| i64::from(at(i).1);
+    let unwraps = len > 1 && (0..len).any(|i| (lon((i + 1) % len) - lon(i)).abs() > HALF_TURN_E7);
+    if unwraps {
+        let closed: Vec<(i32, i32)> = (0..len).map(&at).collect();
+        let (lifted, _) = frame(&closed);
+        return points_are_collinear(lifted.len(), &|i| lifted[i]);
+    }
+    points_are_collinear(len, &|i| {
+        let (lat, lon) = at(i);
+        (i64::from(lon), i64::from(lat))
+    })
 }
 
 const HALF_TURN_E7: i64 = 1_800_000_000;
@@ -914,6 +993,83 @@ mod tests {
         assert_eq!(
             run(&[way(&[1, 2, 3, 4, 5, 6, 1], at)]),
             Err(RingRefusal::SelfTouchingRing)
+        );
+    }
+
+    /// A ring on one line has no even-odd interior, horizontal or not, in
+    /// the fast path for a closed member and in the graph path alike.
+    #[test]
+    fn a_collinear_ring_is_refused() {
+        let flat = |id: i64| match id {
+            1 => (0, 0),
+            2 => (0, 10),
+            3 => (0, 20),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            run(&[way(&[1, 2, 3, 1], flat)]),
+            Err(RingRefusal::DegenerateRing)
+        );
+        let diagonal = |id: i64| match id {
+            1 => (0, 0),
+            2 => (7, 14),
+            3 => (3, 6),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            run(&[way(&[1, 2, 3, 1], diagonal)]),
+            Err(RingRefusal::DegenerateRing)
+        );
+        assert_eq!(
+            run(&[way(&[1, 2], diagonal), way(&[2, 3, 1], diagonal)]),
+            Err(RingRefusal::DegenerateRing)
+        );
+    }
+
+    /// Collinearity is that of the containment frame. Raw points on one
+    /// line that unwrap across the antimeridian enclose a triangle; and a
+    /// ring that unwraps has `+180` and `-180` as one point, so a walk out
+    /// to the seam and back through its other spelling retraces itself.
+    #[test]
+    fn rings_are_judged_in_the_containment_frame() {
+        let e7 = |deg: i64| i32::try_from(deg * 10_000_000).unwrap_or(0);
+        let unwrapped = move |id: i64| match id {
+            1 => (e7(17), e7(170)),
+            2 => (e7(-17), e7(-170)),
+            3 => (-175_000_000, -1_750_000_000),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            run(&[way(&[1, 2, 3, 1], unwrapped)]).map(|r| r.len()),
+            Ok(1)
+        );
+        let seam = move |id: i64| match id {
+            1 => (0, e7(179)),
+            2 => (0, e7(180)),
+            3 => (e7(1), e7(179)),
+            4 => (0, e7(-180)),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            run(&[way(&[1, 2, 3, 4, 1], seam)]),
+            Err(RingRefusal::SelfTouchingRing)
+        );
+        // A ring that does not unwrap keeps the two spellings apart: its
+        // frame is the raw rectangle, which has an interior.
+        let band = move |id: i64| match id {
+            1 => (0, e7(-180)),
+            2 => (0, e7(-60)),
+            3 => (0, e7(60)),
+            4 => (0, e7(180)),
+            5 => (e7(1), e7(180)),
+            6 => (e7(1), e7(60)),
+            7 => (e7(1), e7(-60)),
+            8 => (e7(1), e7(-180)),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            run(&[way(&[1, 2, 3, 4, 5, 6, 7, 8, 1], band)]).map(|r| r.len()),
+            Ok(1)
         );
     }
 

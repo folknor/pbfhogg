@@ -694,7 +694,8 @@ indices pass through as on the read side. Adding those operations changes the
 historical output or adds per-blob or per-tag work to the measured hot path.
 The one exception is off that path: when a rewritten block cannot be cut to
 fit with its whole string table in every piece, the re-encoding cut
-(`renumber/split/reencode.rs`) reads every string reference of the block and
+(`commands/split/reencode.rs`, shared with the history time-filter and the
+sort / `cat --dedupe` sweep) reads every string reference of the block and
 gives each piece a table of only the strings it uses, and only when every
 element field is one the format defines and every index lies within the
 table. Otherwise every piece keeps the whole table and every index as it is,

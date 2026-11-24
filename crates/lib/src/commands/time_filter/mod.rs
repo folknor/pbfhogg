@@ -34,6 +34,7 @@ use super::{
     ensure_way_capacity_local, flush_local, require_sorted, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData};
+use crate::commands::split::Limits;
 use crate::owned::{
     OwnedElement, add_owned_node, add_owned_relation, add_owned_way, dense_node_metadata,
     element_metadata, read_dense_node, read_node, read_relation, read_way,
@@ -221,6 +222,7 @@ fn time_filter_history(
     // raises is located with the input.
     let at_input = |e: crate::Error| e.locate(crate::error::Location::in_file(input));
     let mut bb = BlockBuilder::new();
+    let limits = Limits::new(writer.compression());
     let mut stats = TimeFilterStats {
         versions_seen: 0,
         versions_before_cutoff: 0,
@@ -287,7 +289,7 @@ fn time_filter_history(
         };
         if group_changed
             && let Some(group) = pending.take()
-            && let Err(e) = flush_group(group, &mut bb, writer, &mut stats)
+            && let Err(e) = flush_group(group, &mut bb, writer, &limits, &mut stats)
         {
             flush_error = Err(e);
             return;
@@ -323,11 +325,9 @@ fn time_filter_history(
     flush_error?;
 
     if let Some(group) = pending.take() {
-        flush_group(group, &mut bb, writer, &mut stats)?;
+        flush_group(group, &mut bb, writer, &limits, &mut stats)?;
     }
-    if let Some(block) = bb.take_owned()? {
-        writer.write_primitive_block_owned(block)?;
-    }
+    write_block(&mut bb, writer, &limits)?;
     invocation.marker("TIMEFILTER_HISTORY_END");
     Ok(stats)
 }
@@ -652,6 +652,7 @@ fn flush_group(
     group: PendingGroup,
     bb: &mut BlockBuilder,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+    limits: &Limits,
     stats: &mut TimeFilterStats,
 ) -> Result<()> {
     match group.latest {
@@ -662,7 +663,7 @@ fn flush_group(
             stats.dropped_deleted += 1;
         }
         Some(owned) => {
-            write_owned_element(bb, writer, owned)?;
+            write_owned_element(bb, writer, limits, owned)?;
             stats.elements_written += 1;
         }
     }
@@ -673,33 +674,47 @@ fn flush_group(
 fn write_owned_element(
     bb: &mut BlockBuilder,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+    limits: &Limits,
     elem: OwnedElement,
 ) -> Result<()> {
     match elem {
         OwnedElement::Node(n) => {
-            if !bb.can_add_node()
-                && let Some(block) = bb.take_owned()?
-            {
-                writer.write_primitive_block_owned(block)?;
+            if !bb.can_add_node() {
+                write_block(bb, writer, limits)?;
             }
             add_owned_node(bb, &n);
         }
         OwnedElement::Way(w) => {
-            if !bb.can_add_way()
-                && let Some(block) = bb.take_owned()?
-            {
-                writer.write_primitive_block_owned(block)?;
+            if !bb.can_add_way() {
+                write_block(bb, writer, limits)?;
             }
             add_owned_way(bb, &w);
         }
         OwnedElement::Relation(r) => {
-            if !bb.can_add_relation()
-                && let Some(block) = bb.take_owned()?
-            {
-                writer.write_primitive_block_owned(block)?;
+            if !bb.can_add_relation() {
+                write_block(bb, writer, limits)?;
             }
             add_owned_relation(bb, &r);
         }
+    }
+    Ok(())
+}
+
+/// Write the builder's block, if it holds one. The block gathers the
+/// survivors of many input blobs, cut by count, so it can pass the blob
+/// payload limit while every input blob framed; one that would is cut on
+/// its own bytes before it reaches the writer (`commands/split.rs`), whose
+/// framing runs later on its executor where an overflow could no longer
+/// be recovered.
+fn write_block(
+    bb: &mut BlockBuilder,
+    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+    limits: &Limits,
+) -> Result<()> {
+    if let Some(block) = bb.take_owned()? {
+        crate::commands::split::fit_scanned(block, limits, |piece, _| {
+            writer.write_primitive_block_owned(piece)
+        })?;
     }
     Ok(())
 }
@@ -1130,6 +1145,103 @@ mod tests {
                 assert_eq!(got.2, reference.2, "stats: {what}");
                 assert!(got.0 == reference.0, "output bytes differ: {what}");
             }
+        }
+    }
+
+    /// History survivors gathered from blobs that each frame can make one
+    /// count-cut output block past the payload limit; it is cut into blocks
+    /// that fit, every survivor kept, in order, each block indexed.
+    #[test]
+    fn a_history_block_past_the_payload_limit_is_cut() {
+        const LARGE: usize = 13 << 20;
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("large.pbf");
+        let file = std::fs::File::create(&input).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::None,
+        );
+        let header = crate::block_builder::HeaderBuilder::new()
+            .sorted()
+            .historical();
+        writer.write_header(&header.build().unwrap()).unwrap();
+        let mut bb = BlockBuilder::new();
+        let ids = [100i64, 101, 102, 103];
+        for (k, &id) in ids.iter().enumerate() {
+            let fill = char::from(b'a' + u8::try_from(k).unwrap());
+            let value: String = std::iter::repeat_n(fill, LARGE).collect();
+            let meta = crate::block_builder::Metadata {
+                version: 1,
+                timestamp: 100,
+                changeset: 7,
+                uid: 3,
+                user: "u",
+                visible: true,
+            };
+            bb.add_relation(
+                id,
+                [("note", value.as_str())],
+                &[MemberData {
+                    id: MemberId::Way(10),
+                    role: "outer",
+                }],
+                Some(&meta),
+            );
+            // One relation per input blob: each blob frames.
+            writer
+                .write_primitive_block(bb.take().unwrap().unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let output = dir.path().join("out.pbf");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
+        let host_owner = crate::host::Host::for_tests();
+        let host = host_owner.entered();
+        let options = WriteOptions {
+            compression: Compression::None,
+            ..WriteOptions::default()
+        };
+        let stats = time_filter(
+            &input,
+            staged,
+            CUTOFF,
+            &options,
+            &HeaderOverrides::default(),
+            &host,
+        )
+        .unwrap_or_else(|e| panic!("time-filter: {}", e.report()));
+        assert_eq!(stats.elements_written, 4);
+
+        let mut blocks = Vec::new();
+        for blob in crate::BlobReader::open_in(output.as_path(), false, &host).unwrap() {
+            let blob = blob.unwrap();
+            let index = blob.index();
+            if let crate::BlobDecode::OsmData(block) = blob.decode().unwrap() {
+                let got: Vec<(i64, usize)> = block
+                    .elements()
+                    .map(|e| match e {
+                        Element::Relation(r) => (r.id(), r.tags().next().unwrap().1.len()),
+                        _ => panic!("only relations were written"),
+                    })
+                    .collect();
+                blocks.push((index, got));
+            }
+        }
+        assert!(blocks.len() >= 2, "{} blocks", blocks.len());
+        let all: Vec<(i64, usize)> = blocks.iter().flat_map(|(_, g)| g.clone()).collect();
+        assert_eq!(all, ids.iter().map(|&id| (id, LARGE)).collect::<Vec<_>>());
+        for (index, got) in &blocks {
+            let index = index.unwrap();
+            assert_eq!(index.count, got.len() as u64);
+            assert_eq!(index.min_id, got[0].0);
+            assert_eq!(index.max_id, got[got.len() - 1].0);
         }
     }
 }

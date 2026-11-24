@@ -40,7 +40,7 @@
 
 use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
-use super::{Layout, Piece, partition, widen};
+use super::{Layout, Piece, partition};
 use crate::error::Error;
 
 /// Bytes of the widest length varint a block's field can need.
@@ -136,7 +136,7 @@ const DI_DELTA: [bool; 6] = [false, true, true, true, true, false];
 /// Of those, the ones coded as `sint32` rather than `sint64`.
 const DI_SINT32: [bool; 6] = [false, false, false, true, true, false];
 
-struct Cut<'b> {
+pub(super) struct Cut<'b> {
     block: &'b [u8],
     layout: &'b Layout,
     units: Vec<Unit>,
@@ -150,37 +150,37 @@ struct Cut<'b> {
     group_cost: Vec<usize>,
 }
 
-/// Cut `block` (taken apart as `layout`) into re-encoded pieces of at most
-/// `limit` bytes, or `None` when this cut finds no partition either.
+/// Plan a cut of `block` (taken apart as `layout`) into re-encoded pieces
+/// of at most `limit` bytes: the cut and its cut points over its units, or
+/// `None` when this cut finds no partition either. Nothing is assembled.
 #[cold]
 #[inline(never)]
-pub(super) fn cut(
-    block: &[u8],
-    layout: &Layout,
+pub(super) fn plan<'b>(
+    block: &'b [u8],
+    layout: &'b Layout,
     limit: usize,
-    read_back: bool,
-) -> crate::Result<Option<Vec<Piece>>> {
+) -> Option<(Cut<'b>, Vec<usize>)> {
     let c = Cut::new(block, layout);
     let counts: Vec<u64> = c.units.iter().map(|u| u.count).collect();
     let mut window = Window::new(&c);
-    let Some(cuts) = partition(&counts, |i, j| window.size(i, j), limit) else {
-        return Ok(None);
-    };
-    let mut pieces = Vec::with_capacity(cuts.len().saturating_sub(1));
-    for w in cuts.windows(2) {
-        let piece = c.assemble(w[0], w[1], read_back)?;
-        if piece.bytes.len() > limit {
-            return Err(Error::internal(format!(
-                "renumber: a re-encoded piece is {} bytes, over its bound of {limit}",
-                piece.bytes.len()
-            )));
-        }
-        pieces.push(piece);
-    }
-    Ok(Some(pieces))
+    let cuts = partition(&counts, |i, j| window.size(i, j), limit)?;
+    Some((c, cuts))
 }
 
 impl<'b> Cut<'b> {
+    /// The planned piece holding units `[i, j)`, held to the bound the plan
+    /// sized it by.
+    pub(super) fn piece(&self, i: usize, j: usize, limit: usize) -> crate::Result<Piece> {
+        let piece = self.assemble(i, j)?;
+        if piece.bytes.len() > limit {
+            return Err(Error::internal(format!(
+                "block cut: a re-encoded piece is {} bytes, over its bound of {limit}",
+                piece.bytes.len()
+            )));
+        }
+        Ok(piece)
+    }
+
     fn new(block: &'b [u8], layout: &'b Layout) -> Self {
         let (entries, mut compact) = match table_entries(block, layout.prefix) {
             Some(entries) => (entries, true),
@@ -304,7 +304,7 @@ impl<'b> Cut<'b> {
     }
 
     /// The piece holding units `[i, j)`.
-    fn assemble(&self, i: usize, j: usize, read_back: bool) -> crate::Result<Piece> {
+    fn assemble(&self, i: usize, j: usize) -> crate::Result<Piece> {
         let block = self.block;
         let mut out = Vec::new();
         // Old slot to new, for the slots this piece keeps.
@@ -323,7 +323,7 @@ impl<'b> Cut<'b> {
             let mut table = Vec::new();
             for (new, &old) in kept.iter().enumerate() {
                 map[old as usize] = u32::try_from(new)
-                    .map_err(|_| Error::internal("renumber: string slot overflow"))?;
+                    .map_err(|_| Error::internal("block cut: string slot overflow"))?;
                 let (a, b) = self.entries[old as usize];
                 table.extend_from_slice(&block[a..b]);
             }
@@ -332,7 +332,6 @@ impl<'b> Cut<'b> {
             out.extend_from_slice(&block[self.layout.prefix.0..self.layout.prefix.1]);
         }
         let map = self.compact.then_some(map.as_slice());
-        let mut relation_ids = None;
         let mut count = 0u64;
         let mut k = i;
         let mut body = Vec::new();
@@ -347,7 +346,7 @@ impl<'b> Cut<'b> {
             if let Kind::Node { dense, k: first } = self.units[k].kind {
                 let last = match self.units[end - 1].kind {
                     Kind::Node { k, .. } => k,
-                    _ => return Err(Error::internal("renumber: a dense group mixing units")),
+                    _ => return Err(Error::internal("block cut: a dense group mixing units")),
                 };
                 scratch.clear();
                 self.emit_dense(&self.dense[dense], first, last + 1, map, &mut scratch)?;
@@ -367,7 +366,7 @@ impl<'b> Cut<'b> {
                                 &mut scratch,
                             ) {
                                 return Err(Error::internal(
-                                    "renumber: an element readable once is not on its re-encoding",
+                                    "block cut: an element readable once is not on its re-encoding",
                                 ));
                             }
                             protohoggr::encode_bytes_field_always(&mut body, kind, &scratch);
@@ -378,21 +377,12 @@ impl<'b> Cut<'b> {
             }
             for u in &self.units[k..end] {
                 count += u.count;
-                if read_back && matches!(u.kind, Kind::Plain { kind: RELATION }) {
-                    let id =
-                        super::super::wire_rewrite::relation_id(&block[u.payload.0..u.payload.1])?;
-                    widen(&mut relation_ids, id);
-                }
             }
             protohoggr::encode_bytes_field_always(&mut out, 2, &body);
             k = end;
         }
         out.extend_from_slice(&block[self.layout.suffix.0..self.layout.suffix.1]);
-        Ok(Piece {
-            bytes: out,
-            count,
-            relation_ids,
-        })
+        Ok(Piece { bytes: out, count })
     }
 
     /// Nodes `[a, b)` of `dense` as one `DenseNodes` message.
@@ -522,11 +512,11 @@ fn remapped_sids(
     map: Option<&[u32]>,
     out: &mut Vec<u8>,
 ) -> crate::Result<()> {
-    let map = map.ok_or_else(|| Error::internal("renumber: remapping sids without a map"))?;
+    let map = map.ok_or_else(|| Error::internal("block cut: remapping sids without a map"))?;
     let mut prev: i32 = 0;
     for &sid in &dense.user_sids[a..b] {
         let new = i32::try_from(map[slot(u64::try_from(sid).unwrap_or(u64::MAX))])
-            .map_err(|_| Error::internal("renumber: a remapped sid overflows"))?;
+            .map_err(|_| Error::internal("block cut: a remapped sid overflows"))?;
         protohoggr::encode_varint(out, u64::from(zigzag32(new.wrapping_sub(prev))));
         prev = new;
     }

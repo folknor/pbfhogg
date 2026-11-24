@@ -98,7 +98,7 @@ where
         written: 0,
         orphans: 0,
     };
-    let limits = super::split::Limits::new(writer.compression());
+    let limits = crate::commands::split::Limits::new(writer.compression());
     let sure = limits.sure();
     let cancel = writer.cancel_token().permit();
     run_ordered(

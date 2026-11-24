@@ -148,36 +148,54 @@ writes a metadata-less node dense, which the entry's reporter put at two
 bytes larger than plain (not measured), so a node at exactly the payload
 limit fails. Both need blocks within bytes of 32 MiB.
 
-## CMD-050 - History time-filter and the sort/dedupe sweep can refuse frameable input
+## CMD-050 - Blob-local re-encoders still refuse a rebuilt block past the limit
 
-Reported by: the CMD-049 implementer (2026-11-19); narrowed by its spar
-(2026-11-24).
+Reported by: the CMD-049 implementer (2026-11-19); narrowed twice by spars
+(2026-11-24): history time-filter and the sort / `cat --dedupe` sweep now
+cut an oversized block on its own bytes (`commands/split.rs`, `fit_scanned`).
 
-Both pack records from many input blobs into one `BlockBuilder` with no
-user-set cap, cut by count only, so input whose blobs all frame can build an
-output block past the 32 MiB payload limit at the default 8000 cap: for
-example 1200 selected relations of 10000 members each (about 36 MB of member
-arrays) spread over input blobs of 600. The writer refuses it, typed, exit 2,
-nothing published, and no flag or repack of the input helps. Fix shape:
-recover on the typed payload or body overflow and re-emit the block's records
-in smaller pieces, as apply-changes does. Neither path retains them today:
-history time-filter drops each record once written, so it must hold the
-current output block's records and catch the overflow before the block
-reaches the writer pipeline; the sweep drains one ID group at a time while a
-block spans many, and retaining `Held` records can extend decoded source
-blobs' lifetimes, which the memory design must account for. Cover the final
-flush too.
+The input-blob-local re-encoders (cat re-encode, snapshot time-filter,
+extract, which frame through `FramedBlocks`; tags-filter, getid and
+getparents, which write owned blocks) have no cross-blob growth but no byte
+guarantee either: a rebuilt string table can give common strings wider
+indices, and a codec change can push an unchanged payload's body past the
+limit. They still refuse such a block (typed, exit 2). Fix shape: opt them
+into the shared cut. In `FramedBlocks` the plan can borrow the lent bytes
+inside the `lend_encoded` closure and push each piece's frame; the opt-in is
+explicit per caller, because apply-changes' `RewriteSink` needs the typed
+overflow from `flush_or_overflow` to drive its replay, and repack and degrade
+refuse by design. Each opt-in changes that command's documented refusal in
+`docs/cli/commands.md`.
 
 Ruled, not open: no byte threshold in `can_add_*` or the
-`ensure_*_capacity_local` funnel (any threshold is beaten by the next
-element, `content_len` is a lower bound, and repack's and degrade's layouts
-are count rules the verifier and the unsort modes depend on); repack and
-degrade refuse an over-limit block by design. Known limitation, below the
-fix above: input-blob-local re-encoders (cat re-encode, snapshot
-time-filter, tags-filter, extract, getid, getparents) have no cross-blob
-growth, but carry no byte guarantee either: a rebuilt string table can give
-common strings wider indices, and a codec change can push an unchanged
-payload's body past the limit.
+`ensure_*_capacity_local` funnel; repack and degrade refuse an over-limit
+block by design; the cut's search is sized by a monotone upper bound and
+may miss a partition by the bytes the bound over-counts, which ends in the
+same typed refusal, never a wrong blob.
+
+## CMD-072 - The sort / dedupe sweep's size refusal names no input
+
+Reported by: the CMD-050 scout (2026-11-24); not run.
+
+`Sweep::emit_group` locates an `out.encode` failure at the member's input
+and frame, but a refusal raised when a block is framed (`Output::ship`,
+mid-run and at the final flush) carries no location, though the block holds
+elements of many inputs and blobs. After the oversize cut this is reached
+only by a single element too large for a blob or a missed partition. Fix
+shape: locate the refusal at the input and frame of the block's first or
+offending element.
+
+## CMD-073 - The sort / dedupe sweep may drop a way's inline locations
+
+Reported by: the CMD-050 spar partner (2026-11-24); not verified.
+
+`Output::encode` re-adds a held way with `add_way_partial` from its refs
+alone, and the history time-filter clones ways with `read_way`, which drops
+`node_locations`. An input declaring `LocationsOnWays` whose way blobs are
+swept or filtered would come out with ways without coordinates. Verify
+whether the output header still declares the feature (a silent wrong
+answer) or the input is refused earlier; if neither, re-add with
+`add_way_with_locations_partial` when the way carries locations.
 
 ## CMD-066 - add-locations-to-ways writes one block per way blob, however large
 
@@ -190,7 +208,7 @@ locations through a count-cut `BlockBuilder`. Adding coordinates grows a
 block: 8000 ways of 1200 refs with metre-scale deltas carry about 38 MB of
 location arrays alone, so a frameable input blob comes out refused (exit 2)
 with no cap flag to lower. Fix shape: cut the finished payload between ways,
-reusing renumber's wire partition (`renumber/split.rs`), deriving each
+reusing the shared wire partition (`commands/split.rs`), deriving each
 piece's ID range from the ways it holds (IDs keep their gaps), slicing the
 `WayMembers` bitmap and per-way pin data with them; no extra scan for a
 block that frames. The guarantee is scoped to pieces that fit with the

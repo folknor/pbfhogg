@@ -1510,3 +1510,52 @@ fn a_many_version_group_ships_block_by_block() {
         "{staged} bytes of completed output were held before shipping"
     );
 }
+
+/// Two inputs whose blobs each frame, overlapping in their ID ranges, so the
+/// sweep packs both into one count-cut output block past the 32 MiB payload
+/// limit. The block is cut on its bytes into blocks that fit, every node
+/// kept in order; the cut block counts as staged while its pieces are
+/// framed.
+#[test]
+fn an_overlap_block_past_the_payload_limit_is_cut() {
+    const LARGE: usize = 13 << 20;
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let value = |id: i64| {
+        let fill = char::from(b'a' + u8::try_from(id).expect("small id"));
+        std::iter::repeat_n(fill, LARGE).collect::<String>()
+    };
+    write_node_blobs(&a, true, &[vec![1, 3]], value);
+    write_node_blobs(&b, true, &[vec![2, 4]], value);
+
+    let (host, counters) = recording_host(4);
+    let stats = merge_pbf(
+        &[a.as_path(), b.as_path()],
+        crate::common::out(&output),
+        &uncompressed_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    )
+    .unwrap_or_else(|e| panic!("merge: {}", e.report()));
+    assert_eq!(stats.nodes, 4);
+    assert_eq!(stats.duplicates_removed, 0);
+    let got = nodes_with_value(&output);
+    let ids: Vec<i64> = got.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4]);
+    assert!(
+        got.iter().all(|(id, v)| *v == value(*id)),
+        "a node's value changed"
+    );
+    assert!(
+        frames(&output).len() >= 3,
+        "the 52 MiB block was not cut: {} frames, header included",
+        frames(&output).len()
+    );
+    let staged = counters.get("overlap_run_staged_high_water_bytes");
+    assert!(
+        staged > 4 * u64::try_from(LARGE).expect("size"),
+        "{staged} bytes staged leave out the cut block"
+    );
+}

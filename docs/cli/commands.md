@@ -1507,6 +1507,19 @@ so the output keeps declaring `WayMembers-v1`. Unindexed blobs, and blocks
 no single index describes, are handled as `cat --dedupe` handles them (see
 [cat](#cat), "Blocks no single index describes").
 
+Blobs whose ID ranges overlap are merged into new blocks of up to 8000
+elements each, the same for `sort` and `cat --dedupe`. Records gathered
+from several input blobs can make such a block too large for one blob (the
+32 MiB payload limit, or, compressed, a body past the 32 MiB blob size)
+although every input blob fits. That block is cut between elements into
+blobs that fit, each indexed from its own content: first with every piece
+keeping the block's whole string table, and where that cannot fit, with a
+dense node group cut between nodes and each piece's string table holding
+only the strings it uses. Nothing an element carries changes, and the
+order is kept. What is still refused (exit 2): a single element that does
+not fit even with only its own strings, and a cut that needs the last few
+bytes below the limit.
+
 ### repack
 
 Re-encode a PBF with a configurable per-blob element cap. Element semantics, tags, refs, members, metadata, and DenseNodes encoding all round-trip at the OSM data model's precision (a source block in a non-default framing is converted as [PBF rebuild precision](#pbf-rebuild-precision) describes); output is type-sorted and propagates `Sort.Type_then_ID` from the input header.
@@ -2120,6 +2133,12 @@ is refused once a read has met both kinds of data blob.
 
 The output holds at most one version of each object and never declares
 `HistoricalInformation`, so it can serve as an apply-changes base.
+
+A history input's surviving versions, gathered from many input blobs, are
+written in new blocks of up to 8000 elements. One that would be too large
+for a blob is cut as `sort` cuts an overlap block (see [sort](#sort)), with
+the same remaining refusals. A snapshot input is filtered blob by blob, and
+an output blob too large for the format is still refused (exit 2).
 
 | Flag | Description |
 |------|-------------|

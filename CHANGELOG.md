@@ -825,6 +825,15 @@
   element too large for a blob with only its own strings, and a blob whose
   elements carry fields outside the format where cutting needs those
   changes.
+- **`sort`, `cat --dedupe` and history `time-filter` cut an output block
+  past 32 MiB.** They pack records from several input blobs into new
+  blocks of up to 8000 elements, so input whose blobs all fit (large
+  relations or tag values spread over overlapping or many blobs) could
+  build a block too large for the format, and the run failed with a size
+  error, nothing published. Such a block is now cut between elements into
+  blobs that fit, each indexed from its own content, as `renumber` cuts
+  its blobs; every other block is written as before. Still refused: a
+  single element too large for a blob with only its own strings.
 - **An incompressible block near 32 MiB gets the typed size refusal under
   zlib.** The zlib encoder reserved about 0.1 % over the input and failed
   with an internal "did not complete in one call" error when level 1's

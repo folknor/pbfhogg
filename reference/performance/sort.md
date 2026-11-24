@@ -160,6 +160,24 @@ uncommitted change on that base.
 - No planet cell: the planet input claims `Sort.Type_then_ID` and is
   indexed, so pass 1 takes the header-only path and never runs the walk.
 
+## Oversize cut before the sweep frames (bygg, 2026-11-24)
+
+The overlap sweep now checks each finished output block against the blob
+limits before framing it (one length comparison; the shared wire cut in
+`commands/split.rs` runs only for a block over the limit, which no real
+dataset produces). `dedupe-self --dataset denmark --cache warm`,
+`--iterations 1` cells alternated, baseline `9308a7fe` through `--commit`,
+variant the uncommitted change on that base.
+
+| Pair | `9308a7fe` | variant |
+|---|---|---|
+| 1 | 1.2 s (`5f3ed16c`, first after a worktree build) | 1.2 s (`05a06474`) |
+| 2 | 1.2 s (`b0ca02ad`) | 1.2 s (`63ebbe0b`) |
+
+- Verdict: no cost. No planet cell: the change adds no per-element work,
+  only one comparison per output block, and Denmark's dedupe-self sweeps
+  every blob.
+
 ## History
 
 ### Sort

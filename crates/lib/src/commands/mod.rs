@@ -27,6 +27,7 @@ pub mod repack;
 pub mod sort;
 #[cfg(feature = "commands")]
 pub(crate) mod spatial;
+pub(crate) mod split;
 pub mod tags_count;
 pub mod tags_filter;
 pub mod time_filter;
@@ -298,7 +299,11 @@ pub(crate) fn flush_local<O: BlockSink + ?Sized>(
 /// pushed over by its next element). A command that needs to write such
 /// blocks recovers on the typed overflow with its records retained, as
 /// apply-changes does (`apply_changes/overflow.rs`), or cuts the finished
-/// wire bytes, as renumber does (`renumber/split.rs`).
+/// wire bytes with the shared cut (`commands/split.rs`), as renumber, the
+/// history time-filter and the sort / `cat --dedupe` sweep do. A command
+/// that frames inside [`FramedBlocks`] (cat re-encode, snapshot
+/// time-filter, extract) or writes its owned blocks directly (tags-filter,
+/// getid, getparents) has not opted in and still refuses such a block.
 pub(crate) fn ensure_node_capacity_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
     output: &mut O,

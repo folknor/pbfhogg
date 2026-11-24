@@ -108,7 +108,9 @@
 //! `overlap_run_staged_high_water_bytes` (the largest completed output held
 //! on the sweep's side before shipping: payload lengths of the filled blocks
 //! plus the capacities of the chunk being packed, sampled as each ship
-//! begins, so it leaves out the pieces of the frame being packed). They
+//! begins, so it leaves out the pieces of the frame being packed; while a
+//! block over the blob payload limit is cut, the cut block plus the piece
+//! being framed plus the chunk, sampled as each piece is framed). They
 //! are what the resource tests in `crates/lib/tests/merge_pbf.rs` assert, in place of a
 //! host's resident memory.
 //!
@@ -450,6 +452,8 @@ struct Output<'s> {
     pieces: Vec<Vec<u8>>,
     refs: Vec<i64>,
     compression: &'s Compression,
+    /// What `compression` lets a block hold, for the cut in `ship`.
+    limits: crate::commands::split::Limits,
     metrics: &'s WriterMetrics,
     /// What the run reports (see the module docs, "Resource counters").
     chunks: u64,
@@ -525,23 +529,48 @@ impl Output<'_> {
         self.staged_high_water = self
             .staged_high_water
             .max(filled.saturating_add(self.chunk_bytes));
-        let limit = crate::tunables::OVERLAP_RUN_CHUNK_BYTES;
+        let limits = self.limits;
         for block in std::mem::take(&mut self.filled) {
-            frame_owned(block, self.compression, self.metrics, &mut self.pieces)?;
-            let mut pieces = std::mem::take(&mut self.pieces);
-            for piece in pieces.drain(..) {
-                let cap = piece.capacity();
-                if self.chunk_bytes > 0 && self.chunk_bytes + cap > limit {
-                    self.send(emitter)?;
+            // The block gathers the survivors of many input blobs, cut by
+            // count, so it can pass the blob payload limit while every
+            // input blob framed; one that would is cut on its own bytes
+            // into blocks that fit (`commands/split.rs`), framed here one
+            // at a time while the cut block is still held.
+            crate::commands::split::fit_scanned(block, &limits, |block, held| {
+                if held > 0 {
+                    self.staged_high_water = self.staged_high_water.max(
+                        held.saturating_add(block.bytes.len())
+                            .saturating_add(self.chunk_bytes),
+                    );
                 }
-                self.chunk.push(piece);
-                self.chunk_bytes += cap;
-                if self.chunk_bytes >= limit {
-                    self.send(emitter)?;
-                }
-            }
-            self.pieces = pieces;
+                self.pack(block, emitter)
+            })?;
         }
+        Ok(())
+    }
+
+    /// Frame one block and pack its frame into the chunk, sending full
+    /// chunks.
+    fn pack(
+        &mut self,
+        block: OwnedBlock,
+        emitter: &crate::ordered_pool::Emitter<'_, Chunk, RunCounts>,
+    ) -> Result<()> {
+        let limit = crate::tunables::OVERLAP_RUN_CHUNK_BYTES;
+        frame_owned(block, self.compression, self.metrics, &mut self.pieces)?;
+        let mut pieces = std::mem::take(&mut self.pieces);
+        for piece in pieces.drain(..) {
+            let cap = piece.capacity();
+            if self.chunk_bytes > 0 && self.chunk_bytes + cap > limit {
+                self.send(emitter)?;
+            }
+            self.chunk.push(piece);
+            self.chunk_bytes += cap;
+            if self.chunk_bytes >= limit {
+                self.send(emitter)?;
+            }
+        }
+        self.pieces = pieces;
         Ok(())
     }
 
@@ -672,6 +701,7 @@ impl Sweep<'_, '_> {
             pieces: Vec::new(),
             refs: Vec::new(),
             compression: self.compression,
+            limits: crate::commands::split::Limits::new(*self.compression),
             metrics: self.metrics,
             chunks: 0,
             chunk_high_water: 0,

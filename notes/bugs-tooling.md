@@ -101,22 +101,6 @@ ownership inventory and one shared acquisition and recovery protocol, because
 parsing pins, sequence keys, aliases and ownership separately in each path is
 already producing contradictory answers.
 
-## TOOL-021 - The nofile certifications do not exercise real descriptor limits
-
-Reported by: library-protocol [P1].
-
-`requirements.rs` defines the `nofile.*.v1` capabilities in terms of the soft
-process limit, including external ALTW running with soft nofile 1024. The
-worker instead supplies fixed FdPool grants of 1024, 6 and 896 descriptors
-(`crates/harness/src/scenarios/nofile.rs`) and raises the soft limit to the
-hard limit (`crates/harness/src/process.rs`). Those scenarios can pass without
-exercising real-limit probing or the stated limit. The grant scenarios are
-internally consistent, but the requirement meanings and coverage declarations
-overstate what is certified. Either restore scenarios that prove those
-meanings, or add new capability versions for grant-based admission and
-sizing. Rewording the existing IDs would break the protocol's
-meaning-versioning rule.
-
 ## TOOL-022 - Clock validation uses absolute times where the contract says relative
 
 Reported by: library-protocol [P2].

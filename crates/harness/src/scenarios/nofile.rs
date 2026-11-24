@@ -100,7 +100,7 @@ pub(crate) struct NofileCatRefused;
 impl Scenario for NofileCatRefused {
     fn workload(&self) -> Workload {
         let mut w = descriptor_workload(
-            "nofile-cat-refused",
+            "fd-grant-cat-refused",
             "cat of 1100 spellings of a missing path with a caller grant of 1024 descriptors, refused up front",
             120,
             CAT_GRANT,
@@ -121,7 +121,7 @@ impl Scenario for NofileCatRefused {
         w.assertions = vec![assertion(
             "a.refused",
             Some("a"),
-            &["nofile.cat-refused.v1"],
+            &["fd.grant.cat-refused.v1"],
         )];
         w
     }
@@ -159,7 +159,7 @@ pub(crate) struct NofileMultiExtractRefused;
 impl Scenario for NofileMultiExtractRefused {
     fn workload(&self) -> Workload {
         let mut w = descriptor_workload(
-            "nofile-multi-extract-refused",
+            "fd-grant-multi-extract-refused",
             "single-pass two-region extract of a missing path with a caller grant of 6 descriptors, refused up front",
             120,
             MULTI_GRANT,
@@ -185,7 +185,7 @@ impl Scenario for NofileMultiExtractRefused {
         w.assertions = vec![assertion(
             "a.refused",
             Some("a"),
-            &["nofile.multi-extract-refused.v1"],
+            &["fd.grant.multi-extract-refused.v1"],
         )];
         w
     }
@@ -235,7 +235,7 @@ pub(crate) struct NofileAltwExternal;
 
 /// Sized from the caller's parallelism and the descriptor allowance, three
 /// stage-1 workers ran and the join completed.
-const ALTW_EXTERNAL: &[&str] = &["nofile.altw-external.v1"];
+const ALTW_EXTERNAL: &[&str] = &["fd.grant.altw-external.v1"];
 
 /// Records the counters stage 1 reports about its worker count.
 struct Workers(Mutex<Vec<(String, i64)>>);
@@ -271,7 +271,7 @@ impl Workers {
 impl Scenario for NofileAltwExternal {
     fn workload(&self) -> Workload {
         let mut w = descriptor_workload(
-            "nofile-altw-external",
+            "fd-grant-altw-external",
             "external add-locations-to-ways with a caller grant of 896 descriptors completes with three stage-1 workers",
             1800,
             ALTW_GRANT,

@@ -1,6 +1,13 @@
 //! Independent, driver-owned certification requirements.
 use super::certify::Requirements;
 
+/// The `fd.grant.*` ids certify descriptor admission and sizing against an
+/// exact caller grant (`host::FdPool`), which is what their scenarios run.
+/// They replaced `nofile.*.v1` ids whose meanings claimed the process soft
+/// `RLIMIT_NOFILE`, which no certification scenario sets: the harness raises
+/// soft to hard. Real-limit probing is proven by the child-process contracts
+/// (`crates/harness/tests/nofile.rs`, `crates/lib/tests/process_nofile.rs`),
+/// not here; see reference/testing.md on the deliberate split.
 pub(crate) fn applied() -> Requirements {
     Requirements::new([
         ("calls.repeatable.v1", "two calls in one process, one after another, each install their output and the outputs are byte-identical"),
@@ -9,9 +16,9 @@ pub(crate) fn applied() -> Requirements {
         ("counters.own-snapshot.v1", "concurrent calls' invocation counter snapshots hold only their own values"),
         ("stream.sealed.v1", "a sealed call's stream carries every snapshot counter and one terminal record, with no proven defect"),
         ("fd.pool.v1", "concurrent calls share a caller's descriptor pool, each holding its full grant from before its scan to the end of its scan and returning it whole"),
-        ("nofile.cat-refused.v1", "a cat needing more descriptors than the soft limit allows is refused with a typed descriptor error before acquiring any input, publishing nothing"),
-        ("nofile.multi-extract-refused.v1", "a single-pass multi-region extract needing more descriptors than the soft limit leaves free is refused with a typed descriptor error before acquiring any input, publishing no member"),
-        ("nofile.altw-external.v1", "at caller parallelism 8 and soft nofile 1024, altw external sizes stage 1 to a cpu cap of 6 and a descriptor cap of 3, runs 3 workers, and completes"),
+        ("fd.grant.cat-refused.v1", "a cat needing more descriptors than its caller grant holds is refused as invalid_argument with a descriptor diagnostic, before its scan starts, publishing nothing"),
+        ("fd.grant.multi-extract-refused.v1", "a multi-region extract configured for the single pass, needing more descriptors than its caller grant holds, is refused as invalid_argument naming its descriptor demand with one writer per region counted, before its scan starts, publishing no member"),
+        ("fd.grant.altw-external.v1", "at caller parallelism 8 and a caller grant of 896 descriptors, altw external reports 896 available, sizes stage 1 to a cpu cap of 6 and a descriptor cap of 3, selects 3 stage-1 shard workers, and completes with its output installed"),
         ("executor.global-pool-unused.v1", "a call on a caller-built Executor::Pool completes without ever building rayon's global pool"),
         ("executor.caller-pool.v1", "writer framing runs on the caller's Executor::Pool"),
         ("host.page-cache-keep.v1", "a call on PageCachePolicy::Keep evicts nothing of its inputs from the page cache"),

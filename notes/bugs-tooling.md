@@ -207,6 +207,19 @@ can hang the copy, under brokkr's machine lock (different bytes are caught
 by the later re-hash of the staged copy, a hang is not). Holding the checked
 descriptor through the copy would close it.
 
+## TOOL-050 - The library verifier computes call phases and tail markers nobody reads
+
+Reported by: the scout of the library call-stream verdict work (2026-11-24),
+verified at the code by the spar accountant; not a correctness defect.
+
+`stream::judge` (`crates/library/src/stream.rs`) fills `CallStream.phases`
+(each phase's name and length) and `CallStream.tail` (markers after the
+call returned) for every call, but `collect` in `crates/library/src/run.rs`
+reads only `status` and `detail`; the two fields are read only by
+`stream_tests.rs`, and reference/library-protocol.md says nothing about
+phases. Either the fields were meant to reach a report and that wiring is
+missing, or they are dead work to remove. Decide which.
+
 # From the 2026-11-21 verifier performance hunt
 
 Defects the performance hunters found while reading the code at `e8377a78`
@@ -227,15 +240,3 @@ reads as if the verifier error should, so `Tool` probably belongs in the
 pass-through arm beside `Interrupted` and `Unsettled`. Left for the user
 because it changes which outcomes stop a suite.
 
-## TOOL-047 - reference/verify.md says every fixture runs with --fresh-reference
-
-Reported by: the PERF-072 scout, not yet verified at the code.
-
-reference/verify.md "Decoding summaries" says summaries are neither read nor
-written under `--fresh-reference` and that every fixture test runs in that
-mode. The apply, change, dedupe, extract, getid, read and refs fixtures build
-their cache with `ReferenceCache::new(.., false)`; only the encoding and diff
-fixtures pass `true`. Either summaries can fire in those fixtures (their fake
-osmium keys decodes by content marker, so a stored summary could decide a
-comparison the fixture means to merge), or the doc's claim rests on some
-other switch. Establish which and fix the doc or the fixtures.

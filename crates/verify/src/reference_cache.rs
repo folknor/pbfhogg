@@ -647,10 +647,9 @@ impl ReferenceCache {
     /// The persistent summary key of each decode in `runs` (uncached
     /// `osmium cat` runs), all under one observation of the tool's identity,
     /// so keys made together name one binding. `None` under
-    /// `--fresh-reference` (summaries are neither read nor written then:
-    /// fixture tools answer by file name, not bytes) or when the identity is
-    /// unavailable. `reprobe` allows a new probe when the memo no longer
-    /// holds; without it a moved binding gives `None`. Each run must name
+    /// `--fresh-reference` (summaries are neither read nor written then) or
+    /// when the identity is unavailable. `reprobe` allows a new probe when
+    /// the memo no longer holds; without it a moved binding gives `None`. Each run must name
     /// the output its key promises: osmium picks the OPL writer from `-f`,
     /// never from the output's name, so a launch writing elsewhere decodes
     /// the same bytes.

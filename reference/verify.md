@@ -497,9 +497,16 @@ summary under a key derived from it (the renumber paragraph below).
 The other sequence walks, the derive model and field-policies, whose
 subject is the merge itself, always merge.
 
-Summaries are neither read nor written under `--fresh-reference`; every
-fixture test runs in that mode, since its fake osmium answers by file name,
-not bytes. Retention keeps the most recently used `SUMMARY_RETAIN`
+Summaries are neither read nor written under `--fresh-reference`, which
+also bypasses reference-run hits. The fixture tests choose per fixture:
+those whose fake osmium answers every decode from the operand's bytes
+(apply, change, dedupe, extract, getid, read, refs) run with the cache and
+summaries live, so they reach the summary-decided paths; the encoding
+fixture runs fresh because its fake decodes by file name and a fault side
+file, and the diff fixture because its cached reference runs (derive-changes
+round trip, renumber) would replay one case's output into another. A summary
+hit alone does not skip a merge: a difference still falls through to it.
+Retention keeps the most recently used `SUMMARY_RETAIN`
 summaries (`crates/verify/src/tunables.rs`) after a normally concluded run;
 a zero budget, and `clean-references`, keep none.
 

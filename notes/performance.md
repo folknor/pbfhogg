@@ -1981,10 +1981,11 @@ once the digest moved under the read buffer (per-line hashing cost about
 
 Residue:
 
-- Untested end to end: every fixture test runs under `--fresh-reference`,
-  which disables summaries, so the summary hit, the one-hit scan and the
-  key sealing in `opl_compare` have only the unit test of `Stream`'s
-  summary. A fixture whose fake osmium answers by bytes would cover them.
+- Partly tested end to end: the apply, dedupe, extract, getid, read and
+  refs fixtures run with summaries live and do hit stored summaries
+  (observed by temporary instrumentation, 2026-11-24), but no test asserts
+  which decided path ran, and whether the one-hit scan is reached was not
+  traced. The encoding and diff fixtures run fresh.
 - The one-hit path (pbfhogg output bytes changed, reference summary stored)
   is unmeasured: denmark sort and cat outputs were byte-stable.
 - `compare_with_opl` (the derive-changes expected model) and the derive
@@ -1996,8 +1997,8 @@ Residue:
   though the unchanged side's stored reading could stand in for its
   decode (the changed side would still need a full reading). Building
   both readings during a cold walk costs about 4.8 s on denmark
-  (reference/performance/verifier.md). Like the other summaries, no test
-  reaches the hit path, since fixtures run under `--fresh-reference`.
+  (reference/performance/verifier.md). No test reaches the hit path: renumber
+  is driven only by the diff fixture, which runs fresh.
 - A fresh decode of a missing side is still a full file-backed decode; the
   shortcut saves the other side and the merge only.
 
@@ -2086,9 +2087,10 @@ Residue:
 - Each audited output still gets `index_truth`, `check --index`, a claims
   walk and layout work, and the layout predictors walk the input claims
   once per kind per case (the frame-reader half is PERF-077).
-- No test reaches the summary-decided sequence walk end to end: fixtures
-  run with `--fresh-reference`, whose fake osmium answers by file name,
-  and their 3-object input runs no drop or unsort case. Unit tests hold
+- No test reaches the summary-decided sequence walk end to end: repack and
+  degrade are driven only by the encoding fixture, which runs fresh
+  because its fake osmium decodes by file name, and its 3-object input
+  runs no drop or unsort case. Unit tests hold
   the predicted listing, counts and digest to the merge's.
 
 ## PERF-071 - add-locations-to-ways --mode all decodes ten times for three files

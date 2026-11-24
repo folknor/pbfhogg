@@ -11,6 +11,9 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     let input = dir.join("input.pbf");
     write_pbf(&input, false, 3, &[], &[]);
     let run = run::Run::create(&dir, exe, true).unwrap();
+    // Fresh: the fake decodes by file name and the fault side file, so
+    // byte-identical outputs of different cases decode differently, which a
+    // content-keyed stored summary would not see.
     let cache = reference_cache::ReferenceCache::new(&dir, "encoding".into(), true).unwrap();
     let mut h = harness::Harness::new(
         life,

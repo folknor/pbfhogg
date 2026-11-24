@@ -95,6 +95,11 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
     )
     .unwrap();
     let run = run::Run::create(&dir, exe, true).unwrap();
+    // Fresh: the decodes are by marker, but cached reference runs are not
+    // safe here. The kind-change and kind-change-extra cases feed the
+    // derive-changes round trip the same bytes and argv, and renumber's
+    // reference runs repeat across faults, so a hit would replay one
+    // case's marked output into another and hide the difference it asserts.
     let cache = reference_cache::ReferenceCache::new(&dir, "diff".into(), true).unwrap();
     let mut h = harness::Harness::new(
         life,

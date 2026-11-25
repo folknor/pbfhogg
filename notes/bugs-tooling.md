@@ -147,17 +147,17 @@ precedence and surface as a content difference blamed on pbfhogg. Traced
 from source only; derive emits new's versions, so whether real derives
 reach it is unchecked.
 
-## TOOL-059 - Five verify checks have no fixture driving their run
+## TOOL-059 - Four verify checks have no fixture driving their run
 
 Reported by: the geocode fixture spar (2026-11-25), confirmed by codex.
+Narrowed by the inspect-tags fixture (`inspect_tags_fixture.rs`).
 
 No test under `crates/verify/tests` drives the production `run` of
-`merge_changes`, `getparents`, `inspect_tags`, `check_ids` or
-`field_policies`; they have helper-level unit tests only, and the
-executable fixture in `process.rs` drives `sort`, not these. Their flow,
-verdict names and exit judging are exercised only by real-data runs. Each
-wants a fake-tool fixture with one fault per verdict, as
-`crates/verify/tests/geocode_fixture.rs` and `getid_fixture.rs` do.
+`merge_changes`, `getparents`, `check_ids` or `field_policies`; they have
+helper-level unit tests only. Their flow, verdict names and exit judging
+are exercised only by real-data runs. Worked as a chain, one link per
+check; the per-check rulings and link plan are in
+`notes/TOOL-059-design.md`.
 
 # From the 2026-11-21 verifier performance hunt
 

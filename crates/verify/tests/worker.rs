@@ -35,6 +35,8 @@ mod geocode_fixture;
 mod getid_fixture;
 #[path = "../src/harness.rs"]
 pub(crate) mod harness;
+#[path = "inspect_tags_fixture.rs"]
+mod inspect_tags_fixture;
 #[path = "../src/opl_compare.rs"]
 pub(crate) mod opl_compare;
 #[path = "../src/osc.rs"]
@@ -189,6 +191,13 @@ fn main() {
     } else if args[1..].iter().any(|a| {
         Path::new(a)
             .ancestors()
+            .any(|p| p.file_name().is_some_and(|n| n == "inspect-tags-fixture"))
+    }) && role != "driver"
+    {
+        std::process::exit(inspect_tags_fixture::tool(&args[1..]));
+    } else if args[1..].iter().any(|a| {
+        Path::new(a)
+            .ancestors()
             .any(|p| p.file_name().is_some_and(|n| n == "read-fixture"))
     }) {
         std::process::exit(read_fixture::tool(&args[1..]));
@@ -234,7 +243,8 @@ fn driver(role: &str, dir: &Path) {
     }
     // The check fixtures: each owns its scratch root and ends childless.
     type Fixture = fn(process::Lifecycle, &Path, &Path);
-    let fixtures: [(&str, Fixture); 7] = [
+    let fixtures: [(&str, Fixture); 8] = [
+        ("inspect-tags", inspect_tags_fixture::driver),
         ("encoding", encoding_fixture::driver),
         ("extract", extract_fixture::driver),
         ("read", read_fixture::driver),

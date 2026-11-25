@@ -2,18 +2,41 @@
 
 ## Multi-extract
 
-Single-pass simple strategy on sorted input: read PBF once, classify each
-element against N regions, compress and frame each region's blocks in the
-pool's tasks, write the frames to N sync-mode PbfWriters
-(sync-mode writers over the staged files; publication syncs each output
-after the final flush, once `MULTI_REL_WRITE_END` and every other phase
-marker has ended, between `PUBLISH_START` and `PUBLISH_END`; the `writer_sync_all_ns` and
-`writer_sync_all_calls` counters attribute that cost). The rows below
-predate the per-output sync and the 256 KiB per-output buffer. 3-phase
-barrier (nodes → ways → relations), with per-region `BlockBuilder`s and,
-since the shared region membership below, one membership structure per
-kind (the rows in this table predate it and used one `IdSet` per region
-and kind). 5 disjoint longitude strips per configured bench.
+Simple strategy on sorted input: one run over the PBF for all N regions,
+each kind read once when its indexdata ID ranges are pairwise disjoint
+(the fused pass below) and classified then rewritten otherwise; each
+region's blocks are compressed and framed in the pool's tasks and the frames
+written to N sync-mode PbfWriters (publication syncs each output after the
+final flush, between `PUBLISH_START` and `PUBLISH_END`; the
+`writer_sync_all_ns` and `writer_sync_all_calls` counters attribute that
+cost). Kinds run nodes, then ways, then relations, each after the previous
+kind's membership is frozen. Older rows below predate the per-output sync,
+the 256 KiB per-output buffer, the shared region membership (they used one
+`IdSet` per region and kind) and the fused pass. 5 disjoint longitude strips
+per configured bench.
+
+### Fused simple kind pass (bygg, 2026-11-25, against `a74c2464`)
+
+`brokkr bench --iterations 1 region-extract --mode multi --strategy simple
+--dataset planet` (5 strips), interleaved, baseline `--commit HEAD` at
+`a74c2464`, variant uncommitted on top of it (the commit that lands
+`extract/multi_fused.rs`):
+
+| cell | wall | nodes | ways | relations |
+|--|--|--|--|--|
+| baseline `615b969f` | 68 s | | | |
+| variant `2bd16e7d` | 51.5 s | | | |
+| baseline `90f575e0` | 68 s | 15.48 + 23.02 s | 12.78 + 9.82 s | 0.35 + 0.22 s |
+| variant `6f12427a` | 51.6 s | 28.86 s | 15.76 s | 0.39 s |
+
+About -24 %, same sign in both pairs. Unlike single extract (about -9 %),
+where the fused selection walk cost most of the removed scanner classify,
+the multi selection walk keeps the columnar bbox test of the old node
+classify and the way walk keeps its membership lookups; what goes is the
+second pread, decompression, validation and block build per blob, and the
+write pass's per-element membership lookup. The sidecar's per-phase memory
+column reads about 0.90 GB in the fused node phase against 0.79 GB in the
+old node write phase; schedule scan unchanged (6.5 s).
 
 ### Shared complete-ways and smart pass (bygg, 2026-11-25, against `b20ab376`)
 

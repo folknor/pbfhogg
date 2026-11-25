@@ -372,8 +372,10 @@ grid, the raw-passthrough proof - compares stored decimicrodegrees against that
 one box.
 
 Multi-extract via `--config` JSON: on sorted input, one shared run producing
-multiple output files - simple's classify and write passes
-(`extract/multi.rs`), or for complete-ways and smart a dependency engine
+multiple output files - for simple, one fused read per kind whose blobs'
+indexdata ID ranges are pairwise disjoint (`extract/multi_fused.rs`:
+selection, emission and framing on the worker) and classify and write passes
+for any other kind (`extract/multi.rs`), or for complete-ways and smart a dependency engine
 (`extract/multi_dep.rs`) that keeps per-region bit masks per kind in shared
 `Membership` tables (spatial nodes, matched ways, way-completion nodes,
 relations after the parent closure, smart's extra ways and their nodes) and

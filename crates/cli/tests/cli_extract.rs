@@ -2151,6 +2151,35 @@ fn simple_extract_refuses_an_inexact_id_range_it_relies_on() {
     }
 }
 
+/// Multi-extract's fused kind pass relies on the same disjoint ID ranges and
+/// refuses the same inexact claims, publishing no region.
+#[test]
+fn multi_extract_refuses_an_inexact_id_range_it_relies_on() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    let config = single_region_config(dir.path());
+    for (name, min, max, count) in [("wide", 11, 25, None), ("count", 11, 20, Some(9))] {
+        let input = dir.path().join(format!("{name}.osm.pbf"));
+        let forged = crate::common::adversarial::forge_indexdata_range(&pbf, 2, min, max, count);
+        std::fs::write(&input, forged).expect("write forged fixture");
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg("extract")
+            .arg(&input)
+            .arg("--config")
+            .arg(&config)
+            .arg("--simple")
+            .assert_failed();
+        out.assert_stderr_contains("this run places and counts the blob by its claim");
+        assert!(
+            !dir.path().join("m.osm.pbf").exists(),
+            "{name}: nothing is published"
+        );
+    }
+}
+
 /// A blob whose indexdata bbox claims containment while its nodes are
 /// outside used to be copied raw on the claim alone, putting out-of-region
 /// nodes in the extract. The classify phase now verifies every candidate

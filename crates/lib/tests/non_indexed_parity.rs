@@ -374,6 +374,86 @@ fn extract_simple_repeated_ids_match_the_non_indexed_run() {
     }
 }
 
+/// Multi-extract's counterpart. At block sizes 3 and 100 every repeat sits
+/// inside one blob and takes the fused pass's blob-local union; at block
+/// size 2 the repeats straddle blobs, the ranges overlap, and the kind
+/// classifies then writes. Each region writes every occurrence of an ID any occurrence
+/// matched in that region, as the non-indexed run does.
+#[cfg(feature = "commands")]
+#[test]
+fn extract_multi_simple_repeated_ids_match_the_non_indexed_run() {
+    let node = |id: i64, at: i32| TestNode {
+        id,
+        lat: at,
+        lon: at,
+        tags: vec![],
+        meta: None,
+    };
+    // Region a holds coordinate 1_000, region b 90_000: each repeated ID
+    // has one occurrence in each region.
+    let nodes = vec![
+        node(1, 90_000),
+        node(2, 90_000),
+        node(2, 1_000),
+        node(4, 90_000),
+        node(4, 1_000),
+        node(5, 1_000),
+    ];
+    let ways = generate_ways(1, 1_000, 2, 1);
+    let regions = || {
+        ["0.0,0.0,0.0006,0.0006", "0.008,0.008,0.01,0.01"]
+            .into_iter()
+            .map(|b| {
+                pbfhogg::commands::extract::Region::Bbox(
+                    pbfhogg::commands::extract::parse_bbox(b).expect("parse bbox"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for block_size in [2, 3, 100] {
+        let dir = crate::common::test_scratch();
+        let in_idx = dir.path().join("in_idx.osm.pbf");
+        let in_non = dir.path().join("in_non.osm.pbf");
+        write_multi_block_test_pbf(&in_idx, &nodes, &ways, &[], block_size);
+        write_multi_block_non_indexed_pbf(&in_non, &nodes, &ways, &[], block_size);
+        let outputs = |suffix: &str| {
+            [
+                dir.path().join(format!("a_{suffix}.osm.pbf")),
+                dir.path().join(format!("b_{suffix}.osm.pbf")),
+            ]
+        };
+        let mut all_stats = Vec::new();
+        for (input, suffix) in [(&in_idx, "idx"), (&in_non, "non")] {
+            let stats = pbfhogg::commands::extract::extract_multi(
+                input,
+                &regions(),
+                pbfhogg::OutputSet::files(
+                    outputs(suffix),
+                    pbfhogg::Overwrite::Refuse,
+                    &pbfhogg::host::Diagnostics::discard(),
+                )
+                .expect("stage outputs"),
+                pbfhogg::commands::extract::ExtractStrategy::Simple,
+                true,
+                &pbfhogg::cat::CleanAttrs::default(),
+                &forced(),
+                &pbfhogg::HeaderOverrides::default(),
+                &crate::common::test_host(),
+            )
+            .expect("extract_multi");
+            all_stats.push(stats);
+        }
+        for (idx, non) in outputs("idx").iter().zip(outputs("non").iter()) {
+            assert_elements_equivalent(idx, non);
+        }
+        // a: 2, 2, 4, 4, 5. b: 1, 2, 2, 4, 4.
+        for stats in &all_stats {
+            assert_eq!(stats[0].nodes_in_bbox, 5, "block size {block_size}");
+            assert_eq!(stats[1].nodes_in_bbox, 5, "block size {block_size}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // getid (include mode)
 // ---------------------------------------------------------------------------

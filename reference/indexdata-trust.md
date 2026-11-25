@@ -192,6 +192,13 @@ range hands a neighbour's upsert to the blob as well.
   an equal or descending step inside the blob switches it to a blob-local
   ID set. A kind with an unindexed blob or overlapping ranges reads no
   range and is classified, then written, as before.
+- **`extract --simple --config`** (multi-extract), sorted header: the same
+  gate, per kind, over the shared schedule (`extract/multi_fused.rs`). The
+  rule is decided per region inside the blob, and each blob's claim must be
+  exact before any region's output of it leaves the worker. A raw-copy
+  candidate is copied to every region only when each of its nodes' own
+  hits, before the blob-local union, cover every region. A repeated or
+  descending ID switches the blob to a blob-local `(ID, region)` table.
 - **`diff`** and `diff --format osc`, on the indexed route, every block a
   work unit decodes (both sides of an overlapping pair, every one-sided
   run, every drain and every re-decode of a carried blob), before the

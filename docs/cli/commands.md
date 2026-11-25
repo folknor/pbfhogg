@@ -1735,8 +1735,8 @@ decimicrodegree it selects.
 Node blobs whose indexdata bbox misses the region are skipped unread, and the
 sorted-input schedules split blobs on their indexdata kind; both claims are
 believed. A node blob copied raw is first decoded to prove every node lies in
-the region, but keeps its input `BlobHeader`. Single-region `--simple` on
-sorted input decodes each blob of a kind once when the kind's indexdata ID
+the region, but keeps its input `BlobHeader`. `--simple` on sorted input,
+single region or through `--config`, decodes each blob of a kind once when the kind's indexdata ID
 ranges are pairwise disjoint, and then refuses a blob whose ID range or count
 is not exact for what it holds (nothing is published); a kind without such
 ranges is read twice, a classify pass and a write pass, and its ranges are not

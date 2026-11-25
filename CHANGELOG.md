@@ -26,6 +26,16 @@
   does not name is refused (exit `2`); `cat --reindex` repairs such a file.
   A refused element still leaves the features before it written.
 
+- **Simple multi-extract decodes each blob once on sorted indexed input,
+  and refuses an inexact ID range it relies on.** `extract --simple
+  --config` now selects and writes every region from one read,
+  decompression and decode per blob when a kind's indexdata ID ranges are
+  pairwise disjoint, as single-region simple extract already did: planet
+  with five longitude strips about 68 s to 52 s. Such a blob whose ID range
+  or count is not exact for what it holds is now refused (exit `2`, no
+  region published); `cat --reindex` repairs it. Inputs whose ranges
+  overlap or carry no indexdata run as before.
+
 - **`extract --simple` decodes each blob once on sorted indexed input, and
   refuses an inexact ID range it relies on.** A single-region simple
   extract of a sorted input now reads, decompresses and decodes each blob
@@ -34,7 +44,7 @@
   planet with a continent box. Such a blob whose ID range or count is not
   exact for what it holds is now refused (exit `2`, nothing published);
   `cat --reindex` repairs it. Inputs whose ranges overlap (history files)
-  or carry no indexdata run as before. Multi-extract is unchanged.
+  or carry no indexdata run as before.
 
 - **`sort` and `cat --dedupe` keep `LocationsOnWays` through a rewrite.**
   When every input declares `LocationsOnWays`, a way blob in an overlap run

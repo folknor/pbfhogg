@@ -49,9 +49,18 @@ use crate::owned::{dense_node_metadata, element_metadata};
 /// claimed signed intervals are pairwise disjoint. Only then can a blob's
 /// worker decide the kind-wide ID rule alone (module doc).
 pub(super) fn fusable(schedule: &[&BlobDesc]) -> bool {
-    let mut ranges: Vec<(i64, i64)> = Vec::with_capacity(schedule.len());
-    for d in schedule {
-        match d.index {
+    ranges_disjoint(schedule.iter().map(|d| d.index))
+}
+
+/// [`fusable`] over any schedule's claims: every claim present, and the
+/// signed intervals pairwise disjoint. Multi-extract's fused pass
+/// (`multi_fused.rs`) uses the same gate.
+pub(super) fn ranges_disjoint(
+    claims: impl ExactSizeIterator<Item = Option<crate::blob_meta::BlobIndex>>,
+) -> bool {
+    let mut ranges: Vec<(i64, i64)> = Vec::with_capacity(claims.len());
+    for index in claims {
+        match index {
             Some(idx) if idx.min_id <= idx.max_id => ranges.push((idx.min_id, idx.max_id)),
             _ => return false,
         }

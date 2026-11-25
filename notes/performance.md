@@ -610,25 +610,21 @@ comparison, not a fingerprint.
 
 Kind: high potential for the stated workload.
 
-## PERF-017 - Simple multi-extract has a classify then write barrier inside each kind
+## PERF-017 - Simple extract classifies then rewrites any kind with overlapping ID ranges
 
 Reported by: pipeline, indexdata, spatial.
 
-Single-region sorted simple extract is fused (`extract/fused.rs`: one decode
-per blob for a kind whose indexdata ID ranges are pairwise disjoint, exact
-claim check at decode, blob-local ID set on a repeat; measured about -9 % at
-planet, `reference/performance/extract.md`). Multi-extract
-(`try_extract_multi_single_pass` in `extract/multi.rs`) still classifies each
-kind into the shared `Membership`, freezes it, then rereads, decompresses and
-decodes every blob of the kind again to write the N outputs. The same gate
-applies there: per blob, compute each element's region mask, emit into the
-per-region builders, and hand the masks to the consumer to install. Node
-classify there is a projection pool, so the selection walk may cost a larger
-share of the removed classify than it did for single extract; measure before
-landing. Interval components (preclassify only the blobs whose ranges
-overlap, fuse the rest) would keep history input off the slow form for both.
+Sorted simple extract, single region (`extract/fused.rs`) and multi-extract
+(`extract/multi_fused.rs`), reads each blob once only for a kind whose
+indexdata ID ranges are all present and pairwise disjoint
+(`fused::ranges_disjoint`). One overlapping pair, as in history files, or one
+unindexed blob sends the whole kind back to classify, freeze, then reread and
+decode every blob. Interval components would narrow that: preclassify only
+the blobs whose ranges overlap another, install their IDs, and fuse the rest.
+Unmeasured; on a history kind most blobs may overlap, so the payoff depends
+on how localized the overlap is.
 
-Kind: medium conviction; single extract measured the shape at -9 %.
+Kind: low conviction; no history-input measurement yet.
 
 ## PERF-019 - Complete-ways and smart extract decode the same payloads repeatedly
 

@@ -15,6 +15,7 @@ mod fused;
 mod membership;
 mod multi;
 mod multi_dep;
+mod multi_fused;
 mod polygon;
 mod simple;
 mod smart;
@@ -624,7 +625,10 @@ fn parse_extract_geometry(
 ///
 /// On a sorted input every strategy, cleaned or not, serves every region
 /// from one run over the input rather than one extract per region (simple
-/// visits each kind twice, a classify pass and a write pass; complete-ways
+/// reads each blob of a kind once when the kind's indexdata ID ranges are
+/// pairwise disjoint, refusing a blob whose range or count is not exact,
+/// and otherwise visits the kind twice, a classify pass and a write pass;
+/// complete-ways
 /// and smart classify every kind into shared region masks, smart sweeps the
 /// way blobs once more, and one write pass follows). That run writes every
 /// output through a buffered synchronous writer whatever the configured

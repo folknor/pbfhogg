@@ -1,5 +1,27 @@
 # Check
 
+## Reserved ID-set chunks materialise on first write (bygg, 2026-11-25, against `186acde8`)
+
+`IdSet::pre_allocate` now reserves its direct chunks and an atomic setter
+allocates each 4 MiB bit array on first write, instead of allocating the
+whole floor range (about 2 GB for the node, way and relation floors) up
+front. Planet, where every chunk is written, has to come out neutral:
+`brokkr bench --iterations 1 ref-integrity --dataset planet`, interleaved,
+base `--commit 186acde8` against the uncommitted variant (dirty rows):
+
+| Arm | UUID | Wall |
+|---|---|---:|
+| base | `568c35ed` | 24.7 s (first after the build, cold) |
+| variant | `6d868df2` | 20.6 s |
+| base | `ec0fc3f3` | 19.9 s |
+| variant | `04a8a61b` | 20.3 s |
+| variant | `7b3d6bf0` | 20.3 s |
+| base | `b5cd1500` | 20.0 s |
+
+Warm cells: 20.3 s against 20.0 s, under 2 %, neutral. The win is on
+small inputs: twelve concurrent pair-attribution test bodies in one
+process went from 7.4 s to 0.19 s.
+
 ## A bare check reads an unindexed file once (bygg, 2026-11-25, against `0dccb796`)
 
 Before: on an unindexed file `check::pair` ran the ID check's engine and

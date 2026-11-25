@@ -595,24 +595,83 @@ fn rank_in_chunk(idx: &RankIndex, slot: Slot, cid: u64, chunk: &Chunk, off: u32)
 ///   promoted to the 4 MiB bit array when it would exceed [`SPARSE_MAX`]
 ///   members. Heavily populated chunks use the bit-array form, while an
 ///   isolated key does not cost a whole 4 MiB chunk.
+/// - **Reservation.** [`IdSet::pre_allocate`] reserves the direct chunks
+///   below `reserved` rather than allocating them: an atomic setter
+///   materialises a reserved chunk, as a bit array, on its first write
+///   through `&self`. Every materialised chunk below `reserved` is a bit
+///   array, so an atomic setter never meets an array chunk there. A
+///   reservation costs only its directory cells, so a floor of billions of
+///   IDs on a tiny file allocates and frees nothing it does not write: the
+///   eager form allocated about 2 GB per `check --refs` call however small
+///   the input, and concurrent calls in one process contended on mapping
+///   and unmapping it hard enough to run twenty times slower.
 struct Bitmap {
     /// Chunks with chunk id below `DIRECT_CHUNKS`, indexed by chunk id.
-    chunks: Vec<Option<Chunk>>,
+    chunks: Vec<Cell>,
+    /// Direct chunk ids below this are reserved for the atomic setters.
+    reserved: usize,
     /// Chunks with chunk id at or above `DIRECT_CHUNKS`, keyed by chunk id.
     /// Every key here is above every key in `chunks`.
     overflow: BTreeMap<u64, Chunk>,
+}
+
+/// One direct directory cell: vacant or a materialised chunk. Written
+/// through `&mut` like an `Option`, and through `&self` only by an atomic
+/// setter materialising a reserved bit array, which [`OnceLock`] publishes
+/// whole: a reader sees the cell vacant or the zeroed chunk, never a part.
+///
+/// [`OnceLock`]: std::sync::OnceLock
+struct Cell(std::sync::OnceLock<Chunk>);
+
+impl Cell {
+    const fn vacant() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    #[inline]
+    fn as_ref(&self) -> Option<&Chunk> {
+        self.0.get()
+    }
+
+    #[inline]
+    fn as_mut(&mut self) -> Option<&mut Chunk> {
+        self.0.get_mut()
+    }
+
+    fn is_some(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    fn set(&mut self, chunk: Chunk) {
+        self.0 = std::sync::OnceLock::from(chunk);
+    }
+
+    fn get_or_insert_with(&mut self, f: impl FnOnce() -> Chunk) -> &mut Chunk {
+        if self.0.get().is_none() {
+            self.set(f());
+        }
+        match self.0.get_mut() {
+            Some(chunk) => chunk,
+            None => unreachable!("the cell was set above"),
+        }
+    }
+
+    fn into_inner(self) -> Option<Chunk> {
+        self.0.into_inner()
+    }
 }
 
 impl Bitmap {
     const fn new() -> Self {
         Self {
             chunks: Vec::new(),
+            reserved: 0,
             overflow: BTreeMap::new(),
         }
     }
 
     fn has_any(&self) -> bool {
-        self.chunks.iter().any(Option::is_some) || !self.overflow.is_empty()
+        self.chunks.iter().any(Cell::is_some) || !self.overflow.is_empty()
     }
 
     fn allocated_chunk_count(&self) -> usize {
@@ -632,14 +691,38 @@ impl Bitmap {
         }
     }
 
+    /// Extend the reservation to the direct chunks below `end`, promoting
+    /// the array chunks it newly covers.
+    fn reserve(&mut self, end: usize) {
+        if end > self.chunks.len() {
+            self.chunks.resize_with(end, Cell::vacant);
+        }
+        self.reserved = self.reserved.max(end);
+        self.promote_reserved();
+    }
+
+    /// Restore the reservation's invariant: every materialised chunk below
+    /// `reserved` is a bit array.
+    fn promote_reserved(&mut self) {
+        for cell in &mut self.chunks[..self.reserved] {
+            if let Some(chunk) = cell.as_mut() {
+                chunk.promote();
+            }
+        }
+    }
+
     #[inline]
     fn chunk_entry(&mut self, cid: u64) -> &mut Chunk {
         if cid < DIRECT_CHUNKS {
             let i = cid as usize;
             if i >= self.chunks.len() {
-                self.chunks.resize_with(i + 1, || None);
+                self.chunks.resize_with(i + 1, Cell::vacant);
             }
-            self.chunks[i].get_or_insert_with(Chunk::new_sparse)
+            if i < self.reserved {
+                self.chunks[i].get_or_insert_with(|| Chunk::Dense(new_dense()))
+            } else {
+                self.chunks[i].get_or_insert_with(Chunk::new_sparse)
+            }
         } else {
             self.overflow.entry(cid).or_insert_with(Chunk::new_sparse)
         }
@@ -653,7 +736,8 @@ impl Bitmap {
         // set had; routing every call through `insert_if_new`'s chunk-kind
         // match measured ~1.1 ns/ref slower in altw pass 0's serial union.
         // An overflow chunk id is past `chunks.len()`, so `get_mut` misses.
-        if let Some(Some(Chunk::Dense(words))) = self.chunks.get_mut(cid as usize) {
+        if let Some(Chunk::Dense(words)) = self.chunks.get_mut(cid as usize).and_then(Cell::as_mut)
+        {
             *words[(off >> 6) as usize].get_mut() |= 1u64 << (off & 63);
             return;
         }
@@ -666,20 +750,12 @@ impl Bitmap {
         self.chunk_entry(cid).insert(off)
     }
 
-    /// Bit-array chunks for every key in `0..=max`; see
-    /// [`IdSet::pre_allocate`].
+    /// Bit-array coverage for every key in `0..=max`: the direct chunks
+    /// reserved, the overflow chunks allocated; see [`IdSet::pre_allocate`].
     fn pre_allocate(&mut self, max: NonNegId) {
         let (max_cid, _) = max.split();
         let direct_end = max_cid.min(DIRECT_CHUNKS - 1) as usize;
-        if direct_end >= self.chunks.len() {
-            self.chunks.resize_with(direct_end + 1, || None);
-        }
-        for slot in &mut self.chunks[..=direct_end] {
-            match slot {
-                Some(chunk) => chunk.promote(),
-                None => *slot = Some(Chunk::Dense(new_dense())),
-            }
-        }
+        self.reserve(direct_end + 1);
         for cid in DIRECT_CHUNKS..=max_cid {
             match self.overflow.entry(cid) {
                 Entry::Occupied(mut e) => e.get_mut().promote(),
@@ -691,23 +767,47 @@ impl Bitmap {
     }
 
     /// The bit-array chunk an atomic setter may write for `key`, or `None`:
-    /// no chunk, or a chunk that only holds array contents (the atomic
-    /// setters cannot grow or convert a chunk under `&self`).
+    /// no chunk and no reservation, or a chunk that only holds array
+    /// contents (the atomic setters cannot grow or convert a chunk under
+    /// `&self`). A reserved vacant cell is materialised here.
     #[inline]
     fn dense_for_atomic(&self, key: NonNegId) -> Option<(&[AtomicU64], u32)> {
         let (cid, off) = key.split();
-        match self.chunk(cid)? {
-            (_, Chunk::Dense(words)) => Some((&words[..], off)),
-            (_, Chunk::Sparse(_)) => None,
+        let chunk = if cid < DIRECT_CHUNKS {
+            let i = cid as usize;
+            let cell = self.chunks.get(i)?;
+            if i < self.reserved {
+                cell.0.get_or_init(|| Chunk::Dense(new_dense()))
+            } else {
+                cell.as_ref()?
+            }
+        } else {
+            self.overflow.get(&cid)?
+        };
+        match chunk {
+            Chunk::Dense(words) => Some((&words[..], off)),
+            Chunk::Sparse(_) => None,
         }
     }
 
-    /// The highest allocated chunk id, for the atomic setters' panic message.
+    /// The highest chunk id an atomic setter can write - reserved, or a
+    /// bit array a plain insert promoted outside the reservation - for the
+    /// atomic setters' panic message. It says nothing about holes below it.
     fn last_chunk(&self) -> Option<u64> {
-        self.overflow.keys().next_back().copied().or_else(|| {
-            self.chunks
+        let dense = |chunk: &Chunk| matches!(chunk, Chunk::Dense(_));
+        let overflow = self
+            .overflow
+            .iter()
+            .rev()
+            .find(|(_, chunk)| dense(chunk))
+            .map(|(&cid, _)| cid);
+        overflow.or_else(|| {
+            let materialised = self
+                .chunks
                 .iter()
-                .rposition(Option::is_some)
+                .rposition(|cell| cell.as_ref().is_some_and(dense));
+            materialised
+                .max(self.reserved.checked_sub(1))
                 .map(|i| i as u64)
         })
     }
@@ -741,7 +841,7 @@ impl Bitmap {
         if min_cid < DIRECT_CHUNKS && !self.chunks.is_empty() {
             let last = max_cid.min(self.chunks.len() as u64 - 1);
             for cid in min_cid..=last {
-                if let Some(chunk) = &self.chunks[cid as usize] {
+                if let Some(chunk) = self.chunks[cid as usize].as_ref() {
                     let (lo, hi) = clip(cid);
                     if chunk.any_in(lo, hi) {
                         return true;
@@ -820,10 +920,12 @@ impl Bitmap {
     /// less), its block prefixes and an overflow-map entry.
     fn ranked_bytes_upper_bound(&self) -> u64 {
         use std::mem::size_of;
-        let per_entry =
-            size_of::<Option<Chunk>>() + size_of::<u64>() + size_of::<Option<Vec<u32>>>();
+        let rank_entry = size_of::<u64>() + size_of::<Option<Vec<u32>>>();
         let per_chunk = CHUNK_BYTES + BLOCKS_PER_CHUNK * size_of::<u32>() + 128;
-        let directory = (self.chunks.len() + 1) as u64 * per_entry as u64;
+        // The directory by its capacity (a reservation's vacant cells are
+        // most of it), the rank vectors by its length.
+        let directory = self.chunks.capacity() as u64 * size_of::<Cell>() as u64
+            + (self.chunks.len() + 1) as u64 * rank_entry as u64;
         directory + self.allocated_chunk_count() as u64 * per_chunk as u64
     }
 
@@ -841,7 +943,6 @@ impl Bitmap {
         } else {
             0
         };
-        let direct_entry = size_of::<Option<Chunk>>() + rank_entry;
         let overflow_entry = size_of::<u64>() + size_of::<Chunk>() + 64 + rank_entry;
         let chunk_bytes = |chunk: &Chunk| -> u64 {
             match chunk {
@@ -856,30 +957,37 @@ impl Bitmap {
                 Chunk::Sparse(offsets) => (offsets.capacity() * size_of::<u32>()) as u64,
             }
         };
-        let directory = (self.chunks.len() + 1) as u64 * direct_entry as u64
+        let directory = self.chunks.capacity() as u64 * size_of::<Cell>() as u64
+            + (self.chunks.len() + 1) as u64 * rank_entry as u64
             + self.overflow.len() as u64 * overflow_entry as u64;
         directory
             + self
                 .chunks
                 .iter()
-                .flatten()
+                .filter_map(Cell::as_ref)
                 .chain(self.overflow.values())
                 .map(chunk_bytes)
                 .sum::<u64>()
     }
 
+    /// Union `other`'s members and reservation into this bitmap. `other`'s
+    /// members are those visible when it is read: a complete union needs
+    /// its atomic fill to have finished.
     fn merge_from(&mut self, other: &Bitmap) {
         if other.chunks.len() > self.chunks.len() {
-            self.chunks.resize_with(other.chunks.len(), || None);
+            self.chunks.resize_with(other.chunks.len(), Cell::vacant);
         }
         for (slot, src) in self.chunks.iter_mut().zip(other.chunks.iter()) {
-            if let Some(src) = src {
-                match slot {
+            if let Some(src) = src.as_ref() {
+                match slot.as_mut() {
                     Some(dst) => dst.union_ref(src),
-                    None => *slot = Some(src.clone_chunk()),
+                    None => slot.set(src.clone_chunk()),
                 }
             }
         }
+        // After the members, so an array chunk either side brought into the
+        // union of the reservations is promoted against the final range.
+        self.reserve(other.reserved);
         for (&cid, src) in &other.overflow {
             match self.overflow.entry(cid) {
                 Entry::Occupied(mut e) => e.get_mut().union_ref(src),
@@ -892,19 +1000,22 @@ impl Bitmap {
 
     fn merge(&mut self, other: Bitmap) {
         if other.chunks.len() > self.chunks.len() {
-            self.chunks.resize_with(other.chunks.len(), || None);
+            self.chunks.resize_with(other.chunks.len(), Cell::vacant);
         }
+        let other_reserved = other.reserved;
         for (slot, src) in self.chunks.iter_mut().zip(other.chunks) {
-            if let Some(src) = src {
-                match slot {
+            if let Some(src) = src.into_inner() {
+                match slot.as_mut() {
                     Some(dst) => dst.union_owned(src),
                     // The reason the owned form exists: an absent
                     // destination chunk takes the source allocation whole,
                     // with no 4 MB copy and no word-by-word OR.
-                    None => *slot = Some(src),
+                    None => slot.set(src),
                 }
             }
         }
+        // After the members, as in `merge_from`.
+        self.reserve(other_reserved);
         for (cid, src) in other.overflow {
             match self.overflow.entry(cid) {
                 Entry::Occupied(mut e) => e.get_mut().union_owned(src),
@@ -922,7 +1033,7 @@ impl Bitmap {
         let mut cumulative: u64 = 0;
         for chunk in &self.chunks {
             chunk_prefix.push(cumulative);
-            match chunk {
+            match chunk.as_ref() {
                 Some(chunk) => {
                     let (blocks, count) = chunk.rank_blocks();
                     block_prefix.push(blocks);
@@ -963,7 +1074,7 @@ impl Bitmap {
                 // Past every direct chunk; every overflow key is larger.
                 return idx.chunk_prefix[self.chunks.len()];
             }
-            match &self.chunks[i] {
+            match self.chunks[i].as_ref() {
                 Some(chunk) => rank_in_chunk(idx, Slot::Direct(i), cid, chunk, off),
                 None => idx.chunk_prefix[i],
             }
@@ -993,7 +1104,7 @@ impl Bitmap {
     fn len(&self) -> u64 {
         self.chunks
             .iter()
-            .flatten()
+            .filter_map(Cell::as_ref)
             .chain(self.overflow.values())
             .map(Chunk::count)
             .sum()
@@ -1002,7 +1113,7 @@ impl Bitmap {
     fn is_empty(&self) -> bool {
         self.chunks
             .iter()
-            .flatten()
+            .filter_map(Cell::as_ref)
             .chain(self.overflow.values())
             .all(|chunk| chunk.offsets().next().is_none())
     }
@@ -1023,10 +1134,12 @@ impl Bitmap {
 /// [`DIRECT_CHUNKS`]. A promotion temporarily holds both representations. A
 /// set with no negative member allocates nothing for the negative family.
 ///
-/// The exception is [`Self::pre_allocate`], which creates empty bit-array
-/// chunks for a whole non-negative ID range on request; its argument is the
+/// The exception is [`Self::pre_allocate`], which makes a whole
+/// non-negative ID range atomically writable on request: a bit array is
+/// allocated for each chunk of it an atomic setter writes, and a directory
+/// cell is held for the rest of the range below 2^43; its argument is the
 /// caller's responsibility (see its docs), and merging a pre-allocated set
-/// carries those chunks along.
+/// carries that coverage along.
 ///
 /// # Rank queries
 ///
@@ -1055,8 +1168,9 @@ impl IdSet {
         }
     }
 
-    /// Returns `true` if any chunk has been allocated (at least one insert,
-    /// or a `pre_allocate`).
+    /// Returns `true` if any chunk has been allocated: by an insert, or by
+    /// a `pre_allocate` above the direct directory. A reservation alone
+    /// allocates no direct chunk. Membership is [`Self::is_empty`].
     pub fn has_any(&self) -> bool {
         self.nonneg.has_any() || self.neg.has_any()
     }
@@ -1112,9 +1226,12 @@ impl IdSet {
     /// coverage, so IDs above `max_id` up to the end of its chunk become
     /// writable too; callers that need an exact cutoff apply it themselves.
     ///
-    /// This eagerly allocates 4 MiB per 2^25 IDs of range, so `max_id` sizes
-    /// the allocation directly: a caller deriving it from untrusted input
-    /// (indexdata) must bound it first with [`IdSet::file_bounded_max_id`].
+    /// Below 2^43 the range is reserved, not allocated: each 2^25-ID chunk
+    /// costs a directory cell until an atomic setter first writes it, and
+    /// then its 4 MiB bit array. Above 2^43 it eagerly allocates 4 MiB per
+    /// chunk, so `max_id` still sizes memory there, and a caller deriving it
+    /// from untrusted input (indexdata) must bound it first with
+    /// [`IdSet::file_bounded_max_id`].
     ///
     /// # Invariant for callers
     ///
@@ -1281,7 +1398,7 @@ impl IdSet {
         };
         panic!(
             "{fn_name}: id {id} lands in chunk {}, which pre_allocate did not \
-             cover (allocated chunks reach {max_covered}). Most likely cause: \
+             cover (the highest writable chunk is {max_covered}). Most likely cause: \
              the caller's `pre_allocate(max_id)` argument was derived from \
              indexdata that understated the real maximum ID, or from a \
              hard-coded cap that planet growth has exceeded. See \
@@ -1840,13 +1957,19 @@ mod tests {
         for k in (0..SPARSE_MAX as i64).rev() {
             assert!(s.insert_if_new(k * 3));
         }
-        assert!(matches!(s.nonneg.chunks[0], Some(Chunk::Sparse(_))));
+        assert!(matches!(
+            s.nonneg.chunks[0].as_ref(),
+            Some(Chunk::Sparse(_))
+        ));
         // A duplicate at the boundary must not promote.
         assert!(!s.insert_if_new(0));
-        assert!(matches!(s.nonneg.chunks[0], Some(Chunk::Sparse(_))));
+        assert!(matches!(
+            s.nonneg.chunks[0].as_ref(),
+            Some(Chunk::Sparse(_))
+        ));
         // Member SPARSE_MAX + 1 promotes and keeps every earlier member.
         assert!(s.insert_if_new(1));
-        assert!(matches!(s.nonneg.chunks[0], Some(Chunk::Dense(_))));
+        assert!(matches!(s.nonneg.chunks[0].as_ref(), Some(Chunk::Dense(_))));
         for k in 0..SPARSE_MAX as i64 {
             assert!(s.get(k * 3));
         }
@@ -1863,10 +1986,10 @@ mod tests {
         for k in 1..=SPARSE_MAX as i64 {
             assert!(s.insert_if_new(-k));
         }
-        assert!(matches!(s.neg.chunks[0], Some(Chunk::Sparse(_))));
+        assert!(matches!(s.neg.chunks[0].as_ref(), Some(Chunk::Sparse(_))));
         assert!(s.nonneg.chunks.is_empty(), "no non-negative allocation");
         assert!(s.insert_if_new(-(SPARSE_MAX as i64) - 1));
-        assert!(matches!(s.neg.chunks[0], Some(Chunk::Dense(_))));
+        assert!(matches!(s.neg.chunks[0].as_ref(), Some(Chunk::Dense(_))));
         let s = s.into_ranked();
         assert_eq!(s.total_count(), SPARSE_MAX as u64 + 1);
         assert_eq!(s.numeric_rank_if_set(-1), Some(SPARSE_MAX as u64));
@@ -1946,7 +2069,7 @@ mod tests {
         s.pre_allocate(0);
         s.insert(50);
         s.insert(200);
-        assert!(matches!(s.nonneg.chunks[0], Some(Chunk::Dense(_))));
+        assert!(matches!(s.nonneg.chunks[0].as_ref(), Some(Chunk::Dense(_))));
         assert!(s.any_in_numeric_range(40, 60));
         assert!(s.any_in_numeric_range(50, 50));
         assert!(!s.any_in_numeric_range(56, 199));
@@ -2027,6 +2150,93 @@ mod tests {
         assert_eq!(s.numeric_rank(20), 3);
     }
 
+    /// A reservation allocates only the chunks the atomic setters write, and
+    /// keeps every chunk materialised inside it a bit array: an array chunk
+    /// a merge or a plain insert brings into the range is promoted, so it
+    /// stays atomically writable.
+    #[test]
+    fn a_reservation_materialises_only_written_chunks_as_bit_arrays() {
+        // The first ID of chunk 32: a 33-chunk reservation.
+        const NODE_SCALE: i64 = 32 << ID_SHIFT;
+        let mut s = IdSet::new();
+        s.pre_allocate(NODE_SCALE);
+        assert_eq!(s.allocated_chunk_count(), 0);
+        s.insert_atomic(5);
+        s.insert_atomic(NODE_SCALE);
+        assert_eq!(s.allocated_chunk_count(), 2);
+        assert!(s.get(5) && s.get(NODE_SCALE) && !s.get(6));
+        assert!(!s.try_insert_atomic(NODE_SCALE + (1 << ID_SHIFT)));
+
+        // A plain insert into a vacant reserved cell makes a bit array.
+        s.insert(3 << ID_SHIFT);
+        assert!(matches!(s.nonneg.chunks[3].as_ref(), Some(Chunk::Dense(_))));
+
+        // An array chunk moved into the reservation by a merge, and a
+        // destination array chunk a merged reservation newly covers.
+        let mut sparse = IdSet::new();
+        sparse.insert(4 << ID_SHIFT);
+        s.merge(sparse);
+        assert!(matches!(s.nonneg.chunks[4].as_ref(), Some(Chunk::Dense(_))));
+        assert!(s.try_insert_atomic((4 << ID_SHIFT) + 1));
+        let mut dst = IdSet::new();
+        dst.insert(2 << ID_SHIFT);
+        let mut reserving = IdSet::new();
+        reserving.pre_allocate(3 << ID_SHIFT);
+        dst.merge_from(&reserving);
+        assert!(matches!(
+            dst.nonneg.chunks[2].as_ref(),
+            Some(Chunk::Dense(_))
+        ));
+        assert!(dst.try_insert_atomic(3 << ID_SHIFT));
+        assert!(dst.get(2 << ID_SHIFT) && dst.get(3 << ID_SHIFT));
+
+        // Vacant reserved cells between members: iteration both ways and
+        // rank across the gap.
+        let members = [
+            5,
+            3 << ID_SHIFT,
+            (4 << ID_SHIFT) + 1,
+            4 << ID_SHIFT,
+            NODE_SCALE,
+        ];
+        let mut sorted = members.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(s.iter_numeric_from(0).collect::<Vec<_>>(), sorted);
+        let mut rev: Vec<i64> = s
+            .nonneg
+            .iter_rev_to(NonNegId(u64::MAX >> 1))
+            .map(|k| k.0 as i64)
+            .collect();
+        rev.reverse();
+        assert_eq!(rev, sorted);
+        let ranked = s.into_ranked();
+        assert_eq!(ranked.numeric_rank(10 << ID_SHIFT), 4);
+        assert_eq!(ranked.numeric_rank_if_set(NODE_SCALE), Some(4));
+        assert_eq!(ranked.numeric_rank_if_set(1 << ID_SHIFT), None);
+    }
+
+    /// Racing first writes to one reserved chunk publish one bit array and
+    /// lose no bit.
+    #[test]
+    fn racing_first_writes_to_a_reserved_chunk_lose_no_bit() {
+        let mut s = IdSet::new();
+        s.pre_allocate(1 << ID_SHIFT);
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for t in 0..8_i64 {
+                let (s, start) = (&s, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..1000 {
+                        assert!(s.insert_atomic_if_new(i * 8 + t));
+                    }
+                });
+            }
+        });
+        assert_eq!(s.allocated_chunk_count(), 1);
+        assert_eq!(s.len(), 8000);
+    }
+
     #[test]
     fn has_any_empty_vs_nonempty() {
         let empty = IdSet::new();
@@ -2092,10 +2302,10 @@ mod tests {
         assert_ne!(IdSet::chunk_of(i64::MIN), IdSet::chunk_of(i64::MAX));
     }
 
-    /// `len` and `is_empty` count members, not allocation: a pre-allocated
-    /// range is allocated (`has_any`) but empty. Covers a bit-array chunk, an
-    /// array chunk and an overflow-map chunk above the direct directory, in
-    /// both families.
+    /// `len` and `is_empty` count members, not allocation: a materialised
+    /// reserved chunk is allocated (`has_any`) but empty. Covers a bit-array
+    /// chunk, an array chunk and an overflow-map chunk above the direct
+    /// directory, in both families.
     #[test]
     fn len_and_is_empty_count_members_not_chunks() {
         let mut s = IdSet::new();
@@ -2103,7 +2313,9 @@ mod tests {
         assert_eq!(s.len(), 0);
 
         s.pre_allocate(3 << ID_SHIFT);
-        assert!(s.has_any(), "pre_allocate allocates chunks");
+        assert!(!s.has_any(), "a reservation allocates no chunk");
+        assert!(s.nonneg.dense_for_atomic(NonNegId(5)).is_some());
+        assert!(s.has_any(), "an atomic setter's lookup materialises one");
         assert!(s.is_empty(), "but sets no member");
         assert_eq!(s.len(), 0);
 
@@ -2228,8 +2440,8 @@ mod tests {
     fn atomic_storage_is_u64_aligned_and_parallel_fill_survives_rank_build() {
         let mut s = IdSet::new();
         s.pre_allocate(10_000);
-        let Some(Chunk::Dense(words)) = s.nonneg.chunks[0].as_ref() else {
-            panic!("pre_allocate must create a bit-array chunk");
+        let Some((words, _)) = s.nonneg.dense_for_atomic(NonNegId(0)) else {
+            panic!("pre_allocate must cover the chunk with a bit array");
         };
         assert_eq!((words.as_ptr() as usize) % std::mem::align_of::<u64>(), 0);
         std::thread::scope(|scope| {
@@ -2429,7 +2641,7 @@ mod tests {
         let mut dense_copy = IdSet::new();
         dense_copy.merge_from(&dense);
         a.merge(dense_copy);
-        assert!(matches!(a.nonneg.chunks[0], Some(Chunk::Dense(_))));
+        assert!(matches!(a.nonneg.chunks[0].as_ref(), Some(Chunk::Dense(_))));
         // Bit-array destination, array source.
         dense.merge_from(&sparse);
         assert_eq!(
@@ -2446,9 +2658,12 @@ mod tests {
             y.insert(2 * k + 1);
         }
         y.insert(0); // duplicate of x's first member; y stays an array chunk
-        assert!(matches!(y.nonneg.chunks[0], Some(Chunk::Sparse(_))));
+        assert!(matches!(
+            y.nonneg.chunks[0].as_ref(),
+            Some(Chunk::Sparse(_))
+        ));
         x.merge_from(&y);
-        assert!(matches!(x.nonneg.chunks[0], Some(Chunk::Dense(_))));
+        assert!(matches!(x.nonneg.chunks[0].as_ref(), Some(Chunk::Dense(_))));
         assert_eq!(x.into_ranked().total_count(), 2 * SPARSE_MAX as u64 - 1);
     }
 }

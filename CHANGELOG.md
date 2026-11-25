@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **`IdSet::pre_allocate` reserves instead of allocating, and
+  `IdSet::has_any` no longer turns true on a reservation alone.** Below
+  ID 2^43 the range is made atomically writable without allocating it;
+  each 4 MiB chunk is allocated on its first atomic write. `check --refs`,
+  `check --ids --full` and a bare `check` on a small file no longer
+  allocate and free about 2 GB per call, which made concurrent library
+  calls in one process run many times slower. Planet walls are unchanged.
+  Callers that used `has_any` to detect a pre-allocation use their own
+  record of it; membership is `is_empty`.
+
 - **`apply-changes` no longer limits one base blob's re-cut output, and
   `ErrorKind::OverflowReplayBudget` is gone.** A base blob whose rewritten
   output overflows a block, or grows past 64 MiB, is now written a second

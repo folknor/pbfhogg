@@ -454,7 +454,7 @@ impl<'a, O: Write> DiffSink<'a, O> {
 }
 
 impl<O: Write> MergeSink for DiffSink<'_, O> {
-    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
+    fn record(&mut self, kind: ElementKind, action: BlockMergeAction<'_>) -> Result<()> {
         use crate::osc::merge_join::{element_id, element_version};
         let type_char = kind.type_char();
         match action {
@@ -465,22 +465,22 @@ impl<O: Write> MergeSink for DiffSink<'_, O> {
             // count-only runs skip the element walk that exists only to
             // format each line.
             BlockMergeAction::BlobOldOnly(run) => {
+                self.stats.deleted += run.count;
                 if let Some(out) = self.output.as_mut() {
                     for elem in run.elements() {
                         let ver = element_version(&elem);
                         write_compact_line(out, '-', type_char, element_id(&elem), ver)?;
                     }
                 }
-                self.stats.deleted += run.count;
             }
             BlockMergeAction::BlobNewOnly(run) => {
+                self.stats.created += run.count;
                 if let Some(out) = self.output.as_mut() {
                     for elem in run.elements() {
                         let ver = element_version(&elem);
                         write_compact_line(out, '+', type_char, element_id(&elem), ver)?;
                     }
                 }
-                self.stats.created += run.count;
             }
             BlockMergeAction::ElementEqual(e) => {
                 if !self.options.suppress_common
@@ -671,7 +671,7 @@ impl units::UnitSink for TextUnitSink<'_> {
     fn record_into(
         &mut self,
         kind: ElementKind,
-        action: &BlockMergeAction<'_>,
+        action: BlockMergeAction<'_>,
         out: &mut dyn units::UnitOut<Vec<u8>>,
     ) -> Result<()> {
         // Opportunistic: frees held pieces as the channel drains, and fails

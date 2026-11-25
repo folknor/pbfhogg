@@ -288,3 +288,30 @@ relation direct masks. Fix: carry a per-blob region admission mask from
 the schedule walk and intersect it with the node mask at classify and at
 write, on both routes. Verify against per-region single extracts on a fixture with a
 repeated node ID in two blobs.
+
+## CMD-079 - Forced unsorted multi-extract prints the missing-indexdata warning twice
+
+Reported by: the shared multi-extract chain (its engine link), via the
+spar accounting (2026-11-25); not reproduced.
+
+Multi-extract now admits its input once on the shared route. When the
+sortedness probe then declines (unsorted input under `--force`), the
+per-region fallback calls `extract_to`, which admits again, so the
+missing-indexdata warning is printed one more time than before the shared
+route existed. Admit once and hand the admission to the fallback, or keep
+the fallback from repeating the warning.
+
+## CMD-080 - No cancellation scenario covers multi-extract
+
+Reported by: the spar accounting of the shared multi-extract change, from
+its scout's lateral (2026-11-25).
+
+The extract entry of the cancellation registry in
+`crates/lib/tests/cancel.rs` states that polygons, complete-ways,
+multi-extract and cleaning are not exercised, and the harness
+`extract_scenarios` likewise. Multi-extract now runs a new worker engine
+(`extract/multi_dep.rs`, a classify pass per kind, a parent closure and an
+ordered write pass to every region's output) and the cleaned simple single
+pass, and neither has a scenario that trips the token mid-run and checks
+that nothing is published. Fix shape: a multi-extract cancellation
+scenario per route (simple, complete-ways, smart).

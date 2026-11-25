@@ -525,12 +525,12 @@ impl<W: Write> MergeSink for ChangeWriters<W> {
     /// block-pair merge and the unindexed element stream. The one place
     /// derive turns an action into OSC, so the output depends neither on
     /// the worker count nor on whether the inputs carried indexdata.
-    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
+    fn record(&mut self, kind: ElementKind, action: BlockMergeAction<'_>) -> Result<()> {
         match action {
             BlockMergeAction::BlobEqual { first, last, .. } => {
-                self.repeats.observe(kind, *first, 1, 1, false)?;
+                self.repeats.observe(kind, first, 1, 1, false)?;
                 if first != last {
-                    self.repeats.observe(kind, *last, 1, 1, false)?;
+                    self.repeats.observe(kind, last, 1, 1, false)?;
                 }
             }
             BlockMergeAction::ElementEqual(e) => {
@@ -694,7 +694,7 @@ impl super::units::UnitSink for UnitWriters<'_> {
     fn record_into(
         &mut self,
         kind: ElementKind,
-        action: &BlockMergeAction<'_>,
+        action: BlockMergeAction<'_>,
         out: &mut dyn UnitOut<(Section, Vec<u8>)>,
     ) -> Result<()> {
         match action {

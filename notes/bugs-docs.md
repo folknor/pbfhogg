@@ -362,3 +362,16 @@ agree on well-formed files; they answer differently where a later version
 carries an earlier timestamp, and pbfhogg refuses input osmium accepts
 (descending, repeated or absent versions). `DEVIATIONS.md` records only the
 sequence-number difference for time-filter.
+
+## DOC-052 - verifier.md refuses a shim on an unattributed geocode wall
+
+Reported by: the spar accounting of the verifier reference-order change,
+from its scout's lateral (2026-11-25).
+
+`reference/performance/verifier.md`, in its list of refused work, rejects
+a per-launch subreaper shim because geocode's "whole check takes about
+9 s". The figure names no commit, host or cache state, and brokkr history
+for denmark geocode from that period shows runs from about 6 s to over
+100 s. The Current baselines section of the same file now holds attributed
+geocode cells (warm and cold); reword the refusal to cite those rather than
+an unattributed point.

@@ -169,6 +169,30 @@ the expected 64 is the same either way, so the cell cannot catch a broken
 `.osc.gz` name fallback there. Use bytes that sniff as neither kind under
 that suffix.
 
+## TOOL-056 - verify_input_order.rs allows dead code for slices that have landed
+
+Reported by: the spar accounting of the verifier reference-order change,
+from its scout's lateral (2026-11-25); read from source, not built.
+
+`crates/verify/src/verify_input_order.rs` opens with a module-wide
+`#![allow(dead_code)]` whose reason is "shared verifier helpers consumed by
+the remaining family slices". The input-order family is complete, so the
+reason no longer holds, and the allow hides any helper that has become dead
+(the same change removed one, `Harness::check_sorted`). Remove the allow
+and delete or justify what the compiler then reports.
+
+## TOOL-057 - No fixture test drives the geocode verify check
+
+Reported by: the spar accounting of the verifier reference-order change,
+from its scout's lateral (2026-11-25).
+
+Every other verify check has a fake-osmium fixture test under
+`crates/verify/tests`; nothing there drives `checks::geocode::run`. Its
+whole flow (the grouped pair of index builds, the two osmium chains, query
+writing and both admin bands) and the exit tolerances `build_indexes` names
+are exercised only by real-data runs on denmark. Add a fixture test with a
+fake osmium and a small admin fixture.
+
 # From the 2026-11-21 verifier performance hunt
 
 Defects the performance hunters found while reading the code at `e8377a78`

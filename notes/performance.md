@@ -1183,48 +1183,44 @@ concurrently in native ingest too. Parallel inflation of one gzip member is a
 separate medium-conviction rewrite (DEFLATE bit boundaries, dictionaries,
 member and trailer validation).
 
-## PERF-041 - Diff replays block prefixes and decodes crossing frames per unit
+## PERF-041 - Diff decodes crossing frames per unit and builds full elements to compare
 
 Reported by: decode, osc, merge.
 
-Mechanism: `BlockRun::elements()` builds a fresh iterator and `.skip(n)`;
-`element_merge_pair` rebuilds these for every residual; `BlockElementsIter` has
-no seek, so dense skipping reconstructs IDs, coordinates, metadata and tag
-boundaries, and a large block against many small ones grows superlinearly.
-`Frame` shares compressed bytes across units but `BlockPairSide::decode`
-decompresses and builds a block per unit, plus a clipping walk. After the
-`blobs_byte_equal` shortcut fails, full blocks and elements are built, dense
-metadata decoded though equality ignores it, tags and roles resolved per
+Mechanism: `Frame` shares compressed bytes across units but
+`BlockPairSide::decode` decompresses and builds a block per unit, plus a
+clipping walk (`clip`, metadata-free) and one positioning walk of the clipped
+prefix. After the `blobs_byte_equal` shortcut fails, full elements are built,
+dense metadata decoded though equality ignores it, tags and roles resolved per
 element. Unindexed `StreamingBlocks` decompresses, merges and emits on one
-thread.
+thread (production side overlaps PERF-076). The prefix replay across merge
+rounds is gone: the merge keeps one `ElementCursor` per side across rounds
+(2026-11-25); on planet base against `20260411` it measured neutral, so
+the per-element construction, not the replay, is what remains.
 
-Redesign: owned immutable decoded frames with resumable cursors (message
-position, packed-stream positions, delta accumulators, tag position); crossing
-frames share one decoded form with seek checkpoints from the first scan;
-validation produces comparison views (IDs, normalized coordinates, tag
-boundaries, raw field spans, checkpoints) with metadata lazy and full elements
-only for changed output; equality via increasingly expensive proofs (compressed
-bytes, decompressed primitive bytes, columns, identical packed fields with same
-interpretation, string-table equivalence resolved once, semantic fallback);
-decode unindexed blobs in parallel and plan comparisons over actual ranges.
+Redesign: crossing frames share one decoded form with seek checkpoints from
+the first scan; validation produces comparison views (IDs, normalized
+coordinates, tag boundaries, raw field spans) with metadata lazy and full
+elements only for changed output; equality via increasingly expensive proofs
+(compressed bytes, decompressed primitive bytes, columns, identical packed
+fields with same interpretation, string-table equivalence resolved once,
+semantic fallback); decode unindexed blobs in parallel and plan comparisons
+over actual ranges.
 
-Payoff: removes repeated decompression and superlinear decode; strongest for
-mostly equal snapshots with different block boundaries or encodings.
+Payoff: unmeasured. The crossing decode is costed at about one blob per unit
+(`DIFF_UNIT_TARGET_BYTES` doc). The node phase runs at about 30 cores on
+planet, so the comparison decoder's payoff is per-element CPU.
 
-Risks: bounded shared decoded frames, checkpoint state per delta stream,
-duplicate IDs and history versions at boundaries, signed ordering, equal SIDs
-across tables prove nothing, dense versus plain and noncanonical varints need
-semantic fallback, versions are not content evidence, late dense metadata needs
-prior deltas.
+Risks: any comparison view must stay equal to `content.rs` (digest
+`--form content` shares it), including the `Err`-token rule and derive's
+visibility; text without `-c` needs versions of equal elements; bounded
+shared decoded frames, checkpoint state per delta stream, duplicate IDs and
+history versions at boundaries (equal IDs pair in occurrence order across
+blobs; a held boundary residual), signed ordering, equal SIDs across tables
+prove nothing, dense versus plain and noncanonical varints need semantic
+fallback, late dense metadata needs prior deltas.
 
-Kind: high conviction (cursors); medium conviction, wider payoff (comparison
-decoder).
-
-Defect hunt 2026-11-17 (diff) found the same quadratic prefix replay. The
-repeated-ID boundary defect it also named is fixed without cursors: the pair
-merge holds a boundary ID whose peer block ran out as a residual. A persistent
-cursor must keep that rule (equal IDs pair in occurrence order across blobs,
-and a held side's claim is checked against what lies behind its repeats).
+Kind: medium conviction, wider payoff.
 
 ## PERF-042 - Tag predicates are evaluated per occurrence on resolved strings
 

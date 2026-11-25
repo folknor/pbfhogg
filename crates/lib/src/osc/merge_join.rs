@@ -317,7 +317,7 @@ pub(crate) fn stream_merge_phase(
     sink: &mut impl MergeSink,
 ) -> Result<()> {
     let equality = sink.equality();
-    let mut on_action = |action: BlockMergeAction<'_>| sink.record(kind, &action);
+    let mut on_action = |action: BlockMergeAction<'_>| sink.record(kind, action);
     let mut old_block: Option<PrimitiveBlock> = None;
     let mut new_block: Option<PrimitiveBlock> = None;
     let mut old_iter: Option<crate::BlockElementsIter<'_>> = None;
@@ -417,31 +417,86 @@ pub(crate) enum BlockMergeAction<'a> {
     ElementNewOnly(&'a Element<'a>),
 }
 
-/// A single-sided run of a decoded block: its elements from `skip` up to
-/// `end` (the end of the block when `None`).
+/// A single-sided run of a decoded block: the rest of its window part, as
+/// the cursor the merge left it at.
 pub(crate) struct BlockRun<'a> {
-    pub(crate) block: &'a PrimitiveBlock,
-    /// Elements before the run: consumed by an earlier merge step, or below
-    /// the shard window.
-    pub(crate) skip: usize,
-    /// Exclusive element bound: the first element past the shard window,
-    /// for a block that crosses its window's upper end. `None` runs to the
-    /// end of the block.
-    pub(crate) end: Option<usize>,
-    /// Elements in the run: `end - skip` when bounded, the decoded block's
-    /// element count less `skip` otherwise. Counted either way, never the
-    /// blob's claimed count.
+    cursor: ElementCursor<'a>,
+    /// Elements in the run, counted from the decoded block (its window
+    /// part less what the merge consumed), never the blob's claimed count.
     pub(crate) count: u64,
 }
 
 impl<'a> BlockRun<'a> {
     /// The run's elements. A sink iterates exactly these, so an element
-    /// past the shard window is never printed by the shard below it.
-    pub(crate) fn elements(&self) -> impl Iterator<Item = Element<'a>> + use<'a> {
-        let take = self
-            .end
-            .map_or(usize::MAX, |end| end.saturating_sub(self.skip));
-        self.block.elements().skip(self.skip).take(take)
+    /// past the unit's window is never printed by the unit below it. A
+    /// sink that only counts never walks them.
+    pub(crate) fn elements(self) -> ElementCursor<'a> {
+        self.cursor
+    }
+}
+
+/// A resumable position in a decoded block's window part.
+///
+/// The merge keeps one per side across its rounds, so a block that outlives
+/// several of the peer's blocks is walked once, not rebuilt from its start
+/// each round: [`BlockElementsIter`](crate::BlockElementsIter) has no seek,
+/// and passing over an element rebuilds it (dense IDs, coordinates, tag
+/// boundaries and metadata deltas alike). The head an earlier round peeked
+/// past its boundary is kept, not decoded again. Elements before the window
+/// are passed over once, and only when the cursor is first read, so a run
+/// that is only counted never walks them.
+pub(crate) struct ElementCursor<'a> {
+    iter: crate::BlockElementsIter<'a>,
+    /// Leading elements still to pass over before the first yield.
+    skip: usize,
+    /// Elements left in the window part, the peeked head included.
+    remaining: usize,
+    head: Option<Element<'a>>,
+}
+
+impl<'a> ElementCursor<'a> {
+    /// The elements of `block` from `skip` up to `end` (its end when
+    /// `None`).
+    fn new(block: &'a PrimitiveBlock, skip: usize, end: Option<usize>) -> Self {
+        let len =
+            end.unwrap_or_else(|| usize::try_from(block.element_count()).unwrap_or(usize::MAX));
+        Self {
+            iter: block.elements(),
+            skip,
+            remaining: len.saturating_sub(skip),
+            head: None,
+        }
+    }
+
+    /// The next element, left in place.
+    fn peek(&mut self) -> Option<&Element<'a>> {
+        if self.head.is_none() && self.remaining > 0 {
+            if self.skip > 0 {
+                self.iter.nth(self.skip - 1);
+                self.skip = 0;
+            }
+            self.head = self.iter.next();
+            if self.head.is_none() {
+                self.remaining = 0;
+            }
+        }
+        self.head.as_ref()
+    }
+
+    /// Elements left, the peeked head included.
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+impl<'a> Iterator for ElementCursor<'a> {
+    type Item = Element<'a>;
+
+    fn next(&mut self) -> Option<Element<'a>> {
+        self.peek();
+        let head = self.head.take()?;
+        self.remaining -= 1;
+        Some(head)
     }
 }
 
@@ -450,7 +505,9 @@ impl<'a> BlockRun<'a> {
 /// element prints the same whichever merge found it. Generic rather than
 /// `dyn` so the per-element call inlines.
 pub(crate) trait MergeSink {
-    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()>;
+    /// By value: a single-sided run hands over the merge's cursor, so the
+    /// sink walks it once from where the merge left it.
+    fn record(&mut self, kind: ElementKind, action: BlockMergeAction<'_>) -> Result<()>;
 
     /// The equality a same-ID pair is judged "equal" or "modified" by. No
     /// default: every sink names its own (see [`crate::content::Equality`]).
@@ -517,10 +574,12 @@ impl Window {
     }
 }
 
-/// A decoded block of one side and the part of it still to merge.
+/// A decoded block of one side and its window part. The merge reads it
+/// through an [`ElementCursor`] borrowing it.
 struct BlockState {
     block: PrimitiveBlock,
-    skip_count: usize,
+    /// Elements before the window part (an earlier unit owns them).
+    skip: usize,
     /// Exclusive bound of the window part; `None` when unclipped.
     end: Option<usize>,
     /// For a clipped block, the ID of the last element inside the window:
@@ -532,23 +591,12 @@ struct BlockState {
 impl BlockState {
     /// Nothing of the block is left in the window.
     fn spent(&self) -> bool {
-        self.end.is_some_and(|end| self.skip_count >= end)
+        self.end.is_some_and(|end| self.skip >= end)
     }
 
-    fn run(&self) -> BlockRun<'_> {
-        let count = match self.end {
-            Some(end) => (end - self.skip_count.min(end)) as u64,
-            None => self
-                .block
-                .element_count()
-                .saturating_sub(self.skip_count as u64),
-        };
-        BlockRun {
-            block: &self.block,
-            skip: self.skip_count,
-            end: self.end,
-            count,
-        }
+    /// A cursor at the start of the window part.
+    fn cursor(&self) -> ElementCursor<'_> {
+        ElementCursor::new(&self.block, self.skip, self.end)
     }
 }
 
@@ -1008,14 +1056,14 @@ impl<'a> BlockPairSide<'a> {
             Ok(()) => accepted.into_block(),
             Err(e) => return Err(locate_in(path, &desc, e)),
         };
-        let (skip_count, end, clip_last) = if self.window.crosses(&desc) {
+        let (skip, end, clip_last) = if self.window.crosses(&desc) {
             clip(&block, self.window)
         } else {
             (0, None, None)
         };
         Ok(BlockState {
             block,
-            skip_count,
+            skip,
             end,
             clip_last,
             index: desc.index,
@@ -1188,15 +1236,30 @@ fn emit_block<S: MergeSink>(
     if bs.spent() {
         return Ok(());
     }
-    let run = bs.run();
+    emit_run(bs.cursor(), is_old, kind, sink, stats)
+}
+
+/// Emit what is left at `cursor` as BlobOldOnly or BlobNewOnly: a fresh
+/// block's window part, or a residual's rest from where the merge left it.
+fn emit_run<S: MergeSink>(
+    cursor: ElementCursor<'_>,
+    is_old: bool,
+    kind: ElementKind,
+    sink: &mut S,
+    stats: &mut BlockPairMergeStats,
+) -> Result<()> {
+    let run = BlockRun {
+        count: cursor.len() as u64,
+        cursor,
+    };
     if is_old {
         stats.blobs_old_only += 1;
         stats.elements_old_only += run.count;
-        sink.record(kind, &BlockMergeAction::BlobOldOnly(run))
+        sink.record(kind, BlockMergeAction::BlobOldOnly(run))
     } else {
         stats.blobs_new_only += 1;
         stats.elements_new_only += run.count;
-        sink.record(kind, &BlockMergeAction::BlobNewOnly(run))
+        sink.record(kind, BlockMergeAction::BlobNewOnly(run))
     }
 }
 
@@ -1211,40 +1274,33 @@ fn state_last(bs: &BlockState) -> i64 {
     }
 }
 
-/// Merge a pair of decoded overlapping blocks, tracking residuals.
+/// Merge a pair of decoded overlapping blocks from where their cursors
+/// stand, up to the earlier of their lasts; the outcome says which side
+/// keeps a residual, its cursor left at the residual's head.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn merge_decoded_pair<S: MergeSink>(
-    old_decoded: &mut Option<BlockState>,
-    new_decoded: &mut Option<BlockState>,
+    os: &BlockState,
+    ns: &BlockState,
+    old_cur: &mut ElementCursor<'_>,
+    new_cur: &mut ElementCursor<'_>,
     kind: ElementKind,
     sink: &mut S,
-) -> Result<()> {
-    let Some(mut os) = old_decoded.take() else {
-        return Err(crate::Error::internal(
-            "block-pair merge: no old block to merge",
-        ));
-    };
-    let Some(mut ns) = new_decoded.take() else {
-        return Err(crate::Error::internal(
-            "block-pair merge: no new block to merge",
-        ));
-    };
-
+) -> Result<MergePairOutcome> {
     // The merge boundary is the earlier of the two blocks' OSM-order last
     // IDs. `osm_id_cmp` (not raw `i64` order) throughout, because the merge
     // itself orders by `osm_id_cmp`: for negative IDs, which `osm_id.rs`
     // explicitly supports as 0, -1, -2, ..., 1, 2, ..., a raw `min` picks a
     // boundary that cuts the streams in a different place than the order
     // they are being merged in.
-    let old_last = state_last(&os);
-    let new_last = state_last(&ns);
+    let old_last = state_last(os);
+    let new_last = state_last(ns);
     let merge_up_to = if crate::osm_id::osm_id_cmp(old_last, new_last).is_le() {
         old_last
     } else {
         new_last
     };
 
-    let outcome = element_merge_pair(&os, &ns, merge_up_to, kind, sink)?;
+    let outcome = element_merge_pair(old_cur, new_cur, merge_up_to, kind, sink)?;
 
     // Decoding proved both claims exact and both blocks in order
     // ([`hold_decoded_claim`]), so the side whose last is the boundary ends
@@ -1257,16 +1313,7 @@ fn merge_decoded_pair<S: MergeSink>(
              {merge_up_to}, though both claims were checked exact"
         )));
     }
-
-    if outcome.old_has_more {
-        os.skip_count += outcome.old_consumed;
-        *old_decoded = Some(os);
-    }
-    if outcome.new_has_more {
-        ns.skip_count += outcome.new_consumed;
-        *new_decoded = Some(ns);
-    }
-    Ok(())
+    Ok(outcome)
 }
 
 /// The OSM-order last ID a blob's index claims to cover.
@@ -1311,8 +1358,17 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
     stats: &mut BlockPairMergeStats,
     cancel: &crate::host::Recorder,
 ) -> Result<()> {
-    let mut old_decoded: Option<BlockState> = None;
-    let mut new_decoded: Option<BlockState> = None;
+    // Each side's decoded block and the cursor borrowing it are separate
+    // locals, as in `stream_merge_phase`: a block that outlives several of
+    // the peer's is read on from where the last round left it. A cursor is
+    // `None` exactly when its side has no residual, and every write of a
+    // block slot is followed by a write of its cursor before the cursor is
+    // read again, which is what lets the borrow checker see that no
+    // borrow of the replaced block survives.
+    let mut old_state: Option<BlockState> = None;
+    let mut new_state: Option<BlockState> = None;
+    let mut old_cur: Option<ElementCursor<'_>> = None;
+    let mut new_cur: Option<ElementCursor<'_>> = None;
 
     loop {
         // Once per merge step, each of which decodes at most one blob per
@@ -1322,7 +1378,7 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
         // without decompressing so the compressed bytes can be compared.
         // Only here: a residual is partly consumed, and comparing it whole
         // against a fresh blob would count its consumed elements twice.
-        if old_decoded.is_none() && new_decoded.is_none() {
+        if old_cur.is_none() && new_cur.is_none() {
             let op = old.next_blob();
             let np = new.next_blob();
 
@@ -1360,7 +1416,7 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                         stats.elements_byte_equal += op.index.count;
                         sink.record(
                             kind,
-                            &BlockMergeAction::BlobEqual {
+                            BlockMergeAction::BlobEqual {
                                 count: op.index.count,
                                 first: crate::osm_id::blob_osm_first_id(
                                     op.index.min_id,
@@ -1376,38 +1432,53 @@ pub(crate) fn block_pair_merge_phase<S: MergeSink>(
                     let ns = new.decode(np)?;
                     stats.elements_overlapping_decoded +=
                         os.block.element_count() + ns.block.element_count();
-                    old_decoded = Some(os).filter(|bs| !bs.spent());
-                    new_decoded = Some(ns).filter(|bs| !bs.spent());
+                    old_state = Some(os).filter(|bs| !bs.spent());
+                    old_cur = old_state.as_ref().map(BlockState::cursor);
+                    new_state = Some(ns).filter(|bs| !bs.spent());
+                    new_cur = new_state.as_ref().map(BlockState::cursor);
                 }
             }
         }
 
-        // Slow path: at least one side has a decoded residual block.
-        if old_decoded.is_none() {
-            old_decoded = old.next_decoded()?;
+        // Slow path: at least one side has a decoded residual block. A side
+        // without one takes its next block, and a cursor over it, here; the
+        // cursor is always rewritten right after its block is replaced.
+        if old_cur.is_none() {
+            old_state = old.next_decoded()?;
+            old_cur = old_state.as_ref().map(BlockState::cursor);
         }
-        if new_decoded.is_none() {
-            new_decoded = new.next_decoded()?;
+        if new_cur.is_none() {
+            new_state = new.next_decoded()?;
+            new_cur = new_state.as_ref().map(BlockState::cursor);
         }
 
-        match (old_decoded.take(), new_decoded.take()) {
+        match (old_cur.take(), new_cur.take()) {
             (None, None) => break,
-            (Some(os), None) => emit_block(&os, true, kind, sink, stats)?,
-            (None, Some(ns)) => emit_block(&ns, false, kind, sink, stats)?,
-            (Some(os), Some(ns)) => {
+            (Some(oc), None) => emit_run(oc, true, kind, sink, stats)?,
+            (None, Some(nc)) => emit_run(nc, false, kind, sink, stats)?,
+            (Some(mut oc), Some(mut nc)) => {
+                let (Some(os), Some(ns)) = (old_state.as_ref(), new_state.as_ref()) else {
+                    return Err(crate::Error::internal(
+                        "block-pair merge: a cursor outlived its block",
+                    ));
+                };
                 if blob_entirely_before(&os.index, &ns.index) {
-                    emit_block(&os, true, kind, sink, stats)?;
-                    new_decoded = Some(ns);
+                    emit_run(oc, true, kind, sink, stats)?;
+                    new_cur = Some(nc);
                     continue;
                 }
                 if blob_entirely_before(&ns.index, &os.index) {
-                    emit_block(&ns, false, kind, sink, stats)?;
-                    old_decoded = Some(os);
+                    emit_run(nc, false, kind, sink, stats)?;
+                    old_cur = Some(oc);
                     continue;
                 }
-                old_decoded = Some(os);
-                new_decoded = Some(ns);
-                merge_decoded_pair(&mut old_decoded, &mut new_decoded, kind, sink)?;
+                let outcome = merge_decoded_pair(os, ns, &mut oc, &mut nc, kind, sink)?;
+                if outcome.old_has_more {
+                    old_cur = Some(oc);
+                }
+                if outcome.new_has_more {
+                    new_cur = Some(nc);
+                }
             }
         }
     }
@@ -1461,21 +1532,17 @@ fn blobs_byte_equal(
 /// Processes elements up to `merge_up_to` ID (inclusive). Elements beyond that
 /// boundary in either block are left unconsumed for the caller to handle.
 ///
-/// Returns a [`MergePairOutcome`] - how many elements were consumed from each
-/// side, so the caller can update skip counts without re-scanning, and whether
-/// either side still holds elements past the boundary.
+/// Both cursors advance past what is consumed and stay at the first element
+/// left, so the next round resumes there. Returns a [`MergePairOutcome`]:
+/// whether either side still holds elements past the boundary.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn element_merge_pair<S: MergeSink>(
-    os: &BlockState,
-    ns: &BlockState,
+    old_iter: &mut ElementCursor<'_>,
+    new_iter: &mut ElementCursor<'_>,
     merge_up_to: i64,
     kind: ElementKind,
     sink: &mut S,
 ) -> Result<MergePairOutcome> {
-    let mut old_iter = os.run().elements().peekable();
-    let mut new_iter = ns.run().elements().peekable();
-    let mut old_consumed: usize = 0;
-    let mut new_consumed: usize = 0;
     // `osm_id_cmp`, not raw `<=`: every ordering decision below already
     // uses it, and for negative IDs the two disagree - a raw boundary test
     // would cut the streams somewhere the merge order does not.
@@ -1516,27 +1583,20 @@ fn element_merge_pair<S: MergeSink>(
         match order {
             std::cmp::Ordering::Less => {
                 if let Some(o) = old_iter.next() {
-                    sink.record(kind, &BlockMergeAction::ElementOldOnly(&o))?;
-                    old_consumed += 1;
+                    sink.record(kind, BlockMergeAction::ElementOldOnly(&o))?;
                 }
             }
             std::cmp::Ordering::Greater => {
                 if let Some(n) = new_iter.next() {
-                    sink.record(kind, &BlockMergeAction::ElementNewOnly(&n))?;
-                    new_consumed += 1;
+                    sink.record(kind, BlockMergeAction::ElementNewOnly(&n))?;
                 }
             }
             std::cmp::Ordering::Equal => {
                 if let (Some(o), Some(n)) = (old_iter.next(), new_iter.next()) {
-                    old_consumed += 1;
-                    new_consumed += 1;
                     if sink.equality().equal(&o, &n)? {
-                        sink.record(kind, &BlockMergeAction::ElementEqual(&o))?;
+                        sink.record(kind, BlockMergeAction::ElementEqual(&o))?;
                     } else {
-                        sink.record(
-                            kind,
-                            &BlockMergeAction::ElementModified { old: &o, new: &n },
-                        )?;
+                        sink.record(kind, BlockMergeAction::ElementModified { old: &o, new: &n })?;
                     }
                 }
             }
@@ -1544,8 +1604,6 @@ fn element_merge_pair<S: MergeSink>(
     }
 
     Ok(MergePairOutcome {
-        old_consumed,
-        new_consumed,
         old_has_more: old_iter.peek().is_some(),
         new_has_more: new_iter.peek().is_some(),
     })
@@ -1553,11 +1611,9 @@ fn element_merge_pair<S: MergeSink>(
 
 /// What one [`element_merge_pair`] call did, and what it left behind.
 ///
-/// `*_has_more` is what the bounded iterator actually observed, not what
+/// `*_has_more` is what the bounded cursor actually observed, not what
 /// the blob's indexdata claims; the residual decision is made from these.
 struct MergePairOutcome {
-    old_consumed: usize,
-    new_consumed: usize,
     /// The side keeps a residual: elements past the boundary, or repeats of
     /// the boundary ID held for the peer's next blob.
     old_has_more: bool,

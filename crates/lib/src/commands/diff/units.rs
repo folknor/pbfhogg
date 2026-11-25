@@ -103,7 +103,7 @@ pub(super) trait UnitSink: Send {
     fn record_into(
         &mut self,
         kind: ElementKind,
-        action: &crate::osc::merge_join::BlockMergeAction<'_>,
+        action: crate::osc::merge_join::BlockMergeAction<'_>,
         out: &mut dyn UnitOut<Self::Item>,
     ) -> Result<()>;
 
@@ -393,7 +393,7 @@ impl<S: UnitSink> MergeSink for Chunking<'_, '_, S> {
     fn record(
         &mut self,
         kind: ElementKind,
-        action: &crate::osc::merge_join::BlockMergeAction<'_>,
+        action: crate::osc::merge_join::BlockMergeAction<'_>,
     ) -> Result<()> {
         self.sink.record_into(kind, action, &mut self.out)
     }

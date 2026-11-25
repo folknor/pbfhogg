@@ -339,6 +339,30 @@ relation `Info` parse, a dense slot field). Same workload as above,
 Signs disagree across pairs and every delta is within 2-3 %, so the change
 has no cost.
 
+## Persistent merge cursors (bygg, 2026-11-25, against `31c482e2`)
+
+The block-pair merge used to rebuild each side's element iterator every
+round and pass over its consumed prefix with `skip`, which rebuilds every
+skipped element (dense deltas and metadata included); a block outliving
+several of the peer's blocks was walked once per round. Each side now keeps
+a cursor across rounds, and a residual emitted single-sided hands that cursor
+to the sink. Planet base against `20260411`, `--iterations 1`, no `fstrim`;
+variant cells on the uncommitted tree.
+
+| Cell | Baseline | Variant |
+|---|---|---|
+| text `-c` | `ea4082f6` 1m49s | `810cced3` 1m50s |
+| osc, pair 1 (variant first) | `3d544246` 2m43s | `3fa788de` 2m29s |
+| osc, pair 2 (baseline first) | `88e76d15` 2m29s | `a07b3520` 2m31s |
+
+Text and the second OSC pair are within 2-3 %; the first OSC baseline cell
+is the slow outlier these cells show between runs. Node phase stays at about
+30 cores either way: on these two snapshots, blocks of similar size, the
+replay was not a measurable share. On a mismatched layout, denmark base
+against its `1k` snapshot (`--iterations 3`), baseline `47e899f1` 1.2 s,
+variant `2d7748ee` 1.0 s. No cost on normal input; the win is on inputs
+whose block boundaries differ in size.
+
 ## Diff of a base against its apply-changes output (bygg, 2026-10-31)
 
 `brokkr diff`: the base against the base with one daily OSC applied, run

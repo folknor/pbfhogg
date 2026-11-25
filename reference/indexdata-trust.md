@@ -196,8 +196,12 @@ range hands a neighbour's upsert to the blob as well.
   gate, per kind, over the shared schedule (`extract/multi_fused.rs`). The
   rule is decided per region inside the blob, and each blob's claim must be
   exact before any region's output of it leaves the worker. A raw-copy
-  candidate is copied to every region only when each of its nodes' own
-  hits, before the blob-local union, cover every region. A repeated or
+  candidate is copied to each region it is nominated for (the region's
+  inside box holds the claimed bbox, as in that region's single extract)
+  whose hits, counted over each node occurrence before the blob-local
+  union, include every occurrence; the blob is rebuilt for the other
+  regions that read it. The classify-then-write form applies the same
+  per-region rule. A repeated or
   descending ID switches the blob to a blob-local `(ID, region)` table.
   The gate is judged over the shared schedule, the node blobs any region
   reads, not over each region's own: a region whose single extract would

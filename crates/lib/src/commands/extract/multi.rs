@@ -15,8 +15,8 @@ use crate::read::region_grid::RegionGrid;
 use crate::scan::classify::ScheduledBlob;
 
 use super::common::{
-    BboxInt, MatchableMember, Passthrough, dense_only_payload, matchable_members,
-    spatial_blob_filter, warn_passthrough_demotions,
+    BboxInt, MatchableMember, dense_only_payload, matchable_members, spatial_blob_filter,
+    warn_passthrough_demotions,
 };
 use super::membership::{
     BatchBuilder, Membership, PageBatch, admits, full_mask, mask_words, regions_of, restrict,
@@ -170,33 +170,19 @@ pub(super) fn try_extract_multi_single_pass(
                         // Between regions: only the union box met it.
                         continue;
                     }
-                    // Raw passthrough is only sound for bbox regions - polygon
-                    // regions can exclude nodes inside the bbox but outside the
-                    // polygon boundary or inside holes - and only when the
-                    // blob goes to every region. This nominates on the
-                    // indexdata bbox claim; the node classify phase verifies.
-                    let candidate = !clean.any()
-                        && idx.bbox.as_ref().is_some_and(|blob_bbox| {
-                            inside_bbox_ints
-                                .iter()
-                                .zip(regions.iter())
-                                .all(|(bi, region)| {
-                                    matches!(region, Region::Bbox(_))
-                                        && crate::BlobBbox::new(
-                                            bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
-                                        )
-                                        .contains(blob_bbox)
-                                })
-                        });
+                    // Nominated per region on the indexdata bbox claim, as
+                    // each single extract nominates; the node pass verifies.
+                    let candidates = if clean.any() {
+                        None
+                    } else {
+                        raw_candidates(&inside_bbox_ints, regions, idx)
+                    };
                     node_blobs.push(NodeBlob {
                         entry,
                         claim: Some(*idx),
                         admit,
-                        passthrough: if candidate {
-                            Passthrough::Candidate
-                        } else {
-                            Passthrough::No
-                        },
+                        candidates,
+                        raw: None,
                     });
                 }
                 crate::ElementKind::Way => way_blobs.push(KindBlob {
@@ -214,7 +200,8 @@ pub(super) fn try_extract_multi_single_pass(
                 entry,
                 claim: None,
                 admit: None,
-                passthrough: Passthrough::No,
+                candidates: None,
+                raw: None,
             });
             way_blobs.push(KindBlob { entry, claim: None });
             relation_blobs.push(KindBlob { entry, claim: None });
@@ -228,17 +215,20 @@ pub(super) fn try_extract_multi_single_pass(
     let relation_schedule: Vec<ScheduledBlob> =
         relation_blobs.iter().map(|blob| blob.entry).collect();
 
-    // DO NOT add per-region partial raw passthrough here (decode once,
-    // write raw to contained regions, route elements to non-contained
-    // regions). It was a "high impact at planet scale" item on the
-    // multi-extract optimization plan for a while, resting on the
-    // heuristic that region-contained blobs would cluster under
-    // contiguous-bbox regions.
+    // Per-region partial raw passthrough (decode once, write raw to the
+    // regions that contain the blob, rebuild for the rest) is here for
+    // output parity, not speed: a single extract copies a blob inside its
+    // region raw, keeping a coordinate granularity finer than a
+    // decimicrodegree and sub-second timestamps, and each region must equal
+    // its single extract. Do not justify it, or anything built on it, by
+    // speed. It was once a "high impact at planet scale" item on the
+    // multi-extract optimization plan, resting on the heuristic that
+    // region-contained blobs would cluster under contiguous-bbox regions.
     //
     // Measured end-to-end on 2026-04-20 via a shadow counter that did
     // the full per-region bbox-containment classification per blob
     // without actually passing anything through raw. Shadow added in
-    // the 2026-04-19 landing, reverted here. Planet 5-region
+    // the 2026-04-19 landing, reverted then. Planet 5-region
     // `--config --simple` at commit 57b01f9, UUID dad573cb:
     //
     //   0 / 32,835 node blobs would have qualified for partial
@@ -256,20 +246,10 @@ pub(super) fn try_extract_multi_single_pass(
     // curve over lat/lon) would flip this, but they break
     // Sort.Type_then_ID and are not what we ingest.
     //
-    // The existing all-N-contained raw-passthrough path in
-    // multi_extract_pread_write_nodes is kept for its real but narrow
-    // niche: N=1 extracts and fully-overlapping regions. Don't remove
-    // it on the "fires 0 times at planet 5-region" evidence - the
-    // planet multi-region config is the hardest case, not the only
-    // one.
-    //
-    // This pin is a speed ruling only. It does not cover output parity: a
-    // single extract copies a blob inside its region raw, keeping a
-    // coordinate granularity finer than a decimicrodegree and sub-second
-    // timestamps, which the re-encode here drops for a blob inside some
-    // regions but not all. Fixing that parity is per-region fan-out of the
-    // validated frame, a correctness change this measurement does not
-    // refuse.
+    // So the raw copy fires on planet-shaped configs for no region, and
+    // the nomination costs one bbox test per region per node blob. Don't
+    // remove the raw copy on that evidence either: N=1 extracts, nested
+    // regions and fully-overlapping regions copy, and parity needs it.
     //
     // Sister pin: crates/lib/src/commands/tags_filter/mod.rs pass-2 worker (same
     // precedent: shadow measurement produced zero, reverted, leave the
@@ -297,7 +277,7 @@ pub(super) fn try_extract_multi_single_pass(
         (
             blob.entry,
             blob.claim,
-            blob.passthrough == Passthrough::Candidate,
+            blob.candidates.as_deref(),
             blob.admit.as_deref(),
         )
     }));
@@ -326,9 +306,9 @@ pub(super) fn try_extract_multi_single_pass(
         host.invocation.marker("MULTI_NODE_FUSED_END");
     } else {
         host.invocation.marker("MULTI_NODE_CLASSIFY_START");
-        // Observed node count per node-schedule position, for passthrough
-        // candidates that verified. See `Passthrough`.
-        let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
+        // Per node-schedule position, the candidate regions that verified
+        // and the observed node count. See `RawCopy`.
+        let mut verified_nodes: Vec<Option<Verified>> = vec![None; node_schedule.len()];
         if all_bbox {
             let bboxes = region_bboxes;
             // The one classifier for every node blob, candidate or not, so that
@@ -394,11 +374,10 @@ pub(super) fn try_extract_multi_single_pass(
                 |position, buffer, (columns, scratch, builder)| {
                     let (crate::read::block::NoProjection, validated) =
                         buffer.project(|_, _| crate::read::block::NoProjection)?;
-                    let eligible = if node_blobs_ref[position].passthrough == Passthrough::Candidate
-                    {
-                        Some(dense_only_payload(validated.bytes())?)
-                    } else {
-                        None
+                    let candidates = node_blobs_ref[position].candidates.as_deref();
+                    let eligible = match candidates {
+                        Some(_) => dense_only_payload(validated.bytes())?,
+                        None => false,
                     };
                     let block = validated.into_block();
                     classify_columns(&block, columns, scratch)?;
@@ -411,9 +390,9 @@ pub(super) fn try_extract_multi_single_pass(
                     // Occurrence counts, not set sizes: a duplicate id counts
                     // every time it is copied.
                     let observed = columns.len();
-                    let verified = (eligible == Some(true)
-                        && scratch.iter().all(|ids| ids.len() == observed))
-                    .then_some(observed as u64);
+                    let verified = candidates
+                        .filter(|_| eligible)
+                        .and_then(|c| verified_regions(c, |r| scratch[r].len(), observed));
                     for (region, ids) in scratch.iter().enumerate() {
                         for &id in ids {
                             builder.push(id, region);
@@ -421,21 +400,32 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                     Ok((builder.finish(), verified))
                 },
-                |pos, (batch, verified): (PageBatch, Option<u64>)| {
+                |pos, (batch, verified): (PageBatch, Option<Verified>)| {
                     node_members.install(batch);
                     verified_nodes[pos] = verified;
                 },
                 host,
             )?;
         } else {
+            // Polygon regions are never candidates, but a bbox region beside
+            // them is, so this form verifies its candidates too.
             let node_blobs_ref = &node_blobs;
             crate::scan::classify::parallel_project_phase(
                 &shared_file,
                 &node_schedule,
                 None,
-                || BatchBuilder::new(n),
-                |position, buffer, builder: &mut BatchBuilder| {
-                    let block = buffer.block()?;
+                || (BatchBuilder::new(n), vec![0usize; n]),
+                |position, buffer, (builder, hits): &mut (BatchBuilder, Vec<usize>)| {
+                    let (crate::read::block::NoProjection, validated) =
+                        buffer.project(|_, _| crate::read::block::NoProjection)?;
+                    let candidates = node_blobs_ref[position].candidates.as_deref();
+                    let eligible = match candidates {
+                        Some(_) => dense_only_payload(validated.bytes())?,
+                        None => false,
+                    };
+                    let block = validated.into_block();
+                    hits.fill(0);
+                    let mut observed = 0usize;
                     let admit = node_blobs_ref[position].admit.as_deref();
                     for element in block.elements_skip_metadata() {
                         let (id, lat, lon) = match &element {
@@ -452,6 +442,7 @@ pub(super) fn try_extract_multi_single_pass(
                             _ => continue,
                         };
                         let (lat, lon) = super::common::checked_coords(lat, lon)?;
+                        observed += 1;
                         match &grid {
                             Some(grid) => {
                                 for &region in grid.candidates(lat, lon) {
@@ -464,6 +455,7 @@ pub(super) fn try_extract_multi_single_pass(
                                         )
                                     {
                                         builder.push(id, region);
+                                        hits[region] += 1;
                                     }
                                 }
                             }
@@ -477,36 +469,43 @@ pub(super) fn try_extract_multi_single_pass(
                                         )
                                     {
                                         builder.push(id, region);
+                                        hits[region] += 1;
                                     }
                                 }
                             }
                         }
                     }
-                    Ok(builder.finish())
+                    let verified = candidates
+                        .filter(|_| eligible)
+                        .and_then(|c| verified_regions(c, |r| hits[r], observed));
+                    Ok((builder.finish(), verified))
                 },
-                |_seq, batch: PageBatch| node_members.install(batch),
+                |pos, (batch, verified): (PageBatch, Option<Verified>)| {
+                    node_members.install(batch);
+                    verified_nodes[pos] = verified;
+                },
                 host,
             )?;
         }
         node_members.freeze();
         host.invocation.marker("MULTI_NODE_CLASSIFY_END");
 
-        // Settle every candidate: verified ones pass through counted by what
-        // classify observed, the rest are decoded like any other blob.
+        // Settle every candidate: its verified regions get the raw frame,
+        // counted by what classify observed; every other region it is read
+        // for decodes it like any other blob.
         let mut verified_blobs: u64 = 0;
         let mut demoted_blobs: u64 = 0;
-        for (info, verified) in node_blobs.iter_mut().zip(&verified_nodes) {
-            if info.passthrough == Passthrough::Candidate {
-                info.passthrough = match *verified {
-                    Some(nodes) => {
-                        verified_blobs += 1;
-                        Passthrough::Verified { nodes }
-                    }
-                    None => {
-                        demoted_blobs += 1;
-                        Passthrough::No
-                    }
-                };
+        for (info, verified) in node_blobs.iter_mut().zip(verified_nodes) {
+            let Some(candidates) = info.candidates.as_deref() else {
+                continue;
+            };
+            let raw_mask = verified.as_ref().map(|(mask, _)| &**mask);
+            if raw_mask.is_none_or(|raw| candidates.iter().zip(raw).any(|(c, r)| c & !r != 0)) {
+                demoted_blobs += 1;
+            }
+            if let Some((mask, nodes)) = verified {
+                verified_blobs += 1;
+                info.raw = Some(RawCopy::new(mask, nodes, info.admit.as_deref(), n));
             }
         }
         warn_passthrough_demotions(verified_blobs, demoted_blobs, host);
@@ -586,7 +585,7 @@ pub(super) fn try_extract_multi_single_pass(
     let way_fused = fused_blobs(
         way_blobs
             .iter()
-            .map(|blob| (blob.entry, blob.claim, false, None)),
+            .map(|blob| (blob.entry, blob.claim, None, None)),
     );
     if let Some(fused) = way_fused {
         host.invocation.marker("MULTI_WAY_FUSED_START");
@@ -688,7 +687,7 @@ pub(super) fn try_extract_multi_single_pass(
     let relation_fused = fused_blobs(
         relation_blobs
             .iter()
-            .map(|blob| (blob.entry, blob.claim, false, None)),
+            .map(|blob| (blob.entry, blob.claim, None, None)),
     );
     if let Some(fused) = relation_fused {
         // Nothing reads relation membership after this pass.
@@ -1014,9 +1013,108 @@ struct NodeBlob {
     /// every region): its occurrences are classified for and written to
     /// these alone, on the fused and the two-phase form.
     admit: Option<Box<[u64]>>,
-    /// `Candidate` when the indexdata bbox claims containment in every
-    /// region; settled to `Verified` or `No` after node classify.
-    passthrough: Passthrough,
+    /// The regions whose inside box holds the indexdata bbox claim
+    /// (`raw_candidates`); `None` for none.
+    candidates: Option<Box<[u64]>>,
+    /// Set after node classify for a candidate that verified for at least
+    /// one region.
+    raw: Option<RawCopy>,
+}
+
+impl NodeBlob {
+    /// The regions the write pass rebuilds the blob for: those it is read
+    /// for, less those it is copied raw to.
+    fn rebuild_admit(&self) -> Option<&[u64]> {
+        match &self.raw {
+            Some(raw) => Some(&raw.rebuild),
+            None => self.admit.as_deref(),
+        }
+    }
+
+    /// Whether every region the blob is read for copies it raw, so the
+    /// write pass does not decode it.
+    fn raw_everywhere(&self) -> bool {
+        self.raw
+            .as_ref()
+            .is_some_and(|raw| raw.rebuild.iter().all(|&word| word == 0))
+    }
+}
+
+/// A verified candidate's raw destinations: the regions whose single
+/// extract would copy the blob raw (DenseNodes alone, every occurrence in
+/// the region by its own coordinates), and the rest it is read for.
+struct RawCopy {
+    /// Regions the input frame is copied to.
+    mask: Box<[u64]>,
+    /// Regions read for and not copied to; the write pass rebuilds these.
+    rebuild: Box<[u64]>,
+    /// The node occurrences classify observed, each raw region's count.
+    nodes: u64,
+}
+
+impl RawCopy {
+    fn new(mask: Box<[u64]>, nodes: u64, admit: Option<&[u64]>, n: usize) -> Self {
+        let read = admit.map_or_else(|| full_mask(n), <[u64]>::to_vec);
+        let rebuild = read
+            .iter()
+            .zip(mask.iter())
+            .map(|(r, m)| r & !m)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            mask,
+            rebuild,
+            nodes,
+        }
+    }
+}
+
+/// The regions a node blob is a raw-copy candidate for, as each single
+/// extract nominates: a bbox region (a polygon can exclude nodes inside its
+/// bbox) whose inside box holds the blob's claimed bbox. `None` for none.
+/// The caller passes no claim under cleaning, which rewrites metadata a raw
+/// frame carries.
+fn raw_candidates(
+    inside_bbox_ints: &[BboxInt],
+    regions: &[Region],
+    claim: &crate::blob_meta::BlobIndex,
+) -> Option<Box<[u64]>> {
+    let blob_bbox = claim.bbox.as_ref()?;
+    let mut mask = vec![0u64; mask_words(regions.len())];
+    let mut any = false;
+    for (region, (bi, r)) in inside_bbox_ints.iter().zip(regions).enumerate() {
+        if matches!(r, Region::Bbox(_))
+            && crate::BlobBbox::new(bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon)
+                .contains(blob_bbox)
+        {
+            mask[region / 64] |= 1u64 << (region % 64);
+            any = true;
+        }
+    }
+    any.then(|| mask.into_boxed_slice())
+}
+
+/// A candidate's verified regions and its observed node count.
+type Verified = (Box<[u64]>, u64);
+
+/// The candidate regions holding every one of a blob's `observed` node
+/// occurrences (`hits(region)` counts the region's occurrence hits), with
+/// `observed`; `None` when none does. The caller has proved the payload is
+/// DenseNodes alone.
+fn verified_regions(
+    candidates: &[u64],
+    hits: impl Fn(usize) -> usize,
+    observed: usize,
+) -> Option<Verified> {
+    let mut mask = vec![0u64; candidates.len()];
+    let mut any = false;
+    for region in regions_of(candidates) {
+        if hits(region) == observed {
+            mask[region / 64] |= 1u64 << (region % 64);
+            any = true;
+        }
+    }
+    any.then(|| (mask.into_boxed_slice(), observed as u64))
 }
 
 /// One way or relation blob: its schedule entry and indexdata claim.
@@ -1034,7 +1132,7 @@ fn fused_blobs<'a>(
         Item = (
             ScheduledBlob,
             Option<crate::blob_meta::BlobIndex>,
-            bool,
+            Option<&'a [u64]>,
             Option<&'a [u64]>,
         ),
     > + Clone,
@@ -1043,11 +1141,11 @@ fn fused_blobs<'a>(
         return None;
     }
     blobs
-        .map(|(entry, claim, candidate, admit)| {
+        .map(|(entry, claim, candidates, admit)| {
             Some(super::multi_fused::FusedBlob {
                 entry,
                 claim: claim?,
-                candidate,
+                candidates,
                 admit,
             })
         })
@@ -1056,11 +1154,13 @@ fn fused_blobs<'a>(
 
 /// Node write phase with raw passthrough for verified blobs.
 ///
-/// Blobs verified as fully contained in ALL N regions are written as raw
-/// frames to all N writers without decode, counted by the node count
-/// classify observed. Other blobs go through parallel decode workers.
-/// Workers compress and frame the decoded blobs' per-region blocks; both
-/// streams are interleaved in sequence order by the ordered pool.
+/// A verified blob's input frame goes to each region it verified for,
+/// counted by the node count classify observed. A blob copied raw to every
+/// region it is read for is not decoded; any other goes through the
+/// parallel decode workers, which rebuild it only for the regions not
+/// copied to. Workers compress and frame the decoded blobs' per-region
+/// blocks; both streams are interleaved in sequence order by the ordered
+/// pool.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
@@ -1085,13 +1185,11 @@ where
         + Send
         + Sync,
 {
-    // Blobs verified as fully contained in ALL N regions skip decode
-    // entirely - the consumer writes their raw frame to all N writers
-    // between the decoded ones. Other blobs, including any unsettled
-    // candidate, go through the parallel decode workers.
-    let decode_at = crate::ordered_pool::DecodeSchedule::from_items(blobs, |blob| {
-        !matches!(blob.passthrough, Passthrough::Verified { .. })
-    });
+    // Blobs copied raw to every region they are read for skip decode
+    // entirely - the consumer writes their raw frame between the decoded
+    // ones. Other blobs go through the parallel decode workers.
+    let decode_at =
+        crate::ordered_pool::DecodeSchedule::from_items(blobs, |blob| !blob.raw_everywhere());
 
     let pt = decode_at.passthrough_count();
     if pt > 0 {
@@ -1113,6 +1211,7 @@ where
     let decode_at = &decode_at;
     let mut consumer = MultiNodeConsumer {
         interleaved: crate::ordered_pool::Interleaved::new(decode_at),
+        decode_at,
         blobs,
         input,
         frame_buf: crate::read::read_buf::ReadBuf::default(),
@@ -1135,7 +1234,7 @@ where
             let entry = &blob.entry;
             let block = local.decode(input, entry, &host.invocation)?;
             local
-                .classify(&block, blob.admit.as_deref(), n, &block_fn, framing)
+                .classify(&block, blob.rebuild_admit(), n, &block_fn, framing)
                 .map_err(|e| input.locate_blob(entry, e))
         },
         &mut consumer,
@@ -1359,6 +1458,7 @@ pub(super) fn write_regions(
 /// matching note in `common::pread_execute`).
 struct MultiNodeConsumer<'a> {
     interleaved: crate::ordered_pool::Interleaved<'a>,
+    decode_at: &'a crate::ordered_pool::DecodeSchedule,
     blobs: &'a [NodeBlob],
     input: &'a InputFile,
     frame_buf: crate::read::read_buf::ReadBuf,
@@ -1368,12 +1468,12 @@ struct MultiNodeConsumer<'a> {
 }
 
 impl MultiNodeConsumer<'_> {
-    /// Copy the verified raw frame at schedule position `position` to all N
-    /// writers.
+    /// Copy the verified raw frame at schedule position `position` to each
+    /// region it verified for.
     fn passthrough(&mut self, position: usize) -> Result<()> {
         self.cancel.check()?;
         let blob = &self.blobs[position];
-        let Passthrough::Verified { nodes } = blob.passthrough else {
+        let Some(raw) = &blob.raw else {
             return Err(crate::error::Error::internal(
                 "multi-extract: a decode blob was scheduled as passthrough",
             ));
@@ -1383,9 +1483,10 @@ impl MultiNodeConsumer<'_> {
             .frame_buf
             .read_exact_at(&**self.input.file(), frame_start, blob.entry.frame_size())
             .map_err(|e| self.input.locate_at(frame_start, e.into()))?;
-        for (writer, stats) in self.writers.iter_mut().zip(self.stats.iter_mut()) {
-            writer.write_raw(frame)?;
-            stats.nodes_in_bbox += nodes;
+        for region in regions_of(&raw.mask) {
+            self.cancel.check()?;
+            self.writers[region].write_raw(frame)?;
+            self.stats[region].nodes_in_bbox += raw.nodes;
         }
         // Every region has its copy; the frame buffer follows its retention
         // limit (read/read_buf.rs).
@@ -1402,7 +1503,14 @@ impl crate::ordered_pool::OrderedConsumer<RegionFrames> for MultiNodeConsumer<'_
         Ok(())
     }
 
-    fn consume(&mut self, _ordinal: usize, item: RegionFrames) -> crate::Result<()> {
+    fn consume(&mut self, ordinal: usize, item: RegionFrames) -> crate::Result<()> {
+        // A decoded blob copied raw to some regions: their copies belong to
+        // this schedule position (`before_item` covers only skipped ones).
+        // The rebuild skipped those regions, so each writer gets one form.
+        let position = self.decode_at.position(ordinal);
+        if self.blobs[position].raw.is_some() {
+            self.passthrough(position)?;
+        }
         write_regions(item, self.writers, self.stats, |s| &mut s.nodes_in_bbox)
     }
 }

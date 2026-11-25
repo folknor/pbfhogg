@@ -15,6 +15,26 @@ the 256 KiB per-output buffer, the shared region membership (they used one
 `IdSet` per region and kind) and the fused pass. 5 disjoint longitude strips
 per configured bench.
 
+### Per-region raw copy of node blobs (bygg, 2026-11-25, against `5e1e8843`)
+
+A node blob is nominated and verified for a raw copy per region, as each
+single extract decides it, instead of only when it lies inside every
+region; this is for output parity, not speed. `brokkr bench --iterations
+1 region-extract --mode multi --strategy simple --dataset planet` (5
+strips), interleaved, baseline `--commit HEAD` at `5e1e8843`, variant
+uncommitted on it:
+
+| Arm | Wall | UUID |
+|---|---:|---|
+| base | 52.0 s | `50b51ec1` |
+| variant | 51.6 s | `fdb15e70` |
+| base | 51.5 s | `31a58623` |
+| variant | 51.2 s | `e9c29ae8` |
+
+Neutral: the phase split of the second pair is within 1 % per phase
+(node fused 28.9 s against 28.7 s). No planet node blob lies inside any
+strip, so the only added work is one bbox test per region per node blob.
+
 ### Per-region node blob admission (bygg, 2026-11-25, against `6a8edb6f`)
 
 Each node blob carries the regions its bbox meets, and its occurrences

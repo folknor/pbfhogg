@@ -2155,6 +2155,104 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
     );
 }
 
+/// A region's raw copy is decided per region, as its single extract
+/// decides it. Each node blob's payload gains a 37-nanodegree `lat_offset`,
+/// finer than the decimicrodegree a rebuilt block keeps, with its indexdata
+/// bbox claim left honest. The wide region holds both blobs and the narrow
+/// one only the first, so the second blob is a candidate for the wide region
+/// alone: it must still be copied raw there (its framing kept) and rebuilt
+/// for the narrow one. Run on the fused route, then on the classify-then-
+/// write route (blob 2's claimed ID range widened to overlap blob 1's, an
+/// inexact claim that route neither relies on nor checks), and with a
+/// polygon region beside the bboxes.
+#[test]
+fn multi_extract_copies_a_blob_raw_to_each_region_containing_it() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    write_multi_block_test_pbf(&honest, &inside_nodes(20, 1), &[], &[], 10);
+    let pbf = std::fs::read(&honest).expect("read fixture");
+    // The offset moves each blob's northmost node 37 nanodegrees north, so
+    // its claimed max latitude (bytes 30..34) grows one decimicrodegree to
+    // stay the outward-rounded bound.
+    let offset = |pbf: &[u8], blob: usize| {
+        let pbf = crate::common::adversarial::mutate_blob_payload(pbf, blob, |p| {
+            p.extend_from_slice(&[0x98, 0x01]);
+            crate::common::adversarial::write_varint(p, 37);
+        });
+        crate::common::adversarial::mutate_blob_header_indexdata(&pbf, blob, |ix| {
+            let max_lat = i32::from_le_bytes(ix[30..34].try_into().unwrap()) + 1;
+            ix[30..34].copy_from_slice(&max_lat.to_le_bytes());
+        })
+    };
+    let framed = offset(&offset(&pbf, 1), 2);
+    let fused = dir.path().join("fused.osm.pbf");
+    std::fs::write(&fused, &framed).expect("write fused input");
+    let overlapping = dir.path().join("overlapping.osm.pbf");
+    std::fs::write(
+        &overlapping,
+        crate::common::adversarial::forge_indexdata_range(&framed, 2, 1, 20, None),
+    )
+    .expect("write overlapping input");
+    let wide = "12.4,55.6,12.7,55.8";
+    let narrow = "12.4,55.6,12.7,55.7";
+    for (tag, input) in [("fused", &fused), ("two-phase", &overlapping)] {
+        let outputs = assert_multi_matches_singles(
+            dir.path(),
+            input,
+            tag,
+            &[wide, narrow],
+            Strategy::Simple,
+            &[],
+        );
+        let input_bytes = std::fs::read(input).expect("read input");
+        let wide_bytes = std::fs::read(&outputs[0]).expect("read wide output");
+        for frame in [1, 2] {
+            assert_eq!(
+                indexdata_of(&wide_bytes, frame),
+                indexdata_of(&input_bytes, frame),
+                "{tag}: node blob {frame} is copied raw to the wide region"
+            );
+        }
+
+        // A polygon region beside the wide bbox takes the element-wise
+        // classifier, which must verify the bbox region's candidates too.
+        let invocation_scratch = pbfhogg_test_scratch::scratch();
+        let polygon = dir.path().join(format!("{tag}-triangle.geojson"));
+        std::fs::write(&polygon, TRIANGLE_GEOJSON).expect("write polygon");
+        let multi_wide = dir.path().join(format!("{tag}-mixed-wide.osm.pbf"));
+        let multi_poly = dir.path().join(format!("{tag}-mixed-poly.osm.pbf"));
+        let config = dir.path().join(format!("{tag}-mixed.json"));
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"extracts":[{{"output":"{}","bbox":[{wide}]}},{{"output":"{}","polygon_file":"{}"}}]}}"#,
+                multi_wide.display(),
+                multi_poly.display(),
+                polygon.display(),
+            ),
+        )
+        .expect("write config");
+        CliInvoker::new(&invocation_scratch)
+            .arg("extract")
+            .arg(input)
+            .arg("--config")
+            .arg(&config)
+            .args(["--simple", "--set-bounds"])
+            .assert_success();
+        assert_eq!(
+            read_in_file_order(&multi_wide),
+            read_in_file_order(&outputs[0]),
+            "{tag}: the wide region beside a polygon equals its single extract"
+        );
+        let mixed_bytes = std::fs::read(&multi_wide).expect("read mixed wide output");
+        assert_eq!(
+            indexdata_of(&mixed_bytes, 2),
+            indexdata_of(&input_bytes, 2),
+            "{tag}: node blob 2 is copied raw beside a polygon region"
+        );
+    }
+}
+
 /// Sorted simple extract decodes each blob once when the kind's ID ranges
 /// are disjoint, deciding each ID inside its blob; that rests on the ranges,
 /// so a range that is false for its blob is refused and nothing is

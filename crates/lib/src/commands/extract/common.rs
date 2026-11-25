@@ -237,9 +237,10 @@ pub(super) fn warn_passthrough_demotions(
             host.diagnostics,
             Warning,
             "extract.passthrough_demoted",
-            "{demoted} node blob(s) whose indexdata bbox lies inside the region \
-             hold out-of-region nodes or content other than DenseNodes, so they were \
-             filtered instead of copied raw. The input's indexdata may be wrong."
+            "{demoted} node blob(s) whose indexdata bbox lies inside a region \
+             hold nodes outside it or content other than DenseNodes, so they were \
+             filtered instead of copied raw for that region. The input's indexdata \
+             may be wrong."
         );
     }
 }

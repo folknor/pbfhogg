@@ -197,27 +197,6 @@ kind per block; the case was traced correct in the spar review, not run.
 Fix shape: a history cancellation scenario in `cancel.rs`, and a fixture
 with a mixed-kind blob whose last object straddles the seam.
 
-## CMD-088 - Multi-extract re-encodes a node blob a single extract copies raw
-
-Reported by: the CMD-078 spar (codex), 2026-11-25; read from source, not
-run.
-
-A single-region simple extract copies a DenseNodes blob whose bbox lies
-inside the region raw, after verifying every node; multi-extract nominates
-a raw copy only when the blob lies inside every region, so a blob inside
-region A alone is decoded and re-encoded for A. The decoded output then
-differs from A's single extract on any input where the raw bytes say more
-than the re-encode keeps: a granularity or offset finer than a
-decimicrodegree (the re-encode writes decimicrodegrees), and sub-second
-timestamps (the extract re-encode writes seconds, owned.rs metadata
-conversion). `assert_multi_matches_singles` compares exact nanodegrees,
-so a fixture with such a blob fails it. The fix is per-region raw fan-out:
-decode the blob once, copy its validated frame to the regions whose inside
-box holds every node, re-encode for the rest, and still record its node IDs
-for way and relation matching. The pin in `extract/multi.rs` refusing
-per-region partial passthrough rests on planet speed (no planet blob
-qualifies), not on this parity, so it does not decide this.
-
 ## CMD-079 - Forced unsorted multi-extract prints the missing-indexdata warning twice
 
 Reported by: the shared multi-extract chain (its engine link), via the

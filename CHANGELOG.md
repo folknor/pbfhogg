@@ -893,6 +893,14 @@
 
 ### Fixed
 
+- **Multi-extract copies a node blob raw to each region its single
+  extract would.** `extract --simple --config` copied a node blob raw
+  only when it lay inside every region, and otherwise rebuilt it in the
+  default framing. A region holding a blob that another region did not
+  then lost what the raw copy keeps: a coordinate granularity or offset
+  finer than a decimicrodegree, sub-second timestamps and the blob's own
+  header. The raw copy is now decided per region, so each region's
+  output equals its single-region extract on such input too.
 - **Multi-extract reads each region's node blobs as its single extract
   does.** On sorted indexed input, `extract --config` read a node blob
   whose indexdata bbox met any region and then selected and wrote its

@@ -23,11 +23,14 @@
 //! become a blob-local sorted `(id, region)` table, the OR over every
 //! occurrence of the ID, and emission looks each occurrence's ID up in it.
 //!
-//! A raw-copy candidate (nominated on its indexdata bbox, as in the two-phase
-//! form) is read as its whole frame; it is copied raw to every region only
-//! when its payload is DenseNodes alone, every occurrence's own spatial hits
-//! (before any union) cover all N regions, and its claim is exact. The copy
-//! is the very bytes whose body was validated.
+//! A raw-copy candidate (nominated per region on its indexdata bbox, as in
+//! the two-phase form) is read as its whole frame. It is copied raw to each
+//! candidate region whose single extract would copy it: its payload is
+//! DenseNodes alone, every occurrence's own spatial hits (before any union)
+//! include the region, and its claim is exact. The other regions get the
+//! blob's rebuilt blocks, so a region's output keeps the input's framing
+//! exactly where its single extract does. The copy is the very bytes whose
+//! body was validated.
 //!
 //! Error precedence differs from the two-phase form across blobs: an
 //! emission error in an earlier blob now wins over a classification error
@@ -56,13 +59,14 @@ use super::{ExtractStats, Region};
 use crate::owned::{dense_node_metadata, element_metadata};
 
 /// One blob of a fused kind: its schedule entry, its (exact-checked) claim,
-/// whether it is a raw-copy candidate, and for a node blob the regions it
-/// is read for (`multi::node_blob_regions`; `None` for every region).
+/// the regions it is a raw-copy candidate for (`multi::raw_candidates`;
+/// `None` for none), and for a node blob the regions it is read for
+/// (`multi::node_blob_regions`; `None` for every region).
 #[derive(Clone, Copy)]
 pub(super) struct FusedBlob<'a> {
     pub(super) entry: ScheduledBlob,
     pub(super) claim: BlobIndex,
-    pub(super) candidate: bool,
+    pub(super) candidates: Option<&'a [u64]>,
     pub(super) admit: Option<&'a [u64]>,
 }
 
@@ -100,20 +104,23 @@ impl MultiSelect<'_> {
     }
 }
 
-/// One fused blob's result.
-enum Fused {
-    /// Each region's framed blocks and element count.
-    Frames {
-        frames: super::multi::RegionFrames,
-        batch: Option<PageBatch>,
-        demoted: bool,
-    },
-    /// A verified candidate's input frame, copied raw to every region.
-    Raw {
-        frame: Vec<u8>,
-        nodes: u64,
-        batch: Option<PageBatch>,
-    },
+/// One fused blob's result: the rebuilt regions' frames (`None` when every
+/// region that reads the blob copies it raw), the verified input frame and
+/// the regions it is copied raw to, and the blob's membership batch.
+struct Fused {
+    frames: Option<super::multi::RegionFrames>,
+    raw: Option<RawPart>,
+    batch: Option<PageBatch>,
+    /// A candidate region the blob was not copied raw to.
+    demoted: bool,
+}
+
+/// A verified candidate's input frame and the regions it is copied raw to,
+/// each counted `nodes`.
+struct RawPart {
+    frame: Vec<u8>,
+    mask: Vec<u64>,
+    nodes: u64,
 }
 
 /// One worker's thread-local state.
@@ -280,7 +287,10 @@ fn fuse_blob(
     let entry = &blob.entry;
     // A candidate reads its whole frame, so a verified one is copied from
     // the very bytes whose body was validated.
-    let candidate = blob.candidate && matches!(select, MultiSelect::Nodes { .. });
+    let candidates = blob
+        .candidates
+        .filter(|_| matches!(select, MultiSelect::Nodes { .. }));
+    let candidate = candidates.is_some();
     let mut frame: Option<Vec<u8>> = None;
     let mut buf = crate::blob::pool_get(Some(&local.pool), 0);
     if candidate {
@@ -445,9 +455,43 @@ fn fuse_blob(
     tally.refuse_inexact(&blob.claim)?;
 
     let occurrences = local.dense_ids.len() + local.plain_ids.len();
-    // Each occurrence tests each region once, so a hit total of N per
-    // occurrence means every occurrence's own hits cover every region.
-    if eligible && local.plain_ids.is_empty() && local.dense_hits.len() == n * occurrences {
+    // Each occurrence tests each region once, so a region with one hit per
+    // occurrence holds every occurrence by its own coordinates: the single
+    // extract's raw-copy rule, counted over occurrences, never over IDs.
+    let raw_mask = match candidates {
+        Some(candidates) if eligible && local.plain_ids.is_empty() => {
+            let mut hits = vec![0usize; n];
+            for &(_, region) in &local.dense_hits {
+                hits[region as usize] += 1;
+            }
+            let mut mask = vec![0u64; candidates.len()];
+            for region in regions_of(candidates) {
+                if hits[region] == occurrences {
+                    mask[region / 64] |= 1u64 << (region % 64);
+                }
+            }
+            mask.iter().any(|&w| w != 0).then_some(mask)
+        }
+        _ => None,
+    };
+    let demoted = candidates.is_some_and(|candidates| match &raw_mask {
+        Some(raw) => candidates.iter().zip(raw).any(|(c, r)| c & !r != 0),
+        None => true,
+    });
+    let raw = match raw_mask {
+        Some(mask) => Some(RawPart {
+            frame: frame
+                .take()
+                .ok_or_else(|| crate::error::Error::internal("multi-extract: candidate frame"))?,
+            mask,
+            nodes: occurrences as u64,
+        }),
+        None => None,
+    };
+    // Every region the blob is read for copies it raw: no emission walk.
+    if let Some(part) = &raw
+        && (0..n).all(|r| !admits(blob.admit, r) || admits(Some(&part.mask), r))
+    {
         let batch = collect.then(|| {
             for &(occ, region) in &local.dense_hits {
                 local
@@ -456,14 +500,14 @@ fn fuse_blob(
             }
             local.builder.finish()
         });
-        let frame =
-            frame.ok_or_else(|| crate::error::Error::internal("multi-extract: candidate frame"))?;
-        return Ok(Fused::Raw {
-            frame,
-            nodes: occurrences as u64,
+        return Ok(Fused {
+            frames: None,
+            raw,
             batch,
+            demoted,
         });
     }
+    let skip = raw.as_ref().map(|part| part.mask.as_slice());
 
     let unique = (local.plain_ids.is_empty() && strictly_increasing(&local.dense_ids))
         || (local.dense_ids.is_empty() && strictly_increasing(&local.plain_ids));
@@ -509,7 +553,7 @@ fn fuse_blob(
     for element in block.elements() {
         match (&element, kind) {
             (Element::DenseNode(dn), ElementKind::Node) => {
-                cursors.regions(true, dn.id(), unique, local)?;
+                cursors.regions(true, dn.id(), unique, skip, local)?;
                 if local.regs.is_empty() {
                     continue;
                 }
@@ -524,7 +568,7 @@ fn fuse_blob(
                 }
             }
             (Element::Node(nd), ElementKind::Node) => {
-                cursors.regions(false, nd.id(), unique, local)?;
+                cursors.regions(false, nd.id(), unique, skip, local)?;
                 if local.regs.is_empty() {
                     continue;
                 }
@@ -542,7 +586,7 @@ fn fuse_blob(
                 }
             }
             (Element::Way(w), ElementKind::Way) => {
-                cursors.regions(true, w.id(), unique, local)?;
+                cursors.regions(true, w.id(), unique, None, local)?;
                 if local.regs.is_empty() {
                     continue;
                 }
@@ -561,7 +605,7 @@ fn fuse_blob(
                 }
             }
             (Element::Relation(r), ElementKind::Relation) => {
-                cursors.regions(true, r.id(), unique, local)?;
+                cursors.regions(true, r.id(), unique, None, local)?;
                 if local.regs.is_empty() {
                     continue;
                 }
@@ -589,10 +633,11 @@ fn fuse_blob(
     for (i, blocks) in local.output.iter_mut().enumerate() {
         frames.push(framing.frame_region(i, blocks.drain(..))?);
     }
-    Ok(Fused::Frames {
-        frames: (frames, counts),
+    Ok(Fused {
+        frames: Some((frames, counts)),
+        raw,
         batch,
-        demoted: candidate,
+        demoted,
     })
 }
 
@@ -608,13 +653,16 @@ struct Cursors {
 impl Cursors {
     /// Fill `local.regs` with the next occurrence's regions (ascending) from
     /// the dense or plain list: its run of hits when `unique`, else its ID's
-    /// slice of the blob-local table.
+    /// slice of the blob-local table, less the regions in `skip` (those the
+    /// blob is copied raw to, so nothing of it is rebuilt or converted for
+    /// them).
     #[inline]
     fn regions(
         &mut self,
         dense: bool,
         id: i64,
         unique: bool,
+        skip: Option<&[u64]>,
         local: &mut Local,
     ) -> crate::error::Result<()> {
         local.regs.clear();
@@ -646,6 +694,11 @@ impl Cursors {
                 }
                 local.regs.push(r);
             }
+        }
+        if let Some(skip) = skip {
+            local
+                .regs
+                .retain(|&region| !admits(Some(skip), region as usize));
         }
         Ok(())
     }
@@ -679,34 +732,27 @@ struct Consumer<'a> {
 
 impl crate::ordered_pool::OrderedConsumer<Fused> for Consumer<'_> {
     fn consume(&mut self, _task: usize, item: Fused) -> crate::Result<()> {
-        match item {
-            Fused::Frames {
-                frames,
-                batch,
-                demoted,
-            } => {
-                self.demoted += u64::from(demoted);
-                if let (Some(members), Some(batch)) = (self.members.as_deref_mut(), batch) {
-                    members.install(batch);
-                }
-                write_regions(frames, self.writers, self.stats, self.stat_field)
+        let Fused {
+            frames,
+            raw,
+            batch,
+            demoted,
+        } = item;
+        self.demoted += u64::from(demoted);
+        if let (Some(members), Some(batch)) = (self.members.as_deref_mut(), batch) {
+            members.install(batch);
+        }
+        if let Some(RawPart { frame, mask, nodes }) = raw {
+            self.cancel.check()?;
+            self.verified += 1;
+            for region in regions_of(&mask) {
+                self.writers[region].write_raw(&frame)?;
+                *(self.stat_field)(&mut self.stats[region]) += nodes;
             }
-            Fused::Raw {
-                frame,
-                nodes,
-                batch,
-            } => {
-                self.cancel.check()?;
-                self.verified += 1;
-                if let (Some(members), Some(batch)) = (self.members.as_deref_mut(), batch) {
-                    members.install(batch);
-                }
-                for (writer, stats) in self.writers.iter_mut().zip(self.stats.iter_mut()) {
-                    writer.write_raw(&frame)?;
-                    *(self.stat_field)(stats) += nodes;
-                }
-                Ok(())
-            }
+        }
+        match frames {
+            Some(frames) => write_regions(frames, self.writers, self.stats, self.stat_field),
+            None => Ok(()),
         }
     }
 }

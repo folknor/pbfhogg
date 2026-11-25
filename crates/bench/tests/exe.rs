@@ -146,6 +146,8 @@ fn merge_reports_its_block_and_writes_the_output() {
             "blobs_rewritten",
             "bytes_passthrough",
             "bytes_rewritten",
+            "frames_created",
+            "bytes_created",
             "diff_heap_bytes",
             "output_mb",
         ] {

@@ -662,6 +662,8 @@ mod apply_changes {
             ("blobs_index_hit", s.blobs_index_hit),
             ("bytes_passthrough", s.bytes_passthrough),
             ("bytes_rewritten", s.bytes_rewritten),
+            ("frames_created", s.frames_created),
+            ("bytes_created", s.bytes_created),
             ("loc_nodes_from_base", s.loc_nodes_from_base),
             ("loc_missing", s.loc_missing),
             ("loc_node_blobs_scanned", s.loc_node_blobs_scanned),

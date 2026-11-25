@@ -9,7 +9,11 @@ pub struct MergeStats {
     pub diff_ways: u64,
     pub diff_relations: u64,
     pub deleted: u64,
+    /// Source blobs written through unchanged (see `bytes_passthrough`).
     pub blobs_passthrough: u64,
+    /// Source blobs a worker rewrote. The unit is the input blob: one can
+    /// yield no output frame (every element deleted) or several (an
+    /// overflowing block re-cut); `bytes_rewritten` sums those frames.
     pub blobs_rewritten: u64,
     /// Passthrough blobs written as the input's own indexed frame, unchanged,
     /// whether the scanner passed them on their indexdata or a worker found
@@ -17,10 +21,23 @@ pub struct MergeStats {
     /// `blobs_passthrough`, only an unindexed `--force` blob reframed with
     /// the sidecars derived from its payload is not one.
     pub blobs_index_hit: u64,
-    /// Bytes of raw passthrough frames (wire size including framing).
+    /// Bytes of passthrough frames as written (wire size including
+    /// framing; under `--force` an unindexed blob's frame header is rebuilt
+    /// around its original body).
     pub bytes_passthrough: u64,
-    /// Bytes of rewritten blobs as written (framed, compressed).
+    /// Bytes of every output frame a rewritten source blob yielded (framed,
+    /// compressed), whatever those frames hold: a create inside a rewritten
+    /// blob's range is written here.
     pub bytes_rewritten: u64,
+    /// Output frames written as standalone create runs: the creates the
+    /// drain writes between base blobs, past a kind's last blob and at end
+    /// of input. Classified by provenance, not by OSC action. Not source
+    /// blobs, so not in the summary's source-blob total.
+    pub frames_created: u64,
+    /// Bytes of those create frames (framed, compressed).
+    /// `bytes_passthrough + bytes_rewritten + bytes_created` is the size of
+    /// every OSMData frame in the output; the OSMHeader frame is in none.
+    pub bytes_created: u64,
     /// Backing bytes the parsed OSC holds for the whole rewrite, by
     /// allocation capacity: the record arenas (growth headroom included,
     /// whose untouched pages are not resident), the sorted ID and offset
@@ -96,6 +113,8 @@ impl MergeStats {
             blobs_index_hit: 0,
             bytes_passthrough: 0,
             bytes_rewritten: 0,
+            frames_created: 0,
+            bytes_created: 0,
             diff_heap_bytes: 0,
             blob_sizes: Vec::new(),
             locations_on_ways: false,
@@ -129,6 +148,9 @@ impl MergeStats {
         self.blob_sizes.push(u32::try_from(len).unwrap_or(u32::MAX));
     }
 
+    /// Fold one rewritten blob's element counts into the run's. A worker
+    /// sets only these; every byte and frame total is the drain's, counted
+    /// from the frames it writes.
     pub(super) fn merge_from(&mut self, other: &MergeStats) {
         self.base_nodes += other.base_nodes;
         self.base_ways += other.base_ways;
@@ -137,8 +159,13 @@ impl MergeStats {
         self.diff_ways += other.diff_ways;
         self.diff_relations += other.diff_relations;
         self.deleted += other.deleted;
-        self.bytes_passthrough += other.bytes_passthrough;
-        self.bytes_rewritten += other.bytes_rewritten;
+    }
+
+    /// Account one standalone create frame of `len` bytes.
+    pub(super) fn record_create_frame(&mut self, len: usize) {
+        self.frames_created += 1;
+        self.bytes_created += len as u64;
+        self.record_data_frame(len);
     }
 
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
@@ -161,17 +188,19 @@ impl MergeStats {
         writeln!(w, "  Deleted: {}", self.deleted)?;
         writeln!(
             w,
-            "  Blobs: {} passthrough ({} index-hit), {} rewritten (of {total_blobs} total)",
+            "  Source blobs: {} passthrough ({} index-hit), {} rewritten (of {total_blobs} total)",
             self.blobs_passthrough, self.blobs_index_hit, self.blobs_rewritten,
         )?;
-        let total_bytes = self.bytes_passthrough + self.bytes_rewritten;
+        writeln!(w, "  Create frames: {}", self.frames_created)?;
+        let new_bytes = self.bytes_rewritten + self.bytes_created;
+        let total_bytes = self.bytes_passthrough + new_bytes;
         if total_bytes > 0 {
             #[allow(clippy::cast_precision_loss)]
-            let rewrite_pct = (self.bytes_rewritten as f64 / total_bytes as f64) * 100.0;
+            let new_pct = (new_bytes as f64 / total_bytes as f64) * 100.0;
             writeln!(
                 w,
-                "  Bytes: {} passthrough, {} rewritten ({rewrite_pct:.1}% rewrite ratio)",
-                self.bytes_passthrough, self.bytes_rewritten,
+                "  Output data bytes: {} passthrough, {} rewritten, {} created ({new_pct:.1}% rewritten or created)",
+                self.bytes_passthrough, self.bytes_rewritten, self.bytes_created,
             )?;
         }
         if !self.blob_sizes.is_empty() {

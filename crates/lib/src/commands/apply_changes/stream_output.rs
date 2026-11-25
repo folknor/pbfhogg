@@ -107,7 +107,7 @@ impl<'a> CreateEncoder<'a> {
             &invocation,
             |bb, chunk| encode_and_frame(bb, kind, chunk, diff, loc, &compression, metrics),
             |frame| {
-                stats.record_data_frame(frame.len());
+                stats.record_create_frame(frame.len());
                 writer.write_raw_owned(frame)
             },
         )?;

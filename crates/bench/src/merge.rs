@@ -95,6 +95,8 @@ pub(crate) fn merge(
     eprintln!("blobs_rewritten={}", stats.blobs_rewritten);
     eprintln!("bytes_passthrough={}", stats.bytes_passthrough);
     eprintln!("bytes_rewritten={}", stats.bytes_rewritten);
+    eprintln!("frames_created={}", stats.frames_created);
+    eprintln!("bytes_created={}", stats.bytes_created);
     eprintln!("diff_heap_bytes={}", stats.diff_heap_bytes);
     eprintln!("output_mb={output_mb:.2}");
     // Peak RSS is a best-effort diagnostic; omit the field when the probe

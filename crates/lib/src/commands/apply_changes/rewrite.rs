@@ -759,6 +759,10 @@ pub(crate) fn merge_to<'a>(
     host.invocation
         .counter("merge_bytes_rewritten", final_stats.bytes_rewritten);
     host.invocation
+        .counter("merge_frames_created", final_stats.frames_created);
+    host.invocation
+        .counter("merge_bytes_created", final_stats.bytes_created);
+    host.invocation
         .counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes);
     if locations_on_ways {
         host.invocation

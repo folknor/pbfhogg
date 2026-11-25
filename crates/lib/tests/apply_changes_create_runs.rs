@@ -169,9 +169,31 @@ fn create_runs_are_cut_at_the_element_cap_and_written_in_order() {
             TAIL_RELATIONS.count() as u64,
             "{label}"
         );
+        // Every base blob passes through and the eight other frames are
+        // standalone creates; the three byte totals partition the data
+        // frames, which run from the first data blob to the end of file.
+        assert_eq!(stats.blobs_passthrough, 4, "{label}");
+        assert_eq!(stats.blobs_rewritten, 0, "{label}");
+        assert_eq!(stats.frames_created, 8, "{label}");
+        assert_eq!(stats.bytes_rewritten, 0, "{label}");
+        assert!(stats.bytes_created > 0, "{label}");
+        assert_eq!(
+            stats.bytes_passthrough + stats.bytes_rewritten + stats.bytes_created,
+            data_frame_bytes(&output),
+            "{label}"
+        );
         crate::common::assert_every_data_blob_indexed(&output);
         crate::common::assert_sorted_file(&output);
     }
+}
+
+/// Bytes of every OSMData frame in `path`: the file after its leading
+/// OSMHeader frame.
+fn data_frame_bytes(path: &Path) -> u64 {
+    let mut blobs = BlobReader::from_path(path).unwrap();
+    blobs.next().unwrap().unwrap();
+    let first_data = blobs.next().unwrap().unwrap().offset().unwrap();
+    std::fs::metadata(path).unwrap().len() - first_data.0
 }
 
 /// A plain-XML OSC of node creates `first..first + count`; the node at

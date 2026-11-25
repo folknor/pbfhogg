@@ -924,6 +924,16 @@
   frames (the OSMHeader frame excluded); a rewritten blob contributes one
   sample per frame it writes.
 
+- **The `apply-changes` byte totals count create frames.** Frames of
+  creates written between base blobs, past a kind's last blob or at end
+  of input reached no byte total, so the summary's rewrite ratio left
+  them out. The summary now prints `Source blobs:`, a `Create frames:`
+  line, and `Output data bytes: N passthrough, N rewritten, N created`
+  with the share rewritten or created; the three byte figures sum to the
+  output's data frames. `MergeStats` gains `frames_created` and
+  `bytes_created`, the sidecar gains `merge_frames_created` and
+  `merge_bytes_created`, and the merge bench instrument prints both.
+
 - **Multi-extract copies a node blob raw to each region its single
   extract would.** `extract --simple --config` copied a node blob raw
   only when it lay inside every region, and otherwise rebuilt it in the

@@ -162,18 +162,32 @@ const EXTRACT_ARMS: [&str; 8] = [
 ];
 
 /// The multi-extract comparisons a content or version fault fails, in order.
-const MULTI_ARMS: [&str; 5] = [
-    "multi-extract strip-0 element content differs from the sequential extract",
-    "multi-extract strip-1 element content differs from the sequential extract",
-    "multi-extract mixed strip-0 element content differs from the sequential extract",
-    "multi-extract mixed strip-1 element content differs from the sequential extract",
-    "multi-extract mixed polygon-city element content differs from the sequential extract",
+const MULTI_ARMS: [&str; 15] = [
+    "multi-extract simple strip-0 element content differs from the sequential extract",
+    "multi-extract simple strip-1 element content differs from the sequential extract",
+    "multi-extract simple mixed strip-0 element content differs from the sequential extract",
+    "multi-extract simple mixed strip-1 element content differs from the sequential extract",
+    "multi-extract simple mixed polygon-city element content differs from the sequential extract",
+    "multi-extract complete strip-0 element content differs from the sequential extract",
+    "multi-extract complete strip-1 element content differs from the sequential extract",
+    "multi-extract complete mixed strip-0 element content differs from the sequential extract",
+    "multi-extract complete mixed strip-1 element content differs from the sequential extract",
+    "multi-extract complete mixed polygon-city element content differs from the sequential extract",
+    "multi-extract smart strip-0 element content differs from the sequential extract",
+    "multi-extract smart strip-1 element content differs from the sequential extract",
+    "multi-extract smart mixed strip-0 element content differs from the sequential extract",
+    "multi-extract smart mixed strip-1 element content differs from the sequential extract",
+    "multi-extract smart mixed polygon-city element content differs from the sequential extract",
 ];
 
 /// The multi-extract verdicts the route fault fails, in order.
-const ROUTE_ARMS: [&str; 2] = [
-    "multi-extract took route sequential fallback where the input header predicts single-pass",
-    "multi-extract mixed took route sequential fallback where the input header predicts single-pass",
+const ROUTE_ARMS: [&str; 6] = [
+    "multi-extract simple took route sequential fallback where the input header predicts single-pass",
+    "multi-extract simple mixed took route sequential fallback where the input header predicts single-pass",
+    "multi-extract complete took route sequential fallback where the input header predicts single-pass",
+    "multi-extract complete mixed took route sequential fallback where the input header predicts single-pass",
+    "multi-extract smart took route sequential fallback where the input header predicts single-pass",
+    "multi-extract smart mixed took route sequential fallback where the input header predicts single-pass",
 ];
 
 /// pbfhogg gets the typed bbox, osmium its plain restatement;
@@ -254,7 +268,14 @@ pub fn tool(args: &[OsString]) -> i32 {
                 // sorted input, as a probe that declines it would.
                 let sorted = std::fs::read_to_string(root.join("sorted")).unwrap() == "yes";
                 if sorted && fault != "route" {
-                    eprintln!("[multi-extract] single-pass: 2 regions, simple strategy");
+                    let strategy = if args.contains(&"--simple") {
+                        "simple"
+                    } else if args.contains(&"--smart") {
+                        "smart"
+                    } else {
+                        "complete_ways"
+                    };
+                    eprintln!("[multi-extract] single-pass: 2 regions, {strategy} strategy");
                 } else {
                     eprintln!(
                         "Note: Multi-extract single-pass probe declined the input; using one \

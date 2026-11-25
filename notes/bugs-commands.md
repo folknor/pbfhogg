@@ -266,3 +266,25 @@ when it is raised on a worker, now that a deferred blob is planned and then
 streamed (`apply_changes/overflow.rs`). Fix shape: a modify whose single
 element exceeds the payload limit, asserting the typed error and an absent
 output.
+
+## CMD-078 - Multi-extract admits node blobs by the union bbox, not per region
+
+Reported by: the shared multi-extract spar (codex).
+
+Single-region simple extract skips a node blob whose indexdata bbox misses
+the region, so a node ID selected from one blob is not written again from a
+second blob that misses the region. The multi single pass
+(`extract/multi.rs`) admits node blobs with the union of every region's
+bbox and writes by the ID mask alone, so on input with a node ID in two
+blobs of disjoint claimed bboxes (history-shaped input), region A also gets
+the occurrence from the blob admitted only for region B. The same holds at
+classify: a blob admitted for B classifies its nodes against A too, where
+single-region A would never have read it. Cleaned simple multi-extract now
+takes this route as well, and so does the complete-ways and smart
+dependency route (`extract/multi_dep.rs`), whose node classify admits by
+the union bbox and whose spatial masks are by ID, as the single-region
+`bbox_node_ids` is; there a wrong spatial bit also feeds way matching and
+relation direct masks. Fix: carry a per-blob region admission mask from
+the schedule walk and intersect it with the node mask at classify and at
+write, on both routes. Verify against per-region single extracts on a fixture with a
+repeated node ID in two blobs.

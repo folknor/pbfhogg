@@ -26,10 +26,12 @@
 //!   write pass; unsorted: one reader per kind, smart's pass 2 schedule
 //!   walk, the header read, the write pass's schedule walk and the write
 //!   pass.
-//! - multi-extract, simple without cleaning on a sorted input: the probe
-//!   and the schedule walk, whose descriptor serves every phase. Otherwise
-//!   (a declined probe, or a route that skips it) one extract per region,
-//!   every one of them on the run's one pin.
+//! - multi-extract, simple (cleaned or not) on a sorted input: the probe
+//!   and the schedule walk, whose descriptor serves every phase.
+//!   Complete and smart on a sorted input: the indexdata front read, the
+//!   probe, the schedule walk (every classify phase's descriptor) and the
+//!   write pass. On a declined probe, after the reads before it, one
+//!   extract per region, every one of them on the run's one pin.
 
 use crate::reopen_cell;
 
@@ -126,17 +128,17 @@ impl Route {
         if !self.multi {
             return per_extract;
         }
-        if self.strategy == Strategy::Simple && !self.clean {
-            if self.sorted {
-                // The single-pass probe accepts: probe and schedule walk.
-                2
-            } else {
-                // The probe declines, then one extract per region.
-                1 + 2 * per_extract
-            }
-        } else {
-            // No probe: one extract per region.
-            2 * per_extract
+        // Complete and smart take the indexdata front read before the probe.
+        let front = u64::from(self.strategy != Strategy::Simple);
+        match (self.strategy, self.sorted) {
+            // The single-pass probe accepts: probe and schedule walk.
+            (Strategy::Simple, true) => 2,
+            // The front read, the probe, the schedule walk (its descriptor
+            // shared by every classify phase and smart's extra-way sweep)
+            // and the write pass.
+            (_, true) => 4,
+            // The probe declines, then one extract per region.
+            (_, false) => front + 1 + 2 * per_extract,
         }
     }
 
@@ -453,8 +455,11 @@ fn multi_extract_reads_only_the_pinned_input() {
     // The probe declines; arming after open 6 replaces the input between
     // the two regions' extracts.
     check_route(Route::multi(Strategy::Simple, false));
-    // Strategies and cleaning that skip the probe.
+    // The dependency strategies' single pass, and their declined probe.
     check_route(Route::multi(Strategy::Complete, true));
+    check_route(Route::multi(Strategy::Smart, true));
+    check_route(Route::multi(Strategy::Complete, false));
+    // Cleaning takes the single pass too.
     check_route(Route {
         clean: true,
         ..Route::multi(Strategy::Simple, true)

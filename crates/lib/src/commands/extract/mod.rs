@@ -14,6 +14,7 @@ mod complete;
 mod fused;
 mod membership;
 mod multi;
+mod multi_dep;
 mod polygon;
 mod simple;
 mod smart;
@@ -621,13 +622,17 @@ fn parse_extract_geometry(
 /// Where a later open cannot reach the pinned file, an input replaced
 /// mid-run fails with `InputReplaced`.
 ///
-/// The simple strategy without cleaning serves every region from one run
-/// over the input rather than one extract per region (each kind is still
-/// visited twice, a classify pass and a write pass), and holds a writer per
-/// region for that whole run, so before the input is pinned the
-/// run asks the host for those descriptors (`ProcessActions::fd_allowance`),
-/// plus the pin and a fixed allowance; the other strategies run one region
-/// at a time and ask for the pin and the allowance alone. The library never
+/// On a sorted input every strategy, cleaned or not, serves every region
+/// from one run over the input rather than one extract per region (simple
+/// visits each kind twice, a classify pass and a write pass; complete-ways
+/// and smart classify every kind into shared region masks, smart sweeps the
+/// way blobs once more, and one write pass follows). That run writes every
+/// output through a buffered synchronous writer whatever the configured
+/// backend, and no node blob is copied raw under complete-ways or smart. An
+/// unsorted input runs one extract per region. The run holds a writer per
+/// region, so before the input is pinned it asks the host for those
+/// descriptors (`ProcessActions::fd_allowance`), plus the pin and a fixed
+/// allowance, whatever the strategy. The library never
 /// raises the open-file limit: a caller extracting more regions than its
 /// soft `RLIMIT_NOFILE` leaves room for raises the limit itself, has its
 /// `ProcessActions` grant more, or extracts fewer regions per call. Each
@@ -663,7 +668,7 @@ pub fn extract_multi<'a>(
     let source: InputSource<'a> = input.into();
     // Held to the end of the run, past the pin and every writer: declared
     // before the pin, so it drops after it.
-    let _reservation = admit_multi_descriptors(source, regions.len(), strategy, clean, host)?;
+    let _reservation = admit_multi_descriptors(source, regions.len(), host)?;
     // One pin for the run: the single-pass attempt and, when it declines or
     // is not tried, every region's extract open the input again through it.
     let pin = source.pin(host)?;
@@ -676,38 +681,26 @@ pub fn extract_multi<'a>(
 
 /// Ask the host for the descriptors a multi-region run opens and holds, and
 /// refuse it up front when allowed fewer, before the input is pinned or
-/// read. The route that can take the single pass (simple strategy, nothing
-/// cleaned) holds one synchronous writer per region for the whole scan, so
-/// it asks for one per region; the route is chosen only after the input's
-/// header is read, so an input that turns out unsorted is still asked for
-/// the single pass's count. Every other strategy runs one region at a time,
-/// closing each region's descriptors before the next, so it asks for no
-/// per-region count. Both add the new pin (none for a caller's pin) and
-/// [`EXTRACT_MULTI_EXTRA_FDS`]. The outputs' staging descriptors were opened
+/// read. Every strategy may take its single pass, which holds one
+/// synchronous writer per region for the whole scan, so it asks for one per
+/// region; the route is chosen only after the input's header is read, so an
+/// input that turns out unsorted (one region at a time) is still asked for
+/// the single pass's count. It adds the new pin (none for a caller's pin)
+/// and [`EXTRACT_MULTI_EXTRA_FDS`]. The outputs' staging descriptors were opened
 /// when the caller built the set and are already counted as open.
 ///
 /// [`EXTRACT_MULTI_EXTRA_FDS`]: crate::tunables::EXTRACT_MULTI_EXTRA_FDS
 fn admit_multi_descriptors(
     source: InputSource<'_>,
     regions: usize,
-    strategy: ExtractStrategy,
-    clean: &CleanAttrs,
     host: &crate::host::Entered<'_>,
 ) -> Result<crate::process::FdReservation> {
-    let single_pass = matches!(strategy, ExtractStrategy::Simple) && !clean.any();
-    let writers = if single_pass { regions } else { 0 };
+    let writers = regions;
     let new_pins = crate::read::input::new_pins(&[source]);
-    let what = if single_pass {
-        format!(
-            "a single-pass multi-region extract holds a writer per region for the whole \
-             scan: {regions} regions ({writers} writers, {new_pins} input to pin)"
-        )
-    } else {
-        format!(
-            "a multi-region extract runs one region at a time: {regions} regions \
-             ({new_pins} input to pin)"
-        )
-    };
+    let what = format!(
+        "a single-pass multi-region extract holds a writer per region for the whole \
+         scan: {regions} regions ({writers} writers, {new_pins} input to pin)"
+    );
     super::descriptors::admit(
         &super::descriptors::Demand {
             held: writers.saturating_add(new_pins),
@@ -731,40 +724,57 @@ fn extract_multi_to(
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<Vec<ExtractStats>> {
-    // Try single-pass multi-extract for simple strategy on sorted input. It
-    // writes through the synchronous writer whatever the backend, so only the
-    // compression and the input-side direct-IO flag reach it.
-    if matches!(strategy, ExtractStrategy::Simple)
-        && !clean.any()
-        && let Some(stats) = multi::try_extract_multi_single_pass(
+    // Try the single pass on sorted input: simple's per-kind pass, or the
+    // dependency engine for complete-ways and smart. Both write through the
+    // synchronous writer whatever the backend, so only the compression and
+    // the input-side direct-IO flag reach them.
+    let single_pass = match strategy {
+        ExtractStrategy::Simple => multi::try_extract_multi_single_pass(
             input,
             regions,
             outputs,
             set_bounds,
+            clean,
             write.compression,
             write.direct_reads,
             overrides,
             host,
-        )?
-    {
+        )?,
+        ExtractStrategy::CompleteWays | ExtractStrategy::Smart => {
+            // The admission `extract_to` applies to these strategies, once
+            // for the run: refused without indexdata unless forced.
+            require_dependency_indexdata(input, write, host)?;
+            multi_dep::try_extract_multi_dependent(
+                input,
+                regions,
+                outputs,
+                strategy,
+                set_bounds,
+                clean,
+                write.compression,
+                write.direct_reads,
+                overrides,
+                host,
+            )?
+        }
+    };
+    if let Some(stats) = single_pass {
         return Ok(stats);
     }
 
-    if matches!(strategy, ExtractStrategy::Simple) && !clean.any() {
-        // The single-pass probe declines unsorted, empty or missing-header
-        // input and a first-blob read error. Keep the fallback visible; the
-        // probe reports a swallowed read error under its own event first.
-        // pbfhogg-verify's multi-extract check reads this line and the
-        // probe's single-pass banner to judge the route; keep their openings.
-        crate::host::diag!(
-            host.diagnostics,
-            Note,
-            "extract.multi.sequential_fallback",
-            "Multi-extract single-pass probe declined the input; using one full pass per region"
-        );
-        host.invocation
-            .counter("multi_extract_sequential_fallback", 1);
-    }
+    // The single-pass probe declines unsorted, empty or missing-header input
+    // and a first-blob read error. Keep the fallback visible; the probe
+    // reports a swallowed read error under its own event first.
+    // pbfhogg-verify's multi-extract check reads this line and the probe's
+    // single-pass banner to judge the route; keep their openings.
+    crate::host::diag!(
+        host.diagnostics,
+        Note,
+        "extract.multi.sequential_fallback",
+        "Multi-extract single-pass probe declined the input; using one full pass per region"
+    );
+    host.invocation
+        .counter("multi_extract_sequential_fallback", 1);
 
     // Sequential fallback: one extract at a time, each into its borrowed
     // member. Nothing is published until every region has succeeded.
@@ -956,15 +966,7 @@ pub(crate) fn extract_to(
     host: &crate::host::Entered<'_>,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
-        // A front read of its own, dropped at once: the passes below read
-        // the header again on their own descriptions.
-        super::input_front::InputFront::open(input, write.direct_reads, host)?.require_indexdata(
-            write.force,
-            "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
-             element type or node bounding box, and may be decompressed repeatedly across \
-             processing phases.",
-            host,
-        )?;
+        require_dependency_indexdata(input, write, host)?;
     }
     let result = match strategy {
         ExtractStrategy::Simple => simple::extract_simple(
@@ -990,6 +992,25 @@ pub(crate) fn extract_to(
     host.invocation
         .counter("extract_relations_written", result.relations_written);
     Ok(result)
+}
+
+/// Complete-ways and smart refuse an input without blob-level indexdata
+/// unless `write.force` is set.
+fn require_dependency_indexdata(
+    input: &PinnedInput,
+    write: &WriteOptions,
+    host: &crate::host::Entered<'_>,
+) -> Result<()> {
+    // A front read of its own, dropped at once: the passes read the header
+    // again on their own descriptions.
+    super::input_front::InputFront::open(input, write.direct_reads, host)?.require_indexdata(
+        write.force,
+        "input PBF has no blob-level indexdata. Without it, blobs cannot be skipped by \
+         element type or node bounding box, and may be decompressed repeatedly across \
+         processing phases.",
+        host,
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

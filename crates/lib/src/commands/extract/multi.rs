@@ -5,8 +5,8 @@ use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementKind, PrimitiveBlock};
 
 use super::super::{
-    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local,
+    HeaderOverrides, Result, clean_metadata, clean_partial_metadata, ensure_node_capacity_local,
+    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local,
 };
 use crate::read::input::{InputFile, PinnedInput};
 use crate::read::region_grid::RegionGrid;
@@ -27,8 +27,11 @@ use crate::owned::{dense_node_metadata, element_metadata};
 /// outputs). Returns `None` to fall back to sequential if the input isn't
 /// sorted.
 ///
-/// Simple strategy only (no per-region way/relation ID tracking beyond what
-/// fits in memory). The pool workers compress and frame each region's blocks
+/// Simple strategy only: complete-ways and smart need dependency passes,
+/// which `multi_dep::try_extract_multi_dependent` runs. `clean` is applied
+/// to every element written; a raw node blob carries its metadata, so
+/// cleaning turns raw passthrough off. The pool workers compress and frame
+/// each region's blocks
 /// (`RegionFraming`); the consumer copies the frames into N sync-mode
 /// PbfWriters (no per-writer thread).
 #[allow(
@@ -42,42 +45,14 @@ pub(super) fn try_extract_multi_single_pass(
     regions: &[Region],
     outputs: &crate::output::BoundOutputSet,
     set_bounds: bool,
+    clean: &crate::cat::CleanAttrs,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
     host: &crate::host::Entered<'_>,
 ) -> Result<Option<Vec<ExtractStats>>> {
-    use std::io::BufWriter;
-
-    // Check if input is sorted.
-    let header = {
-        let mut br = crate::BlobReader::open_in(input, direct_io, host)?;
-        match br.next() {
-            Some(Ok(blob)) => match blob.decode()? {
-                crate::blob::BlobDecode::OsmHeader(h) => {
-                    if !h.is_sorted() {
-                        return Ok(None); // fall back to sequential
-                    }
-                    h
-                }
-                _ => return Ok(None),
-            },
-            Some(Err(e)) => {
-                // Declining here keeps the historical fallback (the
-                // sequential passes then fail on their own read), but the
-                // first error must not vanish: name it before falling back.
-                crate::host::diag!(
-                    host.diagnostics,
-                    Note,
-                    "extract.multi.probe_read_error",
-                    "Multi-extract single-pass probe could not read the first blob: {}",
-                    e.report()
-                );
-                host.invocation.counter("multi_extract_probe_read_error", 1);
-                return Ok(None);
-            }
-            None => return Ok(None),
-        }
+    let Some(header) = probe_sorted_header(input, direct_io, host)? else {
+        return Ok(None);
     };
 
     let n = regions.len();
@@ -100,64 +75,17 @@ pub(super) fn try_extract_multi_single_pass(
         .collect();
 
     // Union bbox for blob-level spatial skip.
-    let union_bbox = BboxInt {
-        min_lon: bbox_ints
-            .iter()
-            .map(|b| b.min_lon)
-            .min()
-            .unwrap_or(i32::MIN),
-        min_lat: bbox_ints
-            .iter()
-            .map(|b| b.min_lat)
-            .min()
-            .unwrap_or(i32::MIN),
-        max_lon: bbox_ints
-            .iter()
-            .map(|b| b.max_lon)
-            .max()
-            .unwrap_or(i32::MAX),
-        max_lat: bbox_ints
-            .iter()
-            .map(|b| b.max_lat)
-            .max()
-            .unwrap_or(i32::MAX),
-    };
-    let spatial_filter = spatial_blob_filter(&union_bbox);
+    let spatial_filter = spatial_blob_filter(&union_bbox(&bbox_ints));
 
-    // Open N sync-mode writers. Each owns a 256 KiB buffer; publication
-    // syncs each staged output after the final flush. The writers only copy
-    // frames: compression runs inside the ordered pool's tasks
-    // (`RegionFraming`), so all N regions share the pool's one task window
-    // and its ordinal order is each region's block order. Compressing on
-    // the consumer thread made every write phase run at 2-3 cores with the
-    // workers parked on result send (planet 5-region: 613 s of write phases,
-    // 608 s of it compression). N pipelined writers would instead give each
-    // region its own permits, delivery window and writer thread - N
-    // buffering allowances for one stream of tasks.
-    let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
-    for (region, output) in regions.iter().zip(outputs.iter()) {
-        let bbox = region.bbox();
-        let header_bytes = super::super::output_header::build_one(
-            &header,
-            &super::output_facts(set_bounds, bbox),
-            overrides,
-            host,
-        )?
-        .bytes;
-        // The session and the writer under the run's one token.
-        let mut w = output.sync_pbf_writer(compression)?;
-        // The writer names its output in any error it returns.
-        w.write_header(&header_bytes)?;
-        writers.push(w);
-    }
-    let framing = RegionFraming {
+    let (mut writers, framing) = open_region_writers(
+        &header,
+        regions,
+        outputs,
+        set_bounds,
         compression,
-        destinations: outputs
-            .iter()
-            .map(crate::output::BoundOutput::destination)
-            .collect(),
-        invocation: &host.invocation,
-    };
+        overrides,
+        host,
+    )?;
 
     // One shared membership per kind: each answers which regions hold an ID
     // with one lookup, and stores each member once with its region mask
@@ -234,18 +162,19 @@ pub(super) fn try_extract_multi_single_pass(
                     // polygon boundary or inside holes - and only when the
                     // blob goes to every region. This nominates on the
                     // indexdata bbox claim; the node classify phase verifies.
-                    let candidate = idx.bbox.as_ref().is_some_and(|blob_bbox| {
-                        inside_bbox_ints
-                            .iter()
-                            .zip(regions.iter())
-                            .all(|(bi, region)| {
-                                matches!(region, Region::Bbox(_))
-                                    && crate::BlobBbox::new(
-                                        bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
-                                    )
-                                    .contains(blob_bbox)
-                            })
-                    });
+                    let candidate = !clean.any()
+                        && idx.bbox.as_ref().is_some_and(|blob_bbox| {
+                            inside_bbox_ints
+                                .iter()
+                                .zip(regions.iter())
+                                .all(|(bi, region)| {
+                                    matches!(region, Region::Bbox(_))
+                                        && crate::BlobBbox::new(
+                                            bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
+                                        )
+                                        .contains(blob_bbox)
+                                })
+                        });
                     node_blobs.push(NodeBlob {
                         entry,
                         passthrough: if candidate {
@@ -322,37 +251,11 @@ pub(super) fn try_extract_multi_single_pass(
     let all_bbox = regions
         .iter()
         .all(|region| matches!(region, Region::Bbox(_)));
-    use crate::tunables::GRID_REGION_THRESHOLD;
     let region_bboxes: Vec<(i32, i32, i32, i32)> = inside_bbox_ints
         .iter()
         .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
         .collect();
-    let grid = if n >= GRID_REGION_THRESHOLD {
-        // A test can decline the grid to drive the same config down the
-        // linear scan and compare output byte for byte.
-        #[cfg(pbfhogg_test_hooks)]
-        let grid = if host.invocation.faults().forces_linear_region_grid() {
-            None
-        } else {
-            RegionGrid::build(&region_bboxes)
-        };
-        #[cfg(not(pbfhogg_test_hooks))]
-        let grid = RegionGrid::build(&region_bboxes);
-        if grid.is_none() {
-            // Output is unchanged (the linear classifier tests every
-            // region), but node classification cost grows with N.
-            crate::host::diag!(
-                host.diagnostics,
-                Note,
-                "extract.multi.grid_fallback",
-                "Multi-extract region grid declined {n} regions (coverage over budget or an empty interior); classifying nodes against every region"
-            );
-            host.invocation.counter("multi_extract_grid_fallback", 1);
-        }
-        grid
-    } else {
-        None
-    };
+    let grid = region_grid(&region_bboxes, host);
     host.invocation.marker("MULTI_NODE_CLASSIFY_START");
     // Observed node count per node-schedule position, for passthrough
     // candidates that verified. See `Passthrough`.
@@ -539,7 +442,7 @@ pub(super) fn try_extract_multi_single_pass(
                     Element::DenseNode(dn) if node_members.mask_into(dn.id(), &mut mask) => {
                         let id = dn.id();
                         let (lat, lon) = super::common::dense_coords(dn)?;
-                        let meta = dense_node_metadata(dn)?;
+                        let meta = clean_metadata(dense_node_metadata(dn)?, clean);
                         for i in regions_of(&mask) {
                             ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
                             bbs[i].add_node_dense(id, lat, lon, dn.tags(), meta.as_ref());
@@ -549,7 +452,10 @@ pub(super) fn try_extract_multi_single_pass(
                     Element::Node(nd) if node_members.mask_into(nd.id(), &mut mask) => {
                         let id = nd.id();
                         let (lat, lon) = super::common::plain_coords(nd)?;
-                        let meta = element_metadata(ElementKind::Node, id, &nd.info())?;
+                        let meta = clean_partial_metadata(
+                            element_metadata(ElementKind::Node, id, &nd.info())?,
+                            clean,
+                        );
                         for i in regions_of(&mask) {
                             ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
                             bbs[i].add_node_partial(id, lat, lon, nd.tags(), meta.as_ref());
@@ -629,7 +535,10 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                     scratch.clear();
                     scratch.extend(w.refs());
-                    let meta = element_metadata(ElementKind::Way, wid, &w.info())?;
+                    let meta = clean_partial_metadata(
+                        element_metadata(ElementKind::Way, wid, &w.info())?,
+                        clean,
+                    );
                     for i in regions_of(&mask) {
                         ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
                         bbs[i].add_way_partial(wid, w.tags(), scratch, meta.as_ref());
@@ -704,7 +613,10 @@ pub(super) fn try_extract_multi_single_pass(
                         continue;
                     }
                     r.members_into(&mut members_buf)?;
-                    let meta = element_metadata(ElementKind::Relation, rid, &r.info())?;
+                    let meta = clean_partial_metadata(
+                        element_metadata(ElementKind::Relation, rid, &r.info())?,
+                        clean,
+                    );
                     for i in regions_of(&mask) {
                         ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;
                         bbs[i].add_relation_partial(rid, r.tags(), &members_buf, meta.as_ref());
@@ -753,6 +665,157 @@ pub(super) fn try_extract_multi_single_pass(
     host.invocation.marker("MULTI_EXTRACT_END");
 
     Ok(Some(stats))
+}
+
+// ---------------------------------------------------------------------------
+// Pieces shared with the dependency engine (multi_dep.rs)
+// ---------------------------------------------------------------------------
+
+/// The single pass's entry probe: the input's `OsmHeader` when the file
+/// declares itself sorted, `None` (the caller falls back to one extract per
+/// region) when it is unsorted, empty, starts with a data blob, or its first
+/// blob cannot be read.
+pub(super) fn probe_sorted_header(
+    input: &PinnedInput,
+    direct_io: bool,
+    host: &crate::host::Entered<'_>,
+) -> Result<Option<Box<crate::HeaderBlock>>> {
+    let mut br = crate::BlobReader::open_in(input, direct_io, host)?;
+    match br.next() {
+        Some(Ok(blob)) => match blob.decode()? {
+            crate::blob::BlobDecode::OsmHeader(h) if h.is_sorted() => Ok(Some(h)),
+            _ => Ok(None),
+        },
+        Some(Err(e)) => {
+            // Declining here keeps the historical fallback (the sequential
+            // passes then fail on their own read), but the first error must
+            // not vanish: name it before falling back.
+            crate::host::diag!(
+                host.diagnostics,
+                Note,
+                "extract.multi.probe_read_error",
+                "Multi-extract single-pass probe could not read the first blob: {}",
+                e.report()
+            );
+            host.invocation.counter("multi_extract_probe_read_error", 1);
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// The smallest box holding every region's blob-selection box, for the
+/// blob-level spatial skip.
+pub(super) fn union_bbox(bbox_ints: &[BboxInt]) -> BboxInt {
+    BboxInt {
+        min_lon: bbox_ints
+            .iter()
+            .map(|b| b.min_lon)
+            .min()
+            .unwrap_or(i32::MIN),
+        min_lat: bbox_ints
+            .iter()
+            .map(|b| b.min_lat)
+            .min()
+            .unwrap_or(i32::MIN),
+        max_lon: bbox_ints
+            .iter()
+            .map(|b| b.max_lon)
+            .max()
+            .unwrap_or(i32::MAX),
+        max_lat: bbox_ints
+            .iter()
+            .map(|b| b.max_lat)
+            .max()
+            .unwrap_or(i32::MAX),
+    }
+}
+
+/// The N sync-mode output writers, each with its region's header written,
+/// and the pool-side framing that feeds them.
+///
+/// Each owns a 256 KiB buffer; publication syncs each staged output after
+/// the final flush. The writers only copy frames: compression runs inside
+/// the ordered pool's tasks (`RegionFraming`), so all N regions share the
+/// pool's one task window and its ordinal order is each region's block
+/// order. Compressing on the consumer thread made every write phase run at
+/// 2-3 cores with the workers parked on result send (planet 5-region: 613 s
+/// of write phases, 608 s of it compression). N pipelined writers would
+/// instead give each region its own permits, delivery window and writer
+/// thread - N buffering allowances for one stream of tasks.
+#[allow(clippy::type_complexity)]
+pub(super) fn open_region_writers<'a>(
+    header: &crate::HeaderBlock,
+    regions: &[Region],
+    outputs: &'a crate::output::BoundOutputSet,
+    set_bounds: bool,
+    compression: Compression,
+    overrides: &HeaderOverrides,
+    host: &'a crate::host::Entered<'_>,
+) -> Result<(
+    Vec<PbfWriter<std::io::BufWriter<std::fs::File>>>,
+    RegionFraming<'a>,
+)> {
+    let mut writers = Vec::with_capacity(regions.len());
+    for (region, output) in regions.iter().zip(outputs.iter()) {
+        let bbox = region.bbox();
+        let header_bytes = super::super::output_header::build_one(
+            header,
+            &super::output_facts(set_bounds, bbox),
+            overrides,
+            host,
+        )?
+        .bytes;
+        // The session and the writer under the run's one token.
+        let mut w = output.sync_pbf_writer(compression)?;
+        // The writer names its output in any error it returns.
+        w.write_header(&header_bytes)?;
+        writers.push(w);
+    }
+    let framing = RegionFraming {
+        compression,
+        destinations: outputs
+            .iter()
+            .map(crate::output::BoundOutput::destination)
+            .collect(),
+        invocation: &host.invocation,
+    };
+    Ok((writers, framing))
+}
+
+/// The node classifier's region grid, for `GRID_REGION_THRESHOLD` regions
+/// or more; `None` below it or when the grid declines (then every node is
+/// tested against every region, with the same output).
+pub(super) fn region_grid(
+    region_bboxes: &[(i32, i32, i32, i32)],
+    host: &crate::host::Entered<'_>,
+) -> Option<RegionGrid> {
+    let n = region_bboxes.len();
+    if n < crate::tunables::GRID_REGION_THRESHOLD {
+        return None;
+    }
+    // A test can decline the grid to drive the same config down the linear
+    // scan and compare output byte for byte.
+    #[cfg(pbfhogg_test_hooks)]
+    let grid = if host.invocation.faults().forces_linear_region_grid() {
+        None
+    } else {
+        RegionGrid::build(region_bboxes)
+    };
+    #[cfg(not(pbfhogg_test_hooks))]
+    let grid = RegionGrid::build(region_bboxes);
+    if grid.is_none() {
+        // Output is unchanged (the linear classifier tests every region),
+        // but node classification cost grows with N.
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "extract.multi.grid_fallback",
+            "Multi-extract region grid declined {n} regions (coverage over budget or an empty interior); classifying nodes against every region"
+        );
+        host.invocation.counter("multi_extract_grid_fallback", 1);
+    }
+    grid
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +1025,7 @@ type RegionFrames = (Vec<Vec<Vec<u8>>>, Vec<u64>);
 /// region's frames for its input blob and returns its credit only once the
 /// consumer has handed all of them to the writers. It counts tasks, not
 /// bytes; a slot holds that blob's whole framed fanout.
-struct RegionFraming<'a> {
+pub(super) struct RegionFraming<'a> {
     compression: Compression,
     destinations: Vec<&'a std::path::Path>,
     invocation: &'a crate::host::Recorder,
@@ -973,7 +1036,7 @@ impl RegionFraming<'_> {
     /// task never holds the uncompressed and framed copies of all its
     /// blocks at once. Checks cancellation before each frame; a framing
     /// error names the region's output.
-    fn frame_region(
+    pub(super) fn frame_region(
         &self,
         region: usize,
         blocks: impl Iterator<Item = OwnedBlock>,

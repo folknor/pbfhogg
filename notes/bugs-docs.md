@@ -287,35 +287,6 @@ declared, and splice outputs (apply-changes, renumber) carry it
 undeclared, so the guide should tell a caller to check
 `HeaderBlock::has_shared_node_pins_v1()` before using the bitmap.
 
-## DOC-044 - The advanced guide says multi-extract runs in a single pass
-
-Reported by: the spar accounting of the fused sorted simple extract change,
-from its scout's lateral (2026-11-24).
-
-`docs/guide/advanced.md` introduces the config form with "Extract multiple
-regions in a single pass using a JSON config file". The library doc of
-`extract_multi` (`extract/mod.rs`) and `multi.rs` now say what the simple
-multi-extract does: one run over the input for all regions, each kind
-visited twice (classify, then write). Complete, smart and cleaning runs go
-one region at a time. The guide should say what the run shares rather than
-"single pass". The I/O reach table's "config single-pass outputs" names the
-route, is test-pinned in `crates/cli/src/io_reach.rs`, and is not this
-claim.
-
-## DOC-045 - multi.rs says multi-extract is simple-only for memory reasons
-
-Reported by: the spar accounting of the fused sorted simple extract change,
-from its scout's lateral (2026-11-24).
-
-The doc of `try_extract_multi_single_pass` (`extract/multi.rs`) says
-"Simple strategy only (no per-region way/relation ID tracking beyond what
-fits in memory)". Since the shared `Membership` (`extract/membership.rs`)
-replaced per-region ID sets, membership no longer scales with per-region
-sets the way that sentence implies; the restriction is the strategy's
-dependency shape. `notes/todo.md` "Multi-extract v2 complete/smart
-strategies" repeats the per-region `bbox_node_ids` / `all_way_node_ids`
-premise. Both should state the current reason.
-
 ## DOC-046 - extract.md credits the sorted single-pass gain to the wrong commit
 
 Reported by: the spar accounting of the fused sorted simple extract change,

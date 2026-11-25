@@ -630,31 +630,6 @@ overlap, fuse the rest) would keep history input off the slow form for both.
 
 Kind: medium conviction; single extract measured the shape at -9 %.
 
-## PERF-018 - Multi-region extract reruns whole extractions per region
-
-Reported by: spatial.
-
-Mechanism: in `extract_multi_to`, shared multi-region execution exists only
-for sorted simple extraction without attribute cleaning; complete-ways, smart
-and cleaned simple run the full single-region extraction once per region, so
-decompression, classification, reference scanning and dependency resolution
-multiply with region count.
-
-Redesign: one engine whose records carry region masks: node masks from one
-classification; way masks as the union of referenced node masks; relation masks
-from members; parent propagation for complete-ways and smart; smart completion
-masks to member ways and nodes then their nodes; emit per region in promised
-order. `Membership` (`membership.rs`) already has compressed masks.
-
-Payoff: shared source work becomes nearly independent of region count.
-
-Risks: keep initial spatial membership separate from completion membership or
-added elements seed extra relations; parent relations must not inherit
-multipolygon completion; overlapping-region memory; parent closure through
-cycles.
-
-Kind: high-conviction coherent rewrite.
-
 ## PERF-019 - Complete-ways and smart extract decode the same payloads repeatedly
 
 Reported by: spatial, framing.

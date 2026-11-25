@@ -63,12 +63,6 @@ admission and the regressions.
   to state the contract first, in ADR-0010 or the design note: which
   divergences from `osmium export` are allowed and which are bugs.
 
-- [ ] **Multi-extract v2 complete/smart strategies**: per-region
-  way/relation ID tracking. Single-pass multi-extract covers the simple
-  strategy only; complete and smart fall back to sequential per-region
-  runs. Memory scales with region count (per-region `bbox_node_ids` and
-  `all_way_node_ids`); not yet measured.
-
 ## CLI surface redesign (deferred past 0.6.0, to 0.7.0)
 
 Planned as one coherent CLI-surface cleanup for 0.6.0, then pushed back a

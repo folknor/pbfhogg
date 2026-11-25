@@ -617,6 +617,22 @@
 
 ### Changed
 
+- **`extract --config` shares its passes across regions for every
+  strategy.** On sorted input, complete-ways (the default), `--smart` and
+  cleaned `--simple` multi-extract used to extract the regions one after
+  another, each with its own passes over the input. Cleaned simple now
+  takes the same single pass as uncleaned simple; complete-ways and smart
+  classify nodes, ways and relations once for all regions, resolve way
+  completion, relation parents and smart relation completion per region,
+  and write every region in one pass. Each region's output and summary
+  line are the same as before. These routes hold a writer per region for
+  the run, so they ask for one descriptor per region up front, and they
+  write through buffered outputs (`--direct-io` applies to their input
+  reads only), as the uncleaned simple single pass does. The banner names
+  the strategy (`[multi-extract] single-pass: N regions, smart strategy`).
+  Planet 5-strip complete-ways and smart multi-extract are about 4.6x
+  faster. Unsorted input still extracts one region at a time.
+
 - **History `time-filter` runs on every core.** A history input's versions
   are now selected and encoded on the read's decode workers; only objects
   whose versions straddle a blob boundary are joined in order. A planet-sized

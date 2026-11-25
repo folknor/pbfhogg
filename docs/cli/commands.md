@@ -1744,6 +1744,17 @@ consulted. See
 [indexdata-trust.md](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
 
 Supports multi-extract via `--config` with a JSON config file specifying multiple regions.
+On sorted input every strategy takes a shared route: `--simple` (cleaned or
+not) classifies each kind once for all regions and writes them in a second
+pass; complete-ways and `--smart` classify nodes, ways and relations once for
+all regions, resolve way completion, relation parents and (smart) relation
+completion per region in shared membership tables, and write every region in
+one pass over the input. Each region's output and summary line are those of a
+single-region extract with the same strategy and flags. The shared route
+writes every output through a buffered writer, `--direct-io` or not (see
+the I/O matrix), and asks for one descriptor per region
+up front. Unsorted input takes one full extract per region, announced by a
+`Note: Multi-extract single-pass probe declined the input` line.
 Relative `directory` and `polygon_file` values resolve from the config file's
 directory. Relative `output` paths resolve from `directory`, or from the config
 file's directory when it is omitted. `-d` rebases configured outputs under its

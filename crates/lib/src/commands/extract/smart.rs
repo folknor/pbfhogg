@@ -121,10 +121,10 @@ impl Pass1Known<'_> {
     /// Push the members of smart relation `r` that pass 1 does not already
     /// include.
     fn push_new_members(&self, r: &crate::Relation, ways: &mut Vec<i64>, nodes: &mut Vec<i64>) {
-        for m in r.members() {
-            match m.id {
-                MemberId::Way(id) if !self.matched_way_ids.get(id) => ways.push(id),
-                MemberId::Node(id)
+        for m in completion_members(r) {
+            match m {
+                CompletionMember::Way(id) if !self.matched_way_ids.get(id) => ways.push(id),
+                CompletionMember::Node(id)
                     if !self.bbox_node_ids.get(id) && !self.outside_way_node_ids.get(id) =>
                 {
                     nodes.push(id);
@@ -133,6 +133,35 @@ impl Pass1Known<'_> {
             }
         }
     }
+}
+
+/// A member a directly matched smart relation record pulls into the
+/// extract: a node, or a way with every one of its nodes.
+pub(super) enum CompletionMember {
+    Node(i64),
+    Way(i64),
+}
+
+/// The members a directly matched relation record completes under smart,
+/// in member order: its node and way members when the record itself is a
+/// smart relation ([`is_smart_relation`], judged on this record's tags, not
+/// another version's), none otherwise. Relation and unknown members are
+/// never completed.
+///
+/// The one rule smart extract and the multi-region engine
+/// (`multi_dep.rs`) share. Each applies the extra-way exclusion against
+/// its own matched-way record: a way member already matched is written as
+/// matched, so it is not an extra way (in the region where it matched, for
+/// the multi engine) and its nodes come only from the ways' own completion.
+pub(super) fn completion_members<'a>(
+    r: &'a crate::Relation<'a>,
+) -> impl Iterator<Item = CompletionMember> + 'a {
+    let take = if is_smart_relation(r) { usize::MAX } else { 0 };
+    r.members().take(take).filter_map(|m| match m.id {
+        MemberId::Node(id) => Some(CompletionMember::Node(id)),
+        MemberId::Way(id) => Some(CompletionMember::Way(id)),
+        MemberId::Relation(_) | MemberId::Unknown(_, _) => None,
+    })
 }
 
 /// Which element kind the unsorted fallback's current file sweep resolves.
@@ -260,7 +289,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                             push_parent_edges(r, &mut parent_edges);
                             if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
                                 matched_relation_ids.insert(r.id());
-                                if H::COLLECT_MEMBER_IDS && is_smart_relation(r) {
+                                if H::COLLECT_MEMBER_IDS {
                                     let known = Pass1Known {
                                         bbox_node_ids: &bbox_node_ids,
                                         outside_way_node_ids: &outside_way_node_ids,
@@ -544,7 +573,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 push_parent_edges(r, &mut edges);
                 if relation_has_matched_member(r, known.bbox_node_ids, known.matched_way_ids) {
                     rel_ids.push(r.id());
-                    if H::COLLECT_MEMBER_IDS && is_smart_relation(r) {
+                    if H::COLLECT_MEMBER_IDS {
                         known.push_new_members(r, &mut extra_ways, &mut extra_nodes);
                     }
                 }
@@ -905,7 +934,7 @@ fn is_smart_relation(r: &crate::Relation) -> bool {
 /// Every relation contributes, matched or not: whether a parent is in the
 /// extract depends on its members' membership, which is only known once
 /// every relation blob has been classified.
-fn push_parent_edges(r: &crate::Relation, edges: &mut Vec<(i64, i64)>) {
+pub(super) fn push_parent_edges(r: &crate::Relation, edges: &mut Vec<(i64, i64)>) {
     let parent = r.id();
     for m in r.members() {
         if let MemberId::Relation(child) = m.id {

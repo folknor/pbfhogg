@@ -371,8 +371,14 @@ classifier - element walk, dense columns plus plain nodes, the multi-extract
 grid, the raw-passthrough proof - compares stored decimicrodegrees against that
 one box.
 
-Multi-extract via `--config` JSON: single pass producing multiple output files.
-Node classification against N regions prunes candidates with a CSR grid
+Multi-extract via `--config` JSON: on sorted input, one shared run producing
+multiple output files - simple's classify and write passes
+(`extract/multi.rs`), or for complete-ways and smart a dependency engine
+(`extract/multi_dep.rs`) that keeps per-region bit masks per kind in shared
+`Membership` tables (spatial nodes, matched ways, way-completion nodes,
+relations after the parent closure, smart's extra ways and their nodes) and
+writes every region in one pass over the full blob schedule. Unsorted input
+runs one extract per region. Node classification against N regions prunes candidates with a CSR grid
 (`RegionGrid`, `crates/lib/src/read/region_grid.rs`; 3600x1800 cells of 0.1 degree over
 the region bboxes) once `N >= 16` and the grid fits a 256 MiB coverage
 budget; below either threshold it falls back to the linear per-region scan.
@@ -874,14 +880,14 @@ External `add-locations-to-ways` holds its stage-1 reservation until stage
 
 A multi-region `extract` (`extract_multi`) admits the same way, through
 the same helper (`commands::descriptors::admit`), once its output set is
-bound and before its input is pinned. The simple strategy without cleaning
-may take the single pass, which holds a synchronous writer per region for
-the whole scan, so it asks for one descriptor per region; the route is
-known only after the input's header is read, so an input that then falls
-back to one pass per region was still asked for the single pass's count.
-The other strategies run one region at a time, closing each region's
-descriptors before the next, and ask for no per-region count. Both add
-the new pin and a fixed allowance (`EXTRACT_MULTI_EXTRA_FDS`), and hold
+bound and before its input is pinned. Every strategy may take its shared
+route (simple's single pass, cleaned or not, or the complete-ways and
+smart dependency engine, `extract/multi_dep.rs`), which holds a
+synchronous writer per region for the whole run, so it asks for one
+descriptor per region; the route is known only after the input's header
+is read, so an input that then falls back to one pass per region, closing
+each region's descriptors before the next, was still asked for the shared
+route's count. It adds the new pin and a fixed allowance (`EXTRACT_MULTI_EXTRA_FDS`), and hold
 the reservation past the pin and every writer. Each output's staging
 descriptor (ADR-0017) is opened when the caller builds the `OutputSet`,
 before the call, so the probe already counts it as open and the request

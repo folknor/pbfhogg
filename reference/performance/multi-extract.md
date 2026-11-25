@@ -15,6 +15,34 @@ since the shared region membership below, one membership structure per
 kind (the rows in this table predate it and used one `IdSet` per region
 and kind). 5 disjoint longitude strips per configured bench.
 
+### Shared complete-ways and smart pass (bygg, 2026-11-25, against `b20ab376`)
+
+Complete and smart multi-extract on sorted input share one
+classify and write pass (`extract/multi_dep.rs`), replacing one
+`extract_to` per region; cleaned simple joins simple's single pass.
+Planet `planet-20260223-reindexed`, `brokkr bench --iterations 1
+region-extract --mode multi`, 5 strips, interleaved. Baseline is
+`--commit HEAD` at `b20ab376`; the variant is the uncommitted tree on it.
+
+| Strategy | Arm | Wall | Peak anon | UUID |
+|---|---|---:|---:|---|
+| simple | base | 67.6 s | | `4b50d25e` |
+| simple | variant | 68.2 s | | `d3162e42` |
+| simple | variant | 67.8 s | | `f0a0f58c` |
+| simple | base | 68.0 s | | `e1c35e96` |
+| smart | variant | 86.1 s | 0.81 GB | `7539d5e4` |
+| smart | base | 395.2 s | 1.38 GB | `d421b98c` |
+| complete | base | 334.3 s | | `3e9fdf31` |
+| complete | variant | 72.8 s | 0.80 GB | `5f38873a` |
+
+Simple (uncleaned): neutral, medians 67.8 s against 68.0 s, so link 1's
+clean branch and the factored-out helpers cost nothing. Smart -78 %
+(4.6x), complete -78 % (4.6x), with lower peak anon. Smart variant
+phases (`7539d5e4`): schedule scan 6.3 s, node classify 15.2 s, way
+classify 13.0 s, relation classify 0.4 s, parents 0.02 s, extra-way
+sweep 9.7 s, write 41.4 s. One pair per dependency strategy: a 4.6x
+gap needs no more cells.
+
 ### Negative IDs as region members (bygg, 2026-11-18, against `c79e6cfd`)
 
 Membership keys pages by the ID's two's-complement bits, so negatives land

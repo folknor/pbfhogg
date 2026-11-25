@@ -29,7 +29,7 @@ use std::path::Path;
 use crate::common::{
     NormalizedMeta, TestMember, TestMeta, TestNode, TestRelation, TestWay,
     node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
-    read_all_elements_with_coords, read_header, read_normalized,
+    read_all_elements_with_coords, read_header, read_in_file_order, read_normalized,
     relation_ids_id_only as relation_ids, way_ids_id_only as way_ids, write_multi_block_test_pbf,
     write_test_pbf, write_test_pbf_sorted,
 };
@@ -57,7 +57,7 @@ const SQUARE_WITH_HOLE_GEOJSON: &str = r#"{
     ]
 }"#;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Strategy {
     Simple,
     CompleteWays,
@@ -1495,6 +1495,10 @@ fn multi_extract_diagnostics_use_final_output_paths() {
         "single-pass diagnostics must not expose scratch paths; stderr:\n{simple_stderr}"
     );
 
+    // Every strategy takes the single pass on sorted input, so the
+    // sequential control is an unsorted one.
+    let unsorted = dir.path().join("unsorted.osm.pbf");
+    write_test_pbf(&unsorted, &test_nodes(), &test_ways(), &test_relations());
     let sequential_output = dir.path().join("sequential.osm.pbf");
     std::fs::write(
         &config,
@@ -1504,7 +1508,7 @@ fn multi_extract_diagnostics_use_final_output_paths() {
         ),
     )
     .expect("write config");
-    let sequential = run_extract_multi(&input, &config, Strategy::CompleteWays);
+    let sequential = run_extract_multi(&unsorted, &config, Strategy::CompleteWays);
     let sequential_stderr = sequential.stderr_str();
     assert!(
         sequential_stderr.contains(&format!("Extracting to {}", sequential_output.display())),
@@ -2745,30 +2749,372 @@ fn multi_extract_selects_negative_ids_as_its_single_extracts_do() {
     let (nodes, ways, relations) = negative_graph();
     let input = dir.path().join("neg.osm.pbf");
     write_test_pbf_sorted(&input, &nodes, &ways, &relations);
-    let south = "12.4,53.9,12.6,54.1";
-    let config = dir.path().join("config.json");
-    std::fs::write(
-        &config,
-        format!(
-            r#"{{"directory":"{}","extracts":[{{"output":"a.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}},{{"output":"b.osm.pbf","bbox":[12.4,53.9,12.6,54.1]}}]}}"#,
-            dir.path().display()
-        ),
-    )
-    .unwrap();
-    run_extract_multi(&input, &config, Strategy::Simple);
-    for (name, bbox) in [("a", BBOX_STR), ("b", south)] {
-        let single = dir.path().join(format!("single-{name}.osm.pbf"));
-        run_extract(&input, &single, &RegionArg::Bbox(bbox), Strategy::Simple);
-        let s = read_all_elements(&single);
-        let m = read_all_elements(&dir.path().join(format!("{name}.osm.pbf")));
-        assert_eq!(node_ids(&m), node_ids(&s), "{name}: nodes");
-        assert_eq!(way_ids(&m), way_ids(&s), "{name}: ways");
-        assert_eq!(relation_ids(&m), relation_ids(&s), "{name}: relations");
+    let mut simple_b = None;
+    for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
+        let outputs = assert_multi_matches_singles(
+            dir.path(),
+            &input,
+            "neg",
+            &[BBOX_STR, SOUTH],
+            strategy,
+            &[],
+        );
+        if matches!(strategy, Strategy::Simple) {
+            simple_b = Some(outputs[1].clone());
+        }
     }
-    let b = read_all_elements(&dir.path().join("b.osm.pbf"));
+    let b = read_all_elements(&simple_b.unwrap());
     assert_eq!(node_ids(&b), vec![-2]);
     assert_eq!(sorted_ids(way_ids(&b)), vec![-11, -10, 10]);
     assert_eq!(sorted_ids(relation_ids(&b)), vec![-300, 400]);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-extract parity with single extracts
+// ---------------------------------------------------------------------------
+
+/// Node 2's region (south of `BBOX_STR`).
+const SOUTH: &str = "12.4,53.9,12.6,54.1";
+/// Node 4's region (east of `BBOX_STR`).
+const EAST: &str = "13.5,55.5,14.5,55.9";
+/// Overlaps `BBOX_STR` on node 1 and node 3 (on its south edge) and holds
+/// node 4.
+const WIDE: &str = "12.45,55.65,14.5,55.9";
+
+/// The `Extract (...)` summary line from an extract's stderr: a single
+/// extract's (`region` None), or region `region`'s (1-based) of a
+/// multi-extract.
+fn extract_summary(stderr: &str, region: Option<usize>) -> String {
+    let tag = region.map(|r| format!("[{r}] "));
+    let line = stderr
+        .lines()
+        .find(|l| {
+            l.contains("Extract (")
+                && match &tag {
+                    Some(tag) => l.contains(tag.as_str()),
+                    None => true,
+                }
+        })
+        .unwrap_or_else(|| panic!("no summary for {region:?}; stderr:\n{stderr}"));
+    line[line.find("Extract (").unwrap()..].to_string()
+}
+
+/// Run one `--config` multi-extract of `bboxes` and a single extract per
+/// bbox, under `strategy` and `extra` flags, and assert that the multi run
+/// took the single pass and that every region's output (elements, metadata
+/// and file order) and summary equal its single extract's. Returns the
+/// multi-extract outputs, in region order.
+fn assert_multi_matches_singles(
+    dir: &Path,
+    input: &Path,
+    tag: &str,
+    bboxes: &[&str],
+    strategy: Strategy,
+    extra: &[&str],
+) -> Vec<std::path::PathBuf> {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let at = format!("{tag} {strategy:?} {} regions", bboxes.len());
+    let stem = format!("{tag}-{strategy:?}-{}", bboxes.len());
+    let outputs: Vec<_> = (0..bboxes.len())
+        .map(|i| dir.join(format!("{stem}-{i}.osm.pbf")))
+        .collect();
+    let extracts = outputs
+        .iter()
+        .zip(bboxes)
+        .map(|(o, b)| format!(r#"{{"output":"{}","bbox":[{b}]}}"#, o.display()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let config = dir.join(format!("{stem}.json"));
+    std::fs::write(&config, format!(r#"{{"extracts":[{extracts}]}}"#)).unwrap();
+    let cli = CliInvoker::new(&invocation_scratch)
+        .arg("extract")
+        .arg(input)
+        .arg("--config")
+        .arg(&config);
+    let multi = strategy_args(cli, strategy)
+        .args(extra)
+        .arg("--set-bounds")
+        .assert_success();
+    let multi_stderr = multi.stderr_str();
+    assert!(
+        multi_stderr.contains(&format!(
+            "[multi-extract] single-pass: {} regions",
+            bboxes.len()
+        )),
+        "{at}: the single pass must be taken; stderr:\n{multi_stderr}"
+    );
+    for (i, (output, bbox)) in outputs.iter().zip(bboxes).enumerate() {
+        let single = dir.join(format!("{stem}-{i}-single.osm.pbf"));
+        let cli = CliInvoker::new(&invocation_scratch)
+            .arg("extract")
+            .arg(input)
+            .arg("-o")
+            .arg(&single)
+            .arg("--bbox")
+            .arg(*bbox);
+        let out = strategy_args(cli, strategy)
+            .args(extra)
+            .arg("--set-bounds")
+            .assert_success();
+        assert_eq!(
+            read_in_file_order(output),
+            read_in_file_order(&single),
+            "{at}: region {i} output"
+        );
+        assert_eq!(
+            extract_summary(&multi_stderr, Some(i + 1)),
+            extract_summary(&out.stderr_str(), None),
+            "{at}: region {i} summary"
+        );
+    }
+    outputs
+}
+
+/// Two and three overlapping regions over a graph with parent chains, a
+/// self-member, a parent stored before its child and a multipolygon whose
+/// way is matched in two other regions: each region equals its single
+/// extract under every strategy.
+#[test]
+fn multi_extract_overlapping_regions_match_their_single_extracts() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("overlap.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &parent_relations());
+    for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
+        for bboxes in [&[BBOX_STR, WIDE][..], &[BBOX_STR, WIDE, SOUTH][..]] {
+            assert_multi_matches_singles(dir.path(), &input, "overlap", bboxes, strategy, &[]);
+        }
+    }
+}
+
+/// The same parity on an input without indexdata (`--force`): its blobs
+/// join every classify schedule and the write pass reads each once.
+#[test]
+fn extract_multi_complete_ways_non_indexed_parity() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("non-indexed.osm.pbf");
+    crate::common::write_multi_block_non_indexed_pbf(
+        &input,
+        &test_nodes(),
+        &test_ways(),
+        &parent_relations(),
+        2,
+    );
+    for strategy in [Strategy::CompleteWays, Strategy::Smart] {
+        assert_multi_matches_singles(
+            dir.path(),
+            &input,
+            "non-indexed",
+            &[BBOX_STR, WIDE, SOUTH],
+            strategy,
+            &[],
+        );
+    }
+}
+
+fn versioned(version: i32) -> Option<TestMeta> {
+    Some(TestMeta {
+        version,
+        timestamp: 1_000 * i64::from(version),
+        changeset: i64::from(version),
+        uid: 7,
+        user: "u",
+        visible: true,
+    })
+}
+
+/// Way 20 in two versions: version 1 refers to node 1 (in `BBOX_STR`) and
+/// outside node 5, version 2 only to outside node 8. Multipolygon 600 lists
+/// way 20 and node 4 (in `EAST`).
+fn version_split_pbf(path: &Path) {
+    let node = |id, lat, lon| TestNode {
+        id,
+        lat,
+        lon,
+        tags: vec![],
+        meta: versioned(1),
+    };
+    let nodes = vec![
+        node(1, 557_000_000, 125_000_000),
+        node(4, 557_000_000, 140_000_000),
+        node(5, 500_000_000, 100_000_000),
+        node(8, 510_000_000, 100_000_000),
+    ];
+    let way = |version, refs: &[i64]| TestWay {
+        id: 20,
+        refs: refs.to_vec(),
+        tags: vec![("highway", "path")],
+        meta: versioned(version),
+    };
+    let ways = vec![way(1, &[1, 5]), way(2, &[8])];
+    let relations = vec![TestRelation {
+        id: 600,
+        members: vec![
+            TestMember {
+                id: MemberId::Way(20),
+                role: "outer",
+            },
+            TestMember {
+                id: MemberId::Node(4),
+                role: "",
+            },
+        ],
+        tags: vec![("type", "multipolygon")],
+        meta: versioned(3),
+    }];
+    write_test_pbf_sorted(path, &nodes, &ways, &relations);
+}
+
+/// A way matched in one region by one version and reached in another only
+/// through a relation: the matching region completes only the version that
+/// matched (node 8 stays out), the relation-only region gets both versions
+/// and every version's refs. Cleaned and uncleaned.
+#[test]
+fn multi_extract_completes_ways_per_version_and_region() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("versions.osm.pbf");
+    version_split_pbf(&input);
+    for clean in [&[][..], &["--clean", "version"][..]] {
+        let tag = if clean.is_empty() {
+            "versions"
+        } else {
+            "versions-clean"
+        };
+        for strategy in [Strategy::CompleteWays, Strategy::Smart] {
+            let outputs = assert_multi_matches_singles(
+                dir.path(),
+                &input,
+                tag,
+                &[BBOX_STR, EAST],
+                strategy,
+                clean,
+            );
+            let a = read_all_elements(&outputs[0]);
+            let b = read_all_elements(&outputs[1]);
+            assert_eq!(way_ids(&a), vec![20, 20], "{tag} {strategy:?}");
+            assert!(!node_ids(&a).contains(&8), "{tag} {strategy:?}");
+            assert_eq!(relation_ids(&b), vec![600], "{tag} {strategy:?}");
+            if matches!(strategy, Strategy::Smart) {
+                assert_eq!(sorted_ids(node_ids(&a)), vec![1, 4, 5], "{tag}");
+                assert_eq!(way_ids(&b), vec![20, 20], "{tag}");
+                assert_eq!(sorted_ids(node_ids(&b)), vec![1, 4, 5, 8], "{tag}");
+            } else {
+                assert_eq!(sorted_ids(node_ids(&a)), vec![1, 5], "{tag}");
+                assert!(way_ids(&b).is_empty(), "{tag}");
+            }
+        }
+    }
+}
+
+/// Smart completes a relation by each record's own first `type` tag:
+/// version 1 of relation 700 is a multipolygon matched in `BBOX_STR`,
+/// version 2 a route matched in both regions, so `EAST` completes nothing
+/// of it (way 10, a version 2 member matched only in `BBOX_STR`, stays out).
+#[test]
+fn multi_extract_smart_type_is_per_record() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("types.osm.pbf");
+    let relations = vec![
+        TestRelation {
+            id: 700,
+            members: vec![
+                TestMember {
+                    id: MemberId::Way(12),
+                    role: "outer",
+                },
+                TestMember {
+                    id: MemberId::Node(2),
+                    role: "",
+                },
+            ],
+            tags: vec![("type", "multipolygon")],
+            meta: versioned(1),
+        },
+        TestRelation {
+            id: 700,
+            members: vec![
+                TestMember {
+                    id: MemberId::Node(4),
+                    role: "",
+                },
+                TestMember {
+                    id: MemberId::Way(10),
+                    role: "",
+                },
+            ],
+            tags: vec![("type", "route")],
+            meta: versioned(2),
+        },
+    ];
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
+    for strategy in [Strategy::CompleteWays, Strategy::Smart] {
+        let outputs = assert_multi_matches_singles(
+            dir.path(),
+            &input,
+            "types",
+            &[BBOX_STR, EAST],
+            strategy,
+            &[],
+        );
+        let b = read_all_elements(&outputs[1]);
+        assert_eq!(relation_ids(&b), vec![700, 700], "{strategy:?}");
+        assert_eq!(way_ids(&b), vec![11], "{strategy:?}");
+    }
+}
+
+/// The parent closure per region: multipolygon 800 is matched in
+/// `BBOX_STR` and is a parent (through 801, a cycle with 800) of route 101
+/// matched in `EAST`, so both carry both regions, and 800, already in the
+/// first region, still gains the second. Bits a parent gains never
+/// complete it: `EAST` does not get 800's member node 1. An unseeded cycle
+/// and a self-member add nothing.
+#[test]
+fn multi_extract_parent_closure_crosses_regions_and_cycles() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("parents.osm.pbf");
+    let rel = |id: i64, members: Vec<TestMember>, kind: &'static str| TestRelation {
+        id,
+        members,
+        tags: vec![("type", kind)],
+        meta: None,
+    };
+    let mut relations = test_relations();
+    relations.extend([
+        rel(
+            800,
+            vec![
+                member_relation(801),
+                TestMember {
+                    id: MemberId::Node(1),
+                    role: "",
+                },
+            ],
+            "multipolygon",
+        ),
+        rel(
+            801,
+            vec![member_relation(800), member_relation(101)],
+            "collection",
+        ),
+        rel(900, vec![member_relation(901)], "collection"),
+        rel(901, vec![member_relation(900)], "collection"),
+        rel(902, vec![member_relation(902)], "collection"),
+    ]);
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
+    for strategy in [Strategy::CompleteWays, Strategy::Smart] {
+        let outputs = assert_multi_matches_singles(
+            dir.path(),
+            &input,
+            "parents",
+            &[BBOX_STR, EAST],
+            strategy,
+            &[],
+        );
+        let a = read_all_elements(&outputs[0]);
+        let b = read_all_elements(&outputs[1]);
+        assert_eq!(relation_ids(&a), vec![100, 800, 801], "{strategy:?}");
+        assert_eq!(relation_ids(&b), vec![101, 800, 801], "{strategy:?}");
+        assert_eq!(sorted_ids(node_ids(&b)), vec![2, 4], "{strategy:?}");
+    }
 }
 
 /// A one-node input whose block framing puts the node at a coordinate that

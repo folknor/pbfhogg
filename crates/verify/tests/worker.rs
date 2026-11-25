@@ -33,6 +33,8 @@ pub(crate) mod fake_pbf;
 mod geocode_fixture;
 #[path = "getid_fixture.rs"]
 mod getid_fixture;
+#[path = "getparents_fixture.rs"]
+mod getparents_fixture;
 #[path = "../src/harness.rs"]
 pub(crate) mod harness;
 #[path = "inspect_tags_fixture.rs"]
@@ -181,20 +183,10 @@ fn main() {
     }) && role != "driver"
     {
         std::process::exit(dedupe_fixture::tool(&args[1..]));
-    } else if args[1..].iter().any(|a| {
-        Path::new(a)
-            .ancestors()
-            .any(|p| p.file_name().is_some_and(|n| n == "getid-fixture"))
-    }) && role != "driver"
+    } else if let Some(tool) = rooted_tool(&args[1..])
+        && role != "driver"
     {
-        std::process::exit(getid_fixture::tool(&args[1..]));
-    } else if args[1..].iter().any(|a| {
-        Path::new(a)
-            .ancestors()
-            .any(|p| p.file_name().is_some_and(|n| n == "inspect-tags-fixture"))
-    }) && role != "driver"
-    {
-        std::process::exit(inspect_tags_fixture::tool(&args[1..]));
+        std::process::exit(tool(&args[1..]));
     } else if args[1..].iter().any(|a| {
         Path::new(a)
             .ancestors()
@@ -208,6 +200,26 @@ fn main() {
     } else {
         worker(role);
     }
+}
+
+/// The fake tool of the check fixture whose scratch root an argument lies
+/// under, for the fixtures keyed by root alone.
+fn rooted_tool(args: &[std::ffi::OsString]) -> Option<fn(&[std::ffi::OsString]) -> i32> {
+    type Tool = fn(&[std::ffi::OsString]) -> i32;
+    let tools: [(&str, Tool); 3] = [
+        ("getid-fixture", getid_fixture::tool),
+        ("getparents-fixture", getparents_fixture::tool),
+        ("inspect-tags-fixture", inspect_tags_fixture::tool),
+    ];
+    tools.into_iter().find_map(|(root, tool)| {
+        args.iter()
+            .any(|a| {
+                Path::new(a)
+                    .ancestors()
+                    .any(|p| p.file_name().is_some_and(|n| n == root))
+            })
+            .then_some(tool)
+    })
 }
 
 fn no_children() {
@@ -243,7 +255,8 @@ fn driver(role: &str, dir: &Path) {
     }
     // The check fixtures: each owns its scratch root and ends childless.
     type Fixture = fn(process::Lifecycle, &Path, &Path);
-    let fixtures: [(&str, Fixture); 8] = [
+    let fixtures: [(&str, Fixture); 9] = [
+        ("getparents", getparents_fixture::driver),
         ("inspect-tags", inspect_tags_fixture::driver),
         ("encoding", encoding_fixture::driver),
         ("extract", extract_fixture::driver),

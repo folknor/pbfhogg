@@ -25,8 +25,17 @@ Settled with codex (session 01a2131d-4fba-7772-b6a2-ea5588bdef23).
 
 ## Links
 
-1. inspect-tags - landed (this link). Small.
-2. getparents - medium. Clean graph with real witnesses for node-to-way,
+1. inspect-tags - landed. Small.
+2. getparents - landed. One worker role sufficed (eight cases, about a
+   second). Decisions made in the link: the fake fileinfo is local to the
+   fixture and computed from the operand's OPL records (counts, ranges,
+   order, repeats), leaving `fake_pbf::fileinfo` for link 3 to generalise;
+   the clean case proves every arm by the check's returned claim being
+   exactly none on sorted input and exactly `CLAIM_UNSORTED` on unsorted
+   input, captured inside the judged closure, since `Judged` carries no
+   claim; the error case is a pbfhogg exit only, because a negative-ID or
+   negative-ref refusal is reference-side and would need its own input to
+   stay cache-safe, which the plan did not ask for. Original plan: Clean graph with real witnesses for node-to-way,
    node-to-relation, way-to-relation, relation-to-relation and add-self,
    asserting no coverage gap. Fake answers pbfhogg and osmium getparents
    (both modes, osmium `-s`), fileinfo, `cat -t relation -f opl`, and OPL

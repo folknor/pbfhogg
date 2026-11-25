@@ -117,6 +117,17 @@ fn verifier_inspect_tags_check() {
 }
 
 #[test]
+fn verifier_getparents_check() {
+    let _bound = pbfhogg_test_scratch::HangBound::arm(
+        tunables::TEST_HANG_BOUND,
+        tunables::TEST_REPORT_GRACE,
+        "getparents verifier behaviour",
+    );
+    let scratch = pbfhogg_test_scratch::scratch();
+    run_worker("getparents", scratch.path());
+}
+
+#[test]
 fn verifier_extract_checks() {
     let _bound = pbfhogg_test_scratch::HangBound::arm(
         tunables::TEST_HANG_BOUND,

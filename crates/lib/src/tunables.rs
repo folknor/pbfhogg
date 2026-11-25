@@ -1004,8 +1004,8 @@ pub(crate) const CAT_EXTRA_FDS: u64 = 8;
 /// output backend starts holding more.
 pub(crate) const EXTRACT_MULTI_EXTRA_FDS: u64 = 8;
 
-/// Number of decoded blocks collected before unsorted pass-2 dispatches them
-/// to rayon.
+/// Number of compressed blobs the unsorted simple extract's write pass
+/// collects before its workers decode and write them.
 pub(crate) const EXTRACT_SIMPLE_BATCH_SIZE: usize = 64;
 
 /// Region count from which multi-extract builds a `RegionGrid` to prune

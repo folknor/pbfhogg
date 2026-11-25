@@ -189,10 +189,12 @@ threshold-based dispatch here is new ground.
   blob density. Per-blob coordination cost
   vs per-blob payload work balances differently across the two
   encodings.
-- **`BATCH_SIZE` (extract unsorted pass 2)**: since the fused command
-  transforms landed (ADR-0009, 2026-07-12) the command batch helpers are
-  gone; this constant survives only in `extract/simple.rs` and no longer
-  drives any pipelined command path.
+- **`EXTRACT_SIMPLE_BATCH_SIZE` (extract unsorted pass 2)**: since the
+  fused command transforms landed (ADR-0009, 2026-07-12) the command batch
+  helpers are gone; this constant survives only in `extract/simple.rs`,
+  where it sizes the batch of compressed blobs the unsorted write pass
+  hands to its decoding workers, and no longer drives any pipelined
+  command path.
 
 ### Audit targets for threshold-based dispatch
 

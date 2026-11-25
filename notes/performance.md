@@ -2248,22 +2248,3 @@ with the 8 KiB OPL readers exists to set against it; the readers are now
 1 MiB.
 
 Kind: local.
-
-## PERF-084 - Unsorted simple extract decodes every blob on one thread in pass 2
-
-Reported by: the spar accounting of the fused sorted simple extract change,
-from its scout's lateral (2026-11-24).
-
-`extract_simple_two_pass` (`extract/simple.rs`, input whose header does not
-claim Sort.Type_then_ID) writes in a final sequential `BlobReader` sweep
-that decompresses and builds a `PrimitiveBlock` for every OsmData blob on
-the calling thread, then hands batches of `EXTRACT_SIMPLE_BATCH_SIZE`
-blocks to `process_extract_pass2_batch`. The sweep applies no skip: node
-blobs whose indexdata bbox misses the region, which the pass-1 sweeps
-already skip, are decoded again here, and so is every blob of a kind whose
-ID set is empty. Decode is serialized ahead of each parallel batch write.
-Possible shape: the same bbox and empty-set skips as pass 1, and decode on
-the workers as the sorted route does. Unmeasured; the unsorted route has no
-recorded cell.
-
-Kind: local, unmeasured.

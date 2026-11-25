@@ -375,3 +375,31 @@ for denmark geocode from that period shows runs from about 6 s to over
 100 s. The Current baselines section of the same file now holds attributed
 geocode cells (warm and cold); reword the refusal to cite those rather than
 an unattributed point.
+
+## DOC-053 - derive_changes' doc describes shards and change-bounded memory
+
+Reported by: the spar accounting of the persistent merge cursor change,
+from its scout's lateral (2026-11-25).
+
+The doc comment on `derive_changes` (`commands/diff/derive.rs`) says the
+merge-join runs "over ID-range shards for indexed inputs" with the answer
+"the same at any shard count", and that "Memory is bounded by the number of
+changed elements, not total input size". The indexed engine is streaming
+work units (`commands/diff/units.rs`), and the same file's module doc says
+memory "is bounded by the units and decoded blocks in flight, not total
+change count". Reword the function doc to the units engine and the module
+doc's memory bound.
+
+## DOC-054 - diff.md opens on the retired shard engine and has no History section
+
+Reported by: the spar accounting of the persistent merge cursor change,
+from its scout's lateral (2026-11-25).
+
+`reference/performance/diff.md` is dated sections in filing order, with no
+Current baselines / History split as the `reference/performance/`
+convention asks. Its first section, "Diff between independent snapshots",
+describes the shard-based block-pair merge as the engine ("Both paths
+stream shard output to per-shard scratch temp files", "Walker phase ~15 s"
+via `HeaderWalker`) with no mark that streaming work units replaced it;
+only later sections say so. Move the current planet baselines to the top
+and the shard-era sections under History.

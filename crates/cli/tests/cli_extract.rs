@@ -342,6 +342,41 @@ fn simple_unsorted_reads_ways_behind_an_empty_dense_message() {
     assert_eq!(way_ids(&c), vec![10]);
 }
 
+/// The unsorted simple write pass skips a node blob whose indexdata bbox
+/// misses the region, as the sorted route does: a repeated node ID selected
+/// from an inside blob is not written again from the outside blob, and the
+/// way and relation sets still drive their own blobs.
+#[test]
+fn simple_unsorted_skips_a_bbox_missed_node_blob_in_the_write_pass() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let mut nodes = inside_nodes(1, 1);
+    nodes.push(TestNode {
+        id: 1,
+        lat: 0,
+        lon: 0,
+        tags: vec![],
+        meta: None,
+    });
+    let ways = [TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![],
+        meta: None,
+    }];
+    crate::common::write_test_pbf_impl(&input, &nodes, &ways, &[], false, Some(1));
+    run_extract(
+        &input,
+        &output,
+        &RegionArg::Bbox(BBOX_STR),
+        Strategy::Simple,
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(node_ids(&c), vec![1]);
+    assert_eq!(way_ids(&c), vec![10]);
+}
+
 #[test]
 fn simple_does_not_add_extra_nodes() {
     let dir = crate::common::test_scratch();

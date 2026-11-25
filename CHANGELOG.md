@@ -627,6 +627,14 @@
 
 ### Changed
 
+- **`extract --simple` on unsorted indexed input is about twice as fast,
+  and writes no node from a blob outside the region.** Each classify sweep
+  now decodes only the blobs that claim its kind, and the write pass
+  decodes on every core and skips node blobs whose indexdata bbox misses
+  the region (Denmark's unsorted copy about 7.4 s to 3.3 s). A repeated
+  node ID selected inside the region used to be written again from such a
+  blob; it no longer is, matching sorted input.
+
 - **`extract --config` shares its passes across regions for every
   strategy.** On sorted input, complete-ways (the default), `--smart` and
   cleaned `--simple` multi-extract used to extract the regions one after

@@ -40,6 +40,17 @@ pub(super) enum ClassifyPhase {
     Relations,
 }
 
+impl ClassifyPhase {
+    /// The element kind this sweep resolves.
+    fn kind(self) -> ElementKind {
+        match self {
+            ClassifyPhase::Nodes => ElementKind::Node,
+            ClassifyPhase::Ways => ElementKind::Way,
+            ClassifyPhase::Relations => ElementKind::Relation,
+        }
+    }
+}
+
 /// Classify elements in a single block for simple extract (populate ID sets).
 ///
 /// `phase` selects which kind is resolved; elements of other kinds are
@@ -66,11 +77,7 @@ fn classify_block_simple(
     matched_way_ids: &mut IdSet,
     matched_relation_ids: &mut IdSet,
 ) -> crate::error::Result<()> {
-    let phase_kind = match phase {
-        ClassifyPhase::Nodes => ElementKind::Node,
-        ClassifyPhase::Ways => ElementKind::Way,
-        ClassifyPhase::Relations => ElementKind::Relation,
-    };
+    let phase_kind = phase.kind();
     if !block.element_kinds().has(phase_kind) {
         return Ok(());
     }
@@ -208,8 +215,14 @@ fn extract_simple_two_pass(
             // Even here, where elements are classified after decoding, a
             // blob claimed as nodes is skipped on its indexdata bbox
             // without a decode (reference/indexdata-trust.md).
+            // An indexed blob is decoded only in the sweep of its claimed
+            // kind, where `refuse_blob_foreign_kind` checks that claim
+            // against the payload; the other two sweeps would only drop
+            // it. Every admitted indexed blob still reaches its own sweep,
+            // so the claim is checked once before pass 2 relies on it.
+            // Unindexed blobs are decoded in all three sweeps.
             if let Some(idx) = blob.index()
-                && !spatial_filter.wants_index(&idx)
+                && (!spatial_filter.wants_index(&idx) || idx.kind != phase.kind())
             {
                 continue;
             }
@@ -260,24 +273,34 @@ fn extract_simple_two_pass(
         matched_relation_ids: &matched_relation_ids,
     };
 
-    // The batch's blocks are its working set, each owning the buffer it
-    // decoded into; the batch's clear frees them (read/decompress.rs, "Take
-    // loops").
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(EXTRACT_SIMPLE_BATCH_SIZE);
+    // The batch holds compressed blobs; the workers decompress and decode
+    // them, so decode runs in parallel instead of ahead of each batch on
+    // this thread. Two skips need no decode:
+    // - a node blob whose indexdata bbox misses the region, the same test
+    //   pass 1 skipped it on, so nothing in it was selected (and, as on the
+    //   sorted route, a duplicate ID's occurrence there is not written);
+    // - an indexed blob whose claimed kind has an empty selection set. Pass
+    //   1 decoded every admitted indexed blob in its claimed kind's sweep
+    //   and refused a foreign kind there, so the claim is already checked.
+    //   Node output reads only `bbox_node_ids` here, since
+    //   `outside_way_node_ids` is empty on this route.
+    let empty_for = |kind: ElementKind| match kind {
+        ElementKind::Node => bbox_node_ids.is_empty(),
+        ElementKind::Way => matched_way_ids.is_empty(),
+        ElementKind::Relation => matched_relation_ids.is_empty(),
+    };
+    let mut batch: Vec<crate::blob::Blob> = Vec::with_capacity(EXTRACT_SIMPLE_BATCH_SIZE);
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf),
-            &mut st_scratch,
-            &mut gr_scratch,
-        )?;
-        release_scratch(&mut st_scratch);
-        release_scratch(&mut gr_scratch);
-        batch.push(block);
+        if let Some(idx) = blob.index()
+            && (!spatial_filter.wants_index(&idx) || empty_for(idx.kind))
+        {
+            continue;
+        }
+        batch.push(blob);
         if batch.len() >= EXTRACT_SIMPLE_BATCH_SIZE {
             process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;
             batch.clear();
@@ -885,9 +908,13 @@ fn settle_passthrough_candidates(
     descs
 }
 
-/// Process a batch of blocks in parallel for Pass 2 of complete-ways extraction.
+/// Decode and write a batch of compressed blobs in parallel for pass 2 of the
+/// unsorted simple extract. Each worker decompresses and decodes its blob;
+/// the block takes the decode buffer and drops when the blob is done
+/// (read/decompress.rs, "Take loops"), while the parse scratch is kept per
+/// worker. Results drain in batch order, so output stays in file order.
 fn process_extract_pass2_batch(
-    batch: &[PrimitiveBlock],
+    batch: &[crate::blob::Blob],
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -898,12 +925,25 @@ fn process_extract_pass2_batch(
     let results: Vec<BatchResult> = host.executor.install(|| {
         batch
             .par_iter()
-            .map_init(BlockBuilder::new, |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = extract_block_pass2(block, ids, clean, None, bb, &mut output)?;
-                flush_local(bb, &mut output)?;
-                Ok((output, block_stats))
-            })
+            .map_init(
+                || (BlockBuilder::new(), Vec::new(), Vec::new()),
+                |(bb, st_scratch, gr_scratch), blob| {
+                    let mut decompress_buf: Vec<u8> = Vec::new();
+                    blob.decompress_into(&mut decompress_buf)?;
+                    let block = PrimitiveBlock::from_vec_with_scratch(
+                        decompress_buf,
+                        st_scratch,
+                        gr_scratch,
+                    )?;
+                    release_scratch(st_scratch);
+                    release_scratch(gr_scratch);
+                    let mut output: Vec<OwnedBlock> = Vec::new();
+                    let block_stats =
+                        extract_block_pass2(&block, ids, clean, None, bb, &mut output)?;
+                    flush_local(bb, &mut output)?;
+                    Ok((output, block_stats))
+                },
+            )
             .collect()
     });
 

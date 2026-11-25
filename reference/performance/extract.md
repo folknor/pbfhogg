@@ -57,6 +57,29 @@ decoded block costs most of what the scanner classify cost, and what goes
 is the second pread and decompression. Multi-extract keeps its classify and
 write passes per kind.
 
+### Unsorted simple extract: kind skips and worker decode (bygg, 2026-11-25, variant uncommitted against `e48ff097`)
+
+The unsorted fallback (`extract_simple_two_pass`) used to decode every
+indexed blob in each of its three classify sweeps and again, on the calling
+thread, in its write pass. Variant: each classify sweep decodes only the
+blobs claiming its kind; the write pass skips bbox-missed node blobs and
+blobs of a kind with an empty selection, and its workers decompress and
+decode the batch. No planet, europe or germany unsorted input is
+registered, so the cells are Denmark's `unsorted` snapshot (a
+`degrade --unsort` of Denmark). `region-extract --dataset denmark
+--snapshot unsorted --strategy simple`, `--iterations 1`, interleaved,
+baseline built with `--commit HEAD`. Output bytes (34,979,366) and summary
+identical. Verdict: about 2.2x faster, both pairs; landed. The sorted route
+is untouched.
+
+| Span | baseline | variant |
+|------|----------|---------|
+| wall | 7.3 s (`3ca42ef5`), 7.4 s (`be7dd1e2`) | 3.3 s (`1f9b787d`), 3.3 s (`1b6ffa5d`) |
+| `SIMPLE_UNSORTED_PASS1` | 5.43 s | 2.86 s |
+| `SIMPLE_UNSORTED_PASS2` | 1.93 s | 0.39 s |
+
+Per-span numbers are the `be7dd1e2` and `1b6ffa5d` pair.
+
 Complete-ways and smart pass 1 (`collect_pass1_generic`) uses three-phase
 parallel pread classification (nodes → ways → relations) via a reusable
 `parallel_classify_phase` helper. Smart pass 2 (way dependency resolution)

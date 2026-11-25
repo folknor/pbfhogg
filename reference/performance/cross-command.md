@@ -728,6 +728,23 @@ so a bisect landing near one knows what it changed.
   type-order comparison (`4c254750`); input pinning (`926d5183`
   onwards).
 
+## Blob-local re-encoders opt into the oversize cut (2026-11-25), no cell
+
+cat re-encode, extract, multi-extract, tags-filter, getid, getparents and
+snapshot time-filter cut an output block the writer would refuse. No
+planet cell was run, by the ruling `reference/performance/sort.md`
+records for the sweep's cut: no per-element work is added. Where blocks
+are framed on the worker (`FramedBlocks::cutting`, multi-extract's
+region framing) a block that frames pays nothing more; the cut runs only
+on the writer's refusal. Owned-block routes walk their output once per
+blob and compare each block's length with the sure limit
+(`split::fit_blocks`); a block between the sure and the raw limit, which
+planet blocks never approach, is trial-compressed before the writer
+compresses it. The limits are computed once per run or pass. Not measured
+either: peak memory on oversized input, where a first cut repeats the
+block's string table in every piece and a queued task holds all its
+pieces.
+
 ## History
 
 ### Multi-dataset throughput tables (commit-pinned)

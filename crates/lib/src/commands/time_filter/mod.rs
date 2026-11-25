@@ -881,7 +881,8 @@ fn time_filter_snapshot(
         |block, worker| -> PhaseResult {
             let bb = worker.task()?;
             let mut output =
-                crate::commands::FramedBlocks::new(compression, &host.invocation.metrics().writer);
+                crate::commands::FramedBlocks::new(compression, &host.invocation.metrics().writer)
+                    .cutting();
             let mut bounds: Bounds = None;
             let block_stats =
                 filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, &mut bounds)?;

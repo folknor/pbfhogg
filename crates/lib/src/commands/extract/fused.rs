@@ -330,7 +330,7 @@ fn fuse_blob(
     }
     tally.refuse_inexact(&claim)?;
 
-    let mut output = FramedBlocks::new(compression, metrics);
+    let mut output = FramedBlocks::new(compression, metrics).cutting();
     let kind = select.kind();
     let block_stats = if unique {
         let mut next = local.decisions.iter().copied();

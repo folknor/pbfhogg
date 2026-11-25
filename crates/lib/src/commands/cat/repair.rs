@@ -427,7 +427,7 @@ fn unindexed(
 ) -> Result<Repaired> {
     let (index, tagdata) = crate::blob_meta::scan_block_ids_and_tags(&payload)?;
     let Some(index) = index else {
-        let (blocks, elements) = super::reencode_unclassifiable(payload, declared)?;
+        let (blocks, elements) = super::reencode_unclassifiable(payload, declared, compression)?;
         let count = blocks.len();
         return Ok(Repaired {
             frames: frame_blocks(blocks, compression, metrics)?,
@@ -446,6 +446,12 @@ fn unindexed(
         .and_then(crate::blob_meta::TagIndex::serialize);
     let bytes = if merged.is_some() {
         // A new payload: compressed afresh, framed under the input header.
+        // Not cut when the new body passes the blob limit (a codec change
+        // can do that): every other field of the input BlobHeader is kept,
+        // which pieces could not all share (a field-5 bitmap describes the
+        // whole blob), and a repaired payload keeps source layouts the
+        // shared cut (`commands/split.rs`, `layout`) does not take apart.
+        // Such a blob keeps the writer's typed size refusal.
         let fresh =
             crate::writer::frame_blob_pipelined(&payload, &compression, None, None, None, metrics)?;
         let blob = blob_of_frame(&fresh)?;

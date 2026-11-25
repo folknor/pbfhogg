@@ -124,6 +124,8 @@ pub(crate) struct FramedBlocks<'a> {
     /// Wall time spent framing the blocks (index serialisation, compression
     /// and blob framing; not their encoding), for callers that report it.
     pub(crate) frame_ns: u64,
+    /// Whether a refused block is cut ([`FramedBlocks::cutting`]).
+    cut: bool,
 }
 
 impl<'a> FramedBlocks<'a> {
@@ -149,6 +151,7 @@ impl<'a> FramedBlocks<'a> {
             keep_tagdata,
             frames: Vec::new(),
             frame_ns: 0,
+            cut: false,
         }
     }
 }
@@ -165,28 +168,76 @@ impl FramedBlocks<'_> {
         &mut self,
         bb: &mut BlockBuilder,
     ) -> Result<Option<crate::error::Error>> {
+        self.lend(bb, false)
+    }
+
+    /// Opt this sink into the shared cut (`commands/split.rs`): a block the
+    /// writer refuses as too large is cut between elements on its lent
+    /// bytes, inside the lend, and each piece framed with the index and
+    /// tagdata scanned from its own bytes; a block no plan fits keeps its
+    /// typed refusal. Only [`BlockSink::flush`] cuts, never
+    /// [`Self::flush_or_overflow`], whose caller replays the overflow
+    /// itself. Repack and degrade do not opt in: their layouts are count
+    /// rules. A block that frames costs nothing more; the cut runs only on
+    /// the writer's refusal.
+    pub(crate) fn cutting(mut self) -> Self {
+        self.cut = true;
+        self
+    }
+
+    fn frame(
+        &mut self,
+        bytes: &[u8],
+        index: &crate::blob_meta::BlobIndex,
+        tagdata: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let indexdata = index.serialize();
+        crate::writer::frame_blob_pipelined(
+            bytes,
+            &self.compression,
+            self.keep_indexdata.then_some(indexdata.as_slice()),
+            if self.keep_tagdata { tagdata } else { None },
+            None,
+            self.metrics,
+        )
+    }
+
+    fn lend(
+        &mut self,
+        bb: &mut BlockBuilder,
+        recover: bool,
+    ) -> Result<Option<crate::error::Error>> {
         let outcome = bb.lend_encoded(|block| {
             let t_frame = crate::counters::Stopwatch::start();
-            let indexdata = block.index.serialize();
-            let framed = crate::writer::frame_blob_pipelined(
-                block.bytes,
-                &self.compression,
-                self.keep_indexdata.then_some(indexdata.as_slice()),
-                if self.keep_tagdata {
-                    block.tagdata
-                } else {
-                    None
-                },
-                None,
-                self.metrics,
-            );
-            match framed {
+            match self.frame(block.bytes, &block.index, block.tagdata) {
                 Ok(frame) => {
                     self.frames.push((block.index.kind, frame));
                     self.frame_ns += t_frame.elapsed_ns();
                     Ok(None)
                 }
-                Err(error) if is_block_overflow(&error) => Ok(Some(error)),
+                Err(error) if is_block_overflow(&error) => {
+                    if !(recover && self.cut) {
+                        return Ok(Some(error));
+                    }
+                    let limits = split::Limits::new(self.compression);
+                    let cut = split::cut_lent(
+                        block.bytes,
+                        block.index.kind,
+                        block.index.count,
+                        &limits,
+                        &mut |piece| {
+                            // Only each piece's framing is timed, as for a
+                            // block that frames whole; the plan is not.
+                            let t_piece = crate::counters::Stopwatch::start();
+                            let frame =
+                                self.frame(&piece.bytes, &piece.index, piece.tagdata.as_deref())?;
+                            self.frames.push((piece.index.kind, frame));
+                            self.frame_ns += t_piece.elapsed_ns();
+                            Ok(())
+                        },
+                    )?;
+                    Ok(if cut { None } else { Some(error) })
+                }
                 Err(error) => Err(error),
             }
         })?;
@@ -211,7 +262,7 @@ pub(crate) fn is_block_overflow(error: &crate::error::Error) -> bool {
 
 impl BlockSink for FramedBlocks<'_> {
     fn flush(&mut self, bb: &mut BlockBuilder) -> Result<()> {
-        match self.flush_or_overflow(bb)? {
+        match self.lend(bb, true)? {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -290,10 +341,12 @@ pub(crate) fn flush_local<O: BlockSink + ?Sized>(
 /// apply-changes does (`apply_changes/overflow.rs`), or cuts the finished
 /// wire bytes with the shared cut (`commands/split.rs`), as renumber, the
 /// history time-filter, the sort / `cat --dedupe` sweep and
-/// add-locations-to-ways do. A command
-/// that frames inside [`FramedBlocks`] (cat re-encode, snapshot
-/// time-filter, extract) or writes its owned blocks directly (tags-filter,
-/// getid, getparents) has not opted in and still refuses such a block.
+/// add-locations-to-ways do through their own integration points. The
+/// blob-local re-encoders (cat re-encode, snapshot time-filter, extract,
+/// multi-extract, tags-filter, getid, getparents) opt in through
+/// [`FramedBlocks::cutting`], which cuts on the writer's refusal, or
+/// `split::fit_blocks` over owned blocks before they are written. Repack
+/// and degrade do not opt in.
 pub(crate) fn ensure_node_capacity_local<O: BlockSink + ?Sized>(
     bb: &mut BlockBuilder,
     output: &mut O,
@@ -1159,6 +1212,57 @@ pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, TimestampError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block past the 32 MiB payload limit, built by count: three
+    /// relations with 13 MiB values, uncompressed so the run stays cheap.
+    fn oversized_block() -> BlockBuilder {
+        let mut bb = BlockBuilder::new();
+        for id in 1..=3i64 {
+            let value = "v".repeat(13 << 20) + &id.to_string();
+            let members = [crate::block_builder::MemberData {
+                id: crate::MemberId::Node(id),
+                role: "outer",
+            }];
+            bb.add_relation(id, [("name", value.as_str())], &members, None);
+        }
+        bb
+    }
+
+    /// An opted-in sink cuts a block the writer refuses into frames that
+    /// each hold some of its relations, in order; the strict sink, and
+    /// `flush_or_overflow` on an opted-in one, keep the typed refusal.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_cutting_sink_frames_an_oversized_block_in_pieces() {
+        let compression = crate::write::compression::Compression::None;
+        let metrics = crate::write::metrics::WriterMetrics::new();
+
+        let mut strict = FramedBlocks::new(compression, &metrics);
+        let error = BlockSink::flush(&mut strict, &mut oversized_block()).unwrap_err();
+        assert!(is_block_overflow(&error), "{error}");
+        assert!(strict.frames.is_empty());
+
+        let mut cutting = FramedBlocks::new(compression, &metrics).cutting();
+        let overflow = cutting.flush_or_overflow(&mut oversized_block()).unwrap();
+        assert!(overflow.as_ref().is_some_and(is_block_overflow));
+        assert!(cutting.frames.is_empty());
+
+        let mut bb = oversized_block();
+        BlockSink::flush(&mut cutting, &mut bb).unwrap();
+        assert!(bb.is_empty());
+        assert!(cutting.frames.len() >= 2, "{} frames", cutting.frames.len());
+        let mut ids = Vec::new();
+        for (kind, frame) in &cutting.frames {
+            assert_eq!(*kind, crate::ElementKind::Relation);
+            let mut reader = crate::blob::BlobReader::new(std::io::Cursor::new(frame.clone()));
+            let block = reader.next().unwrap().unwrap().to_primitiveblock().unwrap();
+            ids.extend(block.elements().map(|e| match e {
+                crate::Element::Relation(r) => r.id(),
+                _ => 0,
+            }));
+        }
+        assert_eq!(ids, [1, 2, 3]);
+    }
 
     /// `format_rfc3339_utc`'s domain is exactly the parser's: both ends
     /// format and read back, one second past either is refused, and the

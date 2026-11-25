@@ -1176,7 +1176,6 @@ impl RegionFraming<'_> {
         region: usize,
         blocks: impl Iterator<Item = OwnedBlock>,
     ) -> Result<Vec<Vec<u8>>> {
-        let metrics = &self.invocation.metrics().writer;
         let mut frames = Vec::new();
         for block in blocks {
             self.invocation.check()?;
@@ -1186,20 +1185,58 @@ impl RegionFraming<'_> {
                 tagdata,
                 way_members,
             } = block;
-            let indexdata = index.serialize();
-            let frame = crate::writer::frame_blob_pipelined(
-                &bytes,
-                &self.compression,
-                Some(indexdata.as_slice()),
-                tagdata.as_deref(),
-                way_members.as_deref(),
-                metrics,
-            )
-            .map_err(|e| e.writing(self.destinations[region]))?;
+            match self.frame(&bytes, &index, tagdata.as_deref(), way_members.as_deref()) {
+                Ok(frame) => frames.push(frame),
+                Err(error) if crate::commands::is_block_overflow(&error) => {
+                    // The writer refused the block as too large: cut it
+                    // between elements (`commands/split.rs`) and frame each
+                    // piece; a block no plan fits keeps the refusal.
+                    let limits = crate::commands::split::Limits::new(self.compression);
+                    let cut = crate::commands::split::cut(
+                        &bytes,
+                        index.kind,
+                        index.count,
+                        way_members.as_deref(),
+                        &limits,
+                        &mut |piece, _| {
+                            self.invocation.check()?;
+                            frames.push(self.frame(
+                                &piece.bytes,
+                                &piece.index,
+                                piece.tagdata.as_deref(),
+                                piece.way_members.as_deref(),
+                            )?);
+                            Ok(())
+                        },
+                    )
+                    .map_err(|e| e.writing(self.destinations[region]))?;
+                    if !cut {
+                        return Err(error.writing(self.destinations[region]));
+                    }
+                }
+                Err(error) => return Err(error.writing(self.destinations[region])),
+            }
             drop(bytes);
-            frames.push(frame);
         }
         Ok(frames)
+    }
+
+    fn frame(
+        &self,
+        bytes: &[u8],
+        index: &crate::blob_meta::BlobIndex,
+        tagdata: Option<&[u8]>,
+        way_members: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let indexdata = index.serialize();
+        crate::writer::frame_blob_pipelined(
+            bytes,
+            &self.compression,
+            Some(indexdata.as_slice()),
+            tagdata,
+            way_members,
+            &self.invocation.metrics().writer,
+        )
     }
 }
 

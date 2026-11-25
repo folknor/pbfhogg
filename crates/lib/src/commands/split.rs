@@ -581,44 +581,105 @@ fn fit_scanned_cold(
     limits: &Limits,
     emit: &mut dyn FnMut(OwnedBlock, usize) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    let (bits, max_count) = match block.way_members.as_deref() {
+    let chosen = cut(
+        &block.bytes,
+        block.index.kind,
+        block.index.count,
+        block.way_members.as_deref(),
+        limits,
+        emit,
+    )?;
+    if chosen { Ok(()) } else { emit(block, 0) }
+}
+
+/// Fit every block of `blocks` in place (see [`fit_scanned`]): the vector
+/// is left untouched when every block frames, and otherwise rebuilt from
+/// the first block that does not, its pieces in its place. For a worker
+/// task that returns its owned blocks for a consumer to write, so the cut
+/// runs on the worker and a failure inside it is located with the task's
+/// input blob. A block no plan fits stays whole, for the writer to refuse.
+pub(crate) fn fit_blocks(blocks: &mut Vec<OwnedBlock>, limits: &Limits) -> crate::Result<()> {
+    let mut first = None;
+    for (k, block) in blocks.iter().enumerate() {
+        let count_fits = block.way_members.is_none() || block.index.count <= MAX_WAY_MEMBER_WAYS;
+        if !(count_fits && limits.frames(&block.bytes)?) {
+            first = Some(k);
+            break;
+        }
+    }
+    let Some(first) = first else {
+        return Ok(());
+    };
+    let rest = blocks.split_off(first);
+    for block in rest {
+        fit_scanned(block, limits, |piece, _| {
+            blocks.push(piece);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Cut a block lent as bytes (a `BlockBuilder::lend_encoded` block, which
+/// carries no field-5 payload) into pieces that each frame under `limits`,
+/// handing each to `emit` with its scanned index and tagdata. Returns
+/// `false`, having emitted nothing, when no plan fits; the caller then
+/// keeps the writer's refusal.
+#[cold]
+#[inline(never)]
+pub(crate) fn cut_lent(
+    bytes: &[u8],
+    kind: crate::ElementKind,
+    count: u64,
+    limits: &Limits,
+    emit: &mut dyn FnMut(OwnedBlock) -> crate::Result<()>,
+) -> crate::Result<bool> {
+    cut(bytes, kind, count, None, limits, &mut |piece, _| {
+        emit(piece)
+    })
+}
+
+/// The cut behind [`fit_scanned`] and [`cut_lent`], over borrowed bytes:
+/// `true` when a plan was chosen and every piece emitted, `false` (nothing
+/// emitted) when none fits. `emit`'s second argument is the cut block's
+/// length, as [`fit_scanned`] passes it.
+pub(crate) fn cut(
+    bytes: &[u8],
+    kind: crate::ElementKind,
+    count: u64,
+    way_members: Option<&[u8]>,
+    limits: &Limits,
+    emit: &mut dyn FnMut(OwnedBlock, usize) -> crate::Result<()>,
+) -> crate::Result<bool> {
+    let (bits, max_count) = match way_members {
         Some(payload) => {
-            if block.index.kind != crate::ElementKind::Way {
+            if kind != crate::ElementKind::Way {
                 return Err(Error::internal(
                     "block cut: a block of other elements carries way members",
                 ));
             }
-            (
-                Some(way_member_bits(payload, block.index.count)?),
-                MAX_WAY_MEMBER_WAYS,
-            )
+            (Some(way_member_bits(payload, count)?), MAX_WAY_MEMBER_WAYS)
         }
         None => (None, u64::MAX),
     };
-    let held = block.bytes.len();
-    let chosen = {
-        let layout = layout(&block.bytes)?;
-        match choose(&block.bytes, &layout, limits, max_count)? {
-            Some(plan) => {
-                let mut total = 0u64;
-                for k in 0..plan.len() {
-                    let piece = plan.piece(k)?;
-                    let members = bits.map(|bits| way_member_slice(bits, total, piece.count));
-                    total += piece.count;
-                    emit(scanned(piece, block.index.kind, members)?, held)?;
-                }
-                if total != block.index.count {
-                    return Err(Error::internal(format!(
-                        "block cut: a block of {} elements was cut into pieces holding {total}",
-                        block.index.count
-                    )));
-                }
-                true
-            }
-            None => false,
-        }
+    let held = bytes.len();
+    let layout = layout(bytes)?;
+    let Some(plan) = choose(bytes, &layout, limits, max_count)? else {
+        return Ok(false);
     };
-    if chosen { Ok(()) } else { emit(block, 0) }
+    let mut total = 0u64;
+    for k in 0..plan.len() {
+        let piece = plan.piece(k)?;
+        let members = bits.map(|bits| way_member_slice(bits, total, piece.count));
+        total += piece.count;
+        emit(scanned(piece, kind, members)?, held)?;
+    }
+    if total != count {
+        return Err(Error::internal(format!(
+            "block cut: a block of {count} elements was cut into pieces holding {total}"
+        )));
+    }
+    Ok(true)
 }
 
 /// The plan every piece of which frames: one at the sure limit, which
@@ -816,6 +877,35 @@ mod tests {
             assert!(piece.tagdata.is_some(), "a tagged piece carries tagdata");
             seen.extend(decoded(&piece.bytes));
         }
+        assert_eq!(seen, whole);
+    }
+
+    #[test]
+    fn fit_blocks_cuts_only_what_does_not_frame_and_keeps_the_order() {
+        let a = relations(&[(1, 10), (2, 10)]);
+        let b = relations(&[(5, 300), (7, 300), (9, 300), (12, 300)]);
+        let c = relations(&[(20, 10)]);
+        let limit = b.bytes.len() / 2;
+        let whole: Vec<String> = [&a, &b, &c]
+            .iter()
+            .flat_map(|x| decoded(&x.bytes))
+            .collect();
+        let (a_bytes, c_bytes) = (a.bytes.clone(), c.bytes.clone());
+        let mut fitting = vec![relations(&[(1, 10)]), relations(&[(2, 10)])];
+        let untouched: Vec<Vec<u8>> = fitting.iter().map(|x| x.bytes.clone()).collect();
+        fit_blocks(&mut fitting, &small(limit)).unwrap();
+        assert_eq!(
+            fitting.iter().map(|x| x.bytes.clone()).collect::<Vec<_>>(),
+            untouched
+        );
+
+        let mut blocks = vec![a, b, c];
+        fit_blocks(&mut blocks, &small(limit)).unwrap();
+        assert!(blocks.len() >= 4, "{} blocks", blocks.len());
+        assert_eq!(blocks[0].bytes, a_bytes);
+        assert_eq!(blocks.last().unwrap().bytes, c_bytes);
+        assert!(blocks.iter().all(|x| x.bytes.len() <= limit));
+        let seen: Vec<String> = blocks.iter().flat_map(|x| decoded(&x.bytes)).collect();
         assert_eq!(seen, whole);
     }
 

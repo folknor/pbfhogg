@@ -138,30 +138,31 @@ node of the blob. Also untested: that one overflow needing the
 whole-table plan leaves another overflow of the same blob its compact
 plan (`overflow.rs` `plan`).
 
-## CMD-050 - Blob-local re-encoders still refuse a rebuilt block past the limit
+## CMD-050 - Owned-block re-encoders' uncuttable-block refusal names no input blob
 
-Reported by: the CMD-049 implementer (2026-11-19); narrowed twice by spars
-(2026-11-24): history time-filter and the sort / `cat --dedupe` sweep now
-cut an oversized block on its own bytes (`commands/split.rs`, `fit_scanned`).
+Reported by: the CMD-049 implementer (2026-11-19); narrowed by spars
+(2026-11-24, 2026-11-25): every blob-local re-encoder now cuts an oversized
+block (`FramedBlocks::cutting`, multi-extract's `frame_region`,
+`split::fit_blocks`).
 
-The input-blob-local re-encoders (cat re-encode, snapshot time-filter,
-extract, which frame through `FramedBlocks`; tags-filter, getid and
-getparents, which write owned blocks) have no cross-blob growth but no byte
-guarantee either: a rebuilt string table can give common strings wider
-indices, and a codec change can push an unchanged payload's body past the
-limit. They still refuse such a block (typed, exit 2). Fix shape: opt them
-into the shared cut. In `FramedBlocks` the plan can borrow the lent bytes
-inside the `lend_encoded` closure and push each piece's frame; the opt-in is
-explicit per caller, because apply-changes' `RewriteSink` needs the typed
-overflow from `flush_or_overflow` to drive its replay, and repack and degrade
-refuse by design. Each opt-in changes that command's documented refusal in
-`docs/cli/commands.md`.
+On the owned-block routes (tags-filter, getid, getparents, cat `--type`
+fallback and unclassifiable rebuild, unsorted simple extract),
+`fit_blocks` hands a block no plan fits on whole, and the pipelined writer
+refuses it later with no input location, as CMD-075 describes for altw.
+Unsorted simple extract's pass-2 batch map (`process_extract_pass2_batch`)
+also locates none of its errors, the cut's included. The framing routes
+keep the original refusal at the worker. Fix shape: a strict no-plan
+outcome from the fit that returns the typed size error at the worker
+boundary, shared with CMD-072 and CMD-075. Unmeasured: peak memory on
+oversized input (a first cut repeats the string table in every piece and a
+queued task holds all its pieces).
 
 Ruled, not open: no byte threshold in `can_add_*` or the
 `ensure_*_capacity_local` funnel; repack and degrade refuse an over-limit
-block by design; the cut's search is sized by a monotone upper bound and
-may miss a partition by the bytes the bound over-counts, which ends in the
-same typed refusal, never a wrong blob.
+block by design; a repaired payload `cat --repair` frames under its input
+header is not cut (comment in `cat/repair.rs`); `flush_or_overflow` stays
+strict on an opted-in sink; the cut's search is sized by a monotone upper
+bound and may miss a partition, ending in the same typed refusal.
 
 ## CMD-072 - The sort / dedupe sweep's size refusal names no input
 

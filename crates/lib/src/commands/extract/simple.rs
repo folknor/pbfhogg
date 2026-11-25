@@ -922,6 +922,7 @@ fn process_extract_pass2_batch(
     host: &crate::host::Entered<'_>,
 ) -> Result<()> {
     type BatchResult = crate::Result<(Vec<OwnedBlock>, ExtractStats)>;
+    let limits = crate::commands::split::Limits::new(writer.compression());
     let results: Vec<BatchResult> = host.executor.install(|| {
         batch
             .par_iter()
@@ -941,6 +942,7 @@ fn process_extract_pass2_batch(
                     let block_stats =
                         extract_block_pass2(&block, ids, clean, None, bb, &mut output)?;
                     flush_local(bb, &mut output)?;
+                    crate::commands::split::fit_blocks(&mut output, &limits)?;
                     Ok((output, block_stats))
                 },
             )

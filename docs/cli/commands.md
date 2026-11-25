@@ -98,6 +98,16 @@ status, even if stdout also failed while the command cleaned up. For
 example, an `export` that finds a truncated input exits `2`. Usage errors,
 platform refusals and interruptions keep their own statuses.
 
+A command that re-encodes elements can build an output block too large for
+one blob (the 32 MiB payload limit, or an encoded body past the 32 MiB
+blob size) although every input blob fits: a rebuilt string table, or a
+codec change, can make it larger. `cat`, `extract`, `multi-extract`,
+`tags-filter`, `getid`, `getparents` and `time-filter` cut such a block as
+`sort` does (see [sort](#sort)), with the same remaining refusals (exit
+`2`). `repack` and `degrade` refuse it instead (their layouts are count
+rules), and a repaired payload `cat --repair` frames under its input
+header is refused rather than cut.
+
 A stderr whose reader has gone away (`pbfhogg ... 2>&1 | head`) is not a
 failure either: the diagnostics stop and the status is the command's own.
 Any other stderr write failure (`2>/dev/full`, a full disk behind
@@ -2209,8 +2219,8 @@ surviving version. A block that would be too large for a blob is cut as
 refusals. Only the surviving versions' payloads are read: a superseded
 version is judged by its ID, version, timestamp and visibility, so a bad
 user or role string index on it is not refused. A snapshot input is
-filtered blob by blob too, and an output blob too large for the format is
-still refused (exit 2).
+filtered blob by blob too, and an output block too large for a blob is cut
+the same way, with the same remaining refusals.
 
 | Flag | Description |
 |------|-------------|

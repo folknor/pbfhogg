@@ -438,7 +438,7 @@ where
                     &mut local.st_scratch,
                     &mut local.gr_scratch,
                 )?;
-                let mut output = FramedBlocks::new(compression, metrics);
+                let mut output = FramedBlocks::new(compression, metrics).cutting();
                 let block_stats = block_fn(&block, &mut local.bb, &mut output)?;
                 flush_local(&mut local.bb, &mut output)?;
                 let frames = output.frames.into_iter().map(|(_, frame)| frame).collect();

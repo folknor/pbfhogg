@@ -711,6 +711,7 @@ fn filter_by_id_walker(
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::read::header_walker::HeaderWalker;
 
+    let limits = crate::commands::split::Limits::new(write.compression);
     host.invocation.marker("GETID_SCAN_START");
 
     // Single pread-based pass over blob headers. Data bodies are only
@@ -878,6 +879,7 @@ fn filter_by_id_walker(
                         declared.broken_by_unindexed_way_blob("re-encoding it"),
                     ));
                 }
+                crate::commands::split::fit_blocks(&mut output_blocks, &limits).map_err(locate)?;
                 for block in output_blocks.drain(..) {
                     w.write_primitive_block_owned(block)?;
                 }
@@ -942,6 +944,7 @@ fn filter_by_id_streaming(
     use crate::file_reader::FileReader;
     use crate::read::frame::Frames;
 
+    let limits = crate::commands::split::Limits::new(write.compression);
     host.invocation.marker("GETID_SCAN_START");
 
     let blob_filter = BlobFilter::new(
@@ -1063,6 +1066,7 @@ fn filter_by_id_streaming(
                 )
                 .map_err(locate)?;
                 flush_local(&mut bb, &mut output_blocks)?;
+                crate::commands::split::fit_blocks(&mut output_blocks, &limits).map_err(locate)?;
                 for block in output_blocks.drain(..) {
                     w.write_primitive_block_owned(block)?;
                 }
@@ -1199,6 +1203,7 @@ fn getid_with_refs(
     // Almost every blob holds nothing selected; `included_block` answers that
     // from the validator's pass and builds the block only for a blob that
     // does.
+    let limits = crate::commands::split::Limits::new(writer.compression());
     reader.for_each_fused_buffer(
         |buffer| {
             let Some(block) = included_block(buffer, ids, pulled_ref)? else {
@@ -1217,6 +1222,7 @@ fn getid_with_refs(
                 report_found,
             )?;
             flush_local(&mut bb, &mut output)?;
+            crate::commands::split::fit_blocks(&mut output, &limits)?;
             Ok((output, outcome))
         },
         |(blocks, outcome)| {

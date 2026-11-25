@@ -557,6 +557,7 @@ fn tags_filter_single_pass(
         relations_from_relations: 0,
     };
 
+    let limits = crate::commands::split::Limits::new(writer.compression());
     reader.for_each_fused_block(
         |block| {
             let mut bb = BlockBuilder::new();
@@ -564,6 +565,7 @@ fn tags_filter_single_pass(
             let block_stats =
                 filter_block_parallel(&block, expressions, invert, &mut bb, &mut output)?;
             flush_local(&mut bb, &mut output)?;
+            crate::commands::split::fit_blocks(&mut output, &limits)?;
             Ok((output, block_stats))
         },
         |(blocks, block_stats)| {
@@ -1173,6 +1175,7 @@ fn tags_filter_two_pass(
     // planet safety (no cross-thread PrimitiveBlock retention), not for
     // passthrough.
     {
+        let limits = crate::commands::split::Limits::new(writer.compression());
         // A fixed parallelism caps this pool too, not only the classify
         // passes; `Auto` keeps the decode pool's host-derived sizing.
         let decode_threads = parallelism.resolve(|| {
@@ -1199,6 +1202,7 @@ fn tags_filter_two_pass(
                 let block_stats =
                     filter_block_pass2(block, &id_sets, remove_tags, bb, output_blocks)?;
                 flush_local(bb, output_blocks)?;
+                crate::commands::split::fit_blocks(output_blocks, &limits)?;
                 Ok((std::mem::take(output_blocks), block_stats))
             },
             |_position, (blocks, block_stats): (Vec<OwnedBlock>, TagsFilterStats)| {

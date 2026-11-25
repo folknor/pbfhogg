@@ -435,3 +435,16 @@ blobs' own indexdata"). `--nodes` is a separate engine (`node_stats` on the
 classify pool over a node schedule), and the full-decode report runs on the
 ordered read pipeline. Reword the line to the index-only walk, the
 full-decode scan and what selects each, and `node_stats` as its own read.
+
+## DOC-057 - pipelined-reader-paths.md lists history time-filter as a plain caller
+
+Reported by: the spar accounting of the history time-filter builder fork,
+from its scout's lateral (2026-11-25).
+
+`reference/pipelined-reader-paths.md`, in its description of the **Plain**
+surface (`into_blocks_pipelined` and friends), says "Callers today are the
+`read` bench's pipelined mode, `time-filter` history, and
+`build-geocode-index` pass 1." The history path reads through
+`for_each_fused_blob` with its `HistoryBlobs` transform, as the same file's
+"`time-filter` history path" section says. Drop time-filter from the plain
+callers' sentence.

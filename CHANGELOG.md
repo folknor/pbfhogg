@@ -627,6 +627,18 @@
 
 ### Changed
 
+- **`cat`, `extract`, `multi-extract`, `tags-filter`, `getid`,
+  `getparents` and snapshot `time-filter` cut an output block too large
+  for one blob instead of refusing it.** A re-encoded block can pass the
+  32 MiB payload limit, or its encoded body the 32 MiB blob size, even
+  though its input blob fit (a rebuilt string table, a codec change). Such
+  a run used to fail with exit `2`; the block is now cut between elements
+  as `sort` cuts one, each piece indexed from its own content. A single
+  element too large for a blob, and a cut that needs the last few bytes
+  below the limit, are still refused. `repack` and `degrade`
+  keep refusing, and so does a repaired payload `cat --repair` frames
+  under its input header.
+
 - **`extract --simple` on unsorted indexed input is about twice as fast,
   and writes no node from a blob outside the region.** Each classify sweep
   now decodes only the blobs that claim its kind, and the write pass

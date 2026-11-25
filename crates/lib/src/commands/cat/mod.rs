@@ -510,6 +510,7 @@ fn cat_passthrough(
                                 let (blocks, count) = reencode_unclassifiable(
                                     std::mem::take(&mut decompress_buf),
                                     declared,
+                                    writer.compression(),
                                 )
                                 .map_err(locate)?;
                                 if blocks.is_empty() {
@@ -763,6 +764,7 @@ fn note_reencoded(host: &crate::host::Entered<'_>, rebuilt: u64, omitted: u64) {
 fn reencode_unclassifiable(
     payload: Vec<u8>,
     declared: Declared,
+    compression: crate::write::compression::Compression,
 ) -> crate::Result<(Vec<OwnedBlock>, u64)> {
     let block = PrimitiveBlock::from_vec(payload)?;
     let mut bb = BlockBuilder::new();
@@ -843,6 +845,10 @@ fn reencode_unclassifiable(
         count += 1;
     }
     flush_local(&mut bb, &mut output)?;
+    // A rebuilt block the writer would refuse as too large is cut between
+    // elements (`commands/split.rs`); one no plan fits stays whole and is
+    // refused when framed.
+    super::split::fit_blocks(&mut output, &super::split::Limits::new(compression))?;
     Ok((output, count))
 }
 
@@ -900,6 +906,7 @@ fn cat_type_passthrough(
     let mut elements_written: u64 = 0;
 
     let clean = CleanAttrs::default(); // no-op clean
+    let limits = super::split::Limits::new(writer.compression());
 
     // Hoisted outside per-blob loop: reused across iterations.
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -967,6 +974,7 @@ fn cat_type_passthrough(
                                 declared.broken_by_unindexed_way_blob("re-encoding it"),
                             ));
                         }
+                        super::split::fit_blocks(&mut output_blocks, &limits).map_err(locate)?;
                         for block in output_blocks.drain(..) {
                             writer.write_primitive_block_owned(block)?;
                         }
@@ -1260,7 +1268,8 @@ fn run_filtered_pass(
                 (worker, refs_buf): &mut (super::WorkerBuilder, Vec<i64>)|
      -> PassResult {
         let bb = worker.task()?;
-        let mut output = super::FramedBlocks::new(compression, &host.invocation.metrics().writer);
+        let mut output =
+            super::FramedBlocks::new(compression, &host.invocation.metrics().writer).cutting();
         let count = process_block(block, bb, &mut output, &tf, clean, refs_buf)?;
         flush_local(bb, &mut output)?;
         crate::retention::release_scratch(refs_buf);

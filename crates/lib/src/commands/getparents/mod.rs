@@ -315,6 +315,7 @@ fn getparents_walker(
     };
 
     host.invocation.marker("GETPARENTS_DECODE_START");
+    let limits = crate::commands::split::Limits::new(writer.compression());
     type ClassifyResult = crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))>;
 
     // Results arrive in schedule order through the ordered pool, whose window
@@ -327,7 +328,7 @@ fn getparents_walker(
         None,
         None,
         || (),
-        |buffer, _state| -> ClassifyResult { parents_in(buffer, ids, opts.add_self) },
+        |buffer, _state| -> ClassifyResult { parents_in(buffer, ids, opts.add_self, &limits) },
         |_position, (blocks, (n, w, r))| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
@@ -383,8 +384,9 @@ fn getparents_pipelined(
     };
 
     host.invocation.marker("GETPARENTS_DECODE_START");
+    let limits = crate::commands::split::Limits::new(writer.compression());
     reader.for_each_fused_buffer(
-        |buffer| parents_in(buffer, ids, opts.add_self),
+        |buffer| parents_in(buffer, ids, opts.add_self, &limits),
         |(blocks, (nodes, ways, relations))| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
@@ -426,6 +428,7 @@ fn parents_in(
     buffer: crate::read::block::BlockBuffer<'_>,
     ids: &ElementIds,
     add_self: bool,
+    limits: &crate::commands::split::Limits,
 ) -> crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))> {
     let (probe, accepted) = buffer.project(|_, _| ParentProbe::new(ids, add_self))?;
     if !probe.hit {
@@ -436,6 +439,9 @@ fn parents_in(
     let mut output: Vec<OwnedBlock> = Vec::new();
     let counts = process_block(&block, &mut bb, &mut output, ids, add_self)?;
     flush_local(&mut bb, &mut output)?;
+    // A rebuilt block the writer would refuse as too large is cut between
+    // elements here, on the worker (`commands/split.rs`).
+    crate::commands::split::fit_blocks(&mut output, limits)?;
     Ok((output, counts))
 }
 
@@ -676,7 +682,14 @@ mod tests {
                         &mut gr,
                         None,
                     );
-                    let probed = encoded(super::parents_in(buffer, ids, *add_self));
+                    let probed = encoded(super::parents_in(
+                        buffer,
+                        ids,
+                        *add_self,
+                        &crate::commands::split::Limits::new(
+                            crate::write::compression::Compression::None,
+                        ),
+                    ));
                     let expected = match &oracle {
                         Err(e) => format!("error {e}"),
                         Ok(block) => encoded((|| {

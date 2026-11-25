@@ -1185,12 +1185,14 @@ mod tests {
         assert_eq!(out(-1_000, 1).unwrap(), -1);
         assert_eq!(out(-1_001, 1).unwrap(), -2);
         assert_eq!(out(7, 0).unwrap(), 0);
-        assert!(
-            out(i64::MAX, 2).is_err(),
+        crate::test_support::assert_err_kind!(
+            out(i64::MAX, 2),
+            crate::ErrorKind::WireFormat { msg } if msg.contains("overflows i64 milliseconds"),
             "a scaling that overflows is refused"
         );
-        assert!(
-            out(i64::MIN, 1).is_err(),
+        crate::test_support::assert_err_kind!(
+            out(i64::MIN, 1),
+            crate::ErrorKind::WireFormat { msg } if msg.contains("no longer fits i64 milliseconds"),
             "i64::MIN ms rounds down to a second that does not scale back"
         );
         assert_eq!(out(i64::MIN + 808, 1).unwrap(), i64::MIN / 1000);
@@ -1438,7 +1440,10 @@ mod tests {
             "{}",
             err.report()
         );
-        assert!(super::dense_node_raw_metadata(&dn).is_err());
+        crate::test_support::assert_err_kind!(
+            super::dense_node_raw_metadata(&dn),
+            crate::ErrorKind::WireFormat { .. }
+        );
         let cleaned = super::dense_node_metadata_for_cat(&dn, false, true)
             .expect("cat --clean timestamp does not judge the timestamp it drops")
             .unwrap();

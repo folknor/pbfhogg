@@ -690,10 +690,20 @@ pub(crate) mod test_hooks {
 
         #[test]
         fn pause_requires_a_reachable_checkpoint_and_a_complete_protocol() {
-            for spec in ["", "no", "0", "1:", "1:other", "1:stuck:extra", "0:stuck"] {
-                assert!(
-                    CancelPause::parse(std::ffi::OsStr::new(spec)).is_err(),
-                    "{spec}"
+            let checkpoint = "cancel pause needs a positive checkpoint";
+            let suffix = "cancel pause suffix must be stuck";
+            for (spec, needle) in [
+                ("", checkpoint),
+                ("no", checkpoint),
+                ("0", checkpoint),
+                ("1:", suffix),
+                ("1:other", suffix),
+                ("1:stuck:extra", suffix),
+                ("0:stuck", checkpoint),
+            ] {
+                pbfhogg_test_scratch::refused(
+                    CancelPause::parse(std::ffi::OsStr::new(spec)),
+                    needle,
                 );
             }
             let pause = CancelPause::parse(std::ffi::OsStr::new("2:stuck")).expect("valid pause");

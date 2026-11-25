@@ -192,13 +192,16 @@ mod tests {
             parse_http_date("Sat, 11 Apr 2026 12:34:56 GMT").ok(),
             Some(1_775_910_896)
         );
-        for value in [
-            "not a date",
-            "Sun, 06 XYZ 1994 08:49:37 GMT",
-            "Sun, 31 Feb 2026 08:49:37 GMT",
-            "Sun, 06 Nov 1994 24:00:00 GMT",
+        for (value, needle) in [
+            ("not a date", "expected six parts: 'not a date'"),
+            ("Sun, 06 XYZ 1994 08:49:37 GMT", "unknown month: XYZ"),
+            (
+                "Sun, 31 Feb 2026 08:49:37 GMT",
+                "invalid date: 'Sun, 31 Feb 2026 08:49:37 GMT'",
+            ),
+            ("Sun, 06 Nov 1994 24:00:00 GMT", "invalid time: '24:00:00'"),
         ] {
-            assert!(parse_http_date(value).is_err());
+            pbfhogg_test_scratch::refused(parse_http_date(value), needle);
         }
         let redirect = "HTTP/1.1 302 Found\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n";
         assert_eq!(

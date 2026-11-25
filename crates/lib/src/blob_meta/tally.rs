@@ -334,6 +334,7 @@ pub(crate) fn replay_refusal(
 mod tests {
     use super::*;
     use crate::ElementKind;
+    use crate::test_support::assert_err_kind;
 
     fn claim(min_id: i64, max_id: i64, count: u64) -> BlobIndex {
         BlobIndex {
@@ -419,7 +420,10 @@ mod tests {
         // No claim: order only, and an empty walk is accepted.
         assert_eq!(walk(&[], None, required).unwrap(), None);
         // A claim over no element is refused.
-        assert!(walk(&[], Some(&claim(0, 0, 0)), Order::Free).is_err());
+        assert_err_kind!(
+            walk(&[], Some(&claim(0, 0, 0)), Order::Free),
+            crate::ErrorKind::IndexdataMismatch { .. }
+        );
     }
 
     /// On every non-negative claim the ascending tally reaches the required
@@ -503,6 +507,9 @@ mod tests {
             matches!(e.kind(), crate::ErrorKind::IndexdataMismatch { .. }),
             "{e}"
         );
-        assert!(hold(&[2, 1], claim(1, 2, 2)).is_err());
+        assert_err_kind!(
+            hold(&[2, 1], claim(1, 2, 2)),
+            crate::ErrorKind::Unsorted { .. }
+        );
     }
 }

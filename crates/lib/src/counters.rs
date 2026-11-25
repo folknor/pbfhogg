@@ -582,7 +582,10 @@ mod tests {
         );
         let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
         drop(rx);
-        assert!(super::send_recording_wait(&tx, 1, &wait).is_err());
+        assert_eq!(
+            super::send_recording_wait(&tx, 1, &wait),
+            Err(std::sync::mpsc::SendError(1))
+        );
 
         assert_eq!(wait.load(Relaxed), 0);
     }
@@ -597,6 +600,7 @@ mod tests {
         let mutex = std::sync::Mutex::new(3_u32);
         std::thread::scope(|scope| {
             let poisoner = scope.spawn(|| poison(&mutex));
+            // any-error-deliberate: joins the deliberate poisoning panic; is_poisoned below checks it
             assert!(poisoner.join().is_err());
         });
         assert!(mutex.is_poisoned());

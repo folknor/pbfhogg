@@ -663,12 +663,15 @@ mod tests {
             Reader::Pipelined,
             Reader::Blobreader,
         ] {
-            assert!(decode(&input, reader, &plain_host()).is_err(), "{reader:?}");
+            pbfhogg_test_scratch::refused(
+                decode(&input, reader, &plain_host()),
+                "does not start with an OsmHeader blob",
+            );
         }
         for (writer, compression, _) in ARMS {
             let sink = scratch.child("sink.osm.pbf");
             let result = encode(&input, &sink, writer, compression, &plain_host());
-            assert!(result.is_err(), "{writer:?} {compression:?}");
+            pbfhogg_test_scratch::refused(result, "does not start with an OsmHeader blob");
         }
     }
 

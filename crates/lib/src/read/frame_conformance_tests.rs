@@ -889,5 +889,8 @@ fn the_damaged_zlib_stream_fails_at_decode() {
         blobs[2].decode().map(|_| ())
     };
     decode_last(&fx.intact).unwrap();
-    assert!(decode_last(&fx.zlib_damaged()).is_err());
+    crate::test_support::assert_err_kind!(
+        decode_last(&fx.zlib_damaged()),
+        crate::ErrorKind::InvalidData { msg, .. } if msg.contains("zlib decompress error"),
+    );
 }

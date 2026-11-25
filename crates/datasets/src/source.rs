@@ -217,8 +217,11 @@ mod tests {
             "https://download.geofabrik.de/asia/japan/kanto-latest.osm.pbf"
         );
         assert_eq!(resolve("planet", none).unwrap().source, Source::Planet);
-        assert!(resolve("atlantis", none).is_err());
-        assert!(resolve("a/b c", none).is_err());
+        pbfhogg_test_scratch::refused(resolve("atlantis", none), "unknown region 'atlantis'");
+        pbfhogg_test_scratch::refused(
+            resolve("a/b c", none),
+            "as a dataset key: letters, digits, '_' and '-' only",
+        );
     }
 
     #[test]
@@ -227,16 +230,25 @@ mod tests {
         assert_eq!((r.key.as_str(), r.source), ("world", Source::Planet));
         let r = resolve("denmark", with(Some("Geofabrik"))).unwrap();
         assert_eq!(r.source, Source::Geofabrik("europe/denmark".into()));
-        assert!(resolve("fiji", with(Some("Geofabrik"))).is_err());
-        assert!(resolve("fiji", with(None)).is_err());
+        pbfhogg_test_scratch::refused(
+            resolve("fiji", with(Some("Geofabrik"))),
+            "which names no region",
+        );
+        pbfhogg_test_scratch::refused(resolve("fiji", with(None)), "dataset 'fiji' has no origin");
     }
 
     #[test]
     fn a_key_never_changes_source() {
         let georgia = Some("download.geofabrik.de/asia/georgia");
         assert!(resolve("asia/georgia", with(georgia)).is_ok());
-        assert!(resolve("north-america/us/georgia", with(georgia)).is_err());
-        assert!(resolve("denmark", with(Some(PLANET))).is_err());
+        pbfhogg_test_scratch::refused(
+            resolve("north-america/us/georgia", with(georgia)),
+            "dataset 'georgia' is registered from download.geofabrik.de/asia/georgia",
+        );
+        pbfhogg_test_scratch::refused(
+            resolve("denmark", with(Some(PLANET))),
+            "dataset 'denmark' is registered from planet.openstreetmap.org",
+        );
     }
 }
 

@@ -4115,8 +4115,9 @@ mod tests {
         let dest = dir.path().join("index");
         fs::create_dir(&dest).unwrap();
         fs::write(dest.join("marker"), b"").unwrap();
-        assert!(
-            OutputDir::new(&dest, Overwrite::Replace, Some(refuse_marked), &discard()).is_err()
+        crate::test_support::assert_err_kind!(
+            OutputDir::new(&dest, Overwrite::Replace, Some(refuse_marked), &discard()),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg == "marked"
         );
         fs::remove_file(dest.join("marker")).unwrap();
         let out =
@@ -4205,11 +4206,15 @@ mod tests {
         let out = Output::new(dir.path().join("o"), Overwrite::Refuse, &discard()).unwrap();
         let out = out.bind(&run.invocation).expect("bind output fixture");
         let first = out.writer().unwrap();
-        assert!(
-            out.writer().is_err(),
+        crate::test_support::assert_err_kind!(
+            out.writer(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("already has a writing session"),
             "a second writer would truncate the first"
         );
-        assert!(out.output.begin_write().is_err());
+        crate::test_support::assert_err_kind!(
+            out.output.begin_write(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("already has a writing session"),
+        );
         drop(first);
     }
 
@@ -4277,7 +4282,10 @@ mod tests {
         // A raw frame that is not a frame is still bytes to the writer; a
         // write after the end of stream is the error every backend reports.
         writer.flush().unwrap();
-        assert!(writer.write_raw(b"late").is_err());
+        crate::test_support::assert_err_kind!(
+            writer.write_raw(b"late"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("no further writes are possible"),
+        );
         let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
 
@@ -4297,7 +4305,10 @@ mod tests {
         )
         .unwrap()
         .with_completion(completion);
-        assert!(writer.write_primitive_block(b"\xff\xff\xff").is_err());
+        crate::test_support::assert_err_kind!(
+            writer.write_primitive_block(b"\xff\xff\xff"),
+            crate::ErrorKind::WireFormat { .. }
+        );
         writer.flush().unwrap();
         let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
@@ -4597,7 +4608,10 @@ mod tests {
             output_error(&err),
             OutputError::StagingReplaced { .. }
         ));
-        assert!(fs::symlink_metadata(&dest).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&dest).map_err(|e| e.kind()).err(),
+            Some(io::ErrorKind::NotFound)
+        );
         assert!(elsewhere.is_dir());
     }
 
@@ -4623,7 +4637,10 @@ mod tests {
         writer.flush().unwrap();
         let writer = Mutex::new(writer);
         let out = out.before_publish(move || {
-            assert!(writer.lock().unwrap().write_raw(b"late").is_err());
+            crate::test_support::assert_err_kind!(
+                writer.lock().unwrap().write_raw(b"late"),
+                crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("no further writes are possible")
+            );
         });
         let err = out.publish().unwrap_err();
         assert!(matches!(output_error(&err), OutputError::Unfinished { .. }));
@@ -4668,7 +4685,10 @@ mod tests {
         let ran = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&ran);
         let out = out.before_publish(move || *flag.lock().unwrap() = true);
-        assert!(out.publish().is_err());
+        crate::test_support::assert_err_kind!(
+            out.publish(),
+            crate::ErrorKind::Output(OutputError::Unfinished { .. })
+        );
         assert!(!*ran.lock().unwrap());
     }
 
@@ -5043,6 +5063,20 @@ mod tests {
             token
         }
 
+        /// The armed fault itself is what failed the publish. Its kind is
+        /// `Internal` (`injected`) or the I/O error a sync fault fakes, so
+        /// the bar is the fault's own text: every armed fault's report names
+        /// itself injected.
+        fn assert_injected<T>(result: Result<T>) {
+            match result {
+                Ok(_) => panic!("expected the injected publication fault, got Ok"),
+                Err(err) => assert!(
+                    err.report().contains("injected "),
+                    "expected the injected publication fault, got: {err}"
+                ),
+            }
+        }
+
         /// A group that fails after one member was installed rolls it back
         /// out of the destination and into the staging directory, where
         /// dropping it removes it: nothing is left beside the outputs, and
@@ -5066,7 +5100,7 @@ mod tests {
             for member in set.iter() {
                 stage(member, b"m").unwrap();
             }
-            assert!(set.publish().is_err());
+            assert_injected(set.publish());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &["stage"]).is_empty());
             assert!(others(&stage_dir_path, &[]).is_empty());
@@ -5333,7 +5367,7 @@ mod tests {
             let token = armed(&[PublishFault::BackupSync]);
             let out = out.bind(&token).expect("bind output fixture");
             stage_dir(&out, "new-file", b"new");
-            assert!(out.publish().is_err());
+            assert_injected(out.publish());
             assert_eq!(fs::read(dest.join("old-file")).unwrap(), b"old");
             assert!(!dest.join("new-file").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -5365,7 +5399,7 @@ mod tests {
             let token = armed(&[PublishFault::BeforeInstall]);
             let out = out.bind(&token).expect("bind output fixture");
             stage(&out, b"new").unwrap();
-            assert!(out.publish().is_err());
+            assert_injected(out.publish());
             assert_eq!(fs::read(&dest).unwrap(), b"user data");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -5404,7 +5438,7 @@ mod tests {
             let token = armed(&[PublishFault::ForceLinkFallback, PublishFault::AfterLink]);
             let out = out.bind(&token).expect("bind output fixture");
             stage(&out, b"new").unwrap();
-            assert!(out.publish().is_err());
+            assert_injected(out.publish());
             assert!(!dest.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -5445,7 +5479,7 @@ mod tests {
             let token = armed(&[PublishFault::AfterInstalled(0), PublishFault::Restore]);
             let out = out.bind(&token).expect("bind output fixture");
             stage(&out, b"new").unwrap();
-            assert!(out.publish().is_err());
+            assert_injected(out.publish());
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert!(others(dir.path(), &["out.osm.pbf"]).is_empty());
         }
@@ -5480,7 +5514,7 @@ mod tests {
             fs::write(dir.path().join("b.osm.pbf"), b"old b").unwrap();
             let token = armed(&[PublishFault::AfterInstalled(1)]);
             let (set, a, b) = staged_set(dir.path(), Overwrite::Replace, &token);
-            assert!(set.publish().is_err());
+            assert_injected(set.publish());
             assert_eq!(fs::read(&a).unwrap(), b"old a");
             assert_eq!(fs::read(&b).unwrap(), b"old b");
             assert!(others(dir.path(), &["a.osm.pbf", "b.osm.pbf"]).is_empty());
@@ -5489,7 +5523,7 @@ mod tests {
             let dir = scratch();
             let token = armed(&[PublishFault::AfterInstalled(0)]);
             let (set, a, b) = staged_set(dir.path(), Overwrite::Refuse, &token);
-            assert!(set.publish().is_err());
+            assert_injected(set.publish());
             assert!(!a.exists() && !b.exists());
             assert!(others(dir.path(), &[]).is_empty());
         }
@@ -5506,7 +5540,7 @@ mod tests {
             let token = armed(&[PublishFault::AfterBackup]);
             let out = out.bind(&token).expect("bind output fixture");
             stage_dir(&out, "new.bin", b"new");
-            assert!(out.publish().is_err());
+            assert_injected(out.publish());
             assert_eq!(fs::read(dest.join("old.bin")).unwrap(), b"old");
             assert!(!dest.join("new.bin").exists());
             assert!(others(dir.path(), &["index"]).is_empty());
@@ -6384,8 +6418,14 @@ mod tests {
                 "force-link-fallback".parse::<PublishFault>().ok(),
                 Some(PublishFault::ForceLinkFallback)
             );
-            assert!("after-installed".parse::<PublishFault>().is_err());
-            assert!("restore:1".parse::<PublishFault>().is_err());
+            crate::test_support::assert_err_kind!(
+                "after-installed".parse::<PublishFault>(),
+                crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("not a publication fault: after-installed"),
+            );
+            crate::test_support::assert_err_kind!(
+                "restore:1".parse::<PublishFault>(),
+                crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("not a publication fault: restore:1"),
+            );
         }
     }
 }

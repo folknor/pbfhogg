@@ -1174,7 +1174,13 @@ mod tests {
             i64::MIN,
             i64::MAX,
         ] {
-            assert!(format_rfc3339_utc(secs).is_err(), "{secs}");
+            assert_eq!(
+                format_rfc3339_utc(secs),
+                Err(TimestampError(
+                    "timestamp lies outside years 0000 to 9999, which YYYY-MM-DDTHH:MM:SSZ cannot spell"
+                )),
+                "{secs}"
+            );
         }
         Ok(())
     }
@@ -1194,10 +1200,25 @@ mod tests {
             format_rfc3339_utc_millis(last).as_deref(),
             Ok("9999-12-31T23:59:59.999Z")
         );
-        assert!(format_rfc3339_utc_millis(last + 1).is_err());
+        assert_eq!(
+            format_rfc3339_utc_millis(last + 1),
+            Err(TimestampError(
+                "timestamp lies outside years 0000 to 9999, which RFC 3339 cannot spell"
+            ))
+        );
         assert!(format_rfc3339_utc_millis(RFC3339_MIN_SECS * 1000).is_ok());
-        assert!(format_rfc3339_utc_millis(RFC3339_MIN_SECS * 1000 - 1).is_err());
-        assert!(format_rfc3339_utc_millis(253_402_300_800_000).is_err());
+        assert_eq!(
+            format_rfc3339_utc_millis(RFC3339_MIN_SECS * 1000 - 1),
+            Err(TimestampError(
+                "timestamp lies outside years 0000 to 9999, which RFC 3339 cannot spell"
+            ))
+        );
+        assert_eq!(
+            format_rfc3339_utc_millis(253_402_300_800_000),
+            Err(TimestampError(
+                "timestamp lies outside years 0000 to 9999, which RFC 3339 cannot spell"
+            ))
+        );
         assert!(format_epoch_secs(i64::MIN).ends_with('Z'));
     }
 
@@ -1232,11 +1253,26 @@ mod tests {
         assert_eq!(format_epoch_secs(-1), "1969-12-31T23:59:59Z");
 
         // Rejections.
-        assert!(parse_rfc3339_utc("2026-02-20 21:39:49").is_err()); // wrong shape
-        assert!(parse_rfc3339_utc("2026-13-01T00:00:00Z").is_err()); // month 13
-        assert!(parse_rfc3339_utc("2026-02-30T00:00:00Z").is_err()); // Feb 30
-        assert!(parse_rfc3339_utc("2026-02-20T24:00:00Z").is_err()); // hour 24
-        assert!(parse_rfc3339_utc("not-a-timestamp-at-al").is_err());
+        assert_eq!(
+            parse_rfc3339_utc("2026-02-20 21:39:49"),
+            Err(TimestampError("timestamp must be YYYY-MM-DDTHH:MM:SSZ"))
+        ); // wrong shape
+        assert_eq!(
+            parse_rfc3339_utc("2026-13-01T00:00:00Z"),
+            Err(TimestampError("invalid month in timestamp"))
+        ); // month 13
+        assert_eq!(
+            parse_rfc3339_utc("2026-02-30T00:00:00Z"),
+            Err(TimestampError("invalid day in timestamp"))
+        ); // Feb 30
+        assert_eq!(
+            parse_rfc3339_utc("2026-02-20T24:00:00Z"),
+            Err(TimestampError("invalid time in timestamp"))
+        ); // hour 24
+        assert_eq!(
+            parse_rfc3339_utc("not-a-timestamp-at-al"),
+            Err(TimestampError("timestamp must be YYYY-MM-DDTHH:MM:SSZ"))
+        );
 
         // A sign in any component is malformed, never a rollover.
         for signed in [
@@ -1261,7 +1297,10 @@ mod tests {
             );
         }
         // The formatter's output below year 0000 is outside the grammar.
-        assert!(parse_rfc3339_utc(&format_epoch_secs(-62_198_755_200)).is_err());
+        assert_eq!(
+            parse_rfc3339_utc(&format_epoch_secs(-62_198_755_200)),
+            Err(TimestampError("invalid numeric timestamp component"))
+        );
         Ok(())
     }
 }

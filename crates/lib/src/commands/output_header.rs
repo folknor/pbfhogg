@@ -827,14 +827,13 @@ mod tests {
     fn an_empty_input_slice_is_refused() {
         let host_owner = crate::host::Host::for_tests();
         let host = host_owner.entered();
-        assert!(
+        crate::test_support::assert_err_kind!(
             build(
                 &[],
                 &OutputFacts::carry(Ways::Reencoded),
                 &HeaderOverrides::default(),
                 &host
-            )
-            .is_err()
+            ), crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("no input headers")
         );
     }
 

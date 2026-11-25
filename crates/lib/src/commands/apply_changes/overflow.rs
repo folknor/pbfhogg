@@ -692,7 +692,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         drop(rx);
         *slot.borrow_mut() = Some(tx);
-        assert!(stream.end().is_err());
+        crate::test_support::assert_err_kind!(
+            stream.end(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("the drain closed a blob's frame stream"),
+        );
         assert!(slot.borrow().is_some());
     }
 }

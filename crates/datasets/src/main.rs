@@ -247,8 +247,20 @@ mod tests {
     #[test]
     fn cli_parses_download() {
         Args::command().debug_assert();
-        assert!(Args::try_parse_from(["x", "download", "planet", "--snapshot", "s"]).is_err());
-        for flag in ["--refresh", "--as-snapshot"] {
+        pbfhogg_test_scratch::refused(
+            Args::try_parse_from(["x", "download", "planet", "--snapshot", "s"]),
+            "were not provided:\n  --osc-seq",
+        );
+        for (flag, needle) in [
+            (
+                "--refresh",
+                "'--snapshot <SNAPSHOT>' cannot be used with '--refresh'",
+            ),
+            (
+                "--as-snapshot",
+                "'--snapshot <SNAPSHOT>' cannot be used with '--as-snapshot <AS_SNAPSHOT>'",
+            ),
+        ] {
             let mut args = vec![
                 "x",
                 "download",
@@ -262,7 +274,7 @@ mod tests {
             if flag == "--as-snapshot" {
                 args.push("new");
             }
-            assert!(Args::try_parse_from(args).is_err());
+            pbfhogg_test_scratch::refused(Args::try_parse_from(args), needle);
         }
         assert!(
             Args::try_parse_from([
@@ -276,26 +288,32 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Args::try_parse_from(["x", "download", "denmark", "--force"]).is_err());
-        assert!(
+        pbfhogg_test_scratch::refused(
+            Args::try_parse_from(["x", "download", "denmark", "--force"]),
+            "were not provided:\n  --refresh",
+        );
+        pbfhogg_test_scratch::refused(
             Args::try_parse_from([
                 "x",
                 "download",
                 "denmark",
                 "--refresh",
                 "--as-snapshot",
-                "s"
-            ])
-            .is_err()
+                "s",
+            ]),
+            "'--refresh' cannot be used with '--as-snapshot",
         );
         assert!(Args::try_parse_from(["x", "download", "denmark", "--refresh", "--force"]).is_ok());
-        assert!(Args::try_parse_from(["x", "download"]).is_err());
+        pbfhogg_test_scratch::refused(
+            Args::try_parse_from(["x", "download"]),
+            "were not provided:\n  <REGION>",
+        );
         for extra in [&["--refresh"][..], &["--as-snapshot", "s"], &[]] {
             let mut args = vec!["x", "download", "denmark", "--no-indexed"];
             args.extend_from_slice(extra);
             assert!(Args::try_parse_from(args).is_ok());
         }
-        assert!(
+        pbfhogg_test_scratch::refused(
             Args::try_parse_from([
                 "x",
                 "download",
@@ -304,9 +322,9 @@ mod tests {
                 "--snapshot",
                 "s",
                 "--osc-seq",
-                "13"
-            ])
-            .is_err()
+                "13",
+            ]),
+            "'--no-indexed' cannot be used with '--snapshot",
         );
         assert!(Args::try_parse_from(["x", "download", "denmark", "--host", "h"]).is_ok());
         let parsed = Args::try_parse_from([
@@ -348,18 +366,18 @@ mod tests {
                 ..
             }
         ));
-        assert!(
+        pbfhogg_test_scratch::refused(
             Args::try_parse_from([
                 "x",
                 "promote",
                 "tiny",
                 "output.osm.pbf",
                 "--as-snapshot",
-                "named"
-            ])
-            .is_err()
+                "named",
+            ]),
+            "were not provided:\n  --producer",
         );
-        assert!(
+        pbfhogg_test_scratch::refused(
             Args::try_parse_from([
                 "x",
                 "promote",
@@ -368,9 +386,9 @@ mod tests {
                 "--as-snapshot",
                 "named",
                 "--producer",
-                "sort"
-            ])
-            .is_err()
+                "sort",
+            ]),
+            "invalid value 'sort' for '--producer",
         );
     }
 

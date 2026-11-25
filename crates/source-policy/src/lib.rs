@@ -130,6 +130,7 @@ rules!(
     host_independence,
     environment,
     id_signs,
+    any_error,
 );
 
 /// Every finding of every rule over the tree at `root`.

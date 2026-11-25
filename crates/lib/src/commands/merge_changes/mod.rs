@@ -1559,7 +1559,7 @@ mod tests {
              <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"1\"/>\n  </create>\n",
         );
 
-        merge_changes(
+        let err = merge_changes(
             &[&input],
             crate::output::Output::new(
                 &dest,
@@ -1572,6 +1572,10 @@ mod tests {
             &crate::host::Host::for_tests().entered(),
         )
         .expect_err("a truncated input must be refused");
+        assert!(
+            err.to_string().contains("closing </osmChange>"),
+            "error must name the missing closing tag; got: {err}"
+        );
         assert!(
             !dest.exists(),
             "a failed merge must not leave a partial destination"

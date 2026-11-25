@@ -622,6 +622,7 @@ impl Drop for OwnedChild<'_> {
                 Ok(Some(_)) => break true,
                 Ok(None) if Instant::now() < deadline => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
+                    // any-error-deliberate: cleanup gives up on any poll failure
                     if self.exit.poll_with_none(remaining).is_err() {
                         break false;
                     }
@@ -689,7 +690,8 @@ mod tests {
         let scratch = pbfhogg_test_scratch::scratch();
         let directory = std::fs::File::open(scratch.path()).expect("directory");
         let mut thread = Some(capture(directory).expect("capture"));
-        assert!(finish(&mut thread).is_err());
+        let error = finish(&mut thread).expect_err("reading a directory fails");
+        assert_eq!(error.raw_os_error(), Some(libc::EISDIR), "{error}");
         assert!(thread.is_none());
     }
 }

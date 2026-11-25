@@ -1370,14 +1370,17 @@ mod tests {
     fn an_unlocated_node_of_a_modelled_way_is_outside_the_domain() {
         let mut m = Model::default();
         let r = parse_record("w1 v1 Thighway=residential,name=A Nn1x12.0y55.0,n2xy").unwrap();
-        assert!(model_record(&mut m, &r).is_err());
+        crate::test_support::refused(
+            model_record(&mut m, &r),
+            "has no location, outside the compared domain",
+        );
         let r = parse_record("w2 v1 Thighway=path,name=A Nn1x12.0y55.0,n2").unwrap();
         assert!(model_record(&mut m, &r).is_ok());
         // Both ends are in the domain, but the reader takes the segment the
         // short way round the antimeridian, which the model does not.
         let r =
             parse_record("w3 v1 Thighway=residential,name=A Nn1x-100.0y0.0,n2x100.0y0.0").unwrap();
-        assert!(model_record(&mut m, &r).is_err());
+        crate::test_support::refused(model_record(&mut m, &r), "spans half a turn of longitude");
     }
 
     #[test]
@@ -1387,7 +1390,10 @@ mod tests {
             assert!(refuse_repeat(&mut previous, &parse_record(line).unwrap()).is_ok());
         }
         let r = parse_record("w43 v2 Nn42").unwrap();
-        assert!(refuse_repeat(&mut previous, &r).is_err());
+        crate::test_support::refused(
+            refuse_repeat(&mut previous, &r),
+            "the decoding repeats this object",
+        );
     }
 
     #[test]
@@ -1428,17 +1434,27 @@ mod tests {
         let expect = Expect::Some(true, vec![(5.0, want)]);
         let answer = |name: &str, lon: i64, d: f64| serde_json::json!({"name": name, "snap_lat_e7": 10, "snap_lon_e7": lon, "distance_m": d});
         assert_eq!(judge(&expect, &answer("A", 21, 5.0)), Ok(Some(0)));
-        assert!(judge(&expect, &answer("B", 20, 5.0)).is_err());
-        assert!(judge(&expect, &answer("A", 30, 5.0)).is_err());
-        assert!(judge(&expect, &answer("A", 20, 5.1)).is_err());
-        assert!(judge(&expect, &Value::Null).is_err());
-        assert!(judge(&expect, &answer("A", 20, -0.00005)).is_err());
-        let partial = serde_json::json!({"name": "A", "snap_lat_e7": 10, "snap_lon_e7": 20});
-        assert!(
-            judge(&expect, &partial).is_err(),
-            "a missing key is no answer"
+        crate::test_support::refused(
+            judge(&expect, &answer("B", 20, 5.0)),
+            "answered StreetAnswer { name: \"B\"",
         );
-        assert!(judge::<StreetAnswer>(&Expect::None, &answer("A", 20, 5.0)).is_err());
+        crate::test_support::refused(
+            judge(&expect, &answer("A", 30, 5.0)),
+            "snap_lon: 30 } at 5 m",
+        );
+        crate::test_support::refused(judge(&expect, &answer("A", 20, 5.1)), "at 5.1 m, expected");
+        crate::test_support::refused(judge(&expect, &Value::Null), "answered nothing, expected");
+        crate::test_support::refused(
+            judge(&expect, &answer("A", 20, -0.00005)),
+            "distance_m is not a non-negative number",
+        );
+        let partial = serde_json::json!({"name": "A", "snap_lat_e7": 10, "snap_lon_e7": 20});
+        // A missing key is no answer.
+        crate::test_support::refused(judge(&expect, &partial), "no distance_m key");
+        crate::test_support::refused(
+            judge::<StreetAnswer>(&Expect::None, &answer("A", 20, 5.0)),
+            "expected nothing",
+        );
         assert_eq!(
             judge::<StreetAnswer>(&Expect::None, &Value::Null),
             Ok(Some(2))

@@ -751,8 +751,14 @@ mod tests {
         report.classify(OscAction::Create).add(OscKind::Relation, 2);
         let shared = shared_counts(&counts(10, 5, 3), &counts(9, 5, 4), &report).unwrap();
         assert_eq!(shared, [9, 5, 3]);
-        assert!(shared_counts(&counts(10, 5, 3), &counts(10, 5, 4), &report).is_err());
-        assert!(shared_counts(&counts(0, 5, 3), &counts(0, 5, 4), &report).is_err());
+        crate::test_support::refused(
+            shared_counts(&counts(10, 5, 3), &counts(10, 5, 4), &report),
+            "extract element accounting does not close",
+        );
+        crate::test_support::refused(
+            shared_counts(&counts(0, 5, 3), &counts(0, 5, 4), &report),
+            "extract element accounting does not close",
+        );
     }
 
     #[test]

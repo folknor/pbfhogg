@@ -174,6 +174,6 @@ mod tests {
             let _bound = HangBound::arm(DISARMED_BOUND, Duration::ZERO, "unwind");
             panic!("the operation failed");
         });
-        assert!(outcome.is_err());
+        crate::unwound(outcome, "the operation failed");
     }
 }

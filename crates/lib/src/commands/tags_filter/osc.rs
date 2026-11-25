@@ -914,8 +914,9 @@ mod tests {
         for schedule in SCHEDULES {
             let err = filter_with(&replay, &out, &exprs, schedule).unwrap_err();
             assert!(err.to_string().contains("node -1"), "{schedule:?}: {err}");
-            assert!(
-                filter_with(&truncated, &out, &exprs, schedule).is_err(),
+            crate::test_support::assert_err_kind!(
+                filter_with(&truncated, &out, &exprs, schedule),
+                crate::ErrorKind::InvalidData { .. },
                 "{schedule:?}"
             );
         }

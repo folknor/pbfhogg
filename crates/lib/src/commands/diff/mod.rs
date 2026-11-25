@@ -1378,7 +1378,10 @@ mod text_unit_sink_tests {
         s.emit(piece(0), &mut ch).unwrap();
         s.emit(piece(1), &mut ch).unwrap();
         ch.fail_send = true;
-        assert!(s.emit(piece(2), &mut ch).is_err());
+        crate::test_support::assert_err_kind!(
+            s.emit(piece(2), &mut ch),
+            crate::ErrorKind::Internal { msg, .. } if msg == "test: consumer gone",
+        );
         drop(s);
         assert_eq!(overflow.used.load(Ordering::Relaxed), 0);
 

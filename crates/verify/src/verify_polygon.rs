@@ -194,16 +194,31 @@ mod tests {
 
     #[test]
     fn what_the_gate_cannot_read_is_refused_not_passed() {
-        for text in [
-            r#"{"type":"Point","coordinates":[0,0]}"#,
-            r#"{"type":"FeatureCollection","features":[]}"#,
-            r#"{"type":"FeatureCollection","features":[{"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}}]}"#,
-            r#"{"type":"Feature","geometry":null}"#,
-            r#"{"type":"Polygon","coordinates":[[[0,0],[1,"x"],[1,1],[0,0]]]}"#,
-            r#"{"type":"Polygon","coordinates":[[]]}"#,
-            r#"{"coordinates":[]}"#,
+        for (text, why) in [
+            (
+                r#"{"type":"Point","coordinates":[0,0]}"#,
+                "a GeoJSON Point, not a polygon",
+            ),
+            (
+                r#"{"type":"FeatureCollection","features":[]}"#,
+                "a FeatureCollection of 0 features",
+            ),
+            (
+                r#"{"type":"FeatureCollection","features":[{"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}}]}"#,
+                "an object without a string type",
+            ),
+            (
+                r#"{"type":"Feature","geometry":null}"#,
+                "a Feature without a geometry object",
+            ),
+            (
+                r#"{"type":"Polygon","coordinates":[[[0,0],[1,"x"],[1,1],[0,0]]]}"#,
+                "a position holding something other than numbers",
+            ),
+            (r#"{"type":"Polygon","coordinates":[[]]}"#, "an empty ring"),
+            (r#"{"coordinates":[]}"#, "an object without a string type"),
         ] {
-            assert!(judge(&doc(text)).is_err(), "{text}");
+            crate::test_support::refused(judge(&doc(text)), why);
         }
     }
 }

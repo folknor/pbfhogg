@@ -1079,8 +1079,14 @@ mod tests {
         }
         .next()
         .unwrap();
-        assert!(past_i64.nano_lat().is_err());
-        assert!(past_i64.decimicro_lat().is_err());
+        crate::test_support::assert_err_kind!(
+            past_i64.nano_lat(),
+            crate::ErrorKind::WireFormat { .. }
+        );
+        crate::test_support::assert_err_kind!(
+            past_i64.decimicro_lat(),
+            crate::ErrorKind::WireFormat { .. }
+        );
         assert_eq!(past_i64.nano_lat_exact(), i128::from(i64::MAX) + 1);
         assert!(past_i64.lat() > 9.2e9);
         assert_eq!(past_i64.nano_lat_wrapping(), i64::MIN);
@@ -1099,7 +1105,10 @@ mod tests {
         .next()
         .unwrap();
         assert_eq!(past_i32.nano_lat().unwrap(), 429_496_729_600);
-        assert!(past_i32.decimicro_lat().is_err());
+        crate::test_support::assert_err_kind!(
+            past_i32.decimicro_lat(),
+            crate::ErrorKind::WireFormat { .. }
+        );
         assert_eq!(past_i32.decimicro_lat_wrapping(), 0);
         assert_eq!(past_i32.decimicro_lon().unwrap(), 0);
     }

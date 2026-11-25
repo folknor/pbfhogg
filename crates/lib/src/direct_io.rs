@@ -537,10 +537,28 @@ mod tests {
     #[test]
     fn a_requirement_the_buffers_cannot_keep_is_refused() {
         let oversize = u32::try_from(IO_BUF_BYTES * 2).unwrap_or(u32::MAX);
-        assert!(resolve(reported(512, oversize)).is_err());
+        assert_eq!(
+            resolve(reported(512, oversize)),
+            Err(Reported {
+                mem: 512,
+                offset: oversize
+            })
+        );
         // Not a power of two: an 8192-aligned address is not 6144-aligned.
-        assert!(resolve(reported(6144, 8192)).is_err());
-        assert!(resolve(reported(512, 3000)).is_err());
+        assert_eq!(
+            resolve(reported(6144, 8192)),
+            Err(Reported {
+                mem: 6144,
+                offset: 8192
+            })
+        );
+        assert_eq!(
+            resolve(reported(512, 3000)),
+            Err(Reported {
+                mem: 512,
+                offset: 3000
+            })
+        );
     }
 
     #[test]

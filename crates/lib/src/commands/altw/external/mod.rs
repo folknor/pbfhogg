@@ -599,6 +599,7 @@ mod id_record_tests {
         CLOSURE_FLAG, ID_WORD_SIZE, IdCodec, IdRecord, ShardCodec, ShardRecord, WideCodec,
         WideIdRecord, keys,
     };
+    use crate::test_support::assert_err_kind;
 
     fn rec(local_node_id: u32, blob_idx: u32, blob_local_slot: u32) -> IdRecord {
         IdRecord {
@@ -699,11 +700,26 @@ mod id_record_tests {
     fn a_field_past_its_width_is_refused() {
         let codec = IdCodec::new(3, 2).expect("codec");
         let mut buf = [0u8; 2 * ID_WORD_SIZE];
-        assert!(codec.encode_record(&rec(4, 0, 0), &mut buf).is_err());
-        assert!(codec.encode_record(&rec(0, 2, 0), &mut buf).is_err());
-        assert!(codec.encode(1 << 40, false, 0, 0, &mut buf).is_err());
-        assert!(IdCodec::new(1 << 31, 1).is_err());
-        assert!(IdCodec::new(1, (1 << 32) + 1).is_err());
+        assert_err_kind!(
+            codec.encode_record(&rec(4, 0, 0), &mut buf),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("does not fit"),
+        );
+        assert_err_kind!(
+            codec.encode_record(&rec(0, 2, 0), &mut buf),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("does not fit"),
+        );
+        assert_err_kind!(
+            codec.encode(1 << 40, false, 0, 0, &mut buf),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("does not fit"),
+        );
+        assert_err_kind!(
+            IdCodec::new(1 << 31, 1),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("out of the range"),
+        );
+        assert_err_kind!(
+            IdCodec::new(1, (1 << 32) + 1),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("out of the range"),
+        );
     }
 
     #[test]
@@ -716,16 +732,21 @@ mod id_record_tests {
         let bytes = shard(tight, &[rec(1, 1, 0), rec(1, 1, 9)]);
         let mut out = Vec::new();
         // Whole words, but the escape's extension word is missing.
-        assert!(
-            tight
-                .decode_into(&bytes[..2 * ID_WORD_SIZE], &mut out)
-                .is_err()
+        assert_err_kind!(
+            tight.decode_into(&bytes[..2 * ID_WORD_SIZE], &mut out),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("inside an escaped record")
         );
-        assert!(tight.decode_into(&bytes[..5], &mut out).is_err());
+        assert_err_kind!(
+            tight.decode_into(&bytes[..5], &mut out),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("not a multiple of"),
+        );
         // An extension word wider than u32.
         let mut wide = bytes.clone();
         wide[2 * ID_WORD_SIZE..].copy_from_slice(&(1u64 << 32).to_le_bytes());
-        assert!(tight.decode_into(&wide, &mut out).is_err());
+        assert_err_kind!(
+            tight.decode_into(&wide, &mut out),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("wider than u32"),
+        );
     }
 
     #[test]
@@ -757,12 +778,14 @@ mod id_record_tests {
                 (u64::MAX >> 1, false, 7, 9),
             ]
         );
-        assert!(
-            WideCodec
-                .encode(0, false, 0, CLOSURE_FLAG, &mut buf)
-                .is_err()
+        assert_err_kind!(
+            WideCodec.encode(0, false, 0, CLOSURE_FLAG, &mut buf),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("past any way blob")
         );
-        assert!(WideCodec.decode_into(&bytes[..24], &mut out).is_err());
+        assert_err_kind!(
+            WideCodec.decode_into(&bytes[..24], &mut out),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("not a multiple of"),
+        );
     }
 }
 /// A resolved coordinate ready to be scattered into a slot bucket for
@@ -912,15 +935,25 @@ fn validate_slot_layout(starts: &[u64], total: u64, buckets: usize) -> Result<()
 #[cfg(test)]
 mod slot_layout_tests {
     use super::validate_slot_layout;
+    use crate::test_support::assert_err_kind;
 
     #[test]
     fn checks_straddler_bound_before_bucket_writes() {
         assert!(validate_slot_layout(&[0, 3, 6, 9], 12, 4).is_ok());
-        assert!(validate_slot_layout(&[0, 4], 12, 4).is_err());
-        assert!(validate_slot_layout(&[0, 6, 3], 12, 2).is_err());
+        assert_err_kind!(
+            validate_slot_layout(&[0, 4], 12, 4),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("straddler bound"),
+        );
+        assert_err_kind!(
+            validate_slot_layout(&[0, 6, 3], 12, 2),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("not monotonic"),
+        );
         assert!(validate_slot_layout(&[0, 0], 0, 256).is_ok());
         assert!(validate_slot_layout(&[], 0, 256).is_ok());
-        assert!(validate_slot_layout(&[0], 1, 0).is_err());
+        assert_err_kind!(
+            validate_slot_layout(&[0], 1, 0),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("invalid slot bucket layout"),
+        );
     }
 
     /// Blob starts every 2^31 slots, well under every bucket width below, so
@@ -960,7 +993,10 @@ mod slot_layout_tests {
         );
         // One bucket: the whole total is the widest bucket.
         let total = (1u64 << 32) + 1;
-        assert!(validate_slot_layout(&starts_for(total), total, 1).is_err());
+        assert_err_kind!(
+            validate_slot_layout(&starts_for(total), total, 1),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("above the"),
+        );
     }
 }
 

@@ -998,7 +998,11 @@ mod tests {
         };
         let metrics = crate::write::metrics::WriterMetrics::new();
         let result = deliver_in_order(&inbox, &mut sink, &SeqTotal::new(), &metrics);
-        assert!(result.is_err(), "seq 1 never arrived");
+        crate::test_support::assert_err_kind!(
+            result,
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("still in reorder buffer"),
+            "seq 1 never arrived"
+        );
         assert_eq!(sink.written.len(), 1);
         assert_eq!(
             window_rx.try_iter().count(),
@@ -1018,7 +1022,10 @@ mod tests {
         assert_eq!(item.seq, 7);
         let err = item.data.err().unwrap();
         assert!(err.to_string().contains("ended without a result"), "{err}");
-        assert!(rx.recv().is_err(), "exactly one result per slot");
+        assert!(
+            matches!(rx.recv(), Err(std::sync::mpsc::RecvError)),
+            "exactly one result per slot"
+        );
     }
 
     /// `writer_reorder_high_water` is the seq span, gaps included;

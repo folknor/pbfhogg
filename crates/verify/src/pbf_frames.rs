@@ -1388,7 +1388,10 @@ mod tests {
         let mut bad_size = Vec::new();
         bytes_field(1, b"OSMData", &mut bad_size);
         bytes_field(3, b"x", &mut bad_size);
-        assert!(parse_blob_header(&bad_size).is_err());
+        crate::test_support::refused(
+            parse_blob_header(&bad_size),
+            "blob header field has the wrong wire type",
+        );
     }
 
     #[test]
@@ -1428,16 +1431,25 @@ mod tests {
         };
         assert!(with(4, b"HistoricalInformation").is_ok());
         assert!(with(16, b"osmium/1.0").is_ok());
-        for refused in [
-            with(4, b"DenseNode"),
-            with(4, b"Sort.Type_then_ID"),
-            with(4, b"\xff"),
-            with(5, b"\xff"),
-            with(16, b"\xff"),
-            with(17, b"\xff"),
-            with(34, b"\xff"),
+        for (refused, why) in [
+            (
+                with(4, b"DenseNode"),
+                "required feature \"DenseNode\" unsupported",
+            ),
+            (
+                with(4, b"Sort.Type_then_ID"),
+                "required feature \"Sort.Type_then_ID\" unsupported",
+            ),
+            (with(4, b"\xff"), "invalid UTF-8 in required_features"),
+            (with(5, b"\xff"), "invalid UTF-8 in optional_features"),
+            (with(16, b"\xff"), "invalid UTF-8 in writingprogram"),
+            (with(17, b"\xff"), "invalid UTF-8 in source"),
+            (
+                with(34, b"\xff"),
+                "invalid UTF-8 in osmosis_replication_base_url",
+            ),
         ] {
-            assert!(refused.is_err());
+            crate::test_support::refused(refused, why);
         }
     }
 
@@ -1455,10 +1467,19 @@ mod tests {
         };
         assert!(header(&[]).is_ok());
         assert!(header(&[&complete]).is_ok());
-        assert!(header(&[&[]]).is_err());
-        assert!(header(&[&complete[..6]]).is_err());
-        assert!(header(&[&complete, &[]]).is_err());
-        assert!(header(&[&complete, &complete]).is_err());
+        crate::test_support::refused(
+            header(&[&[]]),
+            "HeaderBlock.bbox is missing a required coordinate",
+        );
+        crate::test_support::refused(
+            header(&[&complete[..6]]),
+            "HeaderBlock.bbox is missing a required coordinate",
+        );
+        crate::test_support::refused(header(&[&complete, &[]]), "HeaderBlock.bbox appears twice");
+        crate::test_support::refused(
+            header(&[&complete, &complete]),
+            "HeaderBlock.bbox appears twice",
+        );
         // A varint on field 1 is an unknown field, not a second bbox.
         let mut block = Vec::new();
         bytes_field(1, &complete, &mut block);
@@ -1484,7 +1505,10 @@ mod tests {
             blob_content(&blob(MAX_BLOB_LEN)).unwrap().len() as u64,
             MAX_BLOB_LEN
         );
-        assert!(blob_content(&blob(MAX_BLOB_LEN + 1)).is_err());
+        crate::test_support::refused(
+            blob_content(&blob(MAX_BLOB_LEN + 1)),
+            "raw_size 33554433 out of range",
+        );
     }
 
     /// The ID walk skips wrong-typed and changeset fields as pbfhogg and
@@ -1524,15 +1548,15 @@ mod tests {
         };
         // zigzag 2 is ID 1, then a delta of 2 is ID 3.
         assert_eq!(dense(&[&[], &[2, 4]]).unwrap(), [(0, 1), (0, 3)]);
-        assert!(dense(&[&[2], &[4]]).is_err());
-        assert!(dense(&[&[2], &[]]).is_err());
+        crate::test_support::refused(dense(&[&[2], &[4]]), "dense ids span two occurrences");
+        crate::test_support::refused(dense(&[&[2], &[]]), "dense ids span two occurrences");
 
         let mut two = Vec::new();
         bytes_field(2, &[], &mut two);
         bytes_field(2, &[], &mut two);
         let mut block = Vec::new();
         bytes_field(2, &two, &mut block);
-        assert!(block_ids(&block).is_err());
+        crate::test_support::refused(block_ids(&block), "a group holds two DenseNodes");
     }
 
     fn header_payload(features: &[&str], zlib: bool) -> Vec<u8> {
@@ -1614,21 +1638,33 @@ mod tests {
     fn refuses_what_pbfhogg_cannot_read_through_indexdata() {
         let good = index(3, 0, 1, 2, 2);
         // Each case is the indexdata fields of one data blob.
-        let cases: Vec<Vec<Vec<u8>>> = vec![
-            vec![],
-            vec![index(4, 0, 1, 2, 2)],
-            vec![index(1, 0, 1, 2, 2)[..20].to_vec()],
-            vec![{
-                let mut v = index(1, 0, 1, 2, 2);
-                v.extend_from_slice(&[0; 16]);
-                v
-            }],
-            vec![index(3, 3, 1, 2, 2)],
-            vec![index(3, 1, 9, 2, 2)],
-            vec![good.clone(), good.clone()],
+        let cases: Vec<(Vec<Vec<u8>>, &str)> = vec![
+            (vec![], "data blob has no indexdata"),
+            (
+                vec![index(4, 0, 1, 2, 2)],
+                "indexdata version 4 is not one brokkr reads",
+            ),
+            (
+                vec![index(1, 0, 1, 2, 2)[..20].to_vec()],
+                "indexdata version 1 is 20 bytes, not 26",
+            ),
+            (
+                vec![{
+                    let mut v = index(1, 0, 1, 2, 2);
+                    v.extend_from_slice(&[0; 16]);
+                    v
+                }],
+                "indexdata version 1 is 42 bytes, not 26",
+            ),
+            (vec![index(3, 3, 1, 2, 2)], "indexdata kind 3 unknown"),
+            (vec![index(3, 1, 9, 2, 2)], "indexdata range 9..2 inverted"),
+            (
+                vec![good.clone(), good.clone()],
+                "data blob has two indexdata fields",
+            ),
         ];
-        for (i, fields) in cases.into_iter().enumerate() {
-            assert!(run(&file(&[fields], &[])).is_err(), "case {i} accepted");
+        for (fields, why) in cases {
+            crate::test_support::refused(run(&file(&[fields], &[])), why);
         }
         // An empty duplicate occurrence is ignored, as pbfhogg does.
         assert!(run(&file(&[vec![good, Vec::new()]], &[])).is_ok());
@@ -1638,31 +1674,49 @@ mod tests {
     fn refuses_overflowing_varints_and_bad_field_numbers() {
         let mut overflow =
             super::Fields::new(&[0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
-        assert!(overflow.varint().is_err());
+        crate::test_support::refused(overflow.varint(), "varint overflows 64 bits");
         let mut top =
             super::Fields::new(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01]);
         assert_eq!(top.varint().unwrap(), 1 << 63);
-        assert!(super::int32(1 << 32 | 1).is_err());
+        crate::test_support::refused(
+            super::int32(1 << 32 | 1),
+            "varint 4294967297 is not an int32",
+        );
         assert_eq!(super::int32(u64::MAX).unwrap(), -1);
         assert_eq!(super::int32(7).unwrap(), 7);
         // Field number zero (key 0x02: field 0, wire type 2).
-        assert!(super::Fields::new(&[0x02, 0x00]).next().unwrap().is_err());
+        crate::test_support::refused(
+            super::Fields::new(&[0x02, 0x00]).next().unwrap(),
+            "field number out of range",
+        );
     }
 
     #[test]
     fn refuses_bad_framing() {
         let bytes = file(&[vec![index(3, 0, 1, 2, 2)]], &[]);
-        assert!(run(&bytes[..bytes.len() - 1]).is_err(), "truncated payload");
-        assert!(run(&[]).is_err(), "no header");
+        crate::test_support::refused(
+            run(&bytes[..bytes.len() - 1]),
+            "blob 1 at byte 19: truncated blob payload",
+        );
+        crate::test_support::refused(run(&[]), "no OSMHeader blob");
         let mut twice = bytes.clone();
         frame("OSMHeader", &[], &header_payload(&[], true), &mut twice);
-        assert!(run(&twice).is_err(), "second header");
+        crate::test_support::refused(
+            run(&twice),
+            "blob 2 at byte 94: OSMHeader not first, or repeated",
+        );
         let mut data_first = Vec::new();
         frame("OSMData", &[&index(3, 0, 1, 2, 2)], b"x", &mut data_first);
-        assert!(run(&data_first).is_err(), "data before header");
+        crate::test_support::refused(
+            run(&data_first),
+            "blob 0 at byte 0: data blob before the OSMHeader",
+        );
         let mut zero = vec![0u8; 4];
         zero.extend_from_slice(&bytes);
-        assert!(run(&zero).is_err(), "zero header length");
+        crate::test_support::refused(
+            run(&zero),
+            "blob 0 at byte 0: blob header length 0 out of range",
+        );
     }
 
     fn read_framing(bytes: &[u8]) -> Result<Framing, String> {
@@ -1713,9 +1767,15 @@ mod tests {
             read_framing(&file(&[vec![], vec![]], &[])).unwrap(),
             Framing::Unindexed
         );
-        assert!(read_framing(&file(&[vec![index(3, 0, 1, 2, 2)], vec![]], &[])).is_err());
+        crate::test_support::refused(
+            read_framing(&file(&[vec![index(3, 0, 1, 2, 2)], vec![]], &[])),
+            "1 data blobs carry indexdata and 1 do not",
+        );
         let good = index(3, 0, 1, 2, 2);
-        assert!(read_framing(&file(&[vec![good.clone(), good]], &[])).is_err());
+        crate::test_support::refused(
+            read_framing(&file(&[vec![good.clone(), good]], &[])),
+            "data blob has two indexdata fields",
+        );
     }
 
     /// A raw `Blob` holding a `PrimitiveBlock` of one group.
@@ -1820,13 +1880,13 @@ mod tests {
         frame("OSMData", &[], &data_blob(&nodes), &mut changed);
         frame("OSMData", &[], &data_blob(&nodes), &mut changed);
         std::fs::write(&other, &changed).unwrap();
-        assert!(
+        crate::test_support::refused(
             super::same_data_payloads(
                 (&path, super::Origin::Other),
-                (&other, super::Origin::Other)
+                (&other, super::Origin::Other),
             )
-            .unwrap()
-            .is_err()
+            .unwrap(),
+            "data blob 1 holds 14 payload bytes in the first and 13 in the second",
         );
     }
 
@@ -1869,6 +1929,9 @@ mod tests {
         let summary = super::walk(&path, super::Origin::Other).unwrap();
         assert_eq!(summary.count(0), 0);
         assert_eq!(summary.count(1), 1);
-        assert!(super::append_empty_claim(&path, 3).is_err());
+        crate::test_support::refused(
+            super::append_empty_claim(&path, 3),
+            "element kind 3 unknown",
+        );
     }
 }

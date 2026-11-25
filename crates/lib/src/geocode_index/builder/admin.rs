@@ -767,10 +767,9 @@ mod tests {
     fn the_store_refuses_more_than_its_capacity() {
         let mut store = super::WayGeometryMap::with_capacity(2, 2).unwrap();
         let refs = crate::read::wire_fixtures::deltas(&[1, 2, 3]);
-        assert!(
-            store
-                .insert(1, Some((&refs, &[(0, 0), (1, 1), (2, 2)])))
-                .is_err()
+        crate::test_support::assert_err_kind!(
+            store.insert(1, Some((&refs, &[(0, 0), (1, 1), (2, 2)]))),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("overflows the")
         );
     }
 
@@ -789,7 +788,10 @@ mod tests {
             &BuildConfig::default(),
             &crate::host::Executor::for_tests(),
         );
-        assert!(result.is_err());
+        crate::test_support::assert_err_kind!(
+            result,
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("decodes 4 refs for 3 stored coordinates"),
+        );
     }
 
     fn relation(id: i64, outer: Vec<i64>, inner: Vec<i64>) -> RawAdminRelation {

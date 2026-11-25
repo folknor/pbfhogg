@@ -233,12 +233,21 @@ mod tests {
     #[test]
     fn cli_requires_one_selection_and_dataset() {
         Args::command().debug_assert();
-        for args in [
-            vec!["x", "verify"],
-            vec!["x", "verify", "s"],
-            vec!["x", "verify", "s", "--all", "--dataset", "d"],
+        for (args, needle) in [
+            (
+                vec!["x", "verify"],
+                "not provided:\n  --dataset <DATASET>\n  <SCENARIO>\n",
+            ),
+            (
+                vec!["x", "verify", "s"],
+                "not provided:\n  --dataset <DATASET>\n\n",
+            ),
+            (
+                vec!["x", "verify", "s", "--all", "--dataset", "d"],
+                "the argument '[SCENARIO]' cannot be used with '--all'",
+            ),
         ] {
-            assert!(Args::try_parse_from(args).is_err());
+            pbfhogg_test_scratch::refused(Args::try_parse_from(args), needle);
         }
         for args in [
             vec!["x", "list"],
@@ -252,12 +261,12 @@ mod tests {
     fn harness_must_be_an_executable_regular_file() {
         let scratch = pbfhogg_test_scratch::scratch();
         let path = scratch.path().join("worker");
-        assert!(executable(&path).is_err());
+        pbfhogg_test_scratch::refused(executable(&path), "worker: No such file or directory");
         std::fs::write(&path, b"x").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(executable(&path).is_err());
+        pbfhogg_test_scratch::refused(executable(&path), "worker is not an executable file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(executable(&path).is_ok());
-        assert!(executable(scratch.path()).is_err());
+        pbfhogg_test_scratch::refused(executable(scratch.path()), "is not an executable file");
     }
 }

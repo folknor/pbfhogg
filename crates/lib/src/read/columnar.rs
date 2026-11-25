@@ -320,7 +320,10 @@ mod tests {
         // At granularity 100 the same values are far past i32 and refused,
         // where the wrapping arithmetic alone gave 0 and -1.
         let mut columns = DenseNodeColumns::new();
-        assert!(columns.decode_append(&dense, 100, 0, 0).is_err());
+        crate::test_support::assert_err_kind!(
+            columns.decode_append(&dense, 100, 0, 0),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     /// The group check matches `scale_to_decimicro` on every node: an
@@ -403,7 +406,13 @@ mod tests {
                         };
                         assert_eq!(column, expected, "{axis} {granularity} {offset} {values:?}");
                     }
-                    None => assert!(got.is_err(), "{axis} {granularity} {offset} {values:?}"),
+                    None => {
+                        crate::test_support::assert_err_kind!(
+                            got,
+                            crate::ErrorKind::WireFormat { .. },
+                            "{axis} {granularity} {offset} {values:?}"
+                        );
+                    }
                 }
             }
         }
@@ -423,7 +432,10 @@ mod tests {
         // i32::MAX: the offset is applied before the narrowing, which refuses
         // it rather than wrapping it to i32::MIN.
         let mut columns = DenseNodeColumns::new();
-        assert!(columns.decode_append(&dense, 100, 100, 100).is_err());
+        crate::test_support::assert_err_kind!(
+            columns.decode_append(&dense, 100, 100, 100),
+            crate::ErrorKind::WireFormat { .. }
+        );
         let mut columns = DenseNodeColumns::new();
         columns
             .decode_append(&dense, 100, 0, 0)

@@ -782,7 +782,11 @@ mod tests {
     fn call_ids_follow_the_wire_alphabet() {
         assert!(super::CallId::new(&"a".repeat(64)).is_ok());
         for bad in ["", "a b", "a%", "\u{e9}", "a\n", &"a".repeat(65)] {
-            assert!(super::CallId::new(bad).is_err(), "{bad:?} must be refused");
+            crate::test_support::assert_err_kind!(
+                super::CallId::new(bad),
+                crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("a call id is 1 to 64 bytes"),
+                "{bad:?} must be refused",
+            );
         }
     }
 
@@ -909,8 +913,15 @@ mod tests {
         let (_scratch, _reader, fifo) = fifo_with_idle_reader();
         let id = || super::CallId::new("a").expect("id");
         drop(fifo.call(id()).expect("first"));
-        assert!(fifo.call(id()).is_err());
-        assert!(fifo.clone().call(id()).is_err(), "clones share the record");
+        crate::test_support::assert_err_kind!(
+            fifo.call(id()),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("already issued"),
+        );
+        crate::test_support::assert_err_kind!(
+            fifo.clone().call(id()),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("already issued"),
+            "clones share the record",
+        );
         assert!(fifo.call(super::CallId::new("b").expect("id")).is_ok());
     }
 

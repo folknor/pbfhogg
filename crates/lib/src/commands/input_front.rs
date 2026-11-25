@@ -201,7 +201,7 @@ mod tests {
                 .require_indexdata(true, "test reason", &host)
                 .unwrap()
         );
-        assert!(forced.header().is_err());
+        crate::test_support::assert_err_kind!(forced.header(), crate::ErrorKind::WireFormat { .. });
     }
 
     /// A first data frame whose payload is cut short is the located

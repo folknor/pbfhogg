@@ -1132,7 +1132,10 @@ mod tests {
     fn the_classifier_reads_the_whole_record() {
         assert!(classify(NODE, NODE).unwrap().is_empty());
         // A record without every field of its kind is no full decoding.
-        assert!(classify(NODE, &NODE.replace(" c3", "")).is_err());
+        crate::test_support::refused(
+            classify(NODE, &NODE.replace(" c3", "")),
+            "field 'c' missing",
+        );
         // A list that changed length is no in-place edit.
         let shorter = WAY.replace(",n2x1y2", "");
         assert_eq!(
@@ -1150,10 +1153,10 @@ mod tests {
             classify(WAY, bare).unwrap(),
             BTreeSet::from([Field::WayLocations])
         );
-        assert!(classify(NODE, WAY).is_err());
-        assert!(classify("n1 v1 v2", "n1 v1 v2").is_err());
-        assert!(classify("n1 N", "n1 N").is_err());
-        assert!(classify("n1 q", "n1 q").is_err());
+        crate::test_support::refused(classify(NODE, WAY), "records of different objects");
+        crate::test_support::refused(classify("n1 v1 v2", "n1 v1 v2"), "field 'v' repeated");
+        crate::test_support::refused(classify("n1 N", "n1 N"), "field 'N' unknown for this kind");
+        crate::test_support::refused(classify("n1 q", "n1 q"), "field 'q' unknown for this kind");
     }
 
     #[test]

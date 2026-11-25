@@ -24,6 +24,7 @@ struct Driver {
 impl Driver {
     fn release_and_join(&mut self) {
         self.cancel.faults().release_blocked_decode();
+        // any-error-deliberate: a join guard reports any driver panic
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {

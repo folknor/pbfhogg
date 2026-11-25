@@ -265,6 +265,7 @@ fn every_blob_index_guard_rejects_empty_and_incomplete_streams() {
     for (i, input) in cases.iter().enumerate() {
         let path = dir.child(format!("invalid-{i}.osm.pbf"));
         std::fs::write(&path, input).expect("write invalid fixture");
+        // any-error-deliberate: catches the guard's deliberate assertion panic
         assert!(
             std::panic::catch_unwind(|| crate::common::assert_every_data_blob_indexed(&path))
                 .is_err(),
@@ -273,6 +274,7 @@ fn every_blob_index_guard_rejects_empty_and_incomplete_streams() {
     }
     let unindexed = dir.child("unindexed.osm.pbf");
     crate::common::write_test_pbf_non_indexed(&unindexed, &generate_nodes(3, 1), &[], &[]);
+    // any-error-deliberate: catches the guard's deliberate assertion panic
     assert!(
         std::panic::catch_unwind(|| crate::common::assert_every_data_blob_indexed(&unindexed))
             .is_err()

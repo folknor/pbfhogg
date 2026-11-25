@@ -1747,7 +1747,11 @@ pub(crate) mod tests {
             super::HeaderWalker::open(&path, &crate::host::Host::for_tests().entered())
                 .expect("walker");
         while let Ok(Some(_)) = walker.next_header() {}
-        assert!(walker.next_header().is_err(), "a refused walk resumed");
+        crate::test_support::assert_err_kind!(
+            walker.next_header(),
+            crate::ErrorKind::Internal { msg, .. } if msg == "frame walk used after a failed frame",
+            "a refused walk resumed",
+        );
 
         for pattern in [&[true, true][..], &[false, false][..], &[][..]] {
             let path = dir.path().join("uniform.pbf");
@@ -1807,7 +1811,11 @@ pub(crate) mod tests {
         let mut bytes = good.clone();
         bytes.extend_from_slice(&[0xFFu8; 4]);
         std::fs::write(&path, &bytes).expect("write committed-frame fixture");
-        count_headers(&path).expect_err("a complete prefix must not be excused as EOF");
+        crate::test_support::assert_err_kind!(
+            count_headers(&path),
+            crate::ErrorKind::Blob(crate::BlobError::HeaderTooBig { .. }),
+            "a complete prefix must not be excused as EOF"
+        );
     }
 
     #[test]
@@ -1874,7 +1882,10 @@ pub(crate) mod tests {
         let dir = crate::path_guard::tests::scratch();
         let empty = dir.path().join("empty.pbf");
         std::fs::File::create(&empty).expect("create empty file");
-        assert!(estimate_blob_count(&empty, &crate::host::Host::for_tests().entered()).is_err());
+        crate::test_support::assert_err_kind!(
+            estimate_blob_count(&empty, &crate::host::Host::for_tests().entered()),
+            crate::ErrorKind::MissingHeader
+        );
     }
 
     #[test]

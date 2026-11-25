@@ -3129,7 +3129,10 @@ mod tests {
         // A zero-length pool is a different thing: no builder emits one, so a
         // truncated strings.bin is corruption and is rejected rather than
         // silently reading as empty.
-        assert!(validate_string_offset(0, b"", "test").is_err());
+        crate::test_support::assert_err_kind!(
+            validate_string_offset(0, b"", "test"),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("string at offset 0"),
+        );
         for (offset, pool) in [
             (1, b"\0\x01\xff" as &[u8]),
             (1, b"\0\x09short"),

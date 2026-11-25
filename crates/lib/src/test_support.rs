@@ -109,6 +109,49 @@ pub(crate) fn with_parked_thread<T: Send, R>(
     })
 }
 
+/// Assert that `result` is an `Err` of `crate::Error` whose kind matches
+/// `pattern` (an optional `if` guard reads the bindings), and evaluate to
+/// the error for further checks. The kind is the cause the test promises:
+/// a refusal of some other kind, or a caught panic, fails here.
+/// `Ok` fails without formatting the value, so `T` need not be `Debug`. A
+/// trailing format string and arguments say what the test meant.
+macro_rules! assert_err_kind {
+    ($result:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {
+        crate::test_support::assert_err_kind!($result, $pattern $(if $guard)?, "")
+    };
+    ($result:expr, $pattern:pat $(if $guard:expr)?, $($context:tt)+) => {
+        match $result {
+            Ok(_) => panic!(
+                "expected an error matching `{}`, got Ok: {}",
+                stringify!($pattern),
+                format_args!($($context)+)
+            ),
+            Err(err) => {
+                let err: crate::Error = err;
+                assert!(
+                    matches!(err.kind(), $pattern $(if $guard)?),
+                    "expected an error matching `{}`, got: {err:?}: {}",
+                    stringify!($pattern),
+                    format_args!($($context)+)
+                );
+                err
+            }
+        }
+    };
+}
+pub(crate) use assert_err_kind;
+
+/// The text of a caught panic's payload, `None` for a payload that is not a
+/// string. A test that catches an unwind compares it with the panic it
+/// injected, so a different panic (a fixture's `expect`, a broken
+/// invariant) cannot pass as the injected one.
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+}
+
 #[path = "../tests/common/skip.rs"]
 mod shared_skip;
 

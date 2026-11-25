@@ -188,6 +188,7 @@ fn write(dir: &Path, name: &str, groups: &[Vec<u8>]) -> std::path::PathBuf {
 }
 
 fn refused(path: &Path) -> bool {
+    // any-error-deliberate: the oracle refuses by a deliberate panic
     catch_unwind(AssertUnwindSafe(|| decode_path(path))).is_err()
 }
 
@@ -554,6 +555,7 @@ fn unresolvable_strings_are_refused() {
         assert!(refused(path), "{} must be refused", path.display());
     }
     for path in [&bad_tag, &bad_role] {
+        // any-error-deliberate: the helper refuses by a deliberate panic
         assert!(
             catch_unwind(AssertUnwindSafe(|| read_all_elements_with_coords(path))).is_err(),
             "the production-reader helper must refuse {}",

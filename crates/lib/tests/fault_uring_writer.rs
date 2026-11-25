@@ -108,6 +108,7 @@ fn require_dispatch_panic_error(
             }
         }
         Ok(Ok(())) => Err("injected writer panic returned success".to_owned()),
+        // any-error-deliberate: any unwind is the failure this arm reports
         Err(_) => Err("writer panic unwound into the caller instead of returning Err".to_owned()),
     }
 }
@@ -115,14 +116,21 @@ fn require_dispatch_panic_error(
 #[test]
 fn dispatch_panic_assertion_rejects_unrelated_error() {
     let unrelated = std::io::Error::other("unrelated write failure");
-    assert!(require_dispatch_panic_error(Ok(Err(unrelated.into())), 3).is_err());
+    let refusal = require_dispatch_panic_error(Ok(Err(unrelated.into())), 3)
+        .expect_err("an unrelated error is refused");
+    assert!(
+        refusal.contains("did not preserve the injected panic"),
+        "{refusal}"
+    );
 }
 
 #[test]
 fn dispatch_panic_assertion_rejects_caller_unwind() {
     let payload: Box<dyn std::any::Any + Send> =
         Box::new("test-hooks: uring_writer dispatch #3 panicking");
-    assert!(require_dispatch_panic_error(Err(payload), 3).is_err());
+    let refusal =
+        require_dispatch_panic_error(Err(payload), 3).expect_err("a caller unwind is refused");
+    assert!(refusal.contains("unwound into the caller"), "{refusal}");
 }
 
 #[test]
@@ -133,6 +141,11 @@ fn dispatch_panic_assertion_requires_reached_dispatch() {
         )
         .into()
     };
-    assert!(require_dispatch_panic_error(Ok(Err(injected())), 2).is_err());
+    let refusal = require_dispatch_panic_error(Ok(Err(injected())), 2)
+        .expect_err("an unreached dispatch is refused");
+    assert!(
+        refusal.contains("expected dispatch 3 to panic"),
+        "{refusal}"
+    );
     assert!(require_dispatch_panic_error(Ok(Err(injected())), 3).is_ok());
 }

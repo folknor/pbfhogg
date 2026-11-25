@@ -1451,7 +1451,11 @@ mod tests {
         let parent = crate::path_guard::tests::scratch();
         let run = RunScratch::create(parent.path(), &host()).expect("run");
         for bad in ["", ".", "..", "a/b", "/abs", LOCK_NAME, READY_NAME, "nul\0"] {
-            assert!(run.file(bad).is_err(), "{bad:?}");
+            crate::test_support::assert_err_kind!(
+                run.file(bad),
+                crate::ErrorKind::Internal { msg, .. } if msg.contains("invalid scratch file name"),
+                "{bad:?}",
+            );
         }
         assert!(run.file("id-W0-007").is_ok());
     }
@@ -1484,14 +1488,27 @@ mod tests {
         let b = RunScratch::create(parent.path(), &host()).expect("b");
         let sub = a.create_subdir("buckets").expect("subdir");
         for bad in ["", "..", "x/y"] {
-            assert!(sub.file(bad).is_err(), "{bad:?}");
+            crate::test_support::assert_err_kind!(
+                sub.file(bad),
+                crate::ErrorKind::Internal { msg, .. } if msg.contains("invalid scratch file name"),
+                "{bad:?}",
+            );
         }
         let path = sub.file("000").expect("name");
         io::Write::write_all(&mut create_file(&path).expect("create"), b"rec").expect("write");
         let mut back = Vec::new();
         io::Read::read_to_end(&mut open_file(&path).expect("open"), &mut back).expect("read");
         assert_eq!(back, b"rec");
-        assert!(b.unlink(&path).is_err());
+        let err = b
+            .unlink(&path)
+            .expect_err("a run does not remove another run's file");
+        assert!(
+            err.kind() == io::ErrorKind::InvalidInput
+                && err
+                    .to_string()
+                    .contains("belongs to another scratch directory"),
+            "{err}"
+        );
         a.unlink(&path).expect("unlink");
         let err = open_file(&path).expect_err("gone");
         assert!(err.to_string().contains("000"), "{err}");

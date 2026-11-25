@@ -768,16 +768,26 @@ mod tests {
             bits,
             [true, false, false, false, false, false, false, true, true]
         );
-        assert!(
-            way_member_bit(payload, 9).is_err(),
+        crate::test_support::assert_err_kind!(
+            way_member_bit(payload, 9),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("the block holds more"),
             "more ways than counted"
         );
-        assert!(way_member_bit(None, 0).is_err(), "declared but absent");
+        crate::test_support::assert_err_kind!(
+            way_member_bit(None, 0),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("carries no field-5"),
+            "declared but absent",
+        );
         assert!(check_way_member_tail(payload, 9).is_ok());
-        assert!(check_way_member_tail(payload, 8).is_err(), "fewer ways");
+        crate::test_support::assert_err_kind!(
+            check_way_member_tail(payload, 8),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("the block holds 8"),
+            "fewer ways",
+        );
         let padded = [0u8, 0b0000_0010];
-        assert!(
-            check_way_member_tail(Some((9, &padded[..])), 9).is_err(),
+        crate::test_support::assert_err_kind!(
+            check_way_member_tail(Some((9, &padded[..])), 9),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("past its last way"),
             "a padding bit set"
         );
         assert!(check_way_member_tail(Some((8, &[0xFF][..])), 8).is_ok());

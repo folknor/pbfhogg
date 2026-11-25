@@ -1178,7 +1178,7 @@ mod tests {
             let _running = running;
             panic!("injected failure before any wait");
         }));
-        assert!(failure.is_err());
+        pbfhogg_test_scratch::unwound(failure, "injected failure before any wait");
         let mut status = 0;
         // SAFETY: WNOHANG never blocks; the owner should already have reaped.
         assert_eq!(

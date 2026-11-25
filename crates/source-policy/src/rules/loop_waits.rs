@@ -499,7 +499,10 @@ mod tests {
 
     #[test]
     fn an_unparsable_file_is_an_error() {
-        assert!(unmarked(&Source::new("fn f( {".to_owned())).is_err());
+        pbfhogg_test_scratch::refused(
+            unmarked(&Source::new("fn f( {".to_owned())),
+            "cannot parse string into token stream",
+        );
     }
 
     #[test]

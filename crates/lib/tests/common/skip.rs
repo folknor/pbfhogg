@@ -144,6 +144,7 @@ mod tests {
             " direct-io",
             "direct-io,,io-uring",
         ] {
+            // any-error-deliberate: a direct String-error parser, no worker to panic
             assert!(parse_requirement(malformed).is_err(), "{malformed:?}");
         }
     }

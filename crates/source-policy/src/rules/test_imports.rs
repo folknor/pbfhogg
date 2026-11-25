@@ -383,13 +383,19 @@ mod tests {
 
     #[test]
     fn unknown_use_syntax_fails_closed() {
-        for src in [
-            "use pbfhogg::{writer::PbfWriter",
-            "use pbfhogg::writer::PbfWriter as;",
-            "use pbfhogg::self::writer;",
-            "use pbfhogg::{a b};",
+        for (src, needle) in [
+            (
+                "use pbfhogg::{writer::PbfWriter",
+                "line 1: unterminated use",
+            ),
+            ("use pbfhogg::writer::PbfWriter as;", "line 1: use rename"),
+            (
+                "use pbfhogg::self::writer;",
+                "line 1: use path continuing after self",
+            ),
+            ("use pbfhogg::{a b};", "line 1: use group token \"b\""),
         ] {
-            assert!(violations(&Source::new(src.to_owned())).is_err(), "{src}");
+            pbfhogg_test_scratch::refused(violations(&Source::new(src.to_owned())), needle);
         }
     }
 }

@@ -972,6 +972,7 @@ pub(super) fn encode_blob_payload_from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_err_kind;
 
     // In tests we use .expect() liberally; clippy::unwrap_used covers .unwrap()
     // but .expect() is always fine.
@@ -1095,7 +1096,11 @@ mod tests {
         let cb = vec![0u8; 15];
         let rcs = [2u32];
         let result = encode_blob_payload(&cb, &rcs, &mut Vec::new());
-        assert!(result.is_err(), "expected Err for length mismatch");
+        assert_err_kind!(
+            result,
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("coord_bytes length mismatch"),
+            "expected Err for length mismatch",
+        );
     }
 
     /// Build a minimal per-way refcount sidecar in memory for `num_way_blobs`
@@ -1300,12 +1305,18 @@ mod tests {
         for blob in 0..3 {
             assert_eq!(mapped.blob_record(blob), owned.blob_record(blob));
         }
-        assert!(load_per_way_refcount_sidecar_indexed(&path, 2).is_err());
+        assert_err_kind!(
+            load_per_way_refcount_sidecar_indexed(&path, 2),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("trailing bytes"),
+        );
         drop(mapped);
         std::fs::write(path.as_path(), b"").expect("empty sidecar");
         let empty = load_per_way_refcount_sidecar_indexed(&path, 0).expect("empty");
         assert_eq!(empty.num_blobs(), 0);
-        assert!(load_per_way_refcount_sidecar_indexed(&path, 1).is_err());
+        assert_err_kind!(
+            load_per_way_refcount_sidecar_indexed(&path, 1),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     // Helper: build a PerWayRcs directly from slice-of-slices.

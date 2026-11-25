@@ -825,7 +825,11 @@ mod tests {
         let (_, ways, _) = run(&node(last_default));
         assert_eq!(ways, 1, "1000 then 100 is default-framed in effect");
         let last_framed = with_scalar(with_scalar(way_block(42, &[7], true), 17, 100), 17, 1000);
-        try_run(&node(last_framed)).expect_err("100 then 1000 is non-default in effect");
+        crate::test_support::assert_err_kind!(
+            try_run(&node(last_framed)),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("non-default coordinate framing"),
+            "100 then 1000 is non-default in effect"
+        );
     }
 
     /// `date_granularity` (18) is copied through so the copied timestamps

@@ -156,7 +156,12 @@ fn a_refused_or_failed_cat_returns_its_grant() {
     let enough = light(budget);
     let (host, _) = watched(&enough, &[]);
     let missing = dir.path().join("missing.osm.pbf");
-    cat(&[&a, &missing], &output, &host).expect_err("a missing input fails after admission");
+    let err =
+        cat(&[&a, &missing], &output, &host).expect_err("a missing input fails after admission");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "expected a NotFound open failure, got: {err}"
+    );
     assert_eq!(enough.available(), budget);
     assert!(!output.exists());
 }

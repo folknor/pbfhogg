@@ -1033,7 +1033,10 @@ fn inventory_rejects_missing_duplicate_misplaced_and_undeclared_results() {
         "assertions":[{"id":"inner","status":"pass"}]});
     let calls = vec![("a.json".into(), call.clone())];
     assert!(validate_inventory(&decl, &scenario, &calls).is_ok());
-    assert!(validate_inventory(&decl, &scenario, &[]).is_err());
+    pbfhogg_test_scratch::refused(
+        validate_inventory(&decl, &scenario, &[]),
+        "call inventory differs",
+    );
     for assertions in [
         serde_json::json!([]),
         serde_json::json!([{"id":"inner","status":"pass"},{"id":"inner","status":"pass"}]),
@@ -1042,13 +1045,22 @@ fn inventory_rejects_missing_duplicate_misplaced_and_undeclared_results() {
     ] {
         let mut bad = call.clone();
         bad["assertions"] = assertions;
-        assert!(validate_inventory(&decl, &scenario, &[("a.json".into(), bad)]).is_err());
+        pbfhogg_test_scratch::refused(
+            validate_inventory(&decl, &scenario, &[("a.json".into(), bad)]),
+            "assertion inventory differs for Some(\"a\")",
+        );
     }
     let mut missing = scenario.clone();
     missing["assertions"] = serde_json::json!([]);
-    assert!(validate_inventory(&decl, &missing, &calls).is_err());
+    pbfhogg_test_scratch::refused(
+        validate_inventory(&decl, &missing, &calls),
+        "assertion inventory differs for None",
+    );
     let duplicates = vec![("a.json".into(), call.clone()), ("a.json".into(), call)];
-    assert!(validate_inventory(&decl, &scenario, &duplicates).is_err());
+    pbfhogg_test_scratch::refused(
+        validate_inventory(&decl, &scenario, &duplicates),
+        "call inventory differs",
+    );
 }
 
 #[test]

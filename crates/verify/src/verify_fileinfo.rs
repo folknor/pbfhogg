@@ -175,7 +175,10 @@ mod tests {
         assert!(!info.strictly_ordered());
         assert_eq!(info.multiple_versions, None);
         let malformed = ORDERED.replace(r#""multiple_versions":false,"#, "");
-        assert!(parse(malformed.as_bytes()).is_err());
+        crate::test_support::refused(
+            parse(malformed.as_bytes()),
+            "an ordered file without data.multiple_versions",
+        );
         let repeated = ORDERED.replace(
             r#""multiple_versions":false"#,
             r#""multiple_versions":true"#,
@@ -198,13 +201,13 @@ mod tests {
             r#""ways":10,"relations":-3},"maxid""#,
         );
         assert_eq!(parse(empty_kind.as_bytes()).unwrap().negative_id(), None);
-        assert!(
+        crate::test_support::refused(
             parse(
                 ORDERED
                     .replace(r#""nodes":2,"ways":1"#, r#""ways":1"#)
-                    .as_bytes()
-            )
-            .is_err()
+                    .as_bytes(),
+            ),
+            "missing field `nodes`",
         );
     }
 }

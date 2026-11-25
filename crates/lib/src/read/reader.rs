@@ -1981,9 +1981,11 @@ mod tests {
                 |a, b| a + b,
             )
         });
-        assert!(
-            result.is_err(),
-            "a worker panic must propagate as a panic, not be swallowed"
+        let payload =
+            result.expect_err("a worker panic must propagate as a panic, not be swallowed");
+        assert_eq!(
+            crate::test_support::panic_text(&*payload).as_deref(),
+            Some("boom in map_op")
         );
     }
 
@@ -2004,9 +2006,11 @@ mod tests {
             .unwrap();
             reader.par_map_reduce(|_e| 1_u64, || 0_u64, |a, b| a + b)
         });
-        assert!(
-            result.is_err(),
-            "a panicking Read must propagate, not deadlock scope cleanup"
+        let payload =
+            result.expect_err("a panicking Read must propagate, not deadlock scope cleanup");
+        assert_eq!(
+            crate::test_support::panic_text(&*payload).as_deref(),
+            Some("boom in Read during pump")
         );
     }
 
@@ -2293,6 +2297,10 @@ mod tests {
             let _held = torn_down;
             panic!("caller unwinds");
         }));
-        assert!(unwound.is_err());
+        let payload = unwound.expect_err("the caller's panic unwinds");
+        assert_eq!(
+            crate::test_support::panic_text(&*payload).as_deref(),
+            Some("caller unwinds")
+        );
     }
 }

@@ -4,6 +4,9 @@
 pub(crate) mod error;
 #[path = "../src/process.rs"]
 pub(crate) mod process;
+#[cfg(test)]
+#[path = "../src/test_support.rs"]
+pub(crate) mod test_support;
 #[path = "../src/tunables.rs"]
 pub(crate) mod tunables;
 

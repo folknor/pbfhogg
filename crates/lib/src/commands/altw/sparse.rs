@@ -447,7 +447,12 @@ mod tests {
                 let refused = &refused;
                 scope.spawn(move || {
                     for _ in 0..1000 {
-                        if writer.insert(1, 0, lat, lon).is_err() {
+                        if let Err(e) = writer.insert(1, 0, lat, lon) {
+                            assert!(
+                                e.to_string()
+                                    .contains("more than once with different coordinates"),
+                                "expected the duplicate-coordinate refusal, got: {e:?}"
+                            );
                             refused.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -463,7 +468,10 @@ mod tests {
         assert_eq!(slots[1].load(Ordering::Relaxed), super::pack(5, 6).unwrap());
         let out = [AtomicU64::new(0)];
         let writer = super::SharedSparseWriter { slots: &out };
-        assert!(writer.insert(3, 0, 900_000_001, 0).is_err());
+        crate::test_support::assert_err_kind!(
+            writer.insert(3, 0, 900_000_001, 0),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("outside the geographic domain")
+        );
         assert_eq!(out[0].load(Ordering::Relaxed), 0);
     }
 
@@ -487,10 +495,13 @@ mod tests {
     fn sparse_allocation_policy_calls_allocator_on_success_only() {
         let dir = crate::path_guard::tests::scratch();
         let file = std::fs::File::create(dir.path().join("store")).expect("create store");
-        super::preallocate_sparse_file_with(&file, dir.path(), 8, 7, |_, _| {
-            panic!("free-space refusal must precede allocation")
-        })
-        .expect_err("insufficient space");
+        crate::test_support::assert_err_kind!(
+            super::preallocate_sparse_file_with(&file, dir.path(), 8, 7, |_, _| {
+                panic!("free-space refusal must precede allocation")
+            }),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+            "insufficient space"
+        );
         let mut called = false;
         super::preallocate_sparse_file_with(&file, dir.path(), 8, 8, |_, length| {
             called = true;

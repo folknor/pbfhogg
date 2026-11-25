@@ -483,8 +483,14 @@ mod tests {
         let with_self = judge(&[object(W, 7, &[-0, 4], &[])], &w).unwrap();
         assert_eq!(with_self.requested, vec![(1, 7)]);
         assert_eq!(with_self.way_ref, Some(0));
-        assert!(judge(&[object(W, 8, &[-4], &[])], &w).is_err());
-        assert!(judge(&[object(R, 8, &[], &[(R, -1)])], &w).is_err());
+        crate::test_support::refused(
+            judge(&[object(W, 8, &[-4], &[])], &w),
+            "way 8 references the negative node -4",
+        );
+        crate::test_support::refused(
+            judge(&[object(R, 8, &[], &[(R, -1)])], &w),
+            "relation 8 has the negative relation member -1",
+        );
     }
 
     #[test]

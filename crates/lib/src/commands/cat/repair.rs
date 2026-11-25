@@ -592,7 +592,10 @@ mod tests {
         let b = vfield(1, 1);
         let way = [vfield(1, 1), field(4, &a), field(4, &b)].concat();
         let block = block_of(&field(3, &way));
-        assert!(merge_repeated_metadata(&block).is_err());
+        crate::test_support::assert_err_kind!(
+            merge_repeated_metadata(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     #[test]
@@ -620,7 +623,10 @@ mod tests {
         let a = field(1, &[0x81]);
         let b = field(1, &[0x01]);
         let dense = [field(1, &[0x02, 0x02]), field(5, &a), field(5, &b)].concat();
-        assert!(merge_repeated_metadata(&block_of(&field(2, &dense))).is_err());
+        crate::test_support::assert_err_kind!(
+            merge_repeated_metadata(&block_of(&field(2, &dense))),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     #[test]

@@ -271,8 +271,14 @@ mod tests {
             (1, 1, 2, 1, 1)
         );
         std::fs::write(&matches, "n99 v0 T\n").unwrap();
-        assert!(expected(&input, &matches, dir, &mut Kept::default()).is_err());
+        crate::test_support::refused(
+            expected(&input, &matches, dir, &mut Kept::default()),
+            "which is no change of the input",
+        );
         std::fs::write(&matches, "n99 v0 T").unwrap();
-        assert!(expected(&input, &matches, dir, &mut Kept::default()).is_err());
+        crate::test_support::refused(
+            expected(&input, &matches, dir, &mut Kept::default()),
+            "matched.opl ends inside a line",
+        );
     }
 }

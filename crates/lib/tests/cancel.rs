@@ -1359,6 +1359,7 @@ fn run_refused(
         return Err(format!("{name}: capabilities left at rest: {rest:?}"));
     }
     match result {
+        // any-error-deliberate: any unwind is the failure this arm reports
         Err(_) => Err(format!(
             "{name}: a refused spawn unwound instead of returning"
         )),

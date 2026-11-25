@@ -150,8 +150,15 @@ fn independently_encoded_address_is_queryable() {
     let address = result.address.expect("encoded address must answer");
     assert_eq!(address.house_number, "10");
     assert_eq!(address.street, Some("Main Street"));
-    assert!(reader.query(f64::NAN, 12.5).is_err());
-    assert!(reader.candidates(55.7, 181.0).is_err());
+    use pbfhogg::geocode_index::reader::QueryError;
+    assert!(matches!(
+        reader.query(f64::NAN, 12.5).err(),
+        Some(QueryError::NonFiniteLatitude(_))
+    ));
+    assert!(matches!(
+        reader.candidates(55.7, 181.0).err(),
+        Some(QueryError::LongitudeOutOfRange(_))
+    ));
 }
 
 #[test]

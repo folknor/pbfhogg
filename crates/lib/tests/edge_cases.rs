@@ -545,17 +545,19 @@ fn altw_refusal_leaves_a_preexisting_destination_intact() {
     write_unresolvable_way_pbf(&input);
     std::fs::write(&output, b"user data").expect("write pre-existing destination");
 
+    let err = pbfhogg::altw::add_locations_to_ways(
+        &input,
+        crate::common::out_replace(&output),
+        &altw_options(),
+        &pbfhogg::HeaderOverrides::default(),
+        &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
+    )
+    .err()
+    .expect("an unresolvable way ref must fail the default policy");
     assert!(
-        pbfhogg::altw::add_locations_to_ways(
-            &input,
-            crate::common::out_replace(&output),
-            &altw_options(),
-            &pbfhogg::HeaderOverrides::default(),
-            &crate::common::test_host(),
-            crate::common::scratch_in(dir.path())
-        )
-        .is_err(),
-        "an unresolvable way ref must fail the default policy"
+        matches!(err.kind(), pbfhogg::ErrorKind::MissingNodeLocations { .. }),
+        "expected MissingNodeLocations, got: {err:?}"
     );
 
     assert_eq!(
@@ -584,6 +586,7 @@ fn normalized_output_requires_header_and_complete_framing() {
     let dir = crate::common::test_scratch();
     let path = dir.path().join("output.pbf");
     std::fs::write(&path, b"").expect("empty output");
+    // any-error-deliberate: catches the helper's deliberate assertion panic
     assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
 
     let mut block = block_builder::BlockBuilder::new();
@@ -596,6 +599,7 @@ fn normalized_output_requires_header_and_complete_framing() {
             .expect("write headerless data");
         writer.flush().expect("flush");
     }
+    // any-error-deliberate: catches the helper's deliberate assertion panic
     assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
 
     write_empty_pbf(&path);
@@ -605,9 +609,11 @@ fn normalized_output_requires_header_and_complete_framing() {
         let mut bytes = valid.clone();
         bytes.extend_from_slice(tail);
         std::fs::write(&path, bytes).expect("malformed tail");
+        // any-error-deliberate: catches the helper's deliberate assertion panic
         assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
     }
     std::fs::write(&path, &valid[..valid.len() - 1]).expect("truncated payload");
+    // any-error-deliberate: catches the helper's deliberate assertion panic
     assert!(std::panic::catch_unwind(|| read_normalized(&path)).is_err());
 }
 
@@ -692,6 +698,7 @@ fn sorted_output_assertion_checks_stream_and_canonical_ids() {
         vec![(2, -1), (2, 0)],
     ] {
         write_order_control(&path, &invalid);
+        // any-error-deliberate: catches the helper's deliberate assertion panic
         assert!(
             std::panic::catch_unwind(|| crate::common::assert_sorted_file(&path)).is_err(),
             "accepted out-of-order control: {invalid:?}"

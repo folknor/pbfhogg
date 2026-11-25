@@ -464,7 +464,10 @@ mod tests {
         let found = literals(&Source::new(src.to_owned())).expect("parses");
         assert_eq!(found[0].0, 4);
         assert!(texts("#![cfg(test)]\nconst X: &str = \"--x\";").is_empty());
-        assert!(literals(&Source::new("fn (".to_owned())).is_err());
+        pbfhogg_test_scratch::refused(
+            literals(&Source::new("fn (".to_owned())),
+            "line 1: does not parse",
+        );
     }
 
     #[test]

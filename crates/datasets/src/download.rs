@@ -1007,10 +1007,10 @@ mod tests {
         assert!(run(&req).unwrap_err().contains("registered by 'other'"));
         assert_eq!(tools.fetches.get(), 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        assert!(
+        pbfhogg_test_scratch::refused(
             dir.join("denmark-20260411-with-indexdata.osm.pbf")
-                .symlink_metadata()
-                .is_err()
+                .symlink_metadata(),
+            "No such file or directory",
         );
     }
 
@@ -1096,7 +1096,7 @@ mod tests {
             today: CivilDate::parse_yyyymmdd("20260411").unwrap(),
         };
         // Day A: Asia publishes its raw and dies before registering.
-        assert!(run(&asia).is_err());
+        pbfhogg_test_scratch::refused(run(&asia), "injected cat failure");
         let leftover = dir.join("georgia-20260411.osm.pbf");
         assert!(leftover.is_file());
         // Day B: the US source registers under another name.
@@ -1498,12 +1498,12 @@ mod tests {
         record("download.geofabrik.de/europe/denmark");
         // A later transfer failure must leave both adoption and learned seq
         // unregistered, even though seq 13 was already published.
-        assert!(
+        pbfhogg_test_scratch::refused(
             run(&Request {
                 osc_seq: Some(14),
                 ..req
-            })
-            .is_err()
+            }),
+            "unexpected transfer",
         );
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
         assert!(dir.join("denmark-seq13.osc.gz").is_file());
@@ -1522,14 +1522,14 @@ mod tests {
         })
         .unwrap();
         std::fs::write(dir.join("denmark-seq11.osc.gz"), b"changed").unwrap();
-        assert!(
+        pbfhogg_test_scratch::refused(
             run(&Request {
                 refresh: false,
                 force: false,
                 config: &config,
                 ..req
-            })
-            .is_err()
+            }),
+            "denmark-seq11.osc.gz: xxhash mismatch",
         );
     }
 
@@ -1600,23 +1600,23 @@ mod tests {
             today: CivilDate::from_unix_timestamp(0).unwrap(),
         };
         for key in ["", "base", "../bad", "a.b", "non ascii"] {
-            assert!(
+            pbfhogg_test_scratch::refused(
                 run(&Request {
                     as_snapshot: Some(key),
                     ..req
-                })
-                .is_err()
+                }),
+                "snapshot key must match",
             );
         }
-        assert!(
+        pbfhogg_test_scratch::refused(
             run(&Request {
                 region: "malta",
                 ..req
-            })
-            .is_err()
+            }),
+            "not found; download its primary first",
         );
         assert_eq!(tools.fetches.get(), 0);
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(run(&req), "injected cat failure");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert_eq!(tools.fetches.get(), 1);
         // Recovery adopts the published raw, but an indexed file this tool
@@ -1645,12 +1645,12 @@ mod tests {
             std::fs::read(dir.join(&snap.pbf["indexed"].file)).unwrap(),
             b"new indexed"
         );
-        assert!(
+        pbfhogg_test_scratch::refused(
             run(&Request {
                 config: &updated,
                 ..req
-            })
-            .is_err()
+            }),
+            "snapshot '20260411' is already registered",
         );
         assert_eq!(tools.fetches.get(), 4);
         // Non-date keys use today's date and need no header or OSC lookup.

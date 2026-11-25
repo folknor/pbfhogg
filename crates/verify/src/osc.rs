@@ -1244,7 +1244,10 @@ mod tests {
                 "{ids:?}"
             );
         }
-        assert!(parse_osc_text(r#"<osmChange><create><node id="1" user="a>"#).is_err());
+        crate::test_support::refused(
+            parse_osc_text(r#"<osmChange><create><node id="1" user="a>"#),
+            "incomplete XML tag",
+        );
     }
 
     #[test]
@@ -1349,8 +1352,11 @@ mod tests {
         // reported as "element-identical PASS".
         let empty = parse_osc_text("").unwrap_err();
         assert!(empty.contains("no <osmChange>"), "got: {empty}");
-        assert!(parse_osc_text("   \n").is_err());
-        assert!(parse_osc_text("not xml at all").is_err());
+        crate::test_support::refused(parse_osc_text("   \n"), "no <osmChange> root element");
+        crate::test_support::refused(
+            parse_osc_text("not xml at all"),
+            "no <osmChange> root element",
+        );
         let osm = parse_osc_text(r#"<osm version="0.6"><node id="1"/></osm>"#).unwrap_err();
         assert!(osm.contains("<osm>"), "got: {osm}");
     }
@@ -1360,7 +1366,10 @@ mod tests {
         let err = parse_osc_text(r#"<osmChange><delete><node id="1" version="1"/>"#).unwrap_err();
         assert!(err.contains("</osmChange>"), "got: {err}");
         // Cut off inside a tag.
-        assert!(parse_osc_text(r#"<osmChange><delete><node id="1" vers"#).is_err());
+        crate::test_support::refused(
+            parse_osc_text(r#"<osmChange><delete><node id="1" vers"#),
+            "incomplete XML tag",
+        );
     }
 
     #[test]
@@ -1413,15 +1422,15 @@ mod tests {
 
     #[test]
     fn unreadable_metadata_is_refused() {
-        for attrs in [
-            "id=\"1\" version=\"x\"",
-            "id=\"1\" user=\"a",
-            "id=\"1\" user=a",
-            "id=\"1\" user=\"&nope;\"",
-            "id=\"1\" user=\"a\" user=\"b\"",
-            "id=\"1\" user",
+        for (attrs, why) in [
+            ("id=\"1\" version=\"x\"", "version \"x\" is not an integer"),
+            ("id=\"1\" user=\"a", "attribute user value is unterminated"),
+            ("id=\"1\" user=a", "attribute user value is not quoted"),
+            ("id=\"1\" user=\"&nope;\"", "unknown reference &nope;"),
+            ("id=\"1\" user=\"a\" user=\"b\"", "attribute user repeated"),
+            ("id=\"1\" user", "attribute \"user\" has no value"),
         ] {
-            assert!(parse_meta(attrs).is_err(), "{attrs}");
+            crate::test_support::refused(parse_meta(attrs), why);
         }
     }
 
@@ -1452,7 +1461,7 @@ mod tests {
             "&#x110000;",
             "&#99999999999999999999;",
         ] {
-            assert!(decode_attribute(raw).is_err(), "{raw}");
+            crate::test_support::refused(decode_attribute(raw), "unknown reference");
         }
     }
 
@@ -1499,8 +1508,15 @@ mod tests {
             (TagKind::Empty, "node", "id=\"1\"")
         );
         assert_eq!(parse_tag("/way \n").unwrap(), (TagKind::End, "way", ""));
-        for bad in [" node", "/ node", "/way x", "node id=\"1\"//", "", "/"] {
-            assert!(parse_tag(bad).is_err(), "{bad:?}");
+        for (bad, why) in [
+            (" node", "malformed tag < node>"),
+            ("/ node", "malformed tag </ node>"),
+            ("/way x", "malformed end tag </way x>"),
+            ("node id=\"1\"//", "malformed tag <node id=\"1\"//>"),
+            ("", "malformed tag <>"),
+            ("/", "malformed tag </>"),
+        ] {
+            crate::test_support::refused(parse_tag(bad), why);
         }
     }
 
@@ -1583,7 +1599,7 @@ mod tests {
             let err = strict(xml).unwrap_err();
             assert!(err.contains(why), "{xml}: {err}");
             // The lexer is the same in both modes.
-            assert!(scan_osc_text(xml, |_, _, _| {}).is_err(), "{xml}");
+            crate::test_support::refused(scan_osc_text(xml, |_, _, _| {}), why);
         }
     }
 }

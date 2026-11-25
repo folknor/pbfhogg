@@ -551,7 +551,7 @@ mod tests {
         len_delimited(2, &plain_only, &mut block);
         assert_eq!(scan(&block).unwrap()[0].id, 7);
         scalar(19, i64::MAX, &mut block);
-        assert!(scan(&block).is_err());
+        crate::test_support::assert_err_kind!(scan(&block), crate::ErrorKind::WireFormat { .. });
     }
 
     fn kinds_of(block: &[u8]) -> ElementKindSet {
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!((t.lat, t.lon), (50, 0));
         let mut huge = block.clone();
         scalar(17, 1 << 31, &mut huge);
-        assert!(scan(&huge).is_err());
+        crate::test_support::assert_err_kind!(scan(&huge), crate::ErrorKind::WireFormat { .. });
 
         // A legal non-default granularity decodes. At 1000 nanodegrees per
         // unit a raw 55_000_000 is 55 degrees = 550_000_000 decimicrodegrees.

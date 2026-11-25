@@ -483,8 +483,12 @@ kind it expects, or a CLI test that requires exit 2, fails on a panic.
 `CliInvoker` offers no any-failure assertion, only exact statuses
 (`assert_refused`, `assert_usage`, `assert_exit`), and the CLI tests
 assert an exact status wherever they expect a failure. A library or unit
-test that asserts only `is_err()` still passes on a panic, and the suite
-does not yet forbid that shape); the `no-debug-only-invariants` textlint
+test that asserts only `is_err()` would still pass on a panic, so the
+source-policy rule `any_error` (`crates/source-policy/src/rules/any_error.rs`)
+forbids that shape and its kin in test code unless a
+`// any-error-deliberate: <reason>` marker binds to the site; crates whose
+errors name their cause only in text assert it with
+`pbfhogg_test_scratch::refused` and, for a caught unwind, `unwound`); the `no-debug-only-invariants` textlint
 enforces ADR-0021, so a production debug-only check exists only on a line
 carrying its `debug-only-measured:` record, which review polices; and every
 bench and verify run is a release build on real data. Not covered by any

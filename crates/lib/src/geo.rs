@@ -1730,7 +1730,10 @@ mod tests {
             (1.0, 0.0, 1.0, 1.0),
             (0.0, 1.0, 1.0, 0.0),
         ] {
-            assert!(Bbox::try_new(values.0, values.1, values.2, values.3).is_err());
+            crate::test_support::assert_err_kind!(
+                Bbox::try_new(values.0, values.1, values.2, values.3),
+                crate::ErrorKind::InvalidArgument { .. }
+            );
         }
     }
 

@@ -259,7 +259,7 @@ mod tests {
         // Force the writer's staging open to fail after PBF publication.
         let blocked = root.join(".brokkr.toml.tmp");
         std::fs::create_dir(&blocked).unwrap();
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(run(&req), "already exists; refusing to overwrite it");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
             file_digest(&root.join("data").join(&old.file)).unwrap(),
@@ -385,7 +385,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("publication name"), "{err}");
-        assert!(dest.symlink_metadata().is_err());
+        pbfhogg_test_scratch::refused(dest.symlink_metadata(), "No such file or directory");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
@@ -420,10 +420,16 @@ mod tests {
         let aliased = load(&format!(
             "{base}[h.datasets.other.pmtiles.t]\nfile = 'alias'\n"
         ));
-        assert!(DatasetLock::acquire(&aliased, "h", &dir, "tiny", &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            DatasetLock::acquire(&aliased, "h", &dir, "tiny", &[]),
+            "passes through it; it is already registered",
+        );
         let plain = load(base);
-        assert!(DatasetLock::acquire(&plain, "h", &dir, "tiny", &[&dir.join("alias")]).is_err());
-        assert!(lock.symlink_metadata().is_err());
+        pbfhogg_test_scratch::refused(
+            DatasetLock::acquire(&plain, "h", &dir, "tiny", &[&dir.join("alias")]),
+            "passes through it; move it elsewhere first",
+        );
+        pbfhogg_test_scratch::refused(lock.symlink_metadata(), "No such file or directory");
 
         // A symlink at the lock name, live or dangling, is not followed.
         symlink(&elsewhere, &lock).unwrap();
@@ -431,9 +437,12 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("symlink"), "{err}");
-        assert!(elsewhere.symlink_metadata().is_err());
+        pbfhogg_test_scratch::refused(elsewhere.symlink_metadata(), "No such file or directory");
         std::fs::write(&elsewhere, b"x").unwrap();
-        assert!(DatasetLock::acquire(&plain, "h", &dir, "tiny", &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            DatasetLock::acquire(&plain, "h", &dir, "tiny", &[]),
+            "is a symlink, not a lock file",
+        );
         std::fs::remove_file(&lock).unwrap();
 
         // A hard link shares another file's inode.
@@ -482,14 +491,17 @@ mod tests {
         };
         for snap in ["base", "../escape", "", "bad.key"] {
             req.snapshot = snap;
-            assert!(run(&req).is_err());
+            pbfhogg_test_scratch::refused(run(&req), "snapshot 'base' is reserved");
         }
         req.snapshot = "ok";
         req.strip_indexdata = true;
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(
+            run(&req),
+            "--strip-indexdata is only valid with --producer degrade",
+        );
         req.strip_indexdata = false;
         req.dataset = "missing";
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(run(&req), "dataset 'missing' is not registered");
         req.dataset = "tiny";
         let dir = root.join("data");
         let lock = DatasetLock::acquire(&config, "h", &dir, "tiny", &[]).unwrap();
@@ -498,13 +510,16 @@ mod tests {
         let digest = file_digest(&input).unwrap();
         let dest = dir.join(format!("tiny-ok-indexed-{digest}.osm.pbf"));
         std::os::unix::fs::symlink(&input, &dest).unwrap();
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(run(&req), "already exists with different bytes or type");
         std::fs::remove_file(&dest).unwrap();
         std::fs::write(&dest, b"wrong bytes").unwrap();
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(run(&req), "already exists with different bytes or type");
         std::fs::remove_file(&dest).unwrap();
         std::fs::write(&input, b"").unwrap();
-        assert!(run(&req).is_err());
+        pbfhogg_test_scratch::refused(
+            run(&req),
+            "promotion requires a nonempty regular output file",
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), text);
     }
 

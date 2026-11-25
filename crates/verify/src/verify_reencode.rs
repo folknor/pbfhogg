@@ -1494,7 +1494,10 @@ mod tests {
                 .contains("w5 v1 Nn1x1y1\n")
         );
         std::fs::write(&decoding, "n1 v1").unwrap();
-        assert!(partition(&decoding, &out, false).is_err());
+        crate::test_support::refused(
+            partition(&decoding, &out, false),
+            "d.opl: a last line without its newline",
+        );
     }
 
     #[test]
@@ -1502,9 +1505,12 @@ mod tests {
         let (side, kind, id, body) = parse_line(b"-w-12 v1 dV Nn1x1y2").unwrap();
         assert_eq!((side, kind, id), (b'-', 1, -12));
         assert_eq!(body, b"w-12 v1 dV Nn1x1y2");
-        assert!(parse_line(b" n1 v1").is_err());
-        assert!(parse_line(b"+c1 v1").is_err());
-        assert!(parse_line(b"+nx v1").is_err());
+        crate::test_support::refused(parse_line(b" n1 v1"), "not a - or + line");
+        crate::test_support::refused(
+            parse_line(b"+c1 v1"),
+            "an object that is not a node, way or relation",
+        );
+        crate::test_support::refused(parse_line(b"+nx v1"), "an object ID that does not read");
     }
 
     #[test]
@@ -1529,8 +1535,14 @@ mod tests {
         std::fs::write(&path, "-n2 v1\n-n1 v1\n").unwrap();
         let mut listing = Listing::open(&path).unwrap();
         listing.next_group().unwrap();
-        assert!(listing.next_group().is_err());
+        crate::test_support::refused(
+            listing.next_group(),
+            "l.opl line 2: an identity out of object order",
+        );
         std::fs::write(&path, "-n2 v1").unwrap();
-        assert!(Listing::open(&path).unwrap().next_group().is_err());
+        crate::test_support::refused(
+            Listing::open(&path).unwrap().next_group(),
+            "l.opl line 1: no terminating newline",
+        );
     }
 }

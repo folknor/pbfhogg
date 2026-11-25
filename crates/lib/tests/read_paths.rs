@@ -553,7 +553,11 @@ fn block_fn_error_stops_pipeline() {
         .read_ahead(1)
         .decode_ahead(1)
         .for_each_block_pipelined(|_| Err(std::io::Error::other("stop").into()));
-    assert!(result.is_err());
+    let err = result.expect_err("the closure's error stops the pipeline");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::Io(e) if e.to_string() == "stop"),
+        "expected the closure's own error, got: {err}"
+    );
 }
 
 /// A mid-file decode failure surfaces from the plain `run_pipeline` in its
@@ -585,7 +589,11 @@ fn decode_error_surfaces_after_prior_blocks() {
             blocks += 1;
             Ok(())
         });
-    assert!(result.is_err(), "decode error must surface");
+    let err = result.expect_err("decode error must surface");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::WireFormat { .. }),
+        "expected the corrupt blob's wire-format failure, got: {err}"
+    );
     assert!(
         blocks > 0,
         "preceding block must be delivered before the error"

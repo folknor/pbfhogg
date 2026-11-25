@@ -29,6 +29,7 @@ struct Release {
 impl Drop for Release {
     fn drop(&mut self) {
         self.invocation.faults().release_built_pool_threads();
+        // any-error-deliberate: a join guard reports any driver panic
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {
@@ -139,6 +140,7 @@ fn decode_pool_is_joined_before_a_panicking_consumer_unwinds() {
     let invocation = Invocation::new();
     let reader_invocation = invocation.clone();
     let unwound = run_held(&invocation, 2, move || {
+        // any-error-deliberate: catches the consumer's deliberate panic
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ElementReader::from_path(&path)
                 .unwrap()

@@ -267,9 +267,15 @@ mod tests {
         let run = Run::create(scratch.path(), &fake_exe(scratch.path()), false).unwrap();
         let dir = run.check_dir("sort").unwrap();
         assert!(dir.is_dir());
-        assert!(run.check_dir("sort").is_err());
+        crate::test_support::refused(
+            run.check_dir("sort"),
+            "checks/sort already exists in this run",
+        );
         for bad in ["", ".", "..", "a/b"] {
-            assert!(run.check_dir(bad).is_err(), "{bad:?}");
+            crate::test_support::refused(
+                run.check_dir(bad),
+                "check directory must be one plain component",
+            );
         }
     }
 

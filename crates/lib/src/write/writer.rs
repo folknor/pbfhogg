@@ -1800,8 +1800,14 @@ mod tests {
             err.to_string().contains("output is incomplete"),
             "got: {err}"
         );
-        assert!(w.flush().is_err());
-        assert!(w.flush().is_err());
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("output is incomplete"),
+        );
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("output is incomplete"),
+        );
     }
 
     /// Writing after `flush` must be an error, not a panic.
@@ -1852,8 +1858,14 @@ mod tests {
             err.to_string().contains("no space left on device"),
             "the thread's own message must reach the caller, got: {err}"
         );
-        assert!(w.flush().is_err());
-        assert!(w.flush().is_err());
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+        );
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+        );
     }
 
     /// The sync (non-pipelined) path must refuse an oversize blob body too.
@@ -2040,8 +2052,14 @@ mod tests {
             err.to_string().contains("owned variant"),
             "write_primitive_block_owned must surface the writer thread's error"
         );
-        assert!(w.flush().is_err());
-        assert!(w.flush().is_err());
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+        );
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+        );
 
         let mut w = writer_with_dead_thread(Err(storage_full(
             "no-indexdata variant: no space left on device",
@@ -2051,8 +2069,14 @@ mod tests {
             err.to_string().contains("no-indexdata variant"),
             "write_primitive_block_no_indexdata must surface the writer thread's error"
         );
-        assert!(w.flush().is_err());
-        assert!(w.flush().is_err());
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+        );
+        crate::test_support::assert_err_kind!(
+            w.flush(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::StorageFull,
+        );
     }
 
     /// Cover the other framing entry points and the raw-send permit path on
@@ -2106,7 +2130,13 @@ mod tests {
                         }
                     });
                 }));
-                assert_eq!(completion.is_err(), !flush);
+                // Only the test's own panic may unwind, and only when asked.
+                let unwound = completion
+                    .err()
+                    .map(|payload| crate::test_support::panic_text(&*payload));
+                let expected =
+                    (!flush).then(|| Some("exercise PbfWriter cleanup during unwind".to_owned()));
+                assert_eq!(unwound, expected);
                 let blobs = crate::BlobReader::from_path(&path)
                     .unwrap()
                     .map(|blob| blob.unwrap())

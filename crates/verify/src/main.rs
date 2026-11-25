@@ -36,6 +36,8 @@ mod reference_cache;
 mod run;
 mod selection;
 mod stream;
+#[cfg(test)]
+mod test_support;
 mod tunables;
 
 use std::os::unix::fs::PermissionsExt;
@@ -793,8 +795,14 @@ mod tests {
         for mode in ["sparse", "external", "all"] {
             assert!(Args::try_parse_from(["x", "add-locations-to-ways", "--mode", mode]).is_ok());
         }
-        assert!(Args::try_parse_from(["x", "add-locations-to-ways", "--mode", "dense"]).is_err());
-        assert!(Args::try_parse_from(["x", "check-refs", "--direct-io"]).is_err());
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "add-locations-to-ways", "--mode", "dense"]),
+            "invalid value 'dense' for '--mode <MODE>'",
+        );
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "check-refs", "--direct-io"]),
+            "unexpected argument '--direct-io' found",
+        );
         assert!(
             matches!(Args::try_parse_from(["x", "degrade", "--locations-on-ways"]).unwrap().check,
             Check::Degrade(a) if a.locations_on_ways)
@@ -819,16 +827,21 @@ mod tests {
         assert!(
             matches!(selections.check, Check::All(s) if s.selections.osc_seq == Some(42) && s.bbox.is_some())
         );
-        assert!(
-            Args::try_parse_from(["x", "all", "--osc", "fixture.osc", "--osc-seq", "42"]).is_err()
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "all", "--osc", "fixture.osc", "--osc-seq", "42"]),
+            "'--osc <OSC>' cannot be used with '--osc-seq <OSC_SEQ>'",
         );
-        assert!(Args::try_parse_from(["x", "all", "--bbox=1,2,NaN,4"]).is_err());
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "all", "--bbox=1,2,NaN,4"]),
+            "bbox component 2 must be finite",
+        );
         let parsed = Args::try_parse_from(["x", "all"]).unwrap();
         assert!(
             matches!(&parsed.check, Check::All(p) if p.pbf.source.dataset == "denmark" && p.pbf.source.variant == "indexed")
         );
-        assert!(
-            Args::try_parse_from(["x", "sort", "--input", "a.pbf", "--snapshot", "s"]).is_err()
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "sort", "--input", "a.pbf", "--snapshot", "s"]),
+            "'--input <INPUT>' cannot be used with '--snapshot <SNAPSHOT>'",
         );
     }
 
@@ -850,11 +863,23 @@ mod tests {
                 .is_ok()
             );
         }
-        assert!(Args::try_parse_from(["x", "diff", "--format", "json"]).is_err());
-        assert!(Args::try_parse_from(["x", "diff", "--osc", "a", "--osc-seq", "1"]).is_err());
-        assert!(Args::try_parse_from(["x", "diff", "--bbox=1,2,3,4"]).is_err());
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "diff", "--format", "json"]),
+            "invalid value 'json' for '--format <FORMAT>'",
+        );
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "diff", "--osc", "a", "--osc-seq", "1"]),
+            "'--osc <OSC>' cannot be used with '--osc-seq <OSC_SEQ>'",
+        );
+        crate::test_support::refused(
+            Args::try_parse_from(["x", "diff", "--bbox=1,2,3,4"]),
+            "unexpected argument '--bbox' found",
+        );
         for name in ["apply-changes", "tags-filter"] {
-            assert!(Args::try_parse_from(["x", name, "--bbox=1,2,3,4"]).is_err());
+            crate::test_support::refused(
+                Args::try_parse_from(["x", name, "--bbox=1,2,3,4"]),
+                "unexpected argument '--bbox' found",
+            );
         }
         let parsed =
             Args::try_parse_from(["x", "renumber", "--start-id", "10,20,30", "--direct-io"])
@@ -873,19 +898,28 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(args).is_ok());
         }
-        for args in [
-            vec!["x", "merge-changes", "--osc", "a", "--osc-range", "1..2"],
-            vec![
-                "x",
-                "merge-changes",
-                "--osc-seq",
-                "1",
-                "--osc-range",
-                "1..2",
-            ],
-            vec!["x", "merge-changes", "--direct-io"],
+        for (args, why) in [
+            (
+                vec!["x", "merge-changes", "--osc", "a", "--osc-range", "1..2"],
+                "'--osc <OSC>' cannot be used with '--osc-range <OSC_RANGE>'",
+            ),
+            (
+                vec![
+                    "x",
+                    "merge-changes",
+                    "--osc-seq",
+                    "1",
+                    "--osc-range",
+                    "1..2",
+                ],
+                "'--osc-seq <OSC_SEQ>' cannot be used with '--osc-range <OSC_RANGE>'",
+            ),
+            (
+                vec!["x", "merge-changes", "--direct-io"],
+                "unexpected argument '--direct-io' found",
+            ),
         ] {
-            assert!(Args::try_parse_from(args).is_err());
+            crate::test_support::refused(Args::try_parse_from(args), why);
         }
     }
 
@@ -894,7 +928,7 @@ mod tests {
         assert!(eligible("denmark").is_ok());
         assert!(eligible("germany").is_ok());
         for name in ["planet", "europe", "north-america", "malta", ""] {
-            assert!(eligible(name).is_err(), "{name}");
+            crate::test_support::refused(eligible(name), "is not verified on real data");
         }
     }
 

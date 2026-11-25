@@ -1587,7 +1587,10 @@ mod tests {
             ways_written: 1,
             ..super::Stats::default()
         };
-        assert!(stats.merge(&claim).is_err());
+        crate::test_support::assert_err_kind!(
+            stats.merge(&claim),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("overflow in nodes_read"),
+        );
         assert_eq!((stats.nodes_read, stats.ways_written), (1, 7));
         stats
             .merge(&super::Stats {

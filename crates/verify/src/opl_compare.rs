@@ -1845,12 +1845,27 @@ mod tests {
     fn repeats_disorder_and_garbage_are_errors() {
         let ok = "n1 v1\n";
         // An identical duplicate on both sides cannot pass as common.
-        assert!(run("n1 v1\nn1 v1\n", "n1 v1\nn1 v1\n").is_err());
-        assert!(run("n2 v1\nn1 v1\n", ok).is_err());
-        assert!(run("w1 v1\nn5 v1\n", ok).is_err());
-        assert!(run(ok, "n- v1\n").is_err());
-        assert!(run(ok, "c1 k1\n").is_err());
-        assert!(run(ok, "n1 v1").is_err());
+        crate::test_support::refused(
+            run("n1 v1\nn1 v1\n", "n1 v1\nn1 v1\n"),
+            "a.opl line 2: an object at or below the previous one",
+        );
+        crate::test_support::refused(
+            run("n2 v1\nn1 v1\n", ok),
+            "a.opl line 2: an object at or below the previous one",
+        );
+        crate::test_support::refused(
+            run("w1 v1\nn5 v1\n", ok),
+            "a.opl line 2: an object at or below the previous one",
+        );
+        crate::test_support::refused(
+            run(ok, "n- v1\n"),
+            "b.opl line 1: an object ID that is not a decimal",
+        );
+        crate::test_support::refused(
+            run(ok, "c1 k1\n"),
+            "b.opl line 1: a line that is not a node, way or relation",
+        );
+        crate::test_support::refused(run(ok, "n1 v1"), "b.opl line 1: no terminating newline");
         assert!(
             run("n0 v1\nn1 v1\n", "n0 v1\nn1 v1\n")
                 .unwrap()
@@ -1893,12 +1908,21 @@ mod tests {
         // A repeat on one side; the other side is ordered, and a parse error
         // in a drained side is that side's alone.
         let walked = judged("n1 v1\nn1 v1\n", "n1 v1\nn2 v1\nx\n").unwrap();
-        assert!(walked.merged.is_err());
+        crate::test_support::refused(
+            walked.merged,
+            "a.opl line 2: an object at or below the previous one",
+        );
         assert!(!walked.scans[0].as_ref().unwrap().ordered);
-        assert!(walked.scans[1].is_err());
+        crate::test_support::refused(
+            walked.scans[1].as_ref(),
+            "b.opl line 3: a line that is not a node, way or relation",
+        );
 
         // A read error before any step-down is raised, not judged.
-        assert!(judged("n1 v1", "n1 v1\n").is_err());
+        crate::test_support::refused(
+            judged("n1 v1", "n1 v1\n"),
+            "a.opl line 1: no terminating newline",
+        );
     }
 
     #[test]
@@ -1906,7 +1930,10 @@ mod tests {
         // Zero, then negatives by magnitude, then positives.
         let text = "n0 v1\nn-1 v1\nn-2 v1\nn1 v1\n";
         assert!(run(text, text).unwrap().0.identical());
-        assert!(run("n-2 v1\nn-1 v1\n", "n-2 v1\n").is_err());
+        crate::test_support::refused(
+            run("n-2 v1\nn-1 v1\n", "n-2 v1\n"),
+            "a.opl line 2: an object at or below the previous one",
+        );
         let (merged, _, listing) = run("n-1 v1\nn1 v1\n", "n-1 v2\nn1 v1\n").unwrap();
         assert_eq!(merged.differs, 1);
         assert_eq!(listing, "-n-1 v1\n+n-1 v2\n");

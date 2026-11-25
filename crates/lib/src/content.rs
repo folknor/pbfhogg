@@ -749,12 +749,24 @@ mod tests {
     #[test]
     fn malformed_pins_are_refused() {
         // Nine refs need two bytes: a short and a long bitmap.
-        assert!(pins(Some(&[0b0000_0001]), 9).is_err());
-        assert!(pins(Some(&[1, 0, 0]), 9).is_err());
+        crate::test_support::assert_err_kind!(
+            pins(Some(&[0b0000_0001]), 9),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("one bit per ref"),
+        );
+        crate::test_support::assert_err_kind!(
+            pins(Some(&[1, 0, 0]), 9),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("one bit per ref"),
+        );
         // Bit 9 on a nine-ref way.
-        assert!(pins(Some(&[0, 0b0000_0010]), 9).is_err());
+        crate::test_support::assert_err_kind!(
+            pins(Some(&[0, 0b0000_0010]), 9),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("pins position 9"),
+        );
         // An empty present bitmap on a way with refs.
-        assert!(pins(Some(&[]), 3).is_err());
+        crate::test_support::assert_err_kind!(
+            pins(Some(&[]), 3),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("one bit per ref"),
+        );
         assert!(pins(Some(&[]), 0).is_ok());
     }
 }

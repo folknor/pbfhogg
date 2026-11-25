@@ -189,7 +189,11 @@ fn a_command_failing_before_it_opens_its_output_records_refused_error() {
         &Default::default(),
         &host,
     );
-    assert!(result.is_err(), "no input");
+    let err = result.err().expect("no input");
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "expected a NotFound open failure, got: {err}"
+    );
     assert_eq!(
         summary(&host.invocation),
         [(1, Decision::RefusedError, vec![Effect::None])]
@@ -534,7 +538,21 @@ mod faults {
             let writer = out.writer().expect("writer");
             std::fs::write(writer.path().join("new"), b"new").expect("new");
             writer.finish();
-            out.publish().expect_err("injected");
+            let err = out.publish().expect_err("injected");
+            if existing {
+                assert!(
+                    matches!(
+                        err.kind(),
+                        pbfhogg::ErrorKind::Output(pbfhogg::OutputError::RollbackIncomplete { .. })
+                    ),
+                    "the old generation could not be restored: {err}"
+                );
+            } else {
+                assert!(
+                    err.report().contains("injected publication fault"),
+                    "the injected fault itself: {err}"
+                );
+            }
             let expected = if existing {
                 Effect::Displaced
             } else {
@@ -579,6 +597,7 @@ mod faults {
         });
         let out = staged(&dir.path().join("a"), &invocation);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.publish()));
+        // any-error-deliberate: the observer's own deliberate panic
         assert!(unwound.is_err());
         let second = staged(&dir.path().join("b"), &invocation);
         second.publish().expect("publishes again");

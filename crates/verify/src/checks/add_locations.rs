@@ -482,25 +482,49 @@ mod tests {
 
     #[test]
     fn digest_report_refuses_malformed_output() {
-        assert!(DigestReport::parse("").is_err());
-        assert!(DigestReport::parse(&report("2", "5")).is_err());
-        assert!(DigestReport::parse(&report("v2", "x")).is_err());
-        assert!(DigestReport::parse(&report("v+2", "5")).is_err());
-        assert!(DigestReport::parse(&report("v2", "+5")).is_err());
+        crate::test_support::refused(DigestReport::parse(""), "empty report");
+        crate::test_support::refused(
+            DigestReport::parse(&report("2", "5")),
+            "carries no form version",
+        );
+        crate::test_support::refused(
+            DigestReport::parse(&report("v2", "x")),
+            "expected a way line",
+        );
+        crate::test_support::refused(
+            DigestReport::parse(&report("v+2", "5")),
+            "carries no form version",
+        );
+        crate::test_support::refused(
+            DigestReport::parse(&report("v2", "+5")),
+            "expected a way line",
+        );
         // Trailing blank lines.
-        assert!(DigestReport::parse(&format!("{}\n\n", report("v2", "5"))).is_err());
+        crate::test_support::refused(
+            DigestReport::parse(&format!("{}\n\n", report("v2", "5"))),
+            "unexpected trailing line \"\"",
+        );
         // A missing kind line.
-        assert!(DigestReport::parse(&format!("xxh128 v2 {H}\nnode 3 {H}\nway 5 {H}\n")).is_err());
+        crate::test_support::refused(
+            DigestReport::parse(&format!("xxh128 v2 {H}\nnode 3 {H}\nway 5 {H}\n")),
+            "no relation line",
+        );
         // Kinds out of order.
-        assert!(
+        crate::test_support::refused(
             DigestReport::parse(&format!(
                 "xxh128 v2 {H}\nway 5 {H}\nnode 3 {H}\nrelation 0 {H}\n"
-            ))
-            .is_err()
+            )),
+            "expected a node line",
         );
         // Anything after the relation line.
-        assert!(DigestReport::parse(&format!("{}node 1 {H}\n", report("v2", "5"))).is_err());
+        crate::test_support::refused(
+            DigestReport::parse(&format!("{}node 1 {H}\n", report("v2", "5"))),
+            "unexpected trailing line \"node 1",
+        );
         // A short hash.
-        assert!(DigestReport::parse(&format!("xxh128 v2 abc\nnode 3 {H}\n")).is_err());
+        crate::test_support::refused(
+            DigestReport::parse(&format!("xxh128 v2 abc\nnode 3 {H}\n")),
+            "carries no single 128-bit hash",
+        );
     }
 }

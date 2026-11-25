@@ -114,7 +114,11 @@ fn trailing_zero_run_after_valid_blobs_is_rejected() {
     for result in reader.by_ref() {
         match result {
             Ok(_) => seen += 1,
-            Err(_) => {
+            Err(err) => {
+                assert!(
+                    matches!(err.kind(), ErrorKind::Blob(BlobError::InvalidHeaderSize)),
+                    "a zero run must be InvalidHeaderSize, got {err}"
+                );
                 errored = true;
                 break;
             }
@@ -659,8 +663,11 @@ fn iteration_stops_after_error() {
     assert_eq!(first.get_type(), BlobType::OsmHeader);
 
     // Second read fails (truncated header data, shape 3)
-    let second = reader.next().unwrap();
-    assert!(second.is_err());
+    let second = reader.next().unwrap().unwrap_err();
+    match second.kind() {
+        ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        other => panic!("expected Io(UnexpectedEof) for truncated header, got {other:?}"),
+    }
 
     // Third read: iteration has stopped (last_blob_ok = false)
     assert!(reader.next().is_none());

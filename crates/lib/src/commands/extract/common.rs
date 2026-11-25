@@ -861,6 +861,9 @@ mod tests {
     fn broken_framing_is_an_error_not_ineligibility() {
         let mut block = node_block();
         block.extend_from_slice(&[0x12, 0x7f]); // a group claiming 127 bytes
-        assert!(dense_only_payload(&block).is_err());
+        crate::test_support::assert_err_kind!(
+            dense_only_payload(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 }

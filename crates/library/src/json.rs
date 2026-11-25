@@ -509,8 +509,14 @@ mod tests {
             canonical(&doc).unwrap(),
             "{\"a\":{\"Z\":\"t\\u0001\\n\\\"\\\\/\u{e9}\",\"z\":null,\"\u{e9}\":true},\"b\":[1,-2,18446744073709551615]}"
         );
-        assert!(canonical(&root("{\"n\": 1.5}")).is_err());
-        assert!(canonical(&root("{\"n\": 1, \"n\": 2}")).is_err());
+        pbfhogg_test_scratch::refused(
+            canonical(&root("{\"n\": 1.5}")),
+            "a number that is not an integer has no canonical form",
+        );
+        pbfhogg_test_scratch::refused(
+            canonical(&root("{\"n\": 1, \"n\": 2}")),
+            "a duplicate key has no canonical form",
+        );
     }
 
     #[test]
@@ -569,8 +575,14 @@ mod tests {
     #[test]
     fn only_whitespace_may_follow_the_document_and_a_bom_is_refused() {
         assert!(parse("doc", b"{} \n").is_ok());
-        assert!(parse("doc", b"{} {}").is_err());
-        assert!(parse("doc", b"\xEF\xBB\xBF{}").is_err());
+        pbfhogg_test_scratch::refused(
+            parse("doc", b"{} {}"),
+            "doc is not valid JSON: trailing characters",
+        );
+        pbfhogg_test_scratch::refused(
+            parse("doc", b"\xEF\xBB\xBF{}"),
+            "doc is not valid JSON: expected value",
+        );
     }
 
     #[test]

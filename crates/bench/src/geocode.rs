@@ -379,9 +379,18 @@ mod tests {
                 .iter()
                 .all(|&(lat, lon)| lat > 0.0 && lon > 0.0)
         );
-        assert!(super::parse_sampling_bbox("1,1,0,2").is_err());
-        assert!(super::parse_sampling_bbox("0,0,1").is_err());
-        assert!(super::parse_sampling_bbox("0,0,1,91").is_err());
+        pbfhogg_test_scratch::refused(
+            super::parse_sampling_bbox("1,1,0,2"),
+            "must be less than max_lon",
+        );
+        pbfhogg_test_scratch::refused(
+            super::parse_sampling_bbox("0,0,1"),
+            "bbox needs four comma-separated values",
+        );
+        pbfhogg_test_scratch::refused(
+            super::parse_sampling_bbox("0,0,1,91"),
+            "must be within -90 and 90 degrees",
+        );
     }
 
     #[test]

@@ -834,8 +834,14 @@ mod tests {
             ]
         );
         let negative_member = [object(R, 1, false, &[], &[(N, -5)])];
-        assert!(judge_exercised(&negative_member, &requested, None).is_err());
+        crate::test_support::refused(
+            judge_exercised(&negative_member, &requested, None),
+            "relation 1 has the negative member -5",
+        );
         let negative_node = [object(W, 50, false, &[-5], &[])];
-        assert!(judge_exercised(&negative_node, &requested, None).is_err());
+        crate::test_support::refused(
+            judge_exercised(&negative_node, &requested, None),
+            "way 50 references the negative node -5",
+        );
     }
 }

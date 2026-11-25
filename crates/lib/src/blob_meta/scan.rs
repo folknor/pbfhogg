@@ -681,6 +681,7 @@ fn ceil_div(a: i128, b: i128) -> i128 {
 mod tests {
     use super::*;
     use crate::blob_meta::{scan_block_ids, scan_block_ids_checked, scan_block_tags};
+    use crate::test_support::assert_err_kind;
 
     // --- Minimal protobuf wire-format builders --------------------------
 
@@ -1176,9 +1177,18 @@ mod tests {
         write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[]), &mut g);
         write_len_delimited(2, &dense_msg(&[2], &[(0, 0)], &[]), &mut g);
         let block = block_with_strings(&[b""], &[&g]);
-        assert!(try_scan_block_ids_checked(&block).is_err());
-        assert!(try_scan_block_tags(&block).is_err());
-        assert!(crate::PrimitiveBlock::from_vec(block).is_err());
+        assert_err_kind!(
+            try_scan_block_ids_checked(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
+        assert_err_kind!(
+            try_scan_block_tags(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
+        assert_err_kind!(
+            crate::PrimitiveBlock::from_vec(block),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     /// Deltas sum modulo 2^64 like the decoder's: a dense block the writer
@@ -1208,8 +1218,14 @@ mod tests {
         let mut block = block_from_groups(&[&mixed]);
         assert!(matches!(try_scan_block_ids_checked(&block), Ok(None)));
         block.extend_from_slice(&[0x12, 0x05, 0x1A]); // group claims 5 bytes, has 1
-        assert!(try_scan_block_ids_checked(&block).is_err());
-        assert!(try_scan_block_tags(&block).is_err());
+        assert_err_kind!(
+            try_scan_block_ids_checked(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
+        assert_err_kind!(
+            try_scan_block_tags(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     // --- A parse failure is an error, never a short result ---------------
@@ -1224,7 +1240,10 @@ mod tests {
         let mut bad = Vec::new();
         write_len_delimited(3, &[0x08, 0x80], &mut bad);
         let block = block_from_groups(&[&good, &bad]);
-        assert!(try_scan_block_ids_checked(&block).is_err());
+        assert_err_kind!(
+            try_scan_block_ids_checked(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
         assert!(
             scan_block_ids(&block).is_none(),
             "the wrapper must not index a prefix"
@@ -1250,10 +1269,14 @@ mod tests {
         write_len_delimited(3, &w1, &mut g);
         write_len_delimited(3, &w2, &mut g);
         let block = block_with_strings(&[b"", b"highway", b"primary", b"amenity"], &[&g]);
-        assert!(try_scan_block_tags(&block).is_err());
+        assert_err_kind!(
+            try_scan_block_tags(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
         assert!(scan_block_tags(&block).is_none());
-        assert!(
-            try_scan_block_ids_checked(&block).is_err(),
+        assert_err_kind!(
+            try_scan_block_ids_checked(&block),
+            crate::ErrorKind::WireFormat { .. },
             "both scanners agree"
         );
     }
@@ -1264,7 +1287,10 @@ mod tests {
         let mut g = Vec::new();
         write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[1]), &mut g);
         let block = block_with_strings(&[b"", b"highway"], &[&g]);
-        assert!(try_scan_block_tags(&block).is_err());
+        assert_err_kind!(
+            try_scan_block_tags(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
 
         // Two nodes but only one tag run.
         let mut g = Vec::new();
@@ -1274,7 +1300,10 @@ mod tests {
             &mut g,
         );
         let block = block_with_strings(&[b"", b"highway"], &[&g]);
-        assert!(try_scan_block_tags(&block).is_err());
+        assert_err_kind!(
+            try_scan_block_tags(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
 
         // Passing counterparts: one run per node, with and without the final
         // terminator, and a value of 0 is a value, not a delimiter.
@@ -1296,7 +1325,10 @@ mod tests {
         let mut g = Vec::new();
         write_len_delimited(2, &dense, &mut g);
         let block = block_from_groups(&[&g]);
-        assert!(try_scan_block_ids_checked(&block).is_err());
+        assert_err_kind!(
+            try_scan_block_ids_checked(&block),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     #[test]
@@ -1304,9 +1336,13 @@ mod tests {
         let mut g = Vec::new();
         write_len_delimited(3, &element_msg(1, &[5], &[1]), &mut g);
         let block = block_with_strings(&[b"", b"highway"], &[&g]);
-        assert!(try_scan_block_tags(&block).is_err());
-        assert!(
-            try_scan_block_ids_checked(&block).is_err(),
+        assert_err_kind!(
+            try_scan_block_tags(&block),
+            crate::ErrorKind::StringtableIndexOutOfBounds { .. }
+        );
+        assert_err_kind!(
+            try_scan_block_ids_checked(&block),
+            crate::ErrorKind::StringtableIndexOutOfBounds { .. },
             "both scanners agree"
         );
     }
@@ -1323,9 +1359,18 @@ mod tests {
         write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[1, 7, 0]), &mut dense);
         for g in [&plain, &dense] {
             let block = block_with_strings(strings, &[g]);
-            assert!(try_scan_block_tags(&block).is_err());
-            assert!(try_scan_block_ids_checked(&block).is_err());
-            assert!(crate::PrimitiveBlock::from_vec(block).is_err());
+            assert_err_kind!(
+                try_scan_block_tags(&block),
+                crate::ErrorKind::StringtableIndexOutOfBounds { .. }
+            );
+            assert_err_kind!(
+                try_scan_block_ids_checked(&block),
+                crate::ErrorKind::StringtableIndexOutOfBounds { .. }
+            );
+            assert_err_kind!(
+                crate::PrimitiveBlock::from_vec(block),
+                crate::ErrorKind::StringtableIndexOutOfBounds { .. }
+            );
         }
         let mut zero = Vec::new();
         write_len_delimited(2, &dense_msg(&[1], &[(0, 0)], &[1, 0, 0]), &mut zero);

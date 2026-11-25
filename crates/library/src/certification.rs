@@ -192,7 +192,10 @@ mod tests {
         std::fs::create_dir(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, owner.path().join("library-certifications"))
             .unwrap();
-        assert!(persist(owner.path(), &mut serde_json::json!({})).is_err());
+        pbfhogg_test_scratch::refused(
+            persist(owner.path(), &mut serde_json::json!({})),
+            "Not a directory",
+        );
         assert_eq!(std::fs::read_dir(elsewhere).unwrap().count(), 0);
     }
 }

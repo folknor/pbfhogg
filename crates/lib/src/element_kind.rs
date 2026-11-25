@@ -228,8 +228,14 @@ mod tests {
                 Some(kind)
             );
         }
-        assert!("Node".parse::<ElementKind>().is_err());
-        assert!("".parse::<ElementKind>().is_err());
+        crate::test_support::assert_err_kind!(
+            "Node".parse::<ElementKind>(),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("invalid element kind 'Node'"),
+        );
+        crate::test_support::assert_err_kind!(
+            "".parse::<ElementKind>(),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("invalid element kind ''"),
+        );
     }
 
     #[test]

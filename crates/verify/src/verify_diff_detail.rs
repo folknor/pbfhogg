@@ -825,14 +825,14 @@ mod tests {
         let (old, new) = (object(old), object(new));
         let mut coverage = Coverage::default();
         let unknown = lines(&["  -member @0 unknown(9)/3 \"outer\""]);
-        assert!(
+        crate::test_support::refused(
             judge(
                 &Expected::Modified(&old, &new),
                 "*r1 v1 -> v2",
                 &unknown,
-                &mut coverage
-            )
-            .is_err()
+                &mut coverage,
+            ),
+            "a member of unknown type",
         );
     }
 

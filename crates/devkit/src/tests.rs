@@ -51,20 +51,17 @@ fn include_chain_namespaces_snapshot_and_digest() {
         snap.observed_digest,
         file_digest(&root.join("data/snapshot.pbf")).unwrap()
     );
-    assert!(
-        config
-            .resolve_input("machine", "region", Some("old"), "source", "indexed")
-            .is_err()
+    pbfhogg_test_scratch::refused(
+        config.resolve_input("machine", "region", Some("old"), "source", "indexed"),
+        "missing or invalid table 'indexed'",
     );
-    assert!(
-        config
-            .resolve_input("machine", "region", Some("missing"), "source", "indexed")
-            .is_err()
+    pbfhogg_test_scratch::refused(
+        config.resolve_input("machine", "region", Some("missing"), "source", "indexed"),
+        "missing or invalid table 'missing'",
     );
-    assert!(
-        config
-            .resolve_input("machine", "region", Some("../bad"), "source", "indexed")
-            .is_err()
+    pbfhogg_test_scratch::refused(
+        config.resolve_input("machine", "region", Some("../bad"), "source", "indexed"),
+        "invalid snapshot key '../bad'",
     );
     // Same semantics with the legacy namespace, including base alias.
     let text = std::fs::read_to_string(root.join("shared/nested/host.toml"))
@@ -127,9 +124,15 @@ fn pins_are_checked_and_unpinned_bytes_are_observed_afresh() {
             .observed_digest
     );
     std::fs::remove_file(root.join("data/input")).unwrap();
-    assert!(config.resolve_input("m", "d", None, "r", "raw").is_err());
+    pbfhogg_test_scratch::refused(
+        config.resolve_input("m", "d", None, "r", "raw"),
+        "data/input: No such file or directory",
+    );
     std::fs::create_dir(root.join("data/input")).unwrap();
-    assert!(config.resolve_input("m", "d", None, "r", "raw").is_err());
+    pbfhogg_test_scratch::refused(
+        config.resolve_input("m", "d", None, "r", "raw"),
+        "data/input: expected a regular file",
+    );
 }
 
 /// A FIFO with no writer at a registered name, directly or through a
@@ -199,7 +202,10 @@ fn precedence_user_layer_and_named_arrays() {
     );
     assert!(table["cargo_env"]["KEY"].get("path").is_none());
     write(root, "user.toml", "[m]\ndata = 'forbidden'\n");
-    assert!(Config::load(&root.join("brokkr.toml"), Some(&root.join("user.toml"))).is_err());
+    pbfhogg_test_scratch::refused(
+        Config::load(&root.join("brokkr.toml"), Some(&root.join("user.toml"))),
+        "'m' is not allowed in the user-wide config",
+    );
     assert!(Config::load(&root.join("brokkr.toml"), Some(&root.join("absent"))).is_ok());
 }
 
@@ -208,26 +214,39 @@ fn invalid_includes_and_ambiguous_hosts_are_refused() {
     let scratch = pbfhogg_test_scratch::scratch();
     let canonical = std::fs::canonicalize(scratch.path()).unwrap();
     let root = canonical.as_path();
-    for text in [
-        "include = ['brokkr.toml']",
-        "include = ['other.toml', './other.toml']",
-        "include = ['absent.toml']",
-        "include = 'other.toml'",
-        "include = [42]",
-        "include = ['']",
-        "not valid toml",
-        "results_server = 'private'",
+    let entries = "brokkr.toml: 'include' entries must be non-empty path strings";
+    for (text, needle) in [
+        ("include = ['brokkr.toml']", "brokkr.toml: include cycle"),
+        (
+            "include = ['other.toml', './other.toml']",
+            "other.toml: included more than once",
+        ),
+        (
+            "include = ['absent.toml']",
+            "absent.toml: No such file or directory",
+        ),
+        (
+            "include = 'other.toml'",
+            "brokkr.toml: 'include' must be an array of paths",
+        ),
+        ("include = [42]", entries),
+        ("include = ['']", entries),
+        ("not valid toml", "brokkr.toml: TOML parse error at line 1"),
+        (
+            "results_server = 'private'",
+            "brokkr.toml: 'results_server' belongs to the user config",
+        ),
     ] {
         write(root, "other.toml", "[m]\ndata = 'data'\n");
         write(root, "brokkr.toml", text);
-        assert!(
-            Config::load(&root.join("brokkr.toml"), None).is_err(),
-            "{text}"
-        );
+        pbfhogg_test_scratch::refused(Config::load(&root.join("brokkr.toml"), None), needle);
     }
     write(root, "brokkr.toml", "include = ['other.toml']");
     write(root, "other.toml", "project = 'wrong'");
-    assert!(Config::load(&root.join("brokkr.toml"), None).is_err());
+    pbfhogg_test_scratch::refused(
+        Config::load(&root.join("brokkr.toml"), None),
+        "'project' belongs in the project's own brokkr.toml",
+    );
     write(
         root,
         "brokkr.toml",
@@ -334,8 +353,8 @@ fn scratch_selection_shares_dataset_host_rules() {
         config.scratch_root("legacy").unwrap(),
         root.join("data/scratch")
     );
-    assert!(config.scratch_root("bad").is_err());
-    assert!(config.scratch_root("unknown").is_err());
+    pbfhogg_test_scratch::refused(config.scratch_root("bad"), "'scratch' must be a string");
+    pbfhogg_test_scratch::refused(config.scratch_root("unknown"), "unknown host 'unknown'");
 }
 
 #[test]
@@ -370,7 +389,10 @@ fn pbfhogg_host_is_not_reserved_by_a_library_child() {
             .to_string()
             .contains("both")
     );
-    assert!(config.edit_dataset("pbfhogg", "d").is_err());
+    pbfhogg_test_scratch::refused(
+        config.edit_dataset("pbfhogg", "d"),
+        "host 'pbfhogg' is configured both as [pbfhogg] and [host.pbfhogg]",
+    );
     write(
         &root,
         "brokkr.toml",
@@ -380,10 +402,9 @@ fn pbfhogg_host_is_not_reserved_by_a_library_child() {
     assert_eq!(config.data_dir("project").unwrap(), root.join("explicit"));
 }
 
-#[test]
-fn selection_primitives_distinguish_absence_from_invalid() {
-    let scratch = pbfhogg_test_scratch::scratch();
-    let root = scratch.path();
+/// One dataset with every selectable kind, an empty snapshot, and snapshots
+/// whose OSC table is missing a file or carries a non-canonical key.
+fn selection_fixture(root: &std::path::Path) -> Config {
     write(root, "data/a.osc", "change a");
     write(root, "data/b.osc", "change b");
     write(root, "data/polygon.json", "{}");
@@ -413,8 +434,17 @@ file = 'missing.osc'
 file = 'b.osc'
 ",
     );
-    let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
-    assert!(c.select_osc("m", "d", None, None).is_err());
+    Config::load(&root.join("brokkr.toml"), None).unwrap()
+}
+
+#[test]
+fn selection_primitives_distinguish_absence_from_invalid() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let c = selection_fixture(scratch.path());
+    pbfhogg_test_scratch::refused(
+        c.select_osc("m", "d", None, None),
+        "multiple OSC entries (10, 11); select --osc-seq",
+    );
     assert_eq!(
         c.select_osc("m", "d", None, Some(10))
             .unwrap()
@@ -422,15 +452,18 @@ file = 'b.osc'
             .variant,
         "10"
     );
-    assert!(c.select_osc("m", "d", None, Some(12)).is_err());
     assert!(
         c.select_osc("m", "d", Some("empty"), None)
             .unwrap()
             .is_none()
     );
-    assert!(c.select_osc("m", "d", Some("empty"), Some(10)).is_err());
-    assert!(c.select_osc("m", "d", Some("missing"), None).is_err());
-    assert!(c.select_osc("m", "d", Some("bad"), None).is_err());
+    for (snapshot, seq, needle) in [
+        ("empty", Some(10), "missing osc.10"),
+        ("missing", None, "missing or invalid table 'missing'"),
+        ("bad", None, "data/missing.osc: No such file or directory"),
+    ] {
+        pbfhogg_test_scratch::refused(c.select_osc("m", "d", Some(snapshot), seq), needle);
+    }
     assert_eq!(
         c.select_osc("m", "d", Some("one"), None)
             .unwrap()
@@ -443,24 +476,49 @@ file = 'b.osc'
         range.iter().map(|r| r.variant.as_str()).collect::<Vec<_>>(),
         ["10", "11"]
     );
-    assert!(c.select_osc_range("m", "d", None, 10, 12).is_err());
-    assert!(c.select_osc_range("m", "d", None, 11, 10).is_err());
+    for (refusal, needle) in [
+        (
+            c.select_osc("m", "d", None, Some(12)).map(drop),
+            "missing osc.12",
+        ),
+        (
+            c.select_osc_range("m", "d", None, 10, 12).map(drop),
+            "missing osc.12",
+        ),
+        (
+            c.select_osc_range("m", "d", None, 11, 10).map(drop),
+            "OSC range must be ascending",
+        ),
+    ] {
+        pbfhogg_test_scratch::refused(refusal, needle);
+    }
     // A non-canonical key refuses the table for every selection, so a sole
     // `011` is never selectable by one path and missing for another.
-    assert!(c.select_osc("m", "d", Some("padded"), None).is_err());
-    assert!(c.select_osc("m", "d", Some("padded"), Some(11)).is_err());
-    assert!(
-        c.select_osc_range("m", "d", Some("padded"), 11, 11)
-            .is_err()
-    );
-    assert!(c.has_osc("m", "d", Some("padded")).is_err());
+    let padded = Some("padded");
+    for refusal in [
+        c.select_osc("m", "d", padded, None).map(drop),
+        c.select_osc("m", "d", padded, Some(11)).map(drop),
+        c.select_osc_range("m", "d", padded, 11, 11).map(drop),
+        c.has_osc("m", "d", padded).map(drop),
+    ] {
+        pbfhogg_test_scratch::refused(refusal, "osc key '011' is not a canonical sequence");
+    }
+}
+
+#[test]
+fn pbf_bbox_and_polygon_selection_distinguish_absence_from_invalid() {
+    let scratch = pbfhogg_test_scratch::scratch();
+    let c = selection_fixture(scratch.path());
     assert!(c.select_pbf("m", "d", None, "raw").unwrap().is_some());
     assert!(
         c.select_pbf("m", "d", Some("empty"), "raw")
             .unwrap()
             .is_none()
     );
-    assert!(c.select_pbf("m", "d", Some("unknown"), "raw").is_err());
+    pbfhogg_test_scratch::refused(
+        c.select_pbf("m", "d", Some("unknown"), "raw"),
+        "missing or invalid table 'unknown'",
+    );
     let bbox = c.select_bbox("m", "d").unwrap().unwrap();
     assert_eq!(bbox.coordinates(), [-1.0, 2.0, 3.0, 4.0]);
     assert_eq!(bbox.to_pbfhogg_arg(), "-b=-1, 2,3,4");
@@ -474,8 +532,17 @@ file = 'b.osc'
         ["a", "z"]
     );
     assert!(c.select_polygon("m", "d", "missing").unwrap().is_none());
-    for bad in ["1,2,3", "1,2,3,NaN", "1,2,inf,4", "a,2,3,4"] {
-        assert!(crate::Bbox::parse(bad).is_err());
+}
+
+#[test]
+fn bbox_parse_names_each_refusal() {
+    for (bad, needle) in [
+        ("1,2,3", "bbox requires four comma-separated coordinates"),
+        ("1,2,3,NaN", "bbox component 3 must be finite"),
+        ("1,2,inf,4", "bbox component 2 must be finite"),
+        ("a,2,3,4", "invalid bbox component 0: 'a'"),
+    ] {
+        pbfhogg_test_scratch::refused(crate::Bbox::parse(bad), needle);
     }
 }
 
@@ -524,13 +591,22 @@ fn selection_primitives_validate_configured_entries() {
     write(root, "data/a.osc", "change a");
     // Pins and file validation apply uniformly to every selected file kind.
     for kind in ["osc.1", "polygon.a", "pbf.raw"] {
-        for entry in [
-            "file = 'missing'",
-            "file = 'a.osc'\nxxhash = '00000000000000000000000000000000'",
-            "file = 3",
-            "file = ''",
-            "file = '.'",
-            "file = 'a.osc'\nsha256 = 'retired'",
+        for (entry, needle) in [
+            (
+                "file = 'missing'",
+                "data/missing: No such file or directory",
+            ),
+            (
+                "file = 'a.osc'\nxxhash = '00000000000000000000000000000000'",
+                "data/a.osc: xxhash mismatch: expected 00000000000000000000000000000000",
+            ),
+            ("file = 3", "'file' must be a string"),
+            ("file = ''", "file entry requires a non-empty 'file'"),
+            ("file = '.'", "data/.: expected a regular file"),
+            (
+                "file = 'a.osc'\nsha256 = 'retired'",
+                "dataset pin 'sha256' is retired; configure 'xxhash' instead",
+            ),
         ] {
             write(
                 root,
@@ -538,28 +614,29 @@ fn selection_primitives_validate_configured_entries() {
                 &format!("[m.datasets.d.{kind}]\n{entry}\n"),
             );
             let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
-            let fails = match kind {
-                "osc.1" => c.select_osc("m", "d", None, None).is_err(),
-                "polygon.a" => c.select_polygons("m", "d").is_err(),
-                _ => c.select_pbf("m", "d", None, "raw").is_err(),
+            let refusal = match kind {
+                "osc.1" => c.select_osc("m", "d", None, None).map(drop),
+                "polygon.a" => c.select_polygons("m", "d").map(drop),
+                _ => c.select_pbf("m", "d", None, "raw").map(drop),
             };
-            assert!(fails, "{kind}: {entry}");
+            pbfhogg_test_scratch::refused(refusal, needle);
         }
     }
-    for setting in [
-        "osc = 3",
-        "pbf = 3",
-        "polygon = 3",
-        "bbox = 3",
-        "bbox = '1,2,NaN,4'",
+    for (setting, needle) in [
+        ("osc = 3", "'osc' must be a table"),
+        ("pbf = 3", "'pbf' must be a table"),
+        ("polygon = 3", "'polygon' must be a table"),
+        ("bbox = 3", "'bbox' must be a string"),
+        ("bbox = '1,2,NaN,4'", "bbox component 2 must be finite"),
     ] {
         write(root, "brokkr.toml", &format!("[m.datasets.d]\n{setting}\n"));
         let c = Config::load(&root.join("brokkr.toml"), None).unwrap();
-        assert!(
-            c.select_osc("m", "d", None, None).is_err()
-                || c.select_pbf("m", "d", None, "raw").is_err()
-                || c.select_polygons("m", "d").is_err()
-                || c.select_bbox("m", "d").is_err()
-        );
+        let refusal = match setting.split(' ').next() {
+            Some("osc") => c.select_osc("m", "d", None, None).map(drop),
+            Some("pbf") => c.select_pbf("m", "d", None, "raw").map(drop),
+            Some("polygon") => c.select_polygons("m", "d").map(drop),
+            _ => c.select_bbox("m", "d").map(drop),
+        };
+        pbfhogg_test_scratch::refused(refusal, needle);
     }
 }

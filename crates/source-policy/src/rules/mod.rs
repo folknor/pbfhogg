@@ -1,6 +1,7 @@
 //! One module per rule. Each exposes `errors(&Corpus) -> Vec<String>` and
 //! carries its own in-memory fixtures.
 
+pub mod any_error;
 pub mod counters;
 pub mod detached_threads;
 pub mod duration_literals;

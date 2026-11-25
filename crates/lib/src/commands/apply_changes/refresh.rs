@@ -913,7 +913,7 @@ mod tests {
             (0, 1, false)
         );
         let lats = packed(&[5, 6]);
-        assert!(
+        crate::test_support::assert_err_kind!(
             evaluate_way(
                 &refs,
                 &lats,
@@ -921,11 +921,11 @@ mod tests {
                 CoordFraming::DEFAULT,
                 &p,
                 &mut Vec::new()
-            )
-            .is_err()
+            ),
+            crate::ErrorKind::WireFormat { .. }
         );
         let short = packed(&[5]);
-        assert!(
+        crate::test_support::assert_err_kind!(
             evaluate_way(
                 &refs,
                 &short,
@@ -933,11 +933,11 @@ mod tests {
                 CoordFraming::DEFAULT,
                 &p,
                 &mut Vec::new()
-            )
-            .is_err()
+            ),
+            crate::ErrorKind::WireFormat { .. }
         );
         let long = packed(&[5, 6, 7]);
-        assert!(
+        crate::test_support::assert_err_kind!(
             evaluate_way(
                 &refs,
                 &long,
@@ -945,8 +945,8 @@ mod tests {
                 CoordFraming::DEFAULT,
                 &p,
                 &mut Vec::new()
-            )
-            .is_err()
+            ),
+            crate::ErrorKind::WireFormat { .. }
         );
     }
 
@@ -959,20 +959,32 @@ mod tests {
         let lats = packed(&[5, 6]);
         let short = packed(&[5]);
         let d = CoordFraming::DEFAULT;
-        assert!(evaluate_way(&refs, &lats, &[], d, &p, &mut Vec::new()).is_err());
-        assert!(evaluate_way(&refs, &lats, &short, d, &p, &mut Vec::new()).is_err());
-        assert!(evaluate_way(&refs, &lats, &[0x80], d, &p, &mut Vec::new()).is_err());
+        crate::test_support::assert_err_kind!(
+            evaluate_way(&refs, &lats, &[], d, &p, &mut Vec::new()),
+            crate::ErrorKind::WireFormat { .. }
+        );
+        crate::test_support::assert_err_kind!(
+            evaluate_way(&refs, &lats, &short, d, &p, &mut Vec::new()),
+            crate::ErrorKind::WireFormat { .. }
+        );
+        crate::test_support::assert_err_kind!(
+            evaluate_way(&refs, &lats, &[0x80], d, &p, &mut Vec::new()),
+            crate::ErrorKind::WireFormat { .. }
+        );
         assert!(evaluate_way(&refs, &lats, &lats, d, &p, &mut Vec::new()).is_ok());
 
         let p = probe(&[(1, ProbeEntry::Upserted(5, 5))]);
         let wild = packed(&[5, i64::from(i32::MAX) * 1000]);
-        assert!(evaluate_way(&refs, &wild, &lats, d, &p, &mut Vec::new()).is_err());
+        crate::test_support::assert_err_kind!(
+            evaluate_way(&refs, &wild, &lats, d, &p, &mut Vec::new()),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     #[test]
     fn truncated_refs_are_refused() {
         let p = probe(&[(1, ProbeEntry::Deleted)]);
-        assert!(
+        crate::test_support::assert_err_kind!(
             evaluate_way(
                 &[0x02, 0x80],
                 &[],
@@ -980,8 +992,8 @@ mod tests {
                 CoordFraming::DEFAULT,
                 &p,
                 &mut Vec::new()
-            )
-            .is_err()
+            ),
+            crate::ErrorKind::WireFormat { .. }
         );
     }
 }

@@ -40,6 +40,7 @@ mod tests {
             let _capture = capture;
             std::panic::resume_unwind(Box::new("deliberate unwind"));
         }));
+        // any-error-deliberate: the closure's own deliberate unwind
         assert!(result.is_err());
         assert_eq!(
             producer

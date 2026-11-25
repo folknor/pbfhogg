@@ -1021,19 +1021,34 @@ mod tests {
 
     #[test]
     fn parse_bbox_wrong_count() {
-        assert!(parse_bbox("12.4,55.6,12.7").is_err());
-        assert!(parse_bbox("12.4,55.6,12.7,55.8,1.0").is_err());
+        crate::test_support::assert_err_kind!(
+            parse_bbox("12.4,55.6,12.7"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("got 3"),
+        );
+        crate::test_support::assert_err_kind!(
+            parse_bbox("12.4,55.6,12.7,55.8,1.0"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("got 5"),
+        );
     }
 
     #[test]
     fn parse_bbox_invalid_number() {
-        assert!(parse_bbox("abc,55.6,12.7,55.8").is_err());
+        crate::test_support::assert_err_kind!(
+            parse_bbox("abc,55.6,12.7,55.8"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("invalid min_lon"),
+        );
     }
 
     #[test]
     fn parse_bbox_min_ge_max() {
-        assert!(parse_bbox("12.7,55.6,12.4,55.8").is_err());
-        assert!(parse_bbox("12.4,55.8,12.7,55.6").is_err());
+        crate::test_support::assert_err_kind!(
+            parse_bbox("12.7,55.6,12.4,55.8"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("min_lon (12.7) must be less"),
+        );
+        crate::test_support::assert_err_kind!(
+            parse_bbox("12.4,55.8,12.7,55.6"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("min_lat (55.8) must be less"),
+        );
     }
 
     /// A bbox outside the geographic domain used to parse cleanly, then
@@ -1532,7 +1547,10 @@ mod tests {
             "coordinates": [10.0, 50.0]
         }"#;
         let path = write_temp_geojson(&dir, "point.geojson", json);
-        assert!(parse_geojson(&path).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_geojson(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("unsupported GeoJSON type: Point"),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1639,7 +1657,10 @@ mod tests {
             "extracts": [{ "output": "bad.osm.pbf" }]
         }"#;
         let path = write_temp_json(&dir, "config.json", json);
-        assert!(parse_extract_config(&path).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_extract_config(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("must have exactly one of"),
+        );
     }
 
     #[test]
@@ -1652,7 +1673,10 @@ mod tests {
             ]
         }"#;
         let path = write_temp_json(&dir, "config.json", json);
-        assert!(parse_extract_config(&path).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_extract_config(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("duplicate output path"),
+        );
     }
 
     #[test]
@@ -1678,7 +1702,11 @@ mod tests {
             "/",
             "/elsewhere/..",
         ] {
-            assert!(ok(bad).is_err(), "{bad:?} must be refused");
+            crate::test_support::assert_err_kind!(
+                ok(bad),
+                crate::ErrorKind::InvalidData { msg, .. } if msg.contains("would leave") || msg.contains("names no file"),
+                "{bad:?} must be refused",
+            );
         }
     }
 
@@ -1690,7 +1718,10 @@ mod tests {
             Path::new("cfg/out"),
             Path::new("/new"),
         );
-        assert!(r.is_err());
+        crate::test_support::assert_err_kind!(
+            r,
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("is absolute but"),
+        );
         let rel = rebase_config_output(
             0,
             Path::new("a.pbf"),
@@ -1705,7 +1736,10 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let json = r#"{ "extracts": [] }"#;
         let path = write_temp_json(&dir, "config.json", json);
-        assert!(parse_extract_config(&path).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_extract_config(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("must not be empty"),
+        );
     }
 
     #[test]
@@ -1715,7 +1749,10 @@ mod tests {
             "extracts": [{ "bbox": [0.0, 0.0, 1.0, 1.0] }]
         }"#;
         let path = write_temp_json(&dir, "config.json", json);
-        assert!(parse_extract_config(&path).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_extract_config(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("missing 'output'"),
+        );
     }
 
     #[test]
@@ -1729,6 +1766,9 @@ mod tests {
             }]
         }"#;
         let path = write_temp_json(&dir, "config.json", json);
-        assert!(parse_extract_config(&path).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_extract_config(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("multiple geometry fields"),
+        );
     }
 }

@@ -560,6 +560,7 @@ newline"/>
             let recorded = batches(dir.path(), &xml).expect("the reader frames it");
             for batch in &recorded {
                 let byte = encode(batch, false);
+                // any-error-deliberate: direct test-local String checker; the next line pins both paths to the same refusal text
                 assert!(byte.is_err(), "{case} accepted: {byte:?}");
                 assert_eq!(byte, encode(batch, true), "{case}");
             }

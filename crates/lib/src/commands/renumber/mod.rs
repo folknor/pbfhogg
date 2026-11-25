@@ -774,7 +774,10 @@ mod tests {
         // One node starting at i64::MAX: the only id handed out fits, though
         // the one-past-the-end cursor does not. Trailing empty blob too.
         assert!(positional_bases(i64::MAX, &[task(1), task(0)], "node").is_ok());
-        assert!(positional_bases(i64::MAX, &[task(2)], "node").is_err());
+        crate::test_support::assert_err_kind!(
+            positional_bases(i64::MAX, &[task(2)], "node"),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("runs past the 64-bit id range"),
+        );
     }
 
     #[test]
@@ -784,11 +787,17 @@ mod tests {
         let bases = positional_bases(-10, &[task(3), task(0), task(2)], "node").expect("fits");
         assert_eq!(bases, vec![-10, -13, -13]);
         assert!(positional_bases(i64::MIN, &[task(1), task(0)], "node").is_ok());
-        assert!(positional_bases(i64::MIN, &[task(2)], "node").is_err());
+        crate::test_support::assert_err_kind!(
+            positional_bases(i64::MIN, &[task(2)], "node"),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("runs past the 64-bit id range"),
+        );
         let index = blob_index(crate::ElementKind::Way, -10, 3, None).expect("index");
         assert_eq!((index.min_id, index.max_id), (-12, -10));
         assert!(positional_last_fits(i64::MIN + 1, 2, "relation").is_ok());
-        assert!(positional_last_fits(i64::MIN + 1, 3, "relation").is_err());
+        crate::test_support::assert_err_kind!(
+            positional_last_fits(i64::MIN + 1, 3, "relation"),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("runs past the 64-bit id range"),
+        );
     }
 
     /// An indexdata claim of `i64::MAX` from a small file must not

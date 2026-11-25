@@ -530,19 +530,34 @@ mod tests {
 
     #[test]
     fn parse_empty_is_error() {
-        assert!(parse_expression("").is_err());
-        assert!(parse_expression("   ").is_err());
+        crate::test_support::assert_err_kind!(
+            parse_expression(""),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg == "empty expression",
+        );
+        crate::test_support::assert_err_kind!(
+            parse_expression("   "),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg == "empty expression",
+        );
     }
 
     #[test]
     fn parse_empty_key_in_value_expr_is_error() {
-        assert!(parse_expression("=value").is_err());
-        assert!(parse_expression(" = value").is_err());
+        crate::test_support::assert_err_kind!(
+            parse_expression("=value"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg == "empty key in expression",
+        );
+        crate::test_support::assert_err_kind!(
+            parse_expression(" = value"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg == "empty key in expression",
+        );
     }
 
     #[test]
     fn parse_empty_key_in_negation_is_error() {
-        assert!(parse_expression("!=value").is_err());
+        crate::test_support::assert_err_kind!(
+            parse_expression("!=value"),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg == "empty key in expression",
+        );
     }
 
     #[test]

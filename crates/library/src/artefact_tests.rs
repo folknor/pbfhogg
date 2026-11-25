@@ -406,10 +406,7 @@ fn a_regular_read_refuses_links_specials_and_oversize() {
     );
     let link = root.join("l");
     std::os::unix::fs::symlink(&file, &link).unwrap();
-    assert!(
-        read_regular(&link, 5).is_err(),
-        "a symlink is never followed"
-    );
+    pbfhogg_test_scratch::refused(read_regular(&link, 5), "/l: cannot open: ");
     assert!(
         read_regular(root, 5)
             .unwrap_err()
@@ -432,7 +429,10 @@ fn a_refusal_names_its_reason() {
         parse_refusal(br#"{"protocol": 1, "reason": "role out-a is bound twice"}"#).unwrap(),
         "role out-a is bound twice"
     );
-    assert!(parse_refusal(br#"{"protocol": 1, "reason": "two\nlines"}"#).is_err());
+    pbfhogg_test_scratch::refused(
+        parse_refusal(br#"{"protocol": 1, "reason": "two\nlines"}"#),
+        "one line of text, without control characters",
+    );
 }
 
 #[test]
@@ -489,7 +489,7 @@ fn refusal_read_is_bounded_and_does_not_follow_a_link() {
     assert_eq!(read_refusal(&refusal).unwrap(), "no input");
     let alias = scratch.path().join("alias");
     std::os::unix::fs::symlink(&refusal, &alias).unwrap();
-    assert!(read_refusal(&alias).is_err());
+    pbfhogg_test_scratch::refused(read_refusal(&alias), "/alias: cannot open: ");
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&refusal)

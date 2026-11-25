@@ -1171,7 +1171,11 @@ mod tests {
             };
             panic!("failed before observing the stalled transform");
         });
-        assert!(result.is_err());
+        let payload = result.expect_err("the test's own panic unwinds");
+        assert_eq!(
+            crate::test_support::panic_text(&*payload).as_deref(),
+            Some("failed before observing the stalled transform")
+        );
         assert!(finished.load(Ordering::Relaxed), "worker joined on unwind");
     }
 
@@ -1445,7 +1449,11 @@ mod tests {
             growth.st.reserve_exact(16);
             panic!("transform failed after growing the scratch");
         }));
-        assert!(outcome.is_err());
+        let payload = outcome.expect_err("the test's own panic unwinds");
+        assert_eq!(
+            crate::test_support::panic_text(&*payload).as_deref(),
+            Some("transform failed after growing the scratch")
+        );
         let bytes = st.capacity() * size_of::<(u32, u32)>();
         assert!(bytes >= 128);
         assert_eq!(pool.load(Ordering::Relaxed), bytes as u64);

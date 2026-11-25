@@ -1244,15 +1244,24 @@ mod tests {
         let decl = declaration();
         let id = decl.calls[0].id;
         let mut inventory = Inventory::default();
-        assert!(inventory.complete(&decl, &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            inventory.complete(&decl, &[]),
+            "started calls: declared [\"a\"], observed []",
+        );
         inventory.start(&decl, id).expect("start");
-        assert!(inventory.complete(&decl, &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            inventory.complete(&decl, &[]),
+            "finished calls: declared [\"a\"], observed []",
+        );
         inventory
             .finish(&decl, id, &[Outcome::judge("checked", true, "ok")])
             .expect("finish");
         inventory.complete(&decl, &[]).expect("complete");
-        assert!(inventory.start(&decl, id).is_err());
-        assert!(inventory.complete(&decl, &[]).is_err());
+        pbfhogg_test_scratch::refused(inventory.start(&decl, id), "repeated call a");
+        pbfhogg_test_scratch::refused(
+            inventory.complete(&decl, &[]),
+            "started calls: declared [\"a\"], observed [\"a\", \"a\"]",
+        );
     }
 
     #[test]
@@ -1263,41 +1272,63 @@ mod tests {
         inventory.start(&decl, id).expect("start");
         let results = [Outcome::judge("checked", true, "ok")];
         inventory.finish(&decl, id, &results).expect("finish");
-        assert!(inventory.finish(&decl, id, &results).is_err());
-        assert!(inventory.complete(&decl, &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            inventory.finish(&decl, id, &results),
+            "call a was not started or was already finished",
+        );
+        pbfhogg_test_scratch::refused(
+            inventory.complete(&decl, &[]),
+            "finished calls: declared [\"a\"], observed [\"a\", \"a\"]",
+        );
         let mut inventory = Inventory::default();
-        assert!(inventory.start(&decl, "undeclared").is_err());
-        assert!(inventory.complete(&decl, &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            inventory.start(&decl, "undeclared"),
+            "undeclared call undeclared",
+        );
+        pbfhogg_test_scratch::refused(
+            inventory.complete(&decl, &[]),
+            "started calls: declared [\"a\"], observed [\"undeclared\"]",
+        );
     }
 
     #[test]
     fn assertion_inventory_rejects_missing_duplicate_misplaced_and_undeclared() {
         let expected = [(Some("call"), "checked"), (None, "scenario")];
-        for actual in [
-            vec![(None, "scenario")],
-            vec![
-                (Some("call"), "checked"),
-                (Some("call"), "checked"),
-                (None, "scenario"),
-            ],
-            vec![(None, "checked"), (Some("call"), "scenario")],
-            vec![
-                (Some("call"), "checked"),
-                (None, "scenario"),
-                (None, "extra"),
-            ],
+        for (actual, needle) in [
+            (vec![(None, "scenario")], "observed [(None, \"scenario\")]"),
+            (
+                vec![
+                    (Some("call"), "checked"),
+                    (Some("call"), "checked"),
+                    (None, "scenario"),
+                ],
+                "observed [(None, \"scenario\"), (Some(\"call\"), \"checked\"), (Some(\"call\"), \"checked\")]",
+            ),
+            (
+                vec![(None, "checked"), (Some("call"), "scenario")],
+                "observed [(None, \"checked\"), (Some(\"call\"), \"scenario\")]",
+            ),
+            (
+                vec![
+                    (Some("call"), "checked"),
+                    (None, "scenario"),
+                    (None, "extra"),
+                ],
+                "observed [(None, \"extra\"), (None, \"scenario\"), (Some(\"call\"), \"checked\")]",
+            ),
         ] {
-            assert!(
-                exact_inventory("assertions", expected.into_iter(), actual.into_iter()).is_err()
+            pbfhogg_test_scratch::refused(
+                exact_inventory("assertions", expected.into_iter(), actual.into_iter()),
+                needle,
             );
         }
-        assert!(
+        pbfhogg_test_scratch::refused(
             exact_inventory(
                 "declarations",
                 ["same", "same"].into_iter(),
-                ["same", "same"].into_iter()
-            )
-            .is_err()
+                ["same", "same"].into_iter(),
+            ),
+            "declarations: declared [\"same\", \"same\"]",
         );
     }
 

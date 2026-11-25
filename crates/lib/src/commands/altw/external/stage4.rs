@@ -1480,14 +1480,26 @@ mod ref_count_sidecar_tests {
             load_ref_count_sidecar(&path, 5).expect("prefixes"),
             [0, 3, 3]
         );
-        assert!(load_ref_count_sidecar(&path, 4).is_err());
+        crate::test_support::assert_err_kind!(
+            load_ref_count_sidecar(&path, 4),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("!= stage 1 total_slots"),
+        );
         write(&[u64::MAX, 1, 0]);
-        assert!(load_ref_count_sidecar(&path, 0).is_err());
+        crate::test_support::assert_err_kind!(
+            load_ref_count_sidecar(&path, 0),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("overflow"),
+        );
         write(&[0]);
         assert!(load_ref_count_sidecar(&path, 0).expect("empty").is_empty());
         std::fs::write(path.as_path(), [0_u8; 9]).expect("unaligned");
-        assert!(load_ref_count_sidecar(&path, 0).is_err());
+        crate::test_support::assert_err_kind!(
+            load_ref_count_sidecar(&path, 0),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("non-aligned"),
+        );
         std::fs::write(path.as_path(), b"").expect("short");
-        assert!(load_ref_count_sidecar(&path, 0).is_err());
+        crate::test_support::assert_err_kind!(
+            load_ref_count_sidecar(&path, 0),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("too small"),
+        );
     }
 }

@@ -1481,7 +1481,14 @@ mod tests {
         }
         assert!(super::claim_seconds(None).is_none());
         let err = crate::read::claims::scale_milli_timestamp(i64::MAX, 1000).unwrap_err();
-        assert!(super::require_timestamp(super::claim_seconds(Some(Err(err))), "node", 7).is_err());
+        let cause = err.to_string();
+        let got = super::require_timestamp(super::claim_seconds(Some(Err(err))), "node", 7)
+            .expect_err("an unscalable timestamp is refused");
+        let got = got.to_string();
+        assert!(
+            got.contains("time-filter: node 7") && got.contains(&cause),
+            "expected the scaling refusal under the element's context, got: {got}"
+        );
     }
 
     /// Neither path reads indexdata, so an input whose indexdata is false on

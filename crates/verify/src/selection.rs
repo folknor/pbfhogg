@@ -191,11 +191,23 @@ file = 'missing.pbf'
         );
         assert!(select(&config, &source).locations_base().unwrap().is_none());
         assert!(select(&config, &source).osc_range("10..10").unwrap()[0].ends_with("base.osc"));
-        assert!(select(&config, &source).osc_range("10..11").is_err());
-        assert!(select(&config, &source).osc_range("11..10").is_err());
-        assert!(select(&config, &source).osc_range("invalid").is_err());
+        crate::test_support::refused(
+            select(&config, &source).osc_range("10..11"),
+            "missing osc.11",
+        );
+        crate::test_support::refused(
+            select(&config, &source).osc_range("11..10"),
+            "OSC range must be ascending",
+        );
+        crate::test_support::refused(
+            select(&config, &source).osc_range("invalid"),
+            "OSC range must be LO..HI",
+        );
         source.snapshot = Some("own".into());
-        assert!(select(&config, &source).osc_range("10..11").is_err());
+        crate::test_support::refused(
+            select(&config, &source).osc_range("10..11"),
+            "missing osc.10",
+        );
         assert!(select(&config, &source).osc_range("11..11").unwrap()[0].ends_with("snap.osc"));
         assert!(
             select(&config, &source)
@@ -208,13 +220,20 @@ file = 'missing.pbf'
             osc_seq: Some(10),
             ..Default::default()
         };
-        assert!(select(&config, &source).osc(&explicit).is_err());
-        for snapshot in ["bad", "invalid", "missing"] {
+        crate::test_support::refused(select(&config, &source).osc(&explicit), "missing osc.10");
+        for (snapshot, why) in [
+            ("bad", "missing.osc: No such file or directory"),
+            ("invalid", "osc.10 must be a table"),
+            ("missing", "missing or invalid table 'missing'"),
+        ] {
             source.snapshot = Some(snapshot.into());
-            assert!(select(&config, &source).osc(&args).is_err());
+            crate::test_support::refused(select(&config, &source).osc(&args), why);
         }
         source.snapshot = Some("broken-base".into());
-        assert!(select(&config, &source).locations_base().is_err());
+        crate::test_support::refused(
+            select(&config, &source).locations_base(),
+            "missing.pbf: No such file or directory",
+        );
         source.input = Some("fixture.pbf".into());
         assert!(select(&config, &source).locations_base().unwrap().is_none());
         source.input = None;
@@ -230,14 +249,23 @@ file = 'missing.pbf'
         );
         source.dataset = "germany".into();
         assert!(select(&config, &source).osc(&args).unwrap().is_none());
-        assert!(select(&config, &source).osc(&explicit).is_err());
+        crate::test_support::refused(select(&config, &source).osc(&explicit), "missing osc.10");
         assert!(select(&config, &source).locations_base().unwrap().is_none());
         source.input = Some("fixture.pbf".into());
         assert!(select(&config, &source).locations_base().unwrap().is_none());
         source.dataset = "planet".into();
-        assert!(select(&config, &source).osc(&args).is_err());
-        assert!(select(&config, &source).bbox(None).is_err());
-        assert!(select(&config, &source).polygons().is_err());
+        crate::test_support::refused(
+            select(&config, &source).osc(&args),
+            "dataset 'planet' is not verified on real data",
+        );
+        crate::test_support::refused(
+            select(&config, &source).bbox(None),
+            "dataset 'planet' is not verified on real data",
+        );
+        crate::test_support::refused(
+            select(&config, &source).polygons(),
+            "dataset 'planet' is not verified on real data",
+        );
         let fixture_args = Selections {
             osc: Some("data/fixture.osc".into()),
             ..Default::default()
@@ -255,6 +283,9 @@ file = 'missing.pbf'
                 .is_some()
         );
         source.input = None;
-        assert!(select(&config, &source).locations_base().is_err());
+        crate::test_support::refused(
+            select(&config, &source).locations_base(),
+            "dataset 'planet' is not verified on real data",
+        );
     }
 }

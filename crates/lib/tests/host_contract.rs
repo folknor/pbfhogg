@@ -507,9 +507,14 @@ fn call_sinks_share_one_fifo_and_keep_their_lines_apart() {
             .map(|run| run.join().expect("run"))
             .collect()
     });
+    let reissued = fifo
+        .call(CallId::new("small").expect("call id"))
+        .err()
+        .expect("an id is issued once");
     assert!(
-        fifo.call(CallId::new("small").expect("call id")).is_err(),
-        "an id is issued once"
+        matches!(reissued.kind(), pbfhogg::ErrorKind::InvalidArgument { .. })
+            && reissued.to_string().contains("already issued"),
+        "{reissued}"
     );
     let edge_whole = write_edge_lines(&fifo);
     assert!(fifo.now_us() >= start, "the clock is monotonic");

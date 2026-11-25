@@ -310,9 +310,14 @@ fn an_empty_visible_is_absent_applied_directly_and_after_re_emission() {
 </create></osmChange>"#,
     )
     .unwrap();
+    let err = pbfhogg::osc::parse_osc_file(&duplicate)
+        .err()
+        .expect("a duplicated visible attribute must still be refused");
     assert!(
-        pbfhogg::osc::parse_osc_file(&duplicate).is_err(),
-        "a duplicated visible attribute must still be refused"
+        matches!(err.kind(), pbfhogg::ErrorKind::InvalidData { .. })
+            && err.report().contains("duplicated attribute"),
+        "{}",
+        err.report()
     );
 }
 

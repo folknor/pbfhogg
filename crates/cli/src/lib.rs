@@ -4775,11 +4775,13 @@ mod derive_clock_tests {
                 .expect("no clock needed"),
             None
         );
-        assert!(
-            super::derive_timestamp(true, || std::time::UNIX_EPOCH
+        pbfhogg_test_scratch::refused(
+            super::derive_timestamp(true, || {
+                std::time::UNIX_EPOCH
                 // fixture-time: an instant before the epoch, the refused input
-                - std::time::Duration::from_secs(1))
-            .is_err()
+                - std::time::Duration::from_secs(1)
+            }),
+            "second time provided was later than self",
         );
     }
 }
@@ -5591,10 +5593,19 @@ mod short_flag_tests {
             parse_type_filter("node,way").map(pbfhogg::TypeFilter::count),
             Ok(2)
         );
-        assert!(parse_single_type("node,way").is_err());
+        pbfhogg_test_scratch::refused(
+            parse_single_type("node,way"),
+            "--type takes exactly one of node, way, or relation",
+        );
         assert!(parse_single_type("way").is_ok());
-        assert!(parse_export_type("relation").is_err());
-        assert!(parse_export_type("node,relation").is_err());
+        pbfhogg_test_scratch::refused(
+            parse_export_type("relation"),
+            "export cannot export relations",
+        );
+        pbfhogg_test_scratch::refused(
+            parse_export_type("node,relation"),
+            "export cannot export relations",
+        );
         assert!(matches!(
             parse_export_type("node,way"),
             Ok(pbfhogg::export::ExportTypes::All)

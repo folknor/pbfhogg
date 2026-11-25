@@ -939,7 +939,10 @@ fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
         );
         for output in &inv.outputs {
             ensure!(
-                std::fs::symlink_metadata(output).is_err(),
+                matches!(
+                    std::fs::symlink_metadata(output).map_err(|e| e.kind()),
+                    Err(std::io::ErrorKind::NotFound)
+                ),
                 "a failed run left {} behind (tmp-dir {tmp_path:?})",
                 output.display()
             );
@@ -2477,7 +2480,10 @@ mod in_publication {
             let state_ok = match dest {
                 Dest::Old => planted(output, row.kind),
                 Dest::New => complete(i, output),
-                Dest::Absent => std::fs::symlink_metadata(output).is_err(),
+                Dest::Absent => matches!(
+                    std::fs::symlink_metadata(output).map_err(|e| e.kind()),
+                    Err(std::io::ErrorKind::NotFound)
+                ),
             };
             ensure!(
                 state_ok,

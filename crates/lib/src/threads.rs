@@ -311,9 +311,13 @@ mod tests {
     fn panics_follow_join_ownership() {
         let inv = crate::host::Invocation::new();
         let caught = scope(&inv, |s| {
-            s.spawn(|| panic!("joined")).unwrap().join().is_err()
+            s.spawn(|| panic!("joined"))
+                .unwrap()
+                .join()
+                .err()
+                .map(|payload| crate::test_support::panic_text(&*payload))
         });
-        assert!(caught);
+        assert_eq!(caught, Some(Some("joined".to_owned())));
 
         let late = AtomicBool::new(false);
         let body = BodyEnded::default();
@@ -330,7 +334,11 @@ mod tests {
                 );
             });
         }));
-        assert!(unwound.is_err());
+        let payload = unwound.expect_err("the unjoined panic is re-raised");
+        assert_eq!(
+            crate::test_support::panic_text(&*payload).as_deref(),
+            Some("unjoined")
+        );
         assert!(
             late.load(SeqCst),
             "re-raised only after every thread exited"

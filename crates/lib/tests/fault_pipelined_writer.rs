@@ -166,20 +166,34 @@ fn end_writer<W: Write>(
             let at = AtReturn::take(invocation);
             // The writer is still alive: a later framed write must be
             // refused without dispatching anything.
-            assert!(
-                writer.write_primitive_block(&EMPTY_BLOCK).is_err(),
-                "a framed write after the writer thread's error was recovered must fail"
+            // Every later operation returns the recovered framing error.
+            let recovered = |later: pbfhogg::Error, what: &str| {
+                assert!(
+                    matches!(later.kind(), pbfhogg::ErrorKind::WireFormat { .. }),
+                    "{what}: expected the recovered framing error, got: {later}"
+                );
+            };
+            recovered(
+                writer.write_primitive_block(&EMPTY_BLOCK).expect_err(
+                    "a framed write after the writer thread's error was recovered must fail",
+                ),
+                "framed write",
             );
             assert_eq!(
                 invocation.faults().framing_jobs_dispatched.load(SeqCst),
                 at.dispatched,
                 "a refused write must not dispatch a framing job"
             );
-            assert!(
-                writer.flush().is_err(),
-                "recovered failure must stay failed"
+            recovered(
+                writer
+                    .flush()
+                    .expect_err("recovered failure must stay failed"),
+                "flush",
             );
-            assert!(writer.flush().is_err(), "repeated flush must stay failed");
+            recovered(
+                writer.flush().expect_err("repeated flush must stay failed"),
+                "repeated flush",
+            );
             (Some(err), at)
         }
     }

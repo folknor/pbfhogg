@@ -1554,10 +1554,9 @@ mod tests {
         let counters = WorkerCounters::new();
         let mut scratch = WorkerScratch::default();
         scratch.local_coords.insert(7, (1, 2));
-        assert!(
-            scratch
-                .between_tasks(&counters, &crate::host::Call::detached())
-                .is_err()
+        crate::test_support::assert_err_kind!(
+            scratch.between_tasks(&counters, &crate::host::Call::detached()),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("never flushed")
         );
     }
 

@@ -1184,9 +1184,14 @@ mod tests {
         // a budget that reaches zero proves the drain ran to its cap.
         let budget = 1 + u64::from(NUM_BUFS) * 4;
         call.faults().uring_enter_failures.store(budget, Relaxed);
-        state
+        let failed = state
             .write(&vec![5_u8; IO_BUF_BYTES])
             .expect_err("injected submit failure");
+        assert!(
+            failed.report().contains("injected io_uring_enter failure"),
+            "{}",
+            failed.report()
+        );
         assert_eq!(state.outstanding.count_ones(), 1);
         // Teardown keeps a retained pool registered, and the kernel's
         // deferred unpin on close can outlast the memlock lease, refusing the
@@ -1260,8 +1265,14 @@ mod tests {
     #[test]
     fn pool_refuses_a_buffer_size_off_its_alignment() {
         let floor = crate::direct_io::DIO_ALIGN_FLOOR;
-        assert!(AlignedBufferPool::new(2, floor * 3, floor * 2).is_err());
-        assert!(AlignedBufferPool::new(2, floor * 3, floor * 3).is_err());
+        crate::test_support::assert_err_kind!(
+            AlignedBufferPool::new(2, floor * 3, floor * 2),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("not a multiple of the direct I/O alignment"),
+        );
+        crate::test_support::assert_err_kind!(
+            AlignedBufferPool::new(2, floor * 3, floor * 3),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("not a multiple of the direct I/O alignment"),
+        );
     }
 
     #[test]

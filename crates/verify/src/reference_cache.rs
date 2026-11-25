@@ -1453,7 +1453,10 @@ mod tests {
         );
         // A second placement over the same names is refused and leaves the
         // first in place.
-        assert!(place(&source, &outputs, &check.join("osmium.stdout")).is_err());
+        crate::test_support::refused(
+            place(&source, &outputs, &check.join("osmium.stdout")),
+            "osmium.osm.pbf already exists",
+        );
         assert!(out.exists());
         // A source that is no longer a regular file is refused, and the
         // names already made are rolled back.
@@ -1463,7 +1466,10 @@ mod tests {
         let outputs = vec![("osmium.osm.pbf".to_owned(), moved.as_path())];
         fs::remove_file(source.join(STDOUT)).unwrap();
         std::os::unix::fs::symlink(source.join("osmium.osm.pbf"), source.join(STDOUT)).unwrap();
-        assert!(place(&source, &outputs, &fresh.join("osmium.stdout")).is_err());
+        crate::test_support::refused(
+            place(&source, &outputs, &fresh.join("osmium.stdout")),
+            "is no longer a regular file at placement",
+        );
         assert!(!moved.exists());
     }
 

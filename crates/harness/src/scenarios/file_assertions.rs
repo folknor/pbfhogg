@@ -53,7 +53,7 @@ mod tests {
         let scratch = pbfhogg_test_scratch::scratch();
         let a = scratch.child("a");
         let b = scratch.child("b");
-        assert!(files_equal(&a, &b).is_err());
+        pbfhogg_test_scratch::refused(files_equal(&a, &b), "No such file or directory");
         for size in [0, 1, 8191, 8192, 8193, 20000] {
             let bytes = vec![42; size];
             std::fs::write(&a, &bytes).expect("write a");
@@ -74,7 +74,7 @@ mod tests {
     fn seed_requires_exact_bytes_and_eof() {
         let scratch = pbfhogg_test_scratch::scratch();
         let path = scratch.child("seed");
-        assert!(holds_seed(&path, "out").is_err());
+        pbfhogg_test_scratch::refused(holds_seed(&path, "out"), "No such file or directory");
         let seed = crate::protocol::seed("out");
         std::fs::write(&path, &seed).expect("seed");
         assert!(holds_seed(&path, "out").expect("holds"));

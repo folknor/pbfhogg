@@ -2,8 +2,10 @@
 //! library's unit and integration tests, the CLI's and the library
 //! harness's. Dev-only; nothing shipped depends on it. It also holds the
 //! other support every harness shares and that needs nothing from pbfhogg:
-//! the repository root, the fail-stop hang bound ([`HangBound`]) and the
-//! doorbell a test waits on for state it or a test build observes ([`Bell`]).
+//! the repository root, the fail-stop hang bound ([`HangBound`]), the
+//! doorbell a test waits on for state it or a test build observes ([`Bell`])
+//! and the refusal assertions ([`refused`], [`unwound`]) for crates whose
+//! errors name their cause only in text.
 //!
 //! Every scratch directory is a random child of the workspace's gitignored
 //! `data/test-scratch`. Random names cannot collide between tests, sweeps or
@@ -20,8 +22,10 @@
 
 mod bell;
 mod hang;
+mod refusal;
 pub use bell::Bell;
 pub use hang::HangBound;
+pub use refusal::{refused, unwound};
 
 use std::fs::{File, FileType};
 use std::io;
@@ -382,9 +386,9 @@ mod tests {
         let dir = scratch();
         assert!(dir.path_state(dir.child("file")).expect("state").is_none());
         for name in ["", ".", "..", "a/b", "/absolute", "a/..", "a/"] {
-            assert!(
-                std::panic::catch_unwind(|| dir.child(name)).is_err(),
-                "{name}"
+            crate::unwound(
+                std::panic::catch_unwind(|| dir.child(name)),
+                "scratch child must be one normal component",
             );
         }
     }
@@ -395,7 +399,10 @@ mod tests {
         assert_eq!(dir.cell(), dir.child("0"));
         assert_eq!(dir.cell(), dir.child("1"));
         std::fs::write(dir.child("2"), b"occupied").expect("write");
-        assert!(std::panic::catch_unwind(|| dir.cell()).is_err());
+        crate::unwound(
+            std::panic::catch_unwind(|| dir.cell()),
+            "create scratch cell",
+        );
         assert_eq!(dir.cell(), dir.child("3"));
     }
 
@@ -410,7 +417,10 @@ mod tests {
                 .expect("file")
                 .is_file()
         );
-        assert!(dir.path_state(file.join("child")).is_err());
+        assert_eq!(
+            dir.path_state(file.join("child")).err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotADirectory)
+        );
         #[cfg(unix)]
         {
             let link = dir.child("link");
@@ -472,7 +482,7 @@ mod tests {
             std::fs::rename(&original, &renamed).expect("rename");
             panic!("exercise restoration on unwind");
         }));
-        assert!(caught.is_err());
+        crate::unwound(caught, "exercise restoration on unwind");
         assert_eq!(
             std::fs::metadata(&renamed)
                 .expect("metadata")
@@ -503,7 +513,7 @@ mod tests {
             tx.send(dir.path().to_path_buf()).expect("send");
             panic!("unwind with the guard in scope");
         });
-        assert!(unwound.is_err());
+        crate::unwound(unwound, "unwind with the guard in scope");
         let path = rx.recv().expect("path");
         assert!(std::fs::symlink_metadata(&path).expect("kept").is_dir());
         std::fs::remove_dir_all(&path).expect("tidy the kept tree");

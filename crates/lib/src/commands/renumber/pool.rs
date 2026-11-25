@@ -178,23 +178,31 @@ mod tests {
         order.admit(Some((1, 5))).unwrap();
         order.admit(None).unwrap();
         order.admit(Some((6, 9))).unwrap();
-        assert!(
-            order.admit(Some((9, 12))).is_err(),
+        crate::test_support::assert_err_kind!(
+            order.admit(Some((9, 12))),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("appears twice"),
             "a repeat must be refused"
         );
         let mut order = StrictOrder::new("node");
         order.admit(Some((10, 20))).unwrap();
-        assert!(
-            order.admit(Some((3, 4))).is_err(),
+        crate::test_support::assert_err_kind!(
+            order.admit(Some((3, 4))),
+            crate::ErrorKind::Unsorted { .. },
             "a step back must be refused"
         );
         // Canonical order: 0, then negatives by magnitude, then positives.
         let mut order = StrictOrder::new("node");
         order.admit(Some((0, -3))).unwrap();
         order.admit(Some((-4, 2))).unwrap();
-        assert!(order.admit(Some((-9, -9))).is_err());
+        crate::test_support::assert_err_kind!(
+            order.admit(Some((-9, -9))),
+            crate::ErrorKind::Unsorted { .. }
+        );
         let mut order = StrictOrder::new("node");
         order.admit(Some((-3, -3))).unwrap();
-        assert!(order.admit(Some((-2, -2))).is_err());
+        crate::test_support::assert_err_kind!(
+            order.admit(Some((-2, -2))),
+            crate::ErrorKind::Unsorted { .. }
+        );
     }
 }

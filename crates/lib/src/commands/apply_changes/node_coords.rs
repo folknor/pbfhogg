@@ -194,14 +194,17 @@ mod tests {
         #[allow(clippy::cast_sign_loss)]
         let minus_100 = (-100_i64) as u64;
         assert_eq!(at(minus_100).unwrap(), vec![(1, -3, -4)]);
-        assert!(at(1 << 31).is_err());
+        crate::test_support::assert_err_kind!(at(1 << 31), crate::ErrorKind::WireFormat { .. });
     }
 
     #[test]
     fn plain_coordinate_outside_i32_is_rejected() {
         let mut group = Vec::new();
         len_delimited(1, &plain(1, i64::from(i32::MAX) + 1, 0), &mut group);
-        assert!(extract(&block(&[group], None)).is_err());
+        crate::test_support::assert_err_kind!(
+            extract(&block(&[group], None)),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 
     /// Dense deltas sum modulo 2^64, as the decoder does: IDs wrap to the
@@ -224,6 +227,9 @@ mod tests {
         packed_sint(9, &[0, 0], &mut body);
         let mut group = Vec::new();
         len_delimited(2, &body, &mut group);
-        assert!(extract(&block(&[group], None)).is_err());
+        crate::test_support::assert_err_kind!(
+            extract(&block(&[group], None)),
+            crate::ErrorKind::WireFormat { .. }
+        );
     }
 }

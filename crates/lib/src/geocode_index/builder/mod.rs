@@ -1196,7 +1196,10 @@ mod config_tests {
             super::checked_count(u32::MAX as usize, "test").expect("limit"),
             u32::MAX
         );
-        assert!(super::checked_count(u32::MAX as usize + 1, "test").is_err());
+        crate::test_support::assert_err_kind!(
+            super::checked_count(u32::MAX as usize + 1, "test"),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("count exceeds u32::MAX"),
+        );
     }
 
     #[test]

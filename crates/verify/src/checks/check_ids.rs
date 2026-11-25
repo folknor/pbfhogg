@@ -634,6 +634,9 @@ mod tests {
         )
         .unwrap();
         assert!(!exit_agrees(1, &empty));
-        assert!(parse_report(r#"{"ids":{"passed":true}}"#.as_bytes()).is_err());
+        crate::test_support::refused(
+            parse_report(r#"{"ids":{"passed":true}}"#.as_bytes()),
+            "missing field `counts`",
+        );
     }
 }

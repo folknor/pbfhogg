@@ -884,17 +884,26 @@ mod tests {
             "no payload may be produced for an ambiguous blob, got {out:?}"
         );
 
-        WireBlob::parse_slice(&blob)
-            .expect_err("WireBlob::parse must reject a two-payload blob too");
+        crate::test_support::assert_err_kind!(
+            WireBlob::parse_slice(&blob),
+            crate::ErrorKind::WireFormat { .. },
+            "WireBlob::parse must reject a two-payload blob too"
+        );
 
         // Field order reversed: the defect was order-dependent, so both orders
         // have to be covered or the test only pins half the fix.
         let reversed = encode_blob(&[(3, &zlib), (1, b"from-raw")]);
         let mut out = Vec::new();
-        super::decompress_blob_raw(&reversed, &mut out)
-            .expect_err("decompress_blob_raw must reject either field order");
-        WireBlob::parse_slice(&reversed)
-            .expect_err("WireBlob::parse must reject either field order");
+        crate::test_support::assert_err_kind!(
+            super::decompress_blob_raw(&reversed, &mut out),
+            crate::ErrorKind::WireFormat { .. },
+            "decompress_blob_raw must reject either field order"
+        );
+        crate::test_support::assert_err_kind!(
+            WireBlob::parse_slice(&reversed),
+            crate::ErrorKind::WireFormat { .. },
+            "WireBlob::parse must reject either field order"
+        );
 
         // A single payload field with the same content still decodes, so the
         // rejection costs a conforming blob nothing.
@@ -932,7 +941,10 @@ mod tests {
         let mut reserved = encode_blob(&[(1, b"from-raw")]);
         reserved[0] = 0x0e;
         assert!(every_route(&reserved).is_none());
-        assert!(super::raw_blob_payload(&reserved).is_err());
+        crate::test_support::assert_err_kind!(
+            super::raw_blob_payload(&reserved),
+            crate::ErrorKind::WireFormat { .. }
+        );
 
         // Field 1 as a varint is not a payload: the envelope is empty.
         let varint_raw = [0x08, 0x05];
@@ -973,7 +985,10 @@ mod tests {
                 "{err:?}"
             );
             assert!(every_route(&lone).is_none());
-            assert!(super::raw_blob_payload(&lone).is_err());
+            crate::test_support::assert_err_kind!(
+                super::raw_blob_payload(&lone),
+                crate::ErrorKind::WireFormat { .. }
+            );
 
             // Beside raw, in either order and even when empty, it is a
             // second payload, never silently dropped in favour of raw.
@@ -1080,7 +1095,10 @@ mod tests {
         }
         // A lying raw_size is refused by decode but accepted by the
         // comparison, which promises no validation ...
-        assert!(super::decompress_blob_raw(&lying_blob, &mut Vec::new()).is_err());
+        crate::test_support::assert_err_kind!(
+            super::decompress_blob_raw(&lying_blob, &mut Vec::new()),
+            crate::ErrorKind::WireFormat { .. }
+        );
         assert_eq!(key(&lying_blob), key(&lying_blob));
         // ... yet it never compares equal to the honest blob, so a pair
         // differing only there is decoded and the refusal surfaces.
@@ -1117,12 +1135,14 @@ mod tests {
                     "{kind:?}: raw_size {lie} against {honest} bytes must be rejected"
                 );
                 let mut out = Vec::new();
-                assert!(
-                    decompress_parsed_blob_into(&blob, &mut out).is_err(),
+                crate::test_support::assert_err_kind!(
+                    decompress_parsed_blob_into(&blob, &mut out),
+                    crate::ErrorKind::WireFormat { .. },
                     "{kind:?}: the pipelined helper must agree with the sequential one"
                 );
-                assert!(
-                    decompress_blob(&blob, None).is_err(),
+                crate::test_support::assert_err_kind!(
+                    decompress_blob(&blob, None),
+                    crate::ErrorKind::WireFormat { .. },
                     "{kind:?}: the Bytes helper must agree too"
                 );
             }
@@ -1175,8 +1195,9 @@ mod tests {
             raw_size: Some(200_000),
         };
         let mut out = Vec::new();
-        assert!(
-            decompress_wire_blob_into(&blob, &mut out).is_err(),
+        crate::test_support::assert_err_kind!(
+            decompress_wire_blob_into(&blob, &mut out),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof,
             "a truncated deflate stream must be an error, not a short read"
         );
     }
@@ -1352,8 +1373,9 @@ mod tests {
         let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
         let compressed = zlib_compress(&payload);
         let mut buf = oversized();
-        assert!(
-            super::zlib_decompress_into(&compressed[..compressed.len() / 2], &mut buf).is_err(),
+        crate::test_support::assert_err_kind!(
+            super::zlib_decompress_into(&compressed[..compressed.len() / 2], &mut buf),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof,
             "a truncated stream is refused"
         );
         assert!(buf.len() < 6 + payload.len());
@@ -1368,7 +1390,10 @@ mod tests {
             *b ^= 0x5A;
         }
         let mut buf = oversized();
-        assert!(super::zlib_decompress_into(&garbage, &mut buf).is_err());
+        crate::test_support::assert_err_kind!(
+            super::zlib_decompress_into(&garbage, &mut buf),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("zlib decompress error"),
+        );
         assert!(
             buf.len() < 6 + cap,
             "the zero fill must not stay as content"

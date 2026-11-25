@@ -1338,7 +1338,13 @@ mod scratch_tests {
                 ChangeSink::new(&scratch, super::Fragments::Raw, false, None).expect("sink");
             panic!("simulate a failed derive run");
         }));
-        assert!(result.is_err());
+        // The simulated failure, not the sink's `expect`, must be what
+        // unwound: a sink that failed to open removes nothing to test.
+        let payload = result.expect_err("the simulated failure unwinds");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"simulate a failed derive run")
+        );
         drop(scratch);
         assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 0);
     }

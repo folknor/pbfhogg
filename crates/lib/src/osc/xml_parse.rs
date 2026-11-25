@@ -2280,7 +2280,10 @@ mod tests {
         let smuggled = format!("lat=\"0.{}1e1000000\"", "0".repeat(999_999));
         assert!(coord(&smuggled, "lat").is_ok_and(|v| v == 10_000_000));
         let smuggled = format!("lat=\"0.{}1e1000002\"", "0".repeat(999_999));
-        assert!(coord(&smuggled, "lat").is_err());
+        crate::test_support::assert_err_kind!(
+            coord(&smuggled, "lat"),
+            crate::ErrorKind::InvalidData { .. }
+        );
         Ok(())
     }
 
@@ -2308,8 +2311,14 @@ mod tests {
             assert!(parse_owned_metadata(&element)?.is_some(), "{attributes}");
         }
         let element = quick_xml::events::BytesStart::from_content("node version=\"no\"", 4);
-        assert!(parse_owned_metadata(&element).is_err());
-        assert!(arena_meta(&element, &mut CompactDiffOverlay::new()).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_owned_metadata(&element),
+            crate::ErrorKind::InvalidData { .. }
+        );
+        crate::test_support::assert_err_kind!(
+            arena_meta(&element, &mut CompactDiffOverlay::new()),
+            crate::ErrorKind::InvalidData { .. }
+        );
         let element = quick_xml::events::BytesStart::from_content(
             "node uid=\"&#48;\" visible=\"False\" timestamp=\"a\tb\"",
             4,
@@ -2340,7 +2349,10 @@ mod tests {
             "member type=\"unknown\" ref=\"1\" role=\"r\"",
             6,
         );
-        assert!(parse_member(&unknown).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_member(&unknown),
+            crate::ErrorKind::InvalidData { .. }
+        );
         Ok(())
     }
 
@@ -2358,19 +2370,32 @@ mod tests {
             r#"member type="node" ref="1" ref="2""#,
             r#"member type="node" ref="1" broken"#,
         ] {
-            assert!(parse_member(&start(bad)).is_err(), "{bad}");
+            crate::test_support::assert_err_kind!(
+                parse_member(&start(bad)),
+                crate::ErrorKind::InvalidData { .. },
+                "{bad}"
+            );
         }
         for bad in [
             r#"nd ref="1" broken"#,
             r#"nd ref="1" ref="2""#,
             r#"nd ref="1" x=y"#,
         ] {
-            assert!(parse_nd(&start(bad)).is_err(), "{bad}");
+            crate::test_support::assert_err_kind!(
+                parse_nd(&start(bad)),
+                crate::ErrorKind::InvalidData { .. },
+                "{bad}"
+            );
         }
         for bad in [r#"tag k="a" v="b" broken"#, r#"tag k="a" v="b" v="c""#] {
-            assert!(parse_tag(&start(bad)).is_err(), "{bad}");
-            assert!(
-                append_tag(&start(bad), &mut String::new()).is_err(),
+            crate::test_support::assert_err_kind!(
+                parse_tag(&start(bad)),
+                crate::ErrorKind::InvalidData { .. },
+                "{bad}"
+            );
+            crate::test_support::assert_err_kind!(
+                append_tag(&start(bad), &mut String::new()),
+                crate::ErrorKind::InvalidData { .. },
                 "{bad}"
             );
         }
@@ -2393,7 +2418,15 @@ mod tests {
         );
         let mut sink = CompactSink::new(&mut overlay, HiddenUpserts::Keep);
         sink.begin_element(OscAction::Create, ElementKind::Node, &stale)?;
-        assert!(sink.end_element().is_err());
+        crate::test_support::assert_err_kind!(
+            sink.end_element(),
+            crate::ErrorKind::VersionRegression {
+                id: 7,
+                version: 4,
+                held: 5,
+                ..
+            }
+        );
         assert!(overlay.is_deleted(ElementKind::Node, 7));
         assert!(!overlay.has_node(7));
         let current = quick_xml::events::BytesStart::from_content(
@@ -2426,9 +2459,9 @@ mod tests {
 
         let mut overlay = CompactDiffOverlay::new();
         let mut sink = CompactSink::new(&mut overlay, HiddenUpserts::Keep);
-        assert!(
-            sink.begin_element(OscAction::Modify, ElementKind::Node, &hidden)
-                .is_err(),
+        crate::test_support::assert_err_kind!(
+            sink.begin_element(OscAction::Modify, ElementKind::Node, &hidden),
+            crate::ErrorKind::InvalidData { .. },
             "the public overlay still stages a hidden node, which needs coordinates"
         );
         Ok(())

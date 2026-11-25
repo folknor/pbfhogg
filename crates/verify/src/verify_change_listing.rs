@@ -645,7 +645,7 @@ mod tests {
     fn an_escape_is_two_uppercase_hex_digits() {
         assert_eq!(unescape("a%0Ab%25%C2%85").unwrap(), "a\nb%\u{85}");
         for field in ["%+A", "%0a", "%-1", "% A", "%A", "%"] {
-            assert!(unescape(field).is_err(), "{field}");
+            crate::test_support::refused(unescape(field), "bad escape in");
         }
     }
 

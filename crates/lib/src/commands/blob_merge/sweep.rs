@@ -1103,8 +1103,9 @@ mod tests {
             (0, 0),
         )
         .expect("open");
-        assert!(
-            cursor.demote(false).is_err(),
+        crate::test_support::assert_err_kind!(
+            cursor.demote(false),
+            crate::ErrorKind::IndexdataMismatch { .. },
             "the claim says 4 elements, the block holds 3"
         );
     }
@@ -1131,8 +1132,9 @@ mod tests {
             (0, 0),
         )
         .expect("open");
-        assert!(
-            drain(&mut wide).is_err(),
+        crate::test_support::assert_err_kind!(
+            drain(&mut wide),
+            crate::ErrorKind::IndexdataMismatch { .. },
             "a claimed range wider than the block is refused"
         );
 
@@ -1144,7 +1146,10 @@ mod tests {
             (0, 0),
         )
         .expect("open");
-        assert!(drain(&mut descending).is_err());
+        crate::test_support::assert_err_kind!(
+            drain(&mut descending),
+            crate::ErrorKind::Unsorted { .. }
+        );
     }
 
     /// The resource tests in `crates/lib/tests/merge_pbf.rs` (the planet-density and

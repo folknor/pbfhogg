@@ -181,10 +181,13 @@ mod tests {
         let dir = scratch.path();
         let file = dir.join("f");
         write(&file, RoleKind::File, "f").unwrap();
-        assert!(state(&file, RoleKind::Directory, "f").is_err());
+        pbfhogg_test_scratch::refused(
+            state(&file, RoleKind::Directory, "f"),
+            "/f is not a directory",
+        );
         let link = dir.join("l");
         std::os::unix::fs::symlink(&file, &link).unwrap();
-        assert!(state(&link, RoleKind::File, "f").is_err());
+        pbfhogg_test_scratch::refused(state(&link, RoleKind::File, "f"), "/l is not a file");
     }
 
     #[test]
@@ -194,7 +197,7 @@ mod tests {
         for kind in [RoleKind::Pbf, RoleKind::File, RoleKind::Directory] {
             let path = scratch.path().join(kind.name());
             write(&path, kind, "first").unwrap();
-            assert!(write(&path, kind, "second").is_err());
+            pbfhogg_test_scratch::refused(write(&path, kind, "second"), "File exists");
             assert_eq!(state(&path, kind, "first").unwrap(), State::Seed);
         }
     }

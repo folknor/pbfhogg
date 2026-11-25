@@ -117,17 +117,18 @@ mod tests {
             parse_points("55.5 12.25\n-1e0\t180\n").unwrap(),
             vec![(55.5, 12.25), (-1.0, 180.0)]
         );
-        for bad in [
-            "55.5\n",
-            "1 2 3\n",
-            "\n",
-            "a 1\n",
-            "NaN 1\n",
-            "1 inf\n",
-            "91 0\n",
-            "0 -180.5\n",
+        let range = "latitude must be within -90 and 90 and longitude within -180 and 180";
+        for (bad, needle) in [
+            ("55.5\n", "points line 1: expected `LAT LON`"),
+            ("1 2 3\n", "points line 1: expected `LAT LON`"),
+            ("\n", "points line 1: expected `LAT LON`"),
+            ("a 1\n", "points line 1: \"a\" is not a finite number"),
+            ("NaN 1\n", "points line 1: \"NaN\" is not a finite number"),
+            ("1 inf\n", "points line 1: \"inf\" is not a finite number"),
+            ("91 0\n", range),
+            ("0 -180.5\n", range),
         ] {
-            assert!(parse_points(bad).is_err(), "{bad:?}");
+            pbfhogg_test_scratch::refused(parse_points(bad), needle);
         }
         assert!(parse_points("").unwrap().is_empty());
     }

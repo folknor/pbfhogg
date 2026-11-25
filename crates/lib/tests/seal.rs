@@ -355,6 +355,7 @@ fn a_consumed_stream_is_destroyed_inside_the_admission() {
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         reader(&bytes).for_each(|_| std::panic::resume_unwind(Box::new("callback")))
     }));
+    // any-error-deliberate: the callback's own deliberate unwind
     assert!(unwound.is_err());
     assert_eq!(
         *seen.lock().unwrap(),

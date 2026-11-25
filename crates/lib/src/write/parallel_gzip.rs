@@ -972,10 +972,13 @@ mod fault_tests {
             }
             Err(_) => panic!("a compress-worker panic must not unwind into the caller"),
         }
-        assert!(
-            finished.is_err(),
-            "finish must report the recorded worker failure"
-        );
+        match finished {
+            Ok(_) => panic!("finish must report the recorded worker failure"),
+            Err(e) => assert!(
+                e.to_string().contains("parallel gzip worker panicked"),
+                "finish must report the recorded worker failure, got: {e}"
+            ),
+        }
     }
 }
 
@@ -1225,10 +1228,14 @@ mod tests {
             err.to_string().contains("probe sink: ENOSPC"),
             "flush must report the underlying cause, got {err}"
         );
-        assert!(
-            gz.finish().is_err(),
-            "finish must join the failed writer and preserve its error"
-        );
+        match gz.finish() {
+            Ok(_) => panic!("finish must join the failed writer and preserve its error"),
+            Err(e) => assert!(
+                e.kind() == io::ErrorKind::StorageFull
+                    && e.to_string().contains("probe sink: ENOSPC"),
+                "finish must join the failed writer and preserve its error, got {e}"
+            ),
+        }
     }
 
     /// A flush on an empty buffer is still a flush: it must reach the inner

@@ -169,7 +169,12 @@ mod tests {
                 panic!("owner unwinds");
             }));
             let done = owner.faults().built_pool_exit_hooks_done.load(SeqCst);
-            done_tx.send((unwound.is_err(), done)).unwrap();
+            // The owner's own panic, not the pool build's `unwrap`, must be
+            // what unwound.
+            let unwound = unwound
+                .err()
+                .and_then(|payload| payload.downcast_ref::<&str>().copied());
+            done_tx.send((unwound, done)).unwrap();
         });
         let _release = Release(invocation.clone(), Some(handle));
         let faults = invocation.faults();
@@ -184,7 +189,7 @@ mod tests {
         );
         faults.release_built_pool_threads();
         let (unwound, done) = done_rx.recv().unwrap();
-        assert!(unwound);
+        assert_eq!(unwound, Some("owner unwinds"));
         assert_eq!(done, 2, "both workers finished before the unwind did");
         assert!(!faults.built_pool_hook_timed_out.load(SeqCst));
     }

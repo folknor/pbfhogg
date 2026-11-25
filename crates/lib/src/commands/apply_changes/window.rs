@@ -143,7 +143,10 @@ mod tests {
         let (mut admit, ret) = seq_window(2);
         admit.admit().unwrap();
         admit.admit().unwrap();
-        assert!(admit.tokens.try_recv().is_err());
+        assert_eq!(
+            admit.tokens.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
         ret.release();
         admit.admit().unwrap();
         assert_eq!(ret.high_water(), 2);
@@ -173,6 +176,9 @@ mod tests {
                 release();
             },
         );
-        assert!(admitted.is_err());
+        crate::test_support::assert_err_kind!(
+            admitted,
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("admission window closed"),
+        );
     }
 }

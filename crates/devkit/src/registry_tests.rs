@@ -179,14 +179,20 @@ fn a_split_dataset_and_a_doubly_spelled_host_are_refused() {
         ("a.toml", "[h.datasets.d]\norigin = \"x\"\n"),
     ]);
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
-    assert!(config.edit_dataset("h", "d").is_err());
+    pbfhogg_test_scratch::refused(
+        config.edit_dataset("h", "d"),
+        "dataset 'd' of host 'h' is split across",
+    );
 
     let (_s, root) = root_with(&[(
         "brokkr.toml",
         "project = \"p\"\n[h]\ndata = \"x\"\n[host.h]\ndata = \"y\"\n",
     )]);
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
-    assert!(config.edit_dataset("h", "d").is_err());
+    pbfhogg_test_scratch::refused(
+        config.edit_dataset("h", "d"),
+        "host 'h' is configured both as [h] and [host.h]",
+    );
 }
 
 #[test]
@@ -217,10 +223,19 @@ fn sequence_insert_preserves_entry_and_refuses_replacement() {
     )]);
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
     let mut edit = config.edit_dataset("h", "d").unwrap();
-    assert!(edit.set_pbf_seq("absent", 10).is_err());
-    assert!(edit.set_pbf_seq("raw", u64::MAX).is_err());
+    pbfhogg_test_scratch::refused(
+        edit.set_pbf_seq("absent", 10),
+        "[h.datasets.d.pbf.absent] does not exist",
+    );
+    pbfhogg_test_scratch::refused(
+        edit.set_pbf_seq("raw", u64::MAX),
+        "sequence does not fit a TOML integer",
+    );
     edit.set_pbf_seq("raw", 10).unwrap();
-    assert!(edit.set_pbf_seq("raw", 11).is_err());
+    pbfhogg_test_scratch::refused(
+        edit.set_pbf_seq("raw", 11),
+        "[h.datasets.d.pbf.raw] already has seq",
+    );
     edit.commit().unwrap();
     assert!(read(&root, "brokkr.toml").contains("# keep"));
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
@@ -260,7 +275,7 @@ fn host_inventory_includes_composed_datasets_and_every_file_kind() {
         ]
     );
     assert!(config.registered_files("empty").unwrap().is_empty());
-    assert!(config.registered_files("absent").is_err());
+    pbfhogg_test_scratch::refused(config.registered_files("absent"), "unknown host 'absent'");
 }
 
 #[test]
@@ -271,10 +286,19 @@ fn snapshot_sequence_insert_never_replaces_or_creates_a_pbf() {
     )]);
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
     let mut edit = config.edit_dataset("h", "d").unwrap();
-    assert!(edit.set_snapshot_pbf_seq("s", "absent", 10).is_err());
-    assert!(edit.set_snapshot_pbf_seq("s", "raw", u64::MAX).is_err());
+    pbfhogg_test_scratch::refused(
+        edit.set_snapshot_pbf_seq("s", "absent", 10),
+        "[h.datasets.d.snapshot.s.pbf.absent] does not exist",
+    );
+    pbfhogg_test_scratch::refused(
+        edit.set_snapshot_pbf_seq("s", "raw", u64::MAX),
+        "sequence does not fit a TOML integer",
+    );
     edit.set_snapshot_pbf_seq("s", "raw", 10).unwrap();
-    assert!(edit.set_snapshot_pbf_seq("s", "raw", 11).is_err());
+    pbfhogg_test_scratch::refused(
+        edit.set_snapshot_pbf_seq("s", "raw", 11),
+        "[h.datasets.d.snapshot.s.pbf.raw] already has seq",
+    );
     edit.commit().unwrap();
     assert!(read(&root, "brokkr.toml").contains("# keep"));
     let config = Config::load(&root.join("brokkr.toml"), None).unwrap();
@@ -294,11 +318,17 @@ fn replace_file_refuses_an_existing_staging_path_without_touching_it() {
     std::fs::write(&registered, "registered bytes").unwrap();
     let staging = root.join(".brokkr.toml.tmp");
     std::fs::write(&staging, "stale or registered").unwrap();
-    assert!(crate::replace_file(&target, b"new").is_err());
+    pbfhogg_test_scratch::refused(
+        crate::replace_file(&target, b"new"),
+        "already exists; refusing to overwrite it",
+    );
     assert_eq!(std::fs::read(&staging).unwrap(), b"stale or registered");
     std::fs::remove_file(&staging).unwrap();
     std::os::unix::fs::symlink(&registered, &staging).unwrap();
-    assert!(crate::replace_file(&target, b"new").is_err());
+    pbfhogg_test_scratch::refused(
+        crate::replace_file(&target, b"new"),
+        "already exists; refusing to overwrite it",
+    );
     assert_eq!(std::fs::read(&registered).unwrap(), b"registered bytes");
     assert_eq!(std::fs::read(&target).unwrap(), b"old");
     std::fs::remove_file(&staging).unwrap();

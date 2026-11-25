@@ -2520,8 +2520,11 @@ mod strict_validation_tests {
             "expected the dense id/lat/lon mismatch error, got: {err}"
         );
 
-        PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 3)]))
-            .expect_err("a short lon array must be rejected");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(block_with_groups(&[dense_group(4, 4, 3)])),
+            crate::ErrorKind::WireFormat { .. },
+            "a short lon array must be rejected"
+        );
     }
 
     /// A packed array whose last varint is cut mid-value is rejected rather
@@ -2737,8 +2740,9 @@ mod strict_validation_tests {
                 .unwrap_or_else(|e| panic!("field {field}: valid element must parse: {e}"));
 
             group.extend_from_slice(&len_field(field, &truncated));
-            assert!(
-                PrimitiveBlock::from_vec(block_with_groups(&[group])).is_err(),
+            crate::test_support::assert_err_kind!(
+                PrimitiveBlock::from_vec(block_with_groups(&[group])),
+                crate::ErrorKind::WireFormat { .. },
                 "field {field}: a malformed element sub-message must be rejected"
             );
         }
@@ -2868,6 +2872,16 @@ mod strict_validation_tests {
             .unwrap_or_default()
     }
 
+    /// Construction refuses `buffer` with the wire-format error, the
+    /// public contract the consumer panics below stand behind.
+    fn refused_at_construction(buffer: &[u8]) {
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(buffer.to_vec()),
+            crate::ErrorKind::WireFormat { .. },
+            "construction must refuse the fixture"
+        );
+    }
+
     /// Bytes that block construction refuses are refused there, and a
     /// consumer handed them anyway (a block view that bypassed
     /// `validate_block`) panics naming the broken invariant instead
@@ -2898,8 +2912,7 @@ mod strict_validation_tests {
         ];
         for (group, what) in dense_cases {
             let buffer = block_with_groups(&[group]);
-            PrimitiveBlock::from_vec(buffer.clone())
-                .expect_err("construction must refuse the fixture");
+            refused_at_construction(&buffer);
             let expected = format!("{what} failed to parse after PrimitiveBlock construction");
 
             let block = unvalidated_block(buffer.clone());
@@ -2955,8 +2968,7 @@ mod strict_validation_tests {
         ];
         for (keys_vals, nodes, what) in keys_vals_cases {
             let buffer = block_with_groups(&[dense_group_with(nodes, keys_vals, None)]);
-            PrimitiveBlock::from_vec(buffer.clone())
-                .expect_err("construction must refuse the fixture");
+            refused_at_construction(&buffer);
             let expected = format!("{what} failed to parse after PrimitiveBlock construction");
             for skip_metadata in [false, true] {
                 let block = unvalidated_block(buffer.clone());
@@ -2981,8 +2993,7 @@ mod strict_validation_tests {
             let mut group = len_field(field, &[0x08, 0x01]);
             group.extend_from_slice(&len_field(field, &truncated_element));
             let buffer = block_with_groups(&[group]);
-            PrimitiveBlock::from_vec(buffer.clone())
-                .expect_err("construction must refuse the fixture");
+            refused_at_construction(&buffer);
             let expected = format!("{what} failed to parse after PrimitiveBlock construction");
 
             let block = unvalidated_block(buffer.clone());
@@ -3090,11 +3101,14 @@ mod strict_validation_tests {
         // Dense: a nonzero key is a string index (0 is the run separator);
         // the value position is covered with a larger table in
         // `blob_meta/scan.rs`.
-        PrimitiveBlock::from_vec(block_with_table(
-            1,
-            &[dense_group_with(1, &[0x01, 0x00], None)],
-        ))
-        .expect_err("a dense key past the table must be refused");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(block_with_table(
+                1,
+                &[dense_group_with(1, &[0x01, 0x00], None)],
+            )),
+            crate::ErrorKind::StringtableIndexOutOfBounds { .. },
+            "a dense key past the table must be refused"
+        );
     }
 
     /// A packed array on a regular element that ends mid-varint is rejected
@@ -3108,8 +3122,11 @@ mod strict_validation_tests {
         // has no successor byte.
         let mut way = vec![0x08u8, 0x01];
         way.extend_from_slice(&len_field(8, &[0x02, 0x02, 0x82]));
-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &way)]))
-            .expect_err("a refs array ending mid-varint must be rejected");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(block_with_groups(&[len_field(3, &way)])),
+            crate::ErrorKind::WireFormat { .. },
+            "a refs array ending mid-varint must be rejected"
+        );
 
         // The same way with a complete final varint is valid.
         let mut good = vec![0x08u8, 0x01];
@@ -3156,8 +3173,11 @@ mod strict_validation_tests {
             "expected a lat/lon mismatch error, got: {err}"
         );
 
-        PrimitiveBlock::from_vec(build(3, 2, 2))
-            .expect_err("coordinates that do not cover every node ref must be rejected");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(build(3, 2, 2)),
+            crate::ErrorKind::WireFormat { .. },
+            "coordinates that do not cover every node ref must be rejected"
+        );
     }
 
     /// A relation's three parallel member arrays must agree in length.
@@ -3185,8 +3205,11 @@ mod strict_validation_tests {
             "expected a member-array mismatch error, got: {err}"
         );
 
-        PrimitiveBlock::from_vec(build(3, 2, 3))
-            .expect_err("a short memids array must be rejected");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(build(3, 2, 3)),
+            crate::ErrorKind::WireFormat { .. },
+            "a short memids array must be rejected"
+        );
     }
 
     /// A corrupt `Info` sub-message is a hard error rather than silently
@@ -3198,8 +3221,11 @@ mod strict_validation_tests {
         let bad_info = len_field(4, &[0x08]);
         let mut node = vec![0x08u8, 0x01];
         node.extend_from_slice(&bad_info);
-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &node)]))
-            .expect_err("a truncated Info sub-message must be rejected");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &node)])),
+            crate::ErrorKind::WireFormat { .. },
+            "a truncated Info sub-message must be rejected"
+        );
 
         // Same node with a well-formed info (version = 1) still parses.
         let mut good = vec![0x08u8, 0x01];
@@ -3213,8 +3239,11 @@ mod strict_validation_tests {
         let mut shadowed = vec![0x08u8, 0x01];
         shadowed.extend_from_slice(&bad_info);
         shadowed.extend_from_slice(&len_field(4, &[0x08, 0x01]));
-        PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &shadowed)]))
-            .expect_err("a malformed Info shadowed by a later valid one must be rejected");
+        crate::test_support::assert_err_kind!(
+            PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &shadowed)])),
+            crate::ErrorKind::WireFormat { .. },
+            "a malformed Info shadowed by a later valid one must be rejected"
+        );
     }
 
     /// `info()` reads present metadata through the validated slice and
@@ -3523,28 +3552,32 @@ mod strict_validation_tests {
             block.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
             let block = PrimitiveBlock::from_vec(block)
                 .expect("coordinate values are not validated at construction");
+            // The refusal is the wire-format one, not any error.
+            fn wire_refused<T>(result: &crate::Result<T>) -> bool {
+                matches!(result, Err(e) if matches!(e.kind(), crate::ErrorKind::WireFormat { .. }))
+            }
             let wrapped = i64::MAX.wrapping_add(100);
             let mut seen = 0;
             let exact = i128::from(i64::MAX) + 100;
             for element in block.elements() {
                 let (checked, e7, exact_lat, wrapping) = match element {
                     super::Element::Node(node) => (
-                        node.nano_lat().is_err(),
-                        node.decimicro_lat().is_err(),
+                        wire_refused(&node.nano_lat()),
+                        wire_refused(&node.decimicro_lat()),
                         node.nano_lat_exact(),
                         node.nano_lat_wrapping(),
                     ),
                     super::Element::DenseNode(node) => (
-                        node.nano_lat().is_err(),
-                        node.decimicro_lat().is_err(),
+                        wire_refused(&node.nano_lat()),
+                        wire_refused(&node.decimicro_lat()),
                         node.nano_lat_exact(),
                         node.nano_lat_wrapping(),
                     ),
                     super::Element::Way(way) => {
                         let loc = way.node_locations().next().expect("one way location");
                         (
-                            loc.nano_lat().is_err(),
-                            loc.decimicro_lat().is_err(),
+                            wire_refused(&loc.nano_lat()),
+                            wire_refused(&loc.decimicro_lat()),
                             loc.nano_lat_exact(),
                             loc.nano_lat_wrapping(),
                         )
@@ -3578,7 +3611,10 @@ mod header_wire_type_tests {
         assert_eq!(h.osmosis_replication_timestamp, Some(7));
 
         // Field 32 with invalid wire type 7 (87 02 00) is refused, not 0.
-        assert!(WireHeaderBlock::parse(&[0x87, 0x02, 0x00]).is_err());
+        crate::test_support::assert_err_kind!(
+            WireHeaderBlock::parse(&[0x87, 0x02, 0x00]),
+            crate::ErrorKind::WireFormat { .. }
+        );
 
         // A varint on a string field (writingprogram, 16) and on the bbox
         // (1) contributes nothing.
@@ -3687,7 +3723,10 @@ mod header_wire_type_tests {
         // Coordinates split across two occurrences: the first is already
         // incomplete.
         let h = [bbox_field(&COMPLETE[..4]), bbox_field(&COMPLETE[4..])].concat();
-        assert!(WireHeaderBlock::parse(&h).is_err());
+        crate::test_support::assert_err_kind!(
+            WireHeaderBlock::parse(&h),
+            crate::ErrorKind::WireFormat { msg } if msg.contains("missing a required coordinate"),
+        );
     }
 
     #[test]

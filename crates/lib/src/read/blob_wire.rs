@@ -775,13 +775,15 @@ mod tests {
             for flags in 0..8u8 {
                 let (tagdata, indexdata, waymembers) =
                     (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
-                assert!(
-                    WireBlobHeader::parse(&bytes, tagdata, indexdata, waymembers).is_err(),
+                crate::test_support::assert_err_kind!(
+                    WireBlobHeader::parse(&bytes, tagdata, indexdata, waymembers),
+                    crate::ErrorKind::WireFormat { .. },
                     "{bad:02x?} with flags {flags:03b} must be refused"
                 );
             }
-            assert!(
-                parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard()).is_err(),
+            crate::test_support::assert_err_kind!(
+                parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard()),
+                crate::ErrorKind::WireFormat { .. },
                 "{bad:02x?} must be refused by the header walk's parser"
             );
         }
@@ -878,12 +880,18 @@ mod tests {
 
         // An empty type string is the same defect spelled differently.
         let empty_type = vec![0x0A, 0x00, 0x18, 100];
-        parse_blob_header_with_index(&empty_type, &crate::host::Diagnostics::discard())
-            .expect_err("an empty type string must be rejected too");
+        crate::test_support::assert_err_kind!(
+            parse_blob_header_with_index(&empty_type, &crate::host::Diagnostics::discard()),
+            crate::ErrorKind::WireFormat { .. },
+            "an empty type string must be rejected too"
+        );
 
         // A completely empty header - what a zero-length frame decodes to.
-        parse_blob_header_with_index(&[], &crate::host::Diagnostics::discard())
-            .expect_err("an empty header must be rejected");
+        crate::test_support::assert_err_kind!(
+            parse_blob_header_with_index(&[], &crate::host::Diagnostics::discard()),
+            crate::ErrorKind::Blob(crate::BlobError::InvalidHeaderSize),
+            "an empty header must be rejected"
+        );
 
         // An unrecognised but non-empty type still parses, so the check has not
         // cost the format its forward compatibility.

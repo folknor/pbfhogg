@@ -1346,10 +1346,11 @@ mod tests {
             ("skip", skip_arm(&truncated)),
             ("walk", walk_arm(&truncated)),
         ] {
-            assert!(
-                result.is_err(),
-                "the {name} arm must hard-error on a payload-truncated file, \
-                 got Ok({result:?}) - shape 4 has drifted apart"
+            crate::test_support::assert_err_kind!(
+                result,
+                crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof,
+                "the {name} arm must hard-error on a payload-truncated file - shape 4 has \
+                 drifted apart"
             );
         }
     }
@@ -1702,7 +1703,10 @@ mod tests {
         let pbf = one_block_pbf();
         let mut reader = BlobReader::new_seekable(Cursor::new(&pbf[..pbf.len() - 1])).unwrap();
         reader.next().unwrap().unwrap();
-        reader.next().unwrap().unwrap_err();
+        crate::test_support::assert_err_kind!(
+            reader.next().unwrap(),
+            crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof
+        );
         let header = reader.blob_from_offset(ByteOffset(0)).unwrap();
         assert_eq!(header.get_type(), BlobType::OsmHeader);
     }
@@ -1721,7 +1725,10 @@ mod tests {
             fail_at,
         })
         .unwrap();
-        reader.seek(ByteOffset(0)).unwrap_err();
+        crate::test_support::assert_err_kind!(
+            reader.seek(ByteOffset(0)),
+            crate::ErrorKind::Io(e) if e.raw_os_error() == Some(libc::ESPIPE)
+        );
         let err = reader.next().unwrap().unwrap_err();
         assert!(err.to_string().contains("a second OSMHeader blob"), "{err}");
         assert_eq!(err.byte_offset(), None);
@@ -1853,16 +1860,18 @@ mod tests {
         // a parser that drops them reads 1 and accepts the one-byte bitmap.
         let overflow = blob_with_waymembers(Some(vec![0x01, 0x81, 0x80, 0x80, 0x80, 0x10, 0x01]));
         assert_eq!(overflow.way_members(), None);
-        assert!(overflow.way_members_checked().is_err());
+        crate::test_support::assert_err_kind!(
+            overflow.way_members_checked(),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("does not fit 32 bits")
+        );
         // The checked parser tells absent from malformed.
         assert!(matches!(
             blob_with_waymembers(None).way_members_checked(),
             Ok(None)
         ));
-        assert!(
-            blob_with_waymembers(Some(vec![0x02, 1, 0x00]))
-                .way_members_checked()
-                .is_err()
+        crate::test_support::assert_err_kind!(
+            blob_with_waymembers(Some(vec![0x02, 1, 0x00])).way_members_checked(),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("version 2, not 1")
         );
         assert!(matches!(
             blob_with_waymembers(Some(vec![0x01, 9, 0xFF, 0x01])).way_members_checked(),

@@ -3744,7 +3744,11 @@ mod tests {
                 msg.contains(&needle),
                 "path {path}: the error must name the element and the held kind, got: {msg}"
             );
-            assert!(bb.take().is_err(), "path {path}: take must refuse it too");
+            crate::test_support::assert_err_kind!(
+                bb.take(),
+                crate::ErrorKind::InvalidData { msg, .. } if msg.contains(&needle),
+                "path {path}: take must refuse it too",
+            );
         }
     }
 
@@ -4088,13 +4092,19 @@ mod tests {
     #[test]
     fn pre_seeding_refuses_a_nonempty_slot_zero_and_a_nonempty_builder() {
         let mut bb = BlockBuilder::new();
-        assert!(
-            bb.pre_seed_string_table(&source_table(&["x", "k"]))
-                .is_err()
+        crate::test_support::assert_err_kind!(
+            bb.pre_seed_string_table(&source_table(&["x", "k"])),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("does not begin with the empty string")
         );
-        assert!(bb.pre_seed_string_table(&source_table(&[])).is_err());
+        crate::test_support::assert_err_kind!(
+            bb.pre_seed_string_table(&source_table(&[])),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("does not begin with the empty string"),
+        );
         bb.add_node(1, 0, 0, [("k", "v")], None);
-        assert!(bb.pre_seed_string_table(&source_table(&["", "k"])).is_err());
+        crate::test_support::assert_err_kind!(
+            bb.pre_seed_string_table(&source_table(&["", "k"])),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("holding elements was pre-seeded"),
+        );
         assert!(bb.take().expect("encode").is_some());
     }
 
@@ -4142,7 +4152,11 @@ mod tests {
         // Sticky: the block is gone, and a fresh legal add cannot flush past
         // the refusal into a file with node 3 missing.
         bb.add_way(10, [("k", "v")], &[1, 2], None);
-        assert!(bb.take_owned().is_err(), "the refusal must survive");
+        crate::test_support::assert_err_kind!(
+            bb.take_owned(),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("node 3 added to a full block"),
+            "the refusal must survive",
+        );
     }
 
     #[test]
@@ -4187,8 +4201,9 @@ mod tests {
 
         // Sticky: the caller cannot flush past it into a later block.
         bb.add_node(1, 0, 0, [("k", "v")], None);
-        assert!(
-            bb.take().is_err(),
+        crate::test_support::assert_err_kind!(
+            bb.take(),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("3 node ref(s) but 2 location(s)"),
             "poison must survive reset - a builder that was handed an \
              unencodable element stays refused"
         );
@@ -4232,8 +4247,9 @@ mod tests {
             role: "future",
         }];
         bb.add_relation(500, [("type", "multipolygon")], &members, None);
-        assert!(
-            bb.take_owned().is_err(),
+        crate::test_support::assert_err_kind!(
+            bb.take_owned(),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("relation 500: member type 7"),
             "an unmodelled member type must not slip out through take_owned"
         );
     }

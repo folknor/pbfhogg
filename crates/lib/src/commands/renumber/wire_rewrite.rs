@@ -1599,7 +1599,10 @@ mod tests {
         .expect("reread");
         assert_eq!(seen, vec![-5, -6, -7]);
         assert!(offset_id(i64::MIN, 0).is_ok());
-        assert!(offset_id(i64::MIN, 1).is_err());
+        crate::test_support::assert_err_kind!(
+            offset_id(i64::MIN, 1),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("leaves the 64-bit id range"),
+        );
     }
 
     /// Strictly increasing ids, within a blob: a node id that steps back, across a group
@@ -1811,7 +1814,11 @@ mod tests {
         varint(5, &mut rel);
         rel.push(0x08);
         varint(6, &mut rel);
-        assert!(relation_id(&rel).is_err(), "R1's reader must refuse it too");
+        crate::test_support::assert_err_kind!(
+            relation_id(&rel),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("Relation carries id more than once"),
+            "R1's reader must refuse it too",
+        );
         let mut group = Vec::new();
         len_delimited(4, &rel, &mut group);
         let err = run(&block_of(&[group])).err().expect("relation");

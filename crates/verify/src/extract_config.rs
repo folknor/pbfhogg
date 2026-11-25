@@ -245,7 +245,10 @@ mod tests {
         let strips = strips(&bbox, 3).unwrap();
         assert_eq!(strips[0].coordinates()[0], -1.0);
         assert_eq!(strips[2].coordinates()[2], 3.0);
-        assert!(super::strips(&bbox, 0).is_err());
+        crate::test_support::refused(
+            super::strips(&bbox, 0),
+            "multi-extract requires at least 1 region",
+        );
         let regions = multi_extract_regions(
             &strips,
             &[PolygonInput {
@@ -275,7 +278,10 @@ mod tests {
         assert!(args.contains(&"--staging-dir".into()));
         assert!(!args.contains(&"--tmp-dir".into()));
         assert_eq!(private, [dir.join("launch/staging")]);
-        assert!(multi_extract_config(&dir, &[]).is_err());
+        crate::test_support::refused(
+            multi_extract_config(&dir, &[]),
+            "multi-extract requires at least 1 region",
+        );
     }
 
     #[test]
@@ -294,7 +300,10 @@ mod tests {
         ] {
             let err = pbfhogg_box(&Bbox::parse(bad).unwrap()).unwrap_err();
             assert!(matches!(err, Error::Tool(_)), "{bad}: {err:?}");
-            assert!(strips(&Bbox::parse(bad).unwrap(), 2).is_err(), "{bad}");
+            crate::test_support::refused(
+                strips(&Bbox::parse(bad).unwrap(), 2),
+                "is not a box pbfhogg extract takes",
+            );
         }
         // A valid parent whose split rounds a seam onto an edge.
         let narrow = Bbox::parse("1,0,1.0000000000000002,1").unwrap();

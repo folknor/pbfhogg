@@ -174,14 +174,34 @@ mod tests {
 
     #[test]
     fn direct_construction_refuses_out_of_range_levels() {
-        assert!(Compression::zlib(10).is_err());
-        assert!(Compression::zlib(u32::MAX).is_err());
+        assert!(
+            Compression::zlib(10)
+                .expect_err("level 10")
+                .0
+                .contains("got 10")
+        );
+        assert!(
+            Compression::zlib(u32::MAX)
+                .expect_err("level u32::MAX")
+                .0
+                .contains("zlib level must be 0-9")
+        );
         let (min, max) = ZstdLevel::range();
         assert!(min < -7, "zstd supports levels below -7, got min {min}");
         assert!(Compression::zstd(min).is_ok());
         assert!(Compression::zstd(max).is_ok());
-        assert!(Compression::zstd(min - 1).is_err());
-        assert!(Compression::zstd(max + 1).is_err());
+        assert!(
+            Compression::zstd(min - 1)
+                .expect_err("below the range")
+                .0
+                .contains("zstd level must be")
+        );
+        assert!(
+            Compression::zstd(max + 1)
+                .expect_err("above the range")
+                .0
+                .contains("zstd level must be")
+        );
     }
 
     #[test]
@@ -218,7 +238,8 @@ mod tests {
         let below = format!("zstd:{}", min - 1);
         let above = format!("zstd:{}", max + 1);
         for invalid in ["zlib:-1", "zlib:10", below.as_str(), above.as_str()] {
-            assert!(invalid.parse::<Compression>().is_err(), "{invalid}");
+            let err = invalid.parse::<Compression>().expect_err(invalid);
+            assert!(err.0.contains("level"), "{invalid}: {}", err.0);
         }
         assert_eq!(
             "zstd"

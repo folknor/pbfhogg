@@ -938,7 +938,10 @@ mod tests {
         }
         // A 4-byte input declaring 0xFFFFFFFF is the unbounded-allocation
         // case and must fail rather than be excused as EOF.
-        assert!(frames(vec![0xFFu8; 4]).next_header().is_err());
+        crate::test_support::assert_err_kind!(
+            frames(vec![0xFFu8; 4]).next_header(),
+            crate::ErrorKind::Blob(crate::BlobError::HeaderTooBig { .. })
+        );
 
         // The tail a stream delivered is consumed, and the position keeps up
         // with it, so a stream that delivers more later is not read as
@@ -987,7 +990,11 @@ mod tests {
         bytes.extend_from_slice(&data_frame(5));
         let mut walk = frames(bytes.clone());
 
-        assert!(walk.read_payload(&mut Vec::new()).is_err(), "no header yet");
+        crate::test_support::assert_err_kind!(
+            walk.read_payload(&mut Vec::new()),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("no frame header read"),
+            "no header yet",
+        );
         let mut walk = frames(bytes.clone());
         let first = walk.next_header().unwrap().unwrap();
         assert_eq!(
@@ -997,9 +1004,16 @@ mod tests {
                 ordinal: Some(0)
             }
         );
-        assert!(walk.next_header().is_err(), "payload still pending");
+        crate::test_support::assert_err_kind!(
+            walk.next_header(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("before the last frame's payload"),
+            "payload still pending",
+        );
         assert!(walk.failed(), "a misuse ends the walk like any failure");
-        assert!(walk.skip_payload().is_err());
+        crate::test_support::assert_err_kind!(
+            walk.skip_payload(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("after a failed frame"),
+        );
 
         let mut walk = frames(bytes.clone());
         walk.next_header().unwrap().unwrap();
@@ -1027,7 +1041,11 @@ mod tests {
         assert_eq!(err.byte_offset(), Some(crate::ByteOffset(18)));
         assert_eq!(err.blob_index(), Some(1));
         assert!(walk.failed());
-        assert!(walk.next_header().is_err(), "a failed walk stays failed");
+        crate::test_support::assert_err_kind!(
+            walk.next_header(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("after a failed frame"),
+            "a failed walk stays failed",
+        );
         walk.seek(std::io::SeekFrom::Start(0)).unwrap();
         assert!(!walk.failed(), "a successful seek resumes the walk");
         assert_eq!(walk.next_header().unwrap().unwrap().id.ordinal, Some(0));
@@ -1199,6 +1217,9 @@ mod tests {
             ),
             "still refusing after the move: {err:?}"
         );
-        assert!(walk_all(&mut refusing(bytes), false).is_err());
+        crate::test_support::assert_err_kind!(
+            walk_all(&mut refusing(bytes), false),
+            crate::ErrorKind::MissingIndexdata { partial: true, .. }
+        );
     }
 }

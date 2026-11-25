@@ -1091,8 +1091,11 @@ mod tests {
         assert_eq!(start_ids(None).unwrap(), [1; 3]);
         assert_eq!(start_ids(Some("10")).unwrap(), [10; 3]);
         assert_eq!(start_ids(Some("10,20,30")).unwrap(), [10, 20, 30]);
-        assert!(start_ids(Some("1,2")).is_err());
-        assert!(start_ids(Some("x")).is_err());
+        crate::test_support::refused(
+            start_ids(Some("1,2")),
+            "--start-id 1,2 is neither one value nor three",
+        );
+        crate::test_support::refused(start_ids(Some("x")), "invalid --start-id x");
     }
 
     #[test]

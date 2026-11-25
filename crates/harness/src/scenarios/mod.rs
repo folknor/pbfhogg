@@ -163,7 +163,7 @@ mod absence_tests {
         std::fs::write(&file, b"x").expect("write");
         assert!(!super::absent(&file).expect("present"));
         assert!(super::absent(&scratch.child("missing")).expect("absent"));
-        assert!(super::absent(&file.join("child")).is_err());
+        pbfhogg_test_scratch::refused(super::absent(&file.join("child")), "Not a directory");
         #[cfg(unix)]
         {
             let link = scratch.child("link");

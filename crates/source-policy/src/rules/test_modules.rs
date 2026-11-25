@@ -775,7 +775,10 @@ mod tests {
             "{target_arch}-unknown-linux-gnu",
             "musl",
         ] {
-            assert!(on(Some(refused), arm).is_err(), "{refused}");
+            pbfhogg_test_scratch::refused(
+                on(Some(refused), arm),
+                &format!("unsupported sweep target {refused:?}"),
+            );
         }
     }
 
@@ -805,7 +808,10 @@ mod tests {
         );
         assert!(require_module_coverage(&qualify(&declared), &qualify(&enabled)).is_ok());
         let (_, enabled) = present_on(lone, &[], musl_arm);
-        assert!(require_module_coverage(&qualify(&declared), &qualify(&enabled)).is_err());
+        pbfhogg_test_scratch::refused(
+            require_module_coverage(&qualify(&declared), &qualify(&enabled)),
+            "outside executable sweep shapes:\n/g.rs:2: mod only",
+        );
         let twins = "#[cfg(target_arch = \"x86_64\")]\nmod arch {}\n\
                      #[cfg(not(target_arch = \"x86_64\"))]\nmod arch {}";
         let (declared, enabled) = present_on(twins, &[], musl_arm);
@@ -838,8 +844,8 @@ mod tests {
             cfg("any(feature = \"a\", feature = \"b\")", &["b"]),
             Ok(true)
         );
-        assert!(cfg("unknown", &[]).is_err());
-        assert!(cfg("any(test, unknown)", &[]).is_err());
+        pbfhogg_test_scratch::refused(cfg("unknown", &[]), "unsupported cfg: unknown");
+        pbfhogg_test_scratch::refused(cfg("any(test, unknown)", &[]), "unsupported cfg: unknown");
         let flags = |f: &[&str]| sweep_cfgs(&f.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         assert_eq!(
             flags(&["--cfg", "pbfhogg_test_hooks"]),
@@ -850,7 +856,7 @@ mod tests {
             Ok(set(&["pbfhogg_test_hooks"]))
         );
         assert_eq!(flags(&["--cfg", "other"]), Ok(set(&[])));
-        assert!(flags(&["--cfg"]).is_err());
+        pbfhogg_test_scratch::refused(flags(&["--cfg"]), "trailing --cfg in sweep rustflags");
     }
 
     #[test]
@@ -890,22 +896,40 @@ mod tests {
 
     #[test]
     fn unsupported_module_shapes_fail_closed() {
-        for src in [
-            "mod inline { mod child; }",
-            "#[cfg_attr(test, path = \"x.rs\")]\nmod x;",
-            "#[cfg_attr(test, allow(dead_code), cfg(any()))]\nmod x;",
-            "#![cfg_attr(test, cfg_attr(test, path = \"x.rs\"))]",
-            "#[cfg_attr(all(), r#path = \"../hidden.inc\")]\nmod x;",
-            "#[r#cfg(unknown)]\nmod x;",
-            "macro_rules! m { () => { #[cfg(any())] mod forgotten {} }; }\nm!();",
-            "fn f() { mod hidden {} }",
-            "#[cfg(unknown)]\nmod x;",
+        let cfg_attr = "cfg_attr modules need explicit audit support";
+        let hidden = "1 `mod` keywords but 0 module items";
+        let unknown = "unsupported cfg: unknown";
+        for (src, needle) in [
+            (
+                "mod inline { mod child; }",
+                "external module inside inline body needs explicit audit support",
+            ),
+            ("#[cfg_attr(test, path = \"x.rs\")]\nmod x;", cfg_attr),
+            (
+                "#[cfg_attr(test, allow(dead_code), cfg(any()))]\nmod x;",
+                cfg_attr,
+            ),
+            (
+                "#![cfg_attr(test, cfg_attr(test, path = \"x.rs\"))]",
+                cfg_attr,
+            ),
+            (
+                "#[cfg_attr(all(), r#path = \"../hidden.inc\")]\nmod x;",
+                cfg_attr,
+            ),
+            ("#[r#cfg(unknown)]\nmod x;", unknown),
+            (
+                "macro_rules! m { () => { #[cfg(any())] mod forgotten {} }; }\nm!();",
+                hidden,
+            ),
+            ("fn f() { mod hidden {} }", hidden),
+            ("#[cfg(unknown)]\nmod x;", unknown),
         ] {
             let result = shape(&Source::new(src.to_owned())).and_then(|s| {
                 let mut out = (BTreeSet::new(), BTreeSet::new());
                 presence(&s.decls, &BTreeSet::new(), GNU, true, &mut out)
             });
-            assert!(result.is_err(), "{src}");
+            pbfhogg_test_scratch::refused(result, needle);
         }
         // Lint-only `cfg_attr`, inner or outer, neither moves nor gates.
         let lints = "#![cfg_attr(not(test), deny(clippy::print_stdout))]\n\
@@ -998,7 +1022,10 @@ mod tests {
             graph(&helper, &["hooks"]),
             Ok(set(&["t/all.rs", "t/helper.rs"]))
         );
-        assert!(graph(&[("t/all.rs", "mod child;")], &[]).is_err());
+        pbfhogg_test_scratch::refused(
+            graph(&[("t/all.rs", "mod child;")], &[]),
+            "module child: expected exactly one of",
+        );
         // A `#[path]`-loaded file owns its directory: its children are its
         // siblings, and a decoy under its stem is not what rustc loads.
         let owned = [

@@ -90,6 +90,7 @@ pub(super) fn classify_blobs_in_bucket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_err_kind;
 
     #[test]
     fn classify_empty_inputs() {
@@ -211,6 +212,10 @@ mod tests {
     fn classify_blob_wider_than_bucket_errors() {
         // Blob 0: [0, 100), bucket: [0, 10) - blob is 10x wider than bucket
         let result = classify_blobs_in_bucket(0, 10, &[0], 100);
-        assert!(result.is_err(), "expected Err for blob wider than bucket");
+        assert_err_kind!(
+            result,
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("structural assumption violated"),
+            "expected Err for blob wider than bucket",
+        );
     }
 }

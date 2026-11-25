@@ -313,6 +313,9 @@ mod tests {
         let mut out = Vec::new();
         encode(&mut out, 1, ROLE_STREET, &[None; VALUE_SLOTS], &[2, 4, 6]);
         out.pop();
-        assert!(SegmentRecords::new(&out).next_way().is_err());
+        crate::test_support::assert_err_kind!(
+            SegmentRecords::new(&out).next_way(),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("does not decode"),
+        );
     }
 }

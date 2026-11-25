@@ -227,19 +227,32 @@ mod tests {
 
     #[test]
     fn malformed_rows_fail() {
-        for bad in [
-            &b"1\t\"a\"\n\n"[..],
-            b"1\t\"a\"\t\"v\"\n",
-            b"1\t\"a\n",
-            b"1\t\"a\"x\n",
-            b"x\t\"a\"\n",
-            b"1\t\"a\"",
+        for (bad, why) in [
+            (
+                &b"1\t\"a\"\n\n"[..],
+                "at byte 6: expected a count and a tab",
+            ),
+            (
+                b"1\t\"a\"\t\"v\"\n",
+                "at byte 0: expected the row to end after its key",
+            ),
+            (b"1\t\"a\n", "at byte 0: unterminated key"),
+            (
+                b"1\t\"a\"x\n",
+                "at byte 0: expected the row to end after its key",
+            ),
+            (b"x\t\"a\"\n", "at byte 0: expected a count and a tab"),
+            (
+                b"1\t\"a\"",
+                "at byte 0: expected the row to end after its key",
+            ),
         ] {
-            assert!(report_rows("osmium", bad, osmium_field).is_err(), "{bad:?}");
-            assert!(
-                report_rows("pbfhogg", bad, pbfhogg_field).is_err(),
-                "{bad:?}"
-            );
+            let osmium =
+                crate::test_support::refused(report_rows("osmium", bad, osmium_field), why);
+            assert!(osmium.to_string().starts_with("osmium tags report"));
+            let pbfhogg =
+                crate::test_support::refused(report_rows("pbfhogg", bad, pbfhogg_field), why);
+            assert!(pbfhogg.to_string().starts_with("pbfhogg tags report"));
         }
     }
 

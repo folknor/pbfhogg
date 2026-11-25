@@ -61,9 +61,12 @@ fn a_generated_tree_is_identified_by_layout_and_bytes_without_framing_collisions
         generated(&file, RoleKind::Pbf).unwrap(),
         format!("xxh128:{}", pbfhogg_devkit::file_digest(&file).unwrap())
     );
-    assert!(generated(&file, RoleKind::Directory).is_err());
-    assert!(
-        generated(&a.join("a"), RoleKind::File).is_err(),
-        "a link is never followed"
+    pbfhogg_test_scratch::refused(
+        generated(&file, RoleKind::Directory),
+        "is not a directory, so it cannot be identified",
+    );
+    pbfhogg_test_scratch::refused(
+        generated(&a.join("a"), RoleKind::File),
+        "is not a file, so it cannot be identified",
     );
 }

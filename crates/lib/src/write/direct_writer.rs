@@ -372,6 +372,16 @@ mod tests {
         }
     }
 
+    /// The read-only file's `write(2)` failure (EBADF) is what `result`
+    /// reports, first-hand or carried by a sticky failed state.
+    fn assert_bad_fd<T: std::fmt::Debug>(result: std::io::Result<T>) {
+        let err = result.expect_err("the read-only file refuses the write");
+        assert!(
+            err.to_string().contains("Bad file descriptor"),
+            "expected the EBADF failure, got: {err}"
+        );
+    }
+
     /// A failed final flush stays failed: a retry must not report success.
     #[test]
     fn a_failed_flush_is_sticky() {
@@ -385,7 +395,8 @@ mod tests {
             again.to_string().contains(&first.to_string()),
             "got: {again}"
         );
-        assert!(w.write(b"more").is_err(), "a failed writer refuses writes");
+        // A failed writer refuses writes.
+        assert_bad_fd(w.write(b"more"));
     }
 
     #[test]
@@ -428,10 +439,10 @@ mod tests {
         let mut w = failing_writer(dir.path());
         let data = vec![7u8; IO_BUF_BYTES * 2];
         assert_eq!(w.write(&data).unwrap(), IO_BUF_BYTES);
-        assert!(w.write(&data[IO_BUF_BYTES..]).is_err());
+        assert_bad_fd(w.write(&data[IO_BUF_BYTES..]));
         assert_eq!(w.logical_size, IO_BUF_BYTES as u64);
-        assert!(w.write_all(&data).is_err());
+        assert_bad_fd(w.write_all(&data));
         assert_eq!(w.logical_size, IO_BUF_BYTES as u64);
-        assert!(w.flush().is_err());
+        assert_bad_fd(w.flush());
     }
 }

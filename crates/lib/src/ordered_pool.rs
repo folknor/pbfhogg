@@ -1885,9 +1885,13 @@ mod tests {
                     |_| Ok(()),
                 )
             })
-            .is_err()
+            .map_err(|payload| crate::test_support::panic_text(&*payload))
         });
-        assert!(outcome, "a worker panic must propagate, not be swallowed");
+        assert_eq!(
+            outcome.err(),
+            Some(Some("injected worker panic".to_owned())),
+            "a worker panic must propagate, not be swallowed"
+        );
     }
 
     /// Caller-owned shards come back with every worker's contribution.
@@ -2032,12 +2036,14 @@ mod tests {
                     panic!("injected consumer panic");
                 })
             }))
-            .is_err();
+            .err()
+            .map(|payload| crate::test_support::panic_text(&*payload));
             (panicked, saw_block.load(Ordering::SeqCst))
         });
         assert!(saw_block, "no worker blocked on the full result channel");
-        assert!(
+        assert_eq!(
             panicked,
+            Some(Some("injected consumer panic".to_owned())),
             "a consumer panic must propagate, not be swallowed"
         );
     }
@@ -2454,9 +2460,14 @@ mod tests {
                     &mut consumer,
                 )
             })
-            .is_err()
+            .err()
+            .map(|payload| crate::test_support::panic_text(&*payload))
         });
-        assert!(panicked, "a worker panic must propagate, not be swallowed");
+        assert_eq!(
+            panicked,
+            Some(Some("injected worker panic".to_owned())),
+            "a worker panic must propagate, not be swallowed"
+        );
     }
 
     /// Every worker panicking: the queued tasks' senders go with the job
@@ -2476,9 +2487,10 @@ mod tests {
                     &mut consumer,
                 )
             })
-            .is_err()
+            .err()
+            .map(|payload| crate::test_support::panic_text(&*payload))
         });
-        assert!(panicked);
+        assert_eq!(panicked, Some(Some("every worker panics".to_owned())));
     }
 
     /// A consumer idle on the head task records its receive wait; with a

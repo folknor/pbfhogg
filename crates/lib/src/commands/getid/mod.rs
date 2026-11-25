@@ -1680,23 +1680,38 @@ mod tests {
 
     #[test]
     fn parse_invalid_prefix() {
-        assert!(parse_id_spec("x123", None).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("x123", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("expected prefix"),
+        );
     }
 
     #[test]
     fn parse_missing_number() {
-        assert!(parse_id_spec("n", None).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("n", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("prefix + number"),
+        );
     }
 
     #[test]
     fn parse_bad_number() {
-        assert!(parse_id_spec("nabc", None).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("nabc", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("is not an integer"),
+        );
     }
 
     #[test]
     fn parse_too_short() {
-        assert!(parse_id_spec("n", None).is_err());
-        assert!(parse_id_spec("", None).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("n", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("prefix + number"),
+        );
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("prefix + number"),
+        );
     }
 
     /// osmium's `read_id_file`: strip spaces, cut at the first space or `#`,
@@ -1720,8 +1735,14 @@ mod tests {
         // Tabs are not whitespace here, as in osmium: the token keeps them
         // and fails to parse.
         assert_eq!(id_file_token("\tn123"), Some("\tn123"));
-        assert!(parse_id_spec("\tn123", None).is_err());
-        assert!(parse_id_spec("n123\t", None).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("\tn123", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("expected prefix"),
+        );
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("n123\t", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("is not an integer"),
+        );
     }
 
     #[test]
@@ -1740,8 +1761,9 @@ mod tests {
         assert!(!ids.node_ids.get(7));
 
         std::fs::write(&path, "n1\n\tn2\n").unwrap();
-        assert!(
-            parse_ids_from_file(&path).is_err(),
+        crate::test_support::assert_err_kind!(
+            parse_ids_from_file(&path),
+            crate::ErrorKind::InvalidData { msg, .. } if msg.contains("invalid id file"),
             "a tab-led id is an illegal id, as in osmium"
         );
     }
@@ -1796,7 +1818,10 @@ mod tests {
     #[test]
     fn parse_ids_bare_without_default_type_errors() {
         let specs: Vec<String> = vec!["123".to_string()];
-        assert!(parse_ids_with_default_type(&specs, None).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_ids_with_default_type(&specs, None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("expected prefix"),
+        );
     }
 
     #[test]
@@ -1823,8 +1848,14 @@ mod tests {
             (ElementKind::Way, i64::MAX)
         );
         // One past either extreme is still a bad number.
-        assert!(parse_id_spec("n-9223372036854775809", None).is_err());
-        assert!(parse_id_spec("-", Some(ElementKind::Node)).is_err());
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("n-9223372036854775809", None),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("is not an integer"),
+        );
+        crate::test_support::assert_err_kind!(
+            parse_id_spec("-", Some(ElementKind::Node)),
+            crate::ErrorKind::InvalidArgument { msg, .. } if msg.contains("bad number"),
+        );
         // A source holding only negative IDs is not an empty request.
         let ids = parse_ids(&["n-3".to_owned()]).unwrap();
         assert!(!ids.is_empty());

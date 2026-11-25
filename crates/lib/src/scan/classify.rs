@@ -1889,6 +1889,7 @@ fn run_accumulate_decoded<S: Send>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{ScheduledBlob, WillneedPrefetch, coalesce_willneed_ranges};
+    use crate::test_support::panic_text;
 
     const UNCHECKED: super::KindClaims = super::KindClaims::Unchecked;
 
@@ -2285,14 +2286,15 @@ mod tests {
         // the failing thread may be descheduled or spend time in the panic
         // hook before unwinding raises the stop flag. Test that guard directly
         // below, independently of thread scheduling and panic reporting.
-        let (outcome, _) = run(true);
-        assert!(outcome.is_err(), "the panic must still propagate");
+        let payload = run(true).0.expect_err("the panic must still propagate");
+        assert_eq!(panic_text(&*payload).as_deref(), Some("first blob panics"));
         let stop = std::sync::atomic::AtomicBool::new(false);
         let outcome = std::panic::catch_unwind(|| {
             let _guard = super::StopOnUnwind(&stop);
             panic!("worker unwinds");
         });
-        assert!(outcome.is_err());
+        let payload = outcome.expect_err("the guard's thread unwinds");
+        assert_eq!(panic_text(&*payload).as_deref(), Some("worker unwinds"));
         assert!(stop.load(Ordering::Relaxed), "unwinding must stop peers");
 
         // Paired counterpart: a run that never fails is exhaustive.

@@ -1231,19 +1231,25 @@ mod tests {
                 threads: 3,
             },
         ];
-        for (what, w) in [
-            ("descriptor pool declared twice", twice_fd),
-            ("executor pool declared twice", twice_pool),
-            ("ambient call, global pool unstarted", ambient_unstarted),
-            ("input read by no call", unread),
-            ("call reads an undeclared input", undeclared),
-            ("unknown executor pool", unknown_pool),
-            ("unknown descriptor pool", unknown_fd),
-            ("unused executor pool", unused_pool),
-            ("unused descriptor pool", unused_fd),
-            ("concurrent schedule of one call", lone_concurrent),
+        for (needle, w) in [
+            ("w: a descriptor pool id is declared twice", twice_fd),
+            ("w: an executor pool id is declared twice", twice_pool),
+            (
+                "w: call a is ambient in a scenario that never starts the global pool",
+                ambient_unstarted,
+            ),
+            ("w: input other is read by no call", unread),
+            ("w: call a reads undeclared input input", undeclared),
+            ("w: call a names no executor pool missing", unknown_pool),
+            ("w: call a names no descriptor pool missing", unknown_fd),
+            ("w: executor pool idle is unused or empty", unused_pool),
+            ("w: descriptor pool idle is unused", unused_fd),
+            (
+                "w: a concurrent schedule of fewer than two calls",
+                lone_concurrent,
+            ),
         ] {
-            assert!(w.validate().is_err(), "{what}");
+            pbfhogg_test_scratch::refused(w.validate(), needle);
         }
     }
 
@@ -1256,7 +1262,10 @@ mod tests {
         w.inputs = vec![InputRole::generated("input", Recipe::Nodes { blocks: 1 })];
         w.calls = vec![CallPlan::plain("a", "cat", cat(&["input"], "out"))];
         w.validate().expect("workload rules hold");
-        assert!(w.decl().validate().is_err());
+        pbfhogg_test_scratch::refused(
+            w.decl().validate(),
+            "a hotpath scenario has one call and no generated role",
+        );
     }
 
     /// The host and its resources are part of the plan: changing either

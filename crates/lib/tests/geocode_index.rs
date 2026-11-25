@@ -3754,9 +3754,13 @@ fn open_dir_reads_the_pinned_directory_only() {
     std::fs::rename(&index_dir, &aside).expect("move aside");
     std::fs::create_dir(&index_dir).expect("replacement directory");
     std::fs::write(index_dir.join("geocode_header.bin"), b"broken").expect("broken header");
+    let err = Reader::open(&index_dir)
+        .err()
+        .expect("the path names the broken index");
     assert!(
-        Reader::open(&index_dir).is_err(),
-        "the path names the broken index"
+        matches!(err.kind(), pbfhogg::ErrorKind::InvalidData { .. })
+            && err.to_string().contains("geocode header too short"),
+        "{err}"
     );
     let pinned = Reader::open_dir(&pin).expect("pinned build opens");
     assert!(

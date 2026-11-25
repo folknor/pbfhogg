@@ -84,12 +84,16 @@ fn require_space(scratch: &Path, needed: u64, available: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_err_kind;
 
     #[test]
     fn estimate_covers_slot_records_payloads_and_file_slack() {
         let needed = remaining_scratch_bytes(100, 2, 1).expect("estimate");
         assert_eq!(needed, 100 * 23 + 3 * 65536);
-        assert!(remaining_scratch_bytes(u64::MAX, 0, 0).is_err());
+        assert_err_kind!(
+            remaining_scratch_bytes(u64::MAX, 0, 0),
+            crate::ErrorKind::Internal { msg, .. } if msg.contains("estimate overflow"),
+        );
     }
 
     #[test]

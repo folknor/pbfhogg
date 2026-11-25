@@ -1536,7 +1536,7 @@ mod capability_tests {
                 !seen_closed.load(SeqCst),
                 "a capability was alive while the invocation was not Open"
             );
-            assert!(inv.call().is_err());
+            crate::test_support::assert_err_kind!(inv.call(), crate::ErrorKind::Sealed);
             assert!(Arc::ptr_eq(&snapshot, &sealed(&inv.seal())));
             let c = inv.capabilities();
             assert_eq!((c.guards, c.permits), (0, 0));

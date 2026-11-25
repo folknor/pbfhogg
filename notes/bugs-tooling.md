@@ -158,18 +158,6 @@ precedence and surface as a content difference blamed on pbfhogg. Traced
 from source only; derive emits new's versions, so whether real derives
 reach it is unchecked.
 
-## TOOL-032 - Refusal tests that accept any error can pass on a panic
-
-Reported by: the release-sweep retirement (commit `e716ad49`).
-
-A caught worker panic is `ErrorKind::Panicked` and exits 101, and the CLI
-tests assert exact exit statuses (`CliInvoker` has no any-failure
-assertion). What remains: library and unit tests holding bare `is_err()`,
-discarded `unwrap_err`/`expect_err`, or `Err(_)` patterns still pass on a
-panic (dev overflow checks panic where release wraps), and no source-policy
-rule keeps new ones out. The settled rulings and the remaining links
-(source-policy rule, sweep, green agent) are in `notes/tool-032-design.md`.
-
 ## TOOL-055 - The .osc.gz routing fixture cannot detect a broken suffix fallback
 
 Reported by: TOOL-032 link 2 review.

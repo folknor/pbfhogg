@@ -411,7 +411,14 @@ header follows from them.
   with its coordinates when every input declares `LocationsOnWays`, and
   refuse a rewritten way that has refs but no coordinates there, since the
   kept declaration would misdescribe it; a way blob they copy is not
-  decoded, so its arrays are believed. time-filter keeps no coordinates:
+  decoded, so its arrays are believed. The filters that write each
+  selected way whole (`extract`, `tags-filter`, `getid`, `getparents`)
+  re-encode it with its coordinates when the input declares
+  `LocationsOnWays`, and refuse a way they re-encode that has refs but no
+  coordinates there, for the same reason; every ref keeps the coordinate
+  the input recorded beside it, including a ref to a node the output does
+  not hold. A way blob `getid --invert` copies whole is not decoded, so its
+  arrays are believed, as in `sort`. time-filter keeps no coordinates:
   they record node positions as of when the input was written, not as of
   the cutoff. The two prepass features are facts about the whole
   file (relation membership, nodes shared between way positions), so they are
@@ -492,8 +499,8 @@ fails with an error rather than write a header that lies.
 | `degrade` (re-encoding flags) | input's, not sorted under `--unsort*` | none |
 | `renumber` | sorted (requires sorted input) | `LocationsOnWays` |
 | `time-filter` | sorted (requires sorted input) | none |
-| `tags-filter`, `getid`, `getparents`, `extract` | input's | none |
-| `getid --invert` | input's | all when no way ID is requested, else none (even when no requested way exists) |
+| `tags-filter`, `getid`, `getparents`, `extract` | input's | `LocationsOnWays` |
+| `getid --invert` | input's | all when no way ID is requested on indexed input, else `LocationsOnWays` (even when no requested way exists) |
 | `add-locations-to-ways` | input's | `LocationsOnWays`, plus the prepass features with `--inject-prepass` |
 | `apply-changes` | sorted | `LocationsOnWays` with `--locations-on-ways`, else none |
 
@@ -1786,6 +1793,13 @@ These rules intentionally differ from `osmium extract`: relative `directory`
 values use the config file's location here, and `-d` rebases absolute outputs
 under the override instead of concatenating the two path strings.
 
+A selected way keeps its inline coordinates when the input declares
+`LocationsOnWays`, so the output declares it too and stays ready for
+`export`: every ref keeps the coordinate the input recorded beside it,
+including a ref to a node the region leaves out. A selected way with refs
+but no coordinates in such an input is refused. osmium extract keeps them
+only when asked with `-f pbf,locations_on_ways=true`.
+
 ```
 pbfhogg extract [OPTIONS] <FILE>
 ```
@@ -1814,6 +1828,8 @@ pbfhogg extract [OPTIONS] <FILE>
 Filter elements by tag expressions. Default mode resolves relation members transitively (matched relations pull in member ways, nodes, and nested relations). With `-R`, only directly matched elements are emitted.
 
 Default mode selects objects by ID: a matched ID includes every record of it, and references are collected from the matching records. It therefore refuses (exit 2, no output published) a PBF whose header declares `HistoricalInformation`, before the first pass, and a PBF that repeats an ID whose records disagree about the expressions, after the second pass. Repeats that agree (every record of the ID matches, or none does) are accepted and every record is written. `-R` decides per record and accepts history files; osmium documents the same restriction (`-R` only on history) without enforcing it.
+
+A written way keeps its inline coordinates when the input declares `LocationsOnWays` (`--remove-tags` strips only tags), and a written way with refs but no coordinates in such an input is refused; see [Output header](#output-header).
 
 Negative IDs are IDs like any other in every mode: a matched `w-7` pulls in exactly the nodes it references, a relation member `n-7` brings `n-7`, and neither brings its positive twin (osmium folds both onto `|id|` when it adds references).
 

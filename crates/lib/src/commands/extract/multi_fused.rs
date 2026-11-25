@@ -81,10 +81,11 @@ pub(super) enum MultiSelect<'a> {
         bboxes: Option<&'a [(i32, i32, i32, i32)]>,
         grid: Option<&'a RegionGrid>,
     },
-    /// Ways: the OR of their refs' node masks.
+    /// Ways: the OR of their refs' node masks, written under `coords`.
     Ways {
         nodes: &'a Membership,
         all: &'a [u64],
+        coords: crate::owned::WayCoords,
     },
     /// Relations: the OR of their matchable members' masks.
     Relations {
@@ -140,7 +141,7 @@ struct Local {
     table: Vec<(i64, u32)>,
     acc: Vec<u64>,
     regs: Vec<u32>,
-    refs: Vec<i64>,
+    way: crate::owned::WayScratch,
     builder: BatchBuilder,
 }
 
@@ -203,7 +204,7 @@ pub(super) fn multi_fused_pass(
             table: Vec::new(),
             acc: vec![0u64; mw],
             regs: Vec::new(),
-            refs: Vec::new(),
+            way: crate::owned::WayScratch::default(),
             builder: BatchBuilder::new(n),
         },
         |(), local: &mut Local, position| {
@@ -393,7 +394,7 @@ fn fuse_blob(
                 }
             }
         }
-        MultiSelect::Ways { nodes, all } => {
+        MultiSelect::Ways { nodes, all, .. } => {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     local.acc.fill(0);
@@ -549,6 +550,10 @@ fn fuse_blob(
     let mut counts = vec![0u64; n];
     let mut cursors = Cursors::default();
     let kind = select.kind();
+    let coords = match select {
+        MultiSelect::Ways { coords, .. } => *coords,
+        MultiSelect::Nodes { .. } | MultiSelect::Relations { .. } => crate::owned::WayCoords::Drop,
+    };
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         match (&element, kind) {
@@ -591,8 +596,7 @@ fn fuse_blob(
                     continue;
                 }
                 let wid = w.id();
-                local.refs.clear();
-                local.refs.extend(w.refs());
+                local.way.prepare(w, coords)?;
                 let meta = clean_partial_metadata(
                     element_metadata(ElementKind::Way, wid, &w.info())?,
                     clean,
@@ -600,7 +604,7 @@ fn fuse_blob(
                 for &i in &local.regs {
                     let i = i as usize;
                     ensure_way_capacity_local(&mut local.bbs[i], &mut local.output[i])?;
-                    local.bbs[i].add_way_partial(wid, w.tags(), &local.refs, meta.as_ref());
+                    local.way.write(&mut local.bbs[i], w.tags(), meta.as_ref());
                     counts[i] += 1;
                 }
             }

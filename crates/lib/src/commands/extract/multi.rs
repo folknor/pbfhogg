@@ -61,6 +61,7 @@ pub(super) fn try_extract_multi_single_pass(
     };
 
     let n = regions.len();
+    let coords = crate::owned::WayCoords::of_input(&header);
     host.invocation.marker("MULTI_EXTRACT_START");
     crate::host::diag!(
         host.diagnostics,
@@ -87,6 +88,7 @@ pub(super) fn try_extract_multi_single_pass(
         regions,
         outputs,
         set_bounds,
+        coords,
         compression,
         overrides,
         host,
@@ -592,6 +594,7 @@ pub(super) fn try_extract_multi_single_pass(
         let select = super::multi_fused::MultiSelect::Ways {
             nodes: &node_members,
             all: &all_regions,
+            coords,
         };
         super::multi_fused::multi_fused_pass(
             &shared_file,
@@ -641,7 +644,7 @@ pub(super) fn try_extract_multi_single_pass(
             &shared_file,
             &way_schedule,
             n,
-            |block, bbs, output, scratch| {
+            |block, bbs, output, way| {
                 let mut counts = vec![0u64; n];
                 let mut mask = vec![0u64; mw];
                 for element in block.elements() {
@@ -650,15 +653,14 @@ pub(super) fn try_extract_multi_single_pass(
                         if !way_members.mask_into(wid, &mut mask) {
                             continue;
                         }
-                        scratch.clear();
-                        scratch.extend(w.refs());
+                        way.prepare(w, coords)?;
                         let meta = clean_partial_metadata(
                             element_metadata(ElementKind::Way, wid, &w.info())?,
                             clean,
                         );
                         for i in regions_of(&mask) {
                             ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_way_partial(wid, w.tags(), scratch, meta.as_ref());
+                            way.write(&mut bbs[i], w.tags(), meta.as_ref());
                             counts[i] += 1;
                         }
                     }
@@ -924,12 +926,13 @@ pub(super) fn node_blob_regions(
 /// of write phases, 608 s of it compression). N pipelined writers would
 /// instead give each region its own permits, delivery window and writer
 /// thread - N buffering allowances for one stream of tasks.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn open_region_writers<'a>(
     header: &crate::HeaderBlock,
     regions: &[Region],
     outputs: &'a crate::output::BoundOutputSet,
     set_bounds: bool,
+    coords: crate::owned::WayCoords,
     compression: Compression,
     overrides: &HeaderOverrides,
     host: &'a crate::host::Entered<'_>,
@@ -942,7 +945,7 @@ pub(super) fn open_region_writers<'a>(
         let bbox = region.bbox();
         let header_bytes = super::super::output_header::build_one(
             header,
-            &super::output_facts(set_bounds, bbox),
+            &super::output_facts(set_bounds, bbox, coords),
             overrides,
             host,
         )?
@@ -1180,7 +1183,7 @@ where
             Option<&[u64]>,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
-            &mut Vec<i64>,
+            &mut crate::owned::WayScratch,
         ) -> crate::Result<Vec<u64>>
         + Send
         + Sync,
@@ -1254,7 +1257,7 @@ struct MultiLocal {
     pool: std::sync::Arc<crate::blob::DecompressPool>,
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
-    i64_scratch: Vec<i64>,
+    way: crate::owned::WayScratch,
 }
 
 impl MultiLocal {
@@ -1266,7 +1269,7 @@ impl MultiLocal {
             pool: crate::blob::DecompressPool::new(invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
-            i64_scratch: Vec::new(),
+            way: crate::owned::WayScratch::default(),
         }
     }
 
@@ -1314,19 +1317,13 @@ impl MultiLocal {
             Option<&[u64]>,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
-            &mut Vec<i64>,
+            &mut crate::owned::WayScratch,
         ) -> crate::Result<Vec<u64>>,
     {
         for v in &mut self.output {
             v.clear();
         }
-        let counts = block_fn(
-            block,
-            admit,
-            &mut self.bbs,
-            &mut self.output,
-            &mut self.i64_scratch,
-        )?;
+        let counts = block_fn(block, admit, &mut self.bbs, &mut self.output, &mut self.way)?;
         for i in 0..n {
             flush_local(&mut self.bbs[i], &mut self.output[i])?;
         }
@@ -1552,7 +1549,7 @@ where
             &PrimitiveBlock,
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
-            &mut Vec<i64>,
+            &mut crate::owned::WayScratch,
         ) -> crate::Result<Vec<u64>>
         + Send
         + Sync,
@@ -1567,7 +1564,7 @@ where
          _admit: Option<&[u64]>,
          bbs: &mut Vec<BlockBuilder>,
          output: &mut Vec<Vec<OwnedBlock>>,
-         scratch: &mut Vec<i64>| block_fn(block, bbs, output, scratch);
+         way: &mut crate::owned::WayScratch| block_fn(block, bbs, output, way);
     crate::scan::classify::parallel_classify_phase_ordered(
         input,
         schedule,

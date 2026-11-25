@@ -423,6 +423,7 @@ fn filter_block_parallel(
     block: &PrimitiveBlock,
     expressions: &[Expression],
     invert: bool,
+    coords: crate::owned::WayCoords,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<TagsFilterStats> {
@@ -436,7 +437,7 @@ fn filter_block_parallel(
         relations_from_relations: 0,
     };
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -478,10 +479,9 @@ fn filter_block_parallel(
                 tags_buf.extend(w.tags());
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Way) != invert {
                     ensure_way_capacity_local(bb, output)?;
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    way.prepare(w, coords)?;
                     let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
-                    bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
+                    way.write(bb, tags_buf.iter().copied(), meta.as_ref());
                     stats.ways_matched += 1;
                 }
             }
@@ -538,11 +538,12 @@ fn tags_filter_single_pass(
         Some(filter) => reader.with_blob_filter(filter),
         None => reader,
     };
+    let coords = crate::owned::WayCoords::of_input(reader.header());
     let mut writer = writer_from_header(
         output,
         compression,
         reader.header(),
-        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        &super::output_header::OutputFacts::carry(coords.rewritten()),
         overrides,
         backend,
         host,
@@ -563,7 +564,7 @@ fn tags_filter_single_pass(
             let mut bb = BlockBuilder::new();
             let mut output = Vec::new();
             let block_stats =
-                filter_block_parallel(&block, expressions, invert, &mut bb, &mut output)?;
+                filter_block_parallel(&block, expressions, invert, coords, &mut bb, &mut output)?;
             flush_local(&mut bb, &mut output)?;
             crate::commands::split::fit_blocks(&mut output, &limits)?;
             Ok((output, block_stats))
@@ -607,6 +608,7 @@ fn filter_block_pass2(
     block: &PrimitiveBlock,
     ids: &Pass2IdSets<'_>,
     remove_tags: bool,
+    coords: crate::owned::WayCoords,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> crate::Result<TagsFilterStats> {
@@ -620,7 +622,7 @@ fn filter_block_pass2(
         relations_from_relations: 0,
     };
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -687,10 +689,9 @@ fn filter_block_pass2(
                     if !remove_tags || direct {
                         tags_buf.extend(w.tags());
                     }
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    way.prepare(w, coords)?;
                     let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
-                    bb.add_way_partial(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
+                    way.write(bb, tags_buf.iter().copied(), meta.as_ref());
                     if direct {
                         stats.ways_matched += 1;
                     } else {
@@ -1052,11 +1053,12 @@ fn tags_filter_two_pass(
     let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
+    let coords = crate::owned::WayCoords::of_input(&header);
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        &super::output_header::OutputFacts::carry(coords.rewritten()),
         overrides,
         backend,
         host,
@@ -1200,7 +1202,7 @@ fn tags_filter_two_pass(
             |block, (bb, output_blocks): &mut (BlockBuilder, Vec<OwnedBlock>)| {
                 output_blocks.clear();
                 let block_stats =
-                    filter_block_pass2(block, &id_sets, remove_tags, bb, output_blocks)?;
+                    filter_block_pass2(block, &id_sets, remove_tags, coords, bb, output_blocks)?;
                 flush_local(bb, output_blocks)?;
                 crate::commands::split::fit_blocks(output_blocks, &limits)?;
                 Ok((std::mem::take(output_blocks), block_stats))

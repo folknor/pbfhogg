@@ -727,8 +727,9 @@ Reported by: spatial.
 
 Mechanism: export requires inline way locations and currently does no lookup;
 producing an ALTW PBF first pays delta encoding, compression, intermediate I/O,
-decompression and decoding to cross a command boundary. Extract re-encodes
-ways without locations, so extract followed by export loses the prerequisite.
+decompression and decoding to cross a command boundary. Extract of a located
+input now keeps the locations, so extract followed by export works, but still
+pays that boundary twice.
 
 Redesign: put the export sink right after coordinate resolution - sparse
 exposes the completed coordinate store to geometry workers, external delivers

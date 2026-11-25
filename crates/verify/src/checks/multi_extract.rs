@@ -200,7 +200,7 @@ impl StrategyRun<'_> {
                 pbf,
                 &seq_out,
                 &captured,
-                crate::harness::WayLocations::Dropped,
+                crate::harness::WayLocations::Kept,
             )?;
             let compared = if input_sorted {
                 seq_out
@@ -283,14 +283,14 @@ impl StrategyRun<'_> {
             for named in pass_regions {
                 let multi_pbf = multi_dir.join(named.output_name());
                 let label = format!("{label_prefix} {}", named.stem);
-                // One invocation writes every region, so its one warning covers
-                // them all: each region is held to dropping the declaration.
+                // One invocation writes every region: each region is held to
+                // keeping the declaration, with no loss warning for it.
                 harness.judge_way_locations(
                     &label,
                     pbf,
                     &multi_pbf,
                     &captured,
-                    crate::harness::WayLocations::Dropped,
+                    crate::harness::WayLocations::Kept,
                 )?;
                 let (compared, order) = if input_sorted {
                     (multi_pbf.clone(), format!("{label} output order"))

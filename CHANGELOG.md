@@ -46,6 +46,20 @@
   `cat --reindex` repairs it. Inputs whose ranges overlap (history files)
   or carry no indexdata run as before.
 
+- **`extract`, `tags-filter`, `getid` and `getparents` keep
+  `LocationsOnWays`.** On an input declaring it, every written way now keeps
+  its inline coordinates (each ref the one its input recorded, including a
+  ref to a node the output does not hold) and the output keeps the
+  declaration, so an extract of an enriched file can go straight to
+  `export`; before, the coordinates were dropped, the declaration removed
+  and `header.way_metadata_loss` warned. This covers every extract strategy
+  and `--config` multi-extract, both tags-filter modes, getid with
+  `--add-referenced` and `--invert` with a way ID. The prepass features are
+  still dropped and warned. A re-encoded way that has refs but no
+  coordinates in such an input is now refused (exit `2`); a way blob
+  `getid --invert` copies whole is not decoded, so its arrays are believed. osmium keeps them only under
+  `-f pbf,locations_on_ways=true`.
+
 - **`sort` and `cat --dedupe` keep `LocationsOnWays` through a rewrite.**
   When every input declares `LocationsOnWays`, a way blob in an overlap run
   (or internally unsorted, or restructured) is now re-encoded with its inline

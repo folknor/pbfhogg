@@ -257,6 +257,17 @@ baseline's 2.440 s; warm cells agree within 1 %. Variant peak anon 135 MB,
 2.6 cores. Output at `-j 1`, `-j 8` and the default is byte-identical
 (sha256). brokkr refuses `-j` on this shape, so no `-j` sweep was measured.
 
+### Ways written under the input's coordinate policy (2026-11-25, bygg)
+
+Both writers now encode ways through `owned::WayScratch` under a
+`WayCoords` policy read from the input header (one branch per written way
+on undeclared input). Matched `--iterations 1` cells of `tag-select`
+(default mode) on the indexed planet, interleaved, baseline at `c3cb52a5`
+against the uncommitted change: pair 1 48.5 s (`dabef763`) against 50.8 s
+(`9d58187c`), pair 2 49.9 s (`3fdc7ba6`) against 49.9 s (`71d1d5a8`).
+Medians 49.2 s and 50.35 s, a 2.3 % gap carried by one cell and absent from
+the second pair: noise, no cost.
+
 ## History
 
 ### Tags-filter

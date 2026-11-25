@@ -76,8 +76,11 @@ pub(super) enum Select<'a> {
         region: &'a Region,
         exact: &'a BboxInt,
     },
-    /// A way with a ref among the region's nodes.
-    Ways { nodes: &'a IdSet },
+    /// A way with a ref among the region's nodes, written under `coords`.
+    Ways {
+        nodes: &'a IdSet,
+        coords: crate::owned::WayCoords,
+    },
     /// A relation with a matchable member selected (no relation closure).
     Relations { nodes: &'a IdSet, ways: &'a IdSet },
 }
@@ -108,7 +111,7 @@ impl Select<'_> {
                 n.id(),
                 region.contains_node(exact, n.decimicro_lat().ok(), n.decimicro_lon().ok())?,
             )),
-            (Select::Ways { nodes }, Element::Way(w)) => {
+            (Select::Ways { nodes, .. }, Element::Way(w)) => {
                 Some((w.id(), w.refs().any(|r| nodes.get(r))))
             }
             (Select::Relations { nodes, ways }, Element::Relation(r)) => {
@@ -332,12 +335,17 @@ fn fuse_blob(
 
     let mut output = FramedBlocks::new(compression, metrics).cutting();
     let kind = select.kind();
+    let coords = match select {
+        Select::Ways { coords, .. } => *coords,
+        Select::Nodes { .. } | Select::Relations { .. } => crate::owned::WayCoords::Drop,
+    };
     let block_stats = if unique {
         let mut next = local.decisions.iter().copied();
         emit(
             &block,
             kind,
             clean,
+            coords,
             |_| next.next().unwrap_or(false),
             &mut local.bb,
             &mut output,
@@ -350,6 +358,7 @@ fn fuse_blob(
             &block,
             kind,
             clean,
+            coords,
             |id| set.binary_search(&id).is_ok(),
             &mut local.bb,
             &mut output,
@@ -375,6 +384,7 @@ fn emit<O: BlockSink + ?Sized>(
     block: &PrimitiveBlock,
     kind: ElementKind,
     clean: &CleanAttrs,
+    coords: crate::owned::WayCoords,
     mut want: impl FnMut(i64) -> bool,
     bb: &mut BlockBuilder,
     output: &mut O,
@@ -388,7 +398,7 @@ fn emit<O: BlockSink + ?Sized>(
         relations_written: 0,
         strategy: "",
     };
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         match (&element, kind) {
@@ -416,13 +426,12 @@ fn emit<O: BlockSink + ?Sized>(
             (Element::Way(w), ElementKind::Way) => {
                 if want(w.id()) {
                     ensure_way_capacity_local(bb, output)?;
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    way.prepare(w, coords)?;
                     let meta = clean_partial_metadata(
                         element_metadata(ElementKind::Way, w.id(), &w.info())?,
                         clean,
                     );
-                    bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    way.write(bb, w.tags(), meta.as_ref());
                     stats.ways_written += 1;
                 }
             }

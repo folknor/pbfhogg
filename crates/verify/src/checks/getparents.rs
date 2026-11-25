@@ -33,8 +33,9 @@
 //! tags and metadata by ID. On sorted input it checks strict output order
 //! and compares the sort features. On unsorted input it checks that pbfhogg
 //! omits `Sort.Type_then_ID` and compares through sorted copies. Each mode
-//! separately checks that pbfhogg omits `LocationsOnWays` and warns of its
-//! loss when the input declares it. Blob skipping is outside the comparison.
+//! separately checks that pbfhogg keeps `LocationsOnWays` when the input
+//! declares it, osmium being asked for the coordinates too, so the element
+//! comparison reads them. Blob skipping is outside the comparison.
 
 use std::path::{Path, PathBuf};
 
@@ -194,7 +195,7 @@ fn run_mode(
         pbf,
         &ours,
         &captured,
-        crate::harness::WayLocations::Dropped,
+        crate::harness::WayLocations::Kept,
     )?;
 
     let theirs = outdir.join(format!("osmium-{stem}.osm.pbf"));
@@ -207,9 +208,13 @@ fn run_mode(
     if add_self {
         run = run.arg("-s");
     }
+    let (run, declares) = crate::checks::sort::ask_declared_locations(run, pbf)?;
     let run = run.arg("-o").output(&theirs).arg("--overwrite");
     let captured = harness.reference(&run, &outdir.join(format!("osmium-{stem}.stdout")))?;
     harness.require_success(&captured, &osmium_label)?;
+    if declares {
+        crate::checks::sort::require_declared_locations(&theirs, &osmium_label)?;
+    }
 
     let listing = outdir.join(format!("osmium-{stem}.opl"));
     let captured = harness.reference(

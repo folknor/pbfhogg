@@ -161,7 +161,7 @@ fn run_mode(
         input.pbf,
         &ours,
         &captured,
-        crate::harness::WayLocations::Dropped,
+        crate::harness::WayLocations::Kept,
     )?;
 
     let theirs = input.outdir.join(format!("osmium-{stem}.osm.pbf"));
@@ -171,6 +171,7 @@ fn run_mode(
     for id in args {
         osmium = osmium.arg(id.as_str());
     }
+    let (osmium, declares) = crate::checks::sort::ask_declared_locations(osmium, input.pbf)?;
     let osmium = osmium
         .args(if remove_tags {
             &["-r", "-t", "-v", "-o"]
@@ -202,6 +203,9 @@ fn run_mode(
                 "{osmium_label} exited 0 after a non-zero status"
             )));
         }
+    }
+    if declares {
+        crate::checks::sort::require_declared_locations(&theirs, osmium_label)?;
     }
     Ok(Mode {
         label,

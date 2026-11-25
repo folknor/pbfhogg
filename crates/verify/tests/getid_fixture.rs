@@ -7,12 +7,13 @@
 //! records by ID from the OPL, and the fake osmium decodes it by the
 //! requested OPL options ([`fake_pbf::project`]).
 //!
-//! Every pbfhogg output but one drops `LocationsOnWays` (it re-encodes or
-//! requests a way); `getid --invert n1` copies the way blob whole and keeps
-//! it, and osmium removeid is asked to keep it too. One inline coordinate
-//! altered on pbfhogg's outputs alone must therefore fail exactly that
-//! comparison, by name, which witnesses the both-declared branch of
-//! `Policy::between` there; a clean run passes.
+//! Every pbfhogg output keeps `LocationsOnWays` (getid in every mode
+//! re-encodes a way with its coordinates, and `getid --invert n1` copies the
+//! way blob whole), and osmium getid and removeid are asked to keep it too.
+//! One inline coordinate altered on pbfhogg's outputs alone must therefore
+//! fail exactly the comparisons whose outputs hold the way, by name, which
+//! witnesses the both-declared branch of `Policy::between` there; a clean
+//! run passes.
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -66,7 +67,12 @@ pub fn driver(life: process::Lifecycle, exe: &Path, dir: &Path) {
             assert_eq!(judged.status, harness::CheckStatus::Failed, "{judged:?}");
             assert_eq!(
                 judged.failed,
-                ["getid --invert without way IDs diff"],
+                [
+                    "getid diff",
+                    "getid --invert without way IDs diff",
+                    "getid --add-referenced diff",
+                    "getid --add-referenced --remove-tags diff",
+                ],
                 "{judged:?}"
             );
         }
@@ -91,6 +97,14 @@ fn with_referenced(objects: &str, keys: &[String]) -> Vec<String> {
         }
     }
     wanted
+}
+
+/// Whether an osmium run asked for inline coordinates, which the verifier
+/// does exactly when the input declares them.
+fn asked(args: &[&str], declares: bool) -> bool {
+    let asked = args.contains(&"pbf,locations_on_ways=true");
+    assert_eq!(asked, declares, "{args:?}");
+    asked
 }
 
 pub fn tool(args: &[OsString]) -> i32 {
@@ -130,19 +144,20 @@ pub fn tool(args: &[OsString]) -> i32 {
     let (wanted, invert, keeps) = match args[0] {
         "getid" if args.contains(&"--invert") => {
             assert!(ours);
-            let way_requested = keys.iter().any(|k| k.starts_with('w'));
-            (keys.clone(), true, !way_requested)
+            (keys.clone(), true, true)
         }
         "getid" if args.contains(&"--add-referenced") || args.contains(&"-r") => {
             assert_eq!(args.contains(&"-v"), !ours);
-            (with_referenced(&objects, &keys), false, false)
+            (
+                with_referenced(&objects, &keys),
+                false,
+                ours || asked(&args, declares),
+            )
         }
-        "getid" => (keys.clone(), false, false),
+        "getid" => (keys.clone(), false, ours || asked(&args, declares)),
         "removeid" => {
             assert!(!ours);
-            let asked = args.contains(&"pbf,locations_on_ways=true");
-            assert_eq!(asked, declares, "{args:?}");
-            (keys.clone(), true, asked)
+            (keys.clone(), true, asked(&args, declares))
         }
         _ => panic!("unexpected getid fixture invocation: {args:?}"),
     };

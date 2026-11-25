@@ -182,12 +182,16 @@ fn run_case(
     if let Some(flag) = case.osmium_flag {
         osmium = osmium.arg(flag);
     }
+    let (osmium, declares) = crate::checks::sort::ask_declared_locations(osmium, pbf)?;
     let osmium = osmium.arg("-o").output(&osmium_out).arg("--overwrite");
     let captured = harness.reference(
         &osmium,
         &outdir.join(format!("osmium-{}.stdout", case.label)),
     )?;
     harness.require_success(&captured, &osmium_label)?;
+    if declares {
+        crate::checks::sort::require_declared_locations(&osmium_out, &osmium_label)?;
+    }
     if case.by_id {
         verify_signs::refuse_folds(
             harness,
@@ -219,7 +223,7 @@ fn run_case(
         pbf,
         &pbfhogg_out,
         &captured,
-        crate::harness::WayLocations::Dropped,
+        crate::harness::WayLocations::Kept,
     )?;
 
     compare_outputs(

@@ -57,12 +57,13 @@ pub(super) fn extract_complete_ways(
     let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
+    let coords = crate::owned::WayCoords::of_input(&header);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        &super::output_facts(set_bounds, bbox),
+        &super::output_facts(set_bounds, bbox, coords),
         overrides,
         backend,
         host,
@@ -91,7 +92,7 @@ pub(super) fn extract_complete_ways(
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {
-                extract_block_pass2(block, &ids, clean, None, bb, output_blocks)
+                extract_block_pass2(block, &ids, clean, coords, None, bb, output_blocks)
             },
             host,
         )?;
@@ -102,7 +103,7 @@ pub(super) fn extract_complete_ways(
             &mut writer,
             &mut stats,
             |block, bb, output_blocks| {
-                extract_block_pass2(block, &ids, clean, None, bb, output_blocks)
+                extract_block_pass2(block, &ids, clean, coords, None, bb, output_blocks)
             },
             host,
         )?;

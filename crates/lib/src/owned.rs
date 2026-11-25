@@ -929,6 +929,83 @@ pub(crate) fn write_declared_way_local(
     Ok(())
 }
 
+/// Whether a command that decodes and re-encodes whole ways writes their
+/// inline coordinates. A way written by such a command keeps every ref it
+/// had, so each kept coordinate is the one its input recorded beside that
+/// ref; a command that alters refs, or whose coordinates would no longer be
+/// true of the output (time-filter), must not use [`WayCoords::Keep`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WayCoords {
+    /// Ways are written with refs only.
+    Drop,
+    /// Ways are written with their inline coordinates, one per ref; a way
+    /// with refs and no coordinates is refused (see [`declared_way_locations`]).
+    Keep,
+}
+
+impl WayCoords {
+    /// Keep exactly when the one input declares `LocationsOnWays`.
+    pub(crate) fn of_input(header: &crate::HeaderBlock) -> Self {
+        if header.has_locations_on_ways() {
+            Self::Keep
+        } else {
+            Self::Drop
+        }
+    }
+
+    /// The header fact of a command that re-encodes every way it writes
+    /// under this policy.
+    pub(crate) fn rewritten(self) -> crate::commands::output_header::Ways {
+        match self {
+            Self::Drop => crate::commands::output_header::Ways::Reencoded,
+            Self::Keep => crate::commands::output_header::Ways::ReencodedWithLocations,
+        }
+    }
+}
+
+/// The one encoder for a way re-encoded whole under a [`WayCoords`] policy.
+/// [`WayScratch::prepare`] decodes the refs and, under `Keep`, the
+/// coordinates from the same way, so the pair is positional by
+/// construction; [`WayScratch::write`] may then add that way to any number of
+/// builders (multi-extract fans one decoded way out to several regions).
+#[derive(Debug, Default)]
+pub(crate) struct WayScratch {
+    id: i64,
+    keep: bool,
+    refs: Vec<i64>,
+    locations: Vec<(i32, i32)>,
+}
+
+impl WayScratch {
+    pub(crate) fn prepare(&mut self, w: &crate::Way<'_>, coords: WayCoords) -> Result<()> {
+        self.id = w.id();
+        self.refs.clear();
+        self.refs.extend(w.refs());
+        self.keep = coords == WayCoords::Keep;
+        if self.keep {
+            declared_way_locations(w, self.refs.len(), &mut self.locations)?;
+        } else {
+            self.locations.clear();
+        }
+        Ok(())
+    }
+
+    /// Add the prepared way to `bb` with `tags` and `meta`; the caller has
+    /// ensured way capacity.
+    pub(crate) fn write<'t>(
+        &self,
+        bb: &mut BlockBuilder,
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+        meta: Option<&PartialMetadata<'_>>,
+    ) {
+        if self.keep {
+            bb.add_way_with_locations_partial(self.id, tags, &self.refs, &self.locations, meta);
+        } else {
+            bb.add_way_partial(self.id, tags, &self.refs, meta);
+        }
+    }
+}
+
 /// A bad role string index is an error naming the relation and member, as in
 /// [`Relation::members_into`](crate::Relation::members_into).
 pub(crate) fn read_relation(r: &crate::Relation<'_>) -> Result<OwnedRelation> {

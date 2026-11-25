@@ -570,11 +570,13 @@ pub(super) fn try_extract_multi_dependent(
 
     // --- Write pass ---
     host.invocation.marker("MULTI_DEP_WRITE_START");
+    let coords = crate::owned::WayCoords::of_input(&header);
     let (mut writers, framing) = open_region_writers(
         &header,
         regions,
         outputs,
         set_bounds,
+        coords,
         compression,
         overrides,
         host,
@@ -588,6 +590,7 @@ pub(super) fn try_extract_multi_dependent(
         relations: &relation_members,
         mw,
         clean,
+        coords,
         strategy: name,
     };
     let mut stats: Vec<ExtractStats> = (0..n).map(|_| empty_stats(name)).collect();
@@ -769,6 +772,7 @@ struct WriteSets<'a> {
     relations: &'a Membership,
     mw: usize,
     clean: &'a crate::cat::CleanAttrs,
+    coords: crate::owned::WayCoords,
     strategy: &'static str,
 }
 
@@ -780,7 +784,7 @@ struct WriteLocal {
     pool: std::sync::Arc<crate::blob::DecompressPool>,
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
-    refs: Vec<i64>,
+    way: crate::owned::WayScratch,
     /// Three masks: two per-set lookups and their union.
     masks: [Vec<u64>; 3],
 }
@@ -843,7 +847,7 @@ fn write_pass(
             pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
-            refs: Vec::new(),
+            way: crate::owned::WayScratch::default(),
             masks: [
                 vec![0u64; sets.mw],
                 vec![0u64; sets.mw],
@@ -903,7 +907,7 @@ fn write_block(
     let WriteLocal {
         bbs,
         output,
-        refs,
+        way,
         masks,
         ..
     } = local;
@@ -972,15 +976,14 @@ fn write_block(
                 for ((u, &m), &x) in union.iter_mut().zip(first.iter()).zip(second.iter()) {
                     *u = m | x;
                 }
-                refs.clear();
-                refs.extend(w.refs());
+                way.prepare(w, sets.coords)?;
                 let meta = clean_partial_metadata(
                     element_metadata(ElementKind::Way, id, &w.info())?,
                     clean,
                 );
                 for i in regions_of(union) {
                     ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
-                    bbs[i].add_way_partial(id, w.tags(), refs, meta.as_ref());
+                    way.write(&mut bbs[i], w.tags(), meta.as_ref());
                     if has(first, i) {
                         counts[i].ways_written += 1;
                     } else {

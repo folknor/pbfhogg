@@ -126,7 +126,7 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
         pbf,
         &pbfhogg_getid,
         &captured,
-        WayLocations::Dropped,
+        WayLocations::Kept,
     )?;
 
     let selected = osmium_counts(harness, (&pbfhogg_getid, Origin::Pbfhogg))?;
@@ -152,12 +152,16 @@ pub fn run(harness: &mut Harness, pbf: &Path, direct_io: bool) -> Result<Option<
     for id in &requested {
         osmium_run = osmium_run.arg(id.as_str());
     }
+    let (osmium_run, declares) = crate::checks::sort::ask_declared_locations(osmium_run, pbf)?;
     let osmium_run = osmium_run
         .arg("-o")
         .output(&osmium_getid)
         .arg("--overwrite");
     let captured = harness.reference(&osmium_run, &outdir.join("osmium-getid.stdout"))?;
     harness.require_success(&captured, "osmium getid")?;
+    if declares {
+        crate::checks::sort::require_declared_locations(&osmium_getid, "osmium getid")?;
+    }
 
     compare_outputs(
         harness,
@@ -287,13 +291,7 @@ impl Invert<'_> {
         } else {
             "pbfhogg getid --invert"
         };
-        harness.judge_way_locations(
-            label,
-            self.pbf,
-            &ours,
-            &captured,
-            invert_way_locations(ids),
-        )?;
+        harness.judge_way_locations(label, self.pbf, &ours, &captured, WayLocations::Kept)?;
 
         // The declaration, not payload arrays: undeclared arrays are not
         // content pbfhogg promises and its output never declares them, so
@@ -326,19 +324,6 @@ impl Invert<'_> {
             &theirs,
         )?;
         Ok(ours)
-    }
-}
-
-/// What `getid --invert` must do with a `LocationsOnWays` declaration
-/// (docs/cli/commands.md, "Output header"): on an indexed input it copies
-/// every way blob whole exactly when no way ID is requested, and otherwise
-/// re-encodes its ways without coordinates. The check's input is fully
-/// indexed ([`pbf_frames::walk`] refuses anything else).
-fn invert_way_locations(ids: &[Vec<i64>; 3]) -> WayLocations {
-    if ids[1].is_empty() {
-        WayLocations::Kept
-    } else {
-        WayLocations::Dropped
     }
 }
 
@@ -382,15 +367,6 @@ mod tests {
             required_features: Vec::new(),
         };
         assert!(id_args(&endpoint_ids(&negative)).is_empty());
-    }
-
-    #[test]
-    fn invert_keeps_way_locations_exactly_without_way_ids() {
-        use crate::harness::WayLocations;
-        let without = [vec![1, 9], Vec::new(), vec![4]];
-        assert_eq!(super::invert_way_locations(&without), WayLocations::Kept);
-        let with = [Vec::new(), vec![7], Vec::new()];
-        assert_eq!(super::invert_way_locations(&with), WayLocations::Dropped);
     }
 
     #[test]

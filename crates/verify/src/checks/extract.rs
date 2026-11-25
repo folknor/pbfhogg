@@ -291,6 +291,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             }
             Region::Polygon(polygon) => tool.arg("-p").input(&polygon.path, Origin::Other),
         };
+        let (tool, declares) = crate::checks::sort::ask_declared_locations(tool, pbf)?;
         let mut osmium_args = osmium_strategy(*strategy);
         osmium_args.push("-o");
         let captured = harness.reference(
@@ -301,6 +302,9 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             &outdir.join(format!("osmium-{strategy_name}.stdout")),
         )?;
         harness.require_success(&captured, "osmium extract")?;
+        if declares {
+            crate::checks::sort::require_declared_locations(&osmium_out, "osmium extract")?;
+        }
 
         // --- pbfhogg's order, and the file it is compared through ---
         let label = format!("pbfhogg extract --{strategy_name}{suffix}");
@@ -357,7 +361,7 @@ fn run_region(harness: &mut Harness, pass: &RegionPass<'_>) -> Result<Option<Str
             pbf,
             &pbfhogg_out,
             &pbfhogg_captured,
-            crate::harness::WayLocations::Dropped,
+            crate::harness::WayLocations::Kept,
         )?;
         if !input_sorted {
             let claims = harness.has_sort_flag(&pbfhogg_out, Origin::Pbfhogg)?;

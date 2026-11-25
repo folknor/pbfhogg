@@ -888,7 +888,8 @@ impl ExtractStats {
 /// order (per kind, or in file order on the unsorted simple fallback), so an
 /// extract of a sorted file is sorted and an extract of an unsorted file must
 /// not say it is. Ways are re-encoded (only node blobs are ever copied raw),
-/// so no way enrichment survives. The bbox is the input's, which contains
+/// so no prepass enrichment survives; each way keeps its inline coordinates
+/// under `coords`, which follows the input's `LocationsOnWays` declaration. The bbox is the input's, which contains
 /// every extracted coordinate, unless `--set-bounds` asks for the region's
 /// envelope - which complete_ways and smart exceed by design with the
 /// out-of-region nodes of selected ways (osmium's `--set-bounds` does the
@@ -896,8 +897,12 @@ impl ExtractStats {
 /// decimicrodegree membership uses (`BboxInt::inside_bbox`), so it names the
 /// columns actually selected and is the same whether the box came from `-b`
 /// text, a `--config` entry or a library caller's f64.
-fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header::OutputFacts {
-    use crate::commands::output_header::{Bbox as HeaderBbox, OutputFacts, Ways};
+fn output_facts(
+    set_bounds: bool,
+    bbox: &Bbox,
+    coords: crate::owned::WayCoords,
+) -> crate::commands::output_header::OutputFacts {
+    use crate::commands::output_header::{Bbox as HeaderBbox, OutputFacts};
     use crate::coord_fmt::from_decimicro;
     OutputFacts {
         bbox: if set_bounds {
@@ -911,7 +916,7 @@ fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header
         } else {
             HeaderBbox::Carry
         },
-        ..OutputFacts::carry(Ways::Reencoded)
+        ..OutputFacts::carry(coords.rewritten())
     }
 }
 

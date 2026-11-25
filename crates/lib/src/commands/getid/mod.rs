@@ -614,12 +614,10 @@ pub(crate) fn removeid_to<'a>(
     // carry indexdata (an unindexed blob behind an indexed first blob makes
     // the file partially indexed, which the walk refuses). The output is a
     // subset of the input with nothing changed, so the copied declarations
-    // still hold.
-    let ways = if indexed && !ids.way_ids.has_any() {
-        Ways::BlobsCopied
-    } else {
-        Ways::Reencoded
-    };
+    // still hold. Otherwise way blobs are rewritten, and the rewritten ways
+    // keep their inline coordinates exactly when the input declares them, so
+    // they agree with the copied ones.
+    let ways_copied = indexed && !ids.way_ids.has_any();
     // Invert mode is pinned to the walker arm. The streaming full-scan
     // arm implements include mode only; fusing invert's raw passthrough
     // into a sequential stream is possible but unmeasured (ADR-0006).
@@ -627,7 +625,7 @@ pub(crate) fn removeid_to<'a>(
         input,
         output,
         ids,
-        Filter::Remove(ways),
+        Filter::Remove { ways_copied },
         write,
         overrides,
         false,
@@ -643,9 +641,9 @@ enum Filter {
     /// Write the requested elements, scanning on the given arm. Every way
     /// blob written is re-encoded.
     Include(ScanArm),
-    /// Write everything but the requested elements, on the walker, with
-    /// what the copied way blobs are.
-    Remove(Ways),
+    /// Write everything but the requested elements, on the walker; with
+    /// `ways_copied`, every way blob is copied whole.
+    Remove { ways_copied: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +665,7 @@ fn filter_by_id(
     report_found: bool,
     host: &crate::host::Entered<'_>,
 ) -> Result<GetidStats> {
-    let (include_mode, ways) = match filter {
+    let (include_mode, ways_copied) = match filter {
         Filter::Include(ScanArm::FullScan) => {
             return filter_by_id_streaming(
                 input,
@@ -679,15 +677,15 @@ fn filter_by_id(
                 host,
             );
         }
-        Filter::Include(ScanArm::Walker) => (true, Ways::Reencoded),
-        Filter::Remove(ways) => (false, ways),
+        Filter::Include(ScanArm::Walker) => (true, false),
+        Filter::Remove { ways_copied } => (false, ways_copied),
     };
     filter_by_id_walker(
         input,
         output,
         ids,
         include_mode,
-        ways,
+        ways_copied,
         write,
         overrides,
         report_found,
@@ -702,7 +700,7 @@ fn filter_by_id_walker(
     output: &crate::output::BoundOutput,
     ids: &ElementIds,
     include_mode: bool,
-    ways: Ways,
+    ways_copied: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     report_found: bool,
@@ -747,7 +745,7 @@ fn filter_by_id_walker(
 
     // Find and decode the leading OsmHeader blob to build the output header.
     let mut writer: Option<PbfWriter<FileWriter>> = None;
-    let facts = OutputFacts::carry(ways);
+    let mut coords = crate::owned::WayCoords::Drop;
     let mut declared = Declared::default();
 
     while let Some(meta) = walker.next_header()? {
@@ -762,6 +760,12 @@ fn filter_by_id_walker(
                     .map_err(locate)?;
                 let header = decode_blob_to_headerblock(data).map_err(locate)?;
                 data_buf.release_outlier(&host.invocation);
+                coords = crate::owned::WayCoords::of_input(&header);
+                let facts = OutputFacts::carry(if ways_copied {
+                    Ways::BlobsCopied
+                } else {
+                    coords.rewritten()
+                });
                 let built = super::output_header::build_one(&header, &facts, overrides, host)?;
                 declared = built.declared;
                 let header_bytes = built.bytes;
@@ -860,16 +864,20 @@ fn filter_by_id_walker(
                     None,
                     false,
                     report_found,
+                    coords,
                 )
                 .map_err(locate)?;
                 flush_local(&mut bb, &mut output_blocks)?;
                 // Only an unindexed blob can be a way blob decoded under a
-                // header that declared way enrichment (with one, no way ID is
-                // removed, so an indexed way blob never matches). The walk
-                // refuses a partially indexed file at that blob's frame, before
-                // this decode, so this is a backstop for the declaration: it
-                // must hold whatever the indexing policy becomes.
-                if meta.index.is_none()
+                // header that declared the copied way enrichments (with
+                // them, no way ID is removed, so an indexed way blob never
+                // matches). The walk refuses a partially indexed file at that
+                // blob's frame, before this decode, so this is a backstop for
+                // the declaration: it must hold whatever the indexing policy
+                // becomes. A header for rewritten ways declares only the
+                // coordinates every rewritten way keeps, so it needs none.
+                if ways_copied
+                    && meta.index.is_none()
                     && declared.way_enrichment()
                     && output_blocks
                         .iter()
@@ -953,6 +961,7 @@ fn filter_by_id_streaming(
         ids.relation_ids.has_any(),
     );
     let mut writer: Option<PbfWriter<FileWriter>> = None;
+    let mut coords = crate::owned::WayCoords::Drop;
     let mut stats = GetidStats {
         nodes_written: 0,
         passthrough_claimed: 0,
@@ -985,11 +994,10 @@ fn filter_by_id_streaming(
                 frames.read_payload(&mut payload)?;
                 let header =
                     decode_blob_to_headerblock(&payload).map_err(|e| frames.locate(id, e))?;
+                coords = crate::owned::WayCoords::of_input(&header);
                 let header_bytes = super::output_header::build_one(
                     &header,
-                    &super::output_header::OutputFacts::carry(
-                        super::output_header::Ways::Reencoded,
-                    ),
+                    &OutputFacts::carry(coords.rewritten()),
                     overrides,
                     host,
                 )?
@@ -1063,6 +1071,7 @@ fn filter_by_id_streaming(
                     None,
                     false,
                     report_found,
+                    coords,
                 )
                 .map_err(locate)?;
                 flush_local(&mut bb, &mut output_blocks)?;
@@ -1185,11 +1194,12 @@ fn getid_with_refs(
         ids.way_ids.has_any() || pulled.way_ids.has_any(),
         ids.relation_ids.has_any() || pulled.relation_ids.has_any(),
     ));
+    let coords = crate::owned::WayCoords::of_input(reader.header());
     let mut writer = writer_from_header(
         output,
         write.compression,
         reader.header(),
-        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        &OutputFacts::carry(coords.rewritten()),
         overrides,
         write.backend,
         host,
@@ -1220,6 +1230,7 @@ fn getid_with_refs(
                 pulled_ref,
                 strip_tags,
                 report_found,
+                coords,
             )?;
             flush_local(&mut bb, &mut output)?;
             crate::commands::split::fit_blocks(&mut output, &limits)?;
@@ -1536,13 +1547,14 @@ fn process_block(
     pulled: Option<&ElementIds>,
     strip_tags: bool,
     report_found: bool,
+    coords: crate::owned::WayCoords,
 ) -> crate::Result<BlockOutcome> {
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;
     let mut found: Vec<(ElementKind, i64)> = Vec::new();
 
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -1593,10 +1605,9 @@ fn process_block(
             }
             Element::Way(w) => {
                 ensure_way_capacity_local(bb, output)?;
-                refs_buf.clear();
-                refs_buf.extend(w.refs());
+                way.prepare(w, coords)?;
                 let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                bb.add_way_partial(w.id(), w.tags().take(keep_tags), &refs_buf, meta.as_ref());
+                way.write(bb, w.tags().take(keep_tags), meta.as_ref());
                 ways += 1;
             }
             Element::Relation(r) => {
@@ -2529,7 +2540,17 @@ mod tests {
          -> crate::Result<String> {
             let mut bb = BlockBuilder::new();
             let mut output = Vec::new();
-            let outcome = process_block(block, &mut bb, &mut output, ids, true, dep, strip, true)?;
+            let outcome = process_block(
+                block,
+                &mut bb,
+                &mut output,
+                ids,
+                true,
+                dep,
+                strip,
+                true,
+                crate::owned::WayCoords::Drop,
+            )?;
             flush_local(&mut bb, &mut output)?;
             let bytes: Vec<Vec<u8>> = output.iter().map(|b| b.bytes.clone()).collect();
             Ok(format!(

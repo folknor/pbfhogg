@@ -196,6 +196,23 @@ there freed live memory but moved no peak, since the freed chunks stay in
 the arenas and the way write's worker-side buffers do not reuse them; it was
 not landed (the reason sits at the site in `simple.rs`).
 
+### Ways written under the input's coordinate policy (2026-11-25, bygg)
+
+Every way writer now goes through `owned::WayScratch` under a
+`WayCoords` policy read from the input header, keeping inline coordinates
+on a `LocationsOnWays` input. On the plain indexed planet it adds one
+branch per written way. Matched `--iterations 1` cells of
+`region-extract --strategy simple`, interleaved, baseline at `c3cb52a5`
+against the uncommitted change on top of it:
+
+| Pair | c3cb52a5 | change |
+|---|---|---|
+| 1 | 50.6 s (`6b11d894`, first after the build, cold) | 43.8 s (`d23c33a5`) |
+| 2 | 44.0 s (`d63d9160`) | 43.5 s (`44dfea5c`) |
+
+Verdict: no cost on undeclared input. A declared input's coordinate cost
+was not measured: no planet cell of extract on `altw` exists yet.
+
 ## History
 
 ### Extract

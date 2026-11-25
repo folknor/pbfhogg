@@ -286,6 +286,7 @@ fn getparents_walker(
     drop(walker);
 
     let header = header_block.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
+    let coords = crate::owned::WayCoords::of_input(&header);
 
     host.invocation
         .counter("getparents_schedule_blobs", schedule.len());
@@ -295,7 +296,7 @@ fn getparents_walker(
 
     let header_bytes = super::output_header::build_one(
         &header,
-        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        &super::output_header::OutputFacts::carry(coords.rewritten()),
         overrides,
         host,
     )?
@@ -328,7 +329,9 @@ fn getparents_walker(
         None,
         None,
         || (),
-        |buffer, _state| -> ClassifyResult { parents_in(buffer, ids, opts.add_self, &limits) },
+        |buffer, _state| -> ClassifyResult {
+            parents_in(buffer, ids, opts.add_self, coords, &limits)
+        },
         |_position, (blocks, (n, w, r))| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
@@ -363,9 +366,10 @@ fn getparents_pipelined(
             need_way_blobs,
             need_relation_blobs,
         ));
+    let coords = crate::owned::WayCoords::of_input(reader.header());
     let header_bytes = super::output_header::build_one(
         reader.header(),
-        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        &super::output_header::OutputFacts::carry(coords.rewritten()),
         overrides,
         host,
     )?
@@ -386,7 +390,7 @@ fn getparents_pipelined(
     host.invocation.marker("GETPARENTS_DECODE_START");
     let limits = crate::commands::split::Limits::new(writer.compression());
     reader.for_each_fused_buffer(
-        |buffer| parents_in(buffer, ids, opts.add_self, &limits),
+        |buffer| parents_in(buffer, ids, opts.add_self, coords, &limits),
         |(blocks, (nodes, ways, relations))| {
             for block in blocks {
                 writer.write_primitive_block_owned(block)?;
@@ -428,6 +432,7 @@ fn parents_in(
     buffer: crate::read::block::BlockBuffer<'_>,
     ids: &ElementIds,
     add_self: bool,
+    coords: crate::owned::WayCoords,
     limits: &crate::commands::split::Limits,
 ) -> crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))> {
     let (probe, accepted) = buffer.project(|_, _| ParentProbe::new(ids, add_self))?;
@@ -437,7 +442,7 @@ fn parents_in(
     let block = accepted.into_block();
     let mut bb = BlockBuilder::new();
     let mut output: Vec<OwnedBlock> = Vec::new();
-    let counts = process_block(&block, &mut bb, &mut output, ids, add_self)?;
+    let counts = process_block(&block, &mut bb, &mut output, ids, add_self, coords)?;
     flush_local(&mut bb, &mut output)?;
     // A rebuilt block the writer would refuse as too large is cut between
     // elements here, on the worker (`commands/split.rs`).
@@ -535,12 +540,13 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     ids: &ElementIds,
     add_self: bool,
+    coords: crate::owned::WayCoords,
 ) -> crate::Result<(u64, u64, u64)> {
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;
 
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -580,10 +586,9 @@ fn process_block(
                 let is_self = add_self && ids.way_ids.get(w.id());
                 if is_parent || is_self {
                     ensure_way_capacity_local(bb, output)?;
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    way.prepare(w, coords)?;
                     let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                    bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    way.write(bb, w.tags(), meta.as_ref());
                     ways += 1;
                 }
             }
@@ -686,6 +691,7 @@ mod tests {
                         buffer,
                         ids,
                         *add_self,
+                        crate::owned::WayCoords::Drop,
                         &crate::commands::split::Limits::new(
                             crate::write::compression::Compression::None,
                         ),
@@ -695,8 +701,14 @@ mod tests {
                         Ok(block) => encoded((|| {
                             let mut bb = BlockBuilder::new();
                             let mut output = Vec::new();
-                            let counts =
-                                super::process_block(block, &mut bb, &mut output, ids, *add_self)?;
+                            let counts = super::process_block(
+                                block,
+                                &mut bb,
+                                &mut output,
+                                ids,
+                                *add_self,
+                                crate::owned::WayCoords::Drop,
+                            )?;
                             super::flush_local(&mut bb, &mut output)?;
                             Ok((output, counts))
                         })()),

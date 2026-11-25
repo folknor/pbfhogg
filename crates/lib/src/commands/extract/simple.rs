@@ -261,12 +261,13 @@ fn extract_simple_two_pass(
     let header = header_blob
         .to_headerblock()
         .map_err(|e| header_blob.locate_error(source.as_ref(), e))?;
+    let coords = crate::owned::WayCoords::of_input(&header);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        &super::output_facts(set_bounds, bbox),
+        &super::output_facts(set_bounds, bbox, coords),
         overrides,
         backend,
         host,
@@ -313,6 +314,7 @@ fn extract_simple_two_pass(
                 source.as_ref(),
                 &ids,
                 clean,
+                coords,
                 &mut writer,
                 &mut stats,
                 host,
@@ -326,6 +328,7 @@ fn extract_simple_two_pass(
             source.as_ref(),
             &ids,
             clean,
+            coords,
             &mut writer,
             &mut stats,
             host,
@@ -442,12 +445,13 @@ fn extract_simple_single_pass(
     let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
+    let coords = crate::owned::WayCoords::of_input(&header);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        &super::output_facts(set_bounds, bbox),
+        &super::output_facts(set_bounds, bbox, coords),
         overrides,
         backend,
         host,
@@ -497,6 +501,7 @@ fn extract_simple_single_pass(
             &way_schedule,
             &super::fused::Select::Ways {
                 nodes: &bbox_node_ids,
+                coords,
             },
             clean,
             &mut writer,
@@ -511,6 +516,7 @@ fn extract_simple_single_pass(
             &way_schedule,
             &bbox_node_ids,
             clean,
+            coords,
             &mut writer,
             &mut stats,
             &mut matched_way_ids,
@@ -649,6 +655,7 @@ fn simple_nodes_two_phase(
                     block,
                     &ids,
                     clean,
+                    crate::owned::WayCoords::Drop,
                     Some(crate::ElementKind::Node),
                     bb,
                     output,
@@ -671,6 +678,7 @@ fn simple_ways_two_phase(
     way_schedule: &[&BlobDesc],
     bbox_node_ids: &IdSet,
     clean: &CleanAttrs,
+    coords: crate::owned::WayCoords,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     matched_way_ids: &mut IdSet,
@@ -750,6 +758,7 @@ fn simple_ways_two_phase(
                     block,
                     &ids,
                     clean,
+                    coords,
                     Some(crate::ElementKind::Way),
                     bb,
                     output,
@@ -833,6 +842,7 @@ fn simple_relations_two_phase(
                     block,
                     &ids,
                     clean,
+                    crate::owned::WayCoords::Drop,
                     Some(crate::ElementKind::Relation),
                     bb,
                     output,
@@ -935,11 +945,13 @@ fn settle_passthrough_candidates(
 /// the block takes the decode buffer and drops when the blob is done
 /// (read/decompress.rs, "Take loops"), while the parse scratch is kept per
 /// worker. Results drain in batch order, so output stays in file order.
+#[allow(clippy::too_many_arguments)]
 fn process_extract_pass2_batch(
     batch: &[crate::blob::Blob],
     source: Option<&std::sync::Arc<std::path::Path>>,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
+    coords: crate::owned::WayCoords,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     host: &crate::host::Entered<'_>,
@@ -964,7 +976,7 @@ fn process_extract_pass2_batch(
                         release_scratch(gr_scratch);
                         let mut output: Vec<OwnedBlock> = Vec::new();
                         let block_stats =
-                            extract_block_pass2(&block, ids, clean, None, bb, &mut output)?;
+                            extract_block_pass2(&block, ids, clean, coords, None, bb, &mut output)?;
                         flush_local(bb, &mut output)?;
                         crate::commands::split::fit_blocks(&mut output, &limits)?;
                         Ok((output, block_stats))

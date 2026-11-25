@@ -734,12 +734,13 @@ pub(super) fn extract_smart(
     let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
+    let coords = crate::owned::WayCoords::of_input(&header);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        &super::output_facts(set_bounds, bbox),
+        &super::output_facts(set_bounds, bbox, coords),
         overrides,
         backend,
         host,
@@ -769,7 +770,9 @@ pub(super) fn extract_smart(
             input,
             &mut writer,
             &mut stats,
-            |block, bb, output_blocks| extract_block_pass3(block, &ids, clean, bb, output_blocks),
+            |block, bb, output_blocks| {
+                extract_block_pass3(block, &ids, clean, coords, bb, output_blocks)
+            },
             host,
         )?;
     } else {
@@ -778,7 +781,9 @@ pub(super) fn extract_smart(
             &pass1_blob_schedule,
             &mut writer,
             &mut stats,
-            |block, bb, output_blocks| extract_block_pass3(block, &ids, clean, bb, output_blocks),
+            |block, bb, output_blocks| {
+                extract_block_pass3(block, &ids, clean, coords, bb, output_blocks)
+            },
             host,
         )?;
     }
@@ -812,6 +817,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
     block: &PrimitiveBlock,
     ids: &ExtractPass3IdSets<'_>,
     clean: &CleanAttrs,
+    coords: crate::owned::WayCoords,
     bb: &mut BlockBuilder,
     output: &mut O,
 ) -> crate::Result<ExtractStats> {
@@ -824,7 +830,7 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
         relations_written: 0,
         strategy: "",
     };
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -875,13 +881,12 @@ fn extract_block_pass3<O: crate::commands::BlockSink + ?Sized>(
                 let in_extra = ids.extra_way_ids.get(w.id());
                 if in_matched || in_extra {
                     ensure_way_capacity_local(bb, output)?;
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    way.prepare(w, coords)?;
                     let meta = clean_partial_metadata(
                         element_metadata(crate::ElementKind::Way, w.id(), &w.info())?,
                         clean,
                     );
-                    bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                    way.write(bb, w.tags(), meta.as_ref());
                     if in_extra && !in_matched {
                         stats.ways_from_relations += 1;
                     } else {

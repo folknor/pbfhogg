@@ -76,15 +76,21 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   declaration and `check --locations` verdicts judge them). Where
   coordinates are the command's promise (add-locations-to-ways), the check
   requires both declarations. Where pbfhogg keeps the input's declaration
-  (cat, `getid --invert`, sort), the osmium reference is written with
+  (cat, sort, getid in every mode, getparents, tags-filter, extract), the
+  osmium reference is written with
   `-f pbf,locations_on_ways=true` when the input declares it, and every
   osmium output or sorted copy written with that option must declare it (a
   verifier error otherwise), so a kept declaration is compared coordinate
-  by coordinate. The option follows the declaration, not the payload, in
-  cat, sort, `getid --invert` and `cat --dedupe` on purpose. Lat/lon arrays
+  by coordinate. Multi-extract's reference is pbfhogg's own sequential
+  extract, so its coordinates are held to the engine parity; the
+  standalone extract comparison is what holds them to osmium. The option
+  follows the declaration, not the payload, in every one of these checks
+  and `cat --dedupe` on purpose. Lat/lon arrays
   an input carries without declaring them are not content these commands
   promise: a blob copied whole keeps them as bytes, a re-encoded way drops
-  them (cat's rebuild of an unclassifiable blob keeps them). pbfhogg never
+  them (cat's rebuild of an unclassifiable blob keeps them), since the
+  commands that keep coordinates on a rewrite do so only under the
+  declaration. pbfhogg never
   declares them on such an input, so `Policy::between` reads no coordinates
   whatever option the reference got, and no false failure is possible.
   `cat --dedupe` still holds every passthrough blob byte for byte to the
@@ -137,8 +143,8 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   arm and exactly sort's element comparison, by name, which witnesses
   that branch on cat and sort. On getid-removeid, over an input with one
   indexed node blob and one indexed way blob, the same change fails
-  exactly the `getid --invert` comparison without way IDs, the one output
-  that keeps the declaration. cat `--dedupe` is driven on four indexed
+  exactly the comparisons whose outputs hold the way: plain getid,
+  `getid --invert` without way IDs and both `--add-referenced` modes. cat `--dedupe` is driven on four indexed
   node blobs whose way exists only in the fake decoding, so every merge
   keeps the declaration and the same change fails each merge's element
   comparison; no real way blob is in that fixture. Its fake writes the
@@ -155,15 +161,14 @@ on the pbfhogg CLI judging its own output, except at the residues listed in
   declaration cannot switch the element comparison to one without
   coordinates and pass. An output never declares it when the input does
   not. On an input that declares it: `cat --type` on an input whose first
-  data blob carries indexdata, `getid --invert` without a way ID,
-  `apply-changes --locations-on-ways`, renumber, sort and `cat --dedupe`
-  (whose operands all carry the input's header) must keep it, sort and
-  `cat --dedupe` because a rewritten way is re-encoded with its
-  coordinates, renumber because its splice copies them beside the
-  renumbered refs. osmium renumber's output never declares it, so the
+  data blob carries indexdata, getid in every mode, getparents,
+  tags-filter, extract, multi-extract, `apply-changes --locations-on-ways`,
+  renumber, sort and `cat --dedupe` (whose operands all carry the input's
+  header) must keep it, the filters, sort and `cat --dedupe` because a
+  rewritten way is re-encoded with its coordinates, renumber because its
+  splice copies them beside the renumbered refs. osmium renumber's output never declares it, so the
   renumber check judges the declaration only, never a coordinate value;
-  the CLI suite holds the values; `getid --invert` with a way ID must drop it with the loss
-  warning. The kept declaration is what makes the element comparison read
+  the CLI suite holds the values. The kept declaration is what makes the element comparison read
   every coordinate. A `cat --dedupe` of operands that disagree on the
   declaration is not driven: the judgement reads one input header. The sort
   check holds its input to its domain of one object per kind and ID before
@@ -609,7 +614,7 @@ suite because a later comparison cannot make that run complete.
 | `getparents` | `osmium getparents` | separate node, way, relation and mixed requests, with and without add-self; selection, content and tags by ID, with absent witnesses named |
 | `add-locations-to-ways` | `osmium add-locations-to-ways --keep-member-nodes` | explicit sparse/external engines; element equality with inline coordinates on both routes, sort declaration, own inline-location agreement, and engine parity (element equality and full-record digest) under mode all |
 | `inspect-tags` | `osmium tags-count` | every kind and `-t way`: count and key rows in order, each tool's key quoting decoded |
-| `getid-removeid` (alias `getid`) | `osmium getid`, `removeid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert element equality with and without way IDs (inline coordinates on a `LocationsOnWays` input without them) and count complement, recursive referenced content and tag removal, with absent witnesses named |
+| `getid-removeid` (alias `getid`) | `osmium getid`, `removeid`, `getid -r` and `getid -r -t` | endpoint selection by kind, invert element equality with and without way IDs (inline coordinates on a `LocationsOnWays` input, in every mode) and count complement, recursive referenced content and tag removal, with absent witnesses named |
 | `extract` | `osmium extract` | strict order, element content and per-strategy membership on the bbox and every configured polygon; simple relations follow the any-direct-node-or-way rule judged against complete_ways |
 | `multi-extract` | sequential pbfhogg extracts | each config run reports the route the input header predicts; for each strategy, config output per region has strict order and element equality with its sequential extract of the same strategy (single-pass/sequential parity), for strips alone and, when configured, strips plus polygons |
 | `geocode` | a verifier-owned model of the documented query rules over `osmium tags-filter` and `osmium add-locations-to-ways` OPL (one decoding of address, highway and interpolation objects, one of boundary relations), both read from the osmium-sorted copy when the input does not claim `Sort.Type_then_ID` (osmium locates a way only from nodes stored before it), the input itself otherwise; a present claim is trusted, so a pass does not validate it | `geocode-query` over two `build-geocode-index` builds of the input, at `--admin-tolerance 20` and `0`, on seeded uniform and witness queries aiming at a quota per class within the fine radius, between the radii and beyond both (at least one each is enforced for every class the model holds), plus witnesses near boundary vertices: every judged address, street and interpolation answer is one of the nearest candidates (tied within 0.1 mm) with equal text and address coordinates, distance within 0.1 mm, a street's nearest point within two decimicrodegrees and an interpolation number one the documented range rules give within the reach of the nearest point's truncation, or none beyond the coarse radius, every answer key present; an input with no answering range judges interpolation absence only and says so. Every judged admin level is a containing area of least stored area (the area within a float error bound of the exact outer-ring shoelace, and no larger than any other containing area's bound), or none; a relation the builder withholds (an outer or inner member way absent from the input, without nodes or referring to an absent node, one way in both roles, or an assembled ring whose points all lie on one line) is judged as contributing no area, and a ref osmium left unlocated is joined against its node record; a level is not judged within 1 mm (tolerance 0) or 21.2 m (tolerance 20) of a boundary of that level, inside the box of a relation the model leaves unmodelled (a member endpoint shared by three or more member ends, a one-node member, a way listed twice in one role, an interior member node shared with another member of the role, a ring revisiting a coordinate or of fewer than three), anywhere at the level of a relation with a member node whose record carries no location, or inside the box of a hole nearer than a decimicrodegree to an outer it may belong to (the relation is otherwise modelled, since that ownership decides answers only inside the hole); witness anchors are drawn class first, uniformly over the classes the model holds, then within the class; at least one containing answer per build is enforced. Queries within 0.1 mm of the coarse radius are not judged; an object repeated in a decoding (adjacent repeats only; this does not certify the input's uniqueness), a modelled way with an unlocated node, data beyond 85 degrees of latitude or near the antimeridian, or a segment spanning half a turn of longitude is a verifier error; a tag value or member role holding a NUL is outside the comparison (libosmium cuts it), and so is a way whose refs end in an empty packed field (libosmium keeps only the last segment) |

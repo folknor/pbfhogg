@@ -461,10 +461,9 @@ struct Output<'s> {
     chunk_bytes: usize,
     /// The frame being packed, in pieces (reused, so it grows only when a frame needs more pieces than any before).
     pieces: Vec<Vec<u8>>,
-    refs: Vec<i64>,
-    locations: Vec<(i32, i32)>,
-    /// The sweep's [`Sweep::keep_locations`].
-    keep_locations: bool,
+    way: crate::owned::WayScratch,
+    /// The sweep's [`Sweep::keep_locations`], as the way encoder's policy.
+    coords: crate::owned::WayCoords,
     compression: &'s Compression,
     /// What `compression` lets a block hold, for the cut in `ship`.
     limits: crate::commands::split::Limits,
@@ -505,21 +504,8 @@ impl Output<'_> {
                 Element::Way(w) => {
                     crate::commands::ensure_way_capacity_local(&mut self.bb, &mut self.filled)?;
                     let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
-                    self.refs.clear();
-                    self.refs.extend(w.refs());
-                    if self.keep_locations {
-                        declared_way_locations(w, self.refs.len(), &mut self.locations)?;
-                        self.bb.add_way_with_locations_partial(
-                            w.id(),
-                            w.tags(),
-                            &self.refs,
-                            &self.locations,
-                            meta.as_ref(),
-                        );
-                    } else {
-                        self.bb
-                            .add_way_partial(w.id(), w.tags(), &self.refs, meta.as_ref());
-                    }
+                    self.way.prepare(w, self.coords)?;
+                    self.way.write(&mut self.bb, w.tags(), meta.as_ref());
                 }
                 Element::Relation(r) => {
                     crate::commands::ensure_relation_capacity_local(
@@ -536,7 +522,7 @@ impl Output<'_> {
             Item::Node(n) => write_single_node_local(n, &mut self.bb, &mut self.filled)?,
             // Owned by `into_owned` under the same flag, so its locations
             // already give one per ref.
-            Item::Way(w) if self.keep_locations => {
+            Item::Way(w) if self.coords == crate::owned::WayCoords::Keep => {
                 write_declared_way_local(w, &mut self.bb, &mut self.filled)?;
             }
             Item::Way(w) => write_single_way_local(w, &mut self.bb, &mut self.filled)?,
@@ -765,9 +751,12 @@ impl Sweep<'_, '_> {
             chunk: Vec::new(),
             chunk_bytes: 0,
             pieces: Vec::new(),
-            refs: Vec::new(),
-            locations: Vec::new(),
-            keep_locations: self.keep_locations,
+            way: crate::owned::WayScratch::default(),
+            coords: if self.keep_locations {
+                crate::owned::WayCoords::Keep
+            } else {
+                crate::owned::WayCoords::Drop
+            },
             compression: self.compression,
             limits: crate::commands::split::Limits::new(*self.compression),
             metrics: self.metrics,

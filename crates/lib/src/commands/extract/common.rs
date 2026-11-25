@@ -633,6 +633,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
+    coords: crate::owned::WayCoords,
     phase_kind: Option<crate::ElementKind>,
     bb: &mut BlockBuilder,
     output: &mut O,
@@ -646,7 +647,7 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
         relations_written: 0,
         strategy: "",
     };
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut way = crate::owned::WayScratch::default();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     let emit_nodes = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Node));
@@ -690,13 +691,12 @@ pub(super) fn extract_block_pass2<O: BlockSink + ?Sized>(
             }
             Element::Way(w) if emit_ways && ids.matched_way_ids.get(w.id()) => {
                 ensure_way_capacity_local(bb, output)?;
-                refs_buf.clear();
-                refs_buf.extend(w.refs());
+                way.prepare(w, coords)?;
                 let meta = clean_partial_metadata(
                     element_metadata(crate::ElementKind::Way, w.id(), &w.info())?,
                     clean,
                 );
-                bb.add_way_partial(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                way.write(bb, w.tags(), meta.as_ref());
                 stats.ways_written += 1;
             }
             Element::Relation(r) if emit_rels && ids.matched_relation_ids.get(r.id()) => {

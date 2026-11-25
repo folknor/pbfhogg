@@ -61,6 +61,20 @@ fn osmium_sort_as(
     Ok(())
 }
 
+/// Whether `input` declares `LocationsOnWays`; if it does, `run` (a
+/// reference writing PBF) is asked for the inline coordinates, and the
+/// caller holds its output to [`require_declared_locations`]. Gated on the
+/// declaration, never on payload arrays, as in [`osmium_sort_as`].
+pub(crate) fn ask_declared_locations(run: ToolRun, input: &Path) -> Result<(ToolRun, bool), Error> {
+    let declares =
+        crate::pbf_frames::header(input, Origin::Other)?.optional_feature("LocationsOnWays");
+    Ok(if declares {
+        (run.args(&["-f", "pbf,locations_on_ways=true"]), true)
+    } else {
+        (run, false)
+    })
+}
+
 /// Require `output`, written by `tool` with `-f pbf,locations_on_ways=true`,
 /// to declare `LocationsOnWays`. The element comparison reads inline
 /// coordinates only when both files declare them ([`Policy::between`]), so a

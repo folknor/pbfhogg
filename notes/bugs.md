@@ -26,15 +26,21 @@ reading or an API hazard rather than a demonstrated wrong result; that label is
 kept. "Reported by" is a fact about the reports. Entries are in no order of
 importance.
 
-## BUG-006 - Rebuild paths drop inline way locations
+## BUG-006 - cat --clean drops inline way locations
 
 Reported by: encoding, sort, spatial.
 
-Extract and tags-filter encode ways without their locations and classify the
-output as re-encoded without enrichments (drop and warn), so the hunters flag it
-for judgement against each command's promise. The sort and `cat --dedupe` sweep
-now keeps them when every input declares `LocationsOnWays`; time-filter drops
-them deliberately (they are not as of the cutoff).
+`cat --clean` (`cat_filtered` and its `process_block` in `cat/mod.rs`)
+re-encodes every way without its inline coordinates and drops a declared
+`LocationsOnWays` with the loss warning, although it writes each way whole,
+the shape whose filters now keep them through `owned::WayCoords`. Keeping
+them is the sweep's rule (every input declares), but that rule refuses a way
+with refs and no coordinates, and `cat` is the documented recovery command
+(its `--clean user` / `--clean timestamp` exist so a broken file stays
+rescuable), so whether `--clean` may refuse such a way, or must instead drop
+the declaration for that run, is a maintainer decision. The other droppers are
+deliberate: time-filter (not as of the cutoff), degrade (a fault tool),
+apply-changes without `--locations-on-ways` (cannot refresh them).
 
 ## BUG-019 - apply-changes blob-size percentiles sample passthrough only
 

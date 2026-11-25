@@ -316,6 +316,16 @@ impl Exp {
         }
     }
 
+    /// A filter that writes each selected way whole, re-encoded with the
+    /// inline coordinates its input declared, and without the prepass
+    /// features.
+    fn filtered(f: Fixture) -> Self {
+        Self {
+            low: f.low(),
+            ..Self::reencoded(f)
+        }
+    }
+
     /// A command that copies every way blob whole.
     fn copied(f: Fixture) -> Self {
         Self {
@@ -556,25 +566,25 @@ const ROWS: &[Row] = &[
         command: "tags-filter",
         label: "tags-filter",
         build: |fx, f| simple(fx, "tags-filter", &[fx.path(f)], &["highway"]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "tags-filter",
         label: "tags-filter -R",
         build: |fx, f| simple(fx, "tags-filter", &[fx.path(f)], &["-R", "highway"]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "getid",
         label: "getid",
         build: |fx, f| simple(fx, "getid", &[fx.path(f)], &["n10", "w3"]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "getid",
         label: "getid -r",
         build: |fx, f| simple(fx, "getid", &[fx.path(f)], &["-r", "w3"]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "getid",
@@ -587,13 +597,13 @@ const ROWS: &[Row] = &[
         command: "getid",
         label: "getid --invert of a way",
         build: |fx, f| simple(fx, "getid", &[fx.path(f)], &["--invert", "w3"]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "getparents",
         label: "getparents",
         build: |fx, f| simple(fx, "getparents", &[fx.path(f)], &["n4"]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "extract",
@@ -606,13 +616,13 @@ const ROWS: &[Row] = &[
                 &["--simple", "-b", &region_arg()],
             )
         },
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "extract",
         label: "extract (complete_ways)",
         build: |fx, f| simple(fx, "extract", &[fx.path(f)], &["-b", &region_arg()]),
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "extract",
@@ -625,7 +635,7 @@ const ROWS: &[Row] = &[
                 &["--smart", "-b", &region_arg()],
             )
         },
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "extract",
@@ -641,7 +651,7 @@ const ROWS: &[Row] = &[
         expect: |f| {
             Outcome::Writes(Exp {
                 bbox: BboxExp::Region,
-                ..Exp::reencoded(f)
+                ..Exp::filtered(f)
             })
         },
     },
@@ -659,7 +669,7 @@ const ROWS: &[Row] = &[
         expect: |f| {
             Outcome::Writes(Exp {
                 bbox: BboxExp::Region,
-                ..Exp::reencoded(f)
+                ..Exp::filtered(f)
             })
         },
     },
@@ -667,7 +677,7 @@ const ROWS: &[Row] = &[
         command: "extract",
         label: "extract --config --simple",
         build: extract_config,
-        expect: |f| Outcome::Writes(Exp::reencoded(f)),
+        expect: |f| Outcome::Writes(Exp::filtered(f)),
     },
     Row {
         command: "add-locations-to-ways",
@@ -1350,6 +1360,154 @@ fn renumber_keeps_every_inline_coordinate_of_a_located_input() {
     assert_eq!(before.len(), usize::try_from(WAYS).unwrap());
     assert!(before.iter().all(|w| !w.is_empty()));
     assert_eq!(way_coordinates(&outputs[0]), before);
+}
+
+/// A distinct inline coordinate per ref, unlike any node record's.
+fn inline_location(r: i64) -> (i32, i32) {
+    let base = i32::try_from(r * 1000).unwrap();
+    (base + 3, base + 7)
+}
+
+/// A sorted input declaring `LocationsOnWays`: nodes 10 to 12 lie in
+/// `0.0009,0.0009,0.00125,0.00125` and nodes 30 and 31 outside it; ways 1
+/// and 2 share a blob and way 3 has its own, so `getid --invert w2` rewrites
+/// one way blob and copies the other. Each way carries [`inline_location`]
+/// per ref, except a way listed in `refs_only`.
+fn write_located_filter_input(path: &Path, refs_only: &[i64]) {
+    let header = HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .unwrap();
+    let mut writer = PbfWriter::new(
+        std::io::BufWriter::new(std::fs::File::create(path).unwrap()),
+        Compression::default(),
+    );
+    writer.write_header(&header).unwrap();
+    let mut bb = BlockBuilder::new();
+    for id in [10i64, 11, 12, 30, 31] {
+        let coord = i32::try_from(id * 1000).unwrap();
+        bb.add_node(id, coord, coord, std::iter::empty::<(&str, &str)>(), None);
+    }
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+    for blob in [&LOCATED_WAYS[..2], &LOCATED_WAYS[2..]] {
+        for &(id, refs) in blob {
+            if refs_only.contains(&id) {
+                bb.add_way(id, [("highway", "path")], refs, None);
+            } else {
+                let locs: Vec<(i32, i32)> = refs.iter().map(|&r| inline_location(r)).collect();
+                bb.add_way_with_locations(id, [("highway", "path")], refs, &locs, None);
+            }
+        }
+        writer
+            .write_primitive_block(bb.take().unwrap().unwrap())
+            .unwrap();
+    }
+    writer.flush().unwrap();
+}
+
+/// The ways of [`write_located_filter_input`], with their refs.
+const LOCATED_WAYS: [(i64, &[i64]); 3] = [(1, &[10, 30, 11]), (2, &[30, 31]), (3, &[12, 31])];
+
+/// The filters that write selected ways whole, each on an input declaring
+/// `LocationsOnWays`.
+const LOCATED_FILTERS: &[&[&str]] = &[
+    &["extract", "--simple", "-b", "0.0009,0.0009,0.00125,0.00125"],
+    &["extract", "-b", "0.0009,0.0009,0.00125,0.00125"],
+    &["extract", "--smart", "-b", "0.0009,0.0009,0.00125,0.00125"],
+    &["tags-filter", "w/highway"],
+    &["tags-filter", "-R", "w/highway"],
+    &["getid", "w1", "w3"],
+    &["getid", "-r", "w1"],
+    &["getid", "--invert", "w2"],
+    &["getparents", "n10"],
+];
+
+/// A filter writes each selected way with the inline coordinate its input
+/// recorded beside each ref, position by position, including the refs to
+/// nodes a simple extract leaves out; the declaration is kept and not
+/// warned. The header table's coverage check alone would miss a coordinate
+/// paired with the wrong ref.
+#[test]
+fn filters_keep_each_inline_coordinate_beside_its_ref() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("located.osm.pbf");
+    write_located_filter_input(&input, &[]);
+    for (i, command) in LOCATED_FILTERS.iter().enumerate() {
+        let output = dir.path().join(format!("out{i}.osm.pbf"));
+        let out = CliInvoker::new(&invocation_scratch)
+            .arg(command[0])
+            .arg(&input)
+            .args(&command[1..])
+            .arg("-o")
+            .arg(&output)
+            .assert_success();
+        assert!(
+            !out.stderr_str().contains("LocationsOnWays"),
+            "{command:?} warned about a declaration it keeps: {}",
+            out.stderr_str()
+        );
+        assert!(read_header(&output).has_locations_on_ways(), "{command:?}");
+        let mut ways = 0;
+        let mut out_of_region = false;
+        for blob in BlobReader::from_path(&output).unwrap() {
+            let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() else {
+                continue;
+            };
+            for element in block.elements() {
+                match element {
+                    Element::Way(w) => {
+                        let got: Vec<(i64, (i32, i32))> =
+                            w.refs()
+                                .zip(w.node_locations().map(|l| {
+                                    (l.decimicro_lat().unwrap(), l.decimicro_lon().unwrap())
+                                }))
+                                .collect();
+                        let (_, refs) = LOCATED_WAYS.iter().find(|(id, _)| *id == w.id()).unwrap();
+                        let want: Vec<(i64, (i32, i32))> =
+                            refs.iter().map(|&r| (r, inline_location(r))).collect();
+                        assert_eq!(got, want, "{command:?}: way {}", w.id());
+                        assert_eq!(w.node_locations().count(), refs.len(), "{command:?}");
+                        ways += 1;
+                    }
+                    Element::Node(n) if n.id() == 30 => out_of_region = true,
+                    Element::DenseNode(n) if n.id() == 30 => out_of_region = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(ways > 0, "{command:?} wrote no way");
+        if command[1] == "--simple" {
+            assert!(
+                !out_of_region,
+                "simple extract wrote the node outside the region"
+            );
+        }
+    }
+}
+
+/// A selected way with refs and no coordinates, in an input declaring
+/// `LocationsOnWays`, is refused: writing it would leave a way the kept
+/// declaration misdescribes.
+#[test]
+fn filters_refuse_a_selected_way_without_the_declared_coordinates() {
+    let invocation_scratch = pbfhogg_test_scratch::scratch();
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("located.osm.pbf");
+    write_located_filter_input(&input, &[1, 3]);
+    for (i, command) in LOCATED_FILTERS.iter().enumerate() {
+        let output = dir.path().join(format!("out{i}.osm.pbf"));
+        CliInvoker::new(&invocation_scratch)
+            .arg(command[0])
+            .arg(&input)
+            .args(&command[1..])
+            .arg("-o")
+            .arg(&output)
+            .assert_refused("0 inline location(s)");
+    }
 }
 
 /// The raw-copying paths decide their header from the first data blob's
